@@ -111,6 +111,8 @@ Useful options:
 | `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |
 | `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
 | `--ipc-live-reassembly-budget-bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | Shared upstream reassembly/retention capacity budget. |
+| `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 | Outstanding forwarding transactions; zero refuses all new forwarding. |
+| `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB | Retained forwarding input; zero refuses positive input. |
 | `--upstream`, `-u` | none | empty | Pre-register an upstream as `NAME=SERVER_ID@ADDRESS`. `SERVER_ID` must match the IPC server handshake identity. Repeatable. |
 
 Examples:
@@ -137,6 +139,17 @@ proof/watch contexts, peer mappings and HTTP buffers are outside this budget.
 Other IPC fields use the Rust resolver's environment inputs, including
 `C2_IPC_POOL_PREWARM_SEGMENTS`, `C2_IPC_POOL_MIN_RETAINED_SEGMENTS` and
 `C2_IPC_POOL_DECAY_SECONDS`. Disabled buddy requires zero prewarm.
+
+Forwarding limits freeze at startup and apply to every business request,
+including callers with unlimited waits. Known input lengths reserve capacity
+before request transfer; unknown lengths charge checked growth as bytes arrive.
+Capacity refusal does not withdraw a route. These limits are independent of
+the upstream storage budgets and do not measure process RSS.
+
+Each forwarding transaction owns its input and upstream operation after its
+HTTP waiter disconnects. Ctrl+C closes admission and waits for actual forwarding
+completion and native-client cleanup. A resource method that never returns can
+keep shutdown pending; disconnecting the caller does not cancel that method.
 
 ```bash
 c3 relay --bind 127.0.0.1:8080 --idle-timeout 10 \

@@ -112,11 +112,17 @@ C2_RELAY_IDLE_TIMEOUT=60
 | 对外公布地址 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | 从 bind 派生 |
 | Mesh seeds | `--seeds` | `C2_RELAY_SEEDS` | 空 |
 | 上游 IPC 空闲断连 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | 60 秒，`0` 关闭时间驱逐 |
+| 转发事务数量 | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 / Relay |
+| 转发保留输入 | `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB / Relay |
 | 系统 HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | 反熵交换间隔 | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 秒 |
 | 客户端路由获取次数 | SDK 原生配置 | `C2_RELAY_ROUTE_MAX_ATTEMPTS` | 3，范围 1–32，`0` 按 1 |
 
 预注册上游的语法为 `--upstream NAME=SERVER_ID@ADDRESS`，身份与 IPC handshake 一致。上游 budget 参数、mesh 和 dry-run 用法见 [c3 指南](../cli/README.md)。
+
+Relay 在启动时冻结转发限额，所有业务转发均受约束，包括调用方无限等待的请求。数量限额 `0` 拒绝全部新转发；输入预算 `0` 拒绝正数输入。已知长度在移交请求前预留，未知长度随实际输入检查增长；超限返回容量错误，不撤销路由。该预算独立于上游 IPC backing 和 reassembly budget，不代表整个进程内存。
+
+HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接，直到实际完成。Relay 关闭先停止准入，再等待转发和原生客户端清理。始终不返回的资源方法会持续占用名额，也会阻塞关闭。
 
 ## 本地端点位置与平台差异
 
