@@ -305,7 +305,9 @@ def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
         for path in (
             fastdb / "ts/fastdb4ts/src/wasm/fastdb4ts.wasm",
             fastdb / "ts/fastdb4ts/node_modules/typescript/bin/tsc",
+            fastdb / "ts/fastdb4ts/dist/payload/index.d.ts",
             ROOT / "core/foundation/c2-mem-ffi/bindings/typescript/node_modules/typescript/bin/tsc",
+            ROOT / "core/foundation/c2-mem-ffi/bindings/typescript/dist/index.js",
         ):
             if not path.is_file():
                 raise RunnerError(f"必须外部先准备/build：{path}")

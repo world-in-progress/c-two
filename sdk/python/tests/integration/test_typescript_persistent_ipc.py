@@ -102,6 +102,8 @@ def persistent_node_project() -> Iterator[tuple[Path, str]]:
         }
         for name, source in dependencies.items():
             assert (source / "package.json").is_file(), f"prebuilt Node dependency missing: {source}"
+            if name != "typescript":
+                assert (source / "dist/index.js").is_file(), f"build the Node dependency before this suite: {source}"
             destination = root / "node_modules" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.symlink_to(source, target_is_directory=True)

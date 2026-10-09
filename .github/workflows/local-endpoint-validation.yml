@@ -232,6 +232,8 @@ jobs:
             echo "fastdb ${{ env.FASTDB_SOURCE_SHA }}"
             echo "runner ${{ runner.os }}-${{ runner.arch }}"
           } > "$evidence/source-pair.txt"
+          cargo test --locked --manifest-path core/Cargo.toml -p c2-local \
+            2>&1 | tee "$evidence/ordinary-local-tests.log"
           cargo test --locked --manifest-path core/Cargo.toml -p c2-local --lib \
             --no-run --message-format=json > "$evidence/build-messages.jsonl"
           python - "$evidence" <<'PY'
@@ -248,7 +250,21 @@ jobs:
           (root / "test-binary-sha256.txt").write_text(hashlib.sha256(binary.read_bytes()).hexdigest() + "\n")
           PY
           binary=$(cat "$evidence/test-binary.txt")
-          sudo -n env C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= "$binary" \
+          # The nobody child re-executes current_exe. The runner checkout
+          # can have private parents, so stage identical bytes under /tmp.
+          stage=$(mktemp -d /tmp/c2-cross-user.XXXXXXXX)
+          trap 'rm -rf "$stage"' EXIT
+          chmod 0755 "$stage"
+          cp "$binary" "$stage/c2-local-tests"
+          chmod 0755 "$stage/c2-local-tests"
+          python - "$binary" "$stage/c2-local-tests" <<'PY'
+          import hashlib, pathlib, sys
+          hashes = [hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in sys.argv[1:]]
+          if hashes[0] != hashes[1]:
+              raise SystemExit("staged test binary differs from the compiled binary")
+          print("STAGED_TEST_BINARY_SHA256", hashes[0])
+          PY
+          sudo -n env C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= "$stage/c2-local-tests" \
             --ignored --exact unix_managed::tests::cross_user_cannot_connect_to_0600_socket_in_0755_directory \
             --nocapture 2>&1 | tee "$evidence/cross-user-tests.log"
           grep -F CROSS_USER_DENIED_VERIFIED "$evidence/cross-user-tests.log"
@@ -320,6 +336,8 @@ jobs:
           # The complete runner checks for WASM before collecting tests.
           # npm ci installs dependencies but does not build this artifact.
           npm run --prefix ../fastdb/ts/fastdb4ts build:wasm
+          npm run --prefix ../fastdb/ts/fastdb4ts build
+          npm test --prefix core/foundation/c2-mem-ffi/bindings/typescript
           git -C ../fastdb diff --exit-code -- ts/fastdb4ts/src/wasm
           {
             for name in EMSDK EMSDK_NODE EMSDK_PYTHON EM_CONFIG; do

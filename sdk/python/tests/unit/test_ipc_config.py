@@ -728,8 +728,9 @@ class _FakeRuntimeSession:
     def adopt_retired_memory_observation(self, observation: _FakeRetiredObservation) -> None:
         self.adopted_observations.append(observation)
 
-    def set_relay_anchor_address(self, relay_address: str | None) -> None:
+    def set_relay_anchor_address(self, relay_address: str | None, *, connect_attempt=None) -> None:
         self.relay_anchor_address_override = relay_address
+        self.connect_attempt = connect_attempt
 
     def lease_tracker(self):
         return None
@@ -748,7 +749,10 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
             expected_crm_ver: str,
             expected_abi_hash: str,
             expected_signature_hash: str,
+            *,
+            connect_attempt,
         ):
+            assert connect_attempt is self.connect_attempt
             calls.append((
                 self.relay_anchor_address_override,
                 route_name,
@@ -830,7 +834,8 @@ def test_relay_connected_http_mode_uses_single_core_client_call_path():
 
     assert 'Connect::RelayAware' in runtime_source
     assert re.search(
-        r'self\s*\.\s*connect_core\s*\(\s*py\s*,\s*expected\s*,\s*Connect::RelayAware\s*,?\s*\)',
+        r'self\s*\.\s*connect_core\s*\(\s*py\s*,\s*expected\s*,\s*Connect::RelayAware\s*,'
+        r'\s*timeout_seconds\s*,\s*connect_attempt\s*,?\s*\)',
         runtime_source,
     )
     assert re.search(r'inner:\s*Mutex\s*<\s*Option\s*<\s*Client\s*>\s*>', client_source)
@@ -854,7 +859,10 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
             expected_crm_ver: str,
             expected_abi_hash: str,
             expected_signature_hash: str,
+            *,
+            connect_attempt,
         ):  # noqa: ARG002
+            assert connect_attempt is self.connect_attempt
             err = RuntimeError('HTTP 404')
             err.status_code = 404
             raise err

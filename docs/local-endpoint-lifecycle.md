@@ -8,6 +8,8 @@
 
 Unix 的最终端点目录由显式代码 `cc.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外用户目录、版本目录或 `.sock` 后缀。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 尝试前冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前登录 SID 的 Named Pipe，明确拒绝 Unix root 配置。
 
+macOS 还会检查目录句柄上的扩展 ACL：只读、遍历和 deny 条目可用；授予新增、删除、修改属性或权限等能力的 allow 条目会被拒绝，包括继承条目。启动失败也会释放本次监听租约，重复文件描述符不会继续占有该租约。
+
 Unix 凭据统一使用既有 schema 3，记录最终 root、namespace id、incarnation 与 socket 身份；编码、解码和 CLI 读取共用 32 KiB 上限。Windows 保持 kernel-managed schema 1。inspect/reap/sweep 使用凭据捕获的上下文，显式传入不一致的 root 在访问目标前被拒绝。凭据中的 socket 完整路径由原生配置派生，不作为输入字段；凭据自身不授予删除权限。
 
 默认生命周期为 Persistent，常驻服务直到显式关闭；普通业务连接断开、idle 驱逐、relay 重连不结束服务。只为一个控制器独占管理整个 Runtime 的专用子进程选择 OwnerBound。控制器通过 cc.owner_control_pair() 创建关系，用 cc.spawn_owned_child(receiver, program, args) 只向目标子进程转移 receiver，独自保存 keepalive。子进程显式调用 cc.adopt_owner_stdin()，并在 register() 前设置 cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(owner_missing_grace_seconds=3.0), owner_control=...)。

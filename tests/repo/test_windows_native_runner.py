@@ -83,7 +83,7 @@ def test_full_scope_gate_inventory_preserves_receipt_order():
     runner = _runner()
     gates = runner.gates(sys.executable, Path("evidence"), runner.FULL_SCOPE)
     names = [name for name, _, _ in gates]
-    assert len(names) == 23 and len(set(names)) == 23
+    assert len(names) == 24 and len(set(names)) == 24
     index = {name: position for position, name in enumerate(names)}
     # Deployable application gates keep their static source-mode link path.
     assert runner.SOURCE_MODE_GATES <= set(names)
@@ -94,6 +94,10 @@ def test_full_scope_gate_inventory_preserves_receipt_order():
         assert not any("cli/Cargo.toml" in argument for argument in arguments), name
     dependencies = {name: list(required) for name, _, required in gates}
     assert dependencies["cli-artifact"] == ["cli-test"]
+    assert dependencies["fastdb-npm-build"] == ["fastdb-npm-install"]
+    assert set(dependencies["python-tests"]) == {"python-build", "fastdb-npm-build", "c2-mem-node-tests"}
+    assert index["fastdb-npm-build"] < index["python-tests"]
+    assert index["c2-mem-node-tests"] < index["python-tests"]
     assert set(dependencies["portable-tests"]) == {"python-build", "cli-artifact"}
     assert "cli-artifact" in dependencies["typescript-tests"]
     # The IPC memory matrix launches real worker processes only after the venv
