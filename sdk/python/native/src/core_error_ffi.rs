@@ -90,9 +90,6 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
         LifecycleError::ClientConfigFrozen => {
             set_attr(value, "lifecycle_kind", "client_config_frozen");
         }
-        LifecycleError::ConfigFrozen => {
-            set_attr(value, "lifecycle_kind", "config_frozen");
-        }
         LifecycleError::DuplicateRoute(route) => {
             set_attr(value, "lifecycle_kind", "duplicate_route");
             set_attr(value, "route_name", route);
@@ -199,7 +196,7 @@ fn register_failure_to_dict<'py>(
     Ok(dict)
 }
 
-fn relay_cleanup_error_to_dict<'py>(
+pub(crate) fn relay_cleanup_error_to_dict<'py>(
     py: Python<'py>,
     error: &RelayCleanupError,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -210,7 +207,7 @@ fn relay_cleanup_error_to_dict<'py>(
     Ok(dict)
 }
 
-fn route_close_outcome_to_dict<'py>(
+pub(crate) fn route_close_outcome_to_dict<'py>(
     py: Python<'py>,
     outcome: &RouteCloseOutcome,
 ) -> PyResult<Bound<'py, PyDict>> {

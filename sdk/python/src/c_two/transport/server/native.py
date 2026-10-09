@@ -543,11 +543,11 @@ class NativeServerBridge:
 
     def _make_dispatcher(
         self, route_name: str, slot: CRMSlot,
-    ) -> Callable[[str, int, object, object], object]:
+    ) -> Callable[[str, int, object], object]:
         """Build the Python callable passed into native route registration.
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
-        held.  Signature: ``(route_name, method_idx, shm_buffer, response_allocator)``.
+        held.  Signature: ``(route_name, method_idx, shm_buffer)``.
         It reads the request via ``memoryview(shm_buffer)``, resolves the
         method, calls the resource, and returns serialized result data (or
         *None* for empty responses). Rust native code owns the response
@@ -564,7 +564,6 @@ class NativeServerBridge:
         def dispatch(
             _route_name: str, method_idx: int,
             request_buf: object,
-            response_allocator: object,
         ) -> object:
             # 1. Resolve method
             method_name = idx_to_name.get(method_idx)
@@ -578,43 +577,31 @@ class NativeServerBridge:
             method, _access, buffer_mode = entry
 
             # 2. Buffer-mode-aware request handling
+            mv = memoryview(request_buf)
+            released = False
+
+            def release_fn():
+                nonlocal released
+                if not released:
+                    released = True
+                    mv.release()
+                    try:
+                        request_buf.release()
+                    except Exception:
+                        pass
+
             if buffer_mode == 'view':
                 # Pass memoryview; _release_fn frees SHM after deserialize
-                mv = memoryview(request_buf)
-                released = False
-                def release_fn():
-                    nonlocal released
-                    if not released:
-                        released = True
-                        mv.release()
-                        try:
-                            request_buf.release()
-                        except Exception:
-                            pass
                 try:
                     result = method(
                         mv,
                         _release_fn=release_fn,
                         _c2_input_buffer_mode=buffer_mode,
-                        _c2_output_allocator=response_allocator,
                     )
                 finally:
                     if not released:
                         release_fn()
             else:  # borrowed
-                mv = memoryview(request_buf)
-                released = False
-
-                def release_fn():
-                    nonlocal released
-                    if not released:
-                        released = True
-                        mv.release()
-                        try:
-                            request_buf.release()
-                        except Exception:
-                            pass
-
                 try:
                     if lease_tracker is not None and hasattr(request_buf, 'track_retained'):
                         request_buf.track_retained(
@@ -627,7 +614,6 @@ class NativeServerBridge:
                         mv,
                         _release_fn=release_fn,
                         _c2_input_buffer_mode=buffer_mode,
-                        _c2_output_allocator=response_allocator,
                     )
                 except Exception:
                     if not released:

@@ -16,9 +16,8 @@ use c2_contract::{
 use c2_core::{
     CallExecutionObserver, Connect, Host, HostClientHeldLeases, HostLifecyclePhase,
     HostLifecycleSnapshot, HostOptions, MethodDefinition, RegisterOutcome, Registration,
-    RelayCleanupError, RetiredMemoryObservation, RouteCloseOutcome, Runtime, RuntimeOptions,
-    ServerLifecyclePolicy, ServiceConcurrencyMode, ServiceDefinition, ShutdownOutcome,
-    UnregisterOutcome,
+    RetiredMemoryObservation, Runtime, RuntimeOptions, ServerLifecyclePolicy,
+    ServiceConcurrencyMode, ServiceDefinition, ShutdownOutcome, UnregisterOutcome,
 };
 use c2_mem::{BufferLeaseStats, BufferLeaseTracker};
 
@@ -26,7 +25,10 @@ use crate::config_ffi::{
     client_ipc_overrides_to_dict, client_ipc_to_dict, parse_client_ipc_overrides,
     parse_server_ipc_overrides, server_ipc_overrides_to_dict,
 };
-use crate::core_error_ffi::{core_error_to_py, lifecycle_error_to_py};
+use crate::core_error_ffi::{
+    core_error_to_py, lifecycle_error_to_py, relay_cleanup_error_to_dict,
+    route_close_outcome_to_dict,
+};
 use crate::core_ffi::{PyCoreClient, PyCoreService};
 use crate::endpoint_ffi::PyLocalEndpointContext;
 use crate::lease_ffi::{PyBufferLeaseTracker, lease_stats_dict};
@@ -1255,30 +1257,6 @@ fn register_outcome_to_dict<'py>(
     Ok(dict)
 }
 
-fn relay_cleanup_error_to_dict<'py>(
-    py: Python<'py>,
-    error: RelayCleanupError,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("route_name", error.route_name)?;
-    dict.set_item("status_code", error.status_code)?;
-    dict.set_item("message", error.message)?;
-    Ok(dict)
-}
-
-fn route_close_outcome_to_dict<'py>(
-    py: Python<'py>,
-    outcome: RouteCloseOutcome,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("route_name", outcome.route_name)?;
-    dict.set_item("local_removed", outcome.local_removed)?;
-    dict.set_item("active_drained", outcome.active_drained)?;
-    dict.set_item("closed_reason", outcome.closed_reason)?;
-    dict.set_item("close_error", outcome.close_error)?;
-    Ok(dict)
-}
-
 /// Human-readable reminder attached to the native snapshot: the budget cells
 /// are C-Two-owned accounting scopes, not process RSS.
 const MEMORY_ACCOUNTING_NOTE: &str =
@@ -1345,9 +1323,9 @@ fn unregister_outcome_to_dict<'py>(
     let dict = PyDict::new(py);
     dict.set_item("route_name", outcome.route_name)?;
     dict.set_item("local_removed", outcome.local_removed)?;
-    dict.set_item("close", route_close_outcome_to_dict(py, outcome.close)?)?;
+    dict.set_item("close", route_close_outcome_to_dict(py, &outcome.close)?)?;
     match outcome.relay_error {
-        Some(error) => dict.set_item("relay_error", relay_cleanup_error_to_dict(py, error)?)?,
+        Some(error) => dict.set_item("relay_error", relay_cleanup_error_to_dict(py, &error)?)?,
         None => dict.set_item("relay_error", py.None())?,
     }
     Ok(dict)
@@ -1362,13 +1340,13 @@ fn shutdown_outcome_to_dict<'py>(
     let route_outcomes = outcome
         .route_outcomes
         .into_iter()
-        .map(|close| route_close_outcome_to_dict(py, close).map(Bound::unbind))
+        .map(|close| route_close_outcome_to_dict(py, &close).map(Bound::unbind))
         .collect::<PyResult<Vec<_>>>()?;
     dict.set_item("route_outcomes", PyList::new(py, route_outcomes)?)?;
     let relay_errors = outcome
         .relay_errors
         .into_iter()
-        .map(|error| relay_cleanup_error_to_dict(py, error).map(Bound::unbind))
+        .map(|error| relay_cleanup_error_to_dict(py, &error).map(Bound::unbind))
         .collect::<PyResult<Vec<_>>>()?;
     dict.set_item("relay_errors", PyList::new(py, relay_errors)?)?;
     dict.set_item("server_was_started", outcome.server_was_started)?;
