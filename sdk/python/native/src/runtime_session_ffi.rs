@@ -325,6 +325,13 @@ impl PyRuntimeSession {
         .map_err(runtime_configuration_error_to_py)
     }
 
+    /// Core captures and inherits the policy without resolving local scope.
+    fn inherit_local_endpoint_selection(&self, previous: &Self) -> PyResult<()> {
+        self.inner
+            .inherit_local_endpoint_selection(&previous.inner)
+            .map_err(runtime_configuration_error_to_py)
+    }
+
     /// Pure native observation; deriving names never freezes local I/O policy.
     fn local_endpoint_context(&self) -> PyResult<PyLocalEndpointContext> {
         self.inner

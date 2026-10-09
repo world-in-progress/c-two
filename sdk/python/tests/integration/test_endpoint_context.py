@@ -238,6 +238,44 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
 
 
 @UNIX_ONLY
+@pytest.mark.parametrize('source', ['environment', 'code'])
+def test_used_selection_survives_repeated_shutdown_then_refreezes(source: str) -> None:
+    missing = f'/tmp/q-{uuid.uuid4().hex[:8]}'
+    changed = f'/tmp/q-{uuid.uuid4().hex[:8]}'
+    _run_isolated(f'''
+        import os
+        from pathlib import Path
+        import c_two as cc
+        from c_two import _native
+        from c_two.transport.client import util
+        from c_two.transport.registry import _ProcessRegistry
+        if {source!r} == 'code':
+            cc.set_local_endpoint(root={missing!r})
+        context = cc.local_endpoint_context()
+        assert not util.ping('ipc://failed-inheritance', .01)
+        assert _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        os.environ['C2_IPC_ROOT'] = {changed!r}
+        for _ in range(2):
+            assert cc.shutdown()['completed']
+            assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+            assert cc.local_endpoint_context() == context
+        assert not util.ping('ipc://failed-inheritance', .01)
+        assert _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        try:
+            cc.set_local_endpoint(root={changed!r})
+        except _native.CoreError as error:
+            assert error.lifecycle_kind == 'config_frozen', error
+        else:
+            raise AssertionError('inherited local selection did not freeze')
+        assert not Path({missing!r}).exists()
+        assert not Path({changed!r}).exists()
+        assert cc.shutdown()['completed']
+        cc.set_local_endpoint(root={changed!r})
+        assert cc.local_endpoint_context().root == {changed!r}
+    ''', C2_IPC_ROOT=missing)
+
+
+@UNIX_ONLY
 @pytest.mark.parametrize('abnormal', [False, True], ids=['normal', 'abnormal'])
 def test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state(abnormal, short_roots) -> None:
     root, other = short_roots

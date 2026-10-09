@@ -154,6 +154,8 @@ struct RuntimeState {
     local_endpoint_sources: Option<c2_config::ConfigSources>,
     local_endpoint_revision: u64,
     frozen_local_endpoint: Option<c2_config::LocalEndpointContext>,
+    /// Accepted domain inherited from a used session, still configurable until I/O.
+    inherited_local_endpoint: Option<c2_config::LocalEndpointContext>,
     /// Resolved client IPC config fixed by the first valid connection
     /// attempt. Later acquires reuse it verbatim so one Runtime can never
     /// run two competing client configurations.
@@ -255,6 +257,7 @@ impl Runtime {
                 local_endpoint_sources: None,
                 local_endpoint_revision: 0,
                 frozen_local_endpoint: None,
+                inherited_local_endpoint: None,
                 frozen_client_config: None,
                 client_pool: None,
                 identity: None,
@@ -423,6 +426,37 @@ impl Runtime {
         }
         state.local_endpoint_options = options;
         state.local_endpoint_sources = sources;
+        state.inherited_local_endpoint = None;
+        state.local_endpoint_revision += 1;
+        Ok(())
+    }
+
+    /// Inherit endpoint selection without resolving sources or platform scope.
+    /// Unused policies remain lazy; a used domain survives environment changes.
+    /// The replacement remains configurable until its own first local I/O.
+    pub fn inherit_local_endpoint_selection(&self, previous: &Self) -> Result<(), LifecycleError> {
+        if Arc::ptr_eq(&self.state, &previous.state) {
+            return Ok(());
+        }
+        let (options, sources, selected) = {
+            let state = previous.state.lock();
+            (
+                state.local_endpoint_options.clone(),
+                state.local_endpoint_sources.clone(),
+                state
+                    .frozen_local_endpoint
+                    .clone()
+                    .or_else(|| state.inherited_local_endpoint.clone()),
+            )
+        };
+        // Never hold both Runtime locks, including for opposite-direction handoffs.
+        let mut state = self.state.lock();
+        if state.frozen_local_endpoint.is_some() {
+            return Err(LifecycleError::ConfigFrozen);
+        }
+        state.local_endpoint_options = options;
+        state.local_endpoint_sources = sources;
+        state.inherited_local_endpoint = selected;
         state.local_endpoint_revision += 1;
         Ok(())
     }
@@ -477,9 +511,18 @@ impl Runtime {
         };
         loop {
             let (options, sources, revision) = {
-                let state = self.state.lock();
+                let mut state = self.state.lock();
                 if let Some(context) = &state.frozen_local_endpoint {
                     return Ok(accepts(context).then(|| context.clone()));
+                }
+                if let Some(context) = state.inherited_local_endpoint.clone() {
+                    if !accepts(&context) {
+                        return Ok(None);
+                    }
+                    if freeze {
+                        state.frozen_local_endpoint = Some(context.clone());
+                    }
+                    return Ok(Some(context));
                 }
                 (
                     state.local_endpoint_options.clone(),
@@ -2269,6 +2312,99 @@ mod tests {
                 .max_outstanding_calls,
             None
         );
+    }
+
+    #[test]
+    fn endpoint_selection_inheritance_keeps_invalid_sources_lazy() {
+        let previous = Runtime::new(RuntimeOptions::default()).unwrap();
+        previous.state.lock().local_endpoint_sources = Some(c2_config::ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Disabled,
+            process_env: c2_config::EnvMap::from([("C2_IPC_ROOT".into(), "relative".into())]),
+        });
+        let replacement = Runtime::new(RuntimeOptions::default()).unwrap();
+        replacement
+            .inherit_local_endpoint_selection(&previous)
+            .unwrap();
+        replacement
+            .inherit_local_endpoint_selection(&replacement.clone())
+            .unwrap();
+        assert!(!previous.local_endpoint_frozen());
+        assert!(!replacement.local_endpoint_frozen());
+        assert!(replacement.local_endpoint_context().is_err());
+        assert!(!replacement.local_endpoint_frozen());
+        assert!(replacement.outgoing_memory_stats().is_none());
+        let expected = c2_contract::ContractRelease::from_descriptor_json(include_bytes!(
+            "../../../../tests/fixtures/contracts/portable-release.contract.json"
+        ))
+        .unwrap()
+        .expected_route("route")
+        .unwrap();
+        let client = RelayAwareHttpClient::new(
+            "https://relay.example",
+            expected,
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap();
+        let client = replacement.project_relay_client_context(client, false);
+        assert!(!client.allows_local_ipc());
+        assert!(client.local_ipc_context().is_none());
+        assert!(!replacement.local_endpoint_frozen());
+        // Explicit sources stay native inputs, rather than disappearing at handoff.
+        assert_eq!(
+            replacement
+                .state
+                .lock()
+                .local_endpoint_sources
+                .as_ref()
+                .unwrap()
+                .process_env
+                .get("C2_IPC_ROOT")
+                .unwrap(),
+            "relative"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_selection_inheritance_pins_used_domain_but_allows_reconfiguration() {
+        let previous = Runtime::new(RuntimeOptions::default()).unwrap();
+        let at = |root: &str| c2_config::LocalEndpointOptions {
+            unix_root: Some(root.into()),
+        };
+        let env_at = |root: &str| c2_config::ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Disabled,
+            process_env: c2_config::EnvMap::from([("C2_IPC_ROOT".into(), root.into())]),
+        };
+        previous
+            .set_local_endpoint_with_sources(Default::default(), env_at("/tmp/c2-old"))
+            .unwrap();
+        let captured = previous.freeze_local_endpoint_context().unwrap();
+        previous.state.lock().local_endpoint_sources = Some(env_at("/tmp/c2-new"));
+        let replacement = Runtime::new(RuntimeOptions::default()).unwrap();
+        replacement
+            .inherit_local_endpoint_selection(&previous)
+            .unwrap();
+        assert!(!replacement.local_endpoint_frozen());
+        assert_eq!(replacement.local_endpoint_context().unwrap(), captured);
+        // Repeated replacements must preserve the inherited selection as well.
+        let next = Runtime::new(RuntimeOptions::default()).unwrap();
+        next.inherit_local_endpoint_selection(&replacement).unwrap();
+        assert_eq!(next.freeze_local_endpoint_context().unwrap(), captured);
+        assert!(next.inherit_local_endpoint_selection(&previous).is_err());
+        assert_eq!(next.local_endpoint_context().unwrap(), captured);
+        assert!(
+            next.set_local_endpoint_with_sources(
+                at("/tmp/c2-new"),
+                c2_config::ConfigSources::empty()
+            )
+            .is_err()
+        );
+        replacement
+            .set_local_endpoint_with_sources(at("/tmp/c2-new"), c2_config::ConfigSources::empty())
+            .unwrap();
+        assert_ne!(replacement.local_endpoint_context().unwrap(), captured);
+        assert_eq!(previous.local_endpoint_context().unwrap(), captured);
     }
 
     #[test]

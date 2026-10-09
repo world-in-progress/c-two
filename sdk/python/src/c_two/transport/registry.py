@@ -274,9 +274,8 @@ class _ProcessRegistry:
                 **kwargs,
             }
         new_session = runtime_session.__class__(**kwargs)
-        # Native context authority pins the replacement to the captured domain,
-        # including a frozen env/.env choice. Python stores no root or paths.
-        new_session.set_local_endpoint(context=runtime_session.local_endpoint_context())
+        # Core inherits lazy sources or the accepted domain without local lookup.
+        new_session.inherit_local_endpoint_selection(runtime_session)
         new_session.adopt_retired_memory_observation(retired_observation)
         if preserve_server_identity:
             new_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001

@@ -51,6 +51,98 @@ def _unused_root() -> str:
     return f'/tmp/q-{uuid.uuid4().hex[:8]}'
 
 
+def test_shutdown_preserves_unused_endpoint_policy_without_resolving_it() -> None:
+    _run_isolated('''
+        import c_two as cc
+        from c_two.transport.client import util
+        from c_two.transport.registry import _ProcessRegistry
+        before = _ProcessRegistry.get()._runtime_session
+        assert not before.local_endpoint_frozen
+        outcome = cc.shutdown()
+        assert outcome['completed'], outcome
+        after = _ProcessRegistry.get()._runtime_session
+        assert after is not before
+        assert not after.local_endpoint_frozen
+        try:
+            util.ping('ipc://invalid-local-policy', 0.01)
+        except ValueError as error:
+            assert 'root' in str(error).lower(), error
+        else:
+            raise AssertionError('shutdown lost the unresolved endpoint policy')
+    ''', C2_IPC_ROOT='relative')
+
+
+@UNIX_ONLY
+@pytest.mark.parametrize('replace', ['shutdown', 'transport_policy'])
+def test_unused_code_root_survives_session_replacement_and_env_change(replace: str) -> None:
+    root = _unused_root()
+    other = _unused_root()
+    _run_isolated(f'''
+        import os
+        from pathlib import Path
+        import c_two as cc
+        from c_two.transport.registry import _ProcessRegistry
+        cc.set_local_endpoint(root={root!r})
+        before = _ProcessRegistry.get()._runtime_session
+        assert not before.local_endpoint_frozen
+        if {replace!r} == 'shutdown':
+            assert cc.shutdown()['completed']
+        else:
+            cc.set_transport_policy(shm_threshold=8192)
+        after = _ProcessRegistry.get()._runtime_session
+        assert after is not before
+        assert not after.local_endpoint_frozen
+        os.environ['C2_IPC_ROOT'] = {other!r}
+        assert cc.local_endpoint_context().root == {root!r}
+        assert not Path({root!r}).exists()
+        assert not Path({other!r}).exists()
+        assert not after.local_endpoint_frozen
+        assert cc.shutdown()['completed']
+        assert cc.local_endpoint_context().root == {root!r}
+    ''', C2_IPC_ROOT='relative')
+
+
+@UNIX_ONLY
+def test_unused_environment_policy_is_still_lazy_after_shutdown() -> None:
+    root, other = _unused_root(), _unused_root()
+    _run_isolated(f'''
+        import os
+        import c_two as cc
+        from c_two.transport.registry import _ProcessRegistry
+        assert cc.shutdown()['completed']
+        os.environ['C2_IPC_ROOT'] = {root!r}
+        assert cc.local_endpoint_context().root == {root!r}
+        assert cc.shutdown()['completed']
+        os.environ['C2_IPC_ROOT'] = {other!r}
+        assert cc.local_endpoint_context().root == {other!r}
+        assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+    ''', C2_IPC_ROOT='relative')
+
+
+def test_unresolved_policy_survives_transport_policy_replacement() -> None:
+    # On Windows the root is inapplicable; on Unix it is invalid. Neither
+    # platform may resolve it merely to replace an unused native session.
+    _run_isolated('''
+        import c_two as cc
+        from c_two.transport.client import util
+        from c_two.transport.registry import _ProcessRegistry
+        before = _ProcessRegistry.get()._runtime_session
+        cc.set_transport_policy(shm_threshold=8192)
+        after = _ProcessRegistry.get()._runtime_session
+        assert after is not before
+        assert not after.local_endpoint_frozen
+        for _ in range(2):
+            assert cc.shutdown()['completed']
+            try:
+                util.ping('ipc://invalid-local-policy', 0.01)
+            except ValueError as error:
+                assert 'root' in str(error).lower(), error
+            else:
+                raise AssertionError('replacement dropped native policy')
+            assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+    ''', C2_IPC_ROOT='relative')
+
+
 @pytest.mark.parametrize('probe', ['ping', 'shutdown'])
 @pytest.mark.parametrize('source', ['environment', 'dotenv'])
 @pytest.mark.parametrize('root', ['relative', ''])
