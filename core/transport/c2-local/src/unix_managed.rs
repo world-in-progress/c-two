@@ -1157,7 +1157,18 @@ pub(crate) fn bind_managed_at(
             _ => endpoint_in_use(),
         });
     }
-    remove_stale_managed_socket(&namespace, endpoint, &names, &lease)?;
+    // Arm immediately after flock: every subsequent failure must explicitly
+    // unlock the OFD, even when a dup/fork keeps another descriptor alive.
+    // The socket rollback guard is created later and drops before this lease.
+    let lease = Lease(Some(lease));
+    #[cfg(test)]
+    if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::LeaseAfterLock) {
+        crate::unix_common::fault::retain_duplicate(lease.file());
+        return Err(io::Error::other(
+            "injected failure immediately after lease lock",
+        ));
+    }
+    remove_stale_managed_socket(&namespace, endpoint, &names, lease.file())?;
     // The socket must be created in the directory this call verified. Re-check
     // the gate identity after the stale-socket work, then bind through the
     // verified descriptor: an absolute path could have been redirected to a
@@ -1172,7 +1183,7 @@ pub(crate) fn bind_managed_at(
     // Everything after a successful bind either completes initialization or
     // withdraws the exact object this call created. The guard never trusts the
     // record it may have failed to write.
-    let mut guard = BoundSocketGuard::capture(&namespace.directory, &names, &lease)?;
+    let mut guard = BoundSocketGuard::capture(&namespace.directory, &names, lease.file())?;
     set_socket_permissions(&namespace.directory, &names, &guard)?;
     listen_verified_socket(&socket, &namespace.directory, &names, &guard)?;
     socket.set_nonblocking(true)?;
@@ -1196,8 +1207,8 @@ pub(crate) fn bind_managed_at(
                 .replace_entry_with_file_for_test(&names.socket)?;
         }
     }
-    write_record(&lease, &record)?;
-    match read_record(&lease) {
+    write_record(lease.file(), &record)?;
+    match read_record(lease.file()) {
         Ok(Some(readback)) if readback == record => {}
         Ok(_) => {
             return Err(io::Error::new(
@@ -1230,7 +1241,7 @@ pub(crate) fn bind_managed_at(
         identity,
         record,
         root: root.to_owned(),
-        lease: Some(Lease(Some(lease))),
+        lease: Some(lease),
         _gate_pin: gate_pin,
         #[cfg(test)]
         gate_identity,

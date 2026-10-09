@@ -12,12 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::fs::File;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum Failure {
         /// `fchmodat` on the freshly bound socket fails.
         SocketPermissions,
+        SocketPermissionsWithDuplicate,
+        LeaseAfterLock,
         /// Permission failure after replacement must preserve the foreign entry.
         SocketPermissionsAfterReplacement,
         /// Read-back reports a mode other than 0600.
@@ -39,6 +42,7 @@ pub(crate) mod fault {
 
     thread_local! {
         static PENDING: Cell<Option<Failure>> = const { Cell::new(None) };
+        static DUPLICATE: RefCell<Option<File>> = const { RefCell::new(None) };
     }
 
     pub(crate) fn inject(failure: Failure) {
@@ -54,6 +58,17 @@ pub(crate) mod fault {
                 false
             }
         })
+    }
+
+    pub(crate) fn retain_duplicate(file: &File) {
+        DUPLICATE.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(file.try_clone().unwrap());
+        });
+    }
+
+    pub(crate) fn take_duplicate() -> File {
+        DUPLICATE.with(|slot| slot.borrow_mut().take().expect("fault retained a real dup"))
     }
 }
 
@@ -136,6 +151,10 @@ impl EndpointDirectory {
     pub(crate) fn validate(&self) -> io::Result<()> {
         let stat = fstat(self.fd())?;
         verify_directory_stat(&self.path, &stat)?;
+        #[cfg(target_os = "macos")]
+        directory_acl::verify(self.fd()).map_err(|error| {
+            directory_policy_error(&self.path, &stat, &format!("extended ACL: {error}"))
+        })?;
         // Check effective credentials and ACLs against the pinned directory,
         // rather than testing a pathname that a rename could redirect.
         if unsafe {
@@ -301,6 +320,10 @@ fn verify_directory_stat(path: &Path, stat: &libc::stat) -> io::Result<()> {
     } else if stat.st_uid != unsafe { libc::geteuid() } {
         Some("owner must equal the current effective uid")
     } else if mode & 0o022 != 0 {
+        // Linux POSIX access ACLs map ACL_MASK (or ACL_GROUP_OBJ without
+        // a mask) to these group bits. Named users/groups cannot gain write
+        // beyond the mask. Darwin extended ACLs do not share that property
+        // and are checked separately on the pinned fd at every validation.
         Some("group and other users must not have write permission")
     } else {
         None
@@ -308,6 +331,113 @@ fn verify_directory_stat(path: &Path, stat: &libc::stat) -> io::Result<()> {
     match condition {
         Some(condition) => Err(directory_policy_error(path, stat, condition)),
         None => Ok(()),
+    }
+}
+
+/// Darwin's extended ACL API is not exposed by libc. Keep its ABI and policy
+/// confined to macOS; neither Linux POSIX ACLs nor Windows SID checks use it.
+#[cfg(target_os = "macos")]
+mod directory_acl {
+    use std::io;
+    use std::ptr;
+
+    type Acl = *mut libc::c_void;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> Acl;
+        fn acl_valid(acl: Acl) -> libc::c_int;
+        fn acl_free(acl: Acl) -> libc::c_int;
+        fn acl_get_entry(acl: Acl, index: libc::c_int, entry: *mut Acl) -> libc::c_int;
+        fn acl_get_tag_type(entry: Acl, tag: *mut libc::c_int) -> libc::c_int;
+        fn acl_get_permset_mask_np(entry: Acl, mask: *mut u64) -> libc::c_int;
+    }
+
+    struct OwnedAcl(Acl);
+    impl Drop for OwnedAcl {
+        fn drop(&mut self) {
+            // SAFETY: this allocation came from acl_get_fd_np, and entries
+            // borrowed from it never outlive this owner.
+            unsafe { acl_free(self.0) };
+        }
+    }
+
+    pub(super) fn verify(fd: libc::c_int) -> io::Result<()> {
+        const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
+        const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+        const ACL_EXTENDED_DENY: libc::c_int = 2;
+        // sys/acl.h: directory aliases and all metadata/security mutations.
+        const MUTATIONS: &[(u64, &str)] = &[
+            (1 << 2, "add_file"),
+            (1 << 4, "delete"),
+            (1 << 5, "add_subdirectory"),
+            (1 << 6, "delete_child"),
+            (1 << 8, "writeattr"),
+            (1 << 10, "writeextattr"),
+            (1 << 12, "writesecurity"),
+            (1 << 13, "chown"),
+        ];
+        // SAFETY: the caller owns the pinned directory fd for this call.
+        let acl = unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let error = io::Error::last_os_error();
+            // Darwin filesec_get_property reports ENOENT for FILESEC_ACL
+            // when the opened object has no ACL. No pathname is involved.
+            return if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        let acl = OwnedAcl(acl);
+        if unsafe { acl_valid(acl.0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut index = 0; // ACL_FIRST_ENTRY
+        let mut ordinal = 0;
+        loop {
+            let mut entry = ptr::null_mut();
+            if unsafe { acl_get_entry(acl.0, index, &mut entry) } != 0 {
+                let error = io::Error::last_os_error();
+                // Darwin returns 0 for a valid entry and -1/EINVAL at end,
+                // including an empty valid ACL (unlike Linux's 1/0 iterator).
+                return if error.raw_os_error() == Some(libc::EINVAL) {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
+            }
+            let mut tag = 0;
+            let mut mask = 0;
+            if unsafe { acl_get_tag_type(entry, &mut tag) } != 0
+                || unsafe { acl_get_permset_mask_np(entry, &mut mask) } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if tag == ACL_EXTENDED_ALLOW {
+                let mutations: Vec<_> = MUTATIONS
+                    .iter()
+                    .filter_map(|(bit, name)| (mask & bit != 0).then_some(*name))
+                    .collect();
+                if !mutations.is_empty() {
+                    // Deliberately reject all such grants, including owner or
+                    // inherit-only entries, without UUID membership resolution
+                    // or guessing whether an earlier deny cancels the grant.
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "allow entry {ordinal} grants {} (permission mask {mask:#x})",
+                            mutations.join(",")
+                        ),
+                    ));
+                }
+            } else if tag != ACL_EXTENDED_DENY {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("entry {ordinal} has unsupported tag {tag}"),
+                ));
+            }
+            index = -1; // ACL_NEXT_ENTRY
+            ordinal += 1;
+        }
     }
 }
 
@@ -715,6 +845,14 @@ pub(crate) fn set_socket_permissions(
     guard: &BoundSocketGuard<'_>,
 ) -> io::Result<()> {
     #[cfg(test)]
+    if fault::take_if(fault::Failure::SocketPermissionsWithDuplicate) {
+        fault::retain_duplicate(guard.ownership);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected socket permission failure with a live lease duplicate",
+        ));
+    }
+    #[cfg(test)]
     if fault::take_if(fault::Failure::SocketPermissionsAfterReplacement) {
         directory.replace_entry_with_file_for_test(&names.socket)?;
         return Err(io::Error::new(
@@ -850,15 +988,37 @@ pub(crate) fn listen_verified_socket(
             ));
         }
         if fault::take_if(fault::Failure::Listen) {
-            // Force the actual OS listen call to fail with ENOTSOCK. This
-            // test owns the socket fd; dup2 closes that bound socket and gives
-            // its RAII owner a duplicate of the pinned regular lease file.
-            // Rollback still has to withdraw the matching rendezvous entry.
-            if unsafe { libc::dup2(guard.ownership.as_raw_fd(), socket.as_raw_fd()) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            return socket.listen(128);
+            return listen_failure_on_regular_fd_for_test(socket, guard.ownership);
         }
     }
     socket.listen(128)
+}
+
+#[cfg(test)]
+pub(crate) fn listen_failure_on_regular_fd_for_test(
+    socket: &socket2::Socket,
+    ownership: &File,
+) -> io::Result<()> {
+    // Call real OS listen on the regular lease fd without replacing any
+    // descriptor. dup2 would clear CLOEXEC on the socket and open a concurrent
+    // child-spawn inheritance window in this harness. This seam also allows
+    // checking the fault mechanism without binding a socket in a sandbox.
+    let socket_flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
+    let lease_flags = unsafe { libc::fcntl(ownership.as_raw_fd(), libc::F_GETFD) };
+    assert!(socket_flags >= 0 && socket_flags & libc::FD_CLOEXEC != 0);
+    assert!(lease_flags >= 0 && lease_flags & libc::FD_CLOEXEC != 0);
+    let result = unsafe { libc::listen(ownership.as_raw_fd(), 128) };
+    let error = io::Error::last_os_error();
+    assert_eq!(result, -1);
+    assert_eq!(error.raw_os_error(), Some(libc::ENOTSOCK));
+    assert_eq!(
+        unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) },
+        socket_flags
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(ownership.as_raw_fd(), libc::F_GETFD) },
+        lease_flags
+    );
+    assert_eq!(socket.r#type()?, socket2::Type::STREAM);
+    Err(error)
 }

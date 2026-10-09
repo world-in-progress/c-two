@@ -2446,7 +2446,7 @@ async fn socket_permission_and_listen_failures_withdraw_only_the_bound_identity(
             assert_eq!(
                 error.raw_os_error(),
                 Some(libc::ENOTSOCK),
-                "the injected descriptor damage must reach the real OS listen: {error}"
+                "the injected regular fd must reach the real OS listen: {error}"
             );
         }
         let path = socket_path_at(root, &endpoint);
@@ -2811,4 +2811,192 @@ async fn before_listen_checkpoint_rejects_an_already_listening_socket() {
     // The guard still owns the exact bound inode and cleans only this fixture.
     drop(guard);
     assert!(!socket_path(&endpoint).exists());
+}
+
+/// Exercises the bind failure exit before socket creation, with the exact
+/// lease OFD still alive through a real dup. No socket permission is needed.
+#[test]
+fn failed_bind_after_lock_releases_lease_with_live_duplicate() {
+    use crate::unix_common::fault::{self, Failure};
+    let namespace = TestNamespace::new();
+    let endpoint = managed_endpoint_at(namespace.path(), "failed-lock-dup");
+    fault::inject(Failure::LeaseAfterLock);
+    let error = bind_managed_at(&endpoint, namespace.path()).err().unwrap();
+    assert!(error.to_string().contains("immediately after lease lock"));
+    let duplicate = fault::take_duplicate();
+    assert!(!socket_path(&endpoint).exists());
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path_at(namespace.path(), &endpoint))
+        .unwrap();
+    let outcome = try_lock_lease(&contender);
+    assert!(
+        outcome.is_ok(),
+        "failed bind retained its flock through a live dup: {outcome:?}"
+    );
+    assert_eq!(
+        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    drop(duplicate);
+}
+
+#[tokio::test]
+async fn failed_socket_initialization_rebinds_with_live_lease_duplicate() {
+    use crate::unix_common::fault::{self, Failure};
+    let namespace = TestNamespace::new();
+    let endpoint = managed_endpoint_at(namespace.path(), "failed-socket-dup");
+    fault::inject(Failure::SocketPermissionsWithDuplicate);
+    let error = bind_managed_at(&endpoint, namespace.path()).err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(!fault::take_if(Failure::SocketPermissionsWithDuplicate));
+    let duplicate = fault::take_duplicate();
+    assert!(!socket_path(&endpoint).exists());
+    let listener = bind_managed_at(&endpoint, namespace.path())
+        .expect("failed bind must unlock its lease while the duplicate remains open");
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    drop(duplicate);
+}
+
+#[test]
+fn listen_fault_preserves_descriptor_ownership_and_cloexec_without_bind() {
+    let ownership = tempfile::tempfile().unwrap();
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    let before = fstat(ownership.as_raw_fd()).unwrap();
+    let error =
+        crate::unix_common::listen_failure_on_regular_fd_for_test(&socket, &ownership).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::ENOTSOCK));
+    assert!(same_file(&before, &fstat(ownership.as_raw_fd()).unwrap()));
+    // Both original owners still refer to their original objects; the seam
+    // asserts CLOEXEC before/after and SO_TYPE on the untouched socket.
+    assert!(stat_is(&fstat(socket.as_raw_fd()).unwrap(), libc::S_IFSOCK));
+}
+
+#[cfg(target_os = "macos")]
+fn set_test_directory_acl(root: &Path, entry: &str) {
+    let cleared = Command::new("/bin/chmod")
+        .arg("-N")
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(cleared.status.success(), "{cleared:?}");
+    let added = Command::new("/bin/chmod")
+        .args(["+a", entry])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(added.status.success(), "{added:?}");
+    assert_eq!(std::fs::metadata(root).unwrap().mode() & 0o777, 0o755);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_directory_acl_rejects_mutating_allow_entries() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for permission in [
+        "add_file",
+        "add_subdirectory",
+        "delete_child",
+        "delete",
+        "writeattr",
+        "writeextattr",
+        "writesecurity",
+        "chown",
+    ] {
+        set_test_directory_acl(root, &format!("everyone allow {permission}"));
+        let error = EndpointDirectory::open(root, false)
+            .err()
+            .expect("0755 must not hide a mutating extended allow ACL");
+        let message = error.to_string();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(message.contains(&root.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("owner {}", unsafe { libc::geteuid() })),
+            "{message}"
+        );
+        assert!(
+            message.contains("mode 0755")
+                && message.contains("ACL")
+                && message.contains(permission),
+            "{message}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_directory_acl_allows_read_traverse_and_deny_only() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    EndpointDirectory::open(root, false)
+        .unwrap()
+        .validate()
+        .unwrap();
+    for entry in [
+        "everyone allow list,search,readattr,readextattr,readsecurity",
+        "everyone deny delete,delete_child,writesecurity,chown",
+    ] {
+        set_test_directory_acl(root, entry);
+        EndpointDirectory::open(root, false)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_directory_acl_changes_are_checked_on_the_pinned_fd() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let directory = EndpointDirectory::open(root, false).unwrap();
+    set_test_directory_acl(
+        root,
+        "everyone allow add_file,add_subdirectory,delete_child",
+    );
+    let error = directory.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("ACL") && error.contains("add_file"),
+        "{error}"
+    );
+    let moved = root.with_file_name("pinned 中文 directory");
+    std::fs::rename(root, &moved).unwrap();
+    std::fs::create_dir(root).unwrap();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    EndpointDirectory::open(root, false)
+        .unwrap()
+        .validate()
+        .unwrap();
+    // The pathname now has no ACL. Validation must still report the ACL on
+    // the original opened directory, rather than sampling the replacement.
+    let error = directory.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("ACL") && error.contains("add_file"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn native_listener_in_directory_with_spaces_and_unicode() {
+    let parent = tempfile::Builder::new()
+        .prefix("c2u-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = parent.path().join("目录 with spaces");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(target_os = "macos")]
+    set_test_directory_acl(&root, "everyone allow list,search,readattr,readsecurity");
+    let endpoint = managed_endpoint_at(&root, "unicode-listener");
+    let mut listener = crate::LocalListener::bind(&endpoint).unwrap();
+    let connecting = crate::LocalStream::connect(&endpoint, Duration::from_secs(5));
+    let (client, accepted) = tokio::join!(connecting, listener.accept());
+    drop(client.unwrap());
+    drop(accepted.unwrap());
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
 }
