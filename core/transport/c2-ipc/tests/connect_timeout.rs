@@ -298,6 +298,101 @@ fn first_handshake_timeout_cannot_publish_late_client_and_next_connect_recovers(
 }
 
 #[test]
+fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() {
+    let (resume, resumed) = oneshot::channel();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let business = Arc::new(AtomicUsize::new(0));
+    let observed = business.clone();
+    let peer = Peer::spawn(move |mut listener| async move {
+        let mut stalled = listener.accept().await.unwrap();
+        read_handshake(&mut stalled).await;
+        // No reply until the expired client's native cleanup has closed its
+        // stream. Count any unexpected post-handshake business frame.
+        loop {
+            let mut length = [0_u8; 4];
+            if stalled.read_exact(&mut length).await.is_err() {
+                break;
+            }
+            let size = u32::from_le_bytes(length);
+            let mut body = vec![0_u8; size as usize];
+            if stalled.read_exact(&mut body).await.is_err() {
+                break;
+            }
+            let (header, _) = decode_frame_body(&body, size).unwrap();
+            if !header.is_signal() {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        drop(stalled);
+        closed_tx.send(()).unwrap();
+        let _ = resumed.await;
+        let mut healthy = listener.accept().await.unwrap();
+        read_handshake(&mut healthy).await;
+        healthy.write_all(&handshake()).await.unwrap();
+        let lookup = read_lookup(&mut healthy).await;
+        reply(&mut healthy, lookup, &ready_reply()).await;
+        std::future::pending::<()>().await;
+    });
+    let pool = ClientPool::new(Duration::from_secs(60));
+    let mut cfg = c2_ipc::ClientIpcConfig::default();
+    cfg.base.pool_segment_size = 1024 * 1024;
+    cfg.base.max_pool_segments = 1;
+    cfg.base.max_pool_memory = 1024 * 1024;
+    cfg.base.pool_prewarm_segments = 1;
+    cfg.base.shm_backing_budget_bytes = 1_536_000;
+    let started = Instant::now();
+    let error = pool
+        .acquire_with_deadline(
+            &peer.address,
+            Some(&cfg),
+            deadline(Duration::from_millis(100)),
+        )
+        .err()
+        .expect("paused prewarmed handshake must expire");
+    assert_deadline(error, "handshake");
+    assert!(started.elapsed() < Duration::from_millis(300));
+    assert_eq!(pool.refcount(&peer.address), 0);
+    assert!(!pool.has_client(&peer.address));
+    let observer = pool.memory_budget_observer().unwrap();
+    closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    // One ordinary maintenance pass also prunes completed records. It must
+    // release the real charge without close_all, budget reset, or new config.
+    pool.sweep_expired();
+    let settled = observer.snapshot();
+    assert_eq!(settled.shm.used_bytes, 0);
+    assert!(settled.shm.peak_bytes > 1024 * 1024);
+    assert_eq!(settled.shm.limit_bytes, 1_536_000);
+    assert_eq!(business.load(Ordering::SeqCst), 0);
+    resume.send(()).unwrap();
+    let lease = pool
+        .acquire_lease_with_deadline(
+            &peer.address,
+            Some(&cfg),
+            deadline(Duration::from_millis(100)),
+        )
+        .unwrap();
+    let recovered = lease.client();
+    assert!(recovered.is_connected());
+    let binding = recovered
+        .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(binding.route_uid(), ROUTE_UID);
+    #[cfg(feature = "test-support")]
+    assert_eq!(recovered.pending_len_for_test(), 0);
+    drop(lease);
+    assert_eq!(pool.refcount(&peer.address), 0);
+    assert_eq!(observer.snapshot().shm.rejected_allocations, 0);
+    // Teardown happens only after recovery and all assertions above pass.
+    peer.finish();
+    let report = pool.close_all(Duration::from_secs(2));
+    assert!(
+        report.error.is_none() && report.unconfirmed.is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(observer.snapshot().shm.used_bytes, 0);
+}
+
+#[test]
 fn cached_client_route_timeout_removes_pending_and_preserves_healthy_stream() {
     let (resume, resumed) = oneshot::channel();
     let (lookup_tx, lookup_rx) = mpsc::channel();

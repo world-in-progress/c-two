@@ -480,8 +480,8 @@ enum RetiredState {
     /// Native work has confirmed close, or a fresh acquire published its client.
     Confirmed = 3,
     /// The last close barrier returned unconfirmed. The record keeps
-    /// ownership of the client reachable so a later `close_all` can retry
-    /// it and keep reporting it unconfirmed until it actually stops.
+    /// ownership of the client reachable for bounded settlement, ordinary
+    /// acquire/sweep, or a later drain to retry. Never treated as stopped.
     UnconfirmedIdle = 4,
 }
 
@@ -494,6 +494,9 @@ struct RetiredClose {
     address: String,
     client: Mutex<Option<Arc<SyncClient>>>,
     state: AtomicU8,
+    // Per-record notification avoids Condvar's unbounded re-acquisition of
+    // the global coordinator after a caller's timed wait has expired.
+    waiters: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
 }
 
 impl RetiredClose {
@@ -502,6 +505,7 @@ impl RetiredClose {
             address,
             client: Mutex::new(client),
             state: AtomicU8::new(state as u8),
+            waiters: Mutex::new(Vec::new()),
         }
     }
     fn state(&self) -> RetiredState {
@@ -515,6 +519,45 @@ impl RetiredClose {
     }
     fn set_state(&self, state: RetiredState) {
         self.state.store(state as u8, Ordering::Release);
+        // Waiter registration checks the state again after releasing this
+        // short, record-local slot; a concurrent completion cannot be lost.
+        let waiters = std::mem::take(&mut *self.waiters.lock());
+        for waiter in waiters {
+            let _ = waiter.send(());
+        }
+    }
+    fn wait_until_settled(&self, deadline: ConnectDeadline) -> Result<(), IpcError> {
+        while self.state() == RetiredState::Closing {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut waiters = connect_lock(&self.waiters, deadline, "pool_cleanup_wait")?;
+            waiters.push(tx);
+            drop(waiters);
+            if self.state() != RetiredState::Closing {
+                break;
+            }
+            match deadline.instant() {
+                Some(end) => {
+                    rx.recv_timeout(end.saturating_duration_since(Instant::now()))
+                        .map_err(|_| crate::client::connect_expired("pool_cleanup_wait"))?;
+                }
+                None => {
+                    let _ = rx.recv();
+                }
+            }
+            crate::client::connect_check(deadline, "pool_cleanup_wait")?;
+        }
+        crate::client::connect_check(deadline, "pool_cleanup_wait")
+    }
+    /// Exactly one settlement/acquire/sweep/drain owns each retry barrier.
+    fn claim_retry(&self) -> bool {
+        self.state
+            .compare_exchange(
+                RetiredState::UnconfirmedIdle as u8,
+                RetiredState::Closing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
@@ -546,11 +589,15 @@ impl FreshClientGuard {
     }
     fn retire(&mut self) {
         if !self.done {
-            let _ = close_retired_work(
+            if close_retired_work(
                 &self.coordinator,
                 &self.work,
                 cleanup_deadline(self.deadline),
-            );
+            )
+            .is_err()
+            {
+                schedule_retired_settlement(&self.coordinator, &self.work);
+            }
             self.done = true;
         }
     }
@@ -576,6 +623,9 @@ impl RetiredBatch {
             &self.work,
             cleanup_deadline(self.deadline),
         );
+        for work in &self.work {
+            schedule_retired_settlement(&self.coordinator, work);
+        }
         self.work.clear();
     }
 }
@@ -653,7 +703,7 @@ const _: () = {
 /// fresh timeout. On confirmation the exact ticket's record is removed; on
 /// an unconfirmed timeout the record **stays** in the registry as
 /// `RetiredState::UnconfirmedIdle`, keeping the client's ownership reachable
-/// so a later `close_all` can retry it and keep reporting it honestly.
+/// so ordinary maintenance or a later drain can retry it honestly.
 /// Returns `Err(address)` when the close did not confirm.
 fn prune_confirmed(txn: &(Mutex<CloseTxnState>, Condvar), work: &RetiredWork) {
     if let Some(mut state) = txn.0.try_lock() {
@@ -678,6 +728,12 @@ fn close_retired_work(
     let confirmed = client.as_ref().is_none_or(|client| {
         client.close_shared(deadline.saturating_duration_since(Instant::now()))
     });
+    if confirmed {
+        // Confirmation, rather than registry-lock availability, releases this
+        // exact owner. Retained payloads keep their own pool Arcs and charges.
+        work.record.client.lock().take();
+    }
+    drop(client);
     work.record.set_state(if confirmed {
         RetiredState::Confirmed
     } else {
@@ -689,6 +745,51 @@ fn close_retired_work(
     } else {
         Err(work.record.address.clone())
     }
+}
+
+/// A caller whose total budget is exhausted cannot wait for native cleanup.
+/// Give its registered owner one independent, bounded settlement attempt.
+/// This finite worker closes only this record; it never loops, acquires pool
+/// metadata locks, resets the connect deadline, or publishes a client. A
+/// failed spawn/barrier leaves UnconfirmedIdle for ordinary maintenance.
+fn schedule_retired_settlement(txn: &Arc<(Mutex<CloseTxnState>, Condvar)>, work: &RetiredWork) {
+    if !work.record.claim_retry() {
+        return;
+    }
+    let settlement = RetiredWork {
+        ticket: work.ticket,
+        record: work.record.clone(),
+    };
+    let coordinator = txn.clone();
+    let deadline = Instant::now() + DETACHED_CLOSE_TIMEOUT;
+    if std::thread::Builder::new()
+        .name("c2-client-retire".into())
+        .spawn(move || {
+            let _ = close_retired_work(&coordinator, &settlement, deadline);
+        })
+        .is_err()
+    {
+        work.record.set_state(RetiredState::UnconfirmedIdle);
+        txn.1.notify_all();
+    }
+}
+
+/// Claim idle failures under the coordinator, without touching healthy cache
+/// entries or changing the domain/epoch. Close outside every metadata lock.
+fn claim_retired_retries(coordinator: &CloseTxnState) -> Vec<RetiredWork> {
+    if coordinator.active_generation.is_some() {
+        return Vec::new();
+    }
+    coordinator
+        .retired
+        .iter()
+        .filter_map(|(ticket, record)| {
+            record.claim_retry().then(|| RetiredWork {
+                ticket: *ticket,
+                record: record.clone(),
+            })
+        })
+        .collect()
 }
 
 fn close_retired_ticket(
@@ -714,13 +815,6 @@ fn run_retired_work(
     for record in work {
         let _ = close_retired_work(txn, record, deadline);
     }
-}
-
-/// Close a batch of registered retired tickets with the detached-close
-/// deadline. Used by non-drain paths (acquire sweeps/stale/loser cleanup);
-/// unconfirmed records stay registered for a later `close_all` to retry.
-fn run_retired_closes(txn: &(Mutex<CloseTxnState>, Condvar), tickets: &[u64]) {
-    run_retired_closes_until(txn, tickets, Instant::now() + DETACHED_CLOSE_TIMEOUT);
 }
 
 fn run_retired_closes_until(
@@ -1022,6 +1116,9 @@ impl ClientPool {
                 }
             }
             if rejection.is_none() {
+                for work in claim_retired_retries(&coordinator) {
+                    retired.push(work);
+                }
                 fresh = Some(FreshClientGuard {
                     work: self.register_close_work(
                         &mut coordinator,
@@ -1043,6 +1140,10 @@ impl ClientPool {
             return Err(error);
         }
 
+        // Another caller's finite settlement can still own backing charges.
+        // A fresh allocation waits for it using this operation's remaining
+        // budget. Cache hits already returned above and stay independent.
+        self.wait_retired_settlement(deadline)?;
         // Derive once before retries; every attempt uses this same snapshot.
         let endpoint = self
             .endpoint_context()?
@@ -1231,9 +1332,30 @@ impl ClientPool {
         detached
     }
 
-    /// Sweep expired entries and close them outside the pool lock.
+    fn wait_retired_settlement(&self, deadline: ConnectDeadline) -> Result<(), IpcError> {
+        let records = {
+            let coordinator = connect_lock(&self.close_txn.0, deadline, "pool_cleanup_wait")?;
+            coordinator
+                .retired
+                .values()
+                .filter(|record| record.state() == RetiredState::Closing)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for record in records {
+            record.wait_until_settled(deadline)?;
+        }
+        Ok(())
+    }
+
+    /// Sweep expired entries and retry unconfirmed retired owners outside the
+    /// pool lock. All barriers share one bounded maintenance budget.
     /// Call this periodically from SDK bindings or before acquire.
     pub fn sweep_expired(&self) {
+        let maintenance = ConnectDeadline::start(
+            c2_config::ConnectOptions::new().with_timeout(DETACHED_CLOSE_TIMEOUT),
+        )
+        .expect("fixed maintenance budget is representable");
         let tickets = {
             let mut state = self.state.lock();
             Self::sweep_expired_locked(&mut state, self.grace_period)
@@ -1241,7 +1363,11 @@ impl ClientPool {
                 .map(|(address, client)| self.retire_locked(&address, client))
                 .collect::<Vec<u64>>()
         };
-        run_retired_closes(&self.close_txn, &tickets);
+        let deadline = maintenance.instant().unwrap();
+        let retries = claim_retired_retries(&self.close_txn.0.lock());
+        run_retired_closes_until(&self.close_txn, &tickets, deadline);
+        run_retired_work(&self.close_txn, &retries, deadline);
+        let _ = self.wait_retired_settlement(maintenance);
     }
 
     /// Drain and explicitly close every cache entry, then reopen the cache
@@ -1352,11 +1478,8 @@ impl ClientPool {
             let retry_tickets: Vec<u64> = txn
                 .retired
                 .iter_mut()
-                .filter(|(_, record)| record.state() == RetiredState::UnconfirmedIdle)
-                .map(|(ticket, record)| {
-                    record.set_state(RetiredState::Closing);
-                    *ticket
-                })
+                .filter(|(_, record)| record.claim_retry())
+                .map(|(ticket, _)| *ticket)
                 .collect();
             (drained_tickets, retry_tickets)
         };
@@ -1643,6 +1766,16 @@ mod tests {
     #[test]
     fn connect_deadline_expired_fresh_client_retains_cleanup_and_recovers() {
         let pool = ClientPool::new(Duration::from_secs(30));
+        let shared = Arc::new(make_disconnected_client());
+        let refs = Arc::new(PoolReferences::new(2, None));
+        pool.state.lock().entries.insert(
+            "ipc://unrelated-shared".into(),
+            PoolEntry {
+                client: shared.clone(),
+                references: refs.clone(),
+            },
+        );
+        let epoch = pool.state.lock().epoch;
         let client = Arc::new(make_disconnected_client());
         let weak = Arc::downgrade(&client);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -1683,21 +1816,226 @@ mod tests {
         );
         assert_eq!(
             coordinator.retired.values().next().unwrap().state(),
-            RetiredState::UnconfirmedIdle
+            RetiredState::Closing
         );
         drop(coordinator);
         drop(state);
         release_tx.send(()).unwrap();
-        let outcome = pool.close_all(Duration::from_secs(1));
-        assert!(
-            outcome.error.is_none() && outcome.unconfirmed.is_empty(),
-            "{outcome:?}"
-        );
+        wait_for_retired_settlement(&pool);
         assert_eq!(pool.retired_records_for_test(), 0);
         assert!(
             weak.upgrade().is_none(),
-            "confirmed close retires exact ownership"
+            "confirmed close retires exact ownership without a pool drain"
         );
+        let state = pool.state.lock();
+        assert_eq!(state.epoch, epoch);
+        assert_eq!(refs.count.load(Ordering::Acquire), 2);
+        assert!(Arc::ptr_eq(
+            &state.entries["ipc://unrelated-shared"].client,
+            &shared
+        ));
+    }
+
+    fn wait_for_retired_settlement(pool: &ClientPool) {
+        let end = Instant::now() + Duration::from_secs(1);
+        let mut coordinator = pool.close_txn.0.lock();
+        loop {
+            coordinator
+                .retired
+                .retain(|_, record| record.state() != RetiredState::Confirmed);
+            if coordinator.retired.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < end,
+                "ordinary settlement left retired native owners behind"
+            );
+            pool.close_txn.1.wait_until(&mut coordinator, end);
+        }
+    }
+
+    #[test]
+    fn connect_deadline_idle_cleanup_retried_by_acquire_and_sweep() {
+        for use_acquire in [false, true] {
+            let pool = ClientPool::new(Duration::from_secs(30));
+            let cfg = ClientIpcConfig::default();
+            pool.state.lock().domain_memory = Some(DomainMemory::from_config(&cfg));
+            let epoch = pool.state.lock().epoch;
+            let client = Arc::new(make_disconnected_client());
+            let weak = Arc::downgrade(&client);
+            pool.register_close_work(
+                &mut pool.close_txn.0.lock(),
+                "ipc://idle",
+                Some(client),
+                RetiredState::UnconfirmedIdle,
+            );
+            if use_acquire {
+                // Invalid endpoint rejects after ordinary retired settlement,
+                // without listening, changing epoch, or draining the cache.
+                assert!(
+                    pool.acquire_with_deadline("invalid-address", Some(&cfg), connect_budget(100))
+                        .is_err()
+                );
+            } else {
+                pool.sweep_expired();
+            }
+            assert!(weak.upgrade().is_none());
+            assert_eq!(pool.retired_records_for_test(), 0);
+            assert_eq!(pool.state.lock().epoch, epoch);
+            assert_eq!(
+                pool.memory_budget_snapshot().unwrap().limits,
+                cfg.memory_budget_limits()
+            );
+        }
+    }
+
+    #[test]
+    fn connect_deadline_settlement_wait_does_not_relock_global_coordinator() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let client = Arc::new(make_disconnected_client());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        client.hold_writer_slot_for_test(ready_tx, release_rx);
+        ready_rx.blocking_recv().unwrap();
+        let work = pool.register_close_work(
+            &mut pool.close_txn.0.lock(),
+            "ipc://settlement-wait",
+            Some(client),
+            RetiredState::UnconfirmedIdle,
+        );
+        schedule_retired_settlement(&pool.close_txn, &work);
+        let coordinator = pool.close_txn.0.lock();
+        let record = work.record.clone();
+        let started = Instant::now();
+        let error = record.wait_until_settled(connect_budget(100)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(matches!(error, IpcError::LocalCallRejected(ref error)
+            if error.code == c2_error::ErrorCode::CallDeadlineExceeded
+                && error.details.get("stage").map(String::as_str) == Some("pool_cleanup_wait")));
+        assert_eq!(work.record.state(), RetiredState::Closing);
+        drop(coordinator);
+        release_tx.send(()).unwrap();
+        wait_for_retired_settlement(&pool);
+    }
+
+    #[test]
+    fn connect_deadline_finite_settlement_preserves_unconfirmed_owner_for_maintenance() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let client = Arc::new(make_disconnected_client());
+        let weak = Arc::downgrade(&client);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        client.hold_writer_slot_for_test(ready_tx, release_rx);
+        ready_rx.blocking_recv().unwrap();
+        let work = pool.register_close_work(
+            &mut pool.close_txn.0.lock(),
+            "ipc://still-blocked",
+            Some(client),
+            RetiredState::UnconfirmedIdle,
+        );
+        let started = Instant::now();
+        schedule_retired_settlement(&pool.close_txn, &work);
+        // A second scheduler cannot start another close for the same owner.
+        schedule_retired_settlement(&pool.close_txn, &work);
+        work.record
+            .wait_until_settled(connect_budget(7000))
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(7));
+        assert_eq!(work.record.state(), RetiredState::UnconfirmedIdle);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(pool.retired_records_for_test(), 1);
+        // No automatic loop: retry is driven by ordinary maintenance after
+        // the blocked native writer has actually become available.
+        release_tx.send(()).unwrap();
+        pool.sweep_expired();
+        assert_eq!(pool.retired_records_for_test(), 0);
+        assert_eq!(work.record.state(), RetiredState::Confirmed);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn connect_deadline_prewarm_accounting_settles_without_drain() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let mut cfg = ClientIpcConfig::default();
+        cfg.base.pool_segment_size = 1024 * 1024;
+        cfg.base.max_pool_segments = 1;
+        cfg.base.max_pool_memory = 1024 * 1024;
+        cfg.base.pool_prewarm_segments = 1;
+        cfg.base.shm_backing_budget_bytes = 1_536_000;
+        let domain = DomainMemory::from_config(&cfg);
+        let budget = domain.budget.clone();
+        pool.state.lock().domain_memory = Some(domain);
+        pool.set_default_config(cfg.clone()).unwrap();
+        let initial_epoch = pool.state.lock().epoch;
+        let mem = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+            pool_config_from_client_config(&cfg),
+            format!("/timeout_accounting_{}", std::process::id()),
+            budget.clone(),
+        )));
+        mem.lock().ensure_buddy_segments(1).unwrap();
+        let charged = budget.snapshot().shm.used_bytes;
+        assert!(charged > 1024 * 1024);
+        assert!(charged * 2 > cfg.base.shm_backing_budget_bytes);
+        // Zero expires before OS connect. The real prewarmed transport pool
+        // is still attached to the failed attempt, exactly as after handshake.
+        let (client, result) = SyncClient::connect_transport_pool_attempt_with_deadline(
+            LocalEndpoint::from_address("ipc://prewarm-accounting").unwrap(),
+            mem,
+            cfg.clone(),
+            budget.clone(),
+            connect_budget(0),
+        );
+        assert!(matches!(result, Err(IpcError::LocalCallRejected(_))));
+        let client = Arc::new(client);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        client.hold_writer_slot_for_test(ready_tx, release_rx);
+        ready_rx.blocking_recv().unwrap();
+        let work = pool.register_close_work(
+            &mut pool.close_txn.0.lock(),
+            "ipc://prewarm-accounting",
+            None,
+            RetiredState::Preparing,
+        );
+        let fresh = FreshClientGuard {
+            work,
+            coordinator: pool.close_txn.clone(),
+            deadline: connect_budget(0),
+            done: false,
+        };
+        fresh.attach(client.clone());
+        drop(client);
+        let started = Instant::now();
+        drop(fresh);
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(
+            budget.snapshot().shm.used_bytes,
+            charged,
+            "busy native owner must retain its actual charge"
+        );
+        assert_eq!(pool.active_count(), 0);
+        assert_eq!(pool.refcount("ipc://prewarm-accounting"), 0);
+        release_tx.send(()).unwrap();
+        wait_for_retired_settlement(&pool);
+        assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        assert_eq!(pool.state.lock().epoch, initial_epoch);
+        assert_eq!(
+            pool.memory_budget_snapshot().unwrap().limits,
+            cfg.memory_budget_limits()
+        );
+        assert_eq!(pool.default_config.lock().as_ref(), Some(&cfg));
+        // The same domain can fund the same prewarm again without close_all,
+        // increasing its limit, or disabling prewarm.
+        let mut recovered = MemPool::new_with_prefix_and_budget(
+            pool_config_from_client_config(&cfg),
+            format!("/timeout_accounting_recovered_{}", std::process::id()),
+            budget.clone(),
+        );
+        recovered.ensure_buddy_segments(1).unwrap();
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        assert_eq!(budget.snapshot().shm.rejected_allocations, 0);
+        drop(recovered);
+        assert_eq!(budget.snapshot().shm.used_bytes, 0);
     }
 
     #[test]
