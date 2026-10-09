@@ -719,3 +719,452 @@ async fn test_owned_driver_finishes_after_application_waiter_leaves() {
     assert!(weak.upgrade().is_none());
     assert_eq!(data.calls.load(Ordering::SeqCst), 1);
 }
+
+// A small advertised native message limit deliberately differs from both the
+// request batching policy and the default limit. Both HTTP-only (explicit
+// relay) and relay-aware calls must consume the selected route's value.
+const RESPONSE_LIMIT: u64 = 8;
+
+#[derive(Clone)]
+struct ResponseData {
+    status: StatusCode,
+    chunked: bool,
+    calls: Arc<AtomicUsize>,
+    late: Option<Arc<Gate>>,
+    tail: Option<Arc<Gate>>,
+}
+
+async fn response_business(
+    State(state): State<ResponseData>,
+    Path((_route, method)): Path<(String, String)>,
+    _body: Bytes,
+) -> Response {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    if method == "good" {
+        return (StatusCode::OK, b"12345678".to_vec()).into_response();
+    }
+    if let Some(gate) = &state.late {
+        gate.wait().await;
+    }
+    let body = if state.chunked {
+        axum::body::Body::from_stream(futures::stream::unfold(
+            (0, state.tail),
+            |(index, tail)| async move {
+                if index == 3 {
+                    if let Some(gate) = tail {
+                        // No EOF: rejection must happen at the crossing chunk,
+                        // rather than after collecting the complete response.
+                        gate.wait().await;
+                    }
+                    return None;
+                }
+                Some((
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b"123")),
+                    (index + 1, tail),
+                ))
+            },
+        ))
+    } else {
+        axum::body::Body::from(vec![b'x'; 9])
+    };
+    (state.status, body).into_response()
+}
+
+async fn response_fixture(state: ResponseData) -> (Server, Server, RelayAwareHttpClient) {
+    let server = serve(
+        Router::new()
+            .route("/{route}/{method}", post(response_business))
+            .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+            .with_state(state),
+    )
+    .await;
+    let mut selected = route(&server.url);
+    selected.max_payload_size = RESPONSE_LIMIT;
+    let registry = serve(Router::new().route(
+        "/_resolve/{route}",
+        get(move || {
+            let selected = selected.clone();
+            async move { Json(vec![selected]) }
+        }),
+    ))
+    .await;
+    let client = client(&registry);
+    (server, registry, client)
+}
+
+fn assert_response_limit(error: &HttpCallError) {
+    assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
+    assert!(!error.is_retry_safe());
+    let HttpError::ServerError(_, body) = error.source_error() else {
+        panic!("expected canonical response protocol error, got {error:?}");
+    };
+    let error = C2Error::from_envelope(serde_json::from_str(body).unwrap()).unwrap();
+    assert_eq!(error.code, ErrorCode::ProtocolViolation);
+    assert_eq!(error.details["reason"], "response_payload_too_large");
+    assert_eq!(
+        error.details["max_payload_size"],
+        RESPONSE_LIMIT.to_string()
+    );
+}
+
+#[tokio::test]
+async fn response_message_limit_covers_success_crm_and_other_errors_before_eof() {
+    for status in [
+        StatusCode::OK,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::CONFLICT,
+        StatusCode::BAD_GATEWAY,
+    ] {
+        for chunked in [false, true] {
+            for http_only in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let tail = Arc::new(Gate::default());
+                let (_server, _registry, client) = response_fixture(ResponseData {
+                    status,
+                    chunked,
+                    calls: calls.clone(),
+                    late: None,
+                    tail: Some(tail.clone()),
+                })
+                .await;
+                let client = if http_only {
+                    client.with_http_only()
+                } else {
+                    client
+                };
+                let control = allowed();
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.call_controlled_async("large", Arc::new(vec![1]), &control),
+                )
+                .await;
+                // Unblock the fixture even when running against the faulty reader.
+                tail.resume.notify_one();
+                let error = result
+                    .expect("reader must reject without waiting for EOF")
+                    .unwrap_err();
+                assert_response_limit(&error);
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "oversize must not replay POST"
+                );
+                assert_eq!(
+                    client
+                        .call_controlled_async("good", Arc::new(vec![2]), &allowed())
+                        .await
+                        .unwrap(),
+                    b"12345678"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn response_message_limit_also_covers_borrowed_legacy_calls() {
+    let (_server, _registry, client) = response_fixture(ResponseData {
+        status: StatusCode::OK,
+        chunked: false,
+        calls: Arc::new(AtomicUsize::new(0)),
+        late: None,
+        tail: None,
+    })
+    .await;
+    let error = client.call_async("large", &[1]).await.unwrap_err();
+    let HttpError::ServerError(_, body) = error else {
+        panic!("expected protocol error: {error:?}");
+    };
+    assert_eq!(
+        C2Error::from_envelope(serde_json::from_str(&body).unwrap())
+            .unwrap()
+            .code,
+        ErrorCode::ProtocolViolation
+    );
+}
+
+struct ReservedResponseInput {
+    bytes: Vec<u8>,
+    _permit: c2_mem::RetentionPermit,
+}
+
+impl AsRef<[u8]> for ReservedResponseInput {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[tokio::test]
+async fn late_response_limit_keeps_owned_input_until_real_driver_completion() {
+    for status in [
+        StatusCode::OK,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+    ] {
+        let late = Arc::new(Gate::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_server, _registry, client) = response_fixture(ResponseData {
+            status,
+            chunked: true,
+            calls: calls.clone(),
+            late: Some(late.clone()),
+            tail: None,
+        })
+        .await;
+        let client = Arc::new(client);
+        let budget = c2_mem::RetentionBudget::new(1, 4);
+        let input = Arc::new(ReservedResponseInput {
+            bytes: vec![1; 4],
+            _permit: budget.reserve(4).unwrap(),
+        });
+        let weak = Arc::downgrade(&input);
+        let expired = Arc::new(AtomicBool::new(false));
+        let observed = expired.clone();
+        let active_checks = Arc::new(AtomicUsize::new(0));
+        let checks = active_checks.clone();
+        let control = HttpCallControl::new(
+            move || {
+                checks.fetch_add(1, Ordering::SeqCst);
+                if observed.load(Ordering::SeqCst) {
+                    Err(rejected())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+        );
+        let driver_client = client.clone();
+        let (delivery, waiter) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(async move {
+            let result = driver_client
+                .call_controlled_async("large", input, &control)
+                .await;
+            (result, delivery.send(()).is_ok())
+        });
+        late.entered.notified().await;
+        // The application waits once. Expiry drops only its delivery channel;
+        // the independent driver continues owning the actual transport/input.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), waiter)
+                .await
+                .is_err()
+        );
+        expired.store(true, Ordering::SeqCst);
+        let checks_at_expiry = active_checks.load(Ordering::SeqCst);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(budget.snapshot().used_operations, 1);
+        assert_eq!(budget.snapshot().used_retained_bytes, 4);
+        assert_eq!(
+            client
+                .call_controlled_async("good", Arc::new(vec![2]), &allowed())
+                .await
+                .unwrap(),
+            b"12345678"
+        );
+        late.resume.notify_one();
+        // Controller observation is separate from the application's waiter.
+        let (result, delivered) = tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !delivered,
+            "late completion cannot deliver a second caller outcome"
+        );
+        assert_response_limit(&result.unwrap_err());
+        assert_eq!(
+            active_checks.load(Ordering::SeqCst),
+            checks_at_expiry,
+            "dispatched response must not recheck caller deadline"
+        );
+        assert!(weak.upgrade().is_none());
+        assert_eq!(budget.snapshot().used_operations, 0);
+        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one large POST and one healthy sibling"
+        );
+    }
+}
+
+// Exercise the actual reqwest body reader without a listening socket. These
+// complement, and never replace, the real HTTP exchanges above.
+fn response_from_chunks(
+    status: u16,
+    known_length: bool,
+    polls: Arc<AtomicUsize>,
+) -> reqwest::Response {
+    let body = if known_length {
+        reqwest::Body::from(vec![b'x'; 9])
+    } else {
+        reqwest::Body::wrap_stream(futures::stream::unfold(0, move |index| {
+            let polls = polls.clone();
+            async move {
+                polls.fetch_add(1, Ordering::SeqCst);
+                if index == 3 {
+                    std::future::pending::<()>().await;
+                }
+                Some((
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b"123")),
+                    index + 1,
+                ))
+            }
+        }))
+    };
+    let mut builder = axum::http::Response::builder().status(status);
+    if known_length {
+        builder = builder.header("content-length", "9");
+    }
+    builder.body(body).unwrap().into()
+}
+
+async fn check_response_reader(status: u16, known_length: bool) {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        crate::payload::read_http_response(
+            response_from_chunks(status, known_length, polls.clone()),
+            RESPONSE_LIMIT,
+        ),
+    )
+    .await
+    .expect("reader must reject before polling EOF");
+    let error = result.unwrap_err();
+    let HttpError::ServerError(_, body) = error else {
+        panic!("expected protocol error: {error:?}");
+    };
+    let error = C2Error::from_envelope(serde_json::from_str(&body).unwrap()).unwrap();
+    assert_eq!(error.code, ErrorCode::ProtocolViolation);
+    assert_eq!(error.details["reason"], "response_payload_too_large");
+    if !known_length {
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[tokio::test]
+async fn response_reader_bounds_200() {
+    check_response_reader(200, true).await;
+}
+#[tokio::test]
+async fn response_reader_bounds_500() {
+    check_response_reader(500, true).await;
+}
+#[tokio::test]
+async fn response_reader_bounds_other_error() {
+    check_response_reader(502, true).await;
+}
+
+#[tokio::test]
+async fn response_reader_bounds_chunked_200() {
+    check_response_reader(200, false).await;
+}
+#[tokio::test]
+async fn response_reader_bounds_chunked_500() {
+    check_response_reader(500, false).await;
+}
+#[tokio::test]
+async fn response_reader_bounds_chunked_other_error() {
+    check_response_reader(502, false).await;
+}
+
+#[tokio::test]
+async fn response_reader_preserves_compliant_bodies_and_uses_actual_body_hint() {
+    for status in [200, 500, 502] {
+        for len in [0, 8] {
+            for streamed in [false, true] {
+                let expected = vec![b'x'; len];
+                let body = if streamed {
+                    reqwest::Body::wrap_stream(futures::stream::iter(
+                        expected
+                            .chunks(3)
+                            .map(|chunk| {
+                                Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(chunk))
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                } else {
+                    reqwest::Body::from(expected.clone())
+                };
+                let response: reqwest::Response = axum::http::Response::builder()
+                    .status(status)
+                    .body(body)
+                    .unwrap()
+                    .into();
+                let result = crate::payload::read_http_response(response, RESPONSE_LIMIT).await;
+                match (status, result) {
+                    (200, Ok(bytes)) => assert_eq!(bytes, expected),
+                    (500, Err(HttpError::CrmError(bytes))) => assert_eq!(bytes, expected),
+                    (502, Err(HttpError::ServerError(502, text))) => {
+                        assert_eq!(text.as_bytes(), expected)
+                    }
+                    (_, other) => panic!("unexpected compliant result: {other:?}"),
+                }
+            }
+        }
+    }
+    // A legal 304 response's Content-Length describes the selected
+    // representation, not its (empty) message body. The reader must consult
+    // the body hint. The separate socket fixture below proves HTTP parsing.
+    let response: reqwest::Response = axum::http::Response::builder()
+        .status(304)
+        .header("content-length", u64::MAX.to_string())
+        .body(reqwest::Body::from(Vec::new()))
+        .unwrap()
+        .into();
+    assert_eq!(response.content_length(), Some(0));
+    assert!(
+        matches!(crate::payload::read_http_response(response, RESPONSE_LIMIT).await, Err(HttpError::ServerError(304, text)) if text.is_empty())
+    );
+
+    for len in [0, 1] {
+        let response: reqwest::Response =
+            axum::http::Response::new(reqwest::Body::from(vec![0; len])).into();
+        let bytes = crate::payload::read_http_response(response, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), len);
+        assert!(
+            bytes.capacity() < 1024,
+            "a huge limit must not drive allocation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn response_content_length_metadata_can_exceed_limit_for_legal_empty_body() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut bytes = [0; 1024];
+            let count = socket.read(&mut bytes).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&bytes[..count]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 304 Not Modified\r\nContent-Length: 999999\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["content-length"], "999999");
+    assert_eq!(response.content_length(), Some(0));
+    assert!(
+        matches!(crate::payload::read_http_response(response, RESPONSE_LIMIT).await, Err(HttpError::ServerError(304, text)) if text.is_empty())
+    );
+    server.await.unwrap();
+}

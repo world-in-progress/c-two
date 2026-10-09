@@ -419,7 +419,11 @@ impl RelayAwareHttpClient {
                 check_active(control)?;
                 let probe = client
                     .client
-                    .probe_route_with_token_async(&self.expected, &route.route_token())
+                    .probe_route_with_token_async(
+                        &self.expected,
+                        &route.route_token(),
+                        route.max_payload_size,
+                    )
                     .await;
                 check_active(control)?;
                 match probe {
@@ -515,6 +519,7 @@ impl RelayAwareHttpClient {
                     .call_with_route_token_async(
                         &self.expected,
                         &route.route_token(),
+                        route.max_payload_size,
                         method_name,
                         &data,
                         control,

@@ -67,7 +67,8 @@ pub enum HttpError {
     #[error("HTTP transport error: {0}")]
     Transport(String),
 
-    /// Non-200, non-500 status codes.
+    /// Remote HTTP errors, or a canonical local response protocol violation
+    /// paired with the actual received status (including 200/500).
     #[error("HTTP {0}: {1}")]
     ServerError(u16, String),
 }
@@ -224,6 +225,7 @@ impl HttpClient {
         &self,
         expected: &ExpectedRouteContract,
         route_token: &HttpRouteToken,
+        max_payload_size: u64,
         method_name: &str,
         data: &HttpCallInput<'_>,
         control: Option<&HttpCallControl>,
@@ -257,26 +259,7 @@ impl HttpClient {
             .await
             .map_err(|e| HttpError::Transport(e.to_string()))?;
 
-        match resp.status().as_u16() {
-            200 => {
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| HttpError::Transport(e.to_string()))?;
-                Ok(bytes.to_vec())
-            }
-            500 => {
-                let body = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| HttpError::Transport(e.to_string()))?;
-                Err(HttpError::CrmError(body.to_vec()))
-            }
-            code => {
-                let text = resp.text().await.unwrap_or_default();
-                Err(HttpError::ServerError(code, text))
-            }
-        }
+        crate::payload::read_http_response(resp, max_payload_size).await
     }
 
     /// Health check — GET /health.
@@ -301,6 +284,7 @@ impl HttpClient {
         &self,
         expected: &ExpectedRouteContract,
         route_token: &HttpRouteToken,
+        max_payload_size: u64,
     ) -> Result<(), HttpError> {
         let url = format!(
             "{}/_probe/{}",
@@ -316,8 +300,11 @@ impl HttpClient {
         match resp.status().as_u16() {
             200 => Ok(()),
             code => {
-                let text = resp.text().await.unwrap_or_default();
-                Err(HttpError::ServerError(code, text))
+                let body = crate::payload::read_http_response_body(resp, max_payload_size).await?;
+                Err(HttpError::ServerError(
+                    code,
+                    String::from_utf8_lossy(&body).into_owned(),
+                ))
             }
         }
     }
@@ -399,7 +386,15 @@ mod tests {
         );
         let input = HttpCallInput::Owned(owner);
         let error = client
-            .call_with_route_token_async(&expected, &token, "step", &input, Some(&control), None)
+            .call_with_route_token_async(
+                &expected,
+                &token,
+                1024,
+                "step",
+                &input,
+                Some(&control),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, HttpError::LocalCallRejected(error) if error == rejection));

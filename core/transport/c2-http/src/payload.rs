@@ -5,6 +5,141 @@ use futures::stream;
 
 use crate::client::{HttpError, HttpInputOwner};
 
+// Local response violations use the same canonical semantic envelope as
+// remote HTTP errors. Preserve the actual status, including 200/500; Core
+// normalizes the envelope on both call and probe/resolution paths. The error
+// code is ProtocolViolation, never stale-route authority or POST replay proof.
+fn response_protocol_error(
+    reason: &str,
+    max_payload_size: u64,
+    observed: String,
+) -> c2_error::C2Error {
+    c2_error::C2Error::new(
+        c2_error::ErrorCode::ProtocolViolation,
+        "HTTP response violates the selected route's message boundary",
+    )
+    .with_details(std::collections::BTreeMap::from([
+        ("transport".into(), "http".into()),
+        ("reason".into(), reason.into()),
+        ("max_payload_size".into(), max_payload_size.to_string()),
+        ("observed_payload_size".into(), observed),
+    ]))
+}
+
+fn checked_response_length(
+    current: usize,
+    incoming: usize,
+    max_payload_size: u64,
+) -> Result<usize, c2_error::C2Error> {
+    let length = current.checked_add(incoming).ok_or_else(|| {
+        response_protocol_error(
+            "response_payload_length_overflow",
+            max_payload_size,
+            "overflow".into(),
+        )
+    })?;
+    let wire_length = u64::try_from(length).map_err(|_| {
+        response_protocol_error(
+            "response_payload_length_overflow",
+            max_payload_size,
+            length.to_string(),
+        )
+    })?;
+    if wire_length > max_payload_size {
+        return Err(response_protocol_error(
+            "response_payload_too_large",
+            max_payload_size,
+            wire_length.to_string(),
+        ));
+    }
+    Ok(length)
+}
+
+// Called only after required length has passed the message-boundary check.
+// Grow from existing capacity, never from Content-Length or the whole limit.
+fn response_growth_capacity(current: usize, required: usize, max_payload_size: u64) -> usize {
+    let ceiling = usize::try_from(max_payload_size).unwrap_or(usize::MAX);
+    current
+        .checked_mul(2)
+        .unwrap_or(ceiling)
+        .max(required)
+        .min(ceiling)
+}
+
+fn append_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_payload_size: u64,
+) -> Result<(), c2_error::C2Error> {
+    let length = checked_response_length(body.len(), chunk.len(), max_payload_size)?;
+    if length > body.capacity() {
+        let capacity = response_growth_capacity(body.capacity(), length, max_payload_size);
+        // Request the capped geometric target exactly; Vec's own growth policy
+        // must not add another doubling beyond the native message ceiling.
+        body.try_reserve_exact(capacity - body.len()).map_err(|_| {
+            response_protocol_error(
+                "response_payload_allocation_failed",
+                max_payload_size,
+                length.to_string(),
+            )
+        })?;
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+pub(crate) async fn read_http_response_body(
+    mut response: reqwest::Response,
+    max_payload_size: u64,
+) -> Result<Vec<u8>, HttpError> {
+    let status = response.status().as_u16();
+    let protocol_error = |error: c2_error::C2Error| {
+        HttpError::ServerError(
+            status,
+            serde_json::to_string(&error.envelope())
+                .expect("canonical error envelope is serializable"),
+        )
+    };
+    // reqwest's content_length is the *body* size hint, not the raw header.
+    // HEAD/304 metadata (and decoded bodies) can legitimately differ from the
+    // header. Never allocate from either hint or the entire configured limit.
+    if let Some(length) = response.content_length()
+        && length > max_payload_size
+    {
+        return Err(protocol_error(response_protocol_error(
+            "response_payload_too_large",
+            max_payload_size,
+            length.to_string(),
+        )));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| HttpError::Transport(error.to_string()))?
+    {
+        append_response_chunk(&mut body, &chunk, max_payload_size).map_err(&protocol_error)?;
+    }
+    Ok(body)
+}
+
+// One response reader for every status and both owned/borrowed call paths.
+pub(crate) async fn read_http_response(
+    response: reqwest::Response,
+    max_payload_size: u64,
+) -> Result<Vec<u8>, HttpError> {
+    let status = response.status().as_u16();
+    let body = read_http_response_body(response, max_payload_size).await?;
+    match status {
+        200 => Ok(body),
+        500 => Err(HttpError::CrmError(body)),
+        code => Err(HttpError::ServerError(
+            code,
+            String::from_utf8_lossy(&body).into_owned(),
+        )),
+    }
+}
+
 pub(crate) fn validate_remote_payload_chunk_size(chunk_size: u64) -> Result<usize, HttpError> {
     c2_config::validate_remote_payload_chunk_size(chunk_size)
         .map_err(|reason| HttpError::InvalidInput(format!("remote_payload_chunk_size {reason}")))?;
@@ -109,6 +244,91 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn response_length_checks_exact_limit_and_platform_overflow() {
+        assert_eq!(checked_response_length(3, 5, 8).unwrap(), 8);
+        assert_eq!(checked_response_length(0, 0, 0).unwrap(), 0);
+        for (current, incoming, limit, reason) in [
+            (3, 6, 8, "response_payload_too_large"),
+            (usize::MAX, 1, u64::MAX, "response_payload_length_overflow"),
+        ] {
+            let error = checked_response_length(current, incoming, limit).unwrap_err();
+            assert_eq!(error.code, c2_error::ErrorCode::ProtocolViolation);
+            assert_eq!(error.details["reason"], reason);
+        }
+    }
+
+    #[test]
+    fn tiny_response_chunks_have_bounded_capacity_growth_and_reject_before_reserve() {
+        const LIMIT: usize = 8192;
+        let mut body = Vec::new();
+        let mut growths = 0;
+        for index in 0..LIMIT {
+            let previous_capacity = body.capacity();
+            append_response_chunk(&mut body, &[(index % 251) as u8], LIMIT as u64).unwrap();
+            growths += usize::from(body.capacity() != previous_capacity);
+            assert!(body.capacity() <= LIMIT);
+        }
+        assert_eq!(
+            body,
+            (0..LIMIT)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>()
+        );
+        let capacity = body.capacity();
+        let error = append_response_chunk(&mut body, &[0], LIMIT as u64).unwrap_err();
+        assert_eq!(error.code, c2_error::ErrorCode::ProtocolViolation);
+        assert_eq!(error.details["reason"], "response_payload_too_large");
+        assert_eq!(body.len(), LIMIT);
+        assert_eq!(
+            body.capacity(),
+            capacity,
+            "rejection must precede allocation"
+        );
+        println!("8192 one-byte chunks: {growths} capacity changes");
+        assert!(
+            growths <= 14,
+            "8192 one-byte chunks caused {growths} capacity growths"
+        );
+    }
+
+    #[test]
+    fn response_capacity_growth_clamps_message_and_platform_limits_without_allocation() {
+        assert_eq!(response_growth_capacity(0, 0, u64::MAX), 0);
+        assert_eq!(response_growth_capacity(0, 1, u64::MAX), 1);
+        assert_eq!(response_growth_capacity(4, 5, 7), 7);
+        assert_eq!(response_growth_capacity(4, 10, 11), 10);
+        let above_half = usize::MAX / 2 + 1;
+        assert_eq!(
+            response_growth_capacity(above_half, above_half + 1, u64::MAX),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn oversized_first_response_chunk_does_not_allocate() {
+        let mut body = Vec::new();
+        let error = append_response_chunk(&mut body, &[0; 9], 8).unwrap_err();
+        assert_eq!(error.code, c2_error::ErrorCode::ProtocolViolation);
+        assert_eq!(error.details["reason"], "response_payload_too_large");
+        assert!(body.is_empty());
+        assert_eq!(body.capacity(), 0);
+    }
+
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn response_reader_accepts_tiny_chunk_stream_without_limit_preallocation() {
+        let body = reqwest::Body::wrap_stream(stream::iter(
+            (0..8192).map(|_| Ok::<_, Infallible>(Bytes::from_static(b"x"))),
+        ));
+        let response: reqwest::Response = axum::http::Response::new(body).into();
+        assert_eq!(response.content_length(), None);
+        let body = read_http_response_body(response, u64::MAX).await.unwrap();
+        assert_eq!(body.len(), 8192);
+        assert!(body.iter().all(|byte| *byte == b'x'));
+        assert_eq!(body.capacity(), 8192);
+    }
 
     struct CountedInput {
         bytes: Vec<u8>,
