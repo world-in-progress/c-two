@@ -22,7 +22,7 @@ use c2_core::{
 use c2_mem::{BufferLeaseStats, BufferLeaseTracker};
 
 use crate::config_ffi::{
-    client_ipc_overrides_to_dict, client_ipc_to_dict, parse_client_ipc_overrides,
+    PyConnectAttempt, client_ipc_overrides_to_dict, client_ipc_to_dict, parse_client_ipc_overrides,
     parse_server_ipc_overrides, server_ipc_overrides_to_dict,
 };
 use crate::core_error_ffi::{
@@ -73,6 +73,81 @@ mod shutdown_timeout_tests {
             Ok(Duration::from_millis(125))
         );
         assert_eq!(checked_shutdown_timeout(5.0), Ok(Duration::from_secs(5)));
+    }
+}
+
+#[cfg(test)]
+mod connect_attempt_tests {
+    use super::*;
+
+    #[test]
+    fn relay_override_host_lock_expires_before_owner_releases_and_recovers() {
+        Python::initialize();
+        let session = Arc::new(
+            PyRuntimeSession::new(None, None, None, None, None, false, None, None).unwrap(),
+        );
+        let host = session.host.lock();
+        let worker_session = session.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let attempt = PyConnectAttempt {
+                inner: c2_core::ConnectAttempt::start(
+                    c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(100)),
+                )
+                .unwrap(),
+            };
+            let started = std::time::Instant::now();
+            let result = Python::attach(|py| {
+                worker_session.set_relay_anchor_address(
+                    py,
+                    Some("http://relay.test".into()),
+                    Some(&attempt),
+                )
+            });
+            done_tx.send((result, started.elapsed())).unwrap();
+        });
+        let (result, elapsed) = done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("native host lock must not block past caller budget");
+        let error = result.unwrap_err();
+        Python::attach(|py| {
+            let value = error.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u16>().unwrap(),
+                715
+            );
+            let details = value.getattr("details").unwrap();
+            assert_eq!(
+                details
+                    .get_item("stage")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "relay_override_host_wait"
+            );
+            assert_eq!(
+                details
+                    .get_item("operation")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "connect"
+            );
+        });
+        assert!(elapsed < Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(300).saturating_sub(elapsed));
+        drop(host);
+        worker.join().unwrap();
+        Python::attach(|py| {
+            session.set_relay_anchor_address(py, Some("http://relay.test".into()), None)
+        })
+        .unwrap();
+        assert_eq!(
+            session.inner.relay_anchor_address_override().as_deref(),
+            Some("http://relay.test")
+        );
+        assert!(!session.inner.client_config_frozen());
+        assert_eq!(session.inner.path_counters().direct_ipc(), 0);
     }
 }
 
@@ -227,8 +302,23 @@ impl PyRuntimeSession {
         py: Python<'_>,
         expected: ExpectedRouteContract,
         mode: Connect,
+        timeout_seconds: Option<f64>,
+        connect_attempt: Option<&PyConnectAttempt>,
     ) -> PyResult<PyCoreClient> {
-        py.detach(|| self.inner.connect(expected, mode))
+        if connect_attempt.is_some() && timeout_seconds.is_some() {
+            return Err(PyValueError::new_err(
+                "provide connect_attempt or timeout_seconds, not both",
+            ));
+        }
+        let attempt = match connect_attempt {
+            Some(attempt) => attempt.inner,
+            None => {
+                let options = c2_config::ConnectOptions::from_timeout_secs(timeout_seconds)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?;
+                c2_core::ConnectAttempt::start(options).map_err(core_error_to_py)?
+            }
+        };
+        py.detach(|| self.inner.connect_with_attempt(expected, mode, &attempt))
             .map(PyCoreClient::new)
             .map_err(core_error_to_py)
     }
@@ -631,22 +721,51 @@ impl PyRuntimeSession {
         Ok(())
     }
 
-    fn set_relay_anchor_address(&self, relay_anchor_address: Option<String>) -> PyResult<()> {
-        if self.host.lock().is_some() {
-            let requested = relay_anchor_address
-                .as_deref()
-                .map(str::trim)
-                .map(|value| value.trim_end_matches('/'));
-            let current = self.inner.relay_anchor_address_override();
-            if requested != current.as_deref() {
-                return Err(PyRuntimeError::new_err(
-                    "relay anchor is frozen after the Core host starts",
-                ));
+    #[pyo3(signature = (relay_anchor_address, *, connect_attempt=None))]
+    fn set_relay_anchor_address(
+        &self,
+        py: Python<'_>,
+        relay_anchor_address: Option<String>,
+        connect_attempt: Option<&PyConnectAttempt>,
+    ) -> PyResult<()> {
+        let attempt = connect_attempt.map(|attempt| attempt.inner);
+        py.detach(|| {
+            let host = match &attempt {
+                Some(attempt) => attempt
+                    .lock(&self.host, "relay_override_host_wait")
+                    .map_err(core_error_to_py)?,
+                None => self.host.lock(),
+            };
+            if host.is_some() {
+                let requested = relay_anchor_address
+                    .as_deref()
+                    .map(str::trim)
+                    .map(|value| value.trim_end_matches('/'));
+                let current = match &attempt {
+                    Some(attempt) => self
+                        .inner
+                        .relay_anchor_address_override_with_attempt(attempt)
+                        .map_err(core_error_to_py)?,
+                    None => self.inner.relay_anchor_address_override(),
+                };
+                if requested != current.as_deref() {
+                    return Err(PyRuntimeError::new_err(
+                        "relay anchor is frozen after the Core host starts",
+                    ));
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        self.inner.set_relay_anchor_address(relay_anchor_address);
-        Ok(())
+            match &attempt {
+                Some(attempt) => self
+                    .inner
+                    .set_relay_anchor_address_with_attempt(relay_anchor_address, attempt)
+                    .map_err(core_error_to_py),
+                None => {
+                    self.inner.set_relay_anchor_address(relay_anchor_address);
+                    Ok(())
+                }
+            }
+        })
     }
 
     #[getter]
@@ -1010,6 +1129,7 @@ impl PyRuntimeSession {
     }
 
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
+    #[pyo3(signature = (address, route_name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, *, timeout_seconds=None, connect_attempt=None))]
     fn acquire_ipc_client(
         &self,
         py: Python<'_>,
@@ -1020,6 +1140,8 @@ impl PyRuntimeSession {
         crm_ver: &str,
         abi_hash: &str,
         signature_hash: &str,
+        timeout_seconds: Option<f64>,
+        connect_attempt: Option<&PyConnectAttempt>,
     ) -> PyResult<PyCoreClient> {
         let expected = expected_route_contract(
             route_name,
@@ -1035,10 +1157,13 @@ impl PyRuntimeSession {
             Connect::DirectIpc {
                 address: address.to_string(),
             },
+            timeout_seconds,
+            connect_attempt,
         )
     }
 
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
+    #[pyo3(signature = (address, route_name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, *, timeout_seconds=None, connect_attempt=None))]
     fn connect_explicit_relay_http(
         &self,
         py: Python<'_>,
@@ -1049,6 +1174,8 @@ impl PyRuntimeSession {
         crm_ver: &str,
         abi_hash: &str,
         signature_hash: &str,
+        timeout_seconds: Option<f64>,
+        connect_attempt: Option<&PyConnectAttempt>,
     ) -> PyResult<PyCoreClient> {
         let expected = expected_route_contract(
             route_name,
@@ -1064,10 +1191,13 @@ impl PyRuntimeSession {
             Connect::ExplicitRelay {
                 relay_url: address.to_string(),
             },
+            timeout_seconds,
+            connect_attempt,
         )
     }
 
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
+    #[pyo3(signature = (route_name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, *, timeout_seconds=None, connect_attempt=None))]
     fn connect_via_relay(
         &self,
         py: Python<'_>,
@@ -1077,6 +1207,8 @@ impl PyRuntimeSession {
         crm_ver: &str,
         abi_hash: &str,
         signature_hash: &str,
+        timeout_seconds: Option<f64>,
+        connect_attempt: Option<&PyConnectAttempt>,
     ) -> PyResult<PyCoreClient> {
         let expected = expected_route_contract(
             route_name,
@@ -1086,7 +1218,13 @@ impl PyRuntimeSession {
             abi_hash,
             signature_hash,
         )?;
-        self.connect_core(py, expected, Connect::RelayAware)
+        self.connect_core(
+            py,
+            expected,
+            Connect::RelayAware,
+            timeout_seconds,
+            connect_attempt,
+        )
     }
 
     fn path_counters<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {

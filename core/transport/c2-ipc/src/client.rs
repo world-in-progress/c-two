@@ -16,7 +16,311 @@ use futures_util::{Stream, StreamExt};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, oneshot};
 
+use c2_config::ConnectDeadline;
+
+// The scope follows each future poll, rather than an OS thread. It projects
+// Core's single deadline into native metadata operations reached by connect;
+// it never creates a new budget or affects an ordinary business call.
+tokio::task_local! { static CONNECT_OPERATION_DEADLINE: ConnectDeadline; }
+
+fn operation_deadline() -> ConnectDeadline {
+    CONNECT_OPERATION_DEADLINE
+        .try_with(|deadline| *deadline)
+        .unwrap_or_default()
+}
+
+fn connect_metadata_lock<'a, T>(
+    mutex: &'a StdMutex<T>,
+    stage: &'static str,
+) -> Result<parking_lot::MutexGuard<'a, T>, IpcError> {
+    let deadline = operation_deadline();
+    connect_check(deadline, stage)?;
+    let guard = match deadline.instant() {
+        Some(instant) => mutex
+            .try_lock_until(instant)
+            .ok_or_else(|| connect_expired(stage))?,
+        None => mutex.lock(),
+    };
+    connect_check(deadline, stage)?;
+    Ok(guard)
+}
+
+fn connect_directory_read<T>(
+    directory: &RwLock<T>,
+) -> Result<parking_lot::RwLockReadGuard<'_, T>, IpcError> {
+    let deadline = operation_deadline();
+    connect_check(deadline, "route_directory_wait")?;
+    let guard = match deadline.instant() {
+        Some(instant) => directory
+            .try_read_until(instant)
+            .ok_or_else(|| connect_expired("route_directory_wait"))?,
+        None => directory.read(),
+    };
+    connect_check(deadline, "route_directory_wait")?;
+    Ok(guard)
+}
+
+fn connect_directory_write<T>(
+    directory: &RwLock<T>,
+) -> Result<parking_lot::RwLockWriteGuard<'_, T>, IpcError> {
+    let deadline = operation_deadline();
+    connect_check(deadline, "route_directory_wait")?;
+    let guard = match deadline.instant() {
+        Some(instant) => directory
+            .try_write_until(instant)
+            .ok_or_else(|| connect_expired("route_directory_wait"))?,
+        None => directory.write(),
+    };
+    connect_check(deadline, "route_directory_wait")?;
+    Ok(guard)
+}
 use c2_error::{C2Error, ErrorCode};
+
+pub(crate) fn connect_expired(stage: &'static str) -> IpcError {
+    IpcError::LocalCallRejected(
+        C2Error::new(ErrorCode::CallDeadlineExceeded, "connect deadline exceeded").with_details(
+            std::collections::BTreeMap::from([
+                ("operation".into(), "connect".into()),
+                ("transport_phase".into(), "pre_dispatch".into()),
+                ("stage".into(), stage.into()),
+                ("fallback_eligible".into(), "false".into()),
+                ("route_withdrawal".into(), "false".into()),
+            ]),
+        ),
+    )
+}
+
+pub(crate) fn connect_check(
+    deadline: ConnectDeadline,
+    stage: &'static str,
+) -> Result<(), IpcError> {
+    deadline.check(stage).map_err(|_| connect_expired(stage))
+}
+
+pub(crate) async fn with_connect_deadline<T>(
+    deadline: ConnectDeadline,
+    stage: &'static str,
+    future: impl std::future::Future<Output = Result<T, IpcError>>,
+) -> Result<T, IpcError> {
+    connect_check(deadline, stage)?;
+    let scoped = CONNECT_OPERATION_DEADLINE.scope(deadline, future);
+    let result = match deadline.instant() {
+        None => scoped.await,
+        Some(instant) => tokio::time::timeout_at(instant.into(), scoped)
+            .await
+            .map_err(|_| connect_expired(stage))?,
+    };
+    // Preserve the precise native lock/phase that exhausted this same budget.
+    if matches!(&result, Err(IpcError::LocalCallRejected(error))
+        if error.code == ErrorCode::CallDeadlineExceeded
+            && error.details.get("operation").is_some_and(|operation| operation == "connect"))
+    {
+        return result;
+    }
+    connect_check(deadline, stage)?;
+    result
+}
+
+#[cfg(test)]
+mod connect_lock_deadline_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn budget() -> ConnectDeadline {
+        ConnectDeadline::start(
+            c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(50)),
+        )
+        .unwrap()
+    }
+
+    fn expected() -> c2_contract::ExpectedRouteContract {
+        c2_contract::ExpectedRouteContract {
+            route_name: "grid".into(),
+            crm_ns: "test.connect_locks".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: "01".repeat(32),
+            signature_hash: "02".repeat(32),
+        }
+    }
+
+    async fn assert_bounded_route_lock(directory: bool) {
+        let client = Arc::new(IpcClient::new("ipc://no-connect-lock-test"));
+        let held_client = client.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            if directory {
+                let _guard = held_client.route_directory.write();
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_millis(300));
+            } else {
+                let _guard = held_client.pending.lock();
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_millis(300));
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        let result =
+            with_connect_deadline(budget(), "route_acquire", client.acquire_route(&expected()))
+                .await;
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "native metadata lock exceeded caller budget: {elapsed:?}"
+        );
+        let Err(IpcError::LocalCallRejected(error)) = result else {
+            panic!("canonical deadline required")
+        };
+        assert_eq!(error.code, ErrorCode::CallDeadlineExceeded);
+        assert_eq!(
+            error.details["stage"],
+            if directory {
+                "route_directory_wait"
+            } else {
+                "control_pending_wait"
+            }
+        );
+        assert_eq!(client.pending_len_for_test(), 0);
+        let recovered =
+            with_connect_deadline(budget(), "route_acquire", client.acquire_route(&expected()))
+                .await;
+        assert!(
+            matches!(recovered, Err(IpcError::Closed)),
+            "after unlocking, acquisition must reach the absent writer"
+        );
+        assert_eq!(client.pending_len_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_directory_lock_wait_is_bounded() {
+        assert_bounded_route_lock(true).await;
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_pending_registration_wait_is_bounded() {
+        assert_bounded_route_lock(false).await;
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_injected_pool_metadata_wait_is_bounded_before_os_connect() {
+        let config = ClientIpcConfig::default();
+        let memory_budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
+        let pool = IpcClient::own_pool_from_config(&config, &memory_budget);
+        let mut client =
+            IpcClient::with_pool("ipc://no-injected-pool-lock-test", pool.clone(), config);
+        let held_pool = pool.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = held_pool.lock();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_millis(300));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        let result = client.connect_with_deadline(budget()).await;
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "native injected-pool metadata wait exceeded the caller budget: {elapsed:?}"
+        );
+        assert!(matches!(result, Err(IpcError::LocalCallRejected(error))
+            if error.code == ErrorCode::CallDeadlineExceeded && error.details["stage"] == "ipc_pool_wait"));
+        assert!(!client.is_connected());
+        assert!(
+            client.abort.lock().is_none(),
+            "timeout must happen before opening an OS stream"
+        );
+        assert_eq!(client.pending_len_for_test(), 0);
+        let recovered = with_connect_deadline(budget(), "ipc_pool_wait", async {
+            drop(connect_metadata_lock(&pool, "ipc_pool_wait")?);
+            Ok(())
+        })
+        .await;
+        assert!(
+            recovered.is_ok(),
+            "releasing metadata contention must restore acquisition"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_control_guard_drop_does_not_wait_for_pending_lock() {
+        let client = Arc::new(IpcClient::with_config(
+            "ipc://no-control-drop-test",
+            ClientIpcConfig {
+                pool_decay_seconds: 0.005,
+                ..ClientIpcConfig::default()
+            },
+        ));
+        let (tx, rx) = oneshot::channel();
+        let rid = register_unary_pending(&client.pending, &client.rid_counter, tx);
+        let (live_tx, mut live_rx) = oneshot::channel();
+        let live_rid = register_unary_pending(&client.pending, &client.rid_counter, live_tx);
+        let mut guard =
+            SendGuard::new_control(client.pending.clone(), client.abort.clone(), rid, None);
+        guard.mark_send_completed();
+        let held_client = client.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held = held_client.pending.lock();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_millis(300));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        drop(guard);
+        drop(rx);
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "timeout cleanup blocked on pending map: {elapsed:?}"
+        );
+        {
+            let pending = client.pending.lock();
+            assert_eq!(
+                pending.len(),
+                2,
+                "busy-map cancellation retains deferred cleanup and unrelated live waiter"
+            );
+            assert!(
+                pending[&rid].tx.as_ref().unwrap().is_closed(),
+                "the dropped receiver is the terminal cancellation marker"
+            );
+        }
+        client.spawn_maintenance().unwrap();
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if !client.pending.lock().contains_key(&rid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("existing maintenance must remove the terminal control entry");
+        assert!(client.pending.lock()[&live_rid].tx.is_some());
+        assert!(
+            matches!(live_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "cancelled control cleanup must preserve an unrelated live waiter"
+        );
+        assert_eq!(client.pending_len_for_test(), 1);
+        assert!(
+            client
+                .close_shared_bounded(Duration::from_millis(200))
+                .await
+        );
+        assert_eq!(client.pending_len_for_test(), 0);
+    }
+}
 use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
 };
@@ -1690,6 +1994,22 @@ fn register_unary_pending(
     }
 }
 
+fn register_control_pending(
+    pending: &StdMutex<PendingMap>,
+    rid_counter: &AtomicU32,
+    tx: oneshot::Sender<Result<ResponseData, IpcError>>,
+) -> Result<u32, IpcError> {
+    let mut pending = connect_metadata_lock(pending, "control_pending_wait")?;
+    loop {
+        let rid = rid_counter.fetch_add(1, Ordering::Relaxed);
+        if let std::collections::hash_map::Entry::Vacant(slot) = pending.entry(rid) {
+            slot.insert(PendingResponse::unary(tx));
+            return Ok(rid);
+        }
+        connect_check(operation_deadline(), "control_pending_wait")?;
+    }
+}
+
 /// Per-call send-cancellation guard.
 ///
 /// A caller future can be dropped at any await point between pending-map
@@ -1711,6 +2031,12 @@ struct SendGuard {
     rid: u32,
     /// Set once a terminal branch owns cleanup; `Drop` does nothing.
     disarmed: bool,
+    /// Control requests carry no transport request allocation to retain after
+    /// cancellation, including when their stream must be poisoned.
+    control_only: bool,
+    // Captured before registering a control waiter; cancellation can abort a
+    // partially written stream without waiting for its mutable owner slot.
+    control_abort: Option<AbortHandle>,
     /// Set once the frame write completed and the call waits for a reply.
     sent: bool,
     /// Set immediately before this call's first frame byte may be written;
@@ -1729,9 +2055,23 @@ impl SendGuard {
             abort,
             rid,
             disarmed: false,
+            control_only: false,
+            control_abort: None,
             sent: false,
             write_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn new_control(
+        pending: Arc<StdMutex<PendingMap>>,
+        abort: Arc<StdMutex<Option<AbortHandle>>>,
+        rid: u32,
+        control_abort: Option<AbortHandle>,
+    ) -> Self {
+        let mut guard = Self::new(pending, abort, rid);
+        guard.control_only = true;
+        guard.control_abort = control_abort;
+        guard
     }
 
     /// A terminal branch owns cleanup from here on.
@@ -1753,6 +2093,25 @@ impl SendGuard {
 impl Drop for SendGuard {
     fn drop(&mut self) {
         if self.disarmed {
+            return;
+        }
+        if self.control_only {
+            // Dropping the control future drops rx too. If metadata is busy,
+            // maintenance/receive/close observes that closed receiver and owns
+            // deferred settlement; timeout never waits for the pending map.
+            if let Some(mut pending) = self.pending.try_lock() {
+                if let Some(entry) = pending.get_mut(&self.rid) {
+                    entry.close_waiter();
+                    if entry.try_release_request() && entry.response.is_none() {
+                        pending.remove(&self.rid);
+                    }
+                }
+            }
+            if !self.sent && self.write_started.load(Ordering::Acquire) {
+                if let Some(abort) = &self.control_abort {
+                    abort.abort();
+                }
+            }
             return;
         }
         if self.sent {
@@ -2226,10 +2585,12 @@ impl IpcClient {
     }
 
     /// The chunk registry, if a confirmed close has not detached it.
+    #[cfg(test)]
     pub(crate) fn chunk_registry_arc(&self) -> Option<Arc<ChunkRegistry>> {
         self.chunk_registry.lock().clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn require_chunk_registry(&self) -> Arc<ChunkRegistry> {
         self.chunk_registry_arc().expect(
             "client chunk registry is unavailable: this client was built around an injected \
@@ -2425,13 +2786,27 @@ impl IpcClient {
 
     /// Connect and perform handshake.
     pub async fn connect(&mut self) -> Result<(), IpcError> {
+        self.connect_with_deadline(ConnectDeadline::default()).await
+    }
+
+    pub async fn connect_with_deadline(
+        &mut self,
+        deadline: ConnectDeadline,
+    ) -> Result<(), IpcError> {
+        CONNECT_OPERATION_DEADLINE
+            .scope(deadline, self.connect_attempt(deadline))
+            .await
+    }
+
+    async fn connect_attempt(&mut self, deadline: ConnectDeadline) -> Result<(), IpcError> {
+        connect_check(deadline, "ipc_connect")?;
         // Reconnect only after the previous close barrier has accounted for
         // both background tasks. Replacing either handle here would detach
         // its task from the client's close and Drop ownership.
         if self.is_connected()
             || self.close_incomplete.load(Ordering::Acquire)
-            || self.recv_handle.lock().is_some()
-            || self.maintenance.lock().is_some()
+            || connect_metadata_lock(&self.recv_handle, "ipc_metadata_wait")?.is_some()
+            || connect_metadata_lock(&self.maintenance, "ipc_metadata_wait")?.is_some()
         {
             return Err(IpcError::Pool(
                 "client must finish closing before reconnect".to_string(),
@@ -2485,23 +2860,25 @@ impl IpcClient {
 
         // A confirmed close detaches the transport-owned pools. Reconnect
         // creates fresh incarnations on the same frozen domain budget.
-        if self.pool_transport_owned && self.pool.lock().is_none() {
+        if self.pool_transport_owned
+            && connect_metadata_lock(&self.pool, "ipc_metadata_wait")?.is_none()
+        {
             let pool = Self::own_pool_from_config(&self.config, &budget);
-            *self.pool.lock() = Some(pool);
+            *connect_metadata_lock(&self.pool, "ipc_metadata_wait")? = Some(pool);
         }
-        if self.chunk_registry.lock().is_none() {
+        if connect_metadata_lock(&self.chunk_registry, "ipc_metadata_wait")?.is_none() {
             let registry = Self::build_chunk_registry(&self.config, &budget);
-            *self.chunk_registry.lock() = Some(registry);
+            *connect_metadata_lock(&self.chunk_registry, "ipc_metadata_wait")? = Some(registry);
         }
 
         // Policy gate for injected pools, checked before any connection I/O so
         // an incompatible pool can never silently bypass the configured buddy
         // policy or be mutated behind its other users.
         if self.pool_injected {
-            let injected_pool = self.pool.lock().clone();
+            let injected_pool = connect_metadata_lock(&self.pool, "ipc_metadata_wait")?.clone();
             if let Some(pool_arc) = injected_pool {
                 let rejection = {
-                    let pool = pool_arc.lock();
+                    let pool = connect_metadata_lock(&pool_arc, "ipc_pool_wait")?;
                     if !self.config.base.pool_enabled && pool.config().buddy_enabled {
                         Some(IpcError::Pool(
                             "injected pool has buddy enabled but the client config disables \
@@ -2526,40 +2903,46 @@ impl IpcClient {
             }
         }
 
-        let stream = LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT).await?;
-        *self.abort.lock() = Some(stream.abort_handle());
+        let stream = with_connect_deadline(deadline, "os_connect", async {
+            Ok(LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT).await?)
+        })
+        .await?;
+        *connect_metadata_lock(&self.abort, "ipc_metadata_wait")? = Some(stream.abort_handle());
         let (reader, mut writer) = stream.into_split();
 
         // Explicit prewarm only: buddy memory is mapped at connect time solely
         // when `pool_prewarm_segments` asks for it; the default stays fully
         // lazy and announces an empty segment list.
-        if let Some(pool_arc) = self.request_pool() {
+        if let Some(pool_arc) = connect_metadata_lock(&self.pool, "ipc_pool_wait")?.clone() {
             let prewarm = self.config.pool_prewarm_segments as usize;
             if prewarm > 0 {
-                let mut pool = pool_arc.lock();
+                let mut pool = connect_metadata_lock(&pool_arc, "ipc_pool_wait")?;
                 pool.ensure_buddy_segments(prewarm)
                     .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
             }
         }
 
         // Perform handshake.
-        let hs = tokio::time::timeout(
-            DEFAULT_CONNECT_TIMEOUT,
-            self.do_handshake(&mut writer, reader),
-        )
-        .await
-        .map_err(|_| {
-            IpcError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "local handshake deadline expired",
-            ))
-        })??;
+        let hs = with_connect_deadline(deadline, "handshake", async {
+            tokio::time::timeout(
+                DEFAULT_CONNECT_TIMEOUT,
+                self.do_handshake(&mut writer, reader),
+            )
+            .await
+            .map_err(|_| {
+                IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "local handshake deadline expired",
+                ))
+            })?
+        })
+        .await?;
         let server_identity = hs
             .server_identity
             .clone()
             .ok_or_else(|| IpcError::Protocol("server handshake missing server identity".into()))?;
 
-        self.route_directory.write().seed_from_handshake(&hs.routes);
+        connect_directory_write(&self.route_directory)?.seed_from_handshake(&hs.routes);
         self.server_segments = hs.segments.clone();
         self.server_identity = Some(server_identity);
 
@@ -2590,20 +2973,27 @@ impl IpcClient {
                 ..PoolConfig::default()
             };
             let pool = MemPool::open_peer(cfg, hs.prefix.clone());
-            *self.server_pool.lock() = Some(ServerPoolState {
-                prefix: hs.prefix.clone(),
-                pool,
-            });
+            *connect_metadata_lock(&self.server_pool, "ipc_metadata_wait")? =
+                Some(ServerPoolState {
+                    prefix: hs.prefix.clone(),
+                    pool,
+                });
         }
 
-        *self.writer.lock().await = Some(writer);
+        let mut ready_writer = with_connect_deadline(deadline, "ipc_ready", async {
+            Ok(self.writer.lock().await)
+        })
+        .await?;
+        *ready_writer = Some(writer);
+        drop(ready_writer);
 
         // Handshake published readiness before spawning the receive task.
         // Do not restore it here: that task may already have observed EOF.
 
         // One cancellable maintenance task per connection: periodic idle
         // retirement for the client's owner pools plus stale chunk sweeps.
-        self.spawn_maintenance();
+        self.spawn_maintenance()?;
+        connect_check(deadline, "ipc_ready")?;
 
         Ok(())
     }
@@ -2618,20 +3008,21 @@ impl IpcClient {
         // lazy-opens by prefix/index/generation when a frame references one.
         // CAP_CHUNKED is independent of pool state — chunked response
         // reassembly always exists (reassembly pool + chunk registry).
-        let (segments, prefix) = if let Some(pool_arc) = self.request_pool() {
-            let pool = pool_arc.lock();
-            let count = pool.segment_count();
-            let mut segs = Vec::with_capacity(count);
-            for i in 0..count {
-                if let (Some(name), Some(seg)) = (pool.segment_name(i), pool.segment(i)) {
-                    segs.push((name.to_string(), seg.allocator().data_size() as u32));
+        let (segments, prefix) =
+            if let Some(pool_arc) = connect_metadata_lock(&self.pool, "ipc_pool_wait")?.clone() {
+                let pool = connect_metadata_lock(&pool_arc, "ipc_pool_wait")?;
+                let count = pool.segment_count();
+                let mut segs = Vec::with_capacity(count);
+                for i in 0..count {
+                    if let (Some(name), Some(seg)) = (pool.segment_name(i), pool.segment(i)) {
+                        segs.push((name.to_string(), seg.allocator().data_size() as u32));
+                    }
                 }
-            }
-            let pfx = pool.prefix().to_string();
-            (segs, pfx)
-        } else {
-            (vec![], String::new())
-        };
+                let pfx = pool.prefix().to_string();
+                (segs, pfx)
+            } else {
+                (vec![], String::new())
+            };
         let cap_flags = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
 
         let payload = encode_client_handshake(&segments, cap_flags, &prefix)
@@ -2678,7 +3069,11 @@ impl IpcClient {
         let connection = ReceiveConnectionState {
             connected: Arc::clone(&self.connected),
         };
-        let chunk_registry = self.require_chunk_registry();
+        let chunk_registry = connect_metadata_lock(&self.chunk_registry, "ipc_metadata_wait")?
+            .clone()
+            .ok_or_else(|| {
+                IpcError::Pool("client chunk registry unavailable during handshake".into())
+            })?;
         let conn_id = self.conn_id;
         #[cfg(test)]
         let partial_header_pending = self.partial_header_pending_for_test.lock().take();
@@ -2698,6 +3093,7 @@ impl IpcClient {
                 });
         #[cfg(any(test, feature = "test-support"))]
         let pending_drain_seam = self.pending_drain_seam.lock().take();
+        let mut recv_slot = connect_metadata_lock(&self.recv_handle, "ipc_metadata_wait")?;
         let recv_handle = tokio::spawn(recv_loop_inner(
             reader,
             pending,
@@ -2713,7 +3109,7 @@ impl IpcClient {
             #[cfg(any(test, feature = "test-support"))]
             pending_drain_seam,
         ));
-        *self.recv_handle.lock() = Some(recv_handle);
+        *recv_slot = Some(recv_handle);
 
         Ok(hs)
     }
@@ -2749,15 +3145,17 @@ impl IpcClient {
     /// - It never selects on the recv loop's `read_exact`, which is not
     ///   cancellation safe — the reader stays owned exclusively by the recv
     ///   loop.
-    fn spawn_maintenance(&self) {
-        let mut maintenance = self.maintenance.lock();
+    fn spawn_maintenance(&self) -> Result<(), IpcError> {
+        let mut maintenance = connect_metadata_lock(&self.maintenance, "ipc_metadata_wait")?;
         if maintenance.is_some() {
-            return;
+            return Ok(());
         }
         let state_probe = Arc::downgrade(&self.maintenance);
-        let request_pool = self.request_pool().map(|pool| Arc::downgrade(&pool));
-        let registry = self
-            .chunk_registry_arc()
+        let request_pool = connect_metadata_lock(&self.pool, "ipc_pool_wait")?
+            .clone()
+            .map(|pool| Arc::downgrade(&pool));
+        let registry = connect_metadata_lock(&self.chunk_registry, "ipc_metadata_wait")?
+            .clone()
             .map(|registry| Arc::downgrade(&registry));
         let pending = Arc::downgrade(&self.pending);
         let server_pool = Arc::downgrade(&self.server_pool);
@@ -2811,6 +3209,7 @@ impl IpcClient {
             stop: stop_tx,
             handle,
         });
+        Ok(())
     }
 
     /// Get a reference to the server SHM pool (for materialising SHM responses).
@@ -2848,11 +3247,10 @@ impl IpcClient {
         }
     }
 
-    fn observed_token_for(&self, route_name: &str) -> Option<(String, u64)> {
-        self.route_directory
-            .read()
+    fn observed_token_for(&self, route_name: &str) -> Result<Option<(String, u64)>, IpcError> {
+        Ok(connect_directory_read(&self.route_directory)?
             .route_table(route_name)
-            .map(|table| (table.route_uid().to_string(), table.route_revision()))
+            .map(|table| (table.route_uid().to_string(), table.route_revision())))
     }
 
     fn payload_msg_type(payload: &[u8]) -> Option<MsgType> {
@@ -2888,24 +3286,29 @@ impl IpcClient {
         writer: Arc<Mutex<Option<LocalWriteHalf>>>,
         pending: Arc<StdMutex<PendingMap>>,
         rid_counter: Arc<AtomicU32>,
+        abort: Arc<StdMutex<Option<AbortHandle>>>,
         payload: Vec<u8>,
         description: &str,
     ) -> Result<Vec<u8>, IpcError> {
         let (tx, rx) = oneshot::channel();
-        let rid = register_unary_pending(&pending, &rid_counter, tx);
+        let control_abort = connect_metadata_lock(&abort, "control_abort_wait")?.clone();
+        let rid = register_control_pending(&pending, &rid_counter, tx)?;
+        let mut guard = SendGuard::new_control(Arc::clone(&pending), abort, rid, control_abort);
 
         let frame = frame::encode_frame(rid as u64, flags::FLAG_CTRL, &payload);
         let send_result: Result<(), IpcError> = async {
             let mut writer_guard = writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
+            guard.mark_write_started();
             writer.write_all(&frame).await?;
             Ok(())
         }
         .await;
         if let Err(err) = send_result {
-            pending.lock().remove(&rid);
+            // A partial write may have damaged framing. Drop isolates this stream.
             return Err(err);
         }
+        guard.mark_send_completed();
 
         let response = match rx.await {
             Ok(result) => result?,
@@ -2923,6 +3326,7 @@ impl IpcClient {
         writer: Arc<Mutex<Option<LocalWriteHalf>>>,
         pending: Arc<StdMutex<PendingMap>>,
         rid_counter: Arc<AtomicU32>,
+        abort: Arc<StdMutex<Option<AbortHandle>>>,
         selector: RouteSelector,
         min_revision: Option<u64>,
     ) -> Result<RouteListResponse, IpcError> {
@@ -2931,9 +3335,15 @@ impl IpcClient {
             min_revision,
         })
         .map_err(IpcError::Protocol)?;
-        let payload =
-            Self::send_control_unary_raw(writer, pending, rid_counter, payload, "route list")
-                .await?;
+        let payload = Self::send_control_unary_raw(
+            writer,
+            pending,
+            rid_counter,
+            abort,
+            payload,
+            "route list",
+        )
+        .await?;
         if Self::payload_msg_type(&payload) == Some(MsgType::RouteNack) {
             return Err(Self::route_nack_error(&payload));
         }
@@ -2944,17 +3354,24 @@ impl IpcClient {
         writer: Arc<Mutex<Option<LocalWriteHalf>>>,
         pending: Arc<StdMutex<PendingMap>>,
         rid_counter: Arc<AtomicU32>,
+        abort: Arc<StdMutex<Option<AbortHandle>>>,
         directory: Arc<RwLock<RouteDirectory>>,
     ) -> Result<(), IpcError> {
-        let response =
-            Self::list_routes_raw(writer, pending, rid_counter, RouteSelector::All, None).await?;
-        directory.write().rebuild_from_list(response);
+        let response = Self::list_routes_raw(
+            writer,
+            pending,
+            rid_counter,
+            abort,
+            RouteSelector::All,
+            None,
+        )
+        .await?;
+        connect_directory_write(&directory)?.rebuild_from_list(response);
         Ok(())
     }
 
     fn bound_route_table(&self, route_name: &str) -> Result<MethodTable, IpcError> {
-        self.route_directory
-            .read()
+        connect_directory_read(&self.route_directory)?
             .route_table(route_name)
             .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))
     }
@@ -4016,6 +4433,7 @@ impl IpcClient {
             Arc::clone(&self.writer),
             Arc::clone(&self.pending),
             Arc::clone(&self.rid_counter),
+            Arc::clone(&self.abort),
             payload,
             description,
         )
@@ -4039,9 +4457,7 @@ impl IpcClient {
     ) -> Result<(), IpcError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
-        let table = self
-            .route_directory
-            .read()
+        let table = connect_directory_read(&self.route_directory)?
             .route_table(&expected.route_name)
             .ok_or_else(|| IpcError::RouteNotFound(expected.route_name.clone()))?;
         Self::validate_method_table_contract(&expected.route_name, &table, expected)
@@ -4052,6 +4468,7 @@ impl IpcClient {
             Arc::clone(&self.writer),
             Arc::clone(&self.pending),
             Arc::clone(&self.rid_counter),
+            Arc::clone(&self.abort),
             Arc::clone(&self.route_directory),
         )
         .await
@@ -4061,7 +4478,7 @@ impl IpcClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
-        let observed = self.observed_token_for(&expected.route_name);
+        let observed = self.observed_token_for(&expected.route_name)?;
         let (observed_route_uid, observed_route_revision) = match observed {
             Some((uid, revision)) => (Some(uid), Some(revision)),
             None => (None, None),
@@ -4074,24 +4491,24 @@ impl IpcClient {
         let payload = encode_route_lookup_request(&request).map_err(IpcError::Protocol)?;
         let payload = self.send_control_inline(payload, "route lookup").await?;
         if Self::payload_msg_type(&payload) == Some(MsgType::RouteNack) {
-            self.route_directory.write().mark_dirty();
+            connect_directory_write(&self.route_directory)?.mark_dirty();
             return Err(Self::route_nack_error(&payload));
         }
         let response = decode_route_lookup_response(&payload).map_err(IpcError::Protocol)?;
         match response {
             RouteLookupResponse::Ready { current } | RouteLookupResponse::Stale { current } => {
-                self.route_directory.write().apply_record(current);
+                connect_directory_write(&self.route_directory)?.apply_record(current);
                 self.validate_route_contract(expected)
             }
             RouteLookupResponse::NotFound { route_name } => {
-                self.route_directory.write().remove_route(&route_name);
+                connect_directory_write(&self.route_directory)?.remove_route(&route_name);
                 Err(IpcError::RouteNotFound(route_name))
             }
             RouteLookupResponse::Removed {
                 route_name,
                 route_uid,
             } => {
-                self.route_directory.write().remove_route(&route_name);
+                connect_directory_write(&self.route_directory)?.remove_route(&route_name);
                 Err(IpcError::RouteRemoved {
                     route_name,
                     route_uid,
@@ -4102,7 +4519,7 @@ impl IpcClient {
                 route_uid,
                 reason,
             } => {
-                self.route_directory.write().remove_route(&route_name);
+                connect_directory_write(&self.route_directory)?.remove_route(&route_name);
                 Err(IpcError::RouteClosed {
                     route_name,
                     route_uid,
@@ -4124,7 +4541,7 @@ impl IpcClient {
                     current.contract.abi_hash,
                     current.contract.signature_hash,
                 );
-                self.route_directory.write().apply_record(current);
+                connect_directory_write(&self.route_directory)?.apply_record(current);
                 Err(IpcError::ContractMismatch(message))
             }
         }
@@ -4177,7 +4594,7 @@ impl IpcClient {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
         {
-            let directory = self.route_directory.read();
+            let directory = connect_directory_read(&self.route_directory)?;
             if !directory.is_dirty()
                 && let Some(table) = directory.route_table(&expected.route_name)
                 && Self::validate_method_table_contract(&expected.route_name, &table, expected)
@@ -4187,10 +4604,10 @@ impl IpcClient {
             }
         }
 
-        if self.route_directory.read().is_dirty() {
+        if connect_directory_read(&self.route_directory)?.is_dirty() {
             self.rebuild_route_directory().await?;
             {
-                let directory = self.route_directory.read();
+                let directory = connect_directory_read(&self.route_directory)?;
                 if let Some(table) = directory.route_table(&expected.route_name)
                     && Self::validate_method_table_contract(&expected.route_name, &table, expected)
                         .is_ok()
@@ -4223,6 +4640,15 @@ impl IpcClient {
     }
 
     /// Authoritatively acquire a route binding for the expected CRM contract.
+    pub async fn acquire_route_with_deadline(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+        deadline: ConnectDeadline,
+    ) -> Result<RouteBinding, IpcError> {
+        with_connect_deadline(deadline, "route_acquire", self.acquire_route(expected)).await
+    }
+
+    /// Authoritatively acquire a route binding without an extra total budget.
     pub async fn acquire_route(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
@@ -4270,6 +4696,7 @@ impl IpcClient {
             Arc::clone(&self.writer),
             Arc::clone(&self.pending),
             Arc::clone(&self.rid_counter),
+            Arc::clone(&self.abort),
             RouteSelector::RouteName {
                 route_name: expected.route_name.clone(),
             },
@@ -4343,9 +4770,26 @@ impl IpcClient {
         Ok(RouteBinding::from_table(table))
     }
 
+    /// Acquire an exact token from current authority under the same caller budget.
+    /// A cached positive token cannot bypass the live admission/token query.
+    pub async fn acquire_route_token_with_deadline(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+        route_uid: &str,
+        route_revision: u64,
+        deadline: ConnectDeadline,
+    ) -> Result<RouteBinding, IpcError> {
+        with_connect_deadline(
+            deadline,
+            "route_acquire",
+            self.acquire_route_token(expected, route_uid, route_revision),
+        )
+        .await
+    }
+
     /// Acquire an exact route token from the connected server's current authority.
-    /// The cached directory is only used to bind the result of a live lookup;
-    /// even a positive cache hit must not bypass current admission/token checks.
+    /// The cached directory only binds the result of a live lookup, including
+    /// positive cache hits, without an extra total connection budget.
     pub async fn acquire_route_token(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
@@ -5767,7 +6211,7 @@ mod tests {
         registry.feed(client.conn_id, 22, 0, &[22; 8192]).unwrap();
         let (release_tx, holder) = park_carrier_callback(held);
         let started = Instant::now();
-        client.spawn_maintenance();
+        client.spawn_maintenance().unwrap();
         wait_for_maintenance_tick(&client).await;
         let tick_elapsed = started.elapsed();
         let started = Instant::now();
@@ -5827,7 +6271,7 @@ mod tests {
         });
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let started = Instant::now();
-        client.spawn_maintenance();
+        client.spawn_maintenance().unwrap();
         wait_for_maintenance_tick(&client).await;
         let tick_elapsed = started.elapsed();
         let cancelled_removed = !client.pending.lock().contains_key(&41);
@@ -7981,5 +8425,130 @@ mod pending_disconnect_tests {
             "terminal pending owners were stranded"
         );
         assert!(matches!(live_rx.await, Ok(Err(IpcError::Closed))));
+    }
+}
+
+#[cfg(test)]
+mod connect_deadline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn zero_connect_deadline_never_polls_transport_without_runtime() {
+        use std::future::Future;
+        let deadline =
+            ConnectDeadline::start(c2_config::ConnectOptions::new().with_timeout(Duration::ZERO))
+                .unwrap();
+        let future = with_connect_deadline(deadline, "route_acquire", async {
+            panic!("zero deadline must not poll native transport work");
+            #[allow(unreachable_code)]
+            Ok::<(), IpcError>(())
+        });
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        let std::task::Poll::Ready(Err(IpcError::LocalCallRejected(error))) =
+            future.as_mut().poll(&mut context)
+        else {
+            panic!("immediate canonical expiry required")
+        };
+        assert_eq!(error.code, ErrorCode::CallDeadlineExceeded);
+        assert_eq!(error.details["operation"], "connect");
+        assert_eq!(error.details["stage"], "route_acquire");
+    }
+
+    #[tokio::test]
+    async fn control_writer_wait_cancellation_removes_only_this_unary() {
+        let client = IpcClient::new("ipc://control-writer-pure");
+        let (other_tx, mut other_rx) = oneshot::channel();
+        let other = register_unary_pending(&client.pending, &client.rid_counter, other_tx);
+        let writer = client.writer.lock().await;
+        let deadline = ConnectDeadline::start(
+            c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(25)),
+        )
+        .unwrap();
+        let error = with_connect_deadline(
+            deadline,
+            "route_acquire",
+            client.send_control_inline(vec![1], "test control"),
+        )
+        .await
+        .unwrap_err();
+        let IpcError::LocalCallRejected(error) = error else {
+            panic!("canonical deadline required")
+        };
+        assert_eq!(error.details["transport_phase"], "pre_dispatch");
+        assert_eq!(client.pending_len_for_test(), 1);
+        assert!(client.pending.lock().contains_key(&other));
+        assert!(matches!(
+            other_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(client.abort.lock().is_none(), "no frame write began");
+        drop(writer);
+        client.pending.lock().remove(&other);
+    }
+
+    #[test]
+    fn partial_control_send_cancellation_retains_no_unary_owner() {
+        let client = IpcClient::new("ipc://control-partial-pure");
+        let (other_tx, _other_rx) = oneshot::channel();
+        let other = register_unary_pending(&client.pending, &client.rid_counter, other_tx);
+        let (tx, _rx) = oneshot::channel();
+        let current = register_unary_pending(&client.pending, &client.rid_counter, tx);
+        let guard =
+            SendGuard::new_control(client.pending.clone(), client.abort.clone(), current, None);
+        guard.mark_write_started();
+        drop(guard);
+        assert!(!client.pending.lock().contains_key(&current));
+        assert!(client.pending.lock().contains_key(&other));
+        client.pending.lock().remove(&other);
+    }
+
+    // Real Unix/Windows transport fixture. The peer reads only the frame
+    // length, proving that cancellation occurs after bytes entered the stream.
+    // Run in an environment permitted to bind local listeners.
+    #[tokio::test]
+    async fn partial_control_write_deadline_aborts_actual_local_stream() {
+        let (stream, mut peer) = c2_local::LocalStream::pair().await.unwrap();
+        let abort = stream.abort_handle();
+        let (reader, writer) = stream.into_split();
+        let client = IpcClient::new("ipc://control-partial-real");
+        *client.abort.lock() = Some(abort.clone());
+        *client.writer.lock().await = Some(writer);
+        let (other_tx, _other_rx) = oneshot::channel();
+        let other = register_unary_pending(&client.pending, &client.rid_counter, other_tx);
+        // Larger than either OS backend's local-stream write buffers. No
+        // business dispatch runs: this exercises only control framing.
+        let payload = vec![1; 8 * 1024 * 1024];
+        let deadline = ConnectDeadline::start(
+            c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(100)),
+        )
+        .unwrap();
+        let (result, read) = tokio::join!(
+            with_connect_deadline(
+                deadline,
+                "route_acquire",
+                client.send_control_inline(payload, "partial control fixture"),
+            ),
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let mut length = [0; 4];
+                peer.read_exact(&mut length).await.unwrap();
+                assert!(u32::from_le_bytes(length) > 8 * 1024 * 1024);
+            }),
+        );
+        read.expect("peer must observe a started frame");
+        let IpcError::LocalCallRejected(error) = result.unwrap_err() else {
+            panic!("canonical deadline required")
+        };
+        assert_eq!(error.code, ErrorCode::CallDeadlineExceeded);
+        assert_eq!(error.details["stage"], "route_acquire");
+        assert!(
+            abort.is_aborted(),
+            "partial control frame must isolate its stream"
+        );
+        assert_eq!(client.pending_len_for_test(), 1);
+        assert!(client.pending.lock().contains_key(&other));
+        client.pending.lock().remove(&other);
+        drop(reader);
     }
 }

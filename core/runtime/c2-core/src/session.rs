@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
+use c2_config::ConnectDeadline;
 use c2_contract::ExpectedRouteContract;
 use c2_http::client::{
     HttpError, RelayAwareClientConfig, RelayAwareHttpClient, RelayControlClient,
@@ -35,6 +36,34 @@ use crate::{
 thread_local! {
     static FORCE_SERVER_RUNTIME_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+fn unlimited_lifecycle_error(error: crate::Error) -> LifecycleError {
+    match error {
+        crate::Error::Lifecycle(error) => error,
+        _ => unreachable!("unlimited metadata projection cannot expire or dispatch"),
+    }
+}
+
+fn connect_stage_check(deadline: ConnectDeadline, stage: &'static str) -> Result<(), crate::Error> {
+    deadline
+        .check(stage)
+        .map_err(|_| crate::connect_deadline_error(stage))
+}
+
+fn connect_state_lock<'a, T>(
+    mutex: &'a Mutex<T>,
+    deadline: ConnectDeadline,
+    stage: &'static str,
+) -> Result<parking_lot::MutexGuard<'a, T>, crate::Error> {
+    crate::connect_deadline::lock(mutex, deadline, stage)
+}
+
+fn connect_error_to_ipc(error: crate::Error) -> c2_ipc::IpcError {
+    match error {
+        crate::Error::Semantic(error) => c2_ipc::IpcError::LocalCallRejected(error),
+        other => c2_ipc::IpcError::Config(other.to_string()),
+    }
 }
 
 pub type ServerIpcConfigOverrides = c2_config::ServerIpcConfigOverrides;
@@ -506,12 +535,26 @@ impl Runtime {
         freeze: bool,
         captured: Option<&c2_config::LocalEndpointContext>,
     ) -> Result<Option<c2_config::LocalEndpointContext>, LifecycleError> {
+        self.resolve_local_endpoint_context_with_deadline(
+            freeze,
+            captured,
+            ConnectDeadline::default(),
+        )
+        .map_err(unlimited_lifecycle_error)
+    }
+
+    fn resolve_local_endpoint_context_with_deadline(
+        &self,
+        freeze: bool,
+        captured: Option<&c2_config::LocalEndpointContext>,
+        deadline: ConnectDeadline,
+    ) -> Result<Option<c2_config::LocalEndpointContext>, crate::Error> {
         let accepts = |context: &c2_config::LocalEndpointContext| {
             captured.is_none_or(|captured| captured == context)
         };
         loop {
             let (options, sources, revision) = {
-                let mut state = self.state.lock();
+                let mut state = connect_state_lock(&self.state, deadline, "runtime_context_wait")?;
                 if let Some(context) = &state.frozen_local_endpoint {
                     return Ok(accepts(context).then(|| context.clone()));
                 }
@@ -531,7 +574,7 @@ impl Runtime {
                 )
             };
             let resolved = resolve_local_endpoint(options, sources);
-            let mut state = self.state.lock();
+            let mut state = connect_state_lock(&self.state, deadline, "runtime_context_wait")?;
             if let Some(context) = &state.frozen_local_endpoint {
                 return Ok(accepts(context).then(|| context.clone()));
             }
@@ -646,8 +689,15 @@ impl Runtime {
         self.state.lock().path_counters
     }
 
-    pub(crate) fn record_path(&self, path: ObservedPath) {
-        self.state.lock().path_counters.record(path);
+    pub(crate) fn record_path_with_deadline(
+        &self,
+        path: ObservedPath,
+        deadline: ConnectDeadline,
+    ) -> Result<(), crate::Error> {
+        connect_state_lock(&self.state, deadline, "connect_finish")?
+            .path_counters
+            .record(path);
+        Ok(())
     }
 
     /// Read-only snapshot of this Runtime's outgoing client memory domain.
@@ -694,16 +744,19 @@ impl Runtime {
     /// `LifecycleError::ClientConfigFrozen` instead of producing a second
     /// configuration. The connect itself runs outside the state lock through
     /// the cache's epoch fence.
-    pub(crate) fn acquire_ipc_client(
+    pub(crate) fn acquire_ipc_client_with_deadline(
         &self,
         address: &str,
-    ) -> Result<Arc<c2_ipc::SyncClient>, c2_ipc::IpcError> {
+        deadline: ConnectDeadline,
+    ) -> Result<c2_ipc::pool::ClientLease, c2_ipc::IpcError> {
         let context = self
-            .freeze_local_endpoint_context()
-            .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
+            .resolve_local_endpoint_context_with_deadline(true, None, deadline)
+            .map_err(connect_error_to_ipc)?
+            .expect("unconditional context resolution");
         let (config, pool) = loop {
             let (overrides, revision) = {
-                let mut state = self.state.lock();
+                let mut state = connect_state_lock(&self.state, deadline, "runtime_config_wait")
+                    .map_err(connect_error_to_ipc)?;
                 if let Some(config) = state.frozen_client_config.clone() {
                     let pool = state
                         .client_pool
@@ -726,7 +779,8 @@ impl Runtime {
                 )
             };
             let resolved = resolve_client_config(overrides);
-            let mut state = self.state.lock();
+            let mut state = connect_state_lock(&self.state, deadline, "runtime_config_wait")
+                .map_err(connect_error_to_ipc)?;
             if state.client_config_revision != revision || state.frozen_client_config.is_some() {
                 continue;
             }
@@ -745,21 +799,25 @@ impl Runtime {
             break (config, pool);
         };
         // Connect outside the RuntimeState lock.
-        pool.acquire(address, Some(&config))
+        pool.acquire_lease_with_deadline(address, Some(&config), deadline)
     }
 
-    pub(crate) fn release_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
-        let pool = self.state.lock().client_pool.clone();
+    pub(crate) fn discard_ipc_client_with_deadline(
+        &self,
+        address: &str,
+        client: &Arc<c2_ipc::SyncClient>,
+        deadline: ConnectDeadline,
+    ) -> Result<(), crate::Error> {
+        let pool = connect_state_lock(&self.state, deadline, "runtime_pool_wait")?
+            .client_pool
+            .clone();
         if let Some(pool) = pool {
-            pool.release_if_same(address, client);
+            pool.discard_if_same_with_deadline(address, client, deadline)
+                .map_err(|error| {
+                    crate::normalize_ipc_error(error, crate::TransportPhase::PreDispatch)
+                })?;
         }
-    }
-
-    pub(crate) fn discard_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
-        let pool = self.state.lock().client_pool.clone();
-        if let Some(pool) = pool {
-            pool.discard_if_same(address, client);
-        }
+        connect_stage_check(deadline, "pool_discard")
     }
 
     pub(crate) fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
@@ -776,9 +834,21 @@ impl Runtime {
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
     }
 
-    pub(crate) fn relay_client_settings(&self) -> Result<RelayClientSettings, LifecycleError> {
+    pub(crate) fn relay_client_settings_with_deadline(
+        &self,
+        deadline: ConnectDeadline,
+    ) -> Result<RelayClientSettings, crate::Error> {
         let sources = c2_config::ConfigSources::from_process();
-        let use_proxy = self.relay_use_proxy()?;
+        connect_stage_check(deadline, "relay_config")?;
+        #[cfg(test)]
+        if let Some(message) = connect_state_lock(&self.state, deadline, "relay_config")?
+            .forced_relay_config_error
+            .clone()
+        {
+            return Err(LifecycleError::Relay(message).into());
+        }
+        let use_proxy = c2_config::ConfigResolver::resolve_relay_use_proxy(sources.clone())
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
         let configured_attempts =
             c2_config::ConfigResolver::resolve_relay_route_max_attempts(sources.clone())
                 .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
@@ -787,10 +857,12 @@ impl Runtime {
                 .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
         let remote_payload_chunk_size =
             c2_config::ConfigResolver::resolve_remote_payload_chunk_size(
-                self.remote_payload_chunk_size_override(),
+                connect_state_lock(&self.state, deadline, "relay_config")?
+                    .remote_payload_chunk_size,
                 sources,
             )
             .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        connect_stage_check(deadline, "relay_config")?;
         Ok(RelayClientSettings {
             use_proxy,
             // One initial observation plus at most one pre-dispatch refresh.
@@ -817,17 +889,50 @@ impl Runtime {
     }
 
     pub fn set_relay_anchor_address(&self, relay_anchor_address: Option<String>) {
-        let mut state = self.state.lock();
+        self.set_relay_anchor_address_with_deadline(
+            relay_anchor_address,
+            ConnectDeadline::default(),
+        )
+        .expect("unbounded relay override cannot expire");
+    }
+
+    #[doc(hidden)]
+    pub fn set_relay_anchor_address_with_attempt(
+        &self,
+        relay_anchor_address: Option<String>,
+        attempt: &crate::ConnectAttempt,
+    ) -> Result<(), crate::Error> {
+        self.set_relay_anchor_address_with_deadline(relay_anchor_address, attempt.deadline())
+    }
+
+    fn set_relay_anchor_address_with_deadline(
+        &self,
+        relay_anchor_address: Option<String>,
+        deadline: ConnectDeadline,
+    ) -> Result<(), crate::Error> {
+        let mut state = connect_state_lock(&self.state, deadline, "relay_override_wait")?;
         let relay_anchor_address =
             relay_anchor_address.map(|addr| canonical_relay_anchor_address(&addr));
         if state.relay_anchor_address_override != relay_anchor_address {
             state.relay_projection = None;
         }
         state.relay_anchor_address_override = relay_anchor_address;
+        Ok(())
     }
 
     pub fn relay_anchor_address_override(&self) -> Option<String> {
         self.state.lock().relay_anchor_address_override.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn relay_anchor_address_override_with_attempt(
+        &self,
+        attempt: &crate::ConnectAttempt,
+    ) -> Result<Option<String>, crate::Error> {
+        Ok(attempt
+            .lock(&self.state, "relay_override_wait")?
+            .relay_anchor_address_override
+            .clone())
     }
 
     /// Set the native policy before the first Host freezes it.
@@ -986,12 +1091,23 @@ impl Runtime {
     }
 
     pub fn effective_relay_anchor_address(&self) -> Result<Option<String>, LifecycleError> {
+        self.effective_relay_anchor_address_with_deadline(ConnectDeadline::default())
+            .map_err(unlimited_lifecycle_error)
+    }
+
+    pub(crate) fn effective_relay_anchor_address_with_deadline(
+        &self,
+        deadline: ConnectDeadline,
+    ) -> Result<Option<String>, crate::Error> {
         #[cfg(test)]
-        if let Some(message) = self.state.lock().forced_relay_config_error.clone() {
-            return Err(LifecycleError::Relay(message));
+        if let Some(message) = connect_state_lock(&self.state, deadline, "relay_config")?
+            .forced_relay_config_error
+            .clone()
+        {
+            return Err(LifecycleError::Relay(message).into());
         }
         let (override_address, use_process_relay_anchor) = {
-            let state = self.state.lock();
+            let state = connect_state_lock(&self.state, deadline, "relay_config")?;
             (
                 state.relay_anchor_address_override.clone(),
                 state.use_process_relay_anchor,
@@ -1006,7 +1122,7 @@ impl Runtime {
         c2_config::ConfigResolver::resolve_relay_anchor_address(
             c2_config::ConfigSources::from_process(),
         )
-        .map_err(|e| LifecycleError::Relay(e.to_string()))
+        .map_err(|e| LifecycleError::Relay(e.to_string()).into())
     }
 
     #[cfg(test)]
@@ -1743,7 +1859,7 @@ impl Runtime {
         self.shutdown(None, Vec::new(), None, false, None, shutdown_timeout)
     }
 
-    pub(crate) fn resolve_relay_connection(
+    pub(crate) fn resolve_relay_connection_with_deadline(
         &self,
         relay_anchor_address: &str,
         expected: ExpectedRouteContract,
@@ -1751,12 +1867,17 @@ impl Runtime {
         max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
-    ) -> Result<RelayResolvedConnection, LifecycleError> {
-        let frozen_context = self.state.lock().frozen_local_endpoint.clone();
-        let projection = self.relay_projection_for_address(
+        deadline: ConnectDeadline,
+    ) -> Result<RelayResolvedConnection, crate::Error> {
+        connect_stage_check(deadline, "relay_acquire")?;
+        let frozen_context = connect_state_lock(&self.state, deadline, "runtime_relay_wait")?
+            .frozen_local_endpoint
+            .clone();
+        let projection = self.relay_projection_for_address_with_deadline(
             relay_anchor_address,
             relay_use_proxy,
             frozen_context.as_ref(),
+            deadline,
         )?;
         let client = RelayAwareHttpClient::new_with_control(
             Arc::clone(&projection.control),
@@ -1768,9 +1889,13 @@ impl Runtime {
                 remote_payload_chunk_size,
             },
         )
-        .map_err(runtime_http_error)?;
-        let client = self.project_relay_client_context(client, true);
-        match client.resolve_target().map_err(runtime_http_error)? {
+        .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
+        let client = self.project_relay_client_context_with_deadline(client, true, deadline)?;
+        match client
+            .resolve_target_with_deadline(deadline)
+            .map_err(|error| {
+                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
+            })? {
             RelayResolvedTarget::Ipc { candidate } => {
                 let context = client
                     .local_ipc_context()
@@ -1794,14 +1919,17 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn resolve_relay_connection_after_local_ipc_failures(
+    pub(crate) fn resolve_relay_connection_after_local_ipc_failures_with_deadline(
         client: RelayAwareHttpClient,
         failed_candidates: &[RelayLocalIpcCandidate],
-    ) -> Result<RelayResolvedConnection, LifecycleError> {
+        deadline: ConnectDeadline,
+    ) -> Result<RelayResolvedConnection, crate::Error> {
+        connect_stage_check(deadline, "relay_acquire")?;
         match client
-            .resolve_target_after_local_ipc_failures(failed_candidates)
-            .map_err(runtime_http_error)?
-        {
+            .resolve_target_after_local_ipc_failures_with_deadline(failed_candidates, deadline)
+            .map_err(|error| {
+                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
+            })? {
             RelayResolvedTarget::Ipc { candidate } => {
                 let context = client
                     .local_ipc_context()
@@ -1825,7 +1953,7 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn connect_explicit_relay_http_client(
+    pub(crate) fn connect_explicit_relay_http_client_with_deadline(
         &self,
         relay_url: &str,
         expected: ExpectedRouteContract,
@@ -1833,7 +1961,9 @@ impl Runtime {
         max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
-    ) -> Result<(RelayAwareHttpClient, String, u64), LifecycleError> {
+        deadline: ConnectDeadline,
+    ) -> Result<(RelayAwareHttpClient, String, u64), crate::Error> {
+        connect_stage_check(deadline, "relay_acquire")?;
         let client = RelayAwareHttpClient::new(
             relay_url,
             expected,
@@ -1844,11 +1974,15 @@ impl Runtime {
                 remote_payload_chunk_size,
             },
         )
-        .map_err(runtime_http_error)?;
+        .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
         let client = self
-            .project_relay_client_context(client, false)
+            .project_relay_client_context_with_deadline(client, false, deadline)?
             .with_http_only();
-        match client.resolve_http_target().map_err(runtime_http_error)? {
+        match client
+            .resolve_http_target_with_deadline(deadline)
+            .map_err(|error| {
+                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
+            })? {
             RelayResolvedTarget::Http {
                 route_uid,
                 route_revision,
@@ -1858,33 +1992,40 @@ impl Runtime {
         }
     }
 
-    fn project_relay_client_context(
+    fn project_relay_client_context_with_deadline(
         &self,
         client: RelayAwareHttpClient,
         prefer_local_ipc: bool,
-    ) -> RelayAwareHttpClient {
-        let frozen = self.state.lock().frozen_local_endpoint.clone();
+        deadline: ConnectDeadline,
+    ) -> Result<RelayAwareHttpClient, crate::Error> {
+        let frozen = connect_state_lock(&self.state, deadline, "runtime_relay_wait")?
+            .frozen_local_endpoint
+            .clone();
         if let Some(context) = frozen {
-            return client.with_local_endpoint_context(&context);
+            return Ok(client.with_local_endpoint_context(&context));
         }
-        if prefer_local_ipc && client.allows_local_ipc() {
-            match self.local_endpoint_context() {
-                Ok(context) => client.with_local_endpoint_context(&context),
+        Ok(if prefer_local_ipc && client.allows_local_ipc() {
+            match self.resolve_local_endpoint_context_with_deadline(false, None, deadline) {
+                Ok(Some(context)) => client.with_local_endpoint_context(&context),
                 // An unusable local root/scope must not break a usable HTTP route.
-                Err(_) => client.with_http_only(),
+                Err(error @ crate::Error::Semantic(_)) => return Err(error),
+                _ => client.with_http_only(),
             }
         } else {
             client.with_http_only()
-        }
+        })
     }
 
     /// Fence the captured comparison immediately before local acquire. A setter
     /// may have changed the Runtime root while relay resolution was in flight.
     /// Never reinterpret that candidate's logical address in a different domain.
-    pub(crate) fn reconcile_relay_connection(
+
+    pub(crate) fn reconcile_relay_connection_with_deadline(
         &self,
         resolved: RelayResolvedConnection,
-    ) -> Result<RelayResolvedConnection, LifecycleError> {
+        deadline: ConnectDeadline,
+    ) -> Result<RelayResolvedConnection, crate::Error> {
+        connect_stage_check(deadline, "relay_acquire")?;
         let RelayResolvedConnection::Ipc {
             client,
             candidate,
@@ -1893,7 +2034,10 @@ impl Runtime {
         else {
             return Ok(resolved);
         };
-        if self.freeze_relay_candidate_context(&context) {
+        if self
+            .resolve_local_endpoint_context_with_deadline(true, Some(&context), deadline)?
+            .is_some()
+        {
             return Ok(RelayResolvedConnection::Ipc {
                 client,
                 candidate,
@@ -1901,7 +2045,11 @@ impl Runtime {
             });
         }
         let client = client.with_http_only();
-        match client.resolve_http_target().map_err(runtime_http_error)? {
+        match client
+            .resolve_http_target_with_deadline(deadline)
+            .map_err(|error| {
+                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
+            })? {
             RelayResolvedTarget::Http {
                 route_uid,
                 route_revision,
@@ -1917,11 +2065,6 @@ impl Runtime {
         }
     }
 
-    fn freeze_relay_candidate_context(&self, captured: &c2_config::LocalEndpointContext) -> bool {
-        self.resolve_local_endpoint_context_guarded(true, Some(captured))
-            .is_ok_and(|context| context.is_some())
-    }
-
     pub fn clear_relay_projection_cache(&self) {
         if let Some(projection) = self.state.lock().relay_projection.as_ref() {
             projection.control.clear_cache();
@@ -1934,9 +2077,25 @@ impl Runtime {
         relay_use_proxy: bool,
         local_endpoint_context: Option<&c2_config::LocalEndpointContext>,
     ) -> Result<RelayProjection, LifecycleError> {
+        self.relay_projection_for_address_with_deadline(
+            relay_anchor_address,
+            relay_use_proxy,
+            local_endpoint_context,
+            ConnectDeadline::default(),
+        )
+        .map_err(unlimited_lifecycle_error)
+    }
+
+    fn relay_projection_for_address_with_deadline(
+        &self,
+        relay_anchor_address: &str,
+        relay_use_proxy: bool,
+        local_endpoint_context: Option<&c2_config::LocalEndpointContext>,
+        deadline: ConnectDeadline,
+    ) -> Result<RelayProjection, crate::Error> {
         let relay_anchor_address = canonical_relay_anchor_address(relay_anchor_address);
         {
-            let state = self.state.lock();
+            let state = connect_state_lock(&self.state, deadline, "runtime_relay_wait")?;
             if let Some(projection) = state.relay_projection.as_ref()
                 && projection.relay_anchor_address == relay_anchor_address
                 && projection.relay_use_proxy == relay_use_proxy
@@ -1958,7 +2117,8 @@ impl Runtime {
             control,
             local_endpoint_context: local_endpoint_context.cloned(),
         };
-        self.state.lock().relay_projection = Some(projection.clone());
+        connect_state_lock(&self.state, deadline, "runtime_relay_wait")?.relay_projection =
+            Some(projection.clone());
         Ok(projection)
     }
 
@@ -2067,16 +2227,6 @@ fn resolve_client_config(
     .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
-fn runtime_http_error(err: HttpError) -> LifecycleError {
-    match err {
-        HttpError::ServerError(status_code, message) => LifecycleError::RelayHttp {
-            status_code,
-            message,
-        },
-        other => LifecycleError::Relay(other.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2089,6 +2239,103 @@ mod tests {
         AccessLevel, BuiltRoute, ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta,
         RouteBuildSpec, SchedulerLimits,
     };
+
+    #[test]
+    fn connect_attempt_relay_override_wait_is_bounded_and_recovers() {
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        let state = runtime.state.lock();
+        let worker_runtime = runtime.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let attempt = crate::ConnectAttempt::start(
+                c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(100)),
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            let result = worker_runtime
+                .set_relay_anchor_address_with_attempt(Some("http://relay.test".into()), &attempt);
+            done_tx.send((result, started.elapsed())).unwrap();
+        });
+        let (result, elapsed) = done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("must return before the 300ms lock owner releases");
+        let crate::Error::Semantic(error) = result.unwrap_err() else {
+            panic!("canonical deadline")
+        };
+        assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
+        assert_eq!(error.details["stage"], "relay_override_wait");
+        assert!(elapsed < Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(300).saturating_sub(elapsed));
+        assert_eq!(state.relay_anchor_address_override, None);
+        drop(state);
+        worker.join().unwrap();
+        let recovered = crate::ConnectAttempt::start(c2_config::ConnectOptions::new()).unwrap();
+        runtime
+            .set_relay_anchor_address_with_attempt(Some("http://relay.test/".into()), &recovered)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .relay_anchor_address_override_with_attempt(&recovered)
+                .unwrap()
+                .as_deref(),
+            Some("http://relay.test")
+        );
+        assert!(!runtime.client_config_frozen());
+        assert_eq!(runtime.path_counters().direct_ipc(), 0);
+    }
+
+    #[test]
+    fn connect_deadline_runtime_waits_are_bounded_in_all_modes() {
+        let runtime = Runtime::new(RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let expected = ExpectedRouteContract {
+            route_name: "connect-timeout".into(),
+            crm_ns: "test.connect".into(),
+            crm_name: "Echo".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: "a".repeat(64),
+            signature_hash: "b".repeat(64),
+        };
+        for mode in [
+            crate::Connect::DirectIpc {
+                address: "malformed-no-io".into(),
+            },
+            crate::Connect::ExplicitRelay {
+                relay_url: "malformed-no-io".into(),
+            },
+            crate::Connect::RelayAware,
+        ] {
+            let state = runtime.state.lock();
+            let worker_runtime = runtime.clone();
+            let expected = expected.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = worker_runtime.connect_with_options(
+                    expected,
+                    mode,
+                    c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(25)),
+                );
+                done_tx.send(result).unwrap();
+            });
+            let result = done_rx.recv_timeout(Duration::from_millis(150));
+            drop(state);
+            worker.join().unwrap();
+            let error = result
+                .expect("connect cannot wait forever for RuntimeState")
+                .unwrap_err();
+            let crate::Error::Semantic(error) = error else {
+                panic!("canonical native deadline required")
+            };
+            assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
+            assert_eq!(error.details["operation"], "connect");
+            assert_eq!(error.details["transport_phase"], "pre_dispatch");
+        }
+        assert!(!runtime.client_config_frozen());
+        assert_eq!(runtime.path_counters(), PathCounters::default());
+    }
 
     fn observer_runtime() -> Runtime {
         let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
@@ -2346,7 +2593,9 @@ mod tests {
             RelayAwareClientConfig::default(),
         )
         .unwrap();
-        let client = replacement.project_relay_client_context(client, false);
+        let client = replacement
+            .project_relay_client_context_with_deadline(client, false, ConnectDeadline::default())
+            .unwrap();
         assert!(!client.allows_local_ipc());
         assert!(client.local_ipc_context().is_none());
         assert!(!replacement.local_endpoint_frozen());
@@ -2434,7 +2683,13 @@ mod tests {
                 RelayAwareClientConfig::default(),
             )
             .unwrap();
-            let client = runtime.project_relay_client_context(client, prefer_local);
+            let client = runtime
+                .project_relay_client_context_with_deadline(
+                    client,
+                    prefer_local,
+                    ConnectDeadline::default(),
+                )
+                .unwrap();
             assert!(!client.allows_local_ipc());
             assert!(client.local_ipc_context().is_none());
             assert!(!runtime.local_endpoint_frozen());
@@ -2463,7 +2718,15 @@ mod tests {
                 c2_config::ConfigSources::empty(),
             )
             .unwrap();
-        assert!(!runtime.freeze_relay_candidate_context(&captured));
+        assert!(
+            !runtime
+                .resolve_local_endpoint_context_with_deadline(
+                    true,
+                    Some(&captured),
+                    ConnectDeadline::default()
+                )
+                .is_ok_and(|context| context.is_some())
+        );
         assert!(!runtime.local_endpoint_frozen());
         assert_ne!(captured, runtime.local_endpoint_context().unwrap());
         runtime
@@ -2475,9 +2738,25 @@ mod tests {
         let current = runtime.local_endpoint_context().unwrap();
         assert!(!runtime.local_endpoint_frozen());
         // This is the private imminent-acquire fence, rather than a pure query.
-        assert!(runtime.freeze_relay_candidate_context(&current));
+        assert!(
+            runtime
+                .resolve_local_endpoint_context_with_deadline(
+                    true,
+                    Some(&current),
+                    ConnectDeadline::default()
+                )
+                .is_ok_and(|context| context.is_some())
+        );
         assert!(runtime.local_endpoint_frozen());
-        assert!(!runtime.freeze_relay_candidate_context(&captured));
+        assert!(
+            !runtime
+                .resolve_local_endpoint_context_with_deadline(
+                    true,
+                    Some(&captured),
+                    ConnectDeadline::default()
+                )
+                .is_ok_and(|context| context.is_some())
+        );
         assert_eq!(runtime.local_endpoint_context().unwrap(), current);
         assert!(runtime.outgoing_memory_stats().is_none());
         assert!(
@@ -2505,7 +2784,15 @@ mod tests {
             env_file: c2_config::EnvFilePolicy::Disabled,
             process_env: c2_config::EnvMap::from([("C2_IPC_ROOT".into(), "relative".into())]),
         });
-        assert!(!runtime.freeze_relay_candidate_context(&captured));
+        assert!(
+            !runtime
+                .resolve_local_endpoint_context_with_deadline(
+                    true,
+                    Some(&captured),
+                    ConnectDeadline::default()
+                )
+                .is_ok_and(|context| context.is_some())
+        );
         assert!(!runtime.local_endpoint_frozen());
         assert!(runtime.outgoing_memory_stats().is_none());
         runtime
@@ -2544,7 +2831,13 @@ mod tests {
                 )
             });
             barrier.wait();
-            let accepted = runtime.freeze_relay_candidate_context(&captured);
+            let accepted = runtime
+                .resolve_local_endpoint_context_with_deadline(
+                    true,
+                    Some(&captured),
+                    ConnectDeadline::default(),
+                )
+                .is_ok_and(|context| context.is_some());
             let set = thread.join().unwrap();
             if accepted {
                 assert_eq!(set, Err(LifecycleError::ConfigFrozen));
@@ -3866,7 +4159,10 @@ mod tests {
         // A failed first attempt still freezes the domain limits atomically.
         assert!(
             session
-                .acquire_ipc_client("ipc://nonexistent_runtime_memory_domain")
+                .acquire_ipc_client_with_deadline(
+                    "ipc://nonexistent_runtime_memory_domain",
+                    ConnectDeadline::default()
+                )
                 .is_err(),
             "no server is listening on this address"
         );
@@ -3923,8 +4219,14 @@ mod tests {
         })
         .expect("runtime b");
 
-        let _ = runtime_a.acquire_ipc_client("ipc://nonexistent_runtime_a");
-        let _ = runtime_b.acquire_ipc_client("ipc://nonexistent_runtime_b");
+        let _ = runtime_a.acquire_ipc_client_with_deadline(
+            "ipc://nonexistent_runtime_a",
+            ConnectDeadline::default(),
+        );
+        let _ = runtime_b.acquire_ipc_client_with_deadline(
+            "ipc://nonexistent_runtime_b",
+            ConnectDeadline::default(),
+        );
         let a = runtime_a
             .memory_stats()
             .runtime_outgoing

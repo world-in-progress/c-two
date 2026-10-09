@@ -334,9 +334,10 @@ def test_registry_does_not_own_generic_relay_or_route_authority():
     ]
     offenders = [needle for needle in forbidden if needle in source]
     assert offenders == []
-    assert "self._runtime_session.acquire_ipc_client" in source
-    assert "self._runtime_session.connect_via_relay" in source
-    assert "self._runtime_session.connect_explicit_relay_http" in source
+    assert "runtime_session = self._runtime_session" in source
+    assert "runtime_session.acquire_ipc_client" in source
+    assert "runtime_session.connect_via_relay" in source
+    assert "runtime_session.connect_explicit_relay_http" in source
 
 
 def test_runtime_endpoint_and_accepted_budget_authority_are_native():
@@ -466,7 +467,8 @@ def test_explicit_ipc_connect_branch_bypasses_relay_facade():
     source = source_path.read_text(encoding="utf-8")
     ipc_branch = source.split("elif address is not None:", 1)[1].split("else:", 1)[0]
 
-    assert "self._runtime_session.acquire_ipc_client" in ipc_branch
+    assert "runtime_session.acquire_ipc_client" in ipc_branch
+    assert "connect_attempt=attempt" in ipc_branch
     forbidden = [
         "_sync_relay_override",
         "connect_via_relay",

@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
-use c2_config::CallOptions;
+use c2_config::{CallOptions, ConnectDeadline, ConnectOptions};
 use c2_http::client::HttpCallControl;
 use c2_ipc::IpcCallControl;
 
@@ -13,7 +13,7 @@ use crate::{CallScope, CallScopeError, CallState};
 
 use c2_contract::{ExpectedRouteContract, validate_expected_route_contract};
 use c2_http::client::{HttpCallPhase, RelayAwareHttpClient, RelayLocalIpcCandidate};
-use c2_ipc::{IpcCallError, RouteBinding, SyncClient};
+use c2_ipc::{IpcCallError, RouteBinding};
 
 use crate::session::RelayResolvedConnection;
 use crate::{
@@ -106,16 +106,8 @@ enum ClientInner {
 }
 
 struct PooledIpcClient {
-    runtime: Runtime,
-    address: String,
-    client: Arc<SyncClient>,
+    client: c2_ipc::pool::ClientLease,
     binding: RouteBinding,
-}
-
-impl Drop for PooledIpcClient {
-    fn drop(&mut self) {
-        self.runtime.release_ipc_client(&self.address, &self.client);
-    }
 }
 
 impl fmt::Debug for Client {
@@ -441,30 +433,54 @@ impl EncodedClient for Client {
 
 impl Runtime {
     pub fn connect(&self, expected: ExpectedRouteContract, mode: Connect) -> Result<Client, Error> {
+        self.connect_with_options(expected, mode, ConnectOptions::new())
+    }
+
+    pub fn connect_with_options(
+        &self,
+        expected: ExpectedRouteContract,
+        mode: Connect,
+        options: ConnectOptions,
+    ) -> Result<Client, Error> {
+        let attempt = crate::ConnectAttempt::start(options)?;
+        self.connect_with_attempt(expected, mode, &attempt)
+    }
+
+    /// Continue an SDK acquisition without restarting its original budget.
+    #[doc(hidden)]
+    pub fn connect_with_attempt(
+        &self,
+        expected: ExpectedRouteContract,
+        mode: Connect,
+        attempt: &crate::ConnectAttempt,
+    ) -> Result<Client, Error> {
+        let deadline = attempt.deadline();
+        crate::connect_deadline::check(deadline, "connect_start")?;
         validate_expected_route_contract(&expected)?;
         match mode {
             Connect::DirectIpc { address } => {
-                let connection = self.acquire_direct_ipc(&address, &expected)?;
+                let connection = self.acquire_direct_ipc(&address, &expected, deadline)?;
                 let observed_route = observed_ipc_route(&connection);
                 self.finish_client(
                     expected,
                     ObservedPath::DirectIpc,
                     observed_route,
                     ClientInner::Ipc(connection),
+                    deadline,
                 )
             }
             Connect::ExplicitRelay { relay_url } => {
-                let settings = self.relay_client_settings()?;
+                let settings = self.relay_client_settings_with_deadline(deadline)?;
                 let (client, route_uid, route_revision) = self
-                    .connect_explicit_relay_http_client(
+                    .connect_explicit_relay_http_client_with_deadline(
                         &relay_url,
                         expected.clone(),
                         settings.use_proxy,
                         settings.max_attempts,
                         settings.call_timeout_secs,
                         settings.remote_payload_chunk_size,
-                    )
-                    .map_err(normalize_resolution_error)?;
+                        deadline,
+                    )?;
                 self.finish_client(
                     expected,
                     ObservedPath::ExplicitRelay,
@@ -473,9 +489,10 @@ impl Runtime {
                         route_revision,
                     },
                     ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
+                    deadline,
                 )
             }
-            Connect::RelayAware => self.connect_relay_aware(expected),
+            Connect::RelayAware => self.connect_relay_aware(expected, deadline),
         }
     }
 
@@ -485,12 +502,14 @@ impl Runtime {
         observed_path: ObservedPath,
         observed_route: ObservedRoute,
         inner: ClientInner,
+        deadline: ConnectDeadline,
     ) -> Result<Client, Error> {
         let path_default = match &inner {
             ClientInner::Ipc(_) => None,
             ClientInner::Http(_, default) => *default,
         };
-        self.record_path(observed_path);
+        self.record_path_with_deadline(observed_path, deadline)?;
+        crate::connect_deadline::check(deadline, "connect_finish")?;
         Ok(Client {
             inner: Arc::new(ClientConnection {
                 expected,
@@ -508,28 +527,23 @@ impl Runtime {
         &self,
         address: &str,
         expected: &ExpectedRouteContract,
+        deadline: ConnectDeadline,
     ) -> Result<PooledIpcClient, Error> {
         for attempt in 0..STALE_POOL_RECONNECT_ATTEMPTS {
             let client = self
-                .acquire_ipc_client(address)
+                .acquire_ipc_client_with_deadline(address, deadline)
                 .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
-            match client.acquire_route(expected) {
+            match client.acquire_route_with_deadline(expected, deadline) {
                 Ok(binding) => {
-                    return Ok(PooledIpcClient {
-                        runtime: self.clone(),
-                        address: address.to_string(),
-                        client,
-                        binding,
-                    });
+                    return Ok(PooledIpcClient { client, binding });
                 }
                 Err(error)
                     if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS
                         && is_stale_pooled_session_error(&error) =>
                 {
-                    self.discard_ipc_client(address, &client);
+                    self.discard_ipc_client_with_deadline(address, client.client(), deadline)?;
                 }
                 Err(error) => {
-                    self.release_ipc_client(address, &client);
                     return Err(normalize_ipc_error(error, TransportPhase::PreDispatch));
                 }
             }
@@ -541,10 +555,11 @@ impl Runtime {
         &self,
         candidate: &RelayLocalIpcCandidate,
         expected: &ExpectedRouteContract,
+        deadline: ConnectDeadline,
     ) -> Result<PooledIpcClient, Error> {
         for attempt in 0..STALE_POOL_RECONNECT_ATTEMPTS {
             let client = self
-                .acquire_ipc_client(&candidate.address)
+                .acquire_ipc_client_with_deadline(&candidate.address, deadline)
                 .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
 
             let actual = client.server_identity();
@@ -560,7 +575,11 @@ impl Runtime {
                         )
                     })
                     .unwrap_or_else(|| ("<missing>".to_string(), "<missing>".to_string()));
-                self.discard_ipc_client(&candidate.address, &client);
+                self.discard_ipc_client_with_deadline(
+                    &candidate.address,
+                    client.client(),
+                    deadline,
+                )?;
                 if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS {
                     continue;
                 }
@@ -575,27 +594,26 @@ impl Runtime {
                 ));
             }
 
-            match client.acquire_route_token(
+            match client.acquire_route_token_with_deadline(
                 expected,
                 &candidate.route_uid,
                 candidate.route_revision,
+                deadline,
             ) {
                 Ok(binding) => {
-                    return Ok(PooledIpcClient {
-                        runtime: self.clone(),
-                        address: candidate.address.clone(),
-                        client,
-                        binding,
-                    });
+                    return Ok(PooledIpcClient { client, binding });
                 }
                 Err(error)
                     if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS
                         && is_stale_pooled_session_error(&error) =>
                 {
-                    self.discard_ipc_client(&candidate.address, &client);
+                    self.discard_ipc_client_with_deadline(
+                        &candidate.address,
+                        client.client(),
+                        deadline,
+                    )?;
                 }
                 Err(error) => {
-                    self.release_ipc_client(&candidate.address, &client);
                     return Err(normalize_ipc_error(error, TransportPhase::PreDispatch));
                 }
             }
@@ -603,24 +621,25 @@ impl Runtime {
         unreachable!("stale pooled relay IPC retry loop must return")
     }
 
-    fn connect_relay_aware(&self, expected: ExpectedRouteContract) -> Result<Client, Error> {
+    fn connect_relay_aware(
+        &self,
+        expected: ExpectedRouteContract,
+        deadline: ConnectDeadline,
+    ) -> Result<Client, Error> {
         let relay_anchor_address = self
-            .effective_relay_anchor_address()?
+            .effective_relay_anchor_address_with_deadline(deadline)?
             .ok_or(LifecycleError::MissingRelayAddress)?;
-        let settings = self.relay_client_settings()?;
-        let resolved = self
-            .resolve_relay_connection(
-                &relay_anchor_address,
-                expected.clone(),
-                settings.use_proxy,
-                settings.max_attempts,
-                settings.call_timeout_secs,
-                settings.remote_payload_chunk_size,
-            )
-            .map_err(normalize_resolution_error)?;
-        let resolved = self
-            .reconcile_relay_connection(resolved)
-            .map_err(normalize_resolution_error)?;
+        let settings = self.relay_client_settings_with_deadline(deadline)?;
+        let resolved = self.resolve_relay_connection_with_deadline(
+            &relay_anchor_address,
+            expected.clone(),
+            settings.use_proxy,
+            settings.max_attempts,
+            settings.call_timeout_secs,
+            settings.remote_payload_chunk_size,
+            deadline,
+        )?;
+        let resolved = self.reconcile_relay_connection_with_deadline(resolved, deadline)?;
         match resolved {
             RelayResolvedConnection::Http {
                 client,
@@ -634,10 +653,11 @@ impl Runtime {
                     route_revision,
                 },
                 ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
+                deadline,
             ),
             RelayResolvedConnection::Ipc {
                 client, candidate, ..
-            } => match self.acquire_relay_ipc(&candidate, &expected) {
+            } => match self.acquire_relay_ipc(&candidate, &expected, deadline) {
                 Ok(connection) => {
                     let observed_route = observed_ipc_route(&connection);
                     self.finish_client(
@@ -645,20 +665,20 @@ impl Runtime {
                         ObservedPath::RelayAwareLocalIpc,
                         observed_route,
                         ClientInner::Ipc(connection),
+                        deadline,
                     )
                 }
                 Err(error) if local_candidate_failure_is_terminal(&error) => Err(error),
                 Err(direct_error) => {
-                    let resolved = Runtime::resolve_relay_connection_after_local_ipc_failures(
-                        client,
-                        std::slice::from_ref(&candidate),
-                    )
-                    .map_err(|error| {
-                        retain_local_ipc_cause(normalize_resolution_error(error), &direct_error)
-                    })?;
-                    let resolved = self
-                        .reconcile_relay_connection(resolved)
-                        .map_err(normalize_resolution_error)?;
+                    let resolved =
+                        Runtime::resolve_relay_connection_after_local_ipc_failures_with_deadline(
+                            client,
+                            std::slice::from_ref(&candidate),
+                            deadline,
+                        )
+                        .map_err(|error| retain_local_ipc_cause(error, &direct_error))?;
+                    let resolved =
+                        self.reconcile_relay_connection_with_deadline(resolved, deadline)?;
                     match resolved {
                         RelayResolvedConnection::Http {
                             client,
@@ -672,15 +692,18 @@ impl Runtime {
                                 route_revision,
                             },
                             ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
+                            deadline,
                         ),
                         RelayResolvedConnection::Ipc { candidate, .. } => {
-                            let connection = self.acquire_relay_ipc(&candidate, &expected)?;
+                            let connection =
+                                self.acquire_relay_ipc(&candidate, &expected, deadline)?;
                             let observed_route = observed_ipc_route(&connection);
                             self.finish_client(
                                 expected,
                                 ObservedPath::RelayAwareLocalIpc,
                                 observed_route,
                                 ClientInner::Ipc(connection),
+                                deadline,
                             )
                         }
                     }
@@ -718,19 +741,6 @@ fn normalize_ipc_call_error(error: IpcCallError) -> Error {
         c2_ipc::TransportPhase::DispatchUncertain => TransportPhase::DispatchUncertain,
     };
     normalize_ipc_error(error.into_source(), phase)
-}
-
-fn normalize_resolution_error(error: LifecycleError) -> Error {
-    match error {
-        LifecycleError::RelayHttp {
-            status_code,
-            message,
-        } => normalize_http_error(
-            c2_http::client::HttpError::ServerError(status_code, message),
-            TransportPhase::PreDispatch,
-        ),
-        other => Error::Lifecycle(other),
-    }
 }
 
 // Candidate exclusion belongs to the relay resolver; its final denial is
@@ -788,7 +798,8 @@ fn local_candidate_failure_is_terminal(error: &Error) -> bool {
         Error::Semantic(error)
             if matches!(
                 error.code,
-                c2_error::ErrorCode::ContractMismatch
+                c2_error::ErrorCode::CallDeadlineExceeded
+                    | c2_error::ErrorCode::ContractMismatch
                     | c2_error::ErrorCode::IdentityMismatch
                     | c2_error::ErrorCode::ProtocolViolation
             )

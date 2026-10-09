@@ -11,7 +11,7 @@ use serde_json::json;
 use super::call_control::check_active;
 use super::http_client::HttpCallInput;
 use super::{
-    HttpCallControl, HttpClient, HttpClientPool, HttpError, HttpInputOwner, RelayControlClient,
+    HttpCallControl, HttpClientPool, HttpError, HttpInputOwner, RelayControlClient,
     RelayResolvedRoutes, RelayRouteInfo,
 };
 use c2_config::LocalEndpointContext;
@@ -297,6 +297,75 @@ impl RelayAwareHttpClient {
             .block_on(self.resolve_target_after_local_ipc_failures_async(failed_candidates))
     }
 
+    /// Resolve/probe using the caller's single connection budget.
+    pub fn resolve_target_with_deadline(
+        &self,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        super::connect_deadline::check(deadline, "relay_resolve")?;
+        super::http_client::runtime_with_deadline(deadline)?
+            .handle()
+            .block_on(self.resolve_target_with_deadline_async(deadline))
+    }
+
+    pub fn resolve_http_target_with_deadline(
+        &self,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        super::connect_deadline::check(deadline, "relay_resolve")?;
+        super::http_client::runtime_with_deadline(deadline)?
+            .handle()
+            .block_on(self.resolve_http_target_with_deadline_async(deadline))
+    }
+
+    pub fn resolve_target_after_local_ipc_failures_with_deadline(
+        &self,
+        failed_candidates: &[RelayLocalIpcCandidate],
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        super::connect_deadline::check(deadline, "relay_resolve")?;
+        super::http_client::runtime_with_deadline(deadline)?
+            .handle()
+            .block_on(self.select_target_with_local_exclusions_async(
+                true,
+                failed_candidates,
+                true,
+                None,
+                deadline,
+            ))
+    }
+
+    pub async fn resolve_target_after_local_ipc_failures_with_deadline_async(
+        &self,
+        failed_candidates: &[RelayLocalIpcCandidate],
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_with_local_exclusions_async(
+            true,
+            failed_candidates,
+            true,
+            None,
+            deadline,
+        )
+        .await
+    }
+
+    pub async fn resolve_target_with_deadline_async(
+        &self,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_with_local_exclusions_async(true, &[], false, None, deadline)
+            .await
+    }
+
+    pub async fn resolve_http_target_with_deadline_async(
+        &self,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_with_local_exclusions_async(false, &[], false, None, deadline)
+            .await
+    }
+
     async fn connect_async(&self) -> Result<(), HttpError> {
         match self.select_target_async(false).await? {
             RelayResolvedTarget::Http { .. } => Ok(()),
@@ -319,24 +388,42 @@ impl RelayAwareHttpClient {
         &self,
         control: &HttpCallControl,
     ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(false, &[], false, Some(control))
-            .await
+        self.select_target_with_local_exclusions_async(
+            false,
+            &[],
+            false,
+            Some(control),
+            c2_config::ConnectDeadline::default(),
+        )
+        .await
     }
 
     pub async fn resolve_target_after_local_ipc_failures_async(
         &self,
         failed_candidates: &[RelayLocalIpcCandidate],
     ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(true, failed_candidates, true, None)
-            .await
+        self.select_target_with_local_exclusions_async(
+            true,
+            failed_candidates,
+            true,
+            None,
+            c2_config::ConnectDeadline::default(),
+        )
+        .await
     }
 
     async fn select_target_async(
         &self,
         prefer_local_ipc: bool,
     ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(prefer_local_ipc, &[], false, None)
-            .await
+        self.select_target_with_local_exclusions_async(
+            prefer_local_ipc,
+            &[],
+            false,
+            None,
+            c2_config::ConnectDeadline::default(),
+        )
+        .await
     }
 
     async fn select_target_with_local_exclusions_async(
@@ -345,17 +432,20 @@ impl RelayAwareHttpClient {
         excluded_local_ipc_candidates: &[RelayLocalIpcCandidate],
         fallback_denied_when_only_excluded: bool,
         control: Option<&HttpCallControl>,
+        deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedTarget, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
         let mut excluded_routes = HashSet::new();
 
         for attempt in 0..attempts {
+            super::connect_deadline::check(deadline, "relay_resolve")?;
             let routes = match self
                 .resolve_routes_async(
                     attempt > 0 || fallback_denied_when_only_excluded,
                     prefer_local_ipc,
                     control,
+                    deadline,
                 )
                 .await
             {
@@ -398,7 +488,7 @@ impl RelayAwareHttpClient {
                 return Ok(RelayResolvedTarget::Ipc { candidate });
             }
 
-            let ordered = self.order_routes(routes, &excluded_routes);
+            let ordered = self.order_routes_with_deadline(routes, &excluded_routes, deadline)?;
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
                     HttpError::ServerError(404, resource_not_found_body(self.route_name()))
@@ -407,37 +497,44 @@ impl RelayAwareHttpClient {
 
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self.acquire_route_client(&relay_url, control) {
-                    Ok(client) => client,
-                    Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
-                    Err(err) => {
-                        last_error = Some(err);
-                        continue;
-                    }
-                };
+                let client =
+                    match self.acquire_route_client_with_deadline(&relay_url, control, deadline) {
+                        Ok(client) => client,
+                        Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
+                        Err(err) => {
+                            last_error = Some(err);
+                            continue;
+                        }
+                    };
 
                 check_active(control)?;
-                let probe = client
-                    .client
-                    .probe_route_with_token_async(
+                let probe = super::connect_deadline::run(
+                    deadline,
+                    "relay_probe",
+                    client.client.probe_route_with_token_async(
                         &self.expected,
                         &route.route_token(),
                         route.max_payload_size,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 check_active(control)?;
                 match probe {
                     Ok(()) => {
-                        *self.current.lock() = Some(relay_url.clone());
+                        *super::connect_deadline::lock(&self.current, deadline, "relay_select")? =
+                            Some(relay_url.clone());
                         return Ok(RelayResolvedTarget::Http {
                             relay_url,
                             route_uid: route.route_uid,
                             route_revision: route.route_revision,
                         });
                     }
+                    Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
                     Err(err) if route_is_stale(&err) => {
-                        self.control.invalidate(self.route_name());
-                        *self.current.lock() = None;
+                        self.control
+                            .invalidate_with_deadline(self.route_name(), deadline)?;
+                        *super::connect_deadline::lock(&self.current, deadline, "relay_select")? =
+                            None;
                         excluded_routes.insert(relay_url);
                         last_error = Some(err);
                     }
@@ -449,7 +546,11 @@ impl RelayAwareHttpClient {
 
             if attempt + 1 < attempts {
                 check_active(control)?;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                super::connect_deadline::run(deadline, "relay_retry", async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok(())
+                })
+                .await?;
                 check_active(control)?;
             }
         }
@@ -480,7 +581,15 @@ impl RelayAwareHttpClient {
         let mut previous_dispatch = None;
 
         for attempt in 0..attempts {
-            let routes = match self.resolve_routes_async(attempt > 0, false, control).await {
+            let routes = match self
+                .resolve_routes_async(
+                    attempt > 0,
+                    false,
+                    control,
+                    c2_config::ConnectDeadline::default(),
+                )
+                .await
+            {
                 Ok(routes) if !routes.routes.is_empty() => routes,
                 Ok(_) => {
                     return Err(HttpError::ServerError(
@@ -562,13 +671,15 @@ impl RelayAwareHttpClient {
         force_refresh: bool,
         prefer_local_ipc: bool,
         control: Option<&HttpCallControl>,
+        deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedRoutes, HttpError> {
         check_active(control)?;
         if force_refresh {
-            self.control.invalidate(self.route_name());
+            self.control
+                .invalidate_with_deadline(self.route_name(), deadline)?;
         }
         let routes = self
-            .resolve_with_endpoint_context_async(prefer_local_ipc)
+            .resolve_with_endpoint_context_async(prefer_local_ipc, deadline)
             .await;
         check_active(control)?;
         let routes = routes?;
@@ -577,9 +688,10 @@ impl RelayAwareHttpClient {
         let filtered = filter_routes_by_expected_contract(routes.routes, &self.expected);
         if !force_refresh && raw_routes_non_empty && filtered.is_empty() {
             check_active(control)?;
-            self.control.invalidate(self.route_name());
+            self.control
+                .invalidate_with_deadline(self.route_name(), deadline)?;
             let refreshed = self
-                .resolve_with_endpoint_context_async(prefer_local_ipc)
+                .resolve_with_endpoint_context_async(prefer_local_ipc, deadline)
                 .await;
             check_active(control)?;
             let refreshed = refreshed?;
@@ -613,6 +725,7 @@ impl RelayAwareHttpClient {
     async fn resolve_with_endpoint_context_async(
         &self,
         prefer_local_ipc: bool,
+        deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedRoutes, HttpError> {
         // A supplied Runtime snapshot may be advertised on HTTP-only paths too;
         // only local selection may lazily request the platform default/SID.
@@ -626,12 +739,12 @@ impl RelayAwareHttpClient {
         match context {
             Some(context) => {
                 self.control
-                    .resolve_matching_with_context_async(&self.expected, context)
+                    .resolve_matching_with_context_deadline_async(&self.expected, context, deadline)
                     .await
             }
             None => {
                 self.control
-                    .resolve_matching_with_namespace_async(&self.expected)
+                    .resolve_matching_with_namespace_deadline_async(&self.expected, deadline)
                     .await
             }
         }
@@ -642,29 +755,31 @@ impl RelayAwareHttpClient {
         relay_url: &str,
         control: Option<&HttpCallControl>,
     ) -> Result<RelayPoolGuard, HttpError> {
+        self.acquire_route_client_with_deadline(
+            relay_url,
+            control,
+            c2_config::ConnectDeadline::default(),
+        )
+    }
+
+    fn acquire_route_client_with_deadline(
+        &self,
+        relay_url: &str,
+        control: Option<&HttpCallControl>,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RelayPoolGuard, HttpError> {
         check_active(control)?;
-        let client = if control.is_some() {
-            self.pool.acquire_controlled(
-                relay_url,
-                self.use_proxy,
-                self.config.remote_payload_chunk_size,
-            )
-        } else {
-            self.pool.acquire_with_options(
-                relay_url,
-                self.use_proxy,
-                self.config.call_timeout_secs,
-                self.config.remote_payload_chunk_size,
-            )
-        }
-        .map(|client| RelayPoolGuard {
-            pool: self.pool,
-            relay_url: relay_url.to_string(),
-            client,
-            controlled: control.is_some(),
-        });
+        let client = self.pool.acquire_lease(
+            relay_url,
+            self.use_proxy,
+            self.config.call_timeout_secs,
+            self.config.remote_payload_chunk_size,
+            control.is_some(),
+            deadline,
+        );
         // The mutex/build wait is complete; rejection also drops the acquired lease.
         check_active(control)?;
+        super::connect_deadline::check(deadline, "relay_pool_acquire")?;
         client
     }
 
@@ -673,13 +788,29 @@ impl RelayAwareHttpClient {
         routes: Vec<RelayRouteInfo>,
         excluded_routes: &HashSet<String>,
     ) -> Vec<RelayRouteInfo> {
+        // Calls retain their existing policy; only connect supplies a deadline.
+        self.order_routes_with_deadline(
+            routes,
+            excluded_routes,
+            c2_config::ConnectDeadline::default(),
+        )
+        .expect("unlimited connection budget cannot expire")
+    }
+
+    fn order_routes_with_deadline(
+        &self,
+        routes: Vec<RelayRouteInfo>,
+        excluded_routes: &HashSet<String>,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<Vec<RelayRouteInfo>, HttpError> {
         let routes = routes
             .into_iter()
             .filter(|route| !excluded_routes.contains(route.relay_url.trim_end_matches('/')))
             .collect::<Vec<_>>();
-        let current = self.current.lock().clone();
+        let current =
+            super::connect_deadline::lock(&self.current, deadline, "relay_select")?.clone();
         let Some(current) = current else {
-            return routes;
+            return Ok(routes);
         };
         let mut preferred = Vec::new();
         let mut rest = Vec::new();
@@ -691,22 +822,11 @@ impl RelayAwareHttpClient {
             }
         }
         preferred.extend(rest);
-        preferred
+        Ok(preferred)
     }
 }
 
-struct RelayPoolGuard {
-    pool: &'static HttpClientPool,
-    relay_url: String,
-    client: Arc<HttpClient>,
-    controlled: bool,
-}
-
-impl Drop for RelayPoolGuard {
-    fn drop(&mut self) {
-        self.pool.release_view(&self.relay_url, self.controlled);
-    }
-}
+type RelayPoolGuard = super::pool::HttpPoolLease;
 
 fn route_is_stale(err: &HttpError) -> bool {
     match err {
@@ -914,6 +1034,208 @@ mod tests {
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn connect_budget(milliseconds: u64) -> c2_config::ConnectDeadline {
+        c2_config::ConnectDeadline::start(
+            c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(milliseconds)),
+        )
+        .unwrap()
+    }
+
+    fn assert_connect_expired(error: HttpError, stage: &str) {
+        let HttpError::LocalCallRejected(error) = error else {
+            panic!("connection timeout must preserve the canonical error");
+        };
+        assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
+        assert_eq!(error.details["operation"], "connect");
+        assert_eq!(error.details["transport_phase"], "pre_dispatch");
+        assert_eq!(error.details["stage"], stage);
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_cancels_unresponsive_resolve_then_recovers() {
+        use std::sync::atomic::AtomicBool;
+        let responsive = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let business_calls = Arc::clone(&calls);
+        let (data_url, data_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route(
+                    "/{route}/{method}",
+                    post(move || {
+                        let calls = Arc::clone(&business_calls);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }),
+                ),
+        )
+        .await;
+        let registry_responsive = Arc::clone(&responsive);
+        let route_url = data_url.clone();
+        let (registry_url, registry_handle) = spawn_app(Router::new().route(
+            "/_resolve/{route}",
+            get(move || {
+                let responsive = Arc::clone(&registry_responsive);
+                let route_url = route_url.clone();
+                async move {
+                    if !responsive.load(Ordering::SeqCst) {
+                        std::future::pending::<()>().await;
+                    }
+                    Json(vec![route_info("grid".into(), route_url)])
+                }
+            }),
+        ))
+        .await;
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap()
+        .with_http_only();
+        let start = std::time::Instant::now();
+        let error = client
+            .resolve_target_with_deadline_async(connect_budget(50))
+            .await
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_connect_expired(error, "relay_resolve");
+        responsive.store(true, Ordering::SeqCst);
+        assert_eq!(
+            client
+                .resolve_http_target_with_deadline_async(connect_budget(1000))
+                .await
+                .unwrap()
+                .as_url(),
+            data_url
+        );
+        assert_eq!(HttpClientPool::instance().refcount(&data_url), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        registry_handle.abort();
+        data_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_resolve_and_probe_share_one_budget() {
+        use std::sync::atomic::AtomicBool;
+        let stall_probe = Arc::new(AtomicBool::new(true));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_stall = Arc::clone(&stall_probe);
+        let probe_count = Arc::clone(&probes);
+        let call_count = Arc::clone(&calls);
+        let (data_url, data_handle) = spawn_app(
+            Router::new()
+                .route(
+                    "/_probe/{route}",
+                    get(move || {
+                        let stall = Arc::clone(&probe_stall);
+                        let probes = Arc::clone(&probe_count);
+                        async move {
+                            probes.fetch_add(1, Ordering::SeqCst);
+                            if stall.load(Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(120)).await;
+                            }
+                            StatusCode::OK
+                        }
+                    }),
+                )
+                .route(
+                    "/{route}/{method}",
+                    post(move || {
+                        let calls = Arc::clone(&call_count);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }),
+                ),
+        )
+        .await;
+        let route_url = data_url.clone();
+        let (registry_url, registry_handle) = spawn_app(Router::new().route(
+            "/_resolve/{route}",
+            get(move || {
+                let route_url = route_url.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    Json(vec![route_info("grid".into(), route_url)])
+                }
+            }),
+        ))
+        .await;
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap()
+        .with_http_only();
+        assert_connect_expired(
+            client
+                .resolve_http_target_with_deadline_async(connect_budget(200))
+                .await
+                .unwrap_err(),
+            "relay_probe",
+        );
+        assert_eq!(HttpClientPool::instance().refcount(&data_url), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        stall_probe.store(false, Ordering::SeqCst);
+        client
+            .resolve_http_target_with_deadline_async(connect_budget(1000))
+            .await
+            .unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert_eq!(HttpClientPool::instance().refcount(&data_url), 0);
+        registry_handle.abort();
+        data_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_resolve_retry_keeps_original_budget() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let (registry_url, registry_handle) = spawn_app(Router::new().route(
+            "/_resolve/{route}",
+            get(move || {
+                let count = Arc::clone(&attempt_count);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        ))
+        .await;
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_http_only();
+        let start = std::time::Instant::now();
+        assert_connect_expired(
+            client
+                .resolve_http_target_with_deadline_async(connect_budget(150))
+                .await
+                .unwrap_err(),
+            "relay_resolve",
+        );
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert!(attempts.load(Ordering::SeqCst) <= 4);
+        registry_handle.abort();
+    }
 
     #[derive(Clone)]
     struct RegistryState {

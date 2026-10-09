@@ -38,6 +38,7 @@ import signal
 import sys
 import threading
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, TypeVar
 
 from c_two.crm.bridge import ResourceBridge, normalize_bridge_map
@@ -101,6 +102,29 @@ def _cc_error_from_native_exception(exc: BaseException) -> CCError | None:
         return CCError.deserialize(error_bytes)
 
 
+def _connect_native_call(operation, *args, **kwargs):
+    """Project Core's canonical connection error without creating timeout policy."""
+    try:
+        return operation(*args, **kwargs)
+    except Exception as exc:
+        if (cc_err := _cc_error_from_native_exception(exc)) is not None:
+            raise cc_err from exc
+        raise
+
+
+@contextmanager
+def _connect_lock(lock, connect_attempt, stage: str):
+    """The native attempt owns timing; Python only releases its acquired lock."""
+    if connect_attempt is None:
+        lock.acquire()
+    else:
+        _connect_native_call(connect_attempt.acquire_lock, lock, stage)
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _ensure_crm_contract_match(
     *,
     route_name: str,
@@ -143,12 +167,14 @@ class _ProcessRegistry:
     _instance_lock = threading.Lock()
 
     @classmethod
-    def get(cls) -> _ProcessRegistry:
+    def get(cls, *, connect_attempt=None) -> _ProcessRegistry:
         """Return the global singleton, creating it on first access."""
         if cls._instance is None:
-            with cls._instance_lock:
+            with _connect_lock(cls._instance_lock, connect_attempt, 'registry_init_wait'):
                 if cls._instance is None:
                     cls._instance = cls()
+        if connect_attempt is not None:
+            _connect_native_call(connect_attempt.check, 'registry_init')
         return cls._instance
 
     @classmethod
@@ -492,6 +518,8 @@ class _ProcessRegistry:
         *,
         name: str,
         address: str | None = None,
+        timeout: float | None = None,
+        _connect_attempt=None,
     ) -> CRM:
         """Obtain a CRM instance connected to a registered resource.
 
@@ -508,6 +536,11 @@ class _ProcessRegistry:
         address:
             Explicit IPC server address (e.g. ``'ipc://remote'``).
             If ``None``, looks up the local registry.
+        timeout:
+            Total connection-operation budget in seconds. ``None``
+            preserves the existing phase guards. A finite non-negative value
+            bounds this connection operation; zero expires immediately.
+            This does not change timeouts on subsequent business calls.
 
         Returns
         -------
@@ -515,15 +548,22 @@ class _ProcessRegistry:
             A CRM instance with ``.client`` set to an
             :class:`CRMProxy`.
         """
+        from c_two._native import ConnectAttempt
+
+        attempt = _connect_attempt
+        if attempt is None:
+            attempt = _connect_native_call(ConnectAttempt, timeout_seconds=timeout)
+        _connect_native_call(attempt.check, 'python_contract')
         expected_contract = crm_contract(crm_class)
-        with self._lock:
+        with _connect_lock(self._lock, attempt, 'registry_snapshot_wait'):
             server = self._server
+            runtime_session = self._runtime_session
             local = (
-                server.get_local_slot_info(name)
+                _connect_native_call(server.get_local_slot_info, name, connect_attempt=attempt)
                 if address is None and server is not None
                 else None
             )
-            lease_tracker = self._runtime_session.lease_tracker()
+            lease_tracker = runtime_session.lease_tracker()
 
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
@@ -542,10 +582,11 @@ class _ProcessRegistry:
         elif address is not None and address.startswith(('http://', 'https://')):
             # HTTP mode — cross-node via relay server.
             try:
-                client = self._runtime_session.connect_explicit_relay_http(
+                client = runtime_session.connect_explicit_relay_http(
                     address,
                     name,
                     *expected_contract.native_args(),
+                    connect_attempt=attempt,
                 )
             except Exception as exc:
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
@@ -565,10 +606,11 @@ class _ProcessRegistry:
         elif address is not None:
             # Remote IPC via pooled RustClient.
             try:
-                client = self._runtime_session.acquire_ipc_client(
+                client = runtime_session.acquire_ipc_client(
                     address,
                     name,
                     *expected_contract.native_args(),
+                    connect_attempt=attempt,
                 )
             except Exception as exc:
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
@@ -581,11 +623,12 @@ class _ProcessRegistry:
                 lease_tracker=lease_tracker,
             )
         else:
-            self._sync_relay_override()
             try:
-                client = self._runtime_session.connect_via_relay(
+                self._sync_relay_override(connect_attempt=attempt, runtime_session=runtime_session)
+                client = runtime_session.connect_via_relay(
                     name,
                     *expected_contract.native_args(),
+                    connect_attempt=attempt,
                 )
             except Exception as exc:
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
@@ -624,9 +667,14 @@ class _ProcessRegistry:
             else:
                 raise RegistryUnavailable(f"Unsupported relay target mode: {mode!r}")
 
-        crm = crm_class()
-        crm.client = proxy
-        return crm
+        try:
+            crm = crm_class()
+            crm.client = proxy
+            _connect_native_call(attempt.check, 'python_connect_finish')
+            return crm
+        except Exception:
+            proxy.terminate()
+            raise
 
     def close(self, crm: object) -> None:
         """Close a connection obtained from :func:`connect`.
@@ -871,8 +919,14 @@ class _ProcessRegistry:
             return None
         return server.native_terminal_outcome()
 
-    def _sync_relay_override(self) -> None:
-        self._runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
+    def _sync_relay_override(self, connect_attempt=None, *, runtime_session=None) -> None:
+        session = self._runtime_session if runtime_session is None else runtime_session
+        if connect_attempt is None:
+            session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
+        else:
+            session.set_relay_anchor_address(
+                settings._relay_anchor_address, connect_attempt=connect_attempt,  # noqa: SLF001
+            )
 
 
 
@@ -1007,12 +1061,19 @@ def connect(
     *,
     name: str,
     address: str | None = None,
+    timeout: float | None = None,
 ) -> CRM:
     """Obtain a CRM proxy for a registered resource.
 
     See :meth:`_ProcessRegistry.connect`.
     """
-    return _ProcessRegistry.get().connect(crm_class, name=name, address=address)
+    from c_two._native import ConnectAttempt
+
+    attempt = _connect_native_call(ConnectAttempt, timeout_seconds=timeout)
+    registry = _ProcessRegistry.get(connect_attempt=attempt)
+    return registry.connect(
+        crm_class, name=name, address=address, timeout=timeout, _connect_attempt=attempt,
+    )
 
 
 def close(crm: object) -> None:

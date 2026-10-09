@@ -15,7 +15,7 @@ pub use c2_contract::{
 pub use c2_core::{
     CallExecutionLimits, CallExecutionLimitsOverrides, CallExecutionObservation,
     CallExecutionObserver, CallExecutionSnapshot, CallOptions, CallTimeout, Client, ConfigSources,
-    Connect, DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome,
+    Connect, ConnectOptions, DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome,
     ENDPOINT_CREDENTIAL_MAX_BYTES, ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential,
     EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
     EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, EnvFilePolicy,

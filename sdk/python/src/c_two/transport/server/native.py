@@ -379,10 +379,18 @@ class NativeServerBridge:
             raise KeyError(f'Name not registered: {name!r}')
         return slot.scheduler
 
-    def get_local_slot_info(self, name: str) -> tuple[object, Scheduler, CRMContract] | None:
-        """Return Python dispatch glue for same-process fast-path calls."""
-        with self._slots_lock:
+    def get_local_slot_info(
+        self, name: str, *, connect_attempt=None,
+    ) -> tuple[object, Scheduler, CRMContract] | None:
+        """Return Python dispatch glue under the native connection budget."""
+        if connect_attempt is None:
+            self._slots_lock.acquire()
+        else:
+            connect_attempt.acquire_lock(self._slots_lock, 'local_slot_wait')
+        try:
             slot = self._slots.get(name)
+        finally:
+            self._slots_lock.release()
         if slot is None:
             return None
         return (

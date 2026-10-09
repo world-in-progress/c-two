@@ -348,8 +348,12 @@ impl RelayControlClient {
         &self,
         expected: &ExpectedRouteContract,
     ) -> Result<RelayResolvedRoutes, HttpError> {
-        self.resolve_with_query_async(expected, self.local_endpoint_context.as_ref())
-            .await
+        self.resolve_with_query_async(
+            expected,
+            self.local_endpoint_context.as_ref(),
+            c2_config::ConnectDeadline::default(),
+        )
+        .await
     }
 
     /// Project an already frozen Runtime context; never resolve process configuration here.
@@ -358,20 +362,53 @@ impl RelayControlClient {
         expected: &ExpectedRouteContract,
         context: &LocalEndpointContext,
     ) -> Result<RelayResolvedRoutes, HttpError> {
-        self.resolve_with_query_async(expected, Some(context)).await
+        self.resolve_with_query_async(
+            expected,
+            Some(context),
+            c2_config::ConnectDeadline::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_matching_with_namespace_deadline_async(
+        &self,
+        expected: &ExpectedRouteContract,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RelayResolvedRoutes, HttpError> {
+        super::connect_deadline::run(
+            deadline,
+            "relay_resolve",
+            self.resolve_with_query_async(expected, self.local_endpoint_context.as_ref(), deadline),
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_matching_with_context_deadline_async(
+        &self,
+        expected: &ExpectedRouteContract,
+        context: &LocalEndpointContext,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RelayResolvedRoutes, HttpError> {
+        super::connect_deadline::run(
+            deadline,
+            "relay_resolve",
+            self.resolve_with_query_async(expected, Some(context), deadline),
+        )
+        .await
     }
 
     async fn resolve_with_query_async(
         &self,
         expected: &ExpectedRouteContract,
         context: Option<&LocalEndpointContext>,
+        deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedRoutes, HttpError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
         let mut cache_key = resolve_cache_key(expected);
         cache_key.local_endpoint_namespace =
             context.map(|context| context.namespace_id().to_owned());
-        if let Some(routes) = self.cached_with_namespace(&cache_key) {
+        if let Some(routes) = self.cached_with_namespace_deadline(&cache_key, deadline)? {
             return Ok(routes);
         }
 
@@ -438,14 +475,15 @@ impl RelayControlClient {
             validate_resolved_route(route)?;
         }
 
-        self.cache.lock().insert(
-            cache_key,
-            CacheEntry {
-                routes: resolved.routes.clone(),
-                local_endpoint_namespace: resolved.local_endpoint_namespace.clone(),
-                inserted_at: Instant::now(),
-            },
-        );
+        // Prepare potentially large metadata before the publish check. A
+        // deadline that expires while cloning must not populate the cache.
+        let entry = CacheEntry {
+            routes: resolved.routes.clone(),
+            local_endpoint_namespace: resolved.local_endpoint_namespace.clone(),
+            inserted_at: Instant::now(),
+        };
+        super::connect_deadline::lock(&self.cache, deadline, "relay_resolve")?
+            .insert(cache_key, entry);
         Ok(resolved)
     }
 
@@ -455,6 +493,16 @@ impl RelayControlClient {
 
     pub fn invalidate(&self, name: &str) {
         self.cache.lock().retain(|key, _| key.route_name() != name);
+    }
+
+    pub(crate) fn invalidate_with_deadline(
+        &self,
+        name: &str,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<(), HttpError> {
+        super::connect_deadline::lock(&self.cache, deadline, "relay_resolve")?
+            .retain(|key, _| key.route_name() != name);
+        Ok(())
     }
 
     pub fn base_url(&self) -> &str {
@@ -525,21 +573,28 @@ impl RelayControlClient {
 
     #[cfg(test)]
     fn cached(&self, key: &ResolveCacheKey) -> Option<Vec<RelayRouteInfo>> {
-        self.cached_with_namespace(key)
+        self.cached_with_namespace_deadline(key, c2_config::ConnectDeadline::default())
+            .unwrap()
             .map(|resolved| resolved.routes)
     }
 
-    fn cached_with_namespace(&self, key: &ResolveCacheKey) -> Option<RelayResolvedRoutes> {
-        let mut cache = self.cache.lock();
-        let entry = cache.get(key)?;
+    fn cached_with_namespace_deadline(
+        &self,
+        key: &ResolveCacheKey,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<Option<RelayResolvedRoutes>, HttpError> {
+        let mut cache = super::connect_deadline::lock(&self.cache, deadline, "relay_resolve")?;
+        let Some(entry) = cache.get(key) else {
+            return Ok(None);
+        };
         if entry.inserted_at.elapsed() >= self.config.cache_ttl {
             cache.remove(key);
-            return None;
+            return Ok(None);
         }
-        Some(RelayResolvedRoutes {
+        Ok(Some(RelayResolvedRoutes {
             routes: entry.routes.clone(),
             local_endpoint_namespace: entry.local_endpoint_namespace.clone(),
-        })
+        }))
     }
 }
 
@@ -569,6 +624,36 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .to_string(),
         }
+    }
+
+    #[test]
+    fn connect_deadline_bounds_resolve_cache_lock() {
+        let control =
+            std::sync::Arc::new(RelayControlClient::new("http://localhost:9985", false).unwrap());
+        let held = control.cache.lock();
+        let waiter_control = std::sync::Arc::clone(&control);
+        let waiter = std::thread::spawn(move || {
+            let deadline = c2_config::ConnectDeadline::start(
+                c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(30)),
+            )
+            .unwrap();
+            let error = runtime()
+                .handle()
+                .block_on(
+                    waiter_control.resolve_matching_with_namespace_deadline_async(
+                        &expected_contract(),
+                        deadline,
+                    ),
+                )
+                .unwrap_err();
+            let HttpError::LocalCallRejected(error) = error else {
+                panic!("canonical error required")
+            };
+            assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
+            assert_eq!(error.details["stage"], "relay_resolve");
+        });
+        waiter.join().unwrap();
+        assert!(held.is_empty());
     }
 
     #[test]
@@ -719,17 +804,28 @@ mod tests {
                 inserted_at: Instant::now(),
             },
         );
-        assert!(client.cached_with_namespace(&legacy).is_none());
+        assert!(
+            client
+                .cached_with_namespace_deadline(&legacy, c2_config::ConnectDeadline::default())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             client
-                .cached_with_namespace(&typed)
+                .cached_with_namespace_deadline(&typed, c2_config::ConnectDeadline::default())
+                .unwrap()
                 .unwrap()
                 .local_endpoint_namespace
                 .as_deref(),
             Some(context.namespace_id())
         );
         client.invalidate("grid");
-        assert!(client.cached_with_namespace(&typed).is_none());
+        assert!(
+            client
+                .cached_with_namespace_deadline(&typed, c2_config::ConnectDeadline::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

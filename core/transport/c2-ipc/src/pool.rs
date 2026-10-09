@@ -8,10 +8,10 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use c2_config::{LocalEndpoint, LocalEndpointContext, MemoryBudgetLimits};
+use c2_config::{ConnectDeadline, LocalEndpoint, LocalEndpointContext, MemoryBudgetLimits};
 use c2_mem::{MemPool, PoolConfig};
 
 /// Label counter for client pools. MemPool adds its incarnation and owns
@@ -224,6 +224,27 @@ pub struct ClientCacheMemorySnapshot {
     pub budget: c2_mem::BudgetSnapshot,
 }
 
+fn connect_lock<'a, T>(
+    mutex: &'a Mutex<T>,
+    deadline: ConnectDeadline,
+    stage: &'static str,
+) -> Result<parking_lot::MutexGuard<'a, T>, IpcError> {
+    crate::client::connect_check(deadline, stage)?;
+    let guard = match deadline.instant() {
+        None => mutex.lock(),
+        Some(instant) => mutex
+            .try_lock_until(instant)
+            .ok_or_else(|| crate::client::connect_expired(stage))?,
+    };
+    crate::client::connect_check(deadline, stage)?;
+    Ok(guard)
+}
+
+fn cleanup_deadline(deadline: ConnectDeadline) -> Instant {
+    let guard = Instant::now() + DETACHED_CLOSE_TIMEOUT;
+    deadline.instant().map_or(guard, |caller| caller.min(guard))
+}
+
 fn is_transient_connect_error(error: &IpcError) -> bool {
     matches!(
         error,
@@ -243,11 +264,15 @@ fn connect_with_transient_retry(
     endpoint: &LocalEndpoint,
     cfg: &ClientIpcConfig,
     budget: &c2_mem::MemoryBudget,
-) -> Result<SyncClient, IpcError> {
+    deadline: ConnectDeadline,
+    mut fresh: FreshClientGuard,
+) -> Result<(Arc<SyncClient>, FreshClientGuard), IpcError> {
+    crate::sync_client::ensure_runtime_with_deadline(deadline)?;
     let pool_config = pool_config_from_client_config(cfg);
     let prewarm_segments = cfg.pool_prewarm_segments as usize;
 
     for attempt in 0..CONNECT_TRANSIENT_RETRY_ATTEMPTS {
+        crate::client::connect_check(deadline, "pool_connect")?;
         let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3c{:08x}{:08x}", std::process::id(), counter);
         let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
@@ -264,33 +289,158 @@ fn connect_with_transient_retry(
                 .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
         }
 
-        match SyncClient::connect_transport_pool(
+        let (client, result) = SyncClient::connect_transport_pool_attempt_with_deadline(
             endpoint.clone(),
             pool,
             cfg.clone(),
             budget.clone(),
-        ) {
-            Ok(client) => return Ok(client),
-            Err(error)
-                if attempt + 1 < CONNECT_TRANSIENT_RETRY_ATTEMPTS
-                    && is_transient_connect_error(&error) =>
-            {
-                std::thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
+            deadline,
+        );
+        let client = Arc::new(client);
+        fresh.attach(client.clone());
+        match result {
+            Ok(()) => return Ok((client, fresh)),
+            Err(error) => {
+                // Even a handshake attempt that spawned native receive work
+                // must keep its exact owner until the native close confirms.
+                fresh.retire();
+                if matches!(&error, IpcError::LocalCallRejected(error) if error.code == c2_error::ErrorCode::CallDeadlineExceeded)
+                {
+                    return Err(error);
+                }
+                crate::client::connect_check(deadline, "pool_cleanup")?;
+                let confirmed = fresh.work.record.state() == RetiredState::Confirmed;
+                if attempt + 1 >= CONNECT_TRANSIENT_RETRY_ATTEMPTS
+                    || !confirmed
+                    || !is_transient_connect_error(&error)
+                {
+                    return Err(error);
+                }
+                let delay = Duration::from_millis(10 * (attempt as u64 + 1));
+                let remaining = deadline
+                    .remaining("pool_retry")
+                    .map_err(|_| crate::client::connect_expired("pool_retry"))?;
+                std::thread::sleep(remaining.map_or(delay, |left| delay.min(left)));
+                crate::client::connect_check(deadline, "pool_retry")?;
+                let work = {
+                    let mut coordinator =
+                        connect_lock(&fresh.coordinator.0, deadline, "pool_cleanup_wait")?;
+                    let ticket = coordinator.next_ticket;
+                    coordinator.next_ticket += 1;
+                    let record = Arc::new(RetiredClose::new(
+                        fresh.work.record.address.clone(),
+                        None,
+                        RetiredState::Preparing,
+                    ));
+                    coordinator.retired.insert(ticket, record.clone());
+                    RetiredWork { ticket, record }
+                };
+                fresh = FreshClientGuard {
+                    work,
+                    coordinator: fresh.coordinator.clone(),
+                    deadline,
+                    done: false,
+                };
             }
-            Err(error) => return Err(error),
         }
     }
 
     unreachable!("connect retry loop always returns before exhausting attempts")
 }
 
+/// Exact-entry reference state: a cancelled connect never needs to wait for
+/// either RuntimeState or the global cache lock to release its reference.
+struct PoolReferences {
+    count: AtomicUsize,
+    // Monotonic nanoseconds relative to a private origin, plus one; zero means
+    // active. Release never needs a mutex, including while the cache is locked.
+    origin: Instant,
+    released_tick: AtomicU64,
+}
+
+impl PoolReferences {
+    fn new(count: usize, last_release: Option<Instant>) -> Self {
+        Self {
+            count: AtomicUsize::new(count),
+            origin: last_release.unwrap_or_else(Instant::now),
+            released_tick: AtomicU64::new(u64::from(last_release.is_some())),
+        }
+    }
+    fn tick(&self) -> u64 {
+        self.origin.elapsed().as_nanos().min((u64::MAX - 1) as u128) as u64 + 1
+    }
+    fn acquire(&self) {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        self.released_tick.store(0, Ordering::Release);
+    }
+    fn release(&self) -> bool {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        // Publish before count can become zero; an idle observer then sees a
+        // current release stamp, including racing acquire/release cycles.
+        self.released_tick.fetch_max(self.tick(), Ordering::AcqRel);
+        match self
+            .count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            }) {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+    fn expired(&self, grace: Duration) -> bool {
+        if self.count.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let released = self.released_tick.load(Ordering::Acquire);
+        released != 0
+            && self.count.load(Ordering::Acquire) == 0
+            && u128::from(self.tick().saturating_sub(released)) >= grace.as_nanos()
+    }
+}
+
+/// One counted lease on an exact pooled connection. Drop releases only this
+/// entry, even if the cache has replaced it or is currently being drained.
+#[doc(hidden)]
+pub struct ClientLease {
+    client: Arc<SyncClient>,
+    references: Arc<PoolReferences>,
+    counted: bool,
+}
+
+impl ClientLease {
+    pub fn client(&self) -> &Arc<SyncClient> {
+        &self.client
+    }
+
+    /// Transfer the counted reference to an explicit-release caller.
+    pub fn into_client(mut self) -> Arc<SyncClient> {
+        self.counted = false;
+        self.client.clone()
+    }
+}
+
+impl std::ops::Deref for ClientLease {
+    type Target = SyncClient;
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+impl Drop for ClientLease {
+    fn drop(&mut self) {
+        if self.counted {
+            self.references.release();
+        }
+    }
+}
+
 // ── Pool entry ───────────────────────────────────────────────────────────
 
 struct PoolEntry {
     client: Arc<SyncClient>,
-    ref_count: usize,
-    /// Set to `Some(Instant::now())` when `ref_count` drops to 0.
-    last_release: Option<Instant>,
+    references: Arc<PoolReferences>,
 }
 
 /// Close-barrier deadline for clients detached by pool bookkeeping
@@ -323,11 +473,16 @@ struct CacheState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetiredState {
     /// A bounded close barrier for this record is currently running.
-    Closing,
+    Closing = 1,
+    /// A fresh acquire is still connecting. It is fenced by the cache epoch;
+    /// no connected client exists yet and a drain need not wait for its I/O.
+    Preparing = 2,
+    /// Native work has confirmed close, or a fresh acquire published its client.
+    Confirmed = 3,
     /// The last close barrier returned unconfirmed. The record keeps
     /// ownership of the client reachable so a later `close_all` can retry
     /// it and keep reporting it unconfirmed until it actually stops.
-    UnconfirmedIdle,
+    UnconfirmedIdle = 4,
 }
 
 /// One client detached from the cache whose bounded close is owned by the
@@ -337,8 +492,97 @@ enum RetiredState {
 /// unaccounted detached work.
 struct RetiredClose {
     address: String,
-    client: Arc<SyncClient>,
-    state: RetiredState,
+    client: Mutex<Option<Arc<SyncClient>>>,
+    state: AtomicU8,
+}
+
+impl RetiredClose {
+    fn new(address: String, client: Option<Arc<SyncClient>>, state: RetiredState) -> Self {
+        Self {
+            address,
+            client: Mutex::new(client),
+            state: AtomicU8::new(state as u8),
+        }
+    }
+    fn state(&self) -> RetiredState {
+        match self.state.load(Ordering::Acquire) {
+            1 => RetiredState::Closing,
+            2 => RetiredState::Preparing,
+            3 => RetiredState::Confirmed,
+            4 => RetiredState::UnconfirmedIdle,
+            _ => unreachable!("invalid native retired close state"),
+        }
+    }
+    fn set_state(&self, state: RetiredState) {
+        self.state.store(state as u8, Ordering::Release);
+    }
+}
+
+struct RetiredWork {
+    ticket: u64,
+    record: Arc<RetiredClose>,
+}
+
+/// Reserve cleanup ownership before connection I/O. Even expiry while waiting
+/// for the map/coordinator to publish can retain the unconfirmed native client
+/// without acquiring either global lock after the caller deadline.
+struct FreshClientGuard {
+    work: RetiredWork,
+    coordinator: Arc<(Mutex<CloseTxnState>, Condvar)>,
+    deadline: ConnectDeadline,
+    done: bool,
+}
+
+impl FreshClientGuard {
+    fn attach(&self, client: Arc<SyncClient>) {
+        *self.work.record.client.lock() = Some(client);
+        self.work.record.set_state(RetiredState::Closing);
+    }
+    fn complete(&mut self) {
+        self.work.record.client.lock().take();
+        self.work.record.set_state(RetiredState::Confirmed);
+        self.done = true;
+        prune_confirmed(&self.coordinator, &self.work);
+    }
+    fn retire(&mut self) {
+        if !self.done {
+            let _ = close_retired_work(
+                &self.coordinator,
+                &self.work,
+                cleanup_deadline(self.deadline),
+            );
+            self.done = true;
+        }
+    }
+}
+impl Drop for FreshClientGuard {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+struct RetiredBatch {
+    work: Vec<RetiredWork>,
+    coordinator: Arc<(Mutex<CloseTxnState>, Condvar)>,
+    deadline: ConnectDeadline,
+}
+impl RetiredBatch {
+    fn push(&mut self, work: RetiredWork) {
+        self.work.push(work);
+    }
+    fn close(&mut self) {
+        run_retired_work(
+            &self.coordinator,
+            &self.work,
+            cleanup_deadline(self.deadline),
+        );
+        self.work.clear();
+    }
+}
+impl Drop for RetiredBatch {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 /// Drain-transaction coordinator, guarded separately from [`CacheState`] so
@@ -352,7 +596,7 @@ struct CloseTxnState {
     active_generation: Option<u64>,
     /// Detached clients with a registered (running or unconfirmed-idle)
     /// close barrier. Keyed by ticket; see [`RetiredClose`].
-    retired: HashMap<u64, RetiredClose>,
+    retired: HashMap<u64, Arc<RetiredClose>>,
     next_ticket: u64,
 }
 
@@ -411,42 +655,64 @@ const _: () = {
 /// `RetiredState::UnconfirmedIdle`, keeping the client's ownership reachable
 /// so a later `close_all` can retry it and keep reporting it honestly.
 /// Returns `Err(address)` when the close did not confirm.
+fn prune_confirmed(txn: &(Mutex<CloseTxnState>, Condvar), work: &RetiredWork) {
+    if let Some(mut state) = txn.0.try_lock() {
+        if work.record.state() == RetiredState::Confirmed
+            && state
+                .retired
+                .get(&work.ticket)
+                .is_some_and(|record| Arc::ptr_eq(record, &work.record))
+        {
+            state.retired.remove(&work.ticket);
+        }
+    }
+    txn.1.notify_all();
+}
+
+fn close_retired_work(
+    txn: &(Mutex<CloseTxnState>, Condvar),
+    work: &RetiredWork,
+    deadline: Instant,
+) -> Result<(), String> {
+    let client = work.record.client.lock().clone();
+    let confirmed = client.as_ref().is_none_or(|client| {
+        client.close_shared(deadline.saturating_duration_since(Instant::now()))
+    });
+    work.record.set_state(if confirmed {
+        RetiredState::Confirmed
+    } else {
+        RetiredState::UnconfirmedIdle
+    });
+    prune_confirmed(txn, work);
+    if confirmed {
+        Ok(())
+    } else {
+        Err(work.record.address.clone())
+    }
+}
+
 fn close_retired_ticket(
     txn: &(Mutex<CloseTxnState>, Condvar),
     ticket: u64,
     deadline: Instant,
 ) -> Result<(), String> {
-    let client = {
-        let txn_state = txn.0.lock();
-        match txn_state.retired.get(&ticket) {
-            Some(record) if record.state == RetiredState::Closing => Arc::clone(&record.client),
-            // Already removed by a confirming retry elsewhere, or never
-            // registered: nothing to close, nothing to report.
+    let record = {
+        let state = txn.0.lock();
+        match state.retired.get(&ticket) {
+            Some(record) if record.state() == RetiredState::Closing => record.clone(),
             _ => return Ok(()),
         }
     };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let confirmed = client.close_shared(remaining);
-    let unconfirmed_address = {
-        let mut txn_state = txn.0.lock();
-        match txn_state.retired.get_mut(&ticket) {
-            Some(record) => {
-                if confirmed {
-                    // Remove the exact record only after confirmation.
-                    txn_state.retired.remove(&ticket);
-                    None
-                } else {
-                    record.state = RetiredState::UnconfirmedIdle;
-                    Some(record.address.clone())
-                }
-            }
-            None => None, // A concurrent retry already resolved this record.
-        }
-    };
-    txn.1.notify_all();
-    match unconfirmed_address {
-        Some(address) => Err(address),
-        None => Ok(()),
+    close_retired_work(txn, &RetiredWork { ticket, record }, deadline)
+}
+
+fn run_retired_work(
+    txn: &(Mutex<CloseTxnState>, Condvar),
+    work: &[RetiredWork],
+    deadline: Instant,
+) {
+    for record in work {
+        let _ = close_retired_work(txn, record, deadline);
     }
 }
 
@@ -454,7 +720,14 @@ fn close_retired_ticket(
 /// deadline. Used by non-drain paths (acquire sweeps/stale/loser cleanup);
 /// unconfirmed records stay registered for a later `close_all` to retry.
 fn run_retired_closes(txn: &(Mutex<CloseTxnState>, Condvar), tickets: &[u64]) {
-    let deadline = Instant::now() + DETACHED_CLOSE_TIMEOUT;
+    run_retired_closes_until(txn, tickets, Instant::now() + DETACHED_CLOSE_TIMEOUT);
+}
+
+fn run_retired_closes_until(
+    txn: &(Mutex<CloseTxnState>, Condvar),
+    tickets: &[u64],
+    deadline: Instant,
+) {
     for ticket in tickets {
         let _ = close_retired_ticket(txn, *ticket, deadline);
     }
@@ -572,19 +845,32 @@ impl ClientPool {
     /// detached client unaccounted. Performs no I/O.
     fn retire_locked(&self, address: &str, client: Arc<SyncClient>) -> u64 {
         let mut txn = self.close_txn.0.lock();
+        self.retire_under_coordinator(&mut txn, address, client)
+            .ticket
+    }
+
+    fn register_close_work(
+        &self,
+        txn: &mut CloseTxnState,
+        address: &str,
+        client: Option<Arc<SyncClient>>,
+        state: RetiredState,
+    ) -> RetiredWork {
         let ticket = txn.next_ticket;
         txn.next_ticket += 1;
-        txn.retired.insert(
-            ticket,
-            RetiredClose {
-                address: address.to_string(),
-                client,
-                state: RetiredState::Closing,
-            },
-        );
-        drop(txn);
+        let record = Arc::new(RetiredClose::new(address.to_string(), client, state));
+        txn.retired.insert(ticket, record.clone());
         self.close_txn.1.notify_all();
-        ticket
+        RetiredWork { ticket, record }
+    }
+
+    fn retire_under_coordinator(
+        &self,
+        txn: &mut CloseTxnState,
+        address: &str,
+        client: Arc<SyncClient>,
+    ) -> RetiredWork {
+        self.register_close_work(txn, address, Some(client), RetiredState::Closing)
     }
 
     /// Acquire a client for `address`. Creates and connects if needed.
@@ -606,35 +892,69 @@ impl ClientPool {
         address: &str,
         config: Option<&ClientIpcConfig>,
     ) -> Result<Arc<SyncClient>, IpcError> {
-        let mut retired: Vec<u64> = Vec::new();
+        self.acquire_with_deadline(address, config, ConnectDeadline::default())
+    }
+
+    pub fn acquire_with_deadline(
+        &self,
+        address: &str,
+        config: Option<&ClientIpcConfig>,
+        deadline: ConnectDeadline,
+    ) -> Result<Arc<SyncClient>, IpcError> {
+        self.acquire_lease_with_deadline(address, config, deadline)
+            .map(ClientLease::into_client)
+    }
+
+    pub fn acquire_lease_with_deadline(
+        &self,
+        address: &str,
+        config: Option<&ClientIpcConfig>,
+        deadline: ConnectDeadline,
+    ) -> Result<ClientLease, IpcError> {
+        let mut retired = RetiredBatch {
+            work: Vec::new(),
+            coordinator: self.close_txn.clone(),
+            deadline,
+        };
+        let mut fresh = None;
         let epoch;
         let cfg;
         let budget;
         let mut rejection: Option<IpcError> = None;
         {
-            let mut state = self.state.lock();
+            let mut state = connect_lock(&self.state, deadline, "pool_wait")?;
+            let mut coordinator = connect_lock(&self.close_txn.0, deadline, "pool_cleanup_wait")?;
+            coordinator
+                .retired
+                .retain(|_, record| record.state() != RetiredState::Confirmed);
             if state.closing_generation.is_some() {
                 return Err(IpcError::Pool(
                     "client pool acquire rejected: cache is closing".to_string(),
                 ));
             }
             epoch = state.epoch;
-            // Detach expired entries before potentially creating a new one;
-            // each detachment registers its pending close in this same
-            // critical section.
-            for (expired_address, client) in
-                Self::sweep_expired_locked(&mut state, self.grace_period)
-            {
-                retired.push(self.retire_locked(&expired_address, client));
-            }
             // Resolve config before any fast-path return: the domain budget
             // gate below must see the same resolved config on a cache hit as
             // on a fresh connect, so a per-address configuration can never
             // bypass the frozen domain limits on the same-address fast path.
             cfg = match config {
                 Some(c) => c.clone(),
-                None => self.default_config.lock().clone().unwrap_or_default(),
+                None => connect_lock(&self.default_config, deadline, "pool_config_wait")?
+                    .clone()
+                    .unwrap_or_default(),
             };
+            // Detach expired entries before potentially creating a new one;
+            // each detachment registers its pending close in this same
+            // critical section.
+            for (expired_address, client) in
+                Self::sweep_expired_locked(&mut state, self.grace_period)
+            {
+                retired.push(self.retire_under_coordinator(
+                    &mut coordinator,
+                    &expired_address,
+                    client,
+                ));
+            }
             // First-connect-wins memory context, installed or validated in
             // the same critical section that resolved the config so a racing
             // acquire can never connect under a second budget policy.
@@ -677,23 +997,48 @@ impl ClientPool {
                 && let Some(entry) = state.entries.get_mut(address)
             {
                 if entry.client.is_connected() {
-                    entry.ref_count += 1;
-                    entry.last_release = None;
-                    let client = Arc::clone(&entry.client);
+                    crate::client::connect_check(deadline, "pool_acquire")?;
+                    entry.references.acquire();
+                    let lease = ClientLease {
+                        client: entry.client.clone(),
+                        references: entry.references.clone(),
+                        counted: true,
+                    };
+                    drop(coordinator);
                     drop(state);
-                    run_retired_closes(&self.close_txn, &retired);
-                    return Ok(client);
+                    retired.close();
+                    if let Err(error) = crate::client::connect_check(deadline, "pool_acquire") {
+                        return Err(error);
+                    }
+                    return Ok(lease);
                 }
                 // Stale — detach and fall through to create a new one.
                 if let Some(entry) = state.entries.remove(address) {
-                    retired.push(self.retire_locked(address, entry.client));
+                    retired.push(self.retire_under_coordinator(
+                        &mut coordinator,
+                        address,
+                        entry.client,
+                    ));
                 }
+            }
+            if rejection.is_none() {
+                fresh = Some(FreshClientGuard {
+                    work: self.register_close_work(
+                        &mut coordinator,
+                        address,
+                        None,
+                        RetiredState::Preparing,
+                    ),
+                    coordinator: self.close_txn.clone(),
+                    deadline,
+                    done: false,
+                });
             }
         }
         // Drop the pool lock before closing retired records or connecting
         // (both may block). Retired tickets registered above are closed even
         // when this acquire is rejected, so no detached client is stranded.
-        run_retired_closes(&self.close_txn, &retired);
+        retired.close();
         if let Some(error) = rejection {
             return Err(error);
         }
@@ -703,21 +1048,33 @@ impl ClientPool {
             .endpoint_context()?
             .endpoint(address)
             .map_err(crate::control::endpoint_error)?;
-        let client = Arc::new(connect_with_transient_retry(&endpoint, &cfg, &budget)?);
+        let (client, mut fresh) = connect_with_transient_retry(
+            &endpoint,
+            &cfg,
+            &budget,
+            deadline,
+            fresh.expect("fresh acquisition reserves cleanup ownership"),
+        )?;
 
-        let mut state = self.state.lock();
+        let mut state = match connect_lock(&self.state, deadline, "pool_publish_wait") {
+            Ok(state) => state,
+            Err(error) => return Err(error),
+        };
+        let mut coordinator = match connect_lock(&self.close_txn.0, deadline, "pool_cleanup_wait") {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                drop(state);
+                return Err(error);
+            }
+        };
         if state.closing_generation.is_some() || state.epoch != epoch {
             // A drain completed while this connect was in flight. The entry
             // cannot join the drained generation; register and close it
             // explicitly while still holding the state lock so the barrier
             // is accounted before we release it.
-            let ticket = self.retire_locked(address, client);
+            drop(coordinator);
             drop(state);
-            let _ = close_retired_ticket(
-                &self.close_txn,
-                ticket,
-                Instant::now() + DETACHED_CLOSE_TIMEOUT,
-            );
+            fresh.retire();
             return Err(IpcError::Pool(
                 "client pool acquire rejected: cache closed while connecting".to_string(),
             ));
@@ -732,51 +1089,59 @@ impl ClientPool {
                 // closed explicitly, and the caller gets a deterministic
                 // mismatch instead of a wrong-policy client.
                 let winner_policy = entry.client.config().clone();
-                let loser_ticket = self.retire_locked(address, client);
+                drop(coordinator);
                 drop(state);
-                let _ = close_retired_ticket(
-                    &self.close_txn,
-                    loser_ticket,
-                    Instant::now() + DETACHED_CLOSE_TIMEOUT,
-                );
+                fresh.retire();
                 return Err(client_policy_mismatch(address, &winner_policy, &cfg));
             }
             // Another thread raced and inserted the same address; its client
             // wins and this fresh connection is the loser. Bump the winner
             // under the lock, register the loser's close, then run it
             // outside the lock.
-            entry.ref_count += 1;
-            entry.last_release = None;
-            let winner = Arc::clone(&entry.client);
-            let loser_ticket = self.retire_locked(address, client);
+            crate::client::connect_check(deadline, "pool_acquire")?;
+            entry.references.acquire();
+            let winner = ClientLease {
+                client: entry.client.clone(),
+                references: entry.references.clone(),
+                counted: true,
+            };
+            drop(coordinator);
             drop(state);
-            let _ = close_retired_ticket(
-                &self.close_txn,
-                loser_ticket,
-                Instant::now() + DETACHED_CLOSE_TIMEOUT,
-            );
+            fresh.retire();
+            if let Err(error) = crate::client::connect_check(deadline, "pool_acquire") {
+                return Err(error);
+            }
             return Ok(winner);
         }
+        crate::client::connect_check(deadline, "pool_publish")?;
+        let references = Arc::new(PoolReferences::new(1, None));
+        let lease = ClientLease {
+            client: client.clone(),
+            references: references.clone(),
+            counted: true,
+        };
         let replaced = state.entries.insert(
             address.to_owned(),
             PoolEntry {
                 client: Arc::clone(&client),
-                ref_count: 1,
-                last_release: None,
+                references,
             },
         );
         // A stale entry raced back in and lost; register its close in the
         // same critical section that replaced it.
-        let replaced_ticket = replaced.map(|old| self.retire_locked(address, old.client));
+        let replaced_ticket = replaced
+            .map(|old| self.retire_under_coordinator(&mut coordinator, address, old.client));
+        fresh.complete();
+        coordinator.retired.remove(&fresh.work.ticket);
+        drop(coordinator);
         drop(state);
-        if let Some(ticket) = replaced_ticket {
-            let _ = close_retired_ticket(
-                &self.close_txn,
-                ticket,
-                Instant::now() + DETACHED_CLOSE_TIMEOUT,
-            );
+        if let Some(work) = replaced_ticket {
+            let _ = close_retired_work(&self.close_txn, &work, cleanup_deadline(deadline));
         }
-        Ok(client)
+        if let Err(error) = crate::client::connect_check(deadline, "pool_acquire") {
+            return Err(error);
+        }
+        Ok(lease)
     }
 
     /// Decrement reference count. When it reaches 0, mark for grace-period
@@ -784,13 +1149,8 @@ impl ClientPool {
     pub fn release(&self, address: &str) {
         let mut state = self.state.lock();
         if let Some(entry) = state.entries.get_mut(address) {
-            if entry.ref_count == 0 {
+            if !entry.references.release() {
                 eprintln!("ClientPool::release: ref_count already 0 for {address}");
-                return;
-            }
-            entry.ref_count -= 1;
-            if entry.ref_count == 0 {
-                entry.last_release = Some(Instant::now());
             }
         } else {
             eprintln!("ClientPool::release: no entry for {address}");
@@ -809,14 +1169,7 @@ impl ClientPool {
         if !Arc::ptr_eq(&entry.client, observed) {
             return false;
         }
-        if entry.ref_count == 0 {
-            return false;
-        }
-        entry.ref_count -= 1;
-        if entry.ref_count == 0 {
-            entry.last_release = Some(Instant::now());
-        }
-        true
+        entry.references.release()
     }
 
     /// Remove one observed unusable client without evicting a racing replacement.
@@ -826,8 +1179,19 @@ impl ClientPool {
     /// detached client's bounded close is registered in the same critical
     /// section that removes the entry, then runs outside the pool lock.
     pub fn discard_if_same(&self, address: &str, observed: &Arc<SyncClient>) -> bool {
+        self.discard_if_same_with_deadline(address, observed, ConnectDeadline::default())
+            .unwrap_or(false)
+    }
+
+    pub fn discard_if_same_with_deadline(
+        &self,
+        address: &str,
+        observed: &Arc<SyncClient>,
+        deadline: ConnectDeadline,
+    ) -> Result<bool, IpcError> {
         let ticket = {
-            let mut state = self.state.lock();
+            let mut state = connect_lock(&self.state, deadline, "pool_discard_wait")?;
+            let mut coordinator = connect_lock(&self.close_txn.0, deadline, "pool_cleanup_wait")?;
             let is_same = state
                 .entries
                 .get(address)
@@ -837,21 +1201,17 @@ impl ClientPool {
                     .entries
                     .remove(address)
                     .expect("entry presence checked above");
-                Some(self.retire_locked(address, entry.client))
+                Some(self.retire_under_coordinator(&mut coordinator, address, entry.client))
             } else {
                 None
             }
         };
         match ticket {
             Some(ticket) => {
-                let _ = close_retired_ticket(
-                    &self.close_txn,
-                    ticket,
-                    Instant::now() + DETACHED_CLOSE_TIMEOUT,
-                );
-                true
+                let _ = close_retired_work(&self.close_txn, &ticket, cleanup_deadline(deadline));
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
     }
 
@@ -862,10 +1222,7 @@ impl ClientPool {
     ) -> Vec<(String, Arc<SyncClient>)> {
         let mut detached = Vec::new();
         state.entries.retain(|address, entry| {
-            if entry.ref_count == 0
-                && let Some(released_at) = entry.last_release
-                && released_at.elapsed() >= grace
-            {
+            if entry.references.expired(grace) {
                 detached.push((address.clone(), Arc::clone(&entry.client)));
                 return false;
             }
@@ -928,11 +1285,13 @@ impl ClientPool {
             let (txn_lock, txn_condvar) = &*self.close_txn;
             let mut txn = txn_lock.lock();
             loop {
+                txn.retired
+                    .retain(|_, record| record.state() != RetiredState::Confirmed);
                 if txn.active_generation.is_none()
                     && !txn
                         .retired
                         .values()
-                        .any(|record| record.state == RetiredState::Closing)
+                        .any(|record| record.state() == RetiredState::Closing)
                 {
                     break;
                 }
@@ -942,13 +1301,15 @@ impl ClientPool {
                     report.error = Some(Self::drain_wait_error(blocked_by_drain));
                     return report;
                 }
-                let result = txn_condvar.wait_for(&mut txn, deadline - now);
+                let result =
+                    txn_condvar.wait_for(&mut txn, (deadline - now).min(Duration::from_millis(5)));
                 if result.timed_out()
+                    && Instant::now() >= deadline
                     && (txn.active_generation.is_some()
                         || txn
                             .retired
                             .values()
-                            .any(|record| record.state == RetiredState::Closing))
+                            .any(|record| record.state() == RetiredState::Closing))
                 {
                     report.error = Some(Self::drain_wait_error(txn.active_generation.is_some()));
                     return report;
@@ -979,11 +1340,11 @@ impl ClientPool {
                     txn.next_ticket += 1;
                     txn.retired.insert(
                         ticket,
-                        RetiredClose {
+                        Arc::new(RetiredClose::new(
                             address,
-                            client,
-                            state: RetiredState::Closing,
-                        },
+                            Some(client),
+                            RetiredState::Closing,
+                        )),
                     );
                     ticket
                 })
@@ -991,9 +1352,9 @@ impl ClientPool {
             let retry_tickets: Vec<u64> = txn
                 .retired
                 .iter_mut()
-                .filter(|(_, record)| record.state == RetiredState::UnconfirmedIdle)
+                .filter(|(_, record)| record.state() == RetiredState::UnconfirmedIdle)
                 .map(|(ticket, record)| {
-                    record.state = RetiredState::Closing;
+                    record.set_state(RetiredState::Closing);
                     *ticket
                 })
                 .collect();
@@ -1020,19 +1381,21 @@ impl ClientPool {
             while txn
                 .retired
                 .values()
-                .any(|record| record.state == RetiredState::Closing)
+                .any(|record| record.state() == RetiredState::Closing)
             {
                 let now = Instant::now();
                 if now >= deadline {
                     report.error = Some(Self::drain_wait_error(false));
                     break;
                 }
-                let result = txn_condvar.wait_for(&mut txn, deadline - now);
+                let result =
+                    txn_condvar.wait_for(&mut txn, (deadline - now).min(Duration::from_millis(5)));
                 if result.timed_out()
+                    && Instant::now() >= deadline
                     && txn
                         .retired
                         .values()
-                        .any(|record| record.state == RetiredState::Closing)
+                        .any(|record| record.state() == RetiredState::Closing)
                 {
                     report.error = Some(Self::drain_wait_error(false));
                     break;
@@ -1053,7 +1416,13 @@ impl ClientPool {
             let mut txn = self.close_txn.0.lock();
             debug_assert_eq!(txn.active_generation, Some(generation));
             txn.active_generation = None;
-            for record in txn.retired.values() {
+            txn.retired
+                .retain(|_, record| record.state() != RetiredState::Confirmed);
+            for record in txn
+                .retired
+                .values()
+                .filter(|record| record.state() != RetiredState::Preparing)
+            {
                 let already_reported = report
                     .unconfirmed
                     .iter()
@@ -1086,7 +1455,7 @@ impl ClientPool {
             .lock()
             .entries
             .get(address)
-            .map_or(0, |e| e.ref_count)
+            .map_or(0, |e| e.references.count.load(Ordering::Acquire))
     }
 
     /// Check if a client exists for the address (for testing).
@@ -1132,7 +1501,7 @@ impl ClientPool {
         let has_closing = |txn: &CloseTxnState| {
             txn.retired
                 .values()
-                .any(|record| record.state == RetiredState::Closing)
+                .any(|record| record.state() == RetiredState::Closing)
         };
         let deadline = Instant::now() + timeout;
         while !has_closing(&txn) {
@@ -1148,11 +1517,16 @@ impl ClientPool {
         true
     }
 
-    /// Number of retired records still registered (pending or
-    /// unconfirmed-idle). Zero means every detached client's close has
-    /// confirmed.
+    /// Number of registered close records; completed metadata awaiting prune
+    /// is excluded. Preparing records retain only acquisition bookkeeping.
     pub(crate) fn retired_records_for_test(&self) -> usize {
-        self.close_txn.0.lock().retired.len()
+        self.close_txn
+            .0
+            .lock()
+            .retired
+            .values()
+            .filter(|record| record.state() != RetiredState::Confirmed)
+            .count()
     }
 }
 
@@ -1186,6 +1560,166 @@ mod tests {
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(b"ok".to_vec()))
         }
+    }
+
+    fn connect_budget(milliseconds: u64) -> ConnectDeadline {
+        ConnectDeadline::start(
+            c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(milliseconds)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn connect_deadline_pool_state_wait_uses_caller_budget() {
+        let pool = Arc::new(ClientPool::new(Duration::from_secs(30)));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_pool = pool.clone();
+        let holder = thread::spawn(move || {
+            let _guard = holder_pool.state.lock();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_millis(250));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        let result = pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        let IpcError::LocalCallRejected(error) =
+            result.err().expect("deadline before endpoint lookup")
+        else {
+            panic!("canonical deadline required")
+        };
+        assert_eq!(error.details["stage"], "pool_wait");
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "unbounded pool lock wait: {elapsed:?}"
+        );
+        assert_eq!(pool.active_count(), 0);
+        assert!(pool.memory_budget_snapshot().is_none());
+    }
+
+    #[test]
+    fn connect_deadline_coordinator_wait_cannot_freeze_or_publish() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let _coordinator = pool.close_txn.0.lock();
+        let started = Instant::now();
+        let result = pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
+        let IpcError::LocalCallRejected(error) = result.err().unwrap() else {
+            panic!("canonical deadline required")
+        };
+        assert_eq!(error.details["stage"], "pool_cleanup_wait");
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(pool.active_count(), 0);
+        assert!(pool.memory_budget_snapshot().is_none());
+    }
+
+    #[test]
+    fn connect_deadline_lease_drop_avoids_map_and_coordinator_locks() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let references = Arc::new(PoolReferences::new(1, None));
+        let client = Arc::new(make_disconnected_client());
+        let lease = ClientLease {
+            client,
+            references: references.clone(),
+            counted: true,
+        };
+        let _state = pool.state.lock();
+        let _coordinator = pool.close_txn.0.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let releaser = thread::spawn(move || {
+            drop(lease);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("exact-entry release must not wait on global locks");
+        releaser.join().unwrap();
+        assert_eq!(references.count.load(Ordering::Acquire), 0);
+        assert_ne!(references.released_tick.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn connect_deadline_expired_fresh_client_retains_cleanup_and_recovers() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let client = Arc::new(make_disconnected_client());
+        let weak = Arc::downgrade(&client);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        client.hold_writer_slot_for_test(ready_tx, release_rx);
+        ready_rx.blocking_recv().unwrap();
+        let work = {
+            let mut coordinator = pool.close_txn.0.lock();
+            pool.register_close_work(
+                &mut coordinator,
+                "ipc://fresh-expired",
+                None,
+                RetiredState::Preparing,
+            )
+        };
+        let fresh = FreshClientGuard {
+            work,
+            coordinator: pool.close_txn.clone(),
+            deadline: connect_budget(0),
+            done: false,
+        };
+        fresh.attach(client.clone());
+        drop(client);
+        let state = pool.state.lock();
+        let coordinator = pool.close_txn.0.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let closer = thread::spawn(move || {
+            drop(fresh);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .expect("expiry cleanup must not wait on pool metadata locks");
+        closer.join().unwrap();
+        assert!(
+            weak.upgrade().is_some(),
+            "unconfirmed close retains its client"
+        );
+        assert_eq!(
+            coordinator.retired.values().next().unwrap().state(),
+            RetiredState::UnconfirmedIdle
+        );
+        drop(coordinator);
+        drop(state);
+        release_tx.send(()).unwrap();
+        let outcome = pool.close_all(Duration::from_secs(1));
+        assert!(
+            outcome.error.is_none() && outcome.unconfirmed.is_empty(),
+            "{outcome:?}"
+        );
+        assert_eq!(pool.retired_records_for_test(), 0);
+        assert!(
+            weak.upgrade().is_none(),
+            "confirmed close retires exact ownership"
+        );
+    }
+
+    #[test]
+    fn connect_deadline_old_lease_cannot_release_replacement() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let old = Arc::new(PoolReferences::new(1, None));
+        let replacement = Arc::new(PoolReferences::new(1, None));
+        let lease = ClientLease {
+            client: Arc::new(make_disconnected_client()),
+            references: old.clone(),
+            counted: true,
+        };
+        pool.state.lock().entries.insert(
+            "ipc://replacement".into(),
+            PoolEntry {
+                client: Arc::new(make_disconnected_client()),
+                references: replacement.clone(),
+            },
+        );
+        drop(lease);
+        assert_eq!(old.count.load(Ordering::Acquire), 0);
+        assert_eq!(pool.refcount("ipc://replacement"), 1);
     }
 
     fn unique_ipc_address(prefix: &str) -> String {
@@ -1258,8 +1792,10 @@ mod tests {
                 "ipc://fake".to_owned(),
                 PoolEntry {
                     client: Arc::new(client),
-                    ref_count: 0,
-                    last_release: Some(Instant::now() - Duration::from_millis(200)),
+                    references: Arc::new(PoolReferences::new(
+                        0,
+                        Some(Instant::now() - Duration::from_millis(200)),
+                    )),
                 },
             );
         }
@@ -1280,8 +1816,7 @@ mod tests {
                 "ipc://recent".to_owned(),
                 PoolEntry {
                     client: Arc::new(client),
-                    ref_count: 0,
-                    last_release: Some(Instant::now()),
+                    references: Arc::new(PoolReferences::new(0, Some(Instant::now()))),
                 },
             );
         }
@@ -1308,8 +1843,7 @@ mod tests {
                 addr.to_owned(),
                 PoolEntry {
                     client: Arc::new(client),
-                    ref_count: 2,
-                    last_release: None,
+                    references: Arc::new(PoolReferences::new(2, None)),
                 },
             );
         }
@@ -1345,8 +1879,7 @@ mod tests {
                 addr.to_owned(),
                 PoolEntry {
                     client: Arc::new(client),
-                    ref_count: 0,
-                    last_release: Some(Instant::now()),
+                    references: Arc::new(PoolReferences::new(0, Some(Instant::now()))),
                 },
             );
         }
@@ -1367,8 +1900,7 @@ mod tests {
             address.to_string(),
             PoolEntry {
                 client: Arc::clone(&observed),
-                ref_count: 1,
-                last_release: None,
+                references: Arc::new(PoolReferences::new(1, None)),
             },
         );
 
@@ -1389,8 +1921,7 @@ mod tests {
             address.to_string(),
             PoolEntry {
                 client: Arc::clone(&replacement),
-                ref_count: 1,
-                last_release: None,
+                references: Arc::new(PoolReferences::new(1, None)),
             },
         );
 
@@ -1412,16 +1943,14 @@ mod tests {
                 "ipc://a".to_owned(),
                 PoolEntry {
                     client: Arc::new(c1),
-                    ref_count: 1,
-                    last_release: None,
+                    references: Arc::new(PoolReferences::new(1, None)),
                 },
             );
             state.entries.insert(
                 "ipc://b".to_owned(),
                 PoolEntry {
                     client: Arc::new(c2),
-                    ref_count: 0,
-                    last_release: Some(Instant::now()),
+                    references: Arc::new(PoolReferences::new(0, Some(Instant::now()))),
                 },
             );
         }
@@ -2453,8 +2982,7 @@ mod tests {
                         key,
                         PoolEntry {
                             client,
-                            ref_count: 1,
-                            last_release: None,
+                            references: Arc::new(PoolReferences::new(1, None)),
                         },
                     );
                 }
