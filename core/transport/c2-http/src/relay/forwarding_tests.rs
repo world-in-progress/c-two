@@ -393,16 +393,36 @@ async fn controlled_eager_http_receives_production_capacity_rejection() {
     capacity_rejection_case(CapacityRequest::ControlledEager).await;
 }
 
+#[tokio::test]
+async fn eager_capacity_rejection_consumes_declared_body_without_admission() {
+    capacity_rejection_case(CapacityRequest::DirectEager).await;
+}
+
+#[tokio::test]
+async fn capacity_freed_during_rejected_body_cleanup_does_not_readmit() {
+    capacity_rejection_case(CapacityRequest::DirectEagerRelease).await;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CapacityRequest {
     Continue,
     ControlledEager,
     Direct,
+    DirectEager,
+    DirectEagerRelease,
 }
 
 async fn capacity_rejection_case(kind: CapacityRequest) {
-    let network = kind != CapacityRequest::Direct;
-    let input_len = if kind == CapacityRequest::ControlledEager {
+    let network = matches!(
+        kind,
+        CapacityRequest::Continue | CapacityRequest::ControlledEager
+    );
+    let input_len = if matches!(
+        kind,
+        CapacityRequest::ControlledEager
+            | CapacityRequest::DirectEager
+            | CapacityRequest::DirectEagerRelease
+    ) {
         4 * 1024 * 1024
     } else {
         INPUT_LEN
@@ -453,6 +473,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
         };
         state.with_route_table_mut(|table| assert!(table.register_route(entry.clone())));
         let (release, released) = oneshot::channel();
+        let release = Arc::new(parking_lot::Mutex::new(Some(release)));
         let pending = state
             .forwarding
             .spawn(input_len as u64, |permit| async move {
@@ -590,12 +611,11 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 serde_json::from_slice(&reply[header_end + 4..]).unwrap()
             } else {
                 use tower::ServiceExt;
-                let head = request_head(
-                    socket,
-                    &entry,
-                    "ping",
-                    &format!("Content-Length: {input_len}\r\nExpect: 100-continue"),
-                );
+                let mut framing = format!("Content-Length: {input_len}");
+                if kind == CapacityRequest::Direct {
+                    framing.push_str("\r\nExpect: 100-continue");
+                }
+                let head = request_head(socket, &entry, "ping", &framing);
                 let mut request = axum::http::Request::builder()
                     .method("POST")
                     .uri("/grid/ping");
@@ -607,15 +627,67 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                     let (name, value) = reply_header(line.as_bytes()).unwrap();
                     request = request.header(name, value);
                 }
-                let body = axum::body::Body::from_stream(futures::stream::once(async {
-                    panic!("early capacity rejection must not poll the request body");
-                    #[allow(unreachable_code)]
-                    Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::new())
-                }));
+                let frames = Arc::new(AtomicUsize::new(0));
+                let eof = Arc::new(AtomicUsize::new(0));
+                let eager = matches!(
+                    kind,
+                    CapacityRequest::DirectEager | CapacityRequest::DirectEagerRelease
+                );
+                let body = if eager {
+                    let frames = frames.clone();
+                    let eof = eof.clone();
+                    let release = release.clone();
+                    let state = state.clone();
+                    let bytes = bytes::Bytes::from(vec![7; input_len]);
+                    axum::body::Body::from_stream(futures::stream::unfold(
+                        (bytes, 0),
+                        move |(bytes, offset)| {
+                            let frames = frames.clone();
+                            let eof = eof.clone();
+                            let release = release.clone();
+                            let state = state.clone();
+                            async move {
+                                if offset == 0 && kind == CapacityRequest::DirectEagerRelease {
+                                    assert_eq!(
+                                        state.forwarding.snapshot().rejected_reservations,
+                                        1
+                                    );
+                                    release.lock().take().unwrap().send(()).unwrap();
+                                    eventually(|| state.forwarding.snapshot().used_operations == 0)
+                                        .await;
+                                }
+                                if offset == bytes.len() {
+                                    eof.fetch_add(1, Ordering::SeqCst);
+                                    return None;
+                                }
+                                let end = (offset + 64 * 1024).min(bytes.len());
+                                frames.fetch_add(1, Ordering::SeqCst);
+                                Some((
+                                    Ok::<_, std::io::Error>(bytes.slice(offset..end)),
+                                    (bytes, end),
+                                ))
+                            }
+                        },
+                    ))
+                } else {
+                    axum::body::Body::from_stream(futures::stream::once(async {
+                        panic!("early capacity rejection must not poll the request body");
+                        #[allow(unreachable_code)]
+                        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::new())
+                    }))
+                };
                 let response = bounded(app.oneshot(request.body(body).unwrap()))
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                if eager {
+                    assert_eq!(frames.load(Ordering::SeqCst), input_len / (64 * 1024));
+                    assert_eq!(
+                        eof.load(Ordering::SeqCst),
+                        1,
+                        "transport must reach EOF before replying"
+                    );
+                }
                 let body = bounded(axum::body::to_bytes(response.into_body(), MAX_REPLY))
                     .await
                     .unwrap();
@@ -634,10 +706,14 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                     1
                 }
             );
-            assert_eq!(state.forwarding.snapshot().used_operations, 1);
+            let freed = kind == CapacityRequest::DirectEagerRelease;
+            assert_eq!(
+                state.forwarding.snapshot().used_operations,
+                if freed { 0 } else { 1 }
+            );
             assert_eq!(
                 state.forwarding.snapshot().used_retained_bytes,
-                input_len as u64
+                if freed { 0 } else { input_len as u64 }
             );
             assert!(state.local_route("grid").is_some());
         })
@@ -645,7 +721,9 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
         .await;
         // Even assertion failure releases the capacity owner and joins the
         // actual listener. Bound shutdown, aborting/joining on a stuck server.
-        let _ = release.send(());
+        if let Some(release) = release.lock().take() {
+            let _ = release.send(());
+        }
         bounded(pending).await.unwrap();
         state.forwarding.close();
         bounded(state.forwarding.drain()).await;
@@ -932,6 +1010,91 @@ impl Fixture {
             .unwrap();
         bounded(self.ipc_task).await.unwrap().unwrap();
         assert!(!self.server.is_running());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
+    let mut fixture = Fixture::start(Carrier::Inline, 1, INPUT_LEN as u64).await;
+    let result = AssertUnwindSafe(async {
+        let mut admitted = bounded(tokio::net::TcpStream::connect(fixture.socket))
+            .await
+            .unwrap();
+        bounded(
+            admitted.write_all(
+                fixture
+                    .head("target", &format!("Content-Length: {INPUT_LEN}"))
+                    .as_bytes(),
+            ),
+        )
+        .await
+        .unwrap();
+        bounded(admitted.write_all(&vec![7; INPUT_LEN]))
+            .await
+            .unwrap();
+        bounded(fixture.probe.entered[1].notified()).await;
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
+
+        let mut rejected = bounded(tokio::net::TcpStream::connect(fixture.socket))
+            .await
+            .unwrap();
+        bounded(
+            rejected.write_all(
+                fixture
+                    .head("ping", &format!("Content-Length: {INPUT_LEN}"))
+                    .as_bytes(),
+            ),
+        )
+        .await
+        .unwrap();
+        bounded(rejected.write_all(&[7])).await.unwrap();
+        eventually(|| fixture.state.forwarding.snapshot().rejected_reservations == 1).await;
+        fixture.release(1);
+        let reply = bounded(read_framed_reply(&mut admitted)).await.unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 200 "));
+        eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
+        assert!(
+            !fixture.state.forwarding.snapshot().closed,
+            "domain must stay open while B finishes uploading"
+        );
+        assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
+
+        bounded(rejected.write_all(&vec![7; INPUT_LEN - 1]))
+            .await
+            .unwrap();
+        let reply = bounded(read_framed_reply(&mut rejected)).await.unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 502 "));
+        let end = reply
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&reply[end + 4..]).unwrap();
+        assert_eq!(error["code"], 717);
+        assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
+        assert_eq!(fixture.state.forwarding.snapshot().rejected_reservations, 1);
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 0);
+        assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
+        assert_eq!(
+            fixture
+                .probe
+                .calls
+                .each_ref()
+                .map(|count| count.load(Ordering::SeqCst)),
+            [0, 1, 0]
+        );
+        assert!(fixture.state.local_route("grid").is_some());
+        assert!(fixture.client.is_connected());
+        let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+            .await
+            .unwrap_or_else(|_| panic!("healthy shared IPC must remain available"));
+        assert!(Arc::ptr_eq(&lease.client(), &fixture.client));
+        drop(lease);
+    })
+    .catch_unwind()
+    .await;
+    fixture.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
     }
 }
 

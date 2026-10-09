@@ -41,6 +41,7 @@ const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
 const ROUTE_UID_HEADER: &str = "x-c2-route-uid";
 const ROUTE_REVISION_HEADER: &str = "x-c2-route-revision";
 const UNKNOWN_LENGTH_BODY_LIMIT_BYTES: u64 = 64 * 1024;
+const REJECTED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct ReadyRequestClient {
     lease: UpstreamLease,
@@ -1633,24 +1634,37 @@ async fn call_handler(
     run_data_plane_after_precheck_hook(&route_name);
     let work_state = state.clone();
     let work_route_name = route_name.clone();
-    let waiter = match state
-        .forwarding
-        .spawn(content_length.unwrap_or(0), move |permit| {
-            forward_call(
-                work_state,
-                work_route_name,
-                method_name,
-                expected_crm,
-                advertised_route,
-                route_token,
-                content_length,
-                body,
-                permit,
-            )
-        }) {
-        Ok(waiter) => waiter,
-        Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
+    // Keep the transport body in the HTTP handler until admission succeeds.
+    // A rejected spawn drops its closure without dropping the unread body.
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+    let work = move |permit| async move {
+        let body = body_rx
+            .await
+            .expect("admitted forwarding input is sent before waiting");
+        forward_call(
+            work_state,
+            work_route_name,
+            method_name,
+            expected_crm,
+            advertised_route,
+            route_token,
+            content_length,
+            body,
+            permit,
+        )
+        .await
     };
+    let waiter = match state.forwarding.spawn(content_length.unwrap_or(0), work) {
+        Ok(waiter) => waiter,
+        Err(error) => {
+            let response = forwarding_capacity_response(&route_name, error.to_string());
+            return finish_capacity_rejection(&headers, content_length, body, response).await;
+        }
+    };
+    // No await separates admission from this ownership handoff.
+    body_tx
+        .send(body)
+        .expect("admitted forwarding task retains its input receiver");
     match waiter.await {
         Ok(response) => response,
         Err(_) => resource_unavailable_response_with_phase(
@@ -1659,6 +1673,50 @@ async fn call_handler(
             "dispatch_uncertain",
         ),
     }
+}
+
+async fn finish_capacity_rejection(
+    headers: &HeaderMap,
+    content_length: Option<u64>,
+    mut body: Body,
+    response: Response,
+) -> Response {
+    // Expect refusals must never poll Incoming: doing so sends 100 Continue.
+    // Unknown bodies are not drained. Invalid/oversized declarations are
+    // rejected by call_handler before admission and never reach this path.
+    if !headers.contains_key(header::EXPECT)
+        && let Some(mut remaining) = content_length
+    {
+        // Hyper 1.x only tries one read after an unread Incoming is dropped,
+        // then closes the read side. An eager sender can lose the final error
+        // to a socket abort. Keep the receiver alive through bounded EOF instead.
+        // This is transport disposal, with no allocation, decoding, IPC acquire
+        // or forwarding permit. It belongs to this handler, never a spawned task.
+        let _ = tokio::time::timeout(REJECTED_BODY_DRAIN_TIMEOUT, async {
+            use axum::body::HttpBody;
+            while let Some(frame) =
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+            {
+                let Ok(frame) = frame else { break };
+                if let Some(data) = frame.data_ref() {
+                    let Ok(length) = u64::try_from(data.len()) else {
+                        break;
+                    };
+                    let Some(rest) = remaining.checked_sub(length) else {
+                        break;
+                    };
+                    remaining = rest;
+                }
+                drop(frame);
+                // Also bound ready-only streams of empty frames/trailers: the
+                // timeout must get polled and other connections must progress.
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+    // A source fault, excess bytes or timeout cannot replace capacity authority.
+    response
 }
 
 fn forwarding_capacity_response(route_name: &str, message: impl Into<String>) -> Response {
@@ -6668,6 +6726,134 @@ mod tests {
 mod forwarding_admission_tests {
     use super::*;
     use c2_mem::RetentionBudget;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct BodyDrop(Arc<AtomicBool>);
+
+    impl Drop for BodyDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn assert_capacity_response(response: Response) {
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["code"], 717);
+        assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
+        assert_eq!(
+            error["message"],
+            "relay forwarding capacity: original refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_body_expect_and_unknown_length_are_never_polled() {
+        for (expect, length) in [(true, Some(4)), (false, None)] {
+            let mut headers = HeaderMap::new();
+            if expect {
+                headers.insert(header::EXPECT, "100-continue".parse().unwrap());
+            }
+            let body = Body::from_stream(futures::stream::once(async {
+                panic!("ineligible rejected body must not be polled");
+                #[allow(unreachable_code)]
+                Ok::<Bytes, std::io::Error>(Bytes::new())
+            }));
+            let response = finish_capacity_rejection(
+                &headers,
+                length,
+                body,
+                forwarding_capacity_response("grid", "original refusal"),
+            )
+            .await;
+            assert_capacity_response(response).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_body_excess_short_and_source_fault_preserve_error() {
+        for ending in ["excess", "fault", "short"] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let owner = BodyDrop(dropped.clone());
+            let observed = polls.clone();
+            let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+                let _keep_owner = &owner;
+                let poll = observed.fetch_add(1, Ordering::SeqCst);
+                let item = match poll {
+                    0 => Some(Ok(Bytes::from_static(b"abc"))),
+                    1 if ending == "fault" => Some(Err(std::io::Error::other("body source fault"))),
+                    1 if ending == "short" => None,
+                    1 => Some(Ok(Bytes::from_static(b"de"))),
+                    _ => panic!("must stop at the first fault or byte-bound violation"),
+                };
+                std::task::Poll::Ready(item)
+            }));
+            let response = finish_capacity_rejection(
+                &HeaderMap::new(),
+                Some(4),
+                body,
+                forwarding_capacity_response("grid", "original refusal"),
+            )
+            .await;
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_capacity_response(response).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_body_pending_and_ready_empty_streams_have_total_deadline() {
+        for always_ready in [false, true] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let owner = BodyDrop(dropped.clone());
+            let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+                let _keep_owner = &owner;
+                if always_ready {
+                    std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(Bytes::new())))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }));
+            let response = tokio::time::timeout(
+                REJECTED_BODY_DRAIN_TIMEOUT + Duration::from_secs(1),
+                finish_capacity_rejection(
+                    &HeaderMap::new(),
+                    Some(4),
+                    body,
+                    forwarding_capacity_response("grid", "original refusal"),
+                ),
+            )
+            .await
+            .expect("rejected transport cleanup must terminate");
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_capacity_response(response).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_body_cleanup_cancellation_drops_owner_without_background_task() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owner = BodyDrop(dropped.clone());
+        let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+            let _keep_owner = &owner;
+            std::task::Poll::Pending::<Option<Result<Bytes, std::io::Error>>>
+        }));
+        let headers = HeaderMap::new();
+        let mut cleanup = Box::pin(finish_capacity_rejection(
+            &headers,
+            Some(4),
+            body,
+            forwarding_capacity_response("grid", "original refusal"),
+        ));
+        assert!(futures::poll!(&mut cleanup).is_pending());
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(cleanup);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn unknown_length_charges_before_growth_and_rejects_without_dispatch() {
