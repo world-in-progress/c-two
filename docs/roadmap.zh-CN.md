@@ -1,8 +1,8 @@
 # C-Two 当前路线图
 
-状态更新：2026-10-07；产品排序沿用 7 月设计优先级。
+状态更新：2026-10-10；产品排序沿用 7 月设计优先级。
 
-这是 C-Two 0.x 的当前维护路线图，以 Python 0.7.0 / c3 0.3.0 为产品基线。FastDB 固定 0.2.1。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。版本可用性与发行门禁见[发布说明](releases/0.7.0.md)。
+这是 C-Two 0.x 的当前维护路线图，以 Python 0.7.4 / c3 0.3.3 为源码基线。FastDB 固定 0.2.1。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。源码变化、已执行门禁和发布状态见[0.7.4 说明](releases/0.7.4.zh-CN.md)与[验证记录](reports/0.7.4-final-validation.zh-CN.md)。
 
 当前端点、生命周期与内存源码证据见[统一验收](reports/canonical-local-endpoint-validation.md)，用法见[生命周期接入](local-endpoint-lifecycle.md)与[内存策略](memory-policy.md)。这是开发源码验证；30 wheel + sdist 与 5 CLI target 正式候选矩阵保留各自绑定源码的发行收据。
 
@@ -14,9 +14,9 @@ Portable-payload 架构与历史本地候选参考为：
 
 `docs/plans/`、`docs/reviews/` 与较早日期的 `docs/superpowers/` 文档只保留历史证据；除非本路线图明确引用，否则不再是当前权威。
 
-## 0.7.4 维护待办
+## 0.7.4 维护
 
-[0.7.4 待办](plans/0.7.4.zh-CN.md)记录下一版维护内容。第一项为放宽自定义 Unix 端点根目录权限、在监听前设置 socket 权限并改进错误诊断，状态为待实施、待验收。
+[实施记录](plans/0.7.4.zh-CN.md)覆盖自定义端点权限、当前路由获取、持久 TypeScript IPC、低风险内部精简及可选连接期限。同源 Linux、macOS 与 Windows 门禁通过；[最终验证记录](reports/0.7.4-final-validation.zh-CN.md)保留精确源对、审查状态与产物证据。
 
 ## 状态定义
 

@@ -1,0 +1,99 @@
+{
+  "fixture_patch_sha256": "66030c27fe443493a892caba9d7221d768d035879f3edf15c563c1b453961d08",
+  "fixed_output_sha": "c539892238c5516fb494e909adfd8aa21b6695a0",
+  "fixed_base_sha": "1fab44f7bb3cb1bd41f843a68a4133c917f6b7e9",
+  "artifact_id": "93d97cca-8248-4203-8714-d3d401db6ee0",
+  "output_file": {
+    "path": "core/transport/c2-http/src/relay/forwarding_tests.rs",
+    "sha256": "13b5cd9f941d73d827217c79eb03e5f536b5d29671caf387b2972c6ad2b7b951"
+  },
+  "evidence": [
+    {
+      "path": "/tmp/c2-074-validation/e6-windows-failed.log",
+      "sha256": "53c7401aa28c352e4162fd13dc18ed76aee30f65e89036c0db206964aa20bfaa"
+    },
+    {
+      "path": "/tmp/c2-074-h1-forwarding-host.log",
+      "sha256": "a43da4dfa466845e1ed81dec7dc2b7afc03ba063814a439a24a028133b7286cf"
+    },
+    {
+      "path": "/tmp/c2-074-astra-h1-eager-probe.log",
+      "sha256": "2d0564b038b34932f9ba56adba746c4e0f13f89af15a2bdbeef486fbe6108b9f"
+    },
+    {
+      "path": "/tmp/c2-074-astra-h1-public-eager-probe.log",
+      "sha256": "40f0aba98cfa97eb88fcc12fb653047fa4b6920b37f390ed4d72288ec85e7c23"
+    },
+    {
+      "path": "/tmp/c2-074-astra-h1-core-probe-adaptation.patch",
+      "sha256": "5fd8c70f015021f0df0b15ae7564c6f9d34642c0604398770b26c57821614665"
+    },
+    {
+      "path": "/tmp/c2-074-astra-h1-public-probe-adaptation.patch",
+      "sha256": "e0352427f5e630eab83e3964234723207738e5fea6f467a1094464d04ad0bcf3"
+    },
+    {
+      "path": "/tmp/c2-074-validation/final-local-builds/result.json",
+      "sha256": "568abb16504cea6d64d8c4f8f8e7cf60013527f1e31e5a37da22f9606c13925d"
+    },
+    {
+      "path": "/tmp/c2-074-validation/final-python-1fab44f7/run.json",
+      "sha256": "73b400ffb83f471e005df330d48af8fb9e51212b0f0f20d0c4e7724ddd1e5b2e"
+    },
+    {
+      "path": "/tmp/c2-074-h1-forwarding-with-eager-host.log",
+      "sha256": "2e25c8797be3da3b72b0acb6c6b46a9a7dbaa8aca394d0c96572ec685bb7d772"
+    },
+    {
+      "path": "/tmp/c2-074-h1-forwarding-with-eager-host-r3.log",
+      "sha256": "bb440def40ef4e02379e461e89fda924a919cf53625991bf20f3b447a258efc2"
+    },
+    {
+      "path": "/tmp/c2-074-h1-forwarding-with-eager-host-r4.log",
+      "sha256": "d3aad45561063f2acbc748fe530fa354bd15f88b5cfd1ceda24f6157a1019ac4"
+    },
+    {
+      "path": "/tmp/c2-074-h1-forwarding-with-eager-host-r5.log",
+      "sha256": "4ca3194b7d6dd115f7767854cadbc337d5c3b7ad23ba9aec97ee0c701caf01cc"
+    },
+    {
+      "path": "/tmp/c2-074-validation/final-source-runtime-comparison.json",
+      "sha256": "f42df2e8c88f63f22cfb57aa9bc6a7d29de26fa560e10d80d55153521cbe97e7"
+    }
+  ],
+  "independent_probes": {
+    "low_level_controlled_http": "2 operation/byte exhaustion rows passed; 4 MiB eager owned body; no Expect or Connection header; canonical 502/717; one dispatch each",
+    "public_relay_aware_http": "2 operation/byte exhaustion rows passed; default max_attempts 3; real resolve and POST; no connect-time probe; canonical 502/717; one dispatch each",
+    "production_mutations": "none; probes operate on a /tmp fixed-source copy; private reexport used only in low-level probe and reverted before public probe",
+    "dependency_versions": "identical to Core lockfile"
+  },
+  "protocol_sources": [
+    "https://www.rfc-editor.org/rfc/rfc9110.html#section-10.1.1",
+    "https://www.rfc-editor.org/rfc/rfc9112.html#section-9.6"
+  ],
+  "scope_limit": "Local probes do not establish Windows 2025 eager SDK behavior; final same-source hosted tests remain pending",
+  "final_host_extension": {
+    "base_sha": "1fab44f7bb3cb1bd41f843a68a4133c917f6b7e9",
+    "path": "core/transport/c2-http/src/relay/forwarding_tests.rs",
+    "file_sha256": "6361a7b690ea17fd415852204a6e7c9541d892517bd82f6fcd5251d847710fe8",
+    "patch_path": "/tmp/c2-074-astra-h1-final-reviewed.patch",
+    "patch_sha256": "8a038b3a92f4ca7dcb5f1d823a35901a18bd2ac15a412a5e9d230b5fcdfc74eb",
+    "scope": "original fixed output plus Host public eager SDK capacity regression, test-only single file",
+    "verified_host_run": "/tmp/c2-074-h1-forwarding-with-eager-host-r5.log",
+    "result": "14 passed, 0 failed, 0 ignored",
+    "pending": "same final source Linux/macOS and Windows2022/2025 hosted runs",
+    "commit": "8c4b039e88df849218fd984e26b1383a5db3eae0"
+  },
+  "decision": "Accept the scoped fixture correction with the reviewed public eager SDK capacity regression; final hosted acceptance remains pending. Original Windows reset is retained and not reclassified as an invalid request or proven fully diagnosed incident.",
+  "report": {
+    "path": "/tmp/c2-074-astra-h1-review.md",
+    "sha256": "d74995e02f96fae8366354236036257878c1f46a1576391ae8a83a64a5b01d85"
+  },
+  "final_hosted_pending": {
+    "windows_all_run": "37989052554",
+    "local_endpoint_validation_run": "37989056917",
+    "source_sha": "8c4b039e88df849218fd984e26b1383a5db3eae0",
+    "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "status": "pending final CI/hash receipts"
+  }
+}

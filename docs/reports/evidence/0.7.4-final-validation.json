@@ -1,0 +1,574 @@
+{
+  "schema": "c-two.0.7.4-final-validation.v1",
+  "source_pair": {
+    "c_two": "0deda44574f2737c9049169d99b965fde23c75fe",
+    "fastdb": "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+  },
+  "runs": [
+    {
+      "id": 37995943560,
+      "url": "https://github.com/Dsssyc/c-two/actions/runs/37995943560",
+      "conclusion": "success",
+      "jobs_passed": 4,
+      "scope": "Windows 2022/2025 full and local-platform"
+    },
+    {
+      "id": 37995946700,
+      "url": "https://github.com/Dsssyc/c-two/actions/runs/37995946700",
+      "conclusion": "success",
+      "jobs_passed": 5,
+      "scope": "Linux Core/Python/focused and Linux/macOS root cross-user"
+    }
+  ],
+  "windows_full": [
+    {
+      "name": "windows-native-windows-2025-full-0deda44574f2737c9049169d99b965fde23c75fe",
+      "artifact_id": 11648715082,
+      "api_digest": "sha256:2ed941ab3442e653f8dfc1d022d942d22423fd5cd3bf24cf2e235a2235a1b6de",
+      "zip_sha256": "2ed941ab3442e653f8dfc1d022d942d22423fd5cd3bf24cf2e235a2235a1b6de",
+      "zip_bytes": 12221886,
+      "scope": "full",
+      "label": "windows-2025",
+      "runner": {
+        "requested_label": "windows-2025",
+        "os": "Windows-2025Server-10.0.26100-SP0",
+        "machine": "AMD64",
+        "image": "win25-vs2026",
+        "image_version": "20260925.250.1"
+      },
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "all_gates": 24,
+      "internal_hashes_verified": 49,
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "c3_sha256": "80e2210c1d94d225bf696067e6b3a225f92346e18e0d525d3c13039267316887",
+      "c3_bytes": 20313088,
+      "wheel_consumers": [
+        {
+          "receipt": "installed-wheel-full-receipt.v1.json",
+          "administrator": true,
+          "direct_and_relay_passed": true,
+          "held_and_borrowed_invalidated": true,
+          "process_temp_cleanup": true
+        },
+        {
+          "receipt": "installed-wheel-standard-user-full-receipt.v1.json",
+          "administrator": false,
+          "direct_and_relay_passed": true,
+          "held_and_borrowed_invalidated": true,
+          "process_temp_cleanup": true
+        }
+      ],
+      "nonadmin_account_process_workspace_cleanup": true,
+      "python": {
+        "ordinary_passed": 1166,
+        "unix_root_capability_skipped": 39,
+        "duration_seconds": 159.9,
+        "log_sha256": "f51330188e632aeb103e8791078240055d937522917e993f2c4ba87f43f5f22d"
+      }
+    },
+    {
+      "name": "windows-native-windows-2022-full-0deda44574f2737c9049169d99b965fde23c75fe",
+      "artifact_id": 11647568003,
+      "api_digest": "sha256:988696a2902e8cf55e9ffae3c6c4adafbe725cc7aea6b711a8a2238bb8cf9288",
+      "zip_sha256": "988696a2902e8cf55e9ffae3c6c4adafbe725cc7aea6b711a8a2238bb8cf9288",
+      "zip_bytes": 12243971,
+      "scope": "full",
+      "label": "windows-2022",
+      "runner": {
+        "requested_label": "windows-2022",
+        "os": "Windows-2022Server-10.0.20348-SP0",
+        "machine": "AMD64",
+        "image": "win22",
+        "image_version": "20261004.326.1"
+      },
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "all_gates": 24,
+      "internal_hashes_verified": 49,
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "c3_sha256": "b4c3fbe7c238801f515852b87a925ecc6865e10243c945ceb55ff4fb8c9d155e",
+      "c3_bytes": 20315136,
+      "wheel_consumers": [
+        {
+          "receipt": "installed-wheel-full-receipt.v1.json",
+          "administrator": true,
+          "direct_and_relay_passed": true,
+          "held_and_borrowed_invalidated": true,
+          "process_temp_cleanup": true
+        },
+        {
+          "receipt": "installed-wheel-standard-user-full-receipt.v1.json",
+          "administrator": false,
+          "direct_and_relay_passed": true,
+          "held_and_borrowed_invalidated": true,
+          "process_temp_cleanup": true
+        }
+      ],
+      "nonadmin_account_process_workspace_cleanup": true,
+      "python": {
+        "ordinary_passed": 1166,
+        "unix_root_capability_skipped": 39,
+        "duration_seconds": 153.6,
+        "log_sha256": "0092c6b4919fbf8c8be7be413ed6c30bcc90dd418e36dceb683204f9fc965fc8"
+      }
+    }
+  ],
+  "windows_zip_artifacts": [
+    {
+      "name": "windows-native-windows-2025-full-0deda44574f2737c9049169d99b965fde23c75fe",
+      "artifact_id": 11648715082,
+      "api_digest": "sha256:2ed941ab3442e653f8dfc1d022d942d22423fd5cd3bf24cf2e235a2235a1b6de",
+      "zip_sha256": "2ed941ab3442e653f8dfc1d022d942d22423fd5cd3bf24cf2e235a2235a1b6de",
+      "zip_bytes": 12221886,
+      "scope": "full",
+      "label": "windows-2025"
+    },
+    {
+      "name": "windows-native-windows-2022-full-0deda44574f2737c9049169d99b965fde23c75fe",
+      "artifact_id": 11647568003,
+      "api_digest": "sha256:988696a2902e8cf55e9ffae3c6c4adafbe725cc7aea6b711a8a2238bb8cf9288",
+      "zip_sha256": "988696a2902e8cf55e9ffae3c6c4adafbe725cc7aea6b711a8a2238bb8cf9288",
+      "zip_bytes": 12243971,
+      "scope": "full",
+      "label": "windows-2022"
+    },
+    {
+      "name": "windows-native-windows-2025-local-platform-0deda44574f2737c9049169d99b965fde23c75fe",
+      "artifact_id": 11647207146,
+      "api_digest": "sha256:966136e448cb0a5c2f52976444b0e9d9f05f25de64d59b763da376ba8c85baac",
+      "zip_sha256": "966136e448cb0a5c2f52976444b0e9d9f05f25de64d59b763da376ba8c85baac",
+      "zip_bytes": 31041,
+      "scope": "local-platform",
+      "label": "windows-2025"
+    },
+    {
+      "name": "windows-native-windows-2022-local-platform-0deda44574f2737c9049169d99b965fde23c75fe",
+      "artifact_id": 11646624779,
+      "api_digest": "sha256:c0f12006fddca8459baa3f5ed7b9e00806b67393851ccf1674ac8fedbbbd95f9",
+      "zip_sha256": "c0f12006fddca8459baa3f5ed7b9e00806b67393851ccf1674ac8fedbbbd95f9",
+      "zip_bytes": 31033,
+      "scope": "local-platform",
+      "label": "windows-2022"
+    }
+  ],
+  "windows_local_platform": [
+    {
+      "label": "windows-2025",
+      "scope": "local-platform",
+      "internal_hashes_verified": 1
+    },
+    {
+      "label": "windows-2022",
+      "scope": "local-platform",
+      "internal_hashes_verified": 1
+    }
+  ],
+  "unix_artifacts": [
+    {
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-python-suite",
+      "artifact_id": 11647207815,
+      "api_digest": "sha256:39e8d0a7d9ac0db23e4aecaf9d0465907d35665d2dad96ec69f48d0d989ddd7c",
+      "zip_sha256": "39e8d0a7d9ac0db23e4aecaf9d0465907d35665d2dad96ec69f48d0d989ddd7c",
+      "zip_bytes": 319074,
+      "status": "passed",
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "workers": 2,
+      "collected": 1244,
+      "ordinary_summary": "1200 passed, 5 skipped in 95.02s (0:01:35)",
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "c3_sha256": "a2610f769805500d86e753b6e4de1a64401c9e8e319802cd10454f6b5981aa5b",
+      "native_sha256": "4eeb8cf69e76bc89e6f788bc841340ccec71360ebc95661155ad95ec2240087c",
+      "node": "v22.23.3",
+      "python_native_name": "_native.cpython-310-x86_64-linux-gnu.so",
+      "all_test_children_and_cleanup_confirmed": true
+    },
+    {
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-core-test",
+      "artifact_id": 11647057963,
+      "api_digest": "sha256:14de34a8c27e31bd76d3dbd25c4d9c99c9e2defb617c8858b600cd41665ddafd",
+      "zip_sha256": "14de34a8c27e31bd76d3dbd25c4d9c99c9e2defb617c8858b600cd41665ddafd",
+      "zip_bytes": 36913,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "runner": "runner Linux-X64",
+      "status": "passed",
+      "test_logs_passed": true
+    },
+    {
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-cross-user-macos-15",
+      "artifact_id": 11646868281,
+      "api_digest": "sha256:a1f5bce4cd190e6476470edf8259b8fd2f3284b4babee22b0f64133b13e34bb9",
+      "zip_sha256": "a1f5bce4cd190e6476470edf8259b8fd2f3284b4babee22b0f64133b13e34bb9",
+      "zip_bytes": 7842,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "runner": "runner macOS-ARM64",
+      "status": "passed",
+      "cross_user_raw_socket_denial_verified": true,
+      "test_binary_sha256": "2a0dbe73631014e7942e65762e97cf667ba8719f817c6b10816b098fd2df5d6a",
+      "ordinary_local_tests_passed": true
+    },
+    {
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-focused-local",
+      "artifact_id": 11646863340,
+      "api_digest": "sha256:550060b40441774e6e3d0b10443e663d463842722f23cdaafa83586e4202af59",
+      "zip_sha256": "550060b40441774e6e3d0b10443e663d463842722f23cdaafa83586e4202af59",
+      "zip_bytes": 11795,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "runner": "runner Linux-X64",
+      "status": "passed",
+      "test_logs_passed": true
+    },
+    {
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-cross-user-ubuntu-24.04",
+      "artifact_id": 11646669039,
+      "api_digest": "sha256:cca69db2a52ae0f54ec03196595b143630085a45e798797bc45d500e065573a2",
+      "zip_sha256": "cca69db2a52ae0f54ec03196595b143630085a45e798797bc45d500e065573a2",
+      "zip_bytes": 8457,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "runner": "runner Linux-X64",
+      "status": "passed",
+      "cross_user_raw_socket_denial_verified": true,
+      "test_binary_sha256": "81264720afab1fe1a156da83c6f2132d8a3c7dcbfb81f6a9d76d4d36dd8a134a",
+      "ordinary_local_tests_passed": true
+    }
+  ],
+  "linux_test_totals": {
+    "core": 1691,
+    "rust_sdk": 18,
+    "cli": 76
+  },
+  "macos": {
+    "build_steps": [
+      {
+        "name": "rust-sdk",
+        "exit_code": 0
+      },
+      {
+        "name": "python-build",
+        "exit_code": 0
+      },
+      {
+        "name": "cli-tests",
+        "exit_code": 0
+      },
+      {
+        "name": "cli-build",
+        "exit_code": 0
+      },
+      {
+        "name": "python-focused",
+        "exit_code": 0
+      }
+    ],
+    "native": {
+      "sha256": "77b6375e1f9e444a951efdc2e2e01fa60053cc37312ceb1f84fca3ec3a516653",
+      "bytes": 10246144
+    },
+    "c3": {
+      "sha256": "427b81e88c675ba07ec8c270e5d46e7eb2e4430bc55eb8ac3917b5c20c2c0eb6",
+      "bytes": 37403104
+    },
+    "http_all_features": {
+      "passed": 427,
+      "failed": 0
+    },
+    "python": {
+      "status": "passed",
+      "exit_code": 0,
+      "workers": 4,
+      "duration_seconds": 85.5805086659966,
+      "collected": 1244,
+      "ordinary_passed": 1200,
+      "windows_only_skipped": 5,
+      "portable_passed": 25,
+      "typescript_passed": 14,
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "native_sha256": "77b6375e1f9e444a951efdc2e2e01fa60053cc37312ceb1f84fca3ec3a516653",
+      "c3_sha256": "427b81e88c675ba07ec8c270e5d46e7eb2e4430bc55eb8ac3917b5c20c2c0eb6",
+      "node": "v22.23.3",
+      "python310_available": true
+    }
+  },
+  "input_summary_sha256": [
+    {
+      "file": "eager-final-windows-artifacts/full-verification.json",
+      "sha256": "3973b4228e3476592d2da6eefad2cb97c7a84533ec9ef6cff19057aeb58ed040"
+    },
+    {
+      "file": "eager-final-windows-artifacts/zip-verification.json",
+      "sha256": "a0e0d23cfc3f50a48e675a5a4ab3d3aff88271b5ccd154ace5d5630ee2dd1aab"
+    },
+    {
+      "file": "eager-final-unix-artifacts/full-verification.json",
+      "sha256": "17fcb8cdef3393bfe7f0d23bfa1cc7b4a1db220a0b5c7fb51d5f9aa4b953130f"
+    },
+    {
+      "file": "eager-final-local-builds/result.json",
+      "sha256": "bb028e5bbb1eb1b7d49a1be00dd620dd114a3774ca71cdd57f52ffdcf6c8c7d1"
+    },
+    {
+      "file": "final-python-0deda445/run.json",
+      "sha256": "e371eae33fa8a7cc04d8d31f97b2a324b598a8ec728823fee03ada30389be85e"
+    }
+  ],
+  "evidence_log_sha256": [
+    {
+      "file": "c2-074-eager-capacity-http-host-r3.log",
+      "sha256": "a27b49f12553976ab26cebb476412dabd747a47c881bd855d5024c123f7fb150"
+    },
+    {
+      "file": "c2-074-validation/eager-final-local-builds/rust-sdk.log",
+      "sha256": "38ddbb8504e4a1405e8ede4630e83a25c6444690ad683d5a8279ff00c29efc6d"
+    },
+    {
+      "file": "c2-074-validation/eager-final-local-builds/python-build.log",
+      "sha256": "3550067adfa9c6a8fbfeae71e6201b65cf5b155e9a1f48b86fc6f08ab6c351f0"
+    },
+    {
+      "file": "c2-074-validation/eager-final-local-builds/cli-tests.log",
+      "sha256": "e4c4c2b4d129d0c69f95f9295c241e73acdde325cd9fcb02b7d7e871621a30cd"
+    },
+    {
+      "file": "c2-074-validation/eager-final-local-builds/cli-build.log",
+      "sha256": "a7a44566c214f69ea59e1cc6cbcf101110c11deb5622f9eab3731f49ba8fa709"
+    },
+    {
+      "file": "c2-074-validation/eager-final-local-builds/python-focused.log",
+      "sha256": "0498b15e0b098770809d5e1c3eced704e10ef448f0790dda8548a793f00fd481"
+    },
+    {
+      "file": "c2-074-validation/final-python-0deda445/collection/full/output.log",
+      "sha256": "bbedac6c13723d6214f0a3d3d9521bed8fad41ccad66980e35300a6e02ed01a4"
+    },
+    {
+      "file": "c2-074-validation/final-python-0deda445/collection/ordinary/output.log",
+      "sha256": "fbca060aa315ece339332224b6b129984af252b18c75f9a8293f6f0a851c4161"
+    },
+    {
+      "file": "c2-074-validation/final-python-0deda445/collection/portable/output.log",
+      "sha256": "1e7104a47c0e535a69897f931b500f2c9ae80743c3f1b307d0ef56cc32c613a2"
+    },
+    {
+      "file": "c2-074-validation/final-python-0deda445/collection/typescript/output.log",
+      "sha256": "1d581fa96e8f85458ca62d9c87ef5f7b8fb7a2c2fdce52e249ce341c0e6b6f7d"
+    },
+    {
+      "file": "c2-074-validation/final-python-0deda445/ordinary/output.log",
+      "sha256": "45a1be98d73afbedce244f9ef545e5386ee1fdb753cbcb8b777dca6a864b1b31"
+    },
+    {
+      "file": "c2-074-validation/final-python-0deda445/portable/output.log",
+      "sha256": "686258a50f05fd849a518a6d322b7d31ae4f8c8301b782a39ced100ab8c7f4d0"
+    },
+    {
+      "file": "c2-074-validation/final-python-0deda445/typescript/output.log",
+      "sha256": "644f90c7249d215a2ae2904e8a40a921616d2c5c92533e3503ff7cb0513b36aa"
+    }
+  ],
+  "host_independent_validator_exit_code": 0,
+  "acceptance": {
+    "T1_to_T7": "complete",
+    "T9": "accepted and checkout removed",
+    "T8": "complete: final Astra acceptance archived; all scoped Buddy workspaces removed",
+    "buddy_removed": [
+      "T1",
+      "T2",
+      "T3",
+      "T7",
+      "T9",
+      "Unix failed partial",
+      "H1",
+      "eager-capacity-repair"
+    ],
+    "buddy_stopped_pending": [],
+    "final_buddy_cleanup": [
+      {
+        "run_id": "5485cd79-e7eb-4d22-9390-47f3df9e88c8",
+        "state": "accepted",
+        "revision": 8,
+        "plan_id": "cln-146de9f6-d0fd-44f3-8ea7-7be9538639e5",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "get_receipt_sha256": "a8cc85c58f37fc6012e89b5dd1f0a90d84aa3599764609a524b2f5198a8e24d6"
+      },
+      {
+        "run_id": "a878c068-076a-4ee9-a11c-794292036699",
+        "state": "accepted",
+        "revision": 8,
+        "plan_id": "cln-9608a031-dfdd-49c5-af59-27dc3c3d7b8f",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "get_receipt_sha256": "ceb492d48c4602833248cf3c9efa6507db977330a5effeb23d53ba1240abb532"
+      }
+    ],
+    "astra": {
+      "model": "gpt-6-astra",
+      "effort": "max",
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "recommendation": "accept implementation and executed validation scope",
+      "blocking_findings": [],
+      "blocking_t1_t9_implementation_or_validation_omissions": [],
+      "validator_exit_code": 0,
+      "archived_report": "docs/reviews/0.7.4-astra-final-acceptance.md",
+      "archived_evidence": "docs/reports/evidence/0.7.4-astra-final-acceptance-evidence.json",
+      "archived_validation": "docs/reports/evidence/0.7.4-astra-final-validation.json",
+      "report_sha256": "4979621a3b475596001935f3e4b012daee7d6e38b9f4d54c5eec43f28d7fbbbe",
+      "evidence_sha256": "b0280d90d9d2a436befef9f1c2d1b081ef789b72b3ff862453ffa33a71172a92",
+      "validation_sha256": "04474bc834bcf24fe97166b0623085f9c0067d238eb7cbd8e14fe5ba1a491ba5"
+    },
+    "all_scoped_buddy_lifecycle": [
+      {
+        "task": "permissions",
+        "run_id": "f2020f7b-00d1-40d6-a028-c39ebca51957",
+        "state": "accepted",
+        "revision": 12,
+        "cleanup_plan_id": "cln-368bf9cc-e469-47a9-b110-9a0871f775eb",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "artifact_id": "2231f5c0-2f4f-41ba-b18f-171a0776feac",
+        "integration_id": "int-c7b90a72-3d88-49f4-933d-9743e5f250b2",
+        "integration_after_commit": "2f5ba2157f9fea7a898bf4cfe278b616ec4e6954",
+        "verdict": "accepted",
+        "get_receipt_sha256": "98af402474ea1e948f1e2cb4d1e32f8ed35c48ac33c88c2ec2ce36f6ffe0fa34"
+      },
+      {
+        "task": "route_authority",
+        "run_id": "904d0a71-8037-42ae-9e14-fb958a6903c8",
+        "state": "accepted",
+        "revision": 12,
+        "cleanup_plan_id": "cln-18358154-781b-4e88-b9d6-b94eae53998e",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "artifact_id": "9e46d631-7166-4dd9-b9d7-2f870fe1c839",
+        "integration_id": "int-2ff5898f-fecb-4e1d-ad2e-237ad84a6642",
+        "integration_after_commit": "0f04828c23686ddbb1d75a9a607ae2a1d718d0bb",
+        "verdict": "accepted",
+        "get_receipt_sha256": "54e84b95c046ebe2961b540b9b65230ae082bfc31939f6d8f105de3fa33bcf6d"
+      },
+      {
+        "task": "typescript_route",
+        "run_id": "5fc075fe-4315-4542-a7f6-541988a9c922",
+        "state": "accepted",
+        "revision": 12,
+        "cleanup_plan_id": "cln-38fb8641-bb1b-4823-8bf4-4ac7cb188399",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "artifact_id": "61b54c8d-c9be-45e8-8742-38d62088a4ba",
+        "integration_id": "int-ddc3b619-ab16-49fb-ba22-c4a9bc1f2f33",
+        "integration_after_commit": "6abfe30a14512816190f42156a3a0d892347c089",
+        "verdict": "accepted",
+        "get_receipt_sha256": "58561febff21c903ecd2569eb25a6216968d1fa5d299b5cafcf38704965ea080"
+      },
+      {
+        "task": "connect_deadline",
+        "run_id": "5feff9e7-ce6e-440b-82af-86c12f078d4d",
+        "state": "accepted",
+        "revision": 17,
+        "cleanup_plan_id": "cln-2c901149-8b9c-4a88-9668-c1f597fc7429",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "artifact_id": "8962aefe-1005-4405-8e60-4a78122edcca",
+        "integration_id": "int-d469a170-e31f-4198-a344-0c87f21eb3d2",
+        "integration_after_commit": "4e9a238e3d6563c20393619342e2c1be0fc54b29",
+        "verdict": "accepted",
+        "get_receipt_sha256": "1fb48d1f4cb36a002c55e7825cc2733ef4804ce972d7b434bc9704816fc8abc7"
+      },
+      {
+        "task": "idle_timer",
+        "run_id": "e69d44f6-cbd2-47a0-90bd-0ca0f7f3a438",
+        "state": "accepted",
+        "revision": 12,
+        "cleanup_plan_id": "cln-e6444e92-228a-4d3d-a2ad-7016f1c76685",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "artifact_id": "b8d4208c-f6c7-41ff-8635-9ec152e16a98",
+        "integration_id": "int-794b1d55-9d38-424b-80d3-8f4f4f3326c8",
+        "integration_after_commit": "e42a8f82d1ffc6fd5f3d1b5e68060c0136e14650",
+        "verdict": "accepted",
+        "get_receipt_sha256": "309e1dd4359923f3484e28fc651e31d73d91c464c700b21a90fead787eb65bac"
+      },
+      {
+        "task": "astra_unix_repair",
+        "run_id": "3c0c184b-1e1b-4293-8536-c6eb7458b4c1",
+        "state": "failed",
+        "revision": 8,
+        "cleanup_plan_id": "cln-2ca5fc89-4280-4c56-9866-7e9abfd599c5",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "artifact_id": "b8201904-0239-44da-84b0-a53d119dc4c5",
+        "integration_id": "int-bc212d07-19a1-4494-b9f4-8cae8052587b",
+        "integration_after_commit": "aa96f151fa97728ff0e634426a52d921eeeaf661",
+        "verdict": "recorded",
+        "get_receipt_sha256": "243da7de99c2e1e1abc5297c77884baaff10aa86114f15f4a7971c0e84b2c68f"
+      },
+      {
+        "task": "h1",
+        "run_id": "5485cd79-e7eb-4d22-9390-47f3df9e88c8",
+        "state": "accepted",
+        "revision": 8,
+        "cleanup_plan_id": "cln-146de9f6-d0fd-44f3-8ea7-7be9538639e5",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "artifact_id": "93d97cca-8248-4203-8714-d3d401db6ee0",
+        "integration_id": "int-62aa6670-ae85-480b-ab33-ca0076b06bd0",
+        "integration_after_commit": "8c4b039e88df849218fd984e26b1383a5db3eae0",
+        "verdict": "accepted",
+        "get_receipt_sha256": "a8cc85c58f37fc6012e89b5dd1f0a90d84aa3599764609a524b2f5198a8e24d6"
+      },
+      {
+        "task": "eager_capacity_repair",
+        "run_id": "a878c068-076a-4ee9-a11c-794292036699",
+        "state": "accepted",
+        "revision": 8,
+        "cleanup_plan_id": "cln-9608a031-dfdd-49c5-af59-27dc3c3d7b8f",
+        "cleanup_state": "applied",
+        "removed": true,
+        "self_shutdown_confirmed": true,
+        "descendant_shutdown_confirmed": true,
+        "artifact_id": "3fbf2402-4fce-4b1a-a731-08b73199d206",
+        "integration_id": "int-a3e64294-e1f6-4e3d-91f1-02219cd8df52",
+        "integration_after_commit": "0deda44574f2737c9049169d99b965fde23c75fe",
+        "verdict": "accepted",
+        "get_receipt_sha256": "ceb492d48c4602833248cf3c9efa6507db977330a5effeb23d53ba1240abb532"
+      }
+    ],
+    "owned_fastdb_validation_checkout_removed": true,
+    "implementation_checkout_retained_for_review": true
+  },
+  "limits": [
+    "Windows 11 desktop and Windows ARM64 not executed",
+    "Rust SDK 0.1.0 remains source-only",
+    "Earlier source 1fab44f7 full Core/native/repository/Node runs are not final-source evidence",
+    "No throughput or net line-count improvement claim",
+    "Two-second rejected-body disposal has no new global rejection concurrency limit; forwarding drain is not an all-HTTP-buffer barrier",
+    "Malformed, incomplete or too-slow uploads need not receive canonical response",
+    "No PR created, no merge, no publication"
+  ],
+  "documentation_commit_policy": "Post-test docs-only commit; runtime/test artifacts remain bound to 0deda44574f2737c9049169d99b965fde23c75fe."
+}

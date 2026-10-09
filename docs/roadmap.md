@@ -1,11 +1,11 @@
 # C-Two Current Roadmap
 
-Status refreshed: 2026-10-07; product ordering retains the July design priorities.
+Status refreshed: 2026-10-10; product ordering retains the July design priorities.
 
-This is the maintained roadmap for C-Two's 0.x line, using Python 0.7.0 / c3
-0.3.0 as the product baseline. FastDB is pinned to 0.2.1. Rust SDK/Core/TypeScript
+This is the maintained roadmap for C-Two's 0.x line, using Python 0.7.4 / c3
+0.3.3 as the source baseline. FastDB is pinned to 0.2.1. Rust SDK/Core/TypeScript
 retain independent 0.1.0 versions with no C-Two crates.io/npm publication.
-See [release notes](releases/0.7.0.md) for availability and release gates.
+See [0.7.4 notes](releases/0.7.4.md) and the [validation record](reports/0.7.4-final-validation.md) for source changes, executed gates and publication status.
 
 Current endpoint/lifecycle and memory source evidence is the
 [canonical validation](reports/canonical-local-endpoint-validation.md), with
@@ -22,9 +22,9 @@ Portable-payload architecture and historical local-candidate references are:
 
 Documents under `docs/plans/`, `docs/reviews/`, and older `docs/superpowers/` dates are retained evidence. They are not current authority unless this roadmap explicitly says otherwise.
 
-## 0.7.4 maintenance backlog
+## 0.7.4 maintenance
 
-The [0.7.4 backlog](plans/0.7.4.md) records the next maintenance work. Its first item relaxes custom Unix endpoint root permissions, moves socket permission setup before listening, and improves diagnostics. Implementation and validation are pending.
+The [implementation record](plans/0.7.4.md) covers custom endpoint permissions, live route acquisition, persistent TypeScript IPC, low-risk internal removals and optional connection deadlines. Same-source Linux, macOS and Windows gates pass; the [final validation record](reports/0.7.4-final-validation.md) retains the exact source pair, review status and artifact evidence.
 
 ## Status Definitions
 

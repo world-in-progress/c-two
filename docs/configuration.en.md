@@ -115,6 +115,8 @@ Pre-register upstreams as `--upstream NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must 
 
 Relay freezes forwarding limits at startup and applies them to all forwarded business calls, including calls with unlimited caller waiting. A zero count limit rejects new forwards; a zero byte budget rejects positive input. Known-length input is reserved before dispatch; unknown-length input is checked as it grows. Capacity refusal preserves the route. These limits are independent of upstream IPC backing and reassembly budgets and do not measure process RSS.
 
+Relay capacity rejection is fixed before business admission. For a request without Expect and with a valid declared length, the HTTP handler discards transport data frame by frame within that length and one two-second deadline. It does not aggregate the payload, decode it, invoke a resource or retry admission; capacity released during disposal does not change the rejection. Rejected Expect or unknown-length bodies are not read. Read faults, length mismatches and timeout preserve the original capacity error. An incomplete or faulty transport can prevent the client from receiving that response.
+
 After an HTTP caller disconnects, an already-dispatched forward retains its input and upstream connection until actual completion. Relay shutdown stops admission and waits for forwarding and native client cleanup. A resource method that never returns continues to occupy its slot and delays shutdown.
 
 ## Local endpoint directories
