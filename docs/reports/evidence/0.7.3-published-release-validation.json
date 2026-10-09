@@ -1,0 +1,109 @@
+{
+  "schema": "c-two.published-release-validation.v1",
+  "status": "passed",
+  "verified_at_utc": "2026-10-09T13:57:15.734412+00:00",
+  "source_commit": "b0031040a8d1a75d9f089f85b10568e7b33c6343",
+  "fastdb_source_commit": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "versions": {
+    "c-two": "0.7.3",
+    "c3": "0.3.2",
+    "fastdb4py": "0.2.1"
+  },
+  "manifest_sha256": "59f910ea837618059bae4dd73afbbcc1e0cc69ead8334b53666e3f86ac0731aa",
+  "runs": {
+    "candidate": 37935084170,
+    "windows_native": 37935084126,
+    "cli_publish": 37938157729,
+    "python_publish": 37938157841
+  },
+  "published_inventory": {
+    "github_release": {
+      "tag": "c3-v0.3.2",
+      "assets": 15,
+      "source_tag_verified": true,
+      "all_names_sizes_sha256_verified": true
+    },
+    "pypi": {
+      "version": "0.7.3",
+      "wheels": 30,
+      "sdist": 1,
+      "all_names_sizes_sha256_verified": true,
+      "none_yanked": true
+    }
+  },
+  "downloaded_files": [
+    {
+      "name": "c_two-0.7.3-cp313-cp313-macosx_11_0_arm64.whl",
+      "bytes": 4083027,
+      "sha256": "61b51784e6f78e65056978a4952a58273174ed8e4e7f6268a4cf973f0eadde0d"
+    },
+    {
+      "name": "fastdb4py-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+      "bytes": 1133461,
+      "sha256": "e203a3262f9260719220fe207bd2f12ed0719031a61b92e14eb42a8c0bc9dd28"
+    },
+    {
+      "name": "c3-aarch64-apple-darwin",
+      "bytes": 11276960,
+      "sha256": "0bcd6e310e91489f0330c1a7aa2f64f8bb501de2158808cf00ad65a015b5bd45"
+    },
+    {
+      "name": "c3-x86_64-pc-windows-msvc.exe",
+      "bytes": 11051520,
+      "sha256": "99d3681367fc0f81534f45d2ba706c995aeaf01ef7af4ae24c86bfa9c3abf263"
+    }
+  ],
+  "isolated_consumer": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "interpreter": "3.13.3 (main, Apr  9 2025, 03:47:57) [Clang 20.1.0 ]",
+    "status": "passed",
+    "source_commit": "b0031040a8d1a75d9f089f85b10568e7b33c6343",
+    "transports": [
+      {
+        "transport": "direct",
+        "observed_mode": "ipc",
+        "status": "passed",
+        "payload_bytes": 1048576,
+        "held_view_invalidated": true
+      },
+      {
+        "transport": "relay",
+        "observed_mode": "http",
+        "status": "passed",
+        "payload_bytes": 1048576,
+        "held_view_invalidated": true
+      }
+    ],
+    "borrowed_inputs_invalidated": 4,
+    "cleanup": {
+      "host_orderly_shutdown": true,
+      "errors": [],
+      "relay_stop": "terminated",
+      "host_stop": "already_exited",
+      "processes_exited": true,
+      "temporary_directory_removed": true
+    }
+  },
+  "windows_native": {
+    "windows-2022": {
+      "artifact": "windows-native-windows-2022-full-b0031040a8d1a75d9f089f85b10568e7b33c6343",
+      "gates_passed": 23,
+      "native_c3_sha256": "b4cf38c0f29680181ea4d0e2f49ebefe4b3a40ab3ffb1eaa00b988e4024d9e2c",
+      "run_id": 37935084126,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/37935084126"
+    },
+    "windows-2025": {
+      "artifact": "windows-native-windows-2025-full-b0031040a8d1a75d9f089f85b10568e7b33c6343",
+      "gates_passed": 23,
+      "native_c3_sha256": "143e474ec616d39db2e9583a490f539e1419521f24b47946ce4dc04bddc521ac",
+      "run_id": 37935084126,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/37935084126"
+    }
+  },
+  "scope": [
+    "Public inventory verified without redownloading all wheels.",
+    "Public macOS ARM64 CPython 3.13 wheel and executable consumed outside the source tree.",
+    "Public Windows x64 exe downloaded and hashed on macOS; actual Windows runtime coverage is Server 2022/2025.",
+    "Windows 11 desktop, ARM64 and services are not established by this record."
+  ]
+}
