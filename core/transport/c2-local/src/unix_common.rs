@@ -616,12 +616,6 @@ impl Drop for BoundSocketGuard<'_> {
     }
 }
 
-/// Denial-only native socket replacement probe.
-///
-/// `true` means a live or undecidable listener owns the path, so replacement
-/// must be refused. `false` means the kernel reported a dead rendezvous; a
-/// failed connect is never positive proof of death by itself, which is why the
-/// caller still requires a matching owner record for the exact inode.
 /// Initiates exactly one nonblocking connect using the verified directory.
 /// Pending connections are completed on the caller's reactor, never in the
 /// macOS directory thread. RAII owns every descriptor through the handoff.
@@ -673,7 +667,12 @@ fn start_nonblocking_connect(path: &Path) -> io::Result<socket2::Socket> {
     }
 }
 
-/// Advisory liveness veto; this result never grants unlink authority.
+/// Denial-only native socket replacement probe.
+///
+/// `true` means a live or undecidable listener owns the path, so replacement
+/// must be refused. `false` means the kernel reported a dead rendezvous; a
+/// failed connect is never positive proof of death by itself, which is why the
+/// caller still requires a matching owner record for the exact inode.
 pub(crate) fn probe_listener_is_live(
     directory: &EndpointDirectory,
     socket_name: &OsStr,
