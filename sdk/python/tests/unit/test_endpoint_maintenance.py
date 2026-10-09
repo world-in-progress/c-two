@@ -14,6 +14,7 @@ executable coverage instead of disappearing from the suite.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -29,7 +30,7 @@ from c_two.transport import endpoint as endpoint_module
 # fresh slot, including calls directly to PyO3; shared-root history cannot be reaped.
 SWEEP_ADDRESSES = [f'ipc://sweep-test-{uuid.uuid4().hex}']
 
-MAX_CREDENTIAL_BYTES = 4096
+MAX_CREDENTIAL_BYTES = 32 * 1024
 #: The native gate's published hard ceilings. The tests own these expectations
 #: so the Python facade cannot silently mirror, weaken, or dominate them.
 MAX_SWEEP_ENTRIES = 4096
@@ -39,20 +40,18 @@ IS_WINDOWS = sys.platform == 'win32'
 
 #: A well-formed managed-v2 credential document. Managed-v2 is a Unix
 #: filesystem namespace, so this document is only meaningful on POSIX.
-MANAGED_V2_DOCUMENT = json.dumps(
-    {
-        'schemaVersion': 2,
-        'address': 'ipc://unit-managed-endpoint',
-        'protocol': 'managed-v2',
-        'platform': 'unix',
+def _unix_document(address: str) -> str:
+    root = f'/tmp/c2-{os.geteuid():x}' if not IS_WINDOWS else '/tmp/c2-unix'
+    namespace = cc.local_endpoint_context(root=root).namespace_id if not IS_WINDOWS else '0' * 64
+    return json.dumps({
+        'schemaVersion': 3, 'address': address, 'protocol': 'managed-v2', 'platform': 'unix',
         'incarnation': '00112233445566778899aabbccddeeff',
-        'device': 1,
-        'inode': 2,
-        'changedSecs': 3,
-        'changedNanos': 4,
-    },
-    separators=(',', ':'),
-)
+        'device': 1, 'inode': 2, 'changedSecs': 3, 'changedNanos': 4,
+        'unixRoot': root, 'namespaceId': namespace,
+    }, separators=(',', ':'))
+
+
+MANAGED_V2_DOCUMENT = _unix_document('ipc://unit-managed-endpoint')
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -74,16 +73,9 @@ def native_namespace():
 
 
 def _native_document(address: str = 'ipc://unit-native-endpoint') -> str:
-    """A well-formed native backend credential for the running platform."""
-    document: dict[str, object] = {
-        'schemaVersion': 1 if IS_WINDOWS else 2,
-        'address': address,
-        'protocol': 'named-pipe' if IS_WINDOWS else 'managed-v2',
-        'platform': 'windows' if IS_WINDOWS else 'unix',
-    }
     if not IS_WINDOWS:
-        document.update({'incarnation': '00112233445566778899aabbccddeeff', 'device': 1, 'inode': 2, 'changedSecs': 3, 'changedNanos': 4})
-    return json.dumps(document, separators=(',', ':'))
+        return _unix_document(address)
+    return json.dumps({'schemaVersion': 1, 'address': address, 'protocol': 'named-pipe', 'platform': 'windows'}, separators=(',', ':'))
 
 
 def _native_credential(address: str = 'ipc://unit-native-endpoint') -> cc.EndpointCredential:
@@ -275,9 +267,9 @@ def test_reap_never_removes_from_the_wrong_root() -> None:
     assert result['status'] == 'stale-target'
 
 
-def test_reap_of_an_unbound_legacy_endpoint_is_platform_honest() -> None:
-    credential = _native_credential('ipc://unit-unbound-legacy')
-    result = cc.reap_endpoint('ipc://unit-unbound-legacy', credential)
+def test_reap_of_an_unbound_endpoint_is_platform_honest() -> None:
+    credential = _native_credential('ipc://unit-unbound-endpoint')
+    result = cc.reap_endpoint('ipc://unit-unbound-endpoint', credential)
     assert set(result) == {
         'status',
         'credential',
@@ -356,17 +348,12 @@ def test_reap_does_not_accept_a_decoded_credential_for_a_new_incarnation() -> No
             assert cc.reap_endpoint(address, current)['status'] in {'already-absent', 'reaped'}
 
 
-def test_reap_uses_the_recorded_protocol_not_the_process_default(
+def test_reap_uses_the_recorded_context_not_the_process_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The process default is made unresolvable on purpose. A reap that
-    # consulted it would raise instead of re-deriving the endpoint from the
-    # credential's recorded protocol.
-    monkeypatch.setenv('C2_IPC_ENDPOINT_PROTOCOL', 'managed-v9')
-    if IS_WINDOWS:
-        credential = _native_credential('ipc://unit-recorded-protocol-pipe')
-    else:
-        credential = cc.EndpointCredential.from_json(MANAGED_V2_DOCUMENT)
+    credential = _native_credential('ipc://unit-recorded-context')
+    # A malformed process root must not reinterpret the captured credential.
+    monkeypatch.setenv('C2_IPC_ROOT', 'invalid-relative-root')
     result = cc.reap_endpoint(credential.address, credential)
     if IS_WINDOWS:
         assert result['status'] == 'not-applicable'

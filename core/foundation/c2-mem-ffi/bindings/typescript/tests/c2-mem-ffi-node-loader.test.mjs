@@ -116,7 +116,7 @@ test('logical addresses resolve to one deterministic native OS endpoint', () => 
   if (process.platform === 'win32') {
     assert.ok(endpoint.startsWith('\\\\.\\pipe\\c_two-'));
   } else {
-    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/v2\.2\/[0-9a-f]{64}\.sock$/);
+    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/[0-9a-f]{32}$/);
   }
   assert.equal(endpoint, resolveLocalIpcEndpoint(address));
   const runtime = createBundledC2MemFfiNodeRuntime();
@@ -191,9 +191,12 @@ test('native context snapshots resolver roots and env files without creating end
     }
     const longRoot = '/tmp/' + 'x'.repeat(200);
     const overlong = symbols.c2_mem_ffi_local_endpoint_context_capture(longRoot);
-    assert.equal(overlong.status, 0, 'root parsing is pure; endpoint derivation owns sun_path capacity');
+    assert.equal(overlong.status, 0, 'root parsing is pure');
     try {
-      assert.deepEqual(overlong.value.endpointName(address), { status: C2_MEM_FFI_STATUS_INVALID_ARGUMENT });
+      const derived = overlong.value.endpointName(address);
+      assert.equal(derived.status, 0);
+      assert.ok(derived.value.startsWith(`${longRoot}/`));
+      assert.equal(derived.value.slice(longRoot.length + 1).length, 32);
       assert.equal(existsSync(longRoot), false);
     } finally {
       overlong.value.close();
@@ -240,7 +243,6 @@ test('Runtime shares its first-attempt native snapshot with queries and reconnec
   const script = `
     import assert from 'node:assert/strict';
     import net from 'node:net';
-    import { syncBuiltinESMExports } from 'node:module';
     import { EventEmitter } from 'node:events';
     import { existsSync } from 'node:fs';
     import { createBundledC2MemFfiNodeRuntime } from ${JSON.stringify(moduleUrl)};
@@ -258,15 +260,14 @@ test('Runtime shares its first-attempt native snapshot with queries and reconnec
       destroy() { if (!this.destroyed) { this.destroyed = true; this.emit('close'); } return this; }
     }
     // Actual native derivation, mocked sockets only; this is not transport evidence.
-    net.createConnection = (path) => {
+    const mockConnect = (path) => {
       paths.push(path);
       const socket = new Socket();
       const failing = fail;
       queueMicrotask(() => socket.emit(failing ? 'error' : 'connect', new Error('first attempt failed')));
       return socket;
     };
-    syncBuiltinESMExports();
-    const runtime = createBundledC2MemFfiNodeRuntime();
+    const runtime = createBundledC2MemFfiNodeRuntime({ createConnection: mockConnect });
     const queryA = runtime.resolveEndpoint('ipc://same');
     process.env.C2_IPC_ROOT = rootB;
     const queryB = runtime.resolveEndpoint('ipc://same');
@@ -280,7 +281,7 @@ test('Runtime shares its first-attempt native snapshot with queries and reconnec
     first.close();
     const retry = await runtime.connect('ipc://same');
     assert.equal(paths.at(-1), queryA);
-    const fresh = createBundledC2MemFfiNodeRuntime();
+    const fresh = createBundledC2MemFfiNodeRuntime({ createConnection: mockConnect });
     const fromB = await fresh.connect('ipc://same');
     assert.equal(paths.at(-1), queryB);
     runtime.close(); runtime.close();
@@ -291,7 +292,7 @@ test('Runtime shares its first-attempt native snapshot with queries and reconnec
     assert.throws(() => runtime.resolveEndpoint('ipc://same'), /connector is closed/);
 
     process.env.C2_IPC_ROOT = rootA;
-    const failed = createBundledC2MemFfiNodeRuntime();
+    const failed = createBundledC2MemFfiNodeRuntime({ createConnection: mockConnect });
     fail = true;
     await assert.rejects(() => failed.connect('ipc://same'), /first attempt failed/);
     process.env.C2_IPC_ROOT = rootB;
@@ -692,7 +693,7 @@ test('native endpoint resolution preserves logical identity and rejects path inp
   if (process.platform === 'win32') {
     assert.match(endpoint, /^\\\\\.\\pipe\\c_two-/);
   } else {
-    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/v2\.2\/[0-9a-f]{64}\.sock$/);
+    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/[0-9a-f]{32}$/);
   }
   for (const invalid of ['/tmp/node.sock', 'ipc://../bad', 'ipc://bad\0name']) {
     assert.throws(() => resolveLocalIpcEndpoint(invalid));

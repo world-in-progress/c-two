@@ -186,6 +186,7 @@ impl EndpointDirectory {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn socket_path(&self, socket_name: &OsStr) -> PathBuf {
         self.path.join(socket_name)
     }
@@ -219,9 +220,8 @@ pub(crate) fn fstat(fd: libc::c_int) -> io::Result<libc::stat> {
 /// same module then refuses to open. The explicit mode keeps a new namespace
 /// private without ever relaxing a pre-existing directory: an existing unsafe
 /// directory remains an explicit error instead of being silently chmod-ed.
-/// The caller creates the UID directory before the version directory. Never
-/// create their ancestors: the application must pre-create its root container,
-/// and a missing or non-directory root must fail at this mkdir operation.
+/// Never create ancestors: only the platform default leaf is initialized by
+/// production callers. Custom directories must already exist.
 fn create_private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let mut builder = fs::DirBuilder::new();
@@ -441,15 +441,15 @@ pub(crate) fn bind_in_directory_on_thread(
     ))
 }
 
-/// Duplicates a directory descriptor with `dup(2)` so a thread can own it
+/// Duplicates a directory descriptor with close-on-exec so a thread can own it
 /// independently of the `EndpointDirectory` that created it.
 #[cfg(target_os = "macos")]
 fn duplicate_directory_descriptor(directory: &EndpointDirectory) -> io::Result<File> {
-    let fd = unsafe { libc::dup(directory.fd()) };
+    let fd = unsafe { libc::fcntl(directory.fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `dup` returned a fresh descriptor that File now owns.
+    // SAFETY: fcntl returned a fresh descriptor that File now owns.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -622,11 +622,64 @@ impl Drop for BoundSocketGuard<'_> {
 /// must be refused. `false` means the kernel reported a dead rendezvous; a
 /// failed connect is never positive proof of death by itself, which is why the
 /// caller still requires a matching owner record for the exact inode.
-pub(crate) fn probe_listener_is_live(path: &Path) -> io::Result<bool> {
-    let probe = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-    probe.set_nonblocking(true)?;
-    match probe.connect(&socket2::SockAddr::unix(path)?) {
-        Ok(()) => Ok(true),
+/// Initiates exactly one nonblocking connect using the verified directory.
+/// Pending connections are completed on the caller's reactor, never in the
+/// macOS directory thread. RAII owns every descriptor through the handoff.
+pub(crate) fn start_connect_in_directory(
+    directory: &EndpointDirectory,
+    socket_name: &OsStr,
+) -> io::Result<socket2::Socket> {
+    if let Some(path) = dirfd_relative_socket_path(directory, socket_name) {
+        return start_nonblocking_connect(&path);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let thread_dir = duplicate_directory_descriptor(directory)?;
+        let name = socket_name.to_owned();
+        std::thread::Builder::new()
+            .name("c2-local-connect".to_owned())
+            .spawn(move || {
+                set_thread_directory(thread_dir.as_raw_fd())?;
+                start_nonblocking_connect(Path::new(&name))
+            })?
+            .join()
+            .map_err(|_| io::Error::other("local endpoint connect thread panicked"))?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "descriptor-relative socket connect is unavailable",
+        ))
+    }
+}
+
+fn start_nonblocking_connect(path: &Path) -> io::Result<socket2::Socket> {
+    // SockAddr validates the actual short argument against sun_path capacity.
+    let address = socket2::SockAddr::unix(path)?;
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    match socket.connect(&address) {
+        Ok(()) => Ok(socket),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINPROGRESS | libc::EALREADY)
+            ) =>
+        {
+            Ok(socket)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Advisory liveness veto; this result never grants unlink authority.
+pub(crate) fn probe_listener_is_live(
+    directory: &EndpointDirectory,
+    socket_name: &OsStr,
+) -> io::Result<bool> {
+    match start_connect_in_directory(directory, socket_name) {
+        Ok(_socket) => Ok(true),
         Err(error)
             if error.kind() == io::ErrorKind::WouldBlock
                 || matches!(

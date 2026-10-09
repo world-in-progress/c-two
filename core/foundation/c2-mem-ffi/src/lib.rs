@@ -23,6 +23,7 @@ pub enum C2MemFfiStatus {
     InvalidArgument = 2,
     PoolError = 3,
     InsufficientBuffer = 4,
+    IoError = 5,
 }
 
 #[repr(C)]
@@ -504,6 +505,67 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_namespace_id_copy(
             dst_len,
             out_written,
         )
+    })
+}
+
+/// Transfers one connected Unix socket to a foreign event loop. Invoke this
+/// bounded operation on a worker, and keep the captured context alive until it
+/// returns. Windows consumers use their native Named Pipe connection API.
+///
+/// # Safety
+/// `context` and the NUL-terminated `address` must remain live throughout the
+/// call. Both output pointers must be writable and non-overlapping. On success
+/// the caller owns `out_fd` and must close or adopt it exactly once. On failure
+/// `out_fd` is -1; `out_os_error` is zero or the native errno.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_unix(
+    context: *const C2MemFfiLocalEndpointContext,
+    address: *const c_char,
+    out_fd: *mut i32,
+    out_os_error: *mut i32,
+) -> C2MemFfiStatus {
+    guard_status(|| {
+        if out_fd.is_null() || out_os_error.is_null() {
+            return Err(C2MemFfiStatus::NullPointer);
+        }
+        unsafe {
+            *out_fd = -1;
+            *out_os_error = 0;
+        }
+        if context.is_null() {
+            return Err(C2MemFfiStatus::NullPointer);
+        }
+        let address = parse_utf8_c_string(address)?;
+        let endpoint = unsafe { (*context).inner.endpoint(&address) }
+            .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::IntoRawFd;
+            let connect = || -> std::io::Result<std::os::unix::net::UnixStream> {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(c2_local::connect_unix_stream(
+                        &endpoint,
+                        c2_local::DEFAULT_CONNECT_TIMEOUT,
+                    ))
+            };
+            let stream = connect().map_err(|error| {
+                unsafe {
+                    *out_os_error = error.raw_os_error().unwrap_or(0);
+                }
+                C2MemFfiStatus::IoError
+            })?;
+            unsafe {
+                *out_fd = stream.into_raw_fd();
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = endpoint;
+            Err(C2MemFfiStatus::InvalidArgument)
+        }
     })
 }
 
@@ -1312,8 +1374,8 @@ mod tests {
         );
         assert_eq!(fresh_legacy_len, explicit.name(&address).len());
 
-        // A root may be syntactically valid while its derived socket exceeds
-        // the native path capacity. Derivation rejects it without creating it.
+        // A descriptive path may exceed socket address capacity. Native IO
+        // addresses its directory descriptor and short name separately.
         let overlong_root = format!("/tmp/c2f{}{}", std::process::id(), "x".repeat(110));
         let root = CString::new(overlong_root.as_str()).unwrap();
         let overlong = EndpointContextHandle::capture(Some(&root));
@@ -1326,9 +1388,10 @@ mod tests {
                     &mut failed_len,
                 )
             },
-            C2MemFfiStatus::InvalidArgument
+            C2MemFfiStatus::Ok
         );
-        assert_eq!(failed_len, 0);
+        assert_eq!(failed_len, overlong.name(&address).len());
+        assert!(failed_len > 108);
         assert!(!std::path::Path::new(&overlong_root).exists());
 
         for invalid_root in ["", "relative/root", "/tmp/../c2-invalid-root"] {
@@ -1973,6 +2036,56 @@ mod tests {
     }
 
     #[test]
+    fn unix_connect_rejects_invalid_arguments_without_transferring_a_descriptor() {
+        let mut fd = 77;
+        let mut os_error = 88;
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_local_endpoint_context_connect_unix(
+                    ptr::null(),
+                    ptr::null(),
+                    &mut fd,
+                    &mut os_error,
+                )
+            },
+            C2MemFfiStatus::NullPointer
+        );
+        assert_eq!((fd, os_error), (-1, 0));
+        let context = C2MemFfiLocalEndpointContext {
+            inner: LocalEndpointContext::default_for_platform().unwrap(),
+        };
+        let address = std::ffi::CString::new("http://invalid").unwrap();
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_local_endpoint_context_connect_unix(
+                    &context,
+                    address.as_ptr(),
+                    &mut fd,
+                    &mut os_error,
+                )
+            },
+            C2MemFfiStatus::InvalidArgument
+        );
+        assert_eq!((fd, os_error), (-1, 0));
+        #[cfg(windows)]
+        {
+            let address = std::ffi::CString::new("ipc://valid").unwrap();
+            assert_eq!(
+                unsafe {
+                    c2_mem_ffi_local_endpoint_context_connect_unix(
+                        &context,
+                        address.as_ptr(),
+                        &mut fd,
+                        &mut os_error,
+                    )
+                },
+                C2MemFfiStatus::InvalidArgument
+            );
+            assert_eq!((fd, os_error), (-1, 0));
+        }
+    }
+
+    #[test]
     fn public_c_header_compiles_and_matches_block_layout() {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let header = manifest_dir.join("include/c2_mem_ffi.h");
@@ -1995,6 +2108,7 @@ mod tests {
 
 _Static_assert(C2_MEM_FFI_STATUS_OK == 0, "status ok value");
 _Static_assert(C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER == 4, "status buffer value");
+_Static_assert(C2_MEM_FFI_STATUS_IO_ERROR == 5, "status IO value");
 _Static_assert(C2_MEM_FFI_MAX_SHM_PREFIX_LEN == 255u, "prefix length limit");
 _Static_assert(C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS == 16u, "segment count limit");
 _Static_assert(C2_MEM_FFI_ABI_VERSION == 3u, "abi version");

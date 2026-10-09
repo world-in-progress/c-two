@@ -355,24 +355,36 @@ mod unix {
     struct Roots(PathBuf);
     impl Roots {
         fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
             let path = PathBuf::from(format!(
                 "/tmp/r{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
             ));
             std::fs::create_dir(&path).unwrap();
+            let roots = Self(path);
             for name in ["a", "b", "c"] {
-                std::fs::create_dir(path.join(name)).unwrap();
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(roots.directory(name))
+                    .unwrap();
             }
-            Self(path)
+            roots
+        }
+        fn directory(&self, name: &str) -> PathBuf {
+            let segment = format!("目录 with spaces {}", "x".repeat(110));
+            let path = (0..4).fold(self.0.join(name), |path, _| path.join(&segment));
+            assert!(path.as_os_str().len() >= 512);
+            path
         }
         fn a(&self) -> PathBuf {
-            self.0.join("a")
+            self.directory("a")
         }
         fn b(&self) -> PathBuf {
-            self.0.join("b")
+            self.directory("b")
         }
         fn c(&self) -> PathBuf {
-            self.0.join("c")
+            self.directory("c")
         }
     }
     impl Drop for Roots {

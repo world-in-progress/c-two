@@ -10,8 +10,7 @@ use std::process::{Child, Command};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
-/// An isolated managed namespace with a private parent: exactly the two-level
-/// `0700` layout the production path verifies.
+/// An isolated, application-provisioned final private directory.
 struct TestNamespace {
     _parent: tempfile::TempDir,
     root: PathBuf,
@@ -25,13 +24,8 @@ impl TestNamespace {
             .expect("isolated managed parent under /tmp");
         std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = namespace_path(parent.path());
-        std::fs::create_dir(root.parent().unwrap()).unwrap();
-        std::fs::set_permissions(
-            root.parent().unwrap(),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-        assert!(root.as_os_str().as_bytes().len() <= 40);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         Self {
             _parent: parent,
             root,
@@ -48,20 +42,13 @@ fn managed_endpoint(label: &str) -> LocalEndpoint {
     LocalEndpoint::from_address(&format!("ipc://{label}-{}", &unique[..16])).unwrap()
 }
 
-// All fixture roots have the real <container>/c2-<uid>/v2.2 layout.
+// Each fixture selects and provisions its final endpoint directory.
 fn namespace_path(container: &Path) -> PathBuf {
-    let context = LocalEndpointContext::with_unix_root(container).unwrap();
-    Path::new(context.endpoint("ipc://fixture").unwrap().os_name())
-        .parent()
-        .unwrap()
-        .to_owned()
+    container.join("ipc")
 }
 
 fn context_for_namespace(root: &Path) -> LocalEndpointContext {
-    let container = root.parent().unwrap().parent().unwrap();
-    let context = LocalEndpointContext::with_unix_root(container).unwrap();
-    assert_eq!(namespace_path(container), root);
-    context
+    LocalEndpointContext::with_unix_root(root).unwrap()
 }
 
 fn managed_endpoint_at(root: &Path, label: &str) -> LocalEndpoint {
@@ -118,8 +105,8 @@ fn context_mismatch_is_refused_before_any_namespace_access() {
         EndpointInspection::Unverified(EndpointUnverifiedReason::RecordMismatch)
     ));
     assert!(ManagedSweep::for_scope(&ea, &[eb]).is_err());
-    assert!(!a.path().exists());
-    assert!(!b.path().exists());
+    assert!(!a.path().join(GATE_NAME).exists());
+    assert!(!b.path().join(GATE_NAME).exists());
 }
 
 fn socket_path(endpoint: &LocalEndpoint) -> PathBuf {
@@ -134,7 +121,7 @@ fn slot_in(root: &Path, endpoint: &LocalEndpoint, suffix: &str) -> PathBuf {
 }
 
 fn socket_path_at(root: &Path, endpoint: &LocalEndpoint) -> PathBuf {
-    slot_in(root, endpoint, SOCKET_SUFFIX)
+    slot_in(root, endpoint, "")
 }
 
 fn lease_path_at(root: &Path, endpoint: &LocalEndpoint) -> PathBuf {
@@ -848,7 +835,7 @@ async fn managed_corrupt_record_and_symlink_are_unverified_and_untouched() {
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let corrupt_socket = root.join(format!("{stem}{SOCKET_SUFFIX}"));
+    let corrupt_socket = root.join(&stem);
     drop(std::os::unix::net::UnixListener::bind(&corrupt_socket).unwrap());
     let corrupt_lease = root.join(format!("{stem}{LEASE_SUFFIX}"));
     let mut file = OpenOptions::new()
@@ -975,7 +962,7 @@ async fn managed_budgeted_sweep_advances_past_busy_and_corrupt_slots() {
 /// managed-v2 namespace, converges registered leftovers, and never touches the
 /// unselected slots.
 #[tokio::test]
-async fn managed_public_sweep_targets_the_versioned_namespace_only() {
+async fn managed_public_sweep_targets_the_selected_namespace_only() {
     let _shared = shared_namespace_guard();
     let live = managed_endpoint("public-sweep-live");
     let live_listener = crate::LocalListener::bind(&live).unwrap();
@@ -1149,6 +1136,8 @@ async fn managed_directory_rename_inside_the_gate_window_never_binds_into_the_re
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = namespace_path(parent.path());
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let moved = parent.path().join("moved");
     let endpoint = managed_endpoint_at(&root, "rename-window");
 
@@ -1247,6 +1236,8 @@ async fn managed_parallel_first_initialization_shares_one_gate_inode() {
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = namespace_path(parent.path());
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let endpoints: Vec<_> = (0..6)
         .map(|i| managed_endpoint_at(&root, &format!("first-{i}")))
         .collect();
@@ -1374,10 +1365,7 @@ fn managed_initialization_window_stays_unverified_without_creating_locks() {
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    drop(
-        std::os::unix::net::UnixListener::bind(root.join(format!("{stem}{SOCKET_SUFFIX}")))
-            .unwrap(),
-    );
+    drop(std::os::unix::net::UnixListener::bind(root.join(&stem)).unwrap());
 
     // An endpoint object without a verifiable first-initialization identity is
     // never adopted: no marker is written and the namespace stays Unverified.
@@ -1972,12 +1960,8 @@ async fn managed_bind_never_changes_the_calling_thread_directory() {
             let mut second = bind_managed_at(&endpoint_b, &root).unwrap();
             let inside_b = std::env::current_dir().unwrap();
             // Both bindings are live rendezvous in the verified directory.
-            let probe_a = tokio::net::UnixStream::connect(socket_path_at(&root, &endpoint_a))
-                .await
-                .is_ok();
-            let probe_b = tokio::net::UnixStream::connect(socket_path_at(&root, &endpoint_b))
-                .await
-                .is_ok();
+            let probe_a = crate::platform::connect(&endpoint_a).await.is_ok();
+            let probe_b = crate::platform::connect(&endpoint_b).await.is_ok();
             assert!(probe_a && probe_b, "both managed sockets must be reachable");
             let _ = first.accept().await;
             let _ = second.accept().await;

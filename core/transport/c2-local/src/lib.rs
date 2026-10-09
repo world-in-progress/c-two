@@ -329,6 +329,26 @@ pub struct LocalStream {
     abort: AbortHandle,
 }
 
+async fn connect_native(
+    endpoint: &LocalEndpoint,
+    timeout: Duration,
+) -> io::Result<platform::Stream> {
+    tokio::time::timeout(timeout, platform::connect(endpoint))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local connection deadline expired"))?
+}
+
+/// Connect using the native directory authority, then transfer an owned Unix
+/// socket to a foreign event loop. The returned descriptor is nonblocking and
+/// close-on-exec; callers must either adopt it exactly once or close it.
+#[cfg(unix)]
+pub async fn connect_unix_stream(
+    endpoint: &LocalEndpoint,
+    timeout: Duration,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    connect_native(endpoint, timeout).await?.into_std()
+}
+
 impl LocalStream {
     fn from_inner(inner: platform::Stream) -> Self {
         Self {
@@ -342,11 +362,7 @@ impl LocalStream {
     }
 
     pub async fn connect(endpoint: &LocalEndpoint, timeout: Duration) -> io::Result<Self> {
-        let stream = tokio::time::timeout(timeout, platform::connect(endpoint))
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "local connection deadline expired")
-            })??;
+        let stream = connect_native(endpoint, timeout).await?;
         Ok(Self::from_inner(stream))
     }
 

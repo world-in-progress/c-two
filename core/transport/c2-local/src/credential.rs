@@ -8,8 +8,8 @@
 //! lock, and never claims that the described endpoint exists.
 //!
 //! The logical [`LocalEndpoint`] is rebuilt from the recorded address and
-//! context through the platform's sole `c2-config` derivation. Default Unix
-//! credentials use schema 2 and /tmp; non-default roots use schema 3 with
+//! context through the platform's sole `c2-config` derivation. All Unix
+//! credentials use the existing schema 3 with
 //! `unixRoot` and `namespaceId`. Windows uses kernel-managed schema 1.
 //! Recorded protocol metadata must match that backend; a root in a document
 //! describes a namespace and is never accepted as deletion authority.
@@ -27,16 +27,14 @@ use crate::EndpointCredential;
 #[cfg(unix)]
 use crate::UnixSocketIdentity;
 
-/// Newest supported credential schema. Default Unix endpoints still encode
-/// schema 2; Windows kernel-managed endpoints still encode schema 1.
+/// Unix credential schema. Windows kernel-managed endpoints encode schema 1.
 pub const ENDPOINT_CREDENTIAL_SCHEMA_VERSION: u32 = 3;
 
 /// Maximum accepted JSON document size, in bytes. The rule is enforced on
 /// both encode and decode so a caller can bound the file it will read.
-pub const ENDPOINT_CREDENTIAL_MAX_BYTES: usize = 4096;
+pub const ENDPOINT_CREDENTIAL_MAX_BYTES: usize = 32 * 1024;
 
 const SCHEMA_VERSION_V1: u32 = 1;
-const SCHEMA_VERSION_V2: u32 = 2;
 const SCHEMA_VERSION_V3: u32 = 3;
 #[cfg(windows)]
 const PROTOCOL_WINDOWS: &str = "named-pipe";
@@ -59,7 +57,7 @@ pub enum EndpointCredentialErrorKind {
     InvalidValue,
     /// A record describes a platform or protocol this build cannot verify.
     UnsupportedPlatform,
-    /// A Unix schema-v2/v3 record must name its listener incarnation.
+    /// A Unix record must name its listener incarnation.
     IncarnationRequired,
 }
 
@@ -188,15 +186,8 @@ impl EndpointCredential {
     /// exists or is alive.
     pub fn to_json(&self) -> Result<String, EndpointCredentialError> {
         let endpoint = self.endpoint();
-        // Keep the default public path and schema unchanged. A lexical root
-        // alias is a distinct context even when native descriptors name /tmp.
         #[cfg(unix)]
-        let schema_version = if endpoint.context().unix_root() == Some(std::path::Path::new("/tmp"))
-        {
-            SCHEMA_VERSION_V2
-        } else {
-            SCHEMA_VERSION_V3
-        };
+        let schema_version = SCHEMA_VERSION_V3;
         #[cfg(not(unix))]
         let schema_version = SCHEMA_VERSION_V1;
         let document = CredentialDocument {
@@ -302,7 +293,7 @@ fn recorded_context(
     schema_version: u32,
     platform: Platform,
 ) -> Result<LocalEndpointContext, EndpointCredentialError> {
-    if schema_version != SCHEMA_VERSION_V3 {
+    if platform == Platform::Windows {
         for (field, value) in [
             ("unixRoot", &wire.unixRoot),
             ("namespaceId", &wire.namespaceId),
@@ -314,14 +305,13 @@ fn recorded_context(
                 ));
             }
         }
-        // Schema 2 is always /tmp, independent of C2_IPC_ROOT.
         return LocalEndpointContext::default_for_platform().map_err(|_| {
             EndpointCredentialError::new(EndpointCredentialErrorKind::UnsupportedPlatform)
         });
     }
-    if platform != Platform::Unix {
+    if schema_version != SCHEMA_VERSION_V3 {
         return Err(EndpointCredentialError::at(
-            EndpointCredentialErrorKind::UnsupportedPlatform,
+            EndpointCredentialErrorKind::InvalidValue,
             "schemaVersion",
         ));
     }
@@ -342,12 +332,6 @@ fn recorded_context(
         LocalEndpointContext::with_unix_root(std::path::Path::new(root)).map_err(|_| {
             EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, "unixRoot")
         })?;
-    if context.unix_root() == Some(std::path::Path::new("/tmp")) {
-        return Err(EndpointCredentialError::at(
-            EndpointCredentialErrorKind::InvalidValue,
-            "unixRoot",
-        ));
-    }
     if namespace_id != context.namespace_id() {
         return Err(EndpointCredentialError::at(
             EndpointCredentialErrorKind::InvalidValue,
@@ -401,7 +385,7 @@ fn schema_version(wire: &CredentialWire) -> Result<u32, EndpointCredentialError>
         EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, "schemaVersion")
     })?;
     match version {
-        SCHEMA_VERSION_V1 | SCHEMA_VERSION_V2 | SCHEMA_VERSION_V3 => Ok(version),
+        SCHEMA_VERSION_V1 | SCHEMA_VERSION_V3 => Ok(version),
         _ => Err(EndpointCredentialError::at(
             EndpointCredentialErrorKind::UnsupportedSchemaVersion,
             "schemaVersion",
@@ -521,39 +505,23 @@ fn unix_credential(
         changed_secs,
         changed_nanos,
     };
-    let incarnation = match wire.incarnation.as_ref() {
-        Some(value) => Some(decode_incarnation(value)?),
-        None => None,
-    };
-    build_unix(endpoint, identity, incarnation, schema_version)
-}
-
-#[cfg(unix)]
-fn build_unix(
-    endpoint: LocalEndpoint,
-    identity: UnixSocketIdentity,
-    incarnation: Option<[u8; 16]>,
-    schema_version: u32,
-) -> Result<EndpointCredential, EndpointCredentialError> {
-    match (schema_version, incarnation) {
-        // Only schema-v2/v3 records with a native incarnation describe Unix listeners.
-        (SCHEMA_VERSION_V2 | SCHEMA_VERSION_V3, Some(incarnation)) => Ok(
-            EndpointCredential::unix_managed(endpoint, identity, incarnation),
-        ),
-        (SCHEMA_VERSION_V2 | SCHEMA_VERSION_V3, None) => Err(EndpointCredentialError::at(
-            EndpointCredentialErrorKind::IncarnationRequired,
-            "incarnation",
-        )),
-        // A v1 record can never be promoted into a UUID incarnation, and a
-        // managed-v2 endpoint is not representable without one.
-        (SCHEMA_VERSION_V1, _) => Err(EndpointCredentialError::at(
+    if schema_version != SCHEMA_VERSION_V3 {
+        return Err(EndpointCredentialError::at(
             EndpointCredentialErrorKind::InvalidValue,
             "schemaVersion",
-        )),
-        _ => Err(EndpointCredentialError::new(
-            EndpointCredentialErrorKind::UnsupportedSchemaVersion,
-        )),
+        ));
     }
+    let incarnation = decode_incarnation(wire.incarnation.as_ref().ok_or_else(|| {
+        EndpointCredentialError::at(
+            EndpointCredentialErrorKind::IncarnationRequired,
+            "incarnation",
+        )
+    })?)?;
+    Ok(EndpointCredential::unix_managed(
+        endpoint,
+        identity,
+        incarnation,
+    ))
 }
 
 #[cfg(not(unix))]

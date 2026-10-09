@@ -19,19 +19,12 @@ pub enum LocalEndpointNamespace {
 /// selects the backend and there is no user-facing protocol selector.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct LocalEndpointOptions {
-    /// Absolute root directory that carries C-Two's private per-user endpoint
-    /// directories. The container is expected to be pre-created by the
-    /// application; resolving or deriving from it never touches the
-    /// filesystem.
+    /// Absolute final endpoint directory. A custom directory is provisioned
+    /// by the application with private permissions; the platform default can
+    /// be initialized by C-Two. Resolution never touches the filesystem.
     pub unix_root: Option<PathBuf>,
 }
 
-#[cfg(unix)]
-const DEFAULT_UNIX_ROOT: &str = "/tmp";
-#[cfg(unix)]
-const UNIX_NAMESPACE_LAYOUT: &str = "v2.2";
-#[cfg(windows)]
-const WINDOWS_PIPE_LAYOUT: &str = "named-pipe.v1";
 #[cfg(windows)]
 const UNIX_ROOT_NOT_APPLICABLE: &str =
     "unix root override is not applicable to the Windows named-pipe backend";
@@ -65,11 +58,9 @@ enum LocalEndpointPlatform {
         /// Normalized absolute root, validated UTF-8.
         root: String,
         uid: u32,
-        layout: &'static str,
     },
     WindowsNamedPipe {
         logon_scope_id: String,
-        layout: &'static str,
     },
 }
 
@@ -85,21 +76,8 @@ impl LocalEndpointPlatform {
         let identity = endpoint_identity(server_id);
         match self {
             #[cfg(unix)]
-            Self::UnixManaged { root, uid, .. } => {
-                let path = PathBuf::from(root)
-                    .join(format!("c2-{uid:x}"))
-                    .join(UNIX_NAMESPACE_LAYOUT)
-                    .join(format!("{identity}.sock"));
-                let os_name = path.into_os_string();
-                use std::os::unix::ffi::OsStrExt;
-                let capacity = std::mem::size_of::<libc::sockaddr_un>() - offset_of_sun_path();
-                if os_name.as_os_str().as_bytes().len() >= capacity {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Unix socket endpoint exceeds sun_path capacity",
-                    ));
-                }
-                Ok(os_name)
+            Self::UnixManaged { root, .. } => {
+                Ok(PathBuf::from(root).join(identity).into_os_string())
             }
             #[cfg(windows)]
             Self::UnixManaged { .. } => Err(io::Error::new(
@@ -120,7 +98,7 @@ impl LocalEndpointPlatform {
 }
 
 impl LocalEndpointContext {
-    /// Context for the platform default: `/tmp` plus the effective uid on
+    /// Context for the platform default: `/tmp/c2-<uidhex>` on
     /// Unix, the current logon scope on Windows. Pure derivation; it never
     /// reads `C2_IPC_ROOT` or any other environment variable.
     pub fn default_for_platform() -> io::Result<Self> {
@@ -129,19 +107,19 @@ impl LocalEndpointContext {
             let logon_scope_id = c2_local_security::current_scope_id()?;
             return Ok(Self::new(LocalEndpointPlatform::WindowsNamedPipe {
                 logon_scope_id,
-                layout: WINDOWS_PIPE_LAYOUT,
             }));
         }
 
         #[cfg(unix)]
         {
-            return Self::with_unix_root(Path::new(DEFAULT_UNIX_ROOT));
+            let uid = unsafe { libc::geteuid() };
+            return Self::with_unix_root(Path::new(&format!("/tmp/c2-{uid:x}")));
         }
     }
 
     /// Context under a user-provided absolute Unix root. The path is
-    /// validated and normalized without touching the filesystem; the root
-    /// container must already exist by the time an endpoint is actually
+    /// validated and normalized without touching the filesystem; a custom
+    /// directory must already exist by the time an endpoint is actually
     /// bound. On Windows this is rejected as not applicable.
     pub fn with_unix_root(root: &Path) -> io::Result<Self> {
         #[cfg(windows)]
@@ -157,11 +135,7 @@ impl LocalEndpointContext {
         {
             let root = validate_unix_root(root)?;
             let uid = unsafe { libc::geteuid() };
-            return Ok(Self::new(LocalEndpointPlatform::UnixManaged {
-                root,
-                uid,
-                layout: UNIX_NAMESPACE_LAYOUT,
-            }));
+            return Ok(Self::new(LocalEndpointPlatform::UnixManaged { root, uid }));
         }
     }
 
@@ -176,14 +150,6 @@ impl LocalEndpointContext {
     /// The OS backend this context was constructed for.
     pub const fn platform_kind(&self) -> LocalEndpointNamespace {
         self.platform.kind()
-    }
-
-    /// Internal layout version of the platform namespace.
-    pub const fn layout(&self) -> &'static str {
-        match &self.platform {
-            LocalEndpointPlatform::UnixManaged { layout, .. } => layout,
-            LocalEndpointPlatform::WindowsNamedPipe { layout, .. } => layout,
-        }
     }
 
     /// Normalized Unix root when this is a `UnixManaged` context.
@@ -211,7 +177,7 @@ impl LocalEndpointContext {
     }
 
     /// Stable cross-process namespace identifier: a domain-separated SHA-256
-    /// over the backend kind, layout version, and platform scope (normalized
+    /// over the backend kind and platform scope (normalized
     /// Unix root plus effective uid, or Windows logon scope), with
     /// length-prefixed component boundaries. It contains no raw path bytes,
     /// never depends on the process pid, and is a routing/comparison key
@@ -222,9 +188,9 @@ impl LocalEndpointContext {
 
     /// Derive the endpoint for a logical IPC address within this context.
     ///
-    /// The final native name is checked against the platform's capacity
-    /// bounds (Unix `sun_path`); overlong roots fail explicitly instead of
-    /// truncating or silently falling back to the default root.
+    /// Unix returns the full descriptive path. Local transport operations use
+    /// the directory descriptor and short name, so `sun_path` does not limit
+    /// the configured directory here.
     pub fn endpoint(&self, address: &str) -> io::Result<LocalEndpoint> {
         LocalEndpoint::in_context(self, address)
     }
@@ -301,18 +267,13 @@ fn compute_namespace_id(platform: &LocalEndpointPlatform) -> String {
     let mut hasher = Sha256::new();
     feed(&mut hasher, NAMESPACE_ID_DOMAIN.as_bytes());
     match platform {
-        LocalEndpointPlatform::UnixManaged { root, uid, layout } => {
+        LocalEndpointPlatform::UnixManaged { root, uid } => {
             feed(&mut hasher, b"unix-filesystem");
-            feed(&mut hasher, layout.as_bytes());
             feed(&mut hasher, root.as_bytes());
             feed(&mut hasher, &uid.to_le_bytes());
         }
-        LocalEndpointPlatform::WindowsNamedPipe {
-            logon_scope_id,
-            layout,
-        } => {
+        LocalEndpointPlatform::WindowsNamedPipe { logon_scope_id } => {
             feed(&mut hasher, b"windows-named-pipe");
-            feed(&mut hasher, layout.as_bytes());
             feed(&mut hasher, logon_scope_id.as_bytes());
         }
     }
@@ -335,7 +296,7 @@ pub struct LocalEndpoint {
 }
 
 impl LocalEndpoint {
-    /// Pure platform-default derivation from `/tmp` (Unix) or the current
+    /// Pure platform-default derivation from `/tmp/c2-<uidhex>` (Unix) or the current
     /// logon scope (Windows). It does not read the process environment;
     /// environment-resolved roots go through `ConfigResolver` and a frozen
     /// `LocalEndpointContext`.
@@ -405,16 +366,11 @@ impl LocalEndpoint {
 fn endpoint_identity(server_id: &str) -> String {
     use sha2::{Digest, Sha256};
 
-    let mut identity = String::with_capacity(64);
-    for byte in Sha256::digest(server_id.as_bytes()) {
+    let mut identity = String::with_capacity(32);
+    for byte in &Sha256::digest(server_id.as_bytes())[..16] {
         write!(&mut identity, "{byte:02x}").expect("writing to String cannot fail");
     }
     identity
-}
-
-#[cfg(unix)]
-fn offset_of_sun_path() -> usize {
-    std::mem::offset_of!(libc::sockaddr_un, sun_path)
 }
 
 #[cfg(test)]
@@ -459,26 +415,15 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_names_preserve_sha256_hex_golden_values() {
+    fn endpoint_names_use_the_first_128_sha256_bits() {
         for (server_id, digest) in [
-            (
-                "Server-A",
-                "1118fcf083aa343ac0caf420a35a30251f311befab9f337abdf921977668e0cd",
-            ),
-            (
-                "server-a",
-                "a79b8498a1fb0114738f243cfd7c1eeae3d52e888e79000e31cb6f0bf2c077eb",
-            ),
-            (
-                "资源-Server-A",
-                "4ad7b4ee929ad2c148664fcaa37c16e8fd17455d6cbb20f33fc14e9313a23e36",
-            ),
+            ("Server-A", "1118fcf083aa343ac0caf420a35a3025"),
+            ("server-a", "a79b8498a1fb0114738f243cfd7c1eea"),
+            ("资源-Server-A", "4ad7b4ee929ad2c148664fcaa37c16e8"),
         ] {
             let endpoint = LocalEndpoint::from_address(&format!("ipc://{server_id}")).unwrap();
             #[cfg(unix)]
-            let expected = format!("/tmp/c2-{:x}/v2.2/{digest}.sock", unsafe {
-                libc::geteuid()
-            });
+            let expected = format!("/tmp/c2-{:x}/{digest}", unsafe { libc::geteuid() });
             #[cfg(windows)]
             let expected = format!(
                 r"\\.\pipe\c_two-{}-{digest}",
@@ -511,7 +456,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn default_context_derivation_matches_historical_golden_bytes() {
+    fn default_context_derives_directly_in_the_private_directory() {
         use sha2::{Digest, Sha256};
 
         let context = LocalEndpointContext::default_for_platform().unwrap();
@@ -519,18 +464,20 @@ mod tests {
             context.platform_kind(),
             LocalEndpointNamespace::UnixFilesystem
         );
-        assert_eq!(context.unix_root(), Some(Path::new("/tmp")));
+        assert_eq!(
+            context.unix_root(),
+            Some(Path::new(&format!("/tmp/c2-{:x}", unsafe {
+                libc::geteuid()
+            })))
+        );
         assert_eq!(context.unix_uid(), Some(unsafe { libc::geteuid() }));
-        assert_eq!(context.layout(), "v2.2");
 
         for server_id in ["Server-A", "server-a", "资源-Server-A"] {
-            let digest: String = Sha256::digest(server_id.as_bytes())
+            let digest: String = Sha256::digest(server_id.as_bytes())[..16]
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
-            let expected = format!("/tmp/c2-{:x}/v2.2/{digest}.sock", unsafe {
-                libc::geteuid()
-            });
+            let expected = format!("/tmp/c2-{:x}/{digest}", unsafe { libc::geteuid() });
             let via_context = context.endpoint(&format!("ipc://{server_id}")).unwrap();
             let via_default = LocalEndpoint::from_address(&format!("ipc://{server_id}")).unwrap();
             assert_eq!(via_context.os_name(), OsStr::new(&expected));
@@ -561,9 +508,10 @@ mod tests {
                 .os_name()
                 .to_str()
                 .unwrap()
-                .starts_with("/tmp/c2-it-根A alpha/c2-")
+                .starts_with("/tmp/c2-it-根A alpha/")
         );
-        assert!(in_alpha.os_name().to_str().unwrap().ends_with(".sock"));
+        assert_eq!(Path::new(in_alpha.os_name()).parent(), Some(root_alpha));
+        assert_eq!(Path::new(in_alpha.os_name()).file_name().unwrap().len(), 32);
         assert_eq!(in_alpha.address(), "ipc://shared-name");
 
         // Reconstructing a context from the same root is one identity, and a
@@ -626,21 +574,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn overlong_custom_root_fails_explicitly_without_fallback() {
-        let root = format!("/tmp/{}", "d".repeat(200));
+    fn long_custom_root_is_the_final_directory_without_socket_capacity_checks() {
+        let root = format!("/tmp/{}", "根目录 with spaces/".repeat(32));
         let context = LocalEndpointContext::with_unix_root(Path::new(&root)).unwrap();
-        let error = context.endpoint("ipc://Server-A").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("sun_path"), "{error}");
+        let endpoint = context.endpoint("ipc://Server-A").unwrap();
+        let path = Path::new(endpoint.os_name());
+        assert_eq!(path.parent(), context.unix_root());
+        assert_eq!(
+            path.file_name().unwrap(),
+            "1118fcf083aa343ac0caf420a35a3025"
+        );
+        assert!(path.as_os_str().len() > 512);
+    }
 
-        // The failure never degrades into the default-root derivation.
-        let default_endpoint = LocalEndpoint::from_address("ipc://Server-A").unwrap();
-        assert!(
-            default_endpoint
-                .os_name()
-                .to_str()
-                .unwrap()
-                .starts_with("/tmp/c2-")
+    #[cfg(unix)]
+    #[test]
+    fn explicit_default_directory_has_the_default_identity() {
+        let default = LocalEndpointContext::default_for_platform().unwrap();
+        let explicit = LocalEndpointContext::with_unix_root(default.unix_root().unwrap()).unwrap();
+        assert_eq!(explicit, default);
+        assert_eq!(
+            explicit.endpoint("ipc://same").unwrap(),
+            default.endpoint("ipc://same").unwrap()
         );
     }
 
@@ -673,7 +628,7 @@ mod tests {
                 .os_name()
                 .to_str()
                 .unwrap()
-                .starts_with("/tmp/c2-snapshot-a/c2-")
+                .starts_with("/tmp/c2-snapshot-a/")
         );
         // The already-frozen context keeps deriving its original names even
         // after a later resolution observed a different environment.
@@ -685,24 +640,24 @@ mod tests {
                 .os_name()
                 .to_str()
                 .unwrap()
-                .starts_with("/tmp/c2-snapshot-b/c2-")
+                .starts_with("/tmp/c2-snapshot-b/")
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn managed_v2_derivation_is_private_versioned_bounded_and_pure() {
+    fn default_derivation_is_private_short_and_pure() {
         use sha2::{Digest, Sha256};
 
         // A per-run logical ID keeps the purity check independent of any real
         // deployed server name that might already own its derived socket path.
         let server_id = format!("slice-{}", uuid::Uuid::new_v4());
         let uid = unsafe { libc::geteuid() };
-        let digest: String = Sha256::digest(server_id.as_bytes())
+        let digest: String = Sha256::digest(server_id.as_bytes())[..16]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let expected = format!("/tmp/c2-{uid:x}/v2.2/{digest}.sock");
+        let expected = format!("/tmp/c2-{uid:x}/{digest}");
         let expected_path = std::path::Path::new(&expected);
         let existed_before = expected_path.exists();
         assert!(!existed_before);
@@ -712,7 +667,7 @@ mod tests {
         assert_eq!(endpoint.os_name(), OsStr::new(&expected));
         assert_eq!(endpoint.protocol(), "managed-v2");
         assert_eq!(endpoint.namespace(), LocalEndpointNamespace::UnixFilesystem);
-        assert!(expected.len() < std::mem::size_of::<libc::sockaddr_un>() - offset_of_sun_path());
+        assert_eq!(expected_path.file_name().unwrap().len(), 32);
         // Derivation is pure: it must not create the endpoint file.
         assert_eq!(expected_path.exists(), existed_before);
 
@@ -728,11 +683,7 @@ mod tests {
     fn long_logical_id_still_derives_a_bounded_native_name() {
         let address = format!("ipc://{}", "资源".repeat(100));
         let endpoint = LocalEndpoint::from_address(&address).unwrap();
-        use std::os::unix::ffi::OsStrExt;
-        assert!(
-            endpoint.os_name().as_bytes().len()
-                < std::mem::size_of::<libc::sockaddr_un>() - offset_of_sun_path()
-        );
+        assert_eq!(Path::new(endpoint.os_name()).file_name().unwrap().len(), 32);
         assert_eq!(endpoint.address(), address);
     }
 
@@ -792,7 +743,6 @@ mod tests {
         );
         assert_eq!(context.unix_root(), None);
         assert_eq!(context.unix_uid(), None);
-        assert_eq!(context.layout(), "named-pipe.v1");
 
         let scope = c2_local_security::current_scope_id().unwrap();
         assert_eq!(
@@ -803,9 +753,7 @@ mod tests {
         // The public identity is backed by the real logon scope; a fake root
         // or uid has no representation on this backend.
         let endpoint = context.endpoint("ipc://Server-A").unwrap();
-        let expected = format!(
-            r"\\.\pipe\c_two-{scope}-1118fcf083aa343ac0caf420a35a30251f311befab9f337abdf921977668e0cd"
-        );
+        let expected = format!(r"\\.\pipe\c_two-{scope}-1118fcf083aa343ac0caf420a35a3025");
         assert_eq!(endpoint.os_name(), OsStr::new(&expected));
         assert_eq!(endpoint.protocol(), "named-pipe");
         assert_eq!(

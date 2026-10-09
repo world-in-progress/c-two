@@ -18,6 +18,7 @@ typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_INVALID_ARGUMENT = 2,
     C2_MEM_FFI_STATUS_POOL_ERROR = 3,
     C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4,
+    C2_MEM_FFI_STATUS_IO_ERROR = 5,
 } C2MemFfiStatus;
 
 /* Backing descriptor: buddy generation > 0; dedicated generation and offset are 0. */
@@ -104,6 +105,19 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_context_namespace_id_copy(
     char *dst,
     size_t dst_len,
     size_t *out_written);
+
+/*
+ * Connect through c2-local's verified directory addressing. Unix only.
+ * Call on a worker: connection completion is bounded by the native default
+ * deadline. context/address must remain live throughout the call; output
+ * storage must not overlap. On success out_fd is an owned nonblocking,
+ * close-on-exec descriptor to adopt or close exactly once. On failure it is
+ * -1 and out_os_error is zero or native errno. Windows returns INVALID_ARGUMENT;
+ * its Node connector uses the native Named Pipe API.
+ */
+C2MemFfiStatus c2_mem_ffi_local_endpoint_context_connect_unix(
+    const C2MemFfiLocalEndpointContext *context, const char *address,
+    int32_t *out_fd, int32_t *out_os_error);
 
 /* Creates a native buddy/dedicated request pool. max_segments must be 1..16. */
 C2MemFfiStatus c2_mem_ffi_request_pool_new(

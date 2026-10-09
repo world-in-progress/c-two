@@ -68,11 +68,6 @@ impl PyLocalEndpointContext {
         self.inner.namespace_id()
     }
 
-    #[getter]
-    fn layout(&self) -> &'static str {
-        self.inner.layout()
-    }
-
     fn endpoint_name(&self, address: &str) -> PyResult<String> {
         self.inner
             .endpoint(address)
