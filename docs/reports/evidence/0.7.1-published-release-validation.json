@@ -1,0 +1,95 @@
+{
+  "schema": "c-two.published-release-validation.v1",
+  "status": "passed",
+  "verified_at_utc": "2026-10-09T06:30:00.555222+00:00",
+  "source_commit": "5ed0414907fe75db6c7a7d142b0835da429629d0",
+  "fastdb_source_commit": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "versions": {
+    "c-two": "0.7.1",
+    "c3": "0.3.1",
+    "fastdb4py": "0.2.1"
+  },
+  "manifest_sha256": "3594245bb41061b2fe62d881467e434bed5e90577675ff14d4709e6b53a167ab",
+  "runs": {
+    "candidate": 37890560911,
+    "windows_native": 37890560893,
+    "cli_publish": 37893121856,
+    "python_publish": 37893121909
+  },
+  "published_inventory": {
+    "pypi": {
+      "wheels": 30,
+      "sdist": 1,
+      "all_file_names_sizes_and_sha256_match_candidate": true,
+      "all_files_unyanked": true
+    },
+    "github": {
+      "assets": 15,
+      "tag_commit": "5ed0414907fe75db6c7a7d142b0835da429629d0",
+      "all_asset_names_sizes_and_sha256_match_plan": true
+    }
+  },
+  "downloaded_files": [
+    {
+      "name": "fastdb4py-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+      "sha256": "e203a3262f9260719220fe207bd2f12ed0719031a61b92e14eb42a8c0bc9dd28",
+      "bytes": 1133461,
+      "distribution": "fastdb4py",
+      "version": "0.2.1"
+    },
+    {
+      "name": "c_two-0.7.1-cp313-cp313-macosx_11_0_arm64.whl",
+      "sha256": "e306a70feca219c73390d3fdd97c4dd5197908fb2279500e867105319c9bd757",
+      "bytes": 4081204,
+      "distribution": "c-two",
+      "version": "0.7.1"
+    },
+    {
+      "name": "c3-aarch64-apple-darwin",
+      "sha256": "2dc2efb3386c9df09f9aa458be79e305f44f3681892113f1a341dbce1af0fe53",
+      "bytes": 11250256
+    },
+    {
+      "name": "c3-x86_64-pc-windows-msvc.exe",
+      "sha256": "8089223959745d9b8b6de5ee7b24fddcddc51ba4780563390e98a7d944833cb1",
+      "bytes": 11046912
+    }
+  ],
+  "isolated_consumer": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "interpreter": "3.13.3 (main, Apr  9 2025, 03:47:57) [Clang 20.1.0 ]",
+    "status": "passed",
+    "source_commit": "5ed0414907fe75db6c7a7d142b0835da429629d0",
+    "transports": [
+      {
+        "transport": "direct",
+        "observed_mode": "ipc",
+        "status": "passed",
+        "payload_bytes": 1048576,
+        "held_view_invalidated": true
+      },
+      {
+        "transport": "relay",
+        "observed_mode": "http",
+        "status": "passed",
+        "payload_bytes": 1048576,
+        "held_view_invalidated": true
+      }
+    ],
+    "borrowed_inputs_invalidated": 4,
+    "cleanup": {
+      "host_orderly_shutdown": true,
+      "errors": [],
+      "relay_stop": "terminated",
+      "host_stop": "already_exited",
+      "processes_exited": true,
+      "temporary_directory_removed": true
+    }
+  },
+  "scope": [
+    "Published registry/API hashes were checked for the complete inventory; only the listed consumer files were downloaded for local runtime validation.",
+    "Windows x64 release executable downloaded and hashed locally; it was not executed on this macOS host.",
+    "Windows Native debug c3 bytes bind their own portable matrices; release c3 bytes bind Release Candidate wheel and non-administrator consumption receipts.",
+    "Windows 11 desktop, Windows ARM64 and Windows services were not validated."
+  ]
+}
