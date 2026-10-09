@@ -422,6 +422,10 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   const observationPath = normalizeIpcObservationPath(options.observationPath);
   const observe = normalizeTransportObserver(options.observe, "C-Two IPC observe");
   let connectionPromise: Promise<C2IpcOpenConnection> | undefined;
+  // Bindings survive stream loss and explicit close. A new connection may
+  // restore this transport, but cannot redirect its already acquired routes.
+  let boundServerIdentity: C2ServerIdentity | undefined;
+  const boundRoutes = new Map<string, C2IpcRouteInfo>();
   let nextRequestId = 1;
   let callChain: Promise<void> = Promise.resolve();
   let requests = 0;
@@ -437,22 +441,133 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
     return connectionPromise;
   };
 
+  const allocateRequestId = (): bigint => {
+    const requestId = nextRequestId;
+    nextRequestId = nextRequestId === Number.MAX_SAFE_INTEGER ? 1 : nextRequestId + 1;
+    return BigInt(requestId);
+  };
+
+  const discardConnection = async (open: C2IpcOpenConnection): Promise<void> => {
+    connectionPromise = undefined;
+    try {
+      await open.connection.close?.();
+    } catch {
+      // Preserve the primary stream failure, including uncertain writes.
+    }
+  };
+
+  const control = async (
+    open: C2IpcOpenConnection,
+    tag: number,
+    request: unknown,
+    responseTag: number,
+  ): Promise<C2IpcCatalogReply> => {
+    const requestId = allocateRequestId();
+    try {
+      await open.connection.write(encodeIpcFrame(requestId, C2_IPC_FLAG_CTRL,
+        concatUint8Arrays([new Uint8Array([tag]), C2_TEXT_ENCODER.encode(JSON.stringify(request))])));
+      const frame = await readIpcFrame(open.connection);
+      if (frame.requestId !== requestId || frame.flags !== (C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_CTRL)) {
+        throw new C2IpcTransportError("C-Two IPC route control reply has invalid request id or flags.");
+      }
+      return decodeIpcCatalogReply(frame.payload, responseTag);
+    } catch (error) {
+      await discardConnection(open);
+      if (error instanceof C2IpcTransportError) {
+        throw error;
+      }
+      throw new C2IpcTransportError(`C-Two IPC route control failed: ${String(error)}`);
+    }
+  };
+
   const prepareRoute = async (
     routeName: string,
     contract: C2ContractIdentity,
   ): Promise<{ readonly open: C2IpcOpenConnection; readonly route: C2IpcRouteInfo }> => {
     requireRouteNamePathValue(routeName);
     const routeContract = requireRouteContractIdentity(contract);
+    const boundRoute = boundRoutes.get(routeName);
+    if (boundRoute !== undefined) {
+      requireMatchingIpcRoute(boundRoute, routeName, routeContract);
+    }
     const open = await openConnection();
     requireExpectedServerIdentity(open.handshake.serverIdentity, expectedServerIdentity);
-    const route = findMatchingIpcRoute(open.handshake.routes, routeName, routeContract);
+    requireExpectedServerIdentity(open.handshake.serverIdentity, boundServerIdentity);
+    const expected = {
+      route_name: routeName,
+      crm_ns: routeContract.namespace,
+      crm_name: routeContract.name,
+      crm_ver: routeContract.version,
+      abi_hash: routeContract.abiHash,
+      signature_hash: routeContract.signatureHash,
+    };
+    const token = boundRoute ?? expectedRouteToken;
+    const request = {
+      expected,
+      observed_route_uid: token?.routeUid ?? null,
+      observed_route_revision: token?.routeRevision ?? null,
+    };
+    // The handshake route list is a snapshot, never an acquire authority.
+    let reply = await control(open, C2_IPC_ROUTE_LOOKUP, request, C2_IPC_ROUTE_LOOKUP_ACK);
+    if (reply.kind === "nack" && (reply.code === 711 || reply.code === 712)) {
+      // Match Rust's bounded catalog recovery without installing a watcher or
+      // changing an already bound token. Only contract-scoped lists are used.
+      const list = await control(open, C2_IPC_ROUTE_LIST,
+        { selector: { type: "contract", expected }, min_revision: null }, C2_IPC_ROUTE_LIST_ACK);
+      if (list.kind === "nack") {
+        throw new C2IpcTransportError(`C-Two IPC route catalog NACK ${list.code}: ${list.message}`);
+      }
+      reply = await control(open, C2_IPC_ROUTE_LOOKUP, request, C2_IPC_ROUTE_LOOKUP_ACK);
+    }
+    if (reply.kind === "nack") {
+      throw new C2IpcTransportError(`C-Two IPC route catalog NACK ${reply.code}: ${reply.message}`);
+    }
+    if (reply.kind !== "lookup") {
+      throw new C2IpcTransportError("C-Two IPC expected route lookup reply.");
+    }
+    if (reply.routeName !== routeName) {
+      await discardConnection(open);
+      throw new C2IpcTransportError("C-Two IPC route lookup reply names a different route.");
+    }
+    if (reply.status === "not_found") {
+      throw new C2IpcRouteNotFoundError(routeName);
+    }
+    if (reply.status === "removed" || reply.status === "closed") {
+      throw new C2IpcTransportError(`C-Two IPC route ${routeName} is ${reply.status}.`);
+    }
+    if (reply.status === "contract_mismatch") {
+      throw new C2IpcTransportError(`C-Two IPC route ${routeName} does not match the expected CRM contract.`);
+    }
+    if (!("current" in reply)) {
+      throw new C2IpcTransportError("C-Two IPC route lookup is missing its current record.");
+    }
+    const current = reply.current;
+    requireExpectedServerIdentity(current.serverIdentity, open.handshake.serverIdentity);
+    const route = current.route;
+    requireMatchingIpcRoute(route, routeName, routeContract);
     requireExpectedRouteToken(route, expectedRouteToken);
+    requireExpectedRouteToken(route, boundRoute);
+    if (current.state !== "ready") {
+      throw new C2IpcTransportError(`C-Two IPC route ${routeName} is ${current.state}.`);
+    }
+    if (boundServerIdentity === undefined) {
+      boundServerIdentity = open.handshake.serverIdentity;
+    }
+    if (boundRoute === undefined) {
+      boundRoutes.set(routeName, route);
+    }
     return { open, route };
+  };
+
+  const enqueue = <T>(run: () => Promise<T>): Promise<T> => {
+    const result = callChain.then(run, run);
+    callChain = result.then(() => undefined, () => undefined);
+    return result;
   };
 
   return {
     async prepare(routeName: string, contract: C2ContractIdentity): Promise<void> {
-      await prepareRoute(routeName, contract);
+      await enqueue(async () => { await prepareRoute(routeName, contract); });
     },
 
     async call(routeName: string, contract: C2ContractIdentity, method: string, payload: Uint8Array): Promise<Payload> {
@@ -464,14 +579,13 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           throw new C2IpcTransportError(`C-Two IPC route ${routeName} payload ${requestPayload.byteLength} exceeds max_payload_size ${route.maxPayloadSize}.`);
         }
         const methodInfo = findIpcMethod(route, method);
-        const requestId = nextRequestId;
-        nextRequestId = nextRequestId === Number.MAX_SAFE_INTEGER ? 1 : nextRequestId + 1;
+        const requestId = allocateRequestId();
         let requestShmBlock: C2IpcRequestShmBlock | undefined;
         try {
-          requestShmBlock = await writeIpcCallRequestFrames(open.connection, BigInt(requestId), open.handshake, route, methodInfo.index, requestPayload, requestShmWriter, requestShmThreshold, requestChunkSize);
+          requestShmBlock = await writeIpcCallRequestFrames(open.connection, requestId, open.handshake, route, methodInfo.index, requestPayload, requestShmWriter, requestShmThreshold, requestChunkSize);
           requests += 1;
         } catch (error) {
-          connectionPromise = undefined;
+          await discardConnection(open);
           if (error instanceof C2IpcTransportError) {
             throw error;
           }
@@ -485,13 +599,15 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         try {
           responseFrame = await readIpcFrame(open.connection);
         } catch (error) {
-          connectionPromise = undefined;
+          await discardConnection(open);
           throw new C2IpcTransportError(`C-Two IPC call response read failed: ${String(error)}`);
         }
-        if (responseFrame.requestId !== BigInt(requestId)) {
+        if (responseFrame.requestId !== requestId) {
+          await discardConnection(open);
           throw new C2IpcTransportError(`C-Two IPC response request id ${responseFrame.requestId} did not match request id ${requestId}.`);
         }
         if ((responseFrame.flags & C2_IPC_FLAG_RESPONSE) === 0 || (responseFrame.flags & C2_IPC_FLAG_REPLY_V2) === 0) {
+          await discardConnection(open);
           throw new C2IpcTransportError("C-Two IPC response is not a v2 reply frame.");
         }
         requestShmServerConsumed = true;
@@ -527,8 +643,9 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         if ((responseFrame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
           let chunkedPayload: Uint8Array;
           try {
-            chunkedPayload = await readIpcChunkedSuccessPayload(open.connection, responseFrame, BigInt(requestId));
+            chunkedPayload = await readIpcChunkedSuccessPayload(open.connection, responseFrame, requestId);
           } catch (error) {
+            await discardConnection(open);
             if (error instanceof C2IpcTransportError) {
               throw error;
             }
@@ -588,9 +705,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         }
         return responseValue as Payload;
       };
-      const result = callChain.then(run, run);
-      callChain = result.then(() => undefined, () => undefined);
-      return await result;
+      return await enqueue(run);
     },
 
     async close(): Promise<void> {
@@ -926,11 +1041,18 @@ const C2_IPC_CAP_METHOD_IDX = 1 << 1;
 const C2_IPC_CAP_CHUNKED = 1 << 2;
 const C2_IPC_FLAG_RESPONSE = 1 << 1;
 const C2_IPC_FLAG_HANDSHAKE = 1 << 2;
+const C2_IPC_FLAG_CTRL = 1 << 4;
 const C2_IPC_FLAG_BUDDY = 1 << 6;
 const C2_IPC_FLAG_CALL_V2 = 1 << 7;
 const C2_IPC_FLAG_REPLY_V2 = 1 << 8;
 const C2_IPC_FLAG_CHUNKED = 1 << 9;
 const C2_IPC_FLAG_CHUNK_LAST = 1 << 10;
+// Canonical c2-wire MsgType discriminants; these are existing v11 controls.
+const C2_IPC_ROUTE_LIST = 0x0e;
+const C2_IPC_ROUTE_LIST_ACK = 0x0f;
+const C2_IPC_ROUTE_LOOKUP = 0x10;
+const C2_IPC_ROUTE_LOOKUP_ACK = 0x11;
+const C2_IPC_ROUTE_NACK = 0x15;
 const C2_IPC_REPLY_STATUS_SUCCESS = 0x00;
 const C2_IPC_REPLY_STATUS_ERROR = 0x01;
 const C2_IPC_REPLY_STATUS_ROUTE_NOT_FOUND = 0x02;
@@ -2317,22 +2439,209 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
   };
 }
 
-function findMatchingIpcRoute(routes: readonly C2IpcRouteInfo[], routeName: string, contract: C2RouteContractIdentity): C2IpcRouteInfo {
-  const namedRoutes = routes.filter((route) => route.name === routeName);
-  if (namedRoutes.length === 0) {
-    throw new C2IpcTransportError(`C-Two IPC route ${routeName} is not present in the server handshake.`);
+interface C2IpcCatalogRecord {
+  readonly route: C2IpcRouteInfo;
+  readonly serverIdentity: C2ServerIdentity;
+  readonly catalogRevision: number;
+  readonly state: string;
+}
+
+type C2IpcCatalogReply =
+  | { readonly kind: "nack"; readonly code: number; readonly message: string }
+  | { readonly kind: "list" }
+  | { readonly kind: "lookup"; readonly status: "ready" | "stale" | "contract_mismatch"; readonly routeName: string; readonly current: C2IpcCatalogRecord }
+  | { readonly kind: "lookup"; readonly status: "not_found" | "removed" | "closed"; readonly routeName: string };
+
+// The canonical codec is a one-byte MsgType followed by serde JSON, carried
+// in an inline FLAG_CTRL response (c2-wire::route_catalog_control). Validate
+// untrusted records before they can become client bindings. JSON u64 values
+// outside JavaScript's exact integer range are rejected instead of rounded.
+function ipcCatalogObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new C2IpcTransportError("C-Two IPC route catalog expected a JSON object.");
   }
-  const route = namedRoutes.find((candidate) =>
-    candidate.crmNs === contract.namespace &&
-    candidate.crmName === contract.name &&
-    candidate.crmVer === contract.version &&
-    candidate.abiHash === contract.abiHash &&
-    candidate.signatureHash === contract.signatureHash
-  );
-  if (route === undefined) {
+  return value as Record<string, unknown>;
+}
+
+function ipcCatalogText(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new C2IpcTransportError(`C-Two IPC route catalog missing ${field}.`);
+  }
+  return value;
+}
+
+function ipcCatalogInteger(value: unknown, field: string, minimum = 0): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) {
+    throw new C2IpcTransportError(`C-Two IPC route catalog invalid integer ${field}.`);
+  }
+  return value;
+}
+
+function ipcCatalogUid(value: unknown): string {
+  const uid = ipcCatalogText(value, "route_uid");
+  if (utf8ByteLength(uid) > C2_MAX_WIRE_TEXT_BYTES || /[\x00-\x20/\\]/.test(uid)) {
+    throw new C2IpcTransportError("C-Two IPC route catalog invalid route_uid.");
+  }
+  return uid;
+}
+
+function ipcCatalogReason(value: unknown): void {
+  if (typeof value !== "string" || ![
+    "register_prepared", "register_committed", "explicit_unregister", "shutdown",
+    "owner_lease_expired", "owner_watch_disconnected", "owner_route_missing",
+    "owner_identity_mismatch", "contract_mismatch", "catalog_compacted", "protocol_violation",
+  ].includes(value)) {
+    throw new C2IpcTransportError("C-Two IPC route catalog invalid state reason.");
+  }
+}
+
+function decodeIpcCatalogRecord(value: unknown): C2IpcCatalogRecord {
+  const item = ipcCatalogObject(value);
+  const name = ipcCatalogText(item.route_name, "route_name");
+  requireRouteNamePathValue(name);
+  const routeUid = ipcCatalogUid(item.route_uid);
+  const contract = ipcCatalogObject(item.contract);
+  if (contract.route_name !== name) {
+    throw new C2IpcTransportError("C-Two IPC route catalog contract route_name mismatch.");
+  }
+  const identity: C2RouteContractIdentity = {
+    schema: "c-two.contract.v2", descriptorSha256: "",
+    namespace: ipcCatalogText(contract.crm_ns, "crm_ns"),
+    name: ipcCatalogText(contract.crm_name, "crm_name"),
+    version: ipcCatalogText(contract.crm_ver, "crm_ver"),
+    abiHash: ipcCatalogText(contract.abi_hash, "abi_hash"),
+    signatureHash: ipcCatalogText(contract.signature_hash, "signature_hash"),
+  };
+  requireRouteContractIdentity(identity);
+  const serverIdentity = {
+    serverId: ipcCatalogText(item.owner_server_id, "owner_server_id"),
+    serverInstanceId: ipcCatalogText(item.owner_server_instance_id, "owner_server_instance_id"),
+  };
+  validateIpcRegionId(serverIdentity.serverId);
+  validateIpcRegionId(serverIdentity.serverInstanceId);
+  ipcCatalogInteger(item.owner_epoch, "owner_epoch");
+  if (item.lease_deadline_ms !== null && item.lease_deadline_ms !== undefined) {
+    ipcCatalogInteger(item.lease_deadline_ms, "lease_deadline_ms");
+  }
+  if (item.state_reason !== null && item.state_reason !== undefined) {
+    ipcCatalogReason(item.state_reason);
+  }
+  const state = ipcCatalogText(item.state, "state");
+  if (!["pending", "ready", "draining", "closed", "removed"].includes(state)) {
+    throw new C2IpcTransportError("C-Two IPC route catalog invalid state.");
+  }
+  if (!Array.isArray(item.methods) || item.methods.length > 256) {
+    throw new C2IpcTransportError("C-Two IPC route catalog invalid methods.");
+  }
+  const names = new Set<string>();
+  const indexes = new Set<number>();
+  const methods = item.methods.map((value): C2IpcMethodInfo => {
+    const method = ipcCatalogObject(value);
+    const name = ipcCatalogText(method.name, "method name");
+    requireMethodPathValue(name);
+    const index = ipcCatalogInteger(method.index, "method index");
+    if (index > 0xffff || names.has(name) || indexes.has(index)) {
+      throw new C2IpcTransportError("C-Two IPC route catalog invalid or duplicate method.");
+    }
+    names.add(name);
+    indexes.add(index);
+    return { name, index };
+  });
+  return {
+    route: {
+      name, routeUid,
+      routeRevision: ipcCatalogInteger(item.route_revision, "route_revision"),
+      crmNs: identity.namespace, crmName: identity.name, crmVer: identity.version,
+      abiHash: identity.abiHash, signatureHash: identity.signatureHash,
+      maxPayloadSize: ipcCatalogInteger(item.max_payload_size, "max_payload_size", 1), methods,
+    },
+    serverIdentity,
+    catalogRevision: ipcCatalogInteger(item.catalog_revision, "catalog_revision"),
+    state,
+  };
+}
+
+function decodeIpcCatalogReply(payload: Uint8Array, responseTag: number): C2IpcCatalogReply {
+  if (payload.byteLength < 2 || (payload[0] !== responseTag && payload[0] !== C2_IPC_ROUTE_NACK)) {
+    throw new C2IpcTransportError("C-Two IPC route catalog unexpected response tag.");
+  }
+  const item = ipcCatalogObject(JSON.parse(utf8Decode(payload.subarray(1), "route catalog")));
+  if (payload[0] === C2_IPC_ROUTE_NACK) {
+    ipcCatalogInteger(item.nonce, "nonce");
+    ipcCatalogInteger(item.rejected_revision, "rejected_revision");
+    const error = ipcCatalogObject(item.error);
+    const code = ipcCatalogInteger(error.code, "error code");
+    const name = ipcCatalogText(error.name, "error name");
+    // NACK is a structured C2 error envelope, not a business reply payload.
+    // Names mirror the canonical c2-error registry for wire validation only.
+    const names = [
+      "Unknown", "ResourceInputDeserializing", "ResourceOutputSerializing",
+      "ResourceFunctionExecuting", "ResourceInputFromBuffer", "ClientInputSerializing",
+      "ClientOutputDeserializing", "ClientCallingResource", "ClientOutputFromBuffer",
+    ];
+    const routeNames = [
+      "ResourceNotFound", "ResourceUnavailable", "ResourceAlreadyRegistered", "RouteStale",
+      "RegistryUnavailable", "WriteConflict", "ResourceClosed", "ResourceRemoved",
+      "ContractMismatch", "IdentityMismatch", "RouteCatalogCompacted", "RouteWatchUnavailable",
+      "ProtocolViolation", "FallbackDenied", "CallDeadlineExceeded", "UnsupportedCallMode", "CallCapacityExceeded",
+    ];
+    if (error.version !== 1 || name !== (code < names.length ? names[code] : routeNames[code - 701]) ||
+      typeof error.message !== "string") {
+      throw new C2IpcTransportError("C-Two IPC route catalog invalid NACK error envelope.");
+    }
+    const details = ipcCatalogObject(error.details);
+    if (Object.values(details).some((value) => typeof value !== "string")) {
+      throw new C2IpcTransportError("C-Two IPC route catalog invalid NACK error details.");
+    }
+    return { kind: "nack", code, message: error.message };
+  }
+  if (responseTag === C2_IPC_ROUTE_LIST_ACK) {
+    const revision = ipcCatalogInteger(item.catalog_revision, "catalog_revision");
+    if (ipcCatalogInteger(item.min_watch_revision, "min_watch_revision") > revision + 1 || !Array.isArray(item.routes)) {
+      throw new C2IpcTransportError("C-Two IPC route catalog invalid list response.");
+    }
+    const names = new Set<string>();
+    const uids = new Set<string>();
+    for (const value of item.routes) {
+      const record = decodeIpcCatalogRecord(value);
+      if (record.catalogRevision > revision || names.has(record.route.name) || uids.has(record.route.routeUid)) {
+        throw new C2IpcTransportError("C-Two IPC route catalog invalid or duplicate list record.");
+      }
+      names.add(record.route.name);
+      uids.add(record.route.routeUid);
+    }
+    return { kind: "list" };
+  }
+  const status = item.status;
+  if (status === "ready" || status === "stale" || status === "contract_mismatch") {
+    const current = decodeIpcCatalogRecord(item.current);
+    return { kind: "lookup", status, routeName: current.route.name, current };
+  }
+  if (status === "not_found" || status === "removed" || status === "closed") {
+    const routeName = ipcCatalogText(item.route_name, "route_name");
+    requireRouteNamePathValue(routeName);
+    if (status === "closed") {
+      ipcCatalogUid(item.route_uid);
+      ipcCatalogReason(item.reason);
+    } else if (status === "removed" && item.route_uid !== null && item.route_uid !== undefined) {
+      ipcCatalogUid(item.route_uid);
+    }
+    return { kind: "lookup", status, routeName };
+  }
+  throw new C2IpcTransportError("C-Two IPC route catalog invalid lookup status.");
+}
+
+function requireMatchingIpcRoute(route: C2IpcRouteInfo, routeName: string, contract: C2RouteContractIdentity): void {
+  if (
+    route.name !== routeName ||
+    route.crmNs !== contract.namespace ||
+    route.crmName !== contract.name ||
+    route.crmVer !== contract.version ||
+    route.abiHash !== contract.abiHash ||
+    route.signatureHash !== contract.signatureHash
+  ) {
     throw new C2IpcTransportError(`C-Two IPC route ${routeName} does not match the expected CRM contract.`);
   }
-  return route;
 }
 
 function findIpcMethod(route: C2IpcRouteInfo, method: string): C2IpcMethodInfo {

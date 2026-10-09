@@ -522,3 +522,391 @@ await configured.close();
 "#,
     );
 }
+
+#[test]
+fn persistent_ipc_acquire_uses_authority_and_keeps_bound_identities() {
+    let project = CompiledTransportProject::compile();
+    project.run_node_fixture(
+        "persistent_ipc_contract.mjs",
+        r#"import assert from 'node:assert/strict';
+import test from 'node:test';
+import { createIpcEncodedTransport, createRelayAwareHttpEncodedTransport } from './dist/typescript/c_two_contract.js';
+
+// Route catalog JSON/tag and FLAG_CTRL framing follow c2-wire's
+// route_catalog_control.rs and c2-ipc client::send_control_unary_raw.
+// Golden request hex was emitted by the Rust encode_route_*_request codecs.
+const CONTRACT = {
+  schema: 'c-two.contract.v2', namespace: 'test.persistent', name: 'Persistent',
+  version: '0.1.0', descriptorSha256: 'd'.repeat(64),
+  abiHash: 'a'.repeat(64), signatureHash: 'b'.repeat(64),
+};
+const wireContract = (name) => ({
+  route_name: name, crm_ns: CONTRACT.namespace, crm_name: CONTRACT.name,
+  crm_ver: CONTRACT.version, abi_hash: CONTRACT.abiHash, signature_hash: CONTRACT.signatureHash,
+});
+const record = (name, overrides = {}) => ({
+  route_name: name, route_uid: `${name}-uid`, route_revision: 1, catalog_revision: 1,
+  owner_server_id: 'server', owner_server_instance_id: 'instance', owner_epoch: 1,
+  contract: wireContract(name), methods: [{name: 'ping', index: 0}],
+  max_payload_size: 1048576, state: 'ready', state_reason: 'register_committed',
+  lease_deadline_ms: null, ...overrides,
+});
+const u16 = (n) => { const b = Buffer.alloc(2); b.writeUInt16LE(n); return b; };
+const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
+const text = (s) => Buffer.concat([Buffer.from([Buffer.byteLength(s)]), Buffer.from(s)]);
+const frame = (id, flags, payload) => Buffer.concat([u32(12 + payload.length), u64(id), u32(flags), payload]);
+const handshake = (routes, instance) => Buffer.concat([
+  Buffer.from([11]), text('/serverpool'), u16(0), u16(7), text('server'), text(instance), u16(routes.length),
+  ...routes.map((r) => Buffer.concat([
+    text(r.route_name), text(r.route_uid), u64(r.route_revision),
+    text(r.contract.crm_ns), text(r.contract.crm_name), text(r.contract.crm_ver),
+    text(r.contract.abi_hash), text(r.contract.signature_hash), u64(r.max_payload_size),
+    u16(r.methods.length), ...r.methods.map((m) => Buffer.concat([text(m.name), u16(m.index)])),
+  ])),
+]);
+function server() {
+  const s = {
+    routes: new Map([['manager', record('manager')]]), instance: 'instance',
+    connections: [], lookups: [], lists: [], calls: [], callFlags: [], failCall: false,
+    failRead: false, responseData: Buffer.alloc(0), chunkedReply: false, shmReply: false,
+    nextControl: undefined, corrupt: undefined,
+  };
+  s.connect = async () => {
+    let buffered = Buffer.alloc(0);
+    let businessReply = false;
+    const c = {
+      closed: 0,
+      async write(data) {
+        const b = Buffer.from(data);
+        assert.equal(b.readUInt32LE(0), b.length - 4);
+        const id = b.readBigUInt64LE(4), flags = b.readUInt32LE(12);
+        const payload = b.subarray(16);
+        const reply = (tag, value) => {
+          const bytes = Buffer.concat([Buffer.from([tag]), Buffer.from(JSON.stringify(value))]);
+          buffered = Buffer.concat([buffered, frame(id, 2 | 16, bytes)]);
+        };
+        if (flags === 4) {
+          buffered = Buffer.concat([buffered, frame(0n, 2 | 4, handshake([...s.routes.values()], s.instance))]);
+        } else if (flags === 16) {
+          const request = JSON.parse(payload.subarray(1).toString());
+          if (payload[0] === 0x0e) {
+            if (request.selector.expected.route_name === 'manager') assert.equal(payload.toString('hex'), '0e7b2273656c6563746f72223a7b2274797065223a22636f6e7472616374222c226578706563746564223a7b22726f7574655f6e616d65223a226d616e61676572222c2263726d5f6e73223a22746573742e70657273697374656e74222c2263726d5f6e616d65223a2250657273697374656e74222c2263726d5f766572223a22302e312e30222c226162695f68617368223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227369676e61747572655f68617368223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262227d7d2c226d696e5f7265766973696f6e223a6e756c6c7d');
+            assert.deepEqual(request, { selector: {type: 'contract', expected: wireContract(request.selector.expected.route_name)}, min_revision: null });
+            s.lists.push(request);
+            reply(0x0f, {catalog_revision: 1, min_watch_revision: 1, routes: [...s.routes.values()].filter((r) => r.route_name === request.selector.expected.route_name)});
+            return;
+          }
+          assert.equal(payload[0], 0x10);
+          if (request.expected.route_name === 'manager' && request.observed_route_uid === null) assert.equal(payload.toString('hex'), '107b226578706563746564223a7b22726f7574655f6e616d65223a226d616e61676572222c2263726d5f6e73223a22746573742e70657273697374656e74222c2263726d5f6e616d65223a2250657273697374656e74222c2263726d5f766572223a22302e312e30222c226162695f68617368223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227369676e61747572655f68617368223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262227d2c226f627365727665645f726f7574655f756964223a6e756c6c2c226f627365727665645f726f7574655f7265766973696f6e223a6e756c6c7d');
+          assert.deepEqual(request.expected, wireContract(request.expected.route_name));
+          assert.deepEqual(Object.keys(request).sort(), ['expected', 'observed_route_revision', 'observed_route_uid']);
+          assert.equal(request.observed_route_uid === null, request.observed_route_revision === null);
+          s.lookups.push(request);
+          if (s.corrupt) {
+            buffered = Buffer.concat([buffered, s.corrupt(id)]);
+            s.corrupt = undefined;
+            return;
+          }
+          if (s.nextControl) {
+            const next = s.nextControl; s.nextControl = undefined;
+            reply(next.tag, next.body); return;
+          }
+          const current = s.routes.get(request.expected.route_name);
+          reply(0x11, current ? {
+            status: request.observed_route_uid !== null && (request.observed_route_uid !== current.route_uid || request.observed_route_revision !== current.route_revision) ? 'stale' : 'ready', current,
+          } : {status: 'not_found', route_name: request.expected.route_name});
+        } else {
+          assert.ok((flags & 128) !== 0);
+          s.callFlags.push(flags);
+          s.calls.push(payload);
+          if (s.failCall) { s.failCall = false; throw new Error('uncertain write'); }
+          if ((flags & 512) !== 0 && (flags & 1024) === 0) return;
+          businessReply = true;
+          const body = Buffer.concat([Buffer.from([0]), s.responseData]);
+          if (s.chunkedReply) {
+            for (let index = 0; index < 2; index += 1) {
+              const data = s.responseData.subarray(index * 2, (index + 1) * 2);
+              buffered = Buffer.concat([buffered, frame(id, 2 | 256 | 512 | (index === 1 ? 1024 : 0), Buffer.concat([u64(s.responseData.length), u32(2), u32(index), data]))]);
+            }
+          } else if (s.shmReply) {
+            const buddy = Buffer.concat([u16(0), u32(1), u32(0), u32(s.responseData.length), Buffer.from([0])]);
+            buffered = Buffer.concat([buffered, frame(id, 2 | 256 | 64, Buffer.concat([buddy, Buffer.from([0])]))]);
+          } else {
+            buffered = Buffer.concat([buffered, frame(id, 2 | 256, body)]);
+          }
+        }
+      },
+      async readExactly(n) {
+        assert.ok(buffered.length >= n, 'control/call frame stream must stay serialized');
+        const b = buffered.subarray(0, n); buffered = buffered.subarray(n);
+        if (businessReply) {
+          businessReply = false;
+          if (s.failRead) { s.failRead = false; throw new Error('uncertain read'); }
+        }
+        return b;
+      },
+      async close() { this.closed += 1; },
+    };
+    s.connections.push(c);
+    return c;
+  };
+  return s;
+}
+const transport = (s, extra = {}) => createIpcEncodedTransport('ipc://persistent', {connect: s.connect, ...extra});
+const call = (t, name = 'manager') => t.call(name, CONTRACT, 'ping', new Uint8Array());
+
+test('authoritative late route, shared serial prepare/calls, and independent tokens', async () => {
+  const s = server(), t = transport(s);
+  await call(t);
+  s.routes.set('builder', record('builder'));
+  await Promise.all([t.prepare('builder', CONTRACT), call(t, 'builder'), call(t)]);
+  assert.equal(s.connections.length, 1);
+  assert.equal(s.calls.length, 3);
+  assert.deepEqual(s.lookups.map((r) => [r.expected.route_name, r.observed_route_uid]), [
+    ['manager', null], ['builder', null], ['builder', 'builder-uid'], ['manager', 'manager-uid'],
+  ]);
+  await t.close(); await t.close();
+  assert.equal(s.connections[0].closed, 1);
+});
+
+test('prepare and call reject replacements without poisoning another route', async () => {
+  const s = server(), t = transport(s);
+  s.routes.set('builder', record('builder'));
+  await call(t, 'builder');
+  s.routes.set('builder', record('builder', {route_uid: 'replacement', route_revision: 2}));
+  await assert.rejects(() => t.prepare('builder', CONTRACT), /route token mismatch/);
+  await assert.rejects(() => call(t, 'builder'), /route token mismatch/);
+  await call(t);
+  assert.equal(s.calls.length, 2);
+  assert.equal(s.connections.length, 1);
+  assert.equal(s.connections[0].closed, 0);
+  await t.close();
+});
+
+test('uncertain writes are never replayed; same identity reconnect retains the old token', async () => {
+  const s = server(), t = transport(s);
+  await call(t);
+  s.failCall = true;
+  await assert.rejects(() => call(t), /uncertain write/);
+  assert.equal(s.calls.length, 2);
+  await call(t);
+  assert.equal(s.connections.length, 2);
+  assert.equal(s.connections[0].closed, 1);
+  s.failCall = true;
+  await assert.rejects(() => call(t), /uncertain write/);
+  s.routes.set('manager', record('manager', {route_uid: 'replacement', route_revision: 2}));
+  await assert.rejects(() => call(t), /route token mismatch/);
+  assert.equal(s.calls.length, 4);
+  await t.close();
+});
+
+test('server incarnation is shared and pinned even for a newly acquired route', async () => {
+  const s = server(), t = transport(s);
+  await call(t);
+  await t.close();
+  s.instance = 'new-instance';
+  s.routes.set('builder', record('builder', {owner_server_instance_id: s.instance}));
+  await assert.rejects(() => t.prepare('builder', CONTRACT), /server identity mismatch/);
+  await assert.rejects(() => call(t), /server identity mismatch/);
+  assert.equal(s.calls.length, 1);
+  await t.close();
+});
+
+test('closed/removed/not-found/contract mismatch do not dispatch or close a healthy stream', async () => {
+  const s = server(), t = transport(s);
+  await call(t);
+  for (const body of [
+    {status: 'closed', route_name: 'manager', route_uid: 'manager-uid', reason: 'shutdown'},
+    {status: 'removed', route_name: 'manager', route_uid: 'manager-uid'},
+    {status: 'not_found', route_name: 'manager'},
+    {status: 'contract_mismatch', current: record('manager')},
+  ]) {
+    s.nextControl = {tag: 0x11, body};
+    await assert.rejects(() => call(t));
+    await call(t);
+  }
+  assert.equal(s.calls.length, 5);
+  assert.equal(s.connections.length, 1);
+  await t.close();
+});
+
+test('compacted catalog uses contract-scoped list then lookup with the pinned token', async () => {
+  const s = server(), t = transport(s);
+  await call(t);
+  s.nextControl = {tag: 0x15, body: {nonce: 0, rejected_revision: 1, error: {
+    version: 1, code: 711, name: 'RouteCatalogCompacted', message: 'compacted', details: {},
+  }}};
+  await call(t);
+  assert.equal(s.lists.length, 1);
+  assert.equal(s.lookups.length, 3);
+  assert.equal(s.lookups[2].observed_route_uid, 'manager-uid');
+  await t.close();
+});
+
+test('corrupt control replies discard the stream without business dispatch', async () => {
+  for (const corrupt of [
+    (id) => frame(id + 1n, 18, Buffer.from([0x11, 123, 125])),
+    (id) => frame(id, 2, Buffer.from([0x11, 123, 125])),
+    (id) => frame(id, 18, Buffer.from([0x13, 123, 125])),
+    (id) => frame(id, 18, Buffer.from([0x11, 123])),
+    (id) => frame(id, 18, Buffer.from([0x11, ...Buffer.from(JSON.stringify({status: 'ready', current: record('manager', {route_revision: 9007199254740992})}))])),
+  ]) {
+    const s = server(), t = transport(s);
+    s.corrupt = corrupt;
+    await assert.rejects(() => call(t));
+    assert.equal(s.calls.length, 0);
+    assert.equal(s.connections[0].closed, 1);
+    await call(t);
+    assert.equal(s.connections.length, 2);
+    await t.close();
+  }
+});
+
+test('resolved relay identity and token remain mandatory in the local acquire path', async () => {
+  const s = server();
+  const t = transport(s, {expectedServerIdentity: {serverId: 'server', serverInstanceId: 'instance'}, expectedRouteToken: {routeUid: 'resolved-old', routeRevision: 1}});
+  await assert.rejects(() => call(t), /route token mismatch/);
+  assert.equal(s.calls.length, 0);
+  await t.close();
+  const local = createRelayAwareHttpEncodedTransport('http://127.0.0.1:7357', {
+    ipc: {connect: s.connect},
+    fetch: async (url) => {
+      assert.ok(url.includes('/_resolve/'), 'no HTTP business fallback after local prepare');
+      return {status: 200, async text() {return JSON.stringify([{
+        name: 'manager', relay_url: 'http://127.0.0.1:7357', ipc_address: 'ipc://persistent',
+        route_uid: 'resolved-old', route_revision: 1, server_id: 'server', server_instance_id: 'instance',
+        crm_ns: CONTRACT.namespace, crm_name: CONTRACT.name, crm_ver: CONTRACT.version,
+        abi_hash: CONTRACT.abiHash, signature_hash: CONTRACT.signatureHash, max_payload_size: 1048576,
+      }]);}};
+    },
+  });
+  await assert.rejects(() => call(local), /same-path fallback denied/);
+  assert.equal(s.calls.length, 0);
+  await local.close();
+
+  const good = server(), observations = [];
+  const matching = createRelayAwareHttpEncodedTransport('http://127.0.0.1:7357', {
+    ipc: {connect: good.connect}, observe: (value) => observations.push(value),
+    fetch: async (url) => {
+      assert.ok(url.includes('/_resolve/'));
+      return {status: 200, async text() {return JSON.stringify([{
+        name: 'manager', relay_url: 'http://127.0.0.1:7357', ipc_address: 'ipc://persistent',
+        route_uid: 'manager-uid', route_revision: 1, server_id: 'server', server_instance_id: 'instance',
+        crm_ns: CONTRACT.namespace, crm_name: CONTRACT.name, crm_ver: CONTRACT.version,
+        abi_hash: CONTRACT.abiHash, signature_hash: CONTRACT.signatureHash, max_payload_size: 1048576,
+      }]);}};
+    },
+  });
+  await call(matching);
+  assert.equal(good.calls.length, 1);
+  assert.equal(good.lookups.length, 2, 'prepare and call both query authority with the resolved token');
+  assert.ok(good.lookups.every((request) => request.observed_route_uid === 'manager-uid'));
+  assert.equal(good.connections[0].closed, 1, 'relay-aware temporary transport closes after its call');
+  assert.equal(observations[0].path, 'RelayAwareLocalIpc');
+  assert.equal(observations[0].requests, 1);
+  await matching.close();
+});
+
+test('response read loss never replays a business call or changes the reconnect token', async () => {
+  const s = server(), t = transport(s);
+  await call(t);
+  s.failRead = true;
+  await assert.rejects(() => call(t), /uncertain read/);
+  assert.equal(s.calls.length, 2);
+  assert.equal(s.connections[0].closed, 1);
+  s.routes.set('manager', record('manager', {route_revision: 2}));
+  await assert.rejects(() => call(t), /route token mismatch/);
+  assert.equal(s.calls.length, 2);
+  assert.equal(s.lookups.at(-1).observed_route_revision, 1);
+  await t.close();
+});
+
+test('contract, owner, and non-ready records cannot change a binding', async () => {
+  const s = server(), t = transport(s);
+  await call(t);
+  const lookups = s.lookups.length;
+  await assert.rejects(() => t.prepare('manager', {...CONTRACT, signatureHash: 'c'.repeat(64)}), /expected CRM contract/);
+  assert.equal(s.lookups.length, lookups);
+  for (const overrides of [
+    {contract: {...wireContract('manager'), signature_hash: 'c'.repeat(64)}},
+    {owner_server_instance_id: 'other-instance'},
+    ...['pending', 'draining', 'closed', 'removed'].map((state) => ({state})),
+  ]) {
+    s.routes.set('manager', record('manager', overrides));
+    await assert.rejects(() => call(t));
+    assert.equal(s.calls.length, 1);
+  }
+  s.routes.set('manager', record('manager'));
+  await call(t);
+  assert.equal(s.connections.length, 1);
+  await t.close();
+});
+
+test('failed initial acquisition leaves server binding unset until successful acquire', async () => {
+  const s = server(), t = transport(s);
+  await assert.rejects(() => t.prepare('builder', CONTRACT));
+  await t.close();
+  s.instance = 'new-instance';
+  s.routes.set('builder', record('builder', {owner_server_instance_id: 'new-instance'}));
+  await call(t, 'builder');
+  assert.equal(s.calls.length, 1);
+  await t.close();
+});
+
+test('provider allocator, SHM release and chunk framing remain on the same shared stream', async () => {
+  const s = server();
+  s.responseData = Buffer.from([42, 43, 44]);
+  const allocations = [], shmEvents = [];
+  const t = transport(s, {
+    requestChunkSize: 2,
+    responsePayloadAllocator(size) {
+      const view = new Uint8Array(size);
+      const payload = {byteLength: size, view};
+      allocations.push(payload);
+      return {payload, view};
+    },
+    responseShmReader: {
+      async read(block, destination) {
+        assert.equal(block.prefix, '/serverpool');
+        assert.equal(block.generation, 1);
+        shmEvents.push('read');
+        destination.set(s.responseData);
+      },
+      async release() {shmEvents.push('response-release');},
+    },
+  });
+  assert.deepEqual(Array.from((await call(t)).view), [42, 43, 44]);
+  s.chunkedReply = true;
+  assert.deepEqual(Array.from((await t.call('manager', CONTRACT, 'ping', new Uint8Array(7))).view), [42, 43, 44]);
+  assert.equal(s.callFlags.filter((flags) => flags & 512).length, 4);
+  assert.equal(s.callFlags.at(-1), 128 | 512 | 1024);
+  s.chunkedReply = false; s.shmReply = true;
+  assert.deepEqual(Array.from((await call(t)).view), [42, 43, 44]);
+  assert.deepEqual(shmEvents, ['read', 'response-release']);
+  assert.deepEqual(allocations.map((p) => p.byteLength), [3, 3, 3]);
+  assert.equal(s.connections.length, 1);
+  await t.close();
+
+  const requestEvents = [];
+  const request = transport(s, {
+    requestShmThreshold: 0,
+    requestShmWriter: {
+      prefix: '/requestpool', segments: [{name: '/requestpool_b0000', size: 1048576}],
+      async write(payload) {
+        requestEvents.push('write');
+        return {segmentIndex: 0, generation: 1, offset: 0, byteLength: payload.byteLength, dedicated: false};
+      },
+      async markConsumed() {requestEvents.push('consumed');},
+      async release() {requestEvents.push('request-release');},
+    },
+  });
+  s.shmReply = false;
+  await request.call('manager', CONTRACT, 'ping', new Uint8Array(7));
+  assert.equal(s.callFlags.at(-1), 128 | 64);
+  assert.deepEqual(requestEvents, ['write', 'consumed']);
+  await request.close();
+});
+"#,
+    );
+}
