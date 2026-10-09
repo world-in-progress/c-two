@@ -360,7 +360,39 @@ def test_runtime_endpoint_and_accepted_budget_authority_are_native():
     }
     assert 'self._runtime_session.set_local_endpoint' in calls
     assert 'self._runtime_session.set_call_execution_limits' in calls
-    assert 'runtime_session.local_endpoint_context' in calls
+    assert 'new_session.inherit_local_endpoint_selection' in calls
+    swap = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == '_swap_runtime_session'
+    )
+    inheritance = [
+        node for node in ast.walk(swap)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and _attribute_name(node.func) == 'new_session.inherit_local_endpoint_selection'
+    ]
+    assert len(inheritance) == 1
+    assert len(inheritance[0].args) == 1
+    assert isinstance(inheritance[0].args[0], ast.Name)
+    assert inheritance[0].args[0].id == 'runtime_session'
+    # Swapping inherits Core's lazy/accepted selection without resolving a
+    # context, re-reading configuration, or deriving OS paths in Python.
+    swap_calls = {
+        ast.unparse(node.func) for node in ast.walk(swap)
+        if isinstance(node, ast.Call)
+    }
+    assert not any(
+        part in call for call in swap_calls
+        for part in ('local_endpoint_context', 'resolve_local_endpoint',
+                     'set_local_endpoint', 'getenv', 'environ', 'Path',
+                     'getuid', 'getsid', 'expanduser', 'tempfile', 'socket')
+    )
+    assert not any(
+        isinstance(node, ast.Attribute)
+        and (node.attr == 'environ' or 'local_endpoint' in node.attr)
+        and node.attr != 'inherit_local_endpoint_selection'
+        for node in ast.walk(swap)
+    )
     assert any(
         isinstance(node, ast.Attribute)
         and node.attr == 'call_execution_limits_overrides'
@@ -375,6 +407,9 @@ def test_runtime_endpoint_and_accepted_budget_authority_are_native():
     assert 'letoverrides=self.inner.call_execution_limits_overrides();' in getter
     context = _rust_compact(_rust_function(native, 'local_endpoint_context'))
     assert 'self.inner.local_endpoint_context()' in context
+    inheritance_native = _rust_compact(_rust_function(native, 'inherit_local_endpoint_selection'))
+    assert 'previous:&Self' in inheritance_native
+    assert 'self.inner.inherit_local_endpoint_selection(&previous.inner)' in inheritance_native
     struct = re.search(
         r'\bpub\s+struct\s+PyRuntimeSession\s*\{(.*?)\n\s*\}', native, flags=re.DOTALL,
     )

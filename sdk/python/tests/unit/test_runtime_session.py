@@ -890,8 +890,8 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         def local_endpoint_context(self) -> LocalEndpointContext:
             return self._context
 
-        def set_local_endpoint(self, *, context: LocalEndpointContext) -> None:
-            self._context = context
+        def inherit_local_endpoint_selection(self, previous: FakeSession) -> None:
+            self._context = previous._context
 
         def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
             assert timeout_seconds == 30.0

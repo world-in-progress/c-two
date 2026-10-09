@@ -715,8 +715,8 @@ class _FakeRuntimeSession:
     def local_endpoint_context(self) -> cc.LocalEndpointContext:
         return self._context
 
-    def set_local_endpoint(self, *, context: cc.LocalEndpointContext) -> None:
-        self._context = context
+    def inherit_local_endpoint_selection(self, previous: _FakeRuntimeSession) -> None:
+        self._context = previous._context
 
     def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
         assert route_names == []
