@@ -210,3 +210,6 @@ sdk/python/benchmarks/results/*
 
 # Specific Python versions
 .python-version
+
+# Local CLI validation output belongs outside source control.
+/cli/tests/outputs/
