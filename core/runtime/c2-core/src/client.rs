@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::fmt;
 use std::io::ErrorKind;
 use std::sync::Arc;
@@ -647,12 +648,14 @@ impl Runtime {
                     )
                 }
                 Err(error) if local_candidate_failure_is_terminal(&error) => Err(error),
-                Err(_) => {
+                Err(direct_error) => {
                     let resolved = Runtime::resolve_relay_connection_after_local_ipc_failures(
                         client,
                         std::slice::from_ref(&candidate),
                     )
-                    .map_err(normalize_resolution_error)?;
+                    .map_err(|error| {
+                        retain_local_ipc_cause(normalize_resolution_error(error), &direct_error)
+                    })?;
                     let resolved = self
                         .reconcile_relay_connection(resolved)
                         .map_err(normalize_resolution_error)?;
@@ -728,6 +731,55 @@ fn normalize_resolution_error(error: LifecycleError) -> Error {
         ),
         other => Error::Lifecycle(other),
     }
+}
+
+// Candidate exclusion belongs to the relay resolver; its final denial is
+// enriched here, where the original typed IPC acquisition error is still owned.
+fn retain_local_ipc_cause(mut resolution: Error, direct: &Error) -> Error {
+    let Error::Semantic(denial) = &mut resolution else {
+        return resolution;
+    };
+    if denial.code != c2_error::ErrorCode::FallbackDenied {
+        return resolution;
+    }
+    denial
+        .details
+        .insert("direct_ipc_failure".into(), direct.to_string());
+    let (kind, phase) = match direct {
+        Error::Semantic(error) => {
+            denial.details.insert(
+                "direct_ipc_failure_envelope".into(),
+                serde_json::to_string(&error.envelope())
+                    .expect("canonical IPC cause contains only serializable fields"),
+            );
+            (format!("semantic:{}", error.code.name()), "pre_dispatch")
+        }
+        Error::Transport(error) => {
+            let kind = match error
+                .source()
+                .and_then(|source| source.downcast_ref::<c2_ipc::IpcError>())
+            {
+                Some(c2_ipc::IpcError::Io(error)) => format!("io:{:?}", error.kind()),
+                Some(c2_ipc::IpcError::Closed) => "ipc:closed".into(),
+                _ => "transport:ipc".into(),
+            };
+            let phase = match error.phase() {
+                TransportPhase::PreDispatch => "pre_dispatch",
+                TransportPhase::DispatchUncertain => "dispatch_uncertain",
+            };
+            (kind, phase)
+        }
+        Error::Contract(_) => ("contract".into(), "pre_dispatch"),
+        Error::Admission(_) => ("admission".into(), "pre_dispatch"),
+        Error::Lifecycle(_) => ("lifecycle".into(), "pre_dispatch"),
+    };
+    denial
+        .details
+        .insert("direct_ipc_failure_kind".into(), kind);
+    denial
+        .details
+        .insert("direct_ipc_failure_phase".into(), phase.into());
+    resolution
 }
 
 fn local_candidate_failure_is_terminal(error: &Error) -> bool {
