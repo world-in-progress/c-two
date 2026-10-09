@@ -18,11 +18,11 @@ this SDK retains its independent 0.1.0 version. See [release notes](../../docs/r
 Rust `c2-core` owns default `Persistent`, explicit `OwnerBound`, shutdown drain
 transactions and local endpoint maintenance. SDKs use the one OS endpoint
 derived by `LocalEndpoint::from_address`; there is no backend selector.
-See [lifecycle integration](../../docs/local-endpoint-lifecycle.md) and the
+See [lifecycle integration](../../docs/local-endpoint-lifecycle.en.md) and the
 [owned-child example](examples/owned_child.rs). Upgrade local clients, hosts and
 relays together across the old Unix endpoint namespace boundary.
 
-[IPC memory policy](../../docs/memory-policy.md) is also shared Core behavior:
+[IPC memory policy](../../docs/memory-policy.en.md) is also shared Core behavior:
 lazy buddy allocation, idle decay, finite direction-scoped backing/reassembly
 budgets and checked transport fallback. Endpoint closure does not release
 retained payload owners or their budgets.

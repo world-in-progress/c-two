@@ -1,6 +1,8 @@
 # C-Two 配置指南
 
-本指南覆盖 C-Two 0.7.1 / c3 0.3.1 的 SDK、IPC、relay、并发和生命周期配置。Rust `c2-config` 负责默认值、环境解析和校验；SDK 提供代码接口，c3 提供命令行接口。
+[English](configuration.en.md) · 简体中文
+
+本指南覆盖 C-Two 的 SDK、IPC、relay、并发和生命周期配置。Rust `c2-config` 负责默认值、环境解析和校验；SDK 提供代码接口，c3 提供命令行接口。
 
 ## 配置来源与生效时机
 
@@ -128,10 +130,19 @@ HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接
 
 | 平台 | 端点 | 位置配置 |
 | --- | --- | --- |
-| Unix | 私有用户目录内的 UDS | 代码 `cc.set_local_endpoint(root=...)`、环境 `C2_IPC_ROOT`、c3 `--ipc-root`，默认 `/tmp` |
+| Unix | 配置目录内的 UDS | 代码 `cc.set_local_endpoint(root=...)`、环境 `C2_IPC_ROOT`、c3 `--ipc-root`，默认 `/tmp/c2-<uidhex>` |
 | Windows | 当前登录会话 SID 下的 Named Pipe | 自动选择；Unix root 配置不适用 |
 
-Unix root 必须是已有的绝对容器路径。应用负责创建容器，C-Two 创建其内的用户私有目录和版本目录。共享本地域的资源进程、客户端和 relay 使用相同 root；root 不改变 SHM 或 file-spill 的位置。配置在首次本地 I/O 尝试时冻结，包括失败的尝试。
+Unix root 是最终端点目录，实际 socket 位于 `<root>/<32 字符标识>`。自定义目录由应用预建，必须由当前用户持有且权限为 `0700`；默认目录由 C-Two 初始化。路径允许中文和空格，绑定、连接与探测通过目录句柄定位短名称，目录长度受文件系统限制。C-Two 只管理自身端点、租约及协调文件，不修改已有目录权限、不递归创建父目录、不删除应用目录或无关文件。共享本地域的资源进程、客户端和 relay 使用相同 root；root 不改变 SHM 或 file-spill 的位置。配置在首次本地 I/O 尝试时冻结，包括失败的尝试。
+
+```python
+from pathlib import Path
+import c_two as cc
+
+ipc_dir = Path('/Users/me/Library/Application Support/my-app/ipc')
+ipc_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+cc.set_local_endpoint(root=str(ipc_dir))
+```
 
 端点凭据保留其原生 scope。控制器在确认子进程退出后使用精确凭据清理；完整规则与 SDK/CLI 示例见[生命周期指南](local-endpoint-lifecycle.md)。
 

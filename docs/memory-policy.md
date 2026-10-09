@@ -1,6 +1,8 @@
 # C-Two 传输内存策略用户指南
 
-本文说明 Python 0.7.1 / c3 0.3.1 的 IPC 内存策略；该版本是尚未发布的候选，可用性与验证进度见[发布说明](releases/0.7.1.md)。配置默认与校验以 Rust resolver 为唯一权威，Python 仅提供类型化覆盖门面；实现背景见[内存优化计划](plans/2026-09-26-memory-policy.md)。
+[English](memory-policy.en.md) · 简体中文
+
+本文说明 IPC 内存预算、惰性分配与层级回退。Rust resolver 统一提供默认值及校验，Python 提供类型化覆盖门面。
 
 ## 1. 三个有限预算单元
 
@@ -14,7 +16,7 @@ C-Two 对自有 IPC 后备与在途组装维护三个有限的字节预算。三
 
 零值语义：`0` 表示该单元拒绝一切正数预留，它不是"无限制"。全部 `u64` 范围都是合法配置。
 
-预算边界：只覆盖 C-Two 自有的 IPC 数据后备与在途组装，不约束 Python/FastDB 堆、HTTP 缓冲、接收端代开的对端映射，也不等于进程 RSS。既有的单消息限制（`max_payload_size`、`max_reassembly_bytes`、`max_total_chunks`、`max_pool_segments` 等）继续独立生效，预算不替代它们。0.7.1 起另有独立的调用延续预算（`C2_CALL_MAX_OUTSTANDING`、`C2_CALL_RETAINED_INPUT_BUDGET_BYTES`）：它只约束有限期限调用为保留请求输入而取得的准入名额与字节预留，不属于这三个 IPC 预算单元，也不约束无限调用。
+预算边界：只覆盖 C-Two 自有的 IPC 数据后备与在途组装，不约束 Python/FastDB 堆、HTTP 缓冲、接收端代开的对端映射，也不等于进程 RSS。既有的单消息限制（`max_payload_size`、`max_reassembly_bytes`、`max_total_chunks`、`max_pool_segments` 等）继续独立生效，预算不替代它们。另有独立的调用延续预算（`C2_CALL_MAX_OUTSTANDING`、`C2_CALL_RETAINED_INPUT_BUDGET_BYTES`）：它只约束有限期限调用为保留请求输入而取得的准入名额与字节预留，不属于这三个 IPC 预算单元，也不约束无限调用。
 
 预算方向：服务端方向（响应池、组装池、响应预热）共享一个预算；Runtime 出站客户端域内所有缓存连接的请求池与组装池共享另一个预算。两个方向相互独立，独立的 Runtime 互不共享。创建 backing 前先原子预留预算：预留失败不会产生任何映射或文件；复用已计费段中的空闲块不二次计费；dedicated 段等待对端 `read_done`/GC 期间保持计费。
 
@@ -48,11 +50,11 @@ FastDB 载荷内容对该层不透明：C-Two 只搬运字节或共享内存指�
 
 校验约束：`pool_enabled=False` 时 `pool_prewarm_segments` 必须为 0（禁用的 buddy 池必须保持惰性），非法组合在 Rust 解析层被拒绝；`pool_min_retained_segments` 不得超过 `max_pool_segments` 与 `reassembly_max_segments`。
 
-## 5. 池段容量与单消息上限相互独立（0.7.1）
+## 5. 池段容量与单消息上限相互独立
 
 `pool_segment_size` 与 `max_payload_size` 是相互独立的维度，对 buddy 开启和关闭两种情况一致：一个较大的池段可以容纳多个较小的消息，池段总容量不必小于每条消息上限。0.7.0 校验中"`pool_segment_size` 不得超过 `max_payload_size`"的交叉限制已删除；保留的只有真正约束构造与线格式的检查（尺寸为正、索引可表示、段数有限、乘法不溢出），实际超过 `max_payload_size` 的请求与响应仍会被拒绝，不会因池段足够大而放行。
 
-因此以下组合在 0.7.1 直接合法：限制单条消息 32 MiB、保留默认 256 MiB 池段，并且关闭 buddy 时不创建任何 buddy 后备，dedicated SHM 仍按需可用：
+以下配置合法：限制单条消息 32 MiB、保留默认 256 MiB 池段，并且关闭 buddy 时不创建任何 buddy 后备，dedicated SHM 仍按需可用：
 
 ```python
 import c_two as cc
@@ -113,7 +115,7 @@ c3 relay --bind 127.0.0.1:8080 \
 
 四个命令行覆盖分别对应 `C2_IPC_POOL_ENABLED` 和上述三个预算环境变量，命令行优先于进程环境/`.env`。其他 client IPC 设置（例如 `C2_IPC_POOL_PREWARM_SEGMENTS`、`C2_IPC_POOL_DECAY_SECONDS`、`C2_SHM_THRESHOLD`）也经既有解析器生效；`c3 relay --dry-run` 可查看 buddy、预热和预算的已解析值。禁用 buddy 时预热必须为零；零预算保留“拒绝正数预留”的含义。
 
-此范围只包含 relay 自有的数据面 IPC 后备与组装。注册证明和控制 watch 使用独立的惰性默认上下文，对端映射和 HTTP 缓冲不计入该预算。HTTP 响应目前仍会全量物化后分片发送；小的发送分片不等于小的响应内存占用。后续治理边界见 [HTTP 预算设计提案](plans/2026-10-06-http-memory-budget.md)，该提案尚未实施。
+此范围只包含 relay 自有的数据面 IPC 后备与组装。注册证明和控制 watch 使用独立的惰性默认上下文，对端映射和 HTTP 缓冲不计入该预算。HTTP 响应仍会全量物化后分片发送；小的发送分片不等于小的响应内存占用。Relay 的转发准入另行约束事务数量与保留输入，见[配置指南](configuration.md#relay-与-c3)。
 
 ## 8. 只读统计：`cc.memory_stats()` 与 `cc.hold_stats()`
 
@@ -129,11 +131,7 @@ c3 relay --bind 127.0.0.1:8080 \
 
 关闭后的持有生命周期：`cc.shutdown()` 不强制释放仍被持有的数据，也不清零计账。其预算计费与保留租约转入 retired 域，继续出现在 `cc.memory_stats()['retired']`，只要旧代理、在途调用或 held 仍持有计数所有者，记录就继续可观察；计费归零与记录删除是两个时刻。最后一个真实所有者消失后，弱观察记录才移除，统计自身不会挽留池、连接、Runtime、回调或 payload。
 
-## 10. 本文不承诺的事项
-
-本文不声称分块路径提供流式或增量资源输入；不给出任何性能百分比；Windows 验证限于最终报告列出的 Server 2022/2025 门禁；不是发布或发布公告；不引入也不承诺兼容 shim。配置与行为以对应版本的 Rust resolver 为准；源码证据见下文。
-
-## 11. 证据指针
+## 10. 证据指针
 
 - `core/foundation/c2-config/src/memory.rs` — 三字段、有限默认与零值语义；`core/foundation/c2-config/src/ipc.rs` — 已解析默认值、覆盖键目录、`FORBIDDEN_IPC_OVERRIDE_KEYS` 与校验规则。
 - `core/foundation/c2-mem/src/budget.rs`、`pool.rs`、`pressure.rs`、`dedicated.rs`、`buddy_segment.rs`、`spill.rs` — 预留原语、层级回退、压力启发式与后备级 guard。
@@ -145,4 +143,4 @@ c3 relay --bind 127.0.0.1:8080 \
 - `docs/reports/memory-budget-contract.md` 与 `docs/plans/2026-09-26-memory-policy.md` — 目标契约与计划背景。
 - [内存阶段验收](reports/memory-native-final-validation.md) — 该阶段固定源码与开发产物证据，保留其历史状态。
 - [0.7.0 统一验收](reports/canonical-local-endpoint-validation.md) — 0.7.0 时期唯一端点的确切源码、Windows/Linux 门禁与开发产物哈希；是历史记录，不作为 0.7.1 证据。
-- [0.7.1 发布说明](releases/0.7.1.md) — 本版本候选的当前状态与已记录的阶段验证边界。
+- [0.7.1 发布说明](releases/0.7.1.md) — 对应源码的行为与验证范围。

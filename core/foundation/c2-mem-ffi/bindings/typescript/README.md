@@ -1,6 +1,6 @@
 # @c-two/c2-mem-ffi
 
-Version 0.1.0, not published on npm. This guide uses the shared Python 0.7.0 / c3 0.3.0 runtime baseline. See [version availability, upgrades and validation progress](../../../../../docs/releases/0.7.0.md) and [canonical source validation](../../../../../docs/reports/canonical-local-endpoint-validation.md); these are not official package-release receipts.
+The TypeScript substrate is built from source with its matching native library and Node addon. Endpoint directory behavior is documented in the [0.7.3 guide](../../../../../docs/releases/0.7.3.md).
 
 TypeScript facade and Node-API loader for the Rust `c2-mem-ffi` memory pool. The native library owns backing names, pool incarnations, buddy generations, allocation and release. JavaScript passes the native block coordinates through unchanged; it does not implement a second allocator or construct OS object names.
 
@@ -25,3 +25,5 @@ npm run pack:check
 The scripts launch child JavaScript through `process.execPath`. TypeScript can be overridden using `TSC_JS` or `TSC`; Cargo can be overridden using `CARGO` or resolved through `CARGO_HOME`, the user's `.cargo/bin`, and then `PATH`. Windows builds require the target MSVC tools to be installed; `node-gyp` selects the matching Node headers and import library.
 
 This package exposes C-Two memory ownership and byte transport only. Portable FastDB adapters are composed separately from Core-generated artifacts and currently open owned payload copies. Holding a payload is a lifetime contract, not a claim of direct response-SHM construction or zero-copy decoding.
+
+Unix connectors establish connections through Rust `c2-local`, including directory-relative addressing for long roots. The N-API worker retains the captured context until completion; an owned descriptor is transferred to Node Socket or closed on disposal. Windows connectors use the current-logon SID Named Pipe. See the [configuration guide](../../../../../docs/configuration.en.md) and [lifecycle guide](../../../../../docs/local-endpoint-lifecycle.en.md).
