@@ -22,7 +22,7 @@
     }
   },
   "devDependencies": {
-    "node-gyp": "12.2.0",
+    "node-gyp": "12.4.0",
     "typescript": "5.9.3"
   },
   "scripts": {
