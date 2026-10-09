@@ -4,6 +4,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 #include <stdbool.h>
 #include <stdint.h>
@@ -105,6 +106,7 @@ typedef C2MemFfiStatus (*endpoint_context_name_len_fn)(const C2MemFfiLocalEndpoi
 typedef C2MemFfiStatus (*endpoint_context_name_copy_fn)(const C2MemFfiLocalEndpointContext *, const char *, char *, size_t, size_t *);
 typedef C2MemFfiStatus (*endpoint_context_namespace_id_len_fn)(const C2MemFfiLocalEndpointContext *, size_t *);
 typedef C2MemFfiStatus (*endpoint_context_namespace_id_copy_fn)(const C2MemFfiLocalEndpointContext *, char *, size_t, size_t *);
+typedef C2MemFfiStatus (*endpoint_context_connect_unix_fn)(const C2MemFfiLocalEndpointContext *, const char *, int32_t *, int32_t *);
 
 typedef struct C2MemFfiNodeSymbols {
     void *library;
@@ -117,6 +119,7 @@ typedef struct C2MemFfiNodeSymbols {
     endpoint_context_name_copy_fn endpoint_context_name_copy;
     endpoint_context_namespace_id_len_fn endpoint_context_namespace_id_len;
     endpoint_context_namespace_id_copy_fn endpoint_context_namespace_id_copy;
+    endpoint_context_connect_unix_fn endpoint_context_connect_unix;
     request_pool_new_fn request_pool_new;
     request_pool_destroy_fn request_pool_destroy;
     request_pool_prefix_len_fn request_pool_prefix_len;
@@ -149,6 +152,9 @@ typedef struct C2MemFfiNodePoolHandle {
 typedef struct C2MemFfiNodeEndpointContext {
     C2MemFfiNodeSymbols *symbols;
     C2MemFfiLocalEndpointContext *ptr;
+    size_t active_connects;
+    bool closed;
+    bool finalized;
 } C2MemFfiNodeEndpointContext;
 
 /* Only wrapped objects created by this addon can carry a context owner. */
@@ -882,15 +888,22 @@ static napi_value local_endpoint(napi_env env, napi_callback_info info) {
     return result;
 }
 
-static void endpoint_context_finalize(napi_env env, void *data, void *hint) {
-    (void)env;
-    (void)hint;
-    C2MemFfiNodeEndpointContext *context = (C2MemFfiNodeEndpointContext *)data;
+static void endpoint_context_release_closed(C2MemFfiNodeEndpointContext *context) {
+    if (!context->closed || context->active_connects != 0) return;
     if (context->ptr != NULL) {
         context->symbols->endpoint_context_free(context->ptr);
         context->ptr = NULL;
     }
-    free(context);
+    if (context->finalized) free(context);
+}
+
+static void endpoint_context_finalize(napi_env env, void *data, void *hint) {
+    (void)env;
+    (void)hint;
+    C2MemFfiNodeEndpointContext *context = (C2MemFfiNodeEndpointContext *)data;
+    context->closed = true;
+    context->finalized = true;
+    endpoint_context_release_closed(context);
 }
 
 static C2MemFfiNodeEndpointContext *endpoint_context_receiver(
@@ -903,7 +916,7 @@ static C2MemFfiNodeEndpointContext *endpoint_context_receiver(
         return NULL;
     }
     C2MemFfiNodeEndpointContext *context = (C2MemFfiNodeEndpointContext *)raw;
-    if (require_open && context->ptr == NULL) {
+    if (require_open && (context->closed || context->ptr == NULL)) {
         throw_type_error(env, "c2-mem-ffi native endpoint context is closed.");
         return NULL;
     }
@@ -938,13 +951,163 @@ static napi_value endpoint_context_close(napi_env env, napi_callback_info info) 
     if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, &receiver, NULL))) return NULL;
     C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, false);
     if (context == NULL) return NULL;
-    if (context->ptr != NULL) {
-        context->symbols->endpoint_context_free(context->ptr);
-        context->ptr = NULL;
-    }
+    context->closed = true;
+    endpoint_context_release_closed(context);
     napi_value result;
     if (!check_napi(napi_get_undefined(env, &result))) return NULL;
     return result;
+}
+
+/* A descriptor remains owned until explicitly taken by Node's Socket. An
+ * ignored async result is closed by GC; every failed handoff closes it here. */
+typedef struct NativeSocketFd { int32_t fd; } NativeSocketFd;
+static const napi_type_tag socket_fd_tag = {
+    UINT64_C(0xb82cd6be1d234b99), UINT64_C(0x9b4e465211132206)
+};
+
+static void close_socket_fd(int32_t fd) {
+#ifndef _WIN32
+    if (fd >= 0) close(fd);
+#else
+    (void)fd; /* Unix descriptor transfer is never available on Windows. */
+#endif
+}
+
+static void socket_fd_finalize(napi_env env, void *data, void *hint) {
+    (void)env; (void)hint;
+    NativeSocketFd *owner = (NativeSocketFd *)data;
+    close_socket_fd(owner->fd);
+    free(owner);
+}
+
+static NativeSocketFd *socket_fd_receiver(napi_env env, napi_callback_info info) {
+    napi_value receiver;
+    bool tagged = false;
+    void *raw = NULL;
+    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, &receiver, NULL)) ||
+        !check_napi(napi_check_object_type_tag(env, receiver, &socket_fd_tag, &tagged)) ||
+        !tagged || !check_napi(napi_unwrap(env, receiver, &raw)) || raw == NULL) {
+        throw_type_error(env, "Expected a native connected Unix socket owner.");
+        return NULL;
+    }
+    return (NativeSocketFd *)raw;
+}
+
+static napi_value socket_fd_take(napi_env env, napi_callback_info info) {
+    NativeSocketFd *owner = socket_fd_receiver(env, info);
+    if (owner == NULL) return NULL;
+    if (owner->fd < 0) return throw_type_error(env, "Native socket was already closed or transferred.");
+    napi_value value;
+    if (!check_napi(napi_create_int32(env, owner->fd, &value))) return NULL;
+    owner->fd = -1;
+    return value;
+}
+
+static napi_value socket_fd_close(napi_env env, napi_callback_info info) {
+    NativeSocketFd *owner = socket_fd_receiver(env, info);
+    if (owner == NULL) return NULL;
+    close_socket_fd(owner->fd);
+    owner->fd = -1;
+    napi_value value;
+    if (!check_napi(napi_get_undefined(env, &value))) return NULL;
+    return value;
+}
+
+static napi_value socket_fd_object(napi_env env, int32_t fd, NativeSocketFd **out_owner) {
+    NativeSocketFd *owner = (NativeSocketFd *)malloc(sizeof(*owner));
+    if (owner == NULL) { close_socket_fd(fd); return throw_error(env, "Out of memory."); }
+    owner->fd = fd;
+    napi_value object;
+    napi_property_descriptor methods[] = {
+        { "takeFd", NULL, socket_fd_take, NULL, NULL, NULL, napi_default, NULL },
+        { "close", NULL, socket_fd_close, NULL, NULL, NULL, napi_default, NULL },
+    };
+    if (!check_napi(napi_create_object(env, &object)) ||
+        !check_napi(napi_define_properties(env, object, 2, methods)) ||
+        !check_napi(napi_type_tag_object(env, object, &socket_fd_tag)) ||
+        !check_napi(napi_wrap(env, object, owner, socket_fd_finalize, NULL, NULL))) {
+        socket_fd_finalize(env, owner, NULL);
+        return NULL;
+    }
+    *out_owner = owner;
+    return object;
+}
+
+typedef struct EndpointConnectWork {
+    C2MemFfiNodeEndpointContext *context;
+    char *address;
+    napi_ref receiver;
+    napi_async_work work;
+    napi_deferred deferred;
+    C2MemFfiStatus status;
+    int32_t fd;
+    int32_t os_error;
+} EndpointConnectWork;
+
+static void endpoint_connect_execute(napi_env env, void *data) {
+    (void)env;
+    EndpointConnectWork *work = (EndpointConnectWork *)data;
+    work->status = work->context->symbols->endpoint_context_connect_unix(
+        work->context->ptr, work->address, &work->fd, &work->os_error);
+}
+
+static void endpoint_connect_dispose(napi_env env, EndpointConnectWork *work) {
+    close_socket_fd(work->fd);
+    work->context->active_connects -= 1;
+    endpoint_context_release_closed(work->context);
+    if (work->receiver != NULL) napi_delete_reference(env, work->receiver);
+    if (work->work != NULL) napi_delete_async_work(env, work->work);
+    free(work->address);
+    free(work);
+}
+
+static void endpoint_connect_complete(napi_env env, napi_status status, void *data) {
+    EndpointConnectWork *work = (EndpointConnectWork *)data;
+    if (status != napi_ok || work->context->closed) work->status = C2_MEM_FFI_STATUS_IO_ERROR;
+    NativeSocketFd *owner = NULL;
+    napi_value value = NULL;
+    if (work->status == C2_MEM_FFI_STATUS_OK) {
+        int32_t fd = work->fd;
+        work->fd = -1;
+        value = socket_fd_object(env, fd, &owner);
+    }
+    napi_value result = make_status_result(env, work->status, value);
+    if (result == NULL || !check_napi(napi_resolve_deferred(env, work->deferred, result))) {
+        if (owner != NULL) { close_socket_fd(owner->fd); owner->fd = -1; }
+    }
+    endpoint_connect_dispose(env, work);
+}
+
+static napi_value endpoint_context_connect(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1], receiver;
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc != 1) {
+        return throw_type_error(env, "connectUnix expects an ipc:// address.");
+    }
+    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
+    if (context == NULL) return NULL;
+    if (context->symbols->endpoint_context_connect_unix == NULL) {
+        return throw_error(env, "Native library does not support directory-relative Unix connections.");
+    }
+    char *address = read_string_arg(env, args[0], "IPC address must be a string.");
+    if (address == NULL) return NULL;
+    EndpointConnectWork *work = (EndpointConnectWork *)calloc(1, sizeof(*work));
+    if (work == NULL) { free(address); return throw_error(env, "Out of memory."); }
+    work->context = context;
+    work->address = address;
+    work->fd = -1;
+    context->active_connects += 1;
+    napi_value promise, name;
+    if (!check_napi(napi_create_promise(env, &work->deferred, &promise)) ||
+        !check_napi(napi_create_string_utf8(env, "c2-local-connect", NAPI_AUTO_LENGTH, &name)) ||
+        !check_napi(napi_create_reference(env, receiver, 1, &work->receiver)) ||
+        !check_napi(napi_create_async_work(env, NULL, name, endpoint_connect_execute,
+            endpoint_connect_complete, work, &work->work)) ||
+        !check_napi(napi_queue_async_work(env, work->work))) {
+        endpoint_connect_dispose(env, work);
+        return throw_error(env, "Failed to queue a native Unix connection.");
+    }
+    return promise;
 }
 
 static napi_value endpoint_context_capture(napi_env env, napi_callback_info info) {
@@ -982,6 +1145,7 @@ static napi_value endpoint_context_capture(napi_env env, napi_callback_info info
     napi_property_descriptor methods[] = {
         { "endpointName", NULL, endpoint_context_name, NULL, NULL, NULL, napi_default, NULL },
         { "namespaceId", NULL, endpoint_context_namespace_id, NULL, NULL, NULL, napi_default, NULL },
+        { "connectUnix", NULL, endpoint_context_connect, NULL, NULL, NULL, napi_default, NULL },
         { "close", NULL, endpoint_context_close, NULL, NULL, NULL, napi_default, NULL },
     };
     if (!check_napi(napi_create_object(env, &object)) ||
@@ -1074,6 +1238,8 @@ static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
         symbols->library, "c2_mem_ffi_local_endpoint_context_namespace_id_len");
     symbols->endpoint_context_namespace_id_copy = (endpoint_context_namespace_id_copy_fn)optional_symbol(
         symbols->library, "c2_mem_ffi_local_endpoint_context_namespace_id_copy");
+    symbols->endpoint_context_connect_unix = (endpoint_context_connect_unix_fn)optional_symbol(
+        symbols->library, "c2_mem_ffi_local_endpoint_context_connect_unix");
     return true;
 }
 

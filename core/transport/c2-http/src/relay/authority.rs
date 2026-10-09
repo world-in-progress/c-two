@@ -1146,10 +1146,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn endpoint_validation_uses_captured_root_capacity_without_opening_it() {
-        // Construction is pure: an overlong root is legal as a context, but
-        // deriving its endpoint must fail the platform's sun_path bound.
-        let root = std::path::PathBuf::from(format!("/{}", "x".repeat(256)));
+    fn endpoint_validation_preserves_a_long_captured_directory_without_opening_it() {
+        // Logical validation is pure. Directory opening and short socket
+        // argument validation belong to the local transport at the IO boundary.
+        let root = std::path::PathBuf::from(format!("/tmp/{}", "目录 with spaces/".repeat(32)));
         let context = c2_config::LocalEndpointContext::with_unix_root(&root).unwrap();
         let state = RelayState::new_with_context(
             Arc::new(RelayConfig::default()),
@@ -1158,10 +1158,9 @@ mod tests {
         );
         let default = c2_config::LocalEndpointContext::default_for_platform().unwrap();
         default.endpoint("ipc://worker").unwrap();
-        assert!(matches!(
-            RouteAuthority::new(&state).validate_ipc_address("ipc://worker"),
-            Err(ControlError::InvalidAddress { reason }) if reason.contains("sun_path")
-        ));
+        RouteAuthority::new(&state)
+            .validate_ipc_address("ipc://worker")
+            .unwrap();
     }
 
     #[test]

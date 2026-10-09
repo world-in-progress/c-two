@@ -28,32 +28,32 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-本文以 **C-Two 0.7.1 / c3 0.3.1** 为基线，支持 Python 3.10+，依赖 FastDB 0.2.1。
+本文介绍 **C-Two 0.7.3**，支持 Python 3.10+，依赖 FastDB 0.2.1。
 
 ## 特点
 
-- **本地与远程调用：**同进程直接传递 Python 对象，同机 IPC 使用 Unix domain socket 或 Windows Named Pipe，跨机器使用 HTTP relay。显式 IPC 连接独立于 relay 发现。
-- **状态与并发：**资源在调用之间保留状态。`@cc.read`、`@cc.write` 声明访问语义，默认采用写访问；原生路由调度统一约束本地和远程调用的并发与排队数量。
-- **跨语言契约与载荷：**`@cc.transfer(...)` 绑定 FastDB `Payload` 规格。契约工具验证描述符并生成 Python、Rust、TypeScript 绑定；Python 之间也支持普通 Python 值。
-- **按契约路由：**客户端匹配路由名称、CRM 身份和契约哈希。Relay 发现选择经过验证的本机 IPC 路径或 HTTP 目标；`c3` 独立运行 relay，并支持 relay mesh。
-- **原生内存传输：**IPC 使用按需 buddy 池、独占共享内存、检查过的分块传输及文件溢出。通过预算和空闲回收控制大载荷的内存与文件用量。详见[内存策略](docs/memory-policy.md)。
-- **明确的载荷生命周期：**`cc.hold()` 保留响应租约，资源注册可选择借用输入；释放时先使 FastDB owner 和 checked view 失效，再释放传输存储。详见 [Python 载荷用法](docs/python-usage.md)。
-- **资源生命周期管理：**资源采用 `Persistent` 或控制器持有的 `OwnerBound` 生命周期；原生 shutdown 排空工作，限定范围的端点维护清理已确认退出的端点。详见[生命周期指南](docs/local-endpoint-lifecycle.md)。
-- **统一 Rust core：**Python 与 Rust 共用路由、传输、内存、错误和生命周期机制。原生 c3 CLI 在 Linux、macOS、Windows x64 上提供 relay、契约工具和端点维护。
+- **本地与远程调用**：同进程直接传递 Python 对象，同机 IPC 使用 Unix domain socket 或 Windows Named Pipe，跨机器使用 HTTP relay。显式 IPC 连接独立于 relay 发现。
+- **状态与并发**：资源在调用之间保留状态。`@cc.read`、`@cc.write` 声明访问语义，默认采用写访问；原生路由调度统一约束本地和远程调用的并发与排队数量。
+- **跨语言契约与载荷**：`@cc.transfer(...)` 绑定 FastDB `Payload` 规格。契约工具验证描述符并生成 Python、Rust、TypeScript 绑定；Python 之间也支持普通 Python 值。
+- **按契约路由**：客户端匹配路由名称、CRM 身份和契约哈希。Relay 发现选择经过验证的本机 IPC 路径或 HTTP 目标；`c3` 独立运行 relay，并支持 relay mesh。
+- **原生内存传输**：IPC 使用按需 buddy 池、独占共享内存、检查过的分块传输及文件溢出。通过预算和空闲回收控制大载荷的内存与文件用量。详见[内存策略](docs/memory-policy.md)。
+- **明确的载荷生命周期**：`cc.hold()` 保留响应租约，资源注册可选择借用输入；释放时先使 FastDB owner 和 checked view 失效，再释放传输存储。详见 [Python 载荷用法](docs/python-usage.md)。
+- **资源生命周期管理**：资源采用 `Persistent` 或控制器持有的 `OwnerBound` 生命周期；原生 shutdown 排空工作，限定范围的端点维护清理已确认退出的端点。详见[生命周期指南](docs/local-endpoint-lifecycle.md)。
+- **统一 Rust core**：Python 与 Rust 共用路由、传输、内存、错误和生命周期机制。原生 c3 CLI 在 Linux、macOS、Windows x64 上提供 relay、契约工具和端点维护。
 
 ## 安装
 
 ```bash
-uv pip install 'c-two==0.7.1'
+uv pip install c-two
 ```
 
 Windows PowerShell 使用相同命令。Linux、macOS 的 c3 安装命令：
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1/c3-installer.sh | sh -s -- --version 0.3.1
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.sh | sh -s -- --version 0.3.2
 ```
 
-Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
+Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
 
 源码构建与测试见[开发指南](docs/development.md)。
 
@@ -101,7 +101,7 @@ finally:
 | Python 契约、跨语言载荷与 hold | [Python SDK 指南](docs/python-usage.md) |
 | Rust SDK | [Rust SDK 指南](sdk/rust/README.md) |
 | Relay 与契约工具 | [c3 CLI 指南](cli/README.md) |
-| 0.7.1 配置与升级细节 | [版本指南](docs/releases/0.7.1.md) |
+| 端点目录配置 | [0.7.3 指南](docs/releases/0.7.3.zh-CN.md) |
 | Windows | [构建与使用](docs/windows-native-usage.md) |
 | 环境变量 | [.env.example](.env.example) |
 | 开发 | [构建与测试](docs/development.md)、[贡献指南](CONTRIBUTING.md) |

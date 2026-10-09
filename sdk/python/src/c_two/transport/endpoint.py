@@ -71,8 +71,8 @@ def local_endpoint_context(*, root: str | None = None) -> LocalEndpointContext:
 
     This query creates no endpoint metadata and does not freeze the Runtime.
     An explicit ``root`` resolves an independent supervisor context through
-    Core, without changing the current Runtime. Unix root containers must be
-    pre-created before bind/connect; Windows rejects root overrides.
+    Core, without changing the current Runtime. A custom Unix root is the final
+    endpoint directory, pre-created with mode 0700; Windows rejects root overrides.
     """
     return _selected_context(root, None)
 

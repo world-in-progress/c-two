@@ -2,35 +2,22 @@
 
 The native Windows backend uses byte-mode Named Pipes for `ipc://` control traffic and named file mappings for shared payload memory. It runs within one logon session under that session's SID. Ordinary SDK code continues to use logical `ipc://` addresses; do not construct pipe or mapping names in an SDK. HTTP relay still provides the network path.
 
-This guide describes Python C-Two **0.7.1** / c3 **0.3.1** on Windows x64 — a
-coordinated candidate pair that is not published yet. See
-[release notes](releases/0.7.1.md) for package and asset availability,
-coordinated upgrades and validation progress. FastDB is pinned to 0.2.1.
+This guide covers Python C-Two **0.7.3**, c3 **0.3.2** and FastDB **0.2.1** on Windows x64. Install the matching Python and c3 versions together; see the [0.7.3 guide](releases/0.7.3.md) for endpoint behavior.
 
-Windows endpoints remain byte-mode Named Pipes within one logon session under
-that session's SID; ordinary SDK code keeps using logical `ipc://` addresses
-and never constructs pipe or mapping names. The 0.7.1 Unix root override
-(`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-root`) is rejected
-as not applicable on Windows instead of being silently ignored, and no
-arbitrary pipe-path parameter bypassing the SID scope exists. HTTP relay still
-provides the network path.
+Unix root overrides (`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-root`) are rejected on Windows. Pipe names derive from the logical address and current logon SID.
 
 ## Install Python and c3
 
 In an activated Python environment, explicitly select the documented version:
 
 ```powershell
-uv pip install 'c-two==0.7.1'
+uv pip install 'c-two==0.7.3'
 ```
 
-The coordinated [c3 0.3.1 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.1)
-uses `c3-x86_64-pc-windows-msvc.exe`, its `.exe.sha256` sidecar and
-`c3-installer.ps1`. The [preparation page](releases/0.7.1.md) records their current
-availability; these target URLs do not assert that 0.3.1 is published.
-Download and verify the standalone executable before running it:
+The [c3 0.3.2 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.2) provides `c3-x86_64-pc-windows-msvc.exe`, its `.exe.sha256` checksum and `c3-installer.ps1`. Download and verify the standalone executable before running it:
 
 ```powershell
-$releaseBase = 'https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1'
+$releaseBase = 'https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2'
 $asset = 'c3-x86_64-pc-windows-msvc.exe'
 Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset" -OutFile ".\$asset"
 Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset.sha256" -OutFile ".\$asset.sha256"
@@ -47,7 +34,7 @@ Alternatively, use the checksum-verifying installer:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.1 -Target x86_64-pc-windows-msvc
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.2 -Target x86_64-pc-windows-msvc
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```
@@ -83,25 +70,8 @@ cargo build --locked --manifest-path cli/Cargo.toml --bin c3
 $env:FASTDB_PAYLOAD_LINK_MODE = 'system'
 ```
 
-## Source validation boundary
+## Validation scope
 
-0.7.1 is an unreleased candidate. Its recorded stage evidence is the Windows
-Native local-platform run
-[37775874925](https://github.com/world-in-progress/c-two/actions/runs/37775874925)
-at C-Two `6ada99f7ac116f63beab14789a04d04b51355a0c` plus FastDB
-`4f99f86a662b0e950a0dd29800c25a1c9fca4def`: Windows Server 2022/2025 x64
-local-platform gates passed with 1,353 applicable local-platform tests per OS.
-That is stage scope only — the full SDK projection, complete wheel matrix,
-cross-language rows and official release gates are still pending and are
-tracked in the [release notes](releases/0.7.1.md).
+The [0.7.3 endpoint validation](reports/0.7.3-endpoint-final-validation.md) records the exact source pairs and full Windows Server 2022/2025 x64 gates, including strict 18-row Rust/Python and 12-row TypeScript receipts and ordinary/non-administrator wheel consumers. Release manifests identify the actual package source; documentation commits are separate from artifact source commits.
 
-The [canonical report](reports/canonical-local-endpoint-validation.md)
-(C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` / FastDB
-`4f99f86a662b0e950a0dd29800c25a1c9fca4def`) remains the frozen 0.7.0 record;
-it is history, not 0.7.1 evidence. Later documentation commits are not
-artifact sources.
-
-Windows 11 desktop, Windows services, Windows ARM64 and a real Windows/Linux
-relay link remain unvalidated coverage targets; a Windows Server x64 result
-does not prove those environments. Their status continues to be recorded in
-[the implementation report](windows-native-implementation.md).
+Windows 11 desktop, Windows services, Windows ARM64 and a real Windows/Linux relay link are outside this evidence. See the [implementation report](windows-native-implementation.md) for platform coverage.

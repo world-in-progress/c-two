@@ -219,6 +219,7 @@ pub(crate) struct EndpointTestRoot(std::path::PathBuf);
 #[cfg(unix)]
 impl EndpointTestRoot {
     pub(crate) fn new() -> Self {
+        use std::os::unix::fs::DirBuilderExt;
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::path::PathBuf::from(format!(
@@ -226,7 +227,10 @@ impl EndpointTestRoot {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir(&path).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
         Self(path)
     }
 

@@ -2,8 +2,9 @@
 
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
-This guide covers **c3 0.3.1 / C-Two 0.7.1**. Configuration and upgrade details
-are in the [version guide](../docs/releases/0.7.1.md).
+This guide covers the native c3 interface. Configuration is documented in the
+[configuration guide](../docs/configuration.en.md); endpoint directory changes
+are described in the [0.7.3 guide](../docs/releases/0.7.3.md).
 
 ## Scope
 
@@ -106,7 +107,7 @@ Useful options:
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
-| `--ipc-root` | `C2_IPC_ROOT` | `/tmp` (Unix) | Absolute container root for the relay's private Unix endpoint directories; the deployment must create the container beforehand. Not applicable on Windows, where upstream IPC uses current-logon-SID Named Pipes. |
+| `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-<uidhex>` (Unix) | Final private endpoint directory; custom directories are application-provisioned with mode `0700`. Not applicable on Windows, where upstream IPC uses current-logon-SID Named Pipes. |
 | `--ipc-pool-enabled <true\|false>` | `C2_IPC_POOL_ENABLED` | Rust resolver | Enable buddy for data-plane upstream IPC; `false` still permits dedicated SHM. |
 | `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |
 | `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
@@ -164,7 +165,7 @@ server. Reconnect preserves full contract and server/instance identity
 validation; it does not replay ambiguous data-plane failures.
 `C2_RELAY_ROUTE_MAX_ATTEMPTS` belongs to relay-aware **clients**, not the relay
 server resolver (default 3, range 1..=32, zero treated as one).
-See the [memory policy](../docs/memory-policy.md) for lazy allocation,
+See the [memory policy](../docs/memory-policy.en.md) for lazy allocation,
 fallback and retained-owner accounting.
 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
@@ -184,8 +185,8 @@ c3 endpoint sweep --address ipc://this-run-server --max-entries 64 --max-ms 10 -
 ```
 
 Inspect, reap and sweep accept `--ipc-root` (or `C2_IPC_ROOT`) to address
-endpoints under a non-default Unix root. The root container must already
-exist; the CLI captures the endpoint context with the inspection and reap
+endpoints in a custom final Unix directory. The application provisions it
+with current-user ownership and mode `0700`; the CLI captures the endpoint context with the inspection and reap
 operates strictly on that captured context, so a credential from one root
 never touches an object under another. Custom-root routes discovered through
 a relay answer over HTTP when the relay's local namespace does not match;
@@ -198,7 +199,7 @@ unverified objects. Keep sweep addresses scoped to the current run; report
 completion only when CLI JSON `sweep.roundComplete` is true, not merely when the batch limit
 is reached. The millisecond budget is a scheduling target, not hard real-time
 filesystem behavior. Windows reports kernel-managed/not-applicable cleanup.
-See the [lifecycle guide](../docs/local-endpoint-lifecycle.md); do not remove
+See the [lifecycle guide](../docs/local-endpoint-lifecycle.en.md); do not remove
 unknown historical directories based on age, PID or connection failure.
 
 ## Registry
@@ -255,7 +256,7 @@ python tools/dev/generate_banner.py
 
 ## Release
 
-The coordinated [c3 0.3.1 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.1)
+The coordinated [c3 0.3.2 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.2)
 uses the following binary target convention. Installation and checksum
 verification are in the [Windows guide](../docs/windows-native-usage.md):
 
@@ -272,14 +273,14 @@ The matching release's `rc-manifest.json` identifies the artifact source.
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.1
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.2
 ```
 
 The installer detects Linux/macOS and x86_64/aarch64. It defaults to
 `/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.1 --bin-dir "$HOME/bin"
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.2 --bin-dir "$HOME/bin"
 ```
 
 ### Windows x64
@@ -288,7 +289,7 @@ Download the PowerShell installer and select the coordinated version explicitly:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.1 -Target x86_64-pc-windows-msvc
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.2 -Target x86_64-pc-windows-msvc
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```

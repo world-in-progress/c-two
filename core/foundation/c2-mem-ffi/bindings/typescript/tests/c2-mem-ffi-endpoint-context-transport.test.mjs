@@ -11,6 +11,7 @@ import {
   captureLocalIpcEndpointContext,
   createBundledC2MemFfiNodeRuntime,
   createNodeIpcConnect,
+  loadBundledC2MemFfiNodeNativeSymbols,
 } from '../dist/index.js';
 import { resolveCargo } from '../scripts/cargo-tools.mjs';
 
@@ -143,8 +144,10 @@ async function exchange(connection, marker) {
 
 async function runScenario(server, container) {
   const ownedRoot = mkdtempSync(resolve(container, 't'));
-  const rootA = resolve(ownedRoot, 'a');
-  const rootB = resolve(ownedRoot, 'b');
+  const segments = Array(4).fill('目录 with spaces ' + 'x'.repeat(100));
+  const rootA = resolve(ownedRoot, 'a', ...segments);
+  const rootB = resolve(ownedRoot, 'b', ...segments);
+  assert.ok(Buffer.byteLength(rootA, 'utf8') >= 512);
   const address = `ipc://node-context-${process.pid}-${randomBytes(6).toString('hex')}`;
   const otherAddress = `${address}-other`;
   const fixtures = [], owners = [], connections = [];
@@ -159,7 +162,7 @@ async function runScenario(server, container) {
     const metadataOtherA = probe(server, rootA, otherAddress);
     assert.notEqual(metadataA.endpointName, metadataB.endpointName);
     assert.notEqual(metadataA.namespaceId, metadataB.namespaceId);
-    mkdirSync(rootA); mkdirSync(rootB);
+    mkdirSync(rootA, { recursive: true, mode: 0o700 }); mkdirSync(rootB, { recursive: true, mode: 0o700 });
     process.env.C2_ENV_FILE = '';
     process.env.C2_IPC_ROOT = rootA;
     const captured = captureLocalIpcEndpointContext();
@@ -244,13 +247,33 @@ async function runScenario(server, container) {
     await exchange(fromB, 0xb2); await exchange(fromExplicitB, 0xb2);
     await fromB.close(); await fromExplicitB.close();
 
+    // Physical connections have their own ownership boundary, independent of
+    // the context used to start them. Closing during async work must stay safe.
+    const fdAddress = `${address}-fd-owner`;
+    const fdFixture = startServer(server, rootA, fdAddress, 0xff, 3);
+    fixtures.push(fdFixture);
+    await fdFixture.ready;
+    const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
+    const raw = symbols.c2_mem_ffi_local_endpoint_context_capture(rootA).value;
+    const owned = await raw.connectUnix(fdAddress);
+    assert.equal(owned.status, 0);
+    owned.value.close(); owned.value.close();
+    assert.throws(() => owned.value.takeFd(), /closed or transferred/);
+    const closing = raw.connectUnix(fdAddress);
+    raw.close(); raw.close();
+    assert.equal((await closing).status, 5, 'closed raw context must discard the socket and retain native context until work ends');
+    const disposed = createNodeIpcConnect({ ipcRoot: rootA });
+    const pending = disposed(fdAddress);
+    disposed.close();
+    await assert.rejects(pending, /connector is closed/);
+
     for (const fixture of fixtures) {
       const result = await fixture.closed;
       assert.equal(result.code, 0, `${JSON.stringify(result.messages)} ${result.stderr}`);
       assert.equal(result.signal, null);
       assert.equal(result.messages.at(-1).cleanup, 'Reaped');
     }
-    return { kind: 'passed', connections: 12, listeners: 3,
+    return { kind: 'passed', connections: 15, listeners: 4,
       evidence: 'Real Node→c2-local streams: success-first and failure-first Runtime A survive env flip to B; new Runtime B, explicit roots, shared typed context, multiple addresses/connections, reconnect and factory disposal preserve stream bytes. No RPC/SHM/matrix assertion.' };
   } finally {
     for (const connection of connections) await connection.close();
@@ -288,9 +311,8 @@ if (process.argv[2] === '--endpoint-context-child') {
     });
     assert.equal(output.error, undefined, `transport child did not finish: ${output.error}`);
     const result = JSON.parse(output.stdout.trim());
-    const unavailableRoot = result.phase === 'derive' && result.fixtureMessage === 'Unix socket endpoint exceeds sun_path capacity';
     const deniedBind = result.phase === 'bind' && [1, 13].includes(result.rawOsError);
-    if (explicitContainer === undefined && (unavailableRoot || deniedBind || result.unsupported)) {
+    if (explicitContainer === undefined && (deniedBind || result.unsupported)) {
       t.skip(`Real transport not run: ${result.message}. Host gate: ${hostCommand}`);
       return;
     }

@@ -181,7 +181,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn probe_native_name_capacity_is_a_configuration_error() {
+    fn probes_accept_a_long_directory_and_report_an_unconfirmed_target() {
         let root = format!("/tmp/{}", "x".repeat(200));
         let context = LocalEndpointContext::with_unix_root(std::path::Path::new(&root)).unwrap();
         let runtime = Runtime::new(crate::RuntimeOptions::default()).unwrap();
@@ -204,7 +204,13 @@ mod tests {
                 .shutdown_direct_ipc("ipc://capacity", Duration::ZERO)
                 .map(|_| ()),
         ] {
-            assert!(matches!(result, Err(LifecycleError::Configuration(_))));
+            assert!(result.is_ok());
         }
+        assert!(!ping_direct_ipc_with_context("ipc://capacity", &context, Duration::ZERO).unwrap());
+        let outcome =
+            shutdown_direct_ipc_with_context("ipc://capacity", &context, Duration::ZERO).unwrap();
+        assert!(!outcome.acknowledged);
+        assert!(!outcome.shutdown_started);
+        assert!(!outcome.server_stopped);
     }
 }

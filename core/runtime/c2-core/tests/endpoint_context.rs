@@ -149,7 +149,7 @@ mod unix {
     struct Roots(PathBuf);
     impl Roots {
         fn new() -> Self {
-            // Short, pre-created container: Darwin sun_path is only 104 bytes.
+            // The application provisions the final private directories.
             let path = PathBuf::from(format!(
                 "/tmp/e{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -163,6 +163,8 @@ mod unix {
         fn create(&self, name: &str) -> PathBuf {
             let root = self.root(name);
             std::fs::create_dir(&root).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
             root
         }
     }
@@ -627,6 +629,25 @@ mod unix {
         assert_eq!(outgoing_a.snapshot().reassembly.used_bytes, 0);
         assert!(restarted.shutdown().runtime_barrier_error.is_none());
         assert!(host_b.shutdown().runtime_barrier_error.is_none());
+    }
+
+    #[test]
+    fn long_directories_preserve_rpc_contract_hold_pools_and_restart() {
+        use std::os::unix::fs::DirBuilderExt;
+        let roots = Roots::new();
+        let segment = format!("目录 with spaces {}", "x".repeat(110));
+        let long = (0..4).fold(roots.root("long"), |path, _| path.join(&segment));
+        let a = long.join("a");
+        let b = long.join("b");
+        assert!(a.as_os_str().len() >= 512);
+        for root in [&a, &b] {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(root)
+                .unwrap();
+        }
+        two_domains_and_restart(&a, &b, false);
     }
 
     #[test]

@@ -260,7 +260,9 @@ name = "c2-mem-ffi"
 version = "0.1.0"
 dependencies = [
  "c2-config",
+ "c2-local",
  "c2-mem",
+ "tokio",
 ]
 
 [[package]]

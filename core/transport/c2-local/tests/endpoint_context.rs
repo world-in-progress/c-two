@@ -1,5 +1,4 @@
-//! Public native context tests. Keep roots short enough for macOS sun_path;
-//! endpoint derivation must never be bypassed with an arbitrary socket path.
+//! Public native context tests, including descriptor-relative long paths.
 #![cfg(unix)]
 
 use c2_config::{ConfigResolver, ConfigSources, EnvFilePolicy, LocalEndpointOptions};
@@ -19,10 +18,13 @@ const OTHER_ROOT: &str = "C2_LOCAL_CONTEXT_OTHER_ROOT";
 const ADDRESS: &str = "ipc://context-same-address";
 
 fn short_root() -> tempfile::TempDir {
-    tempfile::Builder::new()
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::Builder::new()
         .prefix("c2c-")
         .tempdir_in("/tmp")
-        .unwrap()
+        .unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    directory
 }
 
 fn context(root: &Path) -> LocalEndpointContext {
@@ -39,15 +41,12 @@ fn runtime() -> tokio::runtime::Runtime {
 #[tokio::test]
 async fn custom_root_container_missing_is_not_created_by_bind() {
     // The application's outer fixture exists, but its selected root does not.
-    // Keep the complete derived socket name within macOS sun_path capacity.
     let outer = tempfile::Builder::new()
         .prefix("c-")
         .tempdir_in("/tmp")
         .unwrap();
     let root = outer.path().join("r");
     let endpoint = context(&root).endpoint(ADDRESS).unwrap();
-    let version = Path::new(endpoint.os_name()).parent().unwrap();
-    let uid = version.parent().unwrap();
     assert!(!root.exists());
 
     let result = LocalListener::bind(&endpoint);
@@ -58,8 +57,6 @@ async fn custom_root_container_missing_is_not_created_by_bind() {
         !root.exists(),
         "bind must not create the missing root container"
     );
-    assert!(!uid.exists());
-    assert!(!version.exists());
     assert!(!Path::new(endpoint.os_name()).exists());
     assert_eq!(std::fs::read_dir(outer.path()).unwrap().count(), 0);
     assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::ENOENT));
@@ -75,8 +72,6 @@ async fn custom_root_container_file_is_rejected_without_changes() {
     let bytes = b"application-owned root file";
     std::fs::write(&root, bytes).unwrap();
     let endpoint = context(&root).endpoint(ADDRESS).unwrap();
-    let version = Path::new(endpoint.os_name()).parent().unwrap();
-    let uid = version.parent().unwrap();
 
     let result = LocalListener::bind(&endpoint);
     assert!(
@@ -85,8 +80,6 @@ async fn custom_root_container_file_is_rejected_without_changes() {
     );
     assert!(std::fs::symlink_metadata(&root).unwrap().is_file());
     assert_eq!(std::fs::read(&root).unwrap(), bytes);
-    assert!(!uid.exists());
-    assert!(!version.exists());
     assert!(!Path::new(endpoint.os_name()).exists());
     assert_eq!(std::fs::read_dir(outer.path()).unwrap().count(), 1);
     assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::ENOTDIR));
@@ -210,7 +203,7 @@ fn endpoint_context_child_fixture() {
             captured.namespace_id()
         );
         let default = LocalEndpointContext::default_for_platform().unwrap();
-        let default_json = r#"{"schemaVersion":2,"address":"ipc://context-default","protocol":"managed-v2","platform":"unix","incarnation":"00112233445566778899aabbccddeeff","device":1,"inode":2,"changedSecs":3,"changedNanos":4}"#;
+        let default_json = serde_json::json!({"schemaVersion":3,"address":"ipc://context-default","protocol":"managed-v2","platform":"unix","unixRoot":default.unix_root().unwrap(),"namespaceId":default.namespace_id(),"incarnation":"00112233445566778899aabbccddeeff","device":1,"inode":2,"changedSecs":3,"changedNanos":4}).to_string();
         let other = std::env::var(OTHER_ROOT).unwrap();
         // SAFETY: this isolated one-test child has no application workers,
         // reactors, or concurrent readers of the process environment.
@@ -228,7 +221,7 @@ fn endpoint_context_child_fixture() {
             &endpoint
         );
         assert_eq!(
-            EndpointCredential::from_json(default_json)
+            EndpointCredential::from_json(&default_json)
                 .unwrap()
                 .endpoint()
                 .context(),
@@ -236,9 +229,11 @@ fn endpoint_context_child_fixture() {
         );
         // Scope derivation must remain pure and use the old context.
         let scope = EndpointSweep::scope_for_addresses(&endpoint, &[ADDRESS.to_owned()]).unwrap();
-        // A nonexistent old namespace stays nonexistent, even if the new env
-        // root has a different namespace. Opening never falls back to it.
-        assert!(EndpointSweep::for_scope(&scope).is_err());
+        // The pre-created, uninitialized directory remains empty. Opening
+        // never initializes it or falls back to the newly selected env root.
+        let mut sweep = EndpointSweep::for_scope(&scope).unwrap();
+        assert_eq!(finish_sweep(&mut sweep), 0);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         assert!(!Path::new(endpoint.os_name()).exists());
         println!("CODEC_ENVIRONMENT_PASSED");
         return;
@@ -385,4 +380,110 @@ fn captured_open_and_scoped_sweeps_are_stable_after_environment_change() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("SWEEP_ENVIRONMENT_PASSED"));
+}
+
+fn long_root(outer: &Path, bytes: usize) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+    let mut root = outer.to_owned();
+    while root.as_os_str().as_bytes().len() < bytes {
+        let remaining = bytes - root.as_os_str().as_bytes().len();
+        let length = if remaining == 102 {
+            99
+        } else {
+            (remaining - 1).min(100)
+        };
+        let prefix = "目录 with spaces ";
+        let name = if length >= prefix.len() {
+            format!("{prefix}{}", "x".repeat(length - prefix.len()))
+        } else {
+            "x".repeat(length)
+        };
+        root.push(name);
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    assert_eq!(root.as_os_str().as_bytes().len(), bytes);
+    root
+}
+
+#[tokio::test]
+async fn long_directories_support_roundtrip_restart_inspect_reap_and_sweep() {
+    use std::os::unix::ffi::OsStrExt;
+    use tokio::io::AsyncReadExt;
+    let cwd = std::env::current_dir().unwrap();
+    for bytes in [128, 256, 512, 768] {
+        let outer = short_root();
+        let root = long_root(outer.path(), bytes);
+        let unrelated = root.join("application-owned.txt");
+        std::fs::write(&unrelated, b"preserve").unwrap();
+        let captured = context(&root);
+        let endpoint = captured.endpoint(ADDRESS).unwrap();
+        let path = Path::new(endpoint.os_name());
+        assert_eq!(path.parent(), Some(root.as_path()));
+        assert_eq!(path.file_name().unwrap().as_bytes().len(), 32);
+        assert!(path.as_os_str().as_bytes().len() > 108);
+        let mut listener = LocalListener::bind(&endpoint).unwrap();
+        let (mut client, mut server) = tokio::try_join!(
+            LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+            listener.accept()
+        )
+        .unwrap();
+        client.write_all(b"long path request").await.unwrap();
+        let mut data = [0; 17];
+        server.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"long path request");
+        server.write_all(b"long path reply").await.unwrap();
+        let mut reply = [0; 15];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"long path reply");
+        let credential = listener.credential();
+        assert_eq!(
+            EndpointCredential::from_json(&credential.to_json().unwrap()).unwrap(),
+            credential
+        );
+        assert_eq!(retry_inspect(&endpoint), credential);
+        drop(client);
+        drop(server);
+        assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+        assert!(!path.exists());
+        assert_eq!(
+            LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT)
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+
+        let (mut child, dead) = holder(&root);
+        kill_and_wait(&mut child);
+        assert_eq!(retry_inspect(&endpoint), dead);
+        assert!(matches!(
+            retry_reap(&endpoint, &dead),
+            EndpointReapResult::Reaped
+        ));
+        let (mut child, dead) = holder(&root);
+        kill_and_wait(&mut child);
+        let scope = EndpointSweep::scope_for_addresses(&endpoint, &[ADDRESS.to_owned()]).unwrap();
+        let mut sweep = EndpointSweep::for_scope(&scope).unwrap();
+        assert_eq!(finish_sweep(&mut sweep), 1);
+        assert!(matches!(
+            reap_endpoint(&endpoint, &dead),
+            EndpointReapResult::AlreadyAbsent
+        ));
+        assert!(root.is_dir());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"preserve");
+        assert!(
+            std::fs::read_dir(&root).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_type()
+                .unwrap()
+                .is_dir())
+        );
+        assert_eq!(std::env::current_dir().unwrap(), cwd);
+    }
 }

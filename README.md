@@ -28,7 +28,7 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
 
-This README covers **C-Two 0.7.1 / c3 0.3.1**, with Python 3.10+ and FastDB 0.2.1.
+This README describes **C-Two 0.7.3**, with Python 3.10+ and FastDB 0.2.1.
 
 ## Features
 
@@ -36,24 +36,24 @@ This README covers **C-Two 0.7.1 / c3 0.3.1**, with Python 3.10+ and FastDB 0.2.
 - **State and concurrency:** resources keep their state between calls. `@cc.read` and `@cc.write` declare access semantics, with writes as the default. Native route scheduling enforces concurrency and pending-work limits across local and remote invocation.
 - **Portable contracts and payloads:** `@cc.transfer(...)` binds FastDB `Payload` specifications. Contract tooling validates descriptors and generates Python, Rust and TypeScript bindings; ordinary Python values also support Python-to-Python calls.
 - **Contract-scoped routing:** clients match the route name, CRM identity and contract hashes. Relay discovery selects a verified local IPC path or an HTTP target; `c3` runs the relay and supports relay meshes.
-- **Native memory transport:** IPC uses lazy buddy pools, dedicated shared memory, checked chunk transfer and file spill. Budgets and idle reclamation control memory and file usage for large payloads. See [memory policy](docs/memory-policy.md).
+- **Native memory transport:** IPC uses lazy buddy pools, dedicated shared memory, checked chunk transfer and file spill. Budgets and idle reclamation control memory and file usage for large payloads. See [memory policy](docs/memory-policy.en.md).
 - **Explicit payload lifetimes:** `cc.hold()` retains response leases, while registration can select borrowed input lifetimes. Release invalidates FastDB owners and checked views before releasing transport storage. See [Python payload usage](docs/python-usage.md).
-- **Resource lifecycle management:** Resources use `Persistent` or controller-owned `OwnerBound` lifecycles; native shutdown drains work, and scoped endpoint maintenance cleans up confirmed exits. See [lifecycle integration](docs/local-endpoint-lifecycle.md).
+- **Resource lifecycle management:** Resources use `Persistent` or controller-owned `OwnerBound` lifecycles; native shutdown drains work, and scoped endpoint maintenance cleans up confirmed exits. See [lifecycle integration](docs/local-endpoint-lifecycle.en.md).
 - **Shared Rust core:** Python and Rust use the same routing, transport, memory, error and lifecycle mechanisms. The native c3 CLI handles relay, contract tools and endpoint maintenance on Linux, macOS and Windows x64.
 
 ## Install
 
 ```bash
-uv pip install 'c-two==0.7.1'
+uv pip install c-two
 ```
 
 The same command works in Windows PowerShell. For c3 on Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1/c3-installer.sh | sh -s -- --version 0.3.1
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.sh | sh -s -- --version 0.3.2
 ```
 
-On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
+On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
 For source builds and tests, see the [development guide](docs/development.md).
 
@@ -97,11 +97,11 @@ For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_ancho
 | Local calls | [local.py](examples/python/local.py) |
 | Direct IPC | [resource](examples/python/ipc_resource.py), [client](examples/python/ipc_client.py) |
 | Relay | [resource](examples/python/relay_resource.py), [client](examples/python/relay_client.py), [mesh](examples/python/relay_mesh/README.md) |
-| Configuration: code, environment and `.env` | [Configuration guide](docs/configuration.md) |
+| Configuration: code, environment and `.env` | [Configuration guide](docs/configuration.en.md) |
 | Python contracts, portable payloads and hold | [Python SDK guide](docs/python-usage.md) |
 | Rust SDK | [Rust SDK guide](sdk/rust/README.md) |
 | Relay and contract tools | [c3 CLI guide](cli/README.md) |
-| 0.7.1 configuration and upgrade details | [Version guide](docs/releases/0.7.1.md) |
+| Endpoint directory configuration | [0.7.3 guide](docs/releases/0.7.3.md) |
 | Windows | [Build and usage](docs/windows-native-usage.md) |
 | Environment variables | [.env.example](.env.example) |
 | Development | [Build and tests](docs/development.md), [contributing](CONTRIBUTING.md) |

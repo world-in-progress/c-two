@@ -1,11 +1,13 @@
 import { createRequire } from "node:module";
-import { createConnection } from "node:net";
+import { createConnection, Socket } from "node:net";
+import { closeSync } from "node:fs";
 
 export const C2_MEM_FFI_STATUS_OK = 0;
 export const C2_MEM_FFI_STATUS_NULL_POINTER = 1;
 export const C2_MEM_FFI_STATUS_INVALID_ARGUMENT = 2;
 export const C2_MEM_FFI_STATUS_POOL_ERROR = 3;
 export const C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4;
+export const C2_MEM_FFI_STATUS_IO_ERROR = 5;
 
 export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 255;
 export const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
@@ -16,7 +18,8 @@ export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_NULL_POINTER
   | typeof C2_MEM_FFI_STATUS_INVALID_ARGUMENT
   | typeof C2_MEM_FFI_STATUS_POOL_ERROR
-  | typeof C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER;
+  | typeof C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER
+  | typeof C2_MEM_FFI_STATUS_IO_ERROR;
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -122,9 +125,15 @@ export interface C2MemFfiResponsePoolSymbols<Handle = unknown> extends C2MemFfiA
 }
 
 /** Native addon owner; the Rust context pointer is never exposed to JavaScript. */
+export interface C2MemFfiNativeUnixSocket {
+  takeFd(): number;
+  close(): void;
+}
+
 export interface C2MemFfiNativeLocalEndpointContext {
   endpointName(address: string): C2MemFfiCallResult<string>;
   namespaceId(): C2MemFfiCallResult<string>;
+  connectUnix?(address: string): Promise<C2MemFfiCallResult<C2MemFfiNativeUnixSocket>>;
   close(): void;
 }
 
@@ -559,6 +568,33 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
     try {
       freeze();
       const normalizedPath = requireNodeIpcSocketPath(resolveEndpoint(address));
+      if (process.platform !== "win32" && options.createConnection === undefined && options.resolveEndpoint === undefined) {
+        if (snapshot === undefined || typeof nativeEndpointContext(snapshot).connectUnix !== "function") {
+          throw new C2NodeIpcConnectionError("Native library lacks directory-relative Unix connections.");
+        }
+        const active = leaseEndpointContext(snapshot.owner.state);
+        let owner: C2MemFfiNativeUnixSocket | undefined;
+        try {
+          const result = await nativeEndpointContext(active).connectUnix!(address);
+          owner = result?.value;
+          if (result?.status !== C2_MEM_FFI_STATUS_OK || owner === undefined
+            || typeof owner.takeFd !== "function" || typeof owner.close !== "function") {
+            throw new C2NodeIpcConnectionError(`C-Two Node IPC connect failed (${c2MemFfiStatusName(result?.status)}).`);
+          }
+          requireOpen();
+          const fd = owner.takeFd();
+          try {
+            socket = new Socket({ fd, readable: true, writable: true });
+          } catch (error) {
+            closeSync(fd);
+            throw error;
+          }
+          return new NodeIpcConnection(socket);
+        } finally {
+          owner?.close();
+          closeEndpointContextLease(active);
+        }
+      }
       const pendingSocket = openSocket(normalizedPath);
       socket = pendingSocket;
       return await new Promise<C2NodeIpcConnection>((resolve, reject) => {
@@ -1313,6 +1349,8 @@ function c2MemFfiStatusName(status: unknown): string {
       return "POOL_ERROR";
     case C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER:
       return "INSUFFICIENT_BUFFER";
+    case C2_MEM_FFI_STATUS_IO_ERROR:
+      return "IO_ERROR";
     default:
       return `UNKNOWN(${String(status)})`;
   }

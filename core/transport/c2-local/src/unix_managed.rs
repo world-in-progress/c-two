@@ -2,7 +2,7 @@
 //! per live listener, and identity-checked retirement.
 //!
 //! The namespace is the `managed-v2` directory derived by
-//! [`c2_config::LocalEndpoint`] (`/tmp/c2-<uidhex>/v2.2`). Everything in this module
+//! [`c2_config::LocalEndpoint`] (default `/tmp/c2-<uidhex>`). Everything in this module
 //! operates on that namespace through verified directory descriptors:
 //!
 //! - `.gate` is the single long-lived coordinator lock. Every open, create,
@@ -13,7 +13,7 @@
 //! - `<sha256(address)>.lease` is the per-endpoint lease, locked exclusively by
 //!   its listener for life. It stores the bounded owner record (protocol,
 //!   complete logical address, fresh incarnation, socket identity).
-//! - `<sha256(address)>.sock` is the Unix socket.
+//! - `<32-character endpoint id>` is the Unix socket.
 //!
 //! While the gate is held, an endpoint lease is only ever *tried*
 //! (`LOCK_EX | LOCK_NB`), so a listener that holds its lease and is dropping can
@@ -39,7 +39,6 @@ use std::time::Instant;
 
 pub(crate) const GATE_NAME: &str = ".gate";
 pub(crate) const MARKER_NAME: &str = ".gate.marker";
-pub(crate) const SOCKET_SUFFIX: &str = ".sock";
 pub(crate) const LEASE_SUFFIX: &str = ".lease";
 
 /// Test-only rendezvous that pauses an opener *inside* the gate-hold window,
@@ -280,16 +279,21 @@ fn endpoint_stem(endpoint: &LocalEndpoint) -> io::Result<OsString> {
     let name = Path::new(endpoint.os_name())
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "endpoint has no file name"))?;
-    let stem = name
-        .as_bytes()
-        .strip_suffix(SOCKET_SUFFIX.as_bytes())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed endpoint name is not a versioned socket",
-            )
-        })?;
+    let stem = name.as_bytes();
+    if !is_endpoint_stem(stem) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid endpoint file name",
+        ));
+    }
     Ok(OsString::from_vec(stem.to_vec()))
+}
+
+fn is_endpoint_stem(bytes: &[u8]) -> bool {
+    bytes.len() == 32
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 /// Endpoint names for the managed protocol. `lock` carries the per-endpoint
@@ -359,7 +363,6 @@ fn directory_error(error: io::Error, create: bool) -> NamespaceError {
 /// A verified managed namespace with the fixed coordinator gate held.
 pub(crate) struct ManagedNamespace {
     directory: EndpointDirectory,
-    parent: EndpointDirectory,
     gate: File,
 }
 
@@ -374,27 +377,16 @@ impl Drop for ManagedNamespace {
 }
 
 impl ManagedNamespace {
-    /// Opens a managed namespace root, verifying both the private parent
-    /// directory and the versioned namespace directory.
+    /// Opens the final private directory. Only the platform default directory
+    /// can be created here; custom directories belong to the application.
     pub(crate) fn open_root(
         root: &Path,
         create: bool,
         blocking: bool,
     ) -> Result<Self, NamespaceError> {
-        let parent_path = root.parent().ok_or_else(|| {
-            NamespaceError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed namespace has no parent directory",
-            ))
-        })?;
-        let parent = EndpointDirectory::open(parent_path, create)
-            .map_err(|error| directory_error(error, create))?;
-        if !parent.strict_private() {
-            return Err(NamespaceError::Unverified(
-                EndpointUnverifiedReason::UnsafeDirectory,
-            ));
-        }
-        let directory = EndpointDirectory::open(root, create)
+        let default = LocalEndpointContext::default_for_platform().map_err(NamespaceError::Io)?;
+        let create_directory = create && default.unix_root() == Some(root);
+        let directory = EndpointDirectory::open(root, create_directory)
             .map_err(|error| directory_error(error, create))?;
         if !directory.strict_private() {
             return Err(NamespaceError::Unverified(
@@ -432,11 +424,9 @@ impl ManagedNamespace {
         }
         // The wait for the gate is an unbounded window: after it returns, the
         // directory entries that were verified above may already name different
-        // directories. Re-check both parent and root through the open
-        // descriptors, and drop the gate without adopting anything when either
-        // name was redirected.
-        if !parent.path_still_names_open_directory() || !directory.path_still_names_open_directory()
-        {
+        // directories. Re-check the final directory through its open descriptor
+        // and drop the gate without adopting a redirected name.
+        if !directory.path_still_names_open_directory() {
             return Err(NamespaceError::Unverified(
                 EndpointUnverifiedReason::UnsafeDirectory,
             ));
@@ -473,11 +463,7 @@ impl ManagedNamespace {
             }
         }
 
-        Ok(Self {
-            directory,
-            parent,
-            gate,
-        })
+        Ok(Self { directory, gate })
     }
 
     /// The exact directory that must receive this process's socket and lease.
@@ -487,13 +473,12 @@ impl ManagedNamespace {
         &self.directory
     }
 
-    /// Confirms that both the private parent and the versioned root still name
-    /// the descriptors this namespace opened, and that the gate entry is still
+    /// Confirms that the final directory still names its open descriptor and
+    /// that the gate entry is still
     /// the coordinator inode. A renamed or replaced directory invalidates every
     /// operation that would otherwise act on it.
     fn gate_still_named(&self) -> bool {
-        self.parent.path_still_names_open_directory()
-            && self.directory.path_still_names_open_directory()
+        self.directory.path_still_names_open_directory()
             && gate_entry_is_current(&self.directory, &self.gate)
     }
 }
@@ -594,7 +579,11 @@ fn namespace_has_endpoint_entries(root: &Path) -> io::Result<bool> {
         let entry = entry?;
         let name = entry.file_name();
         let bytes = name.as_bytes();
-        if bytes.ends_with(SOCKET_SUFFIX.as_bytes()) || bytes.ends_with(LEASE_SUFFIX.as_bytes()) {
+        if is_endpoint_stem(bytes)
+            || bytes
+                .strip_suffix(LEASE_SUFFIX.as_bytes())
+                .is_some_and(is_endpoint_stem)
+        {
             return Ok(true);
         }
     }
@@ -886,16 +875,6 @@ fn bind_in_verified_directory(
     tokio::net::UnixListener::from_std(std_listener)
 }
 
-/// The address to *probe* for a live listener. Prefers a path that resolves
-/// through the verified descriptor (Linux `/proc/self/fd`); macOS has no such
-/// path, so it uses the absolute name. This is only an advisory liveness veto
-/// for stale-socket removal: it never authorizes an unlink, and every removal
-/// still re-verifies the entry identity through the descriptor afterwards.
-fn descriptor_socket_path(directory: &EndpointDirectory, names: &EndpointNames) -> PathBuf {
-    dirfd_relative_socket_path(directory, &names.socket_os)
-        .unwrap_or_else(|| directory.socket_path(&names.socket_os))
-}
-
 /// Removes a stale managed socket only when the lease record proves the exact
 /// current inode is the previous owner's. A failed connect never authorizes
 /// removal on its own.
@@ -911,7 +890,7 @@ fn remove_stale_managed_socket(
     if !stat_is(&socket_stat, libc::S_IFSOCK) || socket_stat.st_uid != unsafe { libc::geteuid() } {
         return Err(endpoint_in_use());
     }
-    if probe_listener_is_live(&descriptor_socket_path(&namespace.directory, names))? {
+    if probe_listener_is_live(&namespace.directory, &names.socket_os)? {
         return Err(endpoint_in_use());
     }
     let Some(record) = read_record(lease)? else {
@@ -1506,7 +1485,7 @@ fn reap_slot_with_directory(
         Ok(None) => {
             // A socket without any lease is an unregistered object, not proof
             // that the slot is already clean.
-            let socket = slot_name(stem, SOCKET_SUFFIX).ok();
+            let socket = slot_name(stem, "").ok();
             let present = socket
                 .and_then(|name| namespace.directory.stat(&name).ok().flatten())
                 .is_some();
@@ -1779,20 +1758,21 @@ impl ManagedSweep {
         if bytes == GATE_NAME.as_bytes() || bytes == MARKER_NAME.as_bytes() {
             return;
         }
-        if let Some(stem) = bytes.strip_suffix(SOCKET_SUFFIX.as_bytes()) {
+        if is_endpoint_stem(bytes) {
             batch.endpoints_examined += 1;
-            let stem = OsStr::from_bytes(stem);
+            let stem = OsStr::from_bytes(bytes);
             self.count(
                 batch,
                 reap_slot_with_directory(&self.context, stem, Some(&self.directory)),
                 false,
             );
-        } else if let Some(stem) = bytes.strip_suffix(LEASE_SUFFIX.as_bytes()) {
-            // A socket slot is handled through its `.sock` entry, which retires
+        } else if let Some(stem) = bytes
+            .strip_suffix(LEASE_SUFFIX.as_bytes())
+            .filter(|stem| is_endpoint_stem(stem))
+        {
+            // A socket slot is handled through its short entry, which retires
             // both objects. Only a socket-less slot is a lease-only candidate.
-            let mut socket = stem.to_vec();
-            socket.extend_from_slice(SOCKET_SUFFIX.as_bytes());
-            let socket = match CString::new(socket) {
+            let socket = match CString::new(stem) {
                 Ok(socket) => socket,
                 Err(_) => {
                     batch.unverified += 1;
@@ -1842,6 +1822,7 @@ impl ManagedSweep {
 /// production UID path.
 #[cfg(test)]
 pub(crate) fn test_namespace_root(root: &Path) -> io::Result<()> {
+    drop(EndpointDirectory::open(root, true)?);
     ManagedNamespace::open_root(root, true, true)
         .map(|namespace| drop(namespace))
         .map_err(|error| match error {

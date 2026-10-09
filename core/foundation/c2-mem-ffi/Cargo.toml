@@ -13,3 +13,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 [dependencies]
 c2-config = { version = "0.1.0", path = "../c2-config" }
 c2-mem = { version = "0.1.0", path = "../c2-mem" }
+
+[target.'cfg(unix)'.dependencies]
+c2-local = { version = "0.1.0", path = "../../transport/c2-local" }
+tokio = { version = "1", features = ["net", "rt", "time"] }

@@ -25,6 +25,13 @@ declare module "node:net" {
   }
 
   export function createConnection(path: string): Socket;
+  export const Socket: {
+    new(options: { fd: number; readable: boolean; writable: boolean }): Socket;
+  };
+}
+
+declare module "node:fs" {
+  export function closeSync(fd: number): void;
 }
 
 interface ImportMeta {

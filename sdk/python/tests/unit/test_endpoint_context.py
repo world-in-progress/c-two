@@ -178,22 +178,21 @@ def test_admin_probes_surface_invalid_root_configuration(
 
 @UNIX_ONLY
 @pytest.mark.parametrize('probe', ['ping', 'shutdown'])
-def test_admin_probes_surface_explicit_endpoint_name_capacity(probe: str) -> None:
+def test_admin_probes_accept_long_directory_and_report_missing_endpoint(probe: str) -> None:
     _run_isolated(f'''
         from c_two.transport.client import util
-        try:
-            getattr(util, {probe!r})('ipc://name-capacity', 0.01, root='/tmp/' + 'x' * 200)
-        except ValueError as error:
-            assert any(word in str(error).lower() for word in ('path', 'endpoint', 'socket')), error
+        result = getattr(util, {probe!r})('ipc://long-directory', 0.01, root='/tmp/' + 'x' * 200)
+        if {probe!r} == 'ping':
+            assert result is False, result
         else:
-            raise AssertionError('name capacity error reported as an offline endpoint')
+            assert result == {{'acknowledged': True, 'shutdown_started': False, 'server_stopped': True, 'route_outcomes': []}}, result
     ''')
 
 
 @UNIX_ONLY
 @pytest.mark.parametrize('probe', ['ping', 'shutdown'])
 @pytest.mark.parametrize('selection', ['context', 'runtime', 'environment', 'dotenv'])
-def test_admin_probes_surface_endpoint_name_capacity_in_all_contexts(
+def test_admin_probes_accept_long_directory_in_all_contexts(
     tmp_path: Path, probe: str, selection: str,
 ) -> None:
     root = '/tmp/' + 'x' * 200
@@ -215,12 +214,11 @@ def test_admin_probes_surface_endpoint_name_capacity_in_all_contexts(
         elif {selection!r} == 'runtime':
             cc.set_local_endpoint(root={root!r})
         operation = getattr(util, {probe!r})
-        try:
-            operation('ipc://name-capacity', 0.01, **kwargs)
-        except ValueError as error:
-            assert 'sun_path' in str(error), error
+        result = operation('ipc://long-directory', 0.01, **kwargs)
+        if {probe!r} == 'ping':
+            assert result is False, result
         else:
-            raise AssertionError('name capacity error reported as an offline endpoint')
+            assert result == {{'acknowledged': True, 'shutdown_started': False, 'server_stopped': True, 'route_outcomes': []}}, result
         session = _ProcessRegistry.get()._runtime_session
         assert session.local_endpoint_frozen == ({selection!r} != 'context')
         assert not session.client_config_frozen
@@ -338,12 +336,14 @@ def test_common_default_is_opaque_native_and_query_does_not_freeze() -> None:
         if sys.platform == 'win32':
             assert context.platform == 'windows'
             assert context.root is None
-            assert context.layout == 'named-pipe.v1'
             assert name.startswith('\\\\\\\\.\\\\pipe\\\\c_two-')
         else:
             assert context.platform == 'unix'
-            assert context.root == '/tmp'
-            assert context.layout == 'v2.2'
+            import os
+            from pathlib import Path
+            assert context.root == f'/tmp/c2-{os.geteuid():x}'
+            assert Path(name).parent == Path(context.root)
+            assert len(Path(name).name) == 32
         try:
             cc.LocalEndpointContext()
         except TypeError:
@@ -573,20 +573,21 @@ def test_public_replacement_preserves_root_and_native_retirement_observations() 
 
 
 @UNIX_ONLY
-def test_schema2_credential_retains_historical_context_under_new_environment() -> None:
-    document = json.dumps({
-        'schemaVersion': 2, 'address': 'ipc://historical-context',
-        'protocol': 'managed-v2', 'platform': 'unix',
-        'incarnation': '00112233445566778899aabbccddeeff',
-        'device': 1, 'inode': 2, 'changedSecs': 3, 'changedNanos': 4,
-    })
+def test_credential_retains_recorded_directory_under_new_environment() -> None:
     root = _unused_root()
+    other = _unused_root()
     _run_isolated(f'''
+        import json
         import c_two as cc
         from c_two import _native
-        credential = cc.EndpointCredential.from_json({document!r})
+        context = cc.local_endpoint_context(root={other!r})
+        document = {{'schemaVersion': 3, 'address': 'ipc://recorded-context',
+            'protocol': 'managed-v2', 'platform': 'unix', 'unixRoot': context.root,
+            'namespaceId': context.namespace_id, 'incarnation': '00112233445566778899aabbccddeeff',
+            'device': 1, 'inode': 2, 'changedSecs': 3, 'changedNanos': 4}}
+        credential = cc.EndpointCredential.from_json(json.dumps(document))
         assert cc.local_endpoint_context().root == {root!r}
-        assert credential.context.root == '/tmp'
+        assert credential.context == context
         assert credential.to_json() == cc.EndpointCredential.from_json(credential.to_json()).to_json()
         for result in (
             cc.reap_endpoint(credential.address, credential, root={root!r}),
@@ -595,7 +596,53 @@ def test_schema2_credential_retains_historical_context_under_new_environment() -
         ):
             assert result['status'] == 'stale-target', result
             assert result['reason'] == 'credential-context-mismatch', result
+        document['schemaVersion'] = 2
+        try:
+            cc.EndpointCredential.from_json(json.dumps(document))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('superseded Unix schema was accepted')
     ''', C2_IPC_ROOT=root)
+
+
+@UNIX_ONLY
+def test_public_python_rpc_and_maintenance_use_a_long_final_directory(tmp_path: Path) -> None:
+    root = tmp_path
+    for _ in range(4):
+        root = root / ('目录 with spaces ' + 'x' * 110)
+    root.mkdir(parents=True, mode=0o700)
+    assert len(str(root).encode('utf-8')) >= 512
+    _run_isolated(f'''
+        from pathlib import Path
+        import c_two as cc
+        root = Path({str(root)!r})
+        sentinel = root / 'application-data'
+        sentinel.write_text('preserve')
+        cc.set_local_endpoint(root=str(root))
+        @cc.crm(namespace='test.long-directory', version='1.0.0')
+        class Echo:
+            def echo(self, value: bytes) -> bytes: ...
+        class EchoResource:
+            def echo(self, value: bytes) -> bytes: return value
+        cc.register(Echo, EchoResource(), name='echo')
+        address = cc.server_address()
+        context = cc.local_endpoint_context()
+        endpoint = Path(context.endpoint_name(address))
+        assert endpoint.parent == root
+        assert len(endpoint.name) == 32
+        with cc.connect(Echo, name='echo', address=address) as proxy:
+            assert proxy.echo(b'long directory') == b'long directory'
+        observed = cc.inspect_endpoint(address)
+        assert observed['status'] == 'present', observed
+        credential = observed['credential']
+        assert credential.context == context
+        assert cc.EndpointCredential.from_json(credential.to_json()).to_json() == credential.to_json()
+        assert cc.shutdown()['completed']
+        assert not endpoint.exists()
+        assert root.is_dir() and sentinel.read_text() == 'preserve'
+        assert cc.reap_endpoint(address, credential)['status'] == 'already-absent'
+    ''')
 
 
 @pytest.mark.skipif(not IS_WINDOWS, reason='Windows named-pipe platform contract')

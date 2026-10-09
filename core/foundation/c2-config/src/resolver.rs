@@ -396,7 +396,7 @@ impl ConfigResolver {
     /// Resolve the immutable local endpoint context from typed options and
     /// configuration sources: explicit code > process env > `.env` > platform
     /// default. The resolved root is validated without touching the
-    /// filesystem; the root container must be pre-created by the application.
+    /// filesystem; a custom final directory must be pre-created by the application.
     /// An explicit empty, relative, `..`-bearing, NUL-bearing, or non-UTF-8
     /// root is rejected instead of silently falling back to the default.
     /// Environment values reach native validation verbatim — a trailing space
@@ -2251,8 +2251,10 @@ mod tests {
         .expect("default context should resolve");
         assert_eq!(
             default_ctx.unix_root(),
-            Some(std::path::Path::new("/tmp")),
-            "the platform default root must stay /tmp"
+            LocalEndpointContext::default_for_platform()
+                .unwrap()
+                .unix_root(),
+            "the resolver must use the platform default directory"
         );
         assert_eq!(
             default_ctx,
@@ -2398,7 +2400,7 @@ mod tests {
                 .os_name()
                 .to_str()
                 .unwrap()
-                .starts_with("/tmp/c2-r /c2-"),
+                .starts_with("/tmp/c2-r /"),
             "{endpoint:?}"
         );
 

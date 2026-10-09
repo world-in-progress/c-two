@@ -1,6 +1,6 @@
 # Python SDK usage
 
-C-Two 0.7.1 uses CRM contracts to expose stateful resources. For a runnable introduction, see the [quickstart](../README.md#quickstart).
+C-Two uses CRM contracts to expose stateful resources. For a runnable introduction, see the [quickstart](../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 

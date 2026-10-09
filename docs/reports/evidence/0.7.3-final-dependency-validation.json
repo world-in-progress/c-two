@@ -1,0 +1,169 @@
+{
+  "recorded_at": "2026-10-09",
+  "c_two_source": "22315b03eee032f5a5e8abc527b0fdcbf0ee16ee",
+  "fastdb_source": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "dependency_local_verification": {
+    "combined_source_sha": "22315b03eee032f5a5e8abc527b0fdcbf0ee16ee",
+    "endpoint_review_runtime_sha": "4b940f830695f3401571b7edeb2e1d16c7332396",
+    "dependency_only_changes": [
+      "cli/Cargo.lock",
+      "core/Cargo.lock",
+      "core/foundation/c2-mem-ffi/bindings/typescript/package-lock.json",
+      "core/foundation/c2-mem-ffi/bindings/typescript/package.json",
+      "sdk/python/native/Cargo.lock",
+      "sdk/rust/Cargo.lock",
+      "uv.lock"
+    ],
+    "lockfile_sha256": {
+      "cli/Cargo.lock": "fc9664391831df026855bc2af76bd1e68d0cc461c4e89d9bd14a516cb8e0a6a6",
+      "core/Cargo.lock": "1d24edaea8f320a02e66448dcef46d1e10e23fa6df2eb2550001d3951886470f",
+      "core/foundation/c2-mem-ffi/bindings/typescript/package-lock.json": "170943c7999b9154d95599e630a4a7adecdd5fea82ec19be0480dcf4c585e9a7",
+      "core/foundation/c2-mem-ffi/bindings/typescript/package.json": "0565bc54b78b3570390f8c3156d621f60bca4d6acceb1b48c8b411d4d884b5c7",
+      "sdk/python/native/Cargo.lock": "dd0efd5bf6ec8108ec7070583325ca73dfc387783e9f1d08039a240af938afe1",
+      "sdk/rust/Cargo.lock": "b5a8b8a4ab0ef4f26d52e25f3952d03c764fc8b6ddb6c3eebe717d0003cde424",
+      "uv.lock": "44eb5a06a98853120acbe0dcddcab5f05371069b2b148df17aa72c9979f3caee"
+    },
+    "http_passed": 397,
+    "node_passed": 56,
+    "node_windows_only_skipped": 1,
+    "npm_vulnerabilities": 0,
+    "local_processes_exited": true,
+    "rust_sdk_passed": 16,
+    "rust_sdk_exit_code": 0
+  },
+  "linux": {
+    "run_id": 37919777330,
+    "source_sha": "22315b03eee032f5a5e8abc527b0fdcbf0ee16ee",
+    "fastdb_pinned_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "fastdb_fixture_hashes_verified": true,
+    "all_steps_and_cleanup": true,
+    "python": "/home/runner/work/c-two/c-two/c-two/.venv/bin/python",
+    "python_native_sha256": "3ea8aff435cac0fac83ac81d60eb10b369504e34226fb149e5ffed875dbef0f2",
+    "strict_portable_rows": 18,
+    "strict_typescript_rows": 12,
+    "c3_sha256": "c333bf01c574158192aa4aa3bf0409e5dc9732754656b211e88144f7b3b35b1d",
+    "archive_records": [
+      {
+        "artifact_id": 11612080728,
+        "name": "local-endpoint-validation-22315b03eee032f5a5e8abc527b0fdcbf0ee16ee-python-suite",
+        "zip_sha256": "86949a991b624687379a1b9999e417e8060e28971c65f69ddb237654eea82dce",
+        "api_digest_matched": true
+      },
+      {
+        "artifact_id": 11611421352,
+        "name": "local-endpoint-validation-22315b03eee032f5a5e8abc527b0fdcbf0ee16ee-focused-local",
+        "zip_sha256": "c63cf90cb98d34d7e9dbac02765d4bb9bb8c9b231db537ba2edb219e2f5eb0d9",
+        "api_digest_matched": true
+      },
+      {
+        "artifact_id": 11610184919,
+        "name": "local-endpoint-validation-22315b03eee032f5a5e8abc527b0fdcbf0ee16ee-core-test",
+        "zip_sha256": "273ccb85d9af87a11588312ef475e4e9eb838d43f52e1b6839396439ad26a105",
+        "api_digest_matched": true
+      }
+    ]
+  },
+  "windows": [
+    {
+      "artifact_id": 11612720299,
+      "name": "windows-native-windows-2025-full-22315b03eee032f5a5e8abc527b0fdcbf0ee16ee",
+      "zip_sha256": "6871bed9facd8ae9fd5a130673455f343e9286912365178303c624fe36b8bcbf",
+      "api_digest_matched": true,
+      "runner": {
+        "requested_label": "windows-2025",
+        "os": "Windows-2025Server-10.0.26100-SP0",
+        "machine": "AMD64",
+        "image": "win25-vs2026",
+        "image_version": "20260925.250.1"
+      },
+      "source_sha": "22315b03eee032f5a5e8abc527b0fdcbf0ee16ee",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "all_gates": 23,
+      "internal_hashes_verified": 48,
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "c3_sha256": "295d70e8d2f94ed4225397f0458fd2f0e2e11fb41f65146582ca29aa764ccfa4",
+      "c3_bytes": 20190720,
+      "wheel_consumers": [
+        {
+          "receipt": "installed-wheel-full-receipt.v1.json",
+          "administrator": true,
+          "direct_and_relay_passed": true,
+          "held_and_borrowed_invalidated": true,
+          "process_temp_cleanup": true
+        },
+        {
+          "receipt": "installed-wheel-standard-user-full-receipt.v1.json",
+          "administrator": false,
+          "direct_and_relay_passed": true,
+          "held_and_borrowed_invalidated": true,
+          "process_temp_cleanup": true
+        }
+      ],
+      "nonadmin_account_process_workspace_cleanup": true
+    },
+    {
+      "artifact_id": 11612003224,
+      "name": "windows-native-windows-2022-full-22315b03eee032f5a5e8abc527b0fdcbf0ee16ee",
+      "zip_sha256": "20e0d194d594b21e612873dc809cf57fd78eb20d31ccf39ccf1e17dd25a3acbb",
+      "api_digest_matched": true,
+      "runner": {
+        "requested_label": "windows-2022",
+        "os": "Windows-2022Server-10.0.20348-SP0",
+        "machine": "AMD64",
+        "image": "win22",
+        "image_version": "20261004.326.1"
+      },
+      "source_sha": "22315b03eee032f5a5e8abc527b0fdcbf0ee16ee",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "all_gates": 23,
+      "internal_hashes_verified": 48,
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "c3_sha256": "9bf37e69cb9b3fa2b3e8dc0c39c4bcb70ceb1ac048ecc1c759a2be4390e77592",
+      "c3_bytes": 20197376,
+      "wheel_consumers": [
+        {
+          "receipt": "installed-wheel-full-receipt.v1.json",
+          "administrator": true,
+          "direct_and_relay_passed": true,
+          "held_and_borrowed_invalidated": true,
+          "process_temp_cleanup": true
+        },
+        {
+          "receipt": "installed-wheel-standard-user-full-receipt.v1.json",
+          "administrator": false,
+          "direct_and_relay_passed": true,
+          "held_and_borrowed_invalidated": true,
+          "process_temp_cleanup": true
+        }
+      ],
+      "nonadmin_account_process_workspace_cleanup": true
+    }
+  ],
+  "dependencies": {
+    "urllib3": "2.8.0",
+    "rustls": "0.23.45",
+    "rustls_webpki": "0.103.15",
+    "node_gyp": "12.4.0",
+    "http_cache_semantics_in_graph": false,
+    "npm_audit_vulnerabilities": 0,
+    "open_dependabot_alerts": 0,
+    "merged_prs": [
+      175,
+      177
+    ],
+    "superseded_pr": 176,
+    "pr177_merged_main_sha": "2efa53ba2dc59c86b4eb787a5c493ab097273502",
+    "pr177_head_sha": "e14509ae79aa5da421f88f4846bc21fd0e0a15c6",
+    "pr177_identical_git_tree": "9c4d06e06ceffcdb303493cf27628508d0738688",
+    "pr177_successful_checks": 61,
+    "pr177_skipped_checks": 1
+  },
+  "cleanup": {
+    "dependency_worktree_archived": true,
+    "dependency_local_branch_deleted": true,
+    "completed_dependency_remote_branches_deleted": true
+  },
+  "evidence_scope": "development source builds; 0.7.3 publication not performed"
+}
