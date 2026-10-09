@@ -1,0 +1,268 @@
+{
+  "review_date": "2026-10-10",
+  "source_commit": "4cc5b4d229d21f00fc25619e8490169b2246edd1",
+  "production_source_changed": false,
+  "platform": {
+    "system": "Darwin",
+    "machine": "arm64"
+  },
+  "historical_source": {
+    "thread_id": "019e88aa-45f2-74f3-9683-b364bf090f87",
+    "title": "排查闲置续连报错",
+    "url": "codex://threads/019e88aa-45f2-74f3-9683-b364bf090f87",
+    "retrieval": "Direct read_thread tool, selected historical and final review turns; not a claim that every intermediate tool output was reread.",
+    "turns": [
+      {
+        "id": "019e96a6-b1f7-7a00-ae70-61785cf1c18c",
+        "topic": "Reproduced manager then late builder handshake snapshot and local HTTP fallback"
+      },
+      {
+        "id": "019e96b4-93fe-7580-a887-dfe43d18ac9f",
+        "topic": "Shared endpoint and dynamic registration ownership"
+      },
+      {
+        "id": "019e9762-aa9c-7df1-90bd-e327954bb7c0",
+        "topic": "Positive cache cannot confirm later route closure or removal; historical watch-first proposal"
+      },
+      {
+        "id": "019e9a89-be1a-7c42-b0d2-19b2c7349aed",
+        "topic": "Last whole-issue review did not certify the old implementation as complete"
+      }
+    ],
+    "private_business_logs_copied": false
+  },
+  "current_contract": "docs/vision/route-token-endpoint-connection-architecture.md; supersedes the old watch-first correctness framing",
+  "findings": {
+    "rust_exact_token_positive_cache": "reproduced with current Rust source, real local IPC; call-time gate rejected old binding",
+    "typescript_persistent_handshake_snapshot": "reproduced with original TS source, injected byte connection and native-encoded frames",
+    "typescript_default_reconnect_binding": "reproduced prepare acceptance after replacement/restart; pinned options reject; no real OS socket or business execution",
+    "shared_endpoint_semantic_failure_cleanup": "static close path confirmed; composite in-flight result not dynamically verified",
+    "fallback_denied_original_cause": "static: Core discards nonterminal acquire error and error body contains candidates without original typed cause"
+  },
+  "rust_exact_token_probe": {
+    "command": "CARGO_BUILD_JOBS=2 C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= CARGO_TARGET_DIR=/Users/soku/Desktop/codespace/WorldInProgress/c-two/core/target cargo run --manifest-path /tmp/c2-idle-history-probe/Cargo.toml --offline > /tmp/c2-idle-history-probe.log 2>&1",
+    "exit_code": 0,
+    "exit_meaning": "Expected current defect contrast reproduced, not a successful fix",
+    "scenario": [
+      "register route",
+      "connect and authoritative acquire",
+      "server unregister completes",
+      "exact-token acquire from same connection",
+      "call old binding",
+      "ordinary acquire",
+      "close client and server; join runner; assert socket absent"
+    ],
+    "result": {
+      "business_callbacks": 0,
+      "call_error": "C2E1{\"version\":1,\"code\":708,\"name\":\"ResourceRemoved\",\"message\":\"route grid was removed: route_uid 14ad0e26137e4d659f58b556a660d449\",\"details\":{}}",
+      "exact_token_acquire_accepted_after_removal": true,
+      "ordinary_acquire_rejected_after_removal": true,
+      "ordinary_error": "IPC route removed: grid uid=14ad0e26137e4d659f58b556a660d449",
+      "server_removed_route": true,
+      "socket_removed": true
+    },
+    "artifacts": [
+      {
+        "path": "/tmp/c2-idle-history-probe/Cargo.toml",
+        "bytes": 711,
+        "sha256": "1d925bc0bfb0b6532072e865c8c3cb2a610f1f32094755f4f9c289857dbca808"
+      },
+      {
+        "path": "/tmp/c2-idle-history-probe/Cargo.lock",
+        "bytes": 22670,
+        "sha256": "c27c6a412a82f0943d276717356949355c5470800b390de33ffca412c2631e30"
+      },
+      {
+        "path": "/tmp/c2-idle-history-probe/src/main.rs",
+        "bytes": 3883,
+        "sha256": "0ba27f1a69373804e0557a171c46f24dfa6e61e27c9beded593bdec15c507d45"
+      },
+      {
+        "path": "/tmp/c2-idle-history-probe.log",
+        "bytes": 1895,
+        "sha256": "834c4c9e420f5c0ef9d859bc93f374b92106bb9f8ecaa43ca9b57c376ad2bd08"
+      }
+    ]
+  },
+  "typescript_snapshot_probe": {
+    "command": "node --experimental-transform-types /tmp/c2-idle-node-snapshot-probe.mjs",
+    "exit_code": 0,
+    "result": {
+      "sourceCommit": "4cc5b4d229d21f00fc25619e8490169b2246edd1",
+      "nodeVersion": "v25.8.1",
+      "scope": "Original TS transport with an injected byte connection and real c2-wire handshake fixtures; no real OS connection or relay.",
+      "existingTransport": {
+        "connections": 1,
+        "writes": 1,
+        "lateError": "C2IpcTransportError: C-Two IPC transport error: C-Two IPC route builder is not present in the server handshake."
+      },
+      "freshTransportBuilderPrepare": "succeeded",
+      "connections": 2,
+      "closes": 2
+    },
+    "artifacts": [
+      {
+        "path": "/tmp/c2-idle-node-snapshot-probe.mjs",
+        "bytes": 2337,
+        "sha256": "813c6c406a99cbb1179428abcd3728a908091ff3c74c14194294e198c7fc2c08"
+      },
+      {
+        "path": "/tmp/c2-idle-node-handshakes.json",
+        "bytes": 990,
+        "sha256": "dc0ed8db72ae54fa413551c991ad5f801e3d244185a5eea0e98e87a706e74e18"
+      },
+      {
+        "path": "/tmp/c2-idle-node-snapshot-result.json",
+        "bytes": 513,
+        "sha256": "75ac36063d7f86b57d2a8eba1d9a0013c49af41959e0458fc283078642cd60ca"
+      }
+    ]
+  },
+  "typescript_reconnect_probe": {
+    "command": ".venv/bin/python3 -I /tmp/c2-idle-node-reconnect-fixture.py && node --experimental-transform-types /tmp/c2-idle-node-reconnect-probe.mjs",
+    "exit_code": 0,
+    "result": {
+      "sourceCommit": "4cc5b4d229d21f00fc25619e8490169b2246edd1",
+      "nodeVersion": "v25.8.1",
+      "scope": "Original TS transport with injected byte connections and actual c2-wire handshake fixtures; no OS socket or business execution. Prepare acceptance only; no automatic replay asserted.",
+      "results": [
+        {
+          "kind": "replacement",
+          "pinned": false,
+          "connections": 2,
+          "failedCall": "C2IpcTransportError: C-Two IPC transport error: C-Two IPC call write failed: Error: injected failed write before dispatch",
+          "nextPrepareAccepted": true
+        },
+        {
+          "kind": "replacement",
+          "pinned": true,
+          "connections": 2,
+          "failedCall": "C2IpcTransportError: C-Two IPC transport error: C-Two IPC call write failed: Error: injected failed write before dispatch",
+          "nextPrepareAccepted": false,
+          "nextPrepareError": "C2IpcTransportError: C-Two IPC transport error: C-Two IPC route token mismatch: expected manager-uid/1, got replacement-uid/1."
+        },
+        {
+          "kind": "restart",
+          "pinned": false,
+          "connections": 2,
+          "failedCall": "C2IpcTransportError: C-Two IPC transport error: C-Two IPC call write failed: Error: injected failed write before dispatch",
+          "nextPrepareAccepted": true
+        },
+        {
+          "kind": "restart",
+          "pinned": true,
+          "connections": 2,
+          "failedCall": "C2IpcTransportError: C-Two IPC transport error: C-Two IPC call write failed: Error: injected failed write before dispatch",
+          "nextPrepareAccepted": false,
+          "nextPrepareError": "C2IpcTransportError: C-Two IPC transport error: C-Two IPC server identity mismatch: expected history-server/history-instance, got history-server/new-instance."
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "path": "/tmp/c2-idle-node-reconnect-fixture.py",
+        "bytes": 837,
+        "sha256": "6ca5d77b62b7f89124a6912a680d88643c7c8062f7acfdd66cf31549bf92ed76"
+      },
+      {
+        "path": "/tmp/c2-idle-node-reconnect-fixtures.json",
+        "bytes": 1082,
+        "sha256": "a4e19da24a775a0473672ec473528d71ea1bb9f7e514e6492798974d729dad1d"
+      },
+      {
+        "path": "/tmp/c2-idle-node-reconnect-probe.mjs",
+        "bytes": 2997,
+        "sha256": "10eca656136ecf720895b7e58a4a50f5f433e9a9a1f7a79e9240662fb558cc8c"
+      },
+      {
+        "path": "/tmp/c2-idle-node-reconnect-result.json",
+        "bytes": 1717,
+        "sha256": "fadab4ab3785b2938fa00f570d3b32d91f1d2fa5c9c60f46c095d0dcfea7cc63"
+      }
+    ]
+  },
+  "handshake_fixture_provenance": {
+    "import_path": "/tmp/c2-slim-recheck-site",
+    "native_provider": "Verified public C-Two 0.7.3 macOS arm64 CPython 3.13 wheel; c2-wire handshake/frame encoding, no custom codec",
+    "artifact_source_commit": "b0031040a8d1a75d9f089f85b10568e7b33c6343",
+    "production_source_matches_review_head": true,
+    "wheel_sha256": "61b51784e6f78e65056978a4952a58273174ed8e4e7f6268a4cf973f0eadde0d",
+    "existing_checkout_native_extension_rebuilt": false
+  },
+  "shared_endpoint_composite_probe": {
+    "status": "not_run",
+    "reason": "Native subagent service content check blocked the task before any scratch artifact was created. No retry or runtime success claimed.",
+    "static_call_chain": [
+      "c2-http relay/state.rs:501-550 route semantic verify/exact token error",
+      "c2-http relay/conn_pool.rs:689-702 evict exact client without active_requests guard",
+      "c2-http relay/state.rs:575-581 close_failed_acquire_client",
+      "c2-ipc client.rs:4505-4605 close shared stream/receiver/pending"
+    ]
+  },
+  "prior_baseline": {
+    "evidence": "docs/reports/evidence/2026-10-09-slimming-regression-review.json",
+    "rust_http_relay_passed": 397,
+    "mesh_passed": 7,
+    "rerun_this_turn": false,
+    "does_not_cover_new_counterexamples": true
+  },
+  "source_files": [
+    {
+      "path": "core/transport/c2-ipc/src/client.rs",
+      "bytes": 327682,
+      "sha256": "ef2dbab51de4a9255d7d50cb95715753d1ca2e9b61915e34a6fa57cd05226a16"
+    },
+    {
+      "path": "core/runtime/c2-core/src/client.rs",
+      "bytes": 27015,
+      "sha256": "1581d177c83a778bc9f80751277472cbd445f076e295803790f3e3c57be2a454"
+    },
+    {
+      "path": "core/transport/c2-http/src/relay/state.rs",
+      "bytes": 92397,
+      "sha256": "a7f11bde3bff70f4e0cb472b37e2ab65b768d7bd89a46628a2435241f61dafd6"
+    },
+    {
+      "path": "core/transport/c2-http/src/relay/conn_pool.rs",
+      "bytes": 65974,
+      "sha256": "06a2422d61b5e8b65db51f817f582ef409a2ca02ce8441e6f1107f28f44f7483"
+    },
+    {
+      "path": "core/transport/c2-http/src/relay/router.rs",
+      "bytes": 251877,
+      "sha256": "d15e401f03a5947ebc3df22671447398a1c7b1b2858cfebf4922f700970cffb3"
+    },
+    {
+      "path": "core/transport/c2-http/src/relay/upstream_control.rs",
+      "bytes": 15949,
+      "sha256": "da3cf1f7739ef62b54678e21f29c40564e6fb45fcf6fcd7681e466c339fe669f"
+    },
+    {
+      "path": "core/transport/c2-http/src/client/relay_aware.rs",
+      "bytes": 76451,
+      "sha256": "609ac358a80708d35b970918e7a8737cb326ffda0ff3bec01a84bbe533017d2d"
+    },
+    {
+      "path": "core/transport/c2-server/src/server.rs",
+      "bytes": 345924,
+      "sha256": "e01e44b1869e494f4c4b00be596b4403a7475af54d50fe20899c34412b71149d"
+    },
+    {
+      "path": "core/foundation/c2-codegen/assets/typescript_transport.ts",
+      "bytes": 151002,
+      "sha256": "6da43ba8b27a5e690984c234f58c23879a0bc1261f5f4ac073648d0c7f9847fa"
+    },
+    {
+      "path": "core/foundation/c2-codegen/src/targets.rs",
+      "bytes": 41370,
+      "sha256": "f5cb98347d8a70ed19a0d736ddcc548b7798385d42d07e0eeabb146bfa35d0b0"
+    }
+  ],
+  "limits": [
+    "Real Rust IPC probe ran on this macOS host only.",
+    "Node probes use injected byte streams; no actual socket, relay idle timer, or business payload execution.",
+    "No Windows/Linux CI or full downstream long-running task executed in this review.",
+    "No production fixes, PR, commit, or release performed.",
+    "Scratch artifacts are retained under /tmp and may expire; results and hashes are retained here."
+  ]
+}

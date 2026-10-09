@@ -22,6 +22,10 @@ Portable-payload architecture and historical local-candidate references are:
 
 Documents under `docs/plans/`, `docs/reviews/`, and older `docs/superpowers/` dates are retained evidence. They are not current authority unless this roadmap explicitly says otherwise.
 
+## 0.7.4 maintenance backlog
+
+The [0.7.4 backlog](plans/0.7.4.md) records the next maintenance work. Its first item relaxes custom Unix endpoint root permissions, moves socket permission setup before listening, and improves diagnostics. Implementation and validation are pending.
+
 ## Status Definitions
 
 | Status | Meaning |
