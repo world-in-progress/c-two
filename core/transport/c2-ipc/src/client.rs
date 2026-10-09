@@ -1781,8 +1781,8 @@ impl Drop for SendGuard {
 /// prefix plus a parked continuation, so tests can prove that cancelling
 /// after bytes actually landed poisons the stream instead of leaving a frame
 /// prefix a later writer would append to. Production never installs it.
-#[cfg(test)]
-pub(crate) struct FrameWriteSeam {
+#[cfg(any(test, feature = "test-support"))]
+pub struct FrameWriteSeam {
     /// Bytes of the frame to write for real before parking mid-frame.
     pub prefix_bytes: usize,
     /// Completed once the prefix bytes were written to the real stream.
@@ -1795,8 +1795,8 @@ pub(crate) struct FrameWriteSeam {
 /// Park this connection immediately before its terminal pending drain and
 /// report the first real attempt. Tests can hold the pending map across that
 /// attempt without relying on timing or affecting any other connection.
-#[cfg(test)]
-pub(crate) struct PendingDrainSeam {
+#[cfg(any(test, feature = "test-support"))]
+pub struct PendingDrainSeam {
     pub entered: tokio::sync::oneshot::Sender<()>,
     pub resume: tokio::sync::oneshot::Receiver<()>,
     pub attempted: tokio::sync::oneshot::Sender<bool>,
@@ -1958,7 +1958,7 @@ pub struct IpcClient {
     partial_header_pending_for_test: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     receiver_drop_gate_for_test: StdMutex<Option<ReceiverDropGateForTest>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pending_drain_seam: StdMutex<Option<PendingDrainSeam>>,
     /// Serializes close barriers. Only one closer at a time may manipulate
     /// the writer slot and the receive-task handle, so a concurrent close
@@ -2025,7 +2025,7 @@ pub struct IpcClient {
     /// One-shot seam that splits the next prealloc frame write into a real
     /// partial prefix plus a parked continuation. Test-only: production
     /// never installs it, so real builds always write whole frames.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     frame_write_seam: StdMutex<Option<FrameWriteSeam>>,
 }
 
@@ -2137,7 +2137,7 @@ impl IpcClient {
             partial_header_pending_for_test: StdMutex::new(None),
             #[cfg(test)]
             receiver_drop_gate_for_test: StdMutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pending_drain_seam: StdMutex::new(None),
             close_gate: tokio::sync::Mutex::new(()),
             close_incomplete: AtomicBool::new(false),
@@ -2154,7 +2154,7 @@ impl IpcClient {
             maintenance_ticks: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             prealloc_selection_hook: StdMutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             frame_write_seam: StdMutex::new(None),
         }
     }
@@ -2696,7 +2696,7 @@ impl IpcClient {
                         .expect("connected stream has an abort handle")
                         .clone(),
                 });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let pending_drain_seam = self.pending_drain_seam.lock().take();
         let recv_handle = tokio::spawn(recv_loop_inner(
             reader,
@@ -2710,7 +2710,7 @@ impl IpcClient {
             partial_header_pending,
             #[cfg(test)]
             receiver_drop_gate,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pending_drain_seam,
         ));
         *self.recv_handle.lock() = Some(recv_handle);
@@ -3200,7 +3200,7 @@ impl IpcClient {
         writer: &mut LocalWriteHalf,
         parts: &[&[u8]],
     ) -> Result<(), IpcError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             let seam = self.frame_write_seam.lock().take();
             if let Some(seam) = seam {
@@ -4718,13 +4718,13 @@ impl IpcClient {
     /// Install the one-shot partial-write seam for the next business frame.
     ///
     /// Test-only: production never installs it.
-    #[cfg(test)]
-    pub(crate) fn set_frame_write_seam_for_test(&self, seam: Option<FrameWriteSeam>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_frame_write_seam_for_test(&self, seam: Option<FrameWriteSeam>) {
         *self.frame_write_seam.lock() = seam;
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_pending_drain_seam_for_test(&self, seam: PendingDrainSeam) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_pending_drain_seam_for_test(&self, seam: PendingDrainSeam) {
         *self.pending_drain_seam.lock() = Some(seam);
     }
 
@@ -4733,10 +4733,17 @@ impl IpcClient {
         Arc::clone(&self.pending)
     }
 
+    /// Exact request-pool owner for bounded lock-contention tests. This is
+    /// absent from default builds and never substitutes for release authority.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn request_pool_for_test(&self) -> Option<Arc<StdMutex<MemPool>>> {
+        self.request_pool()
+    }
+
     /// Number of live pending-response entries (test-only probe for
     /// per-call pending cleanup).
-    #[cfg(test)]
-    pub(crate) fn pending_len_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_len_for_test(&self) -> usize {
         self.pending.lock().len()
     }
 }
@@ -4951,7 +4958,7 @@ pub(crate) async fn recv_loop(
         None,
         #[cfg(test)]
         None,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         None,
     )
     .await;
@@ -4967,7 +4974,7 @@ async fn recv_loop_inner(
     connection: Option<ReceiveConnectionState>,
     #[cfg(test)] mut partial_header_pending: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)] receiver_drop_gate: Option<ReceiverDropGuardForTest>,
-    #[cfg(test)] pending_drain_seam: Option<PendingDrainSeam>,
+    #[cfg(any(test, feature = "test-support"))] pending_drain_seam: Option<PendingDrainSeam>,
 ) {
     #[cfg(test)]
     let _abort_join_delay = if receiver_drop_gate.is_none() {
@@ -5200,7 +5207,7 @@ async fn recv_loop_inner(
         &pending,
         &server_pool,
         connection.as_ref(),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         pending_drain_seam,
     )
     .await;
@@ -5212,14 +5219,14 @@ async fn drain_pending_on_disconnect(
     pending: &StdMutex<PendingMap>,
     server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
     connection: Option<&ReceiveConnectionState>,
-    #[cfg(test)] pending_drain_seam: Option<PendingDrainSeam>,
+    #[cfg(any(test, feature = "test-support"))] pending_drain_seam: Option<PendingDrainSeam>,
 ) {
     // Publish transport termination before waking a waiter or waiting for
     // pending settlement. Keeping the receiver alive is cleanup, not liveness.
     if let Some(connection) = connection {
         connection.disconnect();
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let attempted = if let Some(seam) = pending_drain_seam {
         let _ = seam.entered.send(());
         let _ = seam.resume.await;
@@ -5228,7 +5235,7 @@ async fn drain_pending_on_disconnect(
         None
     };
     let drained = try_drain_pending(pending, server_pool, true, None);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(attempted) = attempted {
         let _ = attempted.send(drained);
     }

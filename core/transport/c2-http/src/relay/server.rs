@@ -24,7 +24,8 @@ use crate::relay::router;
 use crate::relay::state::{RegisterCommitResult, RelayState, UnregisterResult};
 use crate::relay::url::peer_endpoint_url;
 use c2_config::{
-    ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointOptions, RelayConfig,
+    CallExecutionLimitsOverrides, ConfigResolver, ConfigSources, LocalEndpointContext,
+    LocalEndpointOptions, RelayConfig,
 };
 use c2_ipc::{ClientIpcConfig, IpcClient};
 
@@ -127,11 +128,8 @@ fn control_error_to_relay_error(err: ControlError) -> RelayControlError {
     }
 }
 
-fn close_client(client: IpcClient) {
-    tokio::spawn(async move {
-        let mut client = client;
-        client.close().await;
-    });
+fn close_client(client: crate::relay::client_lifecycle::ManagedClient) {
+    drop(client);
 }
 
 fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
@@ -153,12 +151,13 @@ fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
 async fn connect_register_attestation_client(
     address: &str,
     context: &LocalEndpointContext,
-) -> Result<IpcClient, c2_ipc::IpcError> {
+    clients: &Arc<crate::relay::client_lifecycle::ClientLifecycle>,
+) -> Result<crate::relay::client_lifecycle::ManagedClient, c2_ipc::IpcError> {
     for attempt in 1..=REGISTER_ATTESTATION_CONNECT_ATTEMPTS {
         // Attestation uses private memory accounting and the frozen relay endpoint namespace.
         let config = ClientIpcConfig::default();
         let endpoint = context.endpoint(address).map_err(c2_ipc::IpcError::Io)?;
-        let mut client = IpcClient::with_endpoint(endpoint, config);
+        let mut client = clients.manage(|| IpcClient::with_endpoint(endpoint, config))?;
         match client.connect().await {
             Ok(()) => return Ok(client),
             Err(err)
@@ -173,6 +172,14 @@ async fn connect_register_attestation_client(
     unreachable!("register attestation connect loop always returns");
 }
 
+/// Typed startup overrides for the Relay's bounded forwarding domain.
+#[derive(Debug, Clone, Default)]
+pub struct RelayServerOptions {
+    /// Code overrides take precedence over C2_CALL_* environment and .env values.
+    /// Zero rejects positive admission; limits are frozen before readiness.
+    pub call_execution: CallExecutionLimitsOverrides,
+}
+
 /// Relay server with a synchronous control API.
 #[allow(dead_code)]
 pub struct RelayServer {
@@ -183,14 +190,31 @@ pub struct RelayServer {
 }
 
 impl RelayServer {
+    #[cfg(test)]
+    pub(crate) fn state_for_test(&self) -> Arc<RelayState> {
+        self.state.clone()
+    }
+
+    /// Observe the frozen forwarding domain without changing admission or owners.
+    pub fn call_execution_snapshot(&self) -> c2_mem::RetentionSnapshot {
+        self.state.forwarding.snapshot()
+    }
+
     /// Start the relay server on a background thread.
     pub fn start(config: RelayConfig) -> Result<Self, String> {
+        Self::start_with_options(config, RelayServerOptions::default())
+    }
+
+    pub fn start_with_options(
+        config: RelayConfig,
+        options: RelayServerOptions,
+    ) -> Result<Self, String> {
         let context = ConfigResolver::resolve_local_endpoint(
             LocalEndpointOptions::default(),
             ConfigSources::from_process(),
         )
         .map_err(|error| format!("Invalid relay local endpoint configuration: {error}"))?;
-        Self::start_with_context(config, context)
+        Self::start_with_context_and_options(config, context, options)
     }
 
     /// Start with the caller's immutable native endpoint context.
@@ -198,6 +222,19 @@ impl RelayServer {
         config: RelayConfig,
         context: LocalEndpointContext,
     ) -> Result<Self, String> {
+        Self::start_with_context_and_options(config, context, RelayServerOptions::default())
+    }
+
+    pub fn start_with_context_and_options(
+        config: RelayConfig,
+        context: LocalEndpointContext,
+        options: RelayServerOptions,
+    ) -> Result<Self, String> {
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            options.call_execution,
+            ConfigSources::from_process(),
+        )
+        .map_err(|error| format!("Invalid relay call execution configuration: {error}"))?;
         config
             .validate()
             .map_err(|e| format!("Invalid relay config: {e}"))?;
@@ -218,10 +255,11 @@ impl RelayServer {
         let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> = Arc::new(
             crate::relay::disseminator::FullBroadcast::with_proxy_policy(config.use_proxy),
         );
-        let state = Arc::new(RelayState::new_with_context(
+        let state = Arc::new(RelayState::new_with_execution_limits(
             config.clone(),
             disseminator,
             context,
+            limits,
         ));
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
@@ -255,10 +293,14 @@ impl RelayServer {
             .map_err(|e| format!("Failed to spawn relay thread: {e}"))?;
 
         // Wait for the listener to be ready.
-        ready_rx
+        let readiness = ready_rx
             .blocking_recv()
-            .map_err(|_| "Relay thread exited before ready".to_string())?
-            .map_err(|e| format!("Relay failed to start: {e}"))?;
+            .map_err(|_| "Relay thread exited before ready".to_string())
+            .and_then(|result| result.map_err(|e| format!("Relay failed to start: {e}")));
+        if let Err(error) = readiness {
+            let _ = thread.join();
+            return Err(error);
+        }
 
         Ok(Self {
             cmd_tx: Some(cmd_tx),
@@ -310,8 +352,11 @@ impl RelayServer {
             .map_err(|_| "Relay thread dropped".to_string())
     }
 
-    /// Gracefully stop the relay server.
+    /// Close forwarding admission and wait for native transactions to finish.
+    /// A resource that never returns keeps its finite slot and can keep this
+    /// barrier pending; HTTP waiter departure does not complete the barrier.
     pub fn stop(&mut self) -> Result<(), String> {
+        self.state.forwarding.close();
         // Leave broadcast happens inside the tokio runtime (in `run()`'s shutdown block).
         self.cancel.cancel();
 
@@ -321,7 +366,9 @@ impl RelayServer {
             let _ = reply_rx.blocking_recv();
         }
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            thread
+                .join()
+                .map_err(|_| "Relay thread panicked before shutdown completed".to_string())?;
         }
         Ok(())
     }
@@ -347,15 +394,17 @@ impl RelayServer {
         let app = router::build_router(state.clone());
 
         let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => {
-                let _ = ready_tx.send(Ok(()));
-                l
-            }
+            Ok(l) => l,
             Err(e) => {
                 let _ = ready_tx.send(Err(format!("Failed to bind {addr}: {e}")));
                 return;
             }
         };
+
+        // Native cleanup observation must exist before readiness or commands.
+        let clients = state.clients.clone();
+        let client_observer = tokio::spawn(async move { clients.run().await });
+        let _ = ready_tx.send(Ok(()));
 
         // Spawn background tasks (heartbeat, failure detection, anti-entropy, etc.)
         let bg_handles = spawn_background_tasks(state.clone(), cancel.clone());
@@ -414,6 +463,11 @@ impl RelayServer {
             _ = sweeper => {},
         }
 
+        // Fence admission and observe native forwarding before the runtime can
+        // destroy tasks/IPC futures. Waiter disappearance never counts as drain.
+        state.forwarding.close();
+        state.forwarding.drain().await;
+
         // Shutdown: broadcast leave, cancel background tasks
         let leave = PeerEnvelope::new(
             state.relay_id(),
@@ -430,6 +484,9 @@ impl RelayServer {
         for handle in bg_handles {
             let _ = handle.await;
         }
+        state.stop_upstream_controls().await;
+        state.clients.shutdown().await;
+        let _ = client_observer.await;
     }
 
     /// Periodically evict upstream connections that have been idle
@@ -457,7 +514,7 @@ impl RelayServer {
             for (endpoint, old_client) in evicted {
                 if let Some(arc_client) = old_client {
                     let dead = !arc_client.is_connected();
-                    tokio::spawn(async move { arc_client.close_shared().await });
+                    state.clients.close(&arc_client);
                     if dead {
                         eprintln!("[relay] Evicted dead upstream endpoint: {endpoint}");
                     } else {
@@ -524,6 +581,7 @@ impl RelayServer {
                         match connect_register_attestation_client(
                             &address,
                             state.endpoint_context(),
+                            &state.clients,
                         )
                         .await
                         {
@@ -622,7 +680,7 @@ impl RelayServer {
                                             "route contract attestation returns only contract errors"
                                         ),
                                     };
-                                let client = Arc::new(client);
+                                let client = client.into_shared();
                                 let replacement = match RouteAuthority::new(&state)
                                     .confirm_replacement_for_commit(replacement_candidate)
                                     .await
@@ -632,10 +690,7 @@ impl RelayServer {
                                     | Err(ControlError::DuplicateRoute { .. })
                                     | Err(ControlError::OwnerMismatch)
                                     | Err(ControlError::NotFound) => {
-                                        let close_client = client.clone();
-                                        tokio::spawn(
-                                            async move { close_client.close_shared().await },
-                                        );
+                                        state.clients.close(&client);
                                         eprintln!(
                                             "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=duplicate"
                                         );
@@ -649,10 +704,7 @@ impl RelayServer {
                                     | Err(ControlError::InvalidAddress { reason })
                                     | Err(ControlError::ContractMismatch { reason })
                                     | Err(ControlError::UpstreamUnavailable { reason }) => {
-                                        let close_client = client.clone();
-                                        tokio::spawn(
-                                            async move { close_client.close_shared().await },
-                                        );
+                                        state.clients.close(&client);
                                         eprintln!(
                                             "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
                                         );
@@ -671,7 +723,7 @@ impl RelayServer {
                                     replacement,
                                 }) {
                                     RegisterCommitResult::Registered { entry } => {
-                                        tokio::spawn(async move { client.close_shared().await });
+                                        state.clients.close(&client);
                                         eprintln!(
                                             "[relay] Register command committed: name={} server_id={} server_instance_id={} address={} crm={}/{}/{}",
                                             entry.name,
@@ -687,7 +739,7 @@ impl RelayServer {
                                         Ok(())
                                     }
                                     RegisterCommitResult::SameOwner { entry } => {
-                                        tokio::spawn(async move { client.close_shared().await });
+                                        state.clients.close(&client);
                                         eprintln!(
                                             "[relay] Register command same-owner: name={} server_id={} server_instance_id={} address={} crm={}/{}/{}",
                                             entry.name,
@@ -703,14 +755,14 @@ impl RelayServer {
                                     }
                                     RegisterCommitResult::Duplicate { .. }
                                     | RegisterCommitResult::ConflictingOwner { .. } => {
-                                        tokio::spawn(async move { client.close_shared().await });
+                                        state.clients.close(&client);
                                         eprintln!(
                                             "[relay] Register command rejected: name={name} reason=duplicate"
                                         );
                                         Err(RelayControlError::DuplicateRoute { name })
                                     }
                                     RegisterCommitResult::Invalid { reason } => {
-                                        tokio::spawn(async move { client.close_shared().await });
+                                        state.clients.close(&client);
                                         eprintln!(
                                             "[relay] Register command rejected: name={name} reason={reason}"
                                         );
@@ -742,7 +794,7 @@ impl RelayServer {
                             client,
                         } => {
                             if let Some(arc_client) = client {
-                                tokio::spawn(async move { arc_client.close_shared().await });
+                                state.clients.close(&arc_client);
                             }
                             eprintln!(
                                 "[relay] Unregister command removed: name={} server_id={} removed_at={removed_at} removed_revision={removed_revision}",
@@ -1045,15 +1097,23 @@ mod tests {
             .await
             .expect("configured server ready");
 
+        let clients = crate::relay::client_lifecycle::ClientLifecycle::new();
+        let observer = {
+            let clients = clients.clone();
+            tokio::spawn(async move { clients.run().await })
+        };
         // The managed client the relay actually builds connects.
         let client = super::connect_register_attestation_client(
             &address,
             &c2_config::LocalEndpointContext::default_for_platform().unwrap(),
+            &clients,
         )
         .await
         .expect("configured attestation client connects");
         assert_eq!(client.server_id(), Some(server_id));
         super::close_client(client);
+        clients.shutdown().await;
+        observer.await.unwrap();
 
         let _ = server
             .shutdown_and_wait(std::time::Duration::from_secs(5))

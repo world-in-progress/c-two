@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use c2_config::{
-    ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointOptions, RelayConfig,
-};
+#[cfg(test)]
+use c2_config::{ConfigResolver, ConfigSources, LocalEndpointOptions};
+use c2_config::{LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, RouteBinding};
 use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
@@ -48,6 +48,8 @@ pub struct RelayState {
     /// Control-plane attestation/watch clients use private lazy memory
     /// contexts with the same frozen endpoint namespace and do not charge this data-plane budget.
     upstream_memory_budget: c2_mem::MemoryBudget,
+    pub(crate) forwarding: crate::relay::forwarding::ForwardingDomain,
+    pub(crate) clients: Arc<crate::relay::client_lifecycle::ClientLifecycle>,
 }
 
 fn owner_lease_duration(config: &RelayConfig) -> Option<Duration> {
@@ -131,7 +133,7 @@ async fn verify_route_after_watch_unavailable(
 }
 
 impl RelayState {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
@@ -144,11 +146,26 @@ impl RelayState {
         Self::new_with_context(config, disseminator, context)
     }
 
-    /// Freeze one endpoint namespace for every upstream connection and watcher.
+    /// Test constructor with explicit default execution limits.
+    #[cfg(test)]
     pub fn new_with_context(
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
         endpoint_context: LocalEndpointContext,
+    ) -> Self {
+        Self::new_with_execution_limits(
+            config,
+            disseminator,
+            endpoint_context,
+            c2_config::CallExecutionLimits::default(),
+        )
+    }
+
+    pub(crate) fn new_with_execution_limits(
+        config: Arc<RelayConfig>,
+        disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+        endpoint_context: LocalEndpointContext,
+        limits: c2_config::CallExecutionLimits,
     ) -> Self {
         let default_endpoint_namespace = LocalEndpointContext::default_for_platform()
             .is_ok_and(|default| default == endpoint_context);
@@ -165,6 +182,8 @@ impl RelayState {
             endpoint_context,
             default_endpoint_namespace,
             upstream_memory_budget,
+            forwarding: crate::relay::forwarding::ForwardingDomain::new(&limits),
+            clients: crate::relay::client_lifecycle::ClientLifecycle::new(),
         }
     }
 
@@ -368,6 +387,7 @@ impl RelayState {
         let upstream_ipc = self.config.upstream_ipc.clone();
         let upstream_memory_budget = self.upstream_memory_budget.clone();
         let endpoint_context = self.endpoint_context.clone();
+        let clients = self.clients.clone();
 
         let lease = match self
             .conn_pool
@@ -377,6 +397,7 @@ impl RelayState {
                 let upstream_ipc = upstream_ipc.clone();
                 let upstream_memory_budget = upstream_memory_budget.clone();
                 let endpoint_context = endpoint_context.clone();
+                let clients = clients.clone();
                 async move {
                     if expected.ipc_address.as_deref() != Some(endpoint.address()) {
                         return Err(c2_ipc::IpcError::Protocol(format!(
@@ -396,11 +417,12 @@ impl RelayState {
                             expected.ipc_address
                         )));
                     }
-                    let mut client = IpcClient::with_endpoint_and_shared_budget(
-                        endpoint_context.endpoint(endpoint.address()).map_err(c2_ipc::IpcError::Io)?,
+                    let endpoint = endpoint_context.endpoint(endpoint.address()).map_err(c2_ipc::IpcError::Io)?;
+                    let mut client = clients.manage(|| IpcClient::with_endpoint_and_shared_budget(
+                        endpoint,
                         upstream_ipc,
                         upstream_memory_budget,
-                    );
+                    ))?;
                     client.connect().await?;
                     if client.server_id() != expected.server_id.as_deref()
                         || client.server_instance_id() != expected.server_instance_id.as_deref()
@@ -408,7 +430,7 @@ impl RelayState {
                         let got_server_id = client.server_id().unwrap_or("").to_string();
                         let got_server_instance_id =
                             client.server_instance_id().unwrap_or("").to_string();
-                        client.close().await;
+                        drop(client);
                         return Err(c2_ipc::IpcError::IdentityMismatch {
                             expected_server_id: expected.server_id.clone().unwrap_or_default(),
                             expected_server_instance_id: expected
@@ -421,10 +443,10 @@ impl RelayState {
                     }
                     let expected_contract = expected_contract_for_route(&expected);
                     if let Err(err) = client.acquire_route(&expected_contract).await {
-                        client.close().await;
+                        drop(client);
                         return Err(err);
                     }
-                    Ok(Arc::new(client))
+                    Ok(client.into_shared())
                 }
             })
             .await
@@ -457,7 +479,7 @@ impl RelayState {
                 Ok(()) => {}
                 Err(error) if should_treat_as_semantic_route_failure(&error) => {
                     if let Some(old_client) = lease.evict_current_client() {
-                        old_client.close_shared().await;
+                        self.clients.close(&old_client);
                     }
                     drop(lease);
                     return Err(UpstreamAcquireError::Unreachable {
@@ -468,7 +490,7 @@ impl RelayState {
                 }
                 Err(error) => {
                     if let Some(old_client) = lease.evict_current_client() {
-                        old_client.close_shared().await;
+                        self.clients.close(&old_client);
                     }
                     drop(lease);
                     return Err(UpstreamAcquireError::WatchUnavailable {
@@ -490,7 +512,7 @@ impl RelayState {
             Ok(binding) => binding,
             Err(error) => {
                 if let Some(old_client) = lease.evict_current_client() {
-                    old_client.close_shared().await;
+                    self.clients.close(&old_client);
                 }
                 drop(lease);
                 return match error {
@@ -515,7 +537,7 @@ impl RelayState {
         } else {
             let client = lease.client();
             drop(lease);
-            client.close_shared().await;
+            self.clients.close(&client);
             Err(UpstreamAcquireError::Stale {
                 route: expected.clone(),
             })
@@ -620,6 +642,13 @@ impl RelayState {
     pub(crate) fn insert_owner_slot(&self, entry: &RouteEntry) {
         if let Some(key) = UpstreamEndpointKey::from_route(entry) {
             self.conn_pool.insert_owner(key);
+        }
+    }
+
+    pub(crate) async fn stop_upstream_controls(&self) {
+        let tasks = std::mem::take(&mut *self.upstream_controls.write());
+        for task in tasks.into_values() {
+            task.abort_and_wait().await;
         }
     }
 
@@ -752,6 +781,7 @@ impl RelayState {
             .local_route(name)
             .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
         {
+            self.clients.adopt_for_test(&client);
             self.conn_pool.reconnect(&key, client);
         }
     }

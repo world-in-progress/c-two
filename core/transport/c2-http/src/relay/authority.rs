@@ -809,7 +809,7 @@ impl<'a> RouteAuthority<'a> {
                 .state
                 .remove_connection_if_endpoint_unused(&old_endpoint)
         {
-            close_replaced_owner_client(client);
+            self.state.clients.close(&client);
         }
         Ok(RouteCommandResult::Registered { entry })
     }
@@ -1035,7 +1035,14 @@ impl<'a> RouteAuthority<'a> {
             Ok(endpoint) => endpoint,
             Err(_) => return OwnerProbe::Dead,
         };
-        let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default());
+        let Ok(mut client) = self
+            .state
+            .clients
+            .manage(|| IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()))
+        else {
+            // Owner capacity is not evidence that the captured route is dead.
+            return OwnerProbe::Stale;
+        };
         match client.connect().await {
             Ok(()) => {
                 let identity_matches = client.server_id() == Some(replacement.server_id.as_str())
@@ -1051,7 +1058,7 @@ impl<'a> RouteAuthority<'a> {
                                 && contract.abi_hash == replacement.abi_hash
                                 && contract.signature_hash == replacement.signature_hash
                         });
-                client.close().await;
+                drop(client);
 
                 if !route_matches {
                     OwnerProbe::RouteMissing
@@ -1074,12 +1081,6 @@ enum OwnerProbe {
     RouteMissing,
     Dead,
     Stale,
-}
-
-fn close_replaced_owner_client(client: Arc<IpcClient>) {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move { client.close_shared().await });
-    }
 }
 
 #[cfg(test)]

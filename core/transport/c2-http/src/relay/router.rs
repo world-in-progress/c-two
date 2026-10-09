@@ -563,14 +563,17 @@ fn with_local_namespace_response(state: &RelayState, mut response: Response) -> 
 async fn connect_ipc_for_register(
     address: &str,
     context: &c2_config::LocalEndpointContext,
-) -> Result<IpcClient, String> {
+    clients: &Arc<crate::relay::client_lifecycle::ClientLifecycle>,
+) -> Result<crate::relay::client_lifecycle::ManagedClient, String> {
     let started = Instant::now();
     let timeout = Duration::from_millis(500);
     loop {
         let endpoint = context
             .endpoint(address)
             .map_err(|error| error.to_string())?;
-        let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default());
+        let mut client = clients
+            .manage(|| IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()))
+            .map_err(|error| error.to_string())?;
         match client.connect().await {
             Ok(()) => return Ok(client),
             Err(err) => {
@@ -841,7 +844,13 @@ async fn handle_register(
 
     // Connect IPC client and attest the registered route contract.
     let (client, contract) = {
-        let mut c = match connect_ipc_for_register(&address, state.endpoint_context()).await {
+        let mut c = match connect_ipc_for_register(
+            &address,
+            state.endpoint_context(),
+            &state.clients,
+        )
+        .await
+        {
             Ok(client) => client,
             Err(e) => {
                 eprintln!(
@@ -1081,11 +1090,11 @@ async fn handle_register(
             )
                 .into_response();
         }
-        (Arc::new(c), contract)
+        (c.into_shared(), contract)
     };
 
     if prepare_only {
-        close_arc_client(client);
+        close_arc_client(&state, client);
         eprintln!(
             "[relay] Register prepared: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} crm={}/{}/{}",
             contract.crm_ns, contract.crm_name, contract.crm_ver,
@@ -1107,14 +1116,14 @@ async fn handle_register(
         Ok(replacement) => replacement,
         Err(ControlError::DuplicateRoute { existing_address })
         | Err(ControlError::AddressMismatch { existing_address }) => {
-            close_arc_client(client);
+            close_arc_client(&state, client);
             eprintln!(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=duplicate existing_address={existing_address}"
             );
             return duplicate_route_response(&name, &existing_address);
         }
         Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
-            close_arc_client(client);
+            close_arc_client(&state, client);
             eprintln!(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=owner_not_replaceable"
             );
@@ -1126,7 +1135,7 @@ async fn handle_register(
         | Err(ControlError::InvalidAddress { reason })
         | Err(ControlError::ContractMismatch { reason })
         | Err(ControlError::UpstreamUnavailable { reason }) => {
-            close_arc_client(client);
+            close_arc_client(&state, client);
             eprintln!(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
             );
@@ -1145,7 +1154,7 @@ async fn handle_register(
         replacement,
     }) {
         RegisterCommitResult::Registered { entry } => {
-            close_arc_client(client);
+            close_arc_client(&state, client);
             eprintln!(
                 "[relay] Register committed: name={} server_id={} server_instance_id={} address={} crm={}/{}/{}",
                 entry.name,
@@ -1160,7 +1169,7 @@ async fn handle_register(
             entry
         }
         RegisterCommitResult::SameOwner { entry } => {
-            close_arc_client(client);
+            close_arc_client(&state, client);
             eprintln!(
                 "[relay] Register same-owner: name={} server_id={} server_instance_id={} address={} crm={}/{}/{}",
                 entry.name,
@@ -1180,14 +1189,14 @@ async fn handle_register(
         }
         RegisterCommitResult::Duplicate { existing_address }
         | RegisterCommitResult::ConflictingOwner { existing_address } => {
-            close_arc_client(client);
+            close_arc_client(&state, client);
             eprintln!(
                 "[relay] Register rejected: name={name} reason=duplicate existing_address={existing_address}"
             );
             return duplicate_route_response(&name, &existing_address);
         }
         RegisterCommitResult::Invalid { reason } => {
-            close_arc_client(client);
+            close_arc_client(&state, client);
             eprintln!("[relay] Register rejected: name={name} reason={reason}");
             return (StatusCode::BAD_REQUEST, reason).into_response();
         }
@@ -1202,15 +1211,12 @@ async fn handle_register(
         .into_response()
 }
 
-fn close_arc_client(arc_client: Arc<IpcClient>) {
-    tokio::spawn(async move { arc_client.close_shared().await });
+fn close_arc_client(state: &RelayState, arc_client: Arc<IpcClient>) {
+    state.clients.close(&arc_client);
 }
 
-fn close_client(client: IpcClient) {
-    tokio::spawn(async move {
-        let mut client = client;
-        client.close().await;
-    });
+fn close_client(client: crate::relay::client_lifecycle::ManagedClient) {
+    drop(client);
 }
 
 /// Compare-remove an exact captured registration; no name-only Runtime teardown is accepted.
@@ -1227,7 +1233,7 @@ async fn handle_unregister(
         }) => {
             state.stop_upstream_control_if_owner_idle_for_route(&entry);
             if let Some(client) = client {
-                close_arc_client(client);
+                close_arc_client(&state, client);
             }
             broadcast_route_withdraw(&state, &entry, removed_at, removed_revision);
             (
@@ -1285,7 +1291,7 @@ async fn handle_admin_unregister(
         } => {
             // Close old client asynchronously
             if let Some(arc_client) = client {
-                close_arc_client(arc_client);
+                close_arc_client(&state, arc_client);
             }
 
             broadcast_route_withdraw(&state, &entry, removed_at, removed_revision);
@@ -1472,6 +1478,7 @@ async fn read_unknown_length_body(
     route_name: &str,
     body: Body,
     max_payload_size: u64,
+    permit: &mut c2_mem::RetentionPermit,
 ) -> ResponseResult<Vec<u8>> {
     let limit = UNKNOWN_LENGTH_BODY_LIMIT_BYTES.min(max_payload_size);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -1506,6 +1513,11 @@ async fn read_unknown_length_body(
         if next_len > limit_usize {
             return Err(unknown_length_too_large_response(route_name, limit).into());
         }
+        permit
+            .try_grow(u64::try_from(chunk.len()).map_err(|_| {
+                forwarding_capacity_response(route_name, "input byte count overflow")
+            })?)
+            .map_err(|err| forwarding_capacity_response(route_name, err.to_string()))?;
         data.extend_from_slice(&chunk);
     }
 
@@ -1615,6 +1627,61 @@ async fn call_handler(
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
+    let work_state = state.clone();
+    let work_route_name = route_name.clone();
+    let waiter = match state
+        .forwarding
+        .spawn(content_length.unwrap_or(0), move |permit| {
+            forward_call(
+                work_state,
+                work_route_name,
+                method_name,
+                expected_crm,
+                advertised_route,
+                route_token,
+                content_length,
+                body,
+                permit,
+            )
+        }) {
+        Ok(waiter) => waiter,
+        Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
+    };
+    match waiter.await {
+        Ok(response) => response,
+        Err(_) => resource_unavailable_response_with_phase(
+            &route_name,
+            "relay forwarding transaction failed",
+            "dispatch_uncertain",
+        ),
+    }
+}
+
+fn forwarding_capacity_response(route_name: &str, message: impl Into<String>) -> Response {
+    c2_error_response(
+        StatusCode::BAD_GATEWAY,
+        c2_error::ErrorCode::CallCapacityExceeded,
+        format!("relay forwarding capacity: {}", message.into()),
+        [
+            ("route", route_name.to_owned()),
+            ("dispatch_phase", "pre_dispatch".to_owned()),
+        ],
+    )
+}
+
+// This future belongs to the bounded native domain, never to the HTTP handler.
+#[allow(clippy::too_many_arguments)]
+async fn forward_call(
+    state: Arc<RelayState>,
+    route_name: String,
+    method_name: String,
+    expected_crm: c2_contract::ExpectedRouteContract,
+    advertised_route: RouteEntry,
+    route_token: ExpectedRouteToken,
+    content_length: Option<u64>,
+    body: Body,
+    mut permit: c2_mem::RetentionPermit,
+) -> Response {
     let (lease, acquired_route, binding) =
         match acquire_request_client_for_route(state.clone(), &advertised_route).await {
             RequestClient::Ready(ready) => {
@@ -1674,16 +1741,26 @@ async fn call_handler(
                 .await
         }
         None => {
-            let body =
-                match read_unknown_length_body(&route_name, body, acquired_route.max_payload_size)
-                    .await
-                {
-                    Ok(body) => body,
-                    Err(response) => {
-                        drop(lease);
-                        return response.into_response();
+            let body = match read_unknown_length_body(
+                &route_name,
+                body,
+                acquired_route.max_payload_size,
+                &mut permit,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(response) => {
+                    // Only actual Body stream failures produce BAD_REQUEST
+                    // here; payload/capacity rejection has a different status.
+                    #[cfg(test)]
+                    if response.0.status() == StatusCode::BAD_REQUEST {
+                        state.forwarding.record_source_fault(true);
                     }
-                };
+                    drop(lease);
+                    return response.into_response();
+                }
+            };
             client
                 .call_bound_phased(&binding, &method_name, &body)
                 .await
@@ -1699,6 +1776,18 @@ async fn call_handler(
         Err(error) => {
             let phase = error.phase();
             let error = error.into_source();
+            #[cfg(test)]
+            if matches!(&error, c2_ipc::IpcError::Io(source) if source.to_string().contains("request body stream error"))
+            {
+                match phase {
+                    c2_ipc::TransportPhase::PreDispatch => {
+                        state.forwarding.record_source_fault(false)
+                    }
+                    c2_ipc::TransportPhase::DispatchUncertain => {
+                        state.forwarding.record_published_source_fault()
+                    }
+                }
+            }
             match error {
                 c2_ipc::IpcError::CrmError(err_bytes) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1734,7 +1823,9 @@ async fn call_handler(
                     // the failed transport, but never tell the client that
                     // replay is safe.
                     if let Some(old_client) = lease.evict_current_client() {
-                        close_arc_client(old_client);
+                        // The Relay native lifecycle retains this owner and
+                        // observes confirmed cleanup beyond transaction completion.
+                        state.clients.close(&old_client);
                     }
                     resource_unavailable_response_with_phase(
                         &route_name,
@@ -2074,7 +2165,7 @@ fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry, reason:
     {
         state.stop_upstream_control_if_owner_idle_for_route(&entry);
         if let Some(client) = client {
-            close_arc_client(client);
+            close_arc_client(&state, client);
         }
         eprintln!(
             "{}",
@@ -6136,8 +6227,12 @@ mod tests {
         );
         let server = start_live_server_with_routes(&address, "server-grid", &["manager"]).await;
 
-        let mut stale_client =
-            c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default());
+        let mut stale_client = state
+            .clients
+            .manage(|| {
+                c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default())
+            })
+            .expect("stale snapshot client admission");
         stale_client.connect().await.expect("stale client connects");
         assert!(stale_client.has_route("manager"));
         assert!(!stale_client.has_route("builder"));
@@ -6168,7 +6263,7 @@ mod tests {
                 panic!("unexpected invalid route in test: {reason}")
             }
         }
-        state.reconnect("builder", Arc::new(stale_client));
+        state.reconnect("builder", stale_client.into_shared());
         register_echo_route(&server, "builder").await;
 
         let route = state.local_route("builder");
@@ -6275,15 +6370,19 @@ mod tests {
             }
         }
 
-        let mut stale_data_client =
-            c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default());
+        let mut stale_data_client = state
+            .clients
+            .manage(|| {
+                c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default())
+            })
+            .expect("stale data client admission");
         stale_data_client
             .connect()
             .await
             .expect("stale data-plane client connects");
         stale_data_client.close().await;
         stale_data_client.force_connected(true);
-        state.reconnect("grid", Arc::new(stale_data_client));
+        state.reconnect("grid", stale_data_client.into_shared());
 
         let route = state.local_route("grid").expect("relay route registered");
         let key = crate::relay::upstream_control::owner_key_for_route(&route)
@@ -6558,5 +6657,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[cfg(test)]
+mod forwarding_admission_tests {
+    use super::*;
+    use c2_mem::RetentionBudget;
+
+    #[tokio::test]
+    async fn unknown_length_charges_before_growth_and_rejects_without_dispatch() {
+        let budget = RetentionBudget::new(1, 5);
+        let mut permit = budget.reserve(0).unwrap();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"def")),
+        ]));
+        let response = read_unknown_length_body("grid", body, 100, &mut permit)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let response = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
+        assert_eq!(permit.bytes(), 3);
+        assert_eq!(budget.snapshot().used_retained_bytes, 3);
+        drop(permit);
+        assert_eq!(budget.snapshot().used_operations, 0);
+        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_source_fault_stays_body_error_and_refunds_owner() {
+        let budget = RetentionBudget::new(1, 100);
+        let mut permit = budget.reserve(0).unwrap();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok(Bytes::from_static(b"abc")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "real source failure",
+            )),
+        ]));
+        let response = read_unknown_length_body("grid", body, 100, &mut permit)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(error["error"], "RequestBodyReadError");
+        assert_eq!(permit.bytes(), 3);
+        drop(permit);
+        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_success_and_payload_limit_keep_exact_charges() {
+        let budget = RetentionBudget::new(2, 100);
+        let mut permit = budget.reserve(0).unwrap();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::new()),
+            Ok(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"de")),
+        ]));
+        assert_eq!(
+            read_unknown_length_body("grid", body, 5, &mut permit)
+                .await
+                .unwrap_or_else(|_| panic!("bounded body should succeed")),
+            b"abcde"
+        );
+        assert_eq!(permit.bytes(), 5);
+        let mut rejected = budget.reserve(0).unwrap();
+        let response = read_unknown_length_body("grid", Body::from("abcdef"), 5, &mut rejected)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(rejected.bytes(), 0);
+        drop((permit, rejected));
+        assert_eq!(budget.snapshot().used_retained_bytes, 0);
     }
 }

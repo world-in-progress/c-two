@@ -26,6 +26,11 @@ impl UpstreamControlTask {
         Arc::ptr_eq(&self.token, token)
     }
 
+    pub(crate) async fn abort_and_wait(self) {
+        self.handle.abort();
+        let _ = self.handle.await;
+    }
+
     pub(crate) fn abort(self) {
         self.handle.abort();
     }
@@ -63,7 +68,16 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
                 continue;
             }
         };
-        let mut client = IpcClient::with_endpoint(endpoint, c2_config::ClientIpcConfig::default());
+        let mut client = match state
+            .clients
+            .manage(|| IpcClient::with_endpoint(endpoint, c2_config::ClientIpcConfig::default()))
+        {
+            Ok(client) => client,
+            Err(_) => {
+                state.clear_upstream_control_if_matches(&key, &token);
+                return;
+            }
+        };
         match client.connect().await {
             Ok(()) => {}
             Err(err) => {
@@ -94,7 +108,7 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
                 client.server_instance_id().unwrap_or("")
             );
             remove_owner_routes(&state, &key, "identity_mismatch").await;
-            client.close().await;
+            drop(client);
             state.clear_upstream_control_if_matches(&key, &token);
             return;
         }
@@ -102,7 +116,7 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
 
         loop {
             if state.local_routes_for_owner(&key).is_empty() {
-                client.close().await;
+                drop(client);
                 state.clear_upstream_control_if_matches(&key, &token);
                 return;
             }
@@ -126,7 +140,7 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
             tokio::time::sleep(CONTROL_OBSERVE_INTERVAL).await;
         }
 
-        client.close().await;
+        drop(client);
         tokio::time::sleep(CONTROL_RETRY_DELAY).await;
     }
 }
@@ -159,7 +173,7 @@ async fn remove_route(state: &Arc<RelayState>, route: &RouteEntry, reason: &str)
         return;
     };
     if let Some(client) = client {
-        client.close_shared().await;
+        state.clients.close(&client);
     }
     eprintln!(
         "[relay] Upstream control watch removed route: name={} server_id={} server_instance_id={} address={} removed_at={} removed_revision={} reason={reason}",
