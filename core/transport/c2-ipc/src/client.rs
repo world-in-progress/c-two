@@ -4343,8 +4343,9 @@ impl IpcClient {
         Ok(RouteBinding::from_table(table))
     }
 
-    /// Acquire a route token, refreshing the server route catalog before deciding
-    /// that a cached missing or mismatched token is authoritative.
+    /// Acquire an exact route token from the connected server's current authority.
+    /// The cached directory is only used to bind the result of a live lookup;
+    /// even a positive cache hit must not bypass current admission/token checks.
     pub async fn acquire_route_token(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
@@ -4353,17 +4354,6 @@ impl IpcClient {
     ) -> Result<RouteBinding, IpcError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
-        if let Ok(binding) = self.bind_cached_route_token(expected, route_uid, route_revision) {
-            return Ok(binding);
-        }
-
-        if self.route_directory.read().is_dirty() {
-            self.rebuild_route_directory().await?;
-            if let Ok(binding) = self.bind_cached_route_token(expected, route_uid, route_revision) {
-                return Ok(binding);
-            }
-        }
-
         let mut last_unbound = None;
 
         for delay_ms in ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS

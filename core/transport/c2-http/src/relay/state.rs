@@ -125,15 +125,20 @@ fn expected_contract_for_route(route: &RouteEntry) -> c2_contract::ExpectedRoute
     }
 }
 
-fn should_treat_as_semantic_route_failure(error: &c2_ipc::IpcError) -> bool {
+fn is_route_local_acquire_failure(error: &c2_ipc::IpcError) -> bool {
     matches!(
         error,
-        c2_ipc::IpcError::IdentityMismatch { .. }
-            | c2_ipc::IpcError::ContractMismatch(_)
+        c2_ipc::IpcError::ContractMismatch(_)
             | c2_ipc::IpcError::RouteNotFound(_)
             | c2_ipc::IpcError::RouteRemoved { .. }
             | c2_ipc::IpcError::RouteClosed { .. }
+            | c2_ipc::IpcError::RouteStale { .. }
     )
+}
+
+fn should_treat_as_semantic_route_failure(error: &c2_ipc::IpcError) -> bool {
+    is_route_local_acquire_failure(error)
+        || matches!(error, c2_ipc::IpcError::IdentityMismatch { .. })
 }
 
 async fn verify_route_after_watch_unavailable(
@@ -502,7 +507,9 @@ impl RelayState {
             match verify_route_after_watch_unavailable(&lease, &expected_contract).await {
                 Ok(()) => {}
                 Err(error) if should_treat_as_semantic_route_failure(&error) => {
-                    if let Some(old_client) = lease.evict_current_client() {
+                    if !is_route_local_acquire_failure(&error)
+                        && let Some(old_client) = lease.evict_current_client()
+                    {
                         self.close_failed_acquire_client(&old_client).await;
                     }
                     drop(lease);
@@ -535,7 +542,12 @@ impl RelayState {
         {
             Ok(binding) => binding,
             Err(error) => {
-                if let Some(old_client) = lease.evict_current_client() {
+                // Admission or token rejection concerns only this route. The
+                // endpoint may still be serving another lease's inflight call.
+                // Identity/transport/protocol failures retain exact-client eviction.
+                if !is_route_local_acquire_failure(&error)
+                    && let Some(old_client) = lease.evict_current_client()
+                {
                     self.close_failed_acquire_client(&old_client).await;
                 }
                 drop(lease);
@@ -997,6 +1009,524 @@ mod tests {
         abi_hash: TEST_ABI_HASH,
         signature_hash: TEST_SIGNATURE_HASH,
     };
+
+    // Real IPC regressions: no watch updates or synthetic directory mutations
+    // can stand in for the connected server's admission/token authority.
+    const ACQUIRE_STEP: Duration = Duration::from_secs(10);
+
+    async fn acquire_step<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(ACQUIRE_STEP, future)
+            .await
+            .expect("real acquire regression step timed out")
+    }
+
+    struct AcquireProbe {
+        entered: tokio::sync::Notify,
+        release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        pings: std::sync::atomic::AtomicUsize,
+    }
+
+    impl c2_server::CrmCallback for AcquireProbe {
+        fn invoke(
+            &self,
+            _: &str,
+            method: u16,
+            request: c2_server::RequestData,
+            _: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+        ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
+            let mut owner = c2_server::RequestLease::new(request);
+            if method == 0 {
+                assert_eq!(owner.copy_bytes().unwrap(), vec![7; 8192]);
+                self.entered.notify_one();
+                if let Some(release) = self.release.lock().take() {
+                    release.recv_timeout(ACQUIRE_STEP).unwrap();
+                }
+            } else {
+                self.pings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            owner.release().unwrap();
+            Ok(c2_server::ResponseMeta::Inline(b"completed".to_vec()))
+        }
+    }
+
+    struct AcquireFixture {
+        server: Arc<c2_server::Server>,
+        server_task: tokio::task::JoinHandle<Result<(), c2_server::ServerError>>,
+        state: Arc<RelayState>,
+        observer: tokio::task::JoinHandle<()>,
+        endpoint_context: LocalEndpointContext,
+        #[cfg(unix)]
+        endpoint_root: std::path::PathBuf,
+        probes: [Arc<AcquireProbe>; 2],
+        releases: [Option<std::sync::mpsc::Sender<()>>; 2],
+        entries: Vec<RouteEntry>,
+    }
+
+    impl AcquireFixture {
+        async fn register(server: &c2_server::Server, name: &str, probe: Arc<AcquireProbe>) {
+            let route = server
+                .build_route(
+                    c2_server::RouteBuildSpec {
+                        name: name.into(),
+                        crm_ns: TEST_CRM_NS.into(),
+                        crm_name: TEST_CRM_NAME.into(),
+                        crm_ver: TEST_CRM_VER.into(),
+                        abi_hash: TEST_ABI_HASH.into(),
+                        signature_hash: TEST_SIGNATURE_HASH.into(),
+                        method_names: vec!["block".into(), "ping".into()],
+                        access_map: HashMap::new(),
+                        concurrency_mode: c2_server::ConcurrencyMode::ReadParallel,
+                        limits: c2_server::SchedulerLimits::default(),
+                    },
+                    probe,
+                )
+                .unwrap();
+            let reservation = server.reserve_route(route).await.unwrap();
+            server.commit_reserved_route(reservation).await.unwrap();
+        }
+
+        async fn new() -> Self {
+            use futures::FutureExt;
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = format!(
+                "t2_{}_{}_{:x}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let address = format!("ipc://{id}");
+            #[cfg(unix)]
+            let endpoint_root = {
+                use std::os::unix::fs::DirBuilderExt;
+                let root = std::path::Path::new("/tmp").join(&id);
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&root)
+                    .unwrap();
+                root
+            };
+            #[cfg(unix)]
+            let endpoint_context = LocalEndpointContext::with_unix_root(&endpoint_root).unwrap();
+            #[cfg(windows)]
+            let endpoint_context = LocalEndpointContext::default_for_platform().unwrap();
+            let server = Arc::new(
+                c2_server::Server::new_with_identity_and_endpoint(
+                    endpoint_context.endpoint(&address).unwrap(),
+                    c2_server::ServerIpcConfig::default(),
+                    c2_server::ServerIdentity {
+                        server_id: id.clone(),
+                        server_instance_id: format!("{id}-instance"),
+                    },
+                )
+                .unwrap(),
+            );
+            let (release_a, wait_a) = std::sync::mpsc::channel();
+            let (release_b, wait_b) = std::sync::mpsc::channel();
+            let probes = [wait_a, wait_b].map(|wait| {
+                Arc::new(AcquireProbe {
+                    entered: tokio::sync::Notify::new(),
+                    release: parking_lot::Mutex::new(Some(wait)),
+                    pings: std::sync::atomic::AtomicUsize::new(0),
+                })
+            });
+            for (name, probe) in ["a", "b"].into_iter().zip(&probes) {
+                Self::register(&server, name, probe.clone()).await;
+            }
+            let running = server.clone();
+            let server_task = tokio::spawn(async move { running.run().await });
+            let state = Arc::new(RelayState::new_with_context(
+                test_config(),
+                null_disseminator(),
+                endpoint_context.clone(),
+            ));
+            let domain = state.clients.clone();
+            let observer = tokio::spawn(async move { domain.run().await });
+            let mut fixture = Self {
+                server,
+                server_task,
+                state,
+                observer,
+                endpoint_context,
+                #[cfg(unix)]
+                endpoint_root,
+                probes,
+                releases: [Some(release_a), Some(release_b)],
+                entries: Vec::new(),
+            };
+            let mut probe = fixture.client();
+            let result = std::panic::AssertUnwindSafe(async {
+                acquire_step(fixture.server.wait_until_responsive(Duration::from_secs(2)))
+                    .await
+                    .unwrap();
+                acquire_step(probe.connect()).await.unwrap();
+                for name in ["a", "b"] {
+                    let contract = probe.route_contract(name).unwrap();
+                    let binding = acquire_step(probe.acquire_route(&contract)).await.unwrap();
+                    let entry = match test_commit_registration!(
+                        &fixture.state,
+                        name.into(),
+                        id.clone(),
+                        format!("{id}-instance"),
+                        address.clone(),
+                        TEST_CRM_NS.into(),
+                        TEST_CRM_NAME.into(),
+                        TEST_CRM_VER.into(),
+                        TEST_ABI_HASH.into(),
+                        TEST_SIGNATURE_HASH.into(),
+                        binding.max_payload_size(),
+                        binding.route_uid().into(),
+                        binding.route_revision(),
+                        None
+                    ) {
+                        RegisterCommitResult::Registered { entry } => entry,
+                        _ => panic!("real route registration failed"),
+                    };
+                    fixture.entries.push(entry);
+                }
+            })
+            .catch_unwind()
+            .await;
+            acquire_step(probe.close()).await;
+            if let Err(panic) = result {
+                fixture.finish().await;
+                std::panic::resume_unwind(panic);
+            }
+            fixture
+        }
+
+        fn client(&self) -> IpcClient {
+            IpcClient::with_endpoint(
+                self.endpoint_context
+                    .endpoint(self.server.ipc_address())
+                    .unwrap(),
+                ClientIpcConfig::default(),
+            )
+        }
+
+        fn release(&mut self, index: usize) {
+            if let Some(release) = self.releases[index].take() {
+                let _ = release.send(());
+            }
+        }
+
+        async fn finish(mut self) {
+            self.release(0);
+            self.release(1);
+            // Observe every task even when another cleanup step fails. Only
+            // remove this fixture's root after both native owners are terminal.
+            let clients = tokio::time::timeout(ACQUIRE_STEP, self.state.clients.shutdown()).await;
+            let observer = tokio::time::timeout(ACQUIRE_STEP, &mut self.observer).await;
+            let shutdown = tokio::time::timeout(
+                ACQUIRE_STEP,
+                self.server.shutdown_and_wait(Duration::from_secs(2)),
+            )
+            .await;
+            let server = tokio::time::timeout(ACQUIRE_STEP, &mut self.server_task).await;
+            #[cfg(unix)]
+            if clients.is_ok()
+                && matches!(&observer, Ok(Ok(())))
+                && matches!(&shutdown, Ok(Ok(_)))
+                && matches!(&server, Ok(Ok(_)))
+            {
+                std::fs::remove_dir_all(&self.endpoint_root).unwrap();
+            }
+            clients.expect("client lifecycle cleanup timed out");
+            observer
+                .expect("client lifecycle observer timed out")
+                .unwrap();
+            shutdown.expect("server shutdown timed out").unwrap();
+            server.expect("server task timed out").unwrap().unwrap();
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AcquireTransition {
+        Closed,
+        Removed,
+        Reregistered,
+    }
+
+    async fn exact_token_transition(transition: AcquireTransition) {
+        use futures::FutureExt;
+        let fixture = AcquireFixture::new().await;
+        let mut exact = fixture.client();
+        let mut ordinary = fixture.client();
+        let result = std::panic::AssertUnwindSafe(async {
+            acquire_step(exact.connect()).await.unwrap();
+            acquire_step(ordinary.connect()).await.unwrap();
+            let contract = expected_contract_for_route(&fixture.entries[1]);
+            let old = acquire_step(exact.acquire_route(&contract)).await.unwrap();
+            let ready = acquire_step(exact.acquire_route_token(&contract, old.route_uid(), old.route_revision())).await.unwrap();
+            assert_eq!((ready.route_uid(), ready.route_revision()), (old.route_uid(), old.route_revision()));
+            match transition {
+                AcquireTransition::Closed => { assert_eq!(fixture.server.close_business_admission("OwnerMissing").await, 2); }
+                AcquireTransition::Removed | AcquireTransition::Reregistered => {
+                    assert!(fixture.server.unregister_route("b").await);
+                    if matches!(transition, AcquireTransition::Reregistered) {
+                        AcquireFixture::register(&fixture.server, "b", fixture.probes[1].clone()).await;
+                    }
+                }
+            }
+            // Check exact first: ordinary lookup must not refresh its positive cache.
+            let token = acquire_step(exact.acquire_route_token(&contract, old.route_uid(), old.route_revision())).await;
+            let plain = acquire_step(ordinary.acquire_route(&contract)).await;
+            match transition {
+                AcquireTransition::Closed => {
+                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteClosed { .. })), "exact: {token:?}");
+                    assert!(matches!(plain, Err(c2_ipc::IpcError::RouteClosed { .. })));
+                }
+                AcquireTransition::Removed => {
+                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteRemoved { .. })), "exact: {token:?}");
+                    assert!(matches!(plain, Err(c2_ipc::IpcError::RouteRemoved { .. })));
+                }
+                AcquireTransition::Reregistered => {
+                    let current = plain.unwrap();
+                    assert_ne!(current.route_uid(), old.route_uid());
+                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteStale { ref current_route_uid, current_route_revision, .. })
+                        if current_route_uid == current.route_uid() && current_route_revision == current.route_revision()), "exact: {token:?}");
+                    let fresh = acquire_step(exact.acquire_route_token(&contract, current.route_uid(), current.route_revision())).await.unwrap();
+                    assert_eq!(fresh.route_uid(), current.route_uid());
+                }
+            }
+            let error = acquire_step(exact.call_bound(&old, "ping", &[])).await.unwrap_err();
+            let c2_ipc::IpcError::CrmError(bytes) = error else { panic!("old call: {error}"); };
+            let error = c2_error::C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
+            assert_eq!(error.code, match transition {
+                AcquireTransition::Closed => c2_error::ErrorCode::ResourceClosed,
+                AcquireTransition::Removed => c2_error::ErrorCode::ResourceRemoved,
+                AcquireTransition::Reregistered => c2_error::ErrorCode::RouteStale,
+            });
+            assert_eq!(fixture.probes[1].pings.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!((old.route_uid(), old.route_revision()),
+                (fixture.entries[1].route_uid.as_str(), fixture.entries[1].route_revision));
+        }).catch_unwind().await;
+        acquire_step(exact.close()).await;
+        acquire_step(ordinary.close()).await;
+        fixture.finish().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_token_ready_to_closed_uses_current_authority() {
+        exact_token_transition(AcquireTransition::Closed).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_token_ready_to_removed_uses_current_authority() {
+        exact_token_transition(AcquireTransition::Removed).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_token_ready_to_reregistered_uses_current_authority() {
+        exact_token_transition(AcquireTransition::Reregistered).await;
+    }
+
+    async fn shared_acquire_transition(transition: AcquireTransition, watch_unavailable: bool) {
+        use futures::FutureExt;
+        let mut fixture = AcquireFixture::new().await;
+        let mut blocked_b = None;
+        let mut unregister = None;
+        let mut call_a = None;
+        let result = std::panic::AssertUnwindSafe(async {
+            let (lease_a, _, binding_a) = acquire_step(
+                fixture
+                    .state
+                    .acquire_upstream_for_route(&fixture.entries[0]),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("acquire A"));
+            let client = lease_a.client();
+            let (lease_b, _, old_b) = acquire_step(
+                fixture
+                    .state
+                    .acquire_upstream_for_route(&fixture.entries[1]),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("acquire B"));
+            assert!(Arc::ptr_eq(&client, &lease_b.client()));
+            assert_eq!(client.server_id(), fixture.entries[0].server_id.as_deref());
+            assert_eq!(
+                client.server_instance_id(),
+                fixture.entries[0].server_instance_id.as_deref()
+            );
+            let calling = client.clone();
+            call_a = Some(tokio::spawn(async move {
+                let _lease = lease_a;
+                calling.call_bound(&binding_a, "block", &[7; 8192]).await
+            }));
+            acquire_step(fixture.probes[0].entered.notified()).await;
+            if matches!(transition, AcquireTransition::Closed) {
+                let calling = client.clone();
+                let binding = old_b.clone();
+                blocked_b = Some(tokio::spawn(async move {
+                    calling.call_bound(&binding, "block", &[7; 8192]).await
+                }));
+                acquire_step(fixture.probes[1].entered.notified()).await;
+                let server = fixture.server.clone();
+                unregister = Some(tokio::spawn(
+                    async move { server.unregister_route("b").await },
+                ));
+                acquire_step(async {
+                    while fixture.server.contains_route("b").await {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+            } else {
+                assert!(fixture.server.unregister_route("b").await);
+                if matches!(transition, AcquireTransition::Reregistered) {
+                    AcquireFixture::register(&fixture.server, "b", fixture.probes[1].clone()).await;
+                }
+            }
+            drop(lease_b);
+            let pool = client.request_pool_for_test().unwrap();
+            let allocations = pool.lock().stats().alloc_count;
+            assert!(allocations > 0, "inflight A owns a real SHM request");
+            if watch_unavailable {
+                let key = super::super::upstream_control::owner_key_for_route(&fixture.entries[1])
+                    .unwrap();
+                fixture
+                    .state
+                    .mark_upstream_control_watch_unavailable(&key, "controlled watcher absence");
+            }
+            let rejected = acquire_step(
+                fixture
+                    .state
+                    .acquire_upstream_for_route(&fixture.entries[1]),
+            )
+            .await;
+            match transition {
+                AcquireTransition::Closed => assert!(matches!(
+                    rejected,
+                    Err(UpstreamAcquireError::Unreachable {
+                        error: c2_ipc::IpcError::RouteClosed { .. },
+                        ..
+                    })
+                )),
+                AcquireTransition::Removed => assert!(matches!(
+                    rejected,
+                    Err(UpstreamAcquireError::Unreachable {
+                        error: c2_ipc::IpcError::RouteRemoved { .. },
+                        ..
+                    })
+                )),
+                AcquireTransition::Reregistered => {
+                    assert!(matches!(rejected, Err(UpstreamAcquireError::Stale { .. })))
+                }
+            }
+            let retained_allocations = pool.lock().stats().alloc_count;
+            // Observe A's actual result before checking pool/connection survival.
+            fixture.release(0);
+            let response = acquire_step(call_a.take().unwrap())
+                .await
+                .unwrap()
+                .expect("B semantic rejection must preserve A result");
+            assert_eq!(
+                response
+                    .into_bytes_with_pool(client.server_pool_arc())
+                    .unwrap(),
+                b"completed"
+            );
+            assert_eq!(
+                retained_allocations, allocations,
+                "B rejection must retain A's request carrier"
+            );
+            assert!(
+                client.is_connected(),
+                "healthy shared endpoint remains connected"
+            );
+            let error = acquire_step(client.call_bound(&old_b, "ping", &[]))
+                .await
+                .unwrap_err();
+            let c2_ipc::IpcError::CrmError(bytes) = error else {
+                panic!("old B call: {error}");
+            };
+            let error = c2_error::C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
+            assert_eq!(
+                error.code,
+                match transition {
+                    AcquireTransition::Closed => c2_error::ErrorCode::ResourceClosed,
+                    AcquireTransition::Removed => c2_error::ErrorCode::ResourceRemoved,
+                    AcquireTransition::Reregistered => c2_error::ErrorCode::RouteStale,
+                }
+            );
+            assert_eq!(
+                fixture.probes[1]
+                    .pings
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            fixture.release(1);
+            if let Some(blocked) = blocked_b.take() {
+                acquire_step(blocked).await.unwrap().unwrap();
+            }
+            if let Some(task) = unregister.take() {
+                assert!(acquire_step(task).await.unwrap());
+            }
+            let (same, _, _) = acquire_step(
+                fixture
+                    .state
+                    .acquire_upstream_for_route(&fixture.entries[0]),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("A remains acquirable"));
+            assert!(
+                Arc::ptr_eq(&client, &same.client()),
+                "no endpoint reconnect on route rejection"
+            );
+            acquire_step(async {
+                while pool.lock().stats().alloc_count != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        })
+        .catch_unwind()
+        .await;
+        fixture.release(0);
+        fixture.release(1);
+        if let Some(call) = call_a {
+            let _ = acquire_step(call).await;
+        }
+        if let Some(call) = blocked_b {
+            let _ = acquire_step(call).await;
+        }
+        if let Some(task) = unregister {
+            let _ = acquire_step(task).await;
+        }
+        fixture.finish().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_inflight_call_survives_closed_acquire() {
+        shared_acquire_transition(AcquireTransition::Closed, false).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_inflight_call_survives_removed_acquire() {
+        shared_acquire_transition(AcquireTransition::Removed, false).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_inflight_call_survives_stale_acquire() {
+        shared_acquire_transition(AcquireTransition::Reregistered, false).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_inflight_call_survives_watch_unavailable_closed_acquire() {
+        shared_acquire_transition(AcquireTransition::Closed, true).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_inflight_call_survives_watch_unavailable_removed_acquire() {
+        shared_acquire_transition(AcquireTransition::Removed, true).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_inflight_call_survives_watch_unavailable_stale_acquire() {
+        shared_acquire_transition(AcquireTransition::Reregistered, true).await;
+    }
 
     #[test]
     fn relay_upstream_memory_context_starts_idle_with_canonical_limits() {
