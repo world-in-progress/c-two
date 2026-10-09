@@ -2099,57 +2099,61 @@ async fn managed_bind_target_is_descriptor_relative_not_the_absolute_path() {
 /// unselected orphan and its ownership record unchanged.
 #[tokio::test]
 async fn sweep_scope_reaps_only_selected_slots_and_preserves_active_owner() {
-    let namespace = TestNamespace::new();
-    let root = namespace.path();
-    let selected = managed_endpoint_at(&root, "scope-selected");
-    let unselected = managed_endpoint_at(&root, "scope-unselected");
-    let active = managed_endpoint_at(&root, "scope-active");
-    bind_managed_at(&selected, root).unwrap().abandon_for_test();
-    bind_managed_at(&unselected, root)
-        .unwrap()
-        .abandon_for_test();
-    let active_listener = bind_managed_at(&active, root).unwrap();
-    let untouched_socket = socket_path_at(root, &unselected);
-    let untouched_lease = lease_path_at(root, &unselected);
-    let socket_identity = identity_of(&untouched_socket);
-    let lease_identity = identity_of(&untouched_lease);
-    let lease_bytes = std::fs::read(&untouched_lease).unwrap();
-    for _ in 0..2 {
-        let mut sweep = retry_sweep(|| scoped_sweep_at(root, &[selected.clone(), active.clone()]));
-        let mut complete = false;
-        let mut busy = 0;
-        for _ in 0..32 {
-            let batch = sweep.next_batch(SweepBudget {
-                max_entries: 1,
-                max_duration: Duration::ZERO,
-            });
-            assert!(batch.entries_visited <= 1);
-            assert!(!batch.round_interrupted);
-            busy += batch.busy;
-            if batch.round_complete {
-                complete = true;
-                break;
+    for mode in [0o700, 0o755] {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).unwrap();
+        let selected = managed_endpoint_at(&root, "scope-selected");
+        let unselected = managed_endpoint_at(&root, "scope-unselected");
+        let active = managed_endpoint_at(&root, "scope-active");
+        bind_managed_at(&selected, root).unwrap().abandon_for_test();
+        bind_managed_at(&unselected, root)
+            .unwrap()
+            .abandon_for_test();
+        let active_listener = bind_managed_at(&active, root).unwrap();
+        let untouched_socket = socket_path_at(root, &unselected);
+        let untouched_lease = lease_path_at(root, &unselected);
+        let socket_identity = identity_of(&untouched_socket);
+        let lease_identity = identity_of(&untouched_lease);
+        let lease_bytes = std::fs::read(&untouched_lease).unwrap();
+        for _ in 0..2 {
+            let mut sweep =
+                retry_sweep(|| scoped_sweep_at(root, &[selected.clone(), active.clone()]));
+            let mut complete = false;
+            let mut busy = 0;
+            for _ in 0..32 {
+                let batch = sweep.next_batch(SweepBudget {
+                    max_entries: 1,
+                    max_duration: Duration::ZERO,
+                });
+                assert!(batch.entries_visited <= 1);
+                assert!(!batch.round_interrupted);
+                busy += batch.busy;
+                if batch.round_complete {
+                    complete = true;
+                    break;
+                }
             }
+            assert!(complete, "private stable scope must reach EOF");
+            assert!(busy >= 1, "selected active listener must remain protected");
+            assert!(sweep.next_batch(SweepBudget::default()).round_complete);
+            assert!(!socket_path_at(root, &selected).exists());
+            assert!(!lease_path_at(root, &selected).exists());
+            assert_eq!(identity_of(&untouched_socket), socket_identity);
+            assert_eq!(identity_of(&untouched_lease), lease_identity);
+            assert_eq!(std::fs::read(&untouched_lease).unwrap(), lease_bytes);
         }
-        assert!(complete, "private stable scope must reach EOF");
-        assert!(busy >= 1, "selected active listener must remain protected");
-        assert!(sweep.next_batch(SweepBudget::default()).round_complete);
-        assert!(!socket_path_at(root, &selected).exists());
-        assert!(!lease_path_at(root, &selected).exists());
+        assert!(matches!(
+            active_listener.close(),
+            EndpointReapResult::Reaped
+        ));
+        let mut empty = retry_sweep(|| scoped_sweep_at(root, &[]));
+        let batch = empty.next_batch(SweepBudget::default());
+        assert!(batch.round_complete);
+        assert_eq!(batch.endpoints_examined, 0);
         assert_eq!(identity_of(&untouched_socket), socket_identity);
-        assert_eq!(identity_of(&untouched_lease), lease_identity);
         assert_eq!(std::fs::read(&untouched_lease).unwrap(), lease_bytes);
     }
-    assert!(matches!(
-        active_listener.close(),
-        EndpointReapResult::Reaped
-    ));
-    let mut empty = retry_sweep(|| scoped_sweep_at(root, &[]));
-    let batch = empty.next_batch(SweepBudget::default());
-    assert!(batch.round_complete);
-    assert_eq!(batch.endpoints_examined, 0);
-    assert_eq!(identity_of(&untouched_socket), socket_identity);
-    assert_eq!(std::fs::read(&untouched_lease).unwrap(), lease_bytes);
 }
 
 #[tokio::test]
@@ -2204,7 +2208,8 @@ fn native_umask_child() {
         libc::umask(libc::mode_t::from_str_radix(&mask, 8).unwrap());
     }
     let directory = EndpointDirectory::open(Path::new(&root), true).unwrap();
-    assert!(directory.strict_private());
+    directory.validate().unwrap();
+    assert_eq!(std::fs::metadata(root).unwrap().mode() & 0o777, 0o700);
 }
 
 #[test]
@@ -2411,4 +2416,398 @@ async fn native_concurrent_stale_bind_keeps_the_winner_reachable() {
     server.read_exact(&mut reply).await.unwrap();
     assert_eq!(&reply, b"owned");
     assert!(matches!(winner.close(), EndpointReapResult::Reaped));
+}
+
+#[tokio::test]
+async fn socket_permission_and_listen_failures_withdraw_only_the_bound_identity() {
+    use crate::unix_common::fault::{self, Failure};
+    for failure in [
+        Failure::SocketPermissions,
+        Failure::SocketModeMismatch,
+        Failure::Listen,
+        Failure::SocketPermissionsAfterReplacement,
+        Failure::ListenAfterReplacement,
+    ] {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let unrelated = root.join("application-file");
+        std::fs::write(&unrelated, b"preserved").unwrap();
+        let endpoint = managed_endpoint_at(root, "initialization-failure");
+        fault::inject(failure);
+        let error = bind_managed_at(&endpoint, root)
+            .err()
+            .expect("injected failure must fail bind");
+        assert!(
+            !fault::take_if(failure),
+            "injected failure must have been reached: {error}"
+        );
+        if failure == Failure::Listen {
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ENOTSOCK),
+                "the injected descriptor damage must reach the real OS listen: {error}"
+            );
+        }
+        let path = socket_path_at(root, &endpoint);
+        if matches!(
+            failure,
+            Failure::SocketPermissionsAfterReplacement | Failure::ListenAfterReplacement
+        ) {
+            assert_eq!(std::fs::read(path).unwrap(), b"replacement-marker");
+        } else {
+            assert!(
+                !path.exists(),
+                "{failure:?}: this bind's socket must be withdrawn"
+            );
+            let listener = bind_managed_at(&endpoint, root)
+                .expect("failed bind must leave a reusable address");
+            assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+        }
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"preserved");
+        assert_eq!(std::fs::metadata(root).unwrap().mode() & 0o777, 0o755);
+    }
+}
+
+#[test]
+fn socket_before_listen_umask_child() {
+    use crate::unix_common::fault::{self, Failure};
+    let Some(root) = std::env::var_os("C2_SOCKET_UMASK_ROOT") else {
+        return;
+    };
+    let mask = std::env::var("C2_SOCKET_UMASK").unwrap();
+    // Only this isolated child changes umask, never production or the parent harness.
+    let mask = libc::mode_t::from_str_radix(&mask, 8).unwrap();
+    unsafe {
+        libc::umask(mask);
+    }
+    let root = Path::new(&root);
+    let endpoint = managed_endpoint_at(root, "pre-listen");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            fault::inject(Failure::BeforeListen);
+            let mut listener = bind_managed_at(&endpoint, root).unwrap();
+            assert!(
+                !fault::take_if(Failure::BeforeListen),
+                "pre-listen checkpoint must run"
+            );
+            assert_eq!(
+                std::fs::metadata(socket_path_at(root, &endpoint))
+                    .unwrap()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            for name in [
+                GATE_NAME.to_owned(),
+                MARKER_NAME.to_owned(),
+                lease_path_at(root, &endpoint)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(root.join(name)).unwrap().mode() & 0o777,
+                    0o600
+                );
+            }
+            let (mut client, mut server) =
+                tokio::try_join!(crate::platform::connect(&endpoint), listener.accept()).unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut client, b"private")
+                .await
+                .unwrap();
+            let mut bytes = [0; 7];
+            server.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"private");
+            assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+        });
+    // Read back the process mask in this isolated child and restore it immediately.
+    let after = unsafe { libc::umask(mask) };
+    assert_eq!(
+        after, mask,
+        "production bind must not change the process umask"
+    );
+    println!("PRE_LISTEN_0600_VERIFIED");
+}
+
+#[test]
+fn socket_is_0600_before_listen_under_permissive_umask() {
+    for mask in ["000", "002"] {
+        let namespace = TestNamespace::new();
+        std::fs::set_permissions(namespace.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unix_managed::tests::socket_before_listen_umask_child",
+                "--nocapture",
+            ])
+            .env("C2_SOCKET_UMASK_ROOT", namespace.path())
+            .env("C2_SOCKET_UMASK", mask)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PRE_LISTEN_0600_VERIFIED"));
+    }
+}
+
+#[tokio::test]
+async fn directory_policy_and_diagnostics_are_shared_by_all_entry_points() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint_at(root, "policy");
+    let credential = EndpointCredential::unix_managed(
+        endpoint.clone(),
+        SocketIdentity {
+            device: 1,
+            inode: 2,
+            changed_secs: 3,
+            changed_nanos: 4,
+        },
+        [7; 16],
+    );
+    let mut rejected_modes = vec![0o777, 0o775, 0o770];
+    if unsafe { libc::geteuid() } != 0 {
+        // Root may have actual access despite absent owner bits. The policy
+        // checks effective access, so these are denials only for an ordinary uid.
+        rejected_modes.extend([0o555, 0o600, 0o300]);
+    }
+    for mode in rejected_modes {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).unwrap();
+        let mut errors = vec![
+            bind_managed_at(&endpoint, root).err().unwrap(),
+            crate::platform::connect(&endpoint).await.err().unwrap(),
+            ManagedSweep::for_scope(&endpoint, &[endpoint.clone()])
+                .err()
+                .unwrap(),
+        ];
+        match inspect_managed_at(&endpoint, root) {
+            EndpointInspection::IoError(error) => errors.push(error),
+            other => panic!("directory diagnostic lost in inspect: {other:?}"),
+        }
+        match reap_managed_at(&endpoint, &credential, root) {
+            EndpointReapResult::IoError(error) => errors.push(error),
+            other => panic!("directory diagnostic lost in reap: {other:?}"),
+        }
+        for error in errors {
+            let message = error.to_string();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{message}");
+            assert!(message.contains(&root.display().to_string()), "{message}");
+            assert!(
+                message.contains(&format!("owner {}", unsafe { libc::geteuid() })),
+                "{message}"
+            );
+            assert!(message.contains(&format!("mode {mode:04o}")), "{message}");
+            assert!(
+                message.contains("must not have write")
+                    || message.contains("lacks read/write/traverse")
+                    || message.contains("cannot open"),
+                "{message}"
+            );
+        }
+    }
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        std::fs::read_dir(root).unwrap().count(),
+        0,
+        "failed directory validation must create nothing"
+    );
+    for mode in [0o700, 0o750, 0o755] {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).unwrap();
+        let directory = EndpointDirectory::open(root, false).unwrap();
+        directory.validate().unwrap();
+        assert_eq!(std::fs::metadata(root).unwrap().mode() & 0o777, mode);
+    }
+}
+
+#[test]
+fn final_directory_symlink_and_replacement_are_refused_with_context() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let moved = root.with_file_name("moved");
+    let directory = EndpointDirectory::open(root, false).unwrap();
+    std::fs::rename(root, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, root).unwrap();
+    let error = EndpointDirectory::open(root, false).err().unwrap();
+    let message = error.to_string();
+    assert!(
+        message.contains(&root.display().to_string())
+            && message.contains("owner")
+            && message.contains("mode")
+            && message.contains("symlinks"),
+        "{message}"
+    );
+    assert!(!directory.path_still_names_open_directory());
+    std::fs::remove_file(root).unwrap();
+    std::fs::create_dir(root).unwrap();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = directory.validate().unwrap_err().to_string();
+    assert!(
+        error.contains(&root.display().to_string())
+            && error.contains("owner")
+            && error.contains("mode")
+            && error.contains("no longer names"),
+        "{error}"
+    );
+    assert!(moved.is_dir());
+    assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+}
+
+#[test]
+fn cross_user_socket_child() {
+    let Some(root) = std::env::var_os("C2_CROSS_USER_ROOT") else {
+        return;
+    };
+    let address = std::env::var("C2_CROSS_USER_ADDRESS").unwrap();
+    let context = LocalEndpointContext::with_unix_root(Path::new(&root)).unwrap();
+    let endpoint = context.endpoint(&address).unwrap();
+    let error = std::os::unix::net::UnixStream::connect(endpoint.os_name()).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied,
+        "a second uid must not connect: {error}"
+    );
+    let error = EndpointDirectory::open(Path::new(&root), false)
+        .err()
+        .unwrap();
+    let message = error.to_string();
+    assert!(
+        message.contains("owner must equal")
+            && message.contains("owner 0")
+            && message.contains("mode 0755"),
+        "{message}"
+    );
+    println!("CROSS_USER_DENIED_VERIFIED");
+}
+
+#[tokio::test]
+#[ignore = "requires root to spawn a child as a second ordinary uid; run explicitly on a suitable host"]
+async fn cross_user_cannot_connect_to_0600_socket_in_0755_directory() {
+    use std::os::unix::process::CommandExt;
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "this real cross-user test requires root; do not count a skipped child as evidence"
+    );
+    // Use the actual local nobody account rather than assuming a platform uid.
+    let account = unsafe { libc::getpwnam(c"nobody".as_ptr()) };
+    assert!(!account.is_null(), "a second ordinary account must exist");
+    let (uid, gid) = unsafe { ((*account).pw_uid, (*account).pw_gid) };
+    assert_ne!(uid, 0);
+    let namespace = TestNamespace::new();
+    std::fs::set_permissions(
+        namespace._parent.path(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::set_permissions(namespace.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let endpoint = managed_endpoint_at(namespace.path(), "cross-user");
+    let listener = bind_managed_at(&endpoint, namespace.path()).unwrap();
+    let identity = identity_of(&socket_path(&endpoint));
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "unix_managed::tests::cross_user_socket_child",
+            "--nocapture",
+        ])
+        .env("C2_CROSS_USER_ROOT", namespace.path())
+        .env("C2_CROSS_USER_ADDRESS", endpoint.address())
+        .gid(gid)
+        .uid(uid)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("CROSS_USER_DENIED_VERIFIED"));
+    assert_eq!(identity_of(&socket_path(&endpoint)), identity);
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+}
+
+#[tokio::test]
+async fn missing_coordinator_in_0755_directory_is_never_recreated() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(ManagedNamespace::open_root(root, true, true).unwrap());
+    let marker = std::fs::read(root.join(MARKER_NAME)).unwrap();
+    std::fs::remove_file(root.join(GATE_NAME)).unwrap();
+    let endpoint = managed_endpoint_at(root, "missing-gate-0755");
+    let credential = EndpointCredential::unix_managed(
+        endpoint.clone(),
+        SocketIdentity {
+            device: 1,
+            inode: 2,
+            changed_secs: 3,
+            changed_nanos: 4,
+        },
+        [7; 16],
+    );
+    assert!(matches!(
+        ManagedNamespace::open_root(root, true, false),
+        Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::CoordinatorMissing
+        ))
+    ));
+    assert!(bind_managed_at(&endpoint, root).is_err());
+    assert!(matches!(
+        inspect_managed_at(&endpoint, root),
+        EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorMissing)
+    ));
+    assert!(matches!(
+        reap_managed_at(&endpoint, &credential, root),
+        EndpointReapResult::Unverified(EndpointUnverifiedReason::CoordinatorMissing)
+    ));
+    assert!(!root.join(GATE_NAME).exists());
+    assert_eq!(std::fs::read(root.join(MARKER_NAME)).unwrap(), marker);
+    assert_eq!(std::fs::read_dir(root).unwrap().count(), 1);
+}
+
+/// The positive pre-listen check must fail if a fixture listens too early.
+/// This changes only the fixture socket; production listen ordering is intact.
+#[tokio::test]
+async fn before_listen_checkpoint_rejects_an_already_listening_socket() {
+    use crate::unix_common::fault::{self, Failure};
+    let fixture = TestNamespace::new();
+    let root = fixture.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let endpoint = managed_endpoint_at(root, "pre-listen-negative-control");
+    let namespace = open_root_bounded(root, true).unwrap();
+    let names = managed_names(&endpoint).unwrap();
+    let lease = namespace
+        .directory
+        .open_file(
+            &names.lock,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+        .unwrap()
+        .unwrap();
+    try_lock_lease(&lease).unwrap();
+    let socket = bind_in_verified_directory(&namespace, &names).unwrap();
+    let guard = BoundSocketGuard::capture(&namespace.directory, &names, &lease).unwrap();
+    set_socket_permissions(&namespace.directory, &names, &guard).unwrap();
+    socket.listen(128).unwrap();
+    fault::inject(Failure::BeforeListen);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        listen_verified_socket(&socket, &namespace.directory, &names, &guard)
+    }))
+    .expect_err("an already listening socket must fail the pre-listen checkpoint");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("same-user connect must be refused before listen"),
+        "the actual connect assertion must reject the early listener: {message}"
+    );
+    assert!(
+        !fault::take_if(Failure::BeforeListen),
+        "checkpoint must have run"
+    );
+    // The guard still owns the exact bound inode and cleans only this fixture.
+    drop(guard);
+    assert!(!socket_path(&endpoint).exists());
 }

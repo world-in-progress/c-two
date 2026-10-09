@@ -20,12 +20,6 @@ pub async fn connect(endpoint: &LocalEndpoint) -> io::Result<Stream> {
         )
     })?;
     let directory = crate::unix_common::EndpointDirectory::open(root, false)?;
-    if !directory.strict_private() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "local endpoint directory is not private",
-        ));
-    }
     let name = Path::new(endpoint.os_name())
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "endpoint has no file name"))?;
@@ -38,12 +32,7 @@ pub async fn connect(endpoint: &LocalEndpoint) -> io::Result<Stream> {
     if let Some(error) = stream.take_error()? {
         return Err(error);
     }
-    if !directory.path_still_names_open_directory() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "local endpoint directory changed during connect",
-        ));
-    }
+    directory.validate()?;
     Ok(stream)
 }
 

@@ -39,6 +39,51 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 #[tokio::test]
+async fn custom_0755_root_supports_real_connections_and_restart() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use tokio::io::AsyncReadExt;
+    let root = short_root();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let unrelated = root.path().join("application-file");
+    std::fs::write(&unrelated, b"preserved").unwrap();
+    let endpoint = context(root.path()).endpoint(ADDRESS).unwrap();
+    for _ in 0..2 {
+        let mut listener = LocalListener::bind(&endpoint).expect("owned 0755 final directory");
+        let credential = retry_inspect(&endpoint);
+        let identity = std::fs::symlink_metadata(endpoint.os_name()).unwrap();
+        assert_eq!(identity.mode() & 0o777, 0o600);
+        assert_eq!(
+            LocalListener::bind(&endpoint).err().unwrap().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(endpoint.os_name()).unwrap().ino(),
+            identity.ino()
+        );
+        assert!(matches!(
+            reap_endpoint(&endpoint, &credential),
+            EndpointReapResult::Busy
+        ));
+        let (mut client, mut server) = tokio::try_join!(
+            LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+            listener.accept()
+        )
+        .unwrap();
+        client.write_all(b"0755").await.unwrap();
+        let mut bytes = [0; 4];
+        server.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"0755");
+        assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+        assert!(!Path::new(endpoint.os_name()).exists());
+    }
+    assert_eq!(
+        std::fs::metadata(root.path()).unwrap().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(std::fs::read(unrelated).unwrap(), b"preserved");
+}
+
+#[tokio::test]
 async fn custom_root_container_missing_is_not_created_by_bind() {
     // The application's outer fixture exists, but its selected root does not.
     let outer = tempfile::Builder::new()
@@ -413,77 +458,83 @@ fn long_root(outer: &Path, bytes: usize) -> std::path::PathBuf {
 #[tokio::test]
 async fn long_directories_support_roundtrip_restart_inspect_reap_and_sweep() {
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use tokio::io::AsyncReadExt;
     let cwd = std::env::current_dir().unwrap();
-    for bytes in [128, 256, 512, 768] {
-        let outer = short_root();
-        let root = long_root(outer.path(), bytes);
-        let unrelated = root.join("application-owned.txt");
-        std::fs::write(&unrelated, b"preserve").unwrap();
-        let captured = context(&root);
-        let endpoint = captured.endpoint(ADDRESS).unwrap();
-        let path = Path::new(endpoint.os_name());
-        assert_eq!(path.parent(), Some(root.as_path()));
-        assert_eq!(path.file_name().unwrap().as_bytes().len(), 32);
-        assert!(path.as_os_str().as_bytes().len() > 108);
-        let mut listener = LocalListener::bind(&endpoint).unwrap();
-        let (mut client, mut server) = tokio::try_join!(
-            LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
-            listener.accept()
-        )
-        .unwrap();
-        client.write_all(b"long path request").await.unwrap();
-        let mut data = [0; 17];
-        server.read_exact(&mut data).await.unwrap();
-        assert_eq!(&data, b"long path request");
-        server.write_all(b"long path reply").await.unwrap();
-        let mut reply = [0; 15];
-        client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(&reply, b"long path reply");
-        let credential = listener.credential();
-        assert_eq!(
-            EndpointCredential::from_json(&credential.to_json().unwrap()).unwrap(),
-            credential
-        );
-        assert_eq!(retry_inspect(&endpoint), credential);
-        drop(client);
-        drop(server);
-        assert!(matches!(listener.close(), EndpointReapResult::Reaped));
-        assert!(!path.exists());
-        assert_eq!(
-            LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT)
-                .await
-                .err()
-                .unwrap()
-                .kind(),
-            io::ErrorKind::NotFound
-        );
+    for mode in [0o700, 0o755] {
+        for bytes in [128, 256, 512, 768] {
+            let outer = short_root();
+            let root = long_root(outer.path(), bytes);
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            let unrelated = root.join("application-owned.txt");
+            std::fs::write(&unrelated, b"preserve").unwrap();
+            let captured = context(&root);
+            let endpoint = captured.endpoint(ADDRESS).unwrap();
+            let path = Path::new(endpoint.os_name());
+            assert_eq!(path.parent(), Some(root.as_path()));
+            assert_eq!(path.file_name().unwrap().as_bytes().len(), 32);
+            assert!(path.as_os_str().as_bytes().len() > 108);
+            let mut listener = LocalListener::bind(&endpoint).unwrap();
+            let (mut client, mut server) = tokio::try_join!(
+                LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+                listener.accept()
+            )
+            .unwrap();
+            client.write_all(b"long path request").await.unwrap();
+            let mut data = [0; 17];
+            server.read_exact(&mut data).await.unwrap();
+            assert_eq!(&data, b"long path request");
+            server.write_all(b"long path reply").await.unwrap();
+            let mut reply = [0; 15];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"long path reply");
+            let credential = listener.credential();
+            assert_eq!(
+                EndpointCredential::from_json(&credential.to_json().unwrap()).unwrap(),
+                credential
+            );
+            assert_eq!(retry_inspect(&endpoint), credential);
+            drop(client);
+            drop(server);
+            assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+            assert!(!path.exists());
+            assert_eq!(
+                LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::NotFound
+            );
 
-        let (mut child, dead) = holder(&root);
-        kill_and_wait(&mut child);
-        assert_eq!(retry_inspect(&endpoint), dead);
-        assert!(matches!(
-            retry_reap(&endpoint, &dead),
-            EndpointReapResult::Reaped
-        ));
-        let (mut child, dead) = holder(&root);
-        kill_and_wait(&mut child);
-        let scope = EndpointSweep::scope_for_addresses(&endpoint, &[ADDRESS.to_owned()]).unwrap();
-        let mut sweep = EndpointSweep::for_scope(&scope).unwrap();
-        assert_eq!(finish_sweep(&mut sweep), 1);
-        assert!(matches!(
-            reap_endpoint(&endpoint, &dead),
-            EndpointReapResult::AlreadyAbsent
-        ));
-        assert!(root.is_dir());
-        assert_eq!(std::fs::read(&unrelated).unwrap(), b"preserve");
-        assert!(
-            std::fs::read_dir(&root).unwrap().all(|entry| !entry
-                .unwrap()
-                .file_type()
-                .unwrap()
-                .is_dir())
-        );
-        assert_eq!(std::env::current_dir().unwrap(), cwd);
+            let (mut child, dead) = holder(&root);
+            kill_and_wait(&mut child);
+            assert_eq!(retry_inspect(&endpoint), dead);
+            assert!(matches!(
+                retry_reap(&endpoint, &dead),
+                EndpointReapResult::Reaped
+            ));
+            let (mut child, dead) = holder(&root);
+            kill_and_wait(&mut child);
+            let scope =
+                EndpointSweep::scope_for_addresses(&endpoint, &[ADDRESS.to_owned()]).unwrap();
+            let mut sweep = EndpointSweep::for_scope(&scope).unwrap();
+            assert_eq!(finish_sweep(&mut sweep), 1);
+            assert!(matches!(
+                reap_endpoint(&endpoint, &dead),
+                EndpointReapResult::AlreadyAbsent
+            ));
+            assert!(root.is_dir());
+            assert_eq!(std::fs::metadata(&root).unwrap().mode() & 0o777, mode);
+            assert_eq!(std::fs::read(&unrelated).unwrap(), b"preserve");
+            assert!(
+                std::fs::read_dir(&root).unwrap().all(|entry| !entry
+                    .unwrap()
+                    .file_type()
+                    .unwrap()
+                    .is_dir())
+            );
+            assert_eq!(std::env::current_dir().unwrap(), cwd);
+        }
     }
 }

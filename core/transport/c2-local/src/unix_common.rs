@@ -18,6 +18,15 @@ pub(crate) mod fault {
     pub(crate) enum Failure {
         /// `fchmodat` on the freshly bound socket fails.
         SocketPermissions,
+        /// Permission failure after replacement must preserve the foreign entry.
+        SocketPermissionsAfterReplacement,
+        /// Read-back reports a mode other than 0600.
+        SocketModeMismatch,
+        /// listen fails after permissions have been verified.
+        Listen,
+        ListenAfterReplacement,
+        /// Observe the real socket immediately before listen in a child process.
+        BeforeListen,
         /// A managed-v2 owner record write fails outright.
         ManagedRecordWrite,
         /// A managed-v2 owner record write lands only partially, so the
@@ -86,24 +95,35 @@ impl EndpointDirectory {
             )
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if let Ok(metadata) = fs::symlink_metadata(path) {
+                if metadata.file_type().is_symlink()
+                    || error.kind() == io::ErrorKind::PermissionDenied
+                {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "endpoint directory {} owner {} mode {:04o}: cannot open final directory without following symlinks: {error}",
+                            path.display(),
+                            metadata.uid(),
+                            metadata.mode() & 0o7777
+                        ),
+                    ));
+                }
+            }
+            return Err(error);
         }
         // SAFETY: open returned a fresh descriptor and File assumes ownership.
         let file = unsafe { File::from_raw_fd(fd) };
         let stat = fstat(file.as_raw_fd())?;
-        verify_directory_stat(&stat)?;
+        verify_directory_stat(path, &stat)?;
         let directory = Self {
             file,
             path: path.to_owned(),
             device: stat.st_dev as u64,
             inode: stat.st_ino as u64,
         };
-        if !directory.path_still_names_open_directory() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed endpoint directory changed while opening",
-            ));
-        }
+        directory.validate()?;
         Ok(directory)
     }
 
@@ -111,24 +131,53 @@ impl EndpointDirectory {
         self.file.as_raw_fd()
     }
 
-    /// Strict managed-namespace check: the directory must be owned by the
-    /// current user with exactly `0700` permissions.
-    pub(crate) fn strict_private(&self) -> bool {
-        let Ok(stat) = fstat(self.fd()) else {
-            return false;
-        };
-        stat.st_uid == unsafe { libc::geteuid() } && stat.st_mode as libc::mode_t & 0o777 == 0o700
+    /// The same owner/access policy applies at open and every identity fence.
+    /// Application directories may be 0755; none are chmod-ed by C-Two.
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        let stat = fstat(self.fd())?;
+        verify_directory_stat(&self.path, &stat)?;
+        // Check effective credentials and ACLs against the pinned directory,
+        // rather than testing a pathname that a rename could redirect.
+        if unsafe {
+            libc::faccessat(
+                self.fd(),
+                c".".as_ptr(),
+                libc::R_OK | libc::W_OK | libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        } != 0
+        {
+            return Err(directory_policy_error(
+                &self.path,
+                &stat,
+                &format!(
+                    "effective user lacks read/write/traverse access: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+            directory_policy_error(
+                &self.path,
+                &stat,
+                &format!("cannot verify directory path identity: {error}"),
+            )
+        })?;
+        if !metadata.file_type().is_dir()
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+        {
+            return Err(directory_policy_error(
+                &self.path,
+                &stat,
+                "path no longer names the opened directory",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn path_still_names_open_directory(&self) -> bool {
-        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
-            return false;
-        };
-        metadata.file_type().is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.dev() == self.device
-            && metadata.ino() == self.inode
-            && metadata.mode() & 0o022 == 0
+        self.validate().is_ok()
     }
 
     pub(crate) fn stat(&self, name: &CString) -> io::Result<Option<libc::stat>> {
@@ -233,25 +282,33 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-fn verify_directory_stat(stat: &libc::stat) -> io::Result<()> {
+fn directory_policy_error(path: &Path, stat: &libc::stat, condition: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "endpoint directory {} owner {} mode {:04o}: {condition}",
+            path.display(),
+            stat.st_uid,
+            stat.st_mode as libc::mode_t & 0o7777
+        ),
+    )
+}
+
+fn verify_directory_stat(path: &Path, stat: &libc::stat) -> io::Result<()> {
     let mode = stat.st_mode as libc::mode_t;
-    if mode & libc::S_IFMT != libc::S_IFDIR {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "managed endpoint namespace is not a directory",
-        ));
+    let condition = if mode & libc::S_IFMT != libc::S_IFDIR {
+        Some("final object is not a directory")
+    } else if stat.st_uid != unsafe { libc::geteuid() } {
+        Some("owner must equal the current effective uid")
+    } else if mode & 0o022 != 0 {
+        Some("group and other users must not have write permission")
+    } else {
+        None
+    };
+    match condition {
+        Some(condition) => Err(directory_policy_error(path, stat, condition)),
+        None => Ok(()),
     }
-    if stat.st_uid != unsafe { libc::geteuid() } || mode & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "managed endpoint namespace is not private to the current user (uid {} mode {:o})",
-                stat.st_uid,
-                mode & 0o7777
-            ),
-        ));
-    }
-    Ok(())
 }
 
 pub(crate) fn same_file(left: &libc::stat, right: &libc::stat) -> bool {
@@ -326,119 +383,42 @@ pub(crate) fn dirfd_relative_socket_path(
     }
 }
 
-/// Binds a Unix stream socket named `socket_name` inside `directory` through a
-/// *dedicated short-lived thread* whose own working directory is switched to
-/// the verified descriptor for the duration of the `bind` and then destroyed
-/// with the thread.
-///
-/// This is the macOS primitive. `unix_common::dirfd_relative_socket_path`
-/// returns `None` there because `/dev/fd/<n>/name` is not resolvable for a
-/// socket bind, so the only descriptor-anchored option is
-/// `pthread_fchdir_np(dirfd)`. That switch is per-thread, and this function
-/// owns the thread it switches: it never consults, alters, or restores the
-/// *caller's* thread directory, so a thread that already had its own working
-/// directory keeps it exactly. The thread ends immediately after the bind is
-/// attempted, which destroys its thread-local directory state with it.
-///
-/// The raw descriptor is duplicated before it crosses the thread boundary so
-/// the bind thread owns a descriptor whose lifetime it fully controls; the
-/// duplicate is closed when the thread returns. The freshly bound listener is
-/// sent back as a `std::os::unix::net::UnixListener` and registered with the
-/// caller's reactor afterwards, so no descriptor is ever polled from two
-/// reactors.
-///
-/// Every target that is not macOS reports `Unsupported`; there is deliberately
-/// no fallback to the absolute path, which a concurrent rename can redirect.
+/// Binds without listening. macOS resolves the bare name on a dedicated
+/// thread with a descriptor-pinned cwd; the caller's cwd is untouched. Socket
+/// initialization and rollback stay on the caller, under its ownership guard.
 #[cfg(target_os = "macos")]
 pub(crate) fn bind_in_directory_on_thread(
     directory: &EndpointDirectory,
     socket_name: &OsStr,
-) -> io::Result<std::os::unix::net::UnixListener> {
-    let name = CString::new(socket_name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket name contains NUL"))?;
+) -> io::Result<socket2::Socket> {
+    let name = socket_name.to_owned();
     let thread_dir = duplicate_directory_descriptor(directory)?;
-    let joined = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("c2-managed-bind".to_owned())
         .spawn(move || {
-            // `thread_dir` is owned by this thread; the guard closes it when the
-            // thread returns, and its thread-local cwd dies with the thread.
-            let thread_dir = thread_dir;
-            if let Err(error) = set_thread_directory(thread_dir.as_raw_fd()) {
-                return Err(error);
-            }
-            let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
-            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-            let bytes = name.as_bytes();
-            if bytes.len() >= addr.sun_path.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "socket name does not fit in sockaddr_un",
-                ));
-            }
-            for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
-                *slot = *byte as libc::c_char;
-            }
-            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // Set close-on-exec explicitly: macOS does not accept
-            // `SOCK_CLOEXEC` in the socket type.
-            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-                let error = io::Error::last_os_error();
-                unsafe {
-                    libc::close(fd);
-                }
-                return Err(error);
-            }
-            // SAFETY: `fd` is a fresh descriptor owned here until either the
-            // bind fails (closed below) or it is handed to UnixListener.
-            let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-            let length = (std::mem::size_of::<libc::sa_family_t>() + 1 + name.as_bytes().len() + 1)
-                as libc::socklen_t;
-            if unsafe {
-                libc::bind(
-                    socket.as_raw_fd(),
-                    (&addr as *const libc::sockaddr_un).cast(),
-                    length,
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if unsafe { libc::listen(socket.as_raw_fd(), 128) } != 0 {
-                let error = io::Error::last_os_error();
-                // Withdraw the just-bound socket so a failed listen never leaves
-                // this call's object behind.
-                unsafe {
-                    libc::unlinkat(thread_dir.as_raw_fd(), name.as_ptr(), 0);
-                }
-                return Err(error);
-            }
-            Ok(std::os::unix::net::UnixListener::from(socket))
-        });
-    let handle = match joined {
-        Ok(handle) => handle,
-        Err(error) => return Err(error),
-    };
-    match handle.join() {
-        Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::Other,
-            "managed namespace bind thread panicked",
-        )),
-    }
+            set_thread_directory(thread_dir.as_raw_fd())?;
+            bind_socket(Path::new(&name))
+        })?
+        .join()
+        .map_err(|_| io::Error::other("managed namespace bind thread panicked"))?
 }
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn bind_in_directory_on_thread(
     _directory: &EndpointDirectory,
     _socket_name: &OsStr,
-) -> io::Result<std::os::unix::net::UnixListener> {
+) -> io::Result<socket2::Socket> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "descriptor-anchored socket bind is only available on macOS",
     ))
+}
+
+pub(crate) fn bind_socket(path: &Path) -> io::Result<socket2::Socket> {
+    let address = socket2::SockAddr::unix(path)?;
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.bind(&address)?;
+    Ok(socket)
 }
 
 /// Duplicates a directory descriptor with close-on-exec so a thread can own it
@@ -570,6 +550,13 @@ impl<'a> BoundSocketGuard<'a> {
         })
     }
 
+    pub(crate) fn matches(&self, stat: &libc::stat) -> bool {
+        stat_is(stat, libc::S_IFSOCK)
+            && stat.st_uid == unsafe { libc::geteuid() }
+            && stat.st_dev as u64 == self.device
+            && stat.st_ino as u64 == self.inode
+    }
+
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
@@ -583,11 +570,7 @@ impl<'a> BoundSocketGuard<'a> {
             Ok(None) => return EndpointReapResult::AlreadyAbsent,
             Err(error) => return EndpointReapResult::IoError(error),
         };
-        if !stat_is(&current, libc::S_IFSOCK)
-            || current.st_uid != unsafe { libc::geteuid() }
-            || current.st_dev as u64 != self.device
-            || current.st_ino as u64 != self.inode
-        {
+        if !self.matches(&current) {
             // A replacement object is never removed by rollback.
             return EndpointReapResult::StaleTarget;
         }
@@ -623,6 +606,7 @@ pub(crate) fn start_connect_in_directory(
     directory: &EndpointDirectory,
     socket_name: &OsStr,
 ) -> io::Result<socket2::Socket> {
+    directory.validate()?;
     if let Some(path) = dirfd_relative_socket_path(directory, socket_name) {
         return start_nonblocking_connect(&path);
     }
@@ -728,7 +712,16 @@ impl Drop for SweepLease {
 pub(crate) fn set_socket_permissions(
     directory: &EndpointDirectory,
     names: &EndpointNames,
+    guard: &BoundSocketGuard<'_>,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    if fault::take_if(fault::Failure::SocketPermissionsAfterReplacement) {
+        directory.replace_entry_with_file_for_test(&names.socket)?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected socket permission failure after replacement",
+        ));
+    }
     #[cfg(test)]
     if fault::take_if(fault::Failure::SocketPermissions) {
         return Err(io::Error::new(
@@ -736,19 +729,14 @@ pub(crate) fn set_socket_permissions(
             "injected socket permission failure",
         ));
     }
-    if !directory.path_still_names_open_directory() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "endpoint directory changed",
-        ));
-    }
+    directory.validate()?;
     let current = directory
         .stat(&names.socket)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bound socket disappeared"))?;
-    if let Some(reason) = socket_unverified(&current) {
+    if !guard.matches(&current) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("bound endpoint is unsafe: {reason:?}"),
+            "bound socket was replaced before chmod",
         ));
     }
     if unsafe {
@@ -762,14 +750,115 @@ pub(crate) fn set_socket_permissions(
     {
         return Err(io::Error::last_os_error());
     }
+    #[cfg(test)]
+    if fault::take_if(fault::Failure::SocketModeMismatch) {
+        assert_eq!(
+            unsafe {
+                libc::fchmodat(
+                    directory.fd(),
+                    names.socket.as_ptr(),
+                    0o640,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            0
+        );
+    }
     let changed = directory
         .stat(&names.socket)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bound socket disappeared"))?;
-    if !same_file(&current, &changed) || !stat_is(&changed, libc::S_IFSOCK) {
+    if !same_file(&current, &changed) || socket_unverified(&changed).is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "bound socket was replaced",
         ));
     }
+    if changed.st_mode as libc::mode_t & 0o7777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "bound socket mode {:04o}, required 0600",
+                changed.st_mode as libc::mode_t & 0o7777
+            ),
+        ));
+    }
+    directory.validate()?;
     Ok(())
+}
+
+/// The only production listen point. Never publish a socket until its entry
+/// is still this bind's object and chmod/read-back have established mode 0600.
+pub(crate) fn listen_verified_socket(
+    socket: &socket2::Socket,
+    directory: &EndpointDirectory,
+    names: &EndpointNames,
+    guard: &BoundSocketGuard<'_>,
+) -> io::Result<()> {
+    directory.validate()?;
+    let stat = directory.stat(&names.socket)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "bound socket disappeared before listen",
+        )
+    })?;
+    if !guard.matches(&stat) || stat.st_mode as libc::mode_t & 0o7777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "bound socket identity/mode changed before listen",
+        ));
+    }
+    #[cfg(test)]
+    {
+        if fault::take_if(fault::Failure::BeforeListen) {
+            assert_eq!(stat.st_mode as libc::mode_t & 0o7777, 0o600);
+            // A same-uid, descriptor-relative connect must reach the real socket
+            // and be refused. ENOENT or a permission failure is not evidence of
+            // a bound socket that has not started listening.
+            let error = start_connect_in_directory(directory, &names.socket_os)
+                .expect_err("same-user connect must be refused before listen");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ECONNREFUSED),
+                "pre-listen connect must fail specifically with ECONNREFUSED: {error}"
+            );
+            // macOS defines SO_ACCEPTCONN but getsockopt rejects it with
+            // ENOPROTOOPT. Linux supports this additional listener-state check.
+            #[cfg(target_os = "linux")]
+            {
+                let mut accepting: libc::c_int = -1;
+                let mut len = std::mem::size_of_val(&accepting) as libc::socklen_t;
+                let result = unsafe {
+                    libc::getsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_ACCEPTCONN,
+                        (&mut accepting as *mut libc::c_int).cast(),
+                        &mut len,
+                    )
+                };
+                assert_eq!(result, 0, "SO_ACCEPTCONN: {}", io::Error::last_os_error());
+                assert_eq!(
+                    accepting, 0,
+                    "socket must not be listening before mode verification"
+                );
+            }
+        }
+        if fault::take_if(fault::Failure::ListenAfterReplacement) {
+            directory.replace_entry_with_file_for_test(&names.socket)?;
+            return Err(io::Error::other(
+                "injected listen failure after replacement",
+            ));
+        }
+        if fault::take_if(fault::Failure::Listen) {
+            // Force the actual OS listen call to fail with ENOTSOCK. This
+            // test owns the socket fd; dup2 closes that bound socket and gives
+            // its RAII owner a duplicate of the pinned regular lease file.
+            // Rollback still has to withdraw the matching rendezvous entry.
+            if unsafe { libc::dup2(guard.ownership.as_raw_fd(), socket.as_raw_fd()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return socket.listen(128);
+        }
+    }
+    socket.listen(128)
 }
