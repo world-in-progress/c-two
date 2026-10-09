@@ -42,7 +42,7 @@ wheels = [
 
 [[package]]
 name = "c-two"
-version = "0.7.1"
+version = "0.7.3"
 source = { editable = "sdk/python" }
 dependencies = [
     { name = "fastdb4py" },

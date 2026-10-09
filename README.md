@@ -50,10 +50,10 @@ uv pip install c-two
 The same command works in Windows PowerShell. For c3 on Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1/c3-installer.sh | sh -s -- --version 0.3.1
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.sh | sh -s -- --version 0.3.2
 ```
 
-On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.1/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
+On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
 For source builds and tests, see the [development guide](docs/development.md).
 
