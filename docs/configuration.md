@@ -124,6 +124,8 @@ C2_RELAY_IDLE_TIMEOUT=60
 
 Relay 在启动时冻结转发限额，所有业务转发均受约束，包括调用方无限等待的请求。数量限额 `0` 拒绝全部新转发；输入预算 `0` 拒绝正数输入。已知长度在移交请求前预留，未知长度随实际输入检查增长；超限返回容量错误，不撤销路由。该预算独立于上游 IPC backing 和 reassembly budget，不代表整个进程内存。
 
+Relay 容量不足时，拒绝结果在业务准入前确定。对于没有 Expect 头、长度声明有效的请求，HTTP handler 按帧丢弃传输数据，受声明长度和 2 秒总期限约束；不聚合整包、不解码、不调用资源、不再次申请业务准入。期间容量释放也不改变拒绝结果。Expect 或未知长度的拒绝请求不读取 body；读取错误、长度不符或超时保留原容量错误。未完成或错误的传输可能使客户端无法收到该响应。
+
 HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接，直到实际完成。Relay 关闭先停止准入，再等待转发和原生客户端清理。始终不返回的资源方法会持续占用名额，也会阻塞关闭。
 
 ## 本地端点位置与平台差异
@@ -133,7 +135,9 @@ HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接
 | Unix | 配置目录内的 UDS | 代码 `cc.set_local_endpoint(root=...)`、环境 `C2_IPC_ROOT`、c3 `--ipc-root`，默认 `/tmp/c2-<uidhex>` |
 | Windows | 当前登录会话 SID 下的 Named Pipe | 自动选择；Unix root 配置不适用 |
 
-Unix root 是最终端点目录，实际 socket 位于 `<root>/<32 字符标识>`。自定义目录由应用预建，必须由当前用户持有且权限为 `0700`；默认目录由 C-Two 初始化。路径允许中文和空格，绑定、连接与探测通过目录句柄定位短名称，目录长度受文件系统限制。C-Two 只管理自身端点、租约及协调文件，不修改已有目录权限、不递归创建父目录、不删除应用目录或无关文件。共享本地域的资源进程、客户端和 relay 使用相同 root；root 不改变 SHM 或 file-spill 的位置。配置在首次本地 I/O 尝试时冻结，包括失败的尝试。
+Unix root 是最终端点目录，实际 socket 位于 `<root>/<32 字符标识>`。自定义目录由应用预建，允许 `0755`：当前用户持有目录，具备读、写、遍历权限，组和其他用户没有写权限。默认目录由 C-Two 创建为 `0700`。Socket 在开始监听前设置并核实为 `0600`。路径允许中文和空格，绑定、连接与探测通过目录句柄定位短名称，目录长度受文件系统限制。C-Two 只管理自身端点、租约及协调文件，不修改已有目录权限、不递归创建父目录、不删除应用目录或无关文件。共享本地域的资源进程、客户端和 relay 使用相同 root；root 不改变 SHM 或 file-spill 的位置。配置在首次本地 I/O 尝试时冻结，包括失败的尝试。
+
+macOS 会额外拒绝允许修改目录内容、属性或权限的扩展 ACL 条目，包括继承条目；只读、遍历和 deny 条目可用。
 
 ```python
 from pathlib import Path
@@ -145,6 +149,12 @@ cc.set_local_endpoint(root=str(ipc_dir))
 ```
 
 端点凭据保留其原生 scope。控制器在确认子进程退出后使用精确凭据清理；完整规则与 SDK/CLI 示例见[生命周期指南](local-endpoint-lifecycle.md)。
+
+## 连接期限
+
+`cc.connect(CRM, name='resource', address='ipc://server', timeout=0.1)` 为本次连接获取设置总预算。省略或 `None` 不增加调用方总期限，保留已有阶段保护；`0` 在入口到期，负数和非有限值被拒绝。预算贯穿池等待、连接、握手、路由查询及 relay 发现与获取，重试不重置期限。Rust 使用 `ConnectOptions::new().with_timeout(Duration::from_millis(100))` 和 `Runtime::connect_with_options`。
+
+到期返回 `CallDeadlineExceeded`，details 中 `operation=connect`、`transport_phase=pre_dispatch` 和 `stage` 标明失败位置。连接操作尚未执行资源方法。成功连接后，业务调用的等待由 `cc.with_call_options(...)` 独立设置。
 
 ## 调用等待与准入
 

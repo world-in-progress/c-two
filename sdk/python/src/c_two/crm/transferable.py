@@ -363,9 +363,7 @@ def _build_transfer_wrapper(
         *args,
         _release_fn=None,
         _c2_input_buffer_mode=None,
-        _c2_output_allocator=None,
     ):
-        del _c2_output_allocator
         input_buffer_mode = _c2_input_buffer_mode or buffer
         input_decoder = (
             input.deserialize

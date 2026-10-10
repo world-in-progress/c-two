@@ -1,0 +1,68 @@
+{
+  "reviewed_sha": "e6dcd06b0e519104628b3a2a71de2550c2dcb084",
+  "base_sha": "4cc5b4d229d21f00fc25619e8490169b2246edd1",
+  "files": [
+    {
+      "path": "/tmp/c2-074-astra-probe/Cargo.toml",
+      "sha256": "fb465d39905563bcc834164192be3f16690ff251d3fab18cf9f21cbf5fc01f7a"
+    },
+    {
+      "path": "/tmp/c2-074-astra-probe/src/main.rs",
+      "sha256": "cad9bd250dc96f1b10760b8ce852cc664aed3f88e72d83c310c16dd99eba1baf"
+    },
+    {
+      "path": "/tmp/c2-074-astra-probe/src/bin/acl.rs",
+      "sha256": "959ad5493993c71ea7368f9e2e7e7964322cf660b3a5db8b5d585c550c897c07"
+    },
+    {
+      "path": "/tmp/c2-074-astra-prewarm-probe.log",
+      "sha256": "bef6bbedd8b138a853290f4d68237e8c7163aae069399fdd94439d43abd10b59"
+    },
+    {
+      "path": "/tmp/c2-074-astra-acl-probe.log",
+      "sha256": "1db8ef35022eccd97ca9ef80e8d841275a02daf5e1a2de32b5a0cef60c9669a3"
+    },
+    {
+      "path": "/tmp/c2-074-astra-rebind-probe.log",
+      "sha256": "437a440491bbad9486c02f9360037bbff4d02bdd4d59a69a3f40e640eea348d2"
+    },
+    {
+      "path": "/tmp/c2-074-astra-rebind-instrumentation.patch",
+      "sha256": "ce3185d87a5d2089fcd3e15575b005f17c3a7073c09864854ce5e46044046ffa"
+    },
+    {
+      "path": "/tmp/c2-074-astra-probe/Cargo.lock",
+      "sha256": "56e2c0da671536f9d1e4662b4f658742f9a9053e56ed06b6415cd7f681ddfbce"
+    },
+    {
+      "path": "/tmp/c2-074-astra-local-copy/Cargo.lock",
+      "sha256": "ded25dc82b931aab609f5b8e89fcb1672ce67529381cf988581ee2ea63effca1"
+    },
+    {
+      "path": "/tmp/c2-074-astra-prewarm-probe-locked.log",
+      "sha256": "f921dd04fd18d72b336f2084e74db8dfff01d040c3745d89e19302261d67e8b0"
+    },
+    {
+      "path": "/tmp/c2-074-astra-acl-probe-locked.log",
+      "sha256": "630cc2e8bac2f2e6a493bfa8329f8671db627d444440b6c3974609110404d5bb"
+    },
+    {
+      "path": "/tmp/c2-074-astra-rebind-probe-locked.log",
+      "sha256": "745038d4e827aafab7db5e21beaea23104c59655f2c2b32620acfd98e3533b85"
+    }
+  ],
+  "baseline_binaries": [
+    {
+      "path": "/tmp/c2-074-astra-baseline-binaries/prewarm",
+      "sha256": "feb29aed8f2167cf985dddbc6cfc9bec0746e504027ee527eff153632d71d3c2"
+    },
+    {
+      "path": "/tmp/c2-074-astra-baseline-binaries/acl",
+      "sha256": "d8056abc0f87b2fab5f487991f8b2654f50294774e87243e3b562d8e9d5edaf5"
+    },
+    {
+      "path": "/tmp/c2-074-astra-baseline-binaries/rebind-test",
+      "sha256": "6939fa6e4d1ccc38e699bbbb3ed7d2f686dd81161fa9afe18ff821b5e24196cd"
+    }
+  ]
+}

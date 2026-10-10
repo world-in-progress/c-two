@@ -115,16 +115,20 @@ Pre-register upstreams as `--upstream NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must 
 
 Relay freezes forwarding limits at startup and applies them to all forwarded business calls, including calls with unlimited caller waiting. A zero count limit rejects new forwards; a zero byte budget rejects positive input. Known-length input is reserved before dispatch; unknown-length input is checked as it grows. Capacity refusal preserves the route. These limits are independent of upstream IPC backing and reassembly budgets and do not measure process RSS.
 
+Relay capacity rejection is fixed before business admission. For a request without Expect and with a valid declared length, the HTTP handler discards transport data frame by frame within that length and one two-second deadline. It does not aggregate the payload, decode it, invoke a resource or retry admission; capacity released during disposal does not change the rejection. Rejected Expect or unknown-length bodies are not read. Read faults, length mismatches and timeout preserve the original capacity error. An incomplete or faulty transport can prevent the client from receiving that response.
+
 After an HTTP caller disconnects, an already-dispatched forward retains its input and upstream connection until actual completion. Relay shutdown stops admission and waits for forwarding and native client cleanup. A resource method that never returns continues to occupy its slot and delays shutdown.
 
 ## Local endpoint directories
 
 | Platform | Endpoint | Location configuration |
 | --- | --- | --- |
-| Unix | UDS in the final private directory | `cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, c3 `--ipc-root`; default `/tmp/c2-<uidhex>` |
+| Unix | UDS in the final owner-controlled directory | `cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, c3 `--ipc-root`; default `/tmp/c2-<uidhex>` |
 | Windows | Named Pipe scoped to the current logon SID | Automatic; Unix root overrides are rejected |
 
-On Unix, the socket is `<root>/<32-character id>`. Applications provision custom directories, owned by the current user with mode `0700`; C-Two initializes its default directory. Spaces and Unicode are preserved. Bind, connect and liveness probes address the short name through an open directory descriptor, so filesystem directory-opening limits govern the configured path. C-Two manages its endpoint, lease and coordinator files, preserves unrelated files and directories, and does not change existing permissions or recursively create parents.
+On Unix, the socket is `<root>/<32-character id>`. Applications provision custom directories. Mode `0755` is accepted when the current user owns the directory and has read, write and traversal access, with no group or other write permission. C-Two creates its default directory with mode `0700` and sets and verifies each socket as `0600` before listening. Spaces and Unicode are preserved. Bind, connect and liveness probes address the short name through an open directory descriptor, so filesystem directory-opening limits govern the configured path. C-Two manages its endpoint, lease and coordinator files, preserves unrelated files and directories, and does not change existing permissions or recursively create parents.
+
+macOS also rejects extended ACL allow entries that can change directory contents, attributes or permissions, including inherited entries; read, traversal and deny entries are accepted.
 
 ```python
 from pathlib import Path
@@ -135,7 +139,13 @@ ipc_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 cc.set_local_endpoint(root=str(ipc_dir))
 ```
 
-Resources, clients and relay upstreams sharing a local domain use the same directory. Root selection does not move SHM or file spill. The first local I/O attempt freezes this context, including a failed attempt. Credentials preserve their captured scope; controllers use exact credentials after confirming process exit. See the [lifecycle guide](local-endpoint-lifecycle.en.md) and [0.7.3 directory guide](releases/0.7.3.md).
+Resources, clients and relay upstreams sharing a local domain use the same directory. Root selection does not move SHM or file spill. The first local I/O attempt freezes this context, including a failed attempt. Credentials preserve their captured scope; controllers use exact credentials after confirming process exit. See the [lifecycle guide](local-endpoint-lifecycle.en.md) and [0.7.4 guide](releases/0.7.4.md).
+
+## Connection deadlines
+
+`cc.connect(CRM, name='resource', address='ipc://server', timeout=0.1)` sets one budget for connection acquisition. Omission or `None` adds no caller deadline and preserves existing phase guards. Zero expires at entry; negative and non-finite values are rejected. Pool waiting, connection, handshake, authoritative route lookup and relay discovery/acquisition share the budget; retries do not restart it. Rust exposes `ConnectOptions::new().with_timeout(Duration::from_millis(100))` and `Runtime::connect_with_options`.
+
+Expiration returns `CallDeadlineExceeded` with `operation=connect`, `transport_phase=pre_dispatch` and the failed `stage` in details. Connection acquisition has not invoked a resource method. After connection, configure business-call waiting separately with `cc.with_call_options(...)`.
 
 ## Call deadlines and admission
 

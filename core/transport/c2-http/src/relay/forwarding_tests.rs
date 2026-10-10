@@ -336,6 +336,417 @@ async fn read_framed_reply<R: tokio::io::AsyncRead + Unpin>(
     Ok(reply)
 }
 
+fn request_head(
+    socket: std::net::SocketAddr,
+    entry: &RouteEntry,
+    method: &str,
+    framing: &str,
+) -> String {
+    format!(
+        "POST /grid/{method} HTTP/1.1\r\nHost: {socket}\r\n{framing}\r\nConnection: close\r\nx-c2-expected-crm-ns: test.echo\r\nx-c2-expected-crm-name: Echo\r\nx-c2-expected-crm-ver: 0.1.0\r\nx-c2-expected-abi-hash: {TEST_ABI_HASH}\r\nx-c2-expected-signature-hash: {TEST_SIGNATURE_HASH}\r\nx-c2-route-uid: {}\r\nx-c2-route-revision: {}\r\n\r\n",
+        entry.route_uid, entry.route_revision
+    )
+}
+
+async fn request_capacity_rejection(
+    socket: std::net::SocketAddr,
+    entry: &RouteEntry,
+    input_len: usize,
+) -> Vec<u8> {
+    let mut connection = bounded(tokio::net::TcpStream::connect(socket))
+        .await
+        .unwrap();
+    // Capacity is decided from headers before Body is polled. An eager,
+    // separately written upload can race Hyper closing an unread H1 body and
+    // lose the response to a TCP reset. Use the real H1 continue handshake:
+    // advertise the full input charge, but do not send it without a 100.
+    // This rejection-only helper requires a complete final response; a 100,
+    // reset, EOF or timeout remains a failure, never an excuse to retry.
+    let head = request_head(
+        socket,
+        entry,
+        "ping",
+        &format!("Content-Length: {input_len}\r\nExpect: 100-continue"),
+    );
+    bounded(connection.write_all(head.as_bytes()))
+        .await
+        .unwrap();
+    bounded(read_framed_reply(&mut connection)).await.unwrap()
+}
+
+// Exercise production header-only capacity rejection through Axum/Hyper over
+// real TCP, without an IPC listener. Both operation and byte exhaustion must
+// respond before requesting any upload; the disconnect cases below still own
+// the real shared IPC, callback counts, carriers and drain/stop proof.
+#[tokio::test]
+async fn h1_capacity_rejection_precedes_continue_and_upload() {
+    capacity_rejection_case(CapacityRequest::Continue).await;
+}
+
+#[tokio::test]
+async fn capacity_rejection_does_not_poll_body() {
+    capacity_rejection_case(CapacityRequest::Direct).await;
+}
+
+#[tokio::test]
+async fn controlled_eager_http_receives_production_capacity_rejection() {
+    capacity_rejection_case(CapacityRequest::ControlledEager).await;
+}
+
+#[tokio::test]
+async fn eager_capacity_rejection_consumes_declared_body_without_admission() {
+    capacity_rejection_case(CapacityRequest::DirectEager).await;
+}
+
+#[tokio::test]
+async fn capacity_freed_during_rejected_body_cleanup_does_not_readmit() {
+    capacity_rejection_case(CapacityRequest::DirectEagerRelease).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapacityRequest {
+    Continue,
+    ControlledEager,
+    Direct,
+    DirectEager,
+    DirectEagerRelease,
+}
+
+async fn capacity_rejection_case(kind: CapacityRequest) {
+    let network = matches!(
+        kind,
+        CapacityRequest::Continue | CapacityRequest::ControlledEager
+    );
+    let input_len = if matches!(
+        kind,
+        CapacityRequest::ControlledEager
+            | CapacityRequest::DirectEager
+            | CapacityRequest::DirectEagerRelease
+    ) {
+        4 * 1024 * 1024
+    } else {
+        INPUT_LEN
+    };
+    for operations in [1, 2] {
+        let listener = if network {
+            Some(
+                bounded(tokio::net::TcpListener::bind("127.0.0.1:0"))
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let socket = listener
+            .as_ref()
+            .map(|listener| listener.local_addr().unwrap())
+            .unwrap_or_else(|| "127.0.0.1:9".parse().unwrap());
+        let state = Arc::new(RelayState::new_with_execution_limits(
+            Arc::new(RelayConfig {
+                relay_id: "capacity-http-test".into(),
+                ..RelayConfig::default()
+            }),
+            Arc::new(NoopDisseminator),
+            LocalEndpointContext::default_for_platform().unwrap(),
+            CallExecutionLimits {
+                max_outstanding_calls: operations,
+                retained_input_budget_bytes: input_len as u64,
+            },
+        ));
+        let entry = RouteEntry {
+            name: "grid".into(),
+            relay_id: state.config().relay_id.clone(),
+            relay_url: format!("http://{socket}"),
+            server_id: Some("capacity-server".into()),
+            server_instance_id: Some("capacity-instance".into()),
+            ipc_address: Some("ipc://capacity-must-not-dispatch".into()),
+            crm_ns: "test.echo".into(),
+            crm_name: "Echo".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: TEST_ABI_HASH.into(),
+            signature_hash: TEST_SIGNATURE_HASH.into(),
+            max_payload_size: input_len as u64,
+            route_uid: "capacity-route".into(),
+            route_revision: 1,
+            locality: super::types::Locality::Local,
+            registered_at: 1000.0,
+        };
+        state.with_route_table_mut(|table| assert!(table.register_route(entry.clone())));
+        let (release, released) = oneshot::channel();
+        let release = Arc::new(parking_lot::Mutex::new(Some(release)));
+        let pending = state
+            .forwarding
+            .spawn(input_len as u64, |permit| async move {
+                let _ = released.await;
+                drop(permit);
+            })
+            .unwrap();
+        let (stop, stopped) = oneshot::channel();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let mut app = build_router(state.clone());
+        if kind == CapacityRequest::ControlledEager {
+            let observed = resolves.clone();
+            let observed_posts = posts.clone();
+            app = app.layer(axum::middleware::from_fn(
+                move |request: axum::http::Request<axum::body::Body>,
+                      next: axum::middleware::Next| {
+                    let observed = observed.clone();
+                    let observed_posts = observed_posts.clone();
+                    async move {
+                        assert!(!request.headers().contains_key("expect"));
+                        assert!(!request.headers().contains_key("connection"));
+                        if request.uri().path() == "/_resolve/grid" {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if request.method() == axum::http::Method::POST
+                            && request.uri().path() == "/grid/ping"
+                        {
+                            observed_posts.fetch_add(1, Ordering::SeqCst);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+        }
+        let mut http_task = listener.map(|listener| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+            })
+        });
+        let result = AssertUnwindSafe(async {
+            let envelope: serde_json::Value = if kind == CapacityRequest::ControlledEager {
+                use crate::client::{
+                    HttpCallControl, HttpError, RelayAwareClientConfig, RelayAwareHttpClient,
+                };
+                let expected = c2_contract::ExpectedRouteContract {
+                    route_name: entry.name.clone(),
+                    crm_ns: entry.crm_ns.clone(),
+                    crm_name: entry.crm_name.clone(),
+                    crm_ver: entry.crm_ver.clone(),
+                    abi_hash: entry.abi_hash.clone(),
+                    signature_hash: entry.signature_hash.clone(),
+                };
+                let config = RelayAwareClientConfig {
+                    max_attempts: 3,
+                    ..Default::default()
+                };
+                let client = RelayAwareHttpClient::new(&entry.relay_url, expected, false, config)
+                    .unwrap()
+                    .with_http_only();
+                let dispatches = Arc::new(AtomicUsize::new(0));
+                let observed = dispatches.clone();
+                let control = HttpCallControl::new(
+                    || Ok(()),
+                    move |previous| {
+                        assert!(
+                            previous.is_none(),
+                            "capacity refusal cannot authorize a repeated POST"
+                        );
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                );
+                // Exercise the actual SDK transport: an eager owned body,
+                // no Expect or Connection override, and no hidden POST retry.
+                // This performs production resolve and POST, without the
+                // separate connect-time probe. Three acquisition attempts
+                // must still produce exactly one business dispatch.
+                let mut envelope = serde_json::Value::Null;
+                for calls in 1..=2 {
+                    let error = bounded(client.call_controlled_async(
+                        "ping",
+                        Arc::new(vec![7; input_len]),
+                        &control,
+                    ))
+                    .await
+                    .unwrap_err();
+                    assert_eq!(dispatches.load(Ordering::SeqCst), calls);
+                    assert_eq!(
+                        posts.load(Ordering::SeqCst),
+                        calls,
+                        "the HTTP client must not hide a POST replay"
+                    );
+                    // The HTTP wrapper conservatively preserves uncertainty;
+                    // the canonical capacity envelope still says pre_dispatch.
+                    assert_eq!(
+                        error.phase(),
+                        crate::client::HttpCallPhase::DispatchUncertain
+                    );
+                    let HttpError::ServerError(status, body) = error.source_error() else {
+                        panic!("eager SDK call lost the production capacity response: {error:?}");
+                    };
+                    assert_eq!(*status, 502);
+                    envelope = serde_json::from_str(body).unwrap();
+                    assert_eq!(envelope["code"], 717);
+                    assert_eq!(envelope["details"]["dispatch_phase"], "pre_dispatch");
+                    assert_eq!(
+                        state.forwarding.snapshot().rejected_reservations,
+                        calls as u64
+                    );
+                    assert!(state.local_route("grid").is_some());
+                    assert_eq!(
+                        resolves.load(Ordering::SeqCst),
+                        1,
+                        "capacity must not invalidate the resolved route"
+                    );
+                }
+                envelope
+            } else if network {
+                let reply = request_capacity_rejection(socket, &entry, input_len).await;
+                assert!(
+                    reply.starts_with(b"HTTP/1.1 502 "),
+                    "{}",
+                    String::from_utf8_lossy(&reply)
+                );
+                let header_end = reply
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap();
+                serde_json::from_slice(&reply[header_end + 4..]).unwrap()
+            } else {
+                use tower::ServiceExt;
+                let mut framing = format!("Content-Length: {input_len}");
+                if kind == CapacityRequest::Direct {
+                    framing.push_str("\r\nExpect: 100-continue");
+                }
+                let head = request_head(socket, &entry, "ping", &framing);
+                let mut request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/grid/ping");
+                for line in head
+                    .split("\r\n")
+                    .skip(1)
+                    .take_while(|line| !line.is_empty())
+                {
+                    let (name, value) = reply_header(line.as_bytes()).unwrap();
+                    request = request.header(name, value);
+                }
+                let frames = Arc::new(AtomicUsize::new(0));
+                let eof = Arc::new(AtomicUsize::new(0));
+                let eager = matches!(
+                    kind,
+                    CapacityRequest::DirectEager | CapacityRequest::DirectEagerRelease
+                );
+                let body = if eager {
+                    let frames = frames.clone();
+                    let eof = eof.clone();
+                    let release = release.clone();
+                    let state = state.clone();
+                    let bytes = bytes::Bytes::from(vec![7; input_len]);
+                    axum::body::Body::from_stream(futures::stream::unfold(
+                        (bytes, 0),
+                        move |(bytes, offset)| {
+                            let frames = frames.clone();
+                            let eof = eof.clone();
+                            let release = release.clone();
+                            let state = state.clone();
+                            async move {
+                                if offset == 0 && kind == CapacityRequest::DirectEagerRelease {
+                                    assert_eq!(
+                                        state.forwarding.snapshot().rejected_reservations,
+                                        1
+                                    );
+                                    release.lock().take().unwrap().send(()).unwrap();
+                                    eventually(|| state.forwarding.snapshot().used_operations == 0)
+                                        .await;
+                                }
+                                if offset == bytes.len() {
+                                    eof.fetch_add(1, Ordering::SeqCst);
+                                    return None;
+                                }
+                                let end = (offset + 64 * 1024).min(bytes.len());
+                                frames.fetch_add(1, Ordering::SeqCst);
+                                Some((
+                                    Ok::<_, std::io::Error>(bytes.slice(offset..end)),
+                                    (bytes, end),
+                                ))
+                            }
+                        },
+                    ))
+                } else {
+                    axum::body::Body::from_stream(futures::stream::once(async {
+                        panic!("early capacity rejection must not poll the request body");
+                        #[allow(unreachable_code)]
+                        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::new())
+                    }))
+                };
+                let response = bounded(app.oneshot(request.body(body).unwrap()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                if eager {
+                    assert_eq!(frames.load(Ordering::SeqCst), input_len / (64 * 1024));
+                    assert_eq!(
+                        eof.load(Ordering::SeqCst),
+                        1,
+                        "transport must reach EOF before replying"
+                    );
+                }
+                let body = bounded(axum::body::to_bytes(response.into_body(), MAX_REPLY))
+                    .await
+                    .unwrap();
+                serde_json::from_slice(&body).unwrap()
+            };
+            assert_eq!(envelope["version"], 1);
+            assert_eq!(envelope["code"], 717);
+            assert_eq!(envelope["name"], "CallCapacityExceeded");
+            assert_eq!(envelope["details"]["dispatch_phase"], "pre_dispatch");
+            assert_eq!(envelope["details"]["route"], "grid");
+            assert_eq!(
+                state.forwarding.snapshot().rejected_reservations,
+                if kind == CapacityRequest::ControlledEager {
+                    2
+                } else {
+                    1
+                }
+            );
+            let freed = kind == CapacityRequest::DirectEagerRelease;
+            assert_eq!(
+                state.forwarding.snapshot().used_operations,
+                if freed { 0 } else { 1 }
+            );
+            assert_eq!(
+                state.forwarding.snapshot().used_retained_bytes,
+                if freed { 0 } else { input_len as u64 }
+            );
+            assert!(state.local_route("grid").is_some());
+        })
+        .catch_unwind()
+        .await;
+        // Even assertion failure releases the capacity owner and joins the
+        // actual listener. Bound shutdown, aborting/joining on a stuck server.
+        if let Some(release) = release.lock().take() {
+            let _ = release.send(());
+        }
+        bounded(pending).await.unwrap();
+        state.forwarding.close();
+        bounded(state.forwarding.drain()).await;
+        let _ = stop.send(());
+        if let Some(http_task) = http_task.as_mut() {
+            let stopped = tokio::time::timeout(STEP, &mut *http_task).await;
+            if stopped.is_err() {
+                http_task.abort();
+                let _ = http_task.await;
+            }
+            stopped
+                .expect("capacity HTTP listener did not stop")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(state.forwarding.snapshot().used_operations, 0);
+        assert_eq!(state.forwarding.snapshot().used_retained_bytes, 0);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
 #[tokio::test]
 async fn response_reader_requires_complete_bounded_http_framing_before_reset() {
     struct ResetAfter<'a>(&'a [u8]);
@@ -365,6 +776,7 @@ async fn response_reader_requires_complete_bounded_http_framing_before_reset() {
         );
     }
     for incomplete in [
+        b"HTTP/1.1 100 Continue\r\n\r\n".as_slice(),
         b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 3\r\n".as_slice(),
         b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 3\r\n\r\nab".as_slice(),
         b"HTTP/1.1 502 Bad Gateway\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n"
@@ -560,26 +972,11 @@ impl Fixture {
     }
 
     fn head(&self, method: &str, framing: &str) -> String {
-        format!(
-            "POST /grid/{method} HTTP/1.1\r\nHost: {}\r\n{framing}\r\nConnection: close\r\nx-c2-expected-crm-ns: test.echo\r\nx-c2-expected-crm-name: Echo\r\nx-c2-expected-crm-ver: 0.1.0\r\nx-c2-expected-abi-hash: {TEST_ABI_HASH}\r\nx-c2-expected-signature-hash: {TEST_SIGNATURE_HASH}\r\nx-c2-route-uid: {}\r\nx-c2-route-revision: {}\r\n\r\n",
-            self.socket, self.entry.route_uid, self.entry.route_revision
-        )
+        request_head(self.socket, &self.entry, method, framing)
     }
 
-    async fn request(&self, method: &str, bytes: &[u8]) -> Vec<u8> {
-        let mut connection = bounded(tokio::net::TcpStream::connect(self.socket))
-            .await
-            .unwrap();
-        bounded(
-            connection.write_all(
-                self.head(method, &format!("Content-Length: {}", bytes.len()))
-                    .as_bytes(),
-            ),
-        )
-        .await
-        .unwrap();
-        bounded(connection.write_all(bytes)).await.unwrap();
-        let reply = bounded(read_framed_reply(&mut connection)).await.unwrap();
+    async fn request_capacity_rejection(&self, input_len: usize) -> Vec<u8> {
+        let reply = request_capacity_rejection(self.socket, &self.entry, input_len).await;
         eprintln!(
             "[relay-forwarding] actual capacity response: {}",
             String::from_utf8_lossy(&reply)
@@ -616,6 +1013,91 @@ impl Fixture {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
+    let mut fixture = Fixture::start(Carrier::Inline, 1, INPUT_LEN as u64).await;
+    let result = AssertUnwindSafe(async {
+        let mut admitted = bounded(tokio::net::TcpStream::connect(fixture.socket))
+            .await
+            .unwrap();
+        bounded(
+            admitted.write_all(
+                fixture
+                    .head("target", &format!("Content-Length: {INPUT_LEN}"))
+                    .as_bytes(),
+            ),
+        )
+        .await
+        .unwrap();
+        bounded(admitted.write_all(&vec![7; INPUT_LEN]))
+            .await
+            .unwrap();
+        bounded(fixture.probe.entered[1].notified()).await;
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
+
+        let mut rejected = bounded(tokio::net::TcpStream::connect(fixture.socket))
+            .await
+            .unwrap();
+        bounded(
+            rejected.write_all(
+                fixture
+                    .head("ping", &format!("Content-Length: {INPUT_LEN}"))
+                    .as_bytes(),
+            ),
+        )
+        .await
+        .unwrap();
+        bounded(rejected.write_all(&[7])).await.unwrap();
+        eventually(|| fixture.state.forwarding.snapshot().rejected_reservations == 1).await;
+        fixture.release(1);
+        let reply = bounded(read_framed_reply(&mut admitted)).await.unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 200 "));
+        eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
+        assert!(
+            !fixture.state.forwarding.snapshot().closed,
+            "domain must stay open while B finishes uploading"
+        );
+        assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
+
+        bounded(rejected.write_all(&vec![7; INPUT_LEN - 1]))
+            .await
+            .unwrap();
+        let reply = bounded(read_framed_reply(&mut rejected)).await.unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 502 "));
+        let end = reply
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&reply[end + 4..]).unwrap();
+        assert_eq!(error["code"], 717);
+        assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
+        assert_eq!(fixture.state.forwarding.snapshot().rejected_reservations, 1);
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 0);
+        assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
+        assert_eq!(
+            fixture
+                .probe
+                .calls
+                .each_ref()
+                .map(|count| count.load(Ordering::SeqCst)),
+            [0, 1, 0]
+        );
+        assert!(fixture.state.local_route("grid").is_some());
+        assert!(fixture.client.is_connected());
+        let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+            .await
+            .unwrap_or_else(|_| panic!("healthy shared IPC must remain available"));
+        assert!(Arc::ptr_eq(&lease.client(), &fixture.client));
+        drop(lease);
+    })
+    .catch_unwind()
+    .await;
+    fixture.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 async fn disconnected_response_case(carrier: Carrier, operations: u64) {
     let mut fixture = Fixture::start(carrier, operations, INPUT_LEN as u64).await;
     let client = fixture.client.clone();
@@ -642,7 +1124,7 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
         eventually(|| fixture.state.forwarding.detached_waiters() > detached).await;
         assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (1, INPUT_LEN as u64));
         assert!(fixture.client.is_connected(), "HTTP waiter drop must preserve original shared IPC incarnation");
-        let rejected = fixture.request("ping", &[7; INPUT_LEN]).await;
+        let rejected = fixture.request_capacity_rejection(INPUT_LEN).await;
         assert!(rejected.starts_with(b"HTTP/1.1 502 "), "capacity rejects before upstream dispatch: {}", String::from_utf8_lossy(&rejected));
         assert!(String::from_utf8_lossy(&rejected).contains("pre_dispatch"));
         assert_eq!(fixture.probe.calls[2].load(Ordering::SeqCst), 0);
@@ -959,7 +1441,7 @@ async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() 
         assert_eq!((held.used_operations, held.used_retained_bytes), (1, LEN as u64), "native task still owns full input while real writer is parked");
         assert_eq!(fixture.client.pending_len_for_test(), 2);
         assert!(fixture.client.is_connected(), "waiter departure must not trigger SendGuard's partial-frame abort");
-        let rejected = fixture.request("ping", &[7; LEN]).await;
+        let rejected = fixture.request_capacity_rejection(LEN).await;
         assert!(rejected.starts_with(b"HTTP/1.1 502 "));
         assert!(String::from_utf8_lossy(&rejected).contains("pre_dispatch"));
         assert_eq!(fixture.probe.calls[2].load(Ordering::SeqCst), 0, "exhausted slot rejects dispatch while target owner remains");

@@ -593,10 +593,7 @@ impl EncodedService for PyCoreService {
                 .map_err(|error| python_error_to_c2(py, error))?;
             let result = self
                 .dispatcher
-                .call1(
-                    py,
-                    (self.route_name.as_str(), method_index, request, py.None()),
-                )
+                .call1(py, (self.route_name.as_str(), method_index, request))
                 .map_err(|error| python_error_to_c2(py, error))?;
             let result = result.bind(py);
             if result.is_none() {

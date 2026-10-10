@@ -1,0 +1,148 @@
+{
+  "review_date": "2026-10-09",
+  "source_commit": "4cc5b4d229d21f00fc25619e8490169b2246edd1",
+  "production_source_changed": false,
+  "rust_http_relay": {
+    "command": "CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=4 C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= cargo test --manifest-path core/Cargo.toml --locked --offline -p c2-http --features relay --lib",
+    "platform": "macOS",
+    "exit_code": 0,
+    "passed": 397,
+    "failed": 0,
+    "ignored": 0,
+    "log_sha256": "fb3806bbcb43dc291768b2ddf1783c9174810ccae14a70de5b23a8a785f7f223",
+    "log_path": "/tmp/c2-slim-recheck-relay-tests.log"
+  },
+  "mesh_integration": {
+    "test_file": "sdk/python/tests/integration/test_relay_mesh.py",
+    "command": ".venv/bin/python3 -I /tmp/c2-slim-recheck-run-mesh.py",
+    "platform": "macOS",
+    "exit_code": 0,
+    "passed": 7,
+    "failed": 0,
+    "skipped": 0,
+    "runner_sha256": "373694a2faf9ef30c297efb869af72dc5c2ceb502be2a839c0e0241515408981",
+    "log_sha256": "23a8c334de35d29b6db01e2d9f00db59120387d71fc3a96dc4ac0cb9340d622a",
+    "log_path": "/tmp/c2-slim-recheck-mesh-tests.log",
+    "inputs": {
+      "source_commit": "4cc5b4d229d21f00fc25619e8490169b2246edd1",
+      "artifact_source_commit": "b0031040a8d1a75d9f089f85b10568e7b33c6343",
+      "python_files_byte_matched": 34,
+      "wheel_sha256": [
+        "61b51784e6f78e65056978a4952a58273174ed8e4e7f6268a4cf973f0eadde0d",
+        "e203a3262f9260719220fe207bd2f12ed0719031a61b92e14eb42a8c0bc9dd28"
+      ],
+      "c3_sha256": "0bcd6e310e91489f0330c1a7aa2f64f8bb501de2158808cf00ad65a015b5bd45",
+      "mode": "Published wheel modules first on sys.path; pytest dependencies from existing venv; no package install or checkout native rebuild",
+      "production_source_matches_review_head": true
+    }
+  },
+  "relay_invariant_passed_tests": {
+    "route_identity_and_selection": [
+      "relay::route_table::tests::resolve_matching_filters_by_full_crm_tag",
+      "relay::route_table::tests::resolve_local_before_peer",
+      "relay::route_table::tests::resolve_peers_sorted_deterministically"
+    ],
+    "negative_state_and_restart": [
+      "relay::route_table::tests::tombstone_blocks_stale_route_announce",
+      "relay::route_table::tests::old_tombstone_cannot_delete_newer_route",
+      "relay::route_table::tests::local_register_after_restart_outranks_old_tombstone",
+      "relay::route_table::tests::merge_snapshot_applies_tombstone_before_old_route"
+    ],
+    "digest_and_owner_boundary": [
+      "relay::route_table::tests::route_digest_has_fixed_active_and_tombstone_golden_vectors",
+      "relay::route_table::tests::route_digest_stable_when_only_ipc_only_identity_changes",
+      "relay::peer_handlers::tests::digest_exchange_only_advertises_sender_owned_routes",
+      "relay::peer_handlers::tests::digest_exchange_repairs_stale_peer_route_with_tombstone",
+      "relay::peer_handlers::tests::peer_withdraw_cannot_remove_local_route",
+      "relay::peer::tests::route_state_validator_rejects_digest_diff_hash_replay"
+    ],
+    "compaction_domains": [
+      "relay::route_table::tests::peer_tombstone_gc_compacts_local_revision_not_owner_removed_revision",
+      "relay::route_table::tests::relay_watch_history_overflow_compacts_without_dropping_routes"
+    ],
+    "endpoint_pool_fences": [
+      "relay::conn_pool::tests::stale_lease_drop_after_reinsert_does_not_touch_new_slot",
+      "relay::conn_pool::tests::stale_owner_token_after_reinsert_does_not_match_new_entry",
+      "relay::conn_pool::tests::concurrent_acquire_after_eviction_shares_one_reconnect"
+    ],
+    "final_owner_replacement": [
+      "relay::router::tests::final_replacement_confirmation_rejects_silent_recovered_owner",
+      "relay::state::tests::replacement_proof_is_rejected_after_same_owner_lease_renewal",
+      "relay::state::tests::replacement_proof_cannot_replace_reconnected_owner_slot"
+    ],
+    "route_transport_separation": [
+      "relay::router::tests::semantic_withdrawal_reason_separates_authority_from_transport",
+      "relay::router::tests::relay_reply_capacity_preserves_shared_connection_and_inflight_call",
+      "relay::upstream_control::tests::watch_transport_failure_does_not_withdraw_route",
+      "relay::router::tests::relay_late_route_survives_existing_endpoint_and_idle_eviction"
+    ],
+    "namespace_behavior": [
+      "relay::router::tests::default_relay_namespace_keeps_legacy_loopback_resolution",
+      "relay::router::tests::custom_relay_suppresses_ipc_for_legacy_and_other_namespace_clients",
+      "relay::router::tests::two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace"
+    ],
+    "late_result_ownership": [
+      "relay::forwarding_tests::h1_disconnect_reclaims_late_dedicated_response",
+      "relay::forwarding_tests::h1_disconnect_reclaims_late_file_reassembly_response"
+    ]
+  },
+  "node_callback_counterexample": {
+    "command": "node --experimental-transform-types /tmp/c2-slim-recheck-node-counterexample.mjs",
+    "exit_code": 0,
+    "script_sha256": "bcab8dd7baa7f5a99150d48a4276df7602754a1a5715294f977d6da3f3124eb4",
+    "evidence": {
+      "sourceCommit": "4cc5b4d229d21f00fc25619e8490169b2246edd1",
+      "nodeVersion": "v25.8.1",
+      "scope": "Original TypeScript source imported by Node with type transformation; injected socket reports only through its write callback. No real network, native library or filesystem endpoint is involved.",
+      "outcomes": {
+        "generated": {
+          "outcome": "rejected",
+          "message": "C2IpcTransportError: C-Two IPC transport error: C-Two Node IPC socket write failed: Error: callback-only write failure"
+        },
+        "binding": {
+          "outcome": "resolved"
+        }
+      }
+    },
+    "source_files": [
+      {
+        "path": "core/foundation/c2-codegen/assets/typescript_transport.ts",
+        "sha256": "6da43ba8b27a5e690984c234f58c23879a0bc1261f5f4ac073648d0c7f9847fa"
+      },
+      {
+        "path": "core/foundation/c2-mem-ffi/bindings/typescript/src/index.ts",
+        "sha256": "20b2e1f72a0088b16ae858e2f5b5829069ff55bfbf9d92c4854625db81193936"
+      }
+    ]
+  },
+  "strip_supplement": {
+    "platform": "macOS ARM64",
+    "signature_command": "codesign --verify --strict FILE",
+    "original_signature_exit": 0,
+    "stripped_signature_exit": 0,
+    "native_global_exports_equal": true,
+    "native_global_export_count": 1,
+    "original_native_sha256": "6268ec21c74b02d6981075bde2f1d881f7fa7dc0b41053d69977dfdd277f0997",
+    "stripped_native_sha256": "b06db3ff0f4cd3daa803b3beff4729e5795ab0ea2bf5fdb4bcebb0377e0bbc31",
+    "full_stripped_runtime_suite_run": false
+  },
+  "environment_issue": {
+    "editable_native_import_failed": "cannot import name NativeOwnerReceiver from c_two._native",
+    "resolution_for_review": "Use verified released wheel modules in a temporary directory; all 34 Python source files match the current checkout. Original checkout extension is unchanged."
+  },
+  "conclusions": {
+    "withdraw_direct_node_replacement": true,
+    "withdraw_deleting_public_shm_fill_capability": true,
+    "withdraw_deleting_default_relay_namespace_fallback": true,
+    "descriptor_snapshot_requires_semantic_review": true,
+    "relay_consistency_mechanisms_retain": true
+  },
+  "limits": [
+    "Baseline tests do not prove a future refactor safe.",
+    "Node counterexample uses an injected socket on Node v25.8.1; no real endpoint or FFI is involved.",
+    "The mesh suite used published C-Two/c3 artifacts and local pytest dependencies, not a newly isolated dependency environment.",
+    "No Windows or Linux tests were rerun in this review.",
+    "Existing real Node long-root tests were inspected, not rerun.",
+    "No complete stripped-wheel RPC or cross-platform distribution suite was run."
+  ]
+}

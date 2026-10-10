@@ -20,8 +20,10 @@ pub enum LocalEndpointNamespace {
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct LocalEndpointOptions {
     /// Absolute final endpoint directory. A custom directory is provisioned
-    /// by the application with private permissions; the platform default can
-    /// be initialized by C-Two. Resolution never touches the filesystem.
+    /// by the application, owned by the effective uid with read/write/traverse
+    /// access and no group/other write permission (0755 is allowed).
+    /// C-Two may initialize the platform default as 0700. Resolution never
+    /// touches the filesystem.
     pub unix_root: Option<PathBuf>,
 }
 

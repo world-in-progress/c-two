@@ -1,0 +1,119 @@
+{
+  "review": "C-Two 0.7.4 eager capacity production repair",
+  "captured_at_utc": "2026-10-09T21:47:20.430289+00:00",
+  "reviewer": "independent Astra max subagent",
+  "workspace": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two",
+  "base_commit": "8c4b039e88df849218fd984e26b1383a5db3eae0",
+  "sealed_output_commit": "76fb4ee61f2513bd2373c65945d80f2632c46aed",
+  "sealed_parent": "8c4b039e88df849218fd984e26b1383a5db3eae0",
+  "artifact_id": "3fbf2402-4fce-4b1a-a731-08b73199d206",
+  "sealed_patch": {
+    "path": "/Users/soku/.local/share/hey-my-buddy/state/workspaces/ws-1cde15a4bafcb44a5f4f43ab528b1cff/outputs/d9d5aa1b155502a65f28abc0fbfe08e3ae4e94f1635c8ae1b6f15c84afe21a3e/output.patch",
+    "sha256": "0b16bbe5ffb5f88eeeb7c0d9975abf0514bb65d31238e1a0d88bfac9e02f94b7",
+    "bytes": 15627
+  },
+  "host_head_at_review": "0deda44574f2737c9049169d99b965fde23c75fe",
+  "host_status": "",
+  "changed_paths_from_base": [
+    "core/transport/c2-http/src/relay/forwarding_tests.rs",
+    "core/transport/c2-http/src/relay/router.rs"
+  ],
+  "fixed_production_source": {
+    "path": "core/transport/c2-http/src/relay/router.rs",
+    "sha256": "c79eb983069e2d9ca55e517ccc5121a2a567485672dab3531a601d9a42ee2659",
+    "host_bytes_identical": true
+  },
+  "sealed_test_source": {
+    "path": "core/transport/c2-http/src/relay/forwarding_tests.rs",
+    "sha256": "5a6eed43c800d33fb89c43adb7673729c49d56f4a4871129ee4993ee63ace20b"
+  },
+  "host_final_test_source": {
+    "path": "core/transport/c2-http/src/relay/forwarding_tests.rs",
+    "sha256": "3fedaaeb8db612583aab6c91e5d191a106af5d5e63eff0d042fe642586b9526b",
+    "added_tests": [
+      "capacity_freed_during_rejected_body_cleanup_does_not_readmit",
+      "real_http_capacity_freed_during_rejected_upload_never_dispatches"
+    ]
+  },
+  "reviewed_full_patch": {
+    "path": "/tmp/c2-074-astra-eager-capacity-final-reviewed.patch",
+    "sha256": "3c8c8adb00d7cdc0d2d1fc0eedf0eb38149011898beff2dc0a1c19d8833494fd",
+    "bytes": 22056
+  },
+  "host_test_extension_patch": {
+    "path": "/tmp/c2-074-astra-eager-capacity-host-tests.patch",
+    "sha256": "5315aadea020f683a96b3aa5292539b2d32b6d6775a42a4d3f71a797779faae2",
+    "bytes": 9051
+  },
+  "local_host_tests": [
+    {
+      "path": "/tmp/c2-074-eager-capacity-http-host.log",
+      "sha256": "bec0746d06d5fd763cf26dccbf1e9c01e5e243c19c32777bc2317ffe8be6f6d6",
+      "bytes": 39519,
+      "passed": 425,
+      "failed": 0,
+      "ignored": 0,
+      "test_seconds": 10.56,
+      "executor": "Host macOS",
+      "command_reported_by_host": "cargo test --manifest-path core/Cargo.toml -p c2-http --all-features",
+      "source_scope": "sealed production plus sealed tests"
+    },
+    {
+      "path": "/tmp/c2-074-eager-capacity-http-host-r2.log",
+      "sha256": "a45ce1fd6a3b58382d9c2c655d6e7204d13cfcd7f7be3b7526f211c67d782202",
+      "bytes": 39617,
+      "passed": 426,
+      "failed": 0,
+      "ignored": 0,
+      "test_seconds": 10.49,
+      "executor": "Host macOS",
+      "command_reported_by_host": "cargo test --manifest-path core/Cargo.toml -p c2-http --all-features",
+      "source_scope": "sealed production plus DirectEagerRelease test"
+    },
+    {
+      "path": "/tmp/c2-074-eager-capacity-http-host-r3.log",
+      "sha256": "a27b49f12553976ab26cebb476412dabd747a47c881bd855d5024c123f7fb150",
+      "bytes": 39719,
+      "passed": 427,
+      "failed": 0,
+      "ignored": 0,
+      "test_seconds": 10.53,
+      "executor": "Host macOS",
+      "command_reported_by_host": "cargo test --manifest-path core/Cargo.toml -p c2-http --all-features",
+      "source_scope": "sealed production plus both Host test additions"
+    }
+  ],
+  "unchanged_negative_platform_evidence": {
+    "path": "/tmp/c2-074-validation/final-windows-failed.log",
+    "sha256": "d9685dd3db6b7fd3da227632d6560fc31abff0fefd64dcde13ed2755f30e4b70",
+    "bytes": 1618371
+  },
+  "preserved_initial_review": {
+    "path": "/tmp/c2-074-astra-final-review.md",
+    "sha256": "e6766950de200bb2b0afc196f1bec05f857c3a673eb1e4cbf50517f13f136b85",
+    "bytes": 14843
+  },
+  "design_boundary_note": {
+    "path": "/tmp/c2-074-astra-eager-capacity-design-notes.md",
+    "sha256": "93ead0610d38f0e6b0c97b2f2db282deb5743e17f89c2f1b5b1fc3637884b900",
+    "bytes": 4578
+  },
+  "finding_summary": {
+    "blocking_production_findings": 0,
+    "nonblocking_comment": "router.rs:1693 no allocation wording only supports no payload aggregation or C-Two allocation, not all HTTP allocations"
+  },
+  "limits": [
+    "New production repair has not yet passed Windows 2022 or Windows 2025 hosted gates.",
+    "Current local evidence is Host macOS c2-http all-features; no new full-suite run by reviewer.",
+    "TaskTracker drain covers native forwarding; it is not an all-HTTP-buffer barrier.",
+    "Two-second cleanup is per handler and has no new global rejection concurrency cap.",
+    "Real TCP interleaving uses 8192-byte raw fixture with Connection: close; public eager test separately covers 4 MiB and no header override.",
+    "Unknown, malformed or too slow bodies are bounded but complete canonical delivery is not universally guaranteed."
+  ],
+  "recommendation": "Accept scoped code and tests for same-source hosted validation; keep Windows defect and overall acceptance pending.",
+  "report": {
+    "path": "/tmp/c2-074-astra-eager-capacity-repair-review.md",
+    "sha256": "591a9c940bc38f8ea0ecc70cd9b0a4685c49baff2e62dbe9103429a0119d3996",
+    "bytes": 9662
+  }
+}

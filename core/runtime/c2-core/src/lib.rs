@@ -7,6 +7,7 @@
 mod call_execution;
 mod call_scope;
 mod client;
+mod connect_deadline;
 mod control;
 pub mod error;
 mod host;
@@ -17,11 +18,13 @@ mod outcome;
 mod owner_bound;
 mod session;
 
+pub use c2_config::{ConnectOptions, ConnectTimeoutError};
 pub use call_scope::{CallScope, CallScopeError, CallState};
 pub use client::{
     Client, Connect, EncodedCall, EncodedClient, HeldResponse, ObservedPath, ObservedRoute,
     PathCounters, PreparedCall,
 };
+pub use connect_deadline::{ConnectAttempt, connect_deadline_error};
 pub use control::{
     DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint,
     direct_ipc_endpoint_with_context, ping_direct_ipc, ping_direct_ipc_with_context,

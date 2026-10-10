@@ -1,0 +1,480 @@
+{
+  "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+  "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "captured_at_utc": "2026-10-09T22:31:17.267140+00:00",
+  "workspace_clean_at_start": false,
+  "docs_only_status_at_validation_start": " M docs/configuration.en.md\n M docs/configuration.md\n M docs/plans/0.7.4.md\n M docs/plans/0.7.4.zh-CN.md\n?? docs/reports/0.7.4-final-validation.md\n?? docs/reports/0.7.4-final-validation.zh-CN.md\n?? docs/reports/evidence/0.7.4-astra-eager-capacity-repair-review-evidence.json\n?? docs/reports/evidence/0.7.4-astra-h1-review-evidence.json\n?? docs/reports/evidence/0.7.4-astra-repair-review-evidence.json\n?? docs/reports/evidence/0.7.4-final-validation.json\n?? docs/reviews/0.7.4-astra-eager-capacity-repair-review.md\n?? docs/reviews/0.7.4-astra-h1-review.md\n?? docs/reviews/0.7.4-astra-repair-review.md\n",
+  "production_test_runner_diff_empty": true,
+  "final_diff_equals_reviewed_patch": true,
+  "reviewed_patch_sha256": "3c8c8adb00d7cdc0d2d1fc0eedf0eb38149011898beff2dc0a1c19d8833494fd",
+  "windows_collection_platform_translation": [
+    {
+      "from_macos": [
+        "tests.unit.test_endpoint_maintenance",
+        "test_credential_from_json_rejects_invalid_documents[{\"schemaVersion\":1,\"address\":\"ipc://x\",\"protocol\":\"managed-v2\",\"platform\":\"unix\",\"device\":1,\"inode\":2,\"changedSecs\":3,\"changedNanos\":4}-invalid-value]"
+      ],
+      "to_windows": [
+        "tests.unit.test_endpoint_maintenance",
+        "test_credential_from_json_rejects_invalid_documents[{\"schemaVersion\":1,\"address\":\"ipc://x\",\"protocol\":\"managed-v2\",\"platform\":\"unix\",\"device\":1,\"inode\":2,\"changedSecs\":3,\"changedNanos\":4}-unsupported-platform]"
+      ],
+      "source": "sdk/python/tests/unit/test_endpoint_maintenance.py:168"
+    }
+  ],
+  "local_python": {
+    "source": "0deda44574f2737c9049169d99b965fde23c75fe",
+    "workers": 4,
+    "summary": {
+      "ordinary": {
+        "collected": 1205,
+        "passed": 1200,
+        "skipped": 5
+      },
+      "portable": {
+        "collected": 25,
+        "passed": 25,
+        "skipped": 0
+      },
+      "typescript": {
+        "collected": 14,
+        "passed": 14,
+        "skipped": 0
+      }
+    },
+    "strict_rows": [
+      18,
+      12
+    ],
+    "c3_sha256": "427b81e88c675ba07ec8c270e5d46e7eb2e4430bc55eb8ac3917b5c20c2c0eb6",
+    "native_sha256": "77b6375e1f9e444a951efdc2e2e01fa60053cc37312ceb1f84fca3ec3a516653",
+    "native_bytes_rehashed_locally": true,
+    "duration_seconds": 85.5805086659966,
+    "runner_inputs_verified": {
+      "tools/dev/test_python.py": "c6a2ac85e6f66ac7ca3c5cf23f81cce9913766fa47e0fe57f8217777e0858169",
+      "sdk/python/tests/conftest.py": "0a2832df285dc2f54eec826e0fc4208e68b9fcc1caf6303d29ff134e8cff84a2",
+      "pyproject.toml": "e745752291f469c06250f2d6d777c5cab3e65bc6f8f3a18a6ca4cb8e5221fa4c",
+      "uv.lock": "8070c7479dab80d2b3284de5ff33b3a6ab60efb6fbcc5508ded93b4fdbbe4388"
+    },
+    "path": "/tmp/c2-074-validation/final-python-0deda445"
+  },
+  "windows": [
+    {
+      "artifact_id": 11648715082,
+      "name": "windows-native-windows-2025-full-0deda44574f2737c9049169d99b965fde23c75fe",
+      "zip_sha256": "2ed941ab3442e653f8dfc1d022d942d22423fd5cd3bf24cf2e235a2235a1b6de",
+      "zip_bytes": 12221886,
+      "zip_members_verified": 50,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "run_id": 37995943560,
+      "runner": {
+        "requested_label": "windows-2025",
+        "os": "Windows-2025Server-10.0.26100-SP0",
+        "machine": "AMD64",
+        "image": "win25-vs2026",
+        "image_version": "20260925.250.1"
+      },
+      "scope": "full",
+      "gates": 24,
+      "internal_manifest_hashes_verified": 49,
+      "rust_totals": {
+        "passed": 1579,
+        "failed": 0,
+        "ignored": 2
+      },
+      "eager_and_interleaving_and_timer_executed": true,
+      "strict_rows": [
+        18,
+        12
+      ],
+      "python_counts": {
+        "ordinary_passed": 1166,
+        "ordinary_unix_skips": 39,
+        "portable_passed": 25,
+        "typescript_passed": 14
+      },
+      "python_exact_full_collection_matched_local_source": true,
+      "c3_sha256": "80e2210c1d94d225bf696067e6b3a225f92346e18e0d525d3c13039267316887",
+      "wheel_consumers": [
+        {
+          "administrator": true,
+          "borrowed_invalidated": 4,
+          "held_invalidated": true,
+          "direct_and_relay": true,
+          "artifact_byte_identity": true,
+          "cleanup": true
+        },
+        {
+          "administrator": false,
+          "borrowed_invalidated": 4,
+          "held_invalidated": true,
+          "direct_and_relay": true,
+          "artifact_byte_identity": true,
+          "cleanup": true
+        }
+      ],
+      "nonadmin_wrapper_cleanup": true,
+      "ipc_memory_rows": 9,
+      "rust_sdk": {
+        "passed": 18,
+        "failed": 0,
+        "ignored": 0
+      },
+      "native_tests": {
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0
+      },
+      "cli_tests": {
+        "passed": 60,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "artifact_id": 11647568003,
+      "name": "windows-native-windows-2022-full-0deda44574f2737c9049169d99b965fde23c75fe",
+      "zip_sha256": "988696a2902e8cf55e9ffae3c6c4adafbe725cc7aea6b711a8a2238bb8cf9288",
+      "zip_bytes": 12243971,
+      "zip_members_verified": 50,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "run_id": 37995943560,
+      "runner": {
+        "requested_label": "windows-2022",
+        "os": "Windows-2022Server-10.0.20348-SP0",
+        "machine": "AMD64",
+        "image": "win22",
+        "image_version": "20261004.326.1"
+      },
+      "scope": "full",
+      "gates": 24,
+      "internal_manifest_hashes_verified": 49,
+      "rust_totals": {
+        "passed": 1579,
+        "failed": 0,
+        "ignored": 2
+      },
+      "eager_and_interleaving_and_timer_executed": true,
+      "strict_rows": [
+        18,
+        12
+      ],
+      "python_counts": {
+        "ordinary_passed": 1166,
+        "ordinary_unix_skips": 39,
+        "portable_passed": 25,
+        "typescript_passed": 14
+      },
+      "python_exact_full_collection_matched_local_source": true,
+      "c3_sha256": "b4c3fbe7c238801f515852b87a925ecc6865e10243c945ceb55ff4fb8c9d155e",
+      "wheel_consumers": [
+        {
+          "administrator": true,
+          "borrowed_invalidated": 4,
+          "held_invalidated": true,
+          "direct_and_relay": true,
+          "artifact_byte_identity": true,
+          "cleanup": true
+        },
+        {
+          "administrator": false,
+          "borrowed_invalidated": 4,
+          "held_invalidated": true,
+          "direct_and_relay": true,
+          "artifact_byte_identity": true,
+          "cleanup": true
+        }
+      ],
+      "nonadmin_wrapper_cleanup": true,
+      "ipc_memory_rows": 9,
+      "rust_sdk": {
+        "passed": 18,
+        "failed": 0,
+        "ignored": 0
+      },
+      "native_tests": {
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0
+      },
+      "cli_tests": {
+        "passed": 60,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "artifact_id": 11647207146,
+      "name": "windows-native-windows-2025-local-platform-0deda44574f2737c9049169d99b965fde23c75fe",
+      "zip_sha256": "966136e448cb0a5c2f52976444b0e9d9f05f25de64d59b763da376ba8c85baac",
+      "zip_bytes": 31041,
+      "zip_members_verified": 2,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "run_id": 37995943560,
+      "runner": {
+        "requested_label": "windows-2025",
+        "os": "Windows-2025Server-10.0.26100-SP0",
+        "machine": "AMD64",
+        "image": "win25-vs2026",
+        "image_version": "20260925.250.1"
+      },
+      "scope": "local-platform",
+      "gates": 1,
+      "internal_manifest_hashes_verified": 1,
+      "rust_totals": {
+        "passed": 1501,
+        "failed": 0,
+        "ignored": 2
+      },
+      "eager_and_interleaving_and_timer_executed": true
+    },
+    {
+      "artifact_id": 11646624779,
+      "name": "windows-native-windows-2022-local-platform-0deda44574f2737c9049169d99b965fde23c75fe",
+      "zip_sha256": "c0f12006fddca8459baa3f5ed7b9e00806b67393851ccf1674ac8fedbbbd95f9",
+      "zip_bytes": 31033,
+      "zip_members_verified": 2,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "run_id": 37995943560,
+      "runner": {
+        "requested_label": "windows-2022",
+        "os": "Windows-2022Server-10.0.20348-SP0",
+        "machine": "AMD64",
+        "image": "win22",
+        "image_version": "20261004.326.1"
+      },
+      "scope": "local-platform",
+      "gates": 1,
+      "internal_manifest_hashes_verified": 1,
+      "rust_totals": {
+        "passed": 1501,
+        "failed": 0,
+        "ignored": 2
+      },
+      "eager_and_interleaving_and_timer_executed": true
+    }
+  ],
+  "unix": [
+    {
+      "artifact_id": 11647207815,
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-python-suite",
+      "zip_sha256": "39e8d0a7d9ac0db23e4aecaf9d0465907d35665d2dad96ec69f48d0d989ddd7c",
+      "zip_bytes": 319074,
+      "zip_members_verified": 221,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "run_id": 37995946700,
+      "source": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "workers": 2,
+      "summary": {
+        "ordinary": {
+          "collected": 1205,
+          "passed": 1200,
+          "skipped": 5
+        },
+        "portable": {
+          "collected": 25,
+          "passed": 25,
+          "skipped": 0
+        },
+        "typescript": {
+          "collected": 14,
+          "passed": 14,
+          "skipped": 0
+        }
+      },
+      "strict_rows": [
+        18,
+        12
+      ],
+      "c3_sha256": "a2610f769805500d86e753b6e4de1a64401c9e8e319802cd10454f6b5981aa5b",
+      "native_sha256": "4eeb8cf69e76bc89e6f788bc841340ccec71360ebc95661155ad95ec2240087c",
+      "native_bytes_rehashed_locally": false,
+      "duration_seconds": 156.52547793000002,
+      "runner_inputs_verified": {
+        "tools/dev/test_python.py": "c6a2ac85e6f66ac7ca3c5cf23f81cce9913766fa47e0fe57f8217777e0858169",
+        "sdk/python/tests/conftest.py": "0a2832df285dc2f54eec826e0fc4208e68b9fcc1caf6303d29ff134e8cff84a2",
+        "pyproject.toml": "e745752291f469c06250f2d6d777c5cab3e65bc6f8f3a18a6ca4cb8e5221fa4c",
+        "uv.lock": "8070c7479dab80d2b3284de5ff33b3a6ab60efb6fbcc5508ded93b4fdbbe4388"
+      },
+      "path": "/tmp/c2-074-validation/eager-final-unix-artifacts/local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-python-suite/python-suite"
+    },
+    {
+      "artifact_id": 11647057963,
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-core-test",
+      "zip_sha256": "14de34a8c27e31bd76d3dbd25c4d9c99c9e2defb617c8858b600cd41665ddafd",
+      "zip_bytes": 36913,
+      "zip_members_verified": 4,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "run_id": 37995946700,
+      "runner": "runner Linux-X64",
+      "test_logs": {
+        "core-workspace-tests.log": {
+          "passed": 1691,
+          "failed": 0,
+          "ignored": 5
+        },
+        "cli-tests.log": {
+          "passed": 76,
+          "failed": 0,
+          "ignored": 0
+        },
+        "rust-sdk-tests.log": {
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        }
+      }
+    },
+    {
+      "artifact_id": 11646868281,
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-cross-user-macos-15",
+      "zip_sha256": "a1f5bce4cd190e6476470edf8259b8fd2f3284b4babee22b0f64133b13e34bb9",
+      "zip_bytes": 7842,
+      "zip_members_verified": 6,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "run_id": 37995946700,
+      "runner": "runner macOS-ARM64",
+      "real_cross_uid_verified": true,
+      "ordinary_local_tests": {
+        "passed": 114,
+        "failed": 0,
+        "ignored": 1
+      }
+    },
+    {
+      "artifact_id": 11646863340,
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-focused-local",
+      "zip_sha256": "550060b40441774e6e3d0b10443e663d463842722f23cdaafa83586e4202af59",
+      "zip_bytes": 11795,
+      "zip_members_verified": 2,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "run_id": 37995946700,
+      "runner": "runner Linux-X64",
+      "test_logs": {
+        "focused-local-tests.log": {
+          "passed": 590,
+          "failed": 0,
+          "ignored": 1
+        }
+      }
+    },
+    {
+      "artifact_id": 11646669039,
+      "name": "local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-cross-user-ubuntu-24.04",
+      "zip_sha256": "cca69db2a52ae0f54ec03196595b143630085a45e798797bc45d500e065573a2",
+      "zip_bytes": 8457,
+      "zip_members_verified": 6,
+      "source_sha": "0deda44574f2737c9049169d99b965fde23c75fe",
+      "run_id": 37995946700,
+      "runner": "runner Linux-X64",
+      "real_cross_uid_verified": true,
+      "ordinary_local_tests": {
+        "passed": 108,
+        "failed": 0,
+        "ignored": 1
+      }
+    }
+  ],
+  "api_records": [
+    {
+      "path": "/tmp/c2-074-astra-final-api/windows-run.json",
+      "sha256": "81c6638b2f0186831de655bdd72ff152bd86c37d4d1616a10cd566ba01cf949e"
+    },
+    {
+      "path": "/tmp/c2-074-astra-final-api/windows-jobs.json",
+      "sha256": "00b29831732eac1f2971d43aed8a8b3f1df29f27056b2238bd3ce936c691da7f"
+    },
+    {
+      "path": "/tmp/c2-074-astra-final-api/windows-artifacts.json",
+      "sha256": "7a0fbd9a2b31f8f090123ed46a6907b0ba4bf08c47cbcc7a4da838366cc0aee7"
+    },
+    {
+      "path": "/tmp/c2-074-astra-final-api/unix-run.json",
+      "sha256": "6a2e5a2a4f2428b71ad49d441ac2289b23d26901b260d13cc4ad1ff954df1386"
+    },
+    {
+      "path": "/tmp/c2-074-astra-final-api/unix-jobs.json",
+      "sha256": "a62556e3309ebab20b45e494769adf2139330f1663a45f1695575dad29a7c086"
+    },
+    {
+      "path": "/tmp/c2-074-astra-final-api/unix-artifacts.json",
+      "sha256": "64aad028f51dc05671640f0597a0f68f0b7ad0843dcc9d905f7e0cd3ed8924cb"
+    }
+  ],
+  "local_builds": {
+    "steps": [
+      {
+        "name": "rust-sdk",
+        "exit_code": 0,
+        "log_sha256": "38ddbb8504e4a1405e8ede4630e83a25c6444690ad683d5a8279ff00c29efc6d"
+      },
+      {
+        "name": "python-build",
+        "exit_code": 0,
+        "log_sha256": "3550067adfa9c6a8fbfeae71e6201b65cf5b155e9a1f48b86fc6f08ab6c351f0"
+      },
+      {
+        "name": "cli-tests",
+        "exit_code": 0,
+        "log_sha256": "e4c4c2b4d129d0c69f95f9295c241e73acdde325cd9fcb02b7d7e871621a30cd"
+      },
+      {
+        "name": "cli-build",
+        "exit_code": 0,
+        "log_sha256": "a7a44566c214f69ea59e1cc6cbcf101110c11deb5622f9eab3731f49ba8fa709"
+      },
+      {
+        "name": "python-focused",
+        "exit_code": 0,
+        "log_sha256": "0498b15e0b098770809d5e1c3eced704e10ef448f0790dda8548a793f00fd481"
+      }
+    ],
+    "native": {
+      "path": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two/sdk/python/src/c_two/_native.cpython-313-darwin.so",
+      "sha256": "77b6375e1f9e444a951efdc2e2e01fa60053cc37312ceb1f84fca3ec3a516653",
+      "bytes": 10246144
+    },
+    "c3": {
+      "path": "/tmp/c2-074-cli-target/debug/c3",
+      "sha256": "427b81e88c675ba07ec8c270e5d46e7eb2e4430bc55eb8ac3917b5c20c2c0eb6",
+      "bytes": 37403104
+    }
+  },
+  "source_diff_since_4e9": [
+    ".github/workflows/local-endpoint-validation.yml",
+    "core/transport/c2-http/src/relay/forwarding_tests.rs",
+    "core/transport/c2-http/src/relay/router.rs",
+    "docs/configuration.en.md",
+    "docs/configuration.md",
+    "docs/local-endpoint-lifecycle.en.md",
+    "docs/local-endpoint-lifecycle.md",
+    "docs/plans/0.7.4.md",
+    "docs/plans/0.7.4.zh-CN.md",
+    "docs/reports/evidence/0.7.4-astra-initial-evidence.json",
+    "docs/reviews/0.7.4-astra-initial-review.md",
+    "sdk/python/tests/integration/test_typescript_persistent_ipc.py",
+    "sdk/python/tests/unit/test_ipc_config.py",
+    "tests/repo/test_windows_native_runner.py",
+    "tools/ci/windows_native.py",
+    "tools/dev/test_python.py"
+  ],
+  "preserved_reviews": [
+    {
+      "path": "/tmp/c2-074-astra-final-review.md",
+      "sha256": "e6766950de200bb2b0afc196f1bec05f857c3a673eb1e4cbf50517f13f136b85"
+    },
+    {
+      "path": "/tmp/c2-074-astra-repair-review.md",
+      "sha256": "325637af73ab66615acb35f70a80fdc9e49c17e5fa9da4193b9635921fd1bb32"
+    },
+    {
+      "path": "/tmp/c2-074-astra-h1-review.md",
+      "sha256": "d74995e02f96fae8366354236036257878c1f46a1576391ae8a83a64a5b01d85"
+    },
+    {
+      "path": "/tmp/c2-074-astra-eager-capacity-repair-review.md",
+      "sha256": "591a9c940bc38f8ea0ecc70cd9b0a4685c49baff2e62dbe9103429a0119d3996"
+    }
+  ],
+  "workspace_clean_at_end": false,
+  "docs_only_status_at_validation_end": " M docs/configuration.en.md\n M docs/configuration.md\n M docs/plans/0.7.4.md\n M docs/plans/0.7.4.zh-CN.md\n?? docs/reports/0.7.4-final-validation.md\n?? docs/reports/0.7.4-final-validation.zh-CN.md\n?? docs/reports/evidence/0.7.4-astra-eager-capacity-repair-review-evidence.json\n?? docs/reports/evidence/0.7.4-astra-h1-review-evidence.json\n?? docs/reports/evidence/0.7.4-astra-repair-review-evidence.json\n?? docs/reports/evidence/0.7.4-final-validation.json\n?? docs/reviews/0.7.4-astra-eager-capacity-repair-review.md\n?? docs/reviews/0.7.4-astra-h1-review.md\n?? docs/reviews/0.7.4-astra-repair-review.md\n",
+  "status": "passed"
+}

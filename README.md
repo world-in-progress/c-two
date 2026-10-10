@@ -28,7 +28,7 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
 
-This README describes **C-Two 0.7.3**, with Python 3.10+ and FastDB 0.2.1.
+This README describes **C-Two 0.7.4**, with Python 3.10+ and FastDB 0.2.1.
 
 ## Features
 
@@ -50,10 +50,10 @@ uv pip install c-two
 The same command works in Windows PowerShell. For c3 on Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.sh | sh -s -- --version 0.3.2
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.sh | sh -s -- --version 0.3.3
 ```
 
-On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
+On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
 For source builds and tests, see the [development guide](docs/development.md).
 
@@ -101,7 +101,7 @@ For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_ancho
 | Python contracts, portable payloads and hold | [Python SDK guide](docs/python-usage.md) |
 | Rust SDK | [Rust SDK guide](sdk/rust/README.md) |
 | Relay and contract tools | [c3 CLI guide](cli/README.md) |
-| Endpoint directory configuration | [0.7.3 guide](docs/releases/0.7.3.md) |
+| Endpoint directories and lifecycle | [Lifecycle guide](docs/local-endpoint-lifecycle.en.md) |
 | Windows | [Build and usage](docs/windows-native-usage.md) |
 | Environment variables | [.env.example](.env.example) |
 | Development | [Build and tests](docs/development.md), [contributing](CONTRIBUTING.md) |

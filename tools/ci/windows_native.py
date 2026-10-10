@@ -318,9 +318,18 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
         raise ValueError(f"Unknown native gate scope: {scope}")
     fastdb_typescript = "../fastdb/ts/fastdb4ts"
     c2_mem_typescript = "core/foundation/c2-mem-ffi/bindings/typescript"
+    fastdb_build = npm_command("run", "build", "--prefix", fastdb_typescript)
+    if os.name == "nt":
+        shell = os.environ.get("C2_FASTDB_NPM_SCRIPT_SHELL") or str(
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/bin/bash.exe"
+        )
+        fastdb_build.extend(["--script-shell", shell])
     return [
         ("python310-install", ["uv", "python", "install", "3.10"], ()),
         ("fastdb-npm-install", npm_command("ci", "--prefix", fastdb_typescript), ()),
+        # The persistent generated-client regression is part of the ordinary
+        # suite, before the payload matrix's independent WASM/package build.
+        ("fastdb-npm-build", fastdb_build, ("fastdb-npm-install",)),
         ("c2-mem-npm-install", npm_command("ci", "--prefix", c2_mem_typescript), ()),
         ("c2-mem-node-tests", npm_command("test", "--prefix", c2_mem_typescript), ("c2-mem-npm-install",)),
         ("c2-mem-node-package", npm_command("run", "pack:check", "--prefix", c2_mem_typescript), ("c2-mem-npm-install",)),
@@ -375,7 +384,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
                            "--child-timeout", str(IPC_MEMORY_CHILD_TIMEOUT_S),
                            "--row-timeout", str(IPC_MEMORY_ROW_TIMEOUT_S)],
          ("python-build", "windows-harness-tests")),
-        ("python-tests", ["uv", "run", "--no-sync", "pytest", "sdk/python/tests", "-q", "--timeout=30", *[f"--ignore={path}" for path in (*PORTABLE_TESTS, TYPESCRIPT_TEST)], f"--junitxml={output / 'python-tests.xml'}"], ("python-build",)),
+        ("python-tests", ["uv", "run", "--no-sync", "pytest", "sdk/python/tests", "-q", "--timeout=30", *[f"--ignore={path}" for path in (*PORTABLE_TESTS, TYPESCRIPT_TEST)], f"--junitxml={output / 'python-tests.xml'}"], ("python-build", "fastdb-npm-build", "c2-mem-node-tests")),
         ("portable-tests", ["uv", "run", "--no-sync", "pytest", *PORTABLE_TESTS, "-q", "--timeout=300", f"--junitxml={output / 'portable-tests.xml'}"], ("python-build", "cli-artifact")),
         ("typescript-tests", ["uv", "run", "--no-sync", "pytest", TYPESCRIPT_TEST, "-q", "--timeout=600", f"--junitxml={output / 'typescript-tests.xml'}"], ("python-build", "fastdb-npm-install", "c2-mem-npm-install", "cli-artifact")),
     ]

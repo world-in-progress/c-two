@@ -1,0 +1,287 @@
+{
+  "review_date": "2026-10-09",
+  "source_commit": "4cc5b4d229d21f00fc25619e8490169b2246edd1",
+  "measurement_method": "Physical source lines; explicit test files and cfg(test) Rust block spans separated with a comment/string-aware brace scanner. Includes comments/blank lines. Test-only free items and helpers may remain in source.",
+  "counted_extensions": [
+    "rs",
+    "py",
+    "ts",
+    "js",
+    "c",
+    "h",
+    "mjs",
+    "cjs",
+    "tsx",
+    "jsx",
+    "hpp",
+    "cpp"
+  ],
+  "limits": [
+    "Line counts include comments and blanks. Test-only free items and helpers may remain in non-test counts.",
+    "The runtime-area estimate includes codegen assets and native binding build scripts.",
+    "The strip experiment covers one downloaded macOS ARM64 CPython 3.13 artifact only; it is not a cross-platform or full runtime regression result."
+  ],
+  "summary": {
+    "tracked_files": 734,
+    "tracked_bytes": 17231007,
+    "code_files": 397,
+    "physical_code_lines": 202321,
+    "estimated_test_lines": 108913,
+    "estimated_non_test_lines": 93408,
+    "core_sdk_cli_non_test_lines": 78310,
+    "core_rust_non_test_lines": 55392
+  },
+  "code_groups": {
+    ".github": {
+      "source_lines": 3670,
+      "test_lines": 0,
+      "files": 6
+    },
+    "cli": {
+      "source_lines": 1208,
+      "test_lines": 2070,
+      "files": 11
+    },
+    "core/foundation/c2-codegen": {
+      "source_lines": 6129,
+      "test_lines": 2588,
+      "files": 11
+    },
+    "core/foundation/c2-config": {
+      "source_lines": 2747,
+      "test_lines": 2836,
+      "files": 11
+    },
+    "core/foundation/c2-contract": {
+      "source_lines": 1742,
+      "test_lines": 1003,
+      "files": 7
+    },
+    "core/foundation/c2-error": {
+      "source_lines": 361,
+      "test_lines": 262,
+      "files": 1
+    },
+    "core/foundation/c2-local-security": {
+      "source_lines": 144,
+      "test_lines": 22,
+      "files": 2
+    },
+    "core/foundation/c2-mem-ffi": {
+      "source_lines": 4747,
+      "test_lines": 4395,
+      "files": 22
+    },
+    "core/foundation/c2-mem": {
+      "source_lines": 5215,
+      "test_lines": 4883,
+      "files": 19
+    },
+    "core/protocol/c2-wire": {
+      "source_lines": 3814,
+      "test_lines": 3514,
+      "files": 18
+    },
+    "core/runtime/c2-core": {
+      "source_lines": 6409,
+      "test_lines": 10679,
+      "files": 24
+    },
+    "core/transport/c2-http": {
+      "source_lines": 12855,
+      "test_lines": 16738,
+      "files": 30
+    },
+    "core/transport/c2-ipc": {
+      "source_lines": 7077,
+      "test_lines": 12611,
+      "files": 7
+    },
+    "core/transport/c2-local": {
+      "source_lines": 5002,
+      "test_lines": 4651,
+      "files": 14
+    },
+    "core/transport/c2-server": {
+      "source_lines": 6790,
+      "test_lines": 6580,
+      "files": 11
+    },
+    "examples": {
+      "source_lines": 1124,
+      "test_lines": 0,
+      "files": 11
+    },
+    "sdk/python": {
+      "source_lines": 2742,
+      "test_lines": 26238,
+      "files": 99
+    },
+    "sdk/python/native/src": {
+      "source_lines": 6973,
+      "test_lines": 168,
+      "files": 16
+    },
+    "sdk/python/src": {
+      "source_lines": 6816,
+      "test_lines": 0,
+      "files": 34
+    },
+    "sdk/rust": {
+      "source_lines": 464,
+      "test_lines": 1046,
+      "files": 9
+    },
+    "tests": {
+      "source_lines": 0,
+      "test_lines": 8127,
+      "files": 20
+    },
+    "tools": {
+      "source_lines": 7379,
+      "test_lines": 502,
+      "files": 14
+    }
+  },
+  "largest_non_test_files": [
+    {
+      "path": "core/transport/c2-ipc/src/client.rs",
+      "non_test_physical_lines": 4972
+    },
+    {
+      "path": "core/transport/c2-server/src/server.rs",
+      "non_test_physical_lines": 4249
+    },
+    {
+      "path": "core/foundation/c2-codegen/assets/typescript_transport.ts",
+      "non_test_physical_lines": 3977
+    },
+    {
+      "path": "core/transport/c2-http/src/relay/router.rs",
+      "non_test_physical_lines": 2183
+    },
+    {
+      "path": "core/transport/c2-http/src/client/relay_aware.rs",
+      "non_test_physical_lines": 2165
+    },
+    {
+      "path": "core/runtime/c2-core/src/session.rs",
+      "non_test_physical_lines": 2075
+    },
+    {
+      "path": ".github/scripts/promote_release_candidate.py",
+      "non_test_physical_lines": 1919
+    },
+    {
+      "path": "core/transport/c2-local/src/unix_managed.rs",
+      "non_test_physical_lines": 1695
+    },
+    {
+      "path": "core/foundation/c2-mem/src/pool.rs",
+      "non_test_physical_lines": 1618
+    },
+    {
+      "path": "tools/local_rc/build_candidate.py",
+      "non_test_physical_lines": 1540
+    },
+    {
+      "path": "sdk/python/native/src/runtime_session_ffi.rs",
+      "non_test_physical_lines": 1465
+    },
+    {
+      "path": "core/foundation/c2-mem-ffi/bindings/typescript/src/index.ts",
+      "non_test_physical_lines": 1412
+    },
+    {
+      "path": "core/foundation/c2-mem-ffi/bindings/typescript/native/node_c2_mem_ffi_loader.c",
+      "non_test_physical_lines": 1336
+    },
+    {
+      "path": "tools/local_rc/package_consumers.py",
+      "non_test_physical_lines": 1194
+    },
+    {
+      "path": "tools/benchmarks/ipc_memory.py",
+      "non_test_physical_lines": 1184
+    },
+    {
+      "path": "sdk/python/src/c_two/transport/registry.py",
+      "non_test_physical_lines": 1157
+    }
+  ],
+  "downloaded_wheels": [
+    {
+      "name": "c_two-0.7.3-cp313-cp313-macosx_11_0_arm64.whl",
+      "archive_bytes": 4083027,
+      "uncompressed_bytes": 10829599,
+      "sha256": "61b51784e6f78e65056978a4952a58273174ed8e4e7f6268a4cf973f0eadde0d"
+    },
+    {
+      "name": "fastdb4py-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+      "archive_bytes": 1133461,
+      "uncompressed_bytes": 3238739,
+      "sha256": "e203a3262f9260719220fe207bd2f12ed0719031a61b92e14eb42a8c0bc9dd28"
+    }
+  ],
+  "strip_experiment": {
+    "command": "xcrun strip -S -x -o OUTPUT ORIGINAL",
+    "artifacts": [
+      {
+        "bytes": 10213376,
+        "deflated_zip_bytes": 3840106,
+        "name": "_native.cpython-313-darwin.so",
+        "sha256": "6268ec21c74b02d6981075bde2f1d881f7fa7dc0b41053d69977dfdd277f0997"
+      },
+      {
+        "bytes": 7895376,
+        "deflated_zip_bytes": 3426249,
+        "name": "_native.stripped.so",
+        "sha256": "b06db3ff0f4cd3daa803b3beff4729e5795ab0ea2bf5fdb4bcebb0377e0bbc31"
+      }
+    ],
+    "compression": "Both copies compressed with Python zipfile ZIP_DEFLATED, compresslevel=6, same member name. These archive sizes are not repacked wheel sizes.",
+    "probe": {
+      "scope": "isolated import, exported names and error registry only; not a runtime regression suite",
+      "matching_exports": 118,
+      "registry_matches": true
+    }
+  },
+  "dependency_observation": {
+    "command": "cargo tree --manifest-path sdk/python/native/Cargo.toml --locked --offline -e normal --prefix none",
+    "normal_tree_unique_entries": 140,
+    "codegen_fastdb_chain": [
+      "c2-python-native",
+      "c2-codegen",
+      "fastdb 0.2.1",
+      "fastdb-sys 0.2.1"
+    ],
+    "relay_server_axum_present": false
+  },
+  "performed_checks": [
+    "Git tracked-file inventory and source/inline-test classification",
+    "Repository references and Python AST comparisons",
+    "PyO3 lifecycle result dictionary field comparison",
+    "Offline Cargo normal-dependency tree",
+    "Downloaded wheel and native-copy hashes and byte sizes",
+    "Independent original/stripped native module imports: 118 exported names and error registry match"
+  ],
+  "full_test_suites_run": false,
+  "production_source_changed": false,
+  "delegation_records": [
+    {
+      "concern": "transport and memory",
+      "buddy_run": "6d245a05-263f-4165-9da5-22447441f1ca",
+      "disposition": "failed and recorded; replaced by a native read-only review plus Host source verification"
+    },
+    {
+      "concern": "SDK and Core projections",
+      "buddy_run": "10050112-b69d-450b-a445-dcaa822b6ab2",
+      "disposition": "native shutdown protocol failure, no sealed artifact; final text treated only as leads independently checked by Host"
+    },
+    {
+      "concern": "dependencies and delivery",
+      "buddy_run": "5aa48d04-e8aa-4d8c-8c29-90dc4f4a392f",
+      "disposition": "failed and recorded; inspected by Host"
+    }
+  ]
+}

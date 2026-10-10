@@ -21,8 +21,8 @@
 
 use crate::unix_common::{
     BoundSocketGuard, EndpointDirectory, EndpointNames, SocketIdentity, SweepLease,
-    dirfd_relative_socket_path, fstat, probe_listener_is_live, same_file, set_socket_permissions,
-    socket_unverified, stat_is,
+    dirfd_relative_socket_path, fstat, listen_verified_socket, probe_listener_is_live, same_file,
+    set_socket_permissions, socket_unverified, stat_is,
 };
 use crate::{
     EndpointCredential, EndpointInspection, EndpointReapResult, EndpointUnverifiedReason,
@@ -349,12 +349,6 @@ impl From<io::Error> for NamespaceError {
 fn directory_error(error: io::Error, create: bool) -> NamespaceError {
     if error.kind() == io::ErrorKind::NotFound && !create {
         NamespaceError::Absent
-    } else if error.raw_os_error() == Some(libc::ELOOP) {
-        NamespaceError::Unverified(EndpointUnverifiedReason::Symlink)
-    } else if error.kind() == io::ErrorKind::PermissionDenied
-        || error.kind() == io::ErrorKind::InvalidData
-    {
-        NamespaceError::Unverified(EndpointUnverifiedReason::UnsafeDirectory)
     } else {
         NamespaceError::Io(error)
     }
@@ -377,7 +371,7 @@ impl Drop for ManagedNamespace {
 }
 
 impl ManagedNamespace {
-    /// Opens the final private directory. Only the platform default directory
+    /// Opens the final owner-controlled directory. Only the platform default
     /// can be created here; custom directories belong to the application.
     pub(crate) fn open_root(
         root: &Path,
@@ -388,11 +382,6 @@ impl ManagedNamespace {
         let create_directory = create && default.unix_root() == Some(root);
         let directory = EndpointDirectory::open(root, create_directory)
             .map_err(|error| directory_error(error, create))?;
-        if !directory.strict_private() {
-            return Err(NamespaceError::Unverified(
-                EndpointUnverifiedReason::UnsafeDirectory,
-            ));
-        }
 
         // A marker without its gate must never cause a second coordinator inode
         // to be created. The check happens before any O_CREAT attempt.
@@ -426,11 +415,7 @@ impl ManagedNamespace {
         // directory entries that were verified above may already name different
         // directories. Re-check the final directory through its open descriptor
         // and drop the gate without adopting a redirected name.
-        if !directory.path_still_names_open_directory() {
-            return Err(NamespaceError::Unverified(
-                EndpointUnverifiedReason::UnsafeDirectory,
-            ));
-        }
+        directory.validate().map_err(NamespaceError::Io)?;
         #[cfg(test)]
         barrier::after_gate(root);
 
@@ -864,15 +849,12 @@ fn open_root_bounded(root: &Path, create: bool) -> Result<ManagedNamespace, Name
 fn bind_in_verified_directory(
     namespace: &ManagedNamespace,
     names: &EndpointNames,
-) -> io::Result<tokio::net::UnixListener> {
+) -> io::Result<socket2::Socket> {
     let directory = namespace.directory();
     if let Some(path) = dirfd_relative_socket_path(directory, &names.socket_os) {
-        return tokio::net::UnixListener::bind(path);
+        return crate::unix_common::bind_socket(&path);
     }
-    let std_listener =
-        crate::unix_common::bind_in_directory_on_thread(directory, &names.socket_os)?;
-    std_listener.set_nonblocking(true)?;
-    tokio::net::UnixListener::from_std(std_listener)
+    crate::unix_common::bind_in_directory_on_thread(directory, &names.socket_os)
 }
 
 /// Removes a stale managed socket only when the lease record proves the exact
@@ -1175,7 +1157,18 @@ pub(crate) fn bind_managed_at(
             _ => endpoint_in_use(),
         });
     }
-    remove_stale_managed_socket(&namespace, endpoint, &names, &lease)?;
+    // Arm immediately after flock: every subsequent failure must explicitly
+    // unlock the OFD, even when a dup/fork keeps another descriptor alive.
+    // The socket rollback guard is created later and drops before this lease.
+    let lease = Lease(Some(lease));
+    #[cfg(test)]
+    if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::LeaseAfterLock) {
+        crate::unix_common::fault::retain_duplicate(lease.file());
+        return Err(io::Error::other(
+            "injected failure immediately after lease lock",
+        ));
+    }
+    remove_stale_managed_socket(&namespace, endpoint, &names, lease.file())?;
     // The socket must be created in the directory this call verified. Re-check
     // the gate identity after the stale-socket work, then bind through the
     // verified descriptor: an absolute path could have been redirected to a
@@ -1186,12 +1179,16 @@ pub(crate) fn bind_managed_at(
             "managed namespace identity changed before bind",
         ));
     }
-    let inner = bind_in_verified_directory(&namespace, &names)?;
+    let socket = bind_in_verified_directory(&namespace, &names)?;
     // Everything after a successful bind either completes initialization or
     // withdraws the exact object this call created. The guard never trusts the
     // record it may have failed to write.
-    let mut guard = BoundSocketGuard::capture(&namespace.directory, &names, &lease)?;
-    set_socket_permissions(&namespace.directory, &names)?;
+    let mut guard = BoundSocketGuard::capture(&namespace.directory, &names, lease.file())?;
+    set_socket_permissions(&namespace.directory, &names, &guard)?;
+    listen_verified_socket(&socket, &namespace.directory, &names, &guard)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::os::unix::net::UnixListener = socket.into();
+    let inner = tokio::net::UnixListener::from_std(std_listener)?;
     let identity = socket_identity(&namespace.directory, &names)?;
     let record = OwnerRecord {
         address: endpoint.address().to_owned(),
@@ -1210,8 +1207,8 @@ pub(crate) fn bind_managed_at(
                 .replace_entry_with_file_for_test(&names.socket)?;
         }
     }
-    write_record(&lease, &record)?;
-    match read_record(&lease) {
+    write_record(lease.file(), &record)?;
+    match read_record(lease.file()) {
         Ok(Some(readback)) if readback == record => {}
         Ok(_) => {
             return Err(io::Error::new(
@@ -1244,7 +1241,7 @@ pub(crate) fn bind_managed_at(
         identity,
         record,
         root: root.to_owned(),
-        lease: Some(Lease(Some(lease))),
+        lease: Some(lease),
         _gate_pin: gate_pin,
         #[cfg(test)]
         gate_identity,
@@ -1661,12 +1658,6 @@ impl ManagedSweep {
     fn open_root(root: &Path, context: &LocalEndpointContext) -> io::Result<Self> {
         let lease = SweepLease::acquire()?;
         let directory = EndpointDirectory::open(root, false)?;
-        if !directory.strict_private() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "managed namespace is not private to the current user",
-            ));
-        }
         let entries = fs::read_dir(root)?;
         if !directory.path_still_names_open_directory() {
             return Err(io::Error::new(

@@ -4,6 +4,7 @@
 //! used across the C-Two transport layer (IPC, relay, memory pool).
 
 mod call;
+mod connect_options;
 mod identity;
 mod ipc;
 mod lifecycle;
@@ -17,6 +18,9 @@ mod resolver;
 pub use call::{
     CallExecutionLimits, CallOptions, CallTimeout, CallTimeoutError, DEFAULT_MAX_OUTSTANDING_CALLS,
     DEFAULT_RETAINED_INPUT_BUDGET_BYTES,
+};
+pub use connect_options::{
+    ConnectDeadline, ConnectDeadlineExceeded, ConnectOptions, ConnectTimeoutError,
 };
 pub use identity::{validate_ipc_region_id, validate_relay_id, validate_server_id};
 pub use ipc::{

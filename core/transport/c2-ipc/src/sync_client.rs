@@ -98,19 +98,66 @@ pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
 // ── Global shared runtime ────────────────────────────────────────────────
 
 static GLOBAL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static RUNTIME_INIT: Mutex<()> = Mutex::new(());
+
+fn build_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("c2-client-io")
+        .enable_all()
+        .build()
+        .expect("failed to create tokio runtime")
+}
+
+fn initialize_runtime<'a>(
+    slot: &'a OnceLock<tokio::runtime::Runtime>,
+    coordinator: &Mutex<()>,
+    deadline: c2_config::ConnectDeadline,
+) -> Result<&'a tokio::runtime::Runtime, IpcError> {
+    crate::client::connect_check(deadline, "ipc_runtime_wait")?;
+    if let Some(runtime) = slot.get() {
+        return Ok(runtime);
+    }
+    // OnceLock::get_or_init has no timed wait. All initializers first claim
+    // this gate, so a caller can leave without waiting for another builder.
+    let _initializing = match deadline.instant() {
+        Some(instant) => coordinator
+            .try_lock_until(instant)
+            .ok_or_else(|| crate::client::connect_expired("ipc_runtime_wait"))?,
+        None => coordinator.lock(),
+    };
+    crate::client::connect_check(deadline, "ipc_runtime_wait")?;
+    if let Some(runtime) = slot.get() {
+        return Ok(runtime);
+    }
+    let runtime = build_runtime();
+    if let Err(error) = crate::client::connect_check(deadline, "ipc_runtime_start") {
+        runtime.shutdown_background();
+        return Err(error);
+    }
+    slot.set(runtime)
+        .expect("executor coordinator owns initialization");
+    Ok(slot
+        .get()
+        .expect("executor was published by its coordinator"))
+}
+
+pub(crate) fn ensure_runtime_with_deadline(
+    deadline: c2_config::ConnectDeadline,
+) -> Result<(), IpcError> {
+    initialize_runtime(&GLOBAL_RUNTIME, &RUNTIME_INIT, deadline).map(|_| ())
+}
 
 /// Return the shared tokio runtime, creating it on first call.
 ///
 /// The runtime uses 2 worker threads — sufficient for client I/O.
 fn get_or_create_runtime() -> &'static tokio::runtime::Runtime {
-    GLOBAL_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("c2-client-io")
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime")
-    })
+    initialize_runtime(
+        &GLOBAL_RUNTIME,
+        &RUNTIME_INIT,
+        c2_config::ConnectDeadline::default(),
+    )
+    .expect("unbounded executor initialization cannot expire")
 }
 
 // ── SyncClient ───────────────────────────────────────────────────────────
@@ -204,19 +251,23 @@ impl SyncClient {
     /// injected-pool policy gate. `budget` is the owning cache's shared domain
     /// context: the pool already charges it and the client's reassembly pool
     /// charges the same context.
-    pub(crate) fn connect_transport_pool(
+    pub(crate) fn connect_transport_pool_attempt_with_deadline(
         endpoint: c2_config::LocalEndpoint,
         pool: Arc<Mutex<MemPool>>,
         config: ClientIpcConfig,
         budget: c2_mem::MemoryBudget,
-    ) -> Result<Self, IpcError> {
+        deadline: c2_config::ConnectDeadline,
+    ) -> (Self, Result<(), IpcError>) {
         let rt = get_or_create_runtime();
         let mut client = IpcClient::with_transport_pool(endpoint, pool, config, budget);
-        rt.block_on(client.connect())?;
-        Ok(Self {
-            inner: client,
-            rt: rt.handle().clone(),
-        })
+        let result = rt.block_on(client.connect_with_deadline(deadline));
+        (
+            Self {
+                inner: client,
+                rt: rt.handle().clone(),
+            },
+            result,
+        )
     }
 
     /// The native endpoint retained by this connection.
@@ -519,6 +570,38 @@ impl SyncClient {
         )
     }
 
+    /// Acquire under the caller's unchanged absolute connection deadline.
+    pub fn acquire_route_with_deadline(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RouteBinding, IpcError> {
+        self.rt
+            .block_on(self.inner.acquire_route_with_deadline(expected, deadline))
+    }
+
+    pub fn acquire_route_token_with_deadline(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+        route_uid: &str,
+        route_revision: u64,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<RouteBinding, IpcError> {
+        self.rt
+            .block_on(self.inner.acquire_route_token_with_deadline(
+                expected,
+                route_uid,
+                route_revision,
+                deadline,
+            ))
+    }
+
+    /// CRM tag advertised by a route, if present.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_len_for_test(&self) -> usize {
+        self.inner.pending_len_for_test()
+    }
+
     /// CRM tag advertised by a route, if present.
     pub fn route_contract(&self, route_name: &str) -> Option<c2_contract::ExpectedRouteContract> {
         self.inner.route_contract(route_name)
@@ -583,6 +666,46 @@ impl SyncClient {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn connect_deadline_executor_initialization_wait_is_bounded() {
+        let slot = Arc::new(OnceLock::new());
+        let coordinator = Arc::new(Mutex::new(()));
+        let owner_slot = slot.clone();
+        let owner_coordinator = coordinator.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let _initializing = owner_coordinator.lock();
+            owner_slot.get_or_init(|| {
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                build_runtime()
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let deadline = c2_config::ConnectDeadline::start(
+            c2_config::ConnectOptions::new().with_timeout(std::time::Duration::from_millis(100)),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let result = initialize_runtime(&slot, &coordinator, deadline);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "executor initializer wait escaped budget"
+        );
+        assert!(matches!(result, Err(IpcError::LocalCallRejected(error))
+            if error.details["stage"] == "ipc_runtime_wait"));
+        assert!(
+            slot.get().is_none(),
+            "deadline returned before the owner published its runtime"
+        );
+        owner.join().unwrap();
+        let recovered =
+            initialize_runtime(&slot, &coordinator, c2_config::ConnectDeadline::default()).unwrap();
+        assert_eq!(recovered.handle().block_on(async { 7 }), 7);
+    }
 
     /// Expose runtime pointer for cross-module test assertions.
     pub fn runtime_ptr() -> *const tokio::runtime::Runtime {

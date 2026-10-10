@@ -192,6 +192,92 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  unix-cross-user:
+    name: ${{ matrix.os }} / endpoint cross-user permissions
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: c-two
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: c-two/core -> target
+          key: endpoint-cross-user-${{ matrix.os }}
+
+      # Compile as the ordinary runner, then execute only the explicit
+      # two-UID fixture as root. Its parent/root are traversable 0755; the
+      # child connects as nobody, so denial proves the socket policy.
+      - name: Validate real cross-user endpoint rejection
+        working-directory: c-two
+        shell: bash
+        run: |
+          set -euxo pipefail
+          evidence=artifacts/local-endpoint-validation
+          mkdir -p "$evidence"
+          {
+            echo "c-two $(git rev-parse HEAD)"
+            echo "fastdb ${{ env.FASTDB_SOURCE_SHA }}"
+            echo "runner ${{ runner.os }}-${{ runner.arch }}"
+          } > "$evidence/source-pair.txt"
+          cargo test --locked --manifest-path core/Cargo.toml -p c2-local \
+            2>&1 | tee "$evidence/ordinary-local-tests.log"
+          cargo test --locked --manifest-path core/Cargo.toml -p c2-local --lib \
+            --no-run --message-format=json > "$evidence/build-messages.jsonl"
+          python - "$evidence" <<'PY'
+          import hashlib, json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          binaries = [entry["executable"] for line in (root / "build-messages.jsonl").read_text().splitlines()
+                      if (entry := json.loads(line)).get("reason") == "compiler-artifact"
+                      and entry.get("target", {}).get("name") == "c2_local"
+                      and entry.get("profile", {}).get("test") and entry.get("executable")]
+          if len(binaries) != 1:
+              raise SystemExit(f"expected one c2-local test binary, got {binaries}")
+          binary = pathlib.Path(binaries[0]).resolve()
+          (root / "test-binary.txt").write_text(str(binary) + "\n")
+          (root / "test-binary-sha256.txt").write_text(hashlib.sha256(binary.read_bytes()).hexdigest() + "\n")
+          PY
+          binary=$(cat "$evidence/test-binary.txt")
+          # The nobody child re-executes current_exe. The runner checkout
+          # can have private parents, so stage identical bytes under /tmp.
+          stage=$(mktemp -d /tmp/c2-cross-user.XXXXXXXX)
+          trap 'rm -rf "$stage"' EXIT
+          chmod 0755 "$stage"
+          cp "$binary" "$stage/c2-local-tests"
+          chmod 0755 "$stage/c2-local-tests"
+          python - "$binary" "$stage/c2-local-tests" <<'PY'
+          import hashlib, pathlib, sys
+          hashes = [hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in sys.argv[1:]]
+          if hashes[0] != hashes[1]:
+              raise SystemExit("staged test binary differs from the compiled binary")
+          print("STAGED_TEST_BINARY_SHA256", hashes[0])
+          PY
+          sudo -n env C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= "$stage/c2-local-tests" \
+            --ignored --exact unix_managed::tests::cross_user_cannot_connect_to_0600_socket_in_0755_directory \
+            --nocapture 2>&1 | tee "$evidence/cross-user-tests.log"
+          grep -F CROSS_USER_DENIED_VERIFIED "$evidence/cross-user-tests.log"
+
+      - name: Upload cross-user evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-endpoint-validation-${{ github.sha }}-cross-user-${{ matrix.os }}
+          path: c-two/artifacts/local-endpoint-validation/
+          if-no-files-found: error
+          retention-days: 14
+
   python-suite:
     name: python suite through the local runner
     runs-on: ubuntu-24.04
@@ -250,6 +336,8 @@ jobs:
           # The complete runner checks for WASM before collecting tests.
           # npm ci installs dependencies but does not build this artifact.
           npm run --prefix ../fastdb/ts/fastdb4ts build:wasm
+          npm run --prefix ../fastdb/ts/fastdb4ts build
+          npm test --prefix core/foundation/c2-mem-ffi/bindings/typescript
           git -C ../fastdb diff --exit-code -- ts/fastdb4ts/src/wasm
           {
             for name in EMSDK EMSDK_NODE EMSDK_PYTHON EM_CONFIG; do

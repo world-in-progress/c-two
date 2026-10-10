@@ -39,21 +39,6 @@ impl ResponseData {
         self.len() == 0
     }
 
-    /// Extract inline bytes directly. Panics on SHM/Handle variants.
-    ///
-    /// Prefer `into_bytes_with_pool()` when SHM responses are possible.
-    pub fn into_inline_bytes(self) -> Vec<u8> {
-        match self {
-            ResponseData::Inline(v) => v,
-            ResponseData::Shm { .. } => {
-                panic!("into_inline_bytes called on SHM response — use into_bytes_with_pool()")
-            }
-            ResponseData::Handle(_) => {
-                panic!("into_inline_bytes called on Handle response — use into_bytes_with_pool()")
-            }
-        }
-    }
-
     /// Materialize response into owned bytes, reading from SHM if needed.
     ///
     /// Used by the relay which must copy data before forwarding over HTTP.

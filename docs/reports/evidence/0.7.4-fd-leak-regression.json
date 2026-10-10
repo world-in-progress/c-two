@@ -1,0 +1,222 @@
+{
+  "kind": "c-two-fd-leak-regression",
+  "base_source_sha": "46480adf7424f794482fc761a2c8ec53dd28323b",
+  "fastdb_source_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "test_patch_sha256": "a8b019c53227eed5694ac59fd4a143ef9e3d7c1ed185c03f86b9d9f6e50a16eb",
+  "test_files": {
+    "core/transport/c2-ipc/src/pool.rs": "a7e944b9731ea6450f03565dc5be619576ebaeda3e78177047ba072913528c4c",
+    "sdk/python/tests/fixtures/idle_pool_client.py": "fdc2f61cadd5146c4bbda714872f480498abed9ac478d69eae3e406287a7721e",
+    "sdk/python/tests/fixtures/idle_pool_contract.py": "4214946487b1e44e4fd8744184344d3a5059453a64084495c74e2a86cec3a77e",
+    "sdk/python/tests/fixtures/idle_pool_server.py": "cbcd95a1be1e94d9ba4641edf1ed6d898acdf32f220d1eb374903da45086fb18",
+    "sdk/python/tests/integration/test_client_pool_idle_cleanup.py": "234fea217d6d730941364065631815a8fbc50d90dd166f29dd5f298962d0a379"
+  },
+  "production_code_unchanged": true,
+  "probe": {
+    "version": "0.7.4",
+    "python": "3.13.3 (main, Apr  9 2025, 03:47:57) [Clang 20.1.0 ]",
+    "native_sha256": "77b6375e1f9e444a951efdc2e2e01fa60053cc37312ceb1f84fca3ec3a516653",
+    "source_sha": "46480adf7424f794482fc761a2c8ec53dd28323b",
+    "phases": [
+      {
+        "phase": "main30",
+        "server_unix_fds": 5,
+        "client_unix_fds": 5
+      },
+      {
+        "phase": "idle62",
+        "server_unix_fds": 5,
+        "client_unix_fds": 5
+      },
+      {
+        "phase": "idle62",
+        "server_unix_fds": 5,
+        "client_unix_fds": 5
+      },
+      {
+        "phase": "bgidle70",
+        "server_unix_fds": 5,
+        "client_unix_fds": 5
+      },
+      {
+        "phase": "idle130",
+        "server_unix_fds": 5,
+        "client_unix_fds": 5
+      },
+      {
+        "phase": "main30",
+        "server_unix_fds": 5,
+        "client_unix_fds": 5
+      }
+    ],
+    "baseline_server_unix_fds": 4,
+    "after_client_exit_unix_fds": 4,
+    "exit_code": 0,
+    "verdict": "no growth",
+    "elapsed_seconds": 341.177,
+    "original_directory_unchanged": true,
+    "probe_sha256": "4505053770dbe2dd18c3bdaa72ab83cfe5467c1b3eb4e6c3bd487d0982219db1",
+    "build_log_sha256": "e63a5f5360e9c7d98e93498e524889d43681e4527134f903968d02808bb42131"
+  },
+  "original_probe_script_sha256": "2219175c9ad6199df86d679830f2bddd5d62005f320094d2f9ecc0091b8b25f5",
+  "checks": [
+    {
+      "name": "green-rust",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-ipc",
+        "--lib",
+        "pool::tests::real_",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 12.687,
+      "log_sha256": "46bc7378319d0d6fa2178bfcb021626aeeaacf5d1ea8782ae6a0e52a9052f19c"
+    },
+    {
+      "name": "green-ipc-full",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-ipc",
+        "--lib",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 13.018,
+      "log_sha256": "e5450a4f4882a28f30d7de790ee5bf5259fcaa4a942c6bfeeab3e71e92cd0f87"
+    },
+    {
+      "name": "format",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "--all",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.993,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "diff-check",
+      "argv": [
+        "git",
+        "diff",
+        "--cached",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.038,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "green-sdk",
+      "argv": [
+        "/tmp/c2-074-venv/bin/python",
+        "-m",
+        "pytest",
+        "sdk/python/tests/integration/test_client_pool_idle_cleanup.py",
+        "-q",
+        "--timeout=240"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 127.266,
+      "log_sha256": "f0b578c7021f806494e4b792842c3e8676405e96e798ff147443e16545dc6e74"
+    },
+    {
+      "name": "red-rust",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-ipc",
+        "--lib",
+        "pool::tests::real_",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 101,
+      "elapsed_seconds": 38.241,
+      "log_sha256": "750c5a381a5d1a2a137268006d96673d7f1d21747f874437e2d2f8f55160af59"
+    },
+    {
+      "name": "red-sdk-build",
+      "argv": [
+        "uv",
+        "sync",
+        "--frozen",
+        "--inexact",
+        "--python",
+        "3.13",
+        "--reinstall-package",
+        "c-two"
+      ],
+      "exit_code": 1,
+      "elapsed_seconds": 60.465,
+      "log_sha256": "bdcd94198c69e7fb1cd1f299c863234beaea51cbb2be8a65ea74f0aa530516f9"
+    },
+    {
+      "name": "red-sdk-build-with-sdk-headers",
+      "argv": [
+        "uv",
+        "sync",
+        "--frozen",
+        "--inexact",
+        "--python",
+        "3.13",
+        "--reinstall-package",
+        "c-two"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 59.565,
+      "log_sha256": "317543f2ce244f278969dcbcf4e658ada178e8ddc10de21d12301e37013575c0"
+    },
+    {
+      "name": "red-sdk",
+      "argv": [
+        "/tmp/c2-074-fd-regression/venv-red/bin/python",
+        "-m",
+        "pytest",
+        "sdk/python/tests/integration/test_client_pool_idle_cleanup.py",
+        "-q",
+        "--timeout=30"
+      ],
+      "exit_code": 1,
+      "elapsed_seconds": 73.757,
+      "log_sha256": "d4b704442ec5cd60a9341b354a120f460311b59af0da43ecde033d56a6b6e09d"
+    }
+  ],
+  "negative_control": {
+    "source": "0.7.4 with close_retired_work closure skipped and IpcClient Drop emptied",
+    "rust_expected_exit": 101,
+    "rust_failures": 4,
+    "rust_reason": "timed out waiting for actual peer EOF",
+    "sdk_expected_exit": 1,
+    "sdk_reason": "expected5 Unix socket FDs, observed6 after first62-second idle",
+    "green_native_sha256": "77b6375e1f9e444a951efdc2e2e01fa60053cc37312ceb1f84fca3ec3a516653",
+    "red_native_sha256": "6341efab3de98484d58142c0604ba2b6d327c5084f86ff804dd8c390986bb156",
+    "mutation_sha256": "66b8859f7f7c26ca6f769b386e89b0ec9004046b1e5d2e152633132cc7c8f56a"
+  },
+  "source_review": {
+    "model": "gpt-6-astra",
+    "effort": "max",
+    "patch_sha256": "a8b019c53227eed5694ac59fd4a143ef9e3d7c1ed185c03f86b9d9f6e50a16eb",
+    "findings": [],
+    "scope": "source and fixture semantics; runtime/platform evidence audited separately"
+  },
+  "platform_scope": "Local macOS arm64/Python3.13; SDK FD counting on Linux/macOS. Same Rust EOF tests are collected in both Windows full core gates. Hosted test execution is recorded by the PR workflow, not inferred from this local report.",
+  "raw_evidence_directory": "/tmp/c2-074-fd-regression"
+}

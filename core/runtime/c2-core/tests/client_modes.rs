@@ -758,6 +758,27 @@ fn relay_aware_rejects_a_fallback_to_the_same_failed_local_candidate() {
         panic!("same-path fallback denial must be semantic");
     };
     assert_eq!(error.code, ErrorCode::FallbackDenied);
+    assert_eq!(
+        error
+            .details
+            .get("direct_ipc_failure_kind")
+            .map(String::as_str),
+        Some("io:NotFound")
+    );
+    assert_eq!(
+        error
+            .details
+            .get("direct_ipc_failure_phase")
+            .map(String::as_str),
+        Some("pre_dispatch")
+    );
+    assert!(
+        error
+            .details
+            .get("direct_ipc_failure")
+            .is_some_and(|cause| !cause.is_empty()),
+        "fallback denial must retain the failed IPC acquisition cause"
+    );
     assert_eq!(resolve_count.load(Ordering::SeqCst), 2);
     assert_eq!(runtime.path_counters(), Default::default());
 }

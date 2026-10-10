@@ -852,6 +852,7 @@ impl Drop for RelayServer {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use super::{
         Command, RelayControlError, RelayServer, should_retry_register_attestation_connect,
@@ -867,6 +868,7 @@ mod tests {
         start_live_server_with_identity_and_contracts, start_live_server_with_routes,
     };
     use crate::relay::types::PeerSnapshot;
+    use c2_ipc::{ClientIpcConfig, IpcClient};
 
     static NEXT_IPC_SUFFIX: AtomicU64 = AtomicU64::new(0);
 
@@ -1557,5 +1559,368 @@ mod tests {
             other => panic!("expected RouteWithdraw, got {other:?}"),
         }
         shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn production_idle_sweeper_preserves_owner_and_reconnects_shared_endpoint() {
+        use crate::relay::conn_pool::CachedClient;
+        use crate::relay::test_support::NoopDisseminator;
+        use c2_config::LocalEndpointContext;
+        use futures::FutureExt;
+        use std::sync::atomic::AtomicUsize;
+
+        struct Callback(Arc<AtomicUsize>);
+
+        impl c2_server::CrmCallback for Callback {
+            fn invoke(
+                &self,
+                _route_name: &str,
+                _method_idx: u16,
+                request: c2_server::RequestData,
+                _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
+                let mut request = c2_server::RequestLease::new(request);
+                assert!(request.copy_bytes().unwrap().is_empty());
+                request.release().unwrap();
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(c2_server::ResponseMeta::Inline(b"ok".to_vec()))
+            }
+        }
+
+        const CLEANUP: Duration = Duration::from_secs(10);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = format!(
+            "idle_sweeper_{}_{}_{:x}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let address = format!("ipc://{id}");
+        #[cfg(unix)]
+        let endpoint_root = {
+            use std::os::unix::fs::DirBuilderExt;
+            let root = std::path::Path::new("/tmp").join(&id);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            root
+        };
+        #[cfg(unix)]
+        let endpoint_context = LocalEndpointContext::with_unix_root(&endpoint_root).unwrap();
+        #[cfg(windows)]
+        let endpoint_context = LocalEndpointContext::default_for_platform().unwrap();
+
+        let server_id = format!("{id}-owner");
+        let instance_id = format!("{id}-instance");
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let server = Arc::new(
+            c2_server::Server::new_with_identity_and_endpoint(
+                endpoint_context.endpoint(&address).unwrap(),
+                c2_server::ServerIpcConfig::default(),
+                c2_server::ServerIdentity {
+                    server_id: server_id.clone(),
+                    server_instance_id: instance_id.clone(),
+                },
+            )
+            .unwrap(),
+        );
+        let manager_route = server
+            .build_route(
+                c2_server::RouteBuildSpec {
+                    name: "manager".into(),
+                    crm_ns: "test.echo".into(),
+                    crm_name: "Echo".into(),
+                    crm_ver: "0.1.0".into(),
+                    abi_hash: TEST_ABI_HASH.into(),
+                    signature_hash: TEST_SIGNATURE_HASH.into(),
+                    method_names: vec!["ping".into()],
+                    access_map: std::collections::HashMap::new(),
+                    concurrency_mode: c2_server::ConcurrencyMode::ReadParallel,
+                    limits: c2_server::SchedulerLimits::default(),
+                },
+                Arc::new(Callback(callback_count.clone())),
+            )
+            .unwrap();
+        let reservation = server.reserve_route(manager_route).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+        let running = server.clone();
+        let server_task = tokio::spawn(async move { running.run().await });
+        let state = Arc::new(RelayState::new_with_context(
+            Arc::new(RelayConfig {
+                relay_id: id.clone(),
+                idle_timeout_secs: 1,
+                ..RelayConfig::default()
+            }),
+            Arc::new(NoopDisseminator),
+            endpoint_context.clone(),
+        ));
+        let clients = state.clients.clone();
+        let mut observer = tokio::spawn(async move { clients.run().await });
+        let sweeper_state = state.clone();
+        let mut sweeper = tokio::spawn(async move {
+            RelayServer::idle_sweeper(sweeper_state, 1).await;
+        });
+
+        let body = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(
+                CLEANUP,
+                server.wait_until_responsive(Duration::from_secs(2)),
+            )
+            .await
+            .expect("upstream readiness timed out")
+            .unwrap();
+
+            // The first route is attested and committed before the data-plane
+            // connection is acquired. Registering builder afterward must use
+            // that same endpoint connection and acquire its newly published route.
+            let mut attestor = IpcClient::with_endpoint(
+                endpoint_context.endpoint(&address).unwrap(),
+                ClientIpcConfig::default(),
+            );
+            attestor.connect().await.unwrap();
+            let manager_contract = attestor.route_contract("manager").unwrap();
+            let manager_binding = attestor.acquire_route(&manager_contract).await.unwrap();
+            let manager = match test_commit_registration!(
+                &state,
+                "manager".into(),
+                server_id.clone(),
+                instance_id.clone(),
+                address.clone(),
+                "test.echo".into(),
+                "Echo".into(),
+                "0.1.0".into(),
+                TEST_ABI_HASH.to_string(),
+                TEST_SIGNATURE_HASH.to_string(),
+                manager_binding.max_payload_size(),
+                manager_binding.route_uid().to_string(),
+                manager_binding.route_revision(),
+                None,
+            ) {
+                RegisterCommitResult::Registered { entry } => entry,
+                _ => panic!("live manager registration failed"),
+            };
+            attestor.close().await;
+
+            let (manager_lease, _, manager_binding) = state
+                .acquire_upstream_for_route(&manager)
+                .await
+                .unwrap_or_else(|_| panic!("live manager route acquisition failed"));
+            let manager_client = manager_lease.client();
+            manager_client
+                .call_bound(&manager_binding, "ping", &[])
+                .await
+                .unwrap();
+            let builder_route = server
+                .build_route(
+                    c2_server::RouteBuildSpec {
+                        name: "builder".into(),
+                        crm_ns: "test.echo".into(),
+                        crm_name: "Echo".into(),
+                        crm_ver: "0.1.0".into(),
+                        abi_hash: TEST_ABI_HASH.into(),
+                        signature_hash: TEST_SIGNATURE_HASH.into(),
+                        method_names: vec!["ping".into()],
+                        access_map: std::collections::HashMap::new(),
+                        concurrency_mode: c2_server::ConcurrencyMode::ReadParallel,
+                        limits: c2_server::SchedulerLimits::default(),
+                    },
+                    Arc::new(Callback(callback_count.clone())),
+                )
+                .unwrap();
+            let reservation = server.reserve_route(builder_route).await.unwrap();
+            server.commit_reserved_route(reservation).await.unwrap();
+            // The authored contract is known independently of watch delivery.
+            // Live acquisition must discover the newly published route even
+            // when the connection's handshake/directory has not caught up.
+            let builder_contract = c2_contract::ExpectedRouteContract {
+                route_name: "builder".into(),
+                ..manager_contract.clone()
+            };
+            let builder_binding = manager_client
+                .acquire_route(&builder_contract)
+                .await
+                .unwrap();
+            let builder = match test_commit_registration!(
+                &state,
+                "builder".into(),
+                server_id.clone(),
+                instance_id.clone(),
+                address.clone(),
+                "test.echo".into(),
+                "Echo".into(),
+                "0.1.0".into(),
+                TEST_ABI_HASH.to_string(),
+                TEST_SIGNATURE_HASH.to_string(),
+                builder_binding.max_payload_size(),
+                builder_binding.route_uid().to_string(),
+                builder_binding.route_revision(),
+                None,
+            ) {
+                RegisterCommitResult::Registered { entry } => entry,
+                _ => panic!("live builder registration failed"),
+            };
+            drop(manager_lease);
+
+            let (builder_lease, _, builder_binding) = state
+                .acquire_upstream_for_route(&builder)
+                .await
+                .unwrap_or_else(|_| panic!("live builder route acquisition failed"));
+            let old_client_id = Arc::as_ptr(&manager_client) as usize;
+            assert!(Arc::ptr_eq(&manager_client, &builder_lease.client()));
+            builder_lease
+                .client()
+                .call_bound(&builder_binding, "ping", &[])
+                .await
+                .unwrap();
+            assert_eq!(callback_count.load(Ordering::SeqCst), 2);
+            // Successful acquisition renews the owner lease epoch. Capture
+            // after that renewal so this fence observes only idle eviction.
+            let owner_token = state.owner_token("builder").expect("builder owner token");
+            assert!(state.matches_owner_token("builder", &owner_token));
+
+            // Keep the request lease active beyond a real production tick.
+            // The elapsed-time condition is bounded and confirms that the
+            // sweeper leaves an in-use endpoint connected until release.
+            let active_since = Instant::now();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    if active_since.elapsed() >= Duration::from_secs(6) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("active lease observation timed out");
+            assert!(matches!(
+                state.connection_lookup("builder"),
+                CachedClient::Ready { .. }
+            ));
+            assert!(manager_client.is_connected());
+            drop(builder_lease);
+
+            // The production sweeper ticks immediately and then every 5s for
+            // this timeout. Wait on pool state with a hard upper bound; do not
+            // synthesize an eviction or control Tokio's clock.
+            tokio::time::timeout(Duration::from_secs(12), async {
+                loop {
+                    if matches!(
+                        state.connection_lookup("builder"),
+                        CachedClient::Evicted { .. }
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("production idle sweeper did not evict the idle data client");
+            assert!(!manager_client.is_connected());
+            assert!(state.matches_owner_token("builder", &owner_token));
+            assert_eq!(state.resolve("manager").len(), 1);
+            assert_eq!(state.resolve("builder").len(), 1);
+            let routes = state.list_routes();
+            for route in [&manager, &builder] {
+                let retained = routes
+                    .iter()
+                    .find(|entry| entry.name == route.name)
+                    .unwrap();
+                assert_eq!(retained.server_id.as_deref(), Some(server_id.as_str()));
+                assert_eq!(
+                    retained.server_instance_id.as_deref(),
+                    Some(instance_id.as_str())
+                );
+                assert_eq!(retained.route_uid, route.route_uid);
+                assert_eq!(retained.route_revision, route.route_revision);
+                assert_eq!(retained.crm_ns, "test.echo");
+                assert_eq!(retained.crm_name, "Echo");
+                assert_eq!(retained.crm_ver, "0.1.0");
+                assert_eq!(retained.abi_hash, TEST_ABI_HASH);
+                assert_eq!(retained.signature_hash, TEST_SIGNATURE_HASH);
+            }
+
+            let mut call_tasks = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let state = state.clone();
+                let expected = builder.clone();
+                call_tasks.spawn(async move {
+                    let (lease, _, binding) =
+                        tokio::time::timeout(CLEANUP, state.acquire_upstream_for_route(&expected))
+                            .await
+                            .map_err(|_| "concurrent route acquisition timed out")?
+                            .map_err(|_| "concurrent route acquisition failed")?;
+                    let client = lease.client();
+                    let client_id = Arc::as_ptr(&client) as usize;
+                    tokio::time::timeout(CLEANUP, client.call_bound(&binding, "ping", &[]))
+                        .await
+                        .map_err(|_| "concurrent upstream call timed out")?
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>(client_id)
+                });
+            }
+            let mut reconnected_client_ids = Vec::new();
+            while let Some(joined) = call_tasks.join_next().await {
+                match joined {
+                    Ok(Ok(client_id)) => reconnected_client_ids.push(client_id),
+                    Ok(Err(error)) => {
+                        call_tasks.abort_all();
+                        while call_tasks.join_next().await.is_some() {}
+                        panic!("concurrent reconnect/call failed: {error}");
+                    }
+                    Err(error) => {
+                        call_tasks.abort_all();
+                        while call_tasks.join_next().await.is_some() {}
+                        panic!("concurrent reconnect/call task failed: {error}");
+                    }
+                }
+            }
+            assert_eq!(reconnected_client_ids.len(), 8);
+            let reconnected_client_id = reconnected_client_ids[0];
+            assert_ne!(reconnected_client_id, old_client_id);
+            assert!(
+                reconnected_client_ids
+                    .iter()
+                    .all(|client_id| *client_id == reconnected_client_id)
+            );
+            assert_eq!(callback_count.load(Ordering::SeqCst), 10);
+        })
+        .catch_unwind()
+        .await;
+
+        // Always release callback owners and observe every runtime task before
+        // removing this test's private endpoint root.
+        let clients_done = tokio::time::timeout(CLEANUP, state.clients.shutdown()).await;
+        sweeper.abort();
+        let sweeper_done = tokio::time::timeout(CLEANUP, &mut sweeper).await;
+        let observer_done = tokio::time::timeout(CLEANUP, &mut observer).await;
+        let shutdown_done =
+            tokio::time::timeout(CLEANUP, server.shutdown_and_wait(Duration::from_secs(2))).await;
+        let server_done = tokio::time::timeout(CLEANUP, server_task).await;
+        #[cfg(unix)]
+        if clients_done.is_ok()
+            && matches!(&sweeper_done, Ok(Err(error)) if error.is_cancelled())
+            && matches!(&observer_done, Ok(Ok(())))
+            && matches!(&shutdown_done, Ok(Ok(_)))
+            && matches!(&server_done, Ok(Ok(Ok(_))))
+        {
+            std::fs::remove_dir_all(&endpoint_root).unwrap();
+        }
+        clients_done.expect("client lifecycle cleanup timed out");
+        assert!(matches!(sweeper_done, Ok(Err(error)) if error.is_cancelled()));
+        observer_done
+            .expect("client lifecycle observer timed out")
+            .unwrap();
+        shutdown_done.expect("server shutdown timed out").unwrap();
+        server_done
+            .expect("server task timed out")
+            .unwrap()
+            .unwrap();
+        if let Err(panic) = body {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

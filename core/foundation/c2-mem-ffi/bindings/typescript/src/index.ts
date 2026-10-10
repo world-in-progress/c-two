@@ -220,7 +220,7 @@ export type C2NodeIpcConnector = C2NodeIpcConnect & {
 
 export interface C2NodeIpcSocket {
   readonly destroyed: boolean;
-  write(buffer: Uint8Array, callback?: () => void): boolean;
+  write(buffer: Uint8Array, callback?: (error?: Error | null) => void): boolean;
   end(): C2NodeIpcSocket;
   destroy(error?: Error): C2NodeIpcSocket;
   on(event: "data", listener: (chunk: Uint8Array) => void): C2NodeIpcSocket;
@@ -976,7 +976,7 @@ class NodeIpcConnection implements C2NodeIpcConnection {
       this.socket.once("error", onError);
       this.socket.once("close", onClose);
       try {
-        this.socket.write(bytes, () => finish());
+        this.socket.write(bytes, (error) => finish(error ?? undefined));
       } catch (error) {
         finish(error);
       }

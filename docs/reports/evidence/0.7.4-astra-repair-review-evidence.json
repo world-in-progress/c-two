@@ -1,0 +1,109 @@
+{
+  "reviewed_sha": "4e9a238e3d6563c20393619342e2c1be0fc54b29",
+  "unix_fix_sha": "aa96f151fa97728ff0e634426a52d921eeeaf661",
+  "initial_review_sha": "e6dcd06b0e519104628b3a2a71de2550c2dcb084",
+  "review_scope": "F1/F2/F3 repairs and newly introduced cleanup/concurrency behavior only",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "source_files": [
+    {
+      "path": "core/transport/c2-ipc/src/pool.rs",
+      "sha256": "bd9af7f580f933038698c50bf07e9295447bf4712098c04368e4aacb6761e272",
+      "working_tree_matches_fixed_source": true
+    },
+    {
+      "path": "core/transport/c2-ipc/tests/connect_timeout.rs",
+      "sha256": "c84ace1ceb98e6ed79124edad5bfed80e030389186d36ea74ff2bd76524913e9",
+      "working_tree_matches_fixed_source": true
+    },
+    {
+      "path": "core/transport/c2-local/src/unix_common.rs",
+      "sha256": "7175bbbb6f14615a11d01066ed50ea6fe6873170e86be102b219879f7832032a",
+      "working_tree_matches_fixed_source": true
+    },
+    {
+      "path": "core/transport/c2-local/src/unix_managed.rs",
+      "sha256": "de2ea177f292fbcb223cecc350dd4bf990698fd84eadee1f79079e4e64d1be70",
+      "working_tree_matches_fixed_source": true
+    },
+    {
+      "path": "core/transport/c2-local/src/unix_managed/tests.rs",
+      "sha256": "6a9dde2c97893f6e4670daad21a20d63335f88acab4be545d41ce0cfbc1bb466",
+      "working_tree_matches_fixed_source": true
+    }
+  ],
+  "repair_diff_sha256": "fc683e44d68939b85f6d39a9ec1c08788ba7940f5368fc47f8fa47b71fbef802",
+  "initial_report_unchanged": {
+    "path": "/tmp/c2-074-astra-final-review.md",
+    "sha256": "e6766950de200bb2b0afc196f1bec05f857c3a673eb1e4cbf50517f13f136b85"
+  },
+  "logs": [
+    {
+      "path": "/tmp/c2-074-astra-acl-repair-review.log",
+      "sha256": "f19687a8fe9634f97a5f09b97b94be232f83d22bea5b47076e93c4f7fc6b6dba"
+    },
+    {
+      "path": "/tmp/c2-074-astra-lease-repair-review.log",
+      "sha256": "4a9424cb613ec0e810be1cce06646aa7c1367ea48a59f49f550a4b680a52b763"
+    },
+    {
+      "path": "/tmp/c2-074-astra-prewarm-repair-review.log",
+      "sha256": "f1b0c20f6de7f9054fd11b92b75ca449cf2b274280d014cf66cae13223d58c8f"
+    },
+    {
+      "path": "/tmp/c2-074-astra-unix-host.log",
+      "sha256": "dd4b65d53f8ae8d1fadbf2f1f15c909787ca1473814112a8521f42f56ebbd46b"
+    },
+    {
+      "path": "/tmp/c2-074-prewarm-host-tests.log",
+      "sha256": "29fd8e183e62fe9a5e9f4e86962149dc559a7fcaee1b27dec4fa8c54a8aa35db"
+    },
+    {
+      "path": "/tmp/c2-074-astra-prewarm-probe-fixed-r2.log",
+      "sha256": "c20beb13bab47ef4578afce165c557541fa5972b7e7da6013243dfa1a2631bd7"
+    }
+  ],
+  "original_probes_unchanged": true,
+  "probe_dependency_versions": "Core lockfile; only extra package c2-astra-074-probe 0.0.0",
+  "independent_runs": [
+    {
+      "kind": "F1 original ACL probe",
+      "command": "CARGO_TARGET_DIR=/tmp/c2-074-astra-probe-target CARGO_BUILD_JOBS=2 cargo run --offline --locked --manifest-path /tmp/c2-074-astra-probe/Cargo.toml --bin acl",
+      "log": "/tmp/c2-074-astra-acl-repair-review.log",
+      "observed": "0755 ACL root rejected with owner/mode/granted-mutations diagnostic",
+      "exit_code": 0
+    },
+    {
+      "kind": "F3 live duplicate regression",
+      "command": "CARGO_TARGET_DIR=/tmp/c2-074-astra-probe-target CARGO_BUILD_JOBS=2 cargo test --offline --locked --manifest-path core/Cargo.toml -p c2-local --lib unix_managed::tests::failed_socket_initialization_rebinds_with_live_lease_duplicate -- --exact --nocapture",
+      "log": "/tmp/c2-074-astra-lease-repair-review.log",
+      "observed": "1 passed, 0 failed, duplicate remains alive during rebind",
+      "exit_code": 0
+    },
+    {
+      "kind": "F2 unchanged prewarm probe",
+      "command": "CARGO_TARGET_DIR=/tmp/c2-074-astra-probe-target CARGO_BUILD_JOBS=2 cargo run --offline --locked --manifest-path /tmp/c2-074-astra-probe/Cargo.toml --bin c2-astra-074-probe",
+      "log": "/tmp/c2-074-astra-prewarm-repair-review.log",
+      "observed": "used_bytes=0 after settlement; recovered connect succeeds before close_all; no budget rejection",
+      "exit_code": 0
+    }
+  ],
+  "host_scope_observed": {
+    "c2_local": "93 lib + 9 endpoint_context + 12 lifetime tests passed; 1 root-only ignore",
+    "c2_ipc_test_support": "195 lib + 8 connect_timeout tests passed"
+  },
+  "verdict": "F1/F2/F3 closed at reviewed SHA; no new blocking findings in repair diff; overall release acceptance pending final whole-suite/hosted evidence",
+  "pending_environment_acceptance": [
+    "Linux/macOS root cross-user fixtures on final source",
+    "Windows 2022/2025 all-scope and non-admin consumers on final source",
+    "full Python/3.10 and exact 18/12 portable matrices on final source",
+    "final artifact/source/runtime/header identity receipts"
+  ],
+  "report": {
+    "path": "/tmp/c2-074-astra-repair-review.md",
+    "sha256": "325637af73ab66615acb35f70a80fdc9e49c17e5fa9da4193b9635921fd1bb32"
+  },
+  "abi_primary_reference": {
+    "path": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/acl.h",
+    "validated": "ACL mutation masks, allow/deny tags, first/next entry constants, pointer types and 64-bit permission mask"
+  }
+}

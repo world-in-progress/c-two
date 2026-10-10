@@ -33,16 +33,59 @@ fn encode_segment(s: &str) -> String {
 // ── Shared tokio runtime ────────────────────────────────────────────────
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static RUNTIME_INITIALIZATION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("c2-http-io")
-            .enable_all()
-            .build()
-            .expect("failed to create c2-http runtime")
-    })
+    runtime_with_deadline(c2_config::ConnectDeadline::default())
+        .expect("failed to create c2-http runtime")
+}
+
+pub(crate) fn runtime_with_deadline(
+    deadline: c2_config::ConnectDeadline,
+) -> Result<&'static tokio::runtime::Runtime, HttpError> {
+    runtime_cell_with_deadline(&RUNTIME, &RUNTIME_INITIALIZATION, deadline)
+}
+
+fn runtime_cell_with_deadline<'a>(
+    cell: &'a OnceLock<tokio::runtime::Runtime>,
+    initialization: &parking_lot::Mutex<()>,
+    deadline: c2_config::ConnectDeadline,
+) -> Result<&'a tokio::runtime::Runtime, HttpError> {
+    super::connect_deadline::check(deadline, "http_runtime_wait")?;
+    if let Some(runtime) = cell.get() {
+        return Ok(runtime);
+    }
+    // Every initializer, including ordinary calls with no caller deadline,
+    // uses this coordinator. OnceLock::get never waits on initialization.
+    let _initialization =
+        super::connect_deadline::lock(initialization, deadline, "http_runtime_wait")?;
+    if let Some(runtime) = cell.get() {
+        return Ok(runtime);
+    }
+    super::connect_deadline::check(deadline, "http_runtime_start")?;
+    let constructed = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("c2-http-io")
+        .enable_all()
+        .build();
+    if let Err(error) = super::connect_deadline::check(deadline, "http_runtime_start") {
+        // No work has been submitted. Dispose without publishing and without
+        // blocking a caller that may itself be running in a Tokio context.
+        if let Ok(runtime) = constructed {
+            runtime.shutdown_background();
+        }
+        return Err(error);
+    }
+    let runtime = constructed.map_err(|error| {
+        HttpError::Transport(format!("failed to create c2-http runtime: {error}"))
+    })?;
+    // The coordinator is the sole publication authority for this cell.
+    if let Err(unpublished) = cell.set(runtime) {
+        unpublished.shutdown_background();
+    }
+    Ok(cell
+        .get()
+        .expect("runtime initializer must publish before returning"))
 }
 
 // ── Error type ──────────────────────────────────────────────────────────
@@ -345,6 +388,55 @@ fn add_route_token_headers(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connect_runtime_initialization_wait_obeys_deadline_and_recovers() {
+        let shared = std::sync::Arc::new((
+            std::sync::OnceLock::<tokio::runtime::Runtime>::new(),
+            parking_lot::Mutex::new(()),
+        ));
+        let held = shared.1.lock();
+        let start = std::time::Instant::now();
+        let deadline = c2_config::ConnectDeadline::start(
+            c2_config::ConnectOptions::new().with_timeout(std::time::Duration::from_millis(100)),
+        )
+        .unwrap();
+        let waiter_shared = std::sync::Arc::clone(&shared);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let result = runtime_cell_with_deadline(&waiter_shared.0, &waiter_shared.1, deadline)
+                .map(|_| ());
+            finished_tx.send(result).unwrap();
+        });
+        let result = finished_rx.recv_timeout(std::time::Duration::from_millis(250));
+        let no_publish = shared.0.get().is_none();
+        std::thread::sleep(std::time::Duration::from_millis(300).saturating_sub(start.elapsed()));
+        drop(held);
+        waiter.join().unwrap();
+        let error = result
+            .expect("connect must finish before releasing initialization coordinator")
+            .unwrap_err();
+        let HttpError::LocalCallRejected(error) = error else {
+            panic!("canonical error required")
+        };
+        assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
+        assert_eq!(error.details["stage"], "http_runtime_wait");
+        assert!(no_publish);
+        let runtime =
+            runtime_cell_with_deadline(&shared.0, &shared.1, c2_config::ConnectDeadline::default())
+                .unwrap();
+        assert!(std::ptr::eq(runtime, shared.0.get().unwrap()));
+        // An initialized runtime never waits for the coordinator again.
+        let _held = shared.1.lock();
+        let fast_deadline = c2_config::ConnectDeadline::start(
+            c2_config::ConnectOptions::new().with_timeout(std::time::Duration::from_millis(100)),
+        )
+        .unwrap();
+        assert!(std::ptr::eq(
+            runtime,
+            runtime_cell_with_deadline(&shared.0, &shared.1, fast_deadline).unwrap()
+        ));
+    }
+
     use super::*;
 
     #[tokio::test]

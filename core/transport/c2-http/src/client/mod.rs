@@ -4,6 +4,7 @@
 //! server, and [`HttpClientPool`] for reference-counted connection pooling.
 
 mod call_control;
+mod connect_deadline;
 mod control;
 mod http_client;
 mod pool;
