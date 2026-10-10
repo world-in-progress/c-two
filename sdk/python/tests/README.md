@@ -1,179 +1,83 @@
-# Tests & Benchmarks
+# Python tests and benchmarks
 
-## Running Tests
-
-Relay integration tests start standalone `c3 relay` subprocesses. From a
-source checkout, build and link the local `c3` binary before running those
-tests:
+Run commands from the repository root. Follow the [development setup](../../../docs/development.md) for the matching FastDB Core SDK, sibling source fixtures, Node/Emscripten and Python 3.10 prerequisites. Build the Python native extension and standalone C3 before relay tests:
 
 ```bash
-python tools/dev/c3_tool.py --build --link
+FASTDB_PAYLOAD_LINK_MODE=source uv sync
+FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link
 ```
 
+The SDK does not embed a relay. Tests start their own `c3 relay` processes using the available binary.
+
+## Run the suite
+
+On Linux/macOS, run independent cases with four pytest workers:
+
 ```bash
-# Full test suite (855 tests, ~80s on Apple Silicon)
-uv run pytest sdk/python/tests -q
+C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests -q -n 4 --timeout=30
+```
 
-# Focused runtime-session / relay / direct IPC regressions
-C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
-  sdk/python/tests/unit/test_runtime_session.py \
-  sdk/python/tests/unit/test_name_collision.py \
-  sdk/python/tests/unit/test_serve.py \
-  sdk/python/tests/unit/test_relay_graceful_shutdown.py \
-  sdk/python/tests/integration/test_registry.py \
-  sdk/python/tests/integration/test_http_relay.py \
-  sdk/python/tests/integration/test_p0_fixes.py \
-  sdk/python/tests/integration/test_direct_ipc_control.py \
-  sdk/python/tests/integration/test_zero_copy_ipc.py \
-  sdk/python/tests/integration/test_remote_scheduler_config.py \
-  -q --timeout=30 -rs
+The shared fixtures isolate IPC names by run and worker and lock relay startup only through readiness. Windows uses the serial Python harness; omit `-n 4`. In PowerShell, clear inherited relay discovery with `$env:C2_RELAY_ANCHOR_ADDRESS = ''` before running the command.
 
-# Make the Python 3.10 minimum-compatibility syntax check execute instead of
-# skipping. This matters for downstream stacks such as Taichi that remain
-# pinned to Python 3.10.
+The default timeout is 30 seconds per test. Tests that require longer waits declare their own timeout: the real idle-cleanup regression uses 240 seconds and waits through two actual 62-second idle periods. Portable interoperability gates use 300 seconds. Do not shorten those waits to test-only pool settings.
+
+Run focused regressions after a relevant change:
+
+```bash
+C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest \
+  sdk/python/tests/unit/test_connect_timeout.py \
+  sdk/python/tests/integration/test_connect_timeout.py \
+  sdk/python/tests/integration/test_client_pool_idle_cleanup.py \
+  sdk/python/tests/integration/test_typescript_persistent_ipc.py \
+  -q --timeout=300
+
+# One existing test file
+C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/unit/test_wire.py -q --timeout=30
+
+# Ensure the minimum-supported interpreter check runs.
 uv python install 3.10
-uv python find 3.10
-uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
-
-# Optional broader Python 3.10 smoke test. Use a separate uv environment so
-# `uv run --python 3.10` does not replace the default development `.venv`.
-UV_PROJECT_ENVIRONMENT=.venv-py310 uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
-
-# Single test file
-uv run pytest sdk/python/tests/unit/test_wire.py -q
-
-# Single test function
-uv run pytest sdk/python/tests/unit/test_crm_descriptor.py::test_top_level_custom_transferable_api_is_removed -q
-
-# Run with verbose output
-uv run pytest sdk/python/tests -v --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest \
+  sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python \
+  -q --timeout=30 -rs
 ```
 
-All tests use a **30-second per-test timeout**. Verified on Python 3.14t
-(free-threaded). Python 3.10 remains a supported compatibility floor; do not
-treat a skipped `test_python_examples_compile_on_minimum_supported_python` as
-equivalent to a passing 3.10 check.
+Python 3.10 is the supported minimum; a skipped interpreter check is not a passing compatibility result. For a broader 3.10 run, use a separate environment as described in the development guide.
 
----
+## Coverage
 
-## Unit Tests (`sdk/python/tests/unit/`)
+| Location | Behavior |
+| --- | --- |
+| `unit/test_runtime_session.py`, `unit/test_runtime_session_lifecycle.py` | Native registry authority and lifecycle outcomes |
+| `unit/test_call_options.py`, `integration/test_connect_timeout.py` | Call options and connection-acquisition deadlines |
+| `integration/test_client_pool_idle_cleanup.py` | Two real processes, default idle grace and stable Unix socket counts |
+| `integration/test_typescript_persistent_ipc.py` | Generated TypeScript bindings across route changes and reconnects |
+| `integration/test_memory_capacity_errors.py`, `integration/test_memory_budget_lifetime.py` | Capacity errors, accounting and retained input/response lifetimes |
+| `integration/test_owner_bound_lifecycle.py` | Owner capability and shutdown barriers |
+| `integration/test_http_relay.py`, `integration/test_relay_mesh.py` | External relay and mesh discovery/forwarding |
+| `integration/test_portable_payload_cross_language.py`, `integration/test_portable_payload_matrix.py` | Rust/Python portable payloads and the exact 18-row matrix |
+| `integration/test_typescript_real_calls.py` | Generated TypeScript calls and payload lifetimes |
 
-### CRM Core
+The SDK socket-count regression runs on Unix. Rust pool tests use actual local streams and peer EOF on Unix and Windows Named Pipes; Windows evidence comes from the Windows Native workflow. `protocol_address` currently supplies only unique logical `ipc://` addresses. Same-process and HTTP cases have dedicated fixtures.
 
-| File | Description |
-|------|-------------|
-| `test_crm_decorator.py` | `@cc.crm()` decorator, namespace/version validation, method registration |
-| `test_crm_template.py` | CRM template generation from CRM interface classes |
-| `test_encoding.py` | Wire protocol encoding/decoding, message serialization |
-| `test_error.py` | `CCError` hierarchy — serialization/deserialization across wire |
-| `test_payload_abi_ref.py` | Payload ABI refs and internal payload binding validation |
-| `test_shutdown_decorator.py` | `@cc.on_shutdown` CRM lifecycle cleanup |
-
-### rpc_v2 Transport
-
-| File | Description |
-|------|-------------|
-| `test_wire_v2.py` | Wire v2 codec — call/reply control encoding and explicit route keys |
-| `test_scheduler.py` | Read/write concurrency scheduler for CRM method dispatch |
-| `test_concurrency.py` | Read/write lock semantics for CRM method scheduling |
-| `test_client_pool.py` | `ClientPool` — ref-counted IPC client management, grace period |
-| `test_crm_proxy.py` | `CRMProxy` — thread-local and IPC modes, method routing |
-| `test_proxy_concurrency.py` | CRMProxy concurrency under read/write access control |
-| `test_chunk_assembler.py` | Chunk assembler — OOM validation, reassembly, boundary checks |
-| `test_serve.py` | `cc.serve()` API — server start/stop lifecycle |
-| `test_security_v2.py` | v2 handshake security, frame validation |
-| `test_name_collision.py` | Multi-CRM name collision detection |
-| `test_adaptive_buffer.py` | `AdaptiveBuffer` — grow/shrink, idle decay |
-| `test_op2_safety.py` | Safety regressions — deferred free, TOCTOU, err_len bounds, scatter-write, double-free guard |
-
-### IPC & Buddy Allocator
-
-| File | Description |
-|------|-------------|
-| `test_buddy_pool.py` | Rust buddy allocator — alloc/free, pool stats, dedicated fallback, FFI, segment lifecycle, stale cleanup |
-| `test_ipc.py` | IPC transport — buddy handshake, wire frames, inline/buddy paths, boundary checks, shutdown safety |
-| `test_ipc_security.py` | IPC handshake security — SHM name validation, segment count DoS limits, malformed frame handling |
-
-### Relay
-
-| File | Description |
-|------|-------------|
-| `test_http_client.py` | HTTP client transport — request/response, error handling |
-| `test_relay_graceful_shutdown.py` | RuntimeSession unregister/shutdown relay cleanup outcomes, exactly-once `@on_shutdown` callbacks |
-
-## Integration Tests (`sdk/python/tests/integration/`)
-
-| File | Description |
-|------|-------------|
-| `test_rpc_v2_server.py` | ServerV2 end-to-end — multi-CRM hosting, handshake, method dispatch |
-| `test_rpc_v2_basic.py` | IPC client backward compatibility with legacy IPC server |
-| `test_registry.py` | `cc.register()` / `cc.connect()` / `cc.close()` SOTA API lifecycle |
-| `test_multi_crm_server.py` | Multi-CRM routing — name-based dispatch, concurrent access |
-| `test_crm_proxy.py` | CRMProxy integration — thread-local + IPC modes end-to-end |
-| `test_chunked_transfer.py` | Large payload chunked transfer across transports |
-| `test_backpressure.py` | Buddy pool OOM backpressure — L0/L1/L2 protection |
-| `test_concurrency_safety.py` | Concurrent client safety under load |
-| `test_error_propagation.py` | CRM-side exceptions propagate to client as typed `CCError` |
-| `test_p0_fixes.py` | P0 regression tests — scheduler, proxy, lifecycle fixes |
-| `test_serve.py` | `cc.serve()` integration — multi-protocol serving |
-| `test_http_relay.py` | Standalone `c3 relay` end-to-end — POST routing, error forwarding, RuntimeSession relay-backed no-address connect |
-
-Relay mesh integration tests also exercise standalone `c3 relay` coverage for
-multi-relay route propagation and discovery.
-
-## Shared Fixtures (`sdk/python/tests/fixtures/`)
-
-| File | Description |
-|------|-------------|
-| `ihello.py` | `Hello` CRM interface + Python-only `HelloData` pickle fallback type |
-| `hello.py` | `Hello` CRM implementation (stateful greeting service) |
-| `counter.py` | `ICounter` / `Counter` — minimal read/write CRM for concurrency tests |
-
-## Protocol Address Fixtures (`sdk/python/tests/conftest.py`)
-
-Parametrized `protocol_address` fixture provides unique addresses for each protocol:
-
-| Protocol | Prefix | Transport |
-|----------|--------|-----------|
-| `thread` | `thread://` | In-process, zero-copy (skips serialization) |
-| `memory` | `memory://` | Shared memory file-based, cross-process |
-| `tcp` | `tcp://` | ZeroMQ TCP socket |
-| `http` | `http://` | HTTP/REST via Starlette/uvicorn |
-| `ipc-v2` | `ipc-v2://` | UDS control + Python SharedMemory pool (legacy) |
-| `ipc` | `ipc://` | UDS control + Rust buddy allocator SHM (explicit) |
-| `ipc` | `ipc://` | **Default IPC** — UDS control + Rust buddy allocator SHM |
-
----
-
-## Benchmarks (`sdk/python/benchmarks/`)
-
-Run benchmarks with `uv run python sdk/python/benchmarks/<script>.py`.
-
-| File | Description |
-|------|-------------|
-| `memory_benchmark.py` | Memory transport latency/throughput across payload sizes |
-| `ipc_detailed_bench.py` | IPC detailed latency breakdown (P50/P95/P99, throughput, ops) |
-| `ipc_v2_vs_v3_benchmark.py` | Side-by-side comparison: IPC v2 vs v3 across 64B–1GB |
-| `concurrency_benchmark.py` | Concurrent client load — throughput scaling, contention |
-| `wire_preencoding_benchmark.py` | Wire protocol encoding micro-benchmark |
-| `adaptive_buffer_benchmark.py` | AdaptiveBuffer grow/shrink performance (IPC v2 component) |
-
-### Key Benchmark Notes
-
-- Benchmarks use realistic payload paths rather than echo-optimized no-op shortcuts
-- Default round count: 100 per size tier
-- Payload sizes typically span: 64B, 1KB, 4KB, 64KB, 1MB, 10MB, 50MB, 100MB, 500MB, 1GB
-- Metrics: P50 latency, throughput (GB/s), ops/sec, min/max latency
-
----
-
-## Rust Tests (`core/`)
-
-The Rust workspace has its own test suite:
+Cross-language checks require the development prerequisites above:
 
 ```bash
-# Run focused Rust tests that do not need Python linkage
-cd core && cargo test -p c2-mem -p c2-wire
+C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest \
+  sdk/python/tests/integration/test_portable_payload_cross_language.py \
+  sdk/python/tests/integration/test_portable_payload_matrix.py \
+  -q --timeout=300
+uv run --no-sync pytest tests/repo/test_portable_matrix_receipt.py -q
+cargo test --manifest-path core/Cargo.toml -p c2-ipc
 ```
 
-Run `cd core && cargo check --workspace` before broader Rust changes.
+See the [0.7.4 publication record](../../../docs/reports/0.7.4-publication.md) and [FD regression record](../../../docs/reports/0.7.4-fd-leak-regression.md) for executed source-specific evidence.
+
+## Benchmarks
+
+Benchmark scripts live in [benchmarks](../benchmarks). Run them from the repository root, for example:
+
+```bash
+C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync python sdk/python/benchmarks/segment_size_benchmark.py
+```
+
+`thread_vs_ipc_benchmark.py` compares same-process and IPC calls; `chunked_benchmark.py` exercises chunking; `relay_qps_benchmark.py` measures relay load. Each script controls its own payload sizes and rounds. Benchmark timings do not replace correctness, cleanup or platform validation.

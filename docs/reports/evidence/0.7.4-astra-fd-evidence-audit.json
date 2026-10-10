@@ -1,0 +1,582 @@
+{
+  "schema": "c-two.fd-regression-final-evidence-audit.v1",
+  "audited_at_utc": "2026-10-10T02:11:22.614700+00:00",
+  "reviewer": "Astra max bounded independent final evidence audit",
+  "verdict": "approve",
+  "scope": "Bounded FD-leak follow-up only. No release, merge, or publication acceptance.",
+  "findings": [],
+  "source": {
+    "head_sha": "dd9adecc48d215a63ff1abedd6c7d11fb4a2b688",
+    "base_sha": "46480adf7424f794482fc761a2c8ec53dd28323b",
+    "worktree": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two",
+    "clean_before_and_after": true,
+    "changed_files": [
+      "core/transport/c2-ipc/src/pool.rs",
+      "docs/reports/0.7.4-fd-leak-regression.md",
+      "docs/reports/0.7.4-fd-leak-regression.zh-CN.md",
+      "docs/reports/0.7.4-final-validation.md",
+      "docs/reports/0.7.4-final-validation.zh-CN.md",
+      "docs/reports/evidence/0.7.4-fd-leak-regression.json",
+      "sdk/python/tests/fixtures/idle_pool_client.py",
+      "sdk/python/tests/fixtures/idle_pool_contract.py",
+      "sdk/python/tests/fixtures/idle_pool_server.py",
+      "sdk/python/tests/integration/test_client_pool_idle_cleanup.py"
+    ],
+    "production_code_unchanged": true,
+    "pool_production_prefix_byte_identical": true
+  },
+  "patch": {
+    "path": "/tmp/c2-074-fd-regression/host-test-input.patch",
+    "sha256": "a8b019c53227eed5694ac59fd4a143ef9e3d7c1ed185c03f86b9d9f6e50a16eb",
+    "current_source_diff_byte_identical": true,
+    "prior_source_review": "astra-review.json",
+    "prior_source_review_verdict": "approve"
+  },
+  "proofs": {
+    "original_probe": {
+      "receipt": "probe-result.json",
+      "raw_log": "probe.log",
+      "run_script_sha256": "2219175c9ad6199df86d679830f2bddd5d62005f320094d2f9ecc0091b8b25f5",
+      "original_files_verified": [
+        {
+          "file": "HANDOVER.md",
+          "sha256": "cefdad63775aa4c5a3b9e6c19da3caade57f8c1dbcf9cfbd6ecaac721a5667a6",
+          "bytes": 5855,
+          "copy_verified": true
+        },
+        {
+          "file": "client.py",
+          "sha256": "1603ac5dcaeeae5f3266dcd4d63dff384efeee74ee2786bb05fdf3c71f47f8bf",
+          "bytes": 3339,
+          "copy_verified": true
+        },
+        {
+          "file": "contract.py",
+          "sha256": "fb6403e86cc0dfed45a464f4b65d69d688f998cbd46085e231e175494620ef63",
+          "bytes": 238,
+          "copy_verified": true
+        },
+        {
+          "file": "run.py",
+          "sha256": "2219175c9ad6199df86d679830f2bddd5d62005f320094d2f9ecc0091b8b25f5",
+          "bytes": 3327,
+          "copy_verified": true
+        },
+        {
+          "file": "server.py",
+          "sha256": "075db9aaf6b7caed5138906f8218dfe645b31d3efe457e869d8367833e3c8460",
+          "bytes": 645,
+          "copy_verified": true
+        },
+        {
+          "file": "threshold.log",
+          "sha256": "d6c5590e15c38f4d72e6570e03505f34f4cf5b2ee14409d8e161b7d74d090d36",
+          "bytes": 749,
+          "copy_verified": false
+        }
+      ],
+      "phases": [
+        {
+          "phase": "main30",
+          "server_unix_fds": 5,
+          "client_unix_fds": 5
+        },
+        {
+          "phase": "idle62",
+          "server_unix_fds": 5,
+          "client_unix_fds": 5
+        },
+        {
+          "phase": "idle62",
+          "server_unix_fds": 5,
+          "client_unix_fds": 5
+        },
+        {
+          "phase": "bgidle70",
+          "server_unix_fds": 5,
+          "client_unix_fds": 5
+        },
+        {
+          "phase": "idle130",
+          "server_unix_fds": 5,
+          "client_unix_fds": 5
+        },
+        {
+          "phase": "main30",
+          "server_unix_fds": 5,
+          "client_unix_fds": 5
+        }
+      ],
+      "baseline_server_unix_fds": 4,
+      "after_client_exit_unix_fds": 4,
+      "background_calls": 34,
+      "exit_code": 0,
+      "verdict": "no growth",
+      "elapsed_seconds": 341.177,
+      "probe_root_removed": true,
+      "correction_file": "probe-acceptance-correction.json",
+      "correction_note": "Immutable acceptance note contained a 2/1/1 typo; raw log and receipt consistently show 5/5/4, and the correction is explicit."
+    },
+    "final_native": {
+      "source_sha": "dd9adecc48d215a63ff1abedd6c7d11fb4a2b688",
+      "native_sha256": "77b6375e1f9e444a951efdc2e2e01fa60053cc37312ceb1f84fca3ec3a516653",
+      "actual_file_rehashed": true,
+      "original_probe_and_green_sdk_bytes_identical": true,
+      "build_log": "final-native-build.log",
+      "build_log_sha256": "2737e070e824e60002fa192a885b8e9b911a86eb335093ccc30bf4418f313e4d",
+      "build_exit_code": 0
+    },
+    "local_validation": {
+      "receipt": "validation-sdk-red-recovery/result.json",
+      "base_sha": "46480adf7424f794482fc761a2c8ec53dd28323b",
+      "test_patch_sha256": "a8b019c53227eed5694ac59fd4a143ef9e3d7c1ed185c03f86b9d9f6e50a16eb",
+      "steps": [
+        {
+          "name": "green-rust",
+          "argv": [
+            "cargo",
+            "test",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--lib",
+            "pool::tests::real_",
+            "--",
+            "--nocapture"
+          ],
+          "cwd": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two",
+          "exit_code": 0,
+          "elapsed_seconds": 12.687,
+          "log": "/tmp/c2-074-fd-regression/validation/green-rust.log",
+          "log_sha256": "46bc7378319d0d6fa2178bfcb021626aeeaacf5d1ea8782ae6a0e52a9052f19c"
+        },
+        {
+          "name": "green-ipc-full",
+          "argv": [
+            "cargo",
+            "test",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--lib",
+            "--",
+            "--test-threads=4"
+          ],
+          "cwd": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two",
+          "exit_code": 0,
+          "elapsed_seconds": 13.018,
+          "log": "/tmp/c2-074-fd-regression/validation/green-ipc-full.log",
+          "log_sha256": "e5450a4f4882a28f30d7de790ee5bf5259fcaa4a942c6bfeeab3e71e92cd0f87"
+        },
+        {
+          "name": "format",
+          "argv": [
+            "cargo",
+            "fmt",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "--all",
+            "--check"
+          ],
+          "cwd": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two",
+          "exit_code": 0,
+          "elapsed_seconds": 0.993,
+          "log": "/tmp/c2-074-fd-regression/validation/format.log",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "name": "diff-check",
+          "argv": [
+            "git",
+            "diff",
+            "--cached",
+            "--check"
+          ],
+          "cwd": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two",
+          "exit_code": 0,
+          "elapsed_seconds": 0.038,
+          "log": "/tmp/c2-074-fd-regression/validation/diff-check.log",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "name": "green-sdk",
+          "argv": [
+            "/tmp/c2-074-venv/bin/python",
+            "-m",
+            "pytest",
+            "sdk/python/tests/integration/test_client_pool_idle_cleanup.py",
+            "-q",
+            "--timeout=240"
+          ],
+          "cwd": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two",
+          "exit_code": 0,
+          "elapsed_seconds": 127.266,
+          "log": "/tmp/c2-074-fd-regression/validation/green-sdk.log",
+          "log_sha256": "f0b578c7021f806494e4b792842c3e8676405e96e798ff147443e16545dc6e74"
+        },
+        {
+          "name": "red-rust",
+          "argv": [
+            "cargo",
+            "test",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--lib",
+            "pool::tests::real_",
+            "--",
+            "--nocapture"
+          ],
+          "cwd": "/tmp/c2-074-fd-regression/red-source",
+          "exit_code": 101,
+          "elapsed_seconds": 38.241,
+          "log": "/tmp/c2-074-fd-regression/validation/red-rust.log",
+          "log_sha256": "750c5a381a5d1a2a137268006d96673d7f1d21747f874437e2d2f8f55160af59"
+        },
+        {
+          "name": "red-sdk-build",
+          "argv": [
+            "uv",
+            "sync",
+            "--frozen",
+            "--inexact",
+            "--python",
+            "3.13",
+            "--reinstall-package",
+            "c-two"
+          ],
+          "cwd": "/tmp/c2-074-fd-regression/red-source",
+          "exit_code": 1,
+          "elapsed_seconds": 60.465,
+          "log": "/tmp/c2-074-fd-regression/validation/red-sdk-build.log",
+          "log_sha256": "bdcd94198c69e7fb1cd1f299c863234beaea51cbb2be8a65ea74f0aa530516f9"
+        },
+        {
+          "name": "red-sdk-build-with-sdk-headers",
+          "argv": [
+            "uv",
+            "sync",
+            "--frozen",
+            "--inexact",
+            "--python",
+            "3.13",
+            "--reinstall-package",
+            "c-two"
+          ],
+          "cwd": "/tmp/c2-074-fd-regression/red-source",
+          "exit_code": 0,
+          "elapsed_seconds": 59.565,
+          "log": "/private/tmp/c2-074-fd-regression/validation-sdk-red-recovery/red-sdk-build-with-sdk-headers.log",
+          "log_sha256": "317543f2ce244f278969dcbcf4e658ada178e8ddc10de21d12301e37013575c0"
+        },
+        {
+          "name": "red-sdk",
+          "argv": [
+            "/tmp/c2-074-fd-regression/venv-red/bin/python",
+            "-m",
+            "pytest",
+            "sdk/python/tests/integration/test_client_pool_idle_cleanup.py",
+            "-q",
+            "--timeout=30"
+          ],
+          "cwd": "/tmp/c2-074-fd-regression/red-source",
+          "exit_code": 1,
+          "elapsed_seconds": 73.757,
+          "log": "/private/tmp/c2-074-fd-regression/validation-sdk-red-recovery/red-sdk.log",
+          "log_sha256": "d4b704442ec5cd60a9341b354a120f460311b59af0da43ecde033d56a6b6e09d"
+        }
+      ],
+      "green_rust": "4 passed; 0 failed",
+      "green_ipc_full": "199 passed; 0 failed; 4 test threads",
+      "green_sdk": "1 passed in 125.37s; both real 62-second idles and final server baseline assertions executed",
+      "format_and_diff": "passed",
+      "red_rust": "0 passed; 4 failed; each failure is actual peer EOF timeout",
+      "red_sdk": "1 failed in 70.91s; expected 5 AF_UNIX FDs, repeatedly observed 6",
+      "red_native_sha256": "6341efab3de98484d58142c0604ba2b6d327c5084f86ff804dd8c390986bb156",
+      "red_native_differs_from_green": true,
+      "red_mutation_sha256": "66b8859f7f7c26ca6f769b386e89b0ec9004046b1e5d2e152633132cc7c8f56a",
+      "exact_two_mutations_verified": true,
+      "red_test_sources_equal_green": true,
+      "isolated_source_cargo_and_python_environment": true,
+      "repair": {
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "CXXFLAGS": "-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
+      },
+      "scope_note": "Mechanism-level negative control, not an unchanged 0.6.0 distribution run. Original failed SDK build is excluded as negative-test proof. Re-rendered mutation diff only changes Git index abbreviation width."
+    },
+    "command_receipts": [
+      {
+        "receipt": "probe-command-result-v2.json",
+        "run_id": "a7146d0e-412b-411b-846f-21ddf12bc955",
+        "status": "completed",
+        "exit_code": 0,
+        "shutdown_confirmed": true,
+        "artifact_hashes_verified": [
+          {
+            "kind": "runner-stdout",
+            "sha256": "11842fcf416aa401f217349ef792d75f9a80566da7a7912bac5138d84b07a419",
+            "bytes": 1366
+          },
+          {
+            "kind": "runner-stderr",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "kind": "task-specification",
+            "sha256": "8182f081fa19007e85205ab4054544c7823b5008739c64ebae846594438eaccd",
+            "bytes": 187
+          }
+        ]
+      },
+      {
+        "receipt": "validation-command-result.json",
+        "run_id": "81fcf151-d311-4b33-972a-367fa202278e",
+        "status": "failed",
+        "exit_code": 1,
+        "shutdown_confirmed": true,
+        "artifact_hashes_verified": [
+          {
+            "kind": "runner-stdout",
+            "sha256": "0be8442c6971c864c3e0709db9b5f520ebe3025aec4a01f3228082ae083897ff",
+            "bytes": 94
+          },
+          {
+            "kind": "runner-stderr",
+            "sha256": "2ec34e1ebad3f3f26202a269a517316d0d61b57308e4d4f332fdd5292c5b5d9a",
+            "bytes": 1001
+          },
+          {
+            "kind": "task-specification",
+            "sha256": "1b0b624a678cfec36b43e1dfcc076346407b19445cf5f0b2b7f5a2cad46d6c86",
+            "bytes": 249
+          }
+        ]
+      },
+      {
+        "receipt": "sdk-red-command-result.json",
+        "run_id": "7cc89a98-bc1d-4522-93e7-44d61f4f0ee4",
+        "status": "completed",
+        "exit_code": 0,
+        "shutdown_confirmed": true,
+        "artifact_hashes_verified": [
+          {
+            "kind": "runner-stdout",
+            "sha256": "6ef193c57a7b859b3895db8c1ea62768f8a0e136e30acde8a9c00379fb138aa4",
+            "bytes": 4554
+          },
+          {
+            "kind": "runner-stderr",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "kind": "task-specification",
+            "sha256": "decc09b1a2342608d24fe91b1c4cec63eeb9567c72e8b9723e0579809e52c15f",
+            "bytes": 217
+          }
+        ]
+      }
+    ],
+    "excluded_runs": [
+      {
+        "run_id": "9daca0de-e40e-4fa6-a2e9-a0d623a0f8d7",
+        "reason": "Cancelled while queued; no selected attempt, result or artifacts; not pass proof"
+      },
+      {
+        "run_id": "81fcf151-d311-4b33-972a-367fa202278e",
+        "reason": "Overall driver failed on missing C++ algorithm header and remains rejected; successful preceding steps are individually hash-verified. Recovery 7cc89a98 reran only SDK build/test."
+      }
+    ],
+    "windows": [
+      {
+        "job_id": 114102898524,
+        "job_url": "https://github.com/world-in-progress/c-two/actions/runs/38014902370/job/114102898524",
+        "artifact_id": 11654744461,
+        "artifact_name": "windows-native-windows-2022-local-platform-398009cd61ab2ae82a1142df851f048e3a79f2b4",
+        "zip_sha256": "e76cf94c647dc37be8ceb4d3f2acb268280b99bef47f41bad1d0dc3449a7f452",
+        "log_sha256": "4b6b151a10ff3e2e8465aafbabb3b218d5f78692536126b3ac21a0b566b8bd13",
+        "run_evidence_sha256": "2ef79d4f7bf52ac6475a38b3cde7588acc1711a76875d492a5237b6878ad24d9",
+        "runner": {
+          "requested_label": "windows-2022",
+          "os": "Windows-2022Server-10.0.20348-SP0",
+          "machine": "AMD64",
+          "image": "win22",
+          "image_version": "20261004.326.1"
+        },
+        "run_id": 38014902370,
+        "workflow_sha": "398009cd61ab2ae82a1142df851f048e3a79f2b4",
+        "sources": {
+          "c-two": {
+            "expected_sha": "dd9adecc48d215a63ff1abedd6c7d11fb4a2b688",
+            "actual_sha": "dd9adecc48d215a63ff1abedd6c7d11fb4a2b688",
+            "verified": true
+          },
+          "fastdb": {
+            "expected_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+            "actual_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+            "verified": true
+          }
+        },
+        "gate_status": "passed",
+        "gate_exit_code": 0,
+        "process_exited": true,
+        "cases_passed": [
+          "real_idle_pool_acquire_closes_expired_connection",
+          "real_idle_pool_sweep_closes_expired_connection",
+          "real_pool_discard_closes_connected_observed_and_preserves_replacement",
+          "real_pool_close_all_closes_active_and_idle_connections_and_reopens"
+        ],
+        "api_digest_verified": true
+      },
+      {
+        "job_id": 114102898583,
+        "job_url": "https://github.com/world-in-progress/c-two/actions/runs/38014902370/job/114102898583",
+        "artifact_id": 11655885344,
+        "artifact_name": "windows-native-windows-2025-local-platform-398009cd61ab2ae82a1142df851f048e3a79f2b4",
+        "zip_sha256": "dbd81ae8f3722334c276b60f4ff6caab2a37d799d65536a3c534233ef38caf5a",
+        "log_sha256": "a1f3cd153fe1d19adee8053deb78cab93d7dc6de509fe4460f7ff2b480ffaa1b",
+        "run_evidence_sha256": "5e57e8e88a572ad523e59a7a9762eae9d42de8eadf7091adabd15423c5716624",
+        "runner": {
+          "requested_label": "windows-2025",
+          "os": "Windows-2025Server-10.0.26100-SP0",
+          "machine": "AMD64",
+          "image": "win25-vs2026",
+          "image_version": "20260925.250.1"
+        },
+        "run_id": 38014902370,
+        "workflow_sha": "398009cd61ab2ae82a1142df851f048e3a79f2b4",
+        "sources": {
+          "c-two": {
+            "expected_sha": "dd9adecc48d215a63ff1abedd6c7d11fb4a2b688",
+            "actual_sha": "dd9adecc48d215a63ff1abedd6c7d11fb4a2b688",
+            "verified": true
+          },
+          "fastdb": {
+            "expected_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+            "actual_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+            "verified": true
+          }
+        },
+        "gate_status": "passed",
+        "gate_exit_code": 0,
+        "process_exited": true,
+        "cases_passed": [
+          "real_idle_pool_acquire_closes_expired_connection",
+          "real_idle_pool_sweep_closes_expired_connection",
+          "real_pool_discard_closes_connected_observed_and_preserves_replacement",
+          "real_pool_close_all_closes_active_and_idle_connections_and_reopens"
+        ],
+        "api_digest_verified": true
+      }
+    ]
+  },
+  "remaining_broader_ci": [
+    {
+      "name": "CI",
+      "run_id": 38014902369,
+      "status": "completed",
+      "conclusion": "success",
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/38014902369",
+      "accepted_by_this_audit": false
+    },
+    {
+      "name": "Release Candidate",
+      "run_id": 38014902395,
+      "status": "in_progress",
+      "conclusion": null,
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/38014902395",
+      "accepted_by_this_audit": false
+    },
+    {
+      "name": "windows-2025 / full / MSVC x64",
+      "job_id": 114102898618,
+      "run_id": 38014902370,
+      "status": "in_progress",
+      "conclusion": null,
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/38014902370/job/114102898618",
+      "accepted_by_this_audit": false
+    },
+    {
+      "name": "windows-2022 / full / MSVC x64",
+      "job_id": 114102898683,
+      "run_id": 38014902370,
+      "status": "in_progress",
+      "conclusion": null,
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/38014902370/job/114102898683",
+      "accepted_by_this_audit": false
+    }
+  ],
+  "release_boundary": {
+    "pr": 180,
+    "url": "https://github.com/world-in-progress/c-two/pull/180",
+    "state": "open",
+    "merged": false,
+    "head_sha": "dd9adecc48d215a63ff1abedd6c7d11fb4a2b688",
+    "merge_and_publication_hold": "Retained as instructed; audit performs no merge or publication",
+    "windows_11_desktop_executed": false,
+    "sdk_os_fd_counting": "Unix only; Windows evidence is actual Rust Named Pipe execution"
+  },
+  "verification_method": "Fresh read-only Git/source comparison, SHA-256 recomputation, raw log and receipt parsing, exact negative mutation comparison, and GitHub API metadata comparison. No test, build, or probe rerun; no Git/worktree/control mutation.",
+  "hashes_recomputed": {
+    "/tmp/c2-074-fd-regression/host-test-input.patch": "a8b019c53227eed5694ac59fd4a143ef9e3d7c1ed185c03f86b9d9f6e50a16eb",
+    "/Users/soku/.codex/worktrees/c2-0-7-4/c-two/core/transport/c2-ipc/src/pool.rs": "a7e944b9731ea6450f03565dc5be619576ebaeda3e78177047ba072913528c4c",
+    "/Users/soku/.codex/worktrees/c2-0-7-4/c-two/sdk/python/tests/fixtures/idle_pool_client.py": "fdc2f61cadd5146c4bbda714872f480498abed9ac478d69eae3e406287a7721e",
+    "/Users/soku/.codex/worktrees/c2-0-7-4/c-two/sdk/python/tests/fixtures/idle_pool_contract.py": "4214946487b1e44e4fd8744184344d3a5059453a64084495c74e2a86cec3a77e",
+    "/Users/soku/.codex/worktrees/c2-0-7-4/c-two/sdk/python/tests/fixtures/idle_pool_server.py": "cbcd95a1be1e94d9ba4641edf1ed6d898acdf32f220d1eb374903da45086fb18",
+    "/Users/soku/.codex/worktrees/c2-0-7-4/c-two/sdk/python/tests/integration/test_client_pool_idle_cleanup.py": "234fea217d6d730941364065631815a8fbc50d90dd166f29dd5f298962d0a379",
+    "/Users/soku/Desktop/codespace/mememe/hey-my-buddy/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe/HANDOVER.md": "cefdad63775aa4c5a3b9e6c19da3caade57f8c1dbcf9cfbd6ecaac721a5667a6",
+    "/tmp/c2-074-fd-regression/probe/HANDOVER.md": "cefdad63775aa4c5a3b9e6c19da3caade57f8c1dbcf9cfbd6ecaac721a5667a6",
+    "/Users/soku/Desktop/codespace/mememe/hey-my-buddy/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe/client.py": "1603ac5dcaeeae5f3266dcd4d63dff384efeee74ee2786bb05fdf3c71f47f8bf",
+    "/tmp/c2-074-fd-regression/probe/client.py": "1603ac5dcaeeae5f3266dcd4d63dff384efeee74ee2786bb05fdf3c71f47f8bf",
+    "/Users/soku/Desktop/codespace/mememe/hey-my-buddy/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe/contract.py": "fb6403e86cc0dfed45a464f4b65d69d688f998cbd46085e231e175494620ef63",
+    "/tmp/c2-074-fd-regression/probe/contract.py": "fb6403e86cc0dfed45a464f4b65d69d688f998cbd46085e231e175494620ef63",
+    "/Users/soku/Desktop/codespace/mememe/hey-my-buddy/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe/run.py": "2219175c9ad6199df86d679830f2bddd5d62005f320094d2f9ecc0091b8b25f5",
+    "/tmp/c2-074-fd-regression/probe/run.py": "2219175c9ad6199df86d679830f2bddd5d62005f320094d2f9ecc0091b8b25f5",
+    "/Users/soku/Desktop/codespace/mememe/hey-my-buddy/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe/server.py": "075db9aaf6b7caed5138906f8218dfe645b31d3efe457e869d8367833e3c8460",
+    "/tmp/c2-074-fd-regression/probe/server.py": "075db9aaf6b7caed5138906f8218dfe645b31d3efe457e869d8367833e3c8460",
+    "/Users/soku/Desktop/codespace/mememe/hey-my-buddy/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe/threshold.log": "d6c5590e15c38f4d72e6570e03505f34f4cf5b2ee14409d8e161b7d74d090d36",
+    "/Users/soku/.codex/worktrees/c2-0-7-4/c-two/sdk/python/src/c_two/_native.cpython-313-darwin.so": "77b6375e1f9e444a951efdc2e2e01fa60053cc37312ceb1f84fca3ec3a516653",
+    "/tmp/c2-074-fd-regression/probe.log": "4505053770dbe2dd18c3bdaa72ab83cfe5467c1b3eb4e6c3bd487d0982219db1",
+    "/tmp/c2-074-fd-regression/build.log": "e63a5f5360e9c7d98e93498e524889d43681e4527134f903968d02808bb42131",
+    "/tmp/c2-074-fd-regression/final-native-build.log": "2737e070e824e60002fa192a885b8e9b911a86eb335093ccc30bf4418f313e4d",
+    "/Users/soku/.local/share/hey-my-buddy/state/attempts/a7146d0e-412b-411b-846f-21ddf12bc955/576951e0-dd50-4910-9ebe-21d2a61c7ac0/runner.stdout.log": "11842fcf416aa401f217349ef792d75f9a80566da7a7912bac5138d84b07a419",
+    "/Users/soku/.local/share/hey-my-buddy/state/attempts/a7146d0e-412b-411b-846f-21ddf12bc955/576951e0-dd50-4910-9ebe-21d2a61c7ac0/runner.stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/Users/soku/.local/share/hey-my-buddy/state/attempts/a7146d0e-412b-411b-846f-21ddf12bc955/576951e0-dd50-4910-9ebe-21d2a61c7ac0/task.txt": "8182f081fa19007e85205ab4054544c7823b5008739c64ebae846594438eaccd",
+    "/Users/soku/.local/share/hey-my-buddy/state/attempts/81fcf151-d311-4b33-972a-367fa202278e/6ec33883-01a9-4b7d-89d1-9d6dbe74cbeb/runner.stdout.log": "0be8442c6971c864c3e0709db9b5f520ebe3025aec4a01f3228082ae083897ff",
+    "/Users/soku/.local/share/hey-my-buddy/state/attempts/81fcf151-d311-4b33-972a-367fa202278e/6ec33883-01a9-4b7d-89d1-9d6dbe74cbeb/runner.stderr.log": "2ec34e1ebad3f3f26202a269a517316d0d61b57308e4d4f332fdd5292c5b5d9a",
+    "/Users/soku/.local/share/hey-my-buddy/state/attempts/81fcf151-d311-4b33-972a-367fa202278e/6ec33883-01a9-4b7d-89d1-9d6dbe74cbeb/task.txt": "1b0b624a678cfec36b43e1dfcc076346407b19445cf5f0b2b7f5a2cad46d6c86",
+    "/Users/soku/.local/share/hey-my-buddy/state/attempts/7cc89a98-bc1d-4522-93e7-44d61f4f0ee4/e4c23104-0fe0-4144-83bc-cce369ea8f4f/runner.stdout.log": "6ef193c57a7b859b3895db8c1ea62768f8a0e136e30acde8a9c00379fb138aa4",
+    "/Users/soku/.local/share/hey-my-buddy/state/attempts/7cc89a98-bc1d-4522-93e7-44d61f4f0ee4/e4c23104-0fe0-4144-83bc-cce369ea8f4f/runner.stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/Users/soku/.local/share/hey-my-buddy/state/attempts/7cc89a98-bc1d-4522-93e7-44d61f4f0ee4/e4c23104-0fe0-4144-83bc-cce369ea8f4f/task.txt": "decc09b1a2342608d24fe91b1c4cec63eeb9567c72e8b9723e0579809e52c15f",
+    "/tmp/c2-074-fd-regression/validation/green-rust.log": "46bc7378319d0d6fa2178bfcb021626aeeaacf5d1ea8782ae6a0e52a9052f19c",
+    "/tmp/c2-074-fd-regression/validation/green-ipc-full.log": "e5450a4f4882a28f30d7de790ee5bf5259fcaa4a942c6bfeeab3e71e92cd0f87",
+    "/tmp/c2-074-fd-regression/validation/format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/tmp/c2-074-fd-regression/validation/diff-check.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/tmp/c2-074-fd-regression/validation/green-sdk.log": "f0b578c7021f806494e4b792842c3e8676405e96e798ff147443e16545dc6e74",
+    "/tmp/c2-074-fd-regression/validation/red-rust.log": "750c5a381a5d1a2a137268006d96673d7f1d21747f874437e2d2f8f55160af59",
+    "/tmp/c2-074-fd-regression/validation/red-sdk-build.log": "bdcd94198c69e7fb1cd1f299c863234beaea51cbb2be8a65ea74f0aa530516f9",
+    "/private/tmp/c2-074-fd-regression/validation-sdk-red-recovery/red-sdk-build-with-sdk-headers.log": "317543f2ce244f278969dcbcf4e658ada178e8ddc10de21d12301e37013575c0",
+    "/private/tmp/c2-074-fd-regression/validation-sdk-red-recovery/red-sdk.log": "d4b704442ec5cd60a9341b354a120f460311b59af0da43ecde033d56a6b6e09d",
+    "/private/tmp/c2-074-fd-regression/red-source/sdk/python/src/c_two/_native.cpython-313-darwin.so": "6341efab3de98484d58142c0604ba2b6d327c5084f86ff804dd8c390986bb156",
+    "/tmp/c2-074-fd-regression/validation/red-mutation.diff": "66b8859f7f7c26ca6f769b386e89b0ec9004046b1e5d2e152633132cc7c8f56a",
+    "/tmp/c2-074-fd-regression/windows-11654744461.zip": "e76cf94c647dc37be8ceb4d3f2acb268280b99bef47f41bad1d0dc3449a7f452",
+    "/tmp/c2-074-fd-regression/windows-11655885344.zip": "dbd81ae8f3722334c276b60f4ff6caab2a37d799d65536a3c534233ef38caf5a",
+    "/tmp/c2-074-fd-regression/original-manifest.json": "2cca53863a0e14224979f24d69f04d7eca783a225175aa23a2daa0a8f48730ad",
+    "/tmp/c2-074-fd-regression/probe-result.json": "52cccfd76a1237c77973442aeb6aeed87a12f9afb4c7066a90438557658bef88",
+    "/tmp/c2-074-fd-regression/build-info.json": "3a1e087dbeba56d231dd8f476e258f732de8e57891a53dbe9cb51dd4d6c61d14",
+    "/tmp/c2-074-fd-regression/probe-command-result-v2.json": "b4d72a20879d9d6a69949d640f5a45c26100b1ed7e5110d1fe934d1aaa812101",
+    "/tmp/c2-074-fd-regression/probe-acceptance-correction.json": "557156b5ee37fecd19478563eb9fa457c244d339fd873a23efa62a7438dc026c",
+    "/tmp/c2-074-fd-regression/final-native-identity.json": "3a3786048fea4eb7f3099486a6a0cbf6d4e4961ccda774689945a66f59ca848d",
+    "/tmp/c2-074-fd-regression/astra-review.json": "e558651edc9ca5607e4f4356951967ed901d3ac18d35b62fcdce140b6ab7863d",
+    "/tmp/c2-074-fd-regression/validation-config.json": "6d5bb9087f142ddc3dd6c0556a6a1b081c49a7f065cea6f09773a9644ccef270",
+    "/tmp/c2-074-fd-regression/validation/steps.json": "fb93eeb566a7521205330640a82ab9d46ff7056c9db4466dc4511d60c03f0518",
+    "/tmp/c2-074-fd-regression/validation-sdk-red-recovery/result.json": "d922ac201d127bc45a851648fe632dfcd293253737b633450e823f9ed5af1c18",
+    "/tmp/c2-074-fd-regression/sdk-red-command-result.json": "c7ee8cb277e3996f4c8cba8a838053b6ba39d300b01077da9bc331d41044e186",
+    "/tmp/c2-074-fd-regression/windows-artifacts.json": "560f25447a8769a2ca9c0d110ccc2d8c2fbb4d639fbdf8e731f41822eb3cef57",
+    "/tmp/c2-074-fd-regression/windows-fd-proof.json": "44af5c2e627aa62e054e924febfae95d1e51fa9e66770e4201798d1d6747c02b"
+  }
+}

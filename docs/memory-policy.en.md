@@ -108,4 +108,4 @@ This accounting covers relay-owned data-plane IPC backing and assembly. Registra
 - [Request transport](../core/transport/c2-ipc/src/client.rs), [server responses](../core/transport/c2-server/src/server.rs) and [reassembly](../core/protocol/c2-wire/src/assembler.rs).
 - [Runtime observations](../core/runtime/c2-core/src/memory.rs) and [Python IPC overrides](../sdk/python/src/c_two/config/ipc.py).
 
-Validation reports identify their source pair and platforms. Chunking and hold semantics do not establish incremental resource input, direct FastDB response construction, zero-copy decoding or a measured performance gain.
+The [0.7.4 publication record](reports/0.7.4-publication.md) identifies the current published source pair, platforms and public-artifact verification. Historical validation reports retain their original source pairs. Chunking and hold semantics do not establish incremental resource input, direct FastDB response construction, zero-copy decoding or a measured performance gain.

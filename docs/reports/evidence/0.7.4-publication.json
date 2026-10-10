@@ -1,0 +1,1243 @@
+{
+  "schema": "c-two.publication-evidence.v1",
+  "artifact_source_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+  "fastdb_source_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "reviewed_pr_head": "dd9adecc48d215a63ff1abedd6c7d11fb4a2b688",
+  "published_at": "2026-10-10T02:47:47Z",
+  "pr": {
+    "html_url": "https://github.com/world-in-progress/c-two/pull/180",
+    "merge_commit_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+    "merged": true,
+    "merged_at": "2026-10-10T02:23:15Z",
+    "number": 180,
+    "state": "closed"
+  },
+  "main_gates": {
+    "source_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+    "repository": "world-in-progress/c-two",
+    "runs": [
+      {
+        "id": 38016776535,
+        "name": "Release Candidate",
+        "status": "completed",
+        "conclusion": "success",
+        "head_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+        "event": "push",
+        "head_branch": "main",
+        "url": "https://github.com/world-in-progress/c-two/actions/runs/38016776535",
+        "jobs": [
+          {
+            "id": 114108686017,
+            "name": "release scope",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108701829,
+            "name": "context",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738501,
+            "name": "wheels (x86_64-unknown-linux-gnu)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738516,
+            "name": "wheels (aarch64-unknown-linux-gnu)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738542,
+            "name": "cli (x86_64-unknown-linux-gnu)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738560,
+            "name": "fastdb (aarch64-apple-darwin)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738572,
+            "name": "fastdb (x86_64-unknown-linux-gnu)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738574,
+            "name": "fastdb (aarch64-unknown-linux-gnu)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738589,
+            "name": "cli (x86_64-apple-darwin)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738595,
+            "name": "fastdb (x86_64-pc-windows-msvc)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738602,
+            "name": "cli (aarch64-unknown-linux-gnu)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738614,
+            "name": "fastdb (x86_64-apple-darwin)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738619,
+            "name": "cli (aarch64-apple-darwin)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108738667,
+            "name": "cli (x86_64-pc-windows-msvc)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109549925,
+            "name": "sdist",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550111,
+            "name": "abi-import (x86_64-unknown-linux-gnu / 3.13)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550121,
+            "name": "abi-import (aarch64-unknown-linux-gnu / 3.10)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550142,
+            "name": "abi-import (aarch64-unknown-linux-gnu / 3.11)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550143,
+            "name": "abi-import (x86_64-unknown-linux-gnu / 3.14t)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550151,
+            "name": "abi-import (x86_64-unknown-linux-gnu / 3.10)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550162,
+            "name": "abi-import (x86_64-unknown-linux-gnu / 3.12)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550167,
+            "name": "abi-import (x86_64-unknown-linux-gnu / 3.11)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550168,
+            "name": "abi-import (x86_64-unknown-linux-gnu / 3.14)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550177,
+            "name": "abi-import (aarch64-unknown-linux-gnu / 3.12)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550197,
+            "name": "abi-import (aarch64-unknown-linux-gnu / 3.14)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550215,
+            "name": "abi-import (aarch64-unknown-linux-gnu / 3.13)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550245,
+            "name": "abi-import (aarch64-unknown-linux-gnu / 3.14t)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550270,
+            "name": "wheel (aarch64-apple-darwin / 3.11)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550272,
+            "name": "wheel (x86_64-apple-darwin / 3.14)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550282,
+            "name": "wheel (x86_64-apple-darwin / 3.12)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550286,
+            "name": "wheel (x86_64-apple-darwin / 3.10)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550297,
+            "name": "wheel (x86_64-apple-darwin / 3.11)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550300,
+            "name": "wheel (aarch64-apple-darwin / 3.10)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550305,
+            "name": "wheel (x86_64-apple-darwin / 3.14t)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550318,
+            "name": "wheel (aarch64-apple-darwin / 3.14t)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550363,
+            "name": "wheel (x86_64-apple-darwin / 3.13)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550373,
+            "name": "wheel (x86_64-pc-windows-msvc / 3.14t)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550390,
+            "name": "wheel (x86_64-pc-windows-msvc / 3.12)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550411,
+            "name": "wheel (x86_64-pc-windows-msvc / 3.13)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550419,
+            "name": "wheel (aarch64-apple-darwin / 3.12)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550430,
+            "name": "wheel (x86_64-pc-windows-msvc / 3.14)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550437,
+            "name": "wheel (x86_64-pc-windows-msvc / 3.11)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550462,
+            "name": "wheel (aarch64-apple-darwin / 3.13)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550483,
+            "name": "wheel (x86_64-pc-windows-msvc / 3.10)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114109550621,
+            "name": "wheel (aarch64-apple-darwin / 3.14)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114112796335,
+            "name": "smoke (x86_64-unknown-linux-gnu)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114112796355,
+            "name": "smoke (x86_64-pc-windows-msvc)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114112796357,
+            "name": "windows-standard-user",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114112796407,
+            "name": "smoke (aarch64-apple-darwin)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114112796409,
+            "name": "smoke (aarch64-unknown-linux-gnu)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114112796451,
+            "name": "smoke (x86_64-apple-darwin)",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114112936447,
+            "name": "manifest",
+            "status": "completed",
+            "conclusion": "success"
+          }
+        ]
+      },
+      {
+        "id": 38016776520,
+        "name": "Windows Native",
+        "status": "completed",
+        "conclusion": "success",
+        "head_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+        "event": "push",
+        "head_branch": "main",
+        "url": "https://github.com/world-in-progress/c-two/actions/runs/38016776520",
+        "jobs": [
+          {
+            "id": 114108685575,
+            "name": "windows-2022 / local-platform / MSVC x64",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108685797,
+            "name": "windows-2025 / full / MSVC x64",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108685844,
+            "name": "windows-2025 / local-platform / MSVC x64",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114108685897,
+            "name": "windows-2022 / full / MSVC x64",
+            "status": "completed",
+            "conclusion": "success"
+          }
+        ]
+      }
+    ],
+    "observed_at_utc": "2026-10-10T02:47:02Z",
+    "status": "passed",
+    "failed_jobs": []
+  },
+  "publication_gates": {
+    "source_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+    "repository": "world-in-progress/c-two",
+    "runs": [
+      {
+        "id": 38018161167,
+        "name": "CLI Release",
+        "status": "completed",
+        "conclusion": "success",
+        "head_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+        "event": "workflow_run",
+        "head_branch": "main",
+        "url": "https://github.com/world-in-progress/c-two/actions/runs/38018161167",
+        "jobs": [
+          {
+            "id": 114113001393,
+            "name": "verify tested candidate",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114113301811,
+            "name": "publish verified candidate",
+            "status": "completed",
+            "conclusion": "success"
+          }
+        ]
+      },
+      {
+        "id": 38018161196,
+        "name": "Python Package Release",
+        "status": "completed",
+        "conclusion": "success",
+        "head_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+        "event": "workflow_run",
+        "head_branch": "main",
+        "url": "https://github.com/world-in-progress/c-two/actions/runs/38018161196",
+        "jobs": [
+          {
+            "id": 114113001466,
+            "name": "verify tested candidate",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "id": 114113102675,
+            "name": "publish verified candidate",
+            "status": "completed",
+            "conclusion": "success"
+          }
+        ]
+      }
+    ],
+    "observed_at_utc": "2026-10-10T02:51:54Z",
+    "status": "passed",
+    "failed_jobs": []
+  },
+  "public_inventory": {
+    "source_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+    "c_two_version": "0.7.4",
+    "c3_version": "0.3.3",
+    "pypi_files": 31,
+    "cli_assets": 15,
+    "tag_source": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+    "manifest_sha256": "661c14c0e0fb8f6eb354178864d5589eaad465a232c715444e13da74555a0048",
+    "pypi_inventory": [
+      {
+        "name": "c_two-0.7.4-cp310-cp310-macosx_10_12_x86_64.whl",
+        "bytes": 4309935,
+        "sha256": "8242d60f6d9ac5fa31b71de92687e9a60f672ccb4a710fd35cf3866950dbc007"
+      },
+      {
+        "name": "c_two-0.7.4-cp310-cp310-macosx_11_0_arm64.whl",
+        "bytes": 4214486,
+        "sha256": "d425a48acff9e5ebcbdb6f064c186c18f19e8ff475dc1e455a7bf3d3d6ed74b1"
+      },
+      {
+        "name": "c_two-0.7.4-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "bytes": 5304837,
+        "sha256": "770085a43c88e94ee4f5ac2cb7048fb6503e638d9d0bb234665e483cbab93201"
+      },
+      {
+        "name": "c_two-0.7.4-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 5192285,
+        "sha256": "dffdd916b6adf55486e2c178a2a5ea61728cfff41bde6e37660c30d9e3973a90"
+      },
+      {
+        "name": "c_two-0.7.4-cp310-cp310-win_amd64.whl",
+        "bytes": 4320706,
+        "sha256": "b51573648f864b3caf5ca3c51c740d906f76bc7f573fb0a2a88315f05df4fec8"
+      },
+      {
+        "name": "c_two-0.7.4-cp311-cp311-macosx_10_12_x86_64.whl",
+        "bytes": 4309458,
+        "sha256": "83c2f8f86ece25a0c087745d8710d545960eb252b665a3107173c873ab58ec46"
+      },
+      {
+        "name": "c_two-0.7.4-cp311-cp311-macosx_11_0_arm64.whl",
+        "bytes": 4214596,
+        "sha256": "1d2ef4a846905a3763f024c51ff792f0e4129c88d6335f3d4e4c5007a01aeb6e"
+      },
+      {
+        "name": "c_two-0.7.4-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "bytes": 5304276,
+        "sha256": "fef37cba0098bda386d1cc8f4a85113ea6d03e04132fa4944d0cd6eb4594379c"
+      },
+      {
+        "name": "c_two-0.7.4-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 5191491,
+        "sha256": "e2cb65e14e192bfd9e50fbb1440f6b9132da49f0accc508b81e79ad5bbb9abcd"
+      },
+      {
+        "name": "c_two-0.7.4-cp311-cp311-win_amd64.whl",
+        "bytes": 4321458,
+        "sha256": "38c22e8d98f75ccf96fe45f3b1f35b38d28330f7d5833477d37248805f4e865a"
+      },
+      {
+        "name": "c_two-0.7.4-cp312-cp312-macosx_10_12_x86_64.whl",
+        "bytes": 4321652,
+        "sha256": "efff092cf1d5fbd675aeb77eff88c62bebddb30b030984296448a26a8b0e34c4"
+      },
+      {
+        "name": "c_two-0.7.4-cp312-cp312-macosx_11_0_arm64.whl",
+        "bytes": 4204394,
+        "sha256": "2278b855def5fc55835b971e7e5ed2baf122f8fe6b0ae1662d7df69d6f5f4900"
+      },
+      {
+        "name": "c_two-0.7.4-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "bytes": 5296016,
+        "sha256": "77dc65d7da39d63c304bf283e061eacec0f22a8d2f9a9062e940a6c90280c5ba"
+      },
+      {
+        "name": "c_two-0.7.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 5183523,
+        "sha256": "6bf81a3abe644f1ccce803d9664573656a56e5bd8894e80451863ad81011650e"
+      },
+      {
+        "name": "c_two-0.7.4-cp312-cp312-win_amd64.whl",
+        "bytes": 4314880,
+        "sha256": "6c5719005d542a3ac65565d5b42876d145633923d7b5b6574a51e1e42886b900"
+      },
+      {
+        "name": "c_two-0.7.4-cp313-cp313-macosx_10_12_x86_64.whl",
+        "bytes": 4320956,
+        "sha256": "564abd371aa5d1e6314d89e9ab7ddae72d35bfa8e73390b06abb1c3803a54310"
+      },
+      {
+        "name": "c_two-0.7.4-cp313-cp313-macosx_11_0_arm64.whl",
+        "bytes": 4203932,
+        "sha256": "bb625650f186c6066992cac0948c0f44b95a22af46778c8e63bba30d80ee88b8"
+      },
+      {
+        "name": "c_two-0.7.4-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "bytes": 5297314,
+        "sha256": "3fed662ba6f3e25b676f5a3a6fa74611d17529c57835ef842215ffc450675278"
+      },
+      {
+        "name": "c_two-0.7.4-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 5183669,
+        "sha256": "8c0295908b1c7621ac2f7a8b821434957f3a577336837b9b2da676443ef6522e"
+      },
+      {
+        "name": "c_two-0.7.4-cp313-cp313-win_amd64.whl",
+        "bytes": 4314479,
+        "sha256": "22feca7e1cdd0dfe9cb8d0da7cef7dd8490d73e95279cc5d7425d3373a7cd872"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314-macosx_10_12_x86_64.whl",
+        "bytes": 4314716,
+        "sha256": "ba094cb21d830995a67e91039b56c50c8bb7c65386c128715dd2d17baa963e5e"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314-macosx_11_0_arm64.whl",
+        "bytes": 4199173,
+        "sha256": "8d7228b6d4b4553a873619b0879a511e7dd307f7a17b219283328b7984e6283c"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "bytes": 5297979,
+        "sha256": "7172634065b5ab15e7cc30b6df22888b4e043a14207522df8d293a1096c2f16b"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 5185685,
+        "sha256": "0a4cd2e16a67a540584e6daf38d26bfb25d2a08e9fb6d7ad504b100915f274eb"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314-win_amd64.whl",
+        "bytes": 4314729,
+        "sha256": "b90fba3ca99a13eca19628904d8867bbc0359a6917f227268d8ff1eee1826077"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314t-macosx_10_12_x86_64.whl",
+        "bytes": 4330863,
+        "sha256": "2a67cbec5c8579335849320569e5fb8836272a64e507bc6aea2ad158f1adc0b0"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314t-macosx_11_0_arm64.whl",
+        "bytes": 4211899,
+        "sha256": "546ccdb6559f6c902e59f6a1a6fd40d5a67bf3849f960d4f4882458e6d224ad9"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "bytes": 5301976,
+        "sha256": "3713fb742df073939b3f4eb52c5d280c88e7c4ca754d1188c12548d90292d6e8"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 5193794,
+        "sha256": "2abc078d21386e5433e7ec5537408eaebce72d32f976809428dfb7ba025a34a7"
+      },
+      {
+        "name": "c_two-0.7.4-cp314-cp314t-win_amd64.whl",
+        "bytes": 4325682,
+        "sha256": "1691988c3ee8ee8b85870612b864ecd5117aef28ca298da93caa38e6ca302d13"
+      },
+      {
+        "name": "c_two-0.7.4.tar.gz",
+        "bytes": 1088650,
+        "sha256": "9b92ea4d279fdd33e13110f57a9ec3b8f11c90a49e16a5ffa4b15b191be5e70a"
+      }
+    ],
+    "cli_inventory": [
+      {
+        "name": "rc-manifest.json",
+        "bytes": 17326,
+        "sha256": "661c14c0e0fb8f6eb354178864d5589eaad465a232c715444e13da74555a0048"
+      },
+      {
+        "name": "c3-x86_64-unknown-linux-gnu",
+        "bytes": 14870224,
+        "sha256": "71b651ec58ccb1e1596a732e23b0ad48851dc0abf2682dce23d39e90de6a3ae1"
+      },
+      {
+        "name": "c3-aarch64-unknown-linux-gnu",
+        "bytes": 14088008,
+        "sha256": "eea2f18d572d00e95348d527d3a7c5bc3587c537acf739792bc5aef03a961954"
+      },
+      {
+        "name": "c3-aarch64-apple-darwin",
+        "bytes": 11373632,
+        "sha256": "36ce0b7f26c5add0895789373be6e47a1e45d2f36c49f5d9f065b0e6352e0e85"
+      },
+      {
+        "name": "c3-x86_64-apple-darwin",
+        "bytes": 11749520,
+        "sha256": "4904ac905eee157960724b4cab89a0ec36e71663cd6eae0b1c9166ce34f2512b"
+      },
+      {
+        "name": "c3-x86_64-pc-windows-msvc.exe",
+        "bytes": 11132416,
+        "sha256": "ba76cd0a37d4902a245b8e3a9fbb05fad587674fbf7fe9d1f6fdaf9383ca47d0"
+      },
+      {
+        "name": "c3-installer.sh",
+        "bytes": 4666,
+        "sha256": "7d0cec07bf1478a5d619f75d6e97d936d37a4653c6f8f8a38a2fbda1cabeb026"
+      },
+      {
+        "name": "c3-installer.ps1",
+        "bytes": 5911,
+        "sha256": "0b8bf938976e987b761c43f3946ef9ec4829a5d1faae89010aef9babacc042d0"
+      },
+      {
+        "name": "fastdb-LICENSE",
+        "bytes": 1074,
+        "sha256": "677ced71611f25f1407357b028fb42b015fdd1c09cdbb7797b3aaccd43c09c24"
+      },
+      {
+        "name": "fastdb-THIRD_PARTY_NOTICES.txt",
+        "bytes": 81490,
+        "sha256": "9522bd5e5e7c2a4dc98220eccb6737997c7f774b557f9621e6fbfbf6cc28ee33"
+      },
+      {
+        "name": "c3-x86_64-unknown-linux-gnu.sha256",
+        "bytes": 94,
+        "sha256": "3e78e6a321ae4e793f89b864752c63d87b09b2647aaee7989636c54902510c15"
+      },
+      {
+        "name": "c3-aarch64-unknown-linux-gnu.sha256",
+        "bytes": 95,
+        "sha256": "3d80e2371c2ca4639a2cb5d4e0794138887ab952ae0b3c17248579fe041aa7f2"
+      },
+      {
+        "name": "c3-aarch64-apple-darwin.sha256",
+        "bytes": 90,
+        "sha256": "3984f30541cd9873c75ab92ecdd4abdfff665bbbeaee9cff63556b28fc13cd18"
+      },
+      {
+        "name": "c3-x86_64-apple-darwin.sha256",
+        "bytes": 89,
+        "sha256": "311d6ed238f612295a974ccfec610c1a3948ab88ba65bbccaf4ea018f10d87b6"
+      },
+      {
+        "name": "c3-x86_64-pc-windows-msvc.exe.sha256",
+        "bytes": 97,
+        "sha256": "e73f905415b21c0811c0d55da29b957d543108b20989e6452c9caa656ea7d9f3"
+      }
+    ],
+    "downloads": {
+      "c_two_wheel": "/tmp/c2-074-release/published/c_two-0.7.4-cp313-cp313-macosx_11_0_arm64.whl",
+      "fastdb_wheel": "/tmp/c2-074-release/published/fastdb4py-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+      "mac_c3": "/tmp/c2-074-release/published/c3-aarch64-apple-darwin",
+      "windows_c3": "/tmp/c2-074-release/published/c3-x86_64-pc-windows-msvc.exe"
+    },
+    "status": "passed"
+  },
+  "public_macos_installed_smoke": {
+    "schema": "c-two.installed-wheel-smoke.v1",
+    "status": "passed",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "interpreter": "3.13.3 (main, Apr  9 2025, 03:47:57) [Clang 20.1.0 ]",
+    "checks": [
+      {
+        "paths": {
+          "c_two": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/__init__.py",
+          "c_two._native": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/_native.cpython-313-darwin.so",
+          "fastdb4py": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/__init__.py",
+          "fastdb_library": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/core/libfastdb.dylib",
+          "numpy": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/numpy/__init__.py"
+        },
+        "prefix": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv",
+        "pid": 24282,
+        "installed_wheels": {
+          "fastdb4py": {
+            "direct_url": {
+              "url": "file:///private/tmp/c2-074-release/published/fastdb4py-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+              "archive_info": {}
+            },
+            "sha256": "e203a3262f9260719220fe207bd2f12ed0719031a61b92e14eb42a8c0bc9dd28"
+          },
+          "c-two": {
+            "direct_url": {
+              "url": "file:///private/tmp/c2-074-release/published/c_two-0.7.4-cp313-cp313-macosx_11_0_arm64.whl",
+              "archive_info": {}
+            },
+            "sha256": "bb625650f186c6066992cac0948c0f44b95a22af46778c8e63bba30d80ee88b8"
+          }
+        },
+        "versions": {
+          "c-two": "0.7.4",
+          "fastdb4py": "0.2.1",
+          "numpy": "2.5.3"
+        },
+        "status": "passed",
+        "transport": "direct",
+        "observed_mode": "ipc",
+        "payload_bytes": 1048576,
+        "held_view_invalidated": true
+      },
+      {
+        "paths": {
+          "c_two": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/__init__.py",
+          "c_two._native": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/_native.cpython-313-darwin.so",
+          "fastdb4py": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/__init__.py",
+          "fastdb_library": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/core/libfastdb.dylib",
+          "numpy": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/numpy/__init__.py"
+        },
+        "prefix": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv",
+        "pid": 24283,
+        "installed_wheels": {
+          "fastdb4py": {
+            "direct_url": {
+              "url": "file:///private/tmp/c2-074-release/published/fastdb4py-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+              "archive_info": {}
+            },
+            "sha256": "e203a3262f9260719220fe207bd2f12ed0719031a61b92e14eb42a8c0bc9dd28"
+          },
+          "c-two": {
+            "direct_url": {
+              "url": "file:///private/tmp/c2-074-release/published/c_two-0.7.4-cp313-cp313-macosx_11_0_arm64.whl",
+              "archive_info": {}
+            },
+            "sha256": "bb625650f186c6066992cac0948c0f44b95a22af46778c8e63bba30d80ee88b8"
+          }
+        },
+        "versions": {
+          "c-two": "0.7.4",
+          "fastdb4py": "0.2.1",
+          "numpy": "2.5.3"
+        },
+        "status": "passed",
+        "transport": "relay",
+        "observed_mode": "http",
+        "payload_bytes": 1048576,
+        "held_view_invalidated": true
+      }
+    ],
+    "cleanup": {
+      "host_orderly_shutdown": true,
+      "errors": [],
+      "relay_stop": "terminated",
+      "host_stop": "already_exited",
+      "processes_exited": true,
+      "temporary_directory_removed": true
+    },
+    "source_commit_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+    "identity": {
+      "administrator": null
+    },
+    "artifacts": [
+      {
+        "name": "fastdb4py-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+        "sha256": "e203a3262f9260719220fe207bd2f12ed0719031a61b92e14eb42a8c0bc9dd28",
+        "bytes": 1133461,
+        "distribution": "fastdb4py",
+        "version": "0.2.1"
+      },
+      {
+        "name": "c_two-0.7.4-cp313-cp313-macosx_11_0_arm64.whl",
+        "sha256": "bb625650f186c6066992cac0948c0f44b95a22af46778c8e63bba30d80ee88b8",
+        "bytes": 4203932,
+        "distribution": "c-two",
+        "version": "0.7.4"
+      },
+      {
+        "name": "c3-aarch64-apple-darwin",
+        "sha256": "36ce0b7f26c5add0895789373be6e47a1e45d2f36c49f5d9f065b0e6352e0e85",
+        "bytes": 11373632
+      }
+    ],
+    "installed_packages": [
+      {
+        "name": "c-two",
+        "version": "0.7.4"
+      },
+      {
+        "name": "fastdb4py",
+        "version": "0.2.1"
+      },
+      {
+        "name": "numpy",
+        "version": "2.5.3"
+      }
+    ],
+    "cli_version": "c3 0.3.3",
+    "host": {
+      "paths": {
+        "c_two": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/__init__.py",
+        "c_two._native": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/_native.cpython-313-darwin.so",
+        "fastdb4py": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/__init__.py",
+        "fastdb_library": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/core/libfastdb.dylib",
+        "numpy": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/numpy/__init__.py"
+      },
+      "prefix": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv",
+      "pid": 24171,
+      "installed_wheels": {
+        "fastdb4py": {
+          "direct_url": {
+            "url": "file:///private/tmp/c2-074-release/published/fastdb4py-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+            "archive_info": {}
+          },
+          "sha256": "e203a3262f9260719220fe207bd2f12ed0719031a61b92e14eb42a8c0bc9dd28"
+        },
+        "c-two": {
+          "direct_url": {
+            "url": "file:///private/tmp/c2-074-release/published/c_two-0.7.4-cp313-cp313-macosx_11_0_arm64.whl",
+            "archive_info": {}
+          },
+          "sha256": "bb625650f186c6066992cac0948c0f44b95a22af46778c8e63bba30d80ee88b8"
+        }
+      },
+      "versions": {
+        "c-two": "0.7.4",
+        "fastdb4py": "0.2.1",
+        "numpy": "2.5.3"
+      },
+      "address": "ipc://cc5e6bef7980aa6f5f4e3bbf0ffa6a27f512d3",
+      "status": "ready"
+    },
+    "borrowed_inputs_invalidated": 4,
+    "logs": {
+      "host.log": "",
+      "relay.log": "C-Two relay listening at http://127.0.0.1:53490\nPress Ctrl+C to stop.\n[relay] Register request: name=wheel-echo server_id=cc5e6bef7980aa6f5f4e3bbf0ffa6a27f512d3 server_instance_id=37a4bd46ecae49bd9fa12dd221732b69 address=ipc://cc5e6bef7980aa6f5f4e3bbf0ffa6a27f512d3 prepare_only=true\n[relay] Register prepared: name=wheel-echo server_id=cc5e6bef7980aa6f5f4e3bbf0ffa6a27f512d3 server_instance_id=37a4bd46ecae49bd9fa12dd221732b69 address=ipc://cc5e6bef7980aa6f5f4e3bbf0ffa6a27f512d3 crm=ci.installed-wheels/Echo/1.0.0\n[relay] Register request: name=wheel-echo server_id=cc5e6bef7980aa6f5f4e3bbf0ffa6a27f512d3 server_instance_id=37a4bd46ecae49bd9fa12dd221732b69 address=ipc://cc5e6bef7980aa6f5f4e3bbf0ffa6a27f512d3 prepare_only=false\n[relay] Register committed: name=wheel-echo server_id=cc5e6bef7980aa6f5f4e3bbf0ffa6a27f512d3 server_instance_id=37a4bd46ecae49bd9fa12dd221732b69 address=ipc://cc5e6bef7980aa6f5f4e3bbf0ffa6a27f512d3 crm=ci.installed-wheels/Echo/1.0.0\n"
+    }
+  },
+  "local_source_and_native_sync": {
+    "source_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+    "preserved_stash_sha": "4ec5efe723902fe2d4c58c6ac00c68885d2a4969",
+    "backup": "/tmp/c2-074-release/local-draft-backup-at-sync",
+    "different_preserved_drafts": [
+      "docs/roadmap.md",
+      "docs/roadmap.zh-CN.md",
+      "docs/plans/0.7.4.md",
+      "docs/plans/0.7.4.zh-CN.md"
+    ],
+    "unrelated_mimosa_preserved": true,
+    "native": {
+      "version": "0.7.4",
+      "sdk": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/__init__.py",
+      "native": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/_native.cpython-313-darwin.so",
+      "connect_timeout": true,
+      "sha256": "d9f4deea1f7c8010e5bbb1a7183b86673d868240286c99ed76a16795b0b1d918"
+    },
+    "status": "passed"
+  },
+  "scoped_branch_worktree_cleanup": {
+    "managed_worktree": "archived",
+    "root": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two",
+    "branch": "socu/0.7.4",
+    "local_branch_deleted": true,
+    "origin_branch_deleted": true,
+    "preserved_native": "/tmp/c2-074-fd-regression/retained/final-probe-native.so",
+    "unrelated_locked_worktrees_untouched": true
+  },
+  "original_handover_files": {
+    "directory": "/Users/soku/Desktop/codespace/mememe/hey-my-buddy/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe",
+    "files": {
+      "HANDOVER.md": {
+        "sha256": "cefdad63775aa4c5a3b9e6c19da3caade57f8c1dbcf9cfbd6ecaac721a5667a6",
+        "size": 5855
+      },
+      "client.py": {
+        "sha256": "1603ac5dcaeeae5f3266dcd4d63dff384efeee74ee2786bb05fdf3c71f47f8bf",
+        "size": 3339
+      },
+      "contract.py": {
+        "sha256": "fb6403e86cc0dfed45a464f4b65d69d688f998cbd46085e231e175494620ef63",
+        "size": 238
+      },
+      "run.py": {
+        "sha256": "2219175c9ad6199df86d679830f2bddd5d62005f320094d2f9ecc0091b8b25f5",
+        "size": 3327
+      },
+      "server.py": {
+        "sha256": "075db9aaf6b7caed5138906f8218dfe645b31d3efe457e869d8367833e3c8460",
+        "size": 645
+      },
+      "threshold.log": {
+        "sha256": "d6c5590e15c38f4d72e6570e03505f34f4cf5b2ee14409d8e161b7d74d090d36",
+        "size": 749
+      }
+    }
+  },
+  "fd_final_evidence_audit_sha256": "e06158f935857e76f1f419bf9a558a9b567bc472eb1786de3ee9ad5fd6888d07",
+  "bounds": {
+    "rust_sdk": "source-only 0.1.0",
+    "typescript_sdk": "source-only",
+    "windows_fd_counter": "not executed; Rust real Named Pipe tests executed on Server2022/2025",
+    "windows11_desktop": "not executed"
+  },
+  "build_cleanup": {
+    "status": "passed",
+    "source_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
+    "removed": [
+      {
+        "path": "/tmp/c2-074-astra-probe-target",
+        "allocated_bytes_before": 1014321152
+      },
+      {
+        "path": "/tmp/c2-074-cli-target",
+        "allocated_bytes_before": 1811030016
+      },
+      {
+        "path": "/tmp/c2-074-codegen-target",
+        "allocated_bytes_before": 354582528
+      },
+      {
+        "path": "/tmp/c2-074-core-target",
+        "allocated_bytes_before": 8499666944
+      },
+      {
+        "path": "/tmp/c2-074-deadline-review-target",
+        "allocated_bytes_before": 1556500480
+      },
+      {
+        "path": "/tmp/c2-074-managed-target",
+        "allocated_bytes_before": 327651328
+      },
+      {
+        "path": "/tmp/c2-074-native-target",
+        "allocated_bytes_before": 1776398336
+      },
+      {
+        "path": "/tmp/c2-074-node-target",
+        "allocated_bytes_before": 326225920
+      },
+      {
+        "path": "/tmp/c2-074-rust-sdk-target",
+        "allocated_bytes_before": 1376006144
+      },
+      {
+        "path": "/tmp/c2-074-idle-pool-ba856a91-green",
+        "allocated_bytes_before": 836427776
+      },
+      {
+        "path": "/tmp/c2-074-venv",
+        "allocated_bytes_before": 271396864
+      },
+      {
+        "path": "/tmp/c2-074-astra-baseline-binaries",
+        "allocated_bytes_before": 14483456
+      },
+      {
+        "path": "/tmp/c2-074-astra-local-copy",
+        "allocated_bytes_before": 438272
+      },
+      {
+        "path": "/tmp/c2-074-deadline-fixed-source",
+        "allocated_bytes_before": 19034112
+      },
+      {
+        "path": "/tmp/c2-074-fastdb-sdk",
+        "allocated_bytes_before": 2560000
+      },
+      {
+        "path": "/tmp/c2-074-node22-sdk",
+        "allocated_bytes_before": 65847296
+      },
+      {
+        "path": "/tmp/c2-074-fd-regression/venv-red",
+        "allocated_bytes_before": 217010176
+      },
+      {
+        "path": "/tmp/c2-074-fd-regression/native-red",
+        "allocated_bytes_before": 354340864
+      },
+      {
+        "path": "/tmp/c2-074-fd-regression/cargo-red",
+        "allocated_bytes_before": 569040896
+      },
+      {
+        "path": "/tmp/c2-074-release/reap-validation-v2/target-green",
+        "allocated_bytes_before": 263708672
+      },
+      {
+        "path": "/tmp/c2-074-release/reap-validation-v2/target-red",
+        "allocated_bytes_before": 212664320
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/core/target",
+        "allocated_bytes_before": 4009385984
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/cli/target",
+        "allocated_bytes_before": 945917952
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/rust/target",
+        "allocated_bytes_before": 1315045376
+      },
+      {
+        "path": "/tmp/c2-074-fd-regression/windows-11655885344.zip",
+        "allocated_bytes_before": 32768
+      },
+      {
+        "path": "/tmp/c2-074-fd-regression/windows-11654744461.zip",
+        "allocated_bytes_before": 32768
+      },
+      {
+        "path": "/tmp/c2-074-fd-regression/retained/final-probe-native.so",
+        "allocated_bytes_before": 10248192
+      },
+      {
+        "path": "/tmp/c2-074-fd-regression/retained/negative-control-native.so",
+        "allocated_bytes_before": 10227712
+      },
+      {
+        "path": "/tmp/c2-074-release/pypi-promotion-plan.zip",
+        "allocated_bytes_before": 4096
+      },
+      {
+        "path": "/tmp/c2-074-release/published/c3-x86_64-pc-windows-msvc.exe",
+        "allocated_bytes_before": 11550720
+      },
+      {
+        "path": "/tmp/c2-074-release/published/c3-aarch64-apple-darwin",
+        "allocated_bytes_before": 11550720
+      },
+      {
+        "path": "/tmp/c2-074-release/published/fastdb4py-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+        "allocated_bytes_before": 1134592
+      },
+      {
+        "path": "/tmp/c2-074-release/published/c_two-0.7.4-cp313-cp313-macosx_11_0_arm64.whl",
+        "allocated_bytes_before": 5242880
+      },
+      {
+        "path": "/tmp/c2-074-validation/final-unix-artifacts/local-endpoint-validation-8c4b039e88df849218fd984e26b1383a5db3eae0-focused-local.zip",
+        "allocated_bytes_before": 12288
+      },
+      {
+        "path": "/tmp/c2-074-validation/final-unix-artifacts/local-endpoint-validation-8c4b039e88df849218fd984e26b1383a5db3eae0-core-test.zip",
+        "allocated_bytes_before": 36864
+      },
+      {
+        "path": "/tmp/c2-074-validation/final-unix-artifacts/local-endpoint-validation-8c4b039e88df849218fd984e26b1383a5db3eae0-cross-user-ubuntu-24.04.zip",
+        "allocated_bytes_before": 12288
+      },
+      {
+        "path": "/tmp/c2-074-validation/final-unix-artifacts/local-endpoint-validation-8c4b039e88df849218fd984e26b1383a5db3eae0-cross-user-macos-15.zip",
+        "allocated_bytes_before": 12288
+      },
+      {
+        "path": "/tmp/c2-074-validation/final-unix-artifacts/local-endpoint-validation-8c4b039e88df849218fd984e26b1383a5db3eae0-python-suite.zip",
+        "allocated_bytes_before": 319488
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-unix-artifacts/local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-cross-user-ubuntu-24.04.zip",
+        "allocated_bytes_before": 12288
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-unix-artifacts/local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-core-test.zip",
+        "allocated_bytes_before": 40960
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-unix-artifacts/local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-cross-user-macos-15.zip",
+        "allocated_bytes_before": 8192
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-unix-artifacts/local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-focused-local.zip",
+        "allocated_bytes_before": 12288
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-unix-artifacts/local-endpoint-validation-0deda44574f2737c9049169d99b965fde23c75fe-python-suite.zip",
+        "allocated_bytes_before": 319488
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2022-local-platform-0deda44574f2737c9049169d99b965fde23c75fe.zip",
+        "allocated_bytes_before": 32768
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2022-full-0deda44574f2737c9049169d99b965fde23c75fe.zip",
+        "allocated_bytes_before": 12247040
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2025-full-0deda44574f2737c9049169d99b965fde23c75fe.zip",
+        "allocated_bytes_before": 12222464
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2025-local-platform-0deda44574f2737c9049169d99b965fde23c75fe.zip",
+        "allocated_bytes_before": 32768
+      },
+      {
+        "path": "/tmp/c2-074-validation/failed-windows-local-artifacts/11644815828.zip",
+        "allocated_bytes_before": 32768
+      },
+      {
+        "path": "/tmp/c2-074-validation/failed-windows-local-artifacts/11644875866.zip",
+        "allocated_bytes_before": 32768
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2022-full-0deda44574f2737c9049169d99b965fde23c75fe/cli/c3.exe",
+        "allocated_bytes_before": 20316160
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2022-full-0deda44574f2737c9049169d99b965fde23c75fe/wheels/fastdb/fastdb4py-0.2.1-cp312-cp312-win_amd64.whl",
+        "allocated_bytes_before": 798720
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2022-full-0deda44574f2737c9049169d99b965fde23c75fe/wheels/c-two/c_two-0.7.4-cp312-cp312-win_amd64.whl",
+        "allocated_bytes_before": 4329472
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2025-full-0deda44574f2737c9049169d99b965fde23c75fe/cli/c3.exe",
+        "allocated_bytes_before": 20316160
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2025-full-0deda44574f2737c9049169d99b965fde23c75fe/wheels/fastdb/fastdb4py-0.2.1-cp312-cp312-win_amd64.whl",
+        "allocated_bytes_before": 798720
+      },
+      {
+        "path": "/tmp/c2-074-validation/eager-final-windows-artifacts/windows-native-windows-2025-full-0deda44574f2737c9049169d99b965fde23c75fe/wheels/c-two/c_two-0.7.4-cp312-cp312-win_amd64.whl",
+        "allocated_bytes_before": 4325376
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/.pytest_cache",
+        "allocated_bytes_before": 40960
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/tools/local_rc/__pycache__",
+        "allocated_bytes_before": 163840
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/tools/ci/__pycache__",
+        "allocated_bytes_before": 53248
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/tests/repo/__pycache__",
+        "allocated_bytes_before": 602112
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/.pytest_cache",
+        "allocated_bytes_before": 16384
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/tests/__pycache__",
+        "allocated_bytes_before": 28672
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/tests/unit/__pycache__",
+        "allocated_bytes_before": 1167360
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/tests/integration/__pycache__",
+        "allocated_bytes_before": 774144
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/tests/fixtures/__pycache__",
+        "allocated_bytes_before": 90112
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/__pycache__",
+        "allocated_bytes_before": 32768
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/transport/__pycache__",
+        "allocated_bytes_before": 98304
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/transport/server/__pycache__",
+        "allocated_bytes_before": 40960
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/transport/client/__pycache__",
+        "allocated_bytes_before": 28672
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/config/__pycache__",
+        "allocated_bytes_before": 20480
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/crm/__pycache__",
+        "allocated_bytes_before": 135168
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/mem/__pycache__",
+        "allocated_bytes_before": 4096
+      },
+      {
+        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/.github/scripts/__pycache__",
+        "allocated_bytes_before": 368640
+      }
+    ],
+    "removed_path_count": 72,
+    "removed_allocated_bytes": 26269646848,
+    "available_bytes_delta": 25389998080,
+    "elapsed_seconds": 25.244290113449097,
+    "installed_development_environment_preserved": true,
+    "native_import_after_cleanup": "passed",
+    "original_handover_unchanged": true,
+    "unrelated_locked_buddy_worktrees_untouched": true,
+    "retained_records": [
+      "docs/reports/evidence/0.7.4-publication.json",
+      "docs/reports/evidence/0.7.4-fd-leak-regression.json",
+      "docs/reports/evidence/0.7.4-astra-fd-evidence-audit.json"
+    ]
+  },
+  "documentation_followup": {
+    "sdk_readme_version": "0.7.4 / C3 0.3.3",
+    "usage_guide": "connection and call deadlines, Unix0755 / WindowsSID",
+    "test_guide": "current files; Unix4workers / Windowsserial;240s and300s overrides",
+    "existing_pypi_metadata_retains_old_embedded_readme": true,
+    "validation": {
+      "local_links_checked": 79,
+      "python_and_bash_blocks_checked": 27,
+      "diff_check": "passed"
+    }
+  }
+}

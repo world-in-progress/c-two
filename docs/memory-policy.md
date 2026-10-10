@@ -52,7 +52,7 @@ FastDB 载荷内容对该层不透明：C-Two 只搬运字节或共享内存指�
 
 ## 5. 池段容量与单消息上限相互独立
 
-`pool_segment_size` 与 `max_payload_size` 是相互独立的维度，对 buddy 开启和关闭两种情况一致：一个较大的池段可以容纳多个较小的消息，池段总容量不必小于每条消息上限。0.7.0 校验中"`pool_segment_size` 不得超过 `max_payload_size`"的交叉限制已删除；保留的只有真正约束构造与线格式的检查（尺寸为正、索引可表示、段数有限、乘法不溢出），实际超过 `max_payload_size` 的请求与响应仍会被拒绝，不会因池段足够大而放行。
+`pool_segment_size` 与 `max_payload_size` 是相互独立的维度，对 buddy 开启和关闭两种情况一致：一个较大的池段可以容纳多个较小的消息，池段总容量不必小于每条消息上限。校验约束构造与线格式：尺寸为正、索引可表示、段数有限、乘法不溢出。实际超过 `max_payload_size` 的请求与响应仍会被拒绝，不会因池段足够大而放行。
 
 以下配置合法：限制单条消息 32 MiB、保留默认 256 MiB 池段，并且关闭 buddy 时不创建任何 buddy 后备，dedicated SHM 仍按需可用：
 
@@ -142,5 +142,5 @@ c3 relay --bind 127.0.0.1:8080 \
 - `sdk/python/src/c_two/crm/transferable.py` — `HeldResult` 释放顺序；`.env.example` — `C2_IPC_POOL_ENABLED`/`PREWARM`/`MIN_RETAINED` 键。
 - `docs/reports/memory-budget-contract.md` 与 `docs/plans/2026-09-26-memory-policy.md` — 目标契约与计划背景。
 - [内存阶段验收](reports/memory-native-final-validation.md) — 该阶段固定源码与开发产物证据，保留其历史状态。
-- [0.7.0 统一验收](reports/canonical-local-endpoint-validation.md) — 0.7.0 时期唯一端点的确切源码、Windows/Linux 门禁与开发产物哈希；是历史记录，不作为 0.7.1 证据。
-- [0.7.1 发布说明](releases/0.7.1.md) — 对应源码的行为与验证范围。
+- [0.7.0 统一验收](reports/canonical-local-endpoint-validation.md) — 该版本唯一端点的确切源码、Windows/Linux 门禁与开发产物哈希，保留为历史记录。
+- [0.7.4 发布记录](reports/0.7.4-publication.zh-CN.md) — 当前发布源码、平台门禁与公开产物验证。

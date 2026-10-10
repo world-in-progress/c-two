@@ -72,6 +72,6 @@ $env:FASTDB_PAYLOAD_LINK_MODE = 'system'
 
 ## Validation scope
 
-The [0.7.3 endpoint validation](reports/0.7.3-endpoint-final-validation.md) records the exact source pairs and full Windows Server 2022/2025 x64 gates, including strict 18-row Rust/Python and 12-row TypeScript receipts and ordinary/non-administrator wheel consumers. Release manifests identify the actual package source; documentation commits are separate from artifact source commits.
+The [0.7.4 publication record](reports/0.7.4-publication.md) records the published source pair and full Windows Server 2022/2025 x64 gates, including strict 18-row Rust/Python and 12-row TypeScript receipts and ordinary/non-administrator wheel consumers. The [FD follow-up](reports/0.7.4-fd-leak-regression.md) covers actual Named Pipe close and idle-replacement regressions on both Windows runners. Release manifests identify the actual package source; documentation commits are separate from artifact source commits.
 
 Windows 11 desktop, Windows services, Windows ARM64 and a real Windows/Linux relay link are outside this evidence. See the [implementation report](windows-native-implementation.md) for platform coverage.

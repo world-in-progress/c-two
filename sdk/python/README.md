@@ -2,19 +2,21 @@
 
 C-Two exposes stateful Python resources through typed CRM contracts over same-process calls, local IPC, or an external HTTP relay. This package projects the shared Rust runtime into Python.
 
-Python C-Two **0.7.3** uses c3 **0.3.2**. See the [configuration guide](https://github.com/world-in-progress/c-two/blob/main/docs/configuration.en.md) and [0.7.3 endpoint guide](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.7.3.md).
+Python C-Two **0.7.4** uses c3 **0.3.3**. See the [Python usage guide](https://github.com/world-in-progress/c-two/blob/main/docs/python-usage.md), [configuration guide](https://github.com/world-in-progress/c-two/blob/main/docs/configuration.en.md) and [release notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.7.4.md).
 
 ```bash
-uv pip install 'c-two==0.7.3'
+uv pip install 'c-two==0.7.4'
 ```
 
 FastDB is pinned to `fastdb4py==0.2.1`. See the [project quickstart](https://github.com/world-in-progress/c-two/blob/main/README.md) and [Chinese edition](https://github.com/world-in-progress/c-two/blob/main/README.zh-CN.md).
 
 Local IPC uses Unix domain sockets or current-logon-SID Windows Named Pipes. Unix roots select the final endpoint directory, with short names and directory-relative connections. Rust owns `Persistent`/`OwnerBound` policies, structured shutdown and scoped maintenance. Install matching builds across communicating clients, resource servers and c3. See the [lifecycle guide](https://github.com/world-in-progress/c-two/blob/main/docs/local-endpoint-lifecycle.en.md).
 
+`cc.connect(..., timeout=...)` bounds connection acquisition across pool waiting, handshake and route discovery. `cc.with_call_options(proxy, timeout=...)` sets business-call waiting separately. Custom Unix endpoint directories can use `0755` when the current user owns them and other identities cannot modify them; Windows uses its SID-scoped pipe namespace. See [connection deadlines](https://github.com/world-in-progress/c-two/blob/main/docs/configuration.en.md#connection-deadlines) and [endpoint configuration](https://github.com/world-in-progress/c-two/blob/main/docs/configuration.en.md#local-endpoint-directories).
+
 IPC uses lazy buddy pools, idle decay and finite backing/reassembly budgets; `pool_enabled=False` skips buddy. `cc.memory_stats()` observes native accounting; held responses and borrowed inputs retain independent leases. The standalone relay has its own upstream policy. See the [memory guide](https://github.com/world-in-progress/c-two/blob/main/docs/memory-policy.en.md).
 
-The [endpoint validation record](https://github.com/world-in-progress/c-two/blob/main/docs/reports/0.7.3-endpoint-final-validation.md) identifies tested source pairs and native Windows Server 2022/2025 x64 evidence. Release manifests identify published artifact sources. Windows 11 desktop, ARM64 and services are outside this validation.
+The [0.7.4 publication record](https://github.com/world-in-progress/c-two/blob/main/docs/reports/0.7.4-publication.md) identifies published sources, Linux/macOS and Windows Server 2022/2025 x64 gates, and verification of public artifacts. Windows 11 desktop, Windows ARM64 and Windows services are outside this validation.
 
 ## Development
 
@@ -81,8 +83,10 @@ for platform-specific loader paths and test prerequisites. Keep the existing
 extension build while running the Python tests:
 
 ```bash
-C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests -q -n 4 --timeout=30
 ```
+
+The four-worker command is for Linux/macOS; omit `-n 4` on Windows. See the [test guide](https://github.com/world-in-progress/c-two/blob/main/sdk/python/tests/README.md) for prerequisites and longer real-idle and interoperability cases.
 
 Run Rust core checks when validating shared native runtime changes:
 
