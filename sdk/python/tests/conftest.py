@@ -115,10 +115,20 @@ def _relay_start_lock() -> Iterator[None]:
         str(Path(tempfile.gettempdir()) / f'c2-relay-start-{hashlib.sha256(uid.encode()).hexdigest()[:24]}.lock'),
     ))
     with _relay_start_thread_lock:
-        if os.name != 'posix':
-            if os.environ.get('PYTEST_XDIST_WORKER'):
-                raise RuntimeError('跨worker relay启动锁目前仅实现于Unix；Windows使用原有串行门禁')
-            yield
+        if os.name == 'nt':
+            import msvcrt
+            with path.open('a+b') as stream:
+                stream.seek(0, 2)
+                if stream.tell() == 0:
+                    stream.write(b'\0')
+                    stream.flush()
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
             return
         import fcntl
         # 不unlink：避免等待者与新来者锁到不同inode。

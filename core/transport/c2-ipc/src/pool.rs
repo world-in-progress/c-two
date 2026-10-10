@@ -2485,9 +2485,10 @@ mod tests {
         errors: Vec<String>,
     }
 
-    /// A real local peer on Unix and Windows. Only a zero-byte stream read
-    /// counts as closure; DISCONNECT is acknowledged and followed through to
-    /// EOF. Keeping the listener and all readers alive makes leaked sockets
+    /// A real local peer on Unix and Windows. A zero-byte read or Windows
+    /// ERROR_NO_DATA at a new frame boundary counts as closure; DISCONNECT is
+    /// acknowledged and followed through to EOF. Keeping the listener and all
+    /// readers alive makes leaked sockets
     /// observable even when the pool has already forgotten their entries.
     struct PoolPeer {
         address: String,
@@ -2501,18 +2502,22 @@ mod tests {
         reader: &mut (impl tokio::io::AsyncRead + Unpin),
     ) -> Result<Option<(c2_wire::frame::FrameHeader, Vec<u8>)>, String> {
         let mut prefix = [0_u8; 4];
-        if reader
-            .read(&mut prefix[..1])
-            .await
-            .map_err(|e| e.to_string())?
-            == 0
-        {
-            return Ok(None);
+        match reader.read(&mut prefix[..1]).await {
+            Ok(0) => return Ok(None),
+            #[cfg(windows)]
+            Err(error) if error.raw_os_error() == Some(232) => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "new frame read: {error} (raw={:?})",
+                    error.raw_os_error()
+                ));
+            }
+            Ok(_) => {}
         }
         reader
             .read_exact(&mut prefix[1..])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("frame prefix read: {e} (raw={:?})", e.raw_os_error()))?;
         let len = u32::from_le_bytes(prefix);
         if !(12..=65536).contains(&len) {
             return Err(format!("invalid fixture frame length: {len}"));
@@ -2521,10 +2526,143 @@ mod tests {
         reader
             .read_exact(&mut body)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("frame body read: {e} (raw={:?})", e.raw_os_error()))?;
         let (header, payload) =
             c2_wire::frame::decode_frame_body(&body, len).map_err(|e| e.to_string())?;
         Ok(Some((header, payload.to_vec())))
+    }
+
+    struct PeerReadThenError {
+        bytes: std::io::Cursor<Vec<u8>>,
+        code: i32,
+    }
+
+    impl tokio::io::AsyncRead for PeerReadThenError {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if buf.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let position = self.bytes.position() as usize;
+            let available = &self.bytes.get_ref()[position..];
+            if available.is_empty() {
+                return std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(self.code)));
+            }
+            let count = available.len().min(buf.remaining());
+            buf.put_slice(&available[..count]);
+            self.bytes.set_position((position + count) as u64);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn read_peer_frame_windows_closed_pipe_at_frame_boundary_is_eof() {
+        let mut reader = PeerReadThenError {
+            bytes: std::io::Cursor::new(vec![]),
+            code: 232,
+        };
+        assert!(read_peer_frame(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_peer_frame_closed_pipe_inside_frame_is_error() {
+        for bytes in [vec![12], vec![12, 0, 0, 0], vec![12, 0, 0, 0, 1]] {
+            let mut reader = PeerReadThenError {
+                bytes: std::io::Cursor::new(bytes),
+                code: 232,
+            };
+            assert!(read_peer_frame(&mut reader).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_peer_frame_unrelated_boundary_error_is_error() {
+        let mut reader = PeerReadThenError {
+            bytes: std::io::Cursor::new(vec![]),
+            code: 5,
+        };
+        assert!(read_peer_frame(&mut reader).await.is_err());
+    }
+
+    async fn confirm_peer_disconnect(
+        reader: &mut (impl tokio::io::AsyncRead + Unpin),
+        ack_result: std::io::Result<()>,
+    ) -> Result<(), String> {
+        if let Err(error) = ack_result {
+            // A bounded client close may abort before receiving our ACK. Only
+            // Windows peer-closed errors qualify; the read below must still
+            // independently prove EOF. This does not apply to PING writes.
+            let peer_closed = cfg!(windows) && matches!(error.raw_os_error(), Some(109 | 232));
+            if !peer_closed {
+                return Err(format!(
+                    "ACK write: {error} (raw={:?})",
+                    error.raw_os_error()
+                ));
+            }
+        }
+        match read_peer_frame(reader).await? {
+            None => Ok(()),
+            Some(_) => Err("expected EOF after DISCONNECT_ACK".into()),
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn disconnect_ack_closed_pipe_still_requires_eof() {
+        for code in [109, 232] {
+            let mut closed = PeerReadThenError {
+                bytes: std::io::Cursor::new(vec![]),
+                code: 232,
+            };
+            assert!(
+                confirm_peer_disconnect(&mut closed, Err(std::io::Error::from_raw_os_error(code)))
+                    .await
+                    .is_ok()
+            );
+            let mut partial = PeerReadThenError {
+                bytes: std::io::Cursor::new(vec![12]),
+                code: 232,
+            };
+            assert!(
+                confirm_peer_disconnect(&mut partial, Err(std::io::Error::from_raw_os_error(code)))
+                    .await
+                    .is_err()
+            );
+            let mut live = PeerReadThenError {
+                bytes: std::io::Cursor::new(c2_wire::frame::encode_frame(
+                    0,
+                    c2_wire::flags::FLAG_SIGNAL,
+                    &[0x02],
+                )),
+                code: 232,
+            };
+            assert!(
+                confirm_peer_disconnect(&mut live, Err(std::io::Error::from_raw_os_error(code)))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_ack_unrelated_error_is_rejected() {
+        let mut closed = tokio::io::empty();
+        assert!(
+            confirm_peer_disconnect(&mut closed, Err(std::io::Error::from_raw_os_error(5)))
+                .await
+                .is_err()
+        );
+        #[cfg(not(windows))]
+        assert!(
+            confirm_peer_disconnect(&mut closed, Err(std::io::Error::from_raw_os_error(232)))
+                .await
+                .is_err()
+        );
+        assert!(confirm_peer_disconnect(&mut closed, Ok(())).await.is_ok());
     }
 
     impl PoolPeer {
@@ -2597,7 +2735,9 @@ mod tests {
                                 let read = async {
                                     loop {
                                         let Some((header, payload)) =
-                                            read_peer_frame(&mut reader).await?
+                                            read_peer_frame(&mut reader)
+                                                .await
+                                                .map_err(|error| format!("connection {id}: {error}"))?
                                         else {
                                             observations.0.lock().connections[id].eof = true;
                                             observations.1.notify_all();
@@ -2616,13 +2756,17 @@ mod tests {
                                                         | c2_wire::flags::FLAG_RESPONSE,
                                                     &[0x09],
                                                 );
-                                                writer
+                                                let ack_result = writer
                                                     .lock()
                                                     .await
                                                     .write_all(&ack)
+                                                    .await;
+                                                confirm_peer_disconnect(&mut reader, ack_result)
                                                     .await
-                                                    .map_err(|e| e.to_string())?;
-                                                // Do not drop our stream or declare closure on this signal.
+                                                    .map_err(|error| format!("connection {id}: {error}"))?;
+                                                observations.0.lock().connections[id].eof = true;
+                                                observations.1.notify_all();
+                                                return Ok(());
                                             }
                                             [0x02] => {
                                                 observations.0.lock().connections[id].pongs += 1;
@@ -2649,7 +2793,12 @@ mod tests {
                                                 .await
                                                 .write_all(&ping)
                                                 .await
-                                                .map_err(|e| e.to_string())?;
+                                                .map_err(|e| {
+                                                    format!(
+                                                        "connection {id} PING write: {e} (raw={:?})",
+                                                        e.raw_os_error()
+                                                    )
+                                                })?;
                                         }
                                     }
                                     Err::<(), String>("probe channel closed".into())

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import tempfile
 
 import pytest
 
@@ -41,15 +42,18 @@ def test_build_uses_cli_manifest_without_linking(monkeypatch, tmp_path):
     assert calls == [["cargo", "build", "--manifest-path", str(manifest)]]
 
 
-def test_repo_root_reports_clear_error_outside_source_checkout(monkeypatch, tmp_path):
+def test_repo_root_reports_clear_error_outside_source_checkout(monkeypatch):
     tool = _load_c3_tool()
-    copied_script = tmp_path / "copied" / "c3_tool.py"
-    copied_script.parent.mkdir()
-    copied_script.write_text("", encoding="utf-8")
-    monkeypatch.setattr(tool, "__file__", str(copied_script))
+    # pytest's basetemp may itself live in a source checkout. Use the system
+    # temporary directory and verify the precondition of this negative test.
+    with tempfile.TemporaryDirectory(prefix="c3-outside-source-") as directory:
+        copied_script = Path(directory) / "c3_tool.py"
+        copied_script.write_text("", encoding="utf-8")
+        assert not any((parent / "cli").is_dir() for parent in copied_script.resolve().parents)
+        monkeypatch.setattr(tool, "__file__", str(copied_script))
 
-    with pytest.raises(SystemExit, match="C-Two source checkout"):
-        tool.repo_root()
+        with pytest.raises(SystemExit, match="C-Two source checkout"):
+            tool.repo_root()
 
 
 def test_link_creates_bin_entry_without_rebuilding(monkeypatch, tmp_path):

@@ -549,9 +549,16 @@ def assert_no_forbidden_source_references(
     for path in paths:
         if not path.is_file():
             raise RegistryError(f"source-reference scan input is not a file: {path}")
-        contents = path.read_bytes()
+        # Keep both raw and JSON-unescaped spellings: decoding backslash pairs
+        # alone would turn a raw UNC prefix into one slash. The second view
+        # handles JSON escapes while retaining its decoded UNC double slash.
+        raw = path.read_bytes()
+        spellings = (
+            raw.replace(b"\\", b"/"),
+            raw.replace(b"\\\\", b"\\").replace(b"\\", b"/"),
+        )
         for needle in needles:
-            if needle in contents:
+            if any(needle in contents for contents in spellings):
                 raise RegistryError(
                     f"{path} contains an active repository reference "
                     f"{needle.decode(errors='replace')!r}"

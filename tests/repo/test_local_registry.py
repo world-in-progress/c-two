@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 import sys
 import tarfile
@@ -171,8 +172,9 @@ def test_packaged_normalized_manifest_rejects_paths_or_loose_versions(
         inspect_normalized_manifest(archive)
 
 
+@pytest.mark.parametrize("separator", ["/", "\\", None])
 def test_archives_and_diagnostics_reject_active_repository_paths(
-    tmp_path: Path,
+    tmp_path: Path, separator: str | None,
 ) -> None:
     clean = tmp_path / "clean.txt"
     clean.write_text("portable package diagnostics", encoding="utf-8")
@@ -182,8 +184,12 @@ def test_archives_and_diagnostics_reject_active_repository_paths(
     )
 
     hostile = tmp_path / "hostile.txt"
+    reference = (
+        (REPOSITORY.as_posix() + "/sdk/rust").replace("/", separator)
+        if separator is not None else f"{REPOSITORY}/sdk/rust"
+    )
     hostile.write_text(
-        f"linked from {REPOSITORY}/sdk/rust",
+        "linked from " + reference,
         encoding="utf-8",
     )
     with pytest.raises(RegistryError, match="active repository"):
@@ -191,3 +197,11 @@ def test_archives_and_diagnostics_reject_active_repository_paths(
             [hostile],
             forbidden_roots=(REPOSITORY, REPOSITORY.parent / "fastdb"),
         )
+
+
+@pytest.mark.parametrize("reference", [(REPOSITORY.as_posix() + "/sdk/rust").replace("/", "\\"), r"..\c-two\sdk\rust"])
+def test_json_diagnostics_reject_escaped_windows_source_paths(tmp_path: Path, reference: str) -> None:
+    hostile = tmp_path / "diagnostics.json"
+    hostile.write_text(json.dumps({"source": reference}), encoding="utf-8")
+    with pytest.raises(RegistryError, match="active repository"):
+        assert_no_forbidden_source_references([hostile], forbidden_roots=(REPOSITORY,))

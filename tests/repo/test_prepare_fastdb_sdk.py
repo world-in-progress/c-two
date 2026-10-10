@@ -18,6 +18,16 @@ HELPER_PATH = REPOSITORY / ".github" / "scripts" / "prepare_fastdb_sdk.py"
 # below build synthetic releases instead of downloading anything.
 PROVIDED_RELEASE_FIXTURES = Path("/tmp/fastdb-021-main-candidate/release")
 
+
+def provided_release_fixtures() -> Path:
+    configured = os.environ.get("C2_DEV_FASTDB_RELEASE_FIXTURES")
+    return Path(configured).expanduser().resolve() if configured else PROVIDED_RELEASE_FIXTURES
+
+
+def test_configured_release_fixtures_can_use_native_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("C2_DEV_FASTDB_RELEASE_FIXTURES", str(tmp_path))
+    assert provided_release_fixtures() == tmp_path
+
 SYNTHETIC_VERSION = "9.9.9"
 SYNTHETIC_SOURCE_SHA = "f" * 40
 
@@ -156,8 +166,9 @@ def failure_message(module, capsys) -> str:
 
 
 def test_real_release_fixtures_prepare_every_published_target(tmp_path):
-    if not PROVIDED_RELEASE_FIXTURES.is_dir():
-        pytest.skip(f"provided release fixtures are absent: {PROVIDED_RELEASE_FIXTURES}")
+    fixtures = provided_release_fixtures()
+    if not fixtures.is_dir():
+        pytest.skip(f"provided release fixtures are absent: {fixtures}")
     module = load_helper()
     for target, library in (
         ("x86_64-unknown-linux-gnu", "libfastdb.so"),
@@ -166,7 +177,7 @@ def test_real_release_fixtures_prepare_every_published_target(tmp_path):
     ):
         output = tmp_path / target
         assert module.main([
-            "--from-dir", str(PROVIDED_RELEASE_FIXTURES),
+            "--from-dir", str(fixtures),
             "--target", target,
             "--output", str(output),
         ]) == 0
@@ -176,14 +187,15 @@ def test_real_release_fixtures_prepare_every_published_target(tmp_path):
         if target == "x86_64-pc-windows-msvc":
             assert (lib_dir / "fastdb.lib").is_file()
         # The fixture directory must be consumed read-only.
-        assert not any(path.suffix == ".download" for path in PROVIDED_RELEASE_FIXTURES.iterdir())
+        assert not any(path.suffix == ".download" for path in fixtures.iterdir())
 
 
 def test_real_release_fixture_tampering_is_rejected(tmp_path):
-    if not PROVIDED_RELEASE_FIXTURES.is_dir():
-        pytest.skip(f"provided release fixtures are absent: {PROVIDED_RELEASE_FIXTURES}")
+    fixtures = provided_release_fixtures()
+    if not fixtures.is_dir():
+        pytest.skip(f"provided release fixtures are absent: {fixtures}")
     module = load_helper()
-    manifest = json.loads((PROVIDED_RELEASE_FIXTURES / "release-manifest.json").read_bytes())
+    manifest = json.loads((fixtures / "release-manifest.json").read_bytes())
     manifest["source_sha"] = "0" * 40
     tampered = tmp_path / "release"
     tampered.mkdir()

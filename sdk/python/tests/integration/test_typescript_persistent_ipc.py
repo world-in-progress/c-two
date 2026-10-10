@@ -62,7 +62,7 @@ class PublishingManager(CountingResource):
 
 def _run(command: list[str], root: Path, label: str) -> None:
     completed = subprocess.run(
-        portable_command(command), cwd=root, text=True, capture_output=True,
+        portable_command(command), cwd=root, text=True, encoding="utf-8", capture_output=True,
         timeout=120, check=False,
     )
     log = root / f"{label}.log"
@@ -90,9 +90,6 @@ def persistent_node_project() -> Iterator[tuple[Path, str]]:
     if all(packages):
         archives = [str(Path(package).resolve()) for package in packages if package]
         assert all(Path(archive).is_file() for archive in archives), "supplied TS package tarball missing"
-        _run([
-            "npm", "install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", *archives,
-        ], root, "install")
     else:
         fastdb = REPOSITORY.parent / "fastdb/ts/fastdb4ts"
         dependencies = {
@@ -100,15 +97,27 @@ def persistent_node_project() -> Iterator[tuple[Path, str]]:
             "typescript": fastdb / "node_modules/typescript",
             "@c-two/c2-mem-ffi": REPOSITORY / "core/foundation/c2-mem-ffi/bindings/typescript",
         }
-        for name, source in dependencies.items():
+        archives = []
+        for index, (name, source) in enumerate(dependencies.items()):
             assert (source / "package.json").is_file(), f"prebuilt Node dependency missing: {source}"
             if name != "typescript":
                 assert (source / "dist/index.js").is_file(), f"build the Node dependency before this suite: {source}"
-            destination = root / "node_modules" / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.symlink_to(source, target_is_directory=True)
+            destination = root / "packages" / str(index)
+            destination.mkdir(parents=True)
+            # Consume the same packaged layout as candidate mode. Do not run
+            # prepack/build scripts or modify the already built source trees.
+            _run([
+                "npm", "pack", str(source), "--offline", "--ignore-scripts",
+                "--pack-destination", str(destination),
+            ], root, f"pack-{index}")
+            packed = list(destination.glob("*.tgz"))
+            assert len(packed) == 1, f"expected one prebuilt package archive: {destination}"
+            archives.append(str(packed[0]))
+    _run([
+        "npm", "install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", *archives,
+    ], root, "install")
     compiler = root / "node_modules/typescript"
-    assert json.loads((compiler / "package.json").read_text())["version"] == "5.9.3"
+    assert json.loads((compiler / "package.json").read_text(encoding="utf-8"))["version"] == "5.9.3"
     tsc = compiler / "bin/tsc"
     assert tsc.is_file(), f"pinned TS compiler missing: {tsc}"
     for name, crm in (("manager", Manager), ("builder", Builder)):
@@ -120,7 +129,7 @@ def persistent_node_project() -> Iterator[tuple[Path, str]]:
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(artifact.bytes)
         generated = root / "generated" / name / "typescript/c_two_contract.ts"
-        assert TS_SOURCE.read_text() in generated.read_text(), "native codegen must be rebuilt from this checkout"
+        assert TS_SOURCE.read_text(encoding="utf-8") in generated.read_text(encoding="utf-8"), "native codegen must be rebuilt from this checkout"
     (root / "tsconfig.json").write_text(json.dumps({
         "compilerOptions": {
             "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext",
@@ -148,7 +157,7 @@ class PersistentNode:
         self.process = subprocess.Popen(
             [node, str(root / NODE_FIXTURE.name), str(config)], cwd=root,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
-            text=True, bufsize=1,
+            text=True, encoding="utf-8", bufsize=1,
         )
         assert self.process.stdout is not None
         try:

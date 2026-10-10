@@ -1204,7 +1204,7 @@ def stage_github_release_assets(
         target.write_bytes(source.read_bytes())
         assets.append({
             "name": name,
-            "staged_path": str(target.relative_to(staged_root)),
+            "staged_path": target.relative_to(staged_root).as_posix(),
             "sha256": sha256_file(target),
             "bytes": target.stat().st_size,
         })
@@ -1213,7 +1213,7 @@ def stage_github_release_assets(
             published_sidecar.write_bytes(sidecar.read_bytes())
             assets.append({
                 "name": _sidecar_name(name),
-                "staged_path": str(published_sidecar.relative_to(staged_root)),
+                "staged_path": published_sidecar.relative_to(staged_root).as_posix(),
                 "sha256": sha256_file(published_sidecar),
                 "bytes": published_sidecar.stat().st_size,
             })
@@ -1243,7 +1243,7 @@ def stage_pypi_files(
         )
         target = staging / entry["name"]
         target.write_bytes(source.read_bytes())
-        files.append({"name": entry["name"], "staged_path": str(target.relative_to(staged_root)),
+        files.append({"name": entry["name"], "staged_path": target.relative_to(staged_root).as_posix(),
                       "sha256": sha256_file(target), "bytes": target.stat().st_size})
     _require(len(files) == 31, f"expected 31 PyPI files, staged {len(files)}")
     return files
