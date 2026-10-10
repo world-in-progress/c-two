@@ -469,8 +469,15 @@ async fn managed_concurrent_same_address_bind_has_exactly_one_winner() {
 /// registered SIGKILL leaves socket and lease that a later reap converges.
 #[tokio::test]
 async fn managed_two_process_competition_and_registered_kill_converge() {
-    let _shared = shared_namespace_guard();
-    let endpoint = managed_endpoint("two-process");
+    // The shared guard does not cover every default-root bind. Exact reap
+    // tries the namespace gate, so this immediate absence check needs its own
+    // coordinator even when every parallel test selects a unique address.
+    let namespace = TestNamespace::new();
+    let competing_namespace = TestNamespace::new();
+    let endpoint = managed_endpoint_at(namespace.path(), "two-process");
+    let competing_endpoint =
+        managed_endpoint_at(competing_namespace.path(), "other-registered-owner");
+    let competing_listener = crate::LocalListener::bind(&competing_endpoint).unwrap();
     let mut holder = spawn_managed_holder(&endpoint);
     assert_eq!(
         crate::LocalListener::bind(&endpoint).err().unwrap().kind(),
@@ -493,10 +500,92 @@ async fn managed_two_process_competition_and_registered_kill_converge() {
     ));
     assert!(!socket_path(&endpoint).exists());
     assert!(!lease_path(&endpoint).exists());
+    let root = endpoint.context().unix_root().unwrap();
+    let gate_identity = identity_of(&root.join(GATE_NAME));
+    let gate_bytes = std::fs::read(root.join(GATE_NAME)).unwrap();
+    let marker_bytes = std::fs::read(root.join(MARKER_NAME)).unwrap();
+    let competing_gate =
+        ManagedNamespace::open_root(competing_namespace.path(), false, true).unwrap();
+    assert!(matches!(
+        ManagedNamespace::open_root(competing_namespace.path(), false, false),
+        Err(NamespaceError::Busy)
+    ));
+    let second_reap = reap_managed(&endpoint, &credential);
+    assert_eq!(identity_of(&root.join(GATE_NAME)), gate_identity);
+    assert_eq!(std::fs::read(root.join(GATE_NAME)).unwrap(), gate_bytes);
+    assert_eq!(std::fs::read(root.join(MARKER_NAME)).unwrap(), marker_bytes);
+    assert!(!socket_path(&endpoint).exists());
+    assert!(!lease_path(&endpoint).exists());
+    drop(competing_gate);
+    assert!(matches!(
+        competing_listener.close(),
+        EndpointReapResult::Reaped
+    ));
+    assert!(
+        matches!(second_reap, EndpointReapResult::AlreadyAbsent),
+        "second reap: {second_reap:?}; target gate/marker unchanged; socket/lease absent"
+    );
+}
+
+/// Socket-less registered leases exercise the same exact retirement/absence
+/// path without timing a crash. A different slot can make that absence check
+/// Busy through the namespace gate, even after the target lease is gone.
+#[test]
+fn managed_absent_reap_needs_an_independent_namespace() {
+    let target_namespace = TestNamespace::new();
+    let competing_namespace = TestNamespace::new();
+    let competing_root = competing_namespace.path();
+    drop(ManagedNamespace::open_root(competing_root, true, true).unwrap());
+    let endpoint = managed_endpoint_at(target_namespace.path(), "absent-reap");
+    let root = endpoint.context().unix_root().unwrap();
+    drop(ManagedNamespace::open_root(root, true, true).unwrap());
+    let record = OwnerRecord {
+        address: endpoint.address().to_owned(),
+        incarnation: [0x5a; 16],
+        identity: SocketIdentity {
+            device: 1,
+            inode: 2,
+            changed_secs: 3,
+            changed_nanos: 4,
+        },
+    };
+    let credential =
+        EndpointCredential::unix_managed(endpoint.clone(), record.identity, record.incarnation);
+    write_lease(&lease_path(&endpoint), &record);
     assert!(matches!(
         reap_managed(&endpoint, &credential),
-        EndpointReapResult::AlreadyAbsent
+        EndpointReapResult::Reaped
     ));
+    assert!(!socket_path(&endpoint).exists());
+    assert!(!lease_path(&endpoint).exists());
+    let gate_identity = identity_of(&root.join(GATE_NAME));
+    let gate_bytes = std::fs::read(root.join(GATE_NAME)).unwrap();
+    let marker_bytes = std::fs::read(root.join(MARKER_NAME)).unwrap();
+
+    // Hold exactly the lock used by an unrelated parallel bind. No timer,
+    // retry, endpoint replacement or owner lease participates in this window.
+    let competing_gate = ManagedNamespace::open_root(competing_root, false, true).unwrap();
+    assert!(matches!(
+        ManagedNamespace::open_root(competing_root, false, false),
+        Err(NamespaceError::Busy)
+    ));
+    let second_reap = reap_managed(&endpoint, &credential);
+    assert_eq!(identity_of(&root.join(GATE_NAME)), gate_identity);
+    assert_eq!(std::fs::read(root.join(GATE_NAME)).unwrap(), gate_bytes);
+    assert_eq!(std::fs::read(root.join(MARKER_NAME)).unwrap(), marker_bytes);
+    assert!(!socket_path(&endpoint).exists());
+    assert!(!lease_path(&endpoint).exists());
+    assert!(
+        matches!(second_reap, EndpointReapResult::AlreadyAbsent),
+        "second reap: {second_reap:?}; gate identity/nonce and marker unchanged; socket/lease absent"
+    );
+    drop(competing_gate);
+    let target_parent = target_namespace._parent.path().to_owned();
+    let competing_parent = competing_namespace._parent.path().to_owned();
+    drop(target_namespace);
+    drop(competing_namespace);
+    assert!(!target_parent.exists());
+    assert!(!competing_parent.exists());
 }
 
 #[tokio::test]

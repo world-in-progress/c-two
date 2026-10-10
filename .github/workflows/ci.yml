@@ -250,9 +250,16 @@ jobs:
         run: |
           npm ci --prefix ../fastdb/ts/fastdb4ts
           npm ci --prefix core/foundation/c2-mem-ffi/bindings/typescript
+          # Use setup-node's Node headers for the packaged native addon.
+          node core/foundation/c2-mem-ffi/bindings/typescript/scripts/build-runtime.mjs
           ./emsdk/emsdk install 5.0.2
           ./emsdk/emsdk activate 5.0.2
           source ./emsdk/emsdk_env.sh
+          # Persistent generated Node clients consume the compiled FastDB
+          # module during ordinary pytest, before the portable matrix builds it.
+          npm run --prefix ../fastdb/ts/fastdb4ts build:wasm
+          npm run --prefix ../fastdb/ts/fastdb4ts build
+          git -C ../fastdb diff --exit-code -- ts/fastdb4ts/src/wasm
           for name in EMSDK EMSDK_NODE EMSDK_PYTHON EM_CONFIG; do
             value="${!name:-}"
             if [[ -n "$value" ]]; then
