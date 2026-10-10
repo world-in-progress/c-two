@@ -2473,6 +2473,379 @@ mod tests {
         )
     }
 
+    #[derive(Default)]
+    struct PeerObservation {
+        pongs: usize,
+        eof: bool,
+    }
+
+    #[derive(Default)]
+    struct PeerObservations {
+        connections: Vec<PeerObservation>,
+        errors: Vec<String>,
+    }
+
+    /// A real local peer on Unix and Windows. Only a zero-byte stream read
+    /// counts as closure; DISCONNECT is acknowledged and followed through to
+    /// EOF. Keeping the listener and all readers alive makes leaked sockets
+    /// observable even when the pool has already forgotten their entries.
+    struct PoolPeer {
+        address: String,
+        observations: Arc<(Mutex<PeerObservations>, Condvar)>,
+        probes: tokio::sync::broadcast::Sender<usize>,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        runner: Option<thread::JoinHandle<()>>,
+    }
+
+    async fn read_peer_frame(
+        reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> Result<Option<(c2_wire::frame::FrameHeader, Vec<u8>)>, String> {
+        let mut prefix = [0_u8; 4];
+        if reader
+            .read(&mut prefix[..1])
+            .await
+            .map_err(|e| e.to_string())?
+            == 0
+        {
+            return Ok(None);
+        }
+        reader
+            .read_exact(&mut prefix[1..])
+            .await
+            .map_err(|e| e.to_string())?;
+        let len = u32::from_le_bytes(prefix);
+        if !(12..=65536).contains(&len) {
+            return Err(format!("invalid fixture frame length: {len}"));
+        }
+        let mut body = vec![0_u8; len as usize];
+        reader
+            .read_exact(&mut body)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (header, payload) =
+            c2_wire::frame::decode_frame_body(&body, len).map_err(|e| e.to_string())?;
+        Ok(Some((header, payload.to_vec())))
+    }
+
+    impl PoolPeer {
+        fn start() -> Self {
+            // MemPool's lazy identity includes a fresh UUID; no new Cargo
+            // dependency, process-global environment or endpoint cleanup.
+            let identity = MemPool::new(PoolConfig::default());
+            let address = format!(
+                "ipc://pool_peer_{}",
+                identity.prefix().trim_start_matches('/')
+            );
+            let endpoint = LocalEndpoint::from_address(&address).unwrap();
+            let observations = Arc::new((Mutex::new(PeerObservations::default()), Condvar::new()));
+            let (probes, _) = tokio::sync::broadcast::channel(16);
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let server_observations = observations.clone();
+            let server_probes = probes.clone();
+            let runner = thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let mut listener = match LocalListener::bind(&endpoint) {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error.to_string()));
+                            return;
+                        }
+                    };
+                    ready_tx.send(Ok(())).unwrap();
+                    let mut stopped = stopped;
+                    let mut watchers = tokio::task::JoinSet::new();
+                    loop {
+                        let stream = tokio::select! {
+                            _ = &mut stopped => break,
+                            accepted = listener.accept() => accepted.unwrap(),
+                        };
+                        let observations = server_observations.clone();
+                        let mut probes = server_probes.subscribe();
+                        watchers.spawn(async move {
+                            let result: Result<(), String> = async {
+                                let mut stream = stream;
+                                let handshake = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    read_peer_frame(&mut stream),
+                                )
+                                .await
+                                .map_err(|e| e.to_string())??
+                                .ok_or("EOF before handshake")?;
+                                if !handshake.0.is_handshake() || handshake.0.is_response() {
+                                    return Err("expected client handshake".into());
+                                }
+                                c2_wire::handshake::decode_handshake(&handshake.1)
+                                    .map_err(|e| e.to_string())?;
+                                stream
+                                    .write_all(&grid_handshake_reply_frame())
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                let id = {
+                                    let mut state = observations.0.lock();
+                                    let id = state.connections.len();
+                                    state.connections.push(PeerObservation::default());
+                                    observations.1.notify_all();
+                                    id
+                                };
+                                let (mut reader, writer) = stream.into_split();
+                                let writer = tokio::sync::Mutex::new(writer);
+                                let read = async {
+                                    loop {
+                                        let Some((header, payload)) =
+                                            read_peer_frame(&mut reader).await?
+                                        else {
+                                            observations.0.lock().connections[id].eof = true;
+                                            observations.1.notify_all();
+                                            return Ok::<(), String>(());
+                                        };
+                                        if !header.is_signal() {
+                                            return Err(format!(
+                                                "unexpected non-signal frame: {header:?}"
+                                            ));
+                                        }
+                                        match payload.as_slice() {
+                                            [0x08] => {
+                                                let ack = c2_wire::frame::encode_frame(
+                                                    header.request_id,
+                                                    c2_wire::flags::FLAG_SIGNAL
+                                                        | c2_wire::flags::FLAG_RESPONSE,
+                                                    &[0x09],
+                                                );
+                                                writer
+                                                    .lock()
+                                                    .await
+                                                    .write_all(&ack)
+                                                    .await
+                                                    .map_err(|e| e.to_string())?;
+                                                // Do not drop our stream or declare closure on this signal.
+                                            }
+                                            [0x02] => {
+                                                observations.0.lock().connections[id].pongs += 1;
+                                                observations.1.notify_all();
+                                            }
+                                            _ => {
+                                                return Err(format!(
+                                                    "unexpected signal: {payload:?}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                };
+                                let probe = async {
+                                    while let Ok(target) = probes.recv().await {
+                                        if target == id {
+                                            let ping = c2_wire::frame::encode_frame(
+                                                0,
+                                                c2_wire::flags::FLAG_SIGNAL,
+                                                &[0x01],
+                                            );
+                                            writer
+                                                .lock()
+                                                .await
+                                                .write_all(&ping)
+                                                .await
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                    }
+                                    Err::<(), String>("probe channel closed".into())
+                                };
+                                tokio::select! { result = read => result, result = probe => result }
+                            }
+                            .await;
+                            if let Err(error) = result {
+                                observations.0.lock().errors.push(error);
+                                observations.1.notify_all();
+                            }
+                        });
+                    }
+                    watchers.abort_all();
+                    while watchers.join_next().await.is_some() {}
+                });
+            });
+            let peer = Self {
+                address,
+                observations,
+                probes,
+                stop: Some(stop),
+                runner: Some(runner),
+            };
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("local listener readiness")
+                .expect("real local listener bind");
+            peer
+        }
+
+        fn wait(&self, description: &str, predicate: impl Fn(&PeerObservations) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut state = self.observations.0.lock();
+            loop {
+                assert!(state.errors.is_empty(), "peer errors: {:?}", state.errors);
+                if predicate(&state) {
+                    return;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "timed out waiting for {description}");
+                self.observations.1.wait_for(&mut state, remaining);
+            }
+        }
+
+        fn accepted(&self, count: usize) {
+            self.wait("handshaken connections", |s| s.connections.len() == count);
+        }
+
+        fn eof(&self, id: usize) {
+            self.wait("actual peer EOF", |s| s.connections[id].eof);
+        }
+
+        fn assert_live(&self, id: usize) {
+            let pongs = self.observations.0.lock().connections[id].pongs;
+            self.probes.send(id).unwrap();
+            self.wait("live connection PONG", |s| s.connections[id].pongs > pongs);
+            assert!(!self.observations.0.lock().connections[id].eof);
+        }
+
+        fn live_count(&self) -> usize {
+            self.observations
+                .0
+                .lock()
+                .connections
+                .iter()
+                .filter(|c| !c.eof)
+                .count()
+        }
+    }
+
+    impl Drop for PoolPeer {
+        fn drop(&mut self) {
+            let _ = self.stop.take().unwrap().send(());
+            self.runner.take().unwrap().join().unwrap();
+        }
+    }
+
+    fn real_idle_pool_reclaims_connection(explicit_sweep: bool) {
+        let peer = PoolPeer::start();
+        let pool = ClientPool::new(Duration::from_millis(50));
+        let old = pool.acquire(&peer.address, None).unwrap();
+        peer.accepted(1);
+        pool.release(&peer.address);
+        // Deterministically exercise the unexpired state without depending
+        // on the OS scheduling this test inside a 50ms wall-clock window.
+        let unexpired = pool.state.lock().entries[&peer.address].references.clone();
+        unexpired.released_tick.store(
+            unexpired.tick().saturating_add(5_000_000_000),
+            Ordering::Release,
+        );
+        pool.sweep_expired();
+        peer.assert_live(0);
+        let reused = pool.acquire(&peer.address, None).unwrap();
+        assert!(Arc::ptr_eq(&old, &reused));
+        thread::sleep(Duration::from_millis(80));
+        pool.sweep_expired();
+        peer.assert_live(0); // Active references must survive even past grace.
+        pool.release(&peer.address);
+        thread::sleep(Duration::from_millis(80));
+        if explicit_sweep {
+            pool.sweep_expired();
+            peer.eof(0);
+            assert_eq!(peer.live_count(), 0);
+        }
+        let replacement = pool.acquire(&peer.address, None).unwrap();
+        peer.accepted(2);
+        peer.eof(0); // `old` and `reused` are still retained: Drop cannot mask this.
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert!(!old.is_connected());
+        peer.assert_live(1);
+        assert_eq!(peer.live_count(), 1);
+        assert_eq!(pool.active_count(), 1);
+        let report = pool.close_all(Duration::from_secs(2));
+        assert!(
+            report.error.is_none() && report.unconfirmed.is_empty(),
+            "{report:?}"
+        );
+        peer.eof(1);
+    }
+
+    #[test]
+    fn real_idle_pool_acquire_closes_expired_connection() {
+        real_idle_pool_reclaims_connection(false);
+    }
+
+    #[test]
+    fn real_idle_pool_sweep_closes_expired_connection() {
+        real_idle_pool_reclaims_connection(true);
+    }
+
+    #[test]
+    fn real_pool_discard_closes_connected_observed_and_preserves_replacement() {
+        let peer = PoolPeer::start();
+        let pool = ClientPool::new(Duration::from_millis(50));
+        let observed = pool.acquire(&peer.address, None).unwrap();
+        peer.accepted(1);
+        peer.assert_live(0);
+        assert!(observed.is_connected());
+        // Core discards a still-connected observed client when relay endpoint
+        // identity validation fails before dispatch (c2-core/client.rs). A
+        // healthy stream is not proof that it belongs to the expected server.
+        assert_ne!(
+            observed.server_instance_id(),
+            Some("replacement-server-instance")
+        );
+        assert!(pool.discard_if_same(&peer.address, &observed));
+        peer.eof(0);
+        assert_eq!(peer.live_count(), 0);
+        let replacement = pool.acquire(&peer.address, None).unwrap();
+        peer.accepted(2);
+        assert!(!Arc::ptr_eq(&observed, &replacement));
+        assert!(!pool.discard_if_same(&peer.address, &observed));
+        assert_eq!(pool.refcount(&peer.address), 1);
+        peer.assert_live(1);
+        assert_eq!(peer.live_count(), 1);
+        let report = pool.close_all(Duration::from_secs(2));
+        assert!(
+            report.error.is_none() && report.unconfirmed.is_empty(),
+            "{report:?}"
+        );
+        peer.eof(1);
+    }
+
+    #[test]
+    fn real_pool_close_all_closes_active_and_idle_connections_and_reopens() {
+        let active_peer = PoolPeer::start();
+        let idle_peer = PoolPeer::start();
+        let pool = ClientPool::new(Duration::from_secs(60));
+        let active = pool.acquire(&active_peer.address, None).unwrap();
+        let idle = pool.acquire(&idle_peer.address, None).unwrap();
+        active_peer.accepted(1);
+        idle_peer.accepted(1);
+        pool.release(&idle_peer.address);
+        let report = pool.close_all(Duration::from_secs(2));
+        assert_eq!(report.detached, 2);
+        assert!(
+            report.error.is_none() && report.unconfirmed.is_empty(),
+            "{report:?}"
+        );
+        active_peer.eof(0);
+        idle_peer.eof(0);
+        assert!(!active.is_connected() && !idle.is_connected());
+        let replacement = pool.acquire(&active_peer.address, None).unwrap();
+        active_peer.accepted(2);
+        assert!(!Arc::ptr_eq(&active, &replacement));
+        active_peer.assert_live(1);
+        assert_eq!(active_peer.live_count(), 1);
+        let report = pool.close_all(Duration::from_secs(2));
+        assert!(
+            report.error.is_none() && report.unconfirmed.is_empty(),
+            "{report:?}"
+        );
+        active_peer.eof(1);
+    }
+
     #[test]
     fn concurrent_same_address_loser_is_explicitly_closed() {
         let address = format!("ipc://pool_loser_{}", std::process::id());
