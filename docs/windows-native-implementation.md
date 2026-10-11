@@ -1,5 +1,7 @@
 # Windows native implementation
 
+Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
+
 ## Current status (2026-10-07)
 
 Python c-two 0.7.0 and c3 0.3.0 are the coordinated runtime baseline,

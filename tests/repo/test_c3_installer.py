@@ -6,6 +6,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+from posix_shell import posix_shell, shell_environment, shell_path
+
 
 def _repo_root() -> Path:
     return next(
@@ -24,15 +26,17 @@ def _run_installer(
     env: dict[str, str] | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    merged_env = os.environ.copy()
+    merged_env = shell_environment()
     if env:
         merged_env.update(env)
     return subprocess.run(
-        ["sh", str(_installer()), *args],
+        [posix_shell("sh"), shell_path(_installer()), *args],
         check=check,
         env=merged_env,
         text=True,
+        encoding="utf-8",
         capture_output=True,
+        timeout=30,
     )
 
 
@@ -85,12 +89,13 @@ def test_installer_downloads_verifies_and_installs_from_release_base(tmp_path):
     release_dir = tmp_path / "release"
     release_dir.mkdir()
     asset = release_dir / asset_name
-    asset.write_text("#!/bin/sh\necho c3 test binary\n", encoding="utf-8")
+    asset.write_bytes(b"#!/bin/sh\necho c3 test binary\n")
     asset.chmod(asset.stat().st_mode | stat.S_IXUSR)
     digest = hashlib.sha256(asset.read_bytes()).hexdigest()
     (release_dir / f"{asset_name}.sha256").write_text(
         f"{digest}  {asset_name}\n",
         encoding="utf-8",
+        newline="\n",
     )
     bin_dir = tmp_path / "bin"
 
@@ -98,7 +103,7 @@ def test_installer_downloads_verifies_and_installs_from_release_base(tmp_path):
         "--version",
         "0.0.0-test",
         "--bin-dir",
-        str(bin_dir),
+        shell_path(bin_dir),
         env={
             "C3_INSTALLER_OS": "linux",
             "C3_INSTALLER_ARCH": "x86_64",
@@ -117,10 +122,11 @@ def test_installer_fails_before_installing_when_checksum_mismatches(tmp_path):
     asset_name = f"c3-{target}"
     release_dir = tmp_path / "release"
     release_dir.mkdir()
-    (release_dir / asset_name).write_text("#!/bin/sh\necho c3 test binary\n", encoding="utf-8")
+    (release_dir / asset_name).write_bytes(b"#!/bin/sh\necho c3 test binary\n")
     (release_dir / f"{asset_name}.sha256").write_text(
         f"{'0' * 64}  {asset_name}\n",
         encoding="utf-8",
+        newline="\n",
     )
     bin_dir = tmp_path / "bin"
 
@@ -128,7 +134,7 @@ def test_installer_fails_before_installing_when_checksum_mismatches(tmp_path):
         "--version",
         "0.0.0-test",
         "--bin-dir",
-        str(bin_dir),
+        shell_path(bin_dir),
         check=False,
         env={
             "C3_INSTALLER_OS": "linux",
@@ -147,11 +153,12 @@ def test_installer_fails_before_installing_when_downloaded_binary_cannot_run(tmp
     release_dir = tmp_path / "release"
     release_dir.mkdir()
     asset = release_dir / asset_name
-    asset.write_text("not a runnable binary\n", encoding="utf-8")
+    asset.write_bytes(b"not a runnable binary\n")
     digest = hashlib.sha256(asset.read_bytes()).hexdigest()
     (release_dir / f"{asset_name}.sha256").write_text(
         f"{digest}  {asset_name}\n",
         encoding="utf-8",
+        newline="\n",
     )
     bin_dir = tmp_path / "bin"
 
@@ -159,7 +166,7 @@ def test_installer_fails_before_installing_when_downloaded_binary_cannot_run(tmp
         "--version",
         "0.0.0-test",
         "--bin-dir",
-        str(bin_dir),
+        shell_path(bin_dir),
         check=False,
         env={
             "C3_INSTALLER_OS": "linux",

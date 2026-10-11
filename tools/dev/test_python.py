@@ -4,12 +4,12 @@
 不安装/重建 native 或 c3，不接受 pytest 过滤参数。动态 harness 的编译
 仍由既有矩阵 fixture 串行完成；运行期间不能另开 Cargo/npm/uv 写任务。
 loadfile/worker 命名空间依据：https://pytest-xdist.readthedocs.io/en/stable/
-distribution.html 和 how-to.html。Windows 继续使用既有 native gate。
+distribution.html 和 how-to.html。平台后端限定清理本次启动的进程树。
 """
 
 import argparse
 from collections import Counter
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -22,12 +22,14 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Any, Iterator
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from tools.dev.test_platform import ProcessTree, PlatformError as RunnerError, resource_lease, core_library_name, validate_node_runtime
+
 SDK = "sdk/python/tests"
 PORTABLE = (
     f"{SDK}/integration/test_portable_payload_cross_language.py",
@@ -44,12 +46,37 @@ WINDOWS_ENDPOINT_TESTS = frozenset((
         for source in ("environment", "dotenv") for probe in ("ping", "shutdown")
     ),
 ))
+# Frozen platform cases, including exact parameter IDs. A matching reason on
+# any other test remains a failure; unavailable prerequisites are never allowed.
+UNIX_ENDPOINT_TESTS = frozenset(
+    f'tests/{scope}/test_endpoint_context.py::{name}{suffix}'
+    for scope, name, suffixes in (
+        ('unit', 'test_unused_code_root_survives_session_replacement_and_env_change', ('[shutdown]', '[transport_policy]')),
+        ('unit', 'test_unused_environment_policy_is_still_lazy_after_shutdown', ('',)),
+        ('unit', 'test_admin_probes_accept_long_directory_and_report_missing_endpoint', ('[ping]', '[shutdown]')),
+        ('unit', 'test_admin_probes_accept_long_directory_in_all_contexts', tuple(f'[{source}-{probe}]' for source in ('context', 'runtime', 'environment', 'dotenv') for probe in ('ping', 'shutdown'))),
+        ('unit', 'test_admin_runtime_configuration_precedence_and_freeze', ('[ping]', '[shutdown]')),
+        ('unit', 'test_query_validates_without_creating_root_or_runtime_domains', ('',)),
+        ('unit', 'test_public_code_override_wins_env_and_dotenv_and_survives_session_replacement', ('',)),
+        ('unit', 'test_env_over_dotenv_and_captured_context_survives_env_flip', ('',)),
+        ('unit', 'test_root_validation_is_native', ('[]', '[relative]', '[ /tmp/leading]', '[/tmp/a/../b]', '[/tmp/a\\x00b]')),
+        ('unit', 'test_space_in_root_is_not_trimmed', ('',)),
+        ('unit', 'test_native_context_handoff_ignores_new_process_selection', ('',)),
+        ('unit', 'test_admin_name_defaults_to_runtime_code_context_without_freezing', ('',)),
+        ('unit', 'test_public_replacement_preserves_root_and_native_retirement_observations', ('',)),
+        ('unit', 'test_credential_retains_recorded_directory_under_new_environment', ('',)),
+        ('unit', 'test_public_python_rpc_and_maintenance_use_a_long_final_directory', ('',)),
+        ('integration', 'test_same_logical_address_registers_connects_and_stays_isolated', ('',)),
+        ('integration', 'test_first_failed_local_attempt_freezes_context_without_creating_missing_container', tuple(f'[{attempt}]' for attempt in ('bind', 'connect', 'ping', 'shutdown'))),
+        ('integration', 'test_used_selection_survives_repeated_shutdown_then_refreezes', ('[environment]', '[code]')),
+        ('integration', 'test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state', ('[normal]', '[abnormal]')),
+        ('integration', 'test_sweep_captures_code_context_once_and_keeps_it_across_env_flip', ('',)),
+    )
+    for suffix in suffixes
+)
+UNIX_SOCKET_COUNT_TEST = 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup'
 FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
 PLUGIN = "tools.dev.test_python"
-
-
-class RunnerError(Exception):
-    pass
 
 
 def write_json(path: Path, value: object) -> None:
@@ -101,69 +128,32 @@ def build_pytest_command(python: str, name: str, directory: Path, workers: int, 
     return command
 
 
-@contextmanager
-def resource_lease(resource: Path) -> Iterator[None]:
-    """只协调这个入口；不宣称能阻止不遵守租约的外部构建。"""
-    import fcntl
-
-    # TMPDIR is deliberately different between test runs. A resource shared
-    # by those runs still needs the same lease directory.
-    leases = Path.home() / ".cache" / "c-two" / "python-test-leases"
-    leases.mkdir(parents=True, exist_ok=True)
-    key = hashlib.sha256(str(resource.resolve()).encode()).hexdigest()
-    # 不 unlink：等待者可能已打开同一 inode。
-    with (leases / key).open("a+b") as stream:
-        try:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RunnerError(f"另一验证入口正使用资源：{resource}") from error
-        try:
-            yield
-        finally:
-            fcntl.flock(stream, fcntl.LOCK_UN)
-
-
-def group_alive(pid: int) -> bool:
-    try:
-        os.killpg(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-
-
-def stop_group(process: subprocess.Popen) -> None:
-    def send(sig: int) -> None:
-        try:
-            os.killpg(process.pid, sig)
-        except ProcessLookupError:
-            pass
-    send(signal.SIGINT)
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-    if group_alive(process.pid):
-        send(signal.SIGKILL)
-    process.wait(timeout=5)
-
-
 def run_step(command: list[str], directory: Path, environment: dict[str, str], timeout: float) -> dict:
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise RunnerError('步骤timeout必须为正的有限值')
     directory.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     record = {"command": command, "status": "failed", "exit_code": None, "log": str(directory / "output.log"), "cleanup_confirmed": False}
     with (directory / "output.log").open("wb") as log:
         process = None
+        tree = None
         try:
-            process = subprocess.Popen(command, cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            tree = ProcessTree(command, ROOT, environment, log)
+            process = tree.process
             record["pid"] = process.pid
             record["exit_code"] = process.wait(timeout=timeout)
             record["status"] = "passed" if process.returncode == 0 else "failed"
             # pytest/fixture 应正常 join。父进程退出不等于子进程已退出。
             deadline = time.monotonic() + 2
-            while group_alive(process.pid) and time.monotonic() < deadline:
+            while tree.alive() and time.monotonic() < deadline:
                 time.sleep(0.05)
-            if group_alive(process.pid):
-                stop_group(process)
+            if tree.alive():
+                helpers = tree.reap_compiler_helpers(environment)
+                if helpers:
+                    record['compiler_helper_cleanup'] = helpers
+            if tree.alive():
+                record['residual_processes'] = tree.diagnostics()
+                tree.stop()
                 record["status"] = "failed"
                 record["error"] = "父进程退出后进程组仍存活，已强制清理；不能记成功"
             else:
@@ -176,14 +166,25 @@ def run_step(command: list[str], directory: Path, environment: dict[str, str], t
             record["status"] = "cancelled" if isinstance(error, KeyboardInterrupt) else "timed_out"
             if process is not None:
                 try:
-                    stop_group(process)
+                    record['residual_processes'] = tree.diagnostics()
+                    tree.stop()
                 except (OSError, subprocess.TimeoutExpired, KeyboardInterrupt) as cleanup_error:
                     record["cleanup_error"] = str(cleanup_error)
                 record["exit_code"] = process.returncode
             record["error"] = "取消/超时后清理未经行为验收；保留证据并停止后续组"
         except OSError as error:
+            record['status'] = 'failed'
+            record['cleanup_confirmed'] = False
             record["error"] = str(error)
         finally:
+            if tree is not None:
+                try:
+                    tree.close()
+                except (OSError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+                    record['cleanup_error'] = str(error)
+                    record['cleanup_confirmed'] = False
+                    if record['status'] == 'passed':
+                        record['status'] = 'failed'
             record["duration_seconds"] = time.monotonic() - started
             record["process_exited"] = process is None or process.poll() is not None
     write_json(directory / "step.json", record)
@@ -195,7 +196,7 @@ def stage_environment(base: dict[str, str], directory: Path) -> dict[str, str]:
 
 
 def collected(directory: Path) -> list[str]:
-    value = json.loads((directory / "collected-master.json").read_text())
+    value = json.loads((directory / "collected-master.json").read_text(encoding="utf-8"))
     if value["collection_problems"]:
         raise RunnerError(f"收集包含失败/skip：{value['collection_problems']}")
     return value["nodeids"]
@@ -206,10 +207,10 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
     if len(files) != workers:
         raise RunnerError(f"worker收集证据缺失：期望{workers}，实际{len(files)}")
     for path in files:
-        value = json.loads(path.read_text())
+        value = json.loads(path.read_text(encoding="utf-8"))
         if value["nodeids"] != expected or value["collection_problems"]:
             raise RunnerError(f"运行时收集与计划不同：{path}")
-    evidence = json.loads((directory / "reports.json").read_text())
+    evidence = json.loads((directory / "reports.json").read_text(encoding="utf-8"))
     reports = evidence["reports"]
     observed = {row["nodeid"] for row in reports}
     if observed != set(expected):
@@ -217,11 +218,17 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
     calls = Counter(row["nodeid"] for row in reports if row["when"] == "call")
     if any(count != 1 for count in calls.values()):
         raise RunnerError("同一nodeid被执行多次")
+    allowed_skips = (
+        {**dict.fromkeys(UNIX_ENDPOINT_TESTS, 'Skipped: Unix filesystem root capability'),
+         UNIX_SOCKET_COUNT_TEST: 'Skipped: OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes'}
+        if sys.platform == 'win32' else
+        dict.fromkeys(WINDOWS_ENDPOINT_TESTS, 'Skipped: Windows named-pipe platform contract')
+    )
     platform_skips = {
         row["nodeid"] for row in reports
-        if sys.platform != "win32" and row["nodeid"] in WINDOWS_ENDPOINT_TESTS
+        if row["nodeid"] in allowed_skips
         and row["when"] == "setup" and row["outcome"] == "skipped"
-        and row.get("skip_reason") == "Skipped: Windows named-pipe platform contract"
+        and row.get("skip_reason") == allowed_skips[row['nodeid']]
     }
     problems = [row for row in reports if row["outcome"] != "passed" and not (
         row["nodeid"] in platform_skips and row["when"] == "setup" and row["outcome"] == "skipped"
@@ -246,7 +253,20 @@ print(json.dumps({'prefix': sys.prefix, 'executable': sys.executable,
 
 
 def capture(command: list[str], environment: dict[str, str]) -> str:
-    result = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30)
+    command = list(command)
+    if not os.path.dirname(command[0]):
+        selected = shutil.which(command[0], path=environment.get('PATH', ''))
+        if selected is None:
+            raise RunnerError(f'必要工具不存在：{command[0]}')
+        if os.name == 'nt' and Path(selected).suffix.lower() == '.cmd' and Path(selected).stem.lower() == 'npm':
+            node = shutil.which('node', path=environment.get('PATH', ''))
+            script = Path(selected).parent / 'node_modules/npm/bin/npm-cli.js'
+            if node is None or not script.is_file():
+                raise RunnerError(f'必要npm JavaScript入口不存在：{script}')
+            command = [node, str(script), *command[1:]]
+        else:
+            command[0] = selected
+    result = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30)
     if result.returncode:
         raise RunnerError(f"必要输入探针失败(exit {result.returncode})：{command}\n{result.stdout}\n{result.stderr}")
     return result.stdout.strip()
@@ -265,11 +285,11 @@ def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
     info["source_sha"] = capture(["git", "rev-parse", "HEAD"], environment)
     info["tracked_diff_sha256"] = hashlib.sha256(capture(["git", "diff", "--binary", "HEAD"], environment).encode()).hexdigest()
     info["runner_inputs"] = {str(path.relative_to(ROOT)): sha256(path) for path in (
-        ROOT / "tools/dev/test_python.py", ROOT / "sdk/python/tests/conftest.py",
+        ROOT / "tools/dev/test_python.py", ROOT / "tools/dev/test_platform.py", ROOT / "sdk/python/tests/conftest.py",
         ROOT / "pyproject.toml", ROOT / "uv.lock",
     )}
     # 与既有syntax gate一致，只查询，不安装。
-    python310 = shutil.which("python3.10")
+    python310 = shutil.which("python3.10", path=environment.get('PATH', ''))
     if python310 is None:
         python310 = capture(["uv", "python", "find", "3.10"], environment)
     if not python310 or not capture([python310, "--version"], environment).startswith("Python 3.10."):
@@ -283,10 +303,9 @@ def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
             raise RunnerError(f"collection前需要golden fixture：{path}")
     info["fixtures"] = {str(path): sha256(path) for path in (record, graph)}
     for command in ("cargo", "node", "npm"):
-        if shutil.which(command) is None:
+        if shutil.which(command, path=environment.get('PATH', '')) is None:
             raise RunnerError(f"必要工具不存在：{command}")
-    if not capture(["node", "--version"], environment).startswith("v22."):
-        raise RunnerError("需要Node22")
+    validate_node_runtime(capture(["node", "--version"], environment), capture(["node", "-p", "process.versions.napi"], environment))
     info["tools"] = {command: capture([command, "--version"], environment) for command in ("cargo", "node", "npm")}
     packages = [options.fastdb_package, options.c2_mem_package, options.typescript_package]
     if any(packages) and not all(packages):
@@ -314,7 +333,7 @@ def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
     if environment.get("FASTDB_PAYLOAD_LINK_MODE") != "system":
         raise RunnerError("Rust harness需要预配置CoreSDK system link环境")
     lib = Path(environment.get("FASTDB_PAYLOAD_SYSTEM_LIB_DIR", ""))
-    library = "libfastdb.dylib" if sys.platform == "darwin" else "libfastdb.so"
+    library = core_library_name(sys.platform)
     if not lib.is_absolute() or not (lib / library).is_file():
         raise RunnerError("需要已验证的绝对CoreSDK lib目录")
     info["coresdk_library"] = {"path": str(lib / library), "sha256": sha256(lib / library)}
@@ -397,8 +416,6 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    if os.name != "posix":
-        raise SystemExit("当前入口仅支持本机Unix；Windows保留tools/ci/windows_native.py")
     if not math.isfinite(args.stage_timeout) or not 0 < args.stage_timeout <= 14400:
         raise SystemExit("stage-timeout必须为(0,14400]内有限值")
     # 保留venv的python symlink路径；resolve会把它变成全局解释器。
@@ -428,6 +445,10 @@ def main(argv: list[str] | None = None) -> int:
         "CARGO_BUILD_JOBS": "2", "CMAKE_BUILD_PARALLEL_LEVEL": "2", "CARGO_TARGET_DIR": str(ROOT / "core/target"),
         "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
         "PYTHONPATH": str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")})
+    if sys.platform == 'win32':
+        # MSBuild otherwise deliberately retains build workers after success.
+        # Child-only control documented by MSBuild's ProcessNodeReuseSwitch.
+        base['MSBUILDDISABLENODEREUSE'] = '1'
     for key, value in zip(("C2_TYPESCRIPT_FASTDB_PACKAGE", "C2_TYPESCRIPT_C2_MEM_PACKAGE", "C2_TYPESCRIPT_COMPILER_PACKAGE"), (args.fastdb_package, args.c2_mem_package, args.typescript_package)):
         if value:
             base[key] = str(value)

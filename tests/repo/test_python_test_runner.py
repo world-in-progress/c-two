@@ -15,7 +15,6 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tools.dev import test_python as runner
 
-pytestmark = pytest.mark.skipif(os.name != 'posix', reason='local Python runner uses POSIX process groups and flock; Windows has native gates')
 
 
 @pytest.mark.parametrize('groups', [
@@ -52,17 +51,17 @@ def synthetic_suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bo
     for relative, text in files.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        path.write_text(text, encoding='utf-8')
     (root / 'sdk/python/tests/conftest.py').write_text(
         'from pathlib import Path\nimport pytest\n'
-        + fixture_source({'pytest_configure', 'pytest_collection_modifyitems', '_SERIAL_MATRIX_FILES'})
+        + fixture_source({'pytest_configure', 'pytest_collection_modifyitems', '_SERIAL_MATRIX_FILES'}), encoding='utf-8'
     )
     c3 = root / 'prebuilt c3'
     native = root / 'native bytes'
     c3.write_bytes(b'c3')
     native.write_bytes(b'native')
     environment = {k: v for k, v in os.environ.items() if not k.startswith(('PYTEST_', 'CTWO_'))}
-    environment.update(PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE='1')
+    environment.update(PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1')
     options = SimpleNamespace(python=sys.executable, workers=2, stage_timeout=20, c3=c3)
     info = {'c3_sha256': runner.sha256(c3), 'native': str(native), 'native_sha256': runner.sha256(native)}
     monkeypatch.setattr(runner, 'validate_receipts', lambda *args: None)
@@ -75,13 +74,13 @@ def test_real_pure_pytest_execution_and_matrix_serial(tmp_path: Path, monkeypatc
     evidence = {'steps': []}
     output = root / 'new evidence'
     assert runner.execute(options, output, environment, info, evidence) == expected
-    plan = json.loads((output / 'plan.json').read_text())
+    plan = json.loads((output / 'plan.json').read_text(encoding="utf-8"))
     assert len(plan['full']) == 8  # 参数化两项 + 普通一项 + proof一项 + 两个累积矩阵各两项
     ordinary = next(s for s in evidence['steps'] if s['id'] == 'ordinary')
     assert ordinary['exit_code'] == (1 if fail else 0)
     assert ordinary['status'] == ('passed' if expected == 0 else 'failed')
     assert ordinary['cleanup_confirmed']
-    assert json.loads((output / 'ordinary/step.json').read_text())['status'] == ordinary['status']
+    assert json.loads((output / 'ordinary/step.json').read_text(encoding="utf-8"))['status'] == ordinary['status']
     assert '--dist=loadfile' in ordinary['command']
     assert len(list((output / 'ordinary').glob('collected-gw*.json'))) == 2
     for name in ('portable', 'typescript'):
@@ -90,7 +89,7 @@ def test_real_pure_pytest_execution_and_matrix_serial(tmp_path: Path, monkeypatc
         assert step['command'][step['command'].index('-n') + 1] == '0'
         assert (output / name / 'junit.xml').is_file()
         assert (output / name / 'collected-master.json').is_file()
-    calls = [r['nodeid'] for r in json.loads((output / 'ordinary/reports.json').read_text())['reports'] if r['when'] == 'call']
+    calls = [r['nodeid'] for r in json.loads((output / 'ordinary/reports.json').read_text(encoding="utf-8"))['reports'] if r['when'] == 'call']
     assert set(calls) == set(plan['ordinary'])
 
 
@@ -136,6 +135,59 @@ def test_only_declared_windows_setup_skip_is_not_applicable(
             runner.validate_execution(tmp_path, [nodeid], 1)
 
 
+@pytest.mark.parametrize('platform,nodeid,phase,reason,accepted', [
+    ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'setup', 'Skipped: Unix filesystem root capability', True),
+    ('win32', 'tests/integration/test_endpoint_context.py::test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state[normal]', 'setup', 'Skipped: Unix filesystem root capability', True),
+    ('win32', 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup', 'setup', 'Skipped: OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes', True),
+    ('linux', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'setup', 'Skipped: Unix filesystem root capability', False),
+    ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'call', 'Skipped: Unix filesystem root capability', False),
+    ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'setup', 'Skipped: missing native', False),
+    ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[unknown]', 'setup', 'Skipped: Unix filesystem root capability', False),
+    ('win32', 'unexpected::test_case', 'setup', 'Skipped: Unix filesystem root capability', False),
+])
+def test_windows_platform_skip_allowlist(tmp_path, monkeypatch, platform, nodeid, phase, reason, accepted):
+    monkeypatch.setattr(runner.sys, 'platform', platform)
+    runner.write_json(tmp_path / 'collected-master.json', {'nodeids': [nodeid], 'collection_problems': []})
+    runner.write_json(tmp_path / 'reports.json', {'exit_status': 0, 'reports': [
+        {'nodeid': nodeid, 'when': phase, 'outcome': 'skipped', 'skip_reason': reason},
+        {'nodeid': nodeid, 'when': 'teardown', 'outcome': 'passed'},
+    ]})
+    (tmp_path / 'junit.xml').write_text('<testsuite/>')
+    if accepted:
+        runner.validate_execution(tmp_path, [nodeid], 1)
+    else:
+        with pytest.raises(runner.RunnerError):
+            runner.validate_execution(tmp_path, [nodeid], 1)
+
+
+def test_capture_resolves_selected_environment_tools(tmp_path, monkeypatch):
+    calls = []
+    def which(name, *, path=None):
+        assert path == 'selected tool path'
+        return str(tmp_path / (name + '.exe'))
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout='ok', stderr='')
+    monkeypatch.setattr(runner.shutil, 'which', which)
+    monkeypatch.setattr(runner.subprocess, 'run', run)
+    assert runner.capture(['node', '--version'], {'PATH': 'selected tool path'}) == 'ok'
+    assert calls == [[str(tmp_path / 'node.exe'), '--version']]
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows npm.cmd requires the Node JavaScript entry')
+def test_capture_runs_windows_npm_without_shell(tmp_path, monkeypatch):
+    node = tmp_path / 'node.exe'
+    npm = tmp_path / 'npm.cmd'
+    script = tmp_path / 'node_modules/npm/bin/npm-cli.js'
+    script.parent.mkdir(parents=True)
+    script.write_text('// synthetic npm')
+    monkeypatch.setattr(runner.shutil, 'which', lambda name, *, path=None: str(node if name == 'node' else npm))
+    calls = []
+    monkeypatch.setattr(runner.subprocess, 'run', lambda command, **kwargs: calls.append(command) or SimpleNamespace(returncode=0, stdout='10.9.2', stderr=''))
+    assert runner.capture(['npm', '--version'], {'PATH': str(tmp_path)}) == '10.9.2'
+    assert calls == [[str(node), str(script), '--version']]
+
+
 def test_actual_collected_omission_stops_before_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, options, environment, info = synthetic_suite(tmp_path, monkeypatch)
     original = runner.group_arguments
@@ -152,11 +204,11 @@ def test_raw_exit_log_and_timeout_are_retained(tmp_path: Path) -> None:
     failed = runner.run_step([sys.executable, '-c', 'print("failed evidence"); raise SystemExit(7)'], tmp_path / 'failed', os.environ.copy(), 5)
     assert failed['exit_code'] == 7
     assert failed['status'] == 'failed'
-    assert 'failed evidence' in Path(failed['log']).read_text()
+    assert 'failed evidence' in Path(failed['log']).read_text(encoding="utf-8")
     timed = runner.run_step([sys.executable, '-c', 'import time; time.sleep(20)'], tmp_path / 'timeout', os.environ.copy(), 0.1)
     assert timed['status'] == 'timed_out'
     assert timed['process_exited'] and not timed['cleanup_confirmed']
-    assert json.loads((tmp_path / 'timeout/step.json').read_text()) == timed
+    assert json.loads((tmp_path / 'timeout/step.json').read_text(encoding="utf-8")) == timed
 
 
 def test_timeout_stops_later_groups(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -215,7 +267,7 @@ def test_resource_lease_contends_across_different_temp_directories(tmp_path: Pat
 
 def fixture_source(names: set[str]) -> str:
     """执行公共fixture的真实函数，隔离其无关native导入。"""
-    tree = ast.parse((ROOT / 'sdk/python/tests/conftest.py').read_text())
+    tree = ast.parse((ROOT / 'sdk/python/tests/conftest.py').read_text(encoding="utf-8"))
     selected = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
@@ -259,7 +311,7 @@ def test_fixture_rejects_direct_parallel_matrix_collection() -> None:
 def test_direct_parallel_matrix_guard_stops_real_pytest_before_calls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, options, environment, info = synthetic_suite(tmp_path, monkeypatch)
     source = 'from pathlib import Path\nimport pytest\n' + fixture_source({'pytest_configure', 'pytest_collection_modifyitems', '_SERIAL_MATRIX_FILES'})
-    (root / 'sdk/python/tests/conftest.py').write_text(source)
+    (root / 'sdk/python/tests/conftest.py').write_text(source, encoding='utf-8')
     marker = root / 'partial receipt must not exist'
     (root / runner.TYPESCRIPT).write_text(f'from pathlib import Path\ndef test_row():\n    Path({str(marker)!r}).write_text("partial")\n')
     output = root / 'guard'
@@ -269,7 +321,7 @@ def test_direct_parallel_matrix_guard_stops_real_pytest_before_calls(tmp_path: P
     record = runner.run_step(command, output, runner.stage_environment(environment, output), 20)
     assert record['status'] == 'failed' and record['exit_code'] != 0
     assert not marker.exists()
-    assert '单进程' in Path(record['log']).read_text()
+    assert '单进程' in Path(record['log']).read_text(encoding="utf-8")
 
 
 def test_fixture_relay_lock_serializes_processes(tmp_path: Path) -> None:
@@ -279,7 +331,7 @@ def test_fixture_relay_lock_serializes_processes(tmp_path: Path) -> None:
     env = {**os.environ, 'CTWO_RELAY_START_LOCK': str(tmp_path / 'lock'), 'TRACE': str(tmp_path / 'trace')}
     procs = [subprocess.Popen([sys.executable, '-c', script], env=env) for _ in range(2)]
     assert [p.wait(timeout=5) for p in procs] == [0, 0]
-    assert (tmp_path / 'trace').read_text().splitlines() == ['start', 'end', 'start', 'end']
+    assert (tmp_path / 'trace').read_text(encoding="utf-8").splitlines() == ['start', 'end', 'start', 'end']
 
 
 def test_fixture_relay_logs_survive_close_with_test_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -293,7 +345,7 @@ def test_fixture_relay_logs_survive_close_with_test_identity(tmp_path: Path, mon
     path = Path(log.name)
     log.write('relay failed detail\n')
     log.close()
-    assert 'case[param]' in path.read_text() and 'relay failed detail' in path.read_text()
+    assert 'case[param]' in path.read_text(encoding="utf-8") and 'relay failed detail' in path.read_text(encoding="utf-8")
 
 
 def test_main_preflight_failure_preserves_failure_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -304,7 +356,7 @@ def test_main_preflight_failure_preserves_failure_receipt(tmp_path: Path, monkey
         monkeypatch.delenv(key, raising=False)
     output = tmp_path / 'evidence'
     assert runner.main(['--c3', str(tmp_path / 'missing c3'), '--output', str(output)]) == 1
-    evidence = json.loads((output / 'run.json').read_text())
+    evidence = json.loads((output / 'run.json').read_text(encoding="utf-8"))
     assert evidence['status'] == 'failed' and evidence['exit_code'] == 1
     assert evidence['steps'] == [] and 'missing prebuilt input' in evidence['error']
     with pytest.raises(SystemExit, match='拒绝复用'):
@@ -357,6 +409,31 @@ def test_parent_exit_with_live_descendant_is_not_success(tmp_path: Path) -> None
     assert not record['cleanup_confirmed'] and '进程组仍存活' in record['error']
 
 
+def test_cleanup_failure_cannot_retain_passed_status(tmp_path, monkeypatch):
+    original = runner.ProcessTree.stop
+    failed = False
+    def stop(tree):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError('termination probe failed')
+        return original(tree)
+    monkeypatch.setattr(runner.ProcessTree, 'stop', stop)
+    script = 'import subprocess,sys; subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"])'
+    record = runner.run_step([sys.executable, '-c', script], tmp_path / 'cleanup-error', os.environ.copy(), 5)
+    assert record['status'] == 'failed'
+    assert not record['cleanup_confirmed']
+    assert record['error'] == 'termination probe failed'
+
+
+@pytest.mark.parametrize('timeout', [0, -1, float('nan'), float('inf')])
+def test_run_step_requires_finite_positive_timeout(tmp_path, timeout):
+    with pytest.raises(runner.RunnerError, match='有限'):
+        runner.run_step([sys.executable, '-c', 'pass'], tmp_path / 'invalid', os.environ.copy(), timeout)
+    assert not (tmp_path / 'invalid').exists()
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX virtualenv interpreter symlink semantics')
 def test_main_normalizes_fixture_path_and_preserves_venv_python_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv('C2_PORTABLE_MATRIX_FIXTURE_ROOT', 'fixtures')
@@ -382,4 +459,20 @@ def test_main_cancellation_has_130_exit_and_cancelled_receipt(tmp_path: Path, mo
     monkeypatch.setattr(runner, 'preflight', probe)
     output = tmp_path / 'cancelled'
     assert runner.main(['--c3', 'c3', '--output', str(output)]) == 130
-    assert json.loads((output / 'run.json').read_text())['status'] == 'cancelled'
+    assert json.loads((output / 'run.json').read_text(encoding="utf-8"))['status'] == 'cancelled'
+
+
+@pytest.mark.parametrize('platform,expected', [('win32', '1'), ('linux', None)])
+def test_main_disables_msbuild_node_reuse_only_for_windows_children(tmp_path, monkeypatch, platform, expected):
+    monkeypatch.setattr(runner.sys, 'platform', platform)
+    monkeypatch.delenv('MSBUILDDISABLENODEREUSE', raising=False)
+    for key in ('PYTEST_ADDOPTS', 'PYTEST_PLUGINS', 'PYTEST_DISABLE_PLUGIN_AUTOLOAD'):
+        monkeypatch.delenv(key, raising=False)
+    captured = []
+    def probe(options, environment):
+        captured.append(environment.get('MSBUILDDISABLENODEREUSE'))
+        raise runner.RunnerError('environment probe only')
+    monkeypatch.setattr(runner, 'preflight', probe)
+    assert runner.main(['--c3', 'c3', '--output', str(tmp_path / 'evidence')]) == 1
+    assert captured == [expected]
+    assert 'MSBUILDDISABLENODEREUSE' not in os.environ

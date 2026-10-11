@@ -32,6 +32,8 @@ from typing import Any
 
 import pytest
 
+from posix_shell import posix_shell, shell_environment
+
 _ROOT = next(
     parent
     for parent in Path(__file__).resolve().parents
@@ -2333,7 +2335,7 @@ def _extract_step(text: str, step_name: str) -> dict[str, str]:
 
 _FAKE_GH = """#!/usr/bin/env python3
 import os, sys
-with open(os.environ["GH_LOG"], "a", encoding="utf-8") as log:
+with open(os.environ["GH_LOG"], "a", encoding="utf-8", newline="\\n") as log:
     log.write("\\0".join(sys.argv[1:]) + "\\n")
 sys.exit(0)
 """
@@ -2377,7 +2379,7 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "gh").write_text(_FAKE_GH)
+    (bin_dir / "gh").write_bytes(_FAKE_GH.encode("utf-8"))
     (bin_dir / "gh").chmod(0o755)
 
     staging_root = tmp_path / "roundtrip-staging"
@@ -2394,9 +2396,8 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(file.read_bytes())
         log = workspace / "gh.log"
-        env = dict(os.environ)
+        env = shell_environment(bin_dir)
         env.update({
-            "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "GH_LOG": str(log),
             "GH_TOKEN": "test-token",
             "REPO": REPOSITORY,
@@ -2410,8 +2411,8 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
             if step["if"] and release_exists != "false":
                 continue
             result = subprocess.run(
-                ["bash", "-c", step["run"]], cwd=workspace, env=env,
-                capture_output=True, text=True,
+                [posix_shell(), "-c", step["run"]], cwd=workspace, env=env,
+                capture_output=True, text=True, encoding="utf-8", timeout=30,
             )
             assert result.returncode == 0, result.stderr
         if not log.exists():
@@ -2508,20 +2509,18 @@ def test_gate_rechecks_provenance_returned_by_the_api(override):
 ])
 def test_publish_rechecks_downloaded_staging_bytes(tmp_path, workflow_name, group, collection, relative):
     import subprocess
-    import yaml
-    workflow = yaml.safe_load((_ROOT / ".github/workflows" / workflow_name).read_text())
-    step = next(step for step in workflow["jobs"]["publish"]["steps"]
-                if step.get("name") == "Recheck staged bytes before publication")
+    step = _extract_step(_workflow_text(workflow_name), "Recheck staged bytes before publication")
     path = tmp_path / relative
     path.parent.mkdir(parents=True)
     path.write_bytes(b"tested bytes")
     entry = {"staged_path": relative, "bytes": path.stat().st_size,
              "sha256": _sha(path.read_bytes()), "disposition": "upload"}
     (tmp_path / "promotion-plan.json").write_text(json.dumps({group: {collection: [entry]}}))
-    command = ["bash", "-euo", "pipefail", "-c", step["run"]]
-    assert subprocess.run(command, cwd=tmp_path, capture_output=True).returncode == 0
+    command = [posix_shell(), "-euo", "pipefail", "-c", step["run"]]
+    env = shell_environment(tmp_path / "bin")
+    assert subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, timeout=30).returncode == 0
     path.write_bytes(b"forged bytes")
-    assert subprocess.run(command, cwd=tmp_path, capture_output=True).returncode != 0
+    assert subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, timeout=30).returncode != 0
 
 
 def test_provisioning_receipt_must_derive_from_the_retained_source(tmp_path, environment, capsys):
