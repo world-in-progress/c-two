@@ -1594,24 +1594,26 @@ impl ClientPool {
         self.close_txn.0.lock().active_generation.is_some()
     }
 
-    /// Deterministically wait until a drain transaction is active. The close
-    /// coordinator's condvar is notified when a generation starts, so this
-    /// wakes on the real transition instead of polling.
+    /// Wait for the same closing fence that acquire checks. The coordinator
+    /// announcement precedes that fence; observing it alone is too early.
     pub(crate) fn wait_until_draining_for_test(&self, timeout: Duration) -> bool {
-        let (lock, condvar) = &*self.close_txn;
-        let mut txn = lock.lock();
         let deadline = Instant::now() + timeout;
-        while txn.active_generation.is_none() {
+        loop {
+            if self.state.lock().closing_generation.is_some() {
+                return true;
+            }
             let now = Instant::now();
             if now >= deadline {
                 return false;
             }
-            let result = condvar.wait_for(&mut txn, deadline - now);
-            if result.timed_out() {
-                return txn.active_generation.is_some();
-            }
+            // Never hold the coordinator while locking state: production
+            // registers drained entries in the opposite lock order. A short
+            // bounded wait also covers a notification between checking the
+            // fence and entering the condvar wait.
+            let (lock, condvar) = &*self.close_txn;
+            let mut txn = lock.lock();
+            condvar.wait_for(&mut txn, (deadline - now).min(Duration::from_millis(5)));
         }
-        true
     }
 
     /// Deterministically wait until at least one retired record with a
@@ -3431,6 +3433,21 @@ mod tests {
                 .expect("reopen server should shut down");
             runner.await.unwrap().unwrap();
         });
+    }
+
+    #[test]
+    fn drain_readiness_waits_for_the_acquire_fence() {
+        let pool = ClientPool::new(Duration::from_secs(60));
+        // close_all announces its coordinator before taking the map lock and
+        // setting the acquire fence. That announcement is not readiness.
+        pool.close_txn.0.lock().active_generation = Some(0);
+        assert!(pool.is_draining_for_test());
+        assert!(!pool.wait_until_draining_for_test(Duration::ZERO));
+
+        pool.state.lock().closing_generation = Some(0);
+        assert!(pool.wait_until_draining_for_test(Duration::ZERO));
+        pool.state.lock().closing_generation = None;
+        pool.close_txn.0.lock().active_generation = None;
     }
 
     #[test]
