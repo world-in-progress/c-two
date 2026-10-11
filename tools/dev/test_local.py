@@ -199,6 +199,34 @@ def source_identity(env: dict[str, str], root: Path, excluded: tuple[Path, ...])
             'file_count': len(manifest)}
 
 
+def core_fastdb_identity(env: dict[str, str], sibling: Path) -> dict:
+    sibling = sibling.resolve()
+    checkout_root = Path(probe(['git', 'rev-parse', '--show-toplevel'], env, sibling)).resolve()
+    if checkout_root != sibling:
+        raise LocalError(f'FastDB sibling must be a Git checkout root: {sibling}')
+    identity = source_identity(env, sibling, ())
+    payload = sibling / 'ts/fastdb4ts/src/payload/index.ts'
+    index = probe(['git', 'ls-files', '-v', '-z'], env, sibling)
+    return {**identity, 'path': str(sibling),
+            'hidden_index_entries': [entry for entry in index.split('\0')
+                                     if entry and (entry[0].islower() or entry[0] == 'S')],
+            'worktree_status': probe(['git', 'status', '--porcelain', '--untracked-files=all'], env, sibling),
+            'payload_sha256': strict.sha256(payload) if payload.is_file() else None}
+
+
+def validate_core_fastdb(identity: dict, expected: dict | None = None) -> None:
+    if identity['source_sha'] != strict.FASTDB_SHA:
+        raise LocalError('FastDB sibling source revision does not match pinned commit')
+    if identity['worktree_status']:
+        raise LocalError('FastDB sibling source must be clean')
+    if identity.get('hidden_index_entries'):
+        raise LocalError('FastDB sibling cannot use assume-unchanged or skip-worktree source flags')
+    if identity['payload_sha256'] is None:
+        raise LocalError('FastDB sibling payload source entrypoint is missing')
+    if expected is not None and identity != expected:
+        raise LocalError('FastDB sibling source changed during local validation')
+
+
 def test_counts(name: str, log: str, junit: Path | None) -> dict:
     if junit is not None:
         xml = ET.parse(junit).getroot()
@@ -275,19 +303,22 @@ def check(options, env: dict[str, str]) -> dict:
         except LocalError:
             report['errors'].append('MSVC compiler unavailable: run from Developer PowerShell / vcvars64 environment')
     selected = selected_suites(options.suite)
-    if 'core' in selected and options.action != 'prepare':
+    if 'core' in selected:
         compiler = ROOT.parent / 'fastdb/ts/fastdb4ts/node_modules/typescript/bin/tsc'
         try:
             from tools.dev.test_platform import resource_lease
             with resource_lease(ROOT.parent / 'fastdb'):
-                if not compiler.is_file():
-                    raise LocalError('Core sibling TypeScript compiler missing; run prepare --suite core')
-                version = probe([find_tool('node', env), str(compiler), '--version'], env)
-                if version != 'Version 5.9.3':
-                    raise LocalError(f'Core sibling TypeScript compiler must be 5.9.3: {version}')
-                report['core_typescript'] = {'path': str(compiler), 'version': version}
-                report.setdefault('input_hashes', {}).update(
-                    {str(path): strict.sha256(path) for path in compiler.parent.parent.rglob('*') if path.is_file()})
+                report['core_fastdb'] = core_fastdb_identity(env, ROOT.parent / 'fastdb')
+                validate_core_fastdb(report['core_fastdb'])
+                if options.action != 'prepare':
+                    if not compiler.is_file():
+                        raise LocalError('Core sibling TypeScript compiler missing; run prepare --suite core')
+                    version = probe([find_tool('node', env), str(compiler), '--version'], env)
+                    if version != 'Version 5.9.3':
+                        raise LocalError(f'Core sibling TypeScript compiler must be 5.9.3: {version}')
+                    report['core_typescript'] = {'path': str(compiler), 'version': version}
+                    report.setdefault('input_hashes', {}).update(
+                        {str(path): strict.sha256(path) for path in compiler.parent.parent.rglob('*') if path.is_file()})
         except (LocalError, strict.RunnerError, OSError, subprocess.TimeoutExpired) as error:
             report['errors'].append(str(error))
     if options.action != 'prepare' and 'repo' in selected:
@@ -331,7 +362,7 @@ def validate_input_hashes(inputs: dict[str, str]) -> None:
             raise LocalError(f'input changed during run: {path}')
 
 
-def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], root: Path, timeout: float, *, stop_on_failure=False, resources_leased=False, initial_report=None, input_hashes=None) -> dict:
+def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], root: Path, timeout: float, *, stop_on_failure=False, resources_leased=False, initial_report=None, input_hashes=None, core_fastdb=None) -> dict:
     from tools.dev.test_platform import ProcessTree, resource_lease
     if initial_report is None:
         try:
@@ -376,6 +407,8 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
             with (directory / 'output.log').open('wb') as log:
                 try:
                     if step.name == 'core':
+                        if core_fastdb is not None:
+                            validate_core_fastdb(core_fastdb_identity(env, root.parent / 'fastdb'), core_fastdb)
                         validate_input_hashes(input_hashes or {})
                     record['command'] = resolve_command(step.command, env, step.cwd)
                     tree = ProcessTree(record['command'], cwd=step.cwd, env=env, stdout=log)
@@ -393,6 +426,8 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
                         record['error'] = 'residual child process tree; forced cleanup, stage failed'
                         tree.stop()
                     if step.name == 'core':
+                        if core_fastdb is not None:
+                            validate_core_fastdb(core_fastdb_identity(env, root.parent / 'fastdb'), core_fastdb)
                         validate_input_hashes(input_hashes or {})
                     if planned is not None and record['status'] == 'passed':
                         strict.validate_execution(directory, planned, 1)
@@ -444,6 +479,7 @@ def preparation_steps(options, staging: Path) -> list[Step]:
         options.coresdk_lib = staging / 'coresdk/lib'
         result.append(Step('coresdk', [options.python, '.github/scripts/prepare_fastdb_sdk.py', '--output', str(staging / 'coresdk')]))
     if 'core' in selected:
+        validate_core_fastdb(core_fastdb_identity(env, ROOT.parent / 'fastdb'))
         sibling = ROOT.parent / 'fastdb/ts/fastdb4ts'
         if not all((sibling / name).is_file() for name in ('package.json', 'package-lock.json')):
             raise LocalError(f'Core tests require the FastDB sibling locked npm project: {sibling}')
@@ -578,6 +614,17 @@ def main(argv=None) -> int:
     excluded = ()
 
     def finish():
+        sibling_before = report.get('preflight', {}).get('core_fastdb')
+        if sibling_before is not None:
+            try:
+                from tools.dev.test_platform import resource_lease
+                with resource_lease(ROOT.parent / 'fastdb'):
+                    report['core_fastdb_after'] = core_fastdb_identity(env, ROOT.parent / 'fastdb')
+                    validate_core_fastdb(report['core_fastdb_after'], sibling_before)
+            except (LocalError, strict.RunnerError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+                report['core_fastdb_error'] = str(error)
+                if report['status'] != 'cancelled':
+                    report['status'] = 'failed'
         if 'source_identity_before' in report:
             try:
                 report['source_identity_after'] = source_identity(env, ROOT, excluded)
@@ -634,6 +681,8 @@ def main(argv=None) -> int:
                 for resource in sorted(set(resources)):
                     stack.enter_context(resource_lease(resource))
                 steps = preparation_steps(options, staging)
+                if 'core_fastdb' in preflight:
+                    validate_core_fastdb(core_fastdb_identity(env, ROOT.parent / 'fastdb'), preflight['core_fastdb'])
                 env = child_environment(env, [], options.coresdk_lib)
                 report['phase'] = 'prepare-execution'
                 execute_steps(steps, options.output, env, ROOT, options.stage_timeout, stop_on_failure=True,
@@ -648,7 +697,7 @@ def main(argv=None) -> int:
             steps = suite_steps(options, ROOT)
             report['phase'] = 'run-execution'
             execute_steps(steps, options.output, env, ROOT, options.stage_timeout, initial_report=report,
-                          input_hashes=preflight.get('input_hashes', {}))
+                          input_hashes=preflight.get('input_hashes', {}), core_fastdb=preflight.get('core_fastdb'))
             report['phase'] = 'input-validation'
             for path, digest in preflight.get('input_hashes', {}).items():
                 if strict.sha256(Path(path)) != digest:

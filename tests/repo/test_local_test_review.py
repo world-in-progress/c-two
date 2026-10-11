@@ -100,6 +100,8 @@ def test_core_preparation_installs_compiler_at_actual_sibling_path(tmp_path, mon
     for name in ('package.json', 'package-lock.json'):
         (sibling / name).write_text('{}', encoding='utf-8')
     monkeypatch.setattr(runner, 'ROOT', root)
+    monkeypatch.setattr(runner, 'core_fastdb_identity', lambda *_: {
+        'source_sha': runner.strict.FASTDB_SHA, 'worktree_status': '', 'payload_sha256': 'fixture'})
     monkeypatch.setattr(runner, 'probe', lambda *args: '' if 'status' in args[0] else runner.strict.FASTDB_SHA)
     node = tmp_path / 'node.exe'
     cli = tmp_path / 'node_modules/npm/bin/npm-cli.js'
@@ -179,6 +181,8 @@ def test_core_check_fingerprints_compiler_implementation(tmp_path, monkeypatch):
     implementation.parent.mkdir()
     implementation.write_text('original', encoding='utf-8')
     monkeypatch.setattr(runner, 'ROOT', root)
+    monkeypatch.setattr(runner, 'core_fastdb_identity', lambda *_: {
+        'source_sha': runner.strict.FASTDB_SHA, 'worktree_status': '', 'payload_sha256': 'fixture'})
     monkeypatch.setattr(runner, 'required_tools', lambda *_args, **_kwargs: [])
     monkeypatch.setattr(runner, 'find_tool', lambda *_: sys.executable)
     monkeypatch.setattr(runner, 'probe', lambda *_: 'Version 5.9.3')
