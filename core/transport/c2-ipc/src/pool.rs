@@ -2610,6 +2610,44 @@ mod tests {
         }
     }
 
+    async fn write_peer_disconnect_ack(
+        writer: &mut c2_local::LocalWriteHalf,
+        ack: &[u8],
+    ) -> std::io::Result<()> {
+        // The production convenience method aborts both halves on any write
+        // failure. This observer must keep its read half alive after a remote
+        // close so confirm_peer_disconnect can independently prove peer EOF.
+        tokio::io::AsyncWriteExt::write_all(writer, ack).await?;
+        tokio::io::AsyncWriteExt::flush(writer).await
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn disconnect_ack_write_failure_preserves_peer_eof_observer() {
+        let (client, peer) = c2_local::LocalStream::pair().await.unwrap();
+        let peer_abort = peer.abort_handle();
+        let (mut reader, mut writer) = peer.into_split();
+        client.abort_handle().abort();
+        // First prove that the remote endpoint closed. An ACK-write failure
+        // must not abort our observer and replace that EOF with a local error.
+        assert!(read_peer_frame(&mut reader).await.unwrap().is_none());
+        let ack = c2_wire::frame::encode_frame(
+            0,
+            c2_wire::flags::FLAG_SIGNAL | c2_wire::flags::FLAG_RESPONSE,
+            &[0x09],
+        );
+        let result = write_peer_disconnect_ack(&mut writer, &ack).await;
+        assert!(
+            result.is_err(),
+            "ACK unexpectedly succeeded on a closed pipe"
+        );
+        assert!(
+            !peer_abort.is_aborted(),
+            "ACK failure aborted the EOF observer"
+        );
+        confirm_peer_disconnect(&mut reader, result).await.unwrap();
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn disconnect_ack_closed_pipe_still_requires_eof() {
@@ -2756,11 +2794,11 @@ mod tests {
                                                         | c2_wire::flags::FLAG_RESPONSE,
                                                     &[0x09],
                                                 );
-                                                let ack_result = writer
-                                                    .lock()
-                                                    .await
-                                                    .write_all(&ack)
-                                                    .await;
+                                                let ack_result = write_peer_disconnect_ack(
+                                                    &mut *writer.lock().await,
+                                                    &ack,
+                                                )
+                                                .await;
                                                 confirm_peer_disconnect(&mut reader, ack_result)
                                                     .await
                                                     .map_err(|error| format!("connection {id}: {error}"))?;

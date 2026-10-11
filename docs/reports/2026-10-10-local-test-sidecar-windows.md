@@ -39,3 +39,5 @@ Earlier failed evidence is also retained: `sidecar-all-final` rejected residual 
 ## Remaining platform validation
 
 Actual macOS execution is still required before claiming macOS machine verification. Windows results and shared-interface regression coverage do not establish a macOS pass. Local output directories are intentionally machine-specific; they are neither packaged nor committed.
+
+Subsequent PR 181 Windows 2025 CI execution exposed an ACK-write side effect not covered by the initial fixture repair. The failure, real-pipe regression and correction are recorded in [the CI follow-up](2026-10-11-pr181-windows-2025-ci-failure.md). The original dated local results above remain historical evidence.
