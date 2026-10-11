@@ -82,7 +82,7 @@ def required_tools(suite: str, *, prepare: bool) -> list[str]:
         required.add('cargo')
     if 'repo' in selected and not prepare:
         required.add('cargo')
-    if any(s in selected for s in ('python', 'typescript', 'node')):
+    if any(s in selected for s in ('core', 'python', 'typescript', 'node')):
         required.update(('node', 'npm'))
     if prepare and any(s in selected for s in ('python', 'typescript')):
         required.update(('cmake', 'ninja'))
@@ -114,7 +114,16 @@ def find_tool(name: str, environment: dict[str, str]) -> str:
     result = shutil.which(name, path=environment.get('PATH'))
     if not result:
         raise LocalError(f'missing tool: {name}; activate the toolchain or pass --tool-path DIRECTORY')
-    return result
+    return os.path.abspath(result)
+
+
+def resolve_command(command: list[str], env: dict[str, str], cwd: Path) -> list[str]:
+    command = list(command)
+    if not os.path.dirname(command[0]):
+        command[0] = find_tool(command[0], env)
+    elif not os.path.isabs(command[0]):
+        command[0] = str((cwd / command[0]).resolve())
+    return command
 
 
 def npm_command(node: Path, *args: str) -> list[str]:
@@ -165,10 +174,29 @@ def suite_steps(options, root: Path) -> list[Step]:
 
 
 def probe(command: list[str], env: dict[str, str], cwd: Path = ROOT) -> str:
+    command = resolve_command(command, env, cwd)
     result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, encoding='utf-8', errors='replace', timeout=30)
     if result.returncode:
         raise LocalError(f'probe failed ({result.returncode}): {command}\n{result.stdout}\n{result.stderr}')
     return result.stdout.strip()
+
+
+def source_identity(env: dict[str, str], root: Path, excluded: tuple[Path, ...]) -> dict:
+    """Capture checkout contents as well as HEAD, including untracked source."""
+    head = probe(['git', 'rev-parse', 'HEAD'], env, root)
+    diff = probe(['git', 'diff', '--binary', 'HEAD'], env, root)
+    paths = probe(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], env, root)
+    manifest = {}
+    for relative in sorted(set(paths.split('\0')) - {''}):
+        path = root / relative
+        if any(path.absolute().is_relative_to(directory) for directory in excluded):
+            continue
+        manifest[relative] = strict.sha256(path) if path.is_file() else None
+    if probe(['git', 'rev-parse', 'HEAD'], env, root) != head:
+        raise LocalError('source HEAD changed while capturing identity')
+    return {'source_sha': head, 'tracked_diff_sha256': hashlib.sha256(diff.encode()).hexdigest(),
+            'files_sha256': hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest(),
+            'file_count': len(manifest)}
 
 
 def test_counts(name: str, log: str, junit: Path | None) -> dict:
@@ -247,6 +275,21 @@ def check(options, env: dict[str, str]) -> dict:
         except LocalError:
             report['errors'].append('MSVC compiler unavailable: run from Developer PowerShell / vcvars64 environment')
     selected = selected_suites(options.suite)
+    if 'core' in selected and options.action != 'prepare':
+        compiler = ROOT.parent / 'fastdb/ts/fastdb4ts/node_modules/typescript/bin/tsc'
+        try:
+            from tools.dev.test_platform import resource_lease
+            with resource_lease(ROOT.parent / 'fastdb'):
+                if not compiler.is_file():
+                    raise LocalError('Core sibling TypeScript compiler missing; run prepare --suite core')
+                version = probe([find_tool('node', env), str(compiler), '--version'], env)
+                if version != 'Version 5.9.3':
+                    raise LocalError(f'Core sibling TypeScript compiler must be 5.9.3: {version}')
+                report['core_typescript'] = {'path': str(compiler), 'version': version}
+                report.setdefault('input_hashes', {}).update(
+                    {str(path): strict.sha256(path) for path in compiler.parent.parent.rglob('*') if path.is_file()})
+        except (LocalError, strict.RunnerError, OSError, subprocess.TimeoutExpired) as error:
+            report['errors'].append(str(error))
     if options.action != 'prepare' and 'repo' in selected:
         try:
             probe([os.path.abspath(options.repo_python or options.python), '-c',
@@ -270,7 +313,7 @@ def check(options, env: dict[str, str]) -> dict:
                 raise LocalError('selected Python SDK does not belong to this checkout; run prepare first')
             c3 = options.c3 or ROOT / ('cli/target/debug/c3.exe' if os.name == 'nt' else 'cli/target/debug/c3')
             probe([str(c3), '--version'], env)
-            report['input_hashes'] = {str(c3.resolve()): strict.sha256(c3), info['native']: info['native_sha256']}
+            report.setdefault('input_hashes', {}).update({str(c3.resolve()): strict.sha256(c3), info['native']: info['native_sha256']})
             for path in packages(options):
                 if path and not path.is_file():
                     raise LocalError(f'package missing: {path}')
@@ -282,14 +325,22 @@ def check(options, env: dict[str, str]) -> dict:
     return report
 
 
-def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], root: Path, timeout: float, *, stop_on_failure=False, resources_leased=False) -> dict:
+def validate_input_hashes(inputs: dict[str, str]) -> None:
+    for path, digest in inputs.items():
+        if strict.sha256(Path(path)) != digest:
+            raise LocalError(f'input changed during run: {path}')
+
+
+def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], root: Path, timeout: float, *, stop_on_failure=False, resources_leased=False, initial_report=None, input_hashes=None) -> dict:
     from tools.dev.test_platform import ProcessTree, resource_lease
-    try:
-        output.mkdir(parents=True, exist_ok=False)
-    except FileExistsError as error:
-        raise LocalError(f'output already exists: {output}') from error
-    report = {'schema': 'c-two.local-test-run.v1', 'evidence_stage': 'development', 'platform': sys.platform,
-              'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running', 'steps': []}
+    if initial_report is None:
+        try:
+            output.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as error:
+            raise LocalError(f'output already exists: {output}') from error
+    report = initial_report if initial_report is not None else {
+        'schema': 'c-two.local-test-run.v1', 'evidence_stage': 'development', 'platform': sys.platform,
+        'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running', 'steps': []}
     blocked = False
     for step in steps:
         if blocked:
@@ -305,6 +356,8 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
         with ExitStack() as stack:
             if step.name != 'python' and not resources_leased:
                 stack.enter_context(resource_lease(root))
+                if step.name == 'core':
+                    stack.enter_context(resource_lease(root.parent / 'fastdb'))
             planned = None
             if step.strict_group:
                 collect = directory.parent / (step.name + '-collection')
@@ -322,7 +375,10 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
             tree = None
             with (directory / 'output.log').open('wb') as log:
                 try:
-                    tree = ProcessTree(step.command, cwd=step.cwd, env=env, stdout=log)
+                    if step.name == 'core':
+                        validate_input_hashes(input_hashes or {})
+                    record['command'] = resolve_command(step.command, env, step.cwd)
+                    tree = ProcessTree(record['command'], cwd=step.cwd, env=env, stdout=log)
                     record['exit_code'] = tree.process.wait(timeout=timeout)
                     deadline = time.monotonic() + 2
                     while tree.alive() and time.monotonic() < deadline:
@@ -336,6 +392,8 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
                         record['residual_processes'] = tree.diagnostics()
                         record['error'] = 'residual child process tree; forced cleanup, stage failed'
                         tree.stop()
+                    if step.name == 'core':
+                        validate_input_hashes(input_hashes or {})
                     if planned is not None and record['status'] == 'passed':
                         strict.validate_execution(directory, planned, 1)
                         from tools.local_rc.typescript_receipt import load_and_validate_receipt
@@ -347,7 +405,7 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
                         record['residual_processes'] = tree.diagnostics()
                         tree.stop()
                         record['exit_code'] = tree.process.returncode
-                except (OSError, ValueError, strict.RunnerError) as error:
+                except (LocalError, OSError, ValueError, strict.RunnerError) as error:
                     record['error'] = str(error)
                     record['status'] = 'failed'
                 finally:
@@ -369,8 +427,11 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
             report['steps'].append(record)
             blocked = not record['cleanup_confirmed'] or (stop_on_failure and record['status'] != 'passed')
         strict.write_json(output / 'run.json', report)
-    report['status'] = 'passed' if steps and all(s['status'] == 'passed' for s in report['steps']) else 'failed'
-    report['finished_at'] = datetime.now(timezone.utc).isoformat()
+    outcome = 'passed' if steps and all(s['status'] == 'passed' for s in report['steps']) else 'failed'
+    if initial_report is None:
+        report.update(status=outcome, finished_at=datetime.now(timezone.utc).isoformat())
+    else:
+        report['steps_status'] = outcome
     strict.write_json(output / 'run.json', report)
     return report
 
@@ -382,6 +443,12 @@ def preparation_steps(options, staging: Path) -> list[Step]:
     if options.coresdk_lib is None and any(s in selected for s in ('core', 'rust-sdk', 'python', 'typescript')):
         options.coresdk_lib = staging / 'coresdk/lib'
         result.append(Step('coresdk', [options.python, '.github/scripts/prepare_fastdb_sdk.py', '--output', str(staging / 'coresdk')]))
+    if 'core' in selected:
+        sibling = ROOT.parent / 'fastdb/ts/fastdb4ts'
+        if not all((sibling / name).is_file() for name in ('package.json', 'package-lock.json')):
+            raise LocalError(f'Core tests require the FastDB sibling locked npm project: {sibling}')
+        node = Path(find_tool('node', env))
+        result.append(Step('core-typescript-dependencies', npm_command(node, 'ci', '--ignore-scripts', '--prefix', str(sibling))))
     for suite, manifest in (('core', 'core/Cargo.toml'), ('rust-sdk', 'sdk/rust/Cargo.toml'), ('native', 'sdk/python/native/Cargo.toml')):
         if suite in selected:
             result.append(Step(f'{suite}-dependencies', ['cargo', 'fetch', '--locked', '--manifest-path', manifest],
@@ -421,7 +488,7 @@ def preparation_steps(options, staging: Path) -> list[Step]:
         Step('fastdb-copy', ['git', 'clone', '--no-hardlinks', '--no-checkout', str(source), str(copy)]),
         Step('fastdb-checkout', ['git', '-C', str(copy), 'checkout', '--detach', strict.FASTDB_SHA]),
         Step('fastdb-npm', npm_command(node, 'ci', '--prefix', str(package))),
-        Step('fastdb-wasm-configure', [options.python, str(emcmake), 'cmake', '-G', 'Ninja', '-S', str(copy / 'ts/embind'),
+        Step('fastdb-wasm-configure', [options.python, str(emcmake), find_tool('cmake', env), '-G', 'Ninja', '-S', str(copy / 'ts/embind'),
                                     '-B', str(copy / 'build-wasm'), '-DCMAKE_BUILD_TYPE=Release']),
         Step('fastdb-wasm-build', ['cmake', '--build', str(copy / 'build-wasm'), '--target', 'fastdb4ts']),
         Step('fastdb-tsc', [str(node), str(package / 'node_modules/typescript/bin/tsc'), '-p', str(package / 'tsconfig.json')]),
@@ -503,19 +570,52 @@ def main(argv=None) -> int:
     def cancel(*_):
         raise KeyboardInterrupt
     previous = signal.signal(signal.SIGTERM, cancel)
+    report = {'schema': 'c-two.local-test-run.v1', 'evidence_stage': 'development',
+              'platform': sys.platform, 'action': options.action, 'phase': 'validation',
+              'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running', 'steps': []}
+    owned_output = False
+    env = None
+    excluded = ()
+
+    def finish():
+        if 'source_identity_before' in report:
+            try:
+                report['source_identity_after'] = source_identity(env, ROOT, excluded)
+                if report['source_identity_before'] != report['source_identity_after']:
+                    report['source_error'] = 'source changed during local validation'
+                    if report['status'] != 'cancelled':
+                        report['status'] = 'failed'
+            except (LocalError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+                report['source_error'] = str(error)
+                if report['status'] != 'cancelled':
+                    report['status'] = 'failed'
+        report['finished_at'] = datetime.now(timezone.utc).isoformat()
+        strict.write_json(options.output / 'run.json', report)
+
     try:
-        validate_options(options)
         options.output = options.output.resolve()
+        options.output.mkdir(parents=True, exist_ok=False)
+        owned_output = True
+        strict.write_json(options.output / 'run.json', report)
+        validate_options(options)
         options.python = os.path.abspath(os.path.expanduser(options.python))
-        if options.output.exists():
-            raise LocalError(f'output already exists: {options.output}')
         env = child_environment(dict(os.environ), options.tool_path, options.coresdk_lib)
+        staging = options.output.parent / (options.output.name + '-inputs')
+        excluded = (options.output, staging)
+        report['phase'] = 'source-capture'
+        identity = source_identity(env, ROOT, excluded)
+        report.update(source_identity_before=identity, source_sha=identity['source_sha'],
+                      tracked_diff_sha256=identity['tracked_diff_sha256'])
+        report['phase'] = 'preflight'
+        strict.write_json(options.output / 'run.json', report)
         preflight = check(options, env)
+        report['preflight'] = preflight
         if options.action == 'check' or preflight['status'] != 'passed':
-            options.output.mkdir(parents=True)
             strict.write_json(options.output / 'check.json', preflight)
-            print(json.dumps(preflight, ensure_ascii=False, indent=2))
-            return 0 if preflight['status'] == 'passed' else 1
+            report['status'] = preflight['status']
+            finish()
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report['status'] == 'passed' else 1
         c3 = options.c3 or ROOT / ('cli/target/debug/c3.exe' if os.name == 'nt' else 'cli/target/debug/c3')
         env.update(CTWO_TEST_C3_BIN=str(c3.resolve()), C2_PORTABLE_MATRIX_C3_BIN=str(c3.resolve()))
         for key, path in zip(('C2_TYPESCRIPT_FASTDB_PACKAGE', 'C2_TYPESCRIPT_C2_MEM_PACKAGE', 'C2_TYPESCRIPT_COMPILER_PACKAGE'), packages(options)):
@@ -525,36 +625,52 @@ def main(argv=None) -> int:
         if options.release_fixtures:
             env['C2_DEV_FASTDB_RELEASE_FIXTURES'] = str(options.release_fixtures.resolve())
         if options.action == 'prepare':
-            staging = options.output.parent / (options.output.name + '-inputs')
+            report['phase'] = 'prepare-plan'
             staging.mkdir(parents=True, exist_ok=False)
             with ExitStack() as stack:
                 from tools.dev.test_platform import resource_lease
-                resources = (ROOT, ROOT / '.venv', ROOT / 'core/target', TS, options.fastdb_source or ROOT.parent / 'fastdb')
+                resources = (ROOT, ROOT / '.venv', ROOT / 'core/target', TS, ROOT.parent / 'fastdb',
+                             options.fastdb_source or ROOT.parent / 'fastdb')
                 for resource in sorted(set(resources)):
                     stack.enter_context(resource_lease(resource))
                 steps = preparation_steps(options, staging)
                 env = child_environment(env, [], options.coresdk_lib)
-                report = execute_steps(steps, options.output, env, ROOT, options.stage_timeout, stop_on_failure=True, resources_leased=True)
+                report['phase'] = 'prepare-execution'
+                execute_steps(steps, options.output, env, ROOT, options.stage_timeout, stop_on_failure=True,
+                              resources_leased=True, initial_report=report)
             report['prepared_inputs'] = {'coresdk_lib': str(options.coresdk_lib), 'staging': str(staging),
                                           'repo_python': str(staging / 'repo-venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')),
                                           'release_fixtures': str(options.release_fixtures or staging / 'release-fixtures'),
                                           'packages': {str(p): strict.sha256(p) for p in (staging / 'packages').glob('*.tgz')},
                                           'supplied_packages': {str(p.resolve()): strict.sha256(p) for p in packages(options) if p}}
         else:
-            report = execute_steps(suite_steps(options, ROOT), options.output, env, ROOT, options.stage_timeout)
+            report['phase'] = 'run-plan'
+            steps = suite_steps(options, ROOT)
+            report['phase'] = 'run-execution'
+            execute_steps(steps, options.output, env, ROOT, options.stage_timeout, initial_report=report,
+                          input_hashes=preflight.get('input_hashes', {}))
+            report['phase'] = 'input-validation'
             for path, digest in preflight.get('input_hashes', {}).items():
                 if strict.sha256(Path(path)) != digest:
                     report.update(status='failed', input_error=f'input changed during run: {path}')
-        report['preflight'] = preflight
-        report['source_sha'] = probe(['git', 'rev-parse', 'HEAD'], env)
-        report['tracked_diff_sha256'] = hashlib.sha256(probe(['git', 'diff', '--binary', 'HEAD'], env).encode()).hexdigest()
-        strict.write_json(options.output / 'run.json', report)
+        report['status'] = report.pop('steps_status') if report['status'] == 'running' else report['status']
+        report['phase'] = 'source-validation'
+        finish()
+        if report['status'] == 'passed':
+            report['phase'] = 'complete'
+            strict.write_json(options.output / 'run.json', report)
         print(f"{report['status']}: {options.output / 'run.json'}")
         return 0 if report['status'] == 'passed' else 1
     except (LocalError, strict.RunnerError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        if owned_output:
+            report.update(status='failed', error=str(error))
+            finish()
         print(f'local test: {error}', file=sys.stderr)
         return 1
     except KeyboardInterrupt:
+        if owned_output:
+            report.update(status='cancelled', error='local validation cancelled')
+            finish()
         print('local test cancelled; no passing evidence', file=sys.stderr)
         return 130
     finally:

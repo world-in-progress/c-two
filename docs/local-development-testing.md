@@ -51,3 +51,12 @@ Windows children also set `MSBUILDDISABLENODEREUSE=1` so completed CMake/MSBuild
 The initial implementation is verified on a Windows development machine. macOS command compatibility and the Unix backend have regression coverage, but actual macOS execution must be recorded separately; Windows results do not prove a macOS run.
 
 The initial Windows per-suite results and retained failure investigations are recorded in [the verification report](reports/2026-10-10-local-test-sidecar-windows.md).
+
+
+## Review fixes: source identity and preparation failures
+
+The sidecar records `source_identity_before` before preflight and retains that starting `source_sha`. At completion it compares HEAD, tracked diff and tracked/untracked file hashes against `source_identity_after`; a detected change fails validation. Newly created output and preparation input directories are excluded from file inventory. This is a beginning/end comparison, so an external edit reverted before the final capture is outside its guarantee. The aggregate stays running until final input and source checks complete.
+
+Every accepted new output directory gets `run.json`, including validation, preflight, planning and cancellation failures. The report includes `phase`, error and completion time. Existing evidence directories are never overwritten. Commands launched by the sidecar resolve against the child tool PATH to absolute executables; reports record the actual selected executable.
+
+`prepare --suite core` and `all` install locked npm dependencies with scripts disabled in the actual sibling `../fastdb/ts/fastdb4ts` consumed by the Rust Core TypeScript contract tests. This requires Node/npm and the sibling package manifest and lockfile. `--fastdb-source` continues to select the separate source for staged WASM preparation; it does not change the Core tests' sibling path. Core preflight verifies TypeScript 5.9.3 and fingerprints the compiler package. Sibling leases protect preflight and Core execution; input hashes are checked before/after Core consumption and at final validation.

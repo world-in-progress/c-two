@@ -174,7 +174,7 @@ def test_main_sigterm_is_cancelled_and_handler_restored(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, 'check', interrupted)
     assert runner.main(['check', '--suite', 'cli', '--output', str(tmp_path / 'output')]) == 130
     assert signal.getsignal(signal.SIGTERM) == previous
-    assert not (tmp_path / 'output/run.json').exists()
+    assert json.loads((tmp_path / 'output/run.json').read_text(encoding='utf-8'))['status'] == 'cancelled'
 
 
 def test_native_prepare_has_dependency_stage(tmp_path):
