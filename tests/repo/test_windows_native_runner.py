@@ -113,6 +113,11 @@ def test_full_scope_gate_inventory_preserves_receipt_order():
     assert "c2-core" in local_args
     assert "c2-http" in local_args
     assert "c2-http/relay" in local_args
+    # Automatic runs use only full scope: it must retain the local gate's
+    # integration targets and feature coverage when that separate job is absent.
+    full_core_args = next(command for name, command, _ in gates if name == "core-test")
+    assert "--workspace" in full_core_args and "--lib" not in full_core_args
+    assert "--features" in full_core_args and "c2-http/relay" in full_core_args
 
 
 def test_ipc_memory_matrix_gate_runs_full_required_stats_bounded_matrix():

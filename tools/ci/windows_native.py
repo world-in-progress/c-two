@@ -335,7 +335,9 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
         ("c2-mem-node-package", npm_command("run", "pack:check", "--prefix", c2_mem_typescript), ("c2-mem-npm-install",)),
         cargo("fastdb-rust-test", "../fastdb/bindings/rust/Cargo.toml", "--workspace", "--all-features"),
         ("core-check", ["cargo", "check", "--locked", "--manifest-path", "core/Cargo.toml", "--workspace", "--all-targets"], ()),
-        cargo("core-test", "core/Cargo.toml", "--workspace"),
+        # This subsumes the focused local-platform gate, including its relay
+        # feature and integration targets, in the same prepared runner.
+        cargo("core-test", "core/Cargo.toml", "--workspace", "--no-fail-fast", "--features", "c2-http/relay"),
         ("cli-build", ["cargo", "build", "--locked", "--manifest-path", "cli/Cargo.toml", "--bins"], ()),
         cargo("cli-test", "cli/Cargo.toml"),
         # Retain the CLI only after every gate that can relink it has run.

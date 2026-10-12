@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: "Validation scope; automatic runs always retain both scopes"
+        description: "Full validation, or the focused local-platform diagnostic"
         type: choice
-        options: [all, local-platform, full]
-        default: all
+        options: [full, local-platform]
+        default: full
   push:
     branches: [socu/windows-native-ipc, socu/local-endpoint-validation, socu/0.7.1-runtime, main]
   pull_request:
@@ -46,10 +46,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-2022, windows-2025]
-        # The implementation branch gets focused native evidence per phase.
-        # PR/main and all previously configured branches retain both scopes;
-        # focused runs cannot satisfy exact-main full-scope release promotion.
-        scope: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.scope == 'local-platform' || github.event_name == 'push' && github.ref_name == 'socu/0.7.1-runtime') && '["local-platform"]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && '["full"]' || '["local-platform","full"]') }}
+        # Full validation includes the local-platform crates and relay feature.
+        # Each image prepares one runner; focused diagnostics remain available
+        # manually and on the implementation branch, but cannot satisfy release
+        # promotion's exact-main full-scope evidence requirement.
+        scope: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.scope == 'local-platform' || github.event_name == 'push' && github.ref_name == 'socu/0.7.1-runtime') && '["local-platform"]' || '["full"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
