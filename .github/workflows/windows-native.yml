@@ -29,9 +29,12 @@ concurrency:
 
 env:
   FASTDB_SOURCE_SHA: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
+  EMSDK_SOURCE_SHA: c817c0ca4ba889ee24a185fd954cff7de1bd8afa
+  EMSDK_VERSION: "5.0.2"
   C2_ENV_FILE: ""
   C2_RELAY_ANCHOR_ADDRESS: ""
   CARGO_TERM_COLOR: never
+  SCCACHE_GHA_ENABLED: "true"
   CARGO_BUILD_JOBS: "2"
   CMAKE_BUILD_PARALLEL_LEVEL: "2"
   PYTHONUTF8: "1"
@@ -94,12 +97,25 @@ jobs:
         with:
           node-version: "22"
           check-latest: true
+          cache: npm
+          cache-dependency-path: |
+            fastdb/ts/fastdb4ts/package-lock.json
+            c-two/core/foundation/c2-mem-ffi/bindings/typescript/package-lock.json
+
+      - name: Cache the pinned Emscripten SDK
+        if: matrix.scope == 'full'
+        id: emsdk_cache
+        uses: actions/cache@v4
+        with:
+          path: emsdk
+          key: emsdk-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: matrix.scope == 'full'
+        if: matrix.scope == 'full' && steps.emsdk_cache.outputs.cache-hit != 'true'
         with:
+          persist-credentials: false
           repository: emscripten-core/emsdk
-          ref: c817c0ca4ba889ee24a185fd954cff7de1bd8afa # 5.0.2
+          ref: ${{ env.EMSDK_SOURCE_SHA }}
           path: emsdk
 
       - name: Install Emscripten 5.0.2 for native Windows builds
@@ -123,9 +139,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Git Bash probe failed with $LASTEXITCODE" }
             & ninja --version
             if ($LASTEXITCODE -ne 0) { throw "Ninja is required for the Windows WASM build" }
-            & .\emsdk.ps1 install 5.0.2
+            & .\emsdk.ps1 install $env:EMSDK_VERSION
             if ($LASTEXITCODE -ne 0) { throw "emsdk install failed with $LASTEXITCODE" }
-            & .\emsdk.ps1 activate 5.0.2
+            & .\emsdk.ps1 activate $env:EMSDK_VERSION
             if ($LASTEXITCODE -ne 0) { throw "emsdk activate failed with $LASTEXITCODE" }
             & .\emsdk_env.ps1
             if ($LASTEXITCODE -ne 0) { throw "emsdk environment setup failed with $LASTEXITCODE" }
@@ -153,11 +169,16 @@ jobs:
             fastdb/bindings/rust -> target
           key: ${{ matrix.os }}-${{ matrix.scope }}-msvc-${{ env.FASTDB_SOURCE_SHA }}-coresdk021
 
+      # rust-cache retains dependencies; sccache also reuses unchanged local
+      # crates across the native gates while every cargo command still runs.
+      - uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+
       - name: Collect native build and test evidence
         working-directory: c-two
         env:
           C2_WORKFLOW_SHA: ${{ github.workflow_sha }}
           C2_RUNNER_LABEL: ${{ matrix.os }}
+          RUSTC_WRAPPER: sccache
         run: >-
           python tools/ci/windows_native.py
           --expected-c-two-sha "${{ github.event.pull_request.head.sha || github.sha }}"

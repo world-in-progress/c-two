@@ -308,6 +308,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        if: runner.os != 'Linux'
+        with:
+          workspaces: cli -> target
+          key: candidate-cli-${{ matrix.target }}-source
+
       # MSVC environment (cl.exe, Windows SDK) for the native Windows build.
       # https://github.com/ilammy/msvc-dev-cmd
       - name: Set up MSVC environment
@@ -414,6 +420,7 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           command: build
+          sccache: true
           working-directory: sdk/python
           target: ${{ matrix.target }}
           args: >-
@@ -501,6 +508,12 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/python/native -> target
+          cache-targets: false
+          shared-key: candidate-native-${{ matrix.target }}
+
       - name: Record the row interpreter
         shell: bash
         run: |
@@ -519,6 +532,7 @@ jobs:
           FASTDB_PAYLOAD_LINK_MODE: source
         with:
           command: build
+          sccache: true
           working-directory: sdk/python
           target: ${{ matrix.target }}
           args: --release --out dist -i ${{ env.RC_PYTHON_EXE }}

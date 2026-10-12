@@ -13,6 +13,11 @@ permissions:
   contents: read
   pull-requests: read
 
+env:
+  FASTDB_SOURCE_SHA: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
+  EMSDK_SOURCE_SHA: c817c0ca4ba889ee24a185fd954cff7de1bd8afa
+  EMSDK_VERSION: "5.0.2"
+
 jobs:
   changes:
     runs-on: ubuntu-latest
@@ -24,8 +29,7 @@ jobs:
       ci: ${{ steps.filter.outputs.ci }}
       workflow_policy: ${{ steps.filter.outputs.workflow_policy }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
+      # PR paths come from the API; no repository checkout is needed.
       - uses: dorny/paths-filter@v4
         if: github.event_name == 'pull_request'
         id: filter
@@ -70,7 +74,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: world-in-progress/fastdb
-          ref: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
+          ref: ${{ env.FASTDB_SOURCE_SHA }}
           path: fastdb
 
       - name: Link FastDB source as the expected sibling checkout
@@ -81,6 +85,8 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: fastdb/ts/fastdb4ts/package-lock.json
 
       - name: Install FastDB TypeScript compiler dependencies
         run: npm ci --prefix ../fastdb/ts/fastdb4ts
@@ -180,6 +186,7 @@ jobs:
     name: test (py${{ matrix.python }})
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
 
       - name: Skip full Python tests for unrelated changes
         if: github.event_name != 'merge_group' && needs.changes.outputs.sdk != 'true' && needs.changes.outputs.core != 'true' && needs.changes.outputs.ci != 'true'
@@ -202,7 +209,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: world-in-progress/fastdb
-          ref: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
+          ref: ${{ env.FASTDB_SOURCE_SHA }}
           path: fastdb
 
       - name: Link FastDB source as the expected sibling checkout
@@ -217,7 +224,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         with:
-          workspaces: core -> target
+          # The extension and c3 have independent Cargo target directories.
+          workspaces: |
+            core -> target
+            cli -> target
+            sdk/rust -> target
+            sdk/python/native -> target
+          key: python-${{ matrix.python }}
 
       - uses: astral-sh/setup-uv@v6
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
@@ -236,13 +249,36 @@ jobs:
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            fastdb/ts/fastdb4ts/package-lock.json
+            core/foundation/c2-mem-ffi/bindings/typescript/package-lock.json
+
+      - name: Cache the pinned Emscripten SDK
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
+        id: emsdk_cache
+        uses: actions/cache@v4
+        with:
+          path: emsdk
+          key: emsdk-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
+        if: ((github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')) && steps.emsdk_cache.outputs.cache-hit != 'true'
         with:
+          persist-credentials: false
           repository: emscripten-core/emsdk
-          ref: c817c0ca4ba889ee24a185fd954cff7de1bd8afa # 5.0.2
+          ref: ${{ env.EMSDK_SOURCE_SHA }}
           path: emsdk
+
+      # This is an immutable external dependency, not a C-Two build or test.
+      # Keep the generated-glue diff check and all portable matrix builds.
+      - name: Cache the pinned FastDB WASM prerequisite
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
+        id: fastdb_wasm_cache
+        uses: actions/cache@v4
+        with:
+          path: fastdb/ts/fastdb4ts/src/wasm
+          key: fastdb-wasm-${{ runner.os }}-${{ runner.arch }}-${{ env.FASTDB_SOURCE_SHA }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
 
       - name: Prepare TypeScript portable consumer prerequisites
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
@@ -252,12 +288,14 @@ jobs:
           npm ci --prefix core/foundation/c2-mem-ffi/bindings/typescript
           # Use setup-node's Node headers for the packaged native addon.
           node core/foundation/c2-mem-ffi/bindings/typescript/scripts/build-runtime.mjs
-          ./emsdk/emsdk install 5.0.2
-          ./emsdk/emsdk activate 5.0.2
+          ./emsdk/emsdk install "$EMSDK_VERSION"
+          ./emsdk/emsdk activate "$EMSDK_VERSION"
           source ./emsdk/emsdk_env.sh
           # Persistent generated Node clients consume the compiled FastDB
           # module during ordinary pytest, before the portable matrix builds it.
-          npm run --prefix ../fastdb/ts/fastdb4ts build:wasm
+          if [ "${{ steps.fastdb_wasm_cache.outputs.cache-hit }}" != "true" ]; then
+            npm run --prefix ../fastdb/ts/fastdb4ts build:wasm
+          fi
           npm run --prefix ../fastdb/ts/fastdb4ts build
           git -C ../fastdb diff --exit-code -- ts/fastdb4ts/src/wasm
           for name in EMSDK EMSDK_NODE EMSDK_PYTHON EM_CONFIG; do
