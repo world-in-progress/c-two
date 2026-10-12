@@ -21,7 +21,7 @@ def test_python_release_promotes_only_after_both_candidate_gates_complete():
     text = _workflow_text()
 
     assert "workflow_run:" in text
-    assert "workflows: [Release Candidate, Windows Native]" in text
+    assert "workflows: [Release Candidate, Source Validation]" in text
     assert "types: [completed]" in text
     assert "branches: [main]" in text
     assert "candidate_run_id:" in text
