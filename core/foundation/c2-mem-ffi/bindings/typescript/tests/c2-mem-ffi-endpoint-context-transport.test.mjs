@@ -184,12 +184,18 @@ async function runScenario(server, container) {
     assert.equal(captured.endpointName(address), metadataA.endpointName);
     assert.equal(captured.namespaceId(), metadataA.namespaceId);
 
+    // Binds briefly share each root's namespace gate. Wait for readiness at
+    // startup, then exercise the independently live listeners below.
     const fixtureA = startServer(server, rootA, address, 0xa1, 7);
+    fixtures.push(fixtureA);
+    const readyA = await fixtureA.ready;
     const fixtureOtherA = startServer(server, rootA, otherAddress, 0xa2, 3);
+    fixtures.push(fixtureOtherA);
+    const readyOtherA = await fixtureOtherA.ready;
     const fixtureB = startServer(server, rootB, address, 0xb2, 2);
-    fixtures.push(fixtureA, fixtureOtherA, fixtureB);
-    const readiness = await Promise.all(fixtures.map(f => f.ready));
-    assert.deepEqual(readiness, [
+    fixtures.push(fixtureB);
+    const readyB = await fixtureB.ready;
+    assert.deepEqual([readyA, readyOtherA, readyB], [
       { ...metadataA, kind: 'ready' },
       { ...metadataOtherA, kind: 'ready' },
       { ...metadataB, kind: 'ready' },
