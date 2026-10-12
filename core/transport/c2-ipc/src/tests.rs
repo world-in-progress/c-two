@@ -4920,30 +4920,32 @@ mod lazy_policy_roundtrip_tests {
             matches!(error, IpcError::Io(_)) && error.to_string().contains("budget"),
             "{error:?}"
         );
-        let started = std::time::Instant::now();
-        assert!(
-            !old.close_shared(Duration::from_millis(50)),
-            "busy settlement stays unconfirmed"
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "bounded close exceeded its deadline"
-        );
-        assert_eq!(
-            busy.stats().dedicated_active_count,
-            1,
-            "failed close keeps the exact owner"
-        );
-        assert_eq!(
-            cache
-                .memory_budget_snapshot()
-                .unwrap()
-                .budget
-                .shm
-                .used_bytes,
-            retained
-        );
+        let closing = Arc::clone(&old);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let _ = closed_tx.send(closing.close_shared(Duration::from_millis(50)));
+        });
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map(|closed| {
+                (
+                    closed,
+                    busy.stats().dedicated_active_count,
+                    cache
+                        .memory_budget_snapshot()
+                        .unwrap()
+                        .budget
+                        .shm
+                        .used_bytes,
+                )
+            });
         drop(busy);
+        closer.join().unwrap();
+        let (closed, dedicated, charged) =
+            observed.expect("bounded close must return while the owner remains locked");
+        assert!(!closed, "busy settlement stays unconfirmed");
+        assert_eq!(dedicated, 1, "failed close keeps the exact owner");
+        assert_eq!(charged, retained);
         assert!(
             old.close_shared(Duration::from_secs(2)),
             "close retry must finish settlement"
