@@ -6171,7 +6171,16 @@ mod tests {
             assert_eq!(retained, 1);
             assert_eq!(charged.file.used_bytes, 16384);
             assert_eq!(charged.reassembly.used_bytes, 16384);
-            assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+            // The contended attempt above checks the short deadline. This
+            // retry checks eventual cleanup after the callback releases its
+            // lock; OS mapping destruction has no 50 ms completion guarantee.
+            let retry_started = Instant::now();
+            assert!(
+                client.close_shared_bounded(DEFAULT_CLOSE_TIMEOUT).await,
+                "uncontended cleanup unconfirmed: budget={:?}, elapsed={:?}",
+                DEFAULT_CLOSE_TIMEOUT,
+                retry_started.elapsed()
+            );
             assert!(client.pending.lock().is_empty());
             assert_eq!(budget.snapshot().file.used_bytes, 8192);
             assert_eq!(budget.snapshot().reassembly.used_bytes, 8192);
@@ -6232,7 +6241,15 @@ mod tests {
         assert_eq!(remaining, 1);
         assert_eq!(charged.file.used_bytes, 24576);
         assert_eq!(charged.reassembly.used_bytes, 24576);
-        assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+        // Allow normal OS mapping-destruction latency after releasing the
+        // callback; the contended close above retains its short deadline.
+        let retry_started = Instant::now();
+        assert!(
+            client.close_shared_bounded(DEFAULT_CLOSE_TIMEOUT).await,
+            "uncontended cleanup unconfirmed: budget={:?}, elapsed={:?}",
+            DEFAULT_CLOSE_TIMEOUT,
+            retry_started.elapsed()
+        );
         assert_eq!(registry.active_count(), 0);
         assert_eq!(budget.snapshot().file.used_bytes, 8192);
         assert_eq!(held.copy_bytes().unwrap(), &[11; 8192]);
