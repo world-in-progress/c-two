@@ -40,10 +40,13 @@ runs:
         set -euxo pipefail
         cat > .rc-build-c3.sh <<'EOF'
         set -euxo pipefail
+        # manylinux exposes interpreters under /opt/python, not the base PATH.
+        # Reuse the checksum-verified musl sccache binary from the host action.
+        export PATH="/opt/sccache:/opt/python/cp312-cp312/bin:$PATH"
         command -v cmake >/dev/null 2>&1 || python3 -m pip install --quiet cmake
         export PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_path("scripts"))'):$PATH"
         cmake --version | head -1
-        python3 -m pip install --quiet 'sccache==0.16.0'
+        sccache --version
         source /io/.github/scripts/compiler_cache.sh
         c2_enable_cpp_cache
         c2_report_compiler_cache_on_exit /io/artifacts/compiler-cache
@@ -53,6 +56,7 @@ runs:
         EOF
         docker run --rm \
           -v "$PWD:/io" \
+          -v "$(dirname "$SCCACHE_PATH"):/opt/sccache:ro" \
           -w /io \
           -e CARGO_TARGET_DIR=/io/cli/target \
           -e CARGO_TARGET=${{ inputs.target }} \
