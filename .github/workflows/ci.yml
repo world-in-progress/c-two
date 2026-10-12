@@ -53,6 +53,7 @@ jobs:
               - '.github/scripts/prepare_fastdb_sdk.py'
             workflow_policy:
               - '.github/workflows/**'
+              - '.github/actions/**'
               - '.github/scripts/**'
               - '.github/dependabot.yml'
               - 'cli/install-c3.sh'

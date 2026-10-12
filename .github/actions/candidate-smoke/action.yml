@@ -1,0 +1,147 @@
+name: Retained candidate lifecycle
+description: Reuse the Python 3.12 ABI row and validate uploaded package bytes in isolated consumers
+inputs:
+  target:
+    description: Rust target triple of the completed Python 3.12 ABI row
+    required: true
+  source-sha:
+    description: Exact candidate source commit
+    required: true
+  wheel-artifact:
+    description: Uploaded C-Two wheel artifact for this target
+    required: true
+runs:
+  using: composite
+  steps:
+    # The ABI row already resolved the published FastDB wheel or built its
+    # verified sdist. Retain those exact bytes and the same decision; building
+    # another cp312 wheel would duplicate compilation and produce a new hash.
+    - name: Stage the ABI row's verified FastDB proof
+      shell: python
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+      run: |
+        import hashlib, json, os, shutil, subprocess, sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(".github/scripts").resolve()))
+        from resolve_fastdb_release import pick_exact_wheel
+        target = os.environ["RC_TARGET"]
+        receipt = json.loads(Path(f"abi-{target}-3.12.json").read_text(encoding="utf-8"))
+        assert receipt["status"] == "passed", receipt
+        assert receipt["source_commit_sha"] == os.environ["SOURCE_SHA"], receipt
+        assert receipt["row"]["target"] == target and receipt["row"]["python"] == "3.12", receipt
+        decision = receipt["fastdb"]
+        wheel = pick_exact_wheel("fastdb", "fastdb-built", unique_file=True)
+        identity = decision["built_wheel"] if decision["mode"] == "sdist" else decision
+        assert wheel.name == identity.get("name", identity.get("filename")), identity
+        assert hashlib.sha256(wheel.read_bytes()).hexdigest() == identity["sha256"], identity
+        proof = Path("fastdb-dist")
+        proof.mkdir()
+        shutil.copy2(wheel, proof / wheel.name)
+        (proof / f"fastdb-{target}.json").write_text(
+            json.dumps(decision, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        subprocess.run([sys.executable, ".github/scripts/release_candidate.py", "checksum",
+                        *map(str, sorted(proof.iterdir()))], check=True)
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: rc-fastdb-${{ inputs.target }}
+        path: fastdb-dist/
+
+    # Download into fresh directories even though the producer is this job.
+    # Consumers still prove the retained artifact bytes, with no rebuilds.
+    - uses: actions/download-artifact@v4
+      with:
+        name: rc-cli-${{ inputs.target }}
+        path: retained/cli
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: rc-fastdb-${{ inputs.target }}
+        path: retained/fastdb
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.wheel-artifact }}
+        path: retained/wheels
+
+    - name: Verify exact downloaded bytes and locate inputs
+      id: retained
+      shell: bash
+      env:
+        RC_TARGET: ${{ inputs.target }}
+      run: |
+        set -euxo pipefail
+        C3="retained/cli/c3-${RC_TARGET}"
+        if [ "$RUNNER_OS" = "Windows" ]; then C3="${C3}.exe"; fi
+        test -f "$C3" && test -f "${C3}.sha256"
+        chmod +x "$C3"
+        python .github/scripts/release_candidate.py verify "$C3" retained/fastdb/*.whl retained/wheels/*.whl
+        "$C3" --version
+        FASTDB_WHEEL="$(python .github/scripts/resolve_fastdb_release.py pick-wheel --unique-file retained/fastdb)"
+        CTWO_WHEEL="$(python .github/scripts/resolve_fastdb_release.py pick-wheel retained/wheels)"
+        {
+          echo "c3=$C3"
+          echo "fastdb=$FASTDB_WHEEL"
+          echo "ctwo=$CTWO_WHEEL"
+        } >> "$GITHUB_OUTPUT"
+        echo "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')" >> "$GITHUB_PATH"
+
+    - name: Run the installed-wheel lifecycle smoke
+      shell: bash
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        C3_PATH: ${{ steps.retained.outputs.c3 }}
+        FASTDB_WHEEL: ${{ steps.retained.outputs.fastdb }}
+        CTWO_WHEEL: ${{ steps.retained.outputs.ctwo }}
+      run: |
+        set -euxo pipefail
+        python tools/ci/windows_wheel_smoke.py \
+          --fastdb-wheel "$FASTDB_WHEEL" \
+          --c-two-wheel "$CTWO_WHEEL" \
+          --c3 "$C3_PATH" \
+          --receipt "smoke-${RC_TARGET}.json" \
+          --source-sha "$SOURCE_SHA"
+        python .github/scripts/release_candidate.py checksum smoke-*.json
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: rc-smoke-${{ inputs.target }}
+        path: |
+          smoke-*.json
+          smoke-*.json.sha256
+
+    - name: Run the standard-user lifecycle and cleanup gate
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        C3_PATH: ${{ steps.retained.outputs.c3 }}
+        FASTDB_WHEEL: ${{ steps.retained.outputs.fastdb }}
+        CTWO_WHEEL: ${{ steps.retained.outputs.ctwo }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        & "$PWD/tools/ci/windows_standard_user.ps1" `
+          -PythonExecutable (Get-Command python).Source `
+          -UvExecutable (Get-Command uv).Source `
+          -Helper "$PWD/tools/ci/windows_wheel_smoke.py" `
+          -FastdbWheel (Get-Item -LiteralPath $env:FASTDB_WHEEL).FullName `
+          -CTwoWheel (Get-Item -LiteralPath $env:CTWO_WHEEL).FullName `
+          -C3 (Get-Item -LiteralPath $env:C3_PATH).FullName `
+          -SourceSha $env:SOURCE_SHA `
+          -Receipt "$PWD/standard-user-x86_64-pc-windows-msvc.json"
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        $wrapper = Get-Content standard-user-x86_64-pc-windows-msvc.json.wrapper.json -Raw | ConvertFrom-Json
+        if ($wrapper.status -ne 'passed') { throw "standard-user wrapper status: $($wrapper.status)" }
+        python .github/scripts/release_candidate.py checksum standard-user-x86_64-pc-windows-msvc.json standard-user-x86_64-pc-windows-msvc.json.wrapper.json
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+
+    - uses: actions/upload-artifact@v4
+      if: runner.os == 'Windows'
+      with:
+        name: rc-standard-user-windows
+        path: |
+          standard-user-*.json
+          standard-user-*.json.sha256

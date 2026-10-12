@@ -695,6 +695,56 @@ def test_checksum_commands_need_only_the_standard_library(tmp_path):
                        check=True, capture_output=True, text=True)
 
 
+@pytest.mark.parametrize("mode", ["wheel", "sdist"])
+@pytest.mark.parametrize("tampered", [False, True])
+def test_candidate_smoke_reuses_verified_abi_fastdb_bytes(rc, tmp_path, monkeypatch, mode, tampered):
+    import shutil
+    import yaml
+    from packaging.tags import sys_tags
+
+    action = yaml.safe_load((_ROOT / ".github/actions/candidate-smoke/action.yml").read_text())
+    script = next(step["run"] for step in action["runs"]["steps"]
+                  if step.get("name") == "Stage the ABI row's verified FastDB proof")
+    scripts = tmp_path / ".github/scripts"
+    scripts.mkdir(parents=True)
+    for name in ("release_candidate.py", "resolve_fastdb_release.py"):
+        shutil.copy2(_ROOT / ".github/scripts" / name, scripts / name)
+    target = "target-fixture"
+    wheel_name = f"fastdb4py-0.2.0-{next(iter(sys_tags()))}.whl"
+    wheel = write(tmp_path, f"{'fastdb-built' if mode == 'sdist' else 'fastdb'}/{wheel_name}",
+                  b"the ABI row's already tested wheel")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    decision = {"mode": mode, "filename": wheel_name, "sha256": digest}
+    if mode == "sdist":
+        sdist = write(tmp_path, "fastdb/fastdb4py-0.2.0.tar.gz", b"shared sdist retained by context")
+        decision.update(filename=sdist.name, sha256=hashlib.sha256(sdist.read_bytes()).hexdigest(),
+                        built_wheel={"name": wheel_name, "sha256": digest,
+                                     "bytes": wheel.stat().st_size,
+                                     "derived_from_sdist_sha256": hashlib.sha256(sdist.read_bytes()).hexdigest()})
+    write(tmp_path, f"abi-{target}-3.12.json", json.dumps({
+        "status": "passed", "source_commit_sha": "a" * 40,
+        "row": {"target": target, "python": "3.12"}, "fastdb": decision,
+    }).encode())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(scripts))
+    monkeypatch.setenv("RC_TARGET", target)
+    monkeypatch.setenv("SOURCE_SHA", "a" * 40)
+    if tampered:
+        wheel.write_bytes(b"changed after the ABI receipt")
+        with pytest.raises(AssertionError):
+            exec(compile(script, "candidate-smoke/action.yml", "exec"), {})
+        assert not (tmp_path / "fastdb-dist").exists()
+        return
+    exec(compile(script, "candidate-smoke/action.yml", "exec"), {})
+    proof = tmp_path / "fastdb-dist"
+    assert {path.name for path in proof.iterdir()} == {
+        wheel_name, f"{wheel_name}.sha256", f"fastdb-{target}.json", f"fastdb-{target}.json.sha256",
+    }
+    assert (proof / wheel_name).read_bytes() == wheel.read_bytes()
+    assert json.loads((proof / f"fastdb-{target}.json").read_text()) == decision
+    assert rc.main(["verify", str(proof / wheel_name), str(proof / f"fastdb-{target}.json")]) == 0
+
+
 def test_sdist_workflow_enables_maturin_pep517_repair(tmp_path, monkeypatch):
     import maturin
     import shlex

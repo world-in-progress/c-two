@@ -671,6 +671,18 @@ jobs:
           name: rc-wheel-${{ matrix.target }}-${{ matrix.python }}
           path: staging/
 
+      # Share this interpreter and runner with the retained-package checks.
+      # Every ABI still has its own lifecycle receipt; the cp312 row also
+      # retains FastDB proof and verifies downloaded artifacts (including the
+      # Windows standard-user consumer) before the final manifest can run.
+      - name: Validate the retained Python 3.12 package
+        if: matrix.python == '3.12'
+        uses: ./.github/actions/candidate-smoke
+        with:
+          target: ${{ matrix.target }}
+          source-sha: ${{ env.SOURCE_SHA }}
+          wheel-artifact: rc-wheel-${{ matrix.target }}-3.12
+
   # ── sdist: member-tree inspection plus isolated build/install/lifecycle ────
   sdist:
     needs: [context, cli]
@@ -872,197 +884,6 @@ jobs:
           name: rc-sdist
           path: staging/
 
-  # ── FastDB provisioning for the lifecycle smokes: official wheel, or the ────
-  # exact published sdist built once per sdist-only target at cp312. Only the
-  # built wheel is retained here; the single shared sdist copy is retained by
-  # the context job, so merged artifacts never collide on identical bytes.
-  fastdb:
-    needs: context
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, mode: wheel }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, mode: sdist }
-          - { target: aarch64-apple-darwin, os: macos-latest, mode: wheel }
-          - { target: x86_64-apple-darwin, os: macos-15-intel, mode: sdist }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest, mode: wheel }
-    name: fastdb (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    env:
-      FASTDB_VERSION: ${{ needs.context.outputs.fastdb_version }}
-      RC_TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-
-      - run: python -m pip install --quiet packaging
-
-      - name: Resolve and download the official FastDB wheel
-        if: matrix.mode == 'wheel'
-        shell: bash
-        run: |
-          python .github/scripts/resolve_fastdb_release.py resolve \
-            --version "$FASTDB_VERSION" --download-dir fastdb-dist \
-            --output "fastdb-dist/fastdb-${RC_TARGET}.json"
-
-      # fastdb4py publishes no wheel for Linux arm64 or macOS x86_64; build
-      # the wheel from the exact published, SHA-256-verified sdist with
-      # SWIG >= 4.4 as an explicit prerequisite instead of dropping targets.
-      - name: Build the FastDB wheel from the exact published sdist
-        if: matrix.mode == 'sdist'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -m pip install --quiet "swig>=4.4"
-          export PATH="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))'):$PATH"
-          swig -version | head -2
-          python .github/scripts/resolve_fastdb_release.py resolve \
-            --version "$FASTDB_VERSION" --require-sdist \
-            --download-dir fastdb-tarball --output "fastdb-dist/fastdb-${RC_TARGET}.json"
-          python -m pip wheel --no-deps --wheel-dir fastdb-built fastdb-tarball/fastdb4py-*.tar.gz
-          python - <<'PY'
-          import hashlib, json, os, pathlib, shutil
-          receipt_path = pathlib.Path(f"fastdb-dist/fastdb-{os.environ['RC_TARGET']}.json")
-          decision = json.loads(receipt_path.read_text(encoding="utf-8"))
-          built = sorted(pathlib.Path("fastdb-built").glob("*.whl"))
-          assert len(built) == 1, built
-          decision["built_wheel"] = {
-              "name": built[0].name,
-              "sha256": hashlib.sha256(built[0].read_bytes()).hexdigest(),
-              "bytes": built[0].stat().st_size,
-              "derived_from_sdist_sha256": decision["sha256"],
-          }
-          shutil.copy2(built[0], "fastdb-dist/" + built[0].name)
-          receipt_path.write_text(json.dumps(decision, indent=2, sort_keys=True) + "\n",
-                                  encoding="utf-8")
-          PY
-
-      - name: Checksum FastDB artifacts
-        shell: bash
-        run: python .github/scripts/release_candidate.py checksum fastdb-dist/*
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rc-fastdb-${{ matrix.target }}
-          path: fastdb-dist/
-
-  # ── Lifecycle smoke: exact packaged c3 + cp312 wheel + FastDB, per target ──
-  smoke:
-    needs: [context, cli, build-wheels-linux, build-wheels-native, fastdb]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-apple-darwin, os: macos-15-intel }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest }
-    name: smoke (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    env:
-      RC_TARGET: ${{ matrix.target }}
-      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-
-      - name: Expose uv on PATH
-        shell: bash
-        run: |
-          python -m pip install --quiet packaging uv
-          echo "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')" >> "$GITHUB_PATH"
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: rc-cli-${{ matrix.target }}
-          path: cli
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: rc-fastdb-${{ matrix.target }}
-          path: fastdb
-
-      - uses: actions/download-artifact@v4
-        if: runner.os == 'Linux'
-        with:
-          name: rc-wheels-${{ matrix.target }}
-          path: wheels
-
-      - uses: actions/download-artifact@v4
-        if: runner.os != 'Linux'
-        with:
-          name: rc-wheel-${{ matrix.target }}-3.12
-          path: wheels
-
-      # Explicit filenames after download; the executable bit is restored on
-      # Unix without changing bytes, proven by the retained sidecar digest.
-      - name: Verify exact downloaded bytes and locate inputs
-        shell: bash
-        run: |
-          set -euxo pipefail
-          C3="cli/c3-${RC_TARGET}"
-          case "$(uname -s)" in
-            MINGW*|MSYS*|CYGWIN*) C3="cli/c3-${RC_TARGET}.exe" ;;
-          esac
-          test -f "$C3" && test -f "${C3}.sha256"
-          chmod +x "$C3" 2>/dev/null || true
-          python .github/scripts/release_candidate.py verify "$C3" fastdb/*.whl wheels/*.whl
-          {
-            echo "C3_PATH=$C3"
-            echo "FASTDB_WHEEL=$(ls fastdb/*.whl)"
-            echo "CTWO_WHEEL=$(ls wheels/c_two-*-cp312-cp312-*.whl)"
-          } >> "$GITHUB_ENV"
-          test "$(ls fastdb/*.whl | wc -l)" -eq 1
-          test "$(ls wheels/c_two-*-cp312-cp312-*.whl | wc -l)" -eq 1
-
-      - name: Run the installed-wheel lifecycle smoke (unix)
-        if: runner.os != 'Windows'
-        run: |
-          python tools/ci/windows_wheel_smoke.py \
-            --fastdb-wheel "$FASTDB_WHEEL" \
-            --c-two-wheel "$CTWO_WHEEL" \
-            --c3 "$C3_PATH" \
-            --receipt "smoke-${RC_TARGET}.json" \
-            --source-sha "$SOURCE_SHA"
-
-      - name: Run the installed-wheel lifecycle smoke (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python tools/ci/windows_wheel_smoke.py `
-            --fastdb-wheel "$env:FASTDB_WHEEL" `
-            --c-two-wheel "$env:CTWO_WHEEL" `
-            --c3 "$env:C3_PATH" `
-            --receipt "smoke-$($env:RC_TARGET).json" `
-            --source-sha "$($env:SOURCE_SHA)"
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: Checksum the smoke receipt
-        shell: bash
-        run: python .github/scripts/release_candidate.py checksum smoke-*.json
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rc-smoke-${{ matrix.target }}
-          path: |
-            smoke-*.json
-            smoke-*.json.sha256
-
   # ── Linux ABI rows: consume each advertised interpreter's own wheel ────────
   abi-import-linux:
     needs: [context, cli, build-wheels-linux]
@@ -1191,87 +1012,21 @@ jobs:
             abi-*.json
             abi-*.json.sha256
 
-  # ── Windows standard-user lifecycle/cleanup with the same exact bytes ──────
-  windows-standard-user:
-    needs: [context, cli, build-wheels-native, fastdb]
-    env:
-      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Share this interpreter and runner with the retained-package checks.
+      # Every ABI still has its own lifecycle receipt; the cp312 row also
+      # retains FastDB proof and verifies downloaded artifacts (including the
+      # Windows standard-user consumer) before the final manifest can run.
+      - name: Validate the retained Python 3.12 package
+        if: matrix.python == '3.12'
+        uses: ./.github/actions/candidate-smoke
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-
-      - name: Expose uv on PATH
-        shell: pwsh
-        run: |
-          python -m pip install --quiet uv
-          Add-Content $env:GITHUB_PATH (python -c "import sysconfig; print(sysconfig.get_path('scripts'))")
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: rc-cli-x86_64-pc-windows-msvc
-          path: cli
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: rc-wheel-x86_64-pc-windows-msvc-3.12
-          path: wheels
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: rc-fastdb-x86_64-pc-windows-msvc
-          path: fastdb
-
-      - name: Verify exact downloaded bytes
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $files = @(Get-Item -LiteralPath cli/c3-x86_64-pc-windows-msvc.exe) + @(Get-ChildItem wheels, fastdb -File | Where-Object { $_.Name -notlike '*.sha256' })
-          python .github/scripts/release_candidate.py verify @($files | ForEach-Object { $_.FullName })
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: Run the standard-user lifecycle and cleanup gate
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $c3 = (Get-Item -LiteralPath cli/c3-x86_64-pc-windows-msvc.exe).FullName
-          $ctwo = (Get-ChildItem wheels -Filter *.whl -File).FullName
-          $fastdb = (Get-ChildItem fastdb -Filter *.whl -File).FullName
-          & "$PWD/tools/ci/windows_standard_user.ps1" `
-            -PythonExecutable (Get-Command python).Source `
-            -UvExecutable (Get-Command uv).Source `
-            -Helper "$PWD/tools/ci/windows_wheel_smoke.py" `
-            -FastdbWheel $fastdb `
-            -CTwoWheel $ctwo `
-            -C3 $c3 `
-            -SourceSha $env:SOURCE_SHA `
-            -Receipt "$PWD/standard-user-x86_64-pc-windows-msvc.json"
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          $wrapper = Get-Content standard-user-x86_64-pc-windows-msvc.json.wrapper.json -Raw | ConvertFrom-Json
-          if ($wrapper.status -ne 'passed') { throw "standard-user wrapper status: $($wrapper.status)" }
-
-      - name: Checksum the standard-user receipts
-        shell: pwsh
-        run: |
-          python .github/scripts/release_candidate.py checksum standard-user-x86_64-pc-windows-msvc.json standard-user-x86_64-pc-windows-msvc.json.wrapper.json
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rc-standard-user-windows
-          path: |
-            standard-user-*.json
-            standard-user-*.json.sha256
+          target: ${{ matrix.target }}
+          source-sha: ${{ env.SOURCE_SHA }}
+          wheel-artifact: rc-wheels-${{ matrix.target }}
 
   # ── Immutable source-bound manifest for exact-run promotion ────────────────
   manifest:
-    needs: [context, cli, build-wheels-linux, build-wheels-native, sdist, fastdb, smoke, abi-import-linux, windows-standard-user]
+    needs: [context, cli, build-wheels-linux, build-wheels-native, sdist, abi-import-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
