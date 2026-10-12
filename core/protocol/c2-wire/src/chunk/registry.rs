@@ -794,16 +794,25 @@ mod tests {
     fn feed_updates_last_activity() {
         let pool = test_pool();
         let cfg = ChunkConfig {
-            assembler_timeout: Duration::from_millis(100),
+            assembler_timeout: Duration::from_secs(60),
             ..ChunkConfig::default()
         };
         let reg = ChunkRegistry::new(pool.clone(), cfg);
         reg.insert(1, 1, 3, 1024).unwrap();
-        // Wait 60ms, feed a chunk — resets timer.
-        std::thread::sleep(Duration::from_millis(60));
+        // Make the entry stale without relying on a scheduler waking within
+        // a narrow expiry window. A feed must replace this old activity time.
+        let stale = Instant::now() - Duration::from_secs(120);
+        {
+            let mut shard = reg.shard(1).lock();
+            let entry = shard.get_mut(&(1, 1)).unwrap();
+            entry._created_at = stale;
+            entry.last_activity = stale;
+        }
+        let before_feed = Instant::now();
         reg.feed(1, 1, 0, &[0u8; 1024]).unwrap();
-        // Wait another 60ms (120ms from insert, but only 60ms from last feed).
-        std::thread::sleep(Duration::from_millis(60));
+        let after_feed = Instant::now();
+        let refreshed = reg.shard(1).lock().get(&(1, 1)).unwrap().last_activity;
+        assert!((before_feed..=after_feed).contains(&refreshed));
         let stats = reg.gc_sweep();
         assert_eq!(stats.expired, 0);
         assert_eq!(reg.active_count(), 1);
