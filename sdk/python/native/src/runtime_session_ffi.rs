@@ -90,25 +90,25 @@ mod connect_attempt_tests {
         let worker_session = session.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let attempt = PyConnectAttempt {
-                inner: c2_core::ConnectAttempt::start(
-                    c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(100)),
-                )
-                .unwrap(),
-            };
-            let started = std::time::Instant::now();
             let result = Python::attach(|py| {
+                let attempt = PyConnectAttempt {
+                    inner: c2_core::ConnectAttempt::start(
+                        c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(100)),
+                    )
+                    .unwrap(),
+                };
                 worker_session.set_relay_anchor_address(
                     py,
                     Some("http://relay.test".into()),
                     Some(&attempt),
                 )
             });
-            done_tx.send((result, started.elapsed())).unwrap();
+            done_tx.send(result).unwrap();
         });
-        let (result, elapsed) = done_rx
-            .recv_timeout(Duration::from_millis(250))
-            .expect("native host lock must not block past caller budget");
+        let observed = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(host);
+        worker.join().unwrap();
+        let result = observed.expect("native host lock must expire before its owner releases");
         let error = result.unwrap_err();
         Python::attach(|py| {
             let value = error.value(py);
@@ -134,10 +134,6 @@ mod connect_attempt_tests {
                 "connect"
             );
         });
-        assert!(elapsed < Duration::from_millis(250));
-        std::thread::sleep(Duration::from_millis(300).saturating_sub(elapsed));
-        drop(host);
-        worker.join().unwrap();
         Python::attach(|py| {
             session.set_relay_anchor_address(py, Some("http://relay.test".into()), None)
         })

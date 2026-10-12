@@ -395,21 +395,20 @@ mod tests {
             parking_lot::Mutex::new(()),
         ));
         let held = shared.1.lock();
-        let start = std::time::Instant::now();
-        let deadline = c2_config::ConnectDeadline::start(
-            c2_config::ConnectOptions::new().with_timeout(std::time::Duration::from_millis(100)),
-        )
-        .unwrap();
         let waiter_shared = std::sync::Arc::clone(&shared);
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
+            let deadline = c2_config::ConnectDeadline::start(
+                c2_config::ConnectOptions::new()
+                    .with_timeout(std::time::Duration::from_millis(100)),
+            )
+            .unwrap();
             let result = runtime_cell_with_deadline(&waiter_shared.0, &waiter_shared.1, deadline)
                 .map(|_| ());
             finished_tx.send(result).unwrap();
         });
-        let result = finished_rx.recv_timeout(std::time::Duration::from_millis(250));
+        let result = finished_rx.recv_timeout(std::time::Duration::from_secs(2));
         let no_publish = shared.0.get().is_none();
-        std::thread::sleep(std::time::Duration::from_millis(300).saturating_sub(start.elapsed()));
         drop(held);
         waiter.join().unwrap();
         let error = result

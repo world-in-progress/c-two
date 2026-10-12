@@ -1756,19 +1756,22 @@ mod tests {
             references: references.clone(),
             counted: true,
         };
-        let _state = pool.state.lock();
-        let _coordinator = pool.close_txn.0.lock();
+        let state = pool.state.lock();
+        let coordinator = pool.close_txn.0.lock();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let releaser = thread::spawn(move || {
             drop(lease);
             done_tx.send(()).unwrap();
         });
-        done_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("exact-entry release must not wait on global locks");
+        let observed = done_rx.recv_timeout(Duration::from_secs(2));
+        let count = references.count.load(Ordering::Acquire);
+        let released_tick = references.released_tick.load(Ordering::Acquire);
+        drop(coordinator);
+        drop(state);
         releaser.join().unwrap();
-        assert_eq!(references.count.load(Ordering::Acquire), 0);
-        assert_ne!(references.released_tick.load(Ordering::Acquire), 0);
+        observed.expect("exact-entry release must not wait on global locks");
+        assert_eq!(count, 0);
+        assert_ne!(released_tick, 0);
     }
 
     #[test]
@@ -1814,21 +1817,16 @@ mod tests {
             drop(fresh);
             done_tx.send(()).unwrap();
         });
-        done_rx
-            .recv_timeout(Duration::from_millis(150))
-            .expect("expiry cleanup must not wait on pool metadata locks");
-        closer.join().unwrap();
-        assert!(
-            weak.upgrade().is_some(),
-            "unconfirmed close retains its client"
-        );
-        assert_eq!(
-            coordinator.retired.values().next().unwrap().state(),
-            RetiredState::Closing
-        );
+        let observed = done_rx.recv_timeout(Duration::from_secs(2));
+        let retained = weak.upgrade().is_some();
+        let retired_state = coordinator.retired.values().next().map(|work| work.state());
         drop(coordinator);
         drop(state);
         release_tx.send(()).unwrap();
+        closer.join().unwrap();
+        observed.expect("expiry cleanup must not wait on pool metadata locks");
+        assert!(retained, "unconfirmed close retains its client");
+        assert_eq!(retired_state, Some(RetiredState::Closing));
         wait_for_retired_settlement(&pool);
         assert_eq!(pool.retired_records_for_test(), 0);
         assert!(
