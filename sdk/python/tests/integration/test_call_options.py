@@ -497,8 +497,9 @@ def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
     """Two real HTTP endpoints produce a proven stale refusal then slow success."""
     import json
     import pickle
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from http.server import BaseHTTPRequestHandler
     from c_two.crm.contract import crm_contract
+    from tests.fixtures.http_server import LoopbackHTTPServer
 
     expected = crm_contract(TimedContract)
     calls = [0, 0]
@@ -559,7 +560,7 @@ def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
     unlimited = None
     try:
         for index in range(2):
-            server = ThreadingHTTPServer(('127.0.0.1', 0), handler(index))
+            server = LoopbackHTTPServer(('127.0.0.1', 0), handler(index))
             server.daemon_threads = True
             servers.append(server)
             thread = threading.Thread(target=server.serve_forever)

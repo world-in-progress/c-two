@@ -22,6 +22,7 @@ env:
   EMSDK_VERSION: "5.0.2"
   CARGO_TERM_COLOR: never
   CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
   CMAKE_BUILD_PARALLEL_LEVEL: "2"
   SCCACHE_GHA_ENABLED: "true"
   SCCACHE_IDLE_TIMEOUT: "0"
@@ -102,10 +103,35 @@ jobs:
       - name: Prepare official FastDB CoreSDK
         id: fastdb_sdk
         run: python .github/scripts/prepare_fastdb_sdk.py --output "${{ runner.temp }}/fastdb-core-sdk"
-      - uses: Swatinem/rust-cache@v2
+      - name: Identify the shared Cargo toolchain
+        id: cargo_identity
+        shell: bash
+        run: |
+          python - <<'PYTHON'
+          import hashlib, os, subprocess
+          compiler = "cl" if os.name == "nt" else "cc"
+          identity = subprocess.check_output(["rustc", "-vV"])
+          identity += subprocess.run([compiler, "--version"] if compiler != "cl" else [compiler],
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout
+          inputs = {key: value for key, value in os.environ.items()
+                    if key.startswith(("CARGO", "RUST", "CC", "CXX", "CFLAGS", "CMAKE", "MACOSX", "VCTools"))}
+          identity += repr(sorted(inputs.items())).encode()
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print("key=" + hashlib.sha256(identity).hexdigest()[:24], file=output)
+          PYTHON
+      # All five Cargo workspaces write this target. A workspace-aware pruner
+      # would delete the other workspaces' dependencies; Cargo fingerprints
+      # validate the complete restored tree before every build/test command.
+      - uses: actions/cache/restore@v4
+        id: cargo_cache
         with:
-          workspaces: c-two/core -> target
-          key: source-shared-v1-${{ matrix.os }}-${{ matrix.python }}-${{ env.FASTDB_SOURCE_SHA }}-${{ hashFiles('c-two/**/Cargo.lock', 'fastdb/bindings/rust/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/git/checkouts
+            c-two/core/target
+          key: source-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-${{ matrix.python }}-${{ steps.cargo_identity.outputs.key }}-${{ hashFiles('c-two/**/Cargo.lock', 'c-two/**/Cargo.toml', 'c-two/**/.cargo/config.toml', 'c-two/**/rust-toolchain*', 'fastdb/bindings/rust/Cargo.lock', 'fastdb/bindings/rust/**/Cargo.toml', 'c-two/.github/workflows/ci.yml', 'c-two/tools/ci/source_validation.py') }}-${{ env.FASTDB_SOURCE_SHA }}
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.16.0
@@ -175,6 +201,17 @@ jobs:
           --fastdb-system-lib-dir "${{ steps.fastdb_sdk.outputs.lib-dir }}"
           --scope "${{ matrix.scope }}"
           --output "artifacts/source"
+      - name: Save shared Cargo outputs, including after test failures
+        if: always() && !cancelled() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/git/checkouts
+            c-two/core/target
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
       - name: Retain compiler cache statistics
         if: always()
         shell: bash

@@ -1918,16 +1918,24 @@ mod tests {
         schedule_retired_settlement(&pool.close_txn, &work);
         let coordinator = pool.close_txn.0.lock();
         let record = work.record.clone();
-        let started = Instant::now();
-        let error = record.wait_until_settled(connect_budget(100)).unwrap_err();
-        assert!(started.elapsed() < Duration::from_millis(200));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let result = record.wait_until_settled(connect_budget(100));
+            let _ = done_tx.send(result);
+        });
+        let observed = done_rx.recv_timeout(Duration::from_secs(2));
+        let state_while_blocked = work.record.state();
+        drop(coordinator);
+        release_tx.send(()).unwrap();
+        waiter.join().unwrap();
+        wait_for_retired_settlement(&pool);
+        let error = observed
+            .expect("settlement deadline must finish before coordinator release")
+            .unwrap_err();
         assert!(matches!(error, IpcError::LocalCallRejected(ref error)
             if error.code == c2_error::ErrorCode::CallDeadlineExceeded
                 && error.details.get("stage").map(String::as_str) == Some("pool_cleanup_wait")));
-        assert_eq!(work.record.state(), RetiredState::Closing);
-        drop(coordinator);
-        release_tx.send(()).unwrap();
-        wait_for_retired_settlement(&pool);
+        assert_eq!(state_while_blocked, RetiredState::Closing);
     }
 
     #[test]

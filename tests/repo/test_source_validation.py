@@ -531,7 +531,11 @@ def test_artifact_inventory_retains_proofs_without_disposable_build_trees(tmp_pa
 
 def test_wasm_build_keeps_tracked_loader_and_installs_matching_dist_pair(tmp_path, monkeypatch):
     import subprocess
-    from tools.ci import source_prerequisites as prerequisites
+    path = Path(__file__).resolve().parents[2] / "tools/ci/source_prerequisites.py"
+    spec = importlib.util.spec_from_file_location("source_prerequisites", path)
+    assert spec is not None and spec.loader is not None
+    prerequisites = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prerequisites)
     root = tmp_path / 'c-two'
     root.mkdir()
     fastdb = tmp_path / 'fastdb'
@@ -568,3 +572,39 @@ def test_wasm_build_keeps_tracked_loader_and_installs_matching_dist_pair(tmp_pat
     assert (dist / 'fastdb4ts.js').read_text() == 'platform loader'
     assert (dist / 'fastdb4ts.wasm').read_bytes() == b'matching wasm'
     assert original.read_text() == 'tracked loader'
+
+
+def test_loopback_http_fixture_does_not_require_reverse_dns(monkeypatch):
+    from http.client import HTTPConnection
+    from http.server import BaseHTTPRequestHandler
+    import socket
+    import threading
+    path = Path(__file__).resolve().parents[2] / 'sdk/python/tests/fixtures/http_server.py'
+    spec = importlib.util.spec_from_file_location('loopback_http_fixture', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    def unavailable(*args):
+        raise AssertionError('numeric loopback fixture attempted reverse DNS')
+    monkeypatch.setattr(socket, 'getfqdn', unavailable)
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'ok')
+        def log_message(self, *args):
+            pass
+    server = module.LoopbackHTTPServer(('127.0.0.1', 0), Handler)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    client = HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+    try:
+        client.request('GET', '/')
+        response = client.getresponse()
+        assert response.status == 200 and response.read() == b'ok'
+        assert server.server_name == '127.0.0.1'
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)
+    assert not worker.is_alive()

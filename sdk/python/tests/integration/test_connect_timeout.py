@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 
@@ -12,6 +12,7 @@ import c_two as cc
 from c_two import _native
 from c_two.transport import Server
 from c_two.transport.registry import _ProcessRegistry
+from tests.fixtures.http_server import LoopbackHTTPServer
 
 
 @cc.crm(namespace='test.connect_timeout.integration', version='0.1.0')
@@ -85,7 +86,7 @@ def stalled_relay():
         def log_message(self, *_args):
             pass
 
-    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
     server.daemon_threads = False
     worker = threading.Thread(target=server.serve_forever)
     worker.start()
