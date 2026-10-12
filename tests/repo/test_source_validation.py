@@ -101,6 +101,7 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
         assert dependencies[runner.IPC_MEMORY_GATE] == {"python-build", "source-harness-tests"}
         commands = {name: command for name, command, _ in gates}
         assert "--ignore-scripts" in commands["c2-mem-node-tests"]
+        assert "--ignore-scripts" in commands["c2-mem-npm-install"]
         assert "--prepared" in commands["c2-mem-node-package"]
         assert "--workers" in commands["python-suite"] and "--fastdb-package" in commands["python-suite"]
         assert "--features" in commands["core-test"] and "c2-http/relay" in commands["core-test"]
@@ -526,3 +527,44 @@ def test_artifact_inventory_retains_proofs_without_disposable_build_trees(tmp_pa
         p.write_text("evidence")
     retained = {p.relative_to(tmp_path).as_posix() for p in _runner().retained_artifacts(tmp_path)}
     assert retained == set(paths[:5])
+
+
+def test_wasm_build_keeps_tracked_loader_and_installs_matching_dist_pair(tmp_path, monkeypatch):
+    import subprocess
+    from tools.ci import source_prerequisites as prerequisites
+    root = tmp_path / 'c-two'
+    root.mkdir()
+    fastdb = tmp_path / 'fastdb'
+    original = fastdb / 'ts/fastdb4ts/src/wasm/fastdb4ts.js'
+    original.parent.mkdir(parents=True)
+    original.write_text('tracked loader')
+    subprocess.run(['git', 'init', '-q', str(fastdb)], check=True)
+    subprocess.run(['git', '-C', str(fastdb), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(fastdb), '-c', 'user.name=CI Test', '-c', 'user.email=ci@example.test', 'commit', '-qm', 'fixture'], check=True)
+    monkeypatch.setattr(prerequisites, 'ROOT', root)
+    monkeypatch.setenv('EMSDK', str(tmp_path / 'emsdk'))
+    actual_run = prerequisites.run
+    builds = []
+    def simulated_compile(command, *, cwd, **kwargs):
+        if command[0] == 'git':
+            return actual_run(command, cwd=cwd, **kwargs)
+        if command[0] == 'cmake':
+            generated = cwd / 'ts/fastdb4ts/src/wasm'
+            (generated / 'fastdb4ts.js').write_text('platform loader')
+            (generated / 'fastdb4ts.wasm').write_bytes(b'matching wasm')
+            builds.append(cwd)
+        elif '--prefix' in command:
+            dist = fastdb / 'ts/fastdb4ts/dist/wasm'
+            dist.mkdir(parents=True)
+            (dist / 'fastdb4ts.js').write_text(original.read_text())
+        return None
+    monkeypatch.setattr(prerequisites, 'run', simulated_compile)
+    prerequisites.wasm()
+    prerequisites.wasm()  # A complete pinned cache needs no second compilation.
+    assert len(builds) == 1 and builds[0] != fastdb
+    assert original.read_text() == 'tracked loader'
+    prerequisites.fastdb_package()
+    dist = fastdb / 'ts/fastdb4ts/dist/wasm'
+    assert (dist / 'fastdb4ts.js').read_text() == 'platform loader'
+    assert (dist / 'fastdb4ts.wasm').read_bytes() == b'matching wasm'
+    assert original.read_text() == 'tracked loader'

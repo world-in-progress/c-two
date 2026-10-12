@@ -159,8 +159,8 @@ jobs:
       - name: Cache the pinned FastDB WASM prerequisite
         uses: actions/cache@v4
         with:
-          path: fastdb/ts/fastdb4ts/src/wasm
-          key: fastdb-wasm-${{ runner.os }}-${{ runner.arch }}-${{ env.FASTDB_SOURCE_SHA }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
+          path: fastdb-wasm
+          key: source-fastdb-wasm-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.FASTDB_SOURCE_SHA }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
       - name: Run shared source validation
         env:
           C2_WORKFLOW_SHA: ${{ github.workflow_sha }}

@@ -120,7 +120,7 @@ def run_step(
             record["process_exited"] = process is None or process.poll() is not None
     # Full output remains in the artifact; keep the Actions console bounded.
     print(log_path.read_text(encoding="utf-8", errors="replace")[-16000:], flush=True)
-    print(f"{name}: {record['status']} (exit {record['exit_code']})", flush=True)
+    print(f"{name}: {record['status']} (exit {record['exit_code']}, {record['duration_seconds']} s)", flush=True)
     print("::endgroup::", flush=True)
     return record
 
@@ -340,20 +340,14 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
         raise ValueError(f"Unknown native gate scope: {scope}")
     fastdb_typescript = "../fastdb/ts/fastdb4ts"
     c2_mem_typescript = "core/foundation/c2-mem-ffi/bindings/typescript"
-    fastdb_build = npm_command("run", "build", "--prefix", fastdb_typescript)
-    if os.name == "nt":
-        shell = os.environ.get("C2_FASTDB_NPM_SCRIPT_SHELL") or str(
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/bin/bash.exe"
-        )
-        fastdb_build.extend(["--script-shell", shell])
     selected = [
         ("python310-install", ["uv", "python", "install", "3.10"], ()),
-        ("fastdb-npm-install", npm_command("ci", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", fastdb_typescript), ()),
+        ("fastdb-npm-install", npm_command("ci", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", fastdb_typescript), ()),
         # The persistent generated-client regression is part of the ordinary
         # suite, before the payload matrix's independent WASM/package build.
         ("fastdb-wasm-build", [python, str(ROOT / "tools/ci/source_prerequisites.py"), "wasm"], ()),
-        ("fastdb-npm-build", fastdb_build, ("fastdb-npm-install", "fastdb-wasm-build")),
-        ("c2-mem-npm-install", npm_command("ci", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", c2_mem_typescript), ()),
+        ("fastdb-npm-build", [python, str(ROOT / "tools/ci/source_prerequisites.py"), "fastdb"], ("fastdb-npm-install", "fastdb-wasm-build")),
+        ("c2-mem-npm-install", npm_command("ci", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", c2_mem_typescript), ()),
         ("c2-mem-build", ["node", f"{c2_mem_typescript}/scripts/build-runtime.mjs"], ("c2-mem-npm-install",)),
         ("c2-mem-node-tests", npm_command("test", "--ignore-scripts", "--prefix", c2_mem_typescript), ("c2-mem-build",)),
         ("c2-mem-node-package", npm_command("run", "pack:check", "--prefix", c2_mem_typescript, "--", "--prepared"), ("c2-mem-build",)),

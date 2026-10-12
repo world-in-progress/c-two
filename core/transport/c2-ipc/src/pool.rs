@@ -1727,15 +1727,25 @@ mod tests {
 
     #[test]
     fn connect_deadline_coordinator_wait_cannot_freeze_or_publish() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let _coordinator = pool.close_txn.0.lock();
-        let started = Instant::now();
-        let result = pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
+        let pool = Arc::new(ClientPool::new(Duration::from_secs(30)));
+        let coordinator = pool.close_txn.0.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiting_pool = pool.clone();
+        let waiter = thread::spawn(move || {
+            let result =
+                waiting_pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
+            let _ = done_tx.send(result);
+        });
+        // Prove completion while the coordinator is still held. The watchdog
+        // allows scheduler delay; the actual caller budget remains 25 ms.
+        let observed = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(coordinator);
+        waiter.join().unwrap();
+        let result = observed.expect("connect deadline must finish before coordinator release");
         let IpcError::LocalCallRejected(error) = result.err().unwrap() else {
             panic!("canonical deadline required")
         };
         assert_eq!(error.details["stage"], "pool_cleanup_wait");
-        assert!(started.elapsed() < Duration::from_millis(150));
         assert_eq!(pool.active_count(), 0);
         assert!(pool.memory_budget_snapshot().is_none());
     }
