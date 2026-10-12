@@ -1,0 +1,104 @@
+name: Build retained candidate CLI
+description: Build, checksum and execute one target's retained c3 artifact
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+  manylinux-image:
+    description: Native manylinux image for Linux targets
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: "3.12"
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+
+    - uses: Swatinem/rust-cache@v2
+      if: runner.os != 'Linux'
+      with:
+        workspaces: cli -> target
+        key: candidate-cli-${{ inputs.target }}-source
+
+    # MSVC environment (cl.exe, Windows SDK) for the native Windows build.
+    # https://github.com/ilammy/msvc-dev-cmd
+    - name: Set up MSVC environment
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Build c3 (manylinux container)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euxo pipefail
+        cat > .rc-build-c3.sh <<'EOF'
+        set -euxo pipefail
+        command -v cmake >/dev/null 2>&1 || python3 -m pip install --quiet cmake
+        export PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_path("scripts"))'):$PATH"
+        cmake --version | head -1
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+        source "$HOME/.cargo/env"
+        cargo build --manifest-path /io/cli/Cargo.toml --release --target "$CARGO_TARGET"
+        EOF
+        docker run --rm \
+          -v "$PWD:/io" \
+          -w /io \
+          -e CARGO_TARGET_DIR=/io/cli/target \
+          -e CARGO_TARGET=${{ inputs.target }} \
+          -e FASTDB_PAYLOAD_LINK_MODE=source \
+          "${{ inputs.manylinux-image }}" \
+          bash /io/.rc-build-c3.sh
+        rm -f .rc-build-c3.sh
+
+    - name: Build c3 (native macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        FASTDB_PAYLOAD_LINK_MODE: source
+      run: cargo build --manifest-path cli/Cargo.toml --release --target ${{ inputs.target }}
+
+    - name: Build c3 (native Windows MSVC)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        FASTDB_PAYLOAD_LINK_MODE: source
+      run: |
+        cargo build --manifest-path cli/Cargo.toml --release --target ${{ inputs.target }}
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+
+    - name: Package and execute the packaged c3 (unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        RC_TARGET: ${{ inputs.target }}
+      run: |
+        set -euxo pipefail
+        mkdir -p cli-dist
+        cp "cli/target/${{ inputs.target }}/release/c3" "cli-dist/c3-${RC_TARGET}"
+        python .github/scripts/release_candidate.py checksum "cli-dist/c3-${RC_TARGET}"
+        "./cli-dist/c3-${RC_TARGET}" --version
+        "./cli-dist/c3-${RC_TARGET}" --help >/dev/null
+
+    - name: Package and execute the packaged c3 (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        RC_TARGET: ${{ inputs.target }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        New-Item -ItemType Directory -Force -Path cli-dist | Out-Null
+        Copy-Item "cli/target/${{ inputs.target }}/release/c3.exe" "cli-dist/c3-$($env:RC_TARGET).exe"
+        python .github/scripts/release_candidate.py checksum "cli-dist/c3-$($env:RC_TARGET).exe"
+        & "$PWD/cli-dist/c3-$($env:RC_TARGET).exe" --version
+        if ($LASTEXITCODE -ne 0) { throw "packaged c3 --version failed" }
+        & "$PWD/cli-dist/c3-$($env:RC_TARGET).exe" --help | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "packaged c3 --help failed" }
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: rc-cli-${{ inputs.target }}
+        path: cli-dist/

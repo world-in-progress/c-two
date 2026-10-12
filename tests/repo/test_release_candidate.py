@@ -751,7 +751,7 @@ def test_sdist_workflow_enables_maturin_pep517_repair(tmp_path, monkeypatch):
     import subprocess
     import yaml
     workflow = yaml.safe_load((Path(__file__).resolve().parents[2] /
-                               ".github/workflows/release-candidate.yml").read_text())
+                               ".github/workflows/release-candidate-linux.yml").read_text())
     step = next(s for s in workflow["jobs"]["sdist"]["steps"]
                 if s.get("name") == "Isolated build of the wheel from the extracted sdist contents")
     setting = next(arg for arg in shlex.split(step["run"])
@@ -773,6 +773,30 @@ def test_sdist_workflow_enables_maturin_pep517_repair(tmp_path, monkeypatch):
     assert command[command.index("--auditwheel") + 1] == "repair"
     assert "off" not in command
     assert (out / built.name).read_bytes() == built.read_bytes()
+
+
+def test_target_workflows_keep_the_complete_abi_inventory_and_local_dependencies():
+    import yaml
+
+    root = yaml.safe_load((_ROOT / ".github/workflows/release-candidate.yml").read_text())
+    versions = {"3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"}
+    targets = {"x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+               "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"}
+    rows = []
+    for family, consumer in (("native", "build-wheels-native"), ("linux", "abi-import-linux")):
+        caller = root["jobs"][family]
+        assert caller["needs"] == "context"
+        assert caller["with"]["source-sha"] == "${{ needs.context.outputs.source_sha }}"
+        workflow = yaml.safe_load((_ROOT / caller["uses"]).read_text())
+        job = workflow["jobs"][consumer]
+        # Dependency IDs resolve inside one target invocation, never to the
+        # parent's complete cross-platform CLI matrix.
+        assert job["needs"] == ("cli" if family == "native" else ["cli", "build-wheels-linux"])
+        assert workflow["jobs"]["cli"]["steps"][0]["with"]["ref"] == "${{ inputs.source-sha }}"
+        for platform in caller["strategy"]["matrix"]["include"]:
+            rows.extend((platform["target"], version) for version in job["strategy"]["matrix"]["python"])
+    assert len(rows) == 30 and set(rows) == {(target, version) for target in targets for version in versions}
+    assert set(root["jobs"]["manifest"]["needs"]) == {"context", "native", "linux"}
 
 
 def test_provisioning_receipt_cannot_change_its_sdist_derivation(rc, tmp_path, capsys):

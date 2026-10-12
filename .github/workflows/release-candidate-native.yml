@@ -1,0 +1,248 @@
+name: Candidate native target
+
+on:
+  workflow_call:
+    inputs:
+      source-sha:
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      fastdb-version:
+        required: true
+        type: string
+      fastdb-mode:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  PYTHONUTF8: "1"
+
+jobs:
+  cli:
+    name: c3
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-sha }}
+      - uses: ./.github/actions/candidate-cli
+        with:
+          target: ${{ inputs.target }}
+
+  build-wheels-native:
+    needs: cli
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
+    name: wheel (${{ matrix.python }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    env:
+      RC_TARGET: ${{ inputs.target }}
+      RC_PYTHON: ${{ matrix.python }}
+      FASTDB_VERSION: ${{ inputs.fastdb-version }}
+      SOURCE_SHA: ${{ inputs.source-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-sha }}
+
+      # setup-python provisions the exact interpreter for every advertised
+      # ABI, including the free-threaded "3.14t" build.
+      # https://github.com/actions/setup-python#using-the-python-version-input
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.target }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/python/native -> target
+          cache-targets: false
+          shared-key: candidate-native-${{ inputs.target }}
+
+      - name: Record the row interpreter
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --quiet packaging
+          RC_PYTHON_EXE="$(python -c 'import sys; print(sys.executable)')"
+          export RC_PYTHON_EXE
+          echo "RC_PYTHON_EXE=$RC_PYTHON_EXE" >> "$GITHUB_ENV"
+          python -c 'import platform, sys
+          from packaging.tags import sys_tags
+          first = next(iter(sys_tags()))
+          print(f"row interpreter {first.interpreter}-{first.abi} ({platform.python_version()})")'
+
+      - uses: PyO3/maturin-action@v1
+        env:
+          FASTDB_PAYLOAD_LINK_MODE: source
+        with:
+          command: build
+          sccache: true
+          working-directory: sdk/python
+          target: ${{ inputs.target }}
+          args: --release --out dist -i ${{ env.RC_PYTHON_EXE }}
+
+      - name: Checksum the built wheel
+        shell: bash
+        run: python .github/scripts/release_candidate.py checksum sdk/python/dist/*.whl
+
+      # pick-wheel prints the selection so it becomes a current-shell
+      # variable immediately (set -u safe in this step) and is also exported
+      # for later steps; it fails unless the wheel carries this row's exact
+      # interpreter ABI tag.
+      - name: Select this row's wheel by exact interpreter ABI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CTWO_WHEEL="$(python .github/scripts/resolve_fastdb_release.py pick-wheel \
+            --unique-file sdk/python/dist)"
+          export CTWO_WHEEL
+          echo "CTWO_WHEEL=$CTWO_WHEEL" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rc-cli-${{ inputs.target }}
+          path: cli
+
+      # The retained CLI bytes, not a rebuild: restore the executable bit on
+      # Unix (never changing bytes), verify against the retained sidecar —
+      # including the exact c3-*.exe.sha256 on Windows — and execute it.
+      - name: Verify and execute the retained c3 (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          C3="cli/c3-${RC_TARGET}"
+          test -f "$C3" && test -f "${C3}.sha256"
+          chmod +x "$C3"
+          python .github/scripts/release_candidate.py verify "$C3"
+          "$C3" --version
+          echo "C3_PATH=$C3" >> "$GITHUB_ENV"
+
+      - name: Verify and execute the retained c3 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $c3 = "cli/c3-$($env:RC_TARGET).exe"
+          if (-not (Test-Path $c3) -or -not (Test-Path "$c3.sha256")) { throw "missing $c3" }
+          python .github/scripts/release_candidate.py verify $c3
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$PWD/$c3" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Add-Content $env:GITHUB_ENV "C3_PATH=$c3"
+
+      - name: Provision FastDB for this interpreter
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --quiet packaging "swig>=4.4"
+          export PATH="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))'):$PATH"
+          if [ "${{ inputs.fastdb-mode }}" = "wheel" ]; then
+            python .github/scripts/resolve_fastdb_release.py resolve \
+              --version "$FASTDB_VERSION" \
+              --download-dir fastdb --output fastdb-decision.json
+          else
+            # fastdb4py publishes no wheel for this target: build the exact
+            # published, SHA-256-verified sdist in THIS row's interpreter.
+            # SWIG >= 4.4 is an explicit prerequisite of the sdist build.
+            swig -version | head -2
+            python .github/scripts/resolve_fastdb_release.py resolve \
+              --version "$FASTDB_VERSION" --require-sdist \
+              --download-dir fastdb --output fastdb-decision.json
+            python -m pip wheel --no-deps --wheel-dir fastdb-built fastdb/fastdb4py-*.tar.gz
+          fi
+
+      - name: Run the installed-wheel lifecycle for this ABI row
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --quiet uv
+          FASTDB_WHEEL="$(python .github/scripts/resolve_fastdb_release.py pick-wheel \
+            --unique-file fastdb fastdb-built)"
+          export FASTDB_WHEEL
+          echo "FASTDB_WHEEL=$FASTDB_WHEEL" >> "$GITHUB_ENV"
+          python tools/ci/windows_wheel_smoke.py \
+            --fastdb-wheel "$FASTDB_WHEEL" \
+            --c-two-wheel "$CTWO_WHEEL" \
+            --c3 "$C3_PATH" \
+            --receipt "abi-${RC_TARGET}-${RC_PYTHON}.json" \
+            --source-sha "$SOURCE_SHA"
+
+      - name: Bind the ABI-row receipt to its row and FastDB decision
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib
+          decision = json.loads(pathlib.Path("fastdb-decision.json").read_text(encoding="utf-8"))
+          built = sorted(pathlib.Path("fastdb-built").glob("*.whl")) \
+              if pathlib.Path("fastdb-built").is_dir() else []
+          if built:
+              assert len(built) == 1, built
+              decision["built_wheel"] = {
+                  "name": built[0].name,
+                  "sha256": hashlib.sha256(built[0].read_bytes()).hexdigest(),
+                  "bytes": built[0].stat().st_size,
+                  "derived_from_sdist_sha256": decision["sha256"],
+              }
+          from packaging.tags import sys_tags
+          first = next(iter(sys_tags()))
+          name = f"abi-{os.environ['RC_TARGET']}-{os.environ['RC_PYTHON']}.json"
+          receipt = json.loads(pathlib.Path(name).read_text(encoding="utf-8"))
+          receipt["row"] = {"target": os.environ["RC_TARGET"],
+                            "python": os.environ["RC_PYTHON"],
+                            "fastdb_mode": decision["mode"]}
+          receipt["wheel_abi"] = {"interpreter": first.interpreter, "abi": first.abi}
+          receipt["fastdb"] = decision
+          pathlib.Path(name).write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"bound {name}")
+          PY
+          python .github/scripts/release_candidate.py checksum abi-*.json
+
+      # Stage flat so downloads resolve to explicit filenames; multi-path
+      # uploads would otherwise nest under a least-common-ancestor root.
+      - name: Stage the wheel, its sidecar, and the receipt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p staging
+          cp sdk/python/dist/*.whl sdk/python/dist/*.whl.sha256 staging/
+          cp abi-*.json abi-*.json.sha256 staging/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rc-wheel-${{ inputs.target }}-${{ matrix.python }}
+          path: staging/
+
+      # Share this interpreter and runner with the retained-package checks.
+      # Every ABI still has its own lifecycle receipt; the cp312 row also
+      # retains FastDB proof and verifies downloaded artifacts (including the
+      # Windows standard-user consumer) before the final manifest can run.
+      - name: Validate the retained Python 3.12 package
+        if: matrix.python == '3.12'
+        uses: ./.github/actions/candidate-smoke
+        with:
+          target: ${{ inputs.target }}
+          source-sha: ${{ env.SOURCE_SHA }}
+          wheel-artifact: rc-wheel-${{ inputs.target }}-3.12
