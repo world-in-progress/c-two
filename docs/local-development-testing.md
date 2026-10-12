@@ -1,6 +1,6 @@
 # Local development test sidecar
 
-`tools/dev/test_local.py` shares the local Python executor with macOS/Unix and Windows. It is an explicit development entry, separate from `tools/ci/windows_native.py` and the release workflows. Local reports are development evidence; they do not certify publication, standard-user release installation, or hosted CI success.
+`tools/dev/test_local.py` shares the local Python executor with macOS/Unix and Windows. It is an explicit development entry, separate from `tools/ci/source_validation.py` and the release workflows. Local reports are development evidence; they do not certify publication, standard-user release installation, or hosted CI success.
 
 ## Tools and platform preparation
 

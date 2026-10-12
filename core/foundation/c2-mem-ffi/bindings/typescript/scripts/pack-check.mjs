@@ -28,6 +28,7 @@ function runScript(name) {
   });
 }
 
-runScript('build-runtime.mjs');
+// CI already built and tested these exact runtime bytes in this job.
+if (!process.argv.includes('--prepared')) runScript('build-runtime.mjs');
 runScript('check-pack.mjs');
 runScript('check-consumer-install.mjs');

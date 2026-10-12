@@ -1,12 +1,15 @@
-name: CI
+name: Source Validation
 
 on:
   pull_request:
     branches: [main]
   merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: source-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -17,130 +20,208 @@ env:
   FASTDB_SOURCE_SHA: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
   EMSDK_SOURCE_SHA: c817c0ca4ba889ee24a185fd954cff7de1bd8afa
   EMSDK_VERSION: "5.0.2"
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_IDLE_TIMEOUT: "0"
+  PYTHONUTF8: "1"
 
 jobs:
   changes:
     runs-on: ubuntu-latest
-    name: changes
     outputs:
-      core: ${{ steps.filter.outputs.core }}
-      cli: ${{ steps.filter.outputs.cli }}
-      sdk: ${{ steps.filter.outputs.sdk }}
-      ci: ${{ steps.filter.outputs.ci }}
-      workflow_policy: ${{ steps.filter.outputs.workflow_policy }}
+      source: ${{ steps.filter.outputs.source }}
     steps:
-      # PR paths come from the API; no repository checkout is needed.
+      # PR paths come from the API, without checking out a second copy.
       - uses: dorny/paths-filter@v4
         if: github.event_name == 'pull_request'
         id: filter
         with:
           filters: |
-            core:
+            source:
               - 'core/**'
-            cli:
               - 'cli/**'
-              - 'tools/dev/**'
-              - '.github/workflows/cli-release.yml'
-            sdk:
-              - 'sdk/python/**'
-              - 'examples/python/**'
+              - 'sdk/**'
+              - 'examples/**'
+              - 'tools/**'
+              - 'tests/**'
+              - '.github/**'
+              - '.gitattributes'
               - 'pyproject.toml'
               - 'uv.lock'
-              - '.github/scripts/**'
-              - '.github/workflows/python-package-release.yml'
-            ci:
-              - '.github/workflows/ci.yml'
-              - '.github/scripts/prepare_fastdb_sdk.py'
-            workflow_policy:
-              - '.github/workflows/**'
-              - '.github/actions/**'
-              - '.github/scripts/**'
-              - '.github/dependabot.yml'
-              - 'cli/install-c3.sh'
-              - 'tools/dev/**'
-              - 'tests/repo/**'
+              - 'rust-toolchain*'
 
-  core:
+  source:
     needs: changes
-    if: github.event_name == 'merge_group' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
-    name: core
+    if: github.event_name != 'pull_request' || needs.changes.outputs.source == 'true'
+    name: source (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, python: '3.12', scope: full}
+          - {os: macos-15, python: '3.12', scope: full}
+          - {os: windows-2022, python: '3.12', scope: full}
+          - {os: windows-2025, python: '3.12', scope: full}
+          - {os: ubuntu-24.04, python: '3.14t', scope: python}
+    defaults:
+      run:
+        working-directory: c-two
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # c2-codegen tests include_str! the FastDB golden payload specs and
-      # typecheck generated TypeScript against the sibling fastdb4ts sources,
-      # so the official v0.2.1 source must exist as the sibling checkout.
-      - name: Checkout official FastDB source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: c-two
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: world-in-progress/fastdb
           ref: ${{ env.FASTDB_SOURCE_SHA }}
           path: fastdb
-
-      - name: Link FastDB source as the expected sibling checkout
-        run: |
-          rm -rf "$GITHUB_WORKSPACE/../fastdb"
-          ln -s "$GITHUB_WORKSPACE/fastdb" "$GITHUB_WORKSPACE/../fastdb"
-
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - uses: astral-sh/setup-uv@v6
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: '22'
+          check-latest: true
           cache: npm
-          cache-dependency-path: fastdb/ts/fastdb4ts/package-lock.json
-
-      - name: Install FastDB TypeScript compiler dependencies
-        run: npm ci --prefix ../fastdb/ts/fastdb4ts
-
-      - uses: dtolnay/rust-toolchain@stable
-
+          cache-dependency-path: |
+            fastdb/ts/fastdb4ts/package-lock.json
+            c-two/core/foundation/c2-mem-ffi/bindings/typescript/package-lock.json
+      - name: Prepare official FastDB CoreSDK
+        id: fastdb_sdk
+        run: python .github/scripts/prepare_fastdb_sdk.py --output "${{ runner.temp }}/fastdb-core-sdk"
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: core -> target
-
-      # Core and its generated Rust consumers resolve fastdb = "=0.2.1" from
-      # the registry; the packaged fastdb-sys only links against the published
-      # CoreSDK in system mode.
-      - name: Prepare official FastDB CoreSDK (system link mode)
-        run: >-
-          python3 .github/scripts/prepare_fastdb_sdk.py
-          --emit-github
-          --output "$RUNNER_TEMP/fastdb-core-sdk"
-
-      - name: Test Rust core
-        run: cargo test --manifest-path core/Cargo.toml --workspace
-
-  cli:
-    needs: changes
-    if: github.event_name == 'merge_group' || needs.changes.outputs.cli == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
-    name: cli
-    env:
-      FASTDB_PAYLOAD_LINK_MODE: source
-    steps:
+          workspaces: c-two/core -> target
+          key: source-shared-v1-${{ matrix.os }}-${{ matrix.python }}-${{ env.FASTDB_SOURCE_SHA }}-${{ hashFiles('c-two/**/Cargo.lock', 'fastdb/bindings/rust/Cargo.lock') }}
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.16.0
+      - name: Cache the pinned Emscripten SDK
+        id: emsdk_cache
+        uses: actions/cache@v4
+        with:
+          path: emsdk
+          key: emsdk-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+        if: steps.emsdk_cache.outputs.cache-hit != 'true'
         with:
-          workspaces: |
-            core -> target
-            cli -> target
-
-      - name: Test c3
-        run: cargo test --manifest-path cli/Cargo.toml
-
-      - name: Smoke test c3
+          repository: emscripten-core/emsdk
+          ref: ${{ env.EMSDK_SOURCE_SHA }}
+          path: emsdk
+          persist-credentials: false
+      - name: Activate Emscripten on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: emsdk
         run: |
-          cli/target/debug/c3 --version
-          cli/target/debug/c3 --help
-          cli/target/debug/c3 relay --help
-          cli/target/debug/c3 registry --help
+          ./emsdk install "$EMSDK_VERSION"
+          ./emsdk activate "$EMSDK_VERSION"
+          source ./emsdk_env.sh
+          for name in EMSDK EMSDK_NODE EMSDK_PYTHON EM_CONFIG; do
+            value="${!name:-}"
+            if [[ -n "$value" ]]; then echo "$name=$value" >> "$GITHUB_ENV"; fi
+          done
+          echo "$PWD" >> "$GITHUB_PATH"
+          echo "$PWD/upstream/emscripten" >> "$GITHUB_PATH"
+      - name: Activate Emscripten on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: emsdk
+        run: |
+          $gitBash = Join-Path $env:ProgramFiles "Git/bin/bash.exe"
+          if (-not (Test-Path $gitBash -PathType Leaf)) { throw "Git Bash is required" }
+          "C2_FASTDB_NPM_SCRIPT_SHELL=$gitBash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & .\emsdk.ps1 install $env:EMSDK_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "emsdk install failed" }
+          & .\emsdk.ps1 activate $env:EMSDK_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "emsdk activate failed" }
+          & .\emsdk_env.ps1
+          if ($LASTEXITCODE -ne 0) { throw "emsdk environment failed" }
+          foreach ($name in @("EMSDK", "EMSDK_NODE", "EMSDK_PYTHON", "EM_CONFIG")) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ($value) { "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          }
+          (Get-Location).Path | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          (Join-Path (Get-Location).Path "upstream/emscripten") | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Cache the pinned FastDB WASM prerequisite
+        uses: actions/cache@v4
+        with:
+          path: fastdb/ts/fastdb4ts/src/wasm
+          key: fastdb-wasm-${{ runner.os }}-${{ runner.arch }}-${{ env.FASTDB_SOURCE_SHA }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
+      - name: Run shared source validation
+        env:
+          C2_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          C2_RUNNER_LABEL: ${{ matrix.os }}
+          RUSTC_WRAPPER: sccache
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+        run: >-
+          python tools/ci/source_validation.py
+          --expected-c-two-sha "${{ github.event.pull_request.head.sha || github.sha }}"
+          --expected-fastdb-sha "${{ env.FASTDB_SOURCE_SHA }}"
+          --fastdb-system-lib-dir "${{ steps.fastdb_sdk.outputs.lib-dir }}"
+          --scope "${{ matrix.scope }}"
+          --output "artifacts/source"
+      - name: Retain compiler cache statistics
+        if: always()
+        shell: bash
+        run: |
+          source .github/scripts/compiler_cache.sh
+          c2_write_compiler_cache_stats artifacts/source/compiler-cache
+      - name: Upload source evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.scope }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            c-two/artifacts/source/
+            !c-two/artifacts/source/python-suite/ordinary/tmp/**
+            !c-two/artifacts/source/python-suite/portable/tmp/**
+            !c-two/artifacts/source/python-suite/typescript/tmp/**
+          if-no-files-found: error
+          retention-days: 14
 
+  required:
+    needs: [changes, source, workflow-policy]
+    if: always()
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.12', '3.14t']
+    # Preserve protected-branch check names; both now require every platform.
+    name: test (py${{ matrix.python }})
+    steps:
+      - name: Require every applicable source check
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          SOURCE: ${{ needs.source.result }}
+          POLICY: ${{ needs.workflow-policy.result }}
+          REQUIRED: ${{ github.event_name != 'pull_request' || needs.changes.outputs.source == 'true' }}
+        run: |
+          test "$CHANGES" = success
+          if [ "$REQUIRED" = true ]; then
+            test "$SOURCE" = success
+            test "$POLICY" = success
+          else
+            test "$SOURCE" = skipped
+            test "$POLICY" = skipped
+          fi
   workflow-policy:
     needs: changes
-    if: github.event_name == 'merge_group' || needs.changes.outputs.workflow_policy == 'true' || needs.changes.outputs.ci == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.source == 'true'
     runs-on: ubuntu-latest
     name: workflow policy
     steps:
@@ -174,169 +255,6 @@ jobs:
           tests/repo/test_compiler_cache.py
           tests/repo/test_resolve_fastdb_release.py
           tests/repo/test_release_candidate_promotion.py
-          tests/repo/test_windows_native_runner.py
+          tests/repo/test_source_validation.py
           tests/repo/test_ipc_memory_benchmark.py
           -q --timeout=30
-
-  test:
-    needs: changes
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.12", "3.14t"]
-    name: test (py${{ matrix.python }})
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-
-      - name: Skip full Python tests for unrelated changes
-        if: github.event_name != 'merge_group' && needs.changes.outputs.sdk != 'true' && needs.changes.outputs.core != 'true' && needs.changes.outputs.ci != 'true'
-        run: echo "Skipping full Python tests because this change does not touch sdk/python, examples/python, core, or CI."
-
-      - name: Skip redundant Dependabot matrix leg
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' && matrix.python != '3.12'
-        run: echo "Skipping this matrix leg for Dependabot pull requests"
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        with:
-          python-version: ${{ matrix.python }}
-
-      # Portable payload fixtures read FastDB's golden specs from the sibling
-      # checkout at import time, and generated consumers resolve the official
-      # source for harness compilation.
-      - name: Checkout official FastDB source
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: world-in-progress/fastdb
-          ref: ${{ env.FASTDB_SOURCE_SHA }}
-          path: fastdb
-
-      - name: Link FastDB source as the expected sibling checkout
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        run: |
-          rm -rf "$GITHUB_WORKSPACE/../fastdb"
-          ln -s "$GITHUB_WORKSPACE/fastdb" "$GITHUB_WORKSPACE/../fastdb"
-
-      - uses: dtolnay/rust-toolchain@stable
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-
-      - uses: Swatinem/rust-cache@v2
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        with:
-          # The extension and c3 have independent Cargo target directories.
-          workspaces: |
-            core -> target
-            cli -> target
-            sdk/rust -> target
-            sdk/python/native -> target
-          key: python-${{ matrix.python }}
-
-      - uses: astral-sh/setup-uv@v6
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-
-      # Only expose the lib-dir output here: the Python extension below must
-      # keep building in source mode through its fastdb-sys Git patch, so this
-      # job must not export FASTDB_PAYLOAD_* at the workflow level.
-      - name: Prepare official FastDB CoreSDK for Rust SDK consumers
-        id: fastdb_sdk
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        run: >-
-          python .github/scripts/prepare_fastdb_sdk.py
-          --output "$RUNNER_TEMP/fastdb-core-sdk"
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: |
-            fastdb/ts/fastdb4ts/package-lock.json
-            core/foundation/c2-mem-ffi/bindings/typescript/package-lock.json
-
-      - name: Cache the pinned Emscripten SDK
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        id: emsdk_cache
-        uses: actions/cache@v4
-        with:
-          path: emsdk
-          key: emsdk-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ((github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')) && steps.emsdk_cache.outputs.cache-hit != 'true'
-        with:
-          persist-credentials: false
-          repository: emscripten-core/emsdk
-          ref: ${{ env.EMSDK_SOURCE_SHA }}
-          path: emsdk
-
-      # This is an immutable external dependency, not a C-Two build or test.
-      # Keep the generated-glue diff check and all portable matrix builds.
-      - name: Cache the pinned FastDB WASM prerequisite
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        id: fastdb_wasm_cache
-        uses: actions/cache@v4
-        with:
-          path: fastdb/ts/fastdb4ts/src/wasm
-          key: fastdb-wasm-${{ runner.os }}-${{ runner.arch }}-${{ env.FASTDB_SOURCE_SHA }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
-
-      - name: Prepare TypeScript portable consumer prerequisites
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        shell: bash
-        run: |
-          npm ci --prefix ../fastdb/ts/fastdb4ts
-          npm ci --prefix core/foundation/c2-mem-ffi/bindings/typescript
-          # Use setup-node's Node headers for the packaged native addon.
-          node core/foundation/c2-mem-ffi/bindings/typescript/scripts/build-runtime.mjs
-          ./emsdk/emsdk install "$EMSDK_VERSION"
-          ./emsdk/emsdk activate "$EMSDK_VERSION"
-          source ./emsdk/emsdk_env.sh
-          # Persistent generated Node clients consume the compiled FastDB
-          # module during ordinary pytest, before the portable matrix builds it.
-          if [ "${{ steps.fastdb_wasm_cache.outputs.cache-hit }}" != "true" ]; then
-            npm run --prefix ../fastdb/ts/fastdb4ts build:wasm
-          fi
-          npm run --prefix ../fastdb/ts/fastdb4ts build
-          git -C ../fastdb diff --exit-code -- ts/fastdb4ts/src/wasm
-          for name in EMSDK EMSDK_NODE EMSDK_PYTHON EM_CONFIG; do
-            value="${!name:-}"
-            if [[ -n "$value" ]]; then
-              echo "$name=$value" >> "$GITHUB_ENV"
-            fi
-          done
-          # Keep setup-node's Node 22 for application tests. Only compiler
-          # paths cross the step boundary; emcc has its own configured Node.
-          echo "$GITHUB_WORKSPACE/emsdk" >> "$GITHUB_PATH"
-          echo "$GITHUB_WORKSPACE/emsdk/upstream/emscripten" >> "$GITHUB_PATH"
-          emcc --version
-
-      - name: Install dependencies & build native extension
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        run: |
-          uv python install 3.10
-          uv sync --python "${{ matrix.python }}"
-          cargo build --locked --manifest-path cli/Cargo.toml
-        env:
-          FASTDB_PAYLOAD_LINK_MODE: source
-
-      - name: Test native extension crate
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        run: cargo test --manifest-path sdk/python/native/Cargo.toml
-        env:
-          FASTDB_PAYLOAD_LINK_MODE: source
-          PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
-
-      # The extension is already built in source mode above; --no-sync keeps
-      # uv from relinking it against the system SDK. The system environment is
-      # scoped to this step so spawned Rust SDK consumers (registry fastdb-sys)
-      # link the published CoreSDK instead of rebuilding FastDB from source.
-      - name: Run tests
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        run: uv run --no-sync pytest sdk/python/tests -q --timeout=30
-        env:
-          C2_RELAY_ANCHOR_ADDRESS: ""
-          FASTDB_PAYLOAD_LINK_MODE: system
-          FASTDB_PAYLOAD_SYSTEM_LIB_DIR: ${{ steps.fastdb_sdk.outputs.lib-dir }}
-          LD_LIBRARY_PATH: ${{ steps.fastdb_sdk.outputs.lib-dir }}
