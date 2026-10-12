@@ -10,6 +10,9 @@ inputs:
   wheel-artifact:
     description: Uploaded C-Two wheel artifact for this target
     required: true
+  abi-root:
+    description: Directory containing this ABI row's FastDB inputs
+    default: "."
 runs:
   using: composite
   steps:
@@ -21,6 +24,7 @@ runs:
       env:
         RC_TARGET: ${{ inputs.target }}
         SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: ${{ inputs.abi-root }}
       run: |
         import hashlib, json, os, shutil, subprocess, sys
         from pathlib import Path
@@ -32,7 +36,8 @@ runs:
         assert receipt["source_commit_sha"] == os.environ["SOURCE_SHA"], receipt
         assert receipt["row"]["target"] == target and receipt["row"]["python"] == "3.12", receipt
         decision = receipt["fastdb"]
-        wheel = pick_exact_wheel("fastdb", "fastdb-built", unique_file=True)
+        abi_root = Path(os.environ.get("ABI_ROOT", "."))
+        wheel = pick_exact_wheel(abi_root / "fastdb", abi_root / "fastdb-built", unique_file=True)
         identity = decision["built_wheel"] if decision["mode"] == "sdist" else decision
         assert wheel.name == identity.get("name", identity.get("filename")), identity
         assert hashlib.sha256(wheel.read_bytes()).hexdigest() == identity["sha256"], identity

@@ -275,9 +275,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin, runner: macos-latest, fastdb-mode: wheel }
-          - { target: x86_64-apple-darwin, runner: macos-15-intel, fastdb-mode: sdist }
-          - { target: x86_64-pc-windows-msvc, runner: windows-latest, fastdb-mode: wheel }
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            fastdb-mode: wheel
+            abi-groups:
+              - { label: "3.10-3.12", versions: ["3.10", "3.11", "3.12"] }
+              - { label: "3.13-3.14t", versions: ["3.13", "3.14", "3.14t"] }
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            fastdb-mode: sdist
+            abi-groups:
+              - { label: "3.10-3.12", versions: ["3.10", "3.11", "3.12"] }
+              - { label: "3.13-3.14t", versions: ["3.13", "3.14", "3.14t"] }
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            fastdb-mode: wheel
+            # Windows regular/free-threaded interpreters keep separate jobs.
+            abi-groups:
+              - { label: "3.10", versions: ["3.10"] }
+              - { label: "3.11", versions: ["3.11"] }
+              - { label: "3.12", versions: ["3.12"] }
+              - { label: "3.13", versions: ["3.13"] }
+              - { label: "3.14", versions: ["3.14"] }
+              - { label: "3.14t", versions: ["3.14t"] }
     uses: ./.github/workflows/release-candidate-native.yml
     with:
       source-sha: ${{ needs.context.outputs.source_sha }}
@@ -285,6 +305,7 @@ jobs:
       runner: ${{ matrix.runner }}
       fastdb-version: ${{ needs.context.outputs.fastdb_version }}
       fastdb-mode: ${{ matrix.fastdb-mode }}
+      abi-groups: ${{ toJSON(matrix.abi-groups) }}
 
   linux:
     needs: context

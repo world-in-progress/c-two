@@ -1,0 +1,226 @@
+# Each invocation owns its wheel, FastDB inputs and upload staging directory.
+# Cargo targets are shared only by sequential ABI invocations in this job.
+name: Build and validate one native ABI
+description: Retain each ABI wheel and lifecycle receipt while sharing the job build tree
+inputs:
+  python:
+    description: CPython ABI row, including the t suffix for free-threaded builds
+    required: true
+  target:
+    description: Rust target triple
+    required: true
+  source-sha:
+    description: Exact candidate source commit
+    required: true
+  fastdb-version:
+    description: Verified FastDB release version
+    required: true
+  fastdb-mode:
+    description: Published wheel or verified sdist build
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: ${{ inputs.python }}
+    - name: Record the row interpreter
+      shell: bash
+      run: |
+        set -euxo pipefail
+        python -m pip install --quiet packaging
+        RC_PYTHON_EXE="$(python -c 'import sys; print(sys.executable)')"
+        export RC_PYTHON_EXE
+        echo "path=$RC_PYTHON_EXE" >> "$GITHUB_OUTPUT"
+        python -c 'import platform, sys
+        from packaging.tags import sys_tags
+        first = next(iter(sys_tags()))
+        print(f"row interpreter {first.interpreter}-{first.abi} ({platform.python_version()})")'
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        RC_PYTHON: ${{ inputs.python }}
+        FASTDB_VERSION: ${{ inputs.fastdb-version }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: abi-inputs/${{ inputs.python }}
+      id: interpreter
+    - uses: PyO3/maturin-action@v1
+      env:
+        FASTDB_PAYLOAD_LINK_MODE: source
+      with:
+        command: build
+        sccache: true
+        working-directory: sdk/python
+        target: ${{ inputs.target }}
+        args: --release --out dist/${{ inputs.python }} -i ${{ steps.interpreter.outputs.path }}
+    - name: Checksum the built wheel
+      shell: bash
+      run: python .github/scripts/release_candidate.py checksum "sdk/python/dist/$RC_PYTHON"/*.whl
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        RC_PYTHON: ${{ inputs.python }}
+        FASTDB_VERSION: ${{ inputs.fastdb-version }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: abi-inputs/${{ inputs.python }}
+    - name: Select this row's wheel by exact interpreter ABI
+      shell: bash
+      run: |
+        set -euxo pipefail
+        CTWO_WHEEL="$(python .github/scripts/resolve_fastdb_release.py pick-wheel \
+          --unique-file "sdk/python/dist/$RC_PYTHON")"
+        export CTWO_WHEEL
+        echo "CTWO_WHEEL=$CTWO_WHEEL" >> "$GITHUB_ENV"
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        RC_PYTHON: ${{ inputs.python }}
+        FASTDB_VERSION: ${{ inputs.fastdb-version }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: abi-inputs/${{ inputs.python }}
+    - uses: actions/download-artifact@v4
+      with:
+        name: rc-cli-${{ inputs.target }}
+        path: cli
+    - name: Verify and execute the retained c3 (unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euxo pipefail
+        C3="cli/c3-${RC_TARGET}"
+        test -f "$C3" && test -f "${C3}.sha256"
+        chmod +x "$C3"
+        python .github/scripts/release_candidate.py verify "$C3"
+        "$C3" --version
+        echo "C3_PATH=$C3" >> "$GITHUB_ENV"
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        RC_PYTHON: ${{ inputs.python }}
+        FASTDB_VERSION: ${{ inputs.fastdb-version }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: abi-inputs/${{ inputs.python }}
+    - name: Verify and execute the retained c3 (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $c3 = "cli/c3-$($env:RC_TARGET).exe"
+        if (-not (Test-Path $c3) -or -not (Test-Path "$c3.sha256")) { throw "missing $c3" }
+        python .github/scripts/release_candidate.py verify $c3
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        & "$PWD/$c3" --version
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        Add-Content $env:GITHUB_ENV "C3_PATH=$c3"
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        RC_PYTHON: ${{ inputs.python }}
+        FASTDB_VERSION: ${{ inputs.fastdb-version }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: abi-inputs/${{ inputs.python }}
+    - name: Provision FastDB for this interpreter
+      shell: bash
+      run: |
+        set -euxo pipefail
+        python -m pip install --quiet packaging "swig>=4.4"
+        export PATH="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))'):$PATH"
+        if [ "${{ inputs.fastdb-mode }}" = "wheel" ]; then
+          python .github/scripts/resolve_fastdb_release.py resolve \
+            --version "$FASTDB_VERSION" \
+            --download-dir "$ABI_ROOT/fastdb" --output "$ABI_ROOT/fastdb-decision.json"
+        else
+          # fastdb4py publishes no wheel for this target: build the exact
+          # published, SHA-256-verified sdist in THIS row's interpreter.
+          # SWIG >= 4.4 is an explicit prerequisite of the sdist build.
+          swig -version | head -2
+          python .github/scripts/resolve_fastdb_release.py resolve \
+            --version "$FASTDB_VERSION" --require-sdist \
+            --download-dir "$ABI_ROOT/fastdb" --output "$ABI_ROOT/fastdb-decision.json"
+          python -m pip wheel --no-deps --wheel-dir "$ABI_ROOT/fastdb-built" "$ABI_ROOT"/fastdb/fastdb4py-*.tar.gz
+        fi
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        RC_PYTHON: ${{ inputs.python }}
+        FASTDB_VERSION: ${{ inputs.fastdb-version }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: abi-inputs/${{ inputs.python }}
+    - name: Run the installed-wheel lifecycle for this ABI row
+      shell: bash
+      run: |
+        set -euxo pipefail
+        python -m pip install --quiet uv
+        FASTDB_WHEEL="$(python .github/scripts/resolve_fastdb_release.py pick-wheel \
+          --unique-file "$ABI_ROOT/fastdb" "$ABI_ROOT/fastdb-built")"
+        export FASTDB_WHEEL
+        echo "FASTDB_WHEEL=$FASTDB_WHEEL" >> "$GITHUB_ENV"
+        python tools/ci/windows_wheel_smoke.py \
+          --fastdb-wheel "$FASTDB_WHEEL" \
+          --c-two-wheel "$CTWO_WHEEL" \
+          --c3 "$C3_PATH" \
+          --receipt "abi-${RC_TARGET}-${RC_PYTHON}.json" \
+          --source-sha "$SOURCE_SHA"
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        RC_PYTHON: ${{ inputs.python }}
+        FASTDB_VERSION: ${{ inputs.fastdb-version }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: abi-inputs/${{ inputs.python }}
+    - name: Bind the ABI-row receipt to its row and FastDB decision
+      shell: bash
+      run: |
+        set -euxo pipefail
+        python - <<'PY'
+        import hashlib, json, os, pathlib
+        decision = json.loads((pathlib.Path(os.environ["ABI_ROOT"]) / "fastdb-decision.json").read_text(encoding="utf-8"))
+        built = sorted((pathlib.Path(os.environ["ABI_ROOT"]) / "fastdb-built").glob("*.whl")) \
+            if (pathlib.Path(os.environ["ABI_ROOT"]) / "fastdb-built").is_dir() else []
+        if built:
+            assert len(built) == 1, built
+            decision["built_wheel"] = {
+                "name": built[0].name,
+                "sha256": hashlib.sha256(built[0].read_bytes()).hexdigest(),
+                "bytes": built[0].stat().st_size,
+                "derived_from_sdist_sha256": decision["sha256"],
+            }
+        from packaging.tags import sys_tags
+        first = next(iter(sys_tags()))
+        name = f"abi-{os.environ['RC_TARGET']}-{os.environ['RC_PYTHON']}.json"
+        receipt = json.loads(pathlib.Path(name).read_text(encoding="utf-8"))
+        receipt["row"] = {"target": os.environ["RC_TARGET"],
+                          "python": os.environ["RC_PYTHON"],
+                          "fastdb_mode": decision["mode"]}
+        receipt["wheel_abi"] = {"interpreter": first.interpreter, "abi": first.abi}
+        receipt["fastdb"] = decision
+        pathlib.Path(name).write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"bound {name}")
+        PY
+        python .github/scripts/release_candidate.py checksum abi-*.json
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        RC_PYTHON: ${{ inputs.python }}
+        FASTDB_VERSION: ${{ inputs.fastdb-version }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: abi-inputs/${{ inputs.python }}
+    - name: Stage the wheel, its sidecar, and the receipt
+      shell: bash
+      run: |
+        set -euxo pipefail
+        ROW_STAGING="staging/$RC_PYTHON"
+        mkdir -p "$ROW_STAGING"
+        cp sdk/python/dist/"$RC_PYTHON"/*.whl sdk/python/dist/"$RC_PYTHON"/*.whl.sha256 "$ROW_STAGING/"
+        cp "abi-${RC_TARGET}-${RC_PYTHON}.json" "abi-${RC_TARGET}-${RC_PYTHON}.json.sha256" "$ROW_STAGING/"
+      env:
+        RC_TARGET: ${{ inputs.target }}
+        RC_PYTHON: ${{ inputs.python }}
+        FASTDB_VERSION: ${{ inputs.fastdb-version }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        ABI_ROOT: abi-inputs/${{ inputs.python }}
+    - uses: actions/upload-artifact@v4
+      with:
+        name: rc-wheel-${{ inputs.target }}-${{ inputs.python }}
+        path: staging/${{ inputs.python }}/
+    - name: Validate the retained Python 3.12 package
+      if: inputs.python == '3.12'
+      uses: ./.github/actions/candidate-smoke
+      with:
+        target: ${{ inputs.target }}
+        source-sha: ${{ inputs.source-sha }}
+        wheel-artifact: rc-wheel-${{ inputs.target }}-3.12
+        abi-root: abi-inputs/${{ inputs.python }}
