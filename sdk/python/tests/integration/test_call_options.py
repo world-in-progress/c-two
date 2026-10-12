@@ -507,6 +507,12 @@ def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
     servers = []
     threads = []
     route_name = 'deadline-retry'
+    # Keep enough time for both real HTTP dispatches on a loaded runner. The
+    # second response fits a fresh budget, but the two delays exceed the one
+    # original budget, so restarting that budget would make the call succeed.
+    call_timeout = 3.0
+    stale_delay = 1.5
+    success_delay = 2.0
 
     def route(index):
         return {
@@ -545,12 +551,12 @@ def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
                 calls[index] += 1
                 headers_seen.append(dict(self.headers))
                 if index == 0:
-                    time.sleep(0.1)
+                    time.sleep(stale_delay)
                     refusal = {'version': 1, 'code': 704, 'name': 'RouteStale',
                                'message': 'authoritative stale route', 'details': {}}
                     self.reply(409, json.dumps(refusal).encode())
                 else:
-                    time.sleep(0.2)
+                    time.sleep(success_delay)
                     value, _business_timeout = pickle.loads(body)
                     self.reply(200, pickle.dumps(value))
         return Handler
@@ -568,7 +574,7 @@ def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
             threads.append(thread)
         anchor = f'http://127.0.0.1:{servers[0].server_port}'
         connection = cc.connect(TimedContract, name=route_name, address=anchor)
-        finite = cc.with_call_options(connection, timeout=0.3)
+        finite = cc.with_call_options(connection, timeout=call_timeout)
         with pytest.raises(cc.error.CallDeadlineExceeded) as failure:
             finite.echo('retry')
         assert failure.value.transport_phase == 'dispatch_uncertain'
