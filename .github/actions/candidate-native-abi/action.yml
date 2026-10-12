@@ -46,9 +46,11 @@ runs:
     - uses: PyO3/maturin-action@v1
       env:
         FASTDB_PAYLOAD_LINK_MODE: source
+        RUSTC_WRAPPER: sccache
       with:
         command: build
-        sccache: true
+        # macOS initializes one daemon for the entire ABI group.
+        sccache: ${{ runner.os == 'Windows' }}
         working-directory: sdk/python
         target: ${{ inputs.target }}
         args: --release --out dist/${{ inputs.python }} -i ${{ steps.interpreter.outputs.path }}

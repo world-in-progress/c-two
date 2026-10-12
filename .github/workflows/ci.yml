@@ -171,6 +171,7 @@ jobs:
           tests/repo/test_install_c3_powershell.py
           tests/repo/test_prepare_fastdb_sdk.py
           tests/repo/test_release_candidate.py
+          tests/repo/test_compiler_cache.py
           tests/repo/test_resolve_fastdb_release.py
           tests/repo/test_release_candidate_promotion.py
           tests/repo/test_windows_native_runner.py

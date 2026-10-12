@@ -62,6 +62,8 @@ jobs:
           targets: ${{ inputs.target }}
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
+      - uses: ./.github/actions/setup-cpp-cache
+        if: runner.os == 'macOS'
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: sdk/python/native -> target
@@ -121,3 +123,7 @@ jobs:
           source-sha: ${{ inputs.source-sha }}
           fastdb-version: ${{ inputs.fastdb-version }}
           fastdb-mode: ${{ inputs.fastdb-mode }}
+      - uses: ./.github/actions/report-cpp-cache
+        if: always() && runner.os == 'macOS'
+        with:
+          name: native-${{ inputs.target }}-${{ matrix.label }}

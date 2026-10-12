@@ -72,10 +72,15 @@ jobs:
             python3.13 python3.14 python3.14t
           manylinux: 2014
           docker-options: -e FASTDB_PAYLOAD_LINK_MODE=source
-          before-script-linux: >-
+          before-script-linux: |
             command -v cmake >/dev/null 2>&1 || python3 -m pip install --quiet cmake;
             export PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_path("scripts"))'):$PATH";
             cmake --version | head -1
+            source "$GITHUB_WORKSPACE/.github/scripts/compiler_cache.sh"
+            c2_enable_cpp_cache
+            # maturin-action installs sccache after this hook. The trap runs
+            # while the container daemon and mounted checkout still exist.
+            c2_report_compiler_cache_on_exit "$GITHUB_WORKSPACE/artifacts/compiler-cache"
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -91,6 +96,11 @@ jobs:
         with:
           name: rc-wheels-${{ inputs.target }}
           path: linux-wheel-dist/
+      - uses: ./.github/actions/report-cpp-cache
+        if: always()
+        with:
+          name: wheels-${{ inputs.target }}
+          collect: "false"
 
   abi-import-linux:
     needs: [cli, build-wheels-linux]
@@ -114,6 +124,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
+      - uses: ./.github/actions/setup-cpp-cache
+        if: inputs.fastdb-mode == 'sdist'
 
       - uses: actions/download-artifact@v4
         with:
@@ -218,6 +230,10 @@ jobs:
           target: ${{ inputs.target }}
           source-sha: ${{ env.SOURCE_SHA }}
           wheel-artifact: rc-wheels-${{ inputs.target }}
+      - uses: ./.github/actions/report-cpp-cache
+        if: always() && inputs.fastdb-mode == 'sdist'
+        with:
+          name: fastdb-${{ inputs.target }}-${{ matrix.python }}
 
   sdist:
     needs: cli
