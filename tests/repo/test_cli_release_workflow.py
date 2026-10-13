@@ -224,10 +224,6 @@ def test_ci_keeps_workflow_policy_tests_lightweight():
     assert "--with pytest" in ci_text
     assert "--confcutdir=tests/repo" in ci_text
     assert "--confcutdir=sdk/python/tests/unit" not in ci_text
-    assert "tests/repo/test_check_version.py::TestCheckVersion" in ci_text
-    assert "sdk/python/tests/unit/test_check_version.py::TestCheckVersion" not in ci_text
-    assert "tests/repo/test_check_cli_release.py" in ci_text
-    assert "sdk/python/tests/unit/test_check_cli_release.py" not in ci_text
     assert "tests/repo/test_c3_tool.py" in ci_text
     assert "tests/repo/test_c3_installer.py" in ci_text
     assert "sdk/python/tests/unit/test_c3_tool.py" not in ci_text

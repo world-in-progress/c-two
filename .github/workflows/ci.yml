@@ -286,8 +286,6 @@ jobs:
           --confcutdir=tests/repo
           tests/repo/test_cli_release_workflow.py
           tests/repo/test_python_package_release_workflow.py
-          tests/repo/test_check_version.py::TestCheckVersion
-          tests/repo/test_check_cli_release.py
           tests/repo/test_c3_tool.py
           tests/repo/test_c3_installer.py
           tests/repo/test_install_c3_powershell.py
