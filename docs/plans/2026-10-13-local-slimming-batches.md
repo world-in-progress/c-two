@@ -141,3 +141,9 @@ B7a 实现提交为 `e4b947a4c57ccbdc15f07e1f8aed331b5aa8c4c0`。本项唯一实
 B7b 实现提交为 `d24bc2406d2721cb11d35e4aa17289736c6260cf`。本项 3 文件新增 12 行、删除 16 行；3 处等待移除，4 处伪释放探测移除，并发用例改为同一 20 秒 join 预算、三个 worker 全部退出且各完成 3 次调用，proxy 使用同一关闭路径的 context manager。20 秒仅界定 join，不宣称能取消卡住线程或界定全部注册/teardown。独立审查 run `aa5ba7a6-f648-4e6e-9994-c7beefb73652`，固定快照 `5e80d0fbc731e29863fb0cae59cf4b4a7c4e8486`，无 actionable findings；Host 核对候选字节一致后验收回收。
 
 验证：重建 native 后，原三文件基线 33 passed；保留旧等待加入完成判据后，该并发用例 1 passed；删等待后 `C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/integration/test_zero_copy_ipc.py sdk/python/tests/integration/test_ipc_buddy_reply.py sdk/python/tests/integration/test_direct_ipc_control.py -q --timeout=30`：33 passed。另实际调用 benchmark 两个入口（64 byte、2 MiB segment、原有轮次）均完成；只作 smoke，不使用中位耗时作性能结论。c2-server::buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization 定向回归 1 passed。日志位于 `/tmp/c2-slim-round2-20261013/` 的 b7c-baseline.log、b7c-completion-baseline.log、b7c-regression.log、b7c-benchmark-smoke.log、b7-shm.log。diff check 通过。
+
+### B8a：BorrowedPayload 直接持有
+
+B7c 实现提交为 `b4e916c9aae66a270fc9ec7ed66f41fad0aa01e8`。本项唯一源码 payload.rs 新增 4 行、删除 9 行，删除只有构造 Some 和 Drop take 的 Option 状态；公开借用和生成接口、先失效再析构及 request lease 顺序保持。独立审查 run `36b12c3f-e10a-49a1-8559-fc9ba5582f07`、快照 `26c9c0fad493031c4b21b5ec10d70c4afff1d945`，无 actionable findings，Host 核对字节一致后验收回收。丢弃 invalidation Err 的原策略未改变；顺序等价不等于失效必然成功，也不承诺无 repr 的 Rust 类型布局不变。
+
+验证：`cargo test --manifest-path sdk/rust/Cargo.toml --all-features --test payload_lifetime --locked --offline`：4 passed；`cargo test --manifest-path core/Cargo.toml -p c2-codegen --test generated_rust_sdk --locked --offline`：4 passed，含真实生成消费者的业务 Err、编码失败和 panic 出口。使用第一轮已验证官方 FastDB SDK 的 system mode、限定的 DYLD_LIBRARY_PATH、既有 target 和空 C2 环境；没有修改依赖。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8a-payload-lifetime.log`、`b8a-generated.log`。
