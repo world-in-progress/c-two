@@ -177,7 +177,7 @@ pub fn service_definition<S: Service>(
     service: S,
 ) -> Result<c_two::ServiceDefinition, c_two::Error> {
     let release = contract_release()?;
-    let release_ref = contract_release_ref()?;
+    let release_ref = release.reference();
     let methods = METHODS
         .iter()
         .map(|method| -> Result<c_two::generated::MethodDefinition, c_two::Error> {
