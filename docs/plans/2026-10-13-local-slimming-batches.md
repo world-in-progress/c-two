@@ -129,3 +129,9 @@ B5 实现提交为 `77b3d9bd73c2b6163706891d7f2bdd25710ee187`。本批 6 文件�
 验证：`cargo test --manifest-path core/Cargo.toml -p c2-ipc --features test-support --lib --tests --locked --offline`：203 + 9 passed；`cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib relay::state::tests --locked --offline`：45 passed，含旧 token 拒绝、owner 替换与共享在途调用。rustfmt/diff check 通过。各命令用既有 CARGO_TARGET_DIR 与空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS；日志 `/tmp/c2-slim-round2-20261013/b7a-baseline.log`、`b7a-ipc.log`、`b7a-relay.log`。后续 Python 验证前已以既有 source mode/CPLUS_INCLUDE_PATH 重建 native，日志 `b7-native-build.log`。
 
 buddy 初始 health 正常，但提交时 launcher 返回 UPGRADE_IN_PROGRESS，未创建 run、未进入路由。按原生只读审查替代，由 `/root/b7a_independent_review`（gpt-6-sol/high）完成独立审查，无 actionable findings。Host 及 reviewer 起止均核对固定 diff SHA256 `5c02f2d9b894edbae86ae1ecafe27e0ccb35f8760ac9976594f1f84a5e029d59` 和两个文件 hash，一致后验收；记录 `b7a-review-manifest.json`、`b7a-independent-review.txt`。审查未执行测试，不将源码等价性结论当运行证据。
+
+### B7b：TypeScript 内部转发
+
+B7a 实现提交为 `e4b947a4c57ccbdc15f07e1f8aed331b5aa8c4c0`。本项唯一实现文件 index.ts，新增 1 行、删除 11 行。独立审查 run `64e48cca-ff00-49bd-86e3-7046d400e398`，固定快照 `f8de43786eda0a2d49542e6ba3f471101d65094d`，无 actionable findings；Host 核对字节一致后验收回收。buddy 此时已恢复为 0.32.0。参数绑定/closure、getter 顺序与次数、this、错误类型与 label、冻结和释放均保持；删除 helper 会改变调试栈帧，不承诺源码反射文本不变。
+
+验证：在 TypeScript 包目录运行 `npm run typecheck` 成功；以既有 CARGO_TARGET_DIR、CARGO_NET_OFFLINE=true 和空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS 运行 `npm test`，含原生 Rust/C addon 构建：59 passed、0 failed、1 skipped（需要真实 Windows 的 current-SID 测试）。Node v25.8.1、npm 11.11.0。生成 index.d.ts 与删除前逐字节一致，SHA256 `a5f6e769498bbd868f1090a44e3fef7e21ece469e7b7b0e024cd409d7167b0cb`。日志 `/tmp/c2-slim-round2-20261013/b7b-typecheck.log`、`b7b-node.log`，diff check 通过。

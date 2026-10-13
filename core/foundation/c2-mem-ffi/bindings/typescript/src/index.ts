@@ -435,7 +435,6 @@ export function createBundledC2MemFfiNodeRuntime(
 ): C2MemFfiNodeRuntime {
   const connect = createNodeIpcConnect(options);
   const loadOptions: C2MemFfiNodeNativeLoadOptions = options.addonPath === undefined ? {} : { addonPath: options.addonPath };
-  options = loadOptions;
   return Object.freeze({
     connect,
     resolveEndpoint: connect.resolveEndpoint,
@@ -1073,7 +1072,7 @@ function normalizeRequestPool(pool: C2MemFfiNativeRequestPool, label: string): C
   if (pool.segments.length === 0 || pool.segments.length > C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS) {
     throw new C2MemFfiBindingError(`${label}.segments length must be between 1 and ${C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS}.`);
   }
-  const segments = Object.freeze(pool.segments.map((segment, index) => normalizeRequestSegment(segment, index, label)));
+  const segments = Object.freeze(pool.segments.map((segment, index) => normalizeSegment(segment, `${label}.segments[${index}]`)));
   if (typeof pool.write !== "function") {
     throw new C2MemFfiBindingError(`${label}.write must be a function.`);
   }
@@ -1113,15 +1112,6 @@ function normalizeSegment(segment: C2MemFfiShmSegment, label: string): C2MemFfiS
     throw new C2MemFfiBindingError(`${label}.size must be a positive u32 integer.`);
   }
   return Object.freeze({ name: segment.name, size: segment.size });
-}
-
-function normalizeRequestSegment(
-  segment: C2MemFfiShmSegment,
-  index: number,
-  label: string,
-): C2MemFfiShmSegment {
-  const normalized = normalizeSegment(segment, `${label}.segments[${index}]`);
-  return normalized;
 }
 
 function requirePrefix(value: string, label: string): string {
