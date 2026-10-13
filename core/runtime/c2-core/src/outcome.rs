@@ -1,22 +1,3 @@
-use std::collections::HashMap;
-
-use c2_server::{AccessLevel, ConcurrencyMode};
-
-#[derive(Debug, Clone)]
-pub(crate) struct RuntimeRouteSpec {
-    pub name: String,
-    pub crm_ns: String,
-    pub crm_name: String,
-    pub crm_ver: String,
-    pub abi_hash: String,
-    pub signature_hash: String,
-    pub method_names: Vec<String>,
-    pub access_map: HashMap<u16, AccessLevel>,
-    pub concurrency_mode: ConcurrencyMode,
-    pub max_pending: Option<usize>,
-    pub max_workers: Option<usize>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterOutcome {
     pub route_name: String,

@@ -17,7 +17,6 @@ use c2_server::{
     SchedulerSnapshot, Server, ServerIdentity, ServerRuntimeBuilder,
 };
 
-use crate::outcome::RuntimeRouteSpec;
 use crate::{Error, LifecycleError, RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome};
 
 /// One generated method entry validated against an admitted release.
@@ -707,7 +706,7 @@ impl Host {
 
     pub fn register(&self, definition: ServiceDefinition) -> Result<Registration, Error> {
         let route_name = definition.expected.route_name.clone();
-        let (route_spec, runtime_spec) = route_specs(&definition)?;
+        let route_spec = route_spec(&definition)?;
         let callback: Arc<dyn CrmCallback> = Arc::new(CoreCallback {
             service: Arc::clone(&definition.service),
         });
@@ -722,7 +721,6 @@ impl Host {
         let outcome = self.inner.runtime.register_route(
             &self.inner.server,
             route,
-            runtime_spec,
             self.inner.relay_anchor_address.as_deref(),
             self.inner.relay_use_proxy,
         )?;
@@ -986,9 +984,7 @@ impl Runtime {
     }
 }
 
-fn route_specs(
-    definition: &ServiceDefinition,
-) -> Result<(RouteBuildSpec, RuntimeRouteSpec), Error> {
+fn route_spec(definition: &ServiceDefinition) -> Result<RouteBuildSpec, Error> {
     let method_names = definition
         .methods
         .iter()
@@ -1008,19 +1004,7 @@ fn route_specs(
     let route = &definition.expected;
     let limits = SchedulerLimits::try_from_usize(definition.max_pending, definition.max_workers)
         .map_err(|message| method_contract_error("$.concurrency", message))?;
-    let route_spec = RouteBuildSpec {
-        name: route.route_name.clone(),
-        crm_ns: route.crm_ns.clone(),
-        crm_name: route.crm_name.clone(),
-        crm_ver: route.crm_ver.clone(),
-        abi_hash: route.abi_hash.clone(),
-        signature_hash: route.signature_hash.clone(),
-        method_names: method_names.clone(),
-        access_map: access_map.clone(),
-        concurrency_mode: definition.concurrency_mode.into(),
-        limits,
-    };
-    let runtime_spec = RuntimeRouteSpec {
+    Ok(RouteBuildSpec {
         name: route.route_name.clone(),
         crm_ns: route.crm_ns.clone(),
         crm_name: route.crm_name.clone(),
@@ -1030,10 +1014,8 @@ fn route_specs(
         method_names,
         access_map,
         concurrency_mode: definition.concurrency_mode.into(),
-        max_pending: limits.max_pending.map(usize::from),
-        max_workers: limits.max_workers.map(usize::from),
-    };
-    Ok((route_spec, runtime_spec))
+        limits,
+    })
 }
 
 struct CoreCallback {

@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 use c2_mem::MemPool;
 use c2_wire::chunk::ReassemblyBacking;
+use c2_wire::handshake::MAX_METHODS;
+
+use crate::server::ServerError;
 
 use crate::scheduler::{
     AccessLevel, ConcurrencyMode, RouteConcurrencyHandle, Scheduler, SchedulerLimits,
@@ -271,11 +274,31 @@ pub struct BuiltRoute {
 }
 
 impl BuiltRoute {
-    pub(crate) fn new(route: CrmRoute, route_handle: RouteConcurrencyHandle) -> Self {
-        Self {
+    pub(crate) fn new(route: CrmRoute) -> Result<Self, ServerError> {
+        c2_contract::validate_named_route_name("route name", &route.name)
+            .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        if route.method_names.len() > MAX_METHODS {
+            return Err(ServerError::Protocol(format!(
+                "method count exceeds wire limit: {} > {}",
+                route.method_names.len(),
+                MAX_METHODS
+            )));
+        }
+        for method_name in &route.method_names {
+            c2_contract::validate_contract_text_field("method name", method_name)
+                .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        }
+        c2_contract::validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver)
+            .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        c2_contract::validate_contract_hash("abi_hash", &route.abi_hash)
+            .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        c2_contract::validate_contract_hash("signature_hash", &route.signature_hash)
+            .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        let route_handle = RouteConcurrencyHandle::new(route.scheduler.as_ref().clone());
+        Ok(Self {
             route,
             route_handle,
-        }
+        })
     }
 
     pub(crate) fn into_route(self) -> CrmRoute {

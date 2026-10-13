@@ -187,3 +187,11 @@ B8b 实现提交为 `2949cd719621ae9bb59a74cbb19eff31e5d0c44e`。生产 endpoint
 定向验证：IPC connect_timeout 7 passed（其中表内 10 个场景），Core native_endpoint 3 passed，Python endpoint_maintenance 59 passed，relay state 45 passed；rustfmt/diff check 通过。命令沿用上述 target 和空 C2 环境；日志在 `/tmp/c2-slim-round2-20261013/correction-{ipc-final,config-final,sweep,relay}.log`。测试名和数量因合并变化，不能据此相加或推断覆盖等量。
 
 首次纠偏审查 run `f6c75a41-ff9f-45e7-a9da-04aa74f9e10c` 指出直接删除 IPC 末次结果用例会丢失独有保护，Host 采纳并改为合并用例。重审 run `7262da2f-f19b-40ed-9775-bcac9ca04daf` 因 serverOverloaded 失败，已结案回收，不计通过；随后原生独立代理 `/root/correction_final_independent_review`（gpt-6-sol/high）完成三个测试文件的窄审，无 actionable findings。Host 核对审查起止及最终三文件 diff SHA256 均为 `1c540ef6651b990dbd207fa4dd70f2116d6bf1494ab638ac7ff6348e7b4a3468`；运行证据与源码审查分别记录。
+
+## 第三轮：登记与 relay 整体收敛
+
+用户批准按 R11 → R39 → T02 顺序实施，每项同时收敛生产与测试，回归和独立审查完成后再推进。R22 基准清理顺序、R10/Python 快照、R30 公开配置类型及 P1 仍独立讨论；relay journal 保留。
+
+R11 基线 `b9936f0aa18bb4319139e2e48fa6f72565cb58b4`，5 个 Rust 文件净减少 191 行（含内嵌测试）。删除 RuntimeRouteSpec、双规格构造及 Session 对账；同一 BuiltRoute 派生一次 relay expected。静态 wire 校验收口到 BuiltRoute 私有构造器，handle 由同一 scheduler 派生；reserve 保留动态状态检查。两个专属失配测试及双规格夹具退出，三个非法输入用例改测构造拒绝，未新增测试框架或公开 API。
+
+R11 验证：Core lib 102、host_routes 5、client_modes 15、Server lib 168 passed；source mode 重建 Python native 后，runtime_session、runtime_session_lifecycle、core_transport_parity 首次 73 passed / 1 skipped（缺少可发现的 c3），构建并用 CTWO_TEST_C3_BIN 指定当前 c3 后 parity 文件 3 passed，补齐该跳过项。独立审查 run `9ede0945-0e80-4da2-b0f7-147cd0e140cd`、输入 `a9924810ca04f8500c6c53af566ee99a518b41f7` 无功能性阻塞；Host 清掉审查/编译器指出的五处失效测试导入后重跑 Core/Server lib，无 warning，并核对除此以外五文件与快照一致，审查已验收回收。日志和固定差异证据在 `/tmp/c2-slim-b9-20261013/r11-*`；本地 macOS 验证不代替 Windows、hosted CI 或二进制 ABI 验证。

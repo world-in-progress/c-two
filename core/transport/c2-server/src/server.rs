@@ -46,8 +46,8 @@ use c2_wire::flags::{
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_METHODS, MAX_ROUTES, MethodEntry, RouteInfo,
-    decode_handshake, encode_server_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_ROUTES, MethodEntry, RouteInfo, decode_handshake,
+    encode_server_handshake,
 };
 use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES};
 use c2_wire::registration_control::{
@@ -79,8 +79,7 @@ use crate::dispatcher::{
 use crate::heartbeat::run_heartbeat;
 use crate::response::buddy_response_data_size;
 use crate::scheduler::{
-    RouteConcurrencyHandle, Scheduler, SchedulerAcquireError, SchedulerLimits,
-    SchedulerPendingPermit, SchedulerSnapshot,
+    Scheduler, SchedulerAcquireError, SchedulerLimits, SchedulerPendingPermit, SchedulerSnapshot,
 };
 
 const FRAME_FIXED_BODY_LEN: u32 = 12;
@@ -760,10 +759,8 @@ impl Server {
     ) -> Result<BuiltRoute, ServerError> {
         let scheduler =
             Scheduler::with_limits(spec.concurrency_mode, spec.access_map.clone(), spec.limits);
-        let route_handle = RouteConcurrencyHandle::new(scheduler.clone());
         let route = CrmRoute::new(spec, scheduler, callback);
-        validate_route_for_wire(&route)?;
-        Ok(BuiltRoute::new(route, route_handle))
+        BuiltRoute::new(route)
     }
 
     pub async fn reserve_route(
@@ -771,7 +768,6 @@ impl Server {
         route: BuiltRoute,
     ) -> Result<PendingRouteReservation, ServerError> {
         let route = route.into_route();
-        validate_route_for_wire(&route)?;
         let route_name = route.name.clone();
         let _guard = self.route_registration.lock().await;
         let dispatcher = self.dispatcher.read().await;
@@ -849,10 +845,7 @@ impl Server {
 
     #[cfg(test)]
     async fn register_route(&self, route: CrmRoute) -> Result<(), ServerError> {
-        let route_handle = RouteConcurrencyHandle::new(route.scheduler.as_ref().clone());
-        let reservation = self
-            .reserve_route(BuiltRoute::new(route, route_handle))
-            .await?;
+        let reservation = self.reserve_route(BuiltRoute::new(route)?).await?;
         self.commit_reserved_route(reservation).await
     }
 
@@ -1629,29 +1622,6 @@ async fn ping_server_endpoint(endpoint: &LocalEndpoint) -> bool {
     frame_header.flags & FLAG_SIGNAL != 0
         && frame_header.flags & FLAG_RESPONSE != 0
         && payload == c2_wire::msg_type::PONG_BYTES
-}
-
-fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
-    c2_contract::validate_named_route_name("route name", &route.name)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    if route.method_names.len() > MAX_METHODS {
-        return Err(ServerError::Protocol(format!(
-            "method count exceeds wire limit: {} > {}",
-            route.method_names.len(),
-            MAX_METHODS
-        )));
-    }
-    for method_name in &route.method_names {
-        c2_contract::validate_contract_text_field("method name", method_name)
-            .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    }
-    c2_contract::validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    c2_contract::validate_contract_hash("abi_hash", &route.abi_hash)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    c2_contract::validate_contract_hash("signature_hash", &route.signature_hash)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    Ok(())
 }
 
 fn validate_server_identity(identity: &ServerIdentity) -> Result<(), ServerError> {
@@ -5247,10 +5217,8 @@ mod tests {
         }
 
         let replacement = make_route("grid");
-        let replacement_handle =
-            RouteConcurrencyHandle::new(replacement.scheduler.as_ref().clone());
         let err = match server
-            .reserve_route(BuiltRoute::new(replacement, replacement_handle))
+            .reserve_route(BuiltRoute::new(replacement).unwrap())
             .await
         {
             Ok(_) => panic!("catalog must reject same-name replacement while old route drains"),
@@ -5262,10 +5230,8 @@ mod tests {
         assert!(unregister_task.await.unwrap());
 
         let replacement = make_route("grid");
-        let replacement_handle =
-            RouteConcurrencyHandle::new(replacement.scheduler.as_ref().clone());
         let reservation = server
-            .reserve_route(BuiltRoute::new(replacement, replacement_handle))
+            .reserve_route(BuiltRoute::new(replacement).unwrap())
             .await
             .expect("same-name reserve should succeed after old route is removed");
         server.abort_reserved_route(reservation).await;
@@ -5285,9 +5251,8 @@ mod tests {
             .expect("server ready");
 
         let route = make_route("late");
-        let route_handle = RouteConcurrencyHandle::new(route.scheduler.as_ref().clone());
         let reservation = server
-            .reserve_route(BuiltRoute::new(route, route_handle))
+            .reserve_route(BuiltRoute::new(route).unwrap())
             .await
             .unwrap();
         server.request_shutdown_signal();
@@ -5383,44 +5348,29 @@ mod tests {
         assert_eq!(reused.offset, alloc.offset);
     }
 
-    #[tokio::test]
-    async fn register_route_rejects_wire_invalid_route_name() {
-        let s = Arc::new(Server::new("ipc://long_route_test", ServerIpcConfig::default()).unwrap());
+    #[test]
+    fn built_route_rejects_wire_invalid_route_name() {
         let route = make_route(&"x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1));
-
-        let err = s.register_route(route).await.unwrap_err();
-
+        let err = BuiltRoute::new(route).err().expect("invalid route name");
         assert!(err.to_string().contains("route name"));
-        assert!(s.dispatcher.read().await.is_empty());
     }
 
-    #[tokio::test]
-    async fn register_route_rejects_invalid_crm_tag_fields() {
-        let s = Server::new("ipc://invalid_crm_tag_route", ServerIpcConfig::default()).unwrap();
+    #[test]
+    fn built_route_rejects_invalid_crm_tag_fields() {
         let mut route = make_route("grid");
         route.crm_name = "Grid\0Injected".to_string();
-
-        let err = s
-            .register_route(route)
-            .await
-            .expect_err("invalid CrmTag must fail before route registration");
-
+        let err = BuiltRoute::new(route).err().expect("invalid CRM tag");
         assert!(err.to_string().contains("control characters"));
     }
 
-    #[tokio::test]
-    async fn register_route_rejects_too_many_methods() {
-        let s =
-            Arc::new(Server::new("ipc://method_count_test", ServerIpcConfig::default()).unwrap());
+    #[test]
+    fn built_route_rejects_too_many_methods() {
         let mut route = make_route("grid");
         route.method_names = (0..=c2_wire::handshake::MAX_METHODS)
             .map(|i| format!("m{i}"))
             .collect();
-
-        let err = s.register_route(route).await.unwrap_err();
-
+        let err = BuiltRoute::new(route).err().expect("too many methods");
         assert!(err.to_string().contains("method count"));
-        assert!(s.dispatcher.read().await.is_empty());
     }
 
     #[tokio::test]
