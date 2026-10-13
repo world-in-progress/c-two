@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+import httpx
 
 from c_two.crm.contract import crm_contract
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
+
+
+@pytest.fixture(autouse=True)
+def _benchmark_import_path(monkeypatch):
+    monkeypatch.syspath_prepend(str(_repo_root() / 'sdk/python/benchmarks'))
 
 
 def _load_benchmark(script_name: str) -> ModuleType:
@@ -26,59 +36,32 @@ def _load_benchmark(script_name: str) -> ModuleType:
     return module
 
 
-def test_relay_qps_unregister_sends_server_id():
-    module = _load_benchmark('relay_qps_benchmark.py')
-    calls: list[tuple[str, dict[str, str]]] = []
-    module._post_json = lambda url, payload: calls.append((url, payload))
+def test_relay_session_restores_unset_anchor_after_error(monkeypatch, capsys):
+    import _relay_support as relay
 
-    module._unregister_relay_upstream('http://127.0.0.1:8300', 'grid', 'srv-1')
-
-    assert calls == [
-        ('http://127.0.0.1:8300/_unregister', {'name': 'grid', 'server_id': 'srv-1'}),
-    ]
-
-
-def test_relay_qps_register_sends_instance_and_contract_fields():
-    module = _load_benchmark('relay_qps_benchmark.py')
-    calls: list[tuple[str, dict[str, object]]] = []
-    module._post_json = lambda url, payload: calls.append((url, payload))
-    expected = crm_contract(module.Hello)
-    max_payload_size = 8192
-
-    module._register_relay_upstream(
-        'http://127.0.0.1:8300',
-        'grid',
-        'ipc://grid',
-        'srv-1',
-        'inst-1',
-        expected,
-        max_payload_size,
-    )
-
-    assert calls == [
-        (
-            'http://127.0.0.1:8300/_register',
-            {
-                'name': 'grid',
-                'server_id': 'srv-1',
-                'server_instance_id': 'inst-1',
-                'address': 'ipc://grid',
-                'crm_ns': expected.crm_ns,
-                'crm_name': expected.crm_name,
-                'crm_ver': expected.crm_ver,
-                'abi_hash': expected.abi_hash,
-                'signature_hash': expected.signature_hash,
-                'max_payload_size': max_payload_size,
-            },
-        ),
-    ]
+    original = relay.settings._relay_anchor_address
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://environment:8300')
+    monkeypatch.setattr(relay._NO_PROXY_OPENER, 'open', lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(relay.cc, 'shutdown', lambda: {
+        'completed': True, 'relay_errors': ['withdrawal failed'],
+    })
+    relay.cc.set_relay_anchor('')
+    try:
+        with pytest.raises(ValueError, match='benchmark'):
+            with relay.session('http://127.0.0.1:8300'):
+                raise ValueError('benchmark')
+        assert relay.settings._relay_anchor_address is None
+        assert relay.settings.relay_anchor_address == 'http://environment:8300'
+        assert 'withdrawal failed' in capsys.readouterr().err
+    finally:
+        relay.cc.set_relay_anchor(original or '')
 
 
-def test_relay_qps_hey_args_include_expected_contract_headers():
+def test_relay_qps_hey_args_include_contract_and_route_identity():
     module = _load_benchmark('relay_qps_benchmark.py')
     expected = crm_contract(module.Hello)
 
-    args = module._expected_contract_hey_args(expected)
+    args = module._route_hey_args(expected, 'registered-route-uid', 7)
 
     assert args == [
         '-H',
@@ -91,55 +74,99 @@ def test_relay_qps_hey_args_include_expected_contract_headers():
         f'x-c2-expected-abi-hash: {expected.abi_hash}',
         '-H',
         f'x-c2-expected-signature-hash: {expected.signature_hash}',
+        '-H',
+        'x-c2-route-uid: registered-route-uid',
+        '-H',
+        'x-c2-route-revision: 7',
     ]
 
 
-def test_three_mode_unregister_sends_server_id():
+@pytest.mark.parametrize('script', ['relay_qps_benchmark.py', 'three_mode_benchmark.py'])
+def test_benchmark_http_calls_and_cleanup(script, start_c3_relay, monkeypatch, tmp_path):
+    if script == 'relay_qps_benchmark.py' and shutil.which('hey') is None:
+        pytest.skip('hey is not installed')
+    relay_process = start_c3_relay()
+    port = int(relay_process.bind.rsplit(':', 1)[1])
+    module = _load_benchmark(script)
+    settings = module.relay.settings
+    original_anchor = settings._relay_anchor_address
+    connect = module.cc.connect
+
+    def connect_http(*args, **kwargs):
+        proxy = connect(*args, **kwargs)
+        assert proxy.client.observed_path == 'explicit_relay'
+        return proxy
+
+    monkeypatch.setattr(module.cc, 'connect', connect_http)
+    module.cc.set_relay_anchor('http://previous:8300')
+    try:
+        if script == 'relay_qps_benchmark.py':
+            monkeypatch.setattr(module, 'RELAY_PORT', port)
+            monkeypatch.setattr(module, 'TOTAL_REQUESTS', 3)
+            monkeypatch.setattr(module, 'CONCURRENCY', 1)
+            payload = tmp_path / 'hey-payload.bin'
+            monkeypatch.setattr(module, 'PAYLOAD_FILE', str(payload))
+            payload.write_bytes(b'previous payload')
+            def unavailable(*args, **kwargs):
+                raise OSError('offline')
+            with monkeypatch.context() as offline:
+                offline.setattr(module.relay._NO_PROXY_OPENER, 'open', unavailable)
+                with pytest.raises(SystemExit, match='Start it first'):
+                    module.main()
+            assert payload.read_bytes() == b'previous payload'
+            module.main()
+            assert not payload.exists()
+        else:
+            monkeypatch.setattr(module, '_relay_port', port)
+            monkeypatch.setattr(module, '_SEGMENT_SIZE', 1024 * 1024)
+            monkeypatch.setattr(module, '_rounds', lambda _: 2)
+            monkeypatch.setattr(module, 'WARMUP', 1)
+            assert module.bench_relay(64) is not None
+        assert settings._relay_anchor_address == 'http://previous:8300'
+        with httpx.Client(trust_env=False) as http:
+            assert http.get(f'{relay_process.url}/_routes').json()['routes'] == []
+    finally:
+        module.cc.shutdown()
+        module.cc.set_relay_anchor(original_anchor or '')
+        module._ProcessRegistry.reset()
+
+
+@pytest.mark.parametrize('body_fails', [False, True])
+def test_relay_session_keeps_anchor_while_native_call_drains(body_fails, start_c3_relay, monkeypatch, capsys):
     module = _load_benchmark('three_mode_benchmark.py')
-    calls: list[tuple[str, dict[str, str]]] = []
-    module._post_json = lambda url, payload: calls.append((url, payload))
+    relay_process = start_c3_relay()
+    original = module.relay.settings._relay_anchor_address
+    started, finish = threading.Event(), threading.Event()
+    shutdown = module.cc.shutdown
+    monkeypatch.setattr(module.cc, 'shutdown', lambda: shutdown(timeout=0.01))
 
-    module._unregister_relay_upstream('http://127.0.0.1:8300', 'grid', 'srv-1')
+    class BlockingEcho:
+        def echo(self, data):
+            started.set()
+            assert finish.wait(5)
+            return data
 
-    assert calls == [
-        ('http://127.0.0.1:8300/_unregister', {'name': 'grid', 'server_id': 'srv-1'}),
-    ]
-
-
-def test_three_mode_register_sends_instance_and_contract_fields():
-    module = _load_benchmark('three_mode_benchmark.py')
-    calls: list[tuple[str, dict[str, object]]] = []
-    module._post_json = lambda url, payload: calls.append((url, payload))
-    expected = crm_contract(module.Echo)
-    max_payload_size = 8192
-
-    module._register_relay_upstream(
-        'http://127.0.0.1:8300',
-        'grid',
-        'ipc://grid',
-        'srv-1',
-        'inst-1',
-        expected,
-        max_payload_size,
-    )
-
-    assert calls == [
-        (
-            'http://127.0.0.1:8300/_register',
-            {
-                'name': 'grid',
-                'server_id': 'srv-1',
-                'server_instance_id': 'inst-1',
-                'address': 'ipc://grid',
-                'crm_ns': expected.crm_ns,
-                'crm_name': expected.crm_name,
-                'crm_ver': expected.crm_ver,
-                'abi_hash': expected.abi_hash,
-                'signature_hash': expected.signature_hash,
-                'max_payload_size': max_payload_size,
-            },
-        ),
-    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            error = ValueError if body_fails else RuntimeError
+            with pytest.raises(error, match='benchmark'):
+                with module.relay.session(relay_process.url):
+                    module.cc.register(module.Echo, BlockingEcho(), name='draining-echo')
+                    with module.cc.connect(module.Echo, name='draining-echo') as proxy:
+                        call = pool.submit(proxy.echo, b'pending')
+                        assert started.wait(2)
+                        if body_fails:
+                            raise ValueError('benchmark')
+            assert module.relay.settings._relay_anchor_address == relay_process.url
+            if body_fails:
+                assert 'anchor retained' in capsys.readouterr().err
+            finish.set()
+            assert call.result(timeout=2) == b'pending'
+        finally:
+            finish.set()
+            assert shutdown()['completed']
+            module.cc.set_relay_anchor(original or '')
+            module._ProcessRegistry.reset()
 
 
 def test_three_mode_relay_large_payload_rows_have_explicit_path_label():
@@ -206,43 +233,9 @@ def test_kostya_ctwo_benchmark_contains_no_deleted_fastdb_runtime_authority():
     assert 'fdb.Batch' not in source
 
 
-def test_three_mode_dict_echo_contract_is_descriptor_safe():
-    module = _load_benchmark('three_mode_benchmark.py')
-
+@pytest.mark.parametrize('script', ['three_mode_benchmark.py', 'segment_size_benchmark.py'])
+def test_dict_echo_contract_is_descriptor_safe(script):
+    module = _load_benchmark(script)
     contract = crm_contract(module.DictEcho)
-
     assert len(contract.abi_hash) == 64
     assert len(contract.signature_hash) == 64
-
-
-def test_segment_size_dict_echo_contract_is_descriptor_safe():
-    module = _load_benchmark('segment_size_benchmark.py')
-
-    contract = crm_contract(module.DictEcho)
-
-    assert len(contract.abi_hash) == 64
-    assert len(contract.signature_hash) == 64
-
-
-def test_relay_qps_best_effort_unregister_passes_server_id():
-    module = _load_benchmark('relay_qps_benchmark.py')
-    calls: list[tuple[str, str, str]] = []
-    module._unregister_relay_upstream = lambda relay_url, name, server_id: calls.append(
-        (relay_url, name, server_id)
-    )
-
-    module._best_effort_unregister_relay_upstream('http://127.0.0.1:8300', 'grid', 'srv-1')
-
-    assert calls == [('http://127.0.0.1:8300', 'grid', 'srv-1')]
-
-
-def test_three_mode_best_effort_unregister_passes_server_id():
-    module = _load_benchmark('three_mode_benchmark.py')
-    calls: list[tuple[str, str, str]] = []
-    module._unregister_relay_upstream = lambda relay_url, name, server_id: calls.append(
-        (relay_url, name, server_id)
-    )
-
-    module._best_effort_unregister_relay_upstream('http://127.0.0.1:8300', 'grid', 'srv-1')
-
-    assert calls == [('http://127.0.0.1:8300', 'grid', 'srv-1')]

@@ -243,3 +243,17 @@ catalog 的 list/stale lookup/contract mismatch 三套相同夹具合一，保�
 Rust 基线 IPC lib 203 + integration 7 + server 168 passed；仅合并测试时 catalog 5 passed；候选 IPC 203 + 7、server 166 passed，减少两项为夹具合并。TypeScript 初次基线因缺少编译器依赖而失败，按锁文件 npm ci --ignore-scripts 后基线/候选 transport contract 均 7 passed，候选严格生成类型检查 1 passed。临时脚本使用两版完整 asset 的真实 decoder 对照 1361 个确定性输入，324 accepted、1037 rejected，保留的元数据或异常类型/完整文案一致；范围包含所有前缀截断、逐字节扰动、超范围 revision 和尾随字节，明确忽略退出的私有 routes 字段，脚本未进仓库。
 
 独立审查 run `578ec828-491e-42dc-ae7a-4efda9de4473`、固定输入 `0401fca2d2aefb4ab9f1852c15b6c5b1bc8ea7a2` 无 actionable findings；Host 已核对三文件 SHA-256、实际回归及私有边界并验收报告，`git diff --check` 通过。日志、对照脚本和 manifest 位于 `/tmp/c2-slim-b13-20261013/r34-*`。验证限本地 macOS；R34 的公开协议面和其他构造优化仍未处理。
+
+### B14：R22 基准工具复用既有 SDK 生命周期
+
+执行基线为 `21cb8f63`。本批只修复和精简两个 Python benchmark 及相关测试；不计作生产运行时性能或架构收益。用户明确批准复用现有 SDK 登记、精确撤回和 drain-first 收尾，不修改 Core 的一致性、生命周期、公开 API/ABI 或 relay journal。
+
+两个脚本通过 44 行 `_relay_support.session` 临时设置 anchor 并消费 SDK shutdown 结果，退出手写 register/unregister 报文、额外 IPC 身份回连、重复登记布尔及局部撤回。移除的调用实际依赖已不存在的 CoreClient.server_instance_id / RuntimeSession.release_ipc_client；旧 unregister 报文还因缺 instance/UID/revision 被 422 拒绝。真实 QPS 回归另确认旧请求缺 route token 而 400；现在由显式 HTTP SDK 连接获得既有 client.route_uid/revision，hey 继续发送完整 CRM 指纹和这两个 token，单参数 pickle 值对齐 SDK。计时范围及强制 HTTP 数据路径保留。
+
+独立首审发现未完成 shutdown 仍冻结 Host anchor；无条件恢复会触发 native 错误并使 Python 配置与 native 不一致。Host 用真实 native 在途调用在原候选复现，修复为仅完成后恢复；未完成时保留冻结配置，有原异常则保留并诊断，否则终止 benchmark，避免污染后续测量。模拟 incomplete/shutdown 测试由两个真实 pending 场景替代。QPS payload 清理归到本轮成功写入后的作用域，离线预检不再删除既有文件。
+
+重复报文模拟退出，保留 header、真实 HTTP 路径、输出和 descriptor 覆盖；复用现有 c3 fixture 验证两个小负载 benchmark、anchor 恢复和路由撤回，未新增常驻测试框架。工具代码净减少 212 行，测试净减少 7 行，四个非文档文件合计减少 219 行。
+
+当前 c3 和 Python native 已从本批基线重建。最终 benchmark 13 + examples syntax 9 = 22 passed，无跳过；三个 benchmark 模块另以 Python 3.10 compile 通过。真实 hey 预热报告 496 次、正式 3 次响应，全部 200，单次响应内容为 Hello, Benchmark!，路由及自有 payload 文件已清除。真实 session 探针先调用 manager、后登记 builder，以 idle_timeout=1 的实际 sweeper 约 5 秒后确认驱逐；两条 route identity 保留，8 个并发 builder 调用和 manager 调用通过，最终精确撤回。既有 Rust production_idle_sweeper 回归也为 1 passed，覆盖活跃请求保留和并发共享重连。上述为本地 macOS 正确性证据，不构成吞吐提升或跨平台验收。
+
+首审 run `dea9d4fc-5f4c-450b-95c4-b9d2e91ca51b` 的冻结 anchor 问题已复现并修复；第二轮 run `d3e92af8-c6a5-44f6-9432-b996c0fbca03`、固定输入 `f5be7af91639ec97801352cce50637a05a87b172` 无 actionable findings。Host 核对四文件 SHA-256 与固定输入一致，两份审查报告已验收并回收工作树。`git diff --check` 通过。日志、探针、红绿结果和哈希清单位于 `/tmp/c2-slim-b14-20261013/`。R22 的其他脚本 selector 项不在本批；后续优先回到生产运行时重复逻辑和复杂状态。
