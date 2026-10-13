@@ -208,55 +208,7 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     py: Python<'py>,
     overrides: &ServerIpcConfigOverrides,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    if let Some(value) = overrides.base.pool_enabled {
-        dict.set_item("pool_enabled", value)?;
-    }
-    if let Some(value) = overrides.base.pool_segment_size {
-        dict.set_item("pool_segment_size", value)?;
-    }
-    if let Some(value) = overrides.base.max_pool_segments {
-        dict.set_item("max_pool_segments", value)?;
-    }
-    if let Some(value) = overrides.base.pool_prewarm_segments {
-        dict.set_item("pool_prewarm_segments", value)?;
-    }
-    if let Some(value) = overrides.base.pool_min_retained_segments {
-        dict.set_item("pool_min_retained_segments", value)?;
-    }
-    if let Some(value) = overrides.base.reassembly_segment_size {
-        dict.set_item("reassembly_segment_size", value)?;
-    }
-    if let Some(value) = overrides.base.reassembly_max_segments {
-        dict.set_item("reassembly_max_segments", value)?;
-    }
-    if let Some(value) = overrides.base.max_total_chunks {
-        dict.set_item("max_total_chunks", value)?;
-    }
-    if let Some(value) = overrides.base.chunk_gc_interval_secs {
-        dict.set_item("chunk_gc_interval", value)?;
-    }
-    if let Some(value) = overrides.base.chunk_threshold_ratio {
-        dict.set_item("chunk_threshold_ratio", value)?;
-    }
-    if let Some(value) = overrides.base.chunk_assembler_timeout_secs {
-        dict.set_item("chunk_assembler_timeout", value)?;
-    }
-    if let Some(value) = overrides.base.max_reassembly_bytes {
-        dict.set_item("max_reassembly_bytes", value)?;
-    }
-    if let Some(value) = overrides.base.chunk_size {
-        dict.set_item("chunk_size", value)?;
-    }
-    if let Some(value) = overrides.base.shm_backing_budget_bytes {
-        dict.set_item("shm_backing_budget_bytes", value)?;
-    }
-    if let Some(value) = overrides.base.file_backing_budget_bytes {
-        dict.set_item("file_backing_budget_bytes", value)?;
-    }
-    if let Some(value) = overrides.base.live_reassembly_budget_bytes {
-        dict.set_item("live_reassembly_budget_bytes", value)?;
-    }
+    let dict = base_ipc_overrides_to_dict(py, &overrides.base)?;
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -333,55 +285,7 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     py: Python<'py>,
     overrides: &ClientIpcConfigOverrides,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    if let Some(value) = overrides.base.pool_enabled {
-        dict.set_item("pool_enabled", value)?;
-    }
-    if let Some(value) = overrides.base.pool_segment_size {
-        dict.set_item("pool_segment_size", value)?;
-    }
-    if let Some(value) = overrides.base.max_pool_segments {
-        dict.set_item("max_pool_segments", value)?;
-    }
-    if let Some(value) = overrides.base.pool_prewarm_segments {
-        dict.set_item("pool_prewarm_segments", value)?;
-    }
-    if let Some(value) = overrides.base.pool_min_retained_segments {
-        dict.set_item("pool_min_retained_segments", value)?;
-    }
-    if let Some(value) = overrides.base.reassembly_segment_size {
-        dict.set_item("reassembly_segment_size", value)?;
-    }
-    if let Some(value) = overrides.base.reassembly_max_segments {
-        dict.set_item("reassembly_max_segments", value)?;
-    }
-    if let Some(value) = overrides.base.max_total_chunks {
-        dict.set_item("max_total_chunks", value)?;
-    }
-    if let Some(value) = overrides.base.chunk_gc_interval_secs {
-        dict.set_item("chunk_gc_interval", value)?;
-    }
-    if let Some(value) = overrides.base.chunk_threshold_ratio {
-        dict.set_item("chunk_threshold_ratio", value)?;
-    }
-    if let Some(value) = overrides.base.chunk_assembler_timeout_secs {
-        dict.set_item("chunk_assembler_timeout", value)?;
-    }
-    if let Some(value) = overrides.base.max_reassembly_bytes {
-        dict.set_item("max_reassembly_bytes", value)?;
-    }
-    if let Some(value) = overrides.base.chunk_size {
-        dict.set_item("chunk_size", value)?;
-    }
-    if let Some(value) = overrides.base.shm_backing_budget_bytes {
-        dict.set_item("shm_backing_budget_bytes", value)?;
-    }
-    if let Some(value) = overrides.base.file_backing_budget_bytes {
-        dict.set_item("file_backing_budget_bytes", value)?;
-    }
-    if let Some(value) = overrides.base.live_reassembly_budget_bytes {
-        dict.set_item("live_reassembly_budget_bytes", value)?;
-    }
+    let dict = base_ipc_overrides_to_dict(py, &overrides.base)?;
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -423,6 +327,62 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     }
     if let Some(value) = overrides.pool_decay_seconds {
         dict.set_item("pool_decay_seconds", value)?;
+    }
+    if let Some(value) = overrides.shm_backing_budget_bytes {
+        dict.set_item("shm_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.file_backing_budget_bytes {
+        dict.set_item("file_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.live_reassembly_budget_bytes {
+        dict.set_item("live_reassembly_budget_bytes", value)?;
+    }
+    Ok(dict)
+}
+
+fn base_ipc_overrides_to_dict<'py>(
+    py: Python<'py>,
+    overrides: &c2_config::BaseIpcConfigOverrides,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    if let Some(value) = overrides.pool_enabled {
+        dict.set_item("pool_enabled", value)?;
+    }
+    if let Some(value) = overrides.pool_segment_size {
+        dict.set_item("pool_segment_size", value)?;
+    }
+    if let Some(value) = overrides.max_pool_segments {
+        dict.set_item("max_pool_segments", value)?;
+    }
+    if let Some(value) = overrides.pool_prewarm_segments {
+        dict.set_item("pool_prewarm_segments", value)?;
+    }
+    if let Some(value) = overrides.pool_min_retained_segments {
+        dict.set_item("pool_min_retained_segments", value)?;
+    }
+    if let Some(value) = overrides.reassembly_segment_size {
+        dict.set_item("reassembly_segment_size", value)?;
+    }
+    if let Some(value) = overrides.reassembly_max_segments {
+        dict.set_item("reassembly_max_segments", value)?;
+    }
+    if let Some(value) = overrides.max_total_chunks {
+        dict.set_item("max_total_chunks", value)?;
+    }
+    if let Some(value) = overrides.chunk_gc_interval_secs {
+        dict.set_item("chunk_gc_interval", value)?;
+    }
+    if let Some(value) = overrides.chunk_threshold_ratio {
+        dict.set_item("chunk_threshold_ratio", value)?;
+    }
+    if let Some(value) = overrides.chunk_assembler_timeout_secs {
+        dict.set_item("chunk_assembler_timeout", value)?;
+    }
+    if let Some(value) = overrides.max_reassembly_bytes {
+        dict.set_item("max_reassembly_bytes", value)?;
+    }
+    if let Some(value) = overrides.chunk_size {
+        dict.set_item("chunk_size", value)?;
     }
     if let Some(value) = overrides.shm_backing_budget_bytes {
         dict.set_item("shm_backing_budget_bytes", value)?;

@@ -269,55 +269,24 @@ def test_resolved_ipc_config_exposes_canonical_memory_budget_defaults():
         assert cfg['live_reassembly_budget_bytes'] == 8 * GIB
 
 
-def test_ipc_overrides_roundtrip_memory_budget_bytes():
+@pytest.mark.parametrize(
+    'budgets',
+    [(3 * GIB, 5 * GIB, GIB), (0, 0, 0), (U64_MAX, U64_MAX, U64_MAX)],
+    ids=['explicit', 'zero', 'u64-max'],
+)
+def test_ipc_overrides_roundtrip_memory_budget_bytes(budgets):
     native = ipc_config._native_resolver()  # noqa: SLF001
     overrides = {
-        'shm_backing_budget_bytes': 3 * GIB,
-        'file_backing_budget_bytes': 5 * GIB,
-        'live_reassembly_budget_bytes': GIB,
+        'shm_backing_budget_bytes': budgets[0],
+        'file_backing_budget_bytes': budgets[1],
+        'live_reassembly_budget_bytes': budgets[2],
     }
 
     server_cfg = native.resolve_server_ipc_config(overrides, None)
     client_cfg = native.resolve_client_ipc_config(overrides, None)
 
     for cfg in (server_cfg, client_cfg):
-        assert cfg['shm_backing_budget_bytes'] == 3 * GIB
-        assert cfg['file_backing_budget_bytes'] == 5 * GIB
-        assert cfg['live_reassembly_budget_bytes'] == GIB
-
-
-def test_memory_budget_zero_override_is_retained_not_unlimited():
-    native = ipc_config._native_resolver()  # noqa: SLF001
-    overrides = {
-        'shm_backing_budget_bytes': 0,
-        'file_backing_budget_bytes': 0,
-        'live_reassembly_budget_bytes': 0,
-    }
-
-    server_cfg = native.resolve_server_ipc_config(overrides, None)
-    client_cfg = native.resolve_client_ipc_config(overrides, None)
-
-    for cfg in (server_cfg, client_cfg):
-        assert cfg['shm_backing_budget_bytes'] == 0
-        assert cfg['file_backing_budget_bytes'] == 0
-        assert cfg['live_reassembly_budget_bytes'] == 0
-
-
-def test_memory_budget_full_u64_range_override_is_retained():
-    native = ipc_config._native_resolver()  # noqa: SLF001
-    overrides = {
-        'shm_backing_budget_bytes': U64_MAX,
-        'file_backing_budget_bytes': U64_MAX,
-        'live_reassembly_budget_bytes': U64_MAX,
-    }
-
-    server_cfg = native.resolve_server_ipc_config(overrides, None)
-    client_cfg = native.resolve_client_ipc_config(overrides, None)
-
-    for cfg in (server_cfg, client_cfg):
-        assert cfg['shm_backing_budget_bytes'] == U64_MAX
-        assert cfg['file_backing_budget_bytes'] == U64_MAX
-        assert cfg['live_reassembly_budget_bytes'] == U64_MAX
+        assert {key: cfg[key] for key in overrides} == overrides
 
 
 def test_memory_budget_env_resolves_and_explicit_overrides_win(monkeypatch):

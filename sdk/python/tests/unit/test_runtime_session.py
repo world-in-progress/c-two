@@ -96,20 +96,26 @@ def test_native_runtime_session_explicit_identity_is_lazy() -> None:
     assert session.server_address == 'ipc://unit-server'
 
 
-def test_native_runtime_session_projects_server_ipc_overrides_copy() -> None:
+@pytest.mark.parametrize('side', ['server', 'client'])
+def test_native_runtime_session_projects_ipc_overrides_copy(side: str) -> None:
     from c_two._native import RuntimeSession
 
-    overrides = {'pool_segment_size': 2 * 1024 * 1024}
-    session = RuntimeSession(
-        server_id='unit-server',
-        server_ipc_overrides=overrides,
-    )
+    expected = {
+        'pool_enabled': False,
+        'pool_segment_size': 2 * 1024 * 1024,
+        'reassembly_segment_size': 16 * 1024 * 1024,
+    }
+    overrides = dict(expected, chunk_size=None)
+    option = f'{side}_ipc_overrides'
+    session = RuntimeSession(**{option: overrides})
 
-    projected = session.server_ipc_overrides
-    assert projected == overrides
+    projected = getattr(session, option)
+    assert projected == expected
 
     overrides['pool_segment_size'] = 4 * 1024 * 1024
-    assert session.server_ipc_overrides == {'pool_segment_size': 2 * 1024 * 1024}
+    overrides['reassembly_segment_size'] = 32 * 1024 * 1024
+    projected.clear()
+    assert getattr(session, option) == expected
 
 
 def test_native_runtime_session_rejects_invalid_server_ids() -> None:
@@ -572,19 +578,6 @@ def test_direct_ipc_acquire_waits_for_dynamic_route_publication() -> None:
             resolver.close(crm)
         resolver.shutdown()
         registrar.shutdown()
-
-
-def test_native_runtime_session_projects_client_ipc_overrides_copy() -> None:
-    from c_two._native import RuntimeSession
-
-    overrides = {'reassembly_segment_size': 16 * 1024 * 1024}
-    session = RuntimeSession(client_ipc_overrides=overrides)
-
-    assert session.client_ipc_overrides == overrides
-    overrides['reassembly_segment_size'] = 32 * 1024 * 1024
-    assert session.client_ipc_overrides == {
-        'reassembly_segment_size': 16 * 1024 * 1024,
-    }
 
 
 def test_native_runtime_session_resolves_client_ipc_config(monkeypatch) -> None:

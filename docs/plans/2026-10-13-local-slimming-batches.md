@@ -203,3 +203,13 @@ R39 变更前后 `cargo test --manifest-path core/Cargo.toml -p c2-http --featur
 R39 实现提交为 `2946340d`。T02 在此基础上删除两个 cfg(test) name-only resolve 入口和专属源码签名检查，迁移 102 处调用：选路/排序/活性/投影走生产 resolve_matching，拒绝写入、撤回和保留状态直接观察存储；沿用现有夹具，6 文件净减少 107 行。Host 在内存核对运行时代码前缀，除 cfg(test) helper 删除与一行注释外逐字节一致。
 
 T02 完整 relay lib 426 passed（退出一个旧源码检查，原为 427）；独立审查 run `78e1abf7-7553-47a3-be6c-521608e22112`、输入 `2bc9e7bd6cde0fa2281358e3ecc1432d86d572a5` 指出三处旧协议拒绝用例丢失隐含 peer 活性断言。Host 按意见显式检查 peer_is_alive，保留存储检查，其中一处替换较弱 has_peer；修后 peer_handlers 27 passed。六文件已核对等于快照加这三处指定断言，审查已验收回收；没有把未执行的 Worker 机械比较当通过。日志及 manifest 在 `/tmp/c2-slim-b9-20261013/t02-*`。
+
+### B10：IPC overrides 私有投影去重
+
+执行基线为 `87189c489da10d925704210e199a1c068657d33e`。本批选择 R30 的私有 PyO3 投影子项：`config_ffi.rs` 抽出 server/client 共用的 16 个 base 字段写入，沿用现有 resolved config 的分层方式；flat 字段仍按原顺序覆盖。公开配置类型、字段、解析与冻结逻辑均无改动，R30 的公开类型重构仍待讨论。生产代码净减少 40 行。
+
+两项 RuntimeSession 配置复制测试合并为 server/client 参数化，保留原输入修改隔离，并补强 False、None 省略与返回字典副本隔离；三项内存预算 roundtrip 测试合并为正常值、零值、U64_MAX 参数化，保留双端的全部原输入与断言。两个测试文件净减少 38 行，3 个非文档文件合计净减少 78 行；没有新增测试框架、宏或依赖。
+
+首次 `uv run --frozen --offline` 因自动重建 FastDB 缺失 C++ 头文件路径而在测试启动前失败。合并后的 `test_ipc_config.py`、`test_runtime_session.py` 在原已安装扩展上 107 passed；随后使用 source mode、既有共享 target 与 macOS SDK C++ include 路径重新 `uv sync --frozen --offline --reinstall-package c-two` 成功，候选扩展上相同两文件 107 passed，`git diff --check` 通过。Host 将新 helper 内联展开，整份 `config_ffi.rs` 与基线逐字节一致，覆盖字段次序、base/flat 优先级及错误传播的等价核对。
+
+独立审查 run `412874ec-43ab-42e4-a261-c6c9fb62f5d6`、固定输入 `f10e0f0c99f08a137b5ac14d56fcf269e8a1e4f9` 无 actionable findings；Host 已核对三个文件与审查输入的 SHA-256 一致并验收回收。日志、机械对比与 manifest 位于 `/tmp/c2-slim-b10-20261013/r30-*`。验证范围为本地 macOS 的 native 构建与相关 Python 回归。
