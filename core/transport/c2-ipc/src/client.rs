@@ -7201,6 +7201,7 @@ mod tests {
                     .expect("send first chunk");
                 streams.push(stream);
             }
+            crate::tests::close_listener(listener).await;
             let _ = peer_released.await;
         });
 
@@ -8178,6 +8179,7 @@ mod tests {
         let mut listener = c2_local::LocalListener::bind(&endpoint).expect("test listener");
         let peer = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept client");
+            crate::tests::close_listener(listener).await;
             let mut len_buf = [0u8; 4];
             stream
                 .read_exact(&mut len_buf)

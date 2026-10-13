@@ -1,6 +1,19 @@
 use super::*;
 use tokio::io::AsyncReadExt;
 
+pub(super) fn close_listener(listener: LocalListener) {
+    let outcome = listener.close();
+    assert!(
+        matches!(
+            outcome,
+            EndpointReapResult::Reaped
+                | EndpointReapResult::AlreadyAbsent
+                | EndpointReapResult::NotApplicable
+        ),
+        "listener cleanup failed: {outcome:?}"
+    );
+}
+
 #[tokio::test]
 async fn owned_halves_exchange_bytes_and_abort_wakes_a_pending_read() {
     let (client, server) = LocalStream::pair().await.unwrap();
@@ -45,7 +58,7 @@ async fn duplicate_listener_cannot_displace_owner_and_restart_works() {
     )
     .unwrap();
     drop(first);
-    let _restarted = LocalListener::bind(&endpoint).unwrap();
+    close_listener(LocalListener::bind(&endpoint).unwrap());
 }
 
 #[tokio::test]
@@ -64,6 +77,7 @@ async fn cancelled_accept_can_accept_the_next_client() {
         listener.accept()
     )
     .unwrap();
+    close_listener(listener);
 }
 
 #[tokio::test]
@@ -105,6 +119,7 @@ async fn listener_restarts_after_server_closes_even_with_an_old_client_handle() 
     next_client.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"new listener");
     drop(client);
+    close_listener(next);
 }
 
 #[test]
@@ -161,6 +176,7 @@ async fn another_process_cannot_displace_the_listener() {
     let mut bytes = [0; 5];
     client.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"owner");
+    close_listener(owner);
 }
 
 #[tokio::test]
@@ -175,6 +191,7 @@ async fn listener_restarts_after_owner_process_exits_without_destructors() {
         owner.accept(),
     )
     .unwrap();
+    close_listener(owner);
 }
 
 #[tokio::test]
@@ -184,7 +201,7 @@ async fn listener_ownership_can_be_released_on_another_thread() {
             .unwrap();
     let owner = LocalListener::bind(&endpoint).unwrap();
     std::thread::spawn(move || drop(owner)).join().unwrap();
-    let _restarted = LocalListener::bind(&endpoint).unwrap();
+    close_listener(LocalListener::bind(&endpoint).unwrap());
 }
 
 #[tokio::test]
@@ -213,4 +230,5 @@ async fn listener_restarts_after_cancelling_a_pending_accept() {
     let mut bytes = [0; 12];
     client.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"new listener");
+    close_listener(next);
 }

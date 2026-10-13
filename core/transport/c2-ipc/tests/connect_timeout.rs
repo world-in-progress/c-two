@@ -11,7 +11,7 @@ use c2_config::{ConnectDeadline, ConnectOptions, LocalEndpoint};
 use c2_contract::ExpectedRouteContract;
 use c2_error::ErrorCode;
 use c2_ipc::{ClientPool, IpcError};
-use c2_local::{LocalListener, LocalStream};
+use c2_local::{EndpointCredential, EndpointReapResult, LocalListener, LocalStream};
 use c2_wire::flags;
 use c2_wire::frame::{FrameHeader, decode_frame_body, encode_frame};
 use c2_wire::handshake::{
@@ -149,6 +149,7 @@ async fn reply(stream: &mut LocalStream, header: FrameHeader, response: &RouteLo
 // No endpoint sweep or cleanup of addresses belonging to other tests is used.
 struct Peer {
     address: String,
+    credential: EndpointCredential,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -174,7 +175,7 @@ impl Peer {
                 .unwrap()
                 .block_on(async {
                     let listener = LocalListener::bind(&endpoint).expect("fixture listener");
-                    ready_tx.send(()).unwrap();
+                    ready_tx.send(listener.credential()).unwrap();
                     tokio::select! {
                         _ = stopped => {},
                         result = tokio::time::timeout(Duration::from_secs(10), serve(listener)) => {
@@ -183,29 +184,48 @@ impl Peer {
                     }
                 });
         });
-        ready_rx
+        let credential = ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("listener readiness");
         Self {
             address,
+            credential,
             stop: Some(stop),
             thread: Some(thread),
         }
     }
 
-    fn finish(mut self) {
-        let _ = self.stop.take().unwrap().send(());
-        self.thread.take().unwrap().join().expect("peer task");
+    fn finish(self) {
+        drop(self);
     }
 }
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        let _ = self.stop.take().unwrap().send(());
+        let joined = self.thread.take().unwrap().join();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let reaped = loop {
+            let outcome = c2_local::reap_endpoint(self.credential.endpoint(), &self.credential);
+            if matches!(outcome, EndpointReapResult::Busy) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            } else {
+                break outcome;
+            }
+        };
+        if thread::panicking() {
+            eprintln!("peer cleanup after panic: {reaped:?}");
+        } else {
+            joined.expect("peer task");
+            assert!(
+                matches!(
+                    reaped,
+                    EndpointReapResult::Reaped
+                        | EndpointReapResult::AlreadyAbsent
+                        | EndpointReapResult::NotApplicable
+                ),
+                "peer endpoint cleanup failed: {reaped:?}"
+            );
         }
     }
 }

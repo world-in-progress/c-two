@@ -267,3 +267,15 @@ Rust 基线 IPC lib 203 + integration 7 + server 168 passed；仅合并测试时
 候选 c2-config lib 135 passed，relay upstream 实际配置传播及重连 4 passed；重建 Python native 后，`test_ipc_config.py` 与 `test_runtime_session.py` 共 107 passed，合计 246 项通过、无跳过。临时 native 新旧对照包含 server/client 各六组输入：默认值、全部 16 个字段、false/zero/None、有效 override 遇到非法数值或布尔环境值，以及派生溢出；12 组结果及异常类型、完整文案一致。对照脚本未进仓库，验证范围为本地 macOS。
 
 独立审查 run `5bc00a2b-1c0a-4a9f-a6c5-440c2810773e`、固定输入 `b9b455b9f0f39311cb5c1685dd5a5fa2fe799be3` 无 actionable findings。Host 复核源码 SHA-256 与审查输入一致，核对实际回归后验收并回收审查工作树。日志、16 字段清单、差量审计及新旧对照位于 `/tmp/c2-slim-b15-20261013/`。
+
+### B16：测试端点收尾与存量精确回收
+
+执行基线为 `2f518d3ff86cc9ecad270d2d373f185c2238965a`。用户批准修复测试收尾，要求复用现有 close/reap、验收本次端点零残留，本轮不用 buddy。原生 Drop 在 gate 争用时有意释放句柄并保留记录；缺口是部分测试将 Drop 或 runtime 退出当成完整收尾。隔离诊断中，串行 Drop 32 对连接无残留，8 路并行 Drop 256 对留下 50 组 socket/lease；同样并行显式 close 为零，50 组均可用原生凭据精确回收。
+
+`LocalStream::pair` 在连接尝试结束后通过 spawn_blocking 完成既有 close；普通 listener/codec/peer 夹具检查关闭结果，独立 race server 在 runtime 退出前等待 shutdown。deadline Peer 的取消会移交 listener，故在 readiness 保存 credential，在停止并 join 后对该实例有界 reap。真正测试 Drop、进程异常退出和 stale credential 的场景保留。Python namespace 夹具检查完整终态中的 runtime_barrier_error，精确回收并观察 absent；退出没有消费者且构造接口过期的 hello_server 及其专属准备链，共删除 51 行。生产编译的 pair 辅助函数净增 8 行，测试净增 48 行，非文档合计净增 56 行；本批为收尾缺陷修复，未引入测试框架或改变 Core 生命周期策略。
+
+定向 Rust 回归为 IPC 203 + deadline integration 7、local lib 94 + integration 9 + 12、server 166，合计 491 passed；原有需 root 启动第二 UID 的 1 项测试 ignored。最终 Python endpoint maintenance/server/direct control/heartbeat 共 89 passed。三次运行均比对默认端点目录前后条目及 inode，新增 socket/lease 为零。首轮原生子代理审查指出 inspect 的 WouldBlock 重试遗漏及测试 README 的旧夹具引用，已修正；私有目录中以真实 flock 在 shutdown 前后制造争用，原单次 inspect 断言失败，修复后分别观察 present/absent 且无残留。临时探针未进入仓库。
+
+261 个历史端点已逐项匹配 24 组 Rust 测试源码前缀、原租约地址及 device/inode/incarnation，再与 native inspect 凭据核对；原生 reap 返回 261 个 reaped，原 522 个 socket/lease 路径全部消失。没有使用 unlink 或目录清扫。另有 12 个无 owner 记录的旧空 lease 未纳入该清单，保留原状。最终默认根 socket 数为零，本次测试新增端点条目为零，不将命名空间 gate/marker 或未知历史条目计为已清理。
+
+独立审查由原生子代理完成；第二轮对首审后改动复核无 actionable findings，其他已审源码哈希一致，固定候选补丁 SHA-256 为 `be2498625c2313de3ce2317358ff912f966ce677b29f2df43b36aa6b484a5223`。Host 核对回归、精确清理清单与源文件哈希，验证范围为本地 macOS。清理归属、native 凭据/结果、三份零残留 receipt、实际测试日志和争用红绿探针均在 `/tmp/c2-test-endpoint-cleanup-20261013/`。

@@ -63,13 +63,41 @@ def native_namespace():
         use_process_relay_anchor=False,
     )
     bridge = session.ensure_server_bridge()
+    address = session.server_address
+    context = session.local_endpoint_context()
+    assert address is not None
+
+    def inspect():
+        deadline = time.monotonic() + 1.0
+        while True:
+            observed = cc.inspect_endpoint(address, context=context)
+            if observed['io_kind'] != 'WouldBlock' or time.monotonic() >= deadline:
+                return observed
+            time.sleep(0.01)
+
     try:
         bridge.start()
     finally:
-        outcome = session.shutdown(timeout_seconds=5.0)
-        assert outcome['completed'], outcome
-    # The native listener removes only its owned socket; its legacy rendezvous
-    # lock follows native retention policy. No scoped sweep selects that slot.
+        try:
+            observed = inspect()
+        finally:
+            outcome = session.shutdown(timeout_seconds=5.0)
+        assert outcome['completed'] and outcome['runtime_barrier_error'] is None, outcome
+        if IS_WINDOWS:
+            assert (observed['status'], observed['reason']) == (
+                'not-applicable', 'kernel-managed',
+            ), observed
+        else:
+            assert observed['status'] in {'present', 'absent'}, observed
+            if observed['status'] == 'present':
+                deadline = time.monotonic() + 1.0
+                while True:
+                    reaped = cc.reap_endpoint(address, observed['credential'], context=context)
+                    if reaped['status'] != 'busy' or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.05)
+                assert reaped['status'] in {'reaped', 'already-absent'}, reaped
+            assert inspect()['status'] == 'absent'
     yield
 
 

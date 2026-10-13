@@ -2444,6 +2444,7 @@ mod tests {
                 })
                 .await
                 .expect("retry handshake fixture must finish");
+                crate::tests::close_listener(listener).await;
             });
         });
         ready_rx
@@ -2877,8 +2878,13 @@ mod tests {
                     }
                     watchers.abort_all();
                     while watchers.join_next().await.is_some() {}
+                    crate::tests::close_listener(listener).await;
                 });
             });
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("local listener readiness")
+                .expect("real local listener bind");
             let peer = Self {
                 address,
                 observations,
@@ -2886,10 +2892,6 @@ mod tests {
                 stop: Some(stop),
                 runner: Some(runner),
             };
-            ready_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("local listener readiness")
-                .expect("real local listener bind");
             peer
         }
 
@@ -3122,6 +3124,7 @@ mod tests {
                 for watcher in watchers {
                     watcher.await.unwrap();
                 }
+                crate::tests::close_listener(listener).await;
             });
         });
         listener_ready_rx
@@ -3293,6 +3296,7 @@ mod tests {
 
                 let _ = release_rx.recv();
                 drop(stream);
+                crate::tests::close_listener(listener).await;
             });
         });
         listener_ready_rx
@@ -3378,6 +3382,8 @@ mod tests {
                     Err(_) => false,
                 };
                 let _ = closed_tx.send(closed);
+                drop(stream);
+                crate::tests::close_listener(listener).await;
             });
         });
         listener_ready_rx
@@ -3633,6 +3639,7 @@ mod tests {
                 stream.write_all(&[0_u8, 0]).await.unwrap();
                 let _ = release_rx.recv();
                 drop(stream);
+                crate::tests::close_listener(listener).await;
             });
         });
         listener_ready_rx

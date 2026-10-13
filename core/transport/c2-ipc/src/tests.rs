@@ -1,5 +1,20 @@
 //! c2-ipc unit tests.
 
+pub(crate) async fn close_listener(listener: c2_local::LocalListener) {
+    let outcome = tokio::task::spawn_blocking(move || listener.close())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            c2_local::EndpointReapResult::Reaped
+                | c2_local::EndpointReapResult::AlreadyAbsent
+                | c2_local::EndpointReapResult::NotApplicable
+        ),
+        "listener cleanup failed: {outcome:?}"
+    );
+}
+
 #[cfg(test)]
 mod client_tests {
     use c2_wire::buddy::{BUDDY_PAYLOAD_SIZE, decode_buddy_payload};
@@ -3846,6 +3861,7 @@ mod lazy_policy_roundtrip_tests {
         let (stream_tx, stream_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept client");
+            crate::tests::close_listener(listener).await;
             let mut len_buf = [0u8; 4];
             use tokio::io::AsyncReadExt as _;
             stream
@@ -4848,6 +4864,7 @@ mod lazy_policy_roundtrip_tests {
                 .await
                 .unwrap();
             drop(old_peer);
+            crate::tests::close_listener(listener).await;
         });
 
         let mut cfg = client_config(small_base(64 * 1024, 1), 1024);
