@@ -989,6 +989,36 @@ impl Drop for Lease {
     }
 }
 
+/// Rolls back only the lease created by this bind, while its gate and file
+/// descriptor are still held. Existing slots never acquire this authority.
+struct BindLeaseGuard<'a> {
+    namespace: &'a ManagedNamespace,
+    names: &'a EndpointNames,
+    lease: &'a File,
+    created: bool,
+    socket_bound: bool,
+}
+
+impl Drop for BindLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if !self.created
+            || !self.namespace.gate_still_named()
+            || verify_lease_entry(&self.namespace.directory, &self.names.lock, self.lease).is_err()
+            || try_lock_lease(self.lease).is_err()
+        {
+            return;
+        }
+        // After bind, the socket guard runs first. Preserve the lease if that
+        // socket could not be withdrawn, including an unverified replacement.
+        if self.socket_bound
+            && !matches!(self.namespace.directory.stat(&self.names.socket), Ok(None))
+        {
+            return;
+        }
+        let _ = self.namespace.directory.unlink(&self.names.lock);
+    }
+}
+
 /// A bound managed listener: the socket, its lease handle, and the record
 /// written at bind time.
 pub(crate) struct ManagedListener {
@@ -1140,33 +1170,68 @@ pub(crate) fn bind_managed_at(
     let namespace = open_root_bounded(root, true).map_err(namespace_bind_error)?;
     let gate_pin = namespace.gate.try_clone()?;
     let names = managed_names(endpoint)?;
-    let lease = namespace
-        .directory
-        .open_file(&names.lock, libc::O_RDWR | libc::O_CREAT, 0o600)?
-        .expect("O_CREAT openat must return a lease file");
-    if let Err(reason) = verify_lease_entry(&namespace.directory, &names.lock, &lease) {
+    let (file, created) = match namespace.directory.open_file(
+        &names.lock,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    ) {
+        Ok(Some(file)) => (file, true),
+        Ok(None) => unreachable!("O_CREAT openat must return a lease file"),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+            open_lease(&namespace.directory, &names.lock)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "managed lease disappeared while opening",
+                )
+            })?,
+            false,
+        ),
+        Err(error) => return Err(error),
+    };
+    // Declared before both rollback guards: unlock only after they finish.
+    let lease = Lease(Some(file));
+    let mut lease_guard = BindLeaseGuard {
+        namespace: &namespace,
+        names: &names,
+        lease: lease.file(),
+        created,
+        socket_bound: false,
+    };
+    if let Err(reason) = verify_lease_entry(&namespace.directory, &names.lock, lease.file()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("managed lease is unverifiable: {reason:?}"),
         ));
     }
-    if let Err(result) = try_lock_lease(&lease) {
+    if let Err(result) = try_lock_lease(lease.file()) {
         return Err(match result {
             EndpointReapResult::Busy => endpoint_in_use(),
             EndpointReapResult::IoError(error) => error,
             _ => endpoint_in_use(),
         });
     }
-    // Arm immediately after flock: every subsequent failure must explicitly
-    // unlock the OFD, even when a dup/fork keeps another descriptor alive.
-    // The socket rollback guard is created later and drops before this lease.
-    let lease = Lease(Some(lease));
     #[cfg(test)]
     if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::LeaseAfterLock) {
         crate::unix_common::fault::retain_duplicate(lease.file());
         return Err(io::Error::other(
             "injected failure immediately after lease lock",
         ));
+    }
+    #[cfg(test)]
+    for (failure, name) in [
+        (
+            crate::unix_common::fault::Failure::LeaseAfterReplacement,
+            names.lock.clone(),
+        ),
+        (
+            crate::unix_common::fault::Failure::LeaseAfterGateReplacement,
+            gate_name(),
+        ),
+    ] {
+        if crate::unix_common::fault::take_if(failure) {
+            namespace.directory.replace_entry_with_file_for_test(&name)?;
+            return Err(io::Error::other("injected replacement after lease lock"));
+        }
     }
     remove_stale_managed_socket(&namespace, endpoint, &names, lease.file())?;
     // The socket must be created in the directory this call verified. Re-check
@@ -1180,6 +1245,7 @@ pub(crate) fn bind_managed_at(
         ));
     }
     let socket = bind_in_verified_directory(&namespace, &names)?;
+    lease_guard.socket_bound = true;
     // Everything after a successful bind either completes initialization or
     // withdraws the exact object this call created. The guard never trusts the
     // record it may have failed to write.
@@ -1230,11 +1296,13 @@ pub(crate) fn bind_managed_at(
         }
         Err(error) => return Err(error),
     }
-    guard.disarm();
-    drop(guard);
     #[cfg(test)]
     let gate_identity =
         SocketIdentity::from_stat(&fstat(namespace.gate.as_raw_fd()).map_err(|error| error)?);
+    guard.disarm();
+    drop(guard);
+    lease_guard.created = false;
+    drop(lease_guard);
     Ok(ManagedListener {
         inner: Some(inner),
         endpoint: endpoint.clone(),

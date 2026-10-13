@@ -1104,8 +1104,7 @@ async fn managed_public_sweep_targets_the_selected_namespace_only() {
     assert!(matches!(live_listener.close(), EndpointReapResult::Reaped));
 }
 
-/// Bind rollback: a failed managed initialization withdraws only the socket it
-/// created and leaves the address reusable.
+/// Bind rollback withdraws both entries created by a failed initialization.
 #[tokio::test]
 async fn managed_failed_initialization_withdraws_its_socket_and_rebinds() {
     use crate::unix_common::fault;
@@ -1121,6 +1120,7 @@ async fn managed_failed_initialization_withdraws_its_socket_and_rebinds() {
         !socket_path_at(root, &endpoint).exists(),
         "failed initialization must withdraw the socket it bound"
     );
+    assert!(!lease_path_at(root, &endpoint).exists());
 
     let listener = bind_managed_at(&endpoint, root).expect("the fixed address must be reusable");
     assert!(matches!(listener.close(), EndpointReapResult::Reaped));
@@ -1754,80 +1754,51 @@ async fn managed_bind_is_bounded_when_the_gate_is_held() {
     assert!(matches!(listener.close(), EndpointReapResult::Reaped));
 }
 
-/// Managed record failures are conservative: a failed or partial write rolls
-/// back only this call's socket, and a foreign replacement is never deleted.
+/// Failed record writes withdraw this call's socket and new lease. A foreign
+/// socket replacement is retained along with the lease that records the failed
+/// bind, because the bound socket could not be safely withdrawn.
 #[tokio::test]
 async fn managed_record_failures_roll_back_conservatively() {
-    use crate::unix_common::fault;
+    use crate::unix_common::fault::{self, Failure};
 
-    // 1. The owner record write fails outright: the bound socket is withdrawn
-    //    and the address is reusable.
-    {
+    for failure in [
+        Failure::ManagedRecordWrite,
+        Failure::ManagedRecordPartialWrite,
+    ] {
         let namespace = TestNamespace::new();
         let root = namespace.path();
-        let endpoint = managed_endpoint_at(&root, "record-write");
-        fault::inject(fault::Failure::ManagedRecordWrite);
+        let endpoint = managed_endpoint_at(&root, "record-failure");
+        fault::inject(failure);
         let error = bind_managed_at(&endpoint, root)
             .err()
             .expect("injected record write failure must fail bind");
-        assert_eq!(error.kind(), io::ErrorKind::WriteZero, "{error}");
+        assert!(
+            !fault::take_if(failure),
+            "injected failure was not reached: {error}"
+        );
+        if failure == Failure::ManagedRecordWrite {
+            assert_eq!(error.kind(), io::ErrorKind::WriteZero, "{error}");
+        }
         assert!(
             !socket_path_at(root, &endpoint).exists(),
-            "a failed record write must withdraw this call's socket"
-        );
-        // The lease entry itself is created under the gate before the record
-        // write. With no readable record it cannot prove ownership, so it stays
-        // Unverified rather than being deleted -- but it is never a live
-        // endpoint either, so a fresh bind simply reuses the same slot.
-        let lease = lease_path_at(root, &endpoint);
-        assert!(
-            lease.exists(),
-            "the lease entry is created before the record write and is retained"
+            "{failure:?}: this bind's socket must be withdrawn"
         );
         assert!(
-            matches!(
-                reap_slot(
-                    &context_for_namespace(root),
-                    &endpoint_stem(&endpoint).unwrap()
-                ),
-                EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidRecord)
-                    | EndpointReapResult::Reaped
-                    | EndpointReapResult::AlreadyAbsent
-            ),
-            "a socket-less slot without a readable record stays unverified"
+            !lease_path_at(root, &endpoint).exists(),
+            "{failure:?}: this bind's new lease must be withdrawn"
         );
         assert!(
             matches!(
                 inspect_managed_at(&endpoint, root),
                 EndpointInspection::Absent
             ),
-            "a withdrawn socket must not be reported present"
+            "{failure:?}: a withdrawn socket must not be reported present"
         );
-    }
-
-    // 2. A partial record write cannot read back, so the slot is Unverified and
-    //    the incomplete record is never mistaken for ownership.
-    {
-        let namespace = TestNamespace::new();
-        let root = namespace.path();
-        let endpoint = managed_endpoint_at(&root, "record-partial");
-        fault::inject(fault::Failure::ManagedRecordPartialWrite);
-        assert!(
-            bind_managed_at(&endpoint, root).is_err(),
-            "a partial record must not be accepted"
-        );
-        assert!(matches!(
-            inspect_managed_at(&endpoint, root),
-            EndpointInspection::Unverified(EndpointUnverifiedReason::InvalidRecord)
-                | EndpointInspection::Absent
-        ));
-        assert!(!socket_path_at(root, &endpoint).exists());
-        // The address is still usable once the fault is gone.
         let listener = bind_managed_at(&endpoint, root).unwrap();
         assert!(matches!(listener.close(), EndpointReapResult::Reaped));
     }
 
-    // 3. A foreign replacement between bind and record write is never removed.
+    // A foreign replacement between bind and record write is never removed.
     {
         let namespace = TestNamespace::new();
         let root = namespace.path();
@@ -1843,10 +1814,47 @@ async fn managed_record_failures_roll_back_conservatively() {
             "the foreign replacement must be left in place"
         );
         assert_eq!(std::fs::read(&replacement).unwrap(), b"replacement-marker");
+        assert!(lease_path_at(root, &endpoint).exists());
         assert!(matches!(
             inspect_managed_at(&endpoint, root),
             EndpointInspection::Unverified(_)
         ));
+    }
+}
+
+#[test]
+fn failed_bind_keeps_replaced_lease_or_gate() {
+    use crate::unix_common::fault::{self, Failure};
+
+    for failure in [
+        Failure::LeaseAfterReplacement,
+        Failure::LeaseAfterGateReplacement,
+    ] {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        let endpoint = managed_endpoint_at(root, "replaced-lease-or-gate");
+        fault::inject(failure);
+        let error = bind_managed_at(&endpoint, root)
+            .err()
+            .expect("replacement fault must fail bind");
+        assert!(
+            !fault::take_if(failure),
+            "injected failure was not reached: {error}"
+        );
+        assert!(!socket_path_at(root, &endpoint).exists());
+        let lease_path = lease_path_at(root, &endpoint);
+        if failure == Failure::LeaseAfterReplacement {
+            assert_eq!(std::fs::read(&lease_path).unwrap(), b"replacement-marker");
+        } else {
+            assert_eq!(
+                std::fs::read(root.join(GATE_NAME)).unwrap(),
+                b"replacement-marker"
+            );
+            assert!(
+                lease_path.exists(),
+                "replaced gate must retain the new lease"
+            );
+        }
     }
 }
 
@@ -2442,9 +2450,10 @@ async fn native_unknown_socket_and_unsafe_permissions_are_preserved() {
         io::ErrorKind::AddrInUse
     );
     assert_eq!(identity_of(&path), identity);
+    assert!(!lease.exists(), "refused bind must withdraw its new lease");
     assert!(matches!(
         inspect_managed_at(&endpoint, root),
-        EndpointInspection::Unverified(EndpointUnverifiedReason::InvalidRecord)
+        EndpointInspection::Unverified(EndpointUnverifiedReason::MissingOwnership)
     ));
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o770)).unwrap();
     assert!(bind_managed_at(&endpoint, root).is_err());
@@ -2544,10 +2553,18 @@ async fn socket_permission_and_listen_failures_withdraw_only_the_bound_identity(
             Failure::SocketPermissionsAfterReplacement | Failure::ListenAfterReplacement
         ) {
             assert_eq!(std::fs::read(path).unwrap(), b"replacement-marker");
+            assert!(
+                lease_path_at(root, &endpoint).exists(),
+                "{failure:?}: keep the lease when the bound socket cannot be withdrawn"
+            );
         } else {
             assert!(
                 !path.exists(),
                 "{failure:?}: this bind's socket must be withdrawn"
+            );
+            assert!(
+                !lease_path_at(root, &endpoint).exists(),
+                "{failure:?}: this bind's new lease must be withdrawn"
             );
             let listener = bind_managed_at(&endpoint, root)
                 .expect("failed bind must leave a reusable address");
@@ -2902,33 +2919,67 @@ async fn before_listen_checkpoint_rejects_an_already_listening_socket() {
     assert!(!socket_path(&endpoint).exists());
 }
 
-/// Exercises the bind failure exit before socket creation, with the exact
-/// lease OFD still alive through a real dup. No socket permission is needed.
+/// A failed bind removes a new lease. An inherited duplicate of an existing
+/// lease cannot extend its flock after the failed binder exits.
 #[test]
 fn failed_bind_after_lock_releases_lease_with_live_duplicate() {
     use crate::unix_common::fault::{self, Failure};
-    let namespace = TestNamespace::new();
-    let endpoint = managed_endpoint_at(namespace.path(), "failed-lock-dup");
-    fault::inject(Failure::LeaseAfterLock);
-    let error = bind_managed_at(&endpoint, namespace.path()).err().unwrap();
-    assert!(error.to_string().contains("immediately after lease lock"));
-    let duplicate = fault::take_duplicate();
-    assert!(!socket_path(&endpoint).exists());
-    let contender = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(lease_path_at(namespace.path(), &endpoint))
-        .unwrap();
-    let outcome = try_lock_lease(&contender);
-    assert!(
-        outcome.is_ok(),
-        "failed bind retained its flock through a live dup: {outcome:?}"
-    );
-    assert_eq!(
-        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_UN) },
-        0
-    );
-    drop(duplicate);
+    for original in [None, Some(&b""[..]), Some(&b"broken"[..])] {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        let endpoint = managed_endpoint_at(root, "failed-lock-dup");
+        let lease_path = lease_path_at(root, &endpoint);
+        let old_identity = original.map(|bytes| {
+            // Initialize the namespace, then place an old, incomplete lease.
+            drop(open_root_bounded(root, true).unwrap());
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&lease_path)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+            identity_of(&lease_path)
+        });
+        fault::inject(Failure::LeaseAfterLock);
+        let error = bind_managed_at(&endpoint, root).err().unwrap();
+        assert!(error.to_string().contains("immediately after lease lock"));
+        let duplicate = fault::take_duplicate();
+        assert!(!socket_path(&endpoint).exists());
+        if let Some(bytes) = original {
+            assert_eq!(Some(identity_of(&lease_path)), old_identity);
+            assert_eq!(std::fs::read(&lease_path).unwrap(), bytes);
+            assert!(matches!(
+                reap_slot(
+                    &context_for_namespace(root),
+                    &endpoint_stem(&endpoint).unwrap()
+                ),
+                EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidRecord)
+            ));
+            assert_eq!(Some(identity_of(&lease_path)), old_identity);
+            let contender = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lease_path)
+                .unwrap();
+            let outcome = try_lock_lease(&contender);
+            assert!(
+                outcome.is_ok(),
+                "failed bind retained its flock through a live dup: {outcome:?}"
+            );
+            assert_eq!(
+                unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_UN) },
+                0
+            );
+        } else {
+            assert!(
+                !lease_path.exists(),
+                "new lease must leave with failed bind"
+            );
+        }
+        drop(duplicate);
+    }
 }
 
 #[tokio::test]

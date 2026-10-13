@@ -21,6 +21,8 @@ pub(crate) mod fault {
         SocketPermissions,
         SocketPermissionsWithDuplicate,
         LeaseAfterLock,
+        LeaseAfterReplacement,
+        LeaseAfterGateReplacement,
         /// Permission failure after replacement must preserve the foreign entry.
         SocketPermissionsAfterReplacement,
         /// Read-back reports a mode other than 0600.

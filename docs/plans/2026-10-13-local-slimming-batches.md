@@ -279,3 +279,17 @@ Rust 基线 IPC lib 203 + integration 7 + server 168 passed；仅合并测试时
 261 个历史端点已逐项匹配 24 组 Rust 测试源码前缀、原租约地址及 device/inode/incarnation，再与 native inspect 凭据核对；原生 reap 返回 261 个 reaped，原 522 个 socket/lease 路径全部消失。没有使用 unlink 或目录清扫。另有 12 个无 owner 记录的旧空 lease 未纳入该清单，保留原状。最终默认根 socket 数为零，本次测试新增端点条目为零，不将命名空间 gate/marker 或未知历史条目计为已清理。
 
 独立审查由原生子代理完成；第二轮对首审后改动复核无 actionable findings，其他已审源码哈希一致，固定候选补丁 SHA-256 为 `be2498625c2313de3ce2317358ff912f966ce677b29f2df43b36aa6b484a5223`。Host 核对回归、精确清理清单与源文件哈希，验证范围为本地 macOS。清理归属、native 凭据/结果、三份零残留 receipt、实际测试日志和争用红绿探针均在 `/tmp/c2-test-endpoint-cleanup-20261013/`。
+
+### B17：初始化失败的新建 lease 回滚
+
+执行基线为 `6788f5e19db9e6e367b8d41b074603a79e8106ae`。前轮确认初始化在 owner record 写入前失败会留下空 lease；12 个历史文件中仅 2 个能逐项关联到旧测试的 EPERM bind 失败，其余 10 个未确认具体来源。用户批准修复当前初始化回滚，要求只撤回本次新建且身份未变的 lease，保留历史对象回收规则，本轮继续不用 buddy。
+
+bind 通过 `O_CREAT | O_EXCL` 区分新建与既有 lease；回滚在原 gate 和文件句柄仍持有时核对目录、gate、lease 身份及原生锁。已成功绑定 socket 时，先由既有 socket guard 撤回，确认路径消失后才撤 lease；未知 socket、替换项及失去原身份的对象继续保留。既有 lease 不获得新文件回滚权限，`reap`/`sweep`、Core 生命周期、公开 API/ABI 均未修改，显式 OFD 解锁保留。中英文生命周期指南说明当前回滚边界；历史验收报告补注新旧行为，未改写旧验证结果。
+
+失败测试更新写入/部分写入、权限/listen、未知 socket 和 live duplicate 场景中的 socket/lease 断言；写入失败的重复夹具合并，既有空/损坏 lease 的身份、内容、维护拒绝与解锁断言并入原 live-duplicate 用例。新增 lease/gate 替换故障覆盖。生产净增 52 行，测试净增 69 行（其中 18 行为运行时文件内的 cfg(test) hook），非文档合计净增 121 行；这是初始化收尾缺陷修复，不计作瘦身收益。
+
+先在旧生产实现上运行更新后的 record-failure 用例，确认因新 lease 残留退出 101；候选相同用例通过。最终 local 为 95 + 9 + 12、IPC 为 203 + 7、server 为 166，合计 492 passed，另有原来需要 root 启动第二 UID 的 1 项 ignored。重建 Python native 后，endpoint maintenance/context、RuntimeSession lifecycle、direct IPC control 和 server 六个文件共 171 passed、5 项 Windows 专属 skipped。本地 macOS 合计 663 项通过；不据此声明 Linux/Windows 实跑。
+
+真实原生探针在私有目录使用超出 owner-record 上限的逻辑地址，bind 按原错误拒绝，返回时 socket 与 lease 均已不存在，随后原生定向 sweep 检查到 0 个端点；gate/marker 保留。Rust、Python 回归后分别比较默认目录条目与 inode，均无新增、消失或身份变化，socket 为零；历史 12 个空 lease 的 device/inode、权限、大小、mtime/ctime 和内容逐项保持不变，未执行历史清理。
+
+原生子代理独立审查固定三源码文件的补丁，SHA-256 为 `86e60ab0d21b3281b0d4b93d39ac5fbc18f10a2db8963b826edc46e06d85298c`，无 actionable findings；Host 复核源码哈希与审查输入一致。目录项核验与 unlink 仍沿用既有合作式 gate 模型，不新增对不遵守 gate 的同 UID 进程的原子路径替换保证。`git diff --check` 通过。红绿日志、完整回归、真实探针、零残留 receipt、差量审计及独立审查收据位于 `/tmp/c2-new-lease-rollback-20261013/`。
