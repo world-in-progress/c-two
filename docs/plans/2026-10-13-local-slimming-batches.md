@@ -155,3 +155,13 @@ B8a 实现提交为 `e9d0650c882fa95dd87d0b21a8ed037683321bed`。生产 session.
 验证：Core lib 104、client_modes 15、connect_timeout 5、endpoint_context 12、native_endpoint 4，共 140 passed；endpoint_context 两个 ignored 是由父测试以 --ignored 启动的隔离子进程入口。命令为 `cargo test --manifest-path core/Cargo.toml -p c2-core --lib --test native_endpoint --test client_modes --test endpoint_context --test connect_timeout --locked --offline`，带既有 target 和空 C2 环境。source mode 重建 Python native 后，`uv run --no-sync pytest sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/unit/test_ipc_config.py -q --timeout=30`：107 passed。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8b-baseline.log`、`b8b-core.log`、`b8b-native-build.log`、`b8b-python.log`。
 
 独立审查 run `2a590608-7558-458b-a75f-6f2293d5df11`、固定快照 `e46b3ab5dbf8184051b2781f545ae3221b7c007a`，无 actionable findings；Host 核对字节后验收回收。审查保留 endpoint 冻结与 client config 冻结的区别，以及 Python client_ipc_config 原有重新解析投影，未顺带做语义修改。
+
+### B8c：sweep 的配对 owner
+
+B8b 实现提交为 `2949cd719621ae9bb59a74cbb19eff31e5d0c44e`。生产 endpoint_ffi.rs 新增 22 行、删除 23 行，OpenSweep 将 iterator 与 projection lease 配对，PyEndpointSweep 只持一个 Option；成员声明顺序保证 iterator 先析构，lease 后释放。closed/ensure_open/repr 从 Option 派生，next_batch 先接纳开放 owner 再验证预算；EOF/round_interrupted 仍不自动关闭外层。context、budget、batches 留在外层，公开投影与 PyO3 借用形态保持。
+
+强化旧 owner 重复 close/Drop 不释放新 owner lease，并新增 EOF 后仍占 lease、close 后属性可读和 closed 错误优先回归。第一次旧实现验证失败于“空 scope 一批必达 EOF”的夹具假设；默认目录仍被分批遍历。第二次不必要的 server 夹具启动返回 ENOENT。最终夹具直接使用已有、自有空 tmp_path 的 native context（Windows 用默认原生 context）与空 scope，无需启动 server 或选择历史端点；旧实现两用例均通过。新 owner 先到 EOF，避免 Core lease 遮蔽 projection lease 的错误释放。最终测试文件新增 43 行、删除 4 行。
+
+验证：既有 source mode/CPLUS_INCLUDE_PATH/target 下重新构建 Python native 成功；`C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/unit/test_endpoint_maintenance.py sdk/python/tests/unit/test_endpoint_context.py -q --timeout=30`：111 passed、5 skipped（Windows named-pipe 平台合同用例）。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8c-baseline.log`、`b8c-baseline-r2.log`、`b8c-baseline-r3.log`、`b8c-native-build.log`、`b8c-python.log`；前两次失败不计为通过。本地未执行 Windows 或 free-threading 并发验证。
+
+独立审查 run `4625622f-263e-4d35-ac0b-f1c90b264649`、固定快照 `8bda12ac2b50f490aca9be3a5be3ddb4688ef8a8`，无 actionable findings；Host 核对所有候选字节一致后验收回收。审查为源码证据，与 Host 运行结果分别记录。

@@ -13,6 +13,7 @@ executable coverage instead of disappearing from the suite.
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -70,6 +71,14 @@ def native_namespace():
     # The native listener removes only its owned socket; its legacy rendezvous
     # lock follows native retention policy. No scoped sweep selects that slot.
     yield
+
+
+@pytest.fixture
+def empty_sweep_context(tmp_path):
+    """Keep EOF tests independent of entries in the process-default root."""
+    if IS_WINDOWS:
+        return cc.local_endpoint_context()
+    return cc.local_endpoint_context(root=str(tmp_path))
 
 
 def _native_document(address: str = 'ipc://unit-native-endpoint') -> str:
@@ -381,11 +390,41 @@ class TestSweepLease:
         second = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
         second.close()
 
-    def test_close_is_idempotent(self) -> None:
-        sweep = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
-        sweep.close()
-        sweep.close()
+    def test_close_is_idempotent(self, empty_sweep_context) -> None:
+        first = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        first.close()
+        second = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        try:
+            # End the native round so its own lease cannot hide an incorrect
+            # release of the projection lease by the old owner.
+            assert second.next_batch(max_entries=MAX_SWEEP_ENTRIES, max_ms=MAX_SWEEP_MS)['round_complete'] is True
+            first.close()
+            assert first.closed is True
+            del first
+            gc.collect()
+            with pytest.raises(RuntimeError, match='already active'):
+                cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        finally:
+            second.close()
+
+    def test_completed_round_keeps_lease_until_explicit_close(self, empty_sweep_context) -> None:
+        sweep = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        protocol = sweep.protocol
+        namespace = sweep.context.namespace_id
+        try:
+            assert sweep.next_batch(max_entries=MAX_SWEEP_ENTRIES, max_ms=MAX_SWEEP_MS)['round_complete'] is True
+            assert sweep.closed is False
+            with pytest.raises(RuntimeError, match='already active'):
+                cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        finally:
+            sweep.close()
         assert sweep.closed is True
+        assert sweep.protocol == protocol
+        assert sweep.context.namespace_id == namespace
+        with pytest.raises(ValueError, match='sweep is closed'):
+            sweep._native.__enter__()  # noqa: SLF001
+        with pytest.raises(ValueError, match='sweep is closed'):
+            sweep.next_batch(max_entries=False)
 
     def test_context_manager_releases_the_lease(self) -> None:
         with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
