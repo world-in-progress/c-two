@@ -97,18 +97,6 @@ def _resolve_server_ipc_config(
     ))
 
 
-def _resolve_client_ipc_config(
-    ipc_overrides: ClientIPCOverrides | Mapping[str, object] | None = None,
-    settings: C2Settings | None = None,
-) -> dict[str, Any]:
-    """Resolve client IPC config through Rust from explicit overrides only."""
-    native = _native_resolver()
-    return dict(native.resolve_client_ipc_config(
-        ipc_overrides,
-        _shm_overrides(settings),
-    ))
-
-
 def _native_resolver() -> Any:
     from c_two import _native
 

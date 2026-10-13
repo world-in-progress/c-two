@@ -12,7 +12,7 @@
 | B2 | R28 Python：bridge 工厂依靠 ResourceBridge 构造校验；PayloadBinding 的 scoped-owner 能力依靠已验证 kind | resource conformance、input lifetime、payload binding 相关用例；非法 hook 错误和 borrowed 门禁不变 | 已完成 |
 | B3 | R29：生成 service_definition 复用已有 release.reference() | codegen 单元/生成消费者测试；生成代码仍能编译使用，合同字节及公共生成表面不变 | 已完成 |
 | B4 | R36 局部：bitmap 恒空循环、空 handle 紧邻重验、私有 retention 总和蕴含的局部加法检查、chunk 未读 _created_at | c2-mem bitmap/handle/retention 以及 chunk registry 测试；全域预算、错误计数、世代/跨度/锁、GC last_activity 不变 | 已完成 |
-| B5 | R33 内部孤儿：私有 _resolve_client_ipc_config、三个 local_registry 闲置 helper、只由自身测试调用的 process_guard | native config 投影、local registry/package consumer 相关测试；保留实际 manifest/receipt 校验与 _stop_host 清理 | 待实施 |
+| B5 | R33 内部孤儿：私有 _resolve_client_ipc_config、三个 local_registry 闲置 helper、只由自身测试调用的 process_guard | native config 投影、local registry/package consumer 相关测试；保留实际 manifest/receipt 校验与 _stop_host 清理 | 已完成 |
 | B6 | R37：退出生产发布流程的 check_version/check_cli_release 与专属测试，移除 CI 中对应测试选择 | 当前 release promotion 与 workflow 测试；自动 skip、手工冲突、partial retry、来源/字节验证不变 | 待实施 |
 
 每批记录精确提交、命令、结果、独立审查结论及必要限制。实际发现前提不成立时，把该子项从本批撤出并记录原因；不以增加兼容层或放宽测试完成批次。
@@ -56,3 +56,9 @@ B3 实现提交为 `dcb72f590c6cf6b9172011a8b5798af224975ff7`。本批 4 文件�
 验证：`cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire --lib --locked --offline`：177 + 146 passed；`cargo test --manifest-path core/Cargo.toml -p c2-server --lib --locked --offline`：168 passed，包含 SHM 无 inline materialization 回归。各命令设置本轮 CARGO_TARGET_DIR、空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS。4 文件 rustfmt 与 diff check 通过。重建 Python 原生扩展后，B2 同一组 4 文件测试再次 30 passed。日志分别为 `/tmp/c2-slim-implementation-20261013/b4-memory-wire.log`、`b4-server.log`、`b4-python-r2.log`。
 
 Python 原生扩展初次 system mode 重建成功，但默认加载因缺少 libfastdb 的 LC_RPATH 失败，未收集测试。使用该 SDK 原有的 Git 依赖 source mode、限定进程的 CPLUS_INCLUDE_PATH 重新执行 `uv sync --frozen --offline --reinstall-package c-two` 成功；随后默认加载及上述 Python 回归通过，没有新增加载器配置或修改依赖。Core codegen 的已验证官方 SDK system mode 与 Python 原有源码构建分别遵守其既有依赖边界。
+
+### B5：内部孤儿 helper
+
+B4 实现提交为 `b4c2a4ae7a084db00fc073e9e49500bba085ce2e`。本批 4 文件仅删除 123 行，包括 process_guard 的唯一专属测试及两个失去用途的 import；没有新增实现或测试。Host 与独立审查均检查引用、动态加载、导出及活动指导，未发现运行消费者。native config、真实 manifest/receipt 校验和两条实际进程清理路径保留。独立审查快照 `63f3918f05617642d7844de02321220b609961d2`，run `7497f52d-994a-4be0-a67f-8605ef4c2fa3`，无 actionable findings。审查只读沙箱拒绝 here-document 临时文件，因此补充 AST 比对由 Host 执行：扣除明确删除的定义、专属测试和 imports 后，保留 AST 完全相同，候选文件与审查快照字节一致；Host 已验收并回收审查工作树。
+
+验证：`C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest tests/repo/test_local_registry.py tests/repo/test_package_consumers.py tests/repo/test_local_candidate_manifest.py sdk/python/tests/unit/test_ipc_config.py sdk/python/tests/unit/test_runtime_session.py::test_native_runtime_session_projects_client_ipc_overrides_copy sdk/python/tests/unit/test_runtime_session.py::test_native_runtime_session_resolves_client_ipc_config -q --timeout=30`：113 passed，diff check 通过。日志 `/tmp/c2-slim-implementation-20261013/b5-regression.log`，结构比对 `/tmp/c2-slim-implementation-20261013/b5-structure-check.json`。实际 package_consumers.py 与 source_validation.py 字节未变；该结果不宣称 Windows 进程树终止已获动态证明，也不为仓外私有导入建立兼容承诺。

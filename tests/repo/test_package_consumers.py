@@ -3,7 +3,6 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
-import subprocess
 import sys
 
 import pytest
@@ -22,7 +21,6 @@ from tools.local_rc.package_consumers import (  # noqa: E402
     validate_receipt,
     write_receipt,
 )
-from tools.local_rc.process_guard import guarded_process  # noqa: E402
 
 
 def _digest(value: str) -> str:
@@ -251,19 +249,3 @@ def test_receipt_does_not_accept_reordered_or_missing_consumer(
     receipt["consumers"].pop("node")
     with pytest.raises(ConsumerError, match="missing field"):
         validate_receipt(receipt)
-
-
-def test_process_guard_stops_the_entire_child_process(tmp_path: Path) -> None:
-    with guarded_process(
-        [
-            sys.executable,
-            "-c",
-            "import time; time.sleep(60)",
-        ],
-        cwd=tmp_path,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ) as process:
-        assert process.poll() is None
-
-    assert process.poll() is not None
