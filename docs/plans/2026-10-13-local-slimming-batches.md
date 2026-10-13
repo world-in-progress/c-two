@@ -233,3 +233,13 @@ HTTP 与两个后台消费位置共用 `RouteAuthority::apply_digest_diff`，继
 两项 sender/CRM 拒绝测试合并为两个场景，均放入合法前缀验证整批拒绝；既有删除用例追加相同 digest 在 announce/heartbeat/leave 入口返回 OK 且不改状态的检查。active/deleted hash replay、旧协议、有效应用、URL 和 dead-peer 覆盖保留。测试净减少 10 行，四个非文档文件合计净减少 109 行。
 
 基线完整 relay lib 420 passed；测试先在旧实现上 peer_handlers 26 passed；候选 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 为 419 passed，一项数量差来自两拒绝用例合并。之后仅格式化所改函数，Host 在内存确认空白外内容一致；`git diff --check` 通过。独立审查 run `44f7b584-5124-4cf7-8f10-f77a2afa91f8`、固定输入 `1f280fb7d13234a7d553fcadca962346b29cabfb` 无 actionable findings，四文件与输入 SHA-256 一致并已验收。日志、差量和 manifest 位于 `/tmp/c2-slim-b12-20261013/r28-*`；验证范围为本地 macOS 的 relay feature。
+
+### B13：私有握手快照与墓碑副本收敛
+
+执行基线为 `5f152c62f3c86d84a38d914842740a8f764c3974`。本批处理 R34 的未读私有副本：删除 IpcClient.server_segments、RouteDirectory.catalog_revision；服务端 removed 墓碑仅保存实际查询的 route UID，contract/revision/reason 仍由 watch event 保留；TypeScript 握手不再构造和保存未读的 routes/methods 数组。全部握手字段读取、数值/文本校验、错误顺序与尾随字节检查保留，SHM metadata、capability、真实 revision、live lookup、watch/compaction 和旧 token 校验不变。
+
+catalog 的 list/stale lookup/contract mismatch 三套相同夹具合一，保留原输入条件和 identity/revision/hash golden，并以完整记录相等断言覆盖返回内容；Removed 事件显式验证 UID/revision/reason。生产净减少 39 行、测试净减少 11 行，三个非文档文件合计净减少 50 行，无新增常驻测试框架。
+
+Rust 基线 IPC lib 203 + integration 7 + server 168 passed；仅合并测试时 catalog 5 passed；候选 IPC 203 + 7、server 166 passed，减少两项为夹具合并。TypeScript 初次基线因缺少编译器依赖而失败，按锁文件 npm ci --ignore-scripts 后基线/候选 transport contract 均 7 passed，候选严格生成类型检查 1 passed。临时脚本使用两版完整 asset 的真实 decoder 对照 1361 个确定性输入，324 accepted、1037 rejected，保留的元数据或异常类型/完整文案一致；范围包含所有前缀截断、逐字节扰动、超范围 revision 和尾随字节，明确忽略退出的私有 routes 字段，脚本未进仓库。
+
+独立审查 run `578ec828-491e-42dc-ae7a-4efda9de4473`、固定输入 `0401fca2d2aefb4ab9f1852c15b6c5b1bc8ea7a2` 无 actionable findings；Host 已核对三文件 SHA-256、实际回归及私有边界并验收报告，`git diff --check` 通过。日志、对照脚本和 manifest 位于 `/tmp/c2-slim-b13-20261013/r34-*`。验证限本地 macOS；R34 的公开协议面和其他构造优化仍未处理。

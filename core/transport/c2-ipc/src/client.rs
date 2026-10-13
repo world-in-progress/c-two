@@ -1879,7 +1879,6 @@ impl RouteBinding {
 #[derive(Debug, Default)]
 pub(crate) struct RouteDirectory {
     routes: HashMap<String, MethodTable>,
-    catalog_revision: u64,
     dirty: bool,
 }
 
@@ -1894,7 +1893,6 @@ impl RouteDirectory {
             self.routes
                 .insert(route.name.clone(), MethodTable::from_route(route));
         }
-        self.catalog_revision = 0;
         self.dirty = false;
     }
 
@@ -1903,12 +1901,10 @@ impl RouteDirectory {
         for record in response.routes {
             self.apply_record(record);
         }
-        self.catalog_revision = response.catalog_revision;
         self.dirty = false;
     }
 
     fn apply_record(&mut self, record: RouteRecordWire) {
-        self.catalog_revision = self.catalog_revision.max(record.catalog_revision);
         match record.state {
             RouteStateWire::Ready => {
                 self.routes
@@ -2371,7 +2367,6 @@ pub struct IpcClient {
     pending: Arc<StdMutex<PendingMap>>,
     rid_counter: Arc<AtomicU32>,
     pub(crate) route_directory: Arc<RwLock<RouteDirectory>>,
-    server_segments: Vec<(String, u32)>,
     pub(crate) server_identity: Option<c2_wire::handshake::ServerIdentity>,
     /// Server SHM pool state for reading buddy reply responses.
     pub(crate) server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
@@ -2553,7 +2548,6 @@ impl IpcClient {
             pending: Arc::new(StdMutex::new(HashMap::new())),
             rid_counter: Arc::new(AtomicU32::new(1)),
             route_directory: Arc::new(RwLock::new(RouteDirectory::new())),
-            server_segments: Vec::new(),
             server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: Arc::new(StdMutex::new(None)),
@@ -3008,7 +3002,6 @@ impl IpcClient {
             .ok_or_else(|| IpcError::Protocol("server handshake missing server identity".into()))?;
 
         connect_directory_write(&self.route_directory)?.seed_from_handshake(&hs.routes);
-        self.server_segments = hs.segments.clone();
         self.server_identity = Some(server_identity);
 
         // Open server SHM segments into a ServerPoolState for buddy response reads.

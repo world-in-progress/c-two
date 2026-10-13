@@ -335,7 +335,6 @@ interface C2IpcHandshake {
   readonly shmSegments: readonly C2IpcShmSegment[];
   readonly capabilityFlags: number;
   readonly serverIdentity: C2ServerIdentity;
-  readonly routes: readonly C2IpcRouteInfo[];
 }
 
 interface C2IpcOpenConnection {
@@ -2381,11 +2380,10 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     throw new C2IpcTransportError("C-Two IPC handshake is missing server identity.");
   }
   const routeCount = readU16("route count");
-  const routes: C2IpcRouteInfo[] = [];
   for (let routeIndex = 0; routeIndex < routeCount; routeIndex += 1) {
     const name = readText(`route ${routeIndex} name`);
     const routeUid = readText(`route ${routeIndex} route_uid`);
-    const routeRevision = readU64(`route ${routeIndex} route_revision`);
+    readU64(`route ${routeIndex} route_revision`);
     const crmNs = readText(`route ${routeIndex} crm_ns`);
     const crmName = readText(`route ${routeIndex} crm_name`);
     const crmVer = readText(`route ${routeIndex} crm_ver`);
@@ -2407,25 +2405,11 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     if (maxPayloadSize <= 0) {
       throw new C2IpcTransportError(`C-Two IPC route ${routeIndex} max_payload_size must be positive.`);
     }
-    const methods: C2IpcMethodInfo[] = [];
     for (let methodIndex = 0; methodIndex < methodCount; methodIndex += 1) {
       const methodName = readText(`route ${routeIndex} method ${methodIndex} name`);
-      const index = readU16(`route ${routeIndex} method ${methodIndex} index`);
+      readU16(`route ${routeIndex} method ${methodIndex} index`);
       requireMethodPathValue(methodName);
-      methods.push({ name: methodName, index });
     }
-    routes.push({
-      name,
-      routeUid,
-      routeRevision,
-      crmNs,
-      crmName,
-      crmVer,
-      abiHash,
-      signatureHash,
-      maxPayloadSize,
-      methods,
-    });
   }
   if (offset !== payload.byteLength) {
     throw new C2IpcTransportError("C-Two IPC handshake contains trailing bytes.");
@@ -2435,7 +2419,6 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     shmSegments,
     capabilityFlags,
     serverIdentity: { serverId, serverInstanceId },
-    routes,
   };
 }
 
