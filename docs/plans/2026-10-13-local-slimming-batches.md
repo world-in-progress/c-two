@@ -293,3 +293,17 @@ bind 通过 `O_CREAT | O_EXCL` 区分新建与既有 lease；回滚在原 gate �
 真实原生探针在私有目录使用超出 owner-record 上限的逻辑地址，bind 按原错误拒绝，返回时 socket 与 lease 均已不存在，随后原生定向 sweep 检查到 0 个端点；gate/marker 保留。Rust、Python 回归后分别比较默认目录条目与 inode，均无新增、消失或身份变化，socket 为零；历史 12 个空 lease 的 device/inode、权限、大小、mtime/ctime 和内容逐项保持不变，未执行历史清理。
 
 原生子代理独立审查固定三源码文件的补丁，SHA-256 为 `86e60ab0d21b3281b0d4b93d39ac5fbc18f10a2db8963b826edc46e06d85298c`，无 actionable findings；Host 复核源码哈希与审查输入一致。目录项核验与 unlink 仍沿用既有合作式 gate 模型，不新增对不遵守 gate 的同 UID 进程的原子路径替换保证。`git diff --check` 通过。红绿日志、完整回归、真实探针、零残留 receipt、差量审计及独立审查收据位于 `/tmp/c2-new-lease-rollback-20261013/`。
+
+### B18：R14 私有 SHM 分配流程收敛
+
+执行基线为 `e0dda8fa2e8833afb400064c775be57061e37840`。用户确认本批只统一内存池分配流程，保留 GC 时机、错误顺序、预算/压力计数与释放语义；R01/R02、公开 API/ABI、布局和 GC 策略均不在范围内。本轮继续不用 buddy。
+
+`pool.rs` 的 `alloc`、`alloc_handle`、`try_alloc_shm` 共用私有 `alloc_shm`，后者由既有 `alloc_buddy` 加入原入口的资格判断形成，保持 reuse → GC 有回收才 retry → 容量允许才 expand → dedicated 的顺序。`alloc` 的提前 dedicated GC 仍在零长度检查前；另两个入口保留原校验顺序，只有 `alloc_handle` 在最终 SHM 失败后尝试 file spill，各自错误投影不变。私有 `into_handle` 按真实 `is_dedicated` 投影，buddy 的 actual_size/generation 与请求 len 分别保留。Host 机械比较确认：五个指定函数外生产代码逐字节一致，共享 tier 原函数体除外层资格判断和缩进外一致，计费、压力、释放函数未修改。
+
+两个基本 handle 用例合并为两个大小场景，各自创建新池，保留类型、长度和 dedicated 释放断言，并检查反向类型及 buddy 不返回 DedicatedFreed；其余测试不变。生产净减少 46 行，测试净减少 3 行，非文档合计净减少 49 行；未引入额外状态、策略枚举、测试框架或依赖。
+
+仅合并测试时，原生产实现 c2-mem lib 176 passed。候选回归为 c2-mem 176、c2-wire 146、IPC 203 + 7、server 166，共 698 passed；另有 1 项 c2-mem compile-fail 文档测试通过，无忽略项。IPC 启用 test-support，使已有 pending 清理断言实际执行。重建 Python native 后，mem pool、buffer lease/native buffer lease、held result、input lifetime、zero-copy IPC、IPC reply 和 portable payload runtime 八个文件共 80 passed，无跳过。候选合计 779 项通过（含上述文档测试），验证范围为本机 macOS；未据此声明跨平台或吞吐提升。
+
+Rust 与 Python 回归后分别比对默认端点目录条目及 inode，新增/消失/身份变化均为零，socket 为零；历史 12 个空 lease 的身份、权限、大小、mtime/ctime 和内容保持不变。未执行历史清理。六个改动函数与 rustfmt 输出一致，未格式化其他区域，`git diff --check` 通过。
+
+原生子代理独立审查无 actionable findings。首审后仅将测试的一处 assert 按 rustfmt 换行，Host 和 reviewer 均确认非空白源码一致；最终源码补丁 SHA-256 为 `09c1fd6d21e79fbd6018e235f4ccaec7ed4bbfad2af51c05f54f7ee5f93531b0`，源文件哈希与最终审查输入一致。测试日志、结构比对、零残留 receipt、固定补丁及独立审查报告位于 `/tmp/c2-slim-r14-20261013/`。

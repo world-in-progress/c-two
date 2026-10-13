@@ -73,6 +73,8 @@ Host 在仓库外直接编译当前 `buddy.rs`、`bitmap.rs`、`spinlock.rs`，�
 
 二轮边界：owner incarnation 核验用于共享 pool 容器替换，必须在当前 guard 内重新进行；仅同 guard 内的同值工作可合并。压力拒绝计数是公开观测，计数语义变化也需说明。
 
+后续实施状态：B18 已将三个分配入口的 SHM 选择流程收敛到一个私有函数，生产与测试合计净减 49 行，见[批次记录](../plans/2026-10-13-local-slimming-batches.md)。各入口 GC 时机、错误投影、预算/压力计数和释放语义保留；CheckedSpan、bitmap CAS、GC 策略及 R01/R02 所有权改造未纳入本批。
+
 **R15 · P2 · Chunk 软阈值把每次插入变成全分片 GC。** [insert](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/core/protocol/c2-wire/src/chunk/registry.rs#L173) 超阈值即调用 [全 16 分片 gc_sweep](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/core/protocol/c2-wire/src/chunk/registry.rs#L415)；所有 assembly 都新鲜时，后续每次插入继续扫描但不能回收，transport 又有定时清理。目标是一个维护 owner 合并请求或按进度/时间限频，预算继续作为真正的准入上限。将 [soft_limit_triggers_gc](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/core/protocol/c2-wire/src/chunk/registry.rs#L824) 改为有界维护与最终回收行为；保留 [共享预算](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/core/protocol/c2-wire/src/chunk/registry.rs#L937)、[争用后重新核验](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/core/protocol/c2-wire/src/chunk/registry.rs#L1643) 和 deadline/abort 清理。扫描路径已确认，未测性能。
 
 二轮降为维护进度优化：软阈值同步 GC 仍可在下一次 admission 前释放预算，registry 原本与 runtime 解耦；timer 存在不足以删除同步清理。替代方案须覆盖无 timer 使用下的回收及恢复准入。
