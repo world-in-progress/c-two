@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
-use crate::relay::authority::{RouteAuthority, RouteCommand};
+use crate::relay::authority::RouteAuthority;
 use crate::relay::peer::{
     DigestDiffEntry, PROTOCOL_VERSION, PeerEnvelope, PeerMessage, ValidatedDigestDiffEntry,
     validate_route_state_envelope,
@@ -92,9 +92,9 @@ pub async fn handle_peer_announce(
         } => {
             // Peer wire data never carries owner-private fields; keep peer
             // route storage scrubbed as a second local invariant.
-            let _ = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
+            let _ = RouteAuthority::new(&state).announce_peer(
                 sender_relay_id,
-                entry: Box::new(RouteEntry {
+                RouteEntry {
                     name,
                     relay_id,
                     relay_url,
@@ -111,8 +111,8 @@ pub async fn handle_peer_announce(
                     route_revision,
                     locality: Locality::Peer,
                     registered_at,
-                }),
-            });
+                },
+            );
         }
         PeerMessage::RouteWithdraw {
             name,
@@ -120,13 +120,13 @@ pub async fn handle_peer_announce(
             removed_at,
             removed_revision,
         } => {
-            let _ = RouteAuthority::new(&state).execute(RouteCommand::WithdrawPeer {
+            let _ = RouteAuthority::new(&state).withdraw_peer(
                 sender_relay_id,
                 name,
                 relay_id,
                 removed_at,
                 removed_revision,
-            });
+            );
         }
         _ => {
             if matches!(envelope.message, PeerMessage::Unknown) {
@@ -249,9 +249,7 @@ pub async fn handle_peer_leave(
         {
             return StatusCode::OK;
         }
-        let _ = RouteAuthority::new(&state).execute(RouteCommand::RemovePeerRoutes {
-            relay_id: relay_id.clone(),
-        });
+        RouteAuthority::new(&state).remove_peer_routes(&relay_id);
         state.unregister_peer(&relay_id);
     }
     StatusCode::OK
@@ -344,10 +342,8 @@ pub async fn handle_peer_digest(
                 match diff {
                     ValidatedDigestDiffEntry::Active(active) => {
                         let entry = active.into();
-                        let _ = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
-                            sender_relay_id: sender_relay_id.clone(),
-                            entry: Box::new(entry),
-                        });
+                        let _ = RouteAuthority::new(&state)
+                            .announce_peer(sender_relay_id.clone(), entry);
                     }
                     ValidatedDigestDiffEntry::Deleted(deleted) => {
                         let crate::relay::peer::ValidatedDigestDiffDeleted {
@@ -356,13 +352,13 @@ pub async fn handle_peer_digest(
                             removed_at,
                             removed_revision,
                         } = deleted;
-                        let _ = RouteAuthority::new(&state).execute(RouteCommand::WithdrawPeer {
-                            sender_relay_id: sender_relay_id.clone(),
+                        let _ = RouteAuthority::new(&state).withdraw_peer(
+                            sender_relay_id.clone(),
                             name,
                             relay_id,
                             removed_at,
                             removed_revision,
-                        });
+                        );
                     }
                 }
             }
@@ -478,10 +474,7 @@ mod tests {
     fn announce_peer_route(state: &RelayState, entry: RouteEntry) {
         let sender_relay_id = entry.relay_id.clone();
         RouteAuthority::new(state)
-            .execute(RouteCommand::AnnouncePeer {
-                sender_relay_id,
-                entry: Box::new(entry),
-            })
+            .announce_peer(sender_relay_id, entry)
             .unwrap();
     }
 

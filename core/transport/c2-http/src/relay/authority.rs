@@ -316,35 +316,12 @@ impl OwnerReplacementCandidate {
     }
 }
 
-pub(crate) enum RouteCommand {
-    RegisterLocal(Box<LocalRegistration>),
-    UnregisterLocal {
-        name: String,
-        server_id: String,
-    },
-    AnnouncePeer {
-        sender_relay_id: String,
-        entry: Box<RouteEntry>,
-    },
-    WithdrawPeer {
-        sender_relay_id: String,
-        name: String,
-        relay_id: String,
-        removed_at: f64,
-        removed_revision: u64,
-    },
-    RemovePeerRoutes {
-        relay_id: String,
-    },
+pub(crate) enum RegisterLocalResult {
+    Registered { entry: RouteEntry },
+    SameOwner { entry: RouteEntry },
 }
 
-pub(crate) enum RouteCommandResult {
-    Registered {
-        entry: RouteEntry,
-    },
-    SameOwner {
-        entry: RouteEntry,
-    },
+pub(crate) enum UnregisterLocalResult {
     Unregistered {
         entry: RouteEntry,
         removed_at: f64,
@@ -352,8 +329,6 @@ pub(crate) enum RouteCommandResult {
         client: Option<Arc<IpcClient>>,
     },
     AlreadyUnregistered,
-    PeerRouteChanged,
-    PeerRoutesRemoved,
 }
 
 pub(crate) enum RegistrationWithdrawal {
@@ -589,43 +564,10 @@ impl<'a> RouteAuthority<'a> {
         }
     }
 
-    pub(crate) fn execute(
-        &self,
-        command: RouteCommand,
-    ) -> Result<RouteCommandResult, ControlError> {
-        match command {
-            RouteCommand::RegisterLocal(registration) => self.register_local(*registration),
-            RouteCommand::UnregisterLocal { name, server_id } => {
-                self.unregister_local(name, server_id)
-            }
-            RouteCommand::AnnouncePeer {
-                sender_relay_id,
-                entry,
-            } => self.announce_peer(sender_relay_id, *entry),
-            RouteCommand::WithdrawPeer {
-                sender_relay_id,
-                name,
-                relay_id,
-                removed_at,
-                removed_revision,
-            } => self.withdraw_peer(
-                sender_relay_id,
-                name,
-                relay_id,
-                removed_at,
-                removed_revision,
-            ),
-            RouteCommand::RemovePeerRoutes { relay_id } => {
-                self.remove_peer_routes(&relay_id);
-                Ok(RouteCommandResult::PeerRoutesRemoved)
-            }
-        }
-    }
-
-    fn register_local(
+    pub(crate) fn register_local(
         &self,
         registration: LocalRegistration,
-    ) -> Result<RouteCommandResult, ControlError> {
+    ) -> Result<RegisterLocalResult, ControlError> {
         let LocalRegistration {
             owner:
                 LocalRouteOwner {
@@ -717,7 +659,7 @@ impl<'a> RouteAuthority<'a> {
                                 self.state
                                     .renew_owner_lease_for_endpoint(&existing_endpoint, &token);
                             }
-                            return Ok(RouteCommandResult::SameOwner { entry: existing });
+                            return Ok(RegisterLocalResult::SameOwner { entry: existing });
                         }
                     } else {
                         old_endpoint_for_cleanup = Some(existing_endpoint.clone());
@@ -811,7 +753,7 @@ impl<'a> RouteAuthority<'a> {
         {
             self.state.clients.close(&client);
         }
-        Ok(RouteCommandResult::Registered { entry })
+        Ok(RegisterLocalResult::Registered { entry })
     }
 
     fn different_owner_replacement(
@@ -907,11 +849,11 @@ impl<'a> RouteAuthority<'a> {
         })
     }
 
-    fn unregister_local(
+    pub(crate) fn unregister_local(
         &self,
         name: String,
         server_id: String,
-    ) -> Result<RouteCommandResult, ControlError> {
+    ) -> Result<UnregisterLocalResult, ControlError> {
         self.validate_route_name(&name)?;
         self.validate_server_id(&server_id)?;
 
@@ -919,7 +861,7 @@ impl<'a> RouteAuthority<'a> {
             let mut route_table = self.state.route_table_write();
             let Some(existing) = route_table.local_route(&name) else {
                 if route_table.local_tombstone_matches_server(&name, &server_id) {
-                    return Ok(RouteCommandResult::AlreadyUnregistered);
+                    return Ok(UnregisterLocalResult::AlreadyUnregistered);
                 }
                 return Err(ControlError::NotFound);
             };
@@ -936,7 +878,7 @@ impl<'a> RouteAuthority<'a> {
         let client = UpstreamEndpointKey::from_route(&entry)
             .as_ref()
             .and_then(|key| self.state.remove_connection_if_endpoint_unused(key));
-        Ok(RouteCommandResult::Unregistered {
+        Ok(UnregisterLocalResult::Unregistered {
             entry,
             removed_at,
             removed_revision,
@@ -944,11 +886,11 @@ impl<'a> RouteAuthority<'a> {
         })
     }
 
-    fn announce_peer(
+    pub(crate) fn announce_peer(
         &self,
         sender_relay_id: String,
         mut entry: RouteEntry,
-    ) -> Result<RouteCommandResult, ControlError> {
+    ) -> Result<(), ControlError> {
         self.validate_route_name(&entry.name)?;
         self.validate_relay_id(&sender_relay_id)?;
         self.validate_relay_id(&entry.relay_id)?;
@@ -985,17 +927,17 @@ impl<'a> RouteAuthority<'a> {
         entry.ipc_address = None;
         entry.locality = Locality::Peer;
         route_table.register_route(entry);
-        Ok(RouteCommandResult::PeerRouteChanged)
+        Ok(())
     }
 
-    fn withdraw_peer(
+    pub(crate) fn withdraw_peer(
         &self,
         sender_relay_id: String,
         name: String,
         relay_id: String,
         removed_at: f64,
         removed_revision: u64,
-    ) -> Result<RouteCommandResult, ControlError> {
+    ) -> Result<(), ControlError> {
         self.validate_route_name(&name)?;
         self.validate_relay_id(&sender_relay_id)?;
         self.validate_relay_id(&relay_id)?;
@@ -1008,10 +950,10 @@ impl<'a> RouteAuthority<'a> {
         self.state
             .route_table_write()
             .unregister_route_with_tombstone(&name, &relay_id, removed_at, removed_revision);
-        Ok(RouteCommandResult::PeerRouteChanged)
+        Ok(())
     }
 
-    fn remove_peer_routes(&self, relay_id: &str) {
+    pub(crate) fn remove_peer_routes(&self, relay_id: &str) {
         if self.validate_relay_id(relay_id).is_err() || relay_id == self.state.relay_id() {
             return;
         }
@@ -1261,10 +1203,8 @@ mod tests {
             status: PeerStatus::Alive,
         });
 
-        let result = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
-            sender_relay_id: "bad/relay".into(),
-            entry: Box::new(peer_route("grid", "bad/relay")),
-        });
+        let result = RouteAuthority::new(&state)
+            .announce_peer("bad/relay".into(), peer_route("grid", "bad/relay"));
 
         match result {
             Err(ControlError::OwnerMismatch) => {}

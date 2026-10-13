@@ -195,3 +195,7 @@ B8b 实现提交为 `2949cd719621ae9bb59a74cbb19eff31e5d0c44e`。生产 endpoint
 R11 基线 `b9936f0aa18bb4319139e2e48fa6f72565cb58b4`，5 个 Rust 文件净减少 191 行（含内嵌测试）。删除 RuntimeRouteSpec、双规格构造及 Session 对账；同一 BuiltRoute 派生一次 relay expected。静态 wire 校验收口到 BuiltRoute 私有构造器，handle 由同一 scheduler 派生；reserve 保留动态状态检查。两个专属失配测试及双规格夹具退出，三个非法输入用例改测构造拒绝，未新增测试框架或公开 API。
 
 R11 验证：Core lib 102、host_routes 5、client_modes 15、Server lib 168 passed；source mode 重建 Python native 后，runtime_session、runtime_session_lifecycle、core_transport_parity 首次 73 passed / 1 skipped（缺少可发现的 c3），构建并用 CTWO_TEST_C3_BIN 指定当前 c3 后 parity 文件 3 passed，补齐该跳过项。独立审查 run `9ede0945-0e80-4da2-b0f7-147cd0e140cd`、输入 `a9924810ca04f8500c6c53af566ee99a518b41f7` 无功能性阻塞；Host 清掉审查/编译器指出的五处失效测试导入后重跑 Core/Server lib，无 warning，并核对除此以外五文件与快照一致，审查已验收回收。日志和固定差异证据在 `/tmp/c2-slim-b9-20261013/r11-*`；本地 macOS 验证不代替 Windows、hosted CI 或二进制 ABI 验证。
+
+R11 实现提交为 `e20a614cd77f817bf33cc2d7fb1b198f73e6ae5d`。R39 在此基础上移除 RouteCommand/execute 及混合成功结果，五种操作仍通过同一个 RouteAuthority 执行，登记/注销使用各自的成功结果；公开结果、错误映射、锁和清理顺序保留。测试迁移调用入口并删除恒定成功标签断言，4 个文件净减少 97 行。
+
+R39 变更前后 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 均 427 passed；重建 c3 并指定 CTWO_TEST_C3_BIN 后 Python core_transport_parity 3 passed。独立审查 run `883a09e3-76ab-49b9-b921-b8627b49450c`、输入 `5cdc6a9a9fa86ecaac25f39b1c9c8f1caa6fa28e` 无 actionable findings；Worker 可选机械对比未执行，Host 已在内存核对五个操作函数体除成功结果名称/unit外一致，并验证四文件与固定快照逐字节相同，审查已验收回收。日志及 manifest 在 `/tmp/c2-slim-b9-20261013/r39-*`；本轮未重建不含 relay server feature 的 Python native。

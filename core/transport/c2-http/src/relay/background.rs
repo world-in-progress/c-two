@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::relay::authority::{RouteAuthority, RouteCommand};
+use crate::relay::authority::RouteAuthority;
 use crate::relay::peer::{
     DigestEntry, PeerEnvelope, PeerMessage, ValidatedDigestDiffEntry, validate_route_state_envelope,
 };
@@ -177,9 +177,7 @@ async fn failure_detection_loop(state: Arc<RelayState>, cancel: CancellationToke
                         p.status = PeerStatus::Dead;
                     }
                 });
-                let _ = RouteAuthority::new(&state).execute(RouteCommand::RemovePeerRoutes {
-                    relay_id: relay_id.clone(),
-                });
+                RouteAuthority::new(&state).remove_peer_routes(&relay_id);
             } else if status == PeerStatus::Alive && elapsed > suspect_deadline {
                 state.with_route_table_mut(|rt| {
                     if let Some(p) = rt.get_peer_mut(&relay_id) {
@@ -248,10 +246,7 @@ fn apply_digest_diff(state: &RelayState, peer_id: &str, diff_entry: ValidatedDig
     match diff_entry {
         ValidatedDigestDiffEntry::Active(active) => {
             let entry = active.into();
-            let _ = RouteAuthority::new(state).execute(RouteCommand::AnnouncePeer {
-                sender_relay_id: peer_id.to_string(),
-                entry: Box::new(entry),
-            });
+            let _ = RouteAuthority::new(state).announce_peer(peer_id.to_string(), entry);
         }
         ValidatedDigestDiffEntry::Deleted(deleted) => {
             let crate::relay::peer::ValidatedDigestDiffDeleted {
@@ -260,13 +255,13 @@ fn apply_digest_diff(state: &RelayState, peer_id: &str, diff_entry: ValidatedDig
                 removed_at,
                 removed_revision,
             } = deleted;
-            let _ = RouteAuthority::new(state).execute(RouteCommand::WithdrawPeer {
-                sender_relay_id: peer_id.to_string(),
+            let _ = RouteAuthority::new(state).withdraw_peer(
+                peer_id.to_string(),
                 name,
                 relay_id,
                 removed_at,
                 removed_revision,
-            });
+            );
         }
     }
 }

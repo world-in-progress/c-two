@@ -16,7 +16,7 @@ use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
 
 use crate::relay::authority::{
-    ControlError, LocalRegistration, RouteAuthority, RouteCommand, RouteCommandResult,
+    ControlError, LocalRegistration, RegisterLocalResult, RouteAuthority, UnregisterLocalResult,
 };
 use crate::relay::conn_pool::{
     AcquireError as PoolAcquireError, CachedClient, ConnectionPool, OwnerReplaceError,
@@ -250,12 +250,11 @@ impl RelayState {
         &self,
         registration: LocalRegistration,
     ) -> RegisterCommitResult {
-        match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal(Box::new(registration)))
-        {
-            Ok(RouteCommandResult::Registered { entry }) => {
+        match RouteAuthority::new(self).register_local(registration) {
+            Ok(RegisterLocalResult::Registered { entry }) => {
                 RegisterCommitResult::Registered { entry }
             }
-            Ok(RouteCommandResult::SameOwner { entry }) => {
+            Ok(RegisterLocalResult::SameOwner { entry }) => {
                 RegisterCommitResult::SameOwner { entry }
             }
             Err(ControlError::AddressMismatch { existing_address }) => {
@@ -272,26 +271,18 @@ impl RelayState {
             | Err(ControlError::UpstreamUnavailable { reason }) => {
                 RegisterCommitResult::Invalid { reason }
             }
-            Ok(
-                RouteCommandResult::Unregistered { .. }
-                | RouteCommandResult::AlreadyUnregistered
-                | RouteCommandResult::PeerRouteChanged
-                | RouteCommandResult::PeerRoutesRemoved,
-            )
-            | Err(ControlError::OwnerMismatch)
-            | Err(ControlError::NotFound) => RegisterCommitResult::Duplicate {
-                existing_address: "<unknown>".to_string(),
-            },
+            Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
+                RegisterCommitResult::Duplicate {
+                    existing_address: "<unknown>".to_string(),
+                }
+            }
         }
     }
 
     /// Unregister a LOCAL upstream CRM.
     pub fn unregister_upstream(&self, name: &str, server_id: &str) -> UnregisterResult {
-        match RouteAuthority::new(self).execute(RouteCommand::UnregisterLocal {
-            name: name.to_string(),
-            server_id: server_id.to_string(),
-        }) {
-            Ok(RouteCommandResult::Unregistered {
+        match RouteAuthority::new(self).unregister_local(name.to_string(), server_id.to_string()) {
+            Ok(UnregisterLocalResult::Unregistered {
                 entry,
                 removed_at,
                 removed_revision,
@@ -305,13 +296,7 @@ impl RelayState {
                     client,
                 }
             }
-            Ok(
-                RouteCommandResult::Registered { .. }
-                | RouteCommandResult::SameOwner { .. }
-                | RouteCommandResult::PeerRouteChanged
-                | RouteCommandResult::PeerRoutesRemoved,
-            ) => UnregisterResult::OwnerMismatch,
-            Ok(RouteCommandResult::AlreadyUnregistered) => UnregisterResult::AlreadyRemoved,
+            Ok(UnregisterLocalResult::AlreadyUnregistered) => UnregisterResult::AlreadyRemoved,
             Err(ControlError::NotFound) => UnregisterResult::NotFound,
             Err(ControlError::OwnerMismatch)
             | Err(ControlError::AddressMismatch { .. })
@@ -1981,34 +1966,24 @@ mod tests {
     fn announce_peer_route(state: &RelayState, entry: RouteEntry) {
         let sender_relay_id = entry.relay_id.clone();
         RouteAuthority::new(state)
-            .execute(RouteCommand::AnnouncePeer {
-                sender_relay_id,
-                entry: Box::new(entry),
-            })
+            .announce_peer(sender_relay_id, entry)
             .unwrap();
     }
 
     fn withdraw_peer_route(state: &RelayState, name: &str, relay_id: &str) {
         RouteAuthority::new(state)
-            .execute(RouteCommand::WithdrawPeer {
-                sender_relay_id: relay_id.to_string(),
-                name: name.to_string(),
-                relay_id: relay_id.to_string(),
-                removed_at: 1001.0,
-                removed_revision: 1,
-            })
+            .withdraw_peer(
+                relay_id.to_string(),
+                name.to_string(),
+                relay_id.to_string(),
+                1001.0,
+                1,
+            )
             .unwrap();
     }
 
     fn remove_peer_routes(state: &RelayState, relay_id: &str) {
-        assert!(matches!(
-            RouteAuthority::new(state)
-                .execute(RouteCommand::RemovePeerRoutes {
-                    relay_id: relay_id.to_string(),
-                })
-                .unwrap(),
-            RouteCommandResult::PeerRoutesRemoved
-        ));
+        RouteAuthority::new(state).remove_peer_routes(relay_id);
     }
 
     #[test]
@@ -2279,9 +2254,9 @@ mod tests {
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         // Echo of our own route arriving via DigestDiff with our relay_id.
-        let result = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
-            sender_relay_id: "test-relay".into(),
-            entry: Box::new(RouteEntry {
+        let result = RouteAuthority::new(&state).announce_peer(
+            "test-relay".into(),
+            RouteEntry {
                 name: "grid".into(),
                 relay_id: "test-relay".into(),
                 relay_url: "http://elsewhere:8080".into(),
@@ -2298,8 +2273,8 @@ mod tests {
                 route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
-            }),
-        });
+            },
+        );
         assert!(matches!(result, Err(ControlError::OwnerMismatch)));
 
         let routes = state.resolve("grid");
@@ -2317,13 +2292,13 @@ mod tests {
         let client = Arc::new(IpcClient::new("ipc://grid"));
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
-        let result = RouteAuthority::new(&state).execute(RouteCommand::WithdrawPeer {
-            sender_relay_id: "test-relay".into(),
-            name: "grid".into(),
-            relay_id: "test-relay".into(),
-            removed_at: 1001.0,
-            removed_revision: 1,
-        });
+        let result = RouteAuthority::new(&state).withdraw_peer(
+            "test-relay".into(),
+            "grid".into(),
+            "test-relay".into(),
+            1001.0,
+            1,
+        );
         assert!(matches!(result, Err(ControlError::OwnerMismatch)));
 
         let routes = state.resolve("grid");
