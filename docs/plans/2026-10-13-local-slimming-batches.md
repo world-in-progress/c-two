@@ -223,3 +223,13 @@ T02 完整 relay lib 426 passed（退出一个旧源码检查，原为 427）；
 基线完整 relay lib 426 passed；先只迁移测试、保持原生产实现时，route_table 定向 55 passed；随后候选 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 为 420 passed，`git diff --check` 通过。总数减少 6 项来自六拒绝用例合一及 owner 字段用例并入 roundtrip，原行为场景保留。Host 与独立审查均核对 replacement 提交、tombstone 和 peer 更新后半段与基线逐字节一致。验证范围为本地 macOS 的 c2-http relay feature；未据此声明跨平台或发布通过。
 
 独立审查 run `011ceac7-fa53-4e7b-ad65-49f099058d0c`、固定输入 `bc0993985036e66f3408e82f8a026f890ea8d976` 无 actionable findings；Host 已复核构造不变量、动态状态边界与测试迁移，确认源文件 SHA-256 等于审查输入并验收报告。日志和 manifest 位于 `/tmp/c2-slim-b11-20261013/r28-*`。
+
+### B12：Digest 消息表示与应用逻辑收敛
+
+执行基线为 `557bfd8a`。本批继续 R28：`ValidatedRouteStateEnvelope` 以 Message/DigestDiff 互斥表示取代原始消息加可选字段副本，删除 HTTP 整体 clone、Active/Deleted 影子结构和二次字段搬运。校验时直接移动 owned 字段，Active 持有最终 RouteEntry，Deleted 仍保留原字段直到应用时才生成 tombstone。hash helper 已先接纳同一批静态字段，因此退出其后的重复语法检查；协议、期望 sender、字段、sender/hash 一致检查顺序保持。
+
+HTTP 与两个后台消费位置共用 `RouteAuthority::apply_digest_diff`，继续执行原 announce/withdraw 操作。Host 和独立审查均确认这两个操作及 trusted_peer_owner 与基线逐字节一致，保留当前 peer 活性、owner 和当前 URL 核验；wire 类型、协议常量、外部接口与各 endpoint 返回行为不变。生产代码净减少 99 行。
+
+两项 sender/CRM 拒绝测试合并为两个场景，均放入合法前缀验证整批拒绝；既有删除用例追加相同 digest 在 announce/heartbeat/leave 入口返回 OK 且不改状态的检查。active/deleted hash replay、旧协议、有效应用、URL 和 dead-peer 覆盖保留。测试净减少 10 行，四个非文档文件合计净减少 109 行。
+
+基线完整 relay lib 420 passed；测试先在旧实现上 peer_handlers 26 passed；候选 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 为 419 passed，一项数量差来自两拒绝用例合并。之后仅格式化所改函数，Host 在内存确认空白外内容一致；`git diff --check` 通过。独立审查 run `44f7b584-5124-4cf7-8f10-f77a2afa91f8`、固定输入 `1f280fb7d13234a7d553fcadca962346b29cabfb` 无 actionable findings，四文件与输入 SHA-256 一致并已验收。日志、差量和 manifest 位于 `/tmp/c2-slim-b12-20261013/r28-*`；验证范围为本地 macOS 的 relay feature。

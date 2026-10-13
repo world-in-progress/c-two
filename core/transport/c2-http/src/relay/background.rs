@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::relay::authority::RouteAuthority;
 use crate::relay::peer::{
-    DigestEntry, PeerEnvelope, PeerMessage, ValidatedDigestDiffEntry, validate_route_state_envelope,
+    DigestEntry, PeerEnvelope, PeerMessage, ValidatedRouteStateEnvelope,
+    validate_route_state_envelope,
 };
 use crate::relay::route_table::TombstoneGcEntry;
 use crate::relay::state::RelayState;
@@ -228,45 +229,18 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
         if let Ok(resp) = client.post(&url).json(&envelope).send().await
             && let Ok(resp_env) = resp.json::<PeerEnvelope>().await
         {
-            let Ok(validated) = validate_route_state_envelope(resp_env, Some(peer_id.as_str()))
+            let Ok(ValidatedRouteStateEnvelope::DigestDiff(entries)) =
+                validate_route_state_envelope(resp_env, Some(peer_id.as_str()))
             else {
                 continue;
             };
-            let Some(entries) = validated.into_digest_diff_entries() else {
-                continue;
-            };
             for diff_entry in entries {
-                apply_digest_diff(&state, peer_id, diff_entry);
+                let _ = RouteAuthority::new(&state).apply_digest_diff(peer_id, diff_entry);
             }
         }
     }
 }
 
-fn apply_digest_diff(state: &RelayState, peer_id: &str, diff_entry: ValidatedDigestDiffEntry) {
-    match diff_entry {
-        ValidatedDigestDiffEntry::Active(active) => {
-            let entry = active.into();
-            let _ = RouteAuthority::new(state).announce_peer(peer_id.to_string(), entry);
-        }
-        ValidatedDigestDiffEntry::Deleted(deleted) => {
-            let crate::relay::peer::ValidatedDigestDiffDeleted {
-                name,
-                relay_id,
-                removed_at,
-                removed_revision,
-            } = deleted;
-            let _ = RouteAuthority::new(state).withdraw_peer(
-                peer_id.to_string(),
-                name,
-                relay_id,
-                removed_at,
-                removed_revision,
-            );
-        }
-    }
-}
-
-/// Build a digest from the current route table.
 fn build_digest(state: &RelayState) -> Vec<DigestEntry> {
     state
         .route_digest()
@@ -327,16 +301,14 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
                 if let Ok(resp) = client.post(&digest_url).json(&envelope).send().await
                     && let Ok(resp_env) = resp.json::<PeerEnvelope>().await
                 {
-                    let Ok(validated) =
+                    let Ok(ValidatedRouteStateEnvelope::DigestDiff(entries)) =
                         validate_route_state_envelope(resp_env, Some(relay_id.as_str()))
                     else {
                         continue;
                     };
-                    let Some(entries) = validated.into_digest_diff_entries() else {
-                        continue;
-                    };
                     for diff_entry in entries {
-                        apply_digest_diff(&state, &relay_id, diff_entry);
+                        let _ =
+                            RouteAuthority::new(&state).apply_digest_diff(&relay_id, diff_entry);
                     }
                 }
             }

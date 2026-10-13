@@ -11,6 +11,7 @@ use c2_ipc::{ClientIpcConfig, IpcClient};
 use crate::relay::conn_pool::{
     CachedClient, OwnerReplaceError, OwnerReplacementEvidence, OwnerToken,
 };
+use crate::relay::peer::ValidatedDigestDiffEntry;
 use crate::relay::route_table::{valid_route_name, validate_server_instance_id_value};
 use crate::relay::state::RelayState;
 use crate::relay::types::{Locality, RouteEntry, UpstreamEndpointKey};
@@ -884,6 +885,30 @@ impl<'a> RouteAuthority<'a> {
             removed_revision,
             client,
         })
+    }
+
+    pub(crate) fn apply_digest_diff(
+        &self,
+        sender_relay_id: &str,
+        diff: ValidatedDigestDiffEntry,
+    ) -> Result<(), ControlError> {
+        match diff {
+            ValidatedDigestDiffEntry::Active(entry) => {
+                self.announce_peer(sender_relay_id.to_string(), entry)
+            }
+            ValidatedDigestDiffEntry::Deleted {
+                name,
+                relay_id,
+                removed_at,
+                removed_revision,
+            } => self.withdraw_peer(
+                sender_relay_id.to_string(),
+                name,
+                relay_id,
+                removed_at,
+                removed_revision,
+            ),
+        }
     }
 
     pub(crate) fn announce_peer(
