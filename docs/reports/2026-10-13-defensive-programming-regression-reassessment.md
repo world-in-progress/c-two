@@ -2,6 +2,8 @@
 
 日期：2026-10-13。输入仍为 `2ffe356f15d8ce1c8fad9e08a91ffff808d34dad`。本轮逐项复核[首轮报告](2026-10-13-defensive-programming-review.md)的 R01–R39、T01–T07、C01–C07，通过 Git 引入/修复历史、当前源码和设计文档，重新判断哪些前提已经失效、哪些仍保护真实行为。以下结论优先于首轮的删除建议；首轮已同步修正主要误判。
 
+
+实施进度见[局部精简批次记录](../plans/2026-10-13-local-slimming-batches.md)。本报告的源码链接固定到上述审查输入，保留删除前的历史证据；具体已完成范围以批次记录为准。
 二轮最重要的调整是：无仓内生产读取者只证明当前依赖关系，不能单独证明信息或公开能力没有价值；两次校验只有在输入、锁、owner 和时间边界都相同时，才有合并依据；测试即使没有显式 assert，也可能保护不抛错、OS 创建/析构、默认值或夹具敏感性。应该先建立较小但完整的正确模型，再撤去由旧模型产生的分支。
 
 较强的局部精简证据仍然存在，例如 FIFO 已取代的 waiting_writers 计数、bridge 工厂与构造器对同一值的重复检查、generated service_definition 重建同一 release、紧邻的空 handle 重验、不可达重试尾部，以及退出生产调用链的旧发布脚本。R01–R07 等所有权和同步问题应单独作为正确性修复推进；它们不能作为删除现有保护的理由。
@@ -12,9 +14,9 @@
 
 R26 的“可直接删除”建议撤回，改为暂保留的设计候选。提交 `9f4992ef` 从引入时就把它定义为有界、按 revision 排列的 authority watch history，并用 `cfg_attr(not(test), allow(dead_code))` 保留尚未消费的原语。设计文档[明确规定具体 mesh consumer 需要时才暴露 watch/list](../plans/2026-06-05-route-catalog-watch-redesign.md#L993)，并[记录了事件保留、tombstone 同边界压缩和 peer-leave revision](../plans/2026-06-05-route-catalog-watch-redesign.md#L1100)。没有证据显示它曾是生产消费链、后来因迁移成为残留。
 
-它保存的信息并非当前路由表的完全重复。[Upserted](../../core/transport/c2-http/src/relay/route_table.rs#L58) 保留当时的完整 RouteEntry；Removed 保留 route/relay 身份、route_uid、catalog_revision、removed_revision，以及 tombstone 删除或 peer leave 原因。覆盖或删除路由后，旧实例、旧合同、修改顺序及删除原因不能由当前 routes/tombstones 完整重建。这些信息可以支撑未来增量同步、断点恢复或诊断。
+它保存的信息并非当前路由表的完全重复。[Upserted](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/core/transport/c2-http/src/relay/route_table.rs#L58) 保留当时的完整 RouteEntry；Removed 保留 route/relay 身份、route_uid、catalog_revision、removed_revision，以及 tombstone 删除或 peer leave 原因。覆盖或删除路由后，旧实例、旧合同、修改顺序及删除原因不能由当前 routes/tombstones 完整重建。这些信息可以支撑未来增量同步、断点恢复或诊断。
 
-当前消费关系也有明确边界：relay 的 `watch_from` 只见测试调用，没有公开 HTTP 或诊断读取入口；数据面使用 resolve/probe/call token，anti-entropy 使用当前 routes/tombstones/hash。实际 [GC 运维日志](../../core/transport/c2-http/src/relay/background.rs#L100) 直接读取 TombstoneGcEntry，不依赖这个 journal。`c2-server` 的 [IPC catalog watch](../../core/transport/c2-server/src/server.rs#L2411) 则有真实消费者。三种机制必须分别判断。
+当前消费关系也有明确边界：relay 的 `watch_from` 只见测试调用，没有公开 HTTP 或诊断读取入口；数据面使用 resolve/probe/call token，anti-entropy 使用当前 routes/tombstones/hash。实际 [GC 运维日志](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/core/transport/c2-http/src/relay/background.rs#L100) 直接读取 TombstoneGcEntry，不依赖这个 journal。`c2-server` 的 [IPC catalog watch](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/core/transport/c2-server/src/server.rs#L2411) 则有真实消费者。三种机制必须分别判断。
 
 journal 当前是有界内存历史，尚未构成持久化审计或已交付的诊断能力。其条数上限为 1024，工作发生在路由变更路径；本轮没有测得值得牺牲计划能力的 CPU/内存成本。因此保留它是在保留明确规划的能力基础，也不应把它描述为当前 RPC 正确性的必要依赖。
 
@@ -87,7 +89,7 @@ journal 当前是有界内存历史，尚未构成持久化审计或已交付的
 | C03 | 原报告的局部 GC 风险仍待复现；`f5c9aa33`/`15578b5c` 已有 ChunkAssemblyId、publication guard、线性点和 abort fence，不能描述为全链缺世代。 | 先按具体 assembly identity 条件删除 stale pending，或证明同代 owning。受控“旧项采样→退出→同 key 新代”不能归还新 permit；保留 timeout/rollback/abort 和 finished backing 计费。 |
 | C04 | 5 ms/10 ms/50 ms 分别观察 drain、外部最后 Arc、动态 route authority；`a9111b81` 最近还修复了清理和正缓存失效。 | 通知必须覆盖状态发布、最后 owner 消失、native 终态及真实控制变化后，再逐项移除 timer。保留无丢唤醒、aggregate deadline、unconfirmed owner、transport error 不撤路由；性能尚未测。 |
 | C05 | `5ed04149` 明文保证 appended context symbols 下旧 ABI 3 仍有效；`b0031040` 后默认 Unix 不足以代表 Windows/注入连接/查询。`09166a19` 的 SyncClient 预分配用于 FFI 零复制，`ac4ca86f` 刚补精确 pool owner。 | 0.x 可以 clean cut，但须明确 ABI/公开能力退役、同步 loader/SDK/docs，不能保持旧 ABI 承诺却强制新符号。保留 RequestBlock 直接 fill、panic/error 精确释放、context freeze、HTTP-only 惰性和 Unix/Windows；协议 0x0C/0x0D/0x14 不重编号。 |
-| C06 | 撤回“完成契约未核实”的表述。[round_complete](../../core/transport/c2-local/src/lib.rs#L191) 明确只表示该 batch 到达目录 EOF；与局部 io_errors 共存合法。 | 可以另设计严格 CLI 成功策略或枚举失败投影，但这是退出语义变化。覆盖跨 batch 累计、候选错误、ReadDir 错误、namespace 替换与中断；保留 SweepLease 的并发资源控制。 |
+| C06 | 撤回“完成契约未核实”的表述。[round_complete](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/core/transport/c2-local/src/lib.rs#L191) 明确只表示该 batch 到达目录 EOF；与局部 io_errors 共存合法。 | 可以另设计严格 CLI 成功策略或枚举失败投影，但这是退出语义变化。覆盖跨 batch 累计、候选错误、ReadDir 错误、namespace 替换与中断；保留 SweepLease 的并发资源控制。 |
 | C07 | Python 的当前名称是 unpack_resource_result；meta 仅包装当前类字典，未证明所有继承/自定义适配返回同一形状。relay 缺 namespace 只允许匹配默认 context，已有真实缺省域用途。 | 注册协议封闭后再收敛 shape/direction，不默默冻结动态方法。relay 可用明确 enum 表达，但保留缺省/default、custom-root、metadata 冲突/部分缺失、remote anchor、HTTP-only、handshake/合同及禁止失败 endpoint 重放。 |
 
 ## 建议的落地顺序与证据要求

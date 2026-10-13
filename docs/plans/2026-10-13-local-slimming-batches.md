@@ -2,6 +2,19 @@
 
 依据：[二轮复核](../reports/2026-10-13-defensive-programming-regression-reassessment.md)。起点为 `2ffe356f15d8ce1c8fad9e08a91ffff808d34dad`，实施分支 `socu/slimming-batches`。用户授权先实施证据充分、保持行为的局部精简；每批完成针对性回归和独立审查。Host 负责实现、验证与最终验收，独立审查通过 buddy 的只读固定快照执行。
 
+本轮 B1–B6 已完成，18 个非文档文件新增 7 行、删除 594 行，净减少 587 行；退出 13 项只服务已删除实现的测试。每批均有独立提交、现有行为回归及固定候选独立审查，审查未发现阻塞问题，6 个审查工作树均已验收回收。运行证据来自本机 macOS arm64；未执行 Windows/Linux hosted CI、性能基准或发布，不推导跨平台全面通过或性能收益。relay journal 及 GC 运维日志保持，公开 API/ABI 和 P1 项目仍按下述边界另行推进。
+
+| 批次 | 实现提交 | 实际回归 |
+| --- | --- | --- |
+| B1 | `306a922cd256631f80e20dede0b44815b7db90aa` | c2-server 168 passed |
+| B2 | `d4d0e9012a653e2f867dbfe128d28ff707325453` | Python 30 passed |
+| B3 | `dcb72f590c6cf6b9172011a8b5798af224975ff7` | codegen 2 + generated Rust SDK 4 passed |
+| B4 | `b4c2a4ae7a084db00fc073e9e49500bba085ce2e` | c2-mem 177 + c2-wire 146 + c2-server 168 + 重建后 Python 30 passed |
+| B5 | `77b3d9bd73c2b6163706891d7f2bdd25710ee187` | config、local candidate、consumer 及 RuntimeSession 113 passed |
+| B6 | `8295266fe679c4aba52e31e97c4019a3a253fbc3` | workflow-policy 完整 12 文件清单 506 passed |
+
+以上为各批实际运行次数，重复运行的测试不计为新增独立覆盖。两份历史报告的 280 个源码链接已固定到原审查提交并核对文件与行号，避免删除或移行后丢失依据。
+
 ## 批次与出口
 
 各批按顺序推进，上一批实现、测试和独立审查均完成后再进入下一批；每批独立提交。测试失败先与基线和环境证据区分，任何实质性新改动都重跑对应验证。不为删除字段、恒空分支或重复调用编写镜像测试。
@@ -31,7 +44,7 @@ P1 的 R01 精确分配所有权、R02 safe Rust 别名、R03 shutdown 发送阶
 
 验证：`CARGO_TARGET_DIR=/tmp/c2-slim-implementation-20261013/target cargo test --manifest-path core/Cargo.toml -p c2-server --lib --locked --offline`：168 passed，0 failed，包含 scheduler FIFO/关闭/取消及 buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization。`rustfmt --check --edition 2024 core/transport/c2-server/src/scheduler.rs` 和 `git diff --check` 通过。日志：`/tmp/c2-slim-implementation-20261013/b1-server.log`。
 
-独立审查 run `87bc99c8-6725-4629-9068-cb946ff8d38f` 未发现需修复问题，Host 已验收并回收审查工作树。审查为静态核验，168 项运行证据由 Host 提供。后续 Python 环境准备遇到本机 clang 缺省 C++ 头搜索路径问题，独立于本批 Rust 回归，正在以进程级 CXXFLAGS 验证修复。
+独立审查 run `87bc99c8-6725-4629-9068-cb946ff8d38f` 未发现需修复问题，Host 已验收并回收审查工作树。审查为静态核验，168 项运行证据由 Host 提供。后续 Python 环境准备遇到本机 clang 缺省 C++ 头搜索路径问题，独立于本批 Rust 回归；最终进程级修复与失败尝试见 B2。
 
 ### B2：Python 构造不变量
 
