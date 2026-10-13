@@ -41,11 +41,11 @@ P1 的 R01 精确分配所有权、R02 safe Rust 别名、R03 shutdown 发送阶
 规划输入为首轮完成后的 `08955f0a1c1e94e21da2a45ca5c04abba071dc49`，计划提交为 `60bac6541e2747adaa0c22e6f256adb34fe76589`。用户已同意执行 B7/B8，实际状态与验证见下方执行记录。继续保留 relay journal、公开 API/ABI 和现有错误语义；P1 具体接口/布局/错误投影仍按独立设计边界讨论，不混入本轮局部精简。实施前重新核对源提交与工作树，若前提发生变化，先更新对应边界。
 
 
-B7/B8 六个子项现已全部完成，分别提交并通过针对性回归及独立审查。相对执行基线 60bac654，6 个生产/工具文件净减少 58 行；5 个测试文件净增加 163 行，用于新增 3 个真实行为测试并强化 2 个既有判据；合计 11 个非文档文件净增加 105 行。测试覆盖末次重试结果、并发完成、配置失败后修正，以及跨 owner/EOF 的 lease 生命周期，没有为新字段形状编写镜像测试。
+B7/B8 六个子项的首次提交通过了回归与独立审查，但生产/工具净减少 58 行、测试净增加 163 行，整体反增 105 行，未达到本轮整体精简目标。后续将重复夹具和重叠用例合并：相对执行基线 60bac654，6 个生产/工具文件仍净减少 58 行，5 个测试文件净增加 51 行，11 个非文档文件合计净减少 7 行。首次验证记录见下表，测试收敛记录见文末。后续批次一并评估生产代码和常驻测试的维护成本，优先复用或替换已有行为用例。
 
 | 已完成子项 | 实现提交 | 实际验证 |
 | --- | --- | --- |
-| B7a | `e4b947a4c57ccbdc15f07e1f8aed331b5aa8c4c0` | IPC 203 + deadline 9 + relay state 45 passed |
+| B7a | `e4b947a4c57ccbdc15f07e1f8aed331b5aa8c4c0` | 首次 IPC 203 + deadline 9 + relay state 45 passed |
 | B7b | `d24bc2406d2721cb11d35e4aa17289736c6260cf` | Node 59 passed / 1 Windows-only skipped；typecheck 与公开声明字节比对通过 |
 | B7c | `b4e916c9aae66a270fc9ec7ed66f41fad0aa01e8` | Python 33 passed；SHM 定向 1 passed；bytes/dict smoke 完成 |
 | B8a | `e9d0650c882fa95dd87d0b21a8ed037683321bed` | Rust SDK 4 + generated Rust SDK 4 passed |
@@ -64,7 +64,7 @@ B7 按下表顺序拆成三个独立提交；每项完成针对性回归和固�
 | B7b · R36 | [TypeScript binding](../../core/foundation/c2-mem-ffi/bindings/typescript/src/index.ts#L438)：删除无后续读取的 options = loadOptions；normalizeRequestPool 直接调用 normalizeSegment，删除仅转发的 normalizeRequestSegment | addonPath 捕获、endpoint context 生命周期、segments 快照和冻结、完全相同的错误标签及元数据校验；包 exports、声明接口和 ABI 3 不变 | npm run typecheck 与 npm test（包含既有原生 addon 构建）；核对请求 metadata snapshot、非法 segment 拒绝、release/forgetConsumed/close。无需为删赋值或转发函数新增镜像测试 |
 | B7c · R38，含窄 T04 判据修正 | 两份 IPC integration 文件中 register 后的 3 处 sleep(0.3)；segment_size_benchmark.py 中普通 bytes/dict 结果的 4 处 hasattr/release 探测。并发用例先补线程全部结束及 9 次调用完成的判据，再去对应等待 | register 的同步 native readiness；真实 IPC 数据完整性和清理；保留 GC/业务/跨进程等待以及真实 ResponseBuffer/HeldResult.release；benchmark 的结果持有、计时区间、选路与 close/unregister 保持 | test_zero_copy_ipc.py、test_ipc_buddy_reply.py、test_direct_ipc_control.py；检查启动返回即 ready、重启和重复启动失败路径。benchmark 仅做小负载 bytes/dict 调用 smoke，不运行全矩阵或据此宣称性能提升 |
 
-B7a 的两项直接验收入口是 `core/transport/c2-ipc/tests/connect_timeout.rs` 中的 route_publication_retry_sleep_is_inside_connect_budget 与 matching_cached_route_token_still_has_live_lookup_deadline；relay 还需 exact_token_ready_to_closed/removed/reregistered 的真实调用拒绝及 callback 为 0。Rust 改动后重新构建 Python native 再运行 B7c，避免沿用旧扩展的通过记录。平台声明以实际 gate 为准，保留既有 Linux/macOS/Windows CI，不把本地 macOS 运行替代跨平台通过。
+B7a 的直接验收入口是 `core/transport/c2-ipc/tests/connect_timeout.rs` 中的 route_acquisition_respects_deadlines_and_last_lookup_result，已合并原退避 deadline、cached token live lookup 与末次结果用例；relay 还需 exact_token_ready_to_closed/removed/reregistered 的真实调用拒绝及 callback 为 0。Rust 改动后重新构建 Python native 再运行 B7c，避免沿用旧扩展的通过记录。平台声明以实际 gate 为准，保留既有 Linux/macOS/Windows CI，不把本地 macOS 运行替代跨平台通过。
 
 B7c 的第三处等待位于 `test_ipc_buddy_reply.py::TestBuddyReply::test_concurrent_large_calls`；现有 join(timeout=20) 后仅断言 errors 为空，不能证明工作完成。补完成判据属于防止假通过的测试修缮，应独立核对清理和总超时，不通过增加 sleep 或放宽 timeout 消除失败。其他线程测试和广泛 T04 改造不随本项扩展。
 
@@ -138,7 +138,7 @@ B5 实现提交为 `77b3d9bd73c2b6163706891d7f2bdd25710ee187`。本批 6 文件�
 
 ### B7a：IPC acquisition 重试尾部
 
-实现基线 `60bac6541e2747adaa0c22e6f256adb34fe76589`。三个循环改为消费固定延迟 iterator，在无下次重试时返回当前实际错误，生产代码净减少 35 行。新增一个真实 LocalStream 回归，以 6 个场景验证两入口的末次 Ready/NotFound/ContractMismatch；该测试先在旧实现通过，再在候选上通过。它不单独证明 lookup 与 bind 之间的竞争，或 watch/compaction 的恢复行为。
+实现基线 `60bac6541e2747adaa0c22e6f256adb34fe76589`。三个循环改为消费固定延迟 iterator，在无下次重试时返回当前实际错误，生产代码净减少 35 行。首次提交新增一个真实 LocalStream 回归，以 6 个场景验证两入口的末次 Ready/NotFound/ContractMismatch；该测试先在旧实现通过，再在候选上通过。它不单独证明 lookup 与 bind 之间的竞争，或 watch/compaction 的恢复行为。
 
 验证：`cargo test --manifest-path core/Cargo.toml -p c2-ipc --features test-support --lib --tests --locked --offline`：203 + 9 passed；`cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib relay::state::tests --locked --offline`：45 passed，含旧 token 拒绝、owner 替换与共享在途调用。rustfmt/diff check 通过。各命令用既有 CARGO_TARGET_DIR 与空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS；日志 `/tmp/c2-slim-round2-20261013/b7a-baseline.log`、`b7a-ipc.log`、`b7a-relay.log`。后续 Python 验证前已以既有 source mode/CPLUS_INCLUDE_PATH 重建 native，日志 `b7-native-build.log`。
 
@@ -164,7 +164,7 @@ B7c 实现提交为 `b4e916c9aae66a270fc9ec7ed66f41fad0aa01e8`。本项唯一源
 
 ### B8b：客户端冻结事实唯一化
 
-B8a 实现提交为 `e9d0650c882fa95dd87d0b21a8ed037683321bed`。生产 session.rs 新增 4 行、删除 7 行，frozen_client_config 的 Option 成为唯一冻结事实；public getter、setter 与 lifecycle handoff 两端仍在原锁中判断，revision、提交和 pool 路径均保持。新增真实 Runtime.connect 测试 42 行，先在旧实现通过：非法配置不冻结/不创建 outgoing domain，可由 setter 修正；后续失败仍冻结并拒 setter。第二次 is_err 只证明配置提交后的失败，单独不足以定位为 OS 阶段。
+B8a 实现提交为 `e9d0650c882fa95dd87d0b21a8ed037683321bed`。生产 session.rs 新增 4 行、删除 7 行，frozen_client_config 的 Option 成为唯一冻结事实；public getter、setter 与 lifecycle handoff 两端仍在原锁中判断，revision、提交和 pool 路径均保持。首次提交新增真实 Runtime.connect 测试 42 行，先在旧实现通过：非法配置不冻结/不创建 outgoing domain，可由 setter 修正；后续失败仍冻结并拒 setter。第二次 is_err 只证明配置提交后的失败，单独不足以定位为 OS 阶段。
 
 验证：Core lib 104、client_modes 15、connect_timeout 5、endpoint_context 12、native_endpoint 4，共 140 passed；endpoint_context 两个 ignored 是由父测试以 --ignored 启动的隔离子进程入口。命令为 `cargo test --manifest-path core/Cargo.toml -p c2-core --lib --test native_endpoint --test client_modes --test endpoint_context --test connect_timeout --locked --offline`，带既有 target 和空 C2 环境。source mode 重建 Python native 后，`uv run --no-sync pytest sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/unit/test_ipc_config.py -q --timeout=30`：107 passed。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8b-baseline.log`、`b8b-core.log`、`b8b-native-build.log`、`b8b-python.log`。
 
@@ -174,8 +174,16 @@ B8a 实现提交为 `e9d0650c882fa95dd87d0b21a8ed037683321bed`。生产 session.
 
 B8b 实现提交为 `2949cd719621ae9bb59a74cbb19eff31e5d0c44e`。生产 endpoint_ffi.rs 新增 22 行、删除 23 行，OpenSweep 将 iterator 与 projection lease 配对，PyEndpointSweep 只持一个 Option；成员声明顺序保证 iterator 先析构，lease 后释放。closed/ensure_open/repr 从 Option 派生，next_batch 先接纳开放 owner 再验证预算；EOF/round_interrupted 仍不自动关闭外层。context、budget、batches 留在外层，公开投影与 PyO3 借用形态保持。
 
-强化旧 owner 重复 close/Drop 不释放新 owner lease，并新增 EOF 后仍占 lease、close 后属性可读和 closed 错误优先回归。第一次旧实现验证失败于“空 scope 一批必达 EOF”的夹具假设；默认目录仍被分批遍历。第二次不必要的 server 夹具启动返回 ENOENT。最终夹具直接使用已有、自有空 tmp_path 的 native context（Windows 用默认原生 context）与空 scope，无需启动 server 或选择历史端点；旧实现两用例均通过。新 owner 先到 EOF，避免 Core lease 遮蔽 projection lease 的错误释放。最终测试文件新增 43 行、删除 4 行。
+强化旧 owner 重复 close/Drop 不释放新 owner lease，并新增 EOF 后仍占 lease、close 后属性可读和 closed 错误优先回归。第一次旧实现验证失败于“空 scope 一批必达 EOF”的夹具假设；默认目录仍被分批遍历。第二次不必要的 server 夹具启动返回 ENOENT。最终夹具直接使用已有、自有空 tmp_path 的 native context（Windows 用默认原生 context）与空 scope，无需启动 server 或选择历史端点；旧实现两用例均通过。新 owner 先到 EOF，避免 Core lease 遮蔽 projection lease 的错误释放。首次提交的测试文件新增 43 行、删除 4 行。
 
 验证：既有 source mode/CPLUS_INCLUDE_PATH/target 下重新构建 Python native 成功；`C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/unit/test_endpoint_maintenance.py sdk/python/tests/unit/test_endpoint_context.py -q --timeout=30`：111 passed、5 skipped（Windows named-pipe 平台合同用例）。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8c-baseline.log`、`b8c-baseline-r2.log`、`b8c-baseline-r3.log`、`b8c-native-build.log`、`b8c-python.log`；前两次失败不计为通过。本地未执行 Windows 或 free-threading 并发验证。
 
 独立审查 run `4625622f-263e-4d35-ac0b-f1c90b264649`、固定快照 `8bda12ac2b50f490aca9be3a5be3ddb4688ef8a8`，无 actionable findings；Host 核对所有候选字节一致后验收回收。审查为源码证据，与 Host 运行结果分别记录。
+
+### 测试收敛纠偏
+
+基线 `8bb1d133c69693cd322d999f487f9f19fd17dc68`，仅改三个测试文件，净减少 112 行。IPC 三个用例共用 Peer/pool/清理，以普通和 exact-token 两入口各自验证 live 查询暂停、退避 deadline、末次 Ready/NotFound/ContractMismatch；响应保留 Rust 类型到发送时编码。Runtime 合并非法配置修正与有效配置后连接失败仍冻结的用例，保留显式有效 override、stats 和 ClientConfigFrozen。Python 合并 close/EOF/旧 owner 重复 close/Drop、关闭后属性和错误优先的生命周期断言，保留独立的并发、context exit 和 abandoned Drop 用例。
+
+定向验证：IPC connect_timeout 7 passed（其中表内 10 个场景），Core native_endpoint 3 passed，Python endpoint_maintenance 59 passed，relay state 45 passed；rustfmt/diff check 通过。命令沿用上述 target 和空 C2 环境；日志在 `/tmp/c2-slim-round2-20261013/correction-{ipc-final,config-final,sweep,relay}.log`。测试名和数量因合并变化，不能据此相加或推断覆盖等量。
+
+首次纠偏审查 run `f6c75a41-ff9f-45e7-a9da-04aa74f9e10c` 指出直接删除 IPC 末次结果用例会丢失独有保护，Host 采纳并改为合并用例。重审 run `7262da2f-f19b-40ed-9775-bcac9ca04daf` 因 serverOverloaded 失败，已结案回收，不计通过；随后原生独立代理 `/root/correction_final_independent_review`（gpt-6-sol/high）完成三个测试文件的窄审，无 actionable findings。Host 核对审查起止及最终三文件 diff SHA256 均为 `1c540ef6651b990dbd207fa4dd70f2116d6bf1494ab638ac7ff6348e7b4a3468`；运行证据与源码审查分别记录。

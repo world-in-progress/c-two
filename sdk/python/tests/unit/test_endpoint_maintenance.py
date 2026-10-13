@@ -383,21 +383,16 @@ class TestSweepLease:
         finally:
             first.close()
 
-    def test_close_releases_the_lease(self) -> None:
-        first = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
-        first.close()
-        assert first.closed is True
-        second = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
-        second.close()
-
-    def test_close_is_idempotent(self, empty_sweep_context) -> None:
+    def test_close_releases_only_its_own_lease(self, empty_sweep_context) -> None:
         first = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
         first.close()
         second = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        protocol = second.protocol
         try:
             # End the native round so its own lease cannot hide an incorrect
             # release of the projection lease by the old owner.
             assert second.next_batch(max_entries=MAX_SWEEP_ENTRIES, max_ms=MAX_SWEEP_MS)['round_complete'] is True
+            assert second.closed is False
             first.close()
             assert first.closed is True
             del first
@@ -406,25 +401,13 @@ class TestSweepLease:
                 cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
         finally:
             second.close()
-
-    def test_completed_round_keeps_lease_until_explicit_close(self, empty_sweep_context) -> None:
-        sweep = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
-        protocol = sweep.protocol
-        namespace = sweep.context.namespace_id
-        try:
-            assert sweep.next_batch(max_entries=MAX_SWEEP_ENTRIES, max_ms=MAX_SWEEP_MS)['round_complete'] is True
-            assert sweep.closed is False
-            with pytest.raises(RuntimeError, match='already active'):
-                cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
-        finally:
-            sweep.close()
-        assert sweep.closed is True
-        assert sweep.protocol == protocol
-        assert sweep.context.namespace_id == namespace
+        assert second.closed is True
+        assert second.protocol == protocol
+        assert second.context == empty_sweep_context
         with pytest.raises(ValueError, match='sweep is closed'):
-            sweep._native.__enter__()  # noqa: SLF001
+            second._native.__enter__()  # noqa: SLF001
         with pytest.raises(ValueError, match='sweep is closed'):
-            sweep.next_batch(max_entries=False)
+            second.next_batch(max_entries=False)
 
     def test_context_manager_releases_the_lease(self) -> None:
         with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
@@ -469,12 +452,6 @@ class TestSweepLease:
         finally:
             for sweep in sweeps:
                 sweep.close()
-
-    def test_next_batch_after_close_is_rejected(self) -> None:
-        sweep = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
-        sweep.close()
-        with pytest.raises(ValueError):
-            sweep.next_batch()
 
 
 class TestSweepBudget:
