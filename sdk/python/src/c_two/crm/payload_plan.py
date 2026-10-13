@@ -81,11 +81,7 @@ class PayloadBinding:
 
     @property
     def supports_scoped_owner(self) -> bool:
-        return (
-            self.kind is PayloadPlanKind.FASTDB
-            and self.deserialize is not None
-            and self.invalidate is not None
-        )
+        return self.kind is PayloadPlanKind.FASTDB
 
 
 def no_payload_binding() -> PayloadBinding:
