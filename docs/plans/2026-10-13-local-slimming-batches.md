@@ -257,3 +257,13 @@ Rust 基线 IPC lib 203 + integration 7 + server 168 passed；仅合并测试时
 当前 c3 和 Python native 已从本批基线重建。最终 benchmark 13 + examples syntax 9 = 22 passed，无跳过；三个 benchmark 模块另以 Python 3.10 compile 通过。真实 hey 预热报告 496 次、正式 3 次响应，全部 200，单次响应内容为 Hello, Benchmark!，路由及自有 payload 文件已清除。真实 session 探针先调用 manager、后登记 builder，以 idle_timeout=1 的实际 sweeper 约 5 秒后确认驱逐；两条 route identity 保留，8 个并发 builder 调用和 manager 调用通过，最终精确撤回。既有 Rust production_idle_sweeper 回归也为 1 passed，覆盖活跃请求保留和并发共享重连。上述为本地 macOS 正确性证据，不构成吞吐提升或跨平台验收。
 
 首审 run `dea9d4fc-5f4c-450b-95c4-b9d2e91ca51b` 的冻结 anchor 问题已复现并修复；第二轮 run `d3e92af8-c6a5-44f6-9432-b996c0fbca03`、固定输入 `f5be7af91639ec97801352cce50637a05a87b172` 无 actionable findings。Host 核对四文件 SHA-256 与固定输入一致，两份审查报告已验收并回收工作树。`git diff --check` 通过。日志、探针、红绿结果和哈希清单位于 `/tmp/c2-slim-b14-20261013/`。R22 的其他脚本 selector 项不在本批；后续优先回到生产运行时重复逻辑和复杂状态。
+
+### B15：R30 私有 IPC override 赋值收敛
+
+执行基线为 `7702233c0f868a30f2c4de584375f0a279e19468`。本批按确认方案，将 `resolver.rs` 的三份公共字段赋值函数收敛为一个模块私有宏；16 个字段的来源、目标、类型和赋值顺序均逐项核对一致。两个参数各求值一次，借用限定在独立块内；server/client 均保留先 base 后 flat 的覆盖顺序。逆向文本比较确认，除三个 helper 及四处调用外，其余生产代码逐字节一致。R08、公开配置类型、API/ABI、环境错误、派生溢出检查和生命周期策略均未改动。
+
+在既有 `budget_limits_explicit_overrides_beat_env` 用例内增加两角色 base/flat 冲突、false/零值覆盖和派生结果断言；保留原有 None 及环境预算断言，不增加测试文件或测试框架。扩展后的用例先在原实现上 1 passed。生产代码净减少 103 行，测试增加 16 行，非文档代码合计净减少 87 行。
+
+候选 c2-config lib 135 passed，relay upstream 实际配置传播及重连 4 passed；重建 Python native 后，`test_ipc_config.py` 与 `test_runtime_session.py` 共 107 passed，合计 246 项通过、无跳过。临时 native 新旧对照包含 server/client 各六组输入：默认值、全部 16 个字段、false/zero/None、有效 override 遇到非法数值或布尔环境值，以及派生溢出；12 组结果及异常类型、完整文案一致。对照脚本未进仓库，验证范围为本地 macOS。
+
+独立审查 run `5bc00a2b-1c0a-4a9f-a6c5-440c2810773e`、固定输入 `b9b455b9f0f39311cb5c1685dd5a5fa2fe799be3` 无 actionable findings。Host 复核源码 SHA-256 与审查输入一致，核对实际回归后验收并回收审查工作树。日志、16 字段清单、差量审计及新旧对照位于 `/tmp/c2-slim-b15-20261013/`。

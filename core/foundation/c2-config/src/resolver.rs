@@ -606,6 +606,62 @@ fn resolve_relay_server_config(
     Ok(cfg)
 }
 
+// All three override types expose the same common fields.
+macro_rules! apply_base_overrides {
+    ($cfg:expr, $overrides:expr) => {{
+        let cfg: &mut BaseIpcConfig = $cfg;
+        let overrides = $overrides;
+        if let Some(v) = overrides.pool_enabled {
+            cfg.pool_enabled = v;
+        }
+        if let Some(v) = overrides.pool_segment_size {
+            cfg.pool_segment_size = v;
+        }
+        if let Some(v) = overrides.max_pool_segments {
+            cfg.max_pool_segments = v;
+        }
+        if let Some(v) = overrides.pool_prewarm_segments {
+            cfg.pool_prewarm_segments = v;
+        }
+        if let Some(v) = overrides.pool_min_retained_segments {
+            cfg.pool_min_retained_segments = v;
+        }
+        if let Some(v) = overrides.reassembly_segment_size {
+            cfg.reassembly_segment_size = v;
+        }
+        if let Some(v) = overrides.reassembly_max_segments {
+            cfg.reassembly_max_segments = v;
+        }
+        if let Some(v) = overrides.max_total_chunks {
+            cfg.max_total_chunks = v;
+        }
+        if let Some(v) = overrides.chunk_gc_interval_secs {
+            cfg.chunk_gc_interval_secs = v;
+        }
+        if let Some(v) = overrides.chunk_threshold_ratio {
+            cfg.chunk_threshold_ratio = v;
+        }
+        if let Some(v) = overrides.chunk_assembler_timeout_secs {
+            cfg.chunk_assembler_timeout_secs = v;
+        }
+        if let Some(v) = overrides.max_reassembly_bytes {
+            cfg.max_reassembly_bytes = v;
+        }
+        if let Some(v) = overrides.chunk_size {
+            cfg.chunk_size = v;
+        }
+        if let Some(v) = overrides.shm_backing_budget_bytes {
+            cfg.shm_backing_budget_bytes = v;
+        }
+        if let Some(v) = overrides.file_backing_budget_bytes {
+            cfg.file_backing_budget_bytes = v;
+        }
+        if let Some(v) = overrides.live_reassembly_budget_bytes {
+            cfg.live_reassembly_budget_bytes = v;
+        }
+    }};
+}
+
 fn resolve_server_ipc_config(
     catalog: &EnvCatalog,
     overrides: ServerIpcConfigOverrides,
@@ -657,8 +713,8 @@ fn resolve_server_ipc_config(
         cfg.heartbeat_timeout_secs = v;
     }
 
-    apply_base_overrides(&mut cfg.base, &overrides.base);
-    apply_flat_base_overrides_to_server(&mut cfg, &overrides);
+    apply_base_overrides!(&mut cfg.base, &overrides.base);
+    apply_base_overrides!(&mut cfg.base, &overrides);
     if let Some(v) = overrides.max_frame_size {
         cfg.max_frame_size = v;
     }
@@ -703,8 +759,8 @@ fn resolve_client_ipc_config(
     {
         cfg.pool_decay_seconds = v;
     }
-    apply_base_overrides(&mut cfg.base, &overrides.base);
-    apply_flat_base_overrides_to_client(&mut cfg, &overrides);
+    apply_base_overrides!(&mut cfg.base, &overrides.base);
+    apply_base_overrides!(&mut cfg.base, &overrides);
     if let Some(v) = overrides.pool_decay_seconds {
         cfg.pool_decay_seconds = v;
     }
@@ -808,57 +864,6 @@ fn apply_base_env(cfg: &mut BaseIpcConfig, catalog: &EnvCatalog) -> Result<(), C
     Ok(())
 }
 
-fn apply_base_overrides(cfg: &mut BaseIpcConfig, overrides: &BaseIpcConfigOverrides) {
-    if let Some(v) = overrides.pool_enabled {
-        cfg.pool_enabled = v;
-    }
-    if let Some(v) = overrides.pool_segment_size {
-        cfg.pool_segment_size = v;
-    }
-    if let Some(v) = overrides.max_pool_segments {
-        cfg.max_pool_segments = v;
-    }
-    if let Some(v) = overrides.pool_prewarm_segments {
-        cfg.pool_prewarm_segments = v;
-    }
-    if let Some(v) = overrides.pool_min_retained_segments {
-        cfg.pool_min_retained_segments = v;
-    }
-    if let Some(v) = overrides.reassembly_segment_size {
-        cfg.reassembly_segment_size = v;
-    }
-    if let Some(v) = overrides.reassembly_max_segments {
-        cfg.reassembly_max_segments = v;
-    }
-    if let Some(v) = overrides.max_total_chunks {
-        cfg.max_total_chunks = v;
-    }
-    if let Some(v) = overrides.chunk_gc_interval_secs {
-        cfg.chunk_gc_interval_secs = v;
-    }
-    if let Some(v) = overrides.chunk_threshold_ratio {
-        cfg.chunk_threshold_ratio = v;
-    }
-    if let Some(v) = overrides.chunk_assembler_timeout_secs {
-        cfg.chunk_assembler_timeout_secs = v;
-    }
-    if let Some(v) = overrides.max_reassembly_bytes {
-        cfg.max_reassembly_bytes = v;
-    }
-    if let Some(v) = overrides.chunk_size {
-        cfg.chunk_size = v;
-    }
-    if let Some(v) = overrides.shm_backing_budget_bytes {
-        cfg.shm_backing_budget_bytes = v;
-    }
-    if let Some(v) = overrides.file_backing_budget_bytes {
-        cfg.file_backing_budget_bytes = v;
-    }
-    if let Some(v) = overrides.live_reassembly_budget_bytes {
-        cfg.live_reassembly_budget_bytes = v;
-    }
-}
-
 fn resolve_shm_threshold(
     catalog: &EnvCatalog,
     override_value: Option<u64>,
@@ -899,114 +904,6 @@ fn call_execution_limit_from_env(
         .parse::<u64>()
         .map(Some)
         .map_err(|e| ConfigError::new(format!("{key} must be an unsigned integer: {e}")))
-}
-
-fn apply_flat_base_overrides_to_server(
-    cfg: &mut ServerIpcConfig,
-    overrides: &ServerIpcConfigOverrides,
-) {
-    if let Some(v) = overrides.pool_enabled {
-        cfg.base.pool_enabled = v;
-    }
-    if let Some(v) = overrides.pool_segment_size {
-        cfg.base.pool_segment_size = v;
-    }
-    if let Some(v) = overrides.max_pool_segments {
-        cfg.base.max_pool_segments = v;
-    }
-    if let Some(v) = overrides.pool_prewarm_segments {
-        cfg.base.pool_prewarm_segments = v;
-    }
-    if let Some(v) = overrides.pool_min_retained_segments {
-        cfg.base.pool_min_retained_segments = v;
-    }
-    if let Some(v) = overrides.reassembly_segment_size {
-        cfg.base.reassembly_segment_size = v;
-    }
-    if let Some(v) = overrides.reassembly_max_segments {
-        cfg.base.reassembly_max_segments = v;
-    }
-    if let Some(v) = overrides.max_total_chunks {
-        cfg.base.max_total_chunks = v;
-    }
-    if let Some(v) = overrides.chunk_gc_interval_secs {
-        cfg.base.chunk_gc_interval_secs = v;
-    }
-    if let Some(v) = overrides.chunk_threshold_ratio {
-        cfg.base.chunk_threshold_ratio = v;
-    }
-    if let Some(v) = overrides.chunk_assembler_timeout_secs {
-        cfg.base.chunk_assembler_timeout_secs = v;
-    }
-    if let Some(v) = overrides.max_reassembly_bytes {
-        cfg.base.max_reassembly_bytes = v;
-    }
-    if let Some(v) = overrides.chunk_size {
-        cfg.base.chunk_size = v;
-    }
-    if let Some(v) = overrides.shm_backing_budget_bytes {
-        cfg.base.shm_backing_budget_bytes = v;
-    }
-    if let Some(v) = overrides.file_backing_budget_bytes {
-        cfg.base.file_backing_budget_bytes = v;
-    }
-    if let Some(v) = overrides.live_reassembly_budget_bytes {
-        cfg.base.live_reassembly_budget_bytes = v;
-    }
-}
-
-fn apply_flat_base_overrides_to_client(
-    cfg: &mut ClientIpcConfig,
-    overrides: &ClientIpcConfigOverrides,
-) {
-    if let Some(v) = overrides.pool_enabled {
-        cfg.base.pool_enabled = v;
-    }
-    if let Some(v) = overrides.pool_segment_size {
-        cfg.base.pool_segment_size = v;
-    }
-    if let Some(v) = overrides.max_pool_segments {
-        cfg.base.max_pool_segments = v;
-    }
-    if let Some(v) = overrides.pool_prewarm_segments {
-        cfg.base.pool_prewarm_segments = v;
-    }
-    if let Some(v) = overrides.pool_min_retained_segments {
-        cfg.base.pool_min_retained_segments = v;
-    }
-    if let Some(v) = overrides.reassembly_segment_size {
-        cfg.base.reassembly_segment_size = v;
-    }
-    if let Some(v) = overrides.reassembly_max_segments {
-        cfg.base.reassembly_max_segments = v;
-    }
-    if let Some(v) = overrides.max_total_chunks {
-        cfg.base.max_total_chunks = v;
-    }
-    if let Some(v) = overrides.chunk_gc_interval_secs {
-        cfg.base.chunk_gc_interval_secs = v;
-    }
-    if let Some(v) = overrides.chunk_threshold_ratio {
-        cfg.base.chunk_threshold_ratio = v;
-    }
-    if let Some(v) = overrides.chunk_assembler_timeout_secs {
-        cfg.base.chunk_assembler_timeout_secs = v;
-    }
-    if let Some(v) = overrides.max_reassembly_bytes {
-        cfg.base.max_reassembly_bytes = v;
-    }
-    if let Some(v) = overrides.chunk_size {
-        cfg.base.chunk_size = v;
-    }
-    if let Some(v) = overrides.shm_backing_budget_bytes {
-        cfg.base.shm_backing_budget_bytes = v;
-    }
-    if let Some(v) = overrides.file_backing_budget_bytes {
-        cfg.base.file_backing_budget_bytes = v;
-    }
-    if let Some(v) = overrides.live_reassembly_budget_bytes {
-        cfg.base.live_reassembly_budget_bytes = v;
-    }
 }
 
 fn derive_base(cfg: &mut BaseIpcConfig) -> Result<(), ConfigError> {
@@ -1788,12 +1685,28 @@ mod tests {
             ]),
         };
         let mut overrides = RuntimeConfigOverrides::default();
+        overrides.server_ipc.base.pool_enabled = Some(true);
+        overrides.server_ipc.pool_enabled = Some(false);
+        overrides.server_ipc.base.pool_segment_size = Some(65_536);
+        overrides.server_ipc.pool_segment_size = Some(131_072);
+        overrides.server_ipc.base.max_pool_segments = Some(3);
+        overrides.server_ipc.base.shm_backing_budget_bytes = Some(4_294_967_296);
         overrides.server_ipc.shm_backing_budget_bytes = Some(3_221_225_472);
+        overrides.client_ipc.base.pool_enabled = Some(true);
+        overrides.client_ipc.pool_enabled = Some(false);
+        overrides.client_ipc.base.pool_segment_size = Some(262_144);
+        overrides.client_ipc.pool_segment_size = Some(524_288);
+        overrides.client_ipc.base.max_pool_segments = Some(5);
+        overrides.client_ipc.base.file_backing_budget_bytes = Some(3_221_225_472);
         overrides.client_ipc.file_backing_budget_bytes = Some(0);
         overrides.client_ipc.base.live_reassembly_budget_bytes = Some(2_147_483_648);
 
         let resolved = ConfigResolver::resolve(overrides, sources).expect("resolve");
 
+        assert!(!resolved.server_ipc.pool_enabled);
+        assert!(!resolved.client_ipc.pool_enabled);
+        assert_eq!(resolved.server_ipc.max_pool_memory, 131_072 * 3);
+        assert_eq!(resolved.client_ipc.max_pool_memory, 524_288 * 5);
         assert_eq!(resolved.server_ipc.shm_backing_budget_bytes, 3_221_225_472);
         assert_eq!(resolved.server_ipc.file_backing_budget_bytes, 2_147_483_648);
         assert_eq!(resolved.client_ipc.shm_backing_budget_bytes, 1_073_741_824);
