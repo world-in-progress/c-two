@@ -107,6 +107,48 @@ fn runtime_client_config_freezes_after_a_failed_native_connect() {
     assert!(runtime.set_client_ipc_overrides(Some(replacement)).is_err());
 }
 #[test]
+fn invalid_client_config_can_be_repaired_before_the_first_valid_attempt() {
+    let runtime = Runtime::new(RuntimeOptions {
+        use_process_relay_anchor: false,
+        ..RuntimeOptions::default()
+    })
+    .unwrap();
+    let mut overrides = c2_config::ClientIpcConfigOverrides::default();
+    overrides.base.pool_segment_size = Some(0);
+    runtime
+        .set_client_ipc_overrides(Some(overrides.clone()))
+        .unwrap();
+    let address = format!("ipc://{}", unique_name("invalid-config"));
+    let expected = release().expected_route("unused-route").unwrap();
+    let error = runtime
+        .connect(
+            expected.clone(),
+            Connect::DirectIpc {
+                address: address.clone(),
+            },
+        )
+        .err()
+        .expect("invalid configuration must fail before connecting");
+    assert!(error.to_string().contains("pool_segment_size"), "{error}");
+    assert!(!runtime.client_config_frozen());
+    assert!(runtime.outgoing_memory_stats().is_none());
+
+    overrides.base.pool_segment_size = Some(2 * 1024 * 1024);
+    runtime.set_client_ipc_overrides(Some(overrides)).unwrap();
+    assert!(
+        runtime
+            .connect(expected, Connect::DirectIpc { address })
+            .is_err()
+    );
+    assert!(runtime.client_config_frozen());
+    assert!(runtime.outgoing_memory_stats().is_some());
+    assert!(matches!(
+        runtime.set_client_ipc_overrides(None),
+        Err(c2_core::LifecycleError::ClientConfigFrozen)
+    ));
+}
+
+#[test]
 fn native_host_serves_calls_and_admin_shutdown_initiates_draining() {
     let (runtime, host, address) = native_host(unique_name("native-host"));
     let route = unique_name("native-route");

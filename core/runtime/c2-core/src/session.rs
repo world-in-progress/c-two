@@ -177,7 +177,6 @@ struct RuntimeState {
     call_execution_revision: u64,
     call_execution: Option<CallExecutionContext>,
     call_execution_observer: CallExecutionObserver,
-    client_config_frozen: bool,
     client_config_revision: u64,
     local_endpoint_options: c2_config::LocalEndpointOptions,
     local_endpoint_sources: Option<c2_config::ConfigSources>,
@@ -280,7 +279,6 @@ impl Runtime {
                 call_execution_revision: 0,
                 call_execution: None,
                 call_execution_observer: CallExecutionObserver::new(),
-                client_config_frozen: false,
                 client_config_revision: 0,
                 local_endpoint_options: Default::default(),
                 local_endpoint_sources: None,
@@ -665,7 +663,7 @@ impl Runtime {
         overrides: Option<ClientIpcConfigOverrides>,
     ) -> Result<(), LifecycleError> {
         let mut state = self.state.lock();
-        if state.client_config_frozen {
+        if state.frozen_client_config.is_some() {
             return Err(LifecycleError::ClientConfigFrozen);
         }
         state.client_ipc_overrides = overrides;
@@ -682,7 +680,7 @@ impl Runtime {
     }
 
     pub fn client_config_frozen(&self) -> bool {
-        self.state.lock().client_config_frozen
+        self.state.lock().frozen_client_config.is_some()
     }
 
     pub fn path_counters(&self) -> PathCounters {
@@ -786,7 +784,6 @@ impl Runtime {
             }
             let config = resolved.map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
             state.frozen_client_config = Some(config.clone());
-            state.client_config_frozen = true;
             let pool = state
                 .client_pool
                 .get_or_insert_with(|| {
@@ -971,7 +968,7 @@ impl Runtime {
             target.ensure_no_pending_teardown()?;
             if source.lifecycle_frozen
                 || source.owner_control_consumed
-                || source.client_config_frozen
+                || source.frozen_client_config.is_some()
             {
                 return Err(LifecycleError::Configuration(
                     "cannot transfer lifecycle after Runtime use".into(),
@@ -980,7 +977,7 @@ impl Runtime {
             if target.lifecycle_frozen
                 || target.owner_control_consumed
                 || target.owner_control.is_some()
-                || target.client_config_frozen
+                || target.frozen_client_config.is_some()
                 || target.lifecycle_policy != Default::default()
             {
                 return Err(LifecycleError::Configuration(

@@ -147,3 +147,11 @@ B7b 实现提交为 `d24bc2406d2721cb11d35e4aa17289736c6260cf`。本项 3 文件
 B7c 实现提交为 `b4e916c9aae66a270fc9ec7ed66f41fad0aa01e8`。本项唯一源码 payload.rs 新增 4 行、删除 9 行，删除只有构造 Some 和 Drop take 的 Option 状态；公开借用和生成接口、先失效再析构及 request lease 顺序保持。独立审查 run `36b12c3f-e10a-49a1-8559-fc9ba5582f07`、快照 `26c9c0fad493031c4b21b5ec10d70c4afff1d945`，无 actionable findings，Host 核对字节一致后验收回收。丢弃 invalidation Err 的原策略未改变；顺序等价不等于失效必然成功，也不承诺无 repr 的 Rust 类型布局不变。
 
 验证：`cargo test --manifest-path sdk/rust/Cargo.toml --all-features --test payload_lifetime --locked --offline`：4 passed；`cargo test --manifest-path core/Cargo.toml -p c2-codegen --test generated_rust_sdk --locked --offline`：4 passed，含真实生成消费者的业务 Err、编码失败和 panic 出口。使用第一轮已验证官方 FastDB SDK 的 system mode、限定的 DYLD_LIBRARY_PATH、既有 target 和空 C2 环境；没有修改依赖。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8a-payload-lifetime.log`、`b8a-generated.log`。
+
+### B8b：客户端冻结事实唯一化
+
+B8a 实现提交为 `e9d0650c882fa95dd87d0b21a8ed037683321bed`。生产 session.rs 新增 4 行、删除 7 行，frozen_client_config 的 Option 成为唯一冻结事实；public getter、setter 与 lifecycle handoff 两端仍在原锁中判断，revision、提交和 pool 路径均保持。新增真实 Runtime.connect 测试 42 行，先在旧实现通过：非法配置不冻结/不创建 outgoing domain，可由 setter 修正；后续失败仍冻结并拒 setter。第二次 is_err 只证明配置提交后的失败，单独不足以定位为 OS 阶段。
+
+验证：Core lib 104、client_modes 15、connect_timeout 5、endpoint_context 12、native_endpoint 4，共 140 passed；endpoint_context 两个 ignored 是由父测试以 --ignored 启动的隔离子进程入口。命令为 `cargo test --manifest-path core/Cargo.toml -p c2-core --lib --test native_endpoint --test client_modes --test endpoint_context --test connect_timeout --locked --offline`，带既有 target 和空 C2 环境。source mode 重建 Python native 后，`uv run --no-sync pytest sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/unit/test_ipc_config.py -q --timeout=30`：107 passed。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8b-baseline.log`、`b8b-core.log`、`b8b-native-build.log`、`b8b-python.log`。
+
+独立审查 run `2a590608-7558-458b-a75f-6f2293d5df11`、固定快照 `e46b3ab5dbf8184051b2781f545ae3221b7c007a`，无 actionable findings；Host 核对字节后验收回收。审查保留 endpoint 冻结与 client config 冻结的区别，以及 Python client_ipc_config 原有重新解析投影，未顺带做语义修改。
