@@ -2,7 +2,7 @@
 
 依据：[二轮复核](../reports/2026-10-13-defensive-programming-regression-reassessment.md)。起点为 `2ffe356f15d8ce1c8fad9e08a91ffff808d34dad`，实施分支 `socu/slimming-batches`。用户授权先实施证据充分、保持行为的局部精简；每批完成针对性回归和独立审查。Host 负责实现、验证与最终验收，独立审查通过 buddy 的只读固定快照执行。
 
-本轮 B1–B6 已完成，18 个非文档文件新增 7 行、删除 594 行，净减少 587 行；退出 13 项只服务已删除实现的测试。每批均有独立提交、现有行为回归及固定候选独立审查，审查未发现阻塞问题，6 个审查工作树均已验收回收。运行证据来自本机 macOS arm64；未执行 Windows/Linux hosted CI、性能基准或发布，不推导跨平台全面通过或性能收益。relay journal 及 GC 运维日志保持，公开 API/ABI 和 P1 项目仍按下述边界另行推进。
+首轮 B1–B6 已完成，18 个非文档文件新增 7 行、删除 594 行，净减少 587 行；退出 13 项只服务已删除实现的测试。每批均有独立提交、现有行为回归及固定候选独立审查，审查未发现阻塞问题，6 个审查工作树均已验收回收。运行证据来自本机 macOS arm64；未执行 Windows/Linux hosted CI、性能基准或发布，不推导跨平台全面通过或性能收益。relay journal 及 GC 运维日志保持，公开 API/ABI 和 P1 项目仍按下述边界另行推进。
 
 | 批次 | 实现提交 | 实际回归 |
 | --- | --- | --- |
@@ -39,6 +39,20 @@ P1 的 R01 精确分配所有权、R02 safe Rust 别名、R03 shutdown 发送阶
 ## 第二轮安排
 
 规划输入为首轮完成后的 `08955f0a1c1e94e21da2a45ca5c04abba071dc49`，计划提交为 `60bac6541e2747adaa0c22e6f256adb34fe76589`。用户已同意执行 B7/B8，实际状态与验证见下方执行记录。继续保留 relay journal、公开 API/ABI 和现有错误语义；P1 具体接口/布局/错误投影仍按独立设计边界讨论，不混入本轮局部精简。实施前重新核对源提交与工作树，若前提发生变化，先更新对应边界。
+
+
+B7/B8 六个子项现已全部完成，分别提交并通过针对性回归及独立审查。相对执行基线 60bac654，6 个生产/工具文件净减少 58 行；5 个测试文件净增加 163 行，用于新增 3 个真实行为测试并强化 2 个既有判据；合计 11 个非文档文件净增加 105 行。测试覆盖末次重试结果、并发完成、配置失败后修正，以及跨 owner/EOF 的 lease 生命周期，没有为新字段形状编写镜像测试。
+
+| 已完成子项 | 实现提交 | 实际验证 |
+| --- | --- | --- |
+| B7a | `e4b947a4c57ccbdc15f07e1f8aed331b5aa8c4c0` | IPC 203 + deadline 9 + relay state 45 passed |
+| B7b | `d24bc2406d2721cb11d35e4aa17289736c6260cf` | Node 59 passed / 1 Windows-only skipped；typecheck 与公开声明字节比对通过 |
+| B7c | `b4e916c9aae66a270fc9ec7ed66f41fad0aa01e8` | Python 33 passed；SHM 定向 1 passed；bytes/dict smoke 完成 |
+| B8a | `e9d0650c882fa95dd87d0b21a8ed037683321bed` | Rust SDK 4 + generated Rust SDK 4 passed |
+| B8b | `2949cd719621ae9bb59a74cbb19eff31e5d0c44e` | Rust 140 + Python 107 passed；2 个 ignored 为父用例启动的子进程入口 |
+| B8c | `89e3191d27ae32f85a386a4c36df52d15e9ee1b3` | Python 111 passed / 5 Windows-only skipped |
+
+各批测试次数存在重叠，不相加为独立覆盖总数。B7a 因 buddy 升级围栏改用原生只读代理核对固定 diff/hash；其余 5 项通过 buddy 固定工作树审查，均已验收回收。所有实现提交的非文档内容已与相应审查输入逐文件核对。验证仍限本地 macOS；Windows、free-threading 并发、hosted CI 与发布未由本轮证明。relay journal、Held<T>、P1 修复及公开 API/ABI/错误策略议题仍保持独立。
 
 ### B7：剩余局部精简
 
