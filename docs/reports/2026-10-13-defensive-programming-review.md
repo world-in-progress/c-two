@@ -127,6 +127,8 @@ Host 在仓库外直接编译当前 `buddy.rs`、`bitmap.rs`、`spinlock.rs`，�
 
 二轮限缩：仅完整明确的 Semantic 投影可直接复用；Transport 外层 message 与 error_bytes 内层语义消息可能不同。ERROR_CODE 是公开观察面，可由 native registry 派生以保持值，不凭仓内无读者删除。
 
+后续实施状态：B19 已完成 Rust 错误码单一声明子项，统一生成 enum、registry、name 与 TryFrom，生产及测试合计净减 172 行。名称、数值、顺序、repr、公开签名及未知码语义保留，详见[批次记录](../plans/2026-10-13-local-slimming-batches.md)及其中的端点环境限制。Python 直投、借用序列化与凭据投影尚未处理。
+
 **R33 · P3 · 私有孤儿 helper 及其专属测试可以退出。** [wrap_error](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/sdk/python/src/c_two/transport/server/reply.py#L30) 无消费者，引用不存在的 CRMExecuteFunction，又用宽异常回退 raw bytes；应删除，不应修复为另一套错误编码。[_resolve_client_ipc_config](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/sdk/python/src/c_two/config/ipc.py#L100)、[require_versioned_source_paths](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/tools/local_rc/local_registry.py#L149)、[inspect_all_normalized_manifests](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/tools/local_rc/local_registry.py#L283)、[normalized_manifest_bytes](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/tools/local_rc/local_registry.py#L657) 在全仓只见定义，可删除。[process_guard](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/tools/local_rc/process_guard.py#L1) 69 行仅有 [自己的测试](https://github.com/world-in-progress/c-two/blob/2ffe356f15d8ce1c8fad9e08a91ffff808d34dad/tests/repo/test_package_consumers.py#L256) 调用，生产 consumer 使用另一路 _stop_host；删除整个闲置 helper 与孤立用例，保留真实 consumer 进程退出验证。
 
 二轮补充：历史曾有意保留 wrap_error 为通用工具；今天其具体协议已失效且无调用，删除时也要同步 AGENTS 中仍列出的指导。

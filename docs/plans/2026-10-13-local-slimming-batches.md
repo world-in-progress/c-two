@@ -307,3 +307,19 @@ bind 通过 `O_CREAT | O_EXCL` 区分新建与既有 lease；回滚在原 gate �
 Rust 与 Python 回归后分别比对默认端点目录条目及 inode，新增/消失/身份变化均为零，socket 为零；历史 12 个空 lease 的身份、权限、大小、mtime/ctime 和内容保持不变。未执行历史清理。六个改动函数与 rustfmt 输出一致，未格式化其他区域，`git diff --check` 通过。
 
 原生子代理独立审查无 actionable findings。首审后仅将测试的一处 assert 按 rustfmt 换行，Host 和 reviewer 均确认非空白源码一致；最终源码补丁 SHA-256 为 `09c1fd6d21e79fbd6018e235f4ccaec7ed4bbfad2af51c05f54f7ee5f93531b0`，源文件哈希与最终审查输入一致。测试日志、结构比对、零残留 receipt、固定补丁及独立审查报告位于 `/tmp/c2-slim-r14-20261013/`。
+
+### B19：R32 Rust 错误码单一声明
+
+执行基线为 `d3fe71bc2bdabbe7de30d0537705b09051ee2b39`。用户批准只收敛错误码声明，保留名称、数值、registry 顺序、repr、公开签名及各入口未知码语义。本轮继续不用 buddy。
+
+`c2-error/src/lib.rs` 用一个模块私有宏从既有 26 项声明生成同名 enum、同序 registry、穷尽的 name 匹配及 TryFrom。`repr(u16)`、六项 derive 和公开签名保持；未知数值仍返回 `Err(())`，由原调用方分别拒绝或保留上下文后降级。Host 机械核对声明列表逐字一致，ErrorCodeEntry、From 转换、其余生产代码（含完整 wire codec）均未改变。Python 直投、序列化、凭据投影不在本批。
+
+四项重复测试合成独立手写的 26 项 golden 表，逐项核对 variant、数值、名称、registry 顺序、name 与 TryFrom；额外检查 9、700、718、9999 和 u16::MAX 拒绝。表没有从生产宏生成，先在旧实现上完整 c2-error 12 passed，再迁移生产声明；其余 display/wire 测试保留。生产净减少 119 行，测试净减少 53 行，非文档合计净减少 172 行；没有新增依赖或生成脚本。
+
+首轮扩大 Rust 回归时，c2-error 12 passed，完整 relay 为 338 passed、81 failed；81 项全部在启动时报告 managed endpoint namespace is unverifiable。开始快照已证明默认 `/tmp/c2-1f5/.gate.marker` 缺失，和 B18 快照相比只有该条目消失；历史 12 个空 lease 均未变。重建前已安装的原生扩展实际 register 同样失败，inspect 报 initialization-incomplete，故不能将该轮当完整通过。缺失发生在本轮开始前，删除来源未查证；本批没有恢复 marker、搬移目录或放宽 native 接纳规则。
+
+最终通过的定向 Rust 回归为 c2-error 12、c2-wire 146、HTTP client 89，以及 IPC 的错误阶段、旧 token、合同匹配和 canonical error 五项，共 252 passed。c3 与 Python native 均从候选源码重建；Python 使用本批预建的私有 IPC 根及显式选定的候选 c3，error、native error registry、mesh errors、Core transport parity 和 error propagation 五文件共 187 passed，包含真实 direct IPC、显式 HTTP 和 relay-aware 错误字段一致性。合计 439 项通过，无跳过；首轮失败和后续重复执行不计入此数。完整默认目录 relay gate 仍受上述环境限制，验证限本机 macOS。
+
+Rust 与 Python 运行后默认目录条目及 inode 无新增、消失或替换，历史 12 个 lease 的身份、权限、大小、mtime/ctime 和内容保持不变。本批私有 IPC 根最终 socket/lease 均为零，只保留 native gate/marker；未执行历史清理。改动区域已按 rustfmt 格式化，其余区域未重排，`git diff --check` 通过。
+
+原生子代理独立审查无 actionable findings；Host 核对最终源码与固定审查输入一致，补丁 SHA-256 为 `ee73f160dda7d9f175176dcc05336797a5b1c17cb46571a6a96b421ded40d250`。基线/候选日志、原目录故障复现、私有目录验收、结构比对、固定补丁及审查报告位于 `/tmp/c2-slim-r32-20261013/`。
