@@ -104,7 +104,6 @@ struct SchedulerState {
     active_workers: usize,
     active_readers: usize,
     writer_active: bool,
-    waiting_writers: usize,
     next_ticket: u64,
     queue: VecDeque<QueuedPermit>,
 }
@@ -149,7 +148,6 @@ pub(crate) struct SchedulerPendingPermit {
     inner: Arc<SchedulerInner>,
     access: HeldAccess,
     ticket: u64,
-    writer_wait_registered: bool,
     completed: bool,
 }
 
@@ -350,17 +348,11 @@ impl Scheduler {
         let ticket = state.next_ticket;
         state.next_ticket = state.next_ticket.wrapping_add(1);
         state.queue.push_back(QueuedPermit { ticket, access });
-        let mut writer_wait_registered = false;
-        if access == HeldAccess::Write {
-            state.waiting_writers += 1;
-            writer_wait_registered = true;
-        }
 
         Ok(SchedulerPendingPermit {
             inner: Arc::clone(&self.inner),
             access,
             ticket,
-            writer_wait_registered,
             completed: false,
         })
     }
@@ -440,10 +432,6 @@ impl SchedulerPendingPermit {
                 if state.closed {
                     state.pending -= 1;
                     self.inner.remove_queued(&mut state, self.ticket);
-                    if self.writer_wait_registered {
-                        state.waiting_writers -= 1;
-                        self.writer_wait_registered = false;
-                    }
                     self.completed = true;
                     self.inner.notify_all();
                     return Err(SchedulerAcquireError::Closed);
@@ -451,10 +439,6 @@ impl SchedulerPendingPermit {
 
                 if self.inner.can_activate(&state, self.ticket, self.access) {
                     self.inner.remove_queued(&mut state, self.ticket);
-                    if self.writer_wait_registered {
-                        state.waiting_writers -= 1;
-                        self.writer_wait_registered = false;
-                    }
                     match self.access {
                         HeldAccess::Parallel => {}
                         HeldAccess::Read => state.active_readers += 1,
@@ -481,10 +465,6 @@ impl SchedulerPendingPermit {
         if state.closed {
             state.pending -= 1;
             inner.remove_queued(&mut state, self.ticket);
-            if self.writer_wait_registered {
-                state.waiting_writers -= 1;
-                self.writer_wait_registered = false;
-            }
             self.completed = true;
             inner.notify_all();
             return Err(SchedulerAcquireError::Closed);
@@ -506,10 +486,6 @@ impl SchedulerPendingPermit {
                 let limit = self.inner.limits.max_workers.map_or(1, NonZeroUsize::get);
                 state.pending -= 1;
                 inner.remove_queued(&mut state, self.ticket);
-                if self.writer_wait_registered {
-                    state.waiting_writers -= 1;
-                    self.writer_wait_registered = false;
-                }
                 self.completed = true;
                 inner.notify_all();
                 return Err(SchedulerAcquireError::Capacity { field, limit });
@@ -518,10 +494,6 @@ impl SchedulerPendingPermit {
             if state.closed {
                 state.pending -= 1;
                 inner.remove_queued(&mut state, self.ticket);
-                if self.writer_wait_registered {
-                    state.waiting_writers -= 1;
-                    self.writer_wait_registered = false;
-                }
                 self.completed = true;
                 inner.notify_all();
                 return Err(SchedulerAcquireError::Closed);
@@ -529,10 +501,6 @@ impl SchedulerPendingPermit {
         }
 
         inner.remove_queued(&mut state, self.ticket);
-        if self.writer_wait_registered {
-            state.waiting_writers -= 1;
-            self.writer_wait_registered = false;
-        }
         match self.access {
             HeldAccess::Parallel => {}
             HeldAccess::Read => state.active_readers += 1,
@@ -557,10 +525,6 @@ impl Drop for SchedulerPendingPermit {
         let mut state = inner.state.lock().unwrap();
         state.pending -= 1;
         inner.remove_queued(&mut state, self.ticket);
-        if self.writer_wait_registered {
-            state.waiting_writers -= 1;
-            self.writer_wait_registered = false;
-        }
         self.completed = true;
         inner.notify_all();
     }
