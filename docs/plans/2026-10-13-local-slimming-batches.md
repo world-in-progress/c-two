@@ -213,3 +213,13 @@ T02 完整 relay lib 426 passed（退出一个旧源码检查，原为 427）；
 首次 `uv run --frozen --offline` 因自动重建 FastDB 缺失 C++ 头文件路径而在测试启动前失败。合并后的 `test_ipc_config.py`、`test_runtime_session.py` 在原已安装扩展上 107 passed；随后使用 source mode、既有共享 target 与 macOS SDK C++ include 路径重新 `uv sync --frozen --offline --reinstall-package c-two` 成功，候选扩展上相同两文件 107 passed，`git diff --check` 通过。Host 将新 helper 内联展开，整份 `config_ffi.rs` 与基线逐字节一致，覆盖字段次序、base/flat 优先级及错误传播的等价核对。
 
 独立审查 run `412874ec-43ab-42e4-a261-c6c9fb62f5d6`、固定输入 `f10e0f0c99f08a137b5ac14d56fcf269e8a1e4f9` 无 actionable findings；Host 已核对三个文件与审查输入的 SHA-256 一致并验收回收。日志、机械对比与 manifest 位于 `/tmp/c2-slim-b10-20261013/r30-*`。验证范围为本地 macOS 的 native 构建与相关 Python 回归。
+
+### B11：FULL_SYNC 的接纳与合并收敛
+
+执行基线为 `4493724779455bea54c817c1e63b59220a9b18b7`。本批选择 R28 的 FULL_SYNC 子项：`ValidatedFullSync` 的字段私有，首次接纳经 `TryFrom<FullSyncEnvelope>` 完成，已完成静态字段、hash 和 owner 私有字段接纳；`merge_validated_snapshot` 直接消费它，退出 raw 合并入口及同值重验。缺失 owner、当前 peer 活性、自身/local 路由保护、replacement 完成后提交、tombstone 时序继续保留；替换后的 URL 来自已经验证的 snapshot peer。生产代码净减少 38 行，公开 API/ABI 和 wire 形状无改动。
+
+测试经一个短 fixture helper 走真实 Envelope/ValidatedFullSync 接纳后再合并。六个非法快照用例合并为六种输入场景并统一检查路由、tombstone、peer 无部分修改；owner 私有字段断言并入完整 snapshot roundtrip。缺失 owner、peer 活性、URL 更新和 tombstone 新旧顺序用例全部保留并迁移入口。测试净减少 90 行，本批非文档代码合计净减少 128 行；R28 的 digest/envelope 其他子项尚未处理。
+
+基线完整 relay lib 426 passed；先只迁移测试、保持原生产实现时，route_table 定向 55 passed；随后候选 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 为 420 passed，`git diff --check` 通过。总数减少 6 项来自六拒绝用例合一及 owner 字段用例并入 roundtrip，原行为场景保留。Host 与独立审查均核对 replacement 提交、tombstone 和 peer 更新后半段与基线逐字节一致。验证范围为本地 macOS 的 c2-http relay feature；未据此声明跨平台或发布通过。
+
+独立审查 run `011ceac7-fa53-4e7b-ad65-49f099058d0c`、固定输入 `bc0993985036e66f3408e82f8a026f890ea8d976` 无 actionable findings；Host 已复核构造不变量、动态状态边界与测试迁移，确认源文件 SHA-256 等于审查输入并验收报告。日志和 manifest 位于 `/tmp/c2-slim-b11-20261013/r28-*`。
