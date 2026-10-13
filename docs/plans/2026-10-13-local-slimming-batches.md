@@ -36,6 +36,46 @@ relay journal 保留。公开 API/ABI/语义变化先讨论：旧 transfer buffe
 
 P1 的 R01 精确分配所有权、R02 safe Rust 别名、R03 shutdown 发送阶段和 R04 路由开放登记身份独立列项，保留复现/时序证据，先形成各自最小修复方案与回归要求，不混入上述精简提交。RegistrationPlan、复制/GC/轮询、跨 await 权威获取、OwnedHandle 等条件重构也另行设计。其余局部机会（IPC 重试尾部、内部状态配对、TypeScript 转发、已就绪 fixture 等待）在本轮各批稳定后按相同标准另立批次。
 
+## 下一轮拟议安排
+
+规划输入为首轮完成后的 `08955f0a1c1e94e21da2a45ca5c04abba071dc49`。以下 B7/B8 均为拟议工作，尚未实施或运行项目回归；本次只补充计划。继续保留 relay journal、公开 API/ABI 和现有错误语义。实施前重新核对源提交与工作树，若前提发生变化，先更新对应边界。P1 的设计与反例准备可独立推进，不必等待所有低优先级精简结束。
+
+### B7：剩余局部精简
+
+B7 按下表顺序拆成三个独立提交；每项完成针对性回归和固定快照独立审查后再进入下一项。目标是撤去已失去作用的内部状态与等待，不合并不同层的重试或资源协议。
+
+| 子项 | 精确范围与目标形态 | 必须保持的行为 | 回归与出口 |
+| --- | --- | --- | --- |
+| B7a · R36 | [IPC acquisition](../../core/transport/c2-ipc/src/client.rs#L4615) 的 lookup_route_contract_for_acquire、acquire_route、acquire_route_token：删除 last_not_found/last_unbound 和不可达尾部；循环消费固定退避序列，无下一次重试时直接返回当前实际结果 | 每层原有 6 次迭代、10/25/50/100/200 ms 退避、错误分类与最终错误内容；compaction/watch 恢复的额外查询；每次获取 live authority；外层原始 deadline。不得把两层预算合成一层，或以 unreachable/panic 代替尾部兜底 | c2-ipc 的 lib/tests，启用 test-support 使 pending 清理断言实际执行；c2-http 的 relay state acquisition 用例启用 relay feature。重点验收 deadline 内重试、缓存 token 仍做 live lookup、关闭/移除/同名重登记、最后一次成功与耗尽返回实际错误；仅在现有用例未覆盖后两项时补行为测试 |
+| B7b · R36 | [TypeScript binding](../../core/foundation/c2-mem-ffi/bindings/typescript/src/index.ts#L438)：删除无后续读取的 options = loadOptions；normalizeRequestPool 直接调用 normalizeSegment，删除仅转发的 normalizeRequestSegment | addonPath 捕获、endpoint context 生命周期、segments 快照和冻结、完全相同的错误标签及元数据校验；包 exports、声明接口和 ABI 3 不变 | npm run typecheck 与 npm test（包含既有原生 addon 构建）；核对请求 metadata snapshot、非法 segment 拒绝、release/forgetConsumed/close。无需为删赋值或转发函数新增镜像测试 |
+| B7c · R38，含窄 T04 判据修正 | 两份 IPC integration 文件中 register 后的 3 处 sleep(0.3)；segment_size_benchmark.py 中普通 bytes/dict 结果的 4 处 hasattr/release 探测。并发用例先补线程全部结束及 9 次调用完成的判据，再去对应等待 | register 的同步 native readiness；真实 IPC 数据完整性和清理；保留 GC/业务/跨进程等待以及真实 ResponseBuffer/HeldResult.release；benchmark 的结果持有、计时区间、选路与 close/unregister 保持 | test_zero_copy_ipc.py、test_ipc_buddy_reply.py、test_direct_ipc_control.py；检查启动返回即 ready、重启和重复启动失败路径。benchmark 仅做小负载 bytes/dict 调用 smoke，不运行全矩阵或据此宣称性能提升 |
+
+B7a 的两项直接验收入口是 `core/transport/c2-ipc/tests/connect_timeout.rs` 中的 route_publication_retry_sleep_is_inside_connect_budget 与 matching_cached_route_token_still_has_live_lookup_deadline；relay 还需 exact_token_ready_to_closed/removed/reregistered 的真实调用拒绝及 callback 为 0。Rust 改动后重新构建 Python native 再运行 B7c，避免沿用旧扩展的通过记录。平台声明以实际 gate 为准，保留既有 Linux/macOS/Windows CI，不把本地 macOS 运行替代跨平台通过。
+
+B7c 的第三处等待位于 `test_ipc_buddy_reply.py::TestBuddyReply::test_concurrent_large_calls`；现有 join(timeout=20) 后仅断言 errors 为空，不能证明工作完成。补完成判据属于防止假通过的测试修缮，应独立核对清理和总超时，不通过增加 sleep 或放宽 timeout 消除失败。其他线程测试和广泛 T04 改造不随本项扩展。
+
+### B8：私有状态收敛
+
+R31 的独立只读复核 run 为 `eba0201a-513f-4df7-817c-ceee4d7bbc56`，固定输入与本轮规划一致。Host 已复核关键构造/释放/锁路径，验收报告并回收审查工作树。下面三项可按保持现有行为的方案各自落地；没有要求把全部额外测试缺口一次性铺开。
+
+| 子项 | 最小设计 | 关键回归与边界 |
+| --- | --- | --- |
+| B8a · BorrowedPayload | 直接持有 Payload；payload() 直接借用；Drop 仍先 invalidate，再让字段析构 | sdk/rust 的 payload_lifetime 及 codegen generated_rust_sdk；正常、业务 Err、输出编码失败和 panic 出口的 checked view 失效。保持生成接口和 copy-backed 语义，不用字段形状测试代替生命周期测试 |
+| B8b · client_config_frozen | 删除 RuntimeState 的重复 bool，以 frozen_client_config.is_some() 派生；公开 getter、setter 与生命周期转移两端的检查同步改投影 | 保留原 mutex、revision、锁外解析后的重验、原始 deadline；配置解析失败不冻结，首次有效尝试即冻结，随后连接失败或 shutdown 都不解冻。复用 client_modes/native_endpoint/endpoint_context/connect_timeout 与 Python RuntimeSession 用例；必要时补非法配置可修正的行为。若不改 revision 机制，不为删除 bool 另造同步 hook |
+| B8c · PyEndpointSweep | Option<OpenSweep> 统一 iterator/lease/closed；OpenSweep 字段顺序为 iterator 后 lease；context、budget、batches 留在外层 | close/Drop/unwind 均先销毁 iterator，再归还 projection lease；EOF 或 round_interrupted 不等于公开 close；关闭后 context/protocol 仍可读。复用 endpoint maintenance/context 用例，补“旧 owner 二次 close/drop 不释放新 owner 的 lease”和“EOF 后仍占 lease”；保持 PyO3 借用门禁，不能用 GIL 假定替代同步 |
+
+Held<T> 暂不并入 B8。两个 Option 的稳定状态确实配对，但直接保留 tuple 局部会把 invalidator panic 时的析构顺序从 response→value 改为 value→response。Host 的最小 Rust 探针验证了这一语言机制，日志在 `/tmp/c2-next-batch-plan-20261013/drop-order-probe.log`；它不是实际 transport 释放通过证据。先在原实现补真实 SDK Held<T> 的 invalidation Err、transport Err/组合错误和 unwind 清理顺序，再使用配对 Option，并分别声明局部以保持现有析构顺序。现有 Core 的替身 guard 和 SDK 的 owned-bytes 用例不足以单独证明真实响应租约释放。
+
+### P1 的独立设计与实施入口
+
+| 单元 | 先讨论的具体设计 | 修复前应固定的反例与出口 |
+| --- | --- | --- |
+| R01 + R02 · 分配身份与唯一写所有权 | 分配器记录精确活分配状态；区分入站原始坐标与 allocator 创建的私有 owner，切片借用绑定 owner。统一评估 SHM 布局、公开 Rust 接口及 FFI 影响；不能只改一个方法为 &mut self 或只隐藏 handle 字段 | R01 非法子区间释放被拒且 bitmap/count/free_bytes 不变，活块不退休或重叠；R02 非法可变别名由 safe API 无法构造，覆盖重复打开同 backing。保持正常读写、trim 原容量释放、generation 与多进程共享路径 |
+| R03 · shutdown 发送阶段 | 区分 NotSent 与 DispatchUncertain，覆盖外层 timeout。发送前保持重试；开始控制写后丢确认不重发到同地址的新实例。先确定沿用现有未确认结果还是调整错误投影；ACK 仍只代表 initiate | 发送前暂不可用后成功；部分/完整发送后丢 ACK；原实例退出后同地址替换实例不收到重发；原始总预算不重置。该修复与 B7a 的业务 route acquisition 循环分开 |
+| R04 · 开放登记事务 | token 绑定 route UID/具体登记；开放与 OwnerMissing/关闭共享同步边界，并核对待开放状态。保持 shutdown generation；状态锁不跨 callback drain | A 的旧 token 不能打开同名 B；OwnerMissing 与最终开放交错后 callback 为 0；正常 relay 最终发布仍可开放；catalog 与 scheduler 状态一致。先固定真实行为反例，再改事务和替换仅检查签名的测试 |
+
+以上 P1 设计尚待讨论，优先级不因 B7 的简单程度而降低。它们独立提交、独立回归与审查，不混入精简提交。R08 配置错误策略、R23 timeout、R24 旧 transfer 参数、R25 公开适配协议，以及 RouteAck/Connection/Heartbeat 等公开观察面继续沿原清单另行讨论。
+
 ## 执行记录
 
 ### B1：调度器死计数
