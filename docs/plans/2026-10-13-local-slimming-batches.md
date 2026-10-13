@@ -135,3 +135,9 @@ buddy 初始 health 正常，但提交时 launcher 返回 UPGRADE_IN_PROGRESS，
 B7a 实现提交为 `e4b947a4c57ccbdc15f07e1f8aed331b5aa8c4c0`。本项唯一实现文件 index.ts，新增 1 行、删除 11 行。独立审查 run `64e48cca-ff00-49bd-86e3-7046d400e398`，固定快照 `f8de43786eda0a2d49542e6ba3f471101d65094d`，无 actionable findings；Host 核对字节一致后验收回收。buddy 此时已恢复为 0.32.0。参数绑定/closure、getter 顺序与次数、this、错误类型与 label、冻结和释放均保持；删除 helper 会改变调试栈帧，不承诺源码反射文本不变。
 
 验证：在 TypeScript 包目录运行 `npm run typecheck` 成功；以既有 CARGO_TARGET_DIR、CARGO_NET_OFFLINE=true 和空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS 运行 `npm test`，含原生 Rust/C addon 构建：59 passed、0 failed、1 skipped（需要真实 Windows 的 current-SID 测试）。Node v25.8.1、npm 11.11.0。生成 index.d.ts 与删除前逐字节一致，SHA256 `a5f6e769498bbd868f1090a44e3fef7e21ece469e7b7b0e024cd409d7167b0cb`。日志 `/tmp/c2-slim-round2-20261013/b7b-typecheck.log`、`b7b-node.log`，diff check 通过。
+
+### B7c：就绪等待与测试完成判据
+
+B7b 实现提交为 `d24bc2406d2721cb11d35e4aa17289736c6260cf`。本项 3 文件新增 12 行、删除 16 行；3 处等待移除，4 处伪释放探测移除，并发用例改为同一 20 秒 join 预算、三个 worker 全部退出且各完成 3 次调用，proxy 使用同一关闭路径的 context manager。20 秒仅界定 join，不宣称能取消卡住线程或界定全部注册/teardown。独立审查 run `aa5ba7a6-f648-4e6e-9994-c7beefb73652`，固定快照 `5e80d0fbc731e29863fb0cae59cf4b4a7c4e8486`，无 actionable findings；Host 核对候选字节一致后验收回收。
+
+验证：重建 native 后，原三文件基线 33 passed；保留旧等待加入完成判据后，该并发用例 1 passed；删等待后 `C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/integration/test_zero_copy_ipc.py sdk/python/tests/integration/test_ipc_buddy_reply.py sdk/python/tests/integration/test_direct_ipc_control.py -q --timeout=30`：33 passed。另实际调用 benchmark 两个入口（64 byte、2 MiB segment、原有轮次）均完成；只作 smoke，不使用中位耗时作性能结论。c2-server::buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization 定向回归 1 passed。日志位于 `/tmp/c2-slim-round2-20261013/` 的 b7c-baseline.log、b7c-completion-baseline.log、b7c-regression.log、b7c-benchmark-smoke.log、b7-shm.log。diff check 通过。

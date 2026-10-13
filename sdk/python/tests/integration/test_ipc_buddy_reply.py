@@ -33,7 +33,6 @@ class TestBuddyReply:
 
     def _setup_ipc(self) -> cc.CRMProxy:
         cc.register(IEcho, Echo(), name='echo')
-        time.sleep(0.3)
         address = cc.server_address()
         return cc.connect(IEcho, name='echo', address=address)
 
@@ -115,29 +114,32 @@ class TestBuddyReply:
         import threading
 
         cc.register(IEcho, Echo(), name='echo')
-        time.sleep(0.3)
         addr = cc.server_address()
 
         errors = []
+        completed = [0] * 3
 
         def worker(worker_id):
             try:
-                proxy = cc.connect(IEcho, name='echo', address=addr)
-                for i in range(3):
-                    data = os.urandom(1024 * 1024)  # 1 MB
-                    result = proxy.echo(data)
-                    if result != data:
-                        errors.append(f"Worker {worker_id} call {i}: mismatch")
-                cc.close(proxy)
+                with cc.connect(IEcho, name='echo', address=addr) as proxy:
+                    for i in range(3):
+                        data = os.urandom(1024 * 1024)  # 1 MB
+                        result = proxy.echo(data)
+                        if result != data:
+                            errors.append(f"Worker {worker_id} call {i}: mismatch")
+                        completed[worker_id] += 1
             except Exception as e:
                 errors.append(f"Worker {worker_id}: {e}")
 
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+        deadline = time.monotonic() + 20
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=20)
+            t.join(timeout=max(0, deadline - time.monotonic()))
+        assert all(not t.is_alive() for t in threads), 'Concurrent workers did not finish'
         assert not errors, f"Concurrent test errors: {errors}"
+        assert completed == [3, 3, 3], f"Incomplete concurrent calls: {completed}"
 
     def test_response_buffer_memoryview(self):
         """ResponseBuffer supports zero-copy memoryview access."""
