@@ -11,7 +11,7 @@
 | B1 | R27：仅删除 scheduler.waiting_writers、writer_wait_registered 及维护分支 | scheduler 全部测试，特别是读写公平、async/blocking FIFO、取消/关闭；确认 queue/ticket/notify/pending/active 不变；检查 SHM 路径未改变 | 已完成 |
 | B2 | R28 Python：bridge 工厂依靠 ResourceBridge 构造校验；PayloadBinding 的 scoped-owner 能力依靠已验证 kind | resource conformance、input lifetime、payload binding 相关用例；非法 hook 错误和 borrowed 门禁不变 | 已完成 |
 | B3 | R29：生成 service_definition 复用已有 release.reference() | codegen 单元/生成消费者测试；生成代码仍能编译使用，合同字节及公共生成表面不变 | 已完成 |
-| B4 | R36 局部：bitmap 恒空循环、空 handle 紧邻重验、私有 retention 总和蕴含的局部加法检查、chunk 未读 _created_at | c2-mem bitmap/handle/retention 以及 chunk registry 测试；全域预算、错误计数、世代/跨度/锁、GC last_activity 不变 | 待实施 |
+| B4 | R36 局部：bitmap 恒空循环、空 handle 紧邻重验、私有 retention 总和蕴含的局部加法检查、chunk 未读 _created_at | c2-mem bitmap/handle/retention 以及 chunk registry 测试；全域预算、错误计数、世代/跨度/锁、GC last_activity 不变 | 已完成 |
 | B5 | R33 内部孤儿：私有 _resolve_client_ipc_config、三个 local_registry 闲置 helper、只由自身测试调用的 process_guard | native config 投影、local registry/package consumer 相关测试；保留实际 manifest/receipt 校验与 _stop_host 清理 | 待实施 |
 | B6 | R37：退出生产发布流程的 check_version/check_cli_release 与专属测试，移除 CI 中对应测试选择 | 当前 release promotion 与 workflow 测试；自动 skip、手工冲突、partial retry、来源/字节验证不变 | 待实施 |
 
@@ -48,3 +48,11 @@ B2 实现提交为 `d4d0e9012a653e2f867dbfe128d28ff707325453`。B3 仅将生成 
 验证：`cargo test --manifest-path core/Cargo.toml -p c2-codegen --lib --test generated_rust_sdk --locked --offline`：lib 2 passed、generated Rust SDK 4 passed，含真实生成消费者编译/调用、错误 payload 类型拒绝及 portable fixture 编译。targets.rs 的 rustfmt 和 diff check 通过。日志 `/tmp/c2-slim-implementation-20261013/b3-codegen-r2.log`。生成 Rust 源码一行及其内容哈希预期改变；canonical 合同身份/元数据、公开接口及运行语义保持。
 
 初次 Core 构建因 packaged fastdb-sys 禁止 source mode 而失败；随后运行仓库 prepare_fastdb_sdk.py 校验官方 CoreSDK，并限定该命令使用 FASTDB_PAYLOAD_LINK_MODE=system、FASTDB_PAYLOAD_SYSTEM_LIB_DIR 和 DYLD_LIBRARY_PATH。验证包为 `fastdb-core-0.2.1-aarch64-apple-darwin.tar.gz`，源 SHA `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，归档 SHA256 `5f346177032c3c13838449db9ef30f43f3bd2b6d91241d28d2ac1edcd025ad33`；未改依赖版本。
+
+### B4：局部内存与分块不变量
+
+B3 实现提交为 `dcb72f590c6cf6b9172011a8b5798af224975ff7`。本批 4 文件新增 5 行、删除 15 行。bitmap 的循环上下界恒等；空 handle 保留入口首次完整校验；retention 的私有 permit charge 始终包含在同锁域总量中，全域加法通过即保证局部加法不溢出；chunk 只删除未读创建时间，活动时间与全部断言保留。独立审查快照 `a7113e1d863d9b1fdb0fc1df566fd246020b5fb8`，run `4fecae0c-6c4a-43bc-a927-7c1c031a5b3f`，无 actionable findings。Host 已核对全部文件一致、验收并回收审查工作树。
+
+验证：`cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire --lib --locked --offline`：177 + 146 passed；`cargo test --manifest-path core/Cargo.toml -p c2-server --lib --locked --offline`：168 passed，包含 SHM 无 inline materialization 回归。各命令设置本轮 CARGO_TARGET_DIR、空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS。4 文件 rustfmt 与 diff check 通过。重建 Python 原生扩展后，B2 同一组 4 文件测试再次 30 passed。日志分别为 `/tmp/c2-slim-implementation-20261013/b4-memory-wire.log`、`b4-server.log`、`b4-python-r2.log`。
+
+Python 原生扩展初次 system mode 重建成功，但默认加载因缺少 libfastdb 的 LC_RPATH 失败，未收集测试。使用该 SDK 原有的 Git 依赖 source mode、限定进程的 CPLUS_INCLUDE_PATH 重新执行 `uv sync --frozen --offline --reinstall-package c-two` 成功；随后默认加载及上述 Python 回归通过，没有新增加载器配置或修改依赖。Core codegen 的已验证官方 SDK system mode 与 Python 原有源码构建分别遵守其既有依赖边界。

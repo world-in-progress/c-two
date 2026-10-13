@@ -81,7 +81,6 @@ impl ChunkAssemblyId {
 struct TrackedAssembler {
     inner: ChunkAssembler,
     generation: u64,
-    _created_at: Instant,
     last_activity: Instant,
     total_bytes: u64,
 }
@@ -230,7 +229,6 @@ impl ChunkRegistry {
             let tracked = TrackedAssembler {
                 inner: assembler,
                 generation,
-                _created_at: now,
                 last_activity: now,
                 total_bytes: alloc_bytes,
             };
@@ -805,7 +803,6 @@ mod tests {
         {
             let mut shard = reg.shard(1).lock();
             let entry = shard.get_mut(&(1, 1)).unwrap();
-            entry._created_at = stale;
             entry.last_activity = stale;
         }
         let before_feed = Instant::now();

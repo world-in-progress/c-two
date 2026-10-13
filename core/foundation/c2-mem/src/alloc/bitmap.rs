@@ -69,10 +69,6 @@ impl LevelBitmap {
             let mask = (1u64 << remainder) - 1;
             self.word(full_words).store(mask, Ordering::Release);
         }
-        // Zero out any extra words (shouldn't exist if sized correctly).
-        for i in (full_words + if remainder > 0 { 1 } else { 0 })..self.num_words {
-            self.word(i).store(0, Ordering::Release);
-        }
     }
 
     /// Find and claim a free block. Returns the block index, or None.

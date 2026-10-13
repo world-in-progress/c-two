@@ -1121,7 +1121,6 @@ impl MemPool {
     pub fn copy_handle_data(&self, handle: &MemHandle) -> Result<Vec<u8>, String> {
         self.validate_handle(handle)?;
         if handle.is_empty() {
-            self.validate_handle(handle)?;
             return Ok(Vec::new());
         }
         match handle {
