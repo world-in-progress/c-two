@@ -1297,6 +1297,9 @@ mod lifecycle_tests {
                     Err(error) => panic!("{error}"),
                 }
             };
+            // Accepted sockets inherit O_NONBLOCK on macOS. This peer uses
+            // blocking reads with a bounded timeout on every platform.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

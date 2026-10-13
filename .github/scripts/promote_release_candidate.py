@@ -11,9 +11,9 @@ Contract, fail-closed on every deviation:
 
 - Both gates must have a *successful main-push* run for the exact same source
   SHA: the ``Release Candidate`` workflow (release-candidate.yml) and the
-  ``Windows Native`` workflow (windows-native.yml) with full-scope artifacts
-  from both ``windows-2022`` and ``windows-2025``. A gate that is still
-  running defers (exit 75) so the late completion re-triggers promotion; a
+  ``Source Validation`` workflow (ci.yml) with full-scope artifacts
+  from ``ubuntu-24.04``, ``macos-15``, ``windows-2022`` and ``windows-2025``.
+  A gate that is still running defers (exit 75) so the late completion re-triggers promotion; a
   failed or missing gate fails.
 - The promoting run itself must be on ``refs/heads/main`` of the canonical
   repository; the trusted validation code is the current ``main`` checkout,
@@ -35,13 +35,13 @@ Contract, fail-closed on every deviation:
   published listing and the single retained sdist, plus lifecycle cleanup
   (processes exited, temporary directory removed, borrowed inputs
   invalidated).
-- The Windows Native full-scope evidence is re-validated with the trusted
-  runner source: the full gate inventory from ``tools/ci/windows_native.py``
+- The Source Validation full-scope evidence is re-validated with the trusted
+  runner source: the full gate inventory from ``tools/ci/source_validation.py``
   must be present and passing with no skipped gates, every internal artifact
   hash in ``run-evidence.json`` is verified against the extracted bytes, the
   strict 18-row Rust/Python portable matrix and 12-row TypeScript receipts
-  are re-validated through ``tools/local_rc``, the ordinary and standard-user
-  wheel receipts bind the Native debug ``c3`` (a different build from the
+  are re-validated through ``tools/local_rc``, the ordinary wheel receipts
+  and Windows standard-user receipts bind each source lane's debug ``c3`` (a different build from the
   released candidate executables, never claimed byte-equal), and both source
   pins (C-Two commit and the frozen FastDB revision) must match exactly.
 - FastDB dependency-proof inputs are never classified or staged as C-Two
@@ -121,8 +121,8 @@ EXPECT_REPOSITORY = "world-in-progress/c-two"
 EXPECT_REF = "refs/heads/main"
 CANDIDATE_WORKFLOW_FILE = "release-candidate.yml"
 CANDIDATE_WORKFLOW_NAME = "Release Candidate"
-WINDOWS_NATIVE_WORKFLOW_FILE = "windows-native.yml"
-WINDOWS_NATIVE_WORKFLOW_NAME = "Windows Native"
+SOURCE_VALIDATION_WORKFLOW_FILE = "ci.yml"
+SOURCE_VALIDATION_WORKFLOW_NAME = "Source Validation"
 MANIFEST_SCHEMA = "c-two.release-candidate.v1"
 MANIFEST_NAME = "rc-manifest.json"
 CONTEXT_SCHEMA = "c-two.release-candidate.context.v1"
@@ -170,21 +170,26 @@ EXPECTED_RECEIPT_PREFIX_COUNTS = {
 # asset names; the promotion publishes those exact bytes under the same names.
 EXPECTED_INSTALLER_NAMES = ("c3-installer.sh", "c3-installer.ps1")
 FASTDB_LICENSE_ASSETS = ("fastdb-LICENSE", "fastdb-THIRD_PARTY_NOTICES.txt")
-WINDOWS_NATIVE_YEARS = ("windows-2022", "windows-2025")
-# Frozen FastDB source pin of the Windows Native gates; cross-checked against
-# the trusted checkout's windows-native.yml so silent pin drift fails closed.
-WINDOWS_NATIVE_FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+SOURCE_VALIDATION_LANES = {
+    "ubuntu-24.04": "linux",
+    "macos-15": "macos",
+    "windows-2022": "windows",
+    "windows-2025": "windows",
+}
+# Frozen FastDB source pin of the Source Validation gates; cross-checked against
+# the trusted checkout's ci.yml so silent pin drift fails closed.
+SOURCE_VALIDATION_FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
 SMOKE_SCHEMA = "c-two.installed-wheel-smoke.v1"
 STANDARD_USER_WRAPPER_SCHEMA = "c-two.standard-user-wrapper.v1"
 SDIST_INSPECT_SCHEMA = "c-two.release-candidate.sdist-inspection.v1"
 SDIST_PROOF_SCHEMA = "c-two.release-candidate.sdist-proof.v1"
-NATIVE_EVIDENCE_SCHEMA = "c-two.native-run-evidence.v1"
-MATRIX_RECEIPT_NAME = "portable-matrix-full-receipt.v1.json"
-TYPESCRIPT_RECEIPT_NAME = "typescript-real-call-full-receipt.v1.json"
-NATIVE_WHEEL_RECEIPT = "installed-wheel-full-receipt.v1.json"
-NATIVE_STANDARD_USER_RECEIPT = "installed-wheel-standard-user-full-receipt.v1.json"
-NATIVE_STANDARD_USER_WRAPPER = NATIVE_STANDARD_USER_RECEIPT + ".wrapper.json"
-NATIVE_C3_PATH = "cli/c3.exe"
+SOURCE_EVIDENCE_SCHEMA = "c-two.source-run-evidence.v1"
+MATRIX_RECEIPT_NAME = "python-suite/portable.v1.json"
+TYPESCRIPT_RECEIPT_NAME = "python-suite/typescript.v1.json"
+SOURCE_WHEEL_RECEIPT = "installed-wheel-full-receipt.v1.json"
+SOURCE_STANDARD_USER_RECEIPT = "installed-wheel-standard-user-full-receipt.v1.json"
+SOURCE_STANDARD_USER_WRAPPER = SOURCE_STANDARD_USER_RECEIPT + ".wrapper.json"
+PYTHON_RUN_RECEIPT_NAME = "python-suite/run.json"
 TAG_PREFIX = "c3-v"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
@@ -353,7 +358,7 @@ def resolve_gate(api: GitHubApi, workflow_file: str, workflow_name: str, source_
         )
     raise PromotionError(
         f"no {workflow_name} main-push run exists for {source_sha}; promotion requires "
-        "successful main-push runs of both Release Candidate and Windows Native for the "
+        "successful main-push runs of both Release Candidate and Source Validation for the "
         "exact same source commit"
     )
 
@@ -497,7 +502,7 @@ def verify_manifest_binding(manifest: dict[str, Any], extraction: Path, source_s
     for key in ("c_two_version", "c3_version", "fastdb_version",
                 "fastdb_source_rev", "fastdb_sdist_sha256"):
         _require(isinstance(meta.get(key), str) and meta[key], f"rc-manifest meta.{key} is missing")
-    _require(meta.get("fastdb_source_rev") == WINDOWS_NATIVE_FASTDB_SHA,
+    _require(meta.get("fastdb_source_rev") == SOURCE_VALIDATION_FASTDB_SHA,
              "rc-manifest FastDB source differs from the verified source pair")
     c_two_version, c3_version = meta["c_two_version"], meta["c3_version"]
 
@@ -949,7 +954,7 @@ def verify_candidate_receipts(
              "sdist-proof lifecycle FastDB bytes differ")
     sdk = proof.get("sdk") or {}
     _require(sdk.get("version") == manifest["meta"]["fastdb_version"]
-             and sdk.get("source_sha") == WINDOWS_NATIVE_FASTDB_SHA,
+             and sdk.get("source_sha") == SOURCE_VALIDATION_FASTDB_SHA,
              "sdist-proof Core SDK source/version mismatch")
     bundled = proof.get("bundled_fastdb_libs")
     elf = proof.get("elf_dynamic") or {}
@@ -972,196 +977,254 @@ def verify_candidate_receipts(
                  "file nor a receipt-built wheel")
 
 
-def expected_native_full_gates() -> list[str]:
+def expected_source_full_gates(target_platform: str) -> list[str]:
     """Derive the full-scope gate inventory from the trusted runner source.
 
-    The promoting checkout is current ``main`` code; its ``windows_native.py``
+    The promoting checkout is current ``main`` code; its ``source_validation.py``
     defines exactly which gates a full run must have executed and passed.
     """
-    runner_source = REPO_ROOT / "tools" / "ci" / "windows_native.py"
+    runner_source = REPO_ROOT / "tools" / "ci" / "source_validation.py"
     try:
-        spec = importlib.util.spec_from_file_location("c_two_windows_native_gates", runner_source)
+        spec = importlib.util.spec_from_file_location("c_two_source_validation_gates", runner_source)
         _require(spec is not None and spec.loader is not None,
                  f"cannot load trusted runner source {runner_source}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return [name for name, _, _ in module.gates("python", Path("."), "full")]
+        names = [name for name, _, _ in module.gates(
+            "python", Path("."), "full", target_platform=target_platform)]
+        _require(names and len(names) == len(set(names)),
+                 f"trusted {target_platform} full-scope gate inventory is empty or duplicated")
+        return names
     except OSError as error:
         raise PromotionError(f"cannot read trusted runner source {runner_source}: {error}") from error
 
 
-def _native_fastdb_pin() -> str:
-    """Read the frozen FastDB pin from the trusted windows-native.yml."""
-    workflow = REPO_ROOT / ".github" / "workflows" / "windows-native.yml"
+def _source_fastdb_pin() -> str:
+    """Read the frozen FastDB pin from the trusted ci.yml."""
+    workflow = REPO_ROOT / ".github" / "workflows" / "ci.yml"
     try:
         text = workflow.read_text(encoding="utf-8")
     except OSError as error:
         raise PromotionError(f"cannot read {workflow}: {error}") from error
     match = re.search(r"^\s*FASTDB_SOURCE_SHA:\s*([0-9a-f]{40})\s*$", text, re.MULTILINE)
-    _require(match is not None, "windows-native.yml has no FASTDB_SOURCE_SHA pin")
+    _require(match is not None, "ci.yml has no FASTDB_SOURCE_SHA pin")
     pin = match.group(1)
-    _require(pin == WINDOWS_NATIVE_FASTDB_SHA,
-             f"windows-native.yml FastDB pin {pin} differs from the frozen promotion pin "
-             f"{WINDOWS_NATIVE_FASTDB_SHA}; update the promotion contract deliberately")
+    _require(pin == SOURCE_VALIDATION_FASTDB_SHA,
+             f"ci.yml FastDB pin {pin} differs from the frozen promotion pin "
+             f"{SOURCE_VALIDATION_FASTDB_SHA}; update the promotion contract deliberately")
     return pin
 
 
-def _verify_native_wheel_receipt(
-    receipt_name: str, payload: dict[str, Any], *, expect_admin: bool, native_c3_sha: str,
+def _verify_source_wheel_receipt(
+    receipt_name: str, payload: Any, *, expect_admin: bool | None,
+    source_c3_sha: str, c3_name: str,
 ) -> None:
-    _require(payload.get("schema") == SMOKE_SCHEMA, f"{receipt_name} schema mismatch")
+    _require(isinstance(payload, dict) and payload.get("schema") == SMOKE_SCHEMA,
+             f"{receipt_name} schema mismatch")
     _require(payload.get("status") == "passed", f"{receipt_name} status is not passed")
     identity = payload.get("identity")
-    _require(isinstance(identity, dict) and identity.get("administrator") is expect_admin,
-             f"{receipt_name} administrator={identity.get('administrator')!r}, expected {expect_admin}")
+    _require(isinstance(identity, dict) and "administrator" in identity
+             and identity["administrator"] is expect_admin,
+             f"{receipt_name} identity {identity!r}, expected administrator={expect_admin}")
     _verify_lifecycle_cleanup(receipt_name, payload)
-    recorded = [item for item in payload.get("artifacts", [])
-                if isinstance(item, dict) and str(item.get("name", "")).endswith("c3.exe")]
+    artifacts = payload.get("artifacts")
+    _require(isinstance(artifacts, list), f"{receipt_name} artifacts are missing")
+    recorded = [item for item in artifacts
+                if isinstance(item, dict) and item.get("name") == c3_name]
     _require(len(recorded) == 1, f"{receipt_name} does not bind exactly one c3 executable")
-    _require(recorded[0].get("sha256") == native_c3_sha,
-             f"{receipt_name} c3 bytes do not match the Native gate's own c3.exe")
+    _require(recorded[0].get("sha256") == source_c3_sha,
+             f"{receipt_name} c3 bytes do not match the source lane's own {c3_name}")
 
 
-def verify_windows_native(
+def _verify_python_run_receipt(receipt_name: str, payload: Any, source_c3_sha: str) -> None:
+    """Verify fields emitted by tools/dev/test_python.py after its strict partition."""
+    _require(isinstance(payload, dict) and payload.get("schema") == "c-two.python-test-run.v1",
+             f"{receipt_name} schema mismatch")
+    _require(payload.get("status") == "passed", f"{receipt_name} status is not passed")
+    inputs = payload.get("inputs")
+    _require(isinstance(inputs, dict) and inputs.get("c3_sha256") == source_c3_sha,
+             f"{receipt_name} input c3 hash does not match the source lane's own build")
+    steps = payload.get("steps")
+    expected = {"collect-full", "collect-ordinary", "collect-portable", "collect-typescript",
+                "ordinary", "portable", "typescript"}
+    _require(isinstance(steps, list) and len(steps) == len(expected)
+             and all(isinstance(step, dict) and isinstance(step.get("id"), str) for step in steps)
+             and {step["id"] for step in steps} == expected,
+             f"{receipt_name} collection/execution steps differ from the complete Python partition")
+    for step in steps:
+        _require(step.get("status") == "passed" and step.get("exit_code") == 0
+                 and step.get("process_exited") is True and step.get("cleanup_confirmed") is True
+                 and not step.get("validation_error") and not step.get("error")
+                 and not step.get("cleanup_error"),
+                 f"{receipt_name} step {step['id']} did not pass with confirmed cleanup")
+
+
+def verify_source_validation(
     api: GitHubApi, source_sha: str, successful_runs: list[dict[str, Any]], download_root: Path
 ) -> dict[str, Any]:
-    """Require and re-validate the full-scope Windows Native evidence for both runner images."""
-    fastdb_pin = _native_fastdb_pin()
-    expected_gates = expected_native_full_gates()
-    artifacts_by_year: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    """Re-validate full-scope source evidence for all four platform/runner lanes."""
+    fastdb_pin = _source_fastdb_pin()
+    artifacts_by_label: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for run in sorted(successful_runs, key=lambda item: item.get("id") or 0, reverse=True):
         for artifact in api.run_artifacts(run["id"]):
-            for year in WINDOWS_NATIVE_YEARS:
-                if artifact.get("name") == f"windows-native-{year}-full-{source_sha}":
-                    artifacts_by_year.setdefault(year, (run, artifact))
-    missing = [year for year in WINDOWS_NATIVE_YEARS if year not in artifacts_by_year]
+            for label in SOURCE_VALIDATION_LANES:
+                if artifact.get("name") == f"source-{label}-py3.12-full-{source_sha}":
+                    artifacts_by_label.setdefault(label, (run, artifact))
+    missing = [label for label in SOURCE_VALIDATION_LANES if label not in artifacts_by_label]
     _require(
         not missing,
-        f"Windows Native full-scope artifacts missing for {missing}; promotion requires "
-        f"windows-native-<year>-full-{source_sha} from successful main-push runs",
+        f"Source Validation full-scope artifacts missing for {missing}; promotion requires "
+        f"source-<label>-py3.12-full-{source_sha} from successful main-push runs",
     )
 
     validated: dict[str, Any] = {}
-    for year in WINDOWS_NATIVE_YEARS:
-        run, artifact = artifacts_by_year[year]
-        destination = download_root / "windows-native" / year
+    for label, target_platform in SOURCE_VALIDATION_LANES.items():
+        expected_gates = expected_source_full_gates(target_platform)
+        run, artifact = artifacts_by_label[label]
+        destination = download_root / "source-validation" / label
         # Each runner image extracts into its own directory; the duplicate
         # check is scoped to one destination.
         seen_members: dict[str, tuple[str, str]] = {}
-        require_passed_jobs(api, run["id"], {f"{year} / full / MSVC x64"})
+        require_passed_jobs(api, run["id"], {f"source ({label}, py3.12)"})
         download_and_extract_artifact(api, artifact, destination, seen_members, allow_nested=True)
 
         evidence = _load_json_file(destination / "run-evidence.json")
-        _require(isinstance(evidence, dict) and evidence.get("schema") == NATIVE_EVIDENCE_SCHEMA,
-                 f"{year} run-evidence schema mismatch")
+        _require(isinstance(evidence, dict) and evidence.get("schema") == SOURCE_EVIDENCE_SCHEMA,
+                 f"{label} run-evidence schema mismatch")
         _require(evidence.get("status") == "passed",
-                 f"{year} run-evidence status {evidence.get('status')!r} is not passed")
-        _require(evidence.get("scope") == "full", f"{year} evidence scope is not full")
+                 f"{label} run-evidence status {evidence.get('status')!r} is not passed")
+        _require(evidence.get("scope") == "full", f"{label} evidence scope is not full")
+        _require(evidence.get("platform") == target_platform,
+                 f"{label} evidence platform {evidence.get('platform')!r} is not {target_platform}")
         runner = evidence.get("runner")
-        _require(isinstance(runner, dict) and runner.get("requested_label") == year,
-                 f"{year} evidence runner label mismatch: {runner!r}")
+        _require(isinstance(runner, dict) and runner.get("requested_label") == label,
+                 f"{label} evidence runner label mismatch: {runner!r}")
         sources = evidence.get("sources")
-        _require(isinstance(sources, dict), f"{year} evidence sources are missing")
+        _require(isinstance(sources, dict), f"{label} evidence sources are missing")
         for name, expected_sha in (("c-two", source_sha), ("fastdb", fastdb_pin)):
             source = sources.get(name)
             _require(isinstance(source, dict) and source.get("verified") is True,
-                     f"{year} evidence {name} source is not verified")
+                     f"{label} evidence {name} source is not verified")
             _require(source.get("actual_sha") == expected_sha,
-                     f"{year} evidence {name} SHA {source.get('actual_sha')!r} is not {expected_sha}")
+                     f"{label} evidence {name} SHA {source.get('actual_sha')!r} is not {expected_sha}")
             _require(source.get("expected_sha") == expected_sha,
-                     f"{year} evidence {name} expected_sha differs from the frozen pin")
+                     f"{label} evidence {name} expected_sha differs from the frozen pin")
 
         # Full gate inventory: every applicable gate ran and passed; nothing
         # was skipped, failed, timed out, or left not_run.
         applicable = evidence.get("applicable_gates")
-        _require(isinstance(applicable, list) and applicable,
-                 f"{year} evidence has no applicable gate inventory")
+        _require(isinstance(applicable, list) and applicable
+                 and all(isinstance(name, str) for name in applicable)
+                 and len(applicable) == len(set(applicable)),
+                 f"{label} evidence has no applicable gate inventory")
         _require(set(applicable) == set(expected_gates),
-                 f"{year} applicable gates differ from the trusted full-scope inventory: "
+                 f"{label} applicable gates differ from the trusted full-scope inventory: "
                  f"missing {sorted(set(expected_gates) - set(applicable))}, "
                  f"unexpected {sorted(set(applicable) - set(expected_gates))}")
         steps = evidence.get("steps")
-        _require(isinstance(steps, list), f"{year} evidence has no step records")
+        _require(isinstance(steps, list) and len(steps) == len(applicable)
+                 and all(isinstance(step, dict) and isinstance(step.get("id"), str) for step in steps),
+                 f"{label} evidence has missing, duplicate or malformed step records")
         step_status = {step.get("id"): step.get("status") for step in steps
                        if isinstance(step, dict)}
         _require(set(step_status) == set(applicable),
-                 f"{year} recorded steps differ from the applicable gate inventory")
+                 f"{label} recorded steps differ from the applicable gate inventory")
         not_passed = sorted(name for name, status in step_status.items() if status != "passed")
-        _require(not not_passed, f"{year} gates are not all passed: {not_passed}")
+        _require(not not_passed, f"{label} gates are not all passed: {not_passed}")
 
         # Every internal artifact the runner recorded must be present and
         # byte-identical: CLI, wheels, receipts, JUnit, logs, cleanup evidence.
         recorded_artifacts = evidence.get("artifacts")
         _require(isinstance(recorded_artifacts, list) and recorded_artifacts,
-                 f"{year} evidence records no internal artifacts")
+                 f"{label} evidence records no internal artifacts")
+        recorded_paths: set[str] = set()
         for record in recorded_artifacts:
             _require(isinstance(record, dict) and isinstance(record.get("path"), str),
-                     f"{year} malformed internal artifact record {record!r}")
-            target = destination / record["path"]
+                     f"{label} malformed internal artifact record {record!r}")
+            try:
+                relative = checked_relative_path(record["path"])
+            except CandidateError as error:
+                raise PromotionError(f"{label} invalid internal artifact path: {error}") from error
+            _require(relative not in recorded_paths, f"{label} duplicate internal artifact {relative}")
+            recorded_paths.add(relative)
+            target = destination / relative
             _require(target.is_file(),
-                     f"{year} recorded artifact {record['path']} is absent from the ZIP")
+                     f"{label} recorded artifact {record['path']} is absent from the ZIP")
             _require(sha256_file(target) == record.get("sha256"),
-                     f"{year} recorded artifact {record['path']} SHA-256 mismatch")
+                     f"{label} recorded artifact {record['path']} SHA-256 mismatch")
             _require(target.stat().st_size == record.get("bytes"),
-                     f"{year} recorded artifact {record['path']} size mismatch")
+                     f"{label} recorded artifact {record['path']} size mismatch")
 
-        native_c3 = destination / NATIVE_C3_PATH
-        _require(native_c3.is_file(), f"{year} is missing its {NATIVE_C3_PATH} build")
-        native_c3_sha = sha256_file(native_c3)
+        c3_name = "c3.exe" if target_platform == "windows" else "c3"
+        c3_path = f"cli/{c3_name}"
+        required_paths = {c3_path, MATRIX_RECEIPT_NAME, TYPESCRIPT_RECEIPT_NAME,
+                          PYTHON_RUN_RECEIPT_NAME, SOURCE_WHEEL_RECEIPT}
+        if target_platform == "windows":
+            required_paths.update({SOURCE_STANDARD_USER_RECEIPT, SOURCE_STANDARD_USER_WRAPPER})
+        _require(required_paths <= recorded_paths,
+                 f"{label} required source artifacts are not hash-bound: {sorted(required_paths - recorded_paths)}")
+        source_c3 = destination / c3_path
+        _require(source_c3.is_file(), f"{label} is missing its {c3_path} build")
+        source_c3_sha = sha256_file(source_c3)
+        _verify_python_run_receipt(
+            f"{label}/{PYTHON_RUN_RECEIPT_NAME}",
+            _load_json_file(destination / PYTHON_RUN_RECEIPT_NAME), source_c3_sha)
 
         for receipt_name, validator in (
             (MATRIX_RECEIPT_NAME, portable_matrix_receipt),
             (TYPESCRIPT_RECEIPT_NAME, typescript_receipt),
         ):
             receipt_path = destination / receipt_name
-            _require(receipt_path.is_file(), f"{year} is missing {receipt_name}")
+            _require(receipt_path.is_file(), f"{label} is missing {receipt_name}")
             try:
                 validator.load_and_validate_receipt(receipt_path, expected_stage="development")
             except Exception as error:  # noqa: BLE001 - validator errors are fail-closed evidence
                 raise PromotionError(
-                    f"{year} {receipt_name} failed the reviewed receipt validator: {error}"
+                    f"{label} {receipt_name} failed the reviewed receipt validator: {error}"
                 ) from error
         matrix = _load_json_file(destination / MATRIX_RECEIPT_NAME)
         typescript = _load_json_file(destination / TYPESCRIPT_RECEIPT_NAME)
         _require(len(matrix.get("rows", [])) == 18,
-                 f"{year} portable matrix has {len(matrix.get('rows', []))} rows, expected 18")
+                 f"{label} portable matrix has {len(matrix.get('rows', []))} rows, expected 18")
         _require(len(typescript.get("rows", [])) == 12,
-                 f"{year} TypeScript receipt has {len(typescript.get('rows', []))} rows, expected 12")
-        # Cross-bind the Native debug c3 with its own matrix and wheel
-        # receipts. This is the Native build — deliberately never compared to
-        # the released candidate executables.
+                 f"{label} TypeScript receipt has {len(typescript.get('rows', []))} rows, expected 12")
+        # Bind the source debug c3 to its own matrix and wheel receipts;
+        # released candidate executables have their separate byte identities.
         relay_c3 = {row.get("c3_sha256") for row in matrix.get("rows", []) if row.get("c3_sha256")}
-        _require(relay_c3 == {native_c3_sha},
-                 f"{year} portable matrix c3 hashes do not match the Native c3.exe build")
-        _require(typescript.get("packages", {}).get("c3_sha256") == native_c3_sha,
-                 f"{year} TypeScript receipt c3 hash does not match the Native c3.exe build")
+        _require(relay_c3 == {source_c3_sha},
+                 f"{label} portable matrix c3 hashes do not match the source {c3_name} build")
+        _require(typescript.get("packages", {}).get("c3_sha256") == source_c3_sha,
+                 f"{label} TypeScript receipt c3 hash does not match the source {c3_name} build")
 
-        ordinary = _load_json_file(destination / NATIVE_WHEEL_RECEIPT)
-        _verify_native_wheel_receipt(
-            f"{year}/{NATIVE_WHEEL_RECEIPT}", ordinary,
-            expect_admin=True, native_c3_sha=native_c3_sha)
-        standard = _load_json_file(destination / NATIVE_STANDARD_USER_RECEIPT)
-        _verify_native_wheel_receipt(
-            f"{year}/{NATIVE_STANDARD_USER_RECEIPT}", standard,
-            expect_admin=False, native_c3_sha=native_c3_sha)
-        wrapper = _load_json_file(destination / NATIVE_STANDARD_USER_WRAPPER)
-        _require(wrapper.get("schema") == STANDARD_USER_WRAPPER_SCHEMA,
-                 f"{year} standard-user wrapper schema mismatch")
-        _require(wrapper.get("status") == "passed",
-                 f"{year} standard-user wrapper status is not passed")
-        _require(not wrapper.get("errors"), f"{year} standard-user wrapper errors present")
-        wrapper_cleanup = wrapper.get("cleanup")
-        _require(isinstance(wrapper_cleanup, dict), f"{year} standard-user wrapper has no cleanup")
-        for key in ("processes_exited", "workspace_removed", "account_removed"):
-            _require(wrapper_cleanup.get(key) is True,
-                     f"{year} standard-user wrapper cleanup.{key} is not true")
+        ordinary = _load_json_file(destination / SOURCE_WHEEL_RECEIPT)
+        _verify_source_wheel_receipt(
+            f"{label}/{SOURCE_WHEEL_RECEIPT}", ordinary,
+            expect_admin=True if target_platform == "windows" else None,
+            source_c3_sha=source_c3_sha, c3_name=c3_name)
+        if target_platform == "windows":
+            standard = _load_json_file(destination / SOURCE_STANDARD_USER_RECEIPT)
+            _verify_source_wheel_receipt(
+                f"{label}/{SOURCE_STANDARD_USER_RECEIPT}", standard,
+                expect_admin=False, source_c3_sha=source_c3_sha, c3_name=c3_name)
+            wrapper = _load_json_file(destination / SOURCE_STANDARD_USER_WRAPPER)
+            _require(isinstance(wrapper, dict) and wrapper.get("schema") == STANDARD_USER_WRAPPER_SCHEMA,
+                     f"{label} standard-user wrapper schema mismatch")
+            _require(wrapper.get("status") == "passed",
+                     f"{label} standard-user wrapper status is not passed")
+            _require(not wrapper.get("errors"), f"{label} standard-user wrapper errors present")
+            wrapper_cleanup = wrapper.get("cleanup")
+            _require(isinstance(wrapper_cleanup, dict), f"{label} standard-user wrapper has no cleanup")
+            for key in ("processes_exited", "workspace_removed", "account_removed"):
+                _require(wrapper_cleanup.get(key) is True,
+                         f"{label} standard-user wrapper cleanup.{key} is not true")
 
-        validated[year] = {
+        validated[label] = {
+            "platform": target_platform,
             "run_id": run.get("id"),
             "run_url": run.get("html_url"),
             "artifact": artifact.get("name"),
             "gates_passed": len(applicable),
-            "native_c3_sha256": native_c3_sha,
+            "source_c3_sha256": source_c3_sha,
         }
     return validated
 
@@ -1694,8 +1757,8 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "",
         f"- Release Candidate run: {candidate['url']}",
     ]
-    for year, entry in sorted(plan["windows_native"].items()):
-        lines.append(f"- Windows Native full-scope run ({year}, {entry['gates_passed']} gates): "
+    for label, entry in sorted(plan["source_validation"].items()):
+        lines.append(f"- Source Validation full-scope run ({label}, py3.12, {entry['gates_passed']} gates): "
                      f"{entry['run_url']}")
     lines += [
         "",
@@ -1703,8 +1766,8 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "including the free-threaded cp314-cp314t build), 5 installed-wheel lifecycle smokes, "
         "2 Windows standard-user lifecycle/cleanup receipts, an isolated auditwheel-repaired "
         "sdist build/import/lifecycle proof, and the 18-row Rust/Python portable matrix plus "
-        "12-row TypeScript real-call receipt on both Windows Server 2022 and 2025 CI runners "
-        "(the Windows Native gates exercise their own debug c3 build; the released executables "
+        "12-row TypeScript real-call receipt on Ubuntu 24.04, macOS 15 and Windows Server 2022/2025 CI runners "
+        "(the Source Validation gates exercise each lane's own debug c3 build; the released executables "
         "are the exact tested release candidates). Windows 11 desktop is not verified.",
         "",
     ]
@@ -1762,7 +1825,7 @@ def command_prepare(options: argparse.Namespace) -> int:
 
     try:
         candidate_runs = resolve_gate(api, CANDIDATE_WORKFLOW_FILE, CANDIDATE_WORKFLOW_NAME, source_sha)
-        windows_runs = resolve_gate(api, WINDOWS_NATIVE_WORKFLOW_FILE, WINDOWS_NATIVE_WORKFLOW_NAME, source_sha)
+        source_runs = resolve_gate(api, SOURCE_VALIDATION_WORKFLOW_FILE, SOURCE_VALIDATION_WORKFLOW_NAME, source_sha)
     except DeferredPromotion as deferred:
         print(f"deferred: {deferred}", file=sys.stderr)
         return EXIT_DEFERRED
@@ -1820,7 +1883,7 @@ def command_prepare(options: argparse.Namespace) -> int:
     manifest_sha = sha256_file(extraction / MANIFEST_NAME)
     wheel_by_row = verify_wheel_rows(manifest["wheels"], versions["c_two_version"])
     verify_candidate_receipts(extraction, manifest, source_sha, wheel_by_row)
-    windows_native = verify_windows_native(api, source_sha, windows_runs, download_dir)
+    source_validation = verify_source_validation(api, source_sha, source_runs, download_dir)
 
     staging = download_dir / "staging"
     plan: dict[str, Any] = {
@@ -1831,7 +1894,7 @@ def command_prepare(options: argparse.Namespace) -> int:
         "source_sha": source_sha,
         "versions": versions,
         "candidate_run": {"id": candidate.get("id"), "url": candidate.get("html_url")},
-        "windows_native": windows_native,
+        "source_validation": source_validation,
         "manifest_sha256": manifest_sha,
     }
     if options.target == "github-release":

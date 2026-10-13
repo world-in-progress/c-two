@@ -2251,24 +2251,24 @@ mod tests {
                 c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(100)),
             )
             .unwrap();
-            let started = std::time::Instant::now();
             let result = worker_runtime
                 .set_relay_anchor_address_with_attempt(Some("http://relay.test".into()), &attempt);
-            done_tx.send((result, started.elapsed())).unwrap();
+            done_tx.send(result).unwrap();
         });
-        let (result, elapsed) = done_rx
-            .recv_timeout(Duration::from_millis(250))
-            .expect("must return before the 300ms lock owner releases");
+        // The owner keeps RuntimeState locked until the worker completes.
+        // The watchdog allows thread scheduling without replacing the real
+        // 100ms connect budget or allowing completion after lock release.
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        let relay_override = state.relay_anchor_address_override.clone();
+        drop(state);
+        worker.join().unwrap();
+        let result = result.expect("connect must expire while RuntimeState remains locked");
         let crate::Error::Semantic(error) = result.unwrap_err() else {
             panic!("canonical deadline")
         };
         assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
         assert_eq!(error.details["stage"], "relay_override_wait");
-        assert!(elapsed < Duration::from_millis(250));
-        std::thread::sleep(Duration::from_millis(300).saturating_sub(elapsed));
-        assert_eq!(state.relay_anchor_address_override, None);
-        drop(state);
-        worker.join().unwrap();
+        assert_eq!(relay_override, None);
         let recovered = crate::ConnectAttempt::start(c2_config::ConnectOptions::new()).unwrap();
         runtime
             .set_relay_anchor_address_with_attempt(Some("http://relay.test/".into()), &recovered)
@@ -2320,7 +2320,9 @@ mod tests {
                 );
                 done_tx.send(result).unwrap();
             });
-            let result = done_rx.recv_timeout(Duration::from_millis(150));
+            // Keep the real 25ms budget, but allow the worker to be scheduled.
+            // Completion must still precede release of the contended state.
+            let result = done_rx.recv_timeout(Duration::from_secs(2));
             drop(state);
             worker.join().unwrap();
             let error = result

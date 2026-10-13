@@ -695,13 +695,88 @@ def test_checksum_commands_need_only_the_standard_library(tmp_path):
                        check=True, capture_output=True, text=True)
 
 
+@pytest.mark.parametrize("mode", ["wheel", "sdist"])
+@pytest.mark.parametrize("tampered", [False, True])
+@pytest.mark.parametrize("abi_root", [".", "abi-inputs/3.12"])
+def test_candidate_smoke_reuses_verified_abi_fastdb_bytes(rc, tmp_path, monkeypatch, mode, tampered, abi_root):
+    import shutil
+    import yaml
+    from packaging.tags import sys_tags
+
+    action = yaml.safe_load((_ROOT / ".github/actions/candidate-smoke/action.yml").read_text())
+    script = next(step["run"] for step in action["runs"]["steps"]
+                  if step.get("name") == "Stage the ABI row's verified FastDB proof")
+    scripts = tmp_path / ".github/scripts"
+    scripts.mkdir(parents=True)
+    for name in ("release_candidate.py", "resolve_fastdb_release.py"):
+        shutil.copy2(_ROOT / ".github/scripts" / name, scripts / name)
+    target = "target-fixture"
+    wheel_name = f"fastdb4py-0.2.0-{next(iter(sys_tags()))}.whl"
+    wheel = write(tmp_path / abi_root, f"{'fastdb-built' if mode == 'sdist' else 'fastdb'}/{wheel_name}",
+                  b"the ABI row's already tested wheel")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    decision = {"mode": mode, "filename": wheel_name, "sha256": digest}
+    if mode == "sdist":
+        sdist = write(tmp_path / abi_root, "fastdb/fastdb4py-0.2.0.tar.gz", b"shared sdist retained by context")
+        decision.update(filename=sdist.name, sha256=hashlib.sha256(sdist.read_bytes()).hexdigest(),
+                        built_wheel={"name": wheel_name, "sha256": digest,
+                                     "bytes": wheel.stat().st_size,
+                                     "derived_from_sdist_sha256": hashlib.sha256(sdist.read_bytes()).hexdigest()})
+    write(tmp_path, f"abi-{target}-3.12.json", json.dumps({
+        "status": "passed", "source_commit_sha": "a" * 40,
+        "row": {"target": target, "python": "3.12"}, "fastdb": decision,
+    }).encode())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(scripts))
+    monkeypatch.setenv("RC_TARGET", target)
+    monkeypatch.setenv("SOURCE_SHA", "a" * 40)
+    monkeypatch.setenv("ABI_ROOT", abi_root)
+    if tampered:
+        wheel.write_bytes(b"changed after the ABI receipt")
+        with pytest.raises(AssertionError):
+            exec(compile(script, "candidate-smoke/action.yml", "exec"), {})
+        assert not (tmp_path / "fastdb-dist").exists()
+        return
+    exec(compile(script, "candidate-smoke/action.yml", "exec"), {})
+    proof = tmp_path / "fastdb-dist"
+    assert {path.name for path in proof.iterdir()} == {
+        wheel_name, f"{wheel_name}.sha256", f"fastdb-{target}.json", f"fastdb-{target}.json.sha256",
+    }
+    assert (proof / wheel_name).read_bytes() == wheel.read_bytes()
+    assert json.loads((proof / f"fastdb-{target}.json").read_text()) == decision
+    assert rc.main(["verify", str(proof / wheel_name), str(proof / f"fastdb-{target}.json")]) == 0
+
+
+def test_native_abi_staging_does_not_reupload_earlier_rows(tmp_path):
+    import os
+    import subprocess
+    import yaml
+
+    action = yaml.safe_load((_ROOT / ".github/actions/candidate-native-abi/action.yml").read_text())
+    script = next(step["run"] for step in action["runs"]["steps"]
+                  if step.get("name") == "Stage the wheel, its sidecar, and the receipt")
+    for version in ("3.10", "3.11", "3.12"):
+        tag = "cp" + version.replace(".", "")
+        wheel = f"c_two-0.7.4-{tag}-{tag}-macosx_11_0_arm64.whl"
+        receipt = f"abi-aarch64-apple-darwin-{version}.json"
+        for name in (wheel, wheel + ".sha256"):
+            write(tmp_path, f"sdk/python/dist/{version}/{name}", version.encode())
+        for name in (receipt, receipt + ".sha256"):
+            write(tmp_path, name, version.encode())
+        subprocess.run(["bash", "-c", script], cwd=tmp_path, check=True, capture_output=True,
+                       env={**os.environ, "RC_TARGET": "aarch64-apple-darwin", "RC_PYTHON": version})
+        row = tmp_path / "staging" / version
+        assert {path.name for path in row.iterdir()} == {wheel, wheel + ".sha256", receipt, receipt + ".sha256"}
+        assert {path.read_bytes() for path in row.iterdir()} == {version.encode()}
+
+
 def test_sdist_workflow_enables_maturin_pep517_repair(tmp_path, monkeypatch):
     import maturin
     import shlex
     import subprocess
     import yaml
     workflow = yaml.safe_load((Path(__file__).resolve().parents[2] /
-                               ".github/workflows/release-candidate.yml").read_text())
+                               ".github/workflows/release-candidate-linux.yml").read_text())
     step = next(s for s in workflow["jobs"]["sdist"]["steps"]
                 if s.get("name") == "Isolated build of the wheel from the extracted sdist contents")
     setting = next(arg for arg in shlex.split(step["run"])
@@ -723,6 +798,43 @@ def test_sdist_workflow_enables_maturin_pep517_repair(tmp_path, monkeypatch):
     assert command[command.index("--auditwheel") + 1] == "repair"
     assert "off" not in command
     assert (out / built.name).read_bytes() == built.read_bytes()
+
+
+def test_target_workflows_keep_the_complete_abi_inventory_and_local_dependencies():
+    import yaml
+
+    root = yaml.safe_load((_ROOT / ".github/workflows/release-candidate.yml").read_text())
+    versions = {"3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"}
+    targets = {"x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+               "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"}
+    rows = []
+    for family, consumer in (("native", "build-wheels-native"), ("linux", "abi-import-linux")):
+        caller = root["jobs"][family]
+        assert caller["needs"] == "context"
+        assert caller["with"]["source-sha"] == "${{ needs.context.outputs.source_sha }}"
+        workflow = yaml.safe_load((_ROOT / caller["uses"]).read_text())
+        job = workflow["jobs"][consumer]
+        # Dependency IDs resolve inside one target invocation, never to the
+        # parent's complete cross-platform CLI matrix.
+        assert job["needs"] == ("cli" if family == "native" else ["cli", "build-wheels-linux"])
+        assert workflow["jobs"]["cli"]["steps"][0]["with"]["ref"] == "${{ inputs.source-sha }}"
+        for platform in caller["strategy"]["matrix"]["include"]:
+            if family == "native":
+                assert caller["with"]["abi-groups"] == "${{ toJSON(matrix.abi-groups) }}"
+                assert job["strategy"]["matrix"]["include"] == "${{ fromJSON(inputs.abi-groups) }}"
+                groups = platform["abi-groups"]
+                assert len(groups) == (6 if platform["target"].endswith("windows-msvc") else 2)
+                actual_versions = [version for group in groups for version in group["versions"]]
+                calls = [step for step in job["steps"] if step.get("uses") == "./.github/actions/candidate-native-abi"]
+                assert {step["with"]["python"] for step in calls} == versions
+                for step in calls:
+                    version = step["with"]["python"]
+                    assert step["if"] == f"!cancelled() && contains(matrix.versions, '{version}')"
+            else:
+                actual_versions = job["strategy"]["matrix"]["python"]
+            rows.extend((platform["target"], version) for version in actual_versions)
+    assert len(rows) == 30 and set(rows) == {(target, version) for target in targets for version in versions}
+    assert set(root["jobs"]["manifest"]["needs"]) == {"context", "native", "linux"}
 
 
 def test_provisioning_receipt_cannot_change_its_sdist_derivation(rc, tmp_path, capsys):

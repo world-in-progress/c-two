@@ -1,0 +1,24 @@
+name: Retain compiler cache diagnostics
+description: Record language-specific cache statistics separately from release artifacts
+inputs:
+  name:
+    description: Unique diagnostic artifact suffix
+    required: true
+  collect:
+    description: Read the host daemon; false retains statistics captured inside a container
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: Record compiler cache statistics
+      if: inputs.collect == 'true'
+      shell: bash
+      run: |
+        source .github/scripts/compiler_cache.sh
+        c2_write_compiler_cache_stats artifacts/compiler-cache || true
+    - uses: actions/upload-artifact@v4
+      with:
+        name: compiler-cache-${{ inputs.name }}
+        path: artifacts/compiler-cache/
+        if-no-files-found: warn
+        retention-days: 7

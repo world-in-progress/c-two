@@ -794,16 +794,25 @@ mod tests {
     fn feed_updates_last_activity() {
         let pool = test_pool();
         let cfg = ChunkConfig {
-            assembler_timeout: Duration::from_millis(100),
+            assembler_timeout: Duration::from_secs(60),
             ..ChunkConfig::default()
         };
         let reg = ChunkRegistry::new(pool.clone(), cfg);
         reg.insert(1, 1, 3, 1024).unwrap();
-        // Wait 60ms, feed a chunk — resets timer.
-        std::thread::sleep(Duration::from_millis(60));
+        // Make the entry stale without relying on a scheduler waking within
+        // a narrow expiry window. A feed must replace this old activity time.
+        let stale = Instant::now() - Duration::from_secs(120);
+        {
+            let mut shard = reg.shard(1).lock();
+            let entry = shard.get_mut(&(1, 1)).unwrap();
+            entry._created_at = stale;
+            entry.last_activity = stale;
+        }
+        let before_feed = Instant::now();
         reg.feed(1, 1, 0, &[0u8; 1024]).unwrap();
-        // Wait another 60ms (120ms from insert, but only 60ms from last feed).
-        std::thread::sleep(Duration::from_millis(60));
+        let after_feed = Instant::now();
+        let refreshed = reg.shard(1).lock().get(&(1, 1)).unwrap().last_activity;
+        assert!((before_feed..=after_feed).contains(&refreshed));
         let stats = reg.gc_sweep();
         assert_eq!(stats.expired, 0);
         assert_eq!(reg.active_count(), 1);
@@ -1284,25 +1293,36 @@ mod tests {
             held.with_slice(|bytes| {
                 assert_eq!(bytes, &[11; 512]);
                 ready_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(Duration::from_secs(1));
+                release_rx.recv().unwrap();
             })
             .unwrap();
             held
         });
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let charged = budget.snapshot();
-        let started = Instant::now();
-        let closed = reg.try_cleanup_connection(1);
-        let aborted = reg.try_abort(1, 22);
-        let elapsed = started.elapsed();
-        let live = budget.snapshot();
-        let count = reg.active_count();
-        let bytes = reg.total_bytes();
-        let same_generation = reg.shard(1).lock()[&(1, 22)].generation == partial.generation();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_reg = Arc::clone(&reg);
+        let worker = thread::spawn(move || {
+            let closed = worker_reg.try_cleanup_connection(1);
+            let aborted = worker_reg.try_abort(1, 22);
+            done_tx.send((closed, aborted)).unwrap();
+        });
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        let locked_phase = completed.as_ref().ok().map(|_| {
+            (
+                budget.snapshot(),
+                reg.active_count(),
+                reg.total_bytes(),
+                reg.shard(1).lock()[&(1, 22)].generation == partial.generation(),
+            )
+        });
         let _ = release_tx.send(());
         let mut held = holder.join().unwrap();
+        worker.join().unwrap();
+        let (closed, aborted) =
+            completed.expect("try_cleanup_connection/try_abort blocked on live owner");
+        let (live, count, bytes, same_generation) = locked_phase.unwrap();
         assert!(!closed && !aborted);
-        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
         assert_eq!(count, 2);
         assert_eq!(bytes, 3072);
         assert!(same_generation);
@@ -1337,28 +1357,70 @@ mod tests {
         ));
         reg.insert(1, 11, 1, 512).unwrap();
         reg.feed(1, 11, 0, &[11; 512]).unwrap();
-        let mut held = reg.finish(1, 11).unwrap().backing;
+        let held = reg.finish(1, 11).unwrap().backing;
         reg.insert(1, 22, 2, 1024).unwrap();
         reg.insert(2, 33, 2, 1024).unwrap();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder_reg = Arc::clone(&reg);
-        let holder = thread::spawn(move || {
-            let _shard = holder_reg.shard(2).lock();
-            ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+        let (callback_ready_tx, callback_ready_rx) = std::sync::mpsc::channel();
+        let (callback_release_tx, callback_release_rx) = std::sync::mpsc::channel();
+        let callback_holder = thread::spawn(move || {
+            held.with_slice(|bytes| {
+                assert_eq!(bytes, &[11; 512]);
+                callback_ready_tx.send(()).unwrap();
+                callback_release_rx.recv().unwrap();
+            })
+            .unwrap();
+            held
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (shard_ready_tx, shard_ready_rx) = std::sync::mpsc::channel();
+        let (shard_release_tx, shard_release_rx) = std::sync::mpsc::channel();
+        let holder_reg = Arc::clone(&reg);
+        let shard_holder = thread::spawn(move || {
+            let _shard = holder_reg.shard(2).lock();
+            shard_ready_tx.send(()).unwrap();
+            shard_release_rx.recv().unwrap();
+        });
+        callback_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        shard_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let charged = budget.snapshot();
-        let started = Instant::now();
-        let skipped = held.with_slice(|_| reg.try_gc_sweep()).unwrap();
-        let elapsed = started.elapsed();
-        let live = budget.snapshot();
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let first_reg = Arc::clone(&reg);
+        let first_worker = thread::spawn(move || {
+            first_tx.send(first_reg.try_gc_sweep()).unwrap();
+        });
+        let first_result = first_rx.recv_timeout(Duration::from_secs(2));
+        let live = first_result.as_ref().ok().map(|_| budget.snapshot());
+        if first_result.is_err() {
+            let _ = callback_release_tx.send(());
+            let _ = shard_release_tx.send(());
+            callback_holder.join().unwrap();
+            shard_holder.join().unwrap();
+            first_worker.join().unwrap();
+            panic!("first try_gc_sweep blocked on live callback or shard");
+        }
+        let skipped = first_result.expect("first try_gc_sweep blocked on live callback or shard");
+        let live = live.unwrap();
+        first_worker.join().unwrap();
+        let _ = callback_release_tx.send(());
+        let mut held = callback_holder.join().unwrap();
         // Shard 1 can now release, while shard 2 is still inaccessible.
-        let released_one = reg.try_gc_sweep();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
-        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let second_reg = Arc::clone(&reg);
+        let second_worker = thread::spawn(move || {
+            second_tx.send(second_reg.try_gc_sweep()).unwrap();
+        });
+        let second_result = second_rx.recv_timeout(Duration::from_secs(2));
+        if second_result.is_err() {
+            let _ = shard_release_tx.send(());
+            shard_holder.join().unwrap();
+            second_worker.join().unwrap();
+            panic!("second try_gc_sweep blocked on live shard");
+        }
+        let released_one = second_result.expect("second try_gc_sweep blocked on live shard");
+        second_worker.join().unwrap();
+        let _ = shard_release_tx.send(());
+        shard_holder.join().unwrap();
         assert_eq!(skipped.expired, 0);
         assert_eq!(skipped.remaining, 2);
         assert_eq!(live.file.used_bytes, charged.file.used_bytes);

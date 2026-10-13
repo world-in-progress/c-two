@@ -1,0 +1,129 @@
+name: Candidate native target
+
+on:
+  workflow_call:
+    inputs:
+      source-sha:
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      fastdb-version:
+        required: true
+        type: string
+      fastdb-mode:
+        required: true
+        type: string
+
+      # Explicit ABI groups are passed by the source-bound caller.
+      abi-groups:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  PYTHONUTF8: "1"
+
+jobs:
+  cli:
+    name: c3
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-sha }}
+      - uses: ./.github/actions/candidate-cli
+        with:
+          target: ${{ inputs.target }}
+
+  build-wheels-native:
+    needs: cli
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.abi-groups) }}
+    name: wheels (${{ matrix.label }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.source-sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.target }}
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - uses: ./.github/actions/setup-cpp-cache
+        if: runner.os == 'macOS'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/python/native -> target
+          cache-targets: false
+          shared-key: candidate-native-${{ inputs.target }}
+      - name: Build and validate Python 3.10
+        if: "!cancelled() && contains(matrix.versions, '3.10')"
+        uses: ./.github/actions/candidate-native-abi
+        with:
+          python: '3.10'
+          target: ${{ inputs.target }}
+          source-sha: ${{ inputs.source-sha }}
+          fastdb-version: ${{ inputs.fastdb-version }}
+          fastdb-mode: ${{ inputs.fastdb-mode }}
+      - name: Build and validate Python 3.11
+        if: "!cancelled() && contains(matrix.versions, '3.11')"
+        uses: ./.github/actions/candidate-native-abi
+        with:
+          python: '3.11'
+          target: ${{ inputs.target }}
+          source-sha: ${{ inputs.source-sha }}
+          fastdb-version: ${{ inputs.fastdb-version }}
+          fastdb-mode: ${{ inputs.fastdb-mode }}
+      - name: Build and validate Python 3.12
+        if: "!cancelled() && contains(matrix.versions, '3.12')"
+        uses: ./.github/actions/candidate-native-abi
+        with:
+          python: '3.12'
+          target: ${{ inputs.target }}
+          source-sha: ${{ inputs.source-sha }}
+          fastdb-version: ${{ inputs.fastdb-version }}
+          fastdb-mode: ${{ inputs.fastdb-mode }}
+      - name: Build and validate Python 3.13
+        if: "!cancelled() && contains(matrix.versions, '3.13')"
+        uses: ./.github/actions/candidate-native-abi
+        with:
+          python: '3.13'
+          target: ${{ inputs.target }}
+          source-sha: ${{ inputs.source-sha }}
+          fastdb-version: ${{ inputs.fastdb-version }}
+          fastdb-mode: ${{ inputs.fastdb-mode }}
+      - name: Build and validate Python 3.14
+        if: "!cancelled() && contains(matrix.versions, '3.14')"
+        uses: ./.github/actions/candidate-native-abi
+        with:
+          python: '3.14'
+          target: ${{ inputs.target }}
+          source-sha: ${{ inputs.source-sha }}
+          fastdb-version: ${{ inputs.fastdb-version }}
+          fastdb-mode: ${{ inputs.fastdb-mode }}
+      - name: Build and validate Python 3.14t
+        if: "!cancelled() && contains(matrix.versions, '3.14t')"
+        uses: ./.github/actions/candidate-native-abi
+        with:
+          python: 3.14t
+          target: ${{ inputs.target }}
+          source-sha: ${{ inputs.source-sha }}
+          fastdb-version: ${{ inputs.fastdb-version }}
+          fastdb-mode: ${{ inputs.fastdb-mode }}
+      - uses: ./.github/actions/report-cpp-cache
+        if: always() && runner.os == 'macOS'
+        with:
+          name: native-${{ inputs.target }}-${{ matrix.label }}

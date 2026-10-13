@@ -1,8 +1,9 @@
-"""Run native Windows gates and retain failures without changing success receipts."""
+"""Run the shared source gates on Linux, macOS and Windows with retained evidence."""
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -19,14 +20,10 @@ from typing import Any, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PORTABLE_TESTS = (
-    "sdk/python/tests/integration/test_portable_payload_cross_language.py",
-    "sdk/python/tests/integration/test_portable_payload_matrix.py",
-)
-TYPESCRIPT_TEST = "sdk/python/tests/integration/test_typescript_real_calls.py"
 LOCAL_PLATFORM_SCOPE = "local-platform"
 FULL_SCOPE = "full"
-SCOPES = (LOCAL_PLATFORM_SCOPE, FULL_SCOPE)
+PYTHON_SCOPE = "python"
+SCOPES = (LOCAL_PLATFORM_SCOPE, FULL_SCOPE, PYTHON_SCOPE)
 Gate = tuple[str, list[str], tuple[str, ...]]
 FASTDB_LINK_MODE_ENV = "FASTDB_PAYLOAD_LINK_MODE"
 FASTDB_SYSTEM_LIB_DIR_ENV = "FASTDB_PAYLOAD_SYSTEM_LIB_DIR"
@@ -52,7 +49,12 @@ STEP_TIMEOUT_S = 1200
 # bounded above the summed row budget (9 x 300 s) plus startup margin instead
 # of by the single-command default.
 IPC_MEMORY_STEP_TIMEOUT_S = 3600
-GATE_TIMEOUT_S = {IPC_MEMORY_GATE: IPC_MEMORY_STEP_TIMEOUT_S}
+GATE_TIMEOUT_S = {IPC_MEMORY_GATE: IPC_MEMORY_STEP_TIMEOUT_S, "python-suite": 7200}
+# These write disjoint trees and never invoke Cargo. The FastDB Python wheel
+# can compile while Rust uses the shared target; consumers wait for its result.
+INDEPENDENT_SETUP_GATES = frozenset({
+    "python310-install", "fastdb-npm-install", "c2-mem-npm-install", "fastdb-wheel-build",
+})
 
 
 def capture(command: Sequence[str], cwd: Path) -> dict[str, Any]:
@@ -118,7 +120,7 @@ def run_step(
             record["process_exited"] = process is None or process.poll() is not None
     # Full output remains in the artifact; keep the Actions console bounded.
     print(log_path.read_text(encoding="utf-8", errors="replace")[-16000:], flush=True)
-    print(f"{name}: {record['status']} (exit {record['exit_code']})", flush=True)
+    print(f"{name}: {record['status']} (exit {record['exit_code']}, {record['duration_seconds']} s)", flush=True)
     print("::endgroup::", flush=True)
     return record
 
@@ -281,6 +283,9 @@ def system_mode_environment(base: dict[str, str], lib_dir: Path) -> dict[str, st
     for key in path_keys:
         environment.pop(key)
     environment["PATH"] = f"{lib_dir}{separator}{existing}" if existing else str(lib_dir)
+    if os.name != "nt":
+        loader = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+        environment[loader] = str(lib_dir) + ":" + environment.get(loader, "")
     return environment
 
 
@@ -289,6 +294,10 @@ def source_mode_environment(base: dict[str, str]) -> dict[str, str]:
     environment = dict(base)
     environment[FASTDB_LINK_MODE_ENV] = "source"
     environment.pop(FASTDB_SYSTEM_LIB_DIR_ENV, None)
+    # CMake compiler launchers work with Ninja on MSVC. FastDB's Python wheel
+    # uses its own VS -A x64 build, so this is scoped only to Rust app gates.
+    if os.name == "nt":
+        environment["CMAKE_GENERATOR"] = "Ninja"
     return environment
 
 
@@ -298,11 +307,24 @@ def gate_environment(
     if system_lib_dir is None:
         return dict(base)
     if name in SOURCE_MODE_GATES:
-        return source_mode_environment(base)
+        environment = source_mode_environment(base)
+        if name == "python-native-test":
+            environment["PYO3_PYTHON"] = str(ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+        return environment
     return system_mode_environment(base, system_lib_dir)
 
 
-def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
+def source_platform() -> str:
+    return "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"
+
+
+def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform: str | None = None) -> list[Gate]:
+    target_platform = target_platform or source_platform()
+    if target_platform not in {"linux", "macos", "windows"}:
+        raise ValueError(f"Unsupported source platform: {target_platform}")
+    executable = "c3.exe" if target_platform == "windows" else "c3"
+    retained_cli = output / "cli" / executable
+    venv_python = ROOT / ".venv" / ("Scripts/python.exe" if target_platform == "windows" else "bin/python")
     def cargo(name: str, manifest: str, *arguments: str) -> Gate:
         return name, ["cargo", "test", "--locked", "--manifest-path", manifest, *arguments], ()
 
@@ -314,28 +336,26 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
                       "-p", "c2-config", "-p", "c2-error", "-p", "c2-local-security", "-p", "c2-local",
                       "-p", "c2-mem", "-p", "c2-mem-ffi", "-p", "c2-wire",
                       "-p", "c2-ipc", "-p", "c2-server", "-p", "c2-http", "-p", "c2-core")]
-    if scope != FULL_SCOPE:
+    if scope not in {FULL_SCOPE, PYTHON_SCOPE}:
         raise ValueError(f"Unknown native gate scope: {scope}")
     fastdb_typescript = "../fastdb/ts/fastdb4ts"
     c2_mem_typescript = "core/foundation/c2-mem-ffi/bindings/typescript"
-    fastdb_build = npm_command("run", "build", "--prefix", fastdb_typescript)
-    if os.name == "nt":
-        shell = os.environ.get("C2_FASTDB_NPM_SCRIPT_SHELL") or str(
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/bin/bash.exe"
-        )
-        fastdb_build.extend(["--script-shell", shell])
-    return [
+    selected = [
         ("python310-install", ["uv", "python", "install", "3.10"], ()),
-        ("fastdb-npm-install", npm_command("ci", "--prefix", fastdb_typescript), ()),
+        ("fastdb-npm-install", npm_command("ci", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", fastdb_typescript), ()),
         # The persistent generated-client regression is part of the ordinary
         # suite, before the payload matrix's independent WASM/package build.
-        ("fastdb-npm-build", fastdb_build, ("fastdb-npm-install",)),
-        ("c2-mem-npm-install", npm_command("ci", "--prefix", c2_mem_typescript), ()),
-        ("c2-mem-node-tests", npm_command("test", "--prefix", c2_mem_typescript), ("c2-mem-npm-install",)),
-        ("c2-mem-node-package", npm_command("run", "pack:check", "--prefix", c2_mem_typescript), ("c2-mem-npm-install",)),
+        ("fastdb-wasm-build", [python, str(ROOT / "tools/ci/source_prerequisites.py"), "wasm"], ()),
+        ("fastdb-npm-build", [python, str(ROOT / "tools/ci/source_prerequisites.py"), "fastdb"], ("fastdb-npm-install", "fastdb-wasm-build")),
+        ("c2-mem-npm-install", npm_command("ci", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", c2_mem_typescript), ()),
+        ("c2-mem-build", ["node", f"{c2_mem_typescript}/scripts/build-runtime.mjs"], ("c2-mem-npm-install",)),
+        ("c2-mem-node-tests", npm_command("test", "--ignore-scripts", "--prefix", c2_mem_typescript), ("c2-mem-build",)),
+        ("c2-mem-node-package", npm_command("run", "pack:check", "--prefix", c2_mem_typescript, "--", "--prepared"), ("c2-mem-build",)),
         cargo("fastdb-rust-test", "../fastdb/bindings/rust/Cargo.toml", "--workspace", "--all-features"),
         ("core-check", ["cargo", "check", "--locked", "--manifest-path", "core/Cargo.toml", "--workspace", "--all-targets"], ()),
-        cargo("core-test", "core/Cargo.toml", "--workspace"),
+        # This subsumes the focused local-platform gate, including its relay
+        # feature and integration targets, in the same prepared runner.
+        cargo("core-test", "core/Cargo.toml", "--workspace", "--no-fail-fast", "--features", "c2-http/relay"),
         ("cli-build", ["cargo", "build", "--locked", "--manifest-path", "cli/Cargo.toml", "--bins"], ()),
         cargo("cli-test", "cli/Cargo.toml"),
         # Retain the CLI only after every gate that can relink it has run.
@@ -345,16 +365,18 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
                           "from pathlib import Path; import shutil, sys; "
                           "target = Path(sys.argv[2]); target.parent.mkdir(parents=True, exist_ok=True); "
                           "shutil.copy2(sys.argv[1], target)",
-                          str(ROOT / "cli/target/debug/c3.exe"), str(output / "cli/c3.exe")],
+                          str(ROOT / "core/target/debug" / executable), str(retained_cli)],
          ("cli-test",)),
+        ("cli-smoke", [python, "-c",
+                       "import subprocess,sys; [subprocess.run([sys.argv[1],*args],check=True) for args in "
+                       "[ ['--version'], ['--help'], ['relay','--help'], ['registry','--help'] ]]", str(retained_cli)], ("cli-artifact",)),
         cargo("rust-sdk-test", "sdk/rust/Cargo.toml", "--all-features"),
-        cargo("python-native-test", "sdk/python/native/Cargo.toml"),
         ("fastdb-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/fastdb"), "--no-create-gitignore", "../fastdb"], ()),
         ("python-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/c-two"), "--no-create-gitignore", "sdk/python"], ()),
-        ("windows-wheel-consumer", [python, str(ROOT / "tools/ci/windows_wheel_smoke.py"),
+        ("wheel-consumer", [python, str(ROOT / "tools/ci/windows_wheel_smoke.py"),
                                     "--fastdb-wheel", str(output / "wheels/fastdb"),
                                     "--c-two-wheel", str(output / "wheels/c-two"),
-                                    "--c3", str(output / "cli/c3.exe"),
+                                    "--c3", str(retained_cli),
                                     "--receipt", str(output / "installed-wheel-full-receipt.v1.json")],
          ("fastdb-wheel-build", "python-wheel-build", "cli-artifact")),
         ("windows-standard-user-consumer", ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File",
@@ -364,14 +386,15 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
                                              "-Helper", str(ROOT / "tools/ci/windows_wheel_smoke.py"),
                                              "-FastdbWheel", str(output / "wheels/fastdb"),
                                              "-CTwoWheel", str(output / "wheels/c-two"),
-                                             "-C3", str(output / "cli/c3.exe"),
+                                             "-C3", str(retained_cli),
                                              "-Receipt", str(output / "installed-wheel-standard-user-full-receipt.v1.json")],
-         ("windows-wheel-consumer",)),
+         ("wheel-consumer",)),
         ("python-build", ["uv", "sync", "--locked", "--python", python], ()),
-        ("windows-harness-tests", ["uv", "run", "--no-sync", "pytest",
-                                   "tests/repo/test_windows_native_runner.py", "tests/repo/test_windows_wheel_smoke.py",
+        ("python-native-test", ["cargo", "test", "--locked", "--manifest-path", "sdk/python/native/Cargo.toml"], ("python-build",)),
+        ("source-harness-tests", ["uv", "run", "--no-sync", "pytest",
+                                   "tests/repo/test_source_validation.py", "tests/repo/test_windows_wheel_smoke.py",
                                    "tests/repo/test_ipc_memory_benchmark.py",
-                                   "-q", "--timeout=30", f"--junitxml={output / 'windows-harness-tests.xml'}"],
+                                   "-q", "--timeout=30", f"--junitxml={output / 'source-harness-tests.xml'}"],
          ("python-build",)),
         # The matrix spawns real worker processes, so launch it only after the
         # harness tests proved the worker-dispatch protections and python-build
@@ -383,11 +406,39 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
                            "--memory-stats", "--require-memory-stats",
                            "--child-timeout", str(IPC_MEMORY_CHILD_TIMEOUT_S),
                            "--row-timeout", str(IPC_MEMORY_ROW_TIMEOUT_S)],
-         ("python-build", "windows-harness-tests")),
-        ("python-tests", ["uv", "run", "--no-sync", "pytest", "sdk/python/tests", "-q", "--timeout=30", *[f"--ignore={path}" for path in (*PORTABLE_TESTS, TYPESCRIPT_TEST)], f"--junitxml={output / 'python-tests.xml'}"], ("python-build", "fastdb-npm-build", "c2-mem-node-tests")),
-        ("portable-tests", ["uv", "run", "--no-sync", "pytest", *PORTABLE_TESTS, "-q", "--timeout=300", f"--junitxml={output / 'portable-tests.xml'}"], ("python-build", "cli-artifact")),
-        ("typescript-tests", ["uv", "run", "--no-sync", "pytest", TYPESCRIPT_TEST, "-q", "--timeout=600", f"--junitxml={output / 'typescript-tests.xml'}"], ("python-build", "fastdb-npm-install", "c2-mem-npm-install", "cli-artifact")),
+         ("python-build", "source-harness-tests")),
+        ("typescript-packages", [python, str(ROOT / "tools/ci/source_prerequisites.py"), "packages", "--output", str(output / "npm")],
+         ("fastdb-npm-build", "c2-mem-node-tests", "c2-mem-node-package")),
+        ("python-suite", [python, str(ROOT / "tools/dev/test_python.py"),
+                          "--python", str(venv_python), "--c3", str(retained_cli),
+                          "--workers", "2", "--output", str(output / "python-suite"),
+                          "--fastdb-package", str(output / "npm/fastdb4ts.tgz"),
+                          "--c2-mem-package", str(output / "npm/c2-mem-ffi.tgz"),
+                          "--typescript-package", str(output / "npm/typescript.tgz")],
+         ("python-build", "fastdb-npm-build", "c2-mem-node-tests", "cli-artifact", "python310-install", "typescript-packages")),
     ]
+    if target_platform != "windows":
+        selected = [gate for gate in selected if gate[0] != "windows-standard-user-consumer"]
+    if scope == PYTHON_SCOPE:
+        omitted = {"fastdb-rust-test", "core-check", "core-test", "rust-sdk-test",
+                   "fastdb-wheel-build", "python-wheel-build", "wheel-consumer",
+                   "windows-standard-user-consumer", "source-harness-tests", IPC_MEMORY_GATE}
+        selected = [gate for gate in selected if gate[0] not in omitted]
+    return selected
+
+
+
+def retained_artifacts(output: Path):
+    # pytest's basetemp contains disposable npm installs and compiled harness
+    # trees. Keep receipts, plans, node IDs, logs and JUnit, as in the old gates.
+    scratch_parents = {"python-suite/ordinary", "python-suite/portable", "python-suite/typescript"}
+    for directory, children, files in os.walk(output):
+        parent = Path(directory)
+        if parent.relative_to(output).as_posix() in scratch_parents and "tmp" in children:
+            children.remove("tmp")
+        for filename in sorted(files):
+            if filename != "run-evidence.json":
+                yield parent / filename
 
 
 def write_evidence(output: Path, evidence: dict[str, Any]) -> None:
@@ -410,20 +461,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = options.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
-    # Preserve each crate's conventional output location used by the test
-    # fixtures; shared CARGO_TARGET_DIR would hide c3 from relay tests.
-    environment.pop("CARGO_TARGET_DIR", None)
+    # All workspaces share dependencies. Consumers use a retained CLI so
+    # later Cargo invocations cannot silently change the tested bytes.
+    environment["CARGO_TARGET_DIR"] = str(ROOT / "core/target")
+    executable = "c3.exe" if source_platform() == "windows" else "c3"
+    retained_cli = output / "cli" / executable
     environment.update({
         "C2_ENV_FILE": "", "C2_RELAY_ANCHOR_ADDRESS": "", "PYTHONUTF8": "1",
-        "C2_PORTABLE_MATRIX_RECEIPT": str(output / f"portable-matrix-{options.scope}-receipt.v1.json"),
-        "C2_PORTABLE_MATRIX_EVIDENCE_STAGE": "development",
-        "C2_TYPESCRIPT_RECEIPT": str(output / f"typescript-real-call-{options.scope}-receipt.v1.json"),
-        "C2_TYPESCRIPT_EVIDENCE_STAGE": "development",
-        "C2_TYPESCRIPT_FASTDB_SOURCE_SHA": options.expected_fastdb_sha,
-        # Both matrices must exercise the retained cli/c3.exe bytes. Point them
-        # at the artifact copy instead of a target-dir binary that any later
-        # cargo invocation can relink, and require cli-artifact first.
-        "C2_PORTABLE_MATRIX_C3_BIN": str(output / "cli/c3.exe"),
+        # All consumers use the retained CLI; the Python executor creates
+        # and validates its own complete matrix receipts under python-suite/.
+        "C2_PORTABLE_MATRIX_C3_BIN": str(retained_cli),
+        "CTWO_TEST_C3_BIN": str(retained_cli),
     })
     sources = {}
     for name, path, expected in (
@@ -437,7 +485,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     fastdb_sdk_error: str | None = None
     if options.fastdb_system_lib_dir is not None:
         system_lib_dir, fastdb_sdk_error = validate_system_lib_dir(options.fastdb_system_lib_dir)
-    elif options.scope == FULL_SCOPE:
+    elif options.scope != LOCAL_PLATFORM_SCOPE:
         # Core and the Rust SDK consume the registry fastdb-sys package, which
         # cannot build from source; the full scope is unrunnable without the
         # prepared system CoreSDK.
@@ -457,7 +505,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "msvc": ["cl"] if os.name == "nt" else ["false"],
         "identity": ["whoami", "/all"] if os.name == "nt" else ["id"],
     }
-    if options.scope == FULL_SCOPE:
+    if options.scope != LOCAL_PLATFORM_SCOPE:
         toolchains.update({
             "uv": ["uv", "--version"], "cmake": ["cmake", "--version"],
             "swig": ["swig", "-version"], "node": ["node", "--version"],
@@ -465,7 +513,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "emscripten": [sys.executable, str(Path(os.environ.get("EMSDK", "../emsdk")) / "upstream/emscripten/emcc.py"), "--version"],
         })
     evidence: dict[str, Any] = {
-        "schema": "c-two.native-run-evidence.v1",
+        "schema": "c-two.source-run-evidence.v1",
+        "platform": source_platform(),
         "scope": options.scope,
         "applicable_gates": [name for name, _, _ in selected_gates],
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -473,7 +522,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fastdb_sdk": {
             "system_lib_dir": str(system_lib_dir) if system_lib_dir else None,
             "expected_library": platform_fastdb_library(),
-            "source_mode_gates": sorted(SOURCE_MODE_GATES),
+            "source_mode_gates": sorted(SOURCE_MODE_GATES & {name for name, _, _ in selected_gates}),
         },
         "workflow_sha": os.environ.get("C2_WORKFLOW_SHA"),
         "run_id": os.environ.get("GITHUB_RUN_ID"),
@@ -483,32 +532,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         "steps": [], "artifacts": [],
     }
     write_evidence(output, evidence)
-    if os.name != "nt" or platform.machine().lower() not in {"amd64", "x86_64"}:
-        evidence["error"] = "This gate requires native x64 Windows."
-    elif not all(source["verified"] for source in sources.values()):
+    if not all(source["verified"] for source in sources.values()):
         evidence["error"] = "Checked-out source SHA does not match the requested immutable source."
     elif fastdb_sdk_error is not None:
         evidence["error"] = fastdb_sdk_error
     else:
-        for name, command, dependencies in selected_gates:
-            passed = {step["id"] for step in evidence["steps"] if step["status"] == "passed"}
-            missing = [dependency for dependency in dependencies if dependency not in passed]
-            if missing:
-                record = {"id": name, "command": command, "status": "not_run", "reason": f"prerequisites did not pass: {', '.join(missing)}"}
-            else:
-                record = run_step(name, command, cwd=ROOT, output=output,
-                                  environment=gate_environment(name, environment, system_lib_dir),
-                                  timeout=GATE_TIMEOUT_S.get(name, STEP_TIMEOUT_S))
-                if name == IPC_MEMORY_GATE and record["status"] == "passed":
-                    problem = matrix_evidence_problem(output / IPC_MEMORY_EVIDENCE_DIR)
-                    if problem is not None:
-                        record["status"] = "failed"
-                        record["evidence_problem"] = problem
-            evidence["steps"].append(record)
-            write_evidence(output, evidence)
+        def execute(name: str, command: Sequence[str]) -> dict[str, Any]:
+            return run_step(name, command, cwd=ROOT, output=output,
+                            environment=gate_environment(name, environment, system_lib_dir),
+                            timeout=GATE_TIMEOUT_S.get(name, STEP_TIMEOUT_S))
+
+        with ThreadPoolExecutor(max_workers=4) as setup:
+            pending = {name: setup.submit(execute, name, command)
+                       for name, command, dependencies in selected_gates
+                       if name in INDEPENDENT_SETUP_GATES and not dependencies}
+            for name, command, dependencies in selected_gates:
+                passed = {step["id"] for step in evidence["steps"] if step["status"] == "passed"}
+                missing = [dependency for dependency in dependencies if dependency not in passed]
+                if missing:
+                    record = {"id": name, "command": command, "status": "not_run", "reason": f"prerequisites did not pass: {', '.join(missing)}"}
+                else:
+                    record = pending[name].result() if name in pending else execute(name, command)
+                    if name == IPC_MEMORY_GATE and record["status"] == "passed":
+                        problem = matrix_evidence_problem(output / IPC_MEMORY_EVIDENCE_DIR)
+                        if problem is not None:
+                            record["status"] = "failed"
+                            record["evidence_problem"] = problem
+                evidence["steps"].append(record)
+                write_evidence(output, evidence)
     evidence["status"] = "passed" if evidence["steps"] and all(step["status"] == "passed" for step in evidence["steps"]) and "error" not in evidence else "failed"
-    for artifact in sorted(output.rglob("*")):
-        if artifact.is_file() and artifact.name != "run-evidence.json":
+    for artifact in retained_artifacts(output):
+        if artifact.is_file():
             evidence["artifacts"].append({"path": artifact.relative_to(output).as_posix(), "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(), "bytes": artifact.stat().st_size})
     evidence["finished_at"] = datetime.now(timezone.utc).isoformat()
     write_evidence(output, evidence)

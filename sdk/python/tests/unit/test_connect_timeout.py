@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -194,34 +195,20 @@ def test_connect_deadline_bounds_python_lock_before_owner_releases(target, stage
         lock = _ProcessRegistry._instance_lock
     else:
         lock = registry._lock if target == 'registry' else server._slots_lock
-    held = threading.Event()
-    released = threading.Event()
-
-    def owner():
+    # Keep the owner locked until the waiter has returned. The watchdog allows
+    # runner scheduling delays without changing the actual 100 ms connect budget.
+    with ThreadPoolExecutor(max_workers=1) as executor:
         with lock:
-            held.set()
-            time.sleep(0.3)
-        released.set()
-
-    worker = threading.Thread(target=owner)
-    worker.start()
-    assert held.wait(1)
-    try:
-        started = time.monotonic()
-        with pytest.raises(cc.error.CallDeadlineExceeded) as failure:
-            cc.connect(ConnectContract, name='connect-timeout', timeout=0.1)
-        assert time.monotonic() - started < 0.25
-        assert not released.is_set()
-        assert lock.locked(), 'timeout must not release the lock still owned by another thread'
-        assert failure.value.details['operation'] == 'connect'
-        assert failure.value.details['transport_phase'] == 'pre_dispatch'
-        assert failure.value.details['stage'] == stage
-        assert resource.calls == 0
-        assert not registry._runtime_session.client_config_frozen
-        assert all(value == 0 for value in registry._runtime_session.path_counters().values())
-    finally:
-        worker.join(1)
-        assert not worker.is_alive()
+            waiter = executor.submit(cc.connect, ConnectContract, name='connect-timeout', timeout=0.1)
+            with pytest.raises(cc.error.CallDeadlineExceeded) as failure:
+                waiter.result(timeout=2)
+            assert lock.locked(), 'timeout must not release the lock still owned by another thread'
+            assert failure.value.details['operation'] == 'connect'
+            assert failure.value.details['transport_phase'] == 'pre_dispatch'
+            assert failure.value.details['stage'] == stage
+            assert resource.calls == 0
+            assert not registry._runtime_session.client_config_frozen
+            assert all(value == 0 for value in registry._runtime_session.path_counters().values())
     assert not lock.locked()
     # Timeout released only this waiter's state; the same resource remains usable.
     if target == 'singleton':

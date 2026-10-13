@@ -593,7 +593,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod connect_attempt_tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn python_lock_projection_expires_before_owner_releases_and_recovers() {
@@ -614,27 +614,41 @@ mod connect_attempt_tests {
             });
             let owner_lock = Python::attach(|py| lock.clone_ref(py));
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
             let owner = std::thread::spawn(move || {
                 Python::attach(|py| owner_lock.bind(py).call_method0("acquire").map(|_| ()))
                     .unwrap();
                 ready_tx.send(()).unwrap();
-                std::thread::sleep(Duration::from_millis(300));
+                let _ = release_rx.recv();
                 Python::attach(|py| owner_lock.bind(py).call_method0("release").map(|_| ()))
                     .unwrap();
             });
-            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            let attempt = PyConnectAttempt::new(Some(0.1)).unwrap();
-            let started = Instant::now();
-            Python::attach(|py| {
-                let error = attempt.acquire_lock(py, lock.bind(py), stage).unwrap_err();
-                assert!(started.elapsed() < Duration::from_millis(250));
-                assert!(
-                    lock.bind(py)
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let waiter_lock = Python::attach(|py| lock.clone_ref(py));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let observation = Python::attach(|py| {
+                    let attempt = PyConnectAttempt::new(Some(0.1)).unwrap();
+                    let result = attempt.acquire_lock(py, waiter_lock.bind(py), stage);
+                    let still_locked = waiter_lock
+                        .bind(py)
                         .call_method0("locked")
                         .unwrap()
                         .extract::<bool>()
-                        .unwrap()
-                );
+                        .unwrap();
+                    (result, still_locked)
+                });
+                done_tx.send(observation).unwrap();
+            });
+            let observed = done_rx.recv_timeout(Duration::from_secs(2));
+            release_tx.send(()).unwrap();
+            owner.join().unwrap();
+            waiter.join().unwrap();
+            let (result, still_locked) =
+                observed.expect("connect must expire before owner release");
+            assert!(still_locked);
+            let error = result.unwrap_err();
+            Python::attach(|py| {
                 let value = error.value(py);
                 assert_eq!(
                     value.getattr("code").unwrap().extract::<u16>().unwrap(),
@@ -658,7 +672,6 @@ mod connect_attempt_tests {
                     "connect"
                 );
             });
-            owner.join().unwrap();
             let recovered = PyConnectAttempt::new(None).unwrap();
             Python::attach(|py| {
                 recovered.acquire_lock(py, lock.bind(py), stage).unwrap();

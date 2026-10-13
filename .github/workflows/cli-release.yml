@@ -4,8 +4,9 @@ name: CLI Release
 # never rebuilds: it promotes the byte-exact c3 binaries, canonical installer
 # assets, and FastDB license evidence retained by the Release Candidate
 # workflow, and only after BOTH same-source main-push gates succeeded — the
-# Release Candidate run itself and the Windows Native full-scope runs on
-# windows-2022 and windows-2025. Whichever gate completes first defers; the
+# Release Candidate run itself and the Source Validation full-scope runs on
+# ubuntu-24.04, macos-15, windows-2022 and windows-2025. Whichever gate completes
+# first defers; the
 # late completion re-triggers promotion. All provenance is resolved through
 # the authenticated GitHub API before any publish authority is used, and the
 # publishing job only ever uploads the verified, staged bytes.
@@ -20,7 +21,7 @@ name: CLI Release
 
 on:
   workflow_run:
-    workflows: [Release Candidate, Windows Native]
+    workflows: [Release Candidate, Source Validation]
     types: [completed]
     branches: [main]
   workflow_dispatch:

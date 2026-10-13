@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 
 def _runner():
-    path = Path(__file__).resolve().parents[2] / "tools/ci/windows_native.py"
-    spec = importlib.util.spec_from_file_location("windows_native", path)
+    path = Path(__file__).resolve().parents[2] / "tools/ci/source_validation.py"
+    spec = importlib.util.spec_from_file_location("source_validation", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -53,7 +53,7 @@ def test_failed_prerequisite_marks_scope_failed_and_runs_independent_gate(tmp_pa
     runner = _runner()
     # Exercise the Windows evidence orchestration with real portable child
     # commands; this test does not claim to execute a Windows native backend.
-    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ, walk=os.walk))
     monkeypatch.setattr(runner.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     monkeypatch.setattr(runner, "capture", lambda command, cwd: {"exit_code": 0, "output": "a" * 40})
@@ -79,40 +79,46 @@ def test_failed_prerequisite_marks_scope_failed_and_runs_independent_gate(tmp_pa
     assert "independent executed" in (output / "independent.log").read_text()
 
 
-def test_full_scope_gate_inventory_preserves_receipt_order():
+def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
     runner = _runner()
-    gates = runner.gates(sys.executable, Path("evidence"), runner.FULL_SCOPE)
-    names = [name for name, _, _ in gates]
-    assert len(names) == 24 and len(set(names)) == 24
-    index = {name: position for position, name in enumerate(names)}
-    # Deployable application gates keep their static source-mode link path.
-    assert runner.SOURCE_MODE_GATES <= set(names)
-    assert index["cli-build"] < index["cli-test"] < index["cli-artifact"]
-    # Nothing may relink the CLI after its bytes are retained.
-    for name, command, _ in gates[index["cli-artifact"]:]:
-        arguments = [str(part) for part in command]
-        assert not any("cli/Cargo.toml" in argument for argument in arguments), name
-    dependencies = {name: list(required) for name, _, required in gates}
-    assert dependencies["cli-artifact"] == ["cli-test"]
-    assert dependencies["fastdb-npm-build"] == ["fastdb-npm-install"]
-    assert set(dependencies["python-tests"]) == {"python-build", "fastdb-npm-build", "c2-mem-node-tests"}
-    assert index["fastdb-npm-build"] < index["python-tests"]
-    assert index["c2-mem-node-tests"] < index["python-tests"]
-    assert set(dependencies["portable-tests"]) == {"python-build", "cli-artifact"}
-    assert "cli-artifact" in dependencies["typescript-tests"]
-    # The IPC memory matrix launches real worker processes only after the venv
-    # build and the worker-dispatch/recursion harness tests have passed.
-    assert dependencies["windows-harness-tests"] == ["python-build"]
-    assert set(dependencies[runner.IPC_MEMORY_GATE]) == {"python-build", "windows-harness-tests"}
-    assert index["python-build"] < index["windows-harness-tests"] < index[runner.IPC_MEMORY_GATE]
-    # Local-platform covers native integration/Core state without SDK matrices.
+    inventories = {}
+    for platform_name in ("linux", "macos", "windows"):
+        gates = runner.gates(sys.executable, Path("evidence"), runner.FULL_SCOPE, target_platform=platform_name)
+        names = [name for name, _, _ in gates]
+        assert len(set(names)) == len(names)
+        inventories[platform_name] = set(names)
+        index = {name: position for position, name in enumerate(names)}
+        assert runner.SOURCE_MODE_GATES <= set(names)
+        assert index["cli-build"] < index["cli-test"] < index["cli-artifact"] < index["python-suite"]
+        for name, command, _ in gates[index["cli-artifact"]:]:
+            assert not any("cli/Cargo.toml" in part for part in command), name
+        dependencies = {name: set(required) for name, _, required in gates}
+        assert dependencies["cli-artifact"] == {"cli-test"}
+        assert dependencies["fastdb-npm-build"] == {"fastdb-npm-install", "fastdb-wasm-build"}
+        assert dependencies["c2-mem-node-tests"] == {"c2-mem-build"}
+        assert dependencies["c2-mem-node-package"] == {"c2-mem-build"}
+        assert {"python-build", "cli-artifact", "python310-install", "typescript-packages"} <= dependencies["python-suite"]
+        assert dependencies[runner.IPC_MEMORY_GATE] == {"python-build", "source-harness-tests"}
+        commands = {name: command for name, command, _ in gates}
+        assert "--ignore-scripts" in commands["c2-mem-node-tests"]
+        assert "--ignore-scripts" in commands["c2-mem-npm-install"]
+        assert "--prepared" in commands["c2-mem-node-package"]
+        assert "--workers" in commands["python-suite"] and "--fastdb-package" in commands["python-suite"]
+        assert "--features" in commands["core-test"] and "c2-http/relay" in commands["core-test"]
+        assert "--all-targets" in commands["core-check"]
+        assert "--all-features" in commands["rust-sdk-test"]
+        assert "--all-features" in commands["fastdb-rust-test"]
+        assert "--lib" not in commands["core-test"]
+        assert all(not deps for name, _, deps in gates if name in runner.INDEPENDENT_SETUP_GATES)
+    assert inventories["linux"] == inventories["macos"]
+    assert inventories["windows"] - inventories["linux"] == {"windows-standard-user-consumer"}
+    assert inventories["linux"] <= inventories["windows"]
     local = runner.gates(sys.executable, Path("evidence"), runner.LOCAL_PLATFORM_SCOPE)
     assert [name for name, _, _ in local] == ["local-platform-tests"]
-    local_args = local[0][1]
-    assert "--lib" not in local_args  # owner_control is an integration target
-    assert "c2-core" in local_args
-    assert "c2-http" in local_args
-    assert "c2-http/relay" in local_args
+    assert "c2-core" in local[0][1] and "c2-http/relay" in local[0][1] and "--lib" not in local[0][1]
+    python = {name for name, _, _ in runner.gates(sys.executable, Path("evidence"), runner.PYTHON_SCOPE)}
+    assert {"python-suite", "python-native-test", "python-build", "cli-artifact", "python310-install"} <= python
+    assert "core-test" not in python and "python-wheel-build" not in python
 
 
 def test_ipc_memory_matrix_gate_runs_full_required_stats_bounded_matrix():
@@ -135,7 +141,7 @@ def test_ipc_memory_matrix_gate_runs_full_required_stats_bounded_matrix():
     # The complete table must run: no subset selector, no post-shutdown exemption.
     assert "--only" not in command
     assert "--allow-unavailable-stats-after-shutdown" not in command
-    assert dependencies == ("python-build", "windows-harness-tests")
+    assert dependencies == ("python-build", "source-harness-tests")
     child_timeout = float(flag("--child-timeout"))
     row_timeout = float(flag("--row-timeout"))
     benchmark = _benchmark()
@@ -190,7 +196,7 @@ def test_validate_system_lib_dir_requires_absolute_directory_with_library(tmp_pa
 
 def test_full_scope_requires_prepared_system_sdk(tmp_path, monkeypatch):
     runner = _runner()
-    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ, walk=os.walk))
     monkeypatch.setattr(runner.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     monkeypatch.setattr(runner, "capture", lambda command, cwd: {"exit_code": 0, "output": "a" * 40})
@@ -211,7 +217,7 @@ def test_full_scope_requires_prepared_system_sdk(tmp_path, monkeypatch):
 
 def test_full_scope_rejects_sdk_without_the_platform_library(tmp_path, monkeypatch):
     runner = _runner()
-    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ, walk=os.walk))
     monkeypatch.setattr(runner.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     monkeypatch.setattr(runner, "capture", lambda command, cwd: {"exit_code": 0, "output": "a" * 40})
@@ -233,7 +239,7 @@ def test_full_scope_rejects_sdk_without_the_platform_library(tmp_path, monkeypat
 
 def test_full_scope_children_receive_split_link_modes(tmp_path, monkeypatch):
     runner = _runner()
-    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ, walk=os.walk))
     monkeypatch.setattr(runner.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     monkeypatch.setattr(runner, "capture", lambda command, cwd: {"exit_code": 0, "output": "a" * 40})
@@ -262,7 +268,7 @@ def test_full_scope_children_receive_split_link_modes(tmp_path, monkeypatch):
 
 def test_full_scope_fails_when_source_mode_gate_names_disappear(tmp_path, monkeypatch):
     runner = _runner()
-    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ, walk=os.walk))
     monkeypatch.setattr(runner.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     monkeypatch.setattr(runner, "capture", lambda command, cwd: {"exit_code": 0, "output": "a" * 40})
@@ -288,7 +294,7 @@ def test_full_scope_fails_when_source_mode_gate_names_disappear(tmp_path, monkey
 
 def _stub_windows_main(monkeypatch, runner, tmp_path, stubbed, output_name="evidence"):
     """Run main() on Windows with stubbed gates and a prepared system CoreSDK."""
-    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ, walk=os.walk))
     monkeypatch.setattr(runner.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     monkeypatch.setattr(runner, "capture", lambda command, cwd: {"exit_code": 0, "output": "a" * 40})
@@ -315,10 +321,10 @@ def test_ipc_memory_matrix_gate_requires_harness_gates_to_pass(tmp_path, monkeyp
     monkeypatch.setattr(runner, "run_step", spy)
     stubbed = [
         ("python-build", [sys.executable, "-c", "print('venv built')"], ()),
-        ("windows-harness-tests", [sys.executable, "-c", "raise SystemExit(3)"], ("python-build",)),
+        ("source-harness-tests", [sys.executable, "-c", "raise SystemExit(3)"], ("python-build",)),
         (runner.IPC_MEMORY_GATE,
          [sys.executable, "-c", "raise AssertionError('benchmark must not launch')"],
-         ("python-build", "windows-harness-tests")),
+         ("python-build", "source-harness-tests")),
         ("independent-after-matrix", [sys.executable, "-c", "print('still executed')"], ()),
     ]
     stubbed += [
@@ -330,10 +336,10 @@ def test_ipc_memory_matrix_gate_requires_harness_gates_to_pass(tmp_path, monkeyp
     evidence = json.loads((output / "run-evidence.json").read_text())
     assert result == 1 and evidence["status"] == "failed"
     steps = {step["id"]: step for step in evidence["steps"]}
-    assert steps["windows-harness-tests"]["status"] == "failed"
-    assert steps["windows-harness-tests"]["exit_code"] == 3
+    assert steps["source-harness-tests"]["status"] == "failed"
+    assert steps["source-harness-tests"]["exit_code"] == 3
     assert steps[runner.IPC_MEMORY_GATE]["status"] == "not_run"
-    assert "windows-harness-tests" in steps[runner.IPC_MEMORY_GATE]["reason"]
+    assert "source-harness-tests" in steps[runner.IPC_MEMORY_GATE]["reason"]
     assert steps["independent-after-matrix"]["status"] == "passed"
     assert runner.IPC_MEMORY_GATE not in launched
     assert not (output / f"{runner.IPC_MEMORY_GATE}.log").exists()
@@ -485,3 +491,120 @@ def test_ipc_memory_matrix_gate_status_binds_full_required_stats_evidence(tmp_pa
             }
         else:
             assert step["evidence_problem"], label
+
+
+def test_independent_setup_overlaps_but_consumers_wait(tmp_path, monkeypatch):
+    import threading
+    runner = _runner()
+    first, second = threading.Event(), threading.Event()
+    completed = []
+    stubbed = [("python310-install", [], ()), ("fastdb-npm-install", [], ()),
+               ("consumer", [], ("python310-install", "fastdb-npm-install"))]
+    stubbed += [(name, [], ()) for name in sorted(runner.SOURCE_MODE_GATES)]
+    args = _stub_windows_main(monkeypatch, runner, tmp_path, stubbed)
+    def execute(name, command, **kwargs):
+        if name == "python310-install":
+            first.set()
+            assert second.wait(2), "independent npm setup was serialized"
+        elif name == "fastdb-npm-install":
+            second.set()
+            assert first.wait(2), "independent Python setup was serialized"
+        elif name == "consumer":
+            assert {"python310-install", "fastdb-npm-install"} <= set(completed)
+        completed.append(name)
+        return {"id": name, "status": "passed", "exit_code": 0}
+    monkeypatch.setattr(runner, "run_step", execute)
+    assert runner.main(args) == 0
+
+
+def test_artifact_inventory_retains_proofs_without_disposable_build_trees(tmp_path):
+    paths = ["cli/c3", "python-suite/run.json", "python-suite/portable.v1.json",
+             "python-suite/ordinary/junit.xml", "python-suite/typescript/output.log",
+             "python-suite/portable/tmp/build/unneeded", "python-suite/typescript/tmp/node_modules/typescript/index.js"]
+    for name in paths:
+        p = tmp_path / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("evidence")
+    retained = {p.relative_to(tmp_path).as_posix() for p in _runner().retained_artifacts(tmp_path)}
+    assert retained == set(paths[:5])
+
+
+def test_wasm_build_keeps_tracked_loader_and_installs_matching_dist_pair(tmp_path, monkeypatch):
+    import subprocess
+    path = Path(__file__).resolve().parents[2] / "tools/ci/source_prerequisites.py"
+    spec = importlib.util.spec_from_file_location("source_prerequisites", path)
+    assert spec is not None and spec.loader is not None
+    prerequisites = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prerequisites)
+    root = tmp_path / 'c-two'
+    root.mkdir()
+    fastdb = tmp_path / 'fastdb'
+    original = fastdb / 'ts/fastdb4ts/src/wasm/fastdb4ts.js'
+    original.parent.mkdir(parents=True)
+    original.write_text('tracked loader')
+    subprocess.run(['git', 'init', '-q', str(fastdb)], check=True)
+    subprocess.run(['git', '-C', str(fastdb), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(fastdb), '-c', 'user.name=CI Test', '-c', 'user.email=ci@example.test', 'commit', '-qm', 'fixture'], check=True)
+    monkeypatch.setattr(prerequisites, 'ROOT', root)
+    monkeypatch.setenv('EMSDK', str(tmp_path / 'emsdk'))
+    actual_run = prerequisites.run
+    builds = []
+    def simulated_compile(command, *, cwd, **kwargs):
+        if command[0] == 'git':
+            return actual_run(command, cwd=cwd, **kwargs)
+        if command[0] == 'cmake':
+            generated = cwd / 'ts/fastdb4ts/src/wasm'
+            (generated / 'fastdb4ts.js').write_text('platform loader')
+            (generated / 'fastdb4ts.wasm').write_bytes(b'matching wasm')
+            builds.append(cwd)
+        elif '--prefix' in command:
+            dist = fastdb / 'ts/fastdb4ts/dist/wasm'
+            dist.mkdir(parents=True)
+            (dist / 'fastdb4ts.js').write_text(original.read_text())
+        return None
+    monkeypatch.setattr(prerequisites, 'run', simulated_compile)
+    prerequisites.wasm()
+    prerequisites.wasm()  # A complete pinned cache needs no second compilation.
+    assert len(builds) == 1 and builds[0] != fastdb
+    assert original.read_text() == 'tracked loader'
+    prerequisites.fastdb_package()
+    dist = fastdb / 'ts/fastdb4ts/dist/wasm'
+    assert (dist / 'fastdb4ts.js').read_text() == 'platform loader'
+    assert (dist / 'fastdb4ts.wasm').read_bytes() == b'matching wasm'
+    assert original.read_text() == 'tracked loader'
+
+
+def test_loopback_http_fixture_does_not_require_reverse_dns(monkeypatch):
+    from http.client import HTTPConnection
+    from http.server import BaseHTTPRequestHandler
+    import socket
+    import threading
+    path = Path(__file__).resolve().parents[2] / 'sdk/python/tests/fixtures/http_server.py'
+    spec = importlib.util.spec_from_file_location('loopback_http_fixture', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    def unavailable(*args):
+        raise AssertionError('numeric loopback fixture attempted reverse DNS')
+    monkeypatch.setattr(socket, 'getfqdn', unavailable)
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'ok')
+        def log_message(self, *args):
+            pass
+    server = module.LoopbackHTTPServer(('127.0.0.1', 0), Handler)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    client = HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+    try:
+        client.request('GET', '/')
+        response = client.getresponse()
+        assert response.status == 200 and response.read() == b'ok'
+        assert server.server_name == '127.0.0.1'
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)
+    assert not worker.is_alive()

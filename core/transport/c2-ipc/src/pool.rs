@@ -1697,45 +1697,51 @@ mod tests {
     #[test]
     fn connect_deadline_pool_state_wait_uses_caller_budget() {
         let pool = Arc::new(ClientPool::new(Duration::from_secs(30)));
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder_pool = pool.clone();
-        let holder = thread::spawn(move || {
-            let _guard = holder_pool.state.lock();
-            ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_millis(250));
+        let state = pool.state.lock();
+        let waiting_pool = pool.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let result =
+                waiting_pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
+            let _ = done_tx.send(result);
         });
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let started = Instant::now();
-        let result = pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
+        // Completion must precede lock release; scheduling time is not part
+        // of the worker's 25ms connect budget.
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(state);
+        waiter.join().unwrap();
+        let result = result.expect("connect must expire while pool state remains locked");
         let IpcError::LocalCallRejected(error) =
             result.err().expect("deadline before endpoint lookup")
         else {
             panic!("canonical deadline required")
         };
         assert_eq!(error.details["stage"], "pool_wait");
-        assert!(
-            elapsed < Duration::from_millis(150),
-            "unbounded pool lock wait: {elapsed:?}"
-        );
         assert_eq!(pool.active_count(), 0);
         assert!(pool.memory_budget_snapshot().is_none());
     }
 
     #[test]
     fn connect_deadline_coordinator_wait_cannot_freeze_or_publish() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let _coordinator = pool.close_txn.0.lock();
-        let started = Instant::now();
-        let result = pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
+        let pool = Arc::new(ClientPool::new(Duration::from_secs(30)));
+        let coordinator = pool.close_txn.0.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiting_pool = pool.clone();
+        let waiter = thread::spawn(move || {
+            let result =
+                waiting_pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
+            let _ = done_tx.send(result);
+        });
+        // Prove completion while the coordinator is still held. The watchdog
+        // allows scheduler delay; the actual caller budget remains 25 ms.
+        let observed = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(coordinator);
+        waiter.join().unwrap();
+        let result = observed.expect("connect deadline must finish before coordinator release");
         let IpcError::LocalCallRejected(error) = result.err().unwrap() else {
             panic!("canonical deadline required")
         };
         assert_eq!(error.details["stage"], "pool_cleanup_wait");
-        assert!(started.elapsed() < Duration::from_millis(150));
         assert_eq!(pool.active_count(), 0);
         assert!(pool.memory_budget_snapshot().is_none());
     }
@@ -1750,19 +1756,22 @@ mod tests {
             references: references.clone(),
             counted: true,
         };
-        let _state = pool.state.lock();
-        let _coordinator = pool.close_txn.0.lock();
+        let state = pool.state.lock();
+        let coordinator = pool.close_txn.0.lock();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let releaser = thread::spawn(move || {
             drop(lease);
             done_tx.send(()).unwrap();
         });
-        done_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("exact-entry release must not wait on global locks");
+        let observed = done_rx.recv_timeout(Duration::from_secs(2));
+        let count = references.count.load(Ordering::Acquire);
+        let released_tick = references.released_tick.load(Ordering::Acquire);
+        drop(coordinator);
+        drop(state);
         releaser.join().unwrap();
-        assert_eq!(references.count.load(Ordering::Acquire), 0);
-        assert_ne!(references.released_tick.load(Ordering::Acquire), 0);
+        observed.expect("exact-entry release must not wait on global locks");
+        assert_eq!(count, 0);
+        assert_ne!(released_tick, 0);
     }
 
     #[test]
@@ -1808,21 +1817,16 @@ mod tests {
             drop(fresh);
             done_tx.send(()).unwrap();
         });
-        done_rx
-            .recv_timeout(Duration::from_millis(150))
-            .expect("expiry cleanup must not wait on pool metadata locks");
-        closer.join().unwrap();
-        assert!(
-            weak.upgrade().is_some(),
-            "unconfirmed close retains its client"
-        );
-        assert_eq!(
-            coordinator.retired.values().next().unwrap().state(),
-            RetiredState::Closing
-        );
+        let observed = done_rx.recv_timeout(Duration::from_secs(2));
+        let retained = weak.upgrade().is_some();
+        let retired_state = coordinator.retired.values().next().map(|work| work.state());
         drop(coordinator);
         drop(state);
         release_tx.send(()).unwrap();
+        closer.join().unwrap();
+        observed.expect("expiry cleanup must not wait on pool metadata locks");
+        assert!(retained, "unconfirmed close retains its client");
+        assert_eq!(retired_state, Some(RetiredState::Closing));
         wait_for_retired_settlement(&pool);
         assert_eq!(pool.retired_records_for_test(), 0);
         assert!(
@@ -1908,16 +1912,24 @@ mod tests {
         schedule_retired_settlement(&pool.close_txn, &work);
         let coordinator = pool.close_txn.0.lock();
         let record = work.record.clone();
-        let started = Instant::now();
-        let error = record.wait_until_settled(connect_budget(100)).unwrap_err();
-        assert!(started.elapsed() < Duration::from_millis(200));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let result = record.wait_until_settled(connect_budget(100));
+            let _ = done_tx.send(result);
+        });
+        let observed = done_rx.recv_timeout(Duration::from_secs(2));
+        let state_while_blocked = work.record.state();
+        drop(coordinator);
+        release_tx.send(()).unwrap();
+        waiter.join().unwrap();
+        wait_for_retired_settlement(&pool);
+        let error = observed
+            .expect("settlement deadline must finish before coordinator release")
+            .unwrap_err();
         assert!(matches!(error, IpcError::LocalCallRejected(ref error)
             if error.code == c2_error::ErrorCode::CallDeadlineExceeded
                 && error.details.get("stage").map(String::as_str) == Some("pool_cleanup_wait")));
-        assert_eq!(work.record.state(), RetiredState::Closing);
-        drop(coordinator);
-        release_tx.send(()).unwrap();
-        wait_for_retired_settlement(&pool);
+        assert_eq!(state_while_blocked, RetiredState::Closing);
     }
 
     #[test]
@@ -2007,17 +2019,28 @@ mod tests {
         };
         fresh.attach(client.clone());
         drop(client);
-        let started = Instant::now();
-        drop(fresh);
-        assert!(started.elapsed() < Duration::from_millis(150));
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(fresh);
+            let _ = dropped_tx.send(());
+        });
+        let observed = dropped_rx.recv_timeout(Duration::from_secs(2)).map(|()| {
+            (
+                budget.snapshot().shm.used_bytes,
+                pool.active_count(),
+                pool.refcount("ipc://prewarm-accounting"),
+            )
+        });
+        let _ = release_tx.send(());
+        dropper.join().unwrap();
+        let (retained, active, references) =
+            observed.expect("dropping the fresh guard must not wait for the writer slot");
         assert_eq!(
-            budget.snapshot().shm.used_bytes,
-            charged,
+            retained, charged,
             "busy native owner must retain its actual charge"
         );
-        assert_eq!(pool.active_count(), 0);
-        assert_eq!(pool.refcount("ipc://prewarm-accounting"), 0);
-        release_tx.send(()).unwrap();
+        assert_eq!(active, 0);
+        assert_eq!(references, 0);
         wait_for_retired_settlement(&pool);
         assert_eq!(budget.snapshot().shm.used_bytes, 0);
         assert_eq!(pool.state.lock().epoch, initial_epoch);

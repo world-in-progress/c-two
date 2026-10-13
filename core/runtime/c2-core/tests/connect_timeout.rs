@@ -81,8 +81,21 @@ fn absolute_budget_is_not_restarted_when_copied() {
     std::thread::sleep(Duration::from_millis(35));
     let copied = deadline;
     assert_eq!(copied.instant(), original);
-    assert!(copied.remaining("next_stage").unwrap().unwrap() < Duration::from_millis(65));
-    std::thread::sleep(Duration::from_millis(65));
+    // A loaded runner may resume after the entire budget, which must report
+    // expiry rather than make this test require an impossible scheduling SLA.
+    match copied.remaining("next_stage") {
+        Ok(Some(remaining)) => assert!(remaining < Duration::from_millis(65)),
+        Err(error) => {
+            assert!(std::time::Instant::now() >= original.unwrap());
+            assert_eq!(error.stage, "next_stage");
+        }
+        Ok(None) => panic!("a copied finite deadline became unlimited"),
+    }
+    std::thread::sleep(
+        original
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now()),
+    );
     assert_eq!(copied.check("next_stage").unwrap_err().stage, "next_stage");
 }
 

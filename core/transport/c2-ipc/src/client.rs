@@ -122,9 +122,107 @@ pub(crate) async fn with_connect_deadline<T>(
 }
 
 #[cfg(test)]
+mod contention_test {
+    use std::future::Future;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    pub const WATCHDOG: Duration = Duration::from_secs(2);
+
+    // The holder never releases on a timer. Even a failed observation must
+    // explicitly release and join it before asserting or touching its locks.
+    pub struct Holder<T> {
+        release: Option<Sender<()>>,
+        thread: Option<JoinHandle<T>>,
+    }
+
+    impl<T: Send + 'static> Holder<T> {
+        pub fn start(hold: impl FnOnce(Sender<()>, Receiver<()>) -> T + Send + 'static) -> Self {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let thread = thread::spawn(move || hold(ready_tx, release_rx));
+            let holder = Self {
+                release: Some(release_tx),
+                thread: Some(thread),
+            };
+            if let Err(error) = ready_rx.recv_timeout(WATCHDOG) {
+                let _ = holder.release();
+                panic!("lock holder did not become ready: {error:?}");
+            }
+            holder
+        }
+    }
+
+    impl<T> Holder<T> {
+        pub fn release(mut self) -> thread::Result<T> {
+            let _ = self.release.take().unwrap().send(());
+            self.thread.take().unwrap().join()
+        }
+    }
+
+    impl<T> Drop for Holder<T> {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    pub fn hold_mutex<T: Send + 'static>(mutex: std::sync::Arc<super::StdMutex<T>>) -> Holder<()> {
+        Holder::start(move |ready, release| {
+            let _guard = mutex.lock();
+            let _ = ready.send(());
+            let _ = release.recv();
+        })
+    }
+
+    pub fn observe<T: Send, H: Send + 'static, F: Future<Output = T>>(
+        holder: Holder<H>,
+        operation: impl FnOnce() -> F + Send,
+    ) -> (T, H) {
+        thread::scope(|scope| {
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = scope.spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // A synchronous lock regression in this current-thread
+                    // runtime cannot also stop the observer's watchdog.
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    // After the observer releases a stalled owner, this local
+                    // watchdog also terminates a cooperative wait on failure.
+                    runtime.block_on(async { tokio::time::timeout(WATCHDOG, operation()).await })
+                }));
+                let _ = done_tx.send(());
+                outcome
+            });
+            let observed = done_rx.recv_timeout(WATCHDOG);
+            let released = holder.release();
+            let joined = worker.join();
+            assert!(
+                observed.is_ok(),
+                "worker did not finish while the owner held its lock: {observed:?}"
+            );
+            let held = released.expect("lock holder panicked");
+            match joined.expect("observer worker panicked") {
+                Ok(Ok(value)) => (value, held),
+                Ok(Err(error)) => panic!("worker watchdog expired: {error}"),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+    }
+}
+
+#[cfg(test)]
 mod connect_lock_deadline_tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use contention_test::{Holder, observe};
+    use std::time::Duration;
 
     fn budget() -> ConnectDeadline {
         ConnectDeadline::start(
@@ -147,35 +245,27 @@ mod connect_lock_deadline_tests {
     async fn assert_bounded_route_lock(directory: bool) {
         let client = Arc::new(IpcClient::new("ipc://no-connect-lock-test"));
         let held_client = client.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
+        let holder = Holder::start(move |ready, release| {
             if directory {
                 let _guard = held_client.route_directory.write();
-                ready_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(Duration::from_millis(300));
+                let _ = ready.send(());
+                let _ = release.recv();
             } else {
                 let _guard = held_client.pending.lock();
-                ready_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(Duration::from_millis(300));
+                let _ = ready.send(());
+                let _ = release.recv();
             }
         });
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let started = Instant::now();
-        let result =
+        let (result, ()) = observe(holder, || async {
             with_connect_deadline(budget(), "route_acquire", client.acquire_route(&expected()))
-                .await;
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "native metadata lock exceeded caller budget: {elapsed:?}"
-        );
+                .await
+        });
         let Err(IpcError::LocalCallRejected(error)) = result else {
             panic!("canonical deadline required")
         };
         assert_eq!(error.code, ErrorCode::CallDeadlineExceeded);
+        assert_eq!(error.details["operation"], "connect");
+        assert_eq!(error.details["transport_phase"], "pre_dispatch");
         assert_eq!(
             error.details["stage"],
             if directory {
@@ -212,26 +302,15 @@ mod connect_lock_deadline_tests {
         let pool = IpcClient::own_pool_from_config(&config, &memory_budget);
         let mut client =
             IpcClient::with_pool("ipc://no-injected-pool-lock-test", pool.clone(), config);
-        let held_pool = pool.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            let _guard = held_pool.lock();
-            ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_millis(300));
+        let holder = contention_test::hold_mutex(pool.clone());
+        let (result, ()) = observe(holder, || async {
+            client.connect_with_deadline(budget()).await
         });
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let started = Instant::now();
-        let result = client.connect_with_deadline(budget()).await;
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "native injected-pool metadata wait exceeded the caller budget: {elapsed:?}"
-        );
         assert!(matches!(result, Err(IpcError::LocalCallRejected(error))
-            if error.code == ErrorCode::CallDeadlineExceeded && error.details["stage"] == "ipc_pool_wait"));
+            if error.code == ErrorCode::CallDeadlineExceeded
+                && error.details["stage"] == "ipc_pool_wait"
+                && error.details["operation"] == "connect"
+                && error.details["transport_phase"] == "pre_dispatch"));
         assert!(!client.is_connected());
         assert!(
             client.abort.lock().is_none(),
@@ -265,25 +344,11 @@ mod connect_lock_deadline_tests {
         let mut guard =
             SendGuard::new_control(client.pending.clone(), client.abort.clone(), rid, None);
         guard.mark_send_completed();
-        let held_client = client.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            let _held = held_client.pending.lock();
-            ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_millis(300));
+        let holder = contention_test::hold_mutex(client.pending.clone());
+        observe(holder, || async move {
+            drop(guard);
+            drop(rx);
         });
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let started = Instant::now();
-        drop(guard);
-        drop(rx);
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "timeout cleanup blocked on pending map: {elapsed:?}"
-        );
         {
             let pending = client.pending.lock();
             assert_eq!(
@@ -297,7 +362,7 @@ mod connect_lock_deadline_tests {
             );
         }
         client.spawn_maintenance().unwrap();
-        tokio::time::timeout(Duration::from_millis(200), async {
+        tokio::time::timeout(contention_test::WATCHDOG, async {
             loop {
                 if !client.pending.lock().contains_key(&rid) {
                     break;
@@ -5736,27 +5801,19 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
 mod tests {
     use super::*;
     use crate::response::ResponseLease;
+    use contention_test::{Holder, observe};
 
     #[tokio::test]
     async fn close_owner_pool_mutex_respects_deadline() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let client =
             IpcClient::with_config("ipc://close-owner-pool-mutex", ClientIpcConfig::default());
         let pool = client.request_pool().expect("lazy request pool");
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            let _guard = pool.lock();
-            ready_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_secs(1));
+        let holder = contention_test::hold_mutex(pool);
+        let (confirmed, ()) = observe(holder, || async {
+            client.close_shared_bounded(Duration::from_millis(50)).await
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started = Instant::now();
-        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-        let elapsed = started.elapsed();
-        holder.join().unwrap();
-        eprintln!("elapsed={elapsed:?}, confirmed={confirmed}");
-        assert!(elapsed < Duration::from_millis(200));
         // The client drops its slot reference without inspecting the pool.
         // The lock holder itself keeps the old pool alive, so this contention
         // no longer prevents confirmed close.
@@ -5776,7 +5833,7 @@ mod tests {
     }
 
     async fn check_contended_close_slot(which: CloseSlotForTest) {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         fn park<T>(
             slot: &StdMutex<T>,
@@ -5784,10 +5841,8 @@ mod tests {
             release: std::sync::mpsc::Receiver<()>,
         ) {
             let _guard = slot.lock();
-            ready.send(()).unwrap();
-            // The old blocking close still terminates and fails the elapsed
-            // assertion; a failed test never leaves a holder thread parked.
-            let _ = release.recv_timeout(Duration::from_secs(1));
+            let _ = ready.send(());
+            let _ = release.recv();
         }
 
         let mut client = Arc::new(IpcClient::with_config(
@@ -5796,27 +5851,18 @@ mod tests {
         ));
         let (tx, mut rx) = oneshot::channel();
         client.pending.lock().insert(41, PendingResponse::unary(tx));
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let holder_client = Arc::clone(&client);
-        let holder = std::thread::spawn(move || match which {
-            CloseSlotForTest::Pending => park(&holder_client.pending, ready_tx, release_rx),
-            CloseSlotForTest::Maintenance => park(&holder_client.maintenance, ready_tx, release_rx),
-            CloseSlotForTest::Receiver => park(&holder_client.recv_handle, ready_tx, release_rx),
-            CloseSlotForTest::Abort => park(&holder_client.abort, ready_tx, release_rx),
-            CloseSlotForTest::Pool => park(&holder_client.pool, ready_tx, release_rx),
-            CloseSlotForTest::Registry => park(&holder_client.chunk_registry, ready_tx, release_rx),
+        let holder = Holder::start(move |ready, release| match which {
+            CloseSlotForTest::Pending => park(&holder_client.pending, ready, release),
+            CloseSlotForTest::Maintenance => park(&holder_client.maintenance, ready, release),
+            CloseSlotForTest::Receiver => park(&holder_client.recv_handle, ready, release),
+            CloseSlotForTest::Abort => park(&holder_client.abort, ready, release),
+            CloseSlotForTest::Pool => park(&holder_client.pool, ready, release),
+            CloseSlotForTest::Registry => park(&holder_client.chunk_registry, ready, release),
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started = Instant::now();
-        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "{which:?}: {elapsed:?}"
-        );
+        let (confirmed, ()) = observe(holder, || async {
+            client.close_shared_bounded(Duration::from_millis(50)).await
+        });
         assert!(!confirmed, "{which:?} cleanup must remain unconfirmed");
         if matches!(which, CloseSlotForTest::Pending) {
             assert_eq!(client.pending.lock().len(), 1);
@@ -5901,7 +5947,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_request_permit_mutex_keeps_pending_authority() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let client = IpcClient::with_config("ipc://close-permit-mutex", ClientIpcConfig::default());
         // Only the dispatched-buddy phase/permit handoff is exercised here:
@@ -5923,21 +5969,15 @@ mod tests {
         let mut entry = PendingResponse::unary(tx);
         entry.request = Some(Arc::clone(&request));
         client.pending.lock().insert(42, entry);
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let holder_request = Arc::clone(&request);
-        let holder = std::thread::spawn(move || {
+        let holder = Holder::start(move |ready, release| {
             let _guard = holder_request.permit.lock();
-            ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+            let _ = ready.send(());
+            let _ = release.recv();
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started = Instant::now();
-        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
-        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        let (confirmed, ()) = observe(holder, || async {
+            client.close_shared_bounded(Duration::from_millis(50)).await
+        });
         assert!(!confirmed);
         assert!(matches!(rx.await.unwrap(), Err(IpcError::Closed)));
         assert_eq!(
@@ -5964,26 +6004,13 @@ mod tests {
         let external = IpcClient::own_pool_from_config(&config, &budget);
         let prefix = external.lock().prefix().to_string();
         let client = IpcClient::with_pool("ipc://close-injected", Arc::clone(&external), config);
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder_pool = Arc::clone(&external);
-        let holder = std::thread::spawn(move || {
-            let _guard = holder_pool.lock();
-            ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let holder = contention_test::hold_mutex(Arc::clone(&external));
+        let (confirmed, ()) = observe(holder, || async {
+            client
+                .close_shared_bounded(std::time::Duration::from_millis(50))
+                .await
         });
-        ready_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        let started = std::time::Instant::now();
-        let confirmed = client
-            .close_shared_bounded(std::time::Duration::from_millis(50))
-            .await;
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
         assert!(confirmed);
-        assert!(elapsed < std::time::Duration::from_millis(200));
         assert!(Arc::ptr_eq(&client.request_pool().unwrap(), &external));
         assert_eq!(external.lock().prefix(), prefix);
         assert_eq!(budget.snapshot().shm.used_bytes, 0);
@@ -5991,7 +6018,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_finished_file_carrier_survives_registry_detach() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let mut config = ClientIpcConfig::default();
         config.base.shm_backing_budget_bytes = 0;
@@ -6021,22 +6048,16 @@ mod tests {
         assert_eq!(charged.file.used_bytes, 16 * 1024);
         assert_eq!(charged.reassembly.used_bytes, 16 * 1024);
 
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let holder_pool = Arc::clone(registry.pool());
-        let holder = std::thread::spawn(move || {
+        let holder = Holder::start(move |ready, release| {
             let _guard = holder_pool.write();
-            ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+            let _ = ready.send(());
+            let _ = release.recv();
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started = Instant::now();
-        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
+        let (confirmed, ()) = observe(holder, || async {
+            client.close_shared_bounded(Duration::from_millis(50)).await
+        });
         assert!(confirmed, "a finished carrier owns its pool independently");
-        assert!(elapsed < Duration::from_millis(200));
         assert!(!Arc::ptr_eq(
             &registry,
             &client.chunk_registry_arc().unwrap()
@@ -6075,28 +6096,19 @@ mod tests {
 
     fn park_carrier_callback(
         backing: c2_wire::chunk::ReassemblyBacking,
-    ) -> (
-        std::sync::mpsc::Sender<()>,
-        std::thread::JoinHandle<c2_wire::chunk::ReassemblyBacking>,
-    ) {
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
+    ) -> Holder<c2_wire::chunk::ReassemblyBacking> {
+        Holder::start(move |ready, release| {
             let expected = backing.copy_bytes().unwrap();
             backing
                 .with_slice(|bytes| {
                     assert_eq!(bytes, expected);
-                    ready_tx.send(()).unwrap();
-                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(1));
+                    let _ = ready.send(());
+                    let _ = release.recv();
                     assert_eq!(bytes, expected);
                 })
                 .unwrap();
             backing
-        });
-        ready_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        (release_tx, holder)
+        })
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6120,58 +6132,79 @@ mod tests {
                 client.pending.lock().insert(22, PendingResponse::unary(tx));
                 drop(rx);
             }
-            let (release_tx, holder) = park_carrier_callback(held);
+            let holder = park_carrier_callback(held);
             let pending = Arc::clone(&client.pending);
             let server_pool = Arc::clone(&client.server_pool);
             let cleanup = ConnectionAssemblyCleanup {
                 registry: Arc::clone(&registry),
                 conn_id: client.conn_id,
             };
-            let (entered_tx, entered_rx) = oneshot::channel();
-            *client.recv_handle.lock() = Some(tokio::spawn(async move {
-                let _cleanup = cleanup;
-                let _ = entered_tx.send(());
-                complete_unary_pending(
-                    &pending,
-                    22,
-                    Ok(ResponseData::Handle(response)),
-                    &server_pool,
-                )
-                .await;
-            }));
-            entered_rx.await.unwrap(); // task reached its cooperative cleanup wait
-            assert_eq!(client.pending.lock().len(), 1);
-            assert!(matches!(
-                client.pending.lock()[&22].response,
-                Some(ResponseData::Handle(_))
-            ));
-            // A retained cleanup entry must not be overwritten by a new call
-            // reaching the same id, even for an unknown late response.
-            client.rid_counter.store(22, Ordering::Relaxed);
-            let (new_tx, new_rx) = oneshot::channel();
-            let new_rid = register_unary_pending(&client.pending, &client.rid_counter, new_tx);
-            assert_eq!(new_rid, 23);
-            assert!(matches!(
-                client.pending.lock()[&22].response,
-                Some(ResponseData::Handle(_))
-            ));
-            client.pending.lock().remove(&new_rid);
-            assert!(new_rx.await.is_err());
-            let started = Instant::now();
-            let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-            let elapsed = started.elapsed();
-            let charged = budget.snapshot();
-            let terminal = client.recv_handle.lock().is_none();
-            let retained = client.pending.lock().len();
-            let _ = release_tx.send(());
-            let mut held = holder.join().unwrap();
+            let ((setup, confirmed, charged, terminal, retained), mut held) =
+                observe(holder, || async {
+                    let (entered_tx, entered_rx) = oneshot::channel();
+                    *client.recv_handle.lock() = Some(tokio::spawn(async move {
+                        let _cleanup = cleanup;
+                        let _ = entered_tx.send(());
+                        complete_unary_pending(
+                            &pending,
+                            22,
+                            Ok(ResponseData::Handle(response)),
+                            &server_pool,
+                        )
+                        .await;
+                    }));
+                    entered_rx.await.unwrap(); // task reached its cooperative cleanup wait
+                    let initial_retained = client.pending.lock().len();
+                    let initial_response = matches!(
+                        client.pending.lock()[&22].response,
+                        Some(ResponseData::Handle(_))
+                    );
+                    // A retained cleanup entry must not be overwritten by a new call
+                    // reaching the same id, even for an unknown late response.
+                    client.rid_counter.store(22, Ordering::Relaxed);
+                    let (new_tx, new_rx) = oneshot::channel();
+                    let new_rid =
+                        register_unary_pending(&client.pending, &client.rid_counter, new_tx);
+                    let preserved_response = matches!(
+                        client.pending.lock()[&22].response,
+                        Some(ResponseData::Handle(_))
+                    );
+                    client.pending.lock().remove(&new_rid);
+                    let new_closed = new_rx.await.is_err();
+                    let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+                    (
+                        (
+                            initial_retained,
+                            initial_response,
+                            new_rid,
+                            preserved_response,
+                            new_closed,
+                        ),
+                        confirmed,
+                        budget.snapshot(),
+                        client.recv_handle.lock().is_none(),
+                        client.pending.lock().len(),
+                    )
+                });
+            assert_eq!(setup.0, 1);
+            assert!(setup.1);
+            assert_eq!(setup.2, 23);
+            assert!(setup.3 && setup.4);
             assert!(!confirmed);
-            assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
             assert!(terminal);
             assert_eq!(retained, 1);
             assert_eq!(charged.file.used_bytes, 16384);
             assert_eq!(charged.reassembly.used_bytes, 16384);
-            assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+            // The contended attempt above checks the short deadline. This
+            // retry checks eventual cleanup after the callback releases its
+            // lock; OS mapping destruction has no 50 ms completion guarantee.
+            let retry_started = Instant::now();
+            assert!(
+                client.close_shared_bounded(DEFAULT_CLOSE_TIMEOUT).await,
+                "uncontended cleanup unconfirmed: budget={:?}, elapsed={:?}",
+                DEFAULT_CLOSE_TIMEOUT,
+                retry_started.elapsed()
+            );
             assert!(client.pending.lock().is_empty());
             assert_eq!(budget.snapshot().file.used_bytes, 8192);
             assert_eq!(budget.snapshot().reassembly.used_bytes, 8192);
@@ -6184,13 +6217,11 @@ mod tests {
     }
 
     async fn wait_for_maintenance_tick(client: &IpcClient) {
-        tokio::time::timeout(std::time::Duration::from_millis(100), async {
-            while client.maintenance_ticks.load(Ordering::Relaxed) == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("maintenance tick must not stall the runtime");
+        // Called in the observed worker. The external 2 s watchdog includes
+        // initial scheduling and can release a holder even if this runtime stalls.
+        while client.maintenance_ticks.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6209,30 +6240,32 @@ mod tests {
         let held = registry.finish(client.conn_id, 11).unwrap().backing;
         registry.insert(client.conn_id, 22, 2, 8192).unwrap();
         registry.feed(client.conn_id, 22, 0, &[22; 8192]).unwrap();
-        let (release_tx, holder) = park_carrier_callback(held);
-        let started = Instant::now();
-        client.spawn_maintenance().unwrap();
-        wait_for_maintenance_tick(&client).await;
-        let tick_elapsed = started.elapsed();
-        let started = Instant::now();
-        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-        let elapsed = started.elapsed();
-        let charged = budget.snapshot();
-        let remaining = registry.active_count();
-        let terminal = client.maintenance.lock().is_none();
-        let _ = release_tx.send(());
-        let mut held = holder.join().unwrap();
-        assert!(
-            tick_elapsed < Duration::from_millis(200),
-            "{tick_elapsed:?}"
-        );
-        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        let holder = park_carrier_callback(held);
+        let ((confirmed, charged, remaining, terminal), mut held) = observe(holder, || async {
+            client.spawn_maintenance().unwrap();
+            wait_for_maintenance_tick(&client).await;
+            let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+            (
+                confirmed,
+                budget.snapshot(),
+                registry.active_count(),
+                client.maintenance.lock().is_none(),
+            )
+        });
         assert!(!confirmed);
         assert!(terminal);
         assert_eq!(remaining, 1);
         assert_eq!(charged.file.used_bytes, 24576);
         assert_eq!(charged.reassembly.used_bytes, 24576);
-        assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+        // Allow normal OS mapping-destruction latency after releasing the
+        // callback; the contended close above retains its short deadline.
+        let retry_started = Instant::now();
+        assert!(
+            client.close_shared_bounded(DEFAULT_CLOSE_TIMEOUT).await,
+            "uncontended cleanup unconfirmed: budget={:?}, elapsed={:?}",
+            DEFAULT_CLOSE_TIMEOUT,
+            retry_started.elapsed()
+        );
         assert_eq!(registry.active_count(), 0);
         assert_eq!(budget.snapshot().file.used_bytes, 8192);
         assert_eq!(held.copy_bytes().unwrap(), &[11; 8192]);
@@ -6244,7 +6277,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn close_maintenance_request_pool_contention_does_not_stall_runtime() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let mut config = ClientIpcConfig::default();
         config.base.chunk_gc_interval_secs = 0.005;
@@ -6262,30 +6295,15 @@ mod tests {
             .lock()
             .insert(42, PendingResponse::unary(live_tx));
         let pool = client.request_pool().unwrap();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            let _guard = pool.lock();
-            ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+        let holder = contention_test::hold_mutex(pool);
+        let ((cancelled_removed, live_preserved, confirmed), ()) = observe(holder, || async {
+            client.spawn_maintenance().unwrap();
+            wait_for_maintenance_tick(&client).await;
+            let cancelled_removed = !client.pending.lock().contains_key(&41);
+            let live_preserved = client.pending.lock().contains_key(&42);
+            let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+            (cancelled_removed, live_preserved, confirmed)
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started = Instant::now();
-        client.spawn_maintenance().unwrap();
-        wait_for_maintenance_tick(&client).await;
-        let tick_elapsed = started.elapsed();
-        let cancelled_removed = !client.pending.lock().contains_key(&41);
-        let live_preserved = client.pending.lock().contains_key(&42);
-        let started = Instant::now();
-        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
-        assert!(
-            tick_elapsed < Duration::from_millis(200),
-            "{tick_elapsed:?}"
-        );
-        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
         assert!(confirmed); // an idle pool can detach without waiting for its lock
         assert!(cancelled_removed && live_preserved);
         assert!(matches!(live_rx.await.unwrap(), Err(IpcError::Closed)));
@@ -6315,92 +6333,78 @@ mod tests {
         registry.insert(client.conn_id, 22, 2, 8192).unwrap();
         assert!(!registry.feed(client.conn_id, 22, 0, &[22; 8192]).unwrap());
 
-        let (receiver_ready_tx, receiver_ready_rx) = oneshot::channel();
-        let _peer = if real_reader {
-            // Real OS local streams and the production receive loop, without
-            // the artificial drop delay used by partial-header tests. Polling
-            // the real future to Pending proves the cleanup guard exists and
-            // its empty reader is parked before close can abort it.
-            use std::future::Future;
-            use std::task::Poll;
-
-            let (stream, peer) = LocalStream::pair().await.unwrap();
-            *client.abort.lock() = Some(stream.abort_handle());
-            let (reader, writer) = stream.into_split();
-            *client.writer.lock().await = Some(writer);
-            let receive = recv_loop(
-                reader,
-                Arc::clone(&client.pending),
-                Arc::clone(&client.server_pool),
-                Arc::clone(&client.writer),
-                Arc::clone(&registry),
-                client.conn_id,
-            );
-            *client.recv_handle.lock() = Some(tokio::spawn(async move {
-                let mut receive = Box::pin(receive);
-                let mut ready = Some(receiver_ready_tx);
-                std::future::poll_fn(|cx| match receive.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        if let Some(ready) = ready.take() {
-                            let _ = ready.send(());
-                        }
-                        Poll::Pending
-                    }
-                    Poll::Ready(()) => Poll::Ready(()),
-                })
-                .await;
-            }));
-            Some(peer)
-        } else {
-            // Pure file seam: production cancellation guard and actual close
-            // barrier, with a parked await instead of an OS IPC stream.
-            let cleanup = ConnectionAssemblyCleanup {
-                registry: Arc::clone(&registry),
-                conn_id: client.conn_id,
-            };
-            *client.recv_handle.lock() = Some(tokio::spawn(async move {
-                let _cleanup = cleanup;
-                let _ = receiver_ready_tx.send(());
-                std::future::pending::<()>().await;
-            }));
-            None
-        };
-        receiver_ready_rx.await.unwrap();
-
         // The long-lived guard belongs to a real, completed carrier's public
         // callback. No private lock or forged allocation coordinates are used.
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            finished
-                .backing
-                .with_slice(|bytes| {
-                    assert_eq!(bytes, &[11; 8192]);
-                    ready_tx.send(()).unwrap();
-                    // A red test terminates by itself instead of hanging its join.
-                    let _ = release_rx.recv_timeout(Duration::from_secs(1));
-                    assert_eq!(bytes, &[11; 8192]);
-                })
-                .unwrap();
-            finished.backing
-        });
-        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(finished.backing.copy_bytes().unwrap(), &[11; 8192]);
         let charged = budget.snapshot();
         assert_eq!(charged.file.used_bytes, 24 * 1024);
         assert_eq!(charged.reassembly.used_bytes, 24 * 1024);
-        let started = Instant::now();
-        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-        let elapsed = started.elapsed();
-        let still_charged = budget.snapshot();
-        let remaining = registry.active_count();
-        let receiver_terminal = client.recv_handle.lock().is_none();
-        let _ = release_tx.send(());
-        let mut held = holder.join().unwrap();
+        let holder = park_carrier_callback(finished.backing);
+        let ((confirmed, still_charged, remaining, receiver_terminal), mut held) =
+            observe(holder, || async {
+                let (receiver_ready_tx, receiver_ready_rx) = oneshot::channel();
+                let _peer = if real_reader {
+                    // Real OS local streams and the production receive loop, without
+                    // the artificial drop delay used by partial-header tests. Polling
+                    // the real future to Pending proves the cleanup guard exists and
+                    // its empty reader is parked before close can abort it.
+                    use std::future::Future;
+                    use std::task::Poll;
+
+                    let (stream, peer) = LocalStream::pair().await.unwrap();
+                    *client.abort.lock() = Some(stream.abort_handle());
+                    let (reader, writer) = stream.into_split();
+                    *client.writer.lock().await = Some(writer);
+                    let receive = recv_loop(
+                        reader,
+                        Arc::clone(&client.pending),
+                        Arc::clone(&client.server_pool),
+                        Arc::clone(&client.writer),
+                        Arc::clone(&registry),
+                        client.conn_id,
+                    );
+                    *client.recv_handle.lock() = Some(tokio::spawn(async move {
+                        let mut receive = Box::pin(receive);
+                        let mut ready = Some(receiver_ready_tx);
+                        std::future::poll_fn(|cx| match receive.as_mut().poll(cx) {
+                            Poll::Pending => {
+                                if let Some(ready) = ready.take() {
+                                    let _ = ready.send(());
+                                }
+                                Poll::Pending
+                            }
+                            Poll::Ready(()) => Poll::Ready(()),
+                        })
+                        .await;
+                    }));
+                    Some(peer)
+                } else {
+                    // Pure file seam: production cancellation guard and actual close
+                    // barrier, with a parked await instead of an OS IPC stream.
+                    let cleanup = ConnectionAssemblyCleanup {
+                        registry: Arc::clone(&registry),
+                        conn_id: client.conn_id,
+                    };
+                    *client.recv_handle.lock() = Some(tokio::spawn(async move {
+                        let _cleanup = cleanup;
+                        let _ = receiver_ready_tx.send(());
+                        std::future::pending::<()>().await;
+                    }));
+                    None
+                };
+                receiver_ready_rx.await.unwrap();
+                let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+                (
+                    confirmed,
+                    budget.snapshot(),
+                    registry.active_count(),
+                    client.recv_handle.lock().is_none(),
+                )
+            });
         eprintln!(
-            "file cleanup: elapsed={elapsed:?}, confirmed={confirmed}, active={remaining}, file={}, reassembly={}, receiver_terminal={receiver_terminal}",
+            "file cleanup: confirmed={confirmed}, active={remaining}, file={}, reassembly={}, receiver_terminal={receiver_terminal}",
             still_charged.file.used_bytes, still_charged.reassembly.used_bytes
         );
-        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
         assert!(
             !confirmed,
             "an unfinished assembly must keep its release authority"
@@ -6506,7 +6510,7 @@ mod tests {
         branch: &'static str,
         request: Weak<RequestReleaseState>,
         returned: Arc<AtomicBool>,
-        holder: Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
+        holder: Option<Holder<()>>,
         read_done: bool,
         dispatched: bool,
         finished: bool,
@@ -6549,16 +6553,14 @@ mod tests {
         }
 
         fn hold(&mut self, request: Arc<RequestReleaseState>, lock: &'static str) {
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
             // A pool-only holder must not keep RequestReleaseState alive:
             // the receiver regression requires pending to be its sole owner.
             let pool = Arc::clone(&request.pool);
             let request = (lock != "pool").then_some(request);
-            let holder = std::thread::spawn(move || {
+            self.holder = Some(Holder::start(move |ready, release| {
                 let wait = || {
-                    let _ = ready_tx.send(());
-                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(1));
+                    let _ = ready.send(());
+                    let _ = release.recv();
                 };
                 match lock {
                     "permit" => {
@@ -6575,20 +6577,13 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
-            });
-            // Install before the readiness assertion so unexpected unwind also
-            // releases and joins the holder before touching settlement locks.
-            self.holder = Some((release_tx, holder));
-            ready_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap();
+            }));
         }
 
         fn stop_holder(&mut self) -> Result<(), String> {
-            if let Some((release, holder)) = self.holder.take() {
-                let _ = release.send(());
+            if let Some(holder) = self.holder.take() {
                 holder
-                    .join()
+                    .release()
                     .map_err(|_| "lock holder panicked".to_string())?;
             }
             Ok(())
@@ -6795,61 +6790,54 @@ mod tests {
                 fixture.hold(weak_request.upgrade().unwrap(), "pool");
                 // After the caller's token disappears, pending is the sole
                 // request-state owner. Its Drop cannot force a pool-lock wait.
-                let started = Instant::now();
-                drop(block);
-                let token_elapsed = started.elapsed();
+                let holder = fixture.holder.take().unwrap();
+                let ((owners, result, confirmed, live, terminal, phase, retained), ()) =
+                    observe(holder, || async {
+                        drop(block);
+                        let owners = weak_request.strong_count();
+                        let pending = Arc::clone(&client.pending);
+                        let server_pool = Arc::clone(&client.server_pool);
+                        let cleanup = ConnectionAssemblyCleanup {
+                            registry: client.chunk_registry_arc().unwrap(),
+                            conn_id: client.conn_id,
+                        };
+                        let (done_tx, done_rx) = oneshot::channel();
+                        *client.recv_handle.lock() = Some(tokio::spawn(async move {
+                            let _cleanup = cleanup;
+                            if footer {
+                                try_drain_pending(&pending, &server_pool, true, None);
+                            } else {
+                                complete_unary_pending(
+                                    &pending,
+                                    43,
+                                    Ok(ResponseData::Inline(vec![9])),
+                                    &server_pool,
+                                )
+                                .await;
+                            }
+                            let _ = done_tx.send(());
+                        }));
+                        done_rx.await.unwrap();
+                        let result = rx.await.unwrap();
+                        let confirmed =
+                            client.close_shared_bounded(Duration::from_millis(50)).await;
+                        let request = weak_request
+                            .upgrade()
+                            .expect("pending must retain release authority");
+                        (
+                            owners,
+                            result,
+                            confirmed,
+                            budget.snapshot().shm.used_bytes,
+                            client.recv_handle.lock().is_none(),
+                            request.phase.load(Ordering::Acquire),
+                            client.pending.lock().len(),
+                        )
+                    });
                 assert_eq!(
-                    weak_request.strong_count(),
-                    1,
+                    owners, 1,
                     "pending must be the sole request-state owner while the pool is locked"
                 );
-                let pending = Arc::clone(&client.pending);
-                let server_pool = Arc::clone(&client.server_pool);
-                let cleanup = ConnectionAssemblyCleanup {
-                    registry: client.chunk_registry_arc().unwrap(),
-                    conn_id: client.conn_id,
-                };
-                let (done_tx, done_rx) = oneshot::channel();
-                *client.recv_handle.lock() = Some(tokio::spawn(async move {
-                    let _cleanup = cleanup;
-                    if footer {
-                        try_drain_pending(&pending, &server_pool, true, None);
-                    } else {
-                        complete_unary_pending(
-                            &pending,
-                            43,
-                            Ok(ResponseData::Inline(vec![9])),
-                            &server_pool,
-                        )
-                        .await;
-                    }
-                    let _ = done_tx.send(());
-                }));
-                let started = Instant::now();
-                done_rx.await.unwrap();
-                let terminal_elapsed = started.elapsed();
-                let result = rx.await.unwrap();
-                let started = Instant::now();
-                let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-                let elapsed = started.elapsed();
-                let live = budget.snapshot().shm.used_bytes;
-                let terminal = client.recv_handle.lock().is_none();
-                let request = weak_request
-                    .upgrade()
-                    .expect("pending must retain release authority");
-                let phase = request.phase.load(Ordering::Acquire);
-                let retained = client.pending.lock().len();
-                drop(request);
-                fixture.stop_holder().unwrap();
-                assert!(
-                    token_elapsed < Duration::from_millis(200),
-                    "{token_elapsed:?}"
-                );
-                assert!(
-                    terminal_elapsed < Duration::from_millis(200),
-                    "{terminal_elapsed:?}"
-                );
-                assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
                 assert!(!confirmed && terminal);
                 assert_eq!(phase, RequestReleaseState::PHASE_DISPATCHED);
                 assert_eq!(retained, 1);
@@ -6977,12 +6965,11 @@ mod tests {
                 client.pending.lock().insert(43, entry);
 
                 fixture.hold(Arc::clone(&request), lock);
-                let started = Instant::now();
-                let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-                let elapsed = started.elapsed();
-                fixture.stop_holder().unwrap();
+                let holder = fixture.holder.take().unwrap();
+                let (confirmed, ()) = observe(holder, || async {
+                    client.close_shared_bounded(Duration::from_millis(50)).await
+                });
                 assert!(!confirmed, "{lock}");
-                assert!(elapsed < Duration::from_millis(200), "{lock}: {elapsed:?}");
                 assert!(matches!(rx.await.unwrap(), Err(IpcError::Closed)));
                 assert_eq!(
                     request.phase.load(Ordering::Acquire),

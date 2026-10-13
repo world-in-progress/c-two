@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn try_release_file_preserves_owner_under_live_carrier_callback() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let budget = c2_mem::MemoryBudget::new(0, 8192, 8192);
         let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
@@ -452,26 +452,40 @@ mod tests {
             held.with_slice(|bytes| {
                 assert_eq!(bytes, &[34; 4096]);
                 ready_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(Duration::from_secs(1));
+                release_rx.recv().unwrap();
                 assert_eq!(bytes, &[34; 4096]);
             })
             .unwrap();
             held
         });
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started = Instant::now();
-        let released = backing.try_release().unwrap();
-        let elapsed = started.elapsed();
-        let live = budget.snapshot();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let released = backing.try_release();
+            done_tx.send((backing, released)).unwrap();
+        });
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        let locked_phase = completed.as_ref().ok().map(|(backing, _)| {
+            (
+                budget.snapshot(),
+                backing.is_released(),
+                backing.capacity_bytes(),
+                Arc::ptr_eq(&backing.pool, &pool),
+            )
+        });
         let _ = release_tx.send(());
         let mut held = holder.join().unwrap();
+        worker.join().unwrap();
+        let (mut backing, released) =
+            completed.expect("try_release blocked on live carrier callback");
+        let released = released.unwrap();
+        let (live, was_released, capacity, same_pool) = locked_phase.unwrap();
         assert!(!released);
-        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
-        assert!(!backing.is_released());
-        assert_eq!(backing.capacity_bytes(), 4096);
+        assert!(!was_released);
+        assert_eq!(capacity, 4096);
         assert_eq!(live.file.used_bytes, 8192);
         assert_eq!(live.reassembly.used_bytes, 8192);
-        assert!(Arc::ptr_eq(&backing.pool, &pool));
+        assert!(same_pool);
         assert_eq!(backing.copy_bytes().unwrap(), &[21; 4096]);
         assert_eq!(held.copy_bytes().unwrap(), &[34; 4096]);
 

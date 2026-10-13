@@ -674,34 +674,49 @@ pub(crate) mod tests {
         let owner_slot = slot.clone();
         let owner_coordinator = coordinator.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let owner = std::thread::spawn(move || {
             let _initializing = owner_coordinator.lock();
             owner_slot.get_or_init(|| {
                 ready_tx.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                let _ = release_rx.recv();
                 build_runtime()
             });
         });
         ready_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        let deadline = c2_config::ConnectDeadline::start(
-            c2_config::ConnectOptions::new().with_timeout(std::time::Duration::from_millis(100)),
-        )
-        .unwrap();
-        let started = std::time::Instant::now();
-        let result = initialize_runtime(&slot, &coordinator, deadline);
+        let waiter_slot = slot.clone();
+        let waiter_coordinator = coordinator.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let deadline = c2_config::ConnectDeadline::start(
+                c2_config::ConnectOptions::new()
+                    .with_timeout(std::time::Duration::from_millis(100)),
+            )
+            .unwrap();
+            let result =
+                initialize_runtime(&waiter_slot, &waiter_coordinator, deadline).map(|_| ());
+            result_tx.send(result).unwrap();
+        });
+        // Observe expiry before allowing initialization to finish. The watchdog
+        // tolerates scheduling delays without changing the 100 ms budget.
+        let observed = result_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let unpublished = slot.get().is_none();
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        waiter.join().unwrap();
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(250),
-            "executor initializer wait escaped budget"
+            observed.is_ok(),
+            "executor initializer wait did not expire while the owner was held"
         );
+        let result = observed.unwrap();
         assert!(matches!(result, Err(IpcError::LocalCallRejected(error))
             if error.details["stage"] == "ipc_runtime_wait"));
         assert!(
-            slot.get().is_none(),
+            unpublished,
             "deadline returned before the owner published its runtime"
         );
-        owner.join().unwrap();
         let recovered =
             initialize_runtime(&slot, &coordinator, c2_config::ConnectDeadline::default()).unwrap();
         assert_eq!(recovered.handle().block_on(async { 7 }), 7);

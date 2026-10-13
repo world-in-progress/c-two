@@ -27,7 +27,7 @@ def test_cli_release_promotes_only_after_both_candidate_gates_complete():
     text = _workflow_text()
 
     assert "workflow_run:" in text
-    assert "workflows: [Release Candidate, Windows Native]" in text
+    assert "workflows: [Release Candidate, Source Validation]" in text
     assert "types: [completed]" in text
     assert "branches: [main]" in text
 
@@ -158,7 +158,7 @@ def test_cli_release_body_links_provenance_without_desktop_claims():
     ).read_text(encoding="utf-8")
 
     assert "Windows 11 desktop is not verified" in script
-    assert "Windows Native full-scope run" in script
+    assert "Source Validation full-scope run" in script
 
 
 def test_readmes_document_the_c3_installer_asset():
@@ -183,37 +183,33 @@ def test_readmes_document_the_c3_installer_asset():
 
 
 def test_ci_runs_cli_rust_tests():
+    from tools.ci.source_validation import gates
+
+    for platform in ("linux", "macos", "windows"):
+        commands = {name: command for name, command, _ in gates(
+            "python", Path("."), "full", target_platform=platform)}
+        for name, manifest in (("cli-test", "cli/Cargo.toml"),
+                               ("core-test", "core/Cargo.toml"),
+                               ("python-native-test", "sdk/python/native/Cargo.toml")):
+            assert commands[name][:2] == ["cargo", "test"]
+            assert commands[name][commands[name].index("--manifest-path") + 1] == manifest
+            assert "--exclude" not in commands[name]
+
+
+def test_ci_validates_source_on_pr_merge_group_and_main_push():
     ci_text = (_repo_root() / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
 
-    assert "cargo test --manifest-path cli/Cargo.toml" in ci_text
-    assert "cargo test --manifest-path core/Cargo.toml --workspace" in ci_text
-    assert "cargo test --manifest-path sdk/python/native/Cargo.toml" in ci_text
-    assert "--exclude " + "c2-ffi" not in ci_text
-
-
-def test_ci_routes_tests_by_changed_domain():
-    ci_text = (_repo_root() / ".github" / "workflows" / "ci.yml").read_text(
-        encoding="utf-8"
-    )
-
-    assert "changes:" in ci_text
-    assert "dorny/paths-filter@" in ci_text
-    assert "pull-requests: read" in ci_text
-    assert "sdk/python/**" in ci_text
-    assert "core/**" in ci_text
-    assert "cli/**" in ci_text
-    assert "tools/dev/**" in ci_text
-    assert ".github/dependabot.yml" in ci_text
-    assert ".github/workflows/cli-release.yml" in ci_text
-    assert "github.event_name == 'merge_group'" in ci_text
-    assert "needs.changes.outputs.sdk == 'true'" in ci_text
-    assert "needs.changes.outputs.core == 'true'" in ci_text
-    assert "needs.changes.outputs.ci == 'true'" in ci_text
-    assert "needs.changes.outputs.cli == 'true'" in ci_text
-    assert "Skip full Python tests for unrelated changes" in ci_text
-    assert "this change does not touch sdk/python, examples/python, core, or CI" in ci_text
+    assert ci_text.startswith("name: Source Validation\n")
+    for event in ("pull_request:", "merge_group:", "push:"):
+        assert event in ci_text
+    assert "branches: [main]" in ci_text
+    assert "tools/ci/source_validation.py" in ci_text
+    for label in ("ubuntu-24.04", "macos-15", "windows-2022", "windows-2025"):
+        assert label in ci_text
+    assert "3.12" in ci_text
+    assert "3.14t" in ci_text
 
 
 def test_ci_keeps_workflow_policy_tests_lightweight():
@@ -237,9 +233,14 @@ def test_ci_keeps_workflow_policy_tests_lightweight():
     assert "sdk/python/tests/unit/test_c3_tool.py" not in ci_text
     assert "tests/repo/test_python_package_release_workflow.py" in ci_text
     assert "sdk/python/tests/unit/test_python_package_release_workflow.py" not in ci_text
-    # The native extension is built in source mode first; --no-sync keeps the
-    # system-mode consumer environment from relinking it against the SDK.
-    assert "uv run --no-sync pytest sdk/python/tests -q --timeout=30" in ci_text
+    # The source runner delegates the complete Python partition and receipts
+    # to the prepared test entry point rather than an inline pytest invocation.
+    from tools.ci.source_validation import gates
+
+    commands = {name: command for name, command, _ in gates(
+        "python", Path("."), "full", target_platform="linux")}
+    assert any(argument.endswith("tools/dev/test_python.py")
+               for argument in commands["python-suite"])
 
 
 def test_cli_enables_graceful_termination_signal_handling():

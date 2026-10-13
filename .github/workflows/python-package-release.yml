@@ -3,8 +3,9 @@ name: Python Package Release
 # Exact-tested-candidate promotion (step 2 of the release plan). This workflow
 # never rebuilds: it promotes the 30 byte-exact wheels and the sdist retained
 # by the Release Candidate workflow, and only after BOTH same-source main-push
-# gates succeeded — the Release Candidate run itself and the Windows Native
-# full-scope runs on windows-2022 and windows-2025. Whichever gate completes
+# gates succeeded — the Release Candidate run itself and the Source Validation
+# full-scope runs on ubuntu-24.04, macos-15, windows-2022 and windows-2025.
+# Whichever gate completes
 # first defers; the late completion re-triggers promotion. Only c_two
 # distribution files are ever staged; FastDB dependency-proof inputs are never
 # published as C-Two packages. PyPI idempotency is byte-exact: a rerun skips
@@ -24,7 +25,7 @@ name: Python Package Release
 
 on:
   workflow_run:
-    workflows: [Release Candidate, Windows Native]
+    workflows: [Release Candidate, Source Validation]
     types: [completed]
     branches: [main]
   workflow_dispatch:
