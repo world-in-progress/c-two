@@ -425,36 +425,7 @@ impl RouteTable {
             .any(|entry| UpstreamEndpointKey::from_route(entry).as_ref() == Some(key))
     }
 
-    /// Resolve a name → ordered list of RouteInfo.
-    /// LOCAL first, then PEER sorted by (registered_at, relay_id).
-    #[cfg(test)]
-    pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
-        let mut local = Vec::new();
-        let mut peers = Vec::new();
-
-        for ((n, _), entry) in &self.routes {
-            if n != name {
-                continue;
-            }
-            match entry.locality {
-                Locality::Local => local.push(entry.to_route_info()),
-                Locality::Peer if self.peer_is_alive(&entry.relay_id) => peers.push(entry),
-                Locality::Peer => {}
-            }
-        }
-
-        peers.sort_by(|a, b| {
-            a.registered_at
-                .partial_cmp(&b.registered_at)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.relay_id.cmp(&b.relay_id))
-        });
-
-        let mut result = local;
-        result.extend(peers.into_iter().map(|e| e.to_route_info()));
-        result
-    }
-
+    /// Resolve matching routes: LOCAL first, then live PEER routes ordered by time and ID.
     pub fn resolve_matching(&self, expected: &ExpectedRouteContract) -> Vec<RouteInfo> {
         if c2_contract::validate_expected_route_contract(expected).is_err() {
             return Vec::new();
@@ -1084,68 +1055,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn name_only_resolve_helpers_are_test_only() {
-        let route_table_source = include_str!("route_table.rs");
-        let state_source = include_str!("state.rs");
-        let router_source = include_str!("router.rs");
-        let route_table_pre_tests = route_table_source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("route_table.rs must contain code before tests");
-        let state_pre_tests = state_source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("state.rs must contain code before tests");
-        let test_only_signature =
-            "#[cfg(test)]\n    pub fn resolve(&self, name: &str) -> Vec<RouteInfo>";
-
-        assert!(
-            route_table_pre_tests.contains(test_only_signature),
-            "RouteTable::resolve(name) must remain test-only; runtime resolve uses resolve_matching(expected)"
-        );
-        assert!(
-            state_pre_tests.contains(test_only_signature),
-            "RelayState::resolve(name) must remain test-only; runtime resolve uses resolve_matching(expected)"
-        );
-        let route_table_without_test_helper =
-            route_table_pre_tests.replacen(test_only_signature, "", 1);
-        assert!(
-            !route_table_without_test_helper
-                .contains("pub fn resolve(&self, name: &str) -> Vec<RouteInfo>"),
-            "RouteTable must not expose a production name-only resolve(name) helper"
-        );
-        let state_without_test_helper = state_pre_tests.replacen(test_only_signature, "", 1);
-        assert!(
-            !state_without_test_helper
-                .contains("pub fn resolve(&self, name: &str) -> Vec<RouteInfo>"),
-            "RelayState must not expose a production name-only resolve(name) helper"
-        );
-        for forbidden in [
-            "fn resolve_filtered(",
-            "expected_crm: Option<&ExpectedRouteContract>",
-            "resolve_filtered(name, None)",
-            "resolve_filtered(name, Some(expected))",
-            "pub fn resolve_matching(&self, name: &str, expected: &ExpectedRouteContract)",
-            "name: &str,\n        expected: &c2_contract::ExpectedRouteContract",
-            "self.route_table.read().resolve_matching(name, expected)",
-            "state.resolve_matching(&name, &expected_crm)",
-        ] {
-            assert!(
-                !route_table_pre_tests.contains(forbidden),
-                "RouteTable production resolve path must not keep optional/name-only filtering: {forbidden}",
-            );
-            assert!(
-                !state_pre_tests.contains(forbidden),
-                "RelayState production resolve path must not keep optional/name-only filtering: {forbidden}",
-            );
-            assert!(
-                !router_source.contains(forbidden),
-                "Relay router production resolve path must not pass a route name separate from ExpectedRouteContract: {forbidden}",
-            );
-        }
-    }
-
     fn local_entry(name: &str, relay_id: &str) -> RouteEntry {
         RouteEntry {
             name: name.into(),
@@ -1190,9 +1099,9 @@ mod tests {
         }
     }
 
-    fn expected_contract() -> c2_contract::ExpectedRouteContract {
+    fn expected_contract(name: &str) -> c2_contract::ExpectedRouteContract {
         c2_contract::ExpectedRouteContract {
-            route_name: "grid".to_string(),
+            route_name: name.to_string(),
             crm_ns: "test.ns".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "0.1.0".to_string(),
@@ -1339,7 +1248,7 @@ mod tests {
     fn register_and_resolve_local() {
         let mut rt = RouteTable::new("relay-a".into());
         rt.register_route(local_entry("grid", "relay-a"));
-        let resolved = rt.resolve("grid");
+        let resolved = rt.resolve_matching(&expected_contract("grid"));
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "grid");
         assert!(resolved[0].ipc_address.is_some());
@@ -1359,7 +1268,7 @@ mod tests {
         register_alive_peer(&mut rt, "relay-b");
         rt.register_route(local_entry("grid", "relay-a"));
         rt.register_route(peer_entry("grid", "relay-b", 500.0));
-        let resolved = rt.resolve("grid");
+        let resolved = rt.resolve_matching(&expected_contract("grid"));
         assert_eq!(resolved.len(), 2);
         assert!(resolved[0].ipc_address.is_some()); // LOCAL first
         assert!(resolved[0].server_instance_id.is_some());
@@ -1374,7 +1283,7 @@ mod tests {
         register_alive_peer(&mut rt, "relay-c");
         rt.register_route(peer_entry("grid", "relay-c", 1000.0));
         rt.register_route(peer_entry("grid", "relay-b", 1000.0));
-        let resolved = rt.resolve("grid");
+        let resolved = rt.resolve_matching(&expected_contract("grid"));
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].relay_url, "http://relay-b:8080");
         assert_eq!(resolved[1].relay_url, "http://relay-c:8080");
@@ -1392,7 +1301,7 @@ mod tests {
         });
         rt.register_route(peer_entry("grid", "relay-b", 1000.0));
 
-        assert!(rt.resolve("grid").is_empty());
+        assert!(rt.resolve_matching(&expected_contract("grid")).is_empty());
     }
 
     #[test]
@@ -1407,7 +1316,7 @@ mod tests {
         });
         rt.register_route(peer_entry("grid", "relay-b", 1000.0));
 
-        assert_eq!(rt.resolve("grid").len(), 1);
+        assert_eq!(rt.resolve_matching(&expected_contract("grid")).len(), 1);
     }
 
     #[test]
@@ -1546,7 +1455,7 @@ mod tests {
         rt_c.merge_snapshot_inner(snapshot);
 
         assert!(rt_c.local_route("local_c").is_some());
-        let resolved = rt_c.resolve("grid");
+        let resolved = rt_c.resolve_matching(&expected_contract("grid"));
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
         assert!(rt_c.get_peer("relay-b").is_some());
@@ -1587,7 +1496,10 @@ mod tests {
     #[test]
     fn resolve_missing_name_returns_empty() {
         let rt = RouteTable::new("relay-a".into());
-        assert!(rt.resolve("nonexistent").is_empty());
+        assert!(
+            rt.resolve_matching(&expected_contract("nonexistent"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1608,7 +1520,7 @@ mod tests {
         let mut rt_b = RouteTable::new("relay-b".into());
         rt_b.merge_snapshot_inner(snapshot);
 
-        let resolved = rt_b.resolve("grid");
+        let resolved = rt_b.resolve_matching(&expected_contract("grid"));
         assert_eq!(resolved.len(), 1);
         assert!(
             resolved[0].ipc_address.is_none(),
@@ -1631,7 +1543,7 @@ mod tests {
             peers: vec![],
         });
 
-        let resolved = rt.resolve("grid");
+        let resolved = rt.resolve_matching(&expected_contract("grid"));
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
     }
@@ -1641,8 +1553,8 @@ mod tests {
         let mut rt = RouteTable::new("relay-a".into());
         rt.register_route(local_entry("grid", "relay-a"));
 
-        assert_eq!(rt.resolve_matching(&expected_contract()).len(), 1,);
-        let mut mismatched_hash = expected_contract();
+        assert_eq!(rt.resolve_matching(&expected_contract("grid")).len(), 1,);
+        let mut mismatched_hash = expected_contract("grid");
         mismatched_hash.abi_hash =
             "1111111111111111111111111111111111111111111111111111111111111111".to_string();
         assert!(rt.resolve_matching(&mismatched_hash).is_empty());
@@ -1685,7 +1597,7 @@ mod tests {
         });
 
         assert!(!rt.register_route(peer_entry("grid", "relay-a", 1000.0)));
-        assert!(rt.resolve("grid").is_empty());
+        assert!(rt.list_routes().is_empty());
     }
 
     #[test]
@@ -1696,7 +1608,7 @@ mod tests {
         assert!(!rt.register_route(peer_entry("grid", "relay-a", f64::NAN)));
         assert!(!rt.register_route(peer_entry("grid", "relay-a", f64::INFINITY)));
 
-        assert!(rt.resolve("grid").is_empty());
+        assert!(rt.list_routes().is_empty());
     }
 
     #[test]
@@ -1706,42 +1618,42 @@ mod tests {
         let mut bad_crm = peer_entry("grid", "relay-b", 1000.0);
         bad_crm.crm_name = "Grid\nInjected".into();
         assert!(!rt.register_route(bad_crm));
-        assert!(rt.resolve("grid").is_empty());
+        assert!(rt.list_routes().is_empty());
 
         let bad_route_name = peer_entry("bad\nroute", "relay-b", 1000.0);
         assert!(!rt.register_route(bad_route_name));
-        assert!(rt.resolve("bad\nroute").is_empty());
+        assert!(rt.list_routes().is_empty());
 
         let mut peer_with_private_fields = peer_entry("peer-private", "relay-b", 1000.0);
         peer_with_private_fields.server_id = Some("server-leak".into());
         peer_with_private_fields.server_instance_id = Some("instance-leak".into());
         peer_with_private_fields.ipc_address = Some("ipc://leaked".into());
         assert!(!rt.register_route(peer_with_private_fields));
-        assert!(rt.resolve("peer-private").is_empty());
+        assert!(rt.list_routes().is_empty());
 
         let local_wrong_relay = local_entry("local-wrong-relay", "relay-b");
         assert!(!rt.register_route(local_wrong_relay));
-        assert!(rt.resolve("local-wrong-relay").is_empty());
+        assert!(rt.list_routes().is_empty());
 
         let mut local_bad_server_id = local_entry("local-bad-server", "relay-a");
         local_bad_server_id.server_id = Some("s".repeat(MAX_WIRE_TEXT_BYTES + 1));
         assert!(!rt.register_route(local_bad_server_id));
-        assert!(rt.resolve("local-bad-server").is_empty());
+        assert!(rt.list_routes().is_empty());
 
         let mut local_bad_instance = local_entry("local-bad-instance", "relay-a");
         local_bad_instance.server_instance_id = Some("bad/instance".into());
         assert!(!rt.register_route(local_bad_instance));
-        assert!(rt.resolve("local-bad-instance").is_empty());
+        assert!(rt.list_routes().is_empty());
 
         let mut local_bad_ipc = local_entry("local-bad-ipc", "relay-a");
         local_bad_ipc.ipc_address = Some("ipc://../escape".into());
         assert!(!rt.register_route(local_bad_ipc));
-        assert!(rt.resolve("local-bad-ipc").is_empty());
+        assert!(rt.list_routes().is_empty());
 
         let mut bad_relay_url = peer_entry("bad-relay-url", "relay-b", 1000.0);
         bad_relay_url.relay_url = "not a url".into();
         assert!(!rt.register_route(bad_relay_url));
-        assert!(rt.resolve("bad-relay-url").is_empty());
+        assert!(rt.list_routes().is_empty());
     }
 
     #[test]
@@ -1751,7 +1663,6 @@ mod tests {
         let invalid_peer = peer_entry("grid", "bad/relay", 1000.0);
 
         assert!(!rt.register_route(invalid_peer));
-        assert!(rt.resolve("grid").is_empty());
         assert!(rt.list_routes().is_empty());
     }
 
@@ -1771,7 +1682,7 @@ mod tests {
             observed_at: Instant::now(),
         }));
 
-        assert_eq!(rt.resolve("grid").len(), 1);
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "grid"));
         assert!(rt.list_tombstones().is_empty());
     }
 
@@ -1811,7 +1722,7 @@ mod tests {
             observed_at: Instant::now(),
         }));
 
-        assert_eq!(rt.resolve("grid").len(), 1);
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "grid"));
         assert!(rt.list_tombstones().is_empty());
     }
 
@@ -1831,7 +1742,7 @@ mod tests {
             observed_at: Instant::now(),
         }));
 
-        assert_eq!(rt.resolve("grid").len(), 1);
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "grid"));
         assert!(rt.list_tombstones().is_empty());
     }
 
@@ -1844,7 +1755,7 @@ mod tests {
         let removed = rt.unregister_route_with_tombstone("grid", "relay-a", f64::NAN, 1);
 
         assert!(removed.is_none());
-        assert_eq!(rt.resolve("grid").len(), 1);
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "grid"));
         assert!(rt.list_tombstones().is_empty());
     }
 
@@ -1900,7 +1811,7 @@ mod tests {
         });
 
         assert!(rt.register_route(peer_entry("grid", "relay-a", 2001.0)));
-        assert_eq!(rt.resolve("grid").len(), 1);
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "grid"));
         assert!(rt.list_tombstones().is_empty());
     }
 
@@ -1920,7 +1831,7 @@ mod tests {
             observed_at: Instant::now(),
         }));
 
-        assert_eq!(rt.resolve("grid").len(), 1);
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "grid"));
         assert!(rt.list_tombstones().is_empty());
     }
 
@@ -1951,7 +1862,10 @@ mod tests {
             "http://relay-a-new:8080"
         );
         assert_eq!(rt.get_peer("relay-a").unwrap().route_count, 99);
-        assert_eq!(rt.resolve("grid")[0].relay_url, "http://relay-a-new:8080");
+        assert_eq!(
+            rt.resolve_matching(&expected_contract("grid"))[0].relay_url,
+            "http://relay-a-new:8080"
+        );
     }
 
     #[test]
@@ -1970,7 +1884,10 @@ mod tests {
         });
 
         assert_eq!(rt.get_peer("relay-a").unwrap().url, "http://relay-a:8080");
-        assert_eq!(rt.resolve("grid")[0].relay_url, "http://relay-a:8080");
+        assert_eq!(
+            rt.resolve_matching(&expected_contract("grid"))[0].relay_url,
+            "http://relay-a:8080"
+        );
     }
 
     #[test]
@@ -2044,7 +1961,7 @@ mod tests {
             }],
         });
 
-        assert!(rt.resolve("grid").is_empty());
+        assert!(rt.list_routes().is_empty());
         assert_eq!(rt.list_tombstones().len(), 1);
     }
 
@@ -2071,7 +1988,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(rt.resolve("grid").len(), 1);
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "grid"));
         assert!(rt.list_tombstones().is_empty());
     }
 
@@ -2091,7 +2008,6 @@ mod tests {
         });
 
         assert!(rt.list_routes().is_empty());
-        assert!(rt.resolve("grid").is_empty());
         assert_eq!(
             rt.get_peer("relay-a").map(|peer| peer.status),
             Some(PeerStatus::Dead)
@@ -2121,7 +2037,6 @@ mod tests {
         });
 
         assert!(rt.list_routes().is_empty());
-        assert!(rt.resolve("grid").is_empty());
         assert_eq!(
             rt.get_peer("relay-a").map(|peer| peer.status),
             Some(PeerStatus::Dead)
@@ -2143,7 +2058,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(rt.resolve("grid").len(), 1);
+        assert_eq!(rt.resolve_matching(&expected_contract("grid")).len(), 1);
         assert_eq!(
             rt.get_peer("relay-a").map(|peer| peer.status),
             Some(PeerStatus::Alive)
@@ -2200,9 +2115,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(rt.resolve("existing").len(), 1);
-        assert!(rt.resolve("new").is_empty());
-        assert!(rt.resolve("invalid").is_empty());
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "existing"));
         assert!(rt.list_tombstones().is_empty());
     }
 
@@ -2232,7 +2145,7 @@ mod tests {
         });
 
         assert!(rt.list_tombstones().is_empty());
-        assert_eq!(rt.resolve("existing").len(), 1);
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "existing"));
     }
 
     #[test]
@@ -2252,8 +2165,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(rt.resolve("existing").len(), 1);
-        assert!(rt.resolve("grid").is_empty());
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "existing"));
     }
 
     #[test]
@@ -2289,8 +2201,7 @@ mod tests {
             ],
         });
 
-        assert_eq!(rt.resolve("existing").len(), 1);
-        assert!(rt.resolve("grid").is_empty());
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "existing"));
         assert!(rt.list_tombstones().is_empty());
         assert!(rt.get_peer("relay-c").is_none());
     }
@@ -2320,8 +2231,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(rt.resolve("existing").len(), 1);
-        assert!(rt.resolve("grid").is_empty());
+        assert!(matches!(rt.list_routes().as_slice(), [route] if route.name == "existing"));
         assert!(rt.list_tombstones().is_empty());
         assert!(rt.get_peer("relay-c").is_none());
     }

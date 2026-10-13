@@ -199,3 +199,7 @@ R11 验证：Core lib 102、host_routes 5、client_modes 15、Server lib 168 pas
 R11 实现提交为 `e20a614cd77f817bf33cc2d7fb1b198f73e6ae5d`。R39 在此基础上移除 RouteCommand/execute 及混合成功结果，五种操作仍通过同一个 RouteAuthority 执行，登记/注销使用各自的成功结果；公开结果、错误映射、锁和清理顺序保留。测试迁移调用入口并删除恒定成功标签断言，4 个文件净减少 97 行。
 
 R39 变更前后 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 均 427 passed；重建 c3 并指定 CTWO_TEST_C3_BIN 后 Python core_transport_parity 3 passed。独立审查 run `883a09e3-76ab-49b9-b921-b8627b49450c`、输入 `5cdc6a9a9fa86ecaac25f39b1c9c8f1caa6fa28e` 无 actionable findings；Worker 可选机械对比未执行，Host 已在内存核对五个操作函数体除成功结果名称/unit外一致，并验证四文件与固定快照逐字节相同，审查已验收回收。日志及 manifest 在 `/tmp/c2-slim-b9-20261013/r39-*`；本轮未重建不含 relay server feature 的 Python native。
+
+R39 实现提交为 `2946340d`。T02 在此基础上删除两个 cfg(test) name-only resolve 入口和专属源码签名检查，迁移 102 处调用：选路/排序/活性/投影走生产 resolve_matching，拒绝写入、撤回和保留状态直接观察存储；沿用现有夹具，6 文件净减少 107 行。Host 在内存核对运行时代码前缀，除 cfg(test) helper 删除与一行注释外逐字节一致。
+
+T02 完整 relay lib 426 passed（退出一个旧源码检查，原为 427）；独立审查 run `78e1abf7-7553-47a3-be6c-521608e22112`、输入 `2bc9e7bd6cde0fa2281358e3ecc1432d86d572a5` 指出三处旧协议拒绝用例丢失隐含 peer 活性断言。Host 按意见显式检查 peer_is_alive，保留存储检查，其中一处替换较弱 has_peer；修后 peer_handlers 27 passed。六文件已核对等于快照加这三处指定断言，审查已验收回收；没有把未执行的 Worker 机械比较当通过。日志及 manifest 在 `/tmp/c2-slim-b9-20261013/t02-*`。

@@ -3528,7 +3528,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     async fn post_unregister(state: Arc<RelayState>, name: &str, server_id: &str) -> StatusCode {
@@ -4298,7 +4298,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "relay must not advertise a route that the upstream handshake did not export"
         );
 
@@ -4329,7 +4329,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "relay must not advertise caller-claimed CRM metadata for an unexported IPC route"
         );
 
@@ -4367,7 +4367,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "ordinary register must not publish pending routes even with a valid token"
         );
 
@@ -4413,7 +4413,7 @@ mod tests {
         .await;
         assert_eq!(prepare_status, StatusCode::ACCEPTED);
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "prepare-only registration must not publish relay-visible route state"
         );
 
@@ -4422,7 +4422,7 @@ mod tests {
             post_register(state.clone(), "grid", "server-grid", &address).await,
             StatusCode::CREATED
         );
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(state.local_route("grid").is_some());
 
         shutdown_live_server(&server).await;
     }
@@ -4442,10 +4442,9 @@ mod tests {
             StatusCode::CREATED
         );
 
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].crm_ns, "test.echo");
-        assert_eq!(routes[0].crm_ver, "0.1.0");
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.crm_ns, "test.echo");
+        assert_eq!(route.crm_ver, "0.1.0");
 
         shutdown_live_server(&server).await;
     }
@@ -4478,7 +4477,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "relay must not silently ignore malformed claimed CRM contract fields"
         );
 
@@ -4509,7 +4508,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "relay must not advertise a route with caller-claimed CRM metadata that disagrees with the IPC handshake"
         );
 
@@ -4544,10 +4543,9 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].crm_ns, "test.echo");
-        assert_eq!(routes[0].crm_ver, "0.1.0");
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.crm_ns, "test.echo");
+        assert_eq!(route.crm_ver, "0.1.0");
 
         shutdown_live_server(&server).await;
     }
@@ -4598,10 +4596,9 @@ mod tests {
             post_register(state.clone(), "grid", "server-grid", &address).await,
             StatusCode::BAD_REQUEST
         );
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].crm_ns, "test.echo");
-        assert_eq!(routes[0].crm_name, "Echo");
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.crm_ns, "test.echo");
+        assert_eq!(route.crm_name, "Echo");
 
         shutdown_live_server(&server).await;
     }
@@ -4655,9 +4652,8 @@ mod tests {
             .await,
             StatusCode::BAD_GATEWAY
         );
-        assert_eq!(
-            state.resolve("grid").len(),
-            1,
+        assert!(
+            state.local_route("grid").is_some(),
             "generic IPC I/O errors must not withdraw a route"
         );
     }
@@ -4715,7 +4711,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "connected owner route-missing is semantic withdrawal evidence"
         );
 
@@ -6273,8 +6269,8 @@ mod tests {
             StatusCode::OK,
             "idle-evicted endpoint must reconnect and keep late route usable"
         );
-        assert_eq!(state.resolve("manager").len(), 1);
-        assert_eq!(state.resolve("builder").len(), 1);
+        assert!(state.local_route("manager").is_some());
+        assert!(state.local_route("builder").is_some());
 
         shutdown_live_server(&server).await;
     }
@@ -6354,9 +6350,8 @@ mod tests {
             body.contains("RouteStale"),
             "stale snapshot must not be refreshed by route name: {body}"
         );
-        assert_eq!(
-            state.resolve("builder").len(),
-            1,
+        assert!(
+            state.local_route("builder").is_some(),
             "stale route token must not be treated as generic unreachable"
         );
 
@@ -6377,7 +6372,7 @@ mod tests {
             post_register(state.clone(), "grid", "server-grid", &address).await,
             StatusCode::CREATED
         );
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(state.local_route("grid").is_some());
 
         assert!(server.unregister_route("grid").await);
 

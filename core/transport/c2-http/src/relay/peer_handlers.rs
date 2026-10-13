@@ -504,7 +504,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[tokio::test]
@@ -534,7 +534,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[tokio::test]
@@ -609,7 +609,7 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
             assert!(
-                state.resolve(&route_name).is_empty(),
+                state.list_routes().is_empty(),
                 "invalid CRM tag should not be stored for {route_name}"
             );
         }
@@ -642,8 +642,9 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let routes = state.resolve("grid");
+        let routes = state.list_routes();
         assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "grid");
         assert_eq!(routes[0].relay_url, "http://relay-b:8080");
     }
 
@@ -674,7 +675,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
         assert!(state.list_routes().is_empty());
     }
 
@@ -731,7 +732,9 @@ mod tests {
                 registered_at: 1000.0,
             },
         );
-        assert_eq!(state.resolve("grid")[0].relay_url, "http://relay-b:8080");
+        assert!(
+            matches!(state.list_routes().as_slice(), [route] if route.name == "grid" && route.relay_url == "http://relay-b:8080")
+        );
 
         let envelope = PeerEnvelope::new(
             "relay-b",
@@ -746,9 +749,8 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            state.resolve("grid")[0].relay_url,
-            "http://relay-b-new:8080"
+        assert!(
+            matches!(state.list_routes().as_slice(), [route] if route.name == "grid" && route.relay_url == "http://relay-b-new:8080")
         );
     }
 
@@ -842,8 +844,8 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(state.resolve("grid").len(), 1);
-        assert!(state.has_peer("relay-b"));
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "grid"));
+        assert!(state.peer_is_alive("relay-b"));
     }
 
     #[tokio::test]
@@ -887,7 +889,8 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "grid"));
+        assert!(state.peer_is_alive("relay-b"));
         assert_eq!(tombstone_count(&state), 0);
     }
 
@@ -954,7 +957,8 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "grid"));
+        assert!(state.peer_is_alive("relay-b"));
         assert_eq!(tombstone_count(&state), 0);
     }
 
@@ -997,7 +1001,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "grid"));
     }
 
     #[tokio::test]
@@ -1074,7 +1078,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[tokio::test]
@@ -1107,7 +1111,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[tokio::test]
@@ -1131,8 +1135,9 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let routes = state.resolve("grid");
+        let routes = state.list_routes();
         assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "grid");
         assert_eq!(routes[0].relay_url, "http://relay-b:8080");
     }
 
@@ -1157,7 +1162,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
         assert!(state.list_routes().is_empty());
     }
 
@@ -1330,7 +1335,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
         assert_eq!(tombstone_count(&state), 1);
     }
 
@@ -1401,9 +1406,10 @@ mod tests {
         let mut receiver = crate::relay::route_table::RouteTable::new("relay-c".into());
         receiver.merge_validated_snapshot(ValidatedFullSync::try_from(envelope).unwrap());
 
-        let resolved = receiver.resolve("grid");
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
-        assert!(resolved[0].ipc_address.is_none());
+        let routes = receiver.list_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "grid");
+        assert_eq!(routes[0].relay_url, "http://relay-a:8080");
+        assert!(routes[0].ipc_address.is_none());
     }
 }

@@ -1213,6 +1213,6 @@ mod tests {
                 other.err()
             ),
         }
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 }

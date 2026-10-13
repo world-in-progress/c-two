@@ -335,11 +335,6 @@ impl RelayState {
 
     // -- Route-only operations --
 
-    #[cfg(test)]
-    pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
-        self.route_table.read().resolve(name)
-    }
-
     pub fn resolve_matching(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
@@ -2010,7 +2005,7 @@ mod tests {
         assert!(
             matches!(result, RegisterCommitResult::Invalid { reason } if reason.contains("control characters"))
         );
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[test]
@@ -2037,15 +2032,15 @@ mod tests {
         assert!(
             matches!(result, RegisterCommitResult::Invalid { reason } if reason.contains("path separators"))
         );
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[test]
     fn register_and_resolve_upstream() {
         let state = RelayState::new(test_config(), null_disseminator());
         let client = Arc::new(IpcClient::new("ipc://grid"));
-        register_local(&state, "grid", "server-grid", "ipc://grid", client);
-        let routes = state.resolve("grid");
+        let registered = register_local(&state, "grid", "server-grid", "ipc://grid", client);
+        let routes = state.resolve_matching(&expected_contract_for_route(&registered));
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
         assert_eq!(
@@ -2082,7 +2077,7 @@ mod tests {
             state.evict_idle(0).is_empty(),
             "route registration must not attach a relay data-plane client"
         );
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(state.local_route("grid").is_some());
     }
 
     #[test]
@@ -2138,8 +2133,7 @@ mod tests {
             UnregisterResult::Removed { client: None, .. }
         ));
 
-        assert!(state.resolve("manager").is_empty());
-        assert_eq!(state.resolve("builder").len(), 1);
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "builder"));
         assert_eq!(state.conn_pool.list_connections().len(), 1);
         assert!(matches!(
             state.connection_lookup("builder"),
@@ -2166,7 +2160,7 @@ mod tests {
             .upstream_control_watch_unavailable_for_route(&entry)
             .expect("watch-unavailable reason recorded");
         assert!(reason.contains("watch stream closed"));
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(state.local_route("grid").is_some());
         assert_eq!(state.with_route_table(|rt| rt.list_tombstones().len()), 0);
 
         state.clear_upstream_control_watch_unavailable(&key);
@@ -2176,7 +2170,7 @@ mod tests {
                 .upstream_control_watch_unavailable_for_route(&entry)
                 .is_none()
         );
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(state.local_route("grid").is_some());
     }
 
     #[test]
@@ -2188,7 +2182,7 @@ mod tests {
             state.unregister_upstream("grid", "server-grid"),
             UnregisterResult::Removed { .. }
         ));
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[test]
@@ -2202,9 +2196,8 @@ mod tests {
             state.unregister_upstream("grid", "server-other"),
             UnregisterResult::OwnerMismatch
         ));
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.ipc_address.as_deref(), Some("ipc://grid"));
     }
 
     #[test]
@@ -2238,9 +2231,9 @@ mod tests {
                 registered_at: 1000.0,
             },
         );
-        assert_eq!(state.resolve("remote").len(), 1);
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "remote"));
         withdraw_peer_route(&state, "remote", "peer-1");
-        assert!(state.resolve("remote").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[test]
@@ -2277,10 +2270,9 @@ mod tests {
         );
         assert!(matches!(result, Err(ControlError::OwnerMismatch)));
 
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
+        let route = state.local_route("grid").unwrap().to_route_info();
         assert_eq!(
-            routes[0].ipc_address.as_deref(),
+            route.ipc_address.as_deref(),
             Some("ipc://grid"),
             "echoed peer route must not overwrite our LOCAL route"
         );
@@ -2301,9 +2293,8 @@ mod tests {
         );
         assert!(matches!(result, Err(ControlError::OwnerMismatch)));
 
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.ipc_address.as_deref(), Some("ipc://grid"));
     }
 
     #[test]
@@ -2314,9 +2305,8 @@ mod tests {
 
         remove_peer_routes(&state, "test-relay");
 
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.ipc_address.as_deref(), Some("ipc://grid"));
     }
 
     #[test]
@@ -2929,10 +2919,9 @@ mod tests {
             RegisterCommitResult::Invalid { reason }
                 if reason.contains("CRM contract mismatch")
         ));
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].crm_ns, "test.echo");
-        assert_eq!(routes[0].crm_name, "Echo");
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.crm_ns, "test.echo");
+        assert_eq!(route.crm_name, "Echo");
     }
 
     #[test]
@@ -2977,11 +2966,8 @@ mod tests {
         );
 
         assert!(matches!(result, RegisterCommitResult::Registered { .. }));
-        let routes = state.resolve("grid");
-        assert_eq!(
-            routes[0].server_instance_id.as_deref(),
-            Some("instance-new")
-        );
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.server_instance_id.as_deref(), Some("instance-new"));
         assert!(matches!(
             state.connection_lookup("grid"),
             CachedClient::OwnerOnly { .. }
