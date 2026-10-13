@@ -592,3 +592,85 @@ fn matching_cached_route_token_still_has_live_lookup_deadline() {
     pool.close_all(Duration::from_secs(2));
     peer.finish();
 }
+
+#[test]
+fn route_publication_retry_uses_the_last_lookup_result() {
+    // A route may become ready on the final publication lookup. A terminal
+    // contract error on that lookup must also survive instead of becoming the
+    // earlier NotFound result. Exercise both public acquisition entry points.
+    for exact_token in [false, true] {
+        for final_state in ["ready", "not-found", "mismatch"] {
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&lookups);
+            let peer = Peer::spawn(move |mut listener| async move {
+                let mut stream = listener.accept().await.unwrap();
+                read_handshake(&mut stream).await;
+                stream.write_all(&handshake()).await.unwrap();
+                let not_found = encode_route_lookup_response(&RouteLookupResponse::NotFound {
+                    route_name: "grid".into(),
+                })
+                .unwrap();
+                let final_reply = match final_state {
+                    "ready" => ready_reply(),
+                    "mismatch" => {
+                        let RouteLookupResponse::Ready { mut current } =
+                            c2_wire::route_catalog_control::decode_route_lookup_response(
+                                &ready_reply(),
+                            )
+                            .unwrap()
+                        else {
+                            unreachable!("ready fixture")
+                        };
+                        current.contract.crm_ver = "2.0.0".into();
+                        encode_route_lookup_response(&RouteLookupResponse::ContractMismatch {
+                            current,
+                        })
+                        .unwrap()
+                    }
+                    _ => not_found.clone(),
+                };
+                loop {
+                    let header = read_lookup(&mut stream).await;
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
+                    reply(
+                        &mut stream,
+                        header,
+                        if attempt < 6 {
+                            &not_found
+                        } else {
+                            &final_reply
+                        },
+                    )
+                    .await;
+                }
+            });
+            let pool = ClientPool::new(Duration::from_secs(60));
+            let client = pool.acquire(&peer.address, None).unwrap();
+            let budget = deadline(Duration::from_secs(3));
+            let result = if exact_token {
+                client.acquire_route_token_with_deadline(&expected(), ROUTE_UID, 1, budget)
+            } else {
+                client.acquire_route_with_deadline(&expected(), budget)
+            };
+            assert_eq!(
+                lookups.load(Ordering::SeqCst),
+                6,
+                "{final_state}, exact={exact_token}"
+            );
+            match final_state {
+                "ready" => assert_eq!(result.unwrap().route_uid(), ROUTE_UID),
+                "mismatch" => assert!(
+                    matches!(result, Err(IpcError::ContractMismatch(message)) if message.contains("2.0.0"))
+                ),
+                _ => {
+                    assert!(matches!(result, Err(IpcError::RouteNotFound(name)) if name == "grid"))
+                }
+            }
+            #[cfg(feature = "test-support")]
+            assert_eq!(client.pending_len_for_test(), 0);
+            assert!(pool.release_if_same(&peer.address, &client));
+            peer.finish();
+            pool.close_all(Duration::from_secs(2));
+        }
+    }
+}

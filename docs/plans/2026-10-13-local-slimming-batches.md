@@ -36,9 +36,9 @@ relay journal 保留。公开 API/ABI/语义变化先讨论：旧 transfer buffe
 
 P1 的 R01 精确分配所有权、R02 safe Rust 别名、R03 shutdown 发送阶段和 R04 路由开放登记身份独立列项，保留复现/时序证据，先形成各自最小修复方案与回归要求，不混入上述精简提交。RegistrationPlan、复制/GC/轮询、跨 await 权威获取、OwnedHandle 等条件重构也另行设计。其余局部机会（IPC 重试尾部、内部状态配对、TypeScript 转发、已就绪 fixture 等待）在本轮各批稳定后按相同标准另立批次。
 
-## 下一轮拟议安排
+## 第二轮安排
 
-规划输入为首轮完成后的 `08955f0a1c1e94e21da2a45ca5c04abba071dc49`。以下 B7/B8 均为拟议工作，尚未实施或运行项目回归；本次只补充计划。继续保留 relay journal、公开 API/ABI 和现有错误语义。实施前重新核对源提交与工作树，若前提发生变化，先更新对应边界。P1 的设计与反例准备可独立推进，不必等待所有低优先级精简结束。
+规划输入为首轮完成后的 `08955f0a1c1e94e21da2a45ca5c04abba071dc49`，计划提交为 `60bac6541e2747adaa0c22e6f256adb34fe76589`。用户已同意执行 B7/B8，实际状态与验证见下方执行记录。继续保留 relay journal、公开 API/ABI 和现有错误语义；P1 具体接口/布局/错误投影仍按独立设计边界讨论，不混入本轮局部精简。实施前重新核对源提交与工作树，若前提发生变化，先更新对应边界。
 
 ### B7：剩余局部精简
 
@@ -121,3 +121,11 @@ B4 实现提交为 `b4c2a4ae7a084db00fc073e9e49500bba085ce2e`。本批 4 文件�
 B5 实现提交为 `77b3d9bd73c2b6163706891d7f2bdd25710ee187`。本批 6 文件只删除 410 行，包括两个旧脚本、12 项专属测试、CI 中两个旧选择和 4 个旧路径断言。两个现行发布 workflow 与 promote_release_candidate.py 相对基线字节未变。独立审查快照 `49a132425f546d6d8262ee6db0fa914f46e3e1b0`，run `0aea2c40-e715-4dc5-8640-23e571806d8e`，无 actionable findings；Host 已核对所有候选路径与快照一致、验收并回收审查工作树。
 
 验证按更新后 `.github/workflows/ci.yml` 的 workflow-policy 完整 12 文件选择列表执行，使用 `C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-project --offline --with pytest --with pytest-timeout --with packaging --with pyyaml --with maturin pytest --confcutdir=tests/repo ... -q --timeout=30`：506 passed，0 failed，53.91 秒；唯一 warning 来自故意构造重复 ZIP member 的负例。日志 `/tmp/c2-slim-implementation-20261013/b6-workflow-policy.log`，完整命令 `/tmp/c2-slim-implementation-20261013/b6-regression-command.txt`。包含 fake API 和实际 workflow shell 配合 fake gh 的 promotion 行为测试；本地通过不等于 hosted CI 或真实发布。diff check 通过，活动源码/测试/CI 中已无旧脚本引用。
+
+### B7a：IPC acquisition 重试尾部
+
+实现基线 `60bac6541e2747adaa0c22e6f256adb34fe76589`。三个循环改为消费固定延迟 iterator，在无下次重试时返回当前实际错误，生产代码净减少 35 行。新增一个真实 LocalStream 回归，以 6 个场景验证两入口的末次 Ready/NotFound/ContractMismatch；该测试先在旧实现通过，再在候选上通过。它不单独证明 lookup 与 bind 之间的竞争，或 watch/compaction 的恢复行为。
+
+验证：`cargo test --manifest-path core/Cargo.toml -p c2-ipc --features test-support --lib --tests --locked --offline`：203 + 9 passed；`cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib relay::state::tests --locked --offline`：45 passed，含旧 token 拒绝、owner 替换与共享在途调用。rustfmt/diff check 通过。各命令用既有 CARGO_TARGET_DIR 与空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS；日志 `/tmp/c2-slim-round2-20261013/b7a-baseline.log`、`b7a-ipc.log`、`b7a-relay.log`。后续 Python 验证前已以既有 source mode/CPLUS_INCLUDE_PATH 重建 native，日志 `b7-native-build.log`。
+
+buddy 初始 health 正常，但提交时 launcher 返回 UPGRADE_IN_PROGRESS，未创建 run、未进入路由。按原生只读审查替代，由 `/root/b7a_independent_review`（gpt-6-sol/high）完成独立审查，无 actionable findings。Host 及 reviewer 起止均核对固定 diff SHA256 `5c02f2d9b894edbae86ae1ecafe27e0ccb35f8760ac9976594f1f84a5e029d59` 和两个文件 hash，一致后验收；记录 `b7a-review-manifest.json`、`b7a-independent-review.txt`。审查未执行测试，不将源码等价性结论当运行证据。

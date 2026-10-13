@@ -4616,15 +4616,8 @@ impl IpcClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
-        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
-        let mut last_not_found = None;
-
-        for attempt in 0..attempts {
-            if attempt > 0 {
-                let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt - 1];
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-
+        let mut delays = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.iter();
+        loop {
             let result = match self.lookup_route_contract(expected).await {
                 Err(IpcError::CatalogCompacted { .. } | IpcError::WatchUnavailable(_)) => {
                     self.rebuild_route_directory().await?;
@@ -4634,19 +4627,15 @@ impl IpcClient {
             };
 
             match result {
-                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
-                    last_not_found = Some(route_name);
-                }
-                Err(IpcError::RouteNotFound(route_name)) => {
-                    return Err(IpcError::RouteNotFound(route_name));
+                Err(err @ IpcError::RouteNotFound(_)) => {
+                    let Some(&delay_ms) = delays.next() else {
+                        return Err(err);
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
                 other => return other,
             }
         }
-
-        Err(IpcError::RouteNotFound(
-            last_not_found.unwrap_or_else(|| expected.route_name.clone()),
-        ))
     }
 
     /// Ensure the connected server currently exports a route matching the
@@ -4718,31 +4707,19 @@ impl IpcClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<RouteBinding, IpcError> {
-        let mut last_unbound = None;
-
-        for delay_ms in ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS
-            .iter()
-            .copied()
-            .map(Some)
-            .chain(std::iter::once(None))
-        {
+        let mut delays = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.iter();
+        loop {
             self.lookup_route_contract_for_acquire(expected).await?;
             match self.bind_cached_route(expected) {
-                Ok(binding) => return Ok(binding),
-                Err(IpcError::RouteNotFound(route_name)) if delay_ms.is_some() => {
-                    last_unbound = Some(IpcError::RouteNotFound(route_name));
+                Err(err @ (IpcError::RouteNotFound(_) | IpcError::WatchUnavailable(_))) => {
+                    let Some(&delay_ms) = delays.next() else {
+                        return Err(err);
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
-                Err(IpcError::WatchUnavailable(reason)) if delay_ms.is_some() => {
-                    last_unbound = Some(IpcError::WatchUnavailable(reason));
-                }
-                Err(err) => return Err(err),
-            }
-            if let Some(delay_ms) = delay_ms {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                other => return other,
             }
         }
-
-        Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
     }
 
     /// Attest a route for relay registration without requiring call admission.
@@ -4863,31 +4840,19 @@ impl IpcClient {
     ) -> Result<RouteBinding, IpcError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
-        let mut last_unbound = None;
-
-        for delay_ms in ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS
-            .iter()
-            .copied()
-            .map(Some)
-            .chain(std::iter::once(None))
-        {
+        let mut delays = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.iter();
+        loop {
             self.lookup_route_contract_for_acquire(expected).await?;
             match self.bind_cached_route_token(expected, route_uid, route_revision) {
-                Ok(binding) => return Ok(binding),
-                Err(IpcError::RouteNotFound(route_name)) if delay_ms.is_some() => {
-                    last_unbound = Some(IpcError::RouteNotFound(route_name));
+                Err(err @ (IpcError::RouteNotFound(_) | IpcError::WatchUnavailable(_))) => {
+                    let Some(&delay_ms) = delays.next() else {
+                        return Err(err);
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
-                Err(IpcError::WatchUnavailable(reason)) if delay_ms.is_some() => {
-                    last_unbound = Some(IpcError::WatchUnavailable(reason));
-                }
-                Err(err) => return Err(err),
-            }
-            if let Some(delay_ms) = delay_ms {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                other => return other,
             }
         }
-
-        Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
     }
 
     /// CRM tag advertised by a route, if present.
