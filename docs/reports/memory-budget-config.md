@@ -2,6 +2,8 @@
 
 Task: implement only the typed IPC config projection for the three approved finite memory limits on top of base `72b23e4`. Source contract: [`docs/reports/memory-budget-contract.md`](memory-budget-contract.md) (three finite byte limits). This slice is config and SDK projection only; transport allocation wiring, client cache/GC, statistics, versions/releases, and peer work are explicitly out of scope.
 
+Implementation follow-up (2026-10-13): B15 (`5dbd6b26`) consolidated the three historical override helper functions described below into the private `apply_base_overrides!` macro, with all 16 fields and base-then-flat precedence preserved. Public config types, derived-value checks and malformed-environment errors are unchanged. See the [batch implementation record](../plans/2026-10-13-local-slimming-batches.md) for current validation; the original evidence below retains its historical scope.
+
 ## What was added
 
 Canonical defaults remain owned by `c2_config::MemoryBudgetLimits` (8 GiB SHM backing, 16 GiB file backing, 8 GiB live reassembly; zero rejects positive reservations and is never unlimited). No second defaults table exists in any SDK layer.
