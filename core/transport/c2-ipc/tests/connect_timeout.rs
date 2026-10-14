@@ -573,7 +573,9 @@ fn route_acquisition_respects_deadlines_and_last_lookup_result() {
                 loop {
                     let header = read_lookup(&mut stream).await;
                     let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
-                    if state == "paused" {
+                    // Hold the retried lookup at an awaited reply so expiry
+                    // cannot race a directory update and report its stage.
+                    if state == "paused" || (state == "retrying" && attempt == 2) {
                         std::future::pending::<()>().await;
                     }
                     // Five configured delays allow a sixth and final lookup.
@@ -601,7 +603,7 @@ fn route_acquisition_respects_deadlines_and_last_lookup_result() {
                 if state == "paused" {
                     assert_eq!(queries, 1, "cached token must perform a live lookup");
                 } else {
-                    assert!(queries >= 2, "fixture must exercise retries");
+                    assert_eq!(queries, 2, "fixture must reach the paused retry");
                 }
             } else {
                 assert_eq!(queries, 6, "{state}, exact={exact_token}");
