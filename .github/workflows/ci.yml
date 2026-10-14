@@ -104,6 +104,11 @@ jobs:
           cache-dependency-path: |
             fastdb/ts/fastdb4ts/package-lock.json
             c-two/core/foundation/c2-mem-ffi/bindings/typescript/package-lock.json
+      - name: Set up Go for relay benchmark tool
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.2'
+          cache: false
       - name: Install relay benchmark prerequisite
         shell: bash
         env:
