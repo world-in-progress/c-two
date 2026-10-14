@@ -2051,12 +2051,18 @@ mod tests {
 
     #[test]
     fn full_sync_rejects_invalid_fields_without_partial_mutation() {
-        let cases: [(&str, fn(&mut FullSync)); 6] = [
+        let cases: [(&str, fn(&mut FullSync)); 7] = [
             ("route name", |sync| {
                 sync.routes[0].name = "x".repeat(MAX_WIRE_TEXT_BYTES + 1)
             }),
             ("CRM tag", |sync| {
                 sync.routes[0].crm_name = "Grid\0Injected".into()
+            }),
+            ("second route CRM tag", |sync| {
+                let mut invalid = peer_entry("invalid", "relay-c", 2002.0);
+                invalid.crm_name = "Grid\0Injected".into();
+                sync.routes.push(invalid);
+                sync.peers[0].route_count = 2;
             }),
             ("tombstone name", |sync| {
                 sync.tombstones[0].name = "x".repeat(MAX_WIRE_TEXT_BYTES + 1)
