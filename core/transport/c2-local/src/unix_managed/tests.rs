@@ -130,10 +130,8 @@ fn lease_path_at(root: &Path, endpoint: &LocalEndpoint) -> PathBuf {
 
 fn lease_path(endpoint: &LocalEndpoint) -> PathBuf {
     let names = managed_names(endpoint).unwrap();
-    PathBuf::from(endpoint.os_name())
-        .parent()
-        .unwrap()
-        .join(OsStr::from_bytes(names.lock.as_bytes()))
+    let directories = NamespaceDirectories::open(endpoint.context().unix_root().unwrap(), false).unwrap();
+    directories.records.path().join(OsStr::from_bytes(names.lock.as_bytes()))
 }
 
 fn identity_of(path: &Path) -> SocketIdentity {
@@ -419,8 +417,9 @@ async fn managed_public_namespace_lifecycle_converges_over_repeated_runs() {
         assert!(!socket_path(&endpoint).exists());
         assert!(!lease_path(&endpoint).exists());
     }
-    assert!(guard_root.join(GATE_NAME).exists());
-    assert!(guard_root.join(MARKER_NAME).exists());
+    let directories = NamespaceDirectories::open(&guard_root, false).unwrap();
+    assert!(directories.records.path().join(GATE_NAME).exists());
+    assert!(directories.records.path().join(MARKER_NAME).exists());
 }
 
 #[tokio::test]
@@ -852,7 +851,7 @@ fn captured_sweep_directory_never_adopts_a_replacement_slot() {
     let root = namespace.path();
     test_namespace_root(root).unwrap();
     let endpoint = managed_endpoint_at(root, "sweep-replacement");
-    let captured = EndpointDirectory::open(root, false).unwrap();
+    let captured = NamespaceDirectories::open(root, false).unwrap();
     let moved = namespace._parent.path().join("saved-namespace");
     std::fs::rename(root, &moved).unwrap();
     test_namespace_root(root).unwrap();
@@ -2883,7 +2882,7 @@ async fn before_listen_checkpoint_rejects_an_already_listening_socket() {
     let namespace = open_root_bounded(root, true).unwrap();
     let names = managed_names(&endpoint).unwrap();
     let lease = namespace
-        .directory
+        .directories.records
         .open_file(
             &names.lock,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
@@ -2893,12 +2892,12 @@ async fn before_listen_checkpoint_rejects_an_already_listening_socket() {
         .unwrap();
     try_lock_lease(&lease).unwrap();
     let socket = bind_in_verified_directory(&namespace, &names).unwrap();
-    let guard = BoundSocketGuard::capture(&namespace.directory, &names, &lease).unwrap();
-    set_socket_permissions(&namespace.directory, &names, &guard).unwrap();
+    let guard = BoundSocketGuard::capture(&namespace.directories.records, &namespace.directories.records, &names, &lease).unwrap();
+    set_socket_permissions(&namespace.directories.records, &names, &guard).unwrap();
     socket.listen(128).unwrap();
     fault::inject(Failure::BeforeListen);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        listen_verified_socket(&socket, &namespace.directory, &names, &guard)
+        listen_verified_socket(&socket, &namespace.directories.records, &names, &guard)
     }))
     .expect_err("an already listening socket must fail the pre-listen checkpoint");
     let message = panic

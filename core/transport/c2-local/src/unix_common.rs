@@ -148,6 +148,10 @@ impl EndpointDirectory {
         self.file.as_raw_fd()
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The same owner/access policy applies at open and every identity fence.
     /// Application directories may be 0755; none are chmod-ed by C-Two.
     pub(crate) fn validate(&self) -> io::Result<()> {
@@ -607,12 +611,14 @@ fn io_unverified(error: &io::Error) -> Option<EndpointUnverifiedReason> {
 
 pub(crate) fn unlink_verified(
     directory: &EndpointDirectory,
+    ownership_directory: &EndpointDirectory,
     names: &EndpointNames,
     opened_lock: &libc::stat,
     expected: SocketIdentity,
 ) -> EndpointReapResult {
     if !directory.path_still_names_open_directory()
-        || !lock_entry_matches(directory, &names.lock, opened_lock).unwrap_or(false)
+        || !ownership_directory.path_still_names_open_directory()
+        || !lock_entry_matches(ownership_directory, &names.lock, opened_lock).unwrap_or(false)
     {
         return EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership);
     }
@@ -650,6 +656,7 @@ pub(crate) fn unlink_verified(
 /// instead of the listening descriptor.
 pub(crate) struct BoundSocketGuard<'a> {
     directory: &'a EndpointDirectory,
+    ownership_directory: &'a EndpointDirectory,
     names: &'a EndpointNames,
     ownership: &'a File,
     device: u64,
@@ -660,6 +667,7 @@ pub(crate) struct BoundSocketGuard<'a> {
 impl<'a> BoundSocketGuard<'a> {
     pub(crate) fn capture(
         directory: &'a EndpointDirectory,
+        ownership_directory: &'a EndpointDirectory,
         names: &'a EndpointNames,
         ownership: &'a File,
     ) -> io::Result<Self> {
@@ -674,6 +682,7 @@ impl<'a> BoundSocketGuard<'a> {
         }
         Ok(Self {
             directory,
+            ownership_directory,
             names,
             ownership,
             device: stat.st_dev as u64,
@@ -712,6 +721,7 @@ impl<'a> BoundSocketGuard<'a> {
         };
         unlink_verified(
             self.directory,
+            self.ownership_directory,
             self.names,
             &opened_lock,
             SocketIdentity::from_stat(&current),

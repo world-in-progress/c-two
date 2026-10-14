@@ -128,6 +128,8 @@ After an HTTP caller disconnects, an already-dispatched forward retains its inpu
 
 On Unix, the socket is `<root>/<32-character id>`. Applications provision custom directories. Mode `0755` is accepted when the current user owns the directory and has read, write and traversal access, with no group or other write permission. C-Two creates its default directory with mode `0700` and sets and verifies each socket as `0600` before listening. Spaces and Unicode are preserved. Bind, connect and liveness probes address the short name through an open directory descriptor, so filesystem directory-opening limits govern the configured path. C-Two manages its endpoint, lease and coordinator files, preserves unrelated files and directories, and does not change existing permissions or recursively create parents.
 
+For the macOS default namespace, only gate/marker/lease records move to `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination`; the socket path stays unchanged and aliases share one coordinator. Non-default custom roots and Linux retain colocated records. See the [lifecycle guide](local-endpoint-lifecycle.en.md) for record cleanup and the separate old-layout cold switch.
+
 macOS also rejects extended ACL allow entries that can change directory contents, attributes or permissions, including inherited entries; read, traversal and deny entries are accepted.
 
 ```python
