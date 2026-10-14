@@ -337,6 +337,14 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
+      - name: Install relay benchmark prerequisite
+        shell: bash
+        env:
+          GOBIN: ${{ runner.temp }}/c2-hey
+        run: |
+          go install github.com/rakyll/hey@v0.1.4
+          echo "$GOBIN" >> "$GITHUB_PATH"
+
       - name: Provision the official FastDB CoreSDK
         working-directory: c-two
         run: >-

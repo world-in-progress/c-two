@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import shutil
 import subprocess
 import sys
 import threading
@@ -83,8 +82,6 @@ def test_relay_qps_hey_args_include_contract_and_route_identity():
 
 @pytest.mark.parametrize('script', ['relay_qps_benchmark.py', 'three_mode_benchmark.py'])
 def test_benchmark_http_calls_and_cleanup(script, start_c3_relay, monkeypatch, tmp_path):
-    if script == 'relay_qps_benchmark.py' and shutil.which('hey') is None:
-        pytest.skip('hey is not installed')
     relay_process = start_c3_relay()
     port = int(relay_process.bind.rsplit(':', 1)[1])
     module = _load_benchmark(script)

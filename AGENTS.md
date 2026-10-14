@@ -83,6 +83,8 @@ c3 --version
 c3 relay --upstream grid=my_server@ipc://my_server --bind 0.0.0.0:8080
 ```
 
+The full Python suite runs the real relay benchmark and requires `hey` v0.1.4 on PATH. Install it with `go install github.com/rakyll/hey@v0.1.4` and expose the Go binary directory (`go env GOPATH` plus `/bin`, or `GOBIN`). Both CI suite entry points provision this prerequisite.
+
 Tests use `pytest` with a 30-second per-test timeout. Tests live under `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared fixtures under `sdk/python/tests/fixtures/`. The minimum-supported-Python syntax test discovers `python3.10` or `uv python find 3.10`; run `uv python install 3.10` before the suite if you need to guarantee it does not skip. For broader 3.10 smoke coverage without replacing the default `.venv`, use a separate environment:
 
 ```bash

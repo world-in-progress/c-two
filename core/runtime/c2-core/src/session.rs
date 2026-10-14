@@ -3878,7 +3878,20 @@ mod tests {
             ..RuntimeOptions::default()
         })
         .expect("session");
-        let server = test_server("direct-shutdown-cleanup-fail-server");
+        let directory = tempfile::Builder::new()
+            .prefix("c2-journal-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&format!(
+                "ipc://{}",
+                unique_route_name("direct-shutdown-cleanup-fail-server")
+            ))
+            .unwrap();
+        let server = Arc::new(
+            c2_server::Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap(),
+        );
         let route = dummy_route(&server, &route_name);
         let handle = route.route_handle();
         session
@@ -3920,7 +3933,7 @@ mod tests {
         // Keep the real shutdown draining until after its IPC acknowledgement,
         // so endpoint connection validation still sees the intact lease record.
         let active = handle.blocking_acquire(0).expect("active route guard");
-        let ack = c2_ipc::shutdown(server.ipc_address(), Duration::from_secs(2))
+        let ack = c2_ipc::shutdown_with_endpoint(server.local_endpoint(), Duration::from_secs(2))
             .expect("direct shutdown must be acknowledged");
         assert!(ack.acknowledged && ack.shutdown_started);
         assert!(ack.route_outcomes.is_empty(), "ack is initiation only");
@@ -3940,6 +3953,8 @@ mod tests {
             matches!(reaped, c2_local::EndpointReapResult::Reaped),
             "{reaped:?}"
         );
+        assert!(!std::path::Path::new(server.local_endpoint().os_name()).exists());
+        assert!(!lease_path.exists());
         assert!(
             run_result
                 .unwrap_err()

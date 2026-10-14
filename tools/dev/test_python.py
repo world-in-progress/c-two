@@ -302,7 +302,7 @@ def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
         if not path.is_file():
             raise RunnerError(f"collection前需要golden fixture：{path}")
     info["fixtures"] = {str(path): sha256(path) for path in (record, graph)}
-    for command in ("cargo", "node", "npm"):
+    for command in ("cargo", "node", "npm", "hey"):
         if shutil.which(command, path=environment.get('PATH', '')) is None:
             raise RunnerError(f"必要工具不存在：{command}")
     validate_node_runtime(capture(["node", "--version"], environment), capture(["node", "-p", "process.versions.napi"], environment))

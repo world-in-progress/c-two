@@ -4527,12 +4527,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_join_retires_socket_after_namespace_gate_contention() {
+        let directory = tempfile::Builder::new()
+            .prefix("c2-shutdown-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&unique_readiness_address("shutdown_gate_contention"))
+            .unwrap();
         let server = Arc::new(
-            Server::new(
-                &unique_readiness_address("shutdown_gate_contention"),
-                ServerIpcConfig::default(),
-            )
-            .unwrap(),
+            Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap(),
         );
         let runner = {
             let server = Arc::clone(&server);
@@ -4585,6 +4589,7 @@ mod tests {
             !socket.exists(),
             "successful shutdown/join must retire its socket"
         );
+        assert!(!socket.with_extension("lease").exists());
     }
 
     #[cfg(unix)]
@@ -4592,12 +4597,16 @@ mod tests {
     async fn shutdown_cleanup_failure_is_terminal_observable_and_restartable() {
         use std::os::unix::fs::FileExt;
 
+        let directory = tempfile::Builder::new()
+            .prefix("c2-shutdown-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&unique_readiness_address("shutdown_bad_record"))
+            .unwrap();
         let server = Arc::new(
-            Server::new(
-                &unique_readiness_address("shutdown_bad_record"),
-                ServerIpcConfig::default(),
-            )
-            .unwrap(),
+            Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap(),
         );
         let runner = {
             let server = Arc::clone(&server);
@@ -4691,6 +4700,7 @@ mod tests {
         restarted.await.unwrap().unwrap();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
         assert!(!socket.exists());
+        assert!(!lease_path.exists());
     }
 
     #[test]

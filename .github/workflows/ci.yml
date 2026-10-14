@@ -104,6 +104,13 @@ jobs:
           cache-dependency-path: |
             fastdb/ts/fastdb4ts/package-lock.json
             c-two/core/foundation/c2-mem-ffi/bindings/typescript/package-lock.json
+      - name: Install relay benchmark prerequisite
+        shell: bash
+        env:
+          GOBIN: ${{ runner.temp }}/c2-hey
+        run: |
+          go install github.com/rakyll/hey@v0.1.4
+          echo "$GOBIN" >> "$GITHUB_PATH"
       - name: Prepare official FastDB CoreSDK
         id: fastdb_sdk
         run: python .github/scripts/prepare_fastdb_sdk.py --output "${{ runner.temp }}/fastdb-core-sdk"
