@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- Rust `ServerIpcConfigOverrides` and `ClientIpcConfigOverrides` now store only flat fields; `BaseIpcConfigOverrides` and their nested `base` fields are removed. Migrate each old pair using `flat.or(base)` so explicit `false` and `0` still win, then recompile downstream Rust code. Python override dictionaries, resolved configuration types, wire formats and C ABI 3 are unchanged.
+
 - Rust `EncodedService::invoke` now takes an owned `Vec<u8>`, allowing the
   Python bridge to reuse Core's request snapshot without another byte copy.
   Update manual implementations and regenerate Rust contract modules with the

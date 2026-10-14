@@ -96,7 +96,7 @@ fn runtime_client_config_freezes_on_valid_config_even_when_connect_fails() {
     let absent = format!("ipc://{}", unique_name("absent"));
     let expected = release().expected_route("unused-route").unwrap();
     let mut overrides = c2_config::ClientIpcConfigOverrides::default();
-    overrides.base.pool_segment_size = Some(0);
+    overrides.pool_segment_size = Some(0);
     runtime
         .set_client_ipc_overrides(Some(overrides.clone()))
         .unwrap();
@@ -113,7 +113,7 @@ fn runtime_client_config_freezes_on_valid_config_even_when_connect_fails() {
     assert!(!runtime.client_config_frozen());
     assert!(runtime.outgoing_memory_stats().is_none());
 
-    overrides.base.pool_segment_size = Some(2 * 1024 * 1024);
+    overrides.pool_segment_size = Some(2 * 1024 * 1024);
     runtime.set_client_ipc_overrides(Some(overrides)).unwrap();
     assert!(
         runtime
@@ -123,7 +123,7 @@ fn runtime_client_config_freezes_on_valid_config_even_when_connect_fails() {
     assert!(runtime.client_config_frozen());
     assert!(runtime.outgoing_memory_stats().is_some());
     let mut replacement = c2_config::ClientIpcConfigOverrides::default();
-    replacement.base.pool_enabled = Some(false);
+    replacement.pool_enabled = Some(false);
     assert!(matches!(
         runtime.set_client_ipc_overrides(Some(replacement)),
         Err(c2_core::LifecycleError::ClientConfigFrozen)

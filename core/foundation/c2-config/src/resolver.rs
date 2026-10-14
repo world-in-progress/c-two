@@ -85,28 +85,7 @@ impl EnvCatalog {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct BaseIpcConfigOverrides {
-    pub pool_enabled: Option<bool>,
-    pub pool_segment_size: Option<u64>,
-    pub max_pool_segments: Option<u32>,
-    pub pool_prewarm_segments: Option<u32>,
-    pub pool_min_retained_segments: Option<u32>,
-    pub reassembly_segment_size: Option<u64>,
-    pub reassembly_max_segments: Option<u32>,
-    pub max_total_chunks: Option<u32>,
-    pub chunk_gc_interval_secs: Option<f64>,
-    pub chunk_threshold_ratio: Option<f64>,
-    pub chunk_assembler_timeout_secs: Option<f64>,
-    pub max_reassembly_bytes: Option<u64>,
-    pub chunk_size: Option<u64>,
-    pub shm_backing_budget_bytes: Option<u64>,
-    pub file_backing_budget_bytes: Option<u64>,
-    pub live_reassembly_budget_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct ServerIpcConfigOverrides {
-    pub base: BaseIpcConfigOverrides,
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
@@ -134,7 +113,6 @@ pub struct ServerIpcConfigOverrides {
 
 #[derive(Debug, Clone, Default)]
 pub struct ClientIpcConfigOverrides {
-    pub base: BaseIpcConfigOverrides,
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
@@ -606,7 +584,7 @@ fn resolve_relay_server_config(
     Ok(cfg)
 }
 
-// All three override types expose the same common fields.
+// Both override types expose the same common fields.
 macro_rules! apply_base_overrides {
     ($cfg:expr, $overrides:expr) => {{
         let cfg: &mut BaseIpcConfig = $cfg;
@@ -713,7 +691,6 @@ fn resolve_server_ipc_config(
         cfg.heartbeat_timeout_secs = v;
     }
 
-    apply_base_overrides!(&mut cfg.base, &overrides.base);
     apply_base_overrides!(&mut cfg.base, &overrides);
     if let Some(v) = overrides.max_frame_size {
         cfg.max_frame_size = v;
@@ -759,7 +736,6 @@ fn resolve_client_ipc_config(
     {
         cfg.pool_decay_seconds = v;
     }
-    apply_base_overrides!(&mut cfg.base, &overrides.base);
     apply_base_overrides!(&mut cfg.base, &overrides);
     if let Some(v) = overrides.pool_decay_seconds {
         cfg.pool_decay_seconds = v;
@@ -1685,21 +1661,15 @@ mod tests {
             ]),
         };
         let mut overrides = RuntimeConfigOverrides::default();
-        overrides.server_ipc.base.pool_enabled = Some(true);
         overrides.server_ipc.pool_enabled = Some(false);
-        overrides.server_ipc.base.pool_segment_size = Some(65_536);
         overrides.server_ipc.pool_segment_size = Some(131_072);
-        overrides.server_ipc.base.max_pool_segments = Some(3);
-        overrides.server_ipc.base.shm_backing_budget_bytes = Some(4_294_967_296);
+        overrides.server_ipc.max_pool_segments = Some(3);
         overrides.server_ipc.shm_backing_budget_bytes = Some(3_221_225_472);
-        overrides.client_ipc.base.pool_enabled = Some(true);
         overrides.client_ipc.pool_enabled = Some(false);
-        overrides.client_ipc.base.pool_segment_size = Some(262_144);
         overrides.client_ipc.pool_segment_size = Some(524_288);
-        overrides.client_ipc.base.max_pool_segments = Some(5);
-        overrides.client_ipc.base.file_backing_budget_bytes = Some(3_221_225_472);
+        overrides.client_ipc.max_pool_segments = Some(5);
         overrides.client_ipc.file_backing_budget_bytes = Some(0);
-        overrides.client_ipc.base.live_reassembly_budget_bytes = Some(2_147_483_648);
+        overrides.client_ipc.live_reassembly_budget_bytes = Some(2_147_483_648);
 
         let resolved = ConfigResolver::resolve(overrides, sources).expect("resolve");
 
@@ -2125,10 +2095,10 @@ mod tests {
         assert_eq!(ipc.shm_threshold, 2048);
 
         let mut overrides = RuntimeConfigOverrides::default();
-        overrides.client_ipc.base.pool_enabled = Some(false);
+        overrides.client_ipc.pool_enabled = Some(false);
         overrides.client_ipc.pool_prewarm_segments = Some(0);
         overrides.client_ipc.shm_backing_budget_bytes = Some(0);
-        overrides.client_ipc.base.file_backing_budget_bytes = Some(0);
+        overrides.client_ipc.file_backing_budget_bytes = Some(0);
         overrides.client_ipc.live_reassembly_budget_bytes = Some(0);
         overrides.client_ipc.pool_decay_seconds = Some(30.0);
         overrides.shm_threshold = Some(4096);

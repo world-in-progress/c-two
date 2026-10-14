@@ -103,7 +103,19 @@ def test_native_runtime_session_projects_ipc_overrides_copy(side: str) -> None:
     expected = {
         'pool_enabled': False,
         'pool_segment_size': 2 * 1024 * 1024,
+        'max_pool_segments': 3,
+        'pool_prewarm_segments': 0,
+        'pool_min_retained_segments': 0,
         'reassembly_segment_size': 16 * 1024 * 1024,
+        'reassembly_max_segments': 4,
+        'max_total_chunks': 128,
+        'chunk_gc_interval': 0.5,
+        'chunk_threshold_ratio': 0.75,
+        'chunk_assembler_timeout': 1.0,
+        'max_reassembly_bytes': 32 * 1024 * 1024,
+        'shm_backing_budget_bytes': 0,
+        'file_backing_budget_bytes': 64 * 1024 * 1024,
+        'live_reassembly_budget_bytes': 0,
     }
     overrides = dict(expected, chunk_size=None)
     option = f'{side}_ipc_overrides'
@@ -111,6 +123,7 @@ def test_native_runtime_session_projects_ipc_overrides_copy(side: str) -> None:
 
     projected = getattr(session, option)
     assert projected == expected
+    assert list(projected) == list(expected)
 
     overrides['pool_segment_size'] = 4 * 1024 * 1024
     overrides['reassembly_segment_size'] = 32 * 1024 * 1024

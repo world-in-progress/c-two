@@ -168,9 +168,6 @@ fn parse_server_ipc_overrides_dict(dict: &Bound<'_, PyDict>) -> PyResult<ServerI
     reject_forbidden_ipc_fields(dict)?;
     reject_unknown_ipc_fields(dict, c2_config::SERVER_IPC_OVERRIDE_KEYS)?;
     Ok(ServerIpcConfigOverrides {
-        base: c2_config::BaseIpcConfigOverrides {
-            ..Default::default()
-        },
         pool_enabled: get_opt(dict, "pool_enabled")?,
         pool_segment_size: get_opt(dict, "pool_segment_size")?,
         max_pool_segments: get_opt(dict, "max_pool_segments")?,
@@ -208,7 +205,7 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     py: Python<'py>,
     overrides: &ServerIpcConfigOverrides,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let dict = base_ipc_overrides_to_dict(py, &overrides.base)?;
+    let dict = PyDict::new(py);
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -285,7 +282,7 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     py: Python<'py>,
     overrides: &ClientIpcConfigOverrides,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let dict = base_ipc_overrides_to_dict(py, &overrides.base)?;
+    let dict = PyDict::new(py);
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -340,62 +337,6 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     Ok(dict)
 }
 
-fn base_ipc_overrides_to_dict<'py>(
-    py: Python<'py>,
-    overrides: &c2_config::BaseIpcConfigOverrides,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    if let Some(value) = overrides.pool_enabled {
-        dict.set_item("pool_enabled", value)?;
-    }
-    if let Some(value) = overrides.pool_segment_size {
-        dict.set_item("pool_segment_size", value)?;
-    }
-    if let Some(value) = overrides.max_pool_segments {
-        dict.set_item("max_pool_segments", value)?;
-    }
-    if let Some(value) = overrides.pool_prewarm_segments {
-        dict.set_item("pool_prewarm_segments", value)?;
-    }
-    if let Some(value) = overrides.pool_min_retained_segments {
-        dict.set_item("pool_min_retained_segments", value)?;
-    }
-    if let Some(value) = overrides.reassembly_segment_size {
-        dict.set_item("reassembly_segment_size", value)?;
-    }
-    if let Some(value) = overrides.reassembly_max_segments {
-        dict.set_item("reassembly_max_segments", value)?;
-    }
-    if let Some(value) = overrides.max_total_chunks {
-        dict.set_item("max_total_chunks", value)?;
-    }
-    if let Some(value) = overrides.chunk_gc_interval_secs {
-        dict.set_item("chunk_gc_interval", value)?;
-    }
-    if let Some(value) = overrides.chunk_threshold_ratio {
-        dict.set_item("chunk_threshold_ratio", value)?;
-    }
-    if let Some(value) = overrides.chunk_assembler_timeout_secs {
-        dict.set_item("chunk_assembler_timeout", value)?;
-    }
-    if let Some(value) = overrides.max_reassembly_bytes {
-        dict.set_item("max_reassembly_bytes", value)?;
-    }
-    if let Some(value) = overrides.chunk_size {
-        dict.set_item("chunk_size", value)?;
-    }
-    if let Some(value) = overrides.shm_backing_budget_bytes {
-        dict.set_item("shm_backing_budget_bytes", value)?;
-    }
-    if let Some(value) = overrides.file_backing_budget_bytes {
-        dict.set_item("file_backing_budget_bytes", value)?;
-    }
-    if let Some(value) = overrides.live_reassembly_budget_bytes {
-        dict.set_item("live_reassembly_budget_bytes", value)?;
-    }
-    Ok(dict)
-}
-
 fn copy_ipc_overrides<'py>(
     overrides: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
@@ -421,9 +362,6 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
     reject_forbidden_ipc_fields(&dict)?;
     reject_unknown_ipc_fields(&dict, c2_config::CLIENT_IPC_OVERRIDE_KEYS)?;
     Ok(ClientIpcConfigOverrides {
-        base: c2_config::BaseIpcConfigOverrides {
-            ..Default::default()
-        },
         pool_enabled: get_opt(&dict, "pool_enabled")?,
         pool_segment_size: get_opt(&dict, "pool_segment_size")?,
         max_pool_segments: get_opt(&dict, "max_pool_segments")?,

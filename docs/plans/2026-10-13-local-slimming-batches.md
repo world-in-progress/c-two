@@ -1,5 +1,15 @@
 # C-Two 局部精简批次记录与收束
 
+## R30 override 单一来源续批（2026-10-15，完成）
+
+用户已确认从 `e2f98bd9` 删除公开 Rust `BaseIpcConfigOverrides` 及 Server/Client override 的嵌套 `base`，保留扁平字段，按原 `flat.or(base)` 迁移有效值，不留兼容入口。Python 接口、解析与回读顺序、配置冻结、C/FFI ABI、wire 和生命周期策略保持；resolved `BaseIpcConfig`、Python `BaseIPCOverrides`、共享 key 表与 R08 环境错误策略不在删除范围内。
+
+先迁移测试，原实现的预算覆盖、relay 完整策略与配置冻结 3 项 Rust 用例及 2 项 Python 回读用例通过，再删除生产通道。6 个被扁平值遮蔽的设置退出，其他 base-only 有效值迁移；既有回读用例覆盖全部 16 个公共字段（chunk_size=None 不投影）、字段顺序、False/0 和副本隔离。生产净减 86 行、测试净增 7 行，非文档净减 79 行；未新增框架或测量性能收益。
+
+候选在本机 macOS 通过配置 135、Core 202、完整 c2-http/relay 419、Rust SDK 18 项，共 774 项；4 个标记 ignored 的 Core 入口是由父用例实际调用的子进程 fixture。Python 配置/RuntimeSession/HTTP/mesh/关闭/跨模式/直连/真实闲置回归 203 项通过，另有 Git 元数据用例在实际工作树通过，共 204 项。CLI/PyO3 构建和 C/FFI crate 检查通过；独立原生审查无发现，审查后源码哈希一致。本批隔离 socket/lease 零残留、历史目录快照未变，未使用 buddy，未新增 hosted CI 证据。
+
+隔离副本只重定向默认 socket/协调记录路径及匹配的测试期望。首次配置测试的两处失败来自遗漏的 3 个旧路径字面量；Rust SDK 首次启动缺少 FastDB 动态库搜索路径，补齐测试环境后验证通过，交付源码和断言强度未改。沿用已验证的本机 C++ 头文件路径和 Python strip=none 构建参数。失败/成功日志、产物哈希、统计及端点验收保存在 `~/.codex/diagnostics/c2-r30-12347302/`。
+
 ## R12 局部续批（2026-10-14，完成）
 
 用户已确认从 `9e882f33` 继续：成功获取仅返回 lease 与 live binding，调用者持有原路由快照，退出重复快照和同值后置校验。第一次 `acquire_route`、live token 获取、跨 await 身份栅栏、错误顺序及释放语义保留；公开 API/ABI 不变，不扩展到 endpoint connector 重构。
