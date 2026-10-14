@@ -1,5 +1,17 @@
 # C-Two 局部精简批次记录与收束
 
+## R12 局部续批（2026-10-14，完成）
+
+用户已确认从 `9e882f33` 继续：成功获取仅返回 lease 与 live binding，调用者持有原路由快照，退出重复快照和同值后置校验。第一次 `acquire_route`、live token 获取、跨 await 身份栅栏、错误顺序及释放语义保留；公开 API/ABI 不变，不扩展到 endpoint connector 重构。
+
+先合并路由替换测试的重复搭建，3 项在原生产实现上通过，再收敛 `state.rs`/`router.rs` 及内部调用点。call/probe 保留独立用例并明确断言 `409 / 704 / RouteStale`，同合同替换的 no-replay 断言保留；memory 用例改为验证 live binding 的 UID/revision。
+
+实际生产净减 53 行、测试净减 92 行，非文档合计净减 145 行。移除一次完整路由克隆及重复校验，未测量延迟或吞吐收益。以下历史收束数字仍绑定其原提交。
+
+本机 macOS 隔离副本完成 c2-http 全部 419 项测试（含完整 relay）、Python HTTP/mesh/错误/关闭/benchmark/跨模式及直连回归 93 项；归档缺少 Git 元数据的 1 项另在真实工作树通过，共覆盖 Python 清单 94 项。真实 idle 用例保留两轮各至少 62 秒的等待。独立原生审查无发现；审查后源码 SHA256 核对一致。测试只在副本重定向默认 socket root 和协调记录目录，交付源码路径不变；本批 socket/lease 零残留，历史目录快照未变，未使用 buddy。本批未新增 hosted CI 证据。
+
+构建记录：c3 首次构建缺少本机 C++ 标准头文件，通过既有 CPLUS_INCLUDE_PATH 修正。Python 首轮收集遇到 LINKEDIT 对齐错误，独立最小程序复现了 [Rust 调试信息剥离缺陷](https://github.com/rust-lang/rust/issues/157750)；仅测试构建设置 CARGO_PROFILE_RELEASE_STRIP=none 后扩展加载及回归通过，未修改仓库构建策略。原始失败、成功日志、产物哈希和端点验收保存在 `~/.codex/diagnostics/c2-r12-7fc68311/`。
+
 <a id="closeout"></a>
 ## 本轮收束（2026-10-14）
 

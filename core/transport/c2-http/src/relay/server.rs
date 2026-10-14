@@ -1701,7 +1701,7 @@ mod tests {
             };
             attestor.close().await;
 
-            let (manager_lease, _, manager_binding) = state
+            let (manager_lease, manager_binding) = state
                 .acquire_upstream_for_route(&manager)
                 .await
                 .unwrap_or_else(|_| panic!("live manager route acquisition failed"));
@@ -1761,7 +1761,7 @@ mod tests {
             };
             drop(manager_lease);
 
-            let (builder_lease, _, builder_binding) = state
+            let (builder_lease, builder_binding) = state
                 .acquire_upstream_for_route(&builder)
                 .await
                 .unwrap_or_else(|_| panic!("live builder route acquisition failed"));
@@ -1844,7 +1844,7 @@ mod tests {
                 let state = state.clone();
                 let expected = builder.clone();
                 call_tasks.spawn(async move {
-                    let (lease, _, binding) =
+                    let (lease, binding) =
                         tokio::time::timeout(CLEANUP, state.acquire_upstream_for_route(&expected))
                             .await
                             .map_err(|_| "concurrent route acquisition timed out")?

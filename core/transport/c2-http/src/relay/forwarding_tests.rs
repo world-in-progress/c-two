@@ -930,7 +930,7 @@ impl Fixture {
             assert_eq!(registered.status(), StatusCode::CREATED);
             bounded(registered.bytes()).await.unwrap();
             let entry = state.local_route("grid").unwrap();
-            let (lease, _, binding) = bounded(state.acquire_upstream_for_route(&entry)).await.unwrap_or_else(|_| panic!("real attested pooled IPC acquire failed"));
+            let (lease, binding) = bounded(state.acquire_upstream_for_route(&entry)).await.unwrap_or_else(|_| panic!("real attested pooled IPC acquire failed"));
             let client = lease.client();
             drop(lease);
             (entry, client, binding)
@@ -1084,7 +1084,7 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
         );
         assert!(fixture.state.local_route("grid").is_some());
         assert!(fixture.client.is_connected());
-        let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+        let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
             .await
             .unwrap_or_else(|_| panic!("healthy shared IPC must remain available"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client));
@@ -1143,7 +1143,7 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
         assert!(fixture.client.is_connected());
         let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; INPUT_LEN])).await.unwrap();
         assert_eq!(ping.into_bytes_with_pool(fixture.client.server_pool_arc()).unwrap(), vec![2; 32], "same client ping must succeed without reconnect");
-        let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled client acquire failed"));
+        let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled client acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "liveness cannot be masked by reconnecting");
         drop(lease);
         assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (0, 0));
@@ -1463,7 +1463,7 @@ async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() 
         let current = fixture.state.local_route("grid").expect("HTTP disconnect must not withdraw route");
         assert_eq!(current.route_uid, fixture.entry.route_uid);
         assert_eq!(current.route_revision, fixture.entry.route_revision);
-        let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled IPC acquire failed"));
+        let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled IPC acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "same-client ping cannot be concealed by reconnecting");
         drop(lease);
         assert_eq!(fixture.probe.calls.each_ref().map(|calls| calls.load(Ordering::SeqCst)), [1, 1, 1]);

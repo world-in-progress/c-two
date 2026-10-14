@@ -366,14 +366,14 @@ impl RelayState {
             .read()
             .local_route(name)
             .ok_or(UpstreamAcquireError::NotFound)?;
-        let (lease, route, _binding) = self.acquire_upstream_for_route(&expected).await?;
-        Ok((lease, route))
+        let (lease, _binding) = self.acquire_upstream_for_route(&expected).await?;
+        Ok((lease, expected))
     }
 
     pub async fn acquire_upstream_for_route(
         &self,
         expected: &RouteEntry,
-    ) -> Result<(UpstreamLease, RouteEntry, RouteBinding), UpstreamAcquireError> {
+    ) -> Result<(UpstreamLease, RouteBinding), UpstreamAcquireError> {
         if !self
             .route_table
             .read()
@@ -551,7 +551,7 @@ impl RelayState {
             self.renew_owner_lease_if_current_route(expected, &lease_endpoint);
 
         if route_matches_lease {
-            Ok((lease, expected.clone(), binding))
+            Ok((lease, binding))
         } else {
             let client = lease.client();
             drop(lease);
@@ -1311,7 +1311,7 @@ mod tests {
         let mut unregister = None;
         let mut call_a = None;
         let result = std::panic::AssertUnwindSafe(async {
-            let (lease_a, _, binding_a) = acquire_step(
+            let (lease_a, binding_a) = acquire_step(
                 fixture
                     .state
                     .acquire_upstream_for_route(&fixture.entries[0]),
@@ -1319,7 +1319,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("acquire A"));
             let client = lease_a.client();
-            let (lease_b, _, old_b) = acquire_step(
+            let (lease_b, old_b) = acquire_step(
                 fixture
                     .state
                     .acquire_upstream_for_route(&fixture.entries[1]),
@@ -1446,7 +1446,7 @@ mod tests {
             if let Some(task) = unregister.take() {
                 assert!(acquire_step(task).await.unwrap());
             }
-            let (same, _, _) = acquire_step(
+            let (same, _) = acquire_step(
                 fixture
                     .state
                     .acquire_upstream_for_route(&fixture.entries[0]),
@@ -1692,7 +1692,7 @@ mod tests {
         };
         let mut previous = None;
         for _ in 0..2 {
-            let (lease, _, binding) = match state.acquire_upstream_for_route(&entry).await {
+            let (lease, binding) = match state.acquire_upstream_for_route(&entry).await {
                 Ok(acquired) => acquired,
                 Err(_) => panic!("resolved IPC policy must acquire a real client"),
             };

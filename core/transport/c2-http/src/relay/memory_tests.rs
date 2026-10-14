@@ -273,12 +273,13 @@ impl Upstream {
     }
 
     async fn acquire(&self, state: &RelayState) -> (UpstreamLease, Arc<IpcClient>, RouteBinding) {
-        let (lease, entry, binding) =
+        let (lease, binding) =
             match bounded(state.acquire_upstream_for_route(&self.entry)).await {
                 Ok(value) => value,
                 Err(_) => panic!("real attested upstream acquisition failed"),
             };
-        assert_eq!(entry.route_uid, self.entry.route_uid);
+        assert_eq!(binding.route_uid(), self.entry.route_uid);
+        assert_eq!(binding.route_revision(), self.entry.route_revision);
         let client = lease.client();
         assert!(client.is_connected());
         assert_eq!(client.server_id(), self.entry.server_id.as_deref());
