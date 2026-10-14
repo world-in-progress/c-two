@@ -28,8 +28,12 @@ pub struct MethodDefinition {
 }
 
 /// Opaque-byte service boundary implemented by generated host adapters.
+///
+/// The service receives an owned snapshot, independent of transport storage.
+/// Core retains the request transport lease until invocation returns or unwinds;
+/// adapters must invalidate callback-scoped payload owners before that point.
 pub trait EncodedService: Send + Sync + 'static {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error>;
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error>;
 }
 
 /// Language-neutral execution policy shared by remote dispatch and any
@@ -1045,7 +1049,7 @@ impl CrmCallback for CoreCallback {
                 ));
             }
         };
-        let result = self.service.invoke(method_idx, &bytes);
+        let result = self.service.invoke(method_idx, bytes);
         if let Err(release_error) = lease.release() {
             return Err(CrmError::UserError(
                 protocol_violation(
@@ -1110,8 +1114,8 @@ mod lifecycle_tests {
         use c2_http::relay::{RelayConfig, RelayServer};
         struct Echo;
         impl EncodedService for Echo {
-            fn invoke(&self, _: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
-                Ok(request.to_vec())
+            fn invoke(&self, _: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+                Ok(request)
             }
         }
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1218,8 +1222,8 @@ mod lifecycle_tests {
         use std::io::{Read, Write};
         struct Echo;
         impl EncodedService for Echo {
-            fn invoke(&self, _: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
-                Ok(request.to_vec())
+            fn invoke(&self, _: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+                Ok(request)
             }
         }
         let runtime = Runtime::new(crate::RuntimeOptions {

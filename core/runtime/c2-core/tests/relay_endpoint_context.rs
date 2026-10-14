@@ -43,10 +43,10 @@ fn runtime(relay: Option<String>) -> Runtime {
 
 struct Marker(u8);
 impl EncodedService for Marker {
-    fn invoke(&self, method: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         match method {
             0 => Ok(Vec::new()),
-            1 => Ok([&[self.0], request].concat()),
+            1 => Ok([&[self.0], request.as_slice()].concat()),
             _ => Err(C2Error::new(ErrorCode::ProtocolViolation, "unknown method")),
         }
     }

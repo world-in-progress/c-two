@@ -115,8 +115,8 @@ static TEST_ID: AtomicU64 = AtomicU64::new(0);
 struct Echo;
 
 impl EncodedService for Echo {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
-        match (method_index, request) {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+        match (method_index, request.as_slice()) {
             (0, _) => Ok(Vec::new()),
             (1, b"semantic-error") => Err(C2Error::new(
                 ErrorCode::ResourceFunctionExecuting,
@@ -126,7 +126,7 @@ impl EncodedService for Echo {
                 ("fixture".to_string(), "python".to_string()),
                 ("phase".to_string(), "resource".to_string()),
             ]))),
-            (1, _) => Ok(request.to_vec()),
+            (1, _) => Ok(request),
             (other, _) => Err(C2Error::new(
                 ErrorCode::ProtocolViolation,
                 format!("unexpected method index {other}"),
@@ -718,7 +718,7 @@ fn runtime_admin_context_uses_the_windows_namespace_without_unix_overrides() {
 struct CountedEcho(Arc<AtomicU64>);
 
 impl EncodedService for CountedEcho {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Echo.invoke(method_index, request)
     }

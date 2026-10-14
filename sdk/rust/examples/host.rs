@@ -11,10 +11,10 @@ const DESCRIPTOR: &str = r#"{"schema":"c-two.contract.v2","crm":{"namespace":"te
 struct Resource;
 
 impl EncodedService for Resource {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         match method_index {
             0 => Ok(Vec::new()),
-            1 => Ok(request.to_vec()),
+            1 => Ok(request),
             _ => Err(C2Error::new(
                 ErrorCode::ProtocolViolation,
                 "unexpected generated method index",

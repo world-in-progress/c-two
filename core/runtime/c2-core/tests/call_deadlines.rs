@@ -100,13 +100,13 @@ struct GatedEcho {
 }
 
 impl EncodedService for GatedEcho {
-    fn invoke(&self, method: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if method == 1 && request.first() == Some(&0xa5) {
             self.entered.send(()).expect("callback entry event");
             self.gate.wait();
         }
-        Ok(request.to_vec())
+        Ok(request)
     }
 }
 

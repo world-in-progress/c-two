@@ -16,10 +16,10 @@ static TEST_ID: AtomicU64 = AtomicU64::new(0);
 struct Echo;
 
 impl EncodedService for Echo {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         match method_index {
             0 => Ok(Vec::new()),
-            1 => Ok(request.to_vec()),
+            1 => Ok(request),
             _ => Err(C2Error::new(
                 ErrorCode::ProtocolViolation,
                 "method index escaped validated definition",

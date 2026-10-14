@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Rust `EncodedService::invoke` now takes an owned `Vec<u8>`, allowing the
+  Python bridge to reuse Core's request snapshot without another byte copy.
+  Update manual implementations and regenerate Rust contract modules with the
+  matching generator, including modules used only by clients. Request lease
+  ordering, CRM fingerprints, wire protocols, and C ABI 3 are unchanged.
+
 ## [0.7.0] — companion c3 0.3.0
 
 This entry describes Python `c-two` 0.7.0 and its companion CLI `c3` 0.3.0.

@@ -476,9 +476,9 @@ struct PyCoreRequestBuffer {
 }
 
 impl PyCoreRequestBuffer {
-    fn new(bytes: &[u8]) -> Self {
+    fn new(bytes: Vec<u8>) -> Self {
         Self {
-            bytes: bytes.to_vec(),
+            bytes,
             released: AtomicBool::new(false),
             exports: AtomicU32::new(0),
             lease: Mutex::new(None),
@@ -587,7 +587,7 @@ impl PyCoreService {
 }
 
 impl EncodedService for PyCoreService {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         Python::attach(|py| {
             let request = Py::new(py, PyCoreRequestBuffer::new(request))
                 .map_err(|error| python_error_to_c2(py, error))?;
@@ -766,6 +766,52 @@ mod payload_tests {
             c"payload_test",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn request_snapshot_moves_into_python_and_outlives_service_return() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = module(
+                py,
+                r#"
+def dispatch(route, method, request):
+    global view
+    view = memoryview(request)
+    if method:
+        raise ValueError('dispatch failed')
+"#,
+            );
+            let service = PyCoreService::new(
+                "request-owner".into(),
+                module.getattr("dispatch").unwrap().unbind(),
+            );
+            for method in [0, 1] {
+                let request = vec![b'x'; 32];
+                let address = request.as_ptr();
+                assert_eq!(service.invoke(method, request).is_err(), method == 1);
+                let view = module.getattr("view").unwrap();
+                let owner = view.getattr("obj").unwrap();
+                let owner = owner.cast::<PyCoreRequestBuffer>().unwrap().borrow();
+                assert_eq!(owner.bytes.as_ptr(), address);
+                assert_eq!(
+                    view.call_method0("tobytes")
+                        .unwrap()
+                        .extract::<Vec<u8>>()
+                        .unwrap(),
+                    vec![b'x'; 32],
+                );
+                assert!(
+                    owner
+                        .release()
+                        .unwrap_err()
+                        .is_instance_of::<PyBufferError>(py)
+                );
+                view.call_method0("release").unwrap();
+                owner.release().unwrap();
+                assert!(owner.__len__().is_err());
+            }
+        });
     }
 
     #[test]

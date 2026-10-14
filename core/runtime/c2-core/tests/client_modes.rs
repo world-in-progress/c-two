@@ -33,10 +33,10 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 struct Echo;
 
 impl EncodedService for Echo {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         match method_index {
             0 => Ok(Vec::new()),
-            1 => Ok(request.to_vec()),
+            1 => Ok(request),
             other => Err(C2Error::new(
                 ErrorCode::ProtocolViolation,
                 format!("unexpected method index {other}"),
@@ -1029,7 +1029,7 @@ fn service_error_is_not_replayed() {
     }
 
     impl EncodedService for Fails {
-        fn invoke(&self, _method_index: u16, _request: &[u8]) -> Result<Vec<u8>, C2Error> {
+        fn invoke(&self, _method_index: u16, _request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             Err(
                 C2Error::new(ErrorCode::ResourceFunctionExecuting, "service failed")
