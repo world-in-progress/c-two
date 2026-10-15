@@ -1,5 +1,19 @@
 # C-Two 局部精简批次记录与收束
 
+## R23 Python bridge 单一会话（2026-10-15，完成）
+
+用户确认将 `NativeServerBridge` / Python `Server` 固定绑定到构造时的 `RuntimeSession`，删除独立构造分支、重复身份与配置投影、操作级 session/relay 参数，以及无实际期限作用的 `start(timeout=...)`，不留兼容入口。这是低层 Python 签名变更；常规 `cc.*`、Rust API、C/FFI ABI、wire 和 Core 生命周期策略不变。保留构造阶段配置预检、错误顺序、borrowed 校验、动态 Resource 查找、真实 shutdown 期限，以及未完成关闭时的 slot/hook 保留与释放语义。
+
+实现 `f94f1822464cb5d9f05309a62377bb85cfe9bfe3` 相对 `d140afc9`：生产新增 16、删除 96，净减 80 行；测试新增 185、删除 222，净减 37 行；非文档合计净减 117 行。配置测试直接覆盖现有 resolver，现有夹具增加 9 行 session 构造入口并迁移低层调用；退出影子配置与无效参数的旧证明，保留真实绑定/启动/关闭及错误顺序覆盖。实现内文档新增 15 行，另补本条验收记录；未新增运行时框架或声明性能提升。
+
+基线配置/session 146 项通过，新的预检错误顺序与 owner 测试亦先在原实现通过；候选针对性 176 项通过。本机隔离完成完整 c2-http/relay 419 项、Python 1,289 项（普通 1,249、Git 元数据 1、portable 25、TypeScript 14）及收据校验 26 项，含 18/18 Rust/Python direct/relay 和 12/12 TypeScript 真实调用矩阵。本机 5 个 Windows 专属用例按既有平台条件跳过，由线上 Windows 门禁执行。
+
+[GitHub Actions 38758318061](https://github.com/world-in-progress/c-two/actions/runs/38758318061) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功；Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁及 Ubuntu/Python 3.14t 对应门禁均已核对日志，Windows 包含普通用户 wheel 消费者验证。
+
+本地完整 Python 首轮因验证脚本使用非 editable 安装，52 个显式从源码导入的子进程找不到 native 扩展；逐项核实后改用隔离源码的 editable 安装，确认父子进程加载同一扩展，再运行完整清单通过。首次失败日志与临时目录保留，生产代码和测试断言未改；Git 元数据用例在真实工作树单独执行。GitHub 使用其既有安装流程，未重跑。
+
+独立原生审查无发现；审查补丁、验收源码与 CI 提交一致，扩展、CLI、包与矩阵收据哈希已核对。本批含首次失败目录在内的 socket/lease 零残留，历史目录快照未变，未使用 buddy。隔离副本仅重定向测试默认目录及对应路径期望，交付路径不变；完整命令、日志、产物哈希和验收证据保存在 `~/.codex/diagnostics/c2-r23-d29bbbb7/`。
+
 ## R31 Held owner 配对（2026-10-15，完成）
 
 用户确认将 Rust `Held<T>` 的 value/response 收敛为一个私有 `Option<(T, HeldResponse)>`，删除无合法构造路径的半开状态分支。释放时分别建立局部 owner，保留正常路径先销毁 value、再销毁 response，以及 invalidator panic 时先析构 response、再析构 value 的顺序；Core 失效后释放租约、错误合并和幂等语义不变。公开 API/ABI、wire 和生命周期策略不变。
