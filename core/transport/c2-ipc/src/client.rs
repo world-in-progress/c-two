@@ -3988,12 +3988,6 @@ impl IpcClient {
             }
         };
 
-        // Assemble frame payload: [11B buddy][call_control]
-        let payload_len = buddy_bytes.len() + ctrl.len();
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.extend_from_slice(&buddy_bytes);
-        payload.extend_from_slice(&ctrl);
-
         if let Err(error) = IpcCallControl::check_preparation(control) {
             let _ = block.release();
             return Err(error);
@@ -4004,7 +3998,7 @@ impl IpcClient {
         let rid = register_unary_pending(&self.pending, &self.rid_counter, tx);
 
         let flags = flags::FLAG_CALL_V2 | flags::FLAG_BUDDY;
-        let frame = frame::encode_frame(rid as u64, flags, &payload);
+        let frame = frame::encode_frame_parts(rid as u64, flags, &[&buddy_bytes, &ctrl]);
 
         // Per-call cancellation guard: a caller dropped before a terminal
         // branch either removes this call's pending entry (nothing was
@@ -4159,16 +4153,11 @@ impl IpcClient {
                 let chunk_hdr = encode_chunk_header(i as u16, total_chunks as u16);
 
                 // Chunk 0 includes call_control; subsequent chunks are data-only.
-                let payload_len =
-                    chunk_hdr.len() + if i == 0 { ctrl.len() } else { 0 } + chunk_data.len();
-                let mut payload = Vec::with_capacity(payload_len);
-                payload.extend_from_slice(&chunk_hdr);
-                if i == 0 {
-                    payload.extend_from_slice(&ctrl);
-                }
-                payload.extend_from_slice(chunk_data);
-
-                let frame_bytes = frame::encode_frame(rid as u64, frame_flags, &payload);
+                let frame_bytes = frame::encode_frame_parts(
+                    rid as u64,
+                    frame_flags,
+                    &[&chunk_hdr, if i == 0 { &ctrl } else { &[] }, chunk_data],
+                );
                 self.write_frame_parts(writer, &[&frame_bytes]).await?;
             }
             Ok(())
@@ -4392,15 +4381,11 @@ impl IpcClient {
             frame_flags |= flags::FLAG_CHUNK_LAST;
         }
         let chunk_hdr = encode_chunk_header(chunk_idx as u16, total_chunks as u16);
-        let payload_len = chunk_hdr.len() + ctrl.map_or(0, <[u8]>::len) + chunk_data.len();
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.extend_from_slice(&chunk_hdr);
-        if let Some(ctrl) = ctrl {
-            payload.extend_from_slice(ctrl);
-        }
-        payload.extend_from_slice(chunk_data);
-
-        let frame_bytes = frame::encode_frame(rid as u64, frame_flags, &payload);
+        let frame_bytes = frame::encode_frame_parts(
+            rid as u64,
+            frame_flags,
+            &[&chunk_hdr, ctrl.unwrap_or(&[]), chunk_data],
+        );
         let mut writer_guard = self.writer.lock().await;
         let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
         writer.write_all(&frame_bytes).await?;

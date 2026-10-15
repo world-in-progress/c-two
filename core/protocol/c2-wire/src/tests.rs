@@ -10,16 +10,23 @@ mod frame_tests {
     #[test]
     fn encode_decode_roundtrip() {
         let payload = b"hello world";
-        let encoded = encode_frame(42, FLAG_BUDDY | FLAG_CALL_V2, payload);
-        assert_eq!(encoded.len(), HEADER_SIZE + payload.len());
-
-        let (hdr, decoded_payload) = decode_frame(&encoded).unwrap();
-        assert_eq!(hdr.request_id, 42);
-        assert_eq!(hdr.flags, FLAG_BUDDY | FLAG_CALL_V2);
-        assert_eq!(decoded_payload, payload);
-        assert!(hdr.is_buddy());
-        assert!(hdr.is_call_v2());
-        assert!(!hdr.is_response());
+        let golden = b"\x17\0\0\0\x2a\0\0\0\0\0\0\0\xc0\0\0\0hello world";
+        assert_eq!(encode_frame(42, FLAG_BUDDY | FLAG_CALL_V2, payload), golden);
+        for parts in [
+            &[payload.as_slice()][..],
+            &[b"hello ", b"world"],
+            &[b"", b"hello ", b"", b"world", b""],
+        ] {
+            let encoded = encode_frame_parts(42, FLAG_BUDDY | FLAG_CALL_V2, parts);
+            assert_eq!(encoded, golden);
+            let (hdr, decoded_payload) = decode_frame(&encoded).unwrap();
+            assert_eq!(hdr.request_id, 42);
+            assert_eq!(hdr.flags, FLAG_BUDDY | FLAG_CALL_V2);
+            assert_eq!(decoded_payload, payload);
+            assert!(hdr.is_buddy());
+            assert!(hdr.is_call_v2());
+            assert!(!hdr.is_response());
+        }
     }
 
     #[test]
@@ -30,6 +37,12 @@ mod frame_tests {
         assert_eq!(hdr.flags, 0);
         assert!(payload.is_empty());
         assert_eq!(hdr.total_len, 12); // 8B rid + 4B flags
+        for parts in [&[][..], &[b"".as_slice()], &[b"".as_slice(), b""]] {
+            assert_eq!(
+                encode_frame_parts(0, 0, parts),
+                b"\x0c\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+            );
+        }
     }
 
     #[test]

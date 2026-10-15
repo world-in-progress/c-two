@@ -3808,6 +3808,7 @@ async fn dispatch_chunked_call(
 // ---------------------------------------------------------------------------
 
 const REPLY_FLAGS: u32 = FLAG_RESPONSE | FLAG_REPLY_V2;
+const SUCCESS_REPLY: [u8; 1] = [c2_wire::control::STATUS_SUCCESS];
 
 fn checked_frame_total_len(payload_len: usize, context: &str) -> Result<u32, String> {
     let total_len = 12usize
@@ -3818,10 +3819,8 @@ fn checked_frame_total_len(payload_len: usize, context: &str) -> Result<u32, Str
 }
 
 fn inline_reply_total_len(data_len: usize) -> Result<u32, String> {
-    let ctrl_len = try_encode_reply_control(&ReplyControl::Success)
-        .map_err(|err| err.to_string())?
-        .len();
-    let payload_len = ctrl_len
+    let payload_len = SUCCESS_REPLY
+        .len()
         .checked_add(data_len)
         .ok_or_else(|| "inline reply frame length overflow".to_string())?;
     checked_frame_total_len(payload_len, "inline reply frame")
@@ -3953,8 +3952,7 @@ async fn write_reply_with_data(
     request_id: u64,
     data: &[u8],
 ) -> Result<(), ResponseSendError> {
-    let ctrl_bytes = try_encode_reply_control(&ReplyControl::Success)
-        .map_err(|err| ResponseSendError::UserVisible(err.to_string()))?;
+    let ctrl_bytes = SUCCESS_REPLY;
     let payload_len = ctrl_bytes.len().checked_add(data.len()).ok_or_else(|| {
         ResponseSendError::UserVisible("inline reply frame length overflow".to_string())
     })?;
@@ -3980,10 +3978,7 @@ async fn write_reply_with_data(
             .map_err(|e| ResponseSendError::Transport(format!("inline reply write failed: {e}")))?;
     } else {
         // Large response: heap Vec (existing path)
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.extend_from_slice(&ctrl_bytes);
-        payload.extend_from_slice(data);
-        let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
+        let frame = frame::encode_frame_parts(request_id, REPLY_FLAGS, &[&ctrl_bytes, data]);
         writer
             .lock()
             .await
@@ -4053,16 +4048,9 @@ async fn write_buddy_reply_with_data(
         is_dedicated: alloc.is_dedicated,
     };
     let buddy_bytes = encode_buddy_payload(&bp);
-    let ctrl_bytes = try_encode_reply_control(&ReplyControl::Success)
-        .map_err(|err| BuddyReplyError::Fatal(err.to_string()))?;
-
-    let mut payload = Vec::with_capacity(BUDDY_PAYLOAD_SIZE + ctrl_bytes.len());
-    payload.extend_from_slice(&buddy_bytes);
-    payload.extend_from_slice(&ctrl_bytes);
-
     // 4. Send frame with FLAG_BUDDY.
     let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
-    let frame = encode_frame(request_id, flags, &payload);
+    let frame = frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
     if let Err(err) = writer.lock().await.write_all(&frame).await {
         let mut pool = response_pool.write();
         let _ = pool.free(&alloc);
@@ -4175,13 +4163,9 @@ async fn send_response_meta(
                 is_dedicated,
             };
             let buddy_bytes = encode_buddy_payload(&bp);
-            let ctrl_bytes = try_encode_reply_control(&ReplyControl::Success)
-                .map_err(|err| ResponseSendError::UserVisible(err.to_string()))?;
-            let mut payload = Vec::with_capacity(BUDDY_PAYLOAD_SIZE + ctrl_bytes.len());
-            payload.extend_from_slice(&buddy_bytes);
-            payload.extend_from_slice(&ctrl_bytes);
             let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
-            let frame = encode_frame(request_id, flags, &payload);
+            let frame =
+                frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
             if let Err(err) = writer.lock().await.write_all(&frame).await {
                 let mut pool = response_pool.write();
                 let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);

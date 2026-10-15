@@ -213,80 +213,40 @@ mod client_tests {
 
     #[test]
     fn test_chunked_frame_encoding() {
-        // Simulate a 3-chunk transfer.
         use c2_wire::chunk::encode_chunk_header;
 
-        let route = "grid";
-        let method_idx: u16 = 2;
-        let total_chunks: u16 = 3;
-        let request_id: u64 = 42;
-
-        let ctrl = encode_call_control(&call_identity(route), method_idx).unwrap();
-        let chunk_data = b"chunk_payload_data";
-
-        // ── Chunk 0: [chunk_header][call_control][data] ──
-        let chunk_hdr_0 = encode_chunk_header(0, total_chunks);
-        let mut payload_0 = Vec::new();
-        payload_0.extend_from_slice(&chunk_hdr_0);
-        payload_0.extend_from_slice(&ctrl);
-        payload_0.extend_from_slice(chunk_data);
-
-        let flags_0 = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED;
-        let frame_0 = frame::encode_frame(request_id, flags_0, &payload_0);
-
-        let (hdr_0, fp_0) = frame::decode_frame(&frame_0).unwrap();
-        assert_eq!(hdr_0.request_id, request_id);
-        assert!(hdr_0.is_call_v2());
-        assert!(flags::is_chunked(hdr_0.flags));
-        assert!(!flags::is_chunk_last(hdr_0.flags));
-
-        // Decode chunk header.
-        let (chunk_idx, total, ch_consumed) = decode_chunk_header(fp_0, 0).unwrap();
-        assert_eq!(chunk_idx, 0);
-        assert_eq!(total, 3);
-        assert_eq!(ch_consumed, CHUNK_HEADER_SIZE);
-
-        // Decode call control (present on chunk 0).
-        let (decoded_ctrl, ctrl_consumed) = decode_call_control(fp_0, CHUNK_HEADER_SIZE).unwrap();
-        assert_eq!(decoded_ctrl.identity.route_name, route);
-        assert_eq!(decoded_ctrl.method_idx, method_idx);
-
-        // Remaining is chunk data.
-        let data_start = CHUNK_HEADER_SIZE + ctrl_consumed;
-        assert_eq!(&fp_0[data_start..], chunk_data);
-
-        // ── Chunk 1: [chunk_header][data] (no call_control) ──
-        let chunk_hdr_1 = encode_chunk_header(1, total_chunks);
-        let mut payload_1 = Vec::new();
-        payload_1.extend_from_slice(&chunk_hdr_1);
-        payload_1.extend_from_slice(chunk_data);
-
-        let flags_1 = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED;
-        let frame_1 = frame::encode_frame(request_id, flags_1, &payload_1);
-
-        let (hdr_1, fp_1) = frame::decode_frame(&frame_1).unwrap();
-        assert!(flags::is_chunked(hdr_1.flags));
-        assert!(!flags::is_chunk_last(hdr_1.flags));
-        let (ci_1, tc_1, _) = decode_chunk_header(fp_1, 0).unwrap();
-        assert_eq!(ci_1, 1);
-        assert_eq!(tc_1, 3);
-        assert_eq!(&fp_1[CHUNK_HEADER_SIZE..], chunk_data);
-
-        // ── Chunk 2 (last): [chunk_header][data] + FLAG_CHUNK_LAST ──
-        let chunk_hdr_2 = encode_chunk_header(2, total_chunks);
-        let mut payload_2 = Vec::new();
-        payload_2.extend_from_slice(&chunk_hdr_2);
-        payload_2.extend_from_slice(chunk_data);
-
-        let flags_2 = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED | flags::FLAG_CHUNK_LAST;
-        let frame_2 = frame::encode_frame(request_id, flags_2, &payload_2);
-
-        let (hdr_2, fp_2) = frame::decode_frame(&frame_2).unwrap();
-        assert!(flags::is_chunked(hdr_2.flags));
-        assert!(flags::is_chunk_last(hdr_2.flags));
-        let (ci_2, tc_2, _) = decode_chunk_header(fp_2, 0).unwrap();
-        assert_eq!(ci_2, 2);
-        assert_eq!(tc_2, 3);
+        let ctrl = encode_call_control(&call_identity("grid"), 2).unwrap();
+        let data = [0xABu8; 128];
+        for (idx, count, last) in [(0, 1, true), (0, 3, false), (1, 3, false), (2, 3, true)] {
+            let chunk_header = encode_chunk_header(idx, count);
+            let frame_flags = flags::FLAG_CALL_V2
+                | flags::FLAG_CHUNKED
+                | if last { flags::FLAG_CHUNK_LAST } else { 0 };
+            let encoded = frame::encode_frame_parts(
+                42,
+                frame_flags,
+                &[&chunk_header, if idx == 0 { &ctrl } else { &[] }, &data],
+            );
+            let (header, payload) = frame::decode_frame(&encoded).unwrap();
+            assert_eq!(header.request_id, 42);
+            assert!(header.is_call_v2());
+            assert!(flags::is_chunked(header.flags));
+            assert_eq!(flags::is_chunk_last(header.flags), last);
+            let (actual_idx, actual_count, offset) = decode_chunk_header(payload, 0).unwrap();
+            assert_eq!(
+                (actual_idx, actual_count, offset),
+                (idx, count, CHUNK_HEADER_SIZE)
+            );
+            let control_len = if idx == 0 {
+                let (decoded, consumed) = decode_call_control(payload, offset).unwrap();
+                assert_eq!(decoded.identity.route_name, "grid");
+                assert_eq!(decoded.method_idx, 2);
+                consumed
+            } else {
+                0
+            };
+            assert_eq!(&payload[offset + control_len..], &data);
+        }
     }
 
     #[test]
@@ -398,31 +358,6 @@ mod client_tests {
         assert_eq!(pool.segment_count(), 0);
         assert!(pool.ensure_ready().is_ok());
         assert_eq!(pool.segment_count(), 0);
-    }
-
-    #[test]
-    fn test_chunked_single_chunk() {
-        // Edge case: data exactly at chunk_size boundary → 1 chunk.
-        use c2_wire::chunk::encode_chunk_header;
-
-        let chunk_hdr = encode_chunk_header(0, 1);
-        let ctrl = encode_call_control(&call_identity("route"), 0).unwrap();
-        let data = vec![0xABu8; 128];
-
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&chunk_hdr);
-        payload.extend_from_slice(&ctrl);
-        payload.extend_from_slice(&data);
-
-        let flags_last = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED | flags::FLAG_CHUNK_LAST;
-        let frame_bytes = frame::encode_frame(1, flags_last, &payload);
-
-        let (hdr, fp) = frame::decode_frame(&frame_bytes).unwrap();
-        assert!(flags::is_chunked(hdr.flags));
-        assert!(flags::is_chunk_last(hdr.flags));
-        let (ci, tc, _) = decode_chunk_header(fp, 0).unwrap();
-        assert_eq!(ci, 0);
-        assert_eq!(tc, 1);
     }
 
     // ── SyncClient tests ──────────────────────────────────────────────
