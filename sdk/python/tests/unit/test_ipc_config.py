@@ -289,31 +289,70 @@ def test_ipc_overrides_roundtrip_memory_budget_bytes(budgets):
         assert {key: cfg[key] for key in overrides} == overrides
 
 
-def test_memory_budget_env_resolves_and_explicit_overrides_win(monkeypatch):
-    monkeypatch.setenv('C2_IPC_SHM_BACKING_BUDGET_BYTES', str(GIB))
-    monkeypatch.setenv('C2_IPC_FILE_BACKING_BUDGET_BYTES', str(2 * GIB))
-    monkeypatch.setenv('C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES', str(4 * GIB))
+_COMMON_IPC_FIELDS = (
+    ('pool_enabled', 'C2_IPC_POOL_ENABLED', True, False),
+    ('pool_segment_size', 'C2_IPC_POOL_SEGMENT_SIZE', 131072, 262144),
+    ('max_pool_segments', 'C2_IPC_MAX_POOL_SEGMENTS', 2, 3),
+    ('pool_prewarm_segments', 'C2_IPC_POOL_PREWARM_SEGMENTS', 1, 0),
+    ('pool_min_retained_segments', 'C2_IPC_POOL_MIN_RETAINED_SEGMENTS', 2, 0),
+    ('reassembly_segment_size', 'C2_IPC_REASSEMBLY_SEGMENT_SIZE', 65536, 131072),
+    ('reassembly_max_segments', 'C2_IPC_REASSEMBLY_MAX_SEGMENTS', 3, 2),
+    ('max_total_chunks', 'C2_IPC_MAX_TOTAL_CHUNKS', 8192, 16384),
+    ('chunk_gc_interval', 'C2_IPC_CHUNK_GC_INTERVAL', 2.5, 5.0),
+    ('chunk_threshold_ratio', 'C2_IPC_CHUNK_THRESHOLD_RATIO', 0.5, 0.75),
+    ('chunk_assembler_timeout', 'C2_IPC_CHUNK_ASSEMBLER_TIMEOUT', 30.0, 60.0),
+    ('max_reassembly_bytes', 'C2_IPC_MAX_REASSEMBLY_BYTES', 1048576, 2097152),
+    ('chunk_size', 'C2_IPC_CHUNK_SIZE', 65536, 131072),
+    ('shm_backing_budget_bytes', 'C2_IPC_SHM_BACKING_BUDGET_BYTES', GIB, 0),
+    ('file_backing_budget_bytes', 'C2_IPC_FILE_BACKING_BUDGET_BYTES', 2 * GIB, 0),
+    ('live_reassembly_budget_bytes', 'C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES', 4 * GIB, 0),
+    ('pool_decay_seconds', 'C2_IPC_POOL_DECAY_SECONDS', 12.5, 7.5),
+)
+_SERVER_IPC_FIELDS = (
+    ('max_frame_size', 'C2_IPC_MAX_FRAME_SIZE', 1048576, 2097152),
+    ('max_payload_size', 'C2_IPC_MAX_PAYLOAD_SIZE', 1048576, 2097152),
+    ('max_pending_requests', 'C2_IPC_MAX_PENDING_REQUESTS', 7, 11),
+    ('max_execution_workers', 'C2_IPC_MAX_EXECUTION_WORKERS', 9, 7),
+    ('heartbeat_interval', 'C2_IPC_HEARTBEAT_INTERVAL', 3.0, 0.0),
+    ('heartbeat_timeout', 'C2_IPC_HEARTBEAT_TIMEOUT', 20.0, 45.0),
+)
 
-    native = ipc_config._native_resolver()  # noqa: SLF001
 
-    from_env = native.resolve_client_ipc_config(None, None)
-    assert from_env['shm_backing_budget_bytes'] == GIB
-    assert from_env['file_backing_budget_bytes'] == 2 * GIB
-    assert from_env['live_reassembly_budget_bytes'] == 4 * GIB
+@pytest.mark.parametrize(
+    'role,field,key,env_value,override_value',
+    [(role, *case) for role in ('server', 'client') for case in _COMMON_IPC_FIELDS]
+    + [('server', *case) for case in _SERVER_IPC_FIELDS],
+)
+def test_ipc_field_precedence_and_overridden_invalid_env(
+    monkeypatch, role, field, key, env_value, override_value,
+):
+    resolve = getattr(ipc_config._native_resolver(), f'resolve_{role}_ipc_config')
+    monkeypatch.setenv(key, str(env_value))
+    assert resolve(None, None)[field] == env_value
+    assert resolve({field: override_value}, None)[field] == override_value
 
-    from_env_server = native.resolve_server_ipc_config(None, None)
-    assert from_env_server['shm_backing_budget_bytes'] == GIB
-    assert from_env_server['live_reassembly_budget_bytes'] == 4 * GIB
+    monkeypatch.setenv(key, 'invalid')
+    for overrides in (None, {field: override_value}):
+        with pytest.raises(ValueError, match=key):
+            resolve(overrides, None)
 
-    overrides = {
-        'shm_backing_budget_bytes': 7 * GIB,
-        'file_backing_budget_bytes': 0,
-        'live_reassembly_budget_bytes': 8 * GIB,
-    }
-    from_explicit = native.resolve_client_ipc_config(overrides, None)
-    assert from_explicit['shm_backing_budget_bytes'] == 7 * GIB
-    assert from_explicit['file_backing_budget_bytes'] == 0
-    assert from_explicit['live_reassembly_budget_bytes'] == 8 * GIB
+
+@pytest.mark.parametrize('role', ('server', 'client'))
+def test_ipc_env_errors_precede_derivation_and_final_validation(monkeypatch, role):
+    resolve = getattr(ipc_config._native_resolver(), f'resolve_{role}_ipc_config')
+    overrides = {'pool_segment_size': 2 ** 64 - 1}
+    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'invalid')
+    monkeypatch.setenv('C2_IPC_POOL_DECAY_SECONDS', 'invalid')
+    with pytest.raises(ValueError, match='C2_IPC_POOL_SEGMENT_SIZE'):
+        resolve(overrides, None)
+    monkeypatch.delenv('C2_IPC_POOL_SEGMENT_SIZE')
+    with pytest.raises(ValueError, match='C2_IPC_POOL_DECAY_SECONDS'):
+        resolve(overrides, None)
+    monkeypatch.delenv('C2_IPC_POOL_DECAY_SECONDS')
+    with pytest.raises(ValueError, match='max_pool_memory derived value overflowed'):
+        resolve(overrides, None)
+    with pytest.raises(ValueError, match='pool_segment_size must be > 0'):
+        resolve({'pool_segment_size': 0}, None)
 
 
 def test_memory_budget_negative_and_overflow_overrides_rejected_by_native():
@@ -395,17 +434,6 @@ def test_client_pool_decay_zero_is_immediate_retirement_and_negative_is_rejected
         native.resolve_client_ipc_config({'pool_decay_seconds': -1.0}, None)
 
 
-def test_client_pool_decay_env_resolves_and_override_beats_env(monkeypatch):
-    native = ipc_config._native_resolver()  # noqa: SLF001
-    monkeypatch.setenv('C2_IPC_POOL_DECAY_SECONDS', '12.5')
-
-    client_cfg = native.resolve_client_ipc_config(None, None)
-    assert client_cfg['pool_decay_seconds'] == 12.5
-
-    client_cfg = native.resolve_client_ipc_config({'pool_decay_seconds': 7.5}, None)
-    assert client_cfg['pool_decay_seconds'] == 7.5
-
-
 def test_buddy_policy_defaults_are_lazy_and_retire_to_zero():
     native = ipc_config._native_resolver()  # noqa: SLF001
 
@@ -438,18 +466,6 @@ def test_buddy_policy_overrides_beat_env(monkeypatch):
     )
     assert client_cfg['pool_prewarm_segments'] == 0
     assert client_cfg['pool_min_retained_segments'] == 2
-
-
-def test_buddy_policy_env_resolution(monkeypatch):
-    monkeypatch.setenv('C2_IPC_POOL_PREWARM_SEGMENTS', '1')
-    monkeypatch.setenv('C2_IPC_POOL_MIN_RETAINED_SEGMENTS', '2')
-
-    server = Server(bind_address='ipc://unit_buddy_policy_env')
-    try:
-        assert server._config['pool_prewarm_segments'] == 1  # noqa: SLF001
-        assert server._config['pool_min_retained_segments'] == 2  # noqa: SLF001
-    finally:
-        server.shutdown()
 
 
 def test_prewarm_with_buddy_disabled_is_rejected_by_native():

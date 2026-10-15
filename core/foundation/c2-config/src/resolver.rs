@@ -584,59 +584,38 @@ fn resolve_relay_server_config(
     Ok(cfg)
 }
 
-// Both override types expose the same common fields.
-macro_rules! apply_base_overrides {
-    ($cfg:expr, $overrides:expr) => {{
-        let cfg: &mut BaseIpcConfig = $cfg;
+// Both roles share the base fields and their environment parsing order.
+macro_rules! resolve_ipc_fields {
+    (base, $cfg:expr, $overrides:expr, $catalog:expr) => {
+        resolve_ipc_fields!($cfg, $overrides, $catalog;
+            pool_enabled: optional_bool("C2_IPC_POOL_ENABLED"),
+            pool_segment_size: optional_u64("C2_IPC_POOL_SEGMENT_SIZE"),
+            max_pool_segments: optional_u32("C2_IPC_MAX_POOL_SEGMENTS"),
+            pool_prewarm_segments: optional_u32("C2_IPC_POOL_PREWARM_SEGMENTS"),
+            pool_min_retained_segments: optional_u32("C2_IPC_POOL_MIN_RETAINED_SEGMENTS"),
+            reassembly_segment_size: optional_u64("C2_IPC_REASSEMBLY_SEGMENT_SIZE"),
+            reassembly_max_segments: optional_u32("C2_IPC_REASSEMBLY_MAX_SEGMENTS"),
+            max_total_chunks: optional_u32("C2_IPC_MAX_TOTAL_CHUNKS"),
+            chunk_gc_interval_secs: optional_f64("C2_IPC_CHUNK_GC_INTERVAL"),
+            chunk_threshold_ratio: optional_f64("C2_IPC_CHUNK_THRESHOLD_RATIO"),
+            chunk_assembler_timeout_secs: optional_f64("C2_IPC_CHUNK_ASSEMBLER_TIMEOUT"),
+            max_reassembly_bytes: optional_u64("C2_IPC_MAX_REASSEMBLY_BYTES"),
+            chunk_size: optional_u64("C2_IPC_CHUNK_SIZE"),
+            shm_backing_budget_bytes: optional_u64("C2_IPC_SHM_BACKING_BUDGET_BYTES"),
+            file_backing_budget_bytes: optional_u64("C2_IPC_FILE_BACKING_BUDGET_BYTES"),
+            live_reassembly_budget_bytes: optional_u64("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES"),
+        )
+    };
+    ($cfg:expr, $overrides:expr, $catalog:expr;
+        $($field:ident: $parse:ident($key:literal)),+ $(,)?) => {{
+        let cfg = $cfg;
         let overrides = $overrides;
-        if let Some(v) = overrides.pool_enabled {
-            cfg.pool_enabled = v;
-        }
-        if let Some(v) = overrides.pool_segment_size {
-            cfg.pool_segment_size = v;
-        }
-        if let Some(v) = overrides.max_pool_segments {
-            cfg.max_pool_segments = v;
-        }
-        if let Some(v) = overrides.pool_prewarm_segments {
-            cfg.pool_prewarm_segments = v;
-        }
-        if let Some(v) = overrides.pool_min_retained_segments {
-            cfg.pool_min_retained_segments = v;
-        }
-        if let Some(v) = overrides.reassembly_segment_size {
-            cfg.reassembly_segment_size = v;
-        }
-        if let Some(v) = overrides.reassembly_max_segments {
-            cfg.reassembly_max_segments = v;
-        }
-        if let Some(v) = overrides.max_total_chunks {
-            cfg.max_total_chunks = v;
-        }
-        if let Some(v) = overrides.chunk_gc_interval_secs {
-            cfg.chunk_gc_interval_secs = v;
-        }
-        if let Some(v) = overrides.chunk_threshold_ratio {
-            cfg.chunk_threshold_ratio = v;
-        }
-        if let Some(v) = overrides.chunk_assembler_timeout_secs {
-            cfg.chunk_assembler_timeout_secs = v;
-        }
-        if let Some(v) = overrides.max_reassembly_bytes {
-            cfg.max_reassembly_bytes = v;
-        }
-        if let Some(v) = overrides.chunk_size {
-            cfg.chunk_size = v;
-        }
-        if let Some(v) = overrides.shm_backing_budget_bytes {
-            cfg.shm_backing_budget_bytes = v;
-        }
-        if let Some(v) = overrides.file_backing_budget_bytes {
-            cfg.file_backing_budget_bytes = v;
-        }
-        if let Some(v) = overrides.live_reassembly_budget_bytes {
-            cfg.live_reassembly_budget_bytes = v;
-        }
+        let catalog = $catalog;
+        $(
+            // Parse even when overridden: malformed env values must still fail.
+            let from_env = catalog.$parse($key).transpose()?;
+            cfg.$field = overrides.$field.or(from_env).unwrap_or(cfg.$field);
+        )+
     }};
 }
 
@@ -650,69 +629,16 @@ fn resolve_server_ipc_config(
         ..ServerIpcConfig::default()
     };
 
-    apply_base_env(&mut cfg.base, catalog)?;
-    if let Some(v) = catalog.optional_u64("C2_IPC_MAX_FRAME_SIZE").transpose()? {
-        cfg.max_frame_size = v;
-    }
-    if let Some(v) = catalog
-        .optional_u64("C2_IPC_MAX_PAYLOAD_SIZE")
-        .transpose()?
-    {
-        cfg.max_payload_size = v;
-    }
-    if let Some(v) = catalog
-        .optional_u32("C2_IPC_MAX_PENDING_REQUESTS")
-        .transpose()?
-    {
-        cfg.max_pending_requests = v;
-    }
-    if let Some(v) = catalog
-        .optional_u32("C2_IPC_MAX_EXECUTION_WORKERS")
-        .transpose()?
-    {
-        cfg.max_execution_workers = v;
-    }
-    if let Some(v) = catalog
-        .optional_f64("C2_IPC_POOL_DECAY_SECONDS")
-        .transpose()?
-    {
-        cfg.pool_decay_seconds = v;
-    }
-    if let Some(v) = catalog
-        .optional_f64("C2_IPC_HEARTBEAT_INTERVAL")
-        .transpose()?
-    {
-        cfg.heartbeat_interval_secs = v;
-    }
-    if let Some(v) = catalog
-        .optional_f64("C2_IPC_HEARTBEAT_TIMEOUT")
-        .transpose()?
-    {
-        cfg.heartbeat_timeout_secs = v;
-    }
-
-    apply_base_overrides!(&mut cfg.base, &overrides);
-    if let Some(v) = overrides.max_frame_size {
-        cfg.max_frame_size = v;
-    }
-    if let Some(v) = overrides.max_payload_size {
-        cfg.max_payload_size = v;
-    }
-    if let Some(v) = overrides.max_pending_requests {
-        cfg.max_pending_requests = v;
-    }
-    if let Some(v) = overrides.max_execution_workers {
-        cfg.max_execution_workers = v;
-    }
-    if let Some(v) = overrides.pool_decay_seconds {
-        cfg.pool_decay_seconds = v;
-    }
-    if let Some(v) = overrides.heartbeat_interval_secs {
-        cfg.heartbeat_interval_secs = v;
-    }
-    if let Some(v) = overrides.heartbeat_timeout_secs {
-        cfg.heartbeat_timeout_secs = v;
-    }
+    resolve_ipc_fields!(base, &mut cfg.base, &overrides, catalog);
+    resolve_ipc_fields!(&mut cfg, &overrides, catalog;
+        max_frame_size: optional_u64("C2_IPC_MAX_FRAME_SIZE"),
+        max_payload_size: optional_u64("C2_IPC_MAX_PAYLOAD_SIZE"),
+        max_pending_requests: optional_u32("C2_IPC_MAX_PENDING_REQUESTS"),
+        max_execution_workers: optional_u32("C2_IPC_MAX_EXECUTION_WORKERS"),
+        pool_decay_seconds: optional_f64("C2_IPC_POOL_DECAY_SECONDS"),
+        heartbeat_interval_secs: optional_f64("C2_IPC_HEARTBEAT_INTERVAL"),
+        heartbeat_timeout_secs: optional_f64("C2_IPC_HEARTBEAT_TIMEOUT"),
+    );
 
     derive_base(&mut cfg.base)?;
     cfg.validate().map_err(ConfigError::new)?;
@@ -729,115 +655,14 @@ fn resolve_client_ipc_config(
         ..ClientIpcConfig::default()
     };
 
-    apply_base_env(&mut cfg.base, catalog)?;
-    if let Some(v) = catalog
-        .optional_f64("C2_IPC_POOL_DECAY_SECONDS")
-        .transpose()?
-    {
-        cfg.pool_decay_seconds = v;
-    }
-    apply_base_overrides!(&mut cfg.base, &overrides);
-    if let Some(v) = overrides.pool_decay_seconds {
-        cfg.pool_decay_seconds = v;
-    }
+    resolve_ipc_fields!(base, &mut cfg.base, &overrides, catalog);
+    resolve_ipc_fields!(&mut cfg, &overrides, catalog;
+        pool_decay_seconds: optional_f64("C2_IPC_POOL_DECAY_SECONDS"),
+    );
 
     derive_base(&mut cfg.base)?;
     cfg.validate().map_err(ConfigError::new)?;
     Ok(cfg)
-}
-
-fn apply_base_env(cfg: &mut BaseIpcConfig, catalog: &EnvCatalog) -> Result<(), ConfigError> {
-    if let Some(v) = catalog.optional_bool("C2_IPC_POOL_ENABLED").transpose()? {
-        cfg.pool_enabled = v;
-    }
-    if let Some(v) = catalog
-        .optional_u64("C2_IPC_POOL_SEGMENT_SIZE")
-        .transpose()?
-    {
-        cfg.pool_segment_size = v;
-    }
-    if let Some(v) = catalog
-        .optional_u32("C2_IPC_MAX_POOL_SEGMENTS")
-        .transpose()?
-    {
-        cfg.max_pool_segments = v;
-    }
-    if let Some(v) = catalog
-        .optional_u32("C2_IPC_POOL_PREWARM_SEGMENTS")
-        .transpose()?
-    {
-        cfg.pool_prewarm_segments = v;
-    }
-    if let Some(v) = catalog
-        .optional_u32("C2_IPC_POOL_MIN_RETAINED_SEGMENTS")
-        .transpose()?
-    {
-        cfg.pool_min_retained_segments = v;
-    }
-    if let Some(v) = catalog
-        .optional_u64("C2_IPC_REASSEMBLY_SEGMENT_SIZE")
-        .transpose()?
-    {
-        cfg.reassembly_segment_size = v;
-    }
-    if let Some(v) = catalog
-        .optional_u32("C2_IPC_REASSEMBLY_MAX_SEGMENTS")
-        .transpose()?
-    {
-        cfg.reassembly_max_segments = v;
-    }
-    if let Some(v) = catalog
-        .optional_u32("C2_IPC_MAX_TOTAL_CHUNKS")
-        .transpose()?
-    {
-        cfg.max_total_chunks = v;
-    }
-    if let Some(v) = catalog
-        .optional_f64("C2_IPC_CHUNK_GC_INTERVAL")
-        .transpose()?
-    {
-        cfg.chunk_gc_interval_secs = v;
-    }
-    if let Some(v) = catalog
-        .optional_f64("C2_IPC_CHUNK_THRESHOLD_RATIO")
-        .transpose()?
-    {
-        cfg.chunk_threshold_ratio = v;
-    }
-    if let Some(v) = catalog
-        .optional_f64("C2_IPC_CHUNK_ASSEMBLER_TIMEOUT")
-        .transpose()?
-    {
-        cfg.chunk_assembler_timeout_secs = v;
-    }
-    if let Some(v) = catalog
-        .optional_u64("C2_IPC_MAX_REASSEMBLY_BYTES")
-        .transpose()?
-    {
-        cfg.max_reassembly_bytes = v;
-    }
-    if let Some(v) = catalog.optional_u64("C2_IPC_CHUNK_SIZE").transpose()? {
-        cfg.chunk_size = v;
-    }
-    if let Some(v) = catalog
-        .optional_u64("C2_IPC_SHM_BACKING_BUDGET_BYTES")
-        .transpose()?
-    {
-        cfg.shm_backing_budget_bytes = v;
-    }
-    if let Some(v) = catalog
-        .optional_u64("C2_IPC_FILE_BACKING_BUDGET_BYTES")
-        .transpose()?
-    {
-        cfg.file_backing_budget_bytes = v;
-    }
-    if let Some(v) = catalog
-        .optional_u64("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES")
-        .transpose()?
-    {
-        cfg.live_reassembly_budget_bytes = v;
-    }
-    Ok(())
 }
 
 fn resolve_shm_threshold(
