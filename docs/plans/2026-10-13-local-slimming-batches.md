@@ -1,5 +1,23 @@
 # C-Two 局部精简批次记录与收束
 
+## R13 IPC 拼帧收敛（2026-10-16，完成）
+
+用户确认移除拼帧中间 payload 缓冲。新增无状态 `c2-wire::frame::encode_frame_parts`，现有 `encode_frame` 保持签名并复用同一实现；普通/流式 chunk、SHM 请求元数据及大 inline/SHM 回复直接生成完整帧。成功回复使用已有 `STATUS_SUCCESS` 常量。原长度检查与错误顺序、小回复栈缓冲、整批/逐帧写锁、SendGuard、快照及 lease 释放保持；现有 API/ABI、wire 和生命周期策略不变。
+
+实现 `f45517f785f8fe2d5a95a86894e7dbd99e8b83a0` 相对 `20796fb3`：生产新增 28、删除 52，净减 24 行；测试新增 55、删除 107，净减 52 行；非文档合计净减 76 行。单块与多块测试合并为单块/首块/中块/末块表，wire 测试增加独立手写 golden 与空片段组合；未新增框架。1,440 组新旧单片段/多片段编码逐字节一致。
+
+本机隔离通过 wire 146、server 166、IPC 202 + 7、完整 relay 419 项，共 940 项 Rust 测试；Python 1,289 项及收据校验 26 项通过，含 18/18 Rust/Python direct/relay 和 12/12 TypeScript 真实调用矩阵。5 个 Windows 专属 Python 用例在本机按原条件跳过，由线上 Windows 门禁执行。
+
+同环境性能对照使用 macOS arm64、CPython 3.13.3、相同 release 参数和独立扩展，固定三轮交替运行。多片段编码分配由 2 次降到 1 次；metadata、64 KiB、128 KiB、1 MiB 编码耗时中位数分别下降 34.5%、62.2%、68.8%、61.6%，其中 128 KiB 为 6.233 → 1.946 μs。真实 256 KiB chunk IPC 中位延迟为 1.424 → 1.298 ms（下降 8.9%），各轮仍有波动；SHM 场景观察到约 3.3% 下降，不作为稳定收益。首轮小包慢 7.8%、大 inline 慢 0.7%；随后固定四轮交替并充分预热，小包与大 inline 分别为 +0.6%、+1.3%，组间范围重叠，未证明稳定加速或退化。首轮与补充数据均保留，不把编码微基准外推为整体吞吐提升。
+
+[GitHub Actions 38781805659](https://github.com/world-in-progress/c-two/actions/runs/38781805659) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。五组平台日志均核对：Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁及 Ubuntu/Python 3.14t 对应门禁，Windows 包含普通用户 wheel 消费者验证。
+
+额外的串行 IPC 验证在基线和候选均出现同一关闭测试超时。最小复现是 `close_reserves_time_to_join_an_aborted_receiver` 后接 `two_concurrent_closes_of_one_blocked_receiver_serialize_and_stay_retryable`；采样显示测试专用 Drop 的同步 recv 阻塞 Tokio worker，目标单跑通过。默认并行基线 203 + 7、候选独立 target 202 + 7 通过；这不表示串行夹具问题已修复。测试专用 `block_in_place` 修正已提出，仍待用户单独确认，没有混入本批。
+
+补充对照曾因两个快照共享 Cargo target 而复用基线二进制；已由旧测试仍在清单中发现并剔除该候选结果，改用独立 target 重建后确认 202 项新清单。原 native/CLI 及性能产物通过符号、嵌入源码路径和哈希核实属于各自版本。独立审查无发现，审查补丁与 CI/验收源码一致。
+
+诊断失败留下的 6 对本批 socket/lease 已按运行记录核实归属和退出状态，再用原生凭据精确 reap；最终本批所有作用域 socket/lease 为零，历史目录快照未变，未使用 buddy。隔离副本仅重定向默认测试目录及对应期望，交付路径不变。完整命令、失败与成功日志、性能原始数据、产物哈希及验收证据保存在 `~/.codex/diagnostics/c2-r13-frame-87df291d/`。
+
 ## R23 Python bridge 单一会话（2026-10-15，完成）
 
 用户确认将 `NativeServerBridge` / Python `Server` 固定绑定到构造时的 `RuntimeSession`，删除独立构造分支、重复身份与配置投影、操作级 session/relay 参数，以及无实际期限作用的 `start(timeout=...)`，不留兼容入口。这是低层 Python 签名变更；常规 `cc.*`、Rust API、C/FFI ABI、wire 和 Core 生命周期策略不变。保留构造阶段配置预检、错误顺序、borrowed 校验、动态 Resource 查找、真实 shutdown 期限，以及未完成关闭时的 slot/hook 保留与释放语义。
