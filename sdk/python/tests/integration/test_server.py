@@ -10,6 +10,8 @@ import time
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
 from c_two.transport import Server
 from c_two.transport.client.util import ping, shutdown
@@ -46,8 +48,8 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
     raise TimeoutError(f'Server at {address} not ready after {timeout}s')
 
 
-def _hello_server(address: str, **kwargs) -> Server:
-    server = Server(bind_address=address, **kwargs)
+def _hello_server(address: str, *, ipc_overrides=None) -> Server:
+    server = local_server(address, ipc_overrides=ipc_overrides)
     server.register_crm(Hello, HelloImpl(), name='hello')
     return server
 

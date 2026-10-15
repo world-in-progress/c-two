@@ -5,6 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures import local_server
+
+from c_two._native import RuntimeSession
+
 
 BAD_SHUTDOWN_TIMEOUTS = [float('inf'), float('-inf'), float('nan'), -1.0, -0.001, 1e300, float(2**64)]
 
@@ -150,28 +154,24 @@ def test_registry_identity_is_native_owned() -> None:
     assert '_address_for_server_id' not in source
 
 
-def test_runtime_session_passes_server_instance_identity_to_bridge(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-
-    class FakeBridge:
-        def __init__(self, **kwargs: object) -> None:
-            captured.update(kwargs)
-
-    monkeypatch.setattr(
-        'c_two.transport.server.native.NativeServerBridge',
-        FakeBridge,
-    )
-
-    from c_two._native import RuntimeSession
-
-    session = RuntimeSession(shm_threshold=4096)
-    session.ensure_server_bridge()
-
-    assert isinstance(captured['server_id'], str)
-    assert isinstance(captured['server_instance_id'], str)
-    assert captured['server_id']
-    assert captured['server_instance_id']
-    assert captured['server_id'] != captured['server_instance_id']
+def test_runtime_session_bridge_preflight_preserves_errors_and_owner(monkeypatch) -> None:
+    session = RuntimeSession(server_id='bridge-owner', use_process_relay_anchor=False)
+    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'invalid')
+    monkeypatch.setenv('C2_IPC_POOL_DECAY_SECONDS', 'invalid')
+    for key in ('C2_IPC_POOL_SEGMENT_SIZE', 'C2_IPC_POOL_DECAY_SECONDS'):
+        with pytest.raises(ValueError, match=key):
+            session.ensure_server_bridge()
+        assert not session.host_started
+        monkeypatch.delenv(key)
+    server = session.ensure_server_bridge()
+    try:
+        assert session.ensure_server_bridge() is server
+        server.start()
+        assert session.host_started
+        assert session.server_id == 'bridge-owner'
+    finally:
+        assert server.shutdown()['completed']
+    assert not session.host_started
 
 
 def test_failed_server_construction_does_not_publish_identity() -> None:
@@ -757,7 +757,7 @@ def test_set_transport_policy_after_client_only_ipc_connect_warns() -> None:
             return 'pong'
 
     address = 'ipc://unit_policy_client_only'
-    server = Server(bind_address=address)
+    server = local_server(address)
     server.register_crm(ClientOnlyCRM, ClientOnlyImpl(), name='policy-client-only')
     server.start()
     cc.shutdown()
@@ -788,7 +788,7 @@ def test_set_server_after_client_only_connect_preserves_client_freeze() -> None:
             return 'pong'
 
     address = 'ipc://unit_server_after_client'
-    server = Server(bind_address=address)
+    server = local_server(address)
     server.register_crm(
         ServerAfterClientCRM,
         ServerAfterClientImpl(),

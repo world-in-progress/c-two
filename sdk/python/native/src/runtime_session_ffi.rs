@@ -826,22 +826,12 @@ impl PyRuntimeSession {
         if let Some(server) = slf.server_bridge.lock().as_ref() {
             return Ok(server.clone_ref(py));
         }
-        let identity = slf
-            .inner
+        slf.inner
             .ensure_server()
             .map_err(runtime_configuration_error_to_py)?;
         let module = py.import("c_two.transport.server.native")?;
         let class = module.getattr("NativeServerBridge")?;
         let kwargs = PyDict::new(py);
-        kwargs.set_item("bind_address", &identity.ipc_address)?;
-        kwargs.set_item("server_id", &identity.server_id)?;
-        kwargs.set_item("server_instance_id", &identity.server_instance_id)?;
-        if let Some(overrides) = slf.inner.server_ipc_overrides() {
-            kwargs.set_item(
-                "ipc_overrides",
-                server_ipc_overrides_to_dict(py, &overrides)?,
-            )?;
-        }
         kwargs.set_item("lease_tracker", slf.lease_tracker())?;
         kwargs.set_item("runtime_session", &slf)?;
         let server = class.call((), Some(&kwargs))?.unbind();

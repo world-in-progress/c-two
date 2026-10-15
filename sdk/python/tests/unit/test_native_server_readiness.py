@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from c_two import _native
@@ -18,15 +16,12 @@ def test_core_client_exposes_prepared_payload_call_api():
     assert not hasattr(_native, "RustClient")
 
 
-def test_server_start_rejects_invalid_timeout():
-    from c_two.transport import Server
-
-    server = Server(bind_address="ipc://unit_bad_timeout_native")
+@pytest.mark.parametrize('timeout', [0.0, 5.0, float('nan')])
+def test_server_start_rejects_removed_timeout(timeout):
+    server = _native.RuntimeSession(use_process_relay_anchor=False).ensure_server_bridge()
     try:
-        with pytest.raises(ValueError, match="timeout"):
-            server.start(math.nan)
+        with pytest.raises(TypeError, match='timeout'):
+            server.start(timeout=timeout)
+        assert not server.is_started()
     finally:
-        try:
-            server.shutdown()
-        except Exception:
-            pass
+        assert server.shutdown()['completed']

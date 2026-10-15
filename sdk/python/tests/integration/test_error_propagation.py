@@ -9,6 +9,8 @@ import threading
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
 from c_two.transport.server import Server
 from c_two.transport.client.util import ping
@@ -56,7 +58,7 @@ class ErrorHello(Hello):
 def error_server():
     """Start a server backed by ErrorHello, yield its address, then shut down."""
     address = f'ipc://error_test_{_next_id()}'
-    server = Server(bind_address=address)
+    server = local_server(address)
     server.register_crm(Hello, ErrorHello(), name='hello')
     server.start()
     deadline = time.monotonic() + 5.0

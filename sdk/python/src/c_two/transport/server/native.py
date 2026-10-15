@@ -27,7 +27,7 @@ from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...crm.payload_plan import PayloadPlanKind
 from ...error import ResourceAlreadyRegistered
-from c_two.config.ipc import ServerIPCOverrides, _resolve_server_ipc_config
+from c_two.config.ipc import _resolve_server_ipc_config
 from ..input_lifetime import (
     InputLifetime,
     InputLifetimeLike,
@@ -99,16 +99,6 @@ class CRMSlot:
                 self._dispatch_table[name] = (method, access, buffer_mode)
 
 
-def _ensure_no_standalone_relay(
-    runtime_session: object | None,
-    relay_anchor_address: str | None,
-) -> None:
-    if runtime_session is None and relay_anchor_address is not None:
-        raise ValueError(
-            'relay operations require a runtime_session-owned server bridge',
-        )
-
-
 def _close_outcome_by_route(outcome: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     route_outcomes = outcome.get('route_outcomes') or ()
     by_route: dict[str, Mapping[str, Any]] = {}
@@ -141,7 +131,7 @@ def _close_outcome_is_hook_safe(close: Mapping[str, Any] | None) -> bool:
     return close.get('closed_reason') != 'registration_rollback'
 
 class NativeServerBridge:
-    """Drop-in replacement for the Python ``Server`` class.
+    """Python CRM bindings for one native runtime session.
 
     Manages CRM slots in Python (CRM instance creation, dispatch tables,
     shutdown callbacks) while delegating the IPC transport to the
@@ -150,17 +140,13 @@ class NativeServerBridge:
 
     def __init__(
         self,
-        bind_address: str,
+        runtime_session: object,
         *,
-        ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
-        server_id: str | None = None,
-        server_instance_id: str | None = None,
         hold_warn_seconds: float = 60.0,
         lease_tracker: object | None = None,
-        runtime_session: object | None = None,
     ) -> None:
-        self._config = _resolve_server_ipc_config(ipc_overrides)
-        self._address = bind_address
+        # Keep config failures at bridge construction, before CRM binding work.
+        _resolve_server_ipc_config(runtime_session.server_ipc_overrides)
 
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
@@ -179,18 +165,6 @@ class NativeServerBridge:
             )
         self._hold_sweep_interval = 10
 
-        del server_instance_id
-        if runtime_session is None:
-            from c_two._native import RuntimeSession
-
-            if server_id is None and bind_address.startswith('ipc://'):
-                server_id = bind_address.removeprefix('ipc://')
-            runtime_session = RuntimeSession(
-                server_id=server_id,
-                server_ipc_overrides=ipc_overrides,
-                shm_threshold=int(self._config['shm_threshold']),
-                use_process_relay_anchor=False,
-            )
         self._runtime_session = runtime_session
 
     # ------------------------------------------------------------------
@@ -206,8 +180,6 @@ class NativeServerBridge:
         name: str,
         bridge: dict[str, ResourceBridge] | None = None,
         input_lifetime: Mapping[str, InputLifetimeLike] | None = None,
-        runtime_session: object | None = None,
-        relay_anchor_address: str | None = None,
     ) -> str:
         crm_ns, crm_name, crm_ver = self._extract_contract_identity(crm_class)
         if not isinstance(name, str):
@@ -274,11 +246,6 @@ class NativeServerBridge:
         with self._slots_lock:
             if routing_name in self._slots:
                 raise ValueError(f'Name already registered: {routing_name!r}')
-            _ensure_no_standalone_relay(runtime_session, relay_anchor_address)
-            if runtime_session is None:
-                runtime_session = self._runtime_session
-            else:
-                self._runtime_session = runtime_session
             from ...crm.descriptor import (
                 build_contract_descriptor,
                 contract_descriptor_diagnostics,
@@ -298,7 +265,7 @@ class NativeServerBridge:
                 separators=(',', ':'),
             ).encode()
             try:
-                _outcome, native_concurrency = runtime_session.register_route(
+                _outcome, native_concurrency = self._runtime_session.register_route(
                     routing_name,
                     dispatcher,
                     methods,
@@ -312,7 +279,7 @@ class NativeServerBridge:
                     abi_hash,
                     signature_hash,
                     descriptor_json,
-                    relay_anchor_address,
+                    None,
                 )
             except Exception as exc:
                 if (
@@ -329,26 +296,13 @@ class NativeServerBridge:
             self._slots[routing_name] = slot
         return routing_name
 
-    def unregister_crm(
-        self,
-        name: str,
-        *,
-        runtime_session: object | None = None,
-        relay_anchor_address: str | None = None,
-    ) -> dict[str, Any]:
+    def unregister_crm(self, name: str) -> dict[str, Any]:
         with self._slots_lock:
             slot = self._slots.get(name)
             if slot is None:
                 raise KeyError(f'Name not registered: {name!r}')
 
-        _ensure_no_standalone_relay(runtime_session, relay_anchor_address)
-        if runtime_session is None:
-            runtime_session = self._runtime_session
-
-        outcome = dict(runtime_session.unregister_route(
-            name,
-            relay_anchor_address,
-        ))
+        outcome = dict(self._runtime_session.unregister_route(name, None))
         if not outcome.get('local_removed', False):
             raise KeyError(f'Name not registered in native server: {name!r}')
         close = outcome.get('close')
@@ -434,33 +388,17 @@ class NativeServerBridge:
         """
         return self._runtime_session.native_terminal_outcome()
 
-    def start(self, timeout: float = 5.0) -> None:
-        timeout = float(timeout)
-        if not math.isfinite(timeout) or timeout < 0.0:
-            raise ValueError('timeout must be a non-negative finite number')
-        del timeout
+    def start(self) -> None:
         self._runtime_session.ensure_host_started()
 
-    def shutdown(
-        self,
-        *,
-        timeout: float = 5.0,
-        runtime_session: object | None = None,
-        relay_anchor_address: str | None = None,
-    ) -> dict[str, Any]:
+    def shutdown(self, *, timeout: float = 5.0) -> dict[str, Any]:
         with self._slots_lock:
             slots_by_name = dict(self._slots)
             route_names = list(slots_by_name)
 
-        _ensure_no_standalone_relay(runtime_session, relay_anchor_address)
-        if runtime_session is None:
-            runtime_session = self._runtime_session
-        else:
-            self._runtime_session = runtime_session
-
-        outcome = dict(runtime_session.shutdown(
+        outcome = dict(self._runtime_session.shutdown(
             route_names=route_names,
-            relay_anchor_address=relay_anchor_address,
+            relay_anchor_address=None,
             timeout_seconds=float(timeout),
         ))
 

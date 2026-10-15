@@ -17,6 +17,8 @@ from typing import Any, Iterator
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
 from c_two.transport.server import Server
 from tests.fixtures.process_control import portable_command, readline_with_timeout
@@ -222,7 +224,7 @@ def _reject(result: dict[str, Any], text: str | None = None) -> None:
 def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
     persistent_node_project: tuple[Path, str], unique_ipc_address: str,
 ) -> None:
-    server = Server(bind_address=unique_ipc_address)
+    server = local_server(unique_ipc_address)
     builder = CountingResource()
     manager = PublishingManager(server, builder)
     server.register_crm(Manager, manager, name="manager")
@@ -275,7 +277,7 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
         _ok(node.request("close"))
         _ok(node.request("close", transport="fresh"))
         assert server.shutdown()["completed"]
-        server = Server(bind_address=unique_ipc_address)
+        server = local_server(unique_ipc_address)
         restarted_manager, restarted_builder = CountingResource(), CountingResource()
         server.register_crm(Manager, restarted_manager, name="manager")
         server.register_crm(Builder, restarted_builder, name="builder")

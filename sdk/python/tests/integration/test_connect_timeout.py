@@ -8,9 +8,10 @@ from http.server import BaseHTTPRequestHandler
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
 from c_two import _native
-from c_two.transport import Server
 from c_two.transport.registry import _ProcessRegistry
 from tests.fixtures.http_server import LoopbackHTTPServer
 
@@ -32,7 +33,7 @@ class Resource:
 def test_ipc_timeout_zero_then_finite_and_default_connect_are_usable(unique_ipc_address):
     _ProcessRegistry.reset()
     resource = Resource()
-    server = Server(bind_address=unique_ipc_address)
+    server = local_server(unique_ipc_address)
     server.register_crm(ConnectContract, resource, name='connect-timeout')
     server.start()
     try:

@@ -9,8 +9,10 @@ import uuid
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
-from c_two.transport import Server, CRMProxy
+from c_two.transport import CRMProxy
 
 from tests.fixtures.ihello import Hello
 from tests.fixtures.hello import HelloImpl
@@ -79,7 +81,7 @@ class TestCRMProxyIPC:
     @pytest.fixture
     def server_addr(self):
         addr = f'ipc://{_unique_region()}'
-        server = Server(bind_address=addr)
+        server = local_server(addr)
         server.register_crm(Hello, HelloImpl(), name='hello')
         server.register_crm(Counter, CounterImpl(initial=50), name='counter')
         server.start()

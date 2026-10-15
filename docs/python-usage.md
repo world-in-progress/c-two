@@ -84,6 +84,19 @@ Business-call waiting is independent. `cc.with_call_options` returns a view of a
 
 Unix processes sharing an IPC domain use the same configured root (`cc.set_local_endpoint(root=...)` or `C2_IPC_ROOT`). The application provisions custom roots; `0755` is accepted with verified ownership and protection from other-user mutation. The default is `0700`, and sockets are `0600`. Windows uses current-logon SID Named Pipes and rejects Unix root overrides. See [endpoint configuration](configuration.en.md#local-endpoint-directories) and [lifecycle management](local-endpoint-lifecycle.en.md).
 
+## Low-level server bridge
+
+`c_two.transport.Server` is a bridge bound to one native `RuntimeSession`. Applications normally use `cc.register()` and `cc.shutdown()`. Low-level hosts can obtain a bridge from their explicitly configured session:
+
+```python
+from c_two._native import RuntimeSession
+
+session = RuntimeSession(server_id='local-host', use_process_relay_anchor=False)
+server = session.ensure_server_bridge()
+```
+
+The session owns identity, IPC overrides and relay configuration. `Server(runtime_session, ...)` no longer accepts `bind_address`, `ipc_overrides`, `server_id` or `server_instance_id`; registration, unregister and shutdown no longer accept a replacement session or per-operation relay anchor. Configure independent sessions explicitly rather than inheriting Python process settings. `start()` takes no timeout argument; `shutdown(timeout=...)` retains its Core-owned deadline and completion result. Close the bridge with `shutdown()` when its host is finished.
+
 ## Payload lifetimes
 
 The proven portable receive path opens a **copy-backed** FastDB owner. `cc.hold()` is a lifetime contract, not a zero-copy claim: it retains the C-Two response lease together with the payload owner and guarantees that release invalidates the FastDB owner and its checked views *before* the lease goes back.

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
 from c_two.transport import Server
 from c_two.transport.client.util import ping, shutdown
@@ -31,7 +33,7 @@ def _wait_for_ping(address: str, timeout: float = 5.0) -> None:
 
 
 def _hello_server(address: str, *, name: str = 'hello') -> Server:
-    server = Server(bind_address=address)
+    server = local_server(address)
     server.register_crm(Hello, HelloImpl(), name=name)
     return server
 
@@ -157,7 +159,7 @@ def test_server_start_returns_only_after_direct_ipc_ready(monkeypatch):
     address = f'ipc://{_unique_region("ready")}'
     server = _hello_server(address)
     try:
-        server.start(timeout=5.0)
+        server.start()
         assert ping(address, timeout=0.5) is True
     finally:
         server.shutdown()
@@ -168,37 +170,27 @@ def test_server_start_readiness_ignores_bad_relay_env(monkeypatch):
     address = f'ipc://{_unique_region("ready_bad_relay")}'
     server = _hello_server(address)
     try:
-        server.start(timeout=5.0)
+        server.start()
         assert ping(address, timeout=0.5) is True
     finally:
         server.shutdown()
 
 
-def test_standalone_server_rejects_explicit_relay_without_runtime_session(monkeypatch):
-    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
+def test_bound_server_rejects_per_operation_session_and_relay_overrides(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
     address = f'ipc://{_unique_region("standalone_relay")}'
-    server = Server(bind_address=address)
+    server = local_server(address)
     try:
-        with pytest.raises(ValueError, match='runtime_session-owned'):
-            server.register_crm(
-                Hello,
-                HelloImpl(),
-                name='hello',
-                relay_anchor_address='http://127.0.0.1:9',
-            )
-        assert server.names == []
-
         server.register_crm(Hello, HelloImpl(), name='hello')
-        with pytest.raises(ValueError, match='runtime_session-owned'):
-            server.unregister_crm(
-                'hello',
-                relay_anchor_address='http://127.0.0.1:9',
-            )
-        assert server.names == ['hello']
-
-        with pytest.raises(ValueError, match='runtime_session-owned'):
-            server.shutdown(relay_anchor_address='http://127.0.0.1:9')
-        assert server.names == ['hello']
+        for method, args, kwargs in (
+            (server.register_crm, (Hello, HelloImpl()), {'name': 'other'}),
+            (server.unregister_crm, ('hello',), {}),
+            (server.shutdown, (), {}),
+        ):
+            for key in ('runtime_session', 'relay_anchor_address'):
+                with pytest.raises(TypeError, match=key):
+                    method(*args, **kwargs, **{key: object()})
+                assert server.names == ['hello']
     finally:
         server.shutdown()
 
@@ -207,9 +199,9 @@ def test_starting_second_server_does_not_unlink_active_socket(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("active")}'
     first = _hello_server(address)
-    second = Server(bind_address=address)
+    second = local_server(address)
     try:
-        first.start(timeout=5.0)
+        first.start()
         assert ping(address, timeout=0.5) is True
         with pytest.raises(
             RuntimeError,
@@ -230,7 +222,7 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_allows_new_server(monkeypatch
     address = f'ipc://{_unique_region("external_shutdown")}'
     server = _hello_server(address)
     try:
-        server.start(timeout=5.0)
+        server.start()
         assert ping(address, timeout=0.5) is True
         _assert_shutdown_initiated(shutdown(address, timeout=0.5))
 
@@ -246,7 +238,7 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_allows_new_server(monkeypatch
 
         replacement = _hello_server(address)
         try:
-            replacement.start(timeout=5.0)
+            replacement.start()
             assert ping(address, timeout=0.5) is True
         finally:
             replacement.shutdown()
@@ -284,11 +276,11 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_still_invokes_on_shutdown(
             self._marker_path.write_text('done', encoding='utf-8')
 
     address = f'ipc://{_unique_region("external_shutdown_cleanup")}'
-    server = Server(bind_address=address)
+    server = local_server(address)
     impl = DirectCleanupImpl(marker)
     try:
         server.register_crm(DirectCleanup, impl, name='cleanup')
-        server.start(timeout=5.0)
+        server.start()
         assert ping(address, timeout=0.5) is True
         _assert_shutdown_initiated(shutdown(address, timeout=0.5))
 
@@ -343,7 +335,7 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_waits_for_active_call_before_
             self._marker_path.write_text('done', encoding='utf-8')
 
     address = f'ipc://{_unique_region("external_shutdown_active_cleanup")}'
-    server = Server(bind_address=address)
+    server = local_server(address)
     impl = DirectActiveCleanupImpl(marker)
     client = None
     call_thread = None
@@ -351,7 +343,7 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_waits_for_active_call_before_
     shutdown_result: dict[str, object] = {}
     try:
         server.register_crm(DirectActiveCleanup, impl, name='cleanup')
-        server.start(timeout=5.0)
+        server.start()
         _wait_for_ping(address)
         client = cc.connect(DirectActiveCleanup, name='cleanup', address=address)
         assert client.client._mode == 'ipc'  # noqa: SLF001
@@ -406,7 +398,7 @@ def test_same_bridge_can_start_after_normal_shutdown(monkeypatch):
     server = _hello_server(address)
     try:
         for _ in range(50):
-            server.start(timeout=5.0)
+            server.start()
             assert ping(address, timeout=0.5) is True
             server.shutdown()
             assert server.is_started() is False
@@ -419,9 +411,9 @@ def test_failed_start_can_retry_after_active_socket_released(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("retry_failed_start")}'
     first = _hello_server(address)
-    second = Server(bind_address=address)
+    second = local_server(address)
     try:
-        first.start(timeout=5.0)
+        first.start()
         assert ping(address, timeout=0.5) is True
 
         with pytest.raises(
@@ -440,7 +432,7 @@ def test_failed_start_can_retry_after_active_socket_released(monkeypatch):
             pytest.fail('first server still responds after shutdown')
 
         second.register_crm(Hello, HelloImpl(), name='hello2')
-        second.start(timeout=5.0)
+        second.start()
         assert ping(address, timeout=0.5) is True
     finally:
         try:

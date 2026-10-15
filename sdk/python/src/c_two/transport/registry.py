@@ -481,8 +481,6 @@ class _ProcessRegistry:
                     name=name,
                     bridge=method_bridge_map,
                     input_lifetime=input_lifetime_map,
-                    runtime_session=self._runtime_session,
-                    relay_anchor_address=None,
                 )
 
                 # Start server if not yet running.
@@ -698,15 +696,10 @@ class _ProcessRegistry:
         """
         with self._lock:
             server = self._server
-            runtime_session = self._runtime_session
         if server is None:
             raise KeyError(f'Name not registered: {name!r}')
 
-        outcome = server.unregister_crm(
-            name,
-            runtime_session=runtime_session,
-            relay_anchor_address=None,
-        )
+        outcome = server.unregister_crm(name)
         relay_error = outcome.get('relay_error')
         if relay_error is not None:
             raise _relay_cleanup_exception(dict(relay_error))
@@ -732,8 +725,7 @@ class _ProcessRegistry:
             server = self._server
             runtime_session = self._runtime_session
         if server is not None:
-            outcome = server.shutdown(runtime_session=runtime_session,
-                                      relay_anchor_address=None, timeout=timeout)
+            outcome = server.shutdown(timeout=timeout)
         else:
             outcome = dict(runtime_session.shutdown(route_names=[],
                 relay_anchor_address=None, timeout_seconds=timeout))

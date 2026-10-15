@@ -8,8 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 import pytest
 
+from tests.fixtures import local_server
+
+from c_two._native import RuntimeSession
+
 import c_two as cc
-from c_two.transport import Server
 from c_two.transport.registry import _ProcessRegistry
 
 
@@ -52,7 +55,7 @@ def ipc_connection(unique_ipc_address, request):
             max_outstanding_calls=slots, retained_input_budget_bytes=budget,
         )
     resource = TimedResource()
-    server = Server(bind_address=unique_ipc_address)
+    server = local_server(unique_ipc_address)
     server.register_crm(TimedContract, resource, name='timed')
     server.start()
     connection = cc.connect(TimedContract, name='timed', address=unique_ipc_address)
@@ -367,7 +370,7 @@ def portable_connection(unique_ipc_address, request):
             cc.set_call_execution_limits(**request.param)
         else:
             cc.set_call_execution_limits(retained_input_budget_bytes=request.param)
-    server = Server(bind_address=unique_ipc_address)
+    server = local_server(unique_ipc_address)
     server.register_crm(Echo, EchoResource(), name='portable-options')
     server.start()
     connection = cc.connect(Echo, name='portable-options', address=unique_ipc_address)
