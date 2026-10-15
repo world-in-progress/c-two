@@ -138,28 +138,13 @@ def hold(method: Callable[P, R]) -> Callable[P, HeldResult[R]]:
     return wrapper
 
 
-_VALID_TRANSFER_BUFFERS = frozenset(("view",))
-
-
-def transfer(*, input=None, output=None, buffer=None):
+def transfer(*, input=None, output=None):
     """Bind explicit nested FastDB specs to a portable CRM method."""
-
-    if buffer == "hold":
-        raise ValueError(
-            "server-side scoped input is controlled by "
-            "cc.register(..., input_lifetime=...), not @cc.transfer(buffer='hold')",
-        )
-    if buffer is not None and buffer not in _VALID_TRANSFER_BUFFERS:
-        raise ValueError(
-            f"buffer must be None or one of {sorted(_VALID_TRANSFER_BUFFERS)}, "
-            f"got {buffer!r}",
-        )
 
     def decorator(func):
         func.__cc_transfer__ = {
             "input": input,
             "output": output,
-            "buffer": buffer,
         }
         return func
 
@@ -170,7 +155,6 @@ def _build_transfer_wrapper(
     func,
     input: PayloadBinding | None = None,
     output: PayloadBinding | None = None,
-    buffer: str = "view",
 ):
     """Build the client/resource closure over opaque payload bytes."""
 
@@ -364,7 +348,7 @@ def _build_transfer_wrapper(
         _release_fn=None,
         _c2_input_buffer_mode=None,
     ):
-        input_buffer_mode = _c2_input_buffer_mode or buffer
+        input_buffer_mode = _c2_input_buffer_mode or "view"
         input_decoder = (
             input.deserialize
             if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
@@ -521,25 +505,13 @@ def _build_transfer_wrapper(
             f"Invalid direction value: {crm.direction}. Expected '->' or '<-'.",
         )
 
-    transfer_wrapper._input_buffer_mode = buffer
     transfer_wrapper._input_payload_binding = input
     transfer_wrapper._output_payload_binding = output
     return transfer_wrapper
 
 
-def auto_transfer(func=None, *, input=None, output=None, buffer=None):
+def auto_transfer(func=None, *, input=None, output=None):
     """Wrap a CRM method with explicit FastDB, pickle, or no-payload bindings."""
-
-    if buffer == "hold":
-        raise ValueError(
-            "server-side scoped input is controlled by "
-            "cc.register(..., input_lifetime=...), not buffer='hold'",
-        )
-    if buffer is not None and buffer not in _VALID_TRANSFER_BUFFERS:
-        raise ValueError(
-            f"buffer must be None or one of {sorted(_VALID_TRANSFER_BUFFERS)}, "
-            f"got {buffer!r}",
-        )
 
     def create_wrapper(target):
         parameters = _rpc_parameters(target)
@@ -610,7 +582,6 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
             target,
             input=input_binding,
             output=output_binding,
-            buffer=buffer or "view",
         )
 
     if func is None:

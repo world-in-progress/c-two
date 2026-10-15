@@ -243,7 +243,8 @@ def _runtime_method_descriptor(
     access = get_method_access(method)
     return {
         "access": "read" if access is MethodAccess.READ else "write",
-        "buffer": getattr(method, "_input_buffer_mode", "view"),
+        # Preserve runtime fingerprints; registration owns input lifetime.
+        "buffer": "view",
         "name": method_name,
         "parameters": parameter_descriptors,
         "return": _annotation_descriptor(return_annotation, method_name),

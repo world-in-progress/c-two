@@ -94,15 +94,8 @@ class CRMSlot:
                             'an explicit FastDB Payload input binding',
                         )
                     buffer_mode = 'borrowed'
-                elif lifetime is InputLifetime.MATERIALIZED:
-                    buffer_mode = 'view'
                 else:
-                    buffer_mode = getattr(method, '_input_buffer_mode', 'view')
-                    if buffer_mode == 'hold':
-                        raise ValueError(
-                            "server-side borrowed input is controlled by "
-                            "cc.register(..., input_lifetime=...), not @cc.transfer(buffer='hold')",
-                        )
+                    buffer_mode = 'view'
                 self._dispatch_table[name] = (method, access, buffer_mode)
 
 
