@@ -6,6 +6,8 @@ This file contains repository-specific guidance for Codex and other coding agent
 
 C-Two is currently in the 0.x line. Do not preserve backwards compatibility for incorrect, experimental, or superseded internal APIs unless the user explicitly asks for a compatibility window. Prefer clean cuts over compatibility shims: remove obsolete code paths, tests, docs, and module surfaces rather than leaving dangling fallback behavior or zombie modules that future maintainers must carry. This applies to agent work as well: when a mechanism moves from an SDK into the Rust core, update or remove stale SDK-side guidance in the same change instead of documenting both paths as equally supported.
 
+Breaking API/ABI changes require GitHub Actions validation of the exact implementation candidate across the applicable Linux, macOS and Windows gates. Wait for all required jobs to succeed before accepting the change, and retain the source commit and run URL with the validation record.
+
 ## Project Overview
 
 C-Two is a resource-oriented RPC runtime that enables remote invocation of stateful resource classes across processes and machines. It is designed for distributed scientific computation, not traditional microservices.

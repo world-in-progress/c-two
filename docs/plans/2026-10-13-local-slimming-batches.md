@@ -1,5 +1,15 @@
 # C-Two 局部精简批次记录与收束
 
+## C05 Node 端点能力收敛（2026-10-15，完成）
+
+用户确认升级 C/Node ABI 4，要求完整 context 符号组，将 TypeScript capture 变为必需并删除 UnsupportedError，不保留旧 ABI 接纳。原来的可选组服务于 ABI 3 内追加能力；本批移除 loader 无 context fallback 与 legacySymbols，保留独立 C 查询 API、首次 IO 前纯查询、首次成功/失败 IO 的配置冻结、HTTP-only 惰性加载、严格身份与释放语义，wire 和 Core 生命周期策略不变。预分配等其他 C05 子项仍暂缓。
+
+实现 `1bc6e7415f2497a464d18671963a1f4c146cab2d` 相对 `eebcc539`：生产净减 71 行、测试净减 56 行，非文档合计净减 127 行。现有旧库成功测试改为 ABI 3 提前拒绝和 ABI 4 缺 Unix connect 符号拒绝，保留 ownership/GC/冻结/真实连接用例；使用旧 loader 配 ABI 4 header 的负对照，两项新拒绝断言均失败，候选均通过。未增加运行时抽象或声明性能提升。
+
+本地隔离通过完整 relay 419、FFI 27、Node 59 项及打包安装/类型检查；1 个 Windows 专属用例由线上执行。[GitHub Actions 38693012224](https://github.com/world-in-progress/c-two/actions/runs/38693012224) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，9/9 成功，覆盖 Ubuntu/Python 3.12、Ubuntu/Python 3.14t、macOS 15、Windows 2022/2025 的对应完整门禁。独立审查无发现，审查后源码哈希匹配；本批 socket/lease 零残留，历史目录快照未变，未使用 buddy。后续破坏性 API/ABI 更改的线上跨平台要求已写入 AGENTS.md。
+
+首轮 Node 真实长路径用例因本批显式容器太短，未达到 512 字节前置断言；改用更长的本批容器后该用例通过，生产代码与断言强度未改。隔离副本仅重定向测试默认目录与对应路径期望，线上使用原默认路径。命令、失败/成功日志、负对照、产物哈希、独立审查和端点验收保存在 `~/.codex/diagnostics/c2-c05-8f85ae7c/`；历史 ABI 收据保持原事实。
+
 ## R30 override 单一来源续批（2026-10-15，完成）
 
 用户已确认从 `e2f98bd9` 删除公开 Rust `BaseIpcConfigOverrides` 及 Server/Client override 的嵌套 `base`，保留扁平字段，按原 `flat.or(base)` 迁移有效值，不留兼容入口。Python 接口、解析与回读顺序、配置冻结、C/FFI ABI、wire 和生命周期策略保持；resolved `BaseIpcConfig`、Python `BaseIPCOverrides`、共享 key 表与 R08 环境错误策略不在删除范围内。
