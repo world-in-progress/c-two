@@ -10,7 +10,6 @@ import {
   C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS,
   C2_MEM_FFI_MAX_SHM_PREFIX_BYTES,
   C2MemFfiBindingError,
-  C2MemFfiEndpointContextUnsupportedError,
   captureLocalIpcEndpointContextFromSymbols,
   createC2MemFfiRequestPoolFromSymbols,
   createC2MemFfiNativeRequestBackend,
@@ -332,7 +331,7 @@ test('native capture failure is remembered after first attempt and partial owner
   assert.equal(captures, 1); assert.equal(closes, 1);
 });
 
-test('Node connector rejects unsupported root/context capability while old ABI 3 default endpoint remains usable', async () => {
+test('Node connector rejects missing context symbols before resolving or opening a socket', async () => {
   const fixture = endpointSymbolsFixture();
   delete fixture.symbols.c2_mem_ffi_local_endpoint_context_capture;
   let socketOpens = 0;
@@ -340,18 +339,15 @@ test('Node connector rejects unsupported root/context capability while old ABI 3
     nativeSymbols: fixture.symbols,
     createConnection() { socketOpens += 1; return connectedContextSocket(); },
   };
-  const connection = await createNodeIpcConnect(options)('ipc://legacy-abi3');
-  await connection.close();
-  assert.deepEqual(fixture.atomicAddresses, ['ipc://legacy-abi3']);
-  assert.throws(() => captureLocalIpcEndpointContextFromSymbols(fixture.symbols), C2MemFfiEndpointContextUnsupportedError);
-  await assert.rejects(
-    () => createNodeIpcConnect({ ...options, ipcRoot: 'requested-root' })('ipc://legacy-abi3'),
-    (error) => error instanceof C2MemFfiEndpointContextUnsupportedError
-      && error.code === 'C2_ENDPOINT_CONTEXT_UNSUPPORTED'
-      && /ABI version 3 does not guarantee/.test(error.message),
-  );
-  assert.equal(socketOpens, 1);
-  assert.deepEqual(fixture.atomicAddresses, ['ipc://legacy-abi3']);
+  const missingContext = /must provide c2_mem_ffi_local_endpoint_context_capture/;
+  assert.throws(() => captureLocalIpcEndpointContextFromSymbols(fixture.symbols), missingContext);
+  for (const ipcRoot of [undefined, 'requested-root']) {
+    const connect = createNodeIpcConnect({ ...options, ipcRoot });
+    await assert.rejects(() => connect('ipc://missing-context'), missingContext);
+    connect.close();
+  }
+  assert.equal(socketOpens, 0);
+  assert.deepEqual(fixture.atomicAddresses, []);
 });
 
 test('Node connector validates conflicts and native capture output before opening a socket', async () => {
@@ -389,7 +385,7 @@ test('Node connector validates conflicts and native capture output before openin
   assert.equal(closeCount, 2);
   await assert.rejects(
     () => createNodeIpcConnect({ nativeSymbols: { ...fixture.symbols, c2_mem_ffi_abi_version: () => 2 } })('ipc://wrong-abi'),
-    /ABI version 2.*expected version 3/,
+    /ABI version 2.*expected version 4/,
   );
 });
 
@@ -525,7 +521,7 @@ test('createNodeIpcConnect rejects sockets that close before connect', async () 
 });
 
 test('c2-mem-ffi symbol adapters validate ABI version before creating pools', async () => {
-  assert.equal(C2_MEM_FFI_ABI_VERSION, 3);
+  assert.equal(C2_MEM_FFI_ABI_VERSION, 4);
   let createCount = 0;
   const symbols = {
     c2_mem_ffi_abi_version() {
@@ -566,7 +562,7 @@ test('c2-mem-ffi symbol adapters validate ABI version before creating pools', as
       maxSegments: 1,
       minBlockSize: 512,
     }),
-    /ABI version 2.*expected version 3/,
+    /ABI version 3.*expected version 4/,
   );
   assert.equal(createCount, 0);
 });

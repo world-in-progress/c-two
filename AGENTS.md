@@ -242,7 +242,7 @@ Memory subsystem:
 - `c2-core` owns the default `Persistent` and explicit `OwnerBound` lifecycle policies. A private inherited, non-reconnectable receiver capability must be prepared before OwnerBound readiness; ordinary client disconnects and relay eviction cannot trigger owner shutdown. Each caller's shutdown deadline bounds observation of the same native drain transaction; an incomplete result retains the native session, Python bindings and pending hooks. Listener closure, work drain and retained payload leases are distinct observations. SDKs must not add their own owner watcher, shutdown transaction or endpoint path derivation.
 - Endpoint credentials and bounded sweep state belong to `c2-local` and are projected through Core/SDK/CLI. Controllers capture credentials after readiness, confirm child exit with OS wait when killing it, then request exact native reap. Tests and runners select their own logical addresses for maintenance; historical unknown endpoints are never a test cleanup target. See [the lifecycle integration guide](docs/local-endpoint-lifecycle.md).
 
-Current c2-mem-ffi ABI is 3. Endpoint C functions accept the logical address without a protocol selector; consumers validate ABI before exposing or invoking functions. Historical manifests/receipts retain their actual source ABI.
+Current c2-mem-ffi ABI is 4 and requires the complete endpoint-context symbol group. Endpoint C functions accept the logical address without a protocol selector; consumers validate ABI before exposing or invoking functions. Historical manifests/receipts retain their actual source ABI.
 
 ### CLI
 

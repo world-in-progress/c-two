@@ -8,13 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
-- Rust `ServerIpcConfigOverrides` and `ClientIpcConfigOverrides` now store only flat fields; `BaseIpcConfigOverrides` and their nested `base` fields are removed. Migrate each old pair using `flat.or(base)` so explicit `false` and `0` still win, then recompile downstream Rust code. Python override dictionaries, resolved configuration types, wire formats and C ABI 3 are unchanged.
+- The C/Node memory binding now requires ABI 4 and the complete endpoint-context API. Rebuild the addon, native library and consumers together; ABI 3 libraries are rejected. TypeScript endpoint symbols must provide context capture, and `C2MemFfiEndpointContextUnsupportedError` is removed. C function signatures/layouts, wire formats, configuration freezing and lease lifetimes are unchanged.
+
+- Rust `ServerIpcConfigOverrides` and `ClientIpcConfigOverrides` now store only flat fields; `BaseIpcConfigOverrides` and their nested `base` fields are removed. Migrate each old pair using `flat.or(base)` so explicit `false` and `0` still win, then recompile downstream Rust code. Python override dictionaries, resolved configuration types and wire formats are unchanged.
 
 - Rust `EncodedService::invoke` now takes an owned `Vec<u8>`, allowing the
   Python bridge to reuse Core's request snapshot without another byte copy.
   Update manual implementations and regenerate Rust contract modules with the
   matching generator, including modules used only by clients. Request lease
-  ordering, CRM fingerprints, wire protocols, and C ABI 3 are unchanged.
+  ordering, CRM fingerprints and wire protocols are unchanged.
 
 ## [0.7.0] — companion c3 0.3.0
 

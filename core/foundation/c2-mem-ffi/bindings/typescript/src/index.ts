@@ -11,7 +11,7 @@ export const C2_MEM_FFI_STATUS_IO_ERROR = 5;
 
 export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 255;
 export const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
-export const C2_MEM_FFI_ABI_VERSION = 3;
+export const C2_MEM_FFI_ABI_VERSION = 4;
 
 export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_OK
@@ -143,8 +143,7 @@ export interface C2MemFfiLocalEndpointSymbols {
    * Resolve the automatic platform endpoint through the Rust configuration owner.
    */
   c2_mem_ffi_local_endpoint(address: string): C2MemFfiCallResult<string>;
-  /** Optional capability: older ABI 3 libraries may omit this entire group. */
-  c2_mem_ffi_local_endpoint_context_capture?(unixRoot: string | null): C2MemFfiCallResult<C2MemFfiNativeLocalEndpointContext>;
+  c2_mem_ffi_local_endpoint_context_capture(unixRoot: string | null): C2MemFfiCallResult<C2MemFfiNativeLocalEndpointContext>;
 }
 
 export interface C2MemFfiNodeNativeExtraSymbols<Handle = unknown> extends C2MemFfiLocalEndpointSymbols {
@@ -264,16 +263,6 @@ export class C2NodeIpcConnectionError extends Error {
   }
 }
 
-export class C2MemFfiEndpointContextUnsupportedError extends C2MemFfiBindingError {
-  readonly code = "C2_ENDPOINT_CONTEXT_UNSUPPORTED";
-
-  constructor() {
-    super("C-Two native library does not support endpoint contexts or ipcRoot. ABI version 3 does not guarantee this capability.");
-    this.name = "C2MemFfiEndpointContextUnsupportedError";
-    Object.setPrototypeOf(this, C2MemFfiEndpointContextUnsupportedError.prototype);
-  }
-}
-
 interface LocalEndpointContextState {
   readonly native: C2MemFfiNativeLocalEndpointContext;
   references: number;
@@ -326,16 +315,13 @@ export function captureLocalIpcEndpointContext(
   return captureLocalIpcEndpointContextFromSymbols(symbols, options);
 }
 
-/** Capture through a loaded library; ABI 3 and endpoint-context capability are checked separately. */
+/** Capture through a loaded ABI 4 library. */
 export function captureLocalIpcEndpointContextFromSymbols(
   symbols: C2MemFfiLocalEndpointSymbols,
   options: C2MemFfiLocalEndpointCaptureOptions = {},
 ): C2MemFfiLocalEndpointContext {
   requireEndpointOptions(options);
   requireEndpointSymbols(symbols);
-  if (symbols.c2_mem_ffi_local_endpoint_context_capture === undefined) {
-    throw new C2MemFfiEndpointContextUnsupportedError();
-  }
   const result = symbols.c2_mem_ffi_local_endpoint_context_capture(options.ipcRoot ?? null);
   const native = result?.value;
   if (result?.status !== C2_MEM_FFI_STATUS_OK || typeof native !== "object" || native === null
@@ -376,8 +362,8 @@ function requireEndpointSymbols(symbols: C2MemFfiLocalEndpointSymbols): void {
   if (typeof symbols.c2_mem_ffi_local_endpoint !== "function") {
     throw new C2MemFfiBindingError("C-Two native endpoint symbols must provide c2_mem_ffi_local_endpoint().");
   }
-  if (symbols.c2_mem_ffi_local_endpoint_context_capture !== undefined && typeof symbols.c2_mem_ffi_local_endpoint_context_capture !== "function") {
-    throw new C2MemFfiBindingError("C-Two native endpoint context capture symbol must be a function when provided.");
+  if (typeof symbols.c2_mem_ffi_local_endpoint_context_capture !== "function") {
+    throw new C2MemFfiBindingError("C-Two native endpoint symbols must provide c2_mem_ffi_local_endpoint_context_capture().");
   }
 }
 
@@ -500,7 +486,6 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
   }
   options = { ...options };
   let snapshot: LocalEndpointContextLease | undefined;
-  let legacySymbols: C2MemFfiLocalEndpointSymbols | undefined;
   let attempted = false;
   let captureFailed = false;
   let captureError: unknown;
@@ -521,17 +506,11 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
         } else if (options.resolveEndpoint === undefined) {
           const symbols = options.nativeSymbols ?? loadBundledC2MemFfiNodeNativeSymbols(options).symbols;
           requireEndpointSymbols(symbols);
-          if (symbols.c2_mem_ffi_local_endpoint_context_capture !== undefined || options.ipcRoot !== undefined) {
-            const context = captureLocalIpcEndpointContextFromSymbols(symbols, options);
-            try {
-              snapshot = retainEndpointContext(context);
-            } finally {
-              context.close();
-            }
-          } else {
-            // Older ABI3 libraries still support their existing default query.
-            // They cannot provide a complete captured configuration snapshot.
-            legacySymbols = symbols;
+          const context = captureLocalIpcEndpointContextFromSymbols(symbols, options);
+          try {
+            snapshot = retainEndpointContext(context);
+          } finally {
+            context.close();
           }
         }
       } catch (error) {
@@ -550,7 +529,7 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
       return requireNativeEndpointString(nativeEndpointContext(snapshot).endpointName(address), "endpoint resolution");
     }
     if (options.endpointContext !== undefined) return options.endpointContext.endpointName(address);
-    const symbols = legacySymbols ?? options.nativeSymbols ?? loadBundledC2MemFfiNodeNativeSymbols(options).symbols;
+    const symbols = options.nativeSymbols ?? loadBundledC2MemFfiNodeNativeSymbols(options).symbols;
     requireEndpointSymbols(symbols);
     if (options.ipcRoot !== undefined) {
       const context = captureLocalIpcEndpointContextFromSymbols(symbols, options);
@@ -645,7 +624,6 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
       closed = true;
       if (snapshot !== undefined) closeEndpointContextLease(snapshot);
       snapshot = undefined;
-      legacySymbols = undefined;
       captureError = undefined;
       options = {};
     },

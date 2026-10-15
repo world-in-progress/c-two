@@ -13,7 +13,7 @@ use std::sync::Mutex;
 const MAX_SHM_PREFIX_LEN: usize = 255;
 const OWNER_INCARNATION_SUFFIX_LEN: usize = 41;
 const MAX_IPC_SHM_SEGMENTS: u16 = 16;
-const C2_MEM_FFI_ABI_VERSION: u32 = 3;
+const C2_MEM_FFI_ABI_VERSION: u32 = 4;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2032,7 +2032,7 @@ mod tests {
 
     #[test]
     fn public_abi_version_is_exported() {
-        assert_eq!(c2_mem_ffi_abi_version(), 3);
+        assert_eq!(c2_mem_ffi_abi_version(), 4);
     }
 
     #[test]
@@ -2111,7 +2111,7 @@ _Static_assert(C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER == 4, "status buffer value"
 _Static_assert(C2_MEM_FFI_STATUS_IO_ERROR == 5, "status IO value");
 _Static_assert(C2_MEM_FFI_MAX_SHM_PREFIX_LEN == 255u, "prefix length limit");
 _Static_assert(C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS == 16u, "segment count limit");
-_Static_assert(C2_MEM_FFI_ABI_VERSION == 3u, "abi version");
+_Static_assert(C2_MEM_FFI_ABI_VERSION == 4u, "abi version");
 _Static_assert(sizeof(C2MemFfiRequestBlock) == 16, "request block size");
 _Static_assert(offsetof(C2MemFfiRequestBlock, segment_index) == 0, "request segment_index offset");
 _Static_assert(offsetof(C2MemFfiRequestBlock, is_dedicated) == 2, "request dedicated offset");

@@ -10,7 +10,7 @@ extern "C" {
 
 #define C2_MEM_FFI_MAX_SHM_PREFIX_LEN 255u
 #define C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS 16u
-#define C2_MEM_FFI_ABI_VERSION 3u
+#define C2_MEM_FFI_ABI_VERSION 4u
 
 typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_OK = 0,
@@ -59,8 +59,7 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_copy(
     const char *address, char *dst, size_t dst_len, size_t *out_written);
 
 /*
- * Optional additive ABI-3 capability. An older ABI-3 library may lack these
- * symbols; consumers must detect the complete context API before calling it.
+ * ABI 4 requires the complete context API, including connect_unix.
  *
  * Capture c2-config's complete immutable endpoint context exactly once.
  * NULL unix_root inherits process env/.env/platform default; a non-NULL UTF-8
