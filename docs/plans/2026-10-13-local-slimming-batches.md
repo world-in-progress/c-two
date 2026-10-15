@@ -1,5 +1,15 @@
 # C-Two 局部精简批次记录与收束
 
+## R31 Held owner 配对（2026-10-15，完成）
+
+用户确认将 Rust `Held<T>` 的 value/response 收敛为一个私有 `Option<(T, HeldResponse)>`，删除无合法构造路径的半开状态分支。释放时分别建立局部 owner，保留正常路径先销毁 value、再销毁 response，以及 invalidator panic 时先析构 response、再析构 value 的顺序；Core 失效后释放租约、错误合并和幂等语义不变。公开 API/ABI、wire 和生命周期策略不变。
+
+本批相对 `32e1362f`：生产新增 12、删除 34，净减 22 行；测试新增 32、删除 44，净减 12 行；非文档合计净减 34 行。新增 `#[cfg(test)]` 块计入测试，真实 Held 的失败/panic/重复释放测试替换了测试自造的 SdkHeldDropGuard；保留真实 FastDB owner 测试及 Core 复制/释放错误合并覆盖。新增单测先在原实现通过；8 个显式释放/Drop/错误/panic 顺序场景在基线与候选一致，故意调反局部声明顺序的对照在 panic 场景按预期被拒绝，未新增生产抽象或声明性能提升。
+
+本地隔离回归通过 Rust SDK 19 项、Core 生命周期 5 项、生成 Rust 消费者 4 项、完整 c2-http/relay 419 项；Python 157 项（relay/lifetime 131、Git 元数据 1、portable 25），含 18/18 direct/relay 矩阵；矩阵校验器另 26 项通过。独立原生审查无发现，固定审查补丁与验收源码哈希一致；本批 socket/lease 零残留、历史目录快照未变，未使用 buddy。
+
+本批验证范围为本机 macOS，未新增 hosted CI。隔离副本仅重定向测试默认 socket/协调目录及对应路径期望，交付源码路径不变；顺序探针、负对照、命令、日志、产物哈希及验收证据保存在 `~/.codex/diagnostics/c2-r31-e6591997/`。
+
 ## R24 旧 transfer buffer 配置链退出（2026-10-15，完成）
 
 用户确认删除 Python `transfer` / `auto_transfer` 的旧 `buffer` 形参及声明侧元数据，不留兼容入口；显式传入 None、view、hold 或非法值均由签名拒绝为 TypeError。注册级独立 borrowed 校验、运行时 `_c2_input_buffer_mode`、客户端 hold、动态 Resource 方法查找和释放顺序保留。运行时 descriptor 仍输出 `buffer: "view"`；Rust API、C/FFI ABI、wire 和 Core 生命周期策略不变。
