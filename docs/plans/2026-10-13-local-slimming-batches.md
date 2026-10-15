@@ -1,5 +1,15 @@
 # C-Two 局部精简批次记录与收束
 
+## R24 旧 transfer buffer 配置链退出（2026-10-15，完成）
+
+用户确认删除 Python `transfer` / `auto_transfer` 的旧 `buffer` 形参及声明侧元数据，不留兼容入口；显式传入 None、view、hold 或非法值均由签名拒绝为 TypeError。注册级独立 borrowed 校验、运行时 `_c2_input_buffer_mode`、客户端 hold、动态 Resource 方法查找和释放顺序保留。运行时 descriptor 仍输出 `buffer: "view"`；Rust API、C/FFI ABI、wire 和 Core 生命周期策略不变。
+
+实现 `056ba4a1c50cdd2b921512d1768184a612892d9d` 相对 `9a882710`：生产新增 6、删除 41，净减 35 行；测试新增 6、删除 5，净增 1 行；非文档净减 34 行。两个入口各四种旧关键字值替换原 hold 迁移报错测试，8 项旧实现负对照均按预期失败、候选均通过。普通与 portable 合同的完整 descriptor/fingerprint、以及 portable release reference 快照与基线一致；未增加运行时抽象或声明性能提升。
+
+本地隔离通过完整 Rust relay 419 项、Python 351 项（常规 325、Git 元数据 1、portable 25，含 18/18 direct/relay 矩阵及 Python 3.10 语法检查）。[GitHub Actions 38725348808](https://github.com/world-in-progress/c-two/actions/runs/38725348808) 绑定上述实现与 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功；Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁及 Ubuntu/Python 3.14t 对应门禁均已核对日志，Windows 包含普通用户 wheel 消费者验证。
+
+本地 portable 首轮遗漏专用 `C2_PORTABLE_MATRIX_C3_BIN`，夹具在错误的默认产物路径查找 CLI，造成 24 个 setup 错误；补齐变量并固定 CLI 副本后同一矩阵通过，生产代码与测试断言未改，各阶段产物哈希分别留档。独立审查无发现，审查、测试和提交源码一致；本批 socket/lease 零残留、历史目录快照未变，未使用 buddy。隔离副本仅重定向测试默认目录及对应期望，线上使用原路径。完整证据位于 `~/.codex/diagnostics/c2-r24-4b09f0f5/`。
+
 ## R08 IPC 字段解析收敛（2026-10-15，完成）
 
 用户确认仅合并 IPC 环境赋值与代码覆盖的重复逻辑，保持原行为。16 个公共字段及 server/client 专属字段的环境键、解析器和错误顺序逐项核对；被代码覆盖的非法格式环境值仍拒绝，False/0、派生计算后最终校验及配置冻结保持。未采用先选来源再解析的语义方案；公开 API/ABI、wire 和生命周期不变，relay 配置与 R09 dotenv 快照仍不在本批范围。
