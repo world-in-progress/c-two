@@ -1,5 +1,15 @@
 # C-Two 局部精简批次记录与收束
 
+## R08 IPC 字段解析收敛（2026-10-15，完成）
+
+用户确认仅合并 IPC 环境赋值与代码覆盖的重复逻辑，保持原行为。16 个公共字段及 server/client 专属字段的环境键、解析器和错误顺序逐项核对；被代码覆盖的非法格式环境值仍拒绝，False/0、派生计算后最终校验及配置冻结保持。未采用先选来源再解析的语义方案；公开 API/ABI、wire 和生命周期不变，relay 配置与 R09 dotenv 快照仍不在本批范围。
+
+实现 `0f31294acf7ae21d4f61f0337676ff04b8ccc39e` 相对 `379b389e`：生产新增 45、删除 220，净减 175 行；测试新增 62、删除 46，净增 16 行；非文档合计净减 159 行。原私有覆盖宏与两轮赋值收敛为一个私有字段宏，测试以独立手写字段表合并三段重叠覆盖，未新增框架或声明性能提升。
+
+42 个字段/错误顺序场景先在原实现通过。首轮表中心跳超时误填 15（等于默认间隔），被原校验正确拒绝后改为合法的 20/45，未放宽断言。本机隔离回归通过配置 135、Core 202、完整 c2-http/relay 419 项；4 个 ignored 入口为父用例实际调用的子进程 fixture。Python 配置、冻结、HTTP/mesh、关闭、benchmark、跨模式、直连与真实闲置回归 242 项通过，归档缺少 Git 元数据的 1 项另在实际工作树通过，共 243 项。
+
+[GitHub Actions 38703304629](https://github.com/world-in-progress/c-two/actions/runs/38703304629) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，9/9 首次运行成功；Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁及 Ubuntu/Python 3.14t 对应门禁均已核对日志。独立审查无发现，审查、测试与提交源码哈希一致；本批 socket/lease 零残留、历史目录快照未变，未使用 buddy。隔离副本仅重定向测试默认目录及匹配的路径期望，线上使用原路径。命令、日志、基线对照、产物哈希与验收证据保存在 `~/.codex/diagnostics/c2-r08-bcd260ad/`。
+
 ## C05 Node 端点能力收敛（2026-10-15，完成）
 
 用户确认升级 C/Node ABI 4，要求完整 context 符号组，将 TypeScript capture 变为必需并删除 UnsupportedError，不保留旧 ABI 接纳。原来的可选组服务于 ABI 3 内追加能力；本批移除 loader 无 context fallback 与 legacySymbols，保留独立 C 查询 API、首次 IO 前纯查询、首次成功/失败 IO 的配置冻结、HTTP-only 惰性加载、严格身份与释放语义，wire 和 Core 生命周期策略不变。预分配等其他 C05 子项仍暂缓。
