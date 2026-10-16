@@ -37,6 +37,7 @@ import logging
 import signal
 import sys
 import threading
+from inspect import getattr_static
 from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, TypeVar
@@ -45,6 +46,7 @@ from c_two.crm.bridge import ResourceBridge, normalize_bridge_map
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
 from c_two.crm.methods import rpc_method_names
+from c_two.crm.meta import _SHUTDOWN_ATTR, get_shutdown_method
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.lifecycle import LifecycleConfig
 from c_two.config.settings import settings
@@ -451,6 +453,20 @@ class _ProcessRegistry:
             crm_instance,
             bridge=method_bridge_map,
         )
+        shutdown_method = get_shutdown_method(crm_class)
+        for method_name in dir(type(crm_instance)):
+            method = getattr_static(type(crm_instance), method_name)
+            marked = getattr_static(method, _SHUTDOWN_ATTR, False) is True
+            if isinstance(method, (staticmethod, classmethod)):
+                marked = marked or (
+                    getattr_static(method.__func__, _SHUTDOWN_ATTR, False) is True
+                )
+            if marked and method_name != shutdown_method:
+                raise TypeError(
+                    f'@cc.on_shutdown on resource '
+                    f'{type(crm_instance).__name__}.{method_name} must be '
+                    f'declared with @cc.on_shutdown on CRM {crm_class.__name__}.',
+                )
         validate_input_lifetime_resource_contract(
             crm_class,
             crm_instance,

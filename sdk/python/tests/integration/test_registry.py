@@ -132,6 +132,58 @@ def _clean_registry(monkeypatch):
 class TestRegisterConnect:
     """Core register / connect / close / unregister cycle."""
 
+    @pytest.mark.parametrize('hook_name', ['cleanup', 'greeting'])
+    def test_register_rejects_resource_only_shutdown_marker(self, hook_name):
+        class MarkedResource(HelloImpl):
+            def greeting(self, name: str) -> str:
+                return f'Hello, {name}!'
+
+            def cleanup(self):
+                pass
+
+        cc.on_shutdown(getattr(MarkedResource, hook_name))
+        with pytest.raises(TypeError, match=r'@cc.on_shutdown.*CRM.*Hello'):
+            cc.register(Hello, MarkedResource(), name='misplaced-hook')
+        assert cc.server_address() is None
+
+    @pytest.mark.parametrize('marked_resource', [False, True])
+    def test_contract_shutdown_hook_runs_once(self, marked_resource):
+        @cc.crm(namespace='test.contract-shutdown', version='0.1.0')
+        class WithShutdown:
+            def ping(self) -> int: ...
+
+            @cc.on_shutdown
+            def cleanup(self): ...
+
+        class UnrelatedValue:
+            @property
+            def __cc_on_shutdown__(self):
+                raise AssertionError('registration must not evaluate marker properties')
+
+        class Resource:
+            cleaned = 0
+            unrelated_value = UnrelatedValue()
+
+            def ping(self) -> int:
+                return 42
+
+            def cleanup(self):
+                self.cleaned += 1
+
+            @property
+            def unrelated(self):
+                raise AssertionError('registration must not evaluate properties')
+
+        if marked_resource:
+            cc.on_shutdown(Resource.cleanup)
+        resource = Resource()
+        cc.register(WithShutdown, resource, name='contract-hook')
+        with cc.connect(WithShutdown, name='contract-hook') as client:
+            assert client.ping() == 42
+        cc.unregister('contract-hook')
+        assert cc.shutdown()['completed']
+        assert resource.cleaned == 1
+
     def test_register_returns_name(self):
         n = cc.register(Hello, HelloImpl(), name='hello')
         assert n == 'hello'
