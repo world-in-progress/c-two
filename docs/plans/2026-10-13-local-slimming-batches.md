@@ -1,10 +1,16 @@
 # C-Two 局部精简批次记录与收束
 
-## Python wire/handshake 投影链退役（2026-10-16，执行中）
+## Python wire/handshake 投影链退役（2026-10-16，完成）
 
-执行基线 `9561055d`。用户批准删除旧 Python 协议投影的 4 个 PyClass、13 个 codec 和 35 个常量导出，删除 `transport.protocol`，`transport.wire` 只保留 `MethodTable`；5 个合同投影原样迁至 `contract_ffi.rs`，现有 `_native` 名称不变。低层 Python API 删除不留兼容入口；Rust API、C/FFI ABI、wire、身份与生命周期语义保持，native 的 `c2-wire` 依赖仍由内存投影使用。
+执行基线 `9561055d`，实现候选 `bb46d0a2e89d82eea04fbb47d20ca6e120ffe190`。用户接受删除低层 Python API：4 个协议 PyClass、13 个 codec、35 个常量导出以及 `transport.protocol` 退出，不留兼容入口；`transport.wire` 仅保留 `MethodTable`。5 个合同函数原样移至 `contract_ffi.rs`，现有 `_native` 名称和注册顺序保持，其中 4 个仍由 Python descriptor 生产路径调用，独立合同验证入口也保留。Rust API、C/FFI ABI、wire、身份检查与生命周期保持；`mem_ffi` 仍使用 `c2-wire`，依赖未删。
 
-先在原生产实现上补齐 Rust 握手计数/截断、call/reply 边界、255 字节 route 和零 payload 上限测试，完整 c2-wire 通过后再删除投影及合并 Python 测试。最终出口为重建 native、完整 relay、真实跨语言回归、GitHub Actions 跨平台门禁、独立审查和本批 socket/lease 零残留；验收后记录生产/测试/文档实际净量再提交。仅使用本批隔离路径，历史目录不动，不使用 buddy。
+生产新增 57、删除 871，净减 814 行；测试新增 197、删除 615，净减 418 行；非文档合计净减 1232 行。两份 Python 测试的 44 个协议投影用例退出，7 个 MethodTable 用例合并为 5 个；Rust 新增 7 个边界测试并扩展现有方法数上限覆盖，包含握手计数与字段截断、call/reply 边界、255 字节 route 和零 payload 上限。现有独立手写 golden 保留；新增 Rust 覆盖较方案估算多约 30 行，用于具体错误字段和双向边界，未新增框架或声明性能提升。
+
+新增覆盖先在原生产实现通过完整 c2-wire 150 项。候选本机隔离通过 wire 150、contract 47、完整 relay 416、codegen 32，共 645 项 Rust 测试；重建 native/CLI 后 Python 定向 386 项通过，本地 5 个 Windows 专属项由线上 Windows 门禁覆盖。真实 Rust/Python 跨语言 25 项通过，包含完整 18/18 direct/relay 矩阵；收据校验另 26 项通过。 新扩展确认 52 个退役符号和旧模块均不存在，5 个合同入口可调用；Host 与独立审查逐字核对合同函数体及 MethodTable 与基线一致。
+
+[GitHub Actions 38858773392](https://github.com/world-in-progress/c-two/actions/runs/38858773392) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。已逐组核对日志：Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁，以及 Ubuntu/Python 3.14t 对应门禁；ordinary、portable、TypeScript 分组均通过，两个 Windows 包含普通用户消费者验证。
+
+独立原生只读审查无 actionable findings，固定补丁 SHA-256 为 `135c499470e50f3e9b9e1921abe2a6734b80b6c3c16ca889166cd7465f0f99fe`。本批作用域 socket/lease 零残留，历史路径快照未变，未使用 buddy。隔离副本仅重定向测试默认路径及对应期望；完整命令、产物哈希、API 清单、基线与候选结果、跨语言收据、审查和端点验收位于 `~/.codex/diagnostics/c2-python-wire-6f21c0c3/`。
 
 ## R30 派生配置状态与缓存诊断收敛（2026-10-16，完成）
 
