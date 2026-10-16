@@ -1,6 +1,6 @@
 # R01：Buddy 分配释放身份的独立复现与修复方案
 
-状态：**方案待确认，尚未实施**。评估输入 `3382b3ba81363453d06cfe701ca845d33052756c`；瘦身前对照 `2ffe356f15d8ce1c8fad9e08a91ffff808d34dad`。纯瘦身已收束，当前剩余状态见[批次清单](2026-10-13-local-slimming-batches.md)。本项以错误释放不能破坏其他活分配为目标，不承诺代码净减。
+状态：**已实施并完成本机、跨平台和独立审查验收**。执行基线 `3f030897`，生产候选 `de218272`，独立审查后的测试补强 `141668dd`。评估输入 `3382b3ba81363453d06cfe701ca845d33052756c`；瘦身前对照 `2ffe356f15d8ce1c8fad9e08a91ffff808d34dad`。以下保留批准前的复现与设计记录，实测结果见文末。纯瘦身已收束，当前剩余状态见[批次清单](2026-10-13-local-slimming-batches.md)。本项是正确性修复，不计作瘦身收益。
 
 ## 已执行的复现
 
@@ -91,4 +91,32 @@ backing generation 解决段槽位被回收再创建后的旧引用；本次同�
 | 整体门禁 | 完整 relay、真实 Rust/Python 及 TypeScript direct/relay 矩阵、持久连接/重连与跨进程释放；本批自建 socket/lease/SHM 收尾验收；独立审查。 |
 | GitHub Actions | 对确切候选提交跑 Source Validation 的 Ubuntu、macOS 15、Windows 2022/2025，以及 Python 3.14t 适用门禁，核查实际各 job 和日志；所有必需项通过后才提交验收结论。 |
 
-本次仅完成清单更新、旧/新基线复现、调用链与独立方案复核。未修改生产代码或仓内测试，未执行上述候选回归或触发 GitHub Actions。等待用户确认完整释放身份方案及 SHM 3 / IPC 12 / C ABI 5 等公开变化后，再实施。
+用户已确认上述完整释放身份方案及 SHM 3 / IPC 12 / C ABI 5 等公开变化；实施和验收记录如下。
+
+## 实施验收（2026-10-16，完成）
+
+生产提交 `de218272ac6643400f0c3e81a75f0bef3a521284` 将共享 live record 和不回绕序号接入原锁；请求、响应、chunk trim、预分配、relay materialize、Python/C/Node/TypeScript 释放链均原样传递标识。SHM 3、IPC 12、C ABI 5 直接拒绝旧格式。`attach` 以 header 的逻辑几何为依据，允许 OS 映射的页取整尾部，容量不足仍拒绝。长度取整、原容量释放、计费和生命周期策略保持；计费依据仍是 creator 显式映射长度，不扩展为 OS 实际提交页统计。R02/R07 没有随本项关闭。
+
+基线先补五个反例，原生产实现为 0 passed / 5 failed，18 个正常与非法坐标控制通过。候选的七个 R01 用例及真实 c2-mem 全部 185 项通过；独立 owner/peer 进程验证错误子块、父块、同位置旧标识不能修改 owner 状态，5000 B 按 8192 B 合法释放，四个自建 SHM 原生 Drop 后重开均为 `ENOENT`。未通过重叠 payload 切片或读写来证明缺陷。
+
+本机隔离完整 Core workspace 为 1704 passed、5 项既有 ignored，含完整 relay 416；Rust SDK 19、native Rust 8。Node 为 55 passed、1 项 Windows 专属 skipped；官方 Python driver 为 ordinary 1206 passed / 5 项 Windows 专属 skipped、portable 25、TypeScript 14，严格核验 18/18 Rust/Python 和 12/12 TypeScript direct/relay 收据，包含持久 IPC 和重连。首次普通套件的 1 项失败来自隔离根对应断言漏替换；补齐副本的严格路径断言后完整 driver 通过。Git/Node 22 预检查和初始构建失败日志均保留，没有修改 runner、期限或放宽断言。
+
+两份原生独立审查和随后两文件差量复核均无生产阻断。按 `hey-my-buddy` 0.42.1 进行只读独立审查，也无生产阻断；其零 id 和不足映射容量两条测试建议以 5 行补入现有用例，形成 `141668dd41871acf1cd0d241ad8c9d6691ff7ce4`。分别移除生产零值检查、容量检查的隔离变异体各有 1 项按预期失败，原实现各通过 1 项，随后真实 c2-mem 185 项再次通过。只读产物为空补丁，Host 核验固定输入与候选 tree 相同后完成精确 artifact 验收。
+
+对执行基线统计：生产 +371/−114，净增 257 行；测试 +778/−205，净增 573 行；非文档共增 830 行；文档 +52/−12，净增 40 行（含本记录和清单更新），全部净增 870 行。Rust 内联 `cfg(test)` 与测试 hook 按测试统计，consumer-install 脚本计入测试夹具，未将整个 Rust 文件计为生产。
+
+同环境 release 分配器微基准固定交替 5 轮，每个尺寸预热 1 万、测量 100 万对 alloc/free，backing 256 MiB、min-block 4 KiB：
+
+| 请求尺寸 | 基线中位 ns/对 | 候选中位 ns/对 | 中位差 |
+| --- | ---: | ---: | ---: |
+| 4 KiB | 1860.13 | 1861.42 | +0.07% |
+| 32 KiB | 490.08 | 490.58 | +0.10% |
+| 1 MiB | 184.94 | 183.77 | −0.64% |
+
+差异处于本次样本波动内，不据此声明 RPC 吞吐或 RSS。实测 layout 为 268455936→268980224 B，增加 524288 B（512 KiB，数据容量的 0.1953%）；2 GiB 数据区增加 4 MiB。wire 描述符 15→23 B、C block 16→24 B、header 56→64 B。预算边缘会因必要元数据增加更早触发原有回退。
+
+最终 GitHub Actions 输入为 `141668dd`，[run 38899277267](https://github.com/world-in-progress/c-two/actions/runs/38899277267) 在 attempt 1 全部 9 个 job 通过。逐份核对 Ubuntu 24.04（Python 3.12/3.14t）、macOS 15、Windows 2022/2025 原始日志：适用的完整 Core/relay、Rust SDK、CLI、native、Node/打包、完整 Python 三组、wheel、IPC memory matrix 和 Windows 普通用户门禁均实际通过，FastDB source 固定为 `4f99f86a662b0e950a0dd29800c25a1c9fca4def`。首个 run `38898542899` 因上述 5 行测试补强由并发规则取消；其汇总门禁对 `source=cancelled` 拒绝，不算通过证据。
+
+本次隔离默认根及各轮私有测试根最终 socket/lease 均为零；历史两个默认根在开始及结束均不存在，没有清理、重建或冷切换。812 个跟踪文件逐一核对，仅在隔离副本替换登记的默认目录及对应严格路径断言。Python 完整运行后仅增加上述 5 行 Rust `cfg(test)`，生产前缀逐字一致；最终 c2-mem 与线上候选覆盖该补强。
+
+证据目录 `/Users/soku/.codex/diagnostics/c2-r01-zvd34zy6/` 保留基线红绿、完整回归、严格收据、两组变异实验、源码/包/原生二进制哈希、独立审查、性能样本和 `local-acceptance.json`；构建物与本机证据没有加入 Git。
