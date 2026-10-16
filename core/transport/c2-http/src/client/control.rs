@@ -161,59 +161,7 @@ impl RelayRouteInfo {
     }
 }
 
-#[derive(Deserialize)]
-struct ResolvedRouteWithNamespace {
-    #[serde(flatten)]
-    route: RelayRouteInfo,
-    #[serde(default)]
-    local_endpoint_namespace: Option<String>,
-}
-
-fn resolved_routes_with_namespace(
-    records: Vec<ResolvedRouteWithNamespace>,
-    header_namespace: Option<String>,
-) -> Result<RelayResolvedRoutes, HttpError> {
-    // Header and additive JSON metadata describe the same relay domain. A
-    // disagreement removes only IPC hints; the HTTP route remains usable.
-    let has_header = header_namespace.is_some();
-    let mut namespace = header_namespace;
-    let mut disagreement = false;
-    let mut missing_ipc_metadata = false;
-    for record in &records {
-        if let Some(value) = &record.local_endpoint_namespace {
-            validate_local_endpoint_namespace(value)
-                .map_err(|error| HttpError::Transport(error.to_string()))?;
-            match &namespace {
-                Some(namespace) if namespace != value => disagreement = true,
-                None => namespace = Some(value.clone()),
-                _ => {}
-            }
-        } else if record.route.ipc_address.is_some() {
-            missing_ipc_metadata = true;
-        }
-    }
-    // With no response header, partial JSON metadata must not reinterpret
-    // unlabelled legacy IPC records as custom-root endpoints.
-    let suppress_ipc = disagreement || (!has_header && namespace.is_some() && missing_ipc_metadata);
-    let routes = records
-        .into_iter()
-        .map(|record| {
-            let mut route = record.route;
-            if suppress_ipc {
-                route.ipc_address = None;
-                route.server_id = None;
-                route.server_instance_id = None;
-            }
-            route
-        })
-        .collect();
-    Ok(RelayResolvedRoutes {
-        routes,
-        local_endpoint_namespace: namespace,
-    })
-}
-
-/// Discovery metadata kept separately so existing `RelayRouteInfo` literals remain valid.
+/// Routes and the relay namespace advertised by the discovery response header.
 #[derive(Debug, Clone)]
 pub struct RelayResolvedRoutes {
     pub routes: Vec<RelayRouteInfo>,
@@ -279,7 +227,7 @@ impl RelayControlClient {
 
     /// Freeze the resource owner's native context for registration and discovery.
     /// Custom-root owners must explicitly project their context before registering.
-    /// Legacy constructors emit no header and retain default-namespace behavior.
+    /// Without this projection, control requests carry no namespace header.
     pub fn with_local_endpoint_context(mut self, context: &LocalEndpointContext) -> Self {
         self.local_endpoint_context = Some(context.clone());
         self.cache.get_mut().clear();
@@ -343,7 +291,7 @@ impl RelayControlClient {
             .routes)
     }
 
-    /// Resolve with optional response namespace without changing the legacy route surface.
+    /// Resolve routes with the response's optional namespace header.
     pub async fn resolve_matching_with_namespace_async(
         &self,
         expected: &ExpectedRouteContract,
@@ -456,9 +404,9 @@ impl RelayControlClient {
                 Ok::<_, HttpError>(value.to_owned())
             })
             .transpose()?;
-        let records = match status {
+        let routes = match status {
             200 => resp
-                .json::<Vec<ResolvedRouteWithNamespace>>()
+                .json::<Vec<RelayRouteInfo>>()
                 .await
                 .map_err(|e| HttpError::Transport(e.to_string()))?,
             404 => {
@@ -470,7 +418,10 @@ impl RelayControlClient {
                 return Err(HttpError::ServerError(code, text));
             }
         };
-        let resolved = resolved_routes_with_namespace(records, local_endpoint_namespace)?;
+        let resolved = RelayResolvedRoutes {
+            routes,
+            local_endpoint_namespace,
+        };
         for route in &resolved.routes {
             validate_resolved_route(route)?;
         }
@@ -826,38 +777,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn additive_json_namespace_keeps_legacy_records_and_conflicts_keep_http() {
-        let context = LocalEndpointContext::default_for_platform().unwrap();
-        let base = serde_json::json!({
-            "name": "grid", "relay_url": "http://relay.test", "route_uid": "grid-route-uid-0001", "route_revision": 1,
-            "ipc_address": "ipc://grid", "server_id": "grid", "server_instance_id": "grid-instance",
-            "crm_ns": "test.ns", "crm_name": "Grid", "crm_ver": "0.1.0", "abi_hash": expected_contract().abi_hash,
-            "signature_hash": expected_contract().signature_hash, "max_payload_size": 1024
-        });
-        let records =
-            serde_json::from_value::<Vec<ResolvedRouteWithNamespace>>(serde_json::json!([base]))
-                .unwrap();
-        let legacy = resolved_routes_with_namespace(records, None).unwrap();
-        assert!(legacy.local_endpoint_namespace.is_none());
-        assert!(legacy.routes[0].ipc_address.is_some());
-        let mut typed = base.clone();
-        typed["local_endpoint_namespace"] = serde_json::json!(context.namespace_id());
-        let records = serde_json::from_value(serde_json::json!([typed])).unwrap();
-        let metadata_only = resolved_routes_with_namespace(records, None).unwrap();
-        assert_eq!(
-            metadata_only.local_endpoint_namespace.as_deref(),
-            Some(context.namespace_id())
-        );
-        assert!(metadata_only.routes[0].ipc_address.is_some());
-        typed["local_endpoint_namespace"] = serde_json::json!("a".repeat(64));
-        let records = serde_json::from_value(serde_json::json!([typed])).unwrap();
-        let conflict = resolved_routes_with_namespace(records, Some("b".repeat(64))).unwrap();
-        assert!(conflict.routes[0].ipc_address.is_none());
-        assert_eq!(conflict.routes[0].relay_url, "http://relay.test");
-        assert_eq!(conflict.routes[0].route_uid, "grid-route-uid-0001");
     }
 
     #[test]

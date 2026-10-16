@@ -29,7 +29,7 @@ use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer_handlers;
 use crate::relay::route_table::valid_route_name;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
-use crate::relay::types::{ResolvedRouteInfo, RouteEntry, UpstreamEndpointKey};
+use crate::relay::types::{RouteEntry, UpstreamEndpointKey};
 use c2_ipc::{ClientIpcConfig, IpcClient};
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -1451,13 +1451,6 @@ async fn handle_resolve(
             route.server_instance_id = None;
         }
     }
-    let routes = routes
-        .into_iter()
-        .map(|route| ResolvedRouteInfo {
-            route,
-            local_endpoint_namespace: state.endpoint_context().namespace_id().to_owned(),
-        })
-        .collect::<Vec<_>>();
     with_local_namespace_response(&state, Json(routes).into_response())
 }
 
@@ -2749,7 +2742,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body[0]["ipc_address"], "ipc://same-owner");
-        assert_eq!(body[0]["local_endpoint_namespace"], context.namespace_id());
+        assert!(body[0].get("local_endpoint_namespace").is_none());
         let mismatch = "f".repeat(64);
         let response = namespace_resolve_response(state.clone(), Some(&mismatch)).await;
         assert_eq!(response.status(), StatusCode::OK);
