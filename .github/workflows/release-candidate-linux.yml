@@ -145,7 +145,8 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --quiet packaging "swig>=4.4" uv
-          export PATH="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))'):$PATH"
+          c2_python_scripts="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"
+          export PATH="$c2_python_scripts:$PATH"
           C3_PATH="cli/c3-${RC_TARGET}"
           test -f "$C3_PATH" && test -f "${C3_PATH}.sha256"
           chmod +x "$C3_PATH"

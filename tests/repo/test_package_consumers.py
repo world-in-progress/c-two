@@ -223,6 +223,8 @@ def test_python_interpreter_resolution_has_no_machine_specific_fallback(
 def test_installed_origins_must_live_under_the_consumer_root(
     tmp_path: Path,
 ) -> None:
+    fastdb = tmp_path / "fastdb"
+    fastdb.mkdir()
     environment = tmp_path / "venv"
     installed = environment / "lib/python/site-packages/c_two/__init__.py"
     installed.parent.mkdir(parents=True)
@@ -231,14 +233,14 @@ def test_installed_origins_must_live_under_the_consumer_root(
     validate_installed_origin(
         installed,
         environment,
-        forbidden_roots=(REPOSITORY, REPOSITORY.parent / "fastdb"),
+        forbidden_roots=(REPOSITORY, fastdb),
     )
 
     with pytest.raises(ConsumerError, match="consumer root"):
         validate_installed_origin(
             REPOSITORY / "sdk/python/src/c_two/__init__.py",
             environment,
-            forbidden_roots=(REPOSITORY, REPOSITORY.parent / "fastdb"),
+            forbidden_roots=(REPOSITORY, fastdb),
         )
 
 

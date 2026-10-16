@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -76,6 +77,17 @@ def stop_process_tree(process: subprocess.Popen[bytes]) -> None:
             timeout=30, check=False,
         )
     else:
+        # Nested test drivers own separate sessions. Let their existing
+        # cancellation handlers stop and reap those children before forcing
+        # this group down. The CI step reserves time for this bounded cleanup.
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=40)
+        except subprocess.TimeoutExpired:
+            pass
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -85,9 +97,21 @@ def stop_process_tree(process: subprocess.Popen[bytes]) -> None:
     process.wait(timeout=30)
 
 
+def failure_excerpt(text: str) -> str:
+    """Keep actual assertions even when later successful crates fill the tail."""
+    lines = text.splitlines()
+    marker = re.compile(r"panicked at|^failures:|^error(?:\[|:)|^FAILED |^E\s|^_{3,}.*_{3,}$")
+    selected: set[int] = set()
+    for index, line in enumerate(lines):
+        if marker.search(line):
+            selected.update(range(max(0, index - 2), min(len(lines), index + 18)))
+    return "\n".join(lines[index] for index in sorted(selected))[:24000]
+
+
 def run_step(
     name: str, command: Sequence[str], *, cwd: Path, output: Path,
     environment: dict[str, str], timeout: float = STEP_TIMEOUT_S,
+    summary: Path | None = None,
 ) -> dict[str, Any]:
     """Execute one gate; a failed command remains a failed record and exit code."""
     log_path = output / f"{name}.log"
@@ -118,8 +142,20 @@ def run_step(
         finally:
             record["duration_seconds"] = round(time.monotonic() - started, 3)
             record["process_exited"] = process is None or process.poll() is not None
-    # Full output remains in the artifact; keep the Actions console bounded.
-    print(log_path.read_text(encoding="utf-8", errors="replace")[-16000:], flush=True)
+    # Full output remains in the artifact; surface failures before the tail
+    # so a workspace's last successful crate cannot hide the failing assertion.
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    if record["status"] != "passed":
+        excerpt = failure_excerpt(text) or text[-16000:]
+        (output / f"{name}.failure.txt").write_text(excerpt, encoding="utf-8")
+        print(f"::error title={name}::{name}: {record['status']} (exit {record['exit_code']})", flush=True)
+        print(excerpt, flush=True)
+        if summary is not None:
+            with summary.open("a", encoding="utf-8") as stream:
+                stream.write(f"\n### Failed: {name}\n\nExit: {record['exit_code']}. Full log: `{log_path.name}`.\n\n")
+                stream.write("```text\n" + excerpt.replace("```", "~~~") + "\n```\n")
+    else:
+        print(text[-16000:], flush=True)
     print(f"{name}: {record['status']} (exit {record['exit_code']}, {record['duration_seconds']} s)", flush=True)
     print("::endgroup::", flush=True)
     return record
@@ -457,7 +493,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                              "consumer gates while app gates keep source mode")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scope", choices=SCOPES, default=FULL_SCOPE)
+    parser.add_argument("--timeout", type=float, default=2700,
+                        help="aggregate validation budget in seconds; leaves time for CI evidence upload")
     options = parser.parse_args(argv)
+    if not 0 < options.timeout <= 7200:
+        parser.error("--timeout must be positive and at most 7200 seconds")
+    deadline = time.monotonic() + options.timeout
     output = options.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
@@ -538,9 +579,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         evidence["error"] = fastdb_sdk_error
     else:
         def execute(name: str, command: Sequence[str]) -> dict[str, Any]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"id": name, "command": list(command), "status": "not_run",
+                        "reason": "aggregate validation deadline exhausted"}
             return run_step(name, command, cwd=ROOT, output=output,
                             environment=gate_environment(name, environment, system_lib_dir),
-                            timeout=GATE_TIMEOUT_S.get(name, STEP_TIMEOUT_S))
+                            timeout=min(remaining, GATE_TIMEOUT_S.get(name, STEP_TIMEOUT_S)),
+                            summary=Path(environment["GITHUB_STEP_SUMMARY"])
+                            if environment.get("GITHUB_STEP_SUMMARY") else None)
 
         with ThreadPoolExecutor(max_workers=4) as setup:
             pending = {name: setup.submit(execute, name, command)
@@ -558,6 +605,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         if problem is not None:
                             record["status"] = "failed"
                             record["evidence_problem"] = problem
+                            print(f"::error title={name} evidence::{problem}", flush=True)
+                            if environment.get("GITHUB_STEP_SUMMARY"):
+                                with Path(environment["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+                                    summary.write(f"\n### Failed: {name} evidence\n\n{problem}\n")
                 evidence["steps"].append(record)
                 write_evidence(output, evidence)
     evidence["status"] = "passed" if evidence["steps"] and all(step["status"] == "passed" for step in evidence["steps"]) and "error" not in evidence else "failed"

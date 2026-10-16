@@ -42,7 +42,7 @@ wheels = [
 
 [[package]]
 name = "c-two"
-version = "0.7.5"
+version = "0.7.6"
 source = { editable = "sdk/python" }
 
 [package.optional-dependencies]
@@ -68,12 +68,21 @@ benchmark = [
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "ray", marker = "python_full_version < '3.14'" },
 ]
+ci-policy = [
+    { name = "maturin" },
+    { name = "packaging" },
+    { name = "pytest" },
+    { name = "pytest-timeout" },
+    { name = "pytest-xdist" },
+    { name = "pyyaml" },
+]
 dev = [
     { name = "c-two", extra = ["fastdb"] },
     { name = "httpx" },
     { name = "maturin" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "packaging" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pillow" },
@@ -99,11 +108,20 @@ benchmark = [
     { name = "numpy", specifier = ">=2.2.4" },
     { name = "ray", marker = "python_full_version < '3.14'", specifier = ">=2.55.0" },
 ]
+ci-policy = [
+    { name = "maturin", specifier = ">=1.7,<2.0" },
+    { name = "packaging", specifier = ">=24.0" },
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-timeout", specifier = ">=2.0.0" },
+    { name = "pytest-xdist", specifier = "==3.8.0" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
+]
 dev = [
     { name = "c-two", extras = ["fastdb"], editable = "sdk/python" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "maturin", specifier = ">=1.7,<2.0" },
     { name = "numpy", specifier = ">=2.2.4" },
+    { name = "packaging", specifier = ">=24.0" },
     { name = "pandas", specifier = ">=2.2.0" },
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "pyarrow", specifier = ">=23.0.1" },

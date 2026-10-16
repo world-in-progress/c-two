@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
@@ -22,14 +24,14 @@ def _workflow_text() -> str:
     )
 
 
-def test_cli_release_promotes_only_after_both_candidate_gates_complete():
-    """The promotion triggers on either gate's completion, main pushes only."""
-    text = _workflow_text()
-
-    assert "workflow_run:" in text
-    assert "workflows: [Release Candidate, Source Validation]" in text
-    assert "types: [completed]" in text
-    assert "branches: [main]" in text
+def test_cli_release_requires_an_explicit_candidate_and_defaults_to_preview():
+    workflow = yaml.load(_workflow_text(), Loader=yaml.BaseLoader)
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"candidate_run_id", "dry_run"}
+    assert inputs["candidate_run_id"]["required"] == "true"
+    assert inputs["dry_run"]["default"] == "true"
+    assert "workflow_run" not in _workflow_text()
 
 
 def test_cli_release_accepts_explicit_manual_candidate_inputs():
@@ -37,7 +39,7 @@ def test_cli_release_accepts_explicit_manual_candidate_inputs():
 
     assert "workflow_dispatch:" in text
     assert "candidate_run_id:" in text
-    assert "source_sha:" in text
+    assert "required: true" in text
     assert "dry_run:" in text
 
 
@@ -48,8 +50,7 @@ def test_cli_release_fails_closed_outside_the_canonical_repository():
 
     assert "github.repository == 'world-in-progress/c-two'" in text
     assert "github.ref == 'refs/heads/main'" in text
-    assert "github.event.workflow_run.event == 'push'" in text
-    assert "github.event.workflow_run.head_branch == 'main'" in text
+    assert "github.event_name == 'workflow_dispatch'" in text
 
 
 def test_cli_release_never_rebuilds_the_candidate_bytes():
@@ -68,7 +69,6 @@ def test_cli_release_publishes_only_verified_staged_bytes():
     publish = _workflow_text().split("  publish:", 1)[1]
 
     assert "needs: prepare" in publish
-    assert "needs.prepare.outputs.deferred == 'false'" in publish
     assert "needs.prepare.outputs.action == 'upload'" in publish
     assert "inputs.dry_run != true" in publish
     assert "permissions:" in publish
@@ -94,43 +94,6 @@ def test_cli_release_creates_the_release_only_when_the_plan_says_it_is_missing()
     assert 'extra+=(--verify-tag)' in publish
     assert 'extra+=(--target "$SOURCE_SHA")' in publish
     assert "REPO: world-in-progress/c-two" in _workflow_text()
-
-
-def test_cli_release_defers_when_only_one_gate_has_completed():
-    """Exit 75 (deferred) is a neutral skip; the late event re-triggers promotion."""
-    text = _workflow_text()
-
-    assert 'if [ "$code" -eq 75 ]' in text
-    assert "deferred=true" in text
-    assert "action=deferred" in text
-
-
-def test_cli_release_skips_explicitly_when_version_already_published():
-    """Automatic workflow_run promotions whose c3 version is already fully
-    released from the tagged source commit finish as a no-publication skip
-    validated against the published, manifest-bound release; manual
-    dispatches keep failing closed on that collision."""
-    text = _workflow_text()
-    prepare = text.split("  publish:", 1)[0]
-
-    # The skip allowance exists only on the automatic workflow_run path.
-    assert "AUTOMATIC: ${{ github.event_name == 'workflow_run' }}" in prepare
-    assert (
-        'if [ "$AUTOMATIC" = "true" ]; then args+=(--skip-already-published); fi'
-        in prepare
-    )
-    # The prepare parser accepts the skip plan and reports it explicitly,
-    # reading the reason from the selected group so a late race skip stored
-    # under github_release cannot raise.
-    assert 'plan.get("github_release") or plan["skip"]' in prepare
-    assert "No publication: {release['reason']}" in prepare
-    assert "plan['skip']['reason']" not in prepare
-    assert '"skip-already-published"' in prepare
-    # A skip retains no staged bytes or plan artifact and never publishes:
-    # both retention steps are gated, and publish still requires 'upload'.
-    assert prepare.count("action != 'skip-already-published'") == 2
-    publish = text.split("  publish:", 1)[1]
-    assert "needs.prepare.outputs.action == 'upload'" in publish
 
 
 def test_cli_release_prepare_job_reads_actions_with_least_privilege():
@@ -218,16 +181,12 @@ def test_ci_keeps_workflow_policy_tests_lightweight():
     )
 
     assert "workflow-policy:" in ci_text
-    assert "tests/repo/test_cli_release_workflow.py" in ci_text
+    assert "          tests/repo/\n" in ci_text
     assert "sdk/python/tests/unit/test_cli_release_workflow.py" not in ci_text
-    assert "uv run --no-project" in ci_text
-    assert "--with pytest" in ci_text
+    assert "uv run --locked --only-group ci-policy" in ci_text
     assert "--confcutdir=tests/repo" in ci_text
     assert "--confcutdir=sdk/python/tests/unit" not in ci_text
-    assert "tests/repo/test_c3_tool.py" in ci_text
-    assert "tests/repo/test_c3_installer.py" in ci_text
     assert "sdk/python/tests/unit/test_c3_tool.py" not in ci_text
-    assert "tests/repo/test_python_package_release_workflow.py" in ci_text
     assert "sdk/python/tests/unit/test_python_package_release_workflow.py" not in ci_text
     # The source runner delegates the complete Python partition and receipts
     # to the prepared test entry point rather than an inline pytest invocation.

@@ -9,18 +9,22 @@ dependencies = [
 ]
 
 [dependency-groups]
+ci-policy = [
+    "maturin>=1.7,<2.0",
+    "packaging>=24.0",
+    "pyyaml>=6.0.2",
+    "pytest>=8.0.0",
+    "pytest-timeout>=2.0.0",
+    "pytest-xdist==3.8.0",
+]
 dev = [
+    { include-group = "ci-policy" },
     "c-two[fastdb]",
     "httpx>=0.28.1",
-    "maturin>=1.7,<2.0",
-    "pyyaml>=6.0.2",
     "numpy>=2.2.4",
     "pandas>=2.2.0",
     "pillow>=12.3.0",
     "pyarrow>=23.0.1",
-    "pytest>=8.0.0",
-    "pytest-timeout>=2.0.0",
-    "pytest-xdist==3.8.0",
 ]
 examples = [
     "numpy>=2.2.4",

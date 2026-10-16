@@ -7,9 +7,14 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      force_full:
+        description: "Run complete same-source release qualification"
+        type: boolean
+        default: true
 
 concurrency:
-  group: source-${{ github.ref }}
+  group: source-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -35,31 +40,37 @@ env:
 jobs:
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
-      source: ${{ steps.filter.outputs.source }}
+      source: ${{ steps.select.outputs.source }}
     steps:
-      # PR paths come from the API, without checking out a second copy.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: dorny/paths-filter@v4
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch'
         id: filter
         with:
+          base: ${{ github.event.merge_group.base_sha || github.event.before || github.event.repository.default_branch }}
+          ref: ${{ github.sha }}
+          list-files: json
           filters: |
-            source:
-              - 'core/**'
-              - 'cli/**'
-              - 'sdk/**'
-              - 'examples/**'
-              - 'tools/**'
-              - 'tests/**'
-              - '.github/**'
-              - '.gitattributes'
-              - 'pyproject.toml'
-              - 'uv.lock'
-              - 'rust-toolchain*'
+            changed:
+              - '**'
+      - name: Select required source checks
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_FULL: ${{ github.event_name == 'workflow_dispatch' && inputs.force_full }}
+          CHANGED_FILES_JSON: ${{ steps.filter.outputs.changed_files }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files || 0 }}
+        run: python .github/scripts/ci_scope.py
 
   source:
-    needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.source == 'true'
+    needs: [changes, workflow-policy]
+    if: needs.changes.outputs.source == 'true'
     name: source (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -148,6 +159,10 @@ jobs:
             ~/.cargo/git/checkouts
             c-two/core/target
           key: source-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-${{ matrix.python }}-${{ steps.cargo_identity.outputs.key }}-${{ hashFiles('c-two/**/Cargo.lock', 'c-two/**/Cargo.toml', 'c-two/**/.cargo/config.toml', 'c-two/**/rust-toolchain*', 'fastdb/bindings/rust/Cargo.lock', 'fastdb/bindings/rust/**/Cargo.toml', 'c-two/.github/workflows/ci.yml', 'c-two/tools/ci/source_validation.py') }}-${{ env.FASTDB_SOURCE_SHA }}
+          # Cargo fingerprints revalidate restored outputs; version/lockfile
+          # changes should not discard every unchanged compiled dependency.
+          restore-keys: |
+            source-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-${{ matrix.python }}-${{ steps.cargo_identity.outputs.key }}-
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.16.0
@@ -204,6 +219,7 @@ jobs:
           path: fastdb-wasm
           key: source-fastdb-wasm-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.FASTDB_SOURCE_SHA }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
       - name: Run shared source validation
+        timeout-minutes: 50
         env:
           C2_WORKFLOW_SHA: ${{ github.workflow_sha }}
           C2_RUNNER_LABEL: ${{ matrix.os }}
@@ -216,6 +232,7 @@ jobs:
           --expected-fastdb-sha "${{ env.FASTDB_SOURCE_SHA }}"
           --fastdb-system-lib-dir "${{ steps.fastdb_sdk.outputs.lib-dir }}"
           --scope "${{ matrix.scope }}"
+          --timeout 2700
           --output "artifacts/source"
       - name: Save shared Cargo outputs, including after test failures
         if: always() && !cancelled() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''
@@ -262,20 +279,19 @@ jobs:
           CHANGES: ${{ needs.changes.result }}
           SOURCE: ${{ needs.source.result }}
           POLICY: ${{ needs.workflow-policy.result }}
-          REQUIRED: ${{ github.event_name != 'pull_request' || needs.changes.outputs.source == 'true' }}
+          REQUIRED: ${{ needs.changes.outputs.source == 'true' }}
         run: |
           test "$CHANGES" = success
+          test "$POLICY" = success
           if [ "$REQUIRED" = true ]; then
             test "$SOURCE" = success
-            test "$POLICY" = success
           else
             test "$SOURCE" = skipped
-            test "$POLICY" = skipped
           fi
   workflow-policy:
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.source == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     name: workflow policy
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -286,26 +302,31 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
+      - name: Validate workflow syntax and expressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/workflow-policy
+          curl --fail --silent --show-error --location --retry 2 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" 2>&1 | tee artifacts/workflow-policy/actionlint.log
+
       - name: Run workflow policy tests
         run: >-
-          uv run --no-project
-          --with pytest
-          --with pytest-timeout
-          --with packaging
-          --with pyyaml
-          --with maturin
+          uv run --locked --only-group ci-policy --python 3.12
           pytest
           --confcutdir=tests/repo
-          tests/repo/test_cli_release_workflow.py
-          tests/repo/test_python_package_release_workflow.py
-          tests/repo/test_c3_tool.py
-          tests/repo/test_c3_installer.py
-          tests/repo/test_install_c3_powershell.py
-          tests/repo/test_prepare_fastdb_sdk.py
-          tests/repo/test_release_candidate.py
-          tests/repo/test_compiler_cache.py
-          tests/repo/test_resolve_fastdb_release.py
-          tests/repo/test_release_candidate_promotion.py
-          tests/repo/test_source_validation.py
-          tests/repo/test_ipc_memory_benchmark.py
-          -q --timeout=30
+          tests/repo/
+          -q --timeout=30 --junitxml=artifacts/workflow-policy/pytest.xml
+
+      - name: Retain workflow validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-policy-${{ github.sha }}
+          path: artifacts/workflow-policy/
+          retention-days: 14
+          if-no-files-found: warn

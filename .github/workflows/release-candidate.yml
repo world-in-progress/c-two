@@ -24,15 +24,12 @@ name: Release Candidate
 #   installed-wheel lifecycle with every FASTDB_*/loader-path hint cleared.
 #   That build proves the sdist is installable; the publishable wheels are
 #   the repo source-mode builds.
-# Every job checks out github.event.pull_request.head.sha || github.sha so
-# all artifacts bind to one exact source commit, matching the WindowsNative
-# source evidence practice.
+# Every job checks out the dispatch SHA on canonical main. All artifacts bind
+# to that immutable commit and its successful full source-validation run.
 
+# A candidate is built once, on an explicit release qualification request.
+# PRs and ordinary main pushes run Source Validation without packaging 30 wheels.
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -40,69 +37,19 @@ permissions:
 
 concurrency:
   group: release-candidate-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: never
   PYTHONUTF8: "1"
 
 jobs:
-  # A lockfile-only or documentation PR cannot change a publishable archive.
-  # Keep the workflow visible on every PR, but spend the artifact matrix only
-  # on inputs that can affect the release or its validation. Every main push
-  # and manual dispatch still builds the complete candidate.
-  scope:
-    name: release scope
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      build: ${{ steps.select.outputs.build }}
-    steps:
-      - uses: dorny/paths-filter@v4
-        if: github.event_name == 'pull_request'
-        id: paths
-        with:
-          filters: |
-            candidate:
-              - 'core/**'
-              - 'cli/**'
-              - 'sdk/**'
-              - 'examples/**'
-              - 'tools/**'
-              - 'tests/**'
-              - '.github/**'
-              - 'pyproject.toml'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain*'
-              - '.cargo/**'
-              - '.gitattributes'
-              - '.gitignore'
-              - 'LICENSE'
-
-      - name: Select candidate matrix
-        id: select
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          CANDIDATE_PATHS: ${{ steps.paths.outputs.candidate }}
-          CHANGED_FILES: ${{ github.event.pull_request.changed_files || 0 }}
-        run: |
-          # GitHub's PR files API stops after 3,000 files. Run the complete
-          # matrix when the path result could be incomplete.
-          if [ "$EVENT_NAME" != "pull_request" ] || [ "$CANDIDATE_PATHS" = "true" ] || [ "$CHANGED_FILES" -ge 3000 ]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "Building the complete release candidate."
-          else
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "No release inputs changed; CI remains the PR gate."
-          fi
-
   # ── Source-bound context: versions, commit, official FastDB byte identities ──
   context:
-    needs: scope
-    if: needs.scope.outputs.build == 'true'
+    if: github.repository == 'world-in-progress/c-two' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -115,11 +62,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+
+      - name: Require completed full source validation before packaging
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python -m pip install --quiet packaging
+          python .github/scripts/promote_release_candidate.py check-source --source-sha "${{ github.sha }}" --plan-output source-gate.json
 
       # Python FastDB and the native Core have independent exact pins. Validate
       # both from repository metadata; the optional Python extra is what
@@ -206,7 +160,6 @@ jobs:
       - name: Record candidate context and versions
         id: versions
         env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
           FASTDB_VERSION: ${{ steps.fastdb.outputs.version }}
           FASTDB_SOURCE_REV: ${{ steps.fastdb.outputs.source_rev }}
         run: |
@@ -218,13 +171,13 @@ jobs:
               r'^version = "(.+)"$',
               pathlib.Path("cli/Cargo.toml").read_text(encoding="utf-8"),
               re.MULTILINE).group(1)
-          source_sha = os.environ.get("PR_HEAD_SHA") or os.environ["GITHUB_SHA"]
+          source_sha = os.environ["GITHUB_SHA"]
           context = {
               "schema": "c-two.release-candidate.context.v1",
               "source_commit_sha": source_sha,
               "event": os.environ.get("GITHUB_EVENT_NAME", ""),
               "ref": os.environ.get("GITHUB_REF", ""),
-              "pull_request_head_sha": os.environ.get("PR_HEAD_SHA") or None,
+              "source_validation_run_id": json.loads(pathlib.Path("source-gate.json").read_text())["run_id"],
               "c_two_version": pyproject["project"]["version"],
               "c3_version": cli_version,
               "fastdb_version": os.environ["FASTDB_VERSION"],
@@ -341,7 +294,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -356,8 +309,12 @@ jobs:
       - name: Verify every retained artifact against its sidecar
         run: |
           python -m pip install --quiet packaging
-          python .github/scripts/release_candidate.py verify \
-            $(find candidate -type f ! -name '*.sha256')
+          python - <<'PY'
+          import pathlib, subprocess, sys
+          files = sorted(str(path) for path in pathlib.Path("candidate").rglob("*")
+                         if path.is_file() and path.suffix != ".sha256")
+          subprocess.run([sys.executable, ".github/scripts/release_candidate.py", "verify", *files], check=True)
+          PY
 
       # Inventory binds the exact source sha, versions, and per-artifact
       # SHA-256 digests; enforces the exact 5-target x 6-ABI row set with
@@ -367,7 +324,7 @@ jobs:
       # inputs — including their license evidence — out of product counts.
       - name: Aggregate the source-bound promotion manifest
         env:
-          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           python .github/scripts/release_candidate.py manifest \
             --root candidate \
@@ -380,7 +337,6 @@ jobs:
             --meta "fastdb_version=${{ needs.context.outputs.fastdb_version }}" \
             --meta "fastdb_source_rev=${{ needs.context.outputs.fastdb_source_rev }}" \
             --meta "fastdb_sdist_sha256=${{ needs.context.outputs.fastdb_sdist_sha256 }}" \
-            --meta "pr_head_sha=${{ github.event.pull_request.head.sha || '' }}" \
             --expect-cli 5 \
             --expect-wheels 30 \
             --expect-sdist 1 \

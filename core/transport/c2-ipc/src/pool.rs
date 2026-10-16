@@ -1554,11 +1554,14 @@ impl ClientPool {
             observe_retired_closes(&txn, observed);
             txn.retired
                 .retain(|_, record| record.state() != RetiredState::Confirmed);
-            for record in txn
-                .retired
-                .values()
-                .filter(|record| record.state() != RetiredState::Preparing)
-            {
+            for record in txn.retired.values().filter(|record| {
+                // A preparing acquire can confirm after retain above.
+                // Only unfinished close states belong in this report.
+                matches!(
+                    record.state(),
+                    RetiredState::Closing | RetiredState::UnconfirmedIdle
+                )
+            }) {
                 let already_reported = report
                     .unconfirmed
                     .iter()
