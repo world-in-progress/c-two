@@ -264,24 +264,6 @@ class CRMProxy:
             'call() not available in thread-local mode; use call_direct()',
         )
 
-    def call_prepared(self, method_name: str, plan: object) -> bytes:
-        """Send a prepared payload plan when the underlying transport supports it."""
-        with self._close_lock:
-            if self._closed:
-                raise RuntimeError('Proxy is closed')
-        if self._mode in ('ipc', 'http'):
-            call_prepared = getattr(self._client, 'call_prepared', None)
-            if callable(call_prepared):
-                return _native_call(call_prepared, method_name, plan)
-        if self._mode in ('ipc', 'http'):
-            to_bytes = getattr(plan, 'to_bytes', None)
-            if not callable(to_bytes):
-                raise TypeError('prepared payload plan must define to_bytes() for fallback calls')
-            return self.call(method_name, to_bytes())
-        raise NotImplementedError(
-            'call_prepared() not available in thread-local mode; use call_direct()',
-        )
-
     def call_direct(self, method_name: str, args: tuple) -> Any:
         """Call CRM method directly with Python objects (thread-local mode).
 

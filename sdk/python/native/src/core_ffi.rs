@@ -170,44 +170,6 @@ impl PyNativePreparedCall {
         Self::finish(py, encoded)
     }
 
-    fn call_prepared(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<PyCoreResponse> {
-        let mut prepared = self.take()?;
-        if let Some(nbytes) = prepared_plan_nbytes(plan)? {
-            prepared
-                .charge_input(nbytes as u64)
-                .map_err(core_error_to_py)?;
-            // write_into is user code and stays on this caller/GIL thread.
-            // Its destination owns its memory, even if a view escapes.
-            let request = materialize_python_payload_plan(py, plan, nbytes)?;
-            return Self::finish(py, prepared.encode_vec(request).map_err(core_error_to_py)?);
-        }
-        if let Ok(bytes) = plan.cast_exact::<PyBytes>() {
-            let owner = bytes.clone().unbind();
-            let encoded = prepared
-                .encode(bytes.as_bytes().len(), move || {
-                    Ok(Python::attach(|py| {
-                        let bytes = owner.bind(py).as_bytes();
-                        // Immutable bytes remain pinned by owner while the native
-                        // copy releases the GIL. The expired waiter can reacquire
-                        // Python independently of a still-running native copy.
-                        py.detach(|| bytes.to_vec())
-                    }))
-                })
-                .map_err(core_error_to_py)?;
-            return Self::finish(py, encoded);
-        }
-        let continuation = Self {
-            inner: Mutex::new(Some(prepared)),
-        };
-        if PyBuffer::<u8>::get(plan).is_ok() {
-            return continuation.call(py, plan);
-        }
-        // Unknown-size Python serialization remains on the caller. The same
-        // preparation is charged against its original D before native copying.
-        let materialized = plan.call_method0("to_bytes")?;
-        continuation.call(py, &materialized)
-    }
-
     fn close(&self) {
         let closed = self.inner.lock().take();
         drop(closed);
@@ -274,15 +236,6 @@ impl PyCoreClient {
         data: &Bound<'_, PyAny>,
     ) -> PyResult<PyCoreResponse> {
         self.begin_call(py, method_name)?.call(py, data)
-    }
-
-    fn call_prepared(
-        &self,
-        py: Python<'_>,
-        method_name: &str,
-        plan: &Bound<'_, PyAny>,
-    ) -> PyResult<PyCoreResponse> {
-        self.begin_call(py, method_name)?.call_prepared(py, plan)
     }
 
     fn close(&self) {

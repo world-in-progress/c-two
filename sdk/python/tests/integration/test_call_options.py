@@ -435,63 +435,22 @@ def test_fastdb_checked_owner_and_views_preserve_hold_invalidation_order(portabl
         cc.close(view)
 
 
-def test_native_prepared_call_is_single_use_and_writer_stays_on_caller(ipc_connection):
+def test_native_prepared_call_is_single_use(ipc_connection):
     import pickle
 
     connection, _ = ipc_connection
     view = cc.with_call_options(connection, timeout=1)
     data = pickle.dumps(('prepared', 0.0), protocol=4)
-    caller = threading.get_ident()
-    writer_threads = []
-
-    class Plan:
-        nbytes = len(data)
-
-        def write_into(self, sink):
-            writer_threads.append(threading.get_ident())
-            with memoryview(sink) as destination:
-                destination[:] = data
-
     prepared = view.client.begin_call('echo')
     try:
-        response = prepared.call_prepared(Plan())
+        response = prepared.call(data)
         try:
             assert pickle.loads(memoryview(response)) == 'prepared'
         finally:
             response.release()
-        assert writer_threads == [caller]
         with pytest.raises(ValueError, match='consumed'):
             prepared.call(data)
     finally:
-        prepared.close()
-        cc.close(view)
-
-
-def test_native_prepared_writer_escaped_view_is_pinned_and_never_dispatched(ipc_connection):
-    connection, resource = ipc_connection
-    view = cc.with_call_options(connection, timeout=1)
-    escaped = []
-
-    class EscapingPlan:
-        nbytes = 16
-
-        def write_into(self, sink):
-            escaped.append(memoryview(sink))
-            escaped[0][:] = b'a' * 16
-
-    prepared = view.client.begin_call('echo')
-    try:
-        with pytest.raises(BufferError, match='retained an exported'):
-            prepared.call_prepared(EscapingPlan())
-        assert bytes(escaped[0]) == b'a' * 16
-        escaped[0][:] = b'b' * 16
-        assert resource.calls == 0
-        assert cc.call_execution_snapshot()['used_operations'] == 0
-        assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
-        assert connection.echo('after') == 'after'
-    finally:
-        for destination in escaped:
-            destination.release()
         prepared.close()
         cc.close(view)
 
@@ -692,7 +651,7 @@ def test_closed_view_is_call_resource_error_before_serializer(ipc_connection, in
     assert connection.echo('after') == 'after'
 
 
-def test_prepared_close_gc_and_escaped_writer_failure_refund_only_pre_dispatch(ipc_connection):
+def test_prepared_close_gc_and_invalid_buffer_refund_only_pre_dispatch(ipc_connection):
     import gc
 
     connection, resource = ipc_connection
@@ -710,24 +669,16 @@ def test_prepared_close_gc_and_escaped_writer_failure_refund_only_pre_dispatch(i
             assert cc.call_execution_snapshot()['used_operations'] == 0
             assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
 
-        escaped = []
-
-        class FailingWriter:
-            nbytes = 16
-
-            def write_into(self, sink):
-                escaped.append(memoryview(sink))
-                escaped[0][:] = b'x' * 16
-                raise ValueError('writer failed')
-
         prepared = view.client.begin_call('echo')
-        with pytest.raises(ValueError, match='writer failed'):
-            prepared.call_prepared(FailingWriter())
+        prepared.charge_input(16)
+        with pytest.raises(TypeError):
+            prepared.call(object())
+        assert cc.call_execution_snapshot()['used_operations'] == 0
+        assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
+        with pytest.raises(ValueError, match='consumed'):
+            prepared.call(b'')
         del prepared
         gc.collect()
-        assert bytes(escaped[0]) == b'x' * 16
-        escaped[0][0] = ord('y')
-        escaped[0].release()
         assert cc.call_execution_snapshot()['used_operations'] == 0
         assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
         assert resource.calls == 0

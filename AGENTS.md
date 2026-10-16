@@ -333,6 +333,8 @@ class Grid:
 
 FastDB Core is the sole authority for nested parsing, canonical identity, digest, binary layout, build/open/view/materialize/invalidate behavior, and payload-only codegen. C-Two validates only the outer contract and binding relationship. Server-side borrowed input is explicit registration policy through `cc.register(..., input_lifetime={...})`; method metadata must not bypass that gate.
 
+The old Python `CRMProxy.call_prepared`, `CoreClient.call_prepared`, and `NativePreparedCall.call_prepared` write-plan entry points are retired. Client requests retain `begin_call` / `charge_input` / `call` / `close` and the Python-only pickle fallback; do not restore arbitrary client encoding plans as a formal alternative to FastDB. Core opaque-byte interfaces, server-side writable sinks, Rust IPC preallocation, and the existing custom client/scheduler adaptation protocols remain unchanged.
+
 ### Hold Mode Pattern
 
 `cc.hold()` wraps a CRM proxy bound method for client-side SHM retention. It returns `HeldResult` with `.value`, `.unsafe_buffer`, and `.release()`. Safety layers are explicit release, context manager, and `__del__` fallback.

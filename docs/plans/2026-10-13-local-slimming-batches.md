@@ -1,5 +1,11 @@
 # C-Two 局部精简批次记录与收束
 
+## R25 旧 Python prepared-payload 入口退役（2026-10-16，进行中）
+
+执行基线 `3b191b52`。用户确认删除 `CRMProxy.call_prepared`、`CoreClient.call_prepared` 和 `NativePreparedCall.call_prepared`，不留兼容。该链源自旧 FastDB 写入计划，不作为任意自定义编码器的正式能力维护；现行 FastDB Payload 与 Python-only pickle 调用、Core 字节接口、服务端 sink、Rust 预分配及自定义 client/scheduler 适配协议保留，预算、期限、快照和释放语义不变。
+
+先将单次消费及计费后失败退款测试迁到 `call(data)` 并在原生产实现通过，再删除三个入口与专属 writer 用例，保留服务端 sink 的真实逃逸 view 安全测试。退出条件为针对性回归、完整 relay、真实跨语言、GitHub Actions 跨平台门禁、端点零残留和独立审查；验收后提交并分别报告生产、测试和文档增减。历史目录不动，不使用 buddy；证据位于 `~/.codex/diagnostics/c2-r25-64a02321/`。
+
 ## 生成 TypeScript Node IPC 工厂退役（2026-10-16，完成）
 
 执行基线 `dc7cfd24`，实现候选 `9a50c7e88a67a590b351a92cb19faedb0dfd36b1`。用户接受删除生成模块的 `createNodeIpcConnect`、`C2NodeIpcSocket`、`C2NodeIpcNet`、`C2NodeIpcConnectOptions` 及专属 socket 缓冲/等待状态链，不留兼容入口。通用 `C2IpcConnect` / `C2IpcConnection` 注入保留，官方 `@c-two/c2-mem-ffi` 连接器生产源码逐字不变；配置冻结、HTTP-only 惰性加载、身份与生命周期、Rust API、C/FFI ABI 和 wire 保持。

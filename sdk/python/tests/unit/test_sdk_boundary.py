@@ -618,10 +618,9 @@ def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     assert 'self.inner.lock().take()' in take
     assert 'self.inner.lock().clone()' in clone
     assert '.lock()' not in begin + call + finish
-    for name in ('call', 'call_prepared'):
-        prepared_call = _rust_compact(_rust_function(core_ffi, name))
-        assert 'letmutprepared=self.take()?;' in prepared_call
-        assert 'begin_call(' not in prepared_call
+    prepared_call = _rust_compact(_rust_function(core_ffi, 'call'))
+    assert 'letmutprepared=self.take()?;' in prepared_call
+    assert 'begin_call(' not in prepared_call
     for source in (core_ffi, runtime_session):
         assert re.search(
             r'\bfn\s+call(?:<[^>]*>)?\s*\([^)]*\broute_name\s*:', source,
