@@ -1468,6 +1468,18 @@ impl Drop for RequestBlock {
 /// final writer clear).
 const DEFAULT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+// DISCONNECT is a courtesy exchange, never the local close barrier. Share
+// this short window between its write and ACK so an unresponsive peer cannot
+// consume the caller's server/work-drain budget.
+const DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+const DISCONNECT_NOT_CONNECTED: u8 = 0;
+const DISCONNECT_PENDING: u8 = 1;
+const DISCONNECT_ACKNOWLEDGED: u8 = 2;
+const DISCONNECT_WRITE_FAILED: u8 = 3;
+const DISCONNECT_WRITE_TIMEOUT: u8 = 4;
+const DISCONNECT_ACK_TIMEOUT: u8 = 5;
+const DISCONNECT_PEER_CLOSED: u8 = 6;
+
 /// A chunk failure's stage, independent of allocator diagnostic text.
 #[derive(Debug)]
 pub enum ChunkError {
@@ -2344,6 +2356,7 @@ where
 /// own incarnation, never a new connection's state.
 struct ReceiveConnectionState {
     connected: Arc<AtomicBool>,
+    disconnect: Arc<AtomicU8>,
 }
 
 impl ReceiveConnectionState {
@@ -2390,6 +2403,9 @@ pub struct IpcClient {
     /// tasks finish. Reconnect must wait for that same transaction to finish.
     close_incomplete: AtomicBool,
     connected: Arc<AtomicBool>,
+    /// Protocol observation for this connection incarnation, independent of
+    /// local task/pool cleanup. A retry must retain the original close reason.
+    disconnect: Arc<AtomicU8>,
     /// Transport-owned request pool.
     ///
     /// `Some` while this client owns the pool. A confirmed close detaches the
@@ -2562,6 +2578,7 @@ impl IpcClient {
             close_gate: tokio::sync::Mutex::new(()),
             close_incomplete: AtomicBool::new(false),
             connected: Arc::new(AtomicBool::new(false)),
+            disconnect: Arc::new(AtomicU8::new(DISCONNECT_NOT_CONNECTED)),
             pool: StdMutex::new(pool),
             pool_transport_owned,
             pool_injected,
@@ -2876,6 +2893,7 @@ impl IpcClient {
         // The old receive guard must never publish into a later incarnation.
         // The gate above still requires its task to be joined before reconnect.
         self.connected = Arc::new(AtomicBool::new(false));
+        self.disconnect = Arc::new(AtomicU8::new(DISCONNECT_NOT_CONNECTED));
         let endpoint = self
             .endpoint
             .as_ref()
@@ -3126,8 +3144,10 @@ impl IpcClient {
         let server_pool = self.server_pool.clone();
         let writer_clone = self.writer.clone();
         self.connected.store(true, Ordering::Release);
+        self.disconnect.store(DISCONNECT_PENDING, Ordering::Release);
         let connection = ReceiveConnectionState {
             connected: Arc::clone(&self.connected),
+            disconnect: Arc::clone(&self.disconnect),
         };
         let chunk_registry = connect_metadata_lock(&self.chunk_registry, "ipc_metadata_wait")?
             .clone()
@@ -4902,6 +4922,27 @@ impl IpcClient {
         self.connected.load(Ordering::Acquire)
     }
 
+    /// Only confirmed local closes consume this observation. A missing ACK
+    /// does not imply that receive work, pending allocations or leases drained.
+    pub(crate) fn abnormal_close_reason(&self) -> Option<&'static str> {
+        match self.disconnect.load(Ordering::Acquire) {
+            DISCONNECT_WRITE_FAILED => Some("disconnect_write_failed"),
+            DISCONNECT_WRITE_TIMEOUT => Some("disconnect_write_timeout"),
+            DISCONNECT_ACK_TIMEOUT => Some("disconnect_ack_timeout"),
+            DISCONNECT_PEER_CLOSED => Some("peer_closed_without_disconnect_ack"),
+            _ => None,
+        }
+    }
+
+    fn record_abnormal_disconnect(&self, reason: u8) {
+        let _ = self.disconnect.compare_exchange(
+            DISCONNECT_PENDING,
+            reason,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     /// Manually override the connection flag.
     ///
     /// Intended for test scenarios where a real handshake is not
@@ -4947,6 +4988,9 @@ impl IpcClient {
     /// Receiver teardown and pending settlement retain busy carriers in their
     /// connection owners for retry. This bounds contended cleanup waits, not
     /// OS scheduling or mapping destruction as a hard real-time guarantee.
+    /// The best-effort DISCONNECT write/ACK has its own 100 ms window inside
+    /// that deadline. Forced transport closure can still confirm local drain;
+    /// its protocol reason is retained separately for the owning cache.
     pub async fn close_shared_bounded(&self, timeout: std::time::Duration) -> bool {
         use tokio::time::timeout_at;
 
@@ -4955,6 +4999,7 @@ impl IpcClient {
             .unwrap_or_else(|| {
                 tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365)
             });
+        let disconnect_deadline = deadline.min(tokio::time::Instant::now() + DISCONNECT_GRACE);
         self.connected.store(false, Ordering::Release);
 
         // Serialize close barriers: only one closer manipulates the writer
@@ -4990,31 +5035,39 @@ impl IpcClient {
             }
         }
 
-        // Bound both writer-lock acquisition and the disconnect exchange. A
+        // Bound both writer-lock acquisition and the courtesy disconnect. A
         // cancelled partial write aborts its stream instead of leaving a frame
         // prefix for a later writer to reuse.
-        if timeout_at(deadline, async {
+        let disconnect_write = timeout_at(disconnect_deadline, async {
             let mut guard = self.writer.lock().await;
             if let Some(writer) = guard.as_mut() {
                 let frame = frame::encode_frame(0, flags::FLAG_SIGNAL, &[SIG_DISCONNECT]);
-                let _ = writer.write_all(&frame).await;
+                writer.write_all(&frame).await?;
             }
+            Ok::<_, std::io::Error>(())
         })
-        .await
-        .is_err()
-        {
-            confirmed = false;
+        .await;
+        if !matches!(disconnect_write, Ok(Ok(()))) {
+            self.record_abnormal_disconnect(if disconnect_write.is_err() {
+                DISCONNECT_WRITE_TIMEOUT
+            } else {
+                DISCONNECT_WRITE_FAILED
+            });
             // The writer slot is stuck (for example a blocked bulk write
             // holding the lock). Abort the stream now so that writer fails
-            // and releases the lock instead of pinning the whole deadline.
-            self.abort_stream_for_close(false);
+            // and releases the lock. Local drain is still confirmed only by
+            // the original task, writer and allocation barriers below.
+            confirmed &= self.abort_stream_for_close(false);
         }
 
-        // The receive loop ends on DISCONNECT_ACK or peer EOF. Reserve up to
-        // one second of the original deadline for its abort/join, as before.
+        // The receive loop ends on DISCONNECT_ACK or peer EOF. Never wait on
+        // the peer beyond the courtesy window; retain the original deadline
+        // and its reserved join time for actual local cleanup.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let graceful_deadline = deadline - remaining.min(std::time::Duration::from_secs(1));
+        let graceful_deadline =
+            disconnect_deadline.min(deadline - remaining.min(std::time::Duration::from_secs(1)));
         if !join_close_task(&self.recv_handle, graceful_deadline, |task| task).await {
+            self.record_abnormal_disconnect(DISCONNECT_ACK_TIMEOUT);
             if !self.abort_stream_for_close(false) {
                 confirmed = false;
             }
@@ -5029,6 +5082,7 @@ impl IpcClient {
                 confirmed = false;
             }
         }
+        self.record_abnormal_disconnect(DISCONNECT_PEER_CLOSED);
         if !self.abort_stream_for_close(true) {
             confirmed = false;
         }
@@ -5521,6 +5575,11 @@ async fn recv_loop_inner(
                         }
                     }
                     SIG_DISCONNECT_ACK => {
+                        if let Some(connection) = connection.as_ref() {
+                            connection
+                                .disconnect
+                                .store(DISCONNECT_ACKNOWLEDGED, Ordering::Release);
+                        }
                         break; // Server acknowledged disconnect — exit cleanly.
                     }
                     _ => {} // Ignore unknown signals.
@@ -8302,8 +8361,10 @@ mod pending_disconnect_tests {
         // without an OS listener. The delayed task owns only the old flag.
         let mut client = IpcClient::new("not-an-ipc-address");
         let old = Arc::clone(&client.connected);
+        let old_disconnect = Arc::clone(&client.disconnect);
         let connection = ReceiveConnectionState {
             connected: Arc::clone(&old),
+            disconnect: Arc::clone(&old_disconnect),
         };
         let receiver = tokio::spawn(async move {
             let _connection = connection;
@@ -8311,6 +8372,12 @@ mod pending_disconnect_tests {
         });
         assert!(matches!(client.connect().await, Err(IpcError::Config(_))));
         assert!(!Arc::ptr_eq(&old, &client.connected));
+        assert!(!Arc::ptr_eq(&old_disconnect, &client.disconnect));
+        old_disconnect.store(DISCONNECT_ACKNOWLEDGED, Ordering::Release);
+        assert_eq!(
+            client.disconnect.load(Ordering::Acquire),
+            DISCONNECT_NOT_CONNECTED
+        );
         client.force_connected(true);
         old.store(true, Ordering::Release);
         // Covers cancellation before the receiver's first poll as well as a
@@ -8341,6 +8408,7 @@ mod pending_disconnect_tests {
         let connected = Arc::new(AtomicBool::new(true));
         let connection = ReceiveConnectionState {
             connected: Arc::clone(&connected),
+            disconnect: Arc::new(AtomicU8::new(DISCONNECT_PENDING)),
         };
         let drain = tokio::spawn(async move {
             drain_pending_on_disconnect(

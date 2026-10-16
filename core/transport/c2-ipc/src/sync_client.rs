@@ -518,6 +518,10 @@ impl SyncClient {
         self.rt.block_on(self.inner.close_shared_bounded(timeout))
     }
 
+    pub(crate) fn abnormal_close_reason(&self) -> Option<&'static str> {
+        self.inner.abnormal_close_reason()
+    }
+
     /// Whether the client is connected.
     pub fn is_connected(&self) -> bool {
         self.inner.is_connected()

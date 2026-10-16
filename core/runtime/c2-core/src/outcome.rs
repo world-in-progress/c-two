@@ -1,3 +1,5 @@
+pub use c2_ipc::pool::IpcClientCloseDetail;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterOutcome {
     pub route_name: String,
@@ -57,4 +59,8 @@ pub struct ShutdownOutcome {
     /// barrier was unconfirmed within the shutdown deadline. `None` means
     /// every detached client confirmed its close.
     pub ipc_client_close_error: Option<String>,
+    /// Locally closed outgoing connections without a normal disconnect ACK.
+    /// These are terminal local closes, not pending client/server drain work.
+    pub ipc_clients_abnormally_closed: usize,
+    pub ipc_client_close_details: Vec<IpcClientCloseDetail>,
 }

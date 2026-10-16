@@ -1479,6 +1479,24 @@ fn shutdown_outcome_to_dict<'py>(
     dict.set_item("route_close_error", outcome.route_close_error)?;
     dict.set_item("runtime_barrier_error", outcome.runtime_barrier_error)?;
     dict.set_item("ipc_client_close_error", outcome.ipc_client_close_error)?;
+    dict.set_item(
+        "ipc_clients_abnormally_closed",
+        outcome.ipc_clients_abnormally_closed,
+    )?;
+    let client_close_details = outcome
+        .ipc_client_close_details
+        .into_iter()
+        .map(|detail| {
+            let item = PyDict::new(py);
+            item.set_item("address", detail.address)?;
+            item.set_item("reason", detail.reason)?;
+            Ok(item.unbind())
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    dict.set_item(
+        "ipc_client_close_details",
+        PyList::new(py, client_close_details)?,
+    )?;
     Ok(dict)
 }
 

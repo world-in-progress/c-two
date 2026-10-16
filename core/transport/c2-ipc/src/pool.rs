@@ -574,7 +574,14 @@ struct CloseTxnState {
     next_ticket: u64,
 }
 
-/// Honest outcome of one cache drain.
+/// One confirmed local IPC close without a normal disconnect ACK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcClientCloseDetail {
+    pub address: String,
+    pub reason: String,
+}
+
+/// Local drain and protocol completion are separate observations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientCacheCloseReport {
     /// Number of cache entries detached for close.
@@ -586,6 +593,9 @@ pub struct ClientCacheCloseReport {
     /// barriers started by discard/sweep/loser cleanup. Nothing is claimed
     /// stopped in this case.
     pub error: Option<String>,
+    /// Clients this drain confirmed locally closed without a normal
+    /// DISCONNECT_ACK. These do not make the local close unconfirmed.
+    pub abnormal: Vec<IpcClientCloseDetail>,
 }
 
 /// Reference-counted pool of `SyncClient` instances.
@@ -647,11 +657,22 @@ fn close_retired_work(
     txn: &(Mutex<CloseTxnState>, Condvar),
     work: &RetiredWork,
     deadline: Instant,
-) -> Result<(), String> {
+) -> Result<Option<IpcClientCloseDetail>, String> {
     let client = work.record.client.lock().clone();
     let confirmed = client.as_ref().is_none_or(|client| {
         client.close_shared(deadline.saturating_duration_since(Instant::now()))
     });
+    let abnormal = confirmed
+        .then(|| {
+            client
+                .as_ref()
+                .and_then(|client| client.abnormal_close_reason())
+                .map(|reason| IpcClientCloseDetail {
+                    address: work.record.address.clone(),
+                    reason: reason.to_owned(),
+                })
+        })
+        .flatten();
     if confirmed {
         // Confirmation, rather than registry-lock availability, releases this
         // exact owner. Retained payloads keep their own pool Arcs and charges.
@@ -665,7 +686,7 @@ fn close_retired_work(
     });
     prune_confirmed(txn, work);
     if confirmed {
-        Ok(())
+        Ok(abnormal)
     } else {
         Err(work.record.address.clone())
     }
@@ -720,12 +741,12 @@ fn close_retired_ticket(
     txn: &(Mutex<CloseTxnState>, Condvar),
     ticket: u64,
     deadline: Instant,
-) -> Result<(), String> {
+) -> Result<Option<IpcClientCloseDetail>, String> {
     let record = {
         let state = txn.0.lock();
         match state.retired.get(&ticket) {
             Some(record) if record.state() == RetiredState::Closing => record.clone(),
-            _ => return Ok(()),
+            _ => return Ok(None),
         }
     };
     close_retired_work(txn, &RetiredWork { ticket, record }, deadline)
@@ -1326,6 +1347,7 @@ impl ClientPool {
             detached: 0,
             unconfirmed: Vec::new(),
             error: None,
+            abnormal: Vec::new(),
         };
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -1413,8 +1435,10 @@ impl ClientPool {
         // Children first, then retries, all bounded by the one aggregate
         // deadline (each receives only the time remaining).
         for ticket in drained_tickets.into_iter().chain(retry_tickets) {
-            if let Err(address) = close_retired_ticket(&self.close_txn, ticket, deadline) {
-                report.unconfirmed.push(address);
+            match close_retired_ticket(&self.close_txn, ticket, deadline) {
+                Ok(Some(detail)) => report.abnormal.push(detail),
+                Ok(None) => {}
+                Err(address) => report.unconfirmed.push(address),
             }
         }
 

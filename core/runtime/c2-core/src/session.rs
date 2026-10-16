@@ -1639,13 +1639,20 @@ impl Runtime {
         let client_pool = self.state.lock().client_pool.clone();
         if let Some(client_pool) = client_pool {
             let mut client_close = client_pool.close_all(shutdown_timeout);
+            outcome
+                .ipc_client_close_details
+                .append(&mut client_close.abnormal);
             if server.is_some() {
                 // This native transaction owns outstanding client barriers as well as routes.
                 // Its callers time out independently; keep retrying actual unconfirmed work.
                 while !client_close.unconfirmed.is_empty() || client_close.error.is_some() {
                     client_close = client_pool.close_all(Duration::from_secs(1));
+                    outcome
+                        .ipc_client_close_details
+                        .append(&mut client_close.abnormal);
                 }
             }
+            outcome.ipc_clients_abnormally_closed = outcome.ipc_client_close_details.len();
             outcome.ipc_clients_drained =
                 client_close.unconfirmed.is_empty() && client_close.error.is_none();
             if client_close.error.is_some() || !client_close.unconfirmed.is_empty() {

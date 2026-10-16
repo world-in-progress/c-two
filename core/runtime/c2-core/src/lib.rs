@@ -59,8 +59,8 @@ pub use memory::{
     RetirementHandoff, RuntimeMemoryStats, scope,
 };
 pub use outcome::{
-    RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome, ShutdownOutcome,
-    UnregisterOutcome,
+    IpcClientCloseDetail, RegisterFailureOutcome, RegisterOutcome, RelayCleanupError,
+    RouteCloseOutcome, ShutdownOutcome, UnregisterOutcome,
 };
 pub use owner_bound::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot};
 pub use session::{Runtime, RuntimeIdentity, RuntimeOptions};
