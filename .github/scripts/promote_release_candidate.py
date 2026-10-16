@@ -178,6 +178,7 @@ SOURCE_VALIDATION_LANES = {
 }
 # Frozen FastDB source pin of the Source Validation gates; cross-checked against
 # the trusted checkout's ci.yml so silent pin drift fails closed.
+SOURCE_VALIDATION_FASTDB_CORE_VERSION = "0.2.1"
 SOURCE_VALIDATION_FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
 SMOKE_SCHEMA = "c-two.installed-wheel-smoke.v1"
 STANDARD_USER_WRAPPER_SCHEMA = "c-two.standard-user-wrapper.v1"
@@ -663,6 +664,12 @@ def _receipt_artifact(receipt_name: str, artifacts: Any, predicate, label: str) 
 
 def _verify_lifecycle_cleanup(receipt_name: str, payload: dict[str, Any]) -> None:
     """Lifecycle receipts must prove orderly shutdown and full cleanup."""
+    base = payload.get("base_install") or {}
+    _require(base.get("status") == "passed"
+             and base.get("transports") == ["thread", "ipc"]
+             and base.get("optional_dependencies_present") is False
+             and base.get("optional_modules_loaded") is False,
+             f"receipt {receipt_name} does not prove a dependency-free base installation")
     checks = payload.get("checks")
     _require(isinstance(checks, list) and len(checks) == 2,
              f"receipt {receipt_name} does not record both consumer checks")
@@ -953,7 +960,7 @@ def verify_candidate_receipts(
              (fastdb.get("name"), fastdb.get("sha256")) == (decision["filename"], decision["sha256"]),
              "sdist-proof lifecycle FastDB bytes differ")
     sdk = proof.get("sdk") or {}
-    _require(sdk.get("version") == manifest["meta"]["fastdb_version"]
+    _require(sdk.get("version") == SOURCE_VALIDATION_FASTDB_CORE_VERSION
              and sdk.get("source_sha") == SOURCE_VALIDATION_FASTDB_SHA,
              "sdist-proof Core SDK source/version mismatch")
     bundled = proof.get("bundled_fastdb_libs")
@@ -1749,8 +1756,10 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "",
         f"- c3 version: `{versions['c3_version']}` (Python package `c-two=={versions['c_two_version']}`)",
         f"- Source commit: `{plan['source_sha']}` (canonical `main` push)",
-        f"- FastDB core: statically linked from the official `fastdb4py=={versions['fastdb_version']}` "
-        "release source; upstream LICENSE and THIRD_PARTY_NOTICES are attached verbatim",
+        f"- Native FastDB Core: `{SOURCE_VALIDATION_FASTDB_CORE_VERSION}`, statically linked "
+        f"from source `{versions['fastdb_source_rev']}`",
+        f"- Optional Python FastDB: `fastdb4py=={versions['fastdb_version']}`; "
+        "its upstream LICENSE and THIRD_PARTY_NOTICES are attached verbatim",
         f"- Release-candidate manifest: `rc-manifest.json` (SHA-256 `{manifest_sha}`)",
         "",
         "Validation provenance:",

@@ -20,6 +20,52 @@ import time
 import zipfile
 
 
+# Run before installing the optional extra, in the same isolated environment.
+BASE_CONSUMER = r'''
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+for name in ("fastdb4py", "numpy"):
+    assert importlib.util.find_spec(name) is None, name
+import c_two as cc
+assert Path(cc.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+
+@cc.crm(namespace="ci.base-wheel", version="1.0.0")
+class Echo:
+    def echo(self, value: str) -> str: ...
+
+class Resource:
+    def echo(self, value: str) -> str:
+        return value
+
+try:
+    cc.register(Echo, Resource(), name="plain")
+    with cc.connect(Echo, name="plain") as direct:
+        assert direct.echo("thread") == "thread"
+    with cc.connect(Echo, name="plain", address=cc.server_address()) as ipc:
+        assert ipc.client._mode == "ipc"
+        assert ipc.echo("ipc") == "ipc"
+finally:
+    assert cc.shutdown()["completed"]
+
+try:
+    @cc.crm(namespace="ci.base-wheel.missing", version="1.0.0")
+    class Missing:
+        @cc.transfer(input={})
+        def echo(self, value: bytes) -> bytes: ...
+except ImportError as error:
+    assert "c-two[fastdb]" in str(error)
+else:
+    raise AssertionError("missing FastDB extra was accepted")
+assert not any(name.split(".")[0] in {"fastdb4py", "numpy"} for name in sys.modules)
+print(json.dumps({"status": "passed", "transports": ["thread", "ipc"],
+                  "optional_dependencies_present": False,
+                  "optional_modules_loaded": False}))
+'''
+
+
 # The embedded consumer is copied outside the source checkout and executed
 # only with the new environment's interpreter and installed SDKs.
 CONSUMER = r'''
@@ -169,7 +215,7 @@ def artifact(path: Path) -> dict[str, object]:
             "bytes": path.stat().st_size}
 
 
-def wheel(path: Path, distribution: str) -> tuple[Path, dict[str, object]]:
+def wheel(path: Path, distribution: str, *, fastdb_version: str | None = None) -> tuple[Path, dict[str, object]]:
     candidates = sorted(path.glob("*.whl")) if path.is_dir() else [path]
     if len(candidates) != 1 or not candidates[0].is_file():
         raise ValueError(f"Expected exactly one {distribution} wheel at {path}")
@@ -181,6 +227,16 @@ def wheel(path: Path, distribution: str) -> tuple[Path, dict[str, object]]:
         metadata = Parser().parsestr(archive.read(names[0]).decode("utf-8"))
     if metadata["Name"].replace("_", "-").lower() != distribution:
         raise ValueError(f"Unexpected distribution in {selected}: {metadata['Name']}")
+    if distribution == "c-two":
+        # This release has no default dependencies and one exact optional
+        # dependency. Check the artifact before explicit wheel installation
+        # can hide an empty or incorrectly declared extra.
+        requirements = ["".join(value.split()).replace('"', "'")
+                        for value in metadata.get_all("Requires-Dist", [])]
+        if (fastdb_version is None or metadata.get_all("Provides-Extra", []) != ["fastdb"]
+                or requirements != [f"fastdb4py=={fastdb_version};extra=='fastdb'"]):
+            raise ValueError("C-Two wheel must have no default dependencies and exactly "
+                             f"fastdb4py=={fastdb_version} in its fastdb extra")
     return selected, {**artifact(selected), "distribution": distribution, "version": metadata["Version"]}
 
 
@@ -336,7 +392,7 @@ def main() -> int:
         if options.require_standard_user and (os.name != "nt" or administrator):
             raise RuntimeError("This gate requires a Windows token without administrator membership")
         fastdb, fastdb_info = wheel(options.fastdb_wheel, "fastdb4py")
-        ctwo, ctwo_info = wheel(options.c_two_wheel, "c-two")
+        ctwo, ctwo_info = wheel(options.c_two_wheel, "c-two", fastdb_version=str(fastdb_info["version"]))
         c3 = options.c3.resolve(strict=True)
         receipt["artifacts"] = [fastdb_info, ctwo_info, artifact(c3)]
         with tempfile.TemporaryDirectory(prefix="c-two wheel 安装 ") as directory:
@@ -345,8 +401,12 @@ def main() -> int:
             venv = work / "venv"
             run(["uv", "--no-config", "venv", "--python", sys.executable, str(venv)], work, environment)
             python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-            run(["uv", "--no-config", "pip", "install", "--python", str(python), str(fastdb), str(ctwo)],
+            run(["uv", "--no-config", "pip", "install", "--python", str(python), str(ctwo)],
                 work, environment, timeout=300)
+            receipt["base_install"] = json.loads(run(
+                [str(python), "-c", BASE_CONSUMER], work, environment))
+            run(["uv", "--no-config", "pip", "install", "--python", str(python),
+                 str(fastdb), str(ctwo) + "[fastdb]"], work, environment, timeout=300)
             receipt["installed_packages"] = json.loads(run(
                 ["uv", "--no-config", "pip", "list", "--python", str(python), "--format", "json"], work, environment))
             inputs = work / "inputs.json"

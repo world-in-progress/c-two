@@ -56,6 +56,7 @@ OTHER_SHA = "b" * 40
 C_TWO_VERSION = "0.6.0"
 C3_VERSION = "0.2.0"
 FASTDB_VERSION = "0.2.1"
+FASTDB_CORE_VERSION = "0.2.1"
 FASTDB_SOURCE_REV = promote.SOURCE_VALIDATION_FASTDB_SHA
 CLI_TARGETS = promote.CLI_TARGETS
 WINDOWS_TARGET = promote.WINDOWS_TARGET
@@ -255,6 +256,8 @@ def _smoke_body(
         "platform": "TestPlatform-26.1-test",
         "interpreter": "3.12.3 (main, test)",
         "checks": [check, relay],
+        "base_install": {"status": "passed", "transports": ["thread", "ipc"],
+                         "optional_dependencies_present": False, "optional_modules_loaded": False},
         "cleanup": {"host_orderly_shutdown": True, "errors": [], "relay_stop": "terminated",
                     "host_stop": "already_exited", "processes_exited": True,
                     "temporary_directory_removed": True},
@@ -495,7 +498,7 @@ class CandidateBuilder:
             "isolated_wheel": {"name": "c_two-0.6.0-cp312-cp312-manylinux_2_39_x86_64.whl",
                                "sha256": _sha(b"isolated-wheel")},
             "link_mode": "system",
-            "sdk": {"version": FASTDB_VERSION, "source_sha": FASTDB_SOURCE_REV},
+            "sdk": {"version": FASTDB_CORE_VERSION, "source_sha": FASTDB_SOURCE_REV},
             "bundled_fastdb_libs": ["libfastdb.so"],
             "elf_dynamic": {"runpath": "$ORIGIN/../c_two.libs", "needed": ["libfastdb.so"]},
             "standalone_import": "passed",
@@ -1325,6 +1328,22 @@ def test_happy_path_github_release_plan(tmp_path: Path, environment) -> None:
     assert all(path.startswith("/repos/") for path in api.paths)
 
 
+@pytest.mark.parametrize("core_version, accepted", [("0.2.1", True), ("0.2.2", False)])
+def test_python_fastdb_version_is_independent_of_native_core(
+    tmp_path: Path, environment, monkeypatch, core_version, accepted,
+) -> None:
+    monkeypatch.setitem(globals(), "FASTDB_VERSION", "0.2.2")
+    monkeypatch.setitem(globals(), "FASTDB_CORE_VERSION", core_version)
+    environment(_default_world())
+    code, plan_path, body_path = run_prepare(tmp_path)
+    assert code == (0 if accepted else 1)
+    if accepted:
+        assert json.loads(plan_path.read_text())["versions"]["fastdb_version"] == "0.2.2"
+        body = body_path.read_text()
+        assert "Native FastDB Core: `0.2.1`" in body
+        assert "Optional Python FastDB: `fastdb4py==0.2.2`" in body
+
+
 def test_free_threaded_wheel_rows_use_real_tag_pairs(tmp_path: Path, environment) -> None:
     """cp314-cp314t is the published free-threaded style; invented
     cp314t-cp314t names are rejected."""
@@ -1473,6 +1492,10 @@ def _mutated_receipt_world(receipt_name: str, mutate) -> World:
          lambda p: p["identity"].update(administrator=True)),
         ("standard-user-x86_64-pc-windows-msvc.json.wrapper.json",
          lambda p: p["cleanup"].update(account_removed=False)),
+        ("abi-x86_64-pc-windows-msvc-3.10.json", lambda p: p.pop("base_install")),
+        ("smoke-aarch64-apple-darwin.json", lambda p: p["base_install"].update(optional_modules_loaded=True)),
+        ("smoke-x86_64-unknown-linux-gnu.json", lambda p: p["base_install"].update(optional_dependencies_present=True)),
+        ("sdist-proof.json", lambda p: p["lifecycle"]["base_install"].update(transports=["thread"])),
         ("sdist-proof.json", lambda p: p.update(standalone_import="failed")),
         ("sdist-proof.json", lambda p: p["lifecycle"].update(status="failed")),
         ("sdist-proof.json", lambda p: p["lifecycle"]["cleanup"].update(processes_exited=False)),
