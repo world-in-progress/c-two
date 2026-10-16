@@ -43,7 +43,7 @@ function compileContextFixture(directory, omittedSymbol) {
   const fixture = resolve(directory, 'context.rs');
   writeFileSync(fixture, `
     const NAME: &str = "/tmp/c2-context-fixture.sock";
-    #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 4 }
+    #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 5 }
     ${body}
       use std::sync::atomic::{AtomicUsize, Ordering};
       static FREES: AtomicUsize = AtomicUsize::new(0);
@@ -332,7 +332,7 @@ test('Windows context keeps current-SID pipe defaults and rejects Unix roots nat
   }
 });
 
-test('native addon rejects ABI 4 without the complete context symbol group', () => {
+test('native addon rejects ABI 5 without the complete context symbol group', () => {
   const directory = localTestDirectory('incomplete-abi4-');
   try {
     const library = compileContextFixture(directory, 'c2_mem_ffi_local_endpoint_context_connect_unix');
@@ -464,6 +464,8 @@ test('c2-mem-ffi Node native loader wraps the real request pool C ABI', async ()
   const block = await pool.write(payload);
   assert.equal(block.dedicated, false);
   assert.equal(block.byteLength, payload.byteLength);
+  assert.equal(typeof block.allocationId, 'bigint');
+  assert.ok(block.allocationId > 0n);
 
   const handle = (await symbols.c2_mem_ffi_request_pool_new('/cc2nnode2', 65536, 1, 4096)).value;
   const rawBlock = (await symbols.c2_mem_ffi_request_pool_write(handle, payload)).value;
@@ -600,12 +602,24 @@ test('c2-mem-ffi Node native loader rejects values before lossy native narrowing
 
   const handle = (await symbols.c2_mem_ffi_request_pool_new('/cc2nnode4', 65536, 1, 4096)).value;
   try {
+    const validCoordinates = { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false };
+    for (const allocationId of [undefined, 1, -1n, 0n, 0x1_0000_0000_0000_0000n]) {
+      assert.throws(
+        () => symbols.c2_mem_ffi_request_pool_release(handle, { ...validCoordinates, allocationId }),
+        /allocationId/,
+      );
+    }
+    assert.equal(
+      symbols.c2_mem_ffi_request_pool_release(handle, { ...validCoordinates, allocationId: 0xffffffffffffffffn }).status,
+      2,
+      'max u64 reaches native ownership validation without narrowing',
+    );
     assert.throws(
       () => symbols.c2_mem_ffi_request_pool_release(handle, {
         segmentIndex: 0, generation: 7,
         offset: 0x1_0000_0000,
         byteLength: 1,
-        dedicated: false,
+        allocationId: 1n, dedicated: false,
       }),
       /offset/,
     );
@@ -614,7 +628,7 @@ test('c2-mem-ffi Node native loader rejects values before lossy native narrowing
         segmentIndex: 0, generation: 7,
         offset: 0,
         byteLength: 1.5,
-        dedicated: false,
+        allocationId: 1n, dedicated: false,
       }),
       /byteLength/,
     );
@@ -623,7 +637,7 @@ test('c2-mem-ffi Node native loader rejects values before lossy native narrowing
         segmentIndex: 65536, generation: 7,
         offset: 0,
         byteLength: 1,
-        dedicated: false,
+        allocationId: 1n, dedicated: false,
       }),
       /segmentIndex/,
     );
@@ -632,12 +646,34 @@ test('c2-mem-ffi Node native loader rejects values before lossy native narrowing
         segmentIndex: 0.5, generation: 7,
         offset: 0,
         byteLength: 1,
-        dedicated: false,
+        allocationId: 1n, dedicated: false,
       }),
       /segmentIndex/,
     );
   } finally {
     await symbols.c2_mem_ffi_request_pool_destroy(handle);
+  }
+});
+
+test('old allocation ID cannot release a new block at the same coordinates', async () => {
+  const { symbols } = loadC2MemFfiNodeNativeSymbols(libraryPath());
+  const handle = symbols.c2_mem_ffi_request_pool_new('/cc2nnode-reuse', 65536, 1, 4096).value;
+  try {
+    const payload = new Uint8Array([7, 8, 9]);
+    const first = symbols.c2_mem_ffi_request_pool_write(handle, payload).value;
+    assert.equal(symbols.c2_mem_ffi_request_pool_release(handle, first).status, 0);
+    const second = symbols.c2_mem_ffi_request_pool_write(handle, payload).value;
+    assert.equal(second.segmentIndex, first.segmentIndex);
+    assert.equal(second.generation, first.generation);
+    assert.equal(second.offset, first.offset);
+    assert.notEqual(second.allocationId, first.allocationId);
+    assert.equal(symbols.c2_mem_ffi_request_pool_release(handle, first).status, 2);
+    const destination = new Uint8Array(payload.length);
+    assert.equal(symbols.c2_mem_ffi_request_pool_read_local(handle, second, destination).status, 0);
+    assert.deepEqual(destination, payload);
+    assert.equal(symbols.c2_mem_ffi_request_pool_release(handle, second).status, 0);
+  } finally {
+    symbols.c2_mem_ffi_request_pool_destroy(handle);
   }
 });
 
@@ -744,17 +780,17 @@ test('native dedicated requests and responses complete repeatedly without exhaus
 });
 
 
-test('native addon rejects ABI 3 before loading endpoint or pool symbols', () => {
+test('native addon rejects ABI 4 before loading endpoint or pool symbols', () => {
   const directory = mkdtempSync(resolve(tmpdir(), 'c2-stale-abi-'));
   try {
     const fixture = resolve(directory, 'stale.rs');
-    writeFileSync(fixture, '#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 3 }');
+    writeFileSync(fixture, '#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 4 }');
     const library = resolve(directory, process.platform === 'win32' ? 'stale.dll' : process.platform === 'darwin' ? 'stale.dylib' : 'stale.so');
     const output = spawnSync(process.env.RUSTC ?? 'rustc',
       ['--edition=2024', '--crate-type=cdylib', fixture, '-o', library],
       { cwd: directory, encoding: 'utf8' });
     assert.equal(output.status, 0, `${output.error ?? ''} ${output.stdout} ${output.stderr}`);
-    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 3.*expected version 4/);
+    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 4.*expected version 5/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -250,6 +250,7 @@ impl Connection {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     ) -> FreeResult {
         let state = self.peer_shm.lock();
         // Lazy-open the segment before freeing.
@@ -267,7 +268,14 @@ impl Connection {
             match pool
                 .validate_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
                 .and_then(|_| {
-                    pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
+                    pool.free_at(
+                        seg_idx as u32,
+                        generation,
+                        offset,
+                        data_size,
+                        is_dedicated,
+                        allocation_id,
+                    )
                 }) {
                 Ok(result) => return result,
                 Err(e) => {

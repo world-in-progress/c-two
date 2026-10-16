@@ -47,6 +47,7 @@ pub enum ResponseMeta {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     },
     /// Owned response bytes awaiting native transport selection.
     ///
@@ -71,6 +72,7 @@ pub enum RequestData {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     },
     /// Inline bytes from a local IPC frame.
     Inline(Vec<u8>),
@@ -91,6 +93,7 @@ impl RequestData {
                 offset,
                 data_size,
                 is_dedicated,
+                ..
             } => pool
                 .read()
                 .copy_data_at(
@@ -117,6 +120,7 @@ impl RequestData {
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             } => {
                 let mut pool = pool.write();
                 pool.validate_data_at(
@@ -133,6 +137,7 @@ impl RequestData {
                     offset,
                     data_size,
                     is_dedicated,
+                    allocation_id,
                 )
                 .map_err(|error| format!("request SHM release failed: {error}"))?;
                 Ok(())
@@ -598,6 +603,7 @@ mod tests {
             offset: allocation.offset,
             data_size: u32::try_from(payload.len()).unwrap(),
             is_dedicated: allocation.is_dedicated,
+            allocation_id: allocation.allocation_id,
         });
 
         assert_eq!(lease.copy_bytes().unwrap(), payload);
@@ -624,6 +630,7 @@ mod tests {
                 offset: allocation.offset,
                 data_size: u32::try_from(payload.len()).unwrap(),
                 is_dedicated: allocation.is_dedicated,
+                allocation_id: allocation.allocation_id,
             };
 
             assert_eq!(
@@ -651,6 +658,7 @@ mod tests {
             offset: u32::try_from(capacity - 1).unwrap(),
             data_size: 2,
             is_dedicated: false,
+            allocation_id: allocation.allocation_id,
         };
 
         assert!(

@@ -110,7 +110,7 @@ import {
 
 const { requestSymbols, responseSymbols, symbols } = loadBundledC2MemFfiNodeNativeSymbols();
 
-assert.equal(C2_MEM_FFI_ABI_VERSION, 4);
+assert.equal(C2_MEM_FFI_ABI_VERSION, 5);
 assert.equal(symbols.c2_mem_ffi_abi_version(), C2_MEM_FFI_ABI_VERSION);
 assert.equal(typeof createNodeIpcConnect, 'function');
 
@@ -126,6 +126,8 @@ try {
   const block = await requestPool.write(payload);
   assert.equal(block.dedicated, false);
   assert.equal(block.byteLength, payload.byteLength);
+  assert.equal(typeof block.allocationId, 'bigint');
+  assert.ok(block.allocationId > 0n);
   await requestPool.release(block);
 } finally {
   await requestPool.close?.();
@@ -135,6 +137,8 @@ const handle = (await symbols.c2_mem_ffi_request_pool_new(\`/cc2p\${prefixSeed}b
 try {
   const payload = new Uint8Array([2, 4, 6, 8]);
   const block = (await symbols.c2_mem_ffi_request_pool_write(handle, payload)).value;
+  assert.equal(typeof block.allocationId, 'bigint');
+  assert.ok(block.allocationId > 0n);
   const destination = new Uint8Array(payload.byteLength);
   const readResult = await symbols.c2_mem_ffi_request_pool_read_local(handle, block, destination);
   assert.equal(readResult.status, 0);
@@ -166,7 +170,7 @@ await symbols.c2_mem_ffi_response_pool_destroy(responseHandle);
 try {
   await symbols.c2_mem_ffi_response_pool_read(
     responseHandle,
-    { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false },
+    { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false },
     new Uint8Array(1),
   );
   throw new Error('destroyed native response pool handle remained usable');
@@ -229,7 +233,7 @@ import {
   loadBundledC2MemFfiNodeNativeSymbols,
 } from '@c-two/c2-mem-ffi';
 
-const abiVersion: 4 = C2_MEM_FFI_ABI_VERSION;
+const abiVersion: 5 = C2_MEM_FFI_ABI_VERSION;
 const symbols: C2MemFfiNodeNativeSymbols = loadBundledC2MemFfiNodeNativeSymbols();
 const connect = createNodeIpcConnect();
 const poolConfig: C2MemFfiPoolConfig = {

@@ -2537,10 +2537,17 @@ mod tests {
                     offset,
                     data_size,
                     is_dedicated,
+                    allocation_id,
                 } => {
                     let mut pool = pool.write();
-                    let _ =
-                        pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
+                    let _ = pool.free_at(
+                        seg_idx as u32,
+                        generation,
+                        offset,
+                        data_size,
+                        is_dedicated,
+                        allocation_id,
+                    );
                     "shm"
                 }
                 RequestData::Handle(backing) => {

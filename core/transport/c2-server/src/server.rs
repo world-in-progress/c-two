@@ -3012,6 +3012,7 @@ fn cleanup_buddy_request_block(conn: &Arc<Connection>, payload: &[u8]) {
         bp.offset,
         bp.data_size,
         bp.is_dedicated,
+        bp.allocation_id,
     );
     schedule_peer_buddy_gc_if_idle(conn, free_result);
 }
@@ -3091,6 +3092,7 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
             offset: bp.offset,
             data_size: bp.data_size,
             is_dedicated: bp.is_dedicated,
+            allocation_id: bp.allocation_id,
         }
     } else {
         // Rare edge case: extra inline args after buddy payload — fall back to copy.
@@ -3125,6 +3127,7 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
             bp.offset,
             bp.data_size,
             bp.is_dedicated,
+            bp.allocation_id,
         );
         schedule_peer_buddy_gc_if_idle(conn, free_result);
         let mut combined = args;
@@ -3423,6 +3426,7 @@ async fn dispatch_chunked_call(
                     bp.offset,
                     bp.data_size,
                     bp.is_dedicated,
+                    bp.allocation_id,
                 );
                 schedule_peer_buddy_gc_if_idle(conn, free_result);
                 shm_data = Some(data);
@@ -3990,7 +3994,7 @@ async fn write_reply_with_data(
 }
 
 /// Write a success reply via buddy SHM: allocate from response pool, write
-/// data, send 15-byte generation-bearing pointer metadata. The caller chooses inline or chunked
+/// data, send 23-byte generation and allocation-bearing pointer metadata. The caller chooses inline or chunked
 /// fallback when SHM is unavailable.
 async fn write_buddy_reply_with_data(
     response_pool: &parking_lot::RwLock<MemPool>,
@@ -4046,6 +4050,7 @@ async fn write_buddy_reply_with_data(
         offset: alloc.offset,
         data_size,
         is_dedicated: alloc.is_dedicated,
+        allocation_id: alloc.allocation_id,
     };
     let buddy_bytes = encode_buddy_payload(&bp);
     // 4. Send frame with FLAG_BUDDY.
@@ -4146,10 +4151,18 @@ async fn send_response_meta(
             offset,
             data_size,
             is_dedicated,
+            allocation_id,
         } => {
             if u64::from(data_size) > max_payload_size {
                 let mut pool = response_pool.write();
-                let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
+                let _ = pool.free_at(
+                    seg_idx as u32,
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                    allocation_id,
+                );
                 return Err(ResponseSendError::UserVisible(format!(
                     "response payload size {data_size} exceeds max_payload_size {max_payload_size}"
                 )));
@@ -4161,6 +4174,7 @@ async fn send_response_meta(
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             };
             let buddy_bytes = encode_buddy_payload(&bp);
             let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
@@ -4168,7 +4182,14 @@ async fn send_response_meta(
                 frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
             if let Err(err) = writer.lock().await.write_all(&frame).await {
                 let mut pool = response_pool.write();
-                let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
+                let _ = pool.free_at(
+                    seg_idx as u32,
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                    allocation_id,
+                );
                 return Err(ResponseSendError::Transport(format!(
                     "prepared SHM reply write failed: {err}"
                 )));
@@ -4177,7 +4198,14 @@ async fn send_response_meta(
             // Server-side free for dedicated segments (same as write_buddy_reply_with_data).
             if is_dedicated {
                 let mut pool = response_pool.write();
-                let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, true);
+                let _ = pool.free_at(
+                    seg_idx as u32,
+                    generation,
+                    offset,
+                    data_size,
+                    true,
+                    allocation_id,
+                );
             }
         }
     }
@@ -5307,6 +5335,7 @@ mod tests {
             offset: alloc.offset,
             data_size: 128,
             is_dedicated: alloc.is_dedicated,
+            allocation_id: alloc.allocation_id,
         };
         let scheduler = Scheduler::with_limits(
             ConcurrencyMode::Parallel,
@@ -7043,6 +7072,7 @@ mod tests {
             offset: 4096,
             data_size: 256,
             is_dedicated: false,
+            allocation_id: 1,
         };
         let bp_bytes = encode_buddy_payload(&bp);
         let ctrl_bytes = encode_call_control(&call_identity("grid"), 1).unwrap();
@@ -7090,14 +7120,15 @@ mod tests {
             peer_pool
                 .handle_slice_mut(&mut handle)
                 .copy_from_slice(&data);
-            let (seg_idx, generation, offset, len) = match handle {
+            let (seg_idx, generation, offset, len, allocation_id) = match handle {
                 MemHandle::Buddy {
                     seg_idx,
                     generation,
                     offset,
                     len,
+                    allocation_id,
                     ..
-                } => (seg_idx, generation, offset, len),
+                } => (seg_idx, generation, offset, len, allocation_id),
                 other => panic!("expected buddy request block, got {other:?}"),
             };
             let segments = announced_size
@@ -7127,6 +7158,7 @@ mod tests {
                 offset,
                 data_size: len as u32,
                 is_dedicated: false,
+                allocation_id,
             });
             cleanup_buddy_request_block(&conn, &payload);
             assert_eq!(peer_pool.stats().alloc_count, 0);
@@ -7171,6 +7203,7 @@ mod tests {
                         offset,
                         data_size,
                         is_dedicated,
+                        allocation_id,
                     } => {
                         *self.seen.lock().unwrap() = Some(SeenShmRequest {
                             seg_idx,
@@ -7186,6 +7219,7 @@ mod tests {
                             offset,
                             data_size,
                             is_dedicated,
+                            allocation_id,
                         });
                         Ok(ResponseMeta::Inline(b"ok".to_vec()))
                     }
@@ -7222,14 +7256,15 @@ mod tests {
             unique_response_pool_prefix("rqcb"),
         );
         let handle = peer_pool.try_alloc_shm(128).unwrap();
-        let (seg_idx, generation, offset, len) = match handle {
+        let (seg_idx, generation, offset, len, allocation_id) = match handle {
             MemHandle::Buddy {
                 seg_idx,
                 generation,
                 offset,
                 len,
+                allocation_id,
                 ..
-            } => (seg_idx, generation, offset, len),
+            } => (seg_idx, generation, offset, len, allocation_id),
             other => panic!("expected buddy request block, got {other:?}"),
         };
         assert_eq!(peer_pool.stats().alloc_count, 1);
@@ -7243,6 +7278,7 @@ mod tests {
             offset,
             data_size: len as u32,
             is_dedicated: false,
+            allocation_id,
         })
         .to_vec();
         let call_control = encode_call_control(&call_identity("grid"), 0).unwrap();
@@ -8488,14 +8524,15 @@ mod tests {
         );
         let allocate_buddy_frame = |peer_pool: &mut MemPool| -> Vec<u8> {
             let handle = peer_pool.try_alloc_shm(128).unwrap();
-            let (seg_idx, generation, offset, len) = match handle {
+            let (seg_idx, generation, offset, len, allocation_id) = match handle {
                 MemHandle::Buddy {
                     seg_idx,
                     generation,
                     offset,
                     len,
+                    allocation_id,
                     ..
-                } => (seg_idx, generation, offset, len),
+                } => (seg_idx, generation, offset, len, allocation_id),
                 other => panic!("expected buddy request block, got {other:?}"),
             };
             let mut payload = encode_buddy_payload(&BuddyPayload {
@@ -8504,6 +8541,7 @@ mod tests {
                 offset,
                 data_size: len as u32,
                 is_dedicated: false,
+                allocation_id,
             })
             .to_vec();
             payload.extend_from_slice(&encode_chunk_header(1, 2));
@@ -8758,6 +8796,7 @@ mod tests {
                 offset: alloc.offset,
                 data_size: 8192,
                 is_dedicated: alloc.is_dedicated,
+                allocation_id: alloc.allocation_id,
             },
             1024,
             4096,
@@ -8810,6 +8849,7 @@ mod tests {
                 offset: alloc.offset,
                 data_size: 8192,
                 is_dedicated: alloc.is_dedicated,
+                allocation_id: alloc.allocation_id,
             },
             1024,
             4096,

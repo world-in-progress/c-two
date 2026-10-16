@@ -119,6 +119,7 @@ mod buddy_tests {
             offset: 65536,
             data_size: 1024,
             is_dedicated: false,
+            allocation_id: 0x0807_0605_0403_0201,
         };
         let encoded = encode_buddy_payload(&bp);
         assert_eq!(encoded.len(), BUDDY_PAYLOAD_SIZE);
@@ -136,6 +137,7 @@ mod buddy_tests {
             offset: 0,
             data_size: 256,
             is_dedicated: true,
+            allocation_id: 0,
         };
         let encoded = encode_buddy_payload(&bp);
         assert_eq!(encoded[14], BUDDY_FLAG_DEDICATED);
@@ -147,9 +149,9 @@ mod buddy_tests {
 
     #[test]
     fn canonical_buddy_payload_layout() {
-        // `<HIII B`: segment, generation, offset, size, flags. Distinct bytes
+        // `<HIII B Q`: segment, generation, offset, size, flags, allocation id. Distinct bytes
         // make field-order and truncation mistakes visible in this wire golden.
-        assert_eq!(BUDDY_PAYLOAD_SIZE, 15);
+        assert_eq!(BUDDY_PAYLOAD_SIZE, 23);
 
         let bp = BuddyPayload {
             seg_idx: 0x0201,
@@ -157,10 +159,16 @@ mod buddy_tests {
             offset: 0x0a09_0807,
             data_size: 0x0e0d_0c0b,
             is_dedicated: false,
+            allocation_id: 0x1615_1413_1211_100f,
         };
         let encoded = encode_buddy_payload(&bp);
-        assert_eq!(encoded, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0]);
-        assert_eq!(decode_buddy_payload(&encoded).unwrap(), (bp, 15));
+        assert_eq!(
+            encoded,
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0, 15, 16, 17, 18, 19, 20, 21, 22
+            ]
+        );
+        assert_eq!(decode_buddy_payload(&encoded).unwrap(), (bp, 23));
     }
 
     #[test]
@@ -172,18 +180,19 @@ mod buddy_tests {
                 offset: u32::MAX,
                 data_size: u32::MAX,
                 is_dedicated: false,
+                allocation_id: u64::MAX,
             };
             assert_eq!(
                 decode_buddy_payload(&encode_buddy_payload(&bp)).unwrap(),
-                (bp, 15)
+                (bp, 23)
             );
         }
     }
 
     #[test]
     fn decoder_rejects_zero_buddy_generation() {
-        // Valid 15-byte shape, but only dedicated allocations may use generation 0.
-        let bytes = [0_u8; 15];
+        // Valid 23-byte shape, but only dedicated allocations may use generation 0.
+        let bytes = [0_u8; 23];
         assert!(matches!(
             decode_buddy_payload(&bytes),
             Err(DecodeError::InvalidValue {
@@ -196,7 +205,7 @@ mod buddy_tests {
     #[test]
     fn decoder_rejects_nonzero_dedicated_generation() {
         for generation in [1_u32, u32::MAX] {
-            let mut bytes = [0_u8; 15];
+            let mut bytes = [0_u8; 23];
             bytes[2..6].copy_from_slice(&generation.to_le_bytes());
             bytes[14] = BUDDY_FLAG_DEDICATED;
             assert!(matches!(
@@ -210,7 +219,7 @@ mod buddy_tests {
     #[test]
     fn decoder_rejects_unknown_flags() {
         for flags in [0x02_u8, 0x03, 0x80, 0xff] {
-            let mut bytes = [0_u8; 15];
+            let mut bytes = [0_u8; 23];
             bytes[2] = 1;
             bytes[14] = flags;
             assert!(matches!(
@@ -219,6 +228,35 @@ mod buddy_tests {
                     if value == u64::from(flags)
             ));
         }
+    }
+
+    #[test]
+    fn decoder_rejects_missing_or_wrong_allocation_id() {
+        let mut buddy = [0_u8; BUDDY_PAYLOAD_SIZE];
+        buddy[2] = 1;
+        assert!(matches!(
+            decode_buddy_payload(&buddy),
+            Err(DecodeError::InvalidValue {
+                field: "allocation id",
+                value: 0
+            })
+        ));
+
+        let mut dedicated = [0_u8; BUDDY_PAYLOAD_SIZE];
+        dedicated[14] = BUDDY_FLAG_DEDICATED;
+        dedicated[15] = 1;
+        assert!(matches!(
+            decode_buddy_payload(&dedicated),
+            Err(DecodeError::InvalidValue {
+                field: "allocation id",
+                value: 1
+            })
+        ));
+
+        assert!(matches!(
+            decode_buddy_payload(&buddy[..15]),
+            Err(DecodeError::BufferTooShort { need: 23, have: 15 })
+        ));
     }
 }
 
@@ -696,8 +734,8 @@ mod handshake_tests {
     }
 
     #[test]
-    fn backing_generation_bumps_handshake_version() {
-        assert_eq!(HANDSHAKE_VERSION, 11);
+    fn allocation_identity_bumps_handshake_version() {
+        assert_eq!(HANDSHAKE_VERSION, 12);
 
         let client = encode_client_handshake(&[], CAP_CALL_V2, "")
             .expect("current client handshake encodes");
@@ -709,7 +747,7 @@ mod handshake_tests {
             &test_identity(),
         )
         .expect("current server handshake encodes");
-        for version in [9_u8, 10] {
+        for version in [9_u8, 10, 11] {
             for mut encoded in [client.clone(), server.clone()] {
                 encoded[0] = version;
                 assert!(matches!(
@@ -1192,8 +1230,8 @@ mod handshake_tests {
 
     #[test]
     fn empty_handshake() {
-        // Version 11, prefix_len=0, 0 segments, cap_flags=0
-        let buf = [11, 0, 0, 0, 0, 0];
+        // Version 12, prefix_len=0, 0 segments, cap_flags=0
+        let buf = [12, 0, 0, 0, 0, 0];
         let decoded = decode_handshake(&buf).unwrap();
         assert_eq!(decoded.prefix, "");
         assert!(decoded.segments.is_empty());
@@ -1280,13 +1318,14 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_buddy_payload_fixture_decodes() {
-        let bytes = hex_to_bytes("020007000000001000000002000000");
+        let bytes = hex_to_bytes("0200070000000010000000020000000102030405060708");
         let (bp, consumed) = decode_buddy_payload(&bytes).unwrap();
         assert_eq!(bp.seg_idx, 2);
         assert_eq!(bp.generation, 7);
         assert_eq!(bp.offset, 4096);
         assert_eq!(bp.data_size, 512);
         assert!(!bp.is_dedicated);
+        assert_eq!(bp.allocation_id, 0x0807_0605_0403_0201);
         assert_eq!(consumed, BUDDY_PAYLOAD_SIZE);
     }
 
@@ -1295,7 +1334,7 @@ mod cross_lang_tests {
         let bytes = hex_to_bytes("0200001000000002000000");
         assert!(matches!(
             decode_buddy_payload(&bytes),
-            Err(DecodeError::BufferTooShort { need: 15, have: 11 })
+            Err(DecodeError::BufferTooShort { need: 23, have: 11 })
         ));
     }
 
@@ -1313,8 +1352,8 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_client_handshake_fixture_decodes() {
-        // v11: [0b][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
-        let bytes = hex_to_bytes("0b0001000000001004736567300300");
+        // v12: [0c][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
+        let bytes = hex_to_bytes("0c0001000000001004736567300300");
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
@@ -1327,10 +1366,10 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_server_handshake_fixture_decodes() {
-        // v11: client handshake prefix, server identity, then route table
+        // v12: client handshake prefix, server identity, then route table
         // with per-route full CRM tag and contract hashes.
         let bytes = hex_to_bytes(
-            "0b00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "0c00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -1404,9 +1443,10 @@ mod cross_lang_tests {
             offset: 4096,
             data_size: 512,
             is_dedicated: false,
+            allocation_id: 0x0807_0605_0403_0201,
         };
         let encoded = encode_buddy_payload(&bp);
-        let expected = hex_to_bytes("020007000000001000000002000000");
+        let expected = hex_to_bytes("0200070000000010000000020000000102030405060708");
         assert_eq!(encoded.as_slice(), expected.as_slice());
     }
 
@@ -1414,8 +1454,8 @@ mod cross_lang_tests {
     fn rust_encode_matches_canonical_client_handshake_fixture() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
-        // v11: [0b][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
-        let expected = hex_to_bytes("0b0001000000001004736567300300");
+        // v12: [0c][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
+        let expected = hex_to_bytes("0c0001000000001004736567300300");
         assert_eq!(encoded, expected);
     }
 
@@ -1455,10 +1495,10 @@ mod cross_lang_tests {
             &identity,
         )
         .unwrap();
-        // v11: [0b][00 prefix_len] then segments/caps, identity, and route table
+        // v12: [0c][00 prefix_len] then segments/caps, identity, and route table
         // with per-route full CRM tag and contract hash metadata.
         let expected = hex_to_bytes(
-            "0b00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "0c00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

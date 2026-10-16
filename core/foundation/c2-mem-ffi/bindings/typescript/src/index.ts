@@ -11,7 +11,7 @@ export const C2_MEM_FFI_STATUS_IO_ERROR = 5;
 
 export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 255;
 export const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
-export const C2_MEM_FFI_ABI_VERSION = 4;
+export const C2_MEM_FFI_ABI_VERSION = 5;
 
 export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_OK
@@ -53,6 +53,7 @@ export interface C2MemFfiRequestBlock {
   readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
+  readonly allocationId: bigint;
   readonly dedicated: boolean;
 }
 
@@ -315,7 +316,7 @@ export function captureLocalIpcEndpointContext(
   return captureLocalIpcEndpointContextFromSymbols(symbols, options);
 }
 
-/** Capture through a loaded ABI 4 library. */
+/** Capture through a loaded ABI 5 library. */
 export function captureLocalIpcEndpointContextFromSymbols(
   symbols: C2MemFfiLocalEndpointSymbols,
   options: C2MemFfiLocalEndpointCaptureOptions = {},
@@ -1210,7 +1211,7 @@ function requireOwnedRequestBlock(
 function requireBlockShape(
   block: C2MemFfiRequestBlock,
   label: string,
-): { readonly segmentIndex: number; readonly generation: number; readonly offset: number; readonly byteLength: number; readonly dedicated: boolean } {
+): { readonly segmentIndex: number; readonly generation: number; readonly offset: number; readonly byteLength: number; readonly allocationId: bigint; readonly dedicated: boolean } {
   if (typeof block !== "object" || block === null) {
     throw new C2MemFfiBindingError(`c2-mem-ffi ${label} must be an object.`);
   }
@@ -1232,11 +1233,15 @@ function requireBlockShape(
   if (block.dedicated && block.offset !== 0) {
     throw new C2MemFfiBindingError(`c2-mem-ffi ${label} dedicated offset must be 0.`);
   }
+  if (typeof block.allocationId !== "bigint" || block.allocationId < 0n || block.allocationId > 0xffffffffffffffffn || (block.dedicated ? block.allocationId !== 0n : block.allocationId === 0n)) {
+    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} allocationId must be a nonzero u64 bigint for buddy memory or 0n for dedicated memory.`);
+  }
   return {
     segmentIndex: block.segmentIndex,
     generation: block.generation,
     offset: block.offset,
     byteLength: block.byteLength,
+    allocationId: block.allocationId,
     dedicated: block.dedicated,
   };
 }

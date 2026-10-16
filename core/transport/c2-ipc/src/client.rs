@@ -494,6 +494,7 @@ impl ServerPoolState {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     ) -> Result<(), String> {
         self.ensure_segment(seg_idx, generation, data_size, is_dedicated)?;
         self.pool
@@ -512,6 +513,7 @@ impl ServerPoolState {
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             )
             .map_err(|error| format!("response SHM release failed: {error}"))?;
         Ok(())
@@ -3976,6 +3978,7 @@ impl IpcClient {
             offset: alloc.offset,
             data_size: data_size as u32,
             is_dedicated: alloc.is_dedicated,
+            allocation_id: alloc.allocation_id,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
 
@@ -5236,6 +5239,7 @@ fn try_release_unclaimed_response(
             generation,
             offset,
             data_size,
+            allocation_id,
             is_dedicated,
         } => {
             let Some(mut pool) = server_pool.try_lock() else {
@@ -5244,7 +5248,14 @@ fn try_release_unclaimed_response(
             let state = pool
                 .as_mut()
                 .ok_or_else(|| "server pool not initialised".to_string())?;
-            state.release_response(*seg_idx, *generation, *offset, *data_size, *is_dedicated)?;
+            state.release_response(
+                *seg_idx,
+                *generation,
+                *offset,
+                *data_size,
+                *is_dedicated,
+                *allocation_id,
+            )?;
             Ok(true)
         }
     }
@@ -5730,6 +5741,7 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
                 offset: bp.offset,
                 data_size: bp.data_size,
                 is_dedicated: bp.is_dedicated,
+                allocation_id: bp.allocation_id,
             }),
             ReplyControl::RouteNotFound(route) => Err(IpcError::RouteNotFound(route)),
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
@@ -5909,6 +5921,7 @@ mod tests {
                 actual_size: 4096,
                 level: 0,
                 is_dedicated: false,
+                allocation_id: 1,
             },
         );
         let request = block.try_dispatch(None).unwrap();

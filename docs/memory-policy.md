@@ -33,10 +33,12 @@ C-Two 对自有 IPC 后备与在途组装维护三个有限的字节预算。三
 发送端（客户端请求）保留以下回退顺序：
 
 1. 未选择请求池 SHM 且负载不大于 `chunk_size` 时走 inline 帧；更大的负载走分块。是否选择 SHM 还取决于 `shm_threshold`（默认 4096 字节）和线格式上限。
-2. 负载大于 `shm_threshold` 且不超过 buddy 线格式上限时，走 SHM 指针传输：数据写入本进程请求池，线上携带 15 字节 `BuddyPayload` 位置与 generation 元数据，接收端按前缀/索引/代惰性打开。
+2. 负载大于 `shm_threshold` 且不超过 buddy 线格式上限时，走 SHM 指针传输：数据写入本进程请求池，线上携带 23 字节 `BuddyPayload` 位置、generation 与 allocation_id 元数据，接收端按前缀/索引/代惰性打开。
 3. SHM 不可用（预算拒绝、压力拒绝或超线格式上限）时，回退到检查过的分块传输（`chunk_size` 默认 128 KiB，受 `max_total_chunks`/`max_reassembly_bytes` 约束）；小负载回退 inline。不引入第三种传输栈。
 
 服务端响应对称：不大于 `shm_threshold` 走 inline；否则先尝试 buddy 复用，再尝试 buddy 池扩展，再尝试 dedicated SHM；都不可用或负载无法被 buddy 元数据表示时走分块回退。
+
+SHM 头部版本 3 在同一分配器锁下维护每次 buddy 分配的层级与不回绕标识。释放必须携带该标识并匹配活记录，错误父块、子块或旧标识不会修改位图和计数；长度仍按原规则向上取整，trim 仍释放原容量。每个最小块增加 8 字节元数据，默认 256 MiB/4 KiB backing 的映射和创建预算增加 512 KiB。IPC 握手为 12，C/FFI ABI 为 5；旧格式直接拒绝。
 
 接收端组装是完整预留：按 `total_chunks × chunk_size` 一次性预留全部容量，存储层级为 buddy 复用 → GC 后复用 → buddy 扩展 → dedicated SHM → 文件 mmap 最终回退。组装完成时逻辑长度可以裁剪，但容量计费保持到存储真正释放。注意这是"接收全量、组装完成后一次交给资源"，不是流式或增量资源输入。
 

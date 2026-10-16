@@ -133,7 +133,7 @@ mod client_tests {
     #[test]
     fn test_buddy_frame_encoding() {
         // Build a buddy call frame as call_buddy would:
-        // payload = [15B buddy_payload][call_control]
+        // payload = [23B buddy_payload][call_control]
         // flags   = FLAG_CALL_V2 | FLAG_BUDDY
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
 
@@ -143,10 +143,16 @@ mod client_tests {
             offset: 4096,
             data_size: 8192,
             is_dedicated: false,
+            allocation_id: 0x0807_0605_0403_0201,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
         assert_eq!(buddy_bytes.len(), BUDDY_PAYLOAD_SIZE);
-        assert_eq!(buddy_bytes, [0, 0, 1, 0, 0, 0, 0, 16, 0, 0, 0, 32, 0, 0, 0]);
+        assert_eq!(
+            buddy_bytes,
+            [
+                0, 0, 1, 0, 0, 0, 0, 16, 0, 0, 0, 32, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8
+            ]
+        );
 
         let ctrl = encode_call_control(&call_identity("grid"), 3).unwrap();
         let mut payload = Vec::new();
@@ -170,6 +176,7 @@ mod client_tests {
         assert_eq!(decoded_bp.offset, 4096);
         assert_eq!(decoded_bp.data_size, 8192);
         assert!(!decoded_bp.is_dedicated);
+        assert_eq!(decoded_bp.allocation_id, bp.allocation_id);
         assert_eq!(bp_consumed, BUDDY_PAYLOAD_SIZE);
 
         // Decode call control after buddy payload.
@@ -188,11 +195,14 @@ mod client_tests {
             offset: 0,
             data_size: 1_000_000,
             is_dedicated: true,
+            allocation_id: 0,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
         assert_eq!(
             buddy_bytes,
-            [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x42, 0x0f, 0, 1]
+            [
+                5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x42, 0x0f, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
         );
         let ctrl = encode_call_control(&call_identity("net"), 1).unwrap();
 
@@ -556,6 +566,7 @@ mod response_lease_tests {
                 offset: u32::try_from(segment_capacity - 1).unwrap(),
                 data_size: 2,
                 is_dedicated: false,
+                allocation_id: allocation.allocation_id,
             },
             server_pool,
         );
@@ -608,6 +619,7 @@ mod response_lease_tests {
                 offset: allocation.offset,
                 data_size: u32::try_from(payload.len()).unwrap(),
                 is_dedicated: allocation.is_dedicated,
+                allocation_id: allocation.allocation_id,
             },
             Arc::clone(&server_pool),
         );
@@ -624,6 +636,46 @@ mod response_lease_tests {
                 .alloc_count,
             0
         );
+    }
+
+    #[test]
+    fn response_release_rejects_stale_id_after_same_slot_reuse() {
+        let mut owner = MemPool::new_with_prefix(pool_config(), unique_prefix('i'));
+        let old = owner.alloc(4096).unwrap();
+        owner.free(&old).unwrap();
+        let current = owner.alloc(4096).unwrap();
+        assert_eq!(
+            (current.seg_idx, current.generation, current.offset),
+            (old.seg_idx, old.generation, old.offset)
+        );
+        assert_ne!(current.allocation_id, old.allocation_id);
+
+        let peer = MemPool::open_peer(pool_config(), owner.prefix().to_string());
+        let mut state = ServerPoolState::from_pool_for_test(peer);
+        assert!(
+            state
+                .release_response(
+                    old.seg_idx as u16,
+                    old.generation,
+                    old.offset,
+                    4096,
+                    false,
+                    old.allocation_id
+                )
+                .is_err()
+        );
+        assert_eq!(owner.stats().alloc_count, 1);
+        state
+            .release_response(
+                current.seg_idx as u16,
+                current.generation,
+                current.offset,
+                4096,
+                false,
+                current.allocation_id,
+            )
+            .unwrap();
+        assert_eq!(owner.stats().alloc_count, 0);
     }
 }
 
@@ -1986,7 +2038,7 @@ mod lazy_policy_roundtrip_tests {
         assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
 
-        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true)
+        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0)
             .expect("peer signals read_done");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !returned.load(Ordering::Acquire) || budget.snapshot().shm.used_bytes != 0 {
@@ -2074,7 +2126,7 @@ mod lazy_policy_roundtrip_tests {
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
         assert!(!returned.load(Ordering::Acquire));
 
-        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true)
+        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0)
             .expect("peer signals read_done");
         // Sample the returned flag and scoped count under the executor lock.
         // Independent reads allow the worker to return the permit and clear
@@ -2532,6 +2584,7 @@ mod lazy_policy_roundtrip_tests {
             generation: u32,
             offset: u32,
             data_size: u32,
+            allocation_id: u64,
         }
 
         let mut held: Vec<HeldReply> = Vec::new();
@@ -2544,6 +2597,7 @@ mod lazy_policy_roundtrip_tests {
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             } = echo_roundtrip(&client, "reply_idx16", &payload).await
             else {
                 panic!("expected buddy SHM reply for request {i}");
@@ -2565,6 +2619,7 @@ mod lazy_policy_roundtrip_tests {
                 generation,
                 offset,
                 data_size,
+                allocation_id,
             });
         }
 
@@ -2595,6 +2650,7 @@ mod lazy_policy_roundtrip_tests {
                         reply.offset,
                         reply.data_size,
                         false,
+                        reply.allocation_id,
                     )
                     .unwrap_or_else(|e| panic!("release of reply failed: {e}"));
             }
@@ -4754,6 +4810,7 @@ mod lazy_policy_roundtrip_tests {
                     pointer.offset,
                     pointer.data_size,
                     true,
+                    pointer.allocation_id,
                 )
                 .unwrap();
             published_tx.send(()).unwrap();

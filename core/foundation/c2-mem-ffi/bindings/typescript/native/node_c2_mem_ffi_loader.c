@@ -184,6 +184,12 @@ static bool set_named_uint32(napi_env env, napi_value object, const char *name, 
     return set_named_value(env, object, name, js_value);
 }
 
+static bool set_named_uint64_bigint(napi_env env, napi_value object, const char *name, uint64_t value) {
+    napi_value js_value;
+    return check_napi(napi_create_bigint_uint64(env, value, &js_value)) &&
+        set_named_value(env, object, name, js_value);
+}
+
 static bool set_named_bool(napi_env env, napi_value object, const char *name, bool value) {
     napi_value js_value;
     if (!check_napi(napi_get_boolean(env, value, &js_value))) {
@@ -347,7 +353,8 @@ static bool read_block_common(
     uint8_t *is_dedicated,
     uint32_t *generation,
     uint32_t *offset,
-    uint32_t *byte_length) {
+    uint32_t *byte_length,
+    uint64_t *allocation_id) {
     napi_value property;
     uint32_t temp_u32 = 0;
     bool temp_bool = false;
@@ -378,6 +385,18 @@ static bool read_block_common(
         !read_uint32_arg(env, property, "block.byteLength must be a u32 integer.", byte_length)) {
         return false;
     }
+    bool lossless = false;
+    if (!get_named_property(env, value, "allocationId", &property) ||
+        !check_napi(napi_get_value_bigint_uint64(env, property, allocation_id, &lossless)) ||
+        !lossless) {
+        throw_type_error(env, "block.allocationId must be a lossless u64 bigint.");
+        return false;
+    }
+    if ((*is_dedicated == 0 && *allocation_id == 0) ||
+        (*is_dedicated != 0 && *allocation_id != 0)) {
+        throw_type_error(env, "block.allocationId must be nonzero for buddy memory and zero for dedicated memory.");
+        return false;
+    }
     return true;
 }
 
@@ -387,7 +406,8 @@ static bool read_request_block(napi_env env, napi_value value, C2MemFfiRequestBl
     uint32_t generation = 0;
     uint32_t offset = 0;
     uint32_t byte_length = 0;
-    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length)) {
+    uint64_t allocation_id = 0;
+    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length, &allocation_id)) {
         return false;
     }
     block->segment_index = segment_index;
@@ -396,6 +416,7 @@ static bool read_request_block(napi_env env, napi_value value, C2MemFfiRequestBl
     block->generation = generation;
     block->offset = offset;
     block->byte_length = byte_length;
+    block->allocation_id = allocation_id;
     return true;
 }
 
@@ -405,7 +426,8 @@ static bool read_response_block(napi_env env, napi_value value, C2MemFfiResponse
     uint32_t generation = 0;
     uint32_t offset = 0;
     uint32_t byte_length = 0;
-    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length)) {
+    uint64_t allocation_id = 0;
+    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length, &allocation_id)) {
         return false;
     }
     block->segment_index = segment_index;
@@ -414,6 +436,7 @@ static bool read_response_block(napi_env env, napi_value value, C2MemFfiResponse
     block->generation = generation;
     block->offset = offset;
     block->byte_length = byte_length;
+    block->allocation_id = allocation_id;
     return true;
 }
 
@@ -426,6 +449,7 @@ static napi_value make_request_block(napi_env env, C2MemFfiRequestBlock block) {
         !set_named_uint32(env, object, "generation", block.generation) ||
         !set_named_uint32(env, object, "offset", block.offset) ||
         !set_named_uint32(env, object, "byteLength", block.byte_length) ||
+        !set_named_uint64_bigint(env, object, "allocationId", block.allocation_id) ||
         !set_named_bool(env, object, "dedicated", block.is_dedicated != 0)) {
         return NULL;
     }

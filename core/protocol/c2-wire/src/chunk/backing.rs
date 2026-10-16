@@ -332,6 +332,7 @@ impl ReassemblyBacking {
                 generation,
                 offset,
                 allocation_size,
+                allocation_id,
                 ..
             } => {
                 pool.free_at(
@@ -340,6 +341,7 @@ impl ReassemblyBacking {
                     *offset,
                     *allocation_size,
                     false,
+                    *allocation_id,
                 )
                 .map_err(|e| format!("reassembly backing release failed: {e}"))?;
             }
@@ -347,7 +349,7 @@ impl ReassemblyBacking {
                 let data_size = u32::try_from(*len).map_err(|_| {
                     "dedicated reassembly length exceeds the wire address space".to_string()
                 })?;
-                pool.free_at(u32::from(*seg_idx), 0, 0, data_size, true)
+                pool.free_at(u32::from(*seg_idx), 0, 0, data_size, true, 0)
                     .map_err(|e| format!("reassembly backing release failed: {e}"))?;
             }
             MemHandle::FileSpill { .. } => {

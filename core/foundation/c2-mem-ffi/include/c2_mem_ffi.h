@@ -10,7 +10,7 @@ extern "C" {
 
 #define C2_MEM_FFI_MAX_SHM_PREFIX_LEN 255u
 #define C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS 16u
-#define C2_MEM_FFI_ABI_VERSION 4u
+#define C2_MEM_FFI_ABI_VERSION 5u
 
 typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_OK = 0,
@@ -21,7 +21,7 @@ typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_IO_ERROR = 5,
 } C2MemFfiStatus;
 
-/* Backing descriptor: buddy generation > 0; dedicated generation and offset are 0. */
+/* Backing descriptor: buddy generation/allocation_id > 0; dedicated generation, offset and allocation_id are 0. */
 typedef struct C2MemFfiRequestBlock {
     uint16_t segment_index;
     uint8_t is_dedicated;
@@ -29,9 +29,10 @@ typedef struct C2MemFfiRequestBlock {
     uint32_t generation;
     uint32_t offset;
     uint32_t byte_length;
+    uint64_t allocation_id;
 } C2MemFfiRequestBlock;
 
-/* Backing descriptor: buddy generation > 0; dedicated generation and offset are 0. */
+/* Backing descriptor: buddy generation/allocation_id > 0; dedicated generation, offset and allocation_id are 0. */
 typedef struct C2MemFfiResponseBlock {
     uint16_t segment_index;
     uint8_t is_dedicated;
@@ -39,6 +40,7 @@ typedef struct C2MemFfiResponseBlock {
     uint32_t generation;
     uint32_t offset;
     uint32_t byte_length;
+    uint64_t allocation_id;
 } C2MemFfiResponseBlock;
 
 typedef struct C2MemFfiRequestPool C2MemFfiRequestPool;
@@ -59,7 +61,7 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_copy(
     const char *address, char *dst, size_t dst_len, size_t *out_written);
 
 /*
- * ABI 4 requires the complete context API, including connect_unix.
+ * ABI 5 requires the complete context API, including connect_unix.
  *
  * Capture c2-config's complete immutable endpoint context exactly once.
  * NULL unix_root inherits process env/.env/platform default; a non-NULL UTF-8

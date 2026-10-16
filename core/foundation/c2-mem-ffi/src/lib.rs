@@ -13,7 +13,7 @@ use std::sync::Mutex;
 const MAX_SHM_PREFIX_LEN: usize = 255;
 const OWNER_INCARNATION_SUFFIX_LEN: usize = 41;
 const MAX_IPC_SHM_SEGMENTS: u16 = 16;
-const C2_MEM_FFI_ABI_VERSION: u32 = 4;
+const C2_MEM_FFI_ABI_VERSION: u32 = 5;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +35,7 @@ pub struct C2MemFfiRequestBlock {
     pub generation: u32,
     pub offset: u32,
     pub byte_length: u32,
+    pub allocation_id: u64,
 }
 
 #[repr(C)]
@@ -46,6 +47,7 @@ pub struct C2MemFfiResponseBlock {
     pub generation: u32,
     pub offset: u32,
     pub byte_length: u32,
+    pub allocation_id: u64,
 }
 
 pub struct C2MemFfiRequestPool {
@@ -84,6 +86,7 @@ impl Drop for C2MemFfiResponsePool {
                     block.offset,
                     block.byte_length,
                     block.is_dedicated,
+                    block.allocation_id,
                 );
             }
         }
@@ -97,6 +100,7 @@ struct C2MemFfiBlockKey {
     offset: u32,
     byte_length: u32,
     is_dedicated: bool,
+    allocation_id: u64,
 }
 
 fn guard_status(action: impl FnOnce() -> Result<(), C2MemFfiStatus>) -> C2MemFfiStatus {
@@ -210,8 +214,9 @@ fn copy_c_string(
 fn validate_block(block: C2MemFfiRequestBlock) -> Result<(), C2MemFfiStatus> {
     if block.is_dedicated > 1
         || block.byte_length == 0
-        || (block.is_dedicated == 1 && (block.generation != 0 || block.offset != 0))
-        || (block.is_dedicated == 0 && block.generation == 0)
+        || (block.is_dedicated == 1
+            && (block.generation != 0 || block.offset != 0 || block.allocation_id != 0))
+        || (block.is_dedicated == 0 && (block.generation == 0 || block.allocation_id == 0))
     {
         return Err(C2MemFfiStatus::InvalidArgument);
     }
@@ -226,14 +231,16 @@ fn block_key(block: C2MemFfiRequestBlock) -> Result<C2MemFfiBlockKey, C2MemFfiSt
         offset: block.offset,
         byte_length: block.byte_length,
         is_dedicated: block.is_dedicated != 0,
+        allocation_id: block.allocation_id,
     })
 }
 
 fn validate_response_block(block: C2MemFfiResponseBlock) -> Result<(), C2MemFfiStatus> {
     if block.is_dedicated > 1
         || block.byte_length == 0
-        || (block.is_dedicated == 1 && (block.generation != 0 || block.offset != 0))
-        || (block.is_dedicated == 0 && block.generation == 0)
+        || (block.is_dedicated == 1
+            && (block.generation != 0 || block.offset != 0 || block.allocation_id != 0))
+        || (block.is_dedicated == 0 && (block.generation == 0 || block.allocation_id == 0))
     {
         return Err(C2MemFfiStatus::InvalidArgument);
     }
@@ -248,6 +255,7 @@ fn response_block_key(block: C2MemFfiResponseBlock) -> Result<C2MemFfiBlockKey, 
         offset: block.offset,
         byte_length: block.byte_length,
         is_dedicated: block.is_dedicated != 0,
+        allocation_id: block.allocation_id,
     })
 }
 
@@ -797,6 +805,7 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_write(
                         generation: alloc.generation,
                         offset: alloc.offset,
                         byte_length: data_len as u32,
+                        allocation_id: alloc.allocation_id,
                     };
                 }
                 Ok(())
@@ -812,6 +821,7 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_write(
                 offset: alloc.offset,
                 byte_length: data_len as u32,
                 is_dedicated: alloc.is_dedicated,
+                allocation_id: alloc.allocation_id,
             });
             if !inserted {
                 let _ = state.pool.free(&alloc);
@@ -892,6 +902,7 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_release(
                 block.offset,
                 block.byte_length,
                 block.is_dedicated != 0,
+                block.allocation_id,
             )
             .is_err()
         {
@@ -928,6 +939,7 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_forget_consumed(
                     block.offset,
                     block.byte_length,
                     true,
+                    block.allocation_id,
                 )
                 .is_err()
             {
@@ -1065,6 +1077,7 @@ pub unsafe extern "C" fn c2_mem_ffi_response_pool_release(
                     block.offset,
                     block.byte_length,
                     block.is_dedicated != 0,
+                    block.allocation_id,
                 )
                 .is_err()
             {
@@ -1915,6 +1928,7 @@ mod tests {
                 generation: block.generation,
                 offset: block.offset,
                 byte_length: block.byte_length,
+                allocation_id: block.allocation_id,
             };
             {
                 let peer = ResponsePoolHandle::new(&CString::new(prefix).unwrap());
@@ -2032,7 +2046,7 @@ mod tests {
 
     #[test]
     fn public_abi_version_is_exported() {
-        assert_eq!(c2_mem_ffi_abi_version(), 4);
+        assert_eq!(c2_mem_ffi_abi_version(), 5);
     }
 
     #[test]
@@ -2111,19 +2125,21 @@ _Static_assert(C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER == 4, "status buffer value"
 _Static_assert(C2_MEM_FFI_STATUS_IO_ERROR == 5, "status IO value");
 _Static_assert(C2_MEM_FFI_MAX_SHM_PREFIX_LEN == 255u, "prefix length limit");
 _Static_assert(C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS == 16u, "segment count limit");
-_Static_assert(C2_MEM_FFI_ABI_VERSION == 4u, "abi version");
-_Static_assert(sizeof(C2MemFfiRequestBlock) == 16, "request block size");
+_Static_assert(C2_MEM_FFI_ABI_VERSION == 5u, "abi version");
+_Static_assert(sizeof(C2MemFfiRequestBlock) == 24, "request block size");
 _Static_assert(offsetof(C2MemFfiRequestBlock, segment_index) == 0, "request segment_index offset");
 _Static_assert(offsetof(C2MemFfiRequestBlock, is_dedicated) == 2, "request dedicated offset");
 _Static_assert(offsetof(C2MemFfiRequestBlock, generation) == 4, "generation offset");
 _Static_assert(offsetof(C2MemFfiRequestBlock, offset) == 8, "request offset offset");
 _Static_assert(offsetof(C2MemFfiRequestBlock, byte_length) == 12, "request byte_length offset");
-_Static_assert(sizeof(C2MemFfiResponseBlock) == 16, "response block size");
+_Static_assert(offsetof(C2MemFfiRequestBlock, allocation_id) == 16, "request allocation_id offset");
+_Static_assert(sizeof(C2MemFfiResponseBlock) == 24, "response block size");
 _Static_assert(offsetof(C2MemFfiResponseBlock, segment_index) == 0, "response segment_index offset");
 _Static_assert(offsetof(C2MemFfiResponseBlock, is_dedicated) == 2, "response dedicated offset");
 _Static_assert(offsetof(C2MemFfiResponseBlock, generation) == 4, "generation offset");
 _Static_assert(offsetof(C2MemFfiResponseBlock, offset) == 8, "response offset offset");
 _Static_assert(offsetof(C2MemFfiResponseBlock, byte_length) == 12, "response byte_length offset");
+_Static_assert(offsetof(C2MemFfiResponseBlock, allocation_id) == 16, "response allocation_id offset");
 
 static void use_endpoint_api(void) {
     C2MemFfiLocalEndpointContext *context = NULL;
@@ -2231,6 +2247,7 @@ static void use_response_api(void) {
                 generation: alloc.generation,
                 offset: alloc.offset,
                 byte_length: payload.len() as u32,
+                allocation_id: alloc.allocation_id,
             },
         )
     }
@@ -2267,6 +2284,7 @@ static void use_response_api(void) {
             generation: alloc.generation,
             offset: alloc.offset,
             byte_length: payload.len() as u32,
+            allocation_id: alloc.allocation_id,
         }
     }
 
@@ -2357,6 +2375,7 @@ static void use_response_api(void) {
                     block.offset,
                     block.byte_length,
                     block.is_dedicated != 0,
+                    block.allocation_id,
                 )
                 .is_err()
         );
@@ -2364,6 +2383,60 @@ static void use_response_api(void) {
             unsafe { c2_mem_ffi_response_pool_release(handle.0, block) },
             C2MemFfiStatus::InvalidArgument
         );
+    }
+
+    #[test]
+    fn response_pool_stale_id_cannot_release_reused_buddy_block() {
+        let prefix = test_prefix();
+        let payload = b"same slot, different allocation";
+        let (mut server, first) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
+        let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, first) },
+            C2MemFfiStatus::Ok
+        );
+
+        let alloc = server.alloc(payload.len()).unwrap();
+        assert_eq!(alloc.seg_idx as u16, first.segment_index);
+        assert_eq!(alloc.generation, first.generation);
+        assert_eq!(alloc.offset, first.offset);
+        assert_ne!(alloc.allocation_id, first.allocation_id);
+        let second = C2MemFfiResponseBlock {
+            allocation_id: alloc.allocation_id,
+            ..first
+        };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                server.data_ptr(&alloc).unwrap(),
+                payload.len(),
+            );
+        }
+        let mut observed = vec![0_u8; payload.len()];
+        let mut read = 0;
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_response_pool_read(
+                    handle.0,
+                    second,
+                    observed.as_mut_ptr(),
+                    observed.len(),
+                    &mut read,
+                )
+            },
+            C2MemFfiStatus::Ok
+        );
+        assert_eq!(observed, payload);
+        assert_eq!(read, payload.len());
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, first) },
+            C2MemFfiStatus::InvalidArgument
+        );
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, second) },
+            C2MemFfiStatus::Ok
+        );
+        assert!(server.free(&alloc).is_err());
     }
 
     #[test]
@@ -2400,6 +2473,7 @@ static void use_response_api(void) {
                     block.offset,
                     block.byte_length,
                     block.is_dedicated != 0,
+                    block.allocation_id,
                 )
                 .is_err()
         );
@@ -2424,6 +2498,7 @@ static void use_response_api(void) {
                     block.offset,
                     block.byte_length,
                     block.is_dedicated != 0,
+                    block.allocation_id,
                 )
                 .is_err()
         );
@@ -2467,6 +2542,7 @@ static void use_response_api(void) {
                     block.offset,
                     block.byte_length,
                     block.is_dedicated != 0,
+                    block.allocation_id,
                 )
                 .is_err()
         );
@@ -2582,6 +2658,7 @@ static void use_response_api(void) {
             generation: second.generation,
             offset: second.offset,
             byte_length: payload.len() as u32,
+            allocation_id: second.allocation_id,
         };
         let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
         let mut out = vec![0_u8; payload.len()];
@@ -2654,6 +2731,7 @@ static void use_response_api(void) {
                     block.offset,
                     block.byte_length,
                     false,
+                    block.allocation_id,
                 )
                 .is_err(),
             "peer release must reach the owner allocator"

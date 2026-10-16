@@ -108,6 +108,7 @@ _LAZY_HANDSHAKE_SCRIPT = dedent(
       generation: block.generation,
       offset: block.offset,
       byteLength: block.byteLength,
+      allocationId: block.allocationId,
       dedicated: block.dedicated,
     };
     const bytes = await reader.read(emptySnapshot);

@@ -2,13 +2,13 @@
 //!
 //! Exposes the pool to Python with a clean, safe API:
 //! - MemPool: main pool object (was MemPoolHandle)
-//! - PoolAlloc: allocation result (seg_idx, offset, size, level, is_dedicated)
+//! - PoolAlloc: allocation result (seg_idx, offset, size, level, is_dedicated, allocation_id)
 //! - PoolConfig: configuration dataclass
 //! - PoolStats: statistics dataclass
 
 use c2_mem::{MemPool, PoolAllocation, PoolConfig};
-use c2_wire::chunk::ReassemblyBacking;
 use c2_wire::assembler::ChunkAssembler;
+use c2_wire::chunk::ReassemblyBacking;
 use parking_lot::{Mutex, RwLock};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -155,19 +155,22 @@ pub struct PyPoolAlloc {
     pub level: u16,
     #[pyo3(get)]
     pub is_dedicated: bool,
+    #[pyo3(get)]
+    pub allocation_id: u64,
 }
 
 #[pymethods]
 impl PyPoolAlloc {
     fn __repr__(&self) -> String {
         format!(
-            "PoolAlloc(seg={}, generation={}, off={}, size={}, lvl={}, ded={})",
+            "PoolAlloc(seg={}, generation={}, off={}, size={}, lvl={}, ded={}, allocation_id={})",
             self.seg_idx,
             self.generation,
             self.offset,
             self.actual_size,
             self.level,
-            self.is_dedicated
+            self.is_dedicated,
+            self.allocation_id
         )
     }
 }
@@ -181,6 +184,7 @@ impl From<PoolAllocation> for PyPoolAlloc {
             actual_size: a.actual_size,
             level: a.level,
             is_dedicated: a.is_dedicated,
+            allocation_id: a.allocation_id,
         }
     }
 }
@@ -327,6 +331,7 @@ impl PyMemPool {
             actual_size: alloc.actual_size,
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
+            allocation_id: alloc.allocation_id,
         };
         pool.free(&pa).map_err(PyRuntimeError::new_err)?;
         Ok(())
@@ -342,6 +347,7 @@ impl PyMemPool {
             actual_size: alloc.actual_size,
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
+            allocation_id: alloc.allocation_id,
         };
         let ptr = pool.data_ptr(&pa).map_err(PyRuntimeError::new_err)?;
         if data.len() > alloc.actual_size as usize {
@@ -368,6 +374,7 @@ impl PyMemPool {
             actual_size: alloc.actual_size,
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
+            allocation_id: alloc.allocation_id,
         };
         let ptr = pool.data_ptr(&pa).map_err(PyRuntimeError::new_err)?;
         if size > alloc.actual_size as usize {
@@ -393,6 +400,7 @@ impl PyMemPool {
             actual_size: alloc.actual_size,
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
+            allocation_id: alloc.allocation_id,
         };
         let ptr = pool.data_ptr(&pa).map_err(PyRuntimeError::new_err)?;
         let len = data.len_bytes();
@@ -427,7 +435,7 @@ impl PyMemPool {
         Ok(PyBytes::new(py, slice))
     }
 
-    /// Free a block given (seg_idx, offset, data_size) without a PoolAlloc object.
+    /// Free a block given its coordinates, data size, and allocation identity.
     ///
     /// Used by the remote side to free SHM blocks after reading.
     /// Recomputes the buddy level from data_size internally.
@@ -439,10 +447,18 @@ impl PyMemPool {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     ) -> PyResult<()> {
         let mut pool = self.pool.write();
         let _ = pool
-            .free_at(seg_idx, generation, offset, data_size, is_dedicated)
+            .free_at(
+                seg_idx,
+                generation,
+                offset,
+                data_size,
+                is_dedicated,
+                allocation_id,
+            )
             .map_err(PyRuntimeError::new_err)?;
         Ok(())
     }

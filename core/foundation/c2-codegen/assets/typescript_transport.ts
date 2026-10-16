@@ -83,6 +83,7 @@ export interface C2IpcResponseShmBlock {
   readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
+  readonly allocationId: bigint;
   readonly dedicated: boolean;
 }
 
@@ -99,6 +100,7 @@ export interface C2IpcRequestShmBlock {
   readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
+  readonly allocationId: bigint;
   readonly dedicated: boolean;
 }
 
@@ -339,6 +341,7 @@ interface C2IpcBuddyPayload {
   readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
+  readonly allocationId: bigint;
   readonly dedicated: boolean;
 }
 
@@ -1001,10 +1004,10 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
   };
 }
 
-const C2_IPC_HANDSHAKE_VERSION = 11;
+const C2_IPC_HANDSHAKE_VERSION = 12;
 const C2_IPC_FRAME_BODY_HEADER_BYTES = 12;
 const C2_IPC_FRAME_HEADER_BYTES = 16;
-const C2_IPC_BUDDY_PAYLOAD_BYTES = 15;
+const C2_IPC_BUDDY_PAYLOAD_BYTES = 23;
 const C2_IPC_BUDDY_FLAG_DEDICATED = 1 << 0;
 const C2_IPC_REPLY_CHUNK_META_BYTES = 16;
 const C2_IPC_REQUEST_CHUNK_HEADER_BYTES = 4;
@@ -1025,7 +1028,7 @@ const C2_IPC_FLAG_CALL_V2 = 1 << 7;
 const C2_IPC_FLAG_REPLY_V2 = 1 << 8;
 const C2_IPC_FLAG_CHUNKED = 1 << 9;
 const C2_IPC_FLAG_CHUNK_LAST = 1 << 10;
-// Canonical c2-wire MsgType discriminants; these are existing v11 controls.
+// Canonical c2-wire MsgType discriminants for the v12 handshake.
 const C2_IPC_ROUTE_LIST = 0x0e;
 const C2_IPC_ROUTE_LIST_ACK = 0x0f;
 const C2_IPC_ROUTE_LOOKUP = 0x10;
@@ -1767,6 +1770,7 @@ function requireIpcRequestShmBlock(value: unknown, expectedByteLength: number, r
   const generation = block.generation;
   const offset = block.offset;
   const byteLength = block.byteLength;
+  const allocationId = block.allocationId;
   const dedicated = block.dedicated;
   if (typeof segmentIndex !== "number" || !Number.isSafeInteger(segmentIndex) || segmentIndex < 0 || segmentIndex > 0xffff) {
     throw new C2IpcTransportError("C-Two IPC requestShmWriter block segmentIndex must be a u16 integer.");
@@ -1789,6 +1793,7 @@ function requireIpcRequestShmBlock(value: unknown, expectedByteLength: number, r
   if (dedicated && offset !== 0) {
     throw new C2IpcTransportError("C-Two IPC requestShmWriter dedicated block offset must be 0.");
   }
+  requireIpcAllocationId(allocationId, dedicated, "requestShmWriter block");
   if (!dedicated) {
     const segment = requestShmWriter.segments[segmentIndex];
     if (segment === undefined) {
@@ -1799,7 +1804,7 @@ function requireIpcRequestShmBlock(value: unknown, expectedByteLength: number, r
       throw new C2IpcTransportError(`C-Two IPC requestShmWriter block range ${offset}+${byteLength} exceeds segment ${segmentIndex} size ${segmentSize}.`);
     }
   }
-  return { segmentIndex, generation, offset, byteLength, dedicated };
+  return { segmentIndex, generation, offset, byteLength, allocationId, dedicated };
 }
 
 function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | undefined {
@@ -1811,6 +1816,7 @@ function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | un
   const generation = block.generation;
   const offset = block.offset;
   const byteLength = block.byteLength;
+  const allocationId = block.allocationId;
   const dedicated = block.dedicated;
   if (
     typeof segmentIndex !== "number" ||
@@ -1830,11 +1836,22 @@ function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | un
     !Number.isSafeInteger(byteLength) ||
     byteLength <= 0 ||
     byteLength > 0xffffffff ||
-    typeof dedicated !== "boolean"
+    typeof dedicated !== "boolean" ||
+    !isIpcAllocationId(allocationId, dedicated)
   ) {
     return undefined;
   }
-  return { segmentIndex, generation, offset, byteLength, dedicated };
+  return { segmentIndex, generation, offset, byteLength, allocationId: allocationId as bigint, dedicated };
+}
+
+function isIpcAllocationId(value: unknown, dedicated: boolean): value is bigint {
+  return typeof value === "bigint" && value >= 0n && value <= 0xffffffffffffffffn && (dedicated ? value === 0n : value !== 0n);
+}
+
+function requireIpcAllocationId(value: unknown, dedicated: boolean, label: string): asserts value is bigint {
+  if (!isIpcAllocationId(value, dedicated)) {
+    throw new C2IpcTransportError(`C-Two IPC ${label} allocationId must be a nonzero u64 bigint for buddy memory or 0n for dedicated memory.`);
+  }
 }
 
 function encodeIpcBuddyPayload(block: C2IpcRequestShmBlock): Uint8Array {
@@ -1844,6 +1861,7 @@ function encodeIpcBuddyPayload(block: C2IpcRequestShmBlock): Uint8Array {
     writeU32LE(block.offset),
     writeU32LE(block.byteLength),
     new Uint8Array([block.dedicated ? C2_IPC_BUDDY_FLAG_DEDICATED : 0]),
+    writeU64LEBigInt(block.allocationId, "allocation_id"),
   ]);
 }
 
@@ -2342,11 +2360,14 @@ function decodeIpcBuddyPayload(payload: Uint8Array): C2IpcBuddyPayload {
   if (dedicated ? generation !== 0 : generation === 0) {
     throw new C2IpcTransportError("C-Two IPC buddy generation must be positive; dedicated generation must be 0.");
   }
+  const allocationId = readU64LEBigInt(payload, 15);
+  requireIpcAllocationId(allocationId, dedicated, "buddy payload");
   return {
     segmentIndex: readU16LE(payload, 0),
     generation,
     offset: readU32LE(payload, 6),
     byteLength,
+    allocationId,
     dedicated,
   };
 }
@@ -2369,6 +2390,7 @@ function buildIpcResponseShmBlock(handshake: C2IpcHandshake, buddy: C2IpcBuddyPa
     generation: buddy.generation,
     offset: buddy.offset,
     byteLength: buddy.byteLength,
+    allocationId: buddy.allocationId,
     dedicated: buddy.dedicated,
   };
 }
@@ -2675,6 +2697,19 @@ function writeU64LE(value: number, field: string): Uint8Array {
   const out = new Uint8Array(8);
   new DataView(out.buffer).setBigUint64(0, BigInt(value), true);
   return out;
+}
+
+function writeU64LEBigInt(value: bigint, field: string): Uint8Array {
+  if (typeof value !== "bigint" || value < 0n || value > 0xffffffffffffffffn) {
+    throw new C2IpcTransportError(`C-Two IPC ${field} must be a u64 bigint.`);
+  }
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setBigUint64(0, value, true);
+  return out;
+}
+
+function readU64LEBigInt(value: Uint8Array, offset: number): bigint {
+  return new DataView(value.buffer, value.byteOffset, value.byteLength).getBigUint64(offset, true);
 }
 
 function readU32LE(value: Uint8Array, offset: number): number {
