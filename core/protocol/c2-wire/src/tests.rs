@@ -242,28 +242,10 @@ mod control_tests {
     }
 
     #[test]
-    fn call_control_roundtrip() {
-        let identity = call_identity("grid");
-        let encoded = encode_call_control(&identity, 42).unwrap();
-        let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
-        assert_eq!(consumed, encoded.len());
-        assert_eq!(decoded.identity, identity);
-        assert_eq!(decoded.method_idx, 42);
-    }
-
-    #[test]
     fn call_control_roundtrip_preserves_route_identity_and_contract() {
-        let identity = RouteCallIdentity {
-            route_name: "grid".into(),
-            route_uid: "route-uid-0001".into(),
-            observed_route_revision: 17,
-            crm_ns: "test.grid".into(),
-            crm_name: "Grid".into(),
-            crm_ver: "0.1.0".into(),
-            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                .into(),
-        };
+        let mut identity = call_identity("grid");
+        identity.route_uid = "route-uid-0001".into();
+        identity.observed_route_revision = 17;
 
         let encoded = encode_call_control(&identity, 42).unwrap();
         let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
@@ -274,34 +256,51 @@ mod control_tests {
     }
 
     #[test]
-    fn call_control_rejects_empty_route_name() {
+    fn call_control_rejects_empty_route_name_before_buffer_capacity() {
         let mut identity = call_identity("grid");
         identity.route_name.clear();
-        assert!(encode_call_control(&identity, 0).is_err());
+        let error = encode_call_control(&identity, 0).unwrap_err();
+        let mut buf = [0xAA; 1];
+        assert_eq!(
+            encode_call_control_into(&mut buf, usize::MAX, &identity, 0),
+            Err(error)
+        );
+        assert_eq!(buf, [0xAA]);
         assert!(decode_call_control(&[0, 0, 0], 0).is_err());
     }
 
     #[test]
     fn call_control_with_offset() {
-        let mut buf = vec![0xAA, 0xBB]; // prefix
         let identity = call_identity("net");
-        buf.extend_from_slice(&encode_call_control(&identity, 7).unwrap());
+        let encoded = encode_call_control(&identity, 7).unwrap();
+        let len = encoded.len();
+        let mut buf = vec![0xAA; len + 4];
+        assert_eq!(encode_call_control_into(&mut buf, 2, &identity, 7), Ok(len));
+        assert_eq!(&buf[2..2 + len], encoded);
+        assert_eq!(&buf[..2], &[0xAA; 2]);
+        assert_eq!(&buf[2 + len..], &[0xAA; 2]);
         let (decoded, consumed) = decode_call_control(&buf, 2).unwrap();
         assert_eq!(decoded.identity, identity);
         assert_eq!(decoded.method_idx, 7);
-        assert_eq!(consumed, buf.len() - 2);
+        assert_eq!(consumed, len);
     }
 
     #[test]
-    fn encode_call_control_into_rejects_short_buffer_without_panic() {
+    fn encode_call_control_into_rejects_short_buffer_without_writing() {
         let identity = call_identity("grid");
         let len = encoded_call_control_len(&identity).unwrap();
-        let mut buf = vec![0u8; len - 1];
-
-        let err = encode_call_control_into(&mut buf, 0, &identity, 0)
-            .expect_err("short call-control buffer must be reported");
-
-        assert!(err.to_string().contains("buffer is too short"), "{err}");
+        let mut buf = vec![0xAA; len - 1];
+        for (offset, have) in [(0, len - 1), (1, len - 2), (usize::MAX, 0)] {
+            assert_eq!(
+                encode_call_control_into(&mut buf, offset, &identity, 0),
+                Err(EncodeError::BufferTooShort {
+                    field: "call_control",
+                    need: len,
+                    have
+                }),
+            );
+            assert!(buf.iter().all(|&byte| byte == 0xAA));
+        }
     }
 
     #[test]
@@ -363,26 +362,6 @@ mod control_tests {
         let buf = [0xFF];
         let result = decode_reply_control(&buf, 0);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn canonical_call_control_fixture_matches() {
-        let identity = call_identity("grid");
-        let mut expected = Vec::new();
-        expected.extend_from_slice(b"\x04grid");
-        expected.extend_from_slice(b"\x0dgrid-uid-0001");
-        expected.extend_from_slice(&1u64.to_le_bytes());
-        expected.extend_from_slice(b"\x09test.grid");
-        expected.extend_from_slice(b"\x04Grid");
-        expected.extend_from_slice(b"\x050.1.0");
-        expected.push(64);
-        expected.extend_from_slice(ABI_HASH.as_bytes());
-        expected.push(64);
-        expected.extend_from_slice(SIG_HASH.as_bytes());
-        expected.extend_from_slice(&5u16.to_le_bytes());
-
-        let encoded = encode_call_control(&identity, 5).unwrap();
-        assert_eq!(encoded, expected);
     }
 
     #[test]
@@ -1074,16 +1053,6 @@ mod cross_lang_tests {
         assert_eq!(hdr.request_id, 12345);
         assert_eq!(hdr.flags, 0x1C2);
         assert_eq!(payload, b"test_payload");
-    }
-
-    #[test]
-    fn canonical_call_control_fixture_decodes() {
-        let identity = call_identity("hello");
-        let bytes = encode_call_control(&identity, 7).unwrap();
-        let (ctrl, consumed) = decode_call_control(&bytes, 0).unwrap();
-        assert_eq!(ctrl.identity, identity);
-        assert_eq!(ctrl.method_idx, 7);
-        assert_eq!(consumed, bytes.len());
     }
 
     #[test]

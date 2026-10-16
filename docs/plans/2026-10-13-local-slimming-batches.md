@@ -1,5 +1,15 @@
 # C-Two 局部精简批次记录与收束
 
+## R29 call-control 私有写入校验收敛（2026-10-16，完成）
+
+执行基线为 `73fba191`。用户批准只删除已被公开入口覆盖的私有检查：身份校验中五处重复长度检查退出，`push_text` / `write_text` 不再复验长度或逐字段容量、也不再返回 `Result`；固定长度开销明确为七个长度字节、八字节 revision 和两字节 method index。公开入口身份校验、整段容量检查、错误顺序与文案、失败时缓冲不变、IPC 跨 await 校验均保留；公开签名、错误枚举、API/ABI 和 wire 格式不变。
+
+生产新增 25、删除 54，净减 29 行；测试新增 32、删除 63，净减 31 行；两个源码文件合计净减 60 行。三个重复 roundtrip/golden 用例退出，revision 17 的完整身份往返及跨语言独立手写 golden 保留；既有 offset、短缓冲与空身份用例增强为验证实际写入、前后哨兵、usize::MAX 拒绝和身份错误优先于容量错误。没有新增类型、缓存、测试框架或公开 unchecked 入口。
+
+调整后的完整 wire 143 项先在原生产实现通过。候选本机 macOS 通过 contract 47、wire 143、server 160、IPC 202 + 7、完整 relay 419，共 978 项 Rust 测试；从候选重建 native/CLI 后，Python wire/security、SHM、HTTP/mesh、跨模式和生命周期回归 184 项通过，合计 1162 项，无跳过。独立构建目录中的临时新旧对照覆盖 211 种身份、三档 method index，共 633 组编码及 7596 组缓冲场景；编码字节、错误变体/字段/文案逐字一致，失败缓冲及成功写入前后哨兵均保持。对照探针未进入仓库，未声明性能提升。
+
+独立原生审查无 actionable findings，补丁 SHA-256 为 `bd4f53b8265e6631b1dc45941611a13f1d477b9f7a0749fbfc2ab34926cf8d44`，审查、测试及最终源码一致。Host 逐字核对入站解码、reply 编解码、完整容量 gate、手写 golden 和 IPC client 未改，格式与 diff 检查通过。本批作用域 socket/lease 均为零，无须补做 reap；历史目录快照未变，未使用 buddy。本轮验证限本地 macOS，未新增 hosted CI 证据；隔离副本仅重定向测试默认路径。完整日志、对照结果、构建来源、审查及端点收据位于 `~/.codex/diagnostics/c2-r29-control-d96023b1/`。
+
 ## R34 服务端 peer SHM 状态收敛（2026-10-16，完成）
 
 用户接受删除公开 Rust Connection 的 remote_segment_names/remote_segment_sizes，init_peer_shm 改为仅接收 prefix；不留兼容入口。退出段名/大小副本、首段尺寸及钳制警告，peer pool 的 segment_size 固定为合法初始化下限 8192。实际映射仍依据帧的 index/generation/span、真实 backing 大小和 allocator header；完整握手解码、身份与代际检查、读取/释放/GC 及生命周期策略保持，Python 接口、C/FFI ABI 和 wire 格式不变。
