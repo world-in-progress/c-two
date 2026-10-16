@@ -6,8 +6,13 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
+import signal
+import socket
 import sys
 from types import SimpleNamespace
+
+import pytest
 
 
 def _runner():
@@ -38,6 +43,25 @@ def test_failure_keeps_exit_code_and_does_not_prevent_next_gate(tmp_path):
     assert success["status"] == "passed" and success["exit_code"] == 0
 
 
+def test_workspace_failure_survives_later_successful_crate_output(tmp_path, capsys):
+    summary = tmp_path / "step-summary.md"
+    assertion = "ClientCacheCloseReport { unconfirmed: [\"malformed-no-io\"] }"
+    diagnostic = "thread 'observed_close' panicked at pool.rs:2651:13:\n" + assertion
+    child = tmp_path / "workspace_output.py"
+    child.write_text(f"print({diagnostic!r})\nprint('later crate passed\\n' * 3000)\nraise SystemExit(101)\n")
+    record = _runner().run_step(
+        "core-test",
+        [sys.executable, str(child)],
+        cwd=tmp_path, output=tmp_path,
+        environment=os.environ.copy(), summary=summary,
+    )
+    assert record["status"] == "failed" and record["exit_code"] == 101
+    assert assertion in capsys.readouterr().out
+    assert assertion in summary.read_text()
+    assert assertion in (tmp_path / "core-test.failure.txt").read_text()
+    assert (tmp_path / "core-test.log").read_text().count("later crate passed") == 3000
+
+
 def test_timeout_records_failure_and_reaps_child(tmp_path):
     record = _runner().run_step(
         "timeout", [sys.executable, "-c", "import time; print('started', flush=True); time.sleep(60)"],
@@ -47,6 +71,72 @@ def test_timeout_records_failure_and_reaps_child(tmp_path):
     assert record["process_exited"] is True
     assert record["exit_code"] != 0
     assert "started" in (tmp_path / "timeout.log").read_text()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-session cancellation")
+@pytest.mark.parametrize("driver", ["python-suite", "ipc-memory-matrix"])
+def test_timeout_reaps_independent_session_owned_by_nested_driver(tmp_path, driver):
+    root = Path(__file__).resolve().parents[2]
+    ready = tmp_path / "ready.json"
+    child = tmp_path / "owned_child.py"
+    child.write_text(
+        "import json, os, signal, socket, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "listener = socket.socket(); listener.bind(('127.0.0.1', 0)); listener.listen()\n"
+        f"Path({str(ready)!r}).write_text(json.dumps([os.getpid(), listener.getsockname()[1]]))\n"
+        "while True: time.sleep(1)\n"
+    )
+    controller = tmp_path / "controller.py"
+    common = f"import os, sys\nfrom pathlib import Path\nsys.path.insert(0, {str(root)!r})\n"
+    if driver == "python-suite":
+        body = (
+            "from tools.dev.test_python import run_step\n"
+            f"run_step([sys.executable, {str(child)!r}], Path({str(tmp_path / 'nested')!r}), os.environ.copy(), 60)\n"
+        )
+    else:
+        body = (
+            "from types import SimpleNamespace\n"
+            "from tools.benchmarks import ipc_memory as matrix\n"
+            "original_spawn = matrix.subprocess.Popen\n"
+            "def spawn(command, *args, **kwargs):\n"
+            f"    if kwargs.get('start_new_session'): command = [sys.executable, {str(child)!r}]\n"
+            "    return original_spawn(command, *args, **kwargs)\n"
+            "matrix.subprocess.Popen = spawn\n"
+            f"matrix.run_matrix(SimpleNamespace(output_dir=Path({str(tmp_path / 'nested')!r}), "
+            "only='idle_small_rpc_default_buddy', python=sys.executable, memory_stats=False, "
+            "require_memory_stats=False, allow_unavailable_stats_after_shutdown=False, "
+            "child_timeout=60, row_timeout=60))\n"
+        )
+    controller.write_text(common + body)
+    command = [sys.executable, str(controller)]
+    if driver == "ipc-memory-matrix":
+        uv = shutil.which("uv")
+        assert uv is not None, "the source runner requires uv"
+        command = [uv, "run", "--no-project", "--no-sync", "--python", sys.executable,
+                   "python", str(controller)]
+    try:
+        result = _runner().run_step(
+            driver, command, cwd=tmp_path,
+            output=tmp_path, environment=os.environ.copy(), timeout=2,
+        )
+        assert result["status"] == "timed_out" and result["process_exited"]
+        pid, port = json.loads(ready.read_text())
+        # This listener stays open for the child's entire lifetime. Parent
+        # exit alone cannot make the bind succeed while that child survives.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", port))
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        # The failing baseline must not leak the test's own escaped session.
+        if ready.exists():
+            pid, _ = json.loads(ready.read_text())
+            try:
+                if os.getpgid(pid) == pid:
+                    os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_failed_prerequisite_marks_scope_failed_and_runs_independent_gate(tmp_path, monkeypatch):
@@ -77,6 +167,35 @@ def test_failed_prerequisite_marks_scope_failed_and_runs_independent_gate(tmp_pa
     assert evidence["steps"][1]["exit_code"] == 7
     assert not (output / "dependent.log").exists()
     assert "independent executed" in (output / "independent.log").read_text()
+
+
+def test_aggregate_deadline_bounds_children_and_retains_failure_evidence(tmp_path, monkeypatch):
+    runner = _runner()
+    clock = [0.0]
+    started = []
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(runner, "capture", lambda command, cwd: {"exit_code": 0, "output": "a" * 40})
+    monkeypatch.setattr(runner, "gates", lambda *args: [
+        ("first", ["first"], ()), ("later", ["later"], ()),
+    ])
+
+    def run(name, command, **kwargs):
+        started.append((name, kwargs["timeout"]))
+        clock[0] += kwargs["timeout"]
+        return {"id": name, "status": "timed_out", "exit_code": -9}
+
+    monkeypatch.setattr(runner, "run_step", run)
+    output = tmp_path / "evidence"
+    result = runner.main([
+        "--scope", "local-platform", "--timeout", "10", "--output", str(output),
+        "--expected-c-two-sha", "a" * 40, "--expected-fastdb-sha", "a" * 40,
+    ])
+    evidence = json.loads((output / "run-evidence.json").read_text())
+    assert result == 1 and evidence["status"] == "failed"
+    assert started == [("first", 10.0)]
+    assert evidence["steps"][1]["status"] == "not_run"
+    assert "deadline exhausted" in evidence["steps"][1]["reason"]
 
 
 def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
@@ -470,7 +589,10 @@ def test_ipc_memory_matrix_gate_status_binds_full_required_stats_evidence(tmp_pa
             (name, [sys.executable, "-c", "print('source gate')"], ())
             for name in sorted(runner.SOURCE_MODE_GATES - {"python-build"})
         ]
-        result = runner.main(_stub_windows_main(monkeypatch, runner, tmp_path, stubbed, output_name=f"evidence-{label}"))
+        # Leave the aggregate budget above this phase cap; the deadline test
+        # separately verifies that a shorter remaining budget bounds children.
+        result = runner.main(_stub_windows_main(monkeypatch, runner, tmp_path, stubbed, output_name=f"evidence-{label}")
+                             + ["--timeout", "7200"])
         evidence = json.loads((output / "run-evidence.json").read_text())
         step = next(s for s in evidence["steps"] if s["id"] == runner.IPC_MEMORY_GATE)
         assert step["status"] == expected_status, label

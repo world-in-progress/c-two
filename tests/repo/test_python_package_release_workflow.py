@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
+
 
 def _repo_root() -> Path:
     return next(
@@ -17,16 +19,14 @@ def _workflow_text() -> str:
     )
 
 
-def test_python_release_promotes_only_after_both_candidate_gates_complete():
-    text = _workflow_text()
-
-    assert "workflow_run:" in text
-    assert "workflows: [Release Candidate, Source Validation]" in text
-    assert "types: [completed]" in text
-    assert "branches: [main]" in text
-    assert "candidate_run_id:" in text
-    assert "source_sha:" in text
-    assert "dry_run:" in text
+def test_python_release_requires_an_explicit_candidate_and_defaults_to_preview():
+    workflow = yaml.load(_workflow_text(), Loader=yaml.BaseLoader)
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"candidate_run_id", "dry_run"}
+    assert inputs["candidate_run_id"]["required"] == "true"
+    assert inputs["dry_run"]["default"] == "true"
+    assert "workflow_run" not in _workflow_text()
 
 
 def test_python_release_fails_closed_outside_the_canonical_repository():
@@ -34,8 +34,7 @@ def test_python_release_fails_closed_outside_the_canonical_repository():
 
     assert "github.repository == 'world-in-progress/c-two'" in text
     assert "github.ref == 'refs/heads/main'" in text
-    assert "github.event.workflow_run.event == 'push'" in text
-    assert "github.event.workflow_run.head_branch == 'main'" in text
+    assert "github.event_name == 'workflow_dispatch'" in text
 
 
 def test_python_release_never_rebuilds_wheels_or_sdist():
@@ -58,36 +57,6 @@ def test_python_release_prepare_job_reads_actions_with_least_privilege():
     assert "id-token: write" not in text
 
 
-def test_python_release_skips_explicitly_when_version_already_published():
-    """Automatic workflow_run promotions whose c-two version is already fully
-    published on PyPI (a complete, immutable registry version) finish as a
-    no-publication skip that does not assert candidate byte equality; manual
-    dispatches keep failing closed on that collision. The decision is
-    independent of the c3 release state."""
-    text = _workflow_text()
-    prepare = text.split("  publish:", 1)[0]
-
-    # The skip allowance exists only on the automatic workflow_run path.
-    assert "AUTOMATIC: ${{ github.event_name == 'workflow_run' }}" in prepare
-    assert (
-        'if [ "$AUTOMATIC" = "true" ]; then args+=(--skip-already-published); fi'
-        in prepare
-    )
-    # The prepare parser accepts the skip plan and reports it explicitly,
-    # reading the reason from the selected group so a late race skip stored
-    # under pypi cannot raise.
-    assert 'plan.get("pypi") or plan["skip"]' in prepare
-    assert "No publication: {group['reason']}" in prepare
-    assert "plan['skip']['reason']" not in prepare
-    assert '"skip-already-published"' in prepare
-    # A skip retains no staged distribution files or plan artifact and never
-    # publishes: both retention steps are gated, and publish still requires
-    # 'upload'.
-    assert prepare.count("action != 'skip-already-published'") == 2
-    publish = text.split("  publish:", 1)[1]
-    assert "needs.prepare.outputs.action == 'upload'" in publish
-
-
 def test_publish_uses_pypi_oidc_trust_identity_and_environment():
     publish = _workflow_text().split("  publish:", 1)[1]
 
@@ -103,7 +72,6 @@ def test_publish_uploads_only_the_plan_staged_distribution():
     publish = _workflow_text().split("  publish:", 1)[1]
 
     assert "needs: prepare" in publish
-    assert "needs.prepare.outputs.deferred == 'false'" in publish
     assert "needs.prepare.outputs.action == 'upload'" in publish
     assert "inputs.dry_run != true" in publish
     assert "packages-dir: staging/dist" in publish

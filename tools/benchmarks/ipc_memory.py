@@ -965,6 +965,9 @@ def run_matrix(args: argparse.Namespace) -> int:
             terminated = True
             drain_failure = terminate_owned_session(proc)
             stdout, stderr = '', ''
+        except BaseException:
+            terminate_owned_session(proc)
+            raise
         else:
             if stdout.strip():
                 try:

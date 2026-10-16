@@ -1,42 +1,18 @@
 name: CLI Release
+run-name: CLI Release · candidate ${{ inputs.candidate_run_id }}${{ inputs.dry_run && ' · dry run' || '' }}
 
-# Exact-tested-candidate promotion (step 2 of the release plan). This workflow
-# never rebuilds: it promotes the byte-exact c3 binaries, canonical installer
-# assets, and FastDB license evidence retained by the Release Candidate
-# workflow, and only after BOTH same-source main-push gates succeeded — the
-# Release Candidate run itself and the Source Validation full-scope runs on
-# ubuntu-24.04, macos-15, windows-2022 and windows-2025. Whichever gate completes
-# first defers; the
-# late completion re-triggers promotion. All provenance is resolved through
-# the authenticated GitHub API before any publish authority is used, and the
-# publishing job only ever uploads the verified, staged bytes.
-# The prepare job checks out the current main workflow code (never the
-# candidate SHA) and must run on refs/heads/main of the canonical repository;
-# dry_run performs the identical read-only verification without publishing.
-# Automatic workflow_run promotions whose c3 version is already fully
-# released finish as an explicit no-publication skip: the published release
-# must be complete with digest-carrying assets and bound to the tagged
-# source commit through its retained rc-manifest.json (no tag move, no
-# asset writes); manual dispatches keep failing closed on that collision.
-
+# Promotion never builds. Select one verified, immutable candidate explicitly.
+# Ordinary pushes and completed validation runs cannot publish a release.
 on:
-  workflow_run:
-    workflows: [Release Candidate, Source Validation]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
     inputs:
       candidate_run_id:
-        description: "Release Candidate run id to promote (or leave empty with source_sha)"
-        default: ""
-        type: string
-      source_sha:
-        description: "Candidate source SHA from a canonical main push (or leave empty with candidate_run_id)"
-        default: ""
+        description: "Successful Release Candidate run on canonical main"
+        required: true
         type: string
       dry_run:
-        description: "Prepare and verify the promotion without publishing"
-        default: false
+        description: "Verify and stage the exact candidate without publishing"
+        default: true
         type: boolean
 
 permissions:
@@ -57,16 +33,13 @@ jobs:
     if: >-
       github.repository == 'world-in-progress/c-two' &&
       github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main'))
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       actions: read
     outputs:
-      deferred: ${{ steps.prepare.outputs.deferred }}
       action: ${{ steps.prepare.outputs.action }}
       tag: ${{ steps.prepare.outputs.tag }}
       title: ${{ steps.prepare.outputs.title }}
@@ -89,10 +62,8 @@ jobs:
         id: prepare
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || inputs.source_sha }}
-          CANDIDATE_RUN_ID: ${{ (github.event.workflow_run.name == 'Release Candidate' && github.event.workflow_run.id) || inputs.candidate_run_id }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           DRY_RUN: ${{ inputs.dry_run == true }}
-          AUTOMATIC: ${{ github.event_name == 'workflow_run' }}
         run: |
           set -euo pipefail
           args=(
@@ -101,55 +72,33 @@ jobs:
             --plan-output promotion-plan.json
             --release-body-output release-body.md
           )
-          if [ -n "$SOURCE_SHA" ]; then args+=(--source-sha "$SOURCE_SHA"); fi
-          if [ -n "$CANDIDATE_RUN_ID" ]; then args+=(--candidate-run-id "$CANDIDATE_RUN_ID"); fi
+          args+=(--candidate-run-id "$CANDIDATE_RUN_ID")
           if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
-          # Only the automatic workflow_run path may finish as an explicit
-          # already-published skip; manual dispatches stay fail-closed.
-          if [ "$AUTOMATIC" = "true" ]; then args+=(--skip-already-published); fi
-          code=0
-          python .github/scripts/promote_release_candidate.py prepare "${args[@]}" || code=$?
-          if [ "$code" -eq 75 ]; then
-            {
-              echo "deferred=true"
-              echo "action=deferred"
-            } >> "$GITHUB_OUTPUT"
-            echo "Deferring: the other same-source gate is still running; its completion re-triggers promotion."
-            exit 0
-          fi
-          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python .github/scripts/promote_release_candidate.py prepare "${args[@]}"
           python - <<'PY'
           import json, os, pathlib
           plan = json.loads(pathlib.Path("promotion-plan.json").read_text(encoding="utf-8"))
-          release = plan.get("github_release") or plan["skip"]
+          release = plan["github_release"]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write("deferred=false\n")
               output.write(f"action={release['action']}\n")
               output.write(f"tag={release['tag']}\n")
               output.write(f"title={release['title']}\n")
               output.write(f"source_sha={plan['source_sha']}\n")
               output.write(f"release_exists={str(release['release_exists']).lower()}\n")
               output.write(f"tag_exists={str(release['tag_exists']).lower()}\n")
-          if release["action"] == "skip-already-published":
-              # Early skips live under plan["skip"]; a late race skip is
-              # classified inside github_release — read the selected group's
-              # own reason either way.
-              print(f"No publication: {release['reason']}")
           PY
 
       # The upload's least-common ancestor is the staging directory itself, so
       # the artifact members are <name>; downloading into ./staging
-      # restores the exact plan staged_path layout. An already-published skip
-      # retains nothing: it decided before staging any bytes.
+      # restores the exact plan staged_path layout.
       - name: Retain the staged, verified release bytes
-        if: steps.prepare.outputs.deferred != 'true' && steps.prepare.outputs.action != 'skip-already-published'
         uses: actions/upload-artifact@v4
         with:
           name: promotion-staging
           path: candidate-download/staging
+          retention-days: 7
 
       - name: Retain the promotion plan and release body
-        if: steps.prepare.outputs.deferred != 'true' && steps.prepare.outputs.action != 'skip-already-published'
         uses: actions/upload-artifact@v4
         with:
           name: promotion-plan
@@ -161,7 +110,6 @@ jobs:
     name: publish verified candidate
     needs: prepare
     if: >-
-      needs.prepare.outputs.deferred == 'false' &&
       needs.prepare.outputs.action == 'upload' &&
       inputs.dry_run != true
     runs-on: ubuntu-latest
