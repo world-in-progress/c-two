@@ -29,6 +29,11 @@ The runtime protects memory use at three points:
 pool_segment_size * max_pool_segments
 ```
 
+Python resolved configuration dictionaries retain this derived output. Rust
+`BaseIpcConfig` stores only the two inputs; callers no longer initialize or
+update a separate `max_pool_memory` field. Resolver overflow errors retain
+their original order, before final configuration validation.
+
 The three finite budgets are `shm_backing_budget_bytes`,
 `file_backing_budget_bytes` and `live_reassembly_budget_bytes`; zero refuses
 positive reservations. Backing and reassembly are separate accounting units,

@@ -812,7 +812,6 @@ mod lazy_policy_roundtrip_tests {
         BaseIpcConfig {
             pool_segment_size: segment_size,
             max_pool_segments: segments,
-            max_pool_memory: segment_size * u64::from(segments),
             ..BaseIpcConfig::default()
         }
     }

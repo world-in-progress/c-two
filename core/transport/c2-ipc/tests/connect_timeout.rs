@@ -357,7 +357,6 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
     let mut cfg = c2_ipc::ClientIpcConfig::default();
     cfg.base.pool_segment_size = 1024 * 1024;
     cfg.base.max_pool_segments = 1;
-    cfg.base.max_pool_memory = 1024 * 1024;
     cfg.base.pool_prewarm_segments = 1;
     cfg.base.shm_backing_budget_bytes = 1_536_000;
     let started = Instant::now();

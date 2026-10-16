@@ -71,7 +71,6 @@ fn policy(carrier: Carrier) -> ClientIpcConfig {
     let mut config = ClientIpcConfig::default();
     config.base.pool_segment_size = 64 * 1024;
     config.base.max_pool_segments = 1;
-    config.base.max_pool_memory = 64 * 1024;
     config.base.pool_enabled = carrier == Carrier::Buddy;
     config.base.pool_prewarm_segments = 0;
     config.base.chunk_size = if carrier == Carrier::Inline {

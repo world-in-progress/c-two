@@ -821,7 +821,6 @@ pub(crate) mod tests {
                 pool_enabled: false,
                 pool_segment_size: 2 * 1024 * 1024,
                 max_pool_segments: 2,
-                max_pool_memory: 4 * 1024 * 1024,
                 pool_prewarm_segments: 0,
                 pool_min_retained_segments: 1,
                 reassembly_segment_size: 1024 * 1024,
@@ -1031,7 +1030,6 @@ pub(crate) mod tests {
             base: BaseIpcConfig {
                 pool_segment_size: 65_536,
                 max_pool_segments: 1,
-                max_pool_memory: 65_536,
                 ..BaseIpcConfig::default()
             },
             ..ClientIpcConfig::default()

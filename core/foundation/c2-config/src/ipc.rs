@@ -111,7 +111,6 @@ pub struct BaseIpcConfig {
     pub pool_enabled: bool,
     pub pool_segment_size: u64,
     pub max_pool_segments: u32,
-    pub max_pool_memory: u64,
     /// Buddy segments to map eagerly at connect/register (default 0 = fully
     /// lazy). Prewarming is an explicit transport action: without it, no buddy
     /// memory is mapped until the first allocation that needs it.
@@ -186,7 +185,6 @@ impl Default for BaseIpcConfig {
             pool_enabled: true,
             pool_segment_size: 268_435_456, // 256 MB
             max_pool_segments: 4,
-            max_pool_memory: 1_073_741_824, // 1 GB
             pool_prewarm_segments: 0,
             pool_min_retained_segments: 0,
 
@@ -379,16 +377,6 @@ impl BaseIpcConfig {
             return Err(format!(
                 "max_pool_segments ({}) must be in 1..={MAX_IPC_POOL_SEGMENTS}",
                 self.max_pool_segments,
-            ));
-        }
-        let expected_max_pool_memory = self
-            .pool_segment_size
-            .checked_mul(u64::from(self.max_pool_segments))
-            .ok_or_else(|| "max_pool_memory derived value overflowed".to_string())?;
-        if self.max_pool_memory != expected_max_pool_memory {
-            return Err(format!(
-                "max_pool_memory ({}) must equal pool_segment_size * max_pool_segments ({})",
-                self.max_pool_memory, expected_max_pool_memory,
             ));
         }
         if self.pool_prewarm_segments > self.max_pool_segments {
@@ -986,8 +974,6 @@ mod tests {
         cfg.base.pool_prewarm_segments = cfg.base.max_pool_segments;
         cfg.base.pool_min_retained_segments = cfg.base.max_pool_segments;
         cfg.base.reassembly_max_segments = cfg.base.max_pool_segments;
-        cfg.base.max_pool_memory =
-            cfg.base.pool_segment_size * u64::from(cfg.base.max_pool_segments);
         assert!(cfg.validate().is_ok());
     }
 
@@ -1056,13 +1042,11 @@ mod tests {
 
         let mut cfg = BaseIpcConfig {
             max_pool_segments: MAX_IPC_POOL_SEGMENTS,
-            max_pool_memory: cfg_pool_memory(MAX_IPC_POOL_SEGMENTS),
             ..BaseIpcConfig::default()
         };
         assert!(cfg.validate().is_ok());
 
         cfg.max_pool_segments = MAX_IPC_POOL_SEGMENTS + 1;
-        cfg.max_pool_memory = cfg_pool_memory(MAX_IPC_POOL_SEGMENTS + 1);
         assert!(cfg.validate().unwrap_err().contains("max_pool_segments"));
 
         cfg = BaseIpcConfig {
@@ -1076,10 +1060,6 @@ mod tests {
                 .unwrap_err()
                 .contains("reassembly_max_segments")
         );
-    }
-
-    fn cfg_pool_memory(segments: u32) -> u64 {
-        BaseIpcConfig::default().pool_segment_size * u64::from(segments)
     }
 
     // ── Client pool decay ───────────────────────────────────────────────
@@ -1152,10 +1132,6 @@ mod tests {
             },
             BaseIpcConfig {
                 max_pool_segments: base.max_pool_segments + 1,
-                ..base.clone()
-            },
-            BaseIpcConfig {
-                max_pool_memory: base.max_pool_memory + 4096,
                 ..base.clone()
             },
             BaseIpcConfig {

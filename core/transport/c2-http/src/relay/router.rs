@@ -4982,7 +4982,6 @@ mod tests {
         let mut upstream_ipc = ClientIpcConfig::default();
         upstream_ipc.base.pool_segment_size = 64 * 1024;
         upstream_ipc.base.max_pool_segments = 2;
-        upstream_ipc.base.max_pool_memory = 128 * 1024;
         upstream_ipc.base.reassembly_segment_size = 64 * 1024;
         upstream_ipc.base.reassembly_max_segments = 2;
         upstream_ipc.base.live_reassembly_budget_bytes = 1024;

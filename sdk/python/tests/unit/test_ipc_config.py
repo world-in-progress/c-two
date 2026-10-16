@@ -496,15 +496,22 @@ def test_native_resolver_treats_max_pool_memory_as_unknown_override():
         native.resolve_client_ipc_config({'max_pool_memory': 1024}, None)
 
 
-def test_native_resolver_accepts_mapping_subclasses():
+@pytest.mark.parametrize('segment_size, segments, total', (
+    (268_435_456, 4, 1_073_741_824),
+    (131_072, 3, 393_216),
+    (524_288, 5, 2_621_440),
+))
+def test_native_resolver_accepts_mapping_subclasses(segment_size, segments, total):
     native = ipc_config._native_resolver()  # noqa: SLF001
-    overrides = UserDict({'pool_segment_size': 2 * 1024 * 1024})
+    overrides = UserDict({'pool_segment_size': segment_size, 'max_pool_segments': segments})
 
     server_cfg = native.resolve_server_ipc_config(overrides, None)
     client_cfg = native.resolve_client_ipc_config(overrides, None)
 
-    assert server_cfg['pool_segment_size'] == 2 * 1024 * 1024
-    assert client_cfg['pool_segment_size'] == 2 * 1024 * 1024
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['pool_segment_size'] == segment_size
+        assert cfg['max_pool_segments'] == segments
+        assert cfg['max_pool_memory'] == total
 
 
 def test_unknown_ipc_override_field_is_rejected_by_native():

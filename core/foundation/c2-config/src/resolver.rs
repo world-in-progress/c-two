@@ -640,7 +640,7 @@ fn resolve_server_ipc_config(
         heartbeat_timeout_secs: optional_f64("C2_IPC_HEARTBEAT_TIMEOUT"),
     );
 
-    derive_base(&mut cfg.base)?;
+    validate_pool_memory_product(&cfg.base)?;
     cfg.validate().map_err(ConfigError::new)?;
     Ok(cfg)
 }
@@ -660,7 +660,7 @@ fn resolve_client_ipc_config(
         pool_decay_seconds: optional_f64("C2_IPC_POOL_DECAY_SECONDS"),
     );
 
-    derive_base(&mut cfg.base)?;
+    validate_pool_memory_product(&cfg.base)?;
     cfg.validate().map_err(ConfigError::new)?;
     Ok(cfg)
 }
@@ -707,9 +707,9 @@ fn call_execution_limit_from_env(
         .map_err(|e| ConfigError::new(format!("{key} must be an unsigned integer: {e}")))
 }
 
-fn derive_base(cfg: &mut BaseIpcConfig) -> Result<(), ConfigError> {
-    cfg.max_pool_memory = cfg
-        .pool_segment_size
+// Preserve overflow rejection before final geometry validation.
+fn validate_pool_memory_product(cfg: &BaseIpcConfig) -> Result<(), ConfigError> {
+    cfg.pool_segment_size
         .checked_mul(u64::from(cfg.max_pool_segments))
         .ok_or_else(|| ConfigError::new("max_pool_memory derived value overflowed"))?;
     Ok(())
@@ -829,8 +829,6 @@ mod tests {
             resolved.client_ipc.reassembly_segment_size,
             64 * 1024 * 1024
         );
-        assert_eq!(resolved.server_ipc.max_pool_memory, 268_435_456 * 4);
-        assert_eq!(resolved.client_ipc.max_pool_memory, 268_435_456 * 4);
         assert_eq!(resolved.relay.bind, "0.0.0.0:8080");
         assert_eq!(resolved.relay.idle_timeout_secs, 60);
         assert!(!resolved.relay_use_proxy);
@@ -873,7 +871,6 @@ mod tests {
 
         assert_eq!(resolved.shm_threshold, 16_384);
         assert_eq!(resolved.server_ipc.pool_segment_size, 4_194_304);
-        assert_eq!(resolved.server_ipc.max_pool_memory, 4_194_304 * 4);
         assert_eq!(resolved.relay.bind, "127.0.0.1:8000");
     }
 
@@ -906,7 +903,6 @@ mod tests {
         let resolved = ConfigResolver::resolve(overrides, ConfigSources::empty())
             .expect("large pool segment with a smaller message cap should resolve");
         assert_eq!(resolved.server_ipc.pool_segment_size, 256 * 1024 * 1024);
-        assert_eq!(resolved.server_ipc.max_pool_memory, 1024 * 1024 * 1024);
         assert_eq!(resolved.server_ipc.max_payload_size, 32 * 1024 * 1024);
         assert!(resolved.server_ipc.pool_enabled);
 
@@ -1500,8 +1496,6 @@ mod tests {
 
         assert!(!resolved.server_ipc.pool_enabled);
         assert!(!resolved.client_ipc.pool_enabled);
-        assert_eq!(resolved.server_ipc.max_pool_memory, 131_072 * 3);
-        assert_eq!(resolved.client_ipc.max_pool_memory, 524_288 * 5);
         assert_eq!(resolved.server_ipc.shm_backing_budget_bytes, 3_221_225_472);
         assert_eq!(resolved.server_ipc.file_backing_budget_bytes, 2_147_483_648);
         assert_eq!(resolved.client_ipc.shm_backing_budget_bytes, 1_073_741_824);
@@ -1912,7 +1906,6 @@ mod tests {
         assert!(ipc.pool_enabled);
         assert_eq!(ipc.pool_prewarm_segments, 1);
         assert_eq!(ipc.pool_segment_size, 65536);
-        assert_eq!(ipc.max_pool_memory, 65536 * 3);
         assert_eq!(ipc.shm_backing_budget_bytes, 400);
         assert_eq!(ipc.file_backing_budget_bytes, 200);
         assert_eq!(ipc.live_reassembly_budget_bytes, 300);

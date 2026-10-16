@@ -8849,7 +8849,6 @@ mod tests {
         let base = c2_config::BaseIpcConfig {
             pool_segment_size: 64 * 1024,
             max_pool_segments: 2,
-            max_pool_memory: 128 * 1024,
             pool_prewarm_segments: 1,
             ..c2_config::BaseIpcConfig::default()
         };
@@ -8898,7 +8897,6 @@ mod tests {
         let base = c2_config::BaseIpcConfig {
             pool_segment_size: 64 * 1024,
             max_pool_segments: 2,
-            max_pool_memory: 128 * 1024,
             shm_backing_budget_bytes: 0,
             file_backing_budget_bytes: 0,
             ..c2_config::BaseIpcConfig::default()
@@ -8927,7 +8925,6 @@ mod tests {
         let base = c2_config::BaseIpcConfig {
             pool_segment_size: 64 * 1024,
             max_pool_segments: 2,
-            max_pool_memory: 128 * 1024,
             ..c2_config::BaseIpcConfig::default()
         };
         let config = ServerIpcConfig {

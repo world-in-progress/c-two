@@ -105,107 +105,31 @@ fn differing_client_policy_fields(
 ) -> Vec<&'static str> {
     let mut differing = Vec::new();
     macro_rules! compare {
-        ($name:literal, $cached:expr, $requested:expr) => {
-            if $cached != $requested {
-                differing.push($name);
-            }
+        ($cached:expr, $requested:expr; $($field:ident),+ $(,)?) => {
+            $(if $cached.$field != $requested.$field {
+                differing.push(stringify!($field));
+            })+
         };
     }
-    compare!(
-        "pool_enabled",
-        cached.base.pool_enabled,
-        requested.base.pool_enabled
+    compare!(cached.base, requested.base;
+        pool_enabled,
+        pool_segment_size,
+        max_pool_segments,
+        pool_prewarm_segments,
+        pool_min_retained_segments,
+        reassembly_segment_size,
+        reassembly_max_segments,
+        max_total_chunks,
+        chunk_gc_interval_secs,
+        chunk_threshold_ratio,
+        chunk_assembler_timeout_secs,
+        max_reassembly_bytes,
+        chunk_size,
+        shm_backing_budget_bytes,
+        file_backing_budget_bytes,
+        live_reassembly_budget_bytes,
     );
-    compare!(
-        "pool_segment_size",
-        cached.base.pool_segment_size,
-        requested.base.pool_segment_size
-    );
-    compare!(
-        "max_pool_segments",
-        cached.base.max_pool_segments,
-        requested.base.max_pool_segments
-    );
-    compare!(
-        "max_pool_memory",
-        cached.base.max_pool_memory,
-        requested.base.max_pool_memory
-    );
-    compare!(
-        "pool_prewarm_segments",
-        cached.base.pool_prewarm_segments,
-        requested.base.pool_prewarm_segments
-    );
-    compare!(
-        "pool_min_retained_segments",
-        cached.base.pool_min_retained_segments,
-        requested.base.pool_min_retained_segments
-    );
-    compare!(
-        "reassembly_segment_size",
-        cached.base.reassembly_segment_size,
-        requested.base.reassembly_segment_size
-    );
-    compare!(
-        "reassembly_max_segments",
-        cached.base.reassembly_max_segments,
-        requested.base.reassembly_max_segments
-    );
-    compare!(
-        "max_total_chunks",
-        cached.base.max_total_chunks,
-        requested.base.max_total_chunks
-    );
-    compare!(
-        "chunk_gc_interval_secs",
-        cached.base.chunk_gc_interval_secs,
-        requested.base.chunk_gc_interval_secs
-    );
-    compare!(
-        "chunk_threshold_ratio",
-        cached.base.chunk_threshold_ratio,
-        requested.base.chunk_threshold_ratio
-    );
-    compare!(
-        "chunk_assembler_timeout_secs",
-        cached.base.chunk_assembler_timeout_secs,
-        requested.base.chunk_assembler_timeout_secs
-    );
-    compare!(
-        "max_reassembly_bytes",
-        cached.base.max_reassembly_bytes,
-        requested.base.max_reassembly_bytes
-    );
-    compare!(
-        "chunk_size",
-        cached.base.chunk_size,
-        requested.base.chunk_size
-    );
-    compare!(
-        "shm_backing_budget_bytes",
-        cached.base.shm_backing_budget_bytes,
-        requested.base.shm_backing_budget_bytes
-    );
-    compare!(
-        "file_backing_budget_bytes",
-        cached.base.file_backing_budget_bytes,
-        requested.base.file_backing_budget_bytes
-    );
-    compare!(
-        "live_reassembly_budget_bytes",
-        cached.base.live_reassembly_budget_bytes,
-        requested.base.live_reassembly_budget_bytes
-    );
-    compare!(
-        "shm_threshold",
-        cached.shm_threshold,
-        requested.shm_threshold
-    );
-    compare!(
-        "pool_decay_seconds",
-        cached.pool_decay_seconds,
-        requested.pool_decay_seconds
-    );
+    compare!(cached, requested; shm_threshold, pool_decay_seconds);
     if differing.is_empty() {
         differing.push("none");
     }
@@ -1973,7 +1897,6 @@ mod tests {
         let mut cfg = ClientIpcConfig::default();
         cfg.base.pool_segment_size = 1024 * 1024;
         cfg.base.max_pool_segments = 1;
-        cfg.base.max_pool_memory = 1024 * 1024;
         cfg.base.pool_prewarm_segments = 1;
         cfg.base.shm_backing_budget_bytes = 1_536_000;
         let domain = DomainMemory::from_config(&cfg);
@@ -4210,7 +4133,6 @@ mod tests {
         let base = c2_config::BaseIpcConfig {
             pool_segment_size: 65_536,
             max_pool_segments: 1,
-            max_pool_memory: 65_536,
             ..c2_config::BaseIpcConfig::default()
         };
         let canonical = ClientIpcConfig {
@@ -4230,9 +4152,8 @@ mod tests {
             "identical resolved config must reuse the same client"
         );
 
-        // Every variant keeps the budget limits identical to `canonical`
-        // and changes exactly one resolved policy field.
-        let variants: Vec<(&str, ClientIpcConfig)> = vec![
+        // Every variant keeps the budget limits identical to `canonical`.
+        let mut variants: Vec<(&str, ClientIpcConfig)> = vec![
             (
                 "chunk_size",
                 ClientIpcConfig {
@@ -4299,6 +4220,11 @@ mod tests {
             ),
         ];
 
+        let mut combined = canonical.clone();
+        combined.base.chunk_size = 65_536;
+        combined.shm_threshold = 4_096;
+        variants.push(("chunk_size, shm_threshold", combined));
+
         for (field, variant) in variants {
             assert_eq!(
                 variant.memory_budget_limits(),
@@ -4314,7 +4240,10 @@ mod tests {
                 message.contains("different resolved client policy"),
                 "{field}: {message}"
             );
-            assert!(message.contains(field), "{field}: {message}");
+            assert!(
+                message.contains(&format!("differing fields: {field})")),
+                "{message}"
+            );
             // The rejection must not evict or alter the live entry.
             let still_cached = pool
                 .acquire(&address, Some(&canonical))

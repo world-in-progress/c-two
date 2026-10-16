@@ -455,7 +455,10 @@ fn base_ipc_to_dict<'py>(
     dict.set_item("pool_enabled", cfg.pool_enabled)?;
     dict.set_item("pool_segment_size", cfg.pool_segment_size)?;
     dict.set_item("max_pool_segments", cfg.max_pool_segments)?;
-    dict.set_item("max_pool_memory", cfg.max_pool_memory)?;
+    dict.set_item(
+        "max_pool_memory",
+        cfg.pool_segment_size * u64::from(cfg.max_pool_segments),
+    )?;
     dict.set_item("pool_prewarm_segments", cfg.pool_prewarm_segments)?;
     dict.set_item("pool_min_retained_segments", cfg.pool_min_retained_segments)?;
     dict.set_item("reassembly_segment_size", cfg.reassembly_segment_size)?;
