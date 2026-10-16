@@ -1,57 +1,5 @@
-"""Wire codec — MethodTable for method name→index dispatch.
-
-As of Phase 4, all encoding/decoding primitives live in the Rust c2-wire
-crate, exposed via c_two._native.  This module retains only MethodTable
-(used by NativeServerBridge for dispatch), payload_total_size (used by
-proxy.py for size checks), and thin Python wrappers that preserve the
-offset=0 / error_data=None defaults from the original Python API.
-"""
+"""Method name/index dispatch table for the Python resource bridge."""
 from __future__ import annotations
-
-from c_two._native import (  # noqa: F401 — re-export
-    encode_call_control,
-)
-from c_two._native import (
-    decode_call_control as _ffi_decode_call_control,
-    encode_reply_control as _ffi_encode_reply_control,
-    decode_reply_control as _ffi_decode_reply_control,
-)
-
-
-def decode_call_control(
-    data: bytes | memoryview, offset: int = 0,
-) -> tuple[str, str, int, str, str, str, str, str, int, int]:
-    """Decode call control -> route identity fields, method_idx, bytes_consumed."""
-    return _ffi_decode_call_control(bytes(data), offset)
-
-
-def encode_reply_control(status: int, payload: bytes | None = None) -> bytes:
-    """Encode reply control payload.
-
-    ``payload`` carries error bytes for ``STATUS_ERROR`` and route-name bytes
-    for ``STATUS_ROUTE_NOT_FOUND``.
-    """
-    return _ffi_encode_reply_control(status, payload)
-
-
-def decode_reply_control(
-    data: bytes | memoryview, offset: int = 0,
-) -> tuple[int, bytes | None, int]:
-    """Decode reply control -> (status, payload_or_none, bytes_consumed)."""
-    return _ffi_decode_reply_control(bytes(data), offset)
-
-
-def payload_total_size(payload) -> int:
-    """Return total byte length of payload.
-
-    payload may be bytes, memoryview, a tuple/list of such segments
-    (scatter-write), or None.
-    """
-    if payload is None:
-        return 0
-    if isinstance(payload, (list, tuple)):
-        return sum(len(s) for s in payload)
-    return len(payload)
 
 
 class MethodTable:

@@ -372,6 +372,62 @@ mod control_tests {
         let err = encode_call_control(&identity, 0).unwrap_err();
         assert!(err.to_string().contains("route_name"));
     }
+
+    #[test]
+    fn call_control_rejects_truncated_method_and_text() {
+        let encoded = encode_call_control(&call_identity("grid"), 42).unwrap();
+        assert_eq!(
+            decode_call_control(&encoded, encoded.len() + 1),
+            Err(crate::frame::DecodeError::BufferTooShort { need: 17, have: 0 })
+        );
+        let err = decode_call_control(&encoded[..encoded.len() - 1], 0).unwrap_err();
+        assert_eq!(err.to_string(), "method_idx: need 2 bytes, have 1");
+
+        // The signature hash is the final text field, so its declared length
+        // cannot consume another field's bytes and mask the text bounds check.
+        let mut malformed = encoded;
+        let hash = SIG_HASH.as_bytes();
+        let hash_start = malformed
+            .windows(hash.len())
+            .position(|w| w == hash)
+            .unwrap();
+        malformed[hash_start - 1] = u8::MAX;
+        let err = decode_call_control(&malformed, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("signature_hash: need 255 bytes")
+        );
+    }
+
+    #[test]
+    fn call_control_accepts_maximum_route_name() {
+        let mut identity = call_identity("grid");
+        identity.route_name = "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES);
+        let encoded = encode_call_control(&identity, 100).unwrap();
+        let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.identity, identity);
+        assert_eq!(decoded.method_idx, 100);
+    }
+
+    #[test]
+    fn reply_control_error_rejects_truncated_header_body_and_offset() {
+        let encoded = try_encode_reply_control(&ReplyControl::Error(b"hello".to_vec())).unwrap();
+        let err = decode_reply_control(&encoded[..3], 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "reply control error_len: need 5 bytes, have 3"
+        );
+        let err = decode_reply_control(&encoded[..encoded.len() - 1], 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "reply control error_data: need 10 bytes, have 9"
+        );
+        assert_eq!(
+            decode_reply_control(&encoded, encoded.len() + 1),
+            Err(crate::frame::DecodeError::BufferTooShort { need: 1, have: 0 })
+        );
+    }
 }
 
 mod route_catalog_control_tests {
@@ -544,6 +600,7 @@ mod route_catalog_control_tests {
 }
 
 mod handshake_tests {
+    use crate::control::EncodeError;
     use crate::handshake::*;
 
     const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -971,7 +1028,7 @@ mod handshake_tests {
 
     #[test]
     fn server_handshake_rejects_too_many_methods() {
-        let routes = vec![RouteInfo {
+        let mut routes = vec![RouteInfo {
             name: "grid".into(),
             route_uid: "grid-route-uid-0001".into(),
             route_revision: 1,
@@ -992,6 +1049,138 @@ mod handshake_tests {
         let err =
             encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
         assert!(err.to_string().contains("method count"));
+
+        routes[0].methods.pop();
+        let encoded =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap();
+        assert_eq!(
+            decode_handshake(&encoded).unwrap().routes[0].methods.len(),
+            MAX_METHODS
+        );
+    }
+
+    #[test]
+    fn handshake_segment_count_limit_is_symmetric() {
+        let segments: Vec<_> = (0..MAX_SEGMENTS).map(|i| (format!("s{i}"), 256)).collect();
+        let encoded = encode_client_handshake(&segments, CAP_CALL_V2, "").unwrap();
+        assert_eq!(
+            decode_handshake(&encoded).unwrap().segments.len(),
+            MAX_SEGMENTS
+        );
+
+        let mut excessive = encoded.clone();
+        excessive[2..4].copy_from_slice(&((MAX_SEGMENTS + 1) as u16).to_le_bytes());
+        let err = decode_handshake(&excessive).unwrap_err();
+        assert_eq!(err.to_string(), "segment count: invalid value 17");
+        let mut too_many = segments;
+        too_many.push(("extra".into(), 256));
+        let err = encode_client_handshake(&too_many, CAP_CALL_V2, "").unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::FieldTooLong {
+                field: "segment count",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn handshake_route_and_method_count_limits_are_symmetric() {
+        let routes: Vec<_> = (0..MAX_ROUTES)
+            .map(|i| route(&format!("r{i}"), &[]))
+            .collect();
+        let encoded =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap();
+        assert_eq!(decode_handshake(&encoded).unwrap().routes.len(), MAX_ROUTES);
+        let mut too_many = routes;
+        too_many.push(route("extra", &[]));
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &too_many, "", &test_identity()).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::FieldTooLong {
+                field: "route count",
+                ..
+            }
+        ));
+
+        let mut empty =
+            encode_server_handshake(&[], CAP_CALL_V2, &[], "", &test_identity()).unwrap();
+        let count = empty.len() - 2;
+        empty[count..].copy_from_slice(&((MAX_ROUTES + 1) as u16).to_le_bytes());
+        let err = decode_handshake(&empty).unwrap_err();
+        assert_eq!(err.to_string(), "route count: invalid value 65");
+
+        let mut one = encode_server_handshake(
+            &[],
+            CAP_CALL_V2,
+            &[route("grid", &[])],
+            "",
+            &test_identity(),
+        )
+        .unwrap();
+        let count = one.len() - 2;
+        one[count..].copy_from_slice(&((MAX_METHODS + 1) as u16).to_le_bytes());
+        let err = decode_handshake(&one).unwrap_err();
+        assert_eq!(err.to_string(), "method count: invalid value 257");
+    }
+
+    #[test]
+    fn handshake_rejects_truncated_segment_and_route_fields() {
+        let client = encode_client_handshake(&[("seg".into(), 256)], CAP_CALL_V2, "").unwrap();
+        let err = decode_handshake(&client[..8]).unwrap_err();
+        assert_eq!(err.to_string(), "segment entry: need 5 bytes, have 4");
+        let err = decode_handshake(&client[..9]).unwrap_err();
+        assert_eq!(err.to_string(), "segment name: need 3 bytes, have 0");
+        let err = decode_handshake(&client[..client.len() - 1]).unwrap_err();
+        assert_eq!(err.to_string(), "capability flags: need 2 bytes, have 1");
+
+        let mut server =
+            encode_server_handshake(&[], CAP_CALL_V2, &[], "", &test_identity()).unwrap();
+        server.truncate(server.len() - 2); // replace route count with one incomplete route
+        server.extend_from_slice(&1u16.to_le_bytes());
+        server.extend_from_slice(&[4, b'g']);
+        let err = decode_handshake(&server).unwrap_err();
+        assert_eq!(err.to_string(), "route name: need 4 bytes, have 1");
+
+        let method = encode_server_handshake(
+            &[],
+            CAP_CALL_V2,
+            &[route("grid", &["get"])],
+            "",
+            &test_identity(),
+        )
+        .unwrap();
+        let err = decode_handshake(&method[..method.len() - 1]).unwrap_err();
+        assert_eq!(err.to_string(), "method index: need 2 bytes, have 1");
+    }
+
+    #[test]
+    fn handshake_rejects_zero_max_payload_size_on_encode_and_decode() {
+        let mut invalid = route("grid", &[]);
+        invalid.max_payload_size = 0;
+        let err = encode_server_handshake(&[], CAP_CALL_V2, &[invalid], "", &test_identity())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::InvalidText {
+                field: "max_payload_size",
+                ..
+            }
+        ));
+
+        let mut encoded = encode_server_handshake(
+            &[],
+            CAP_CALL_V2,
+            &[route("grid", &[])],
+            "",
+            &test_identity(),
+        )
+        .unwrap();
+        let payload_start = encoded.len() - 10; // 8-byte maximum followed by 2-byte method count
+        encoded[payload_start..payload_start + 8].fill(0);
+        let err = decode_handshake(&encoded).unwrap_err();
+        assert_eq!(err.to_string(), "max_payload_size: invalid value 0");
     }
 
     #[test]

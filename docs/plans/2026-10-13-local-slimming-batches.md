@@ -1,5 +1,11 @@
 # C-Two 局部精简批次记录与收束
 
+## Python wire/handshake 投影链退役（2026-10-16，执行中）
+
+执行基线 `9561055d`。用户批准删除旧 Python 协议投影的 4 个 PyClass、13 个 codec 和 35 个常量导出，删除 `transport.protocol`，`transport.wire` 只保留 `MethodTable`；5 个合同投影原样迁至 `contract_ffi.rs`，现有 `_native` 名称不变。低层 Python API 删除不留兼容入口；Rust API、C/FFI ABI、wire、身份与生命周期语义保持，native 的 `c2-wire` 依赖仍由内存投影使用。
+
+先在原生产实现上补齐 Rust 握手计数/截断、call/reply 边界、255 字节 route 和零 payload 上限测试，完整 c2-wire 通过后再删除投影及合并 Python 测试。最终出口为重建 native、完整 relay、真实跨语言回归、GitHub Actions 跨平台门禁、独立审查和本批 socket/lease 零残留；验收后记录生产/测试/文档实际净量再提交。仅使用本批隔离路径，历史目录不动，不使用 buddy。
+
 ## R30 派生配置状态与缓存诊断收敛（2026-10-16，完成）
 
 执行基线 `2fc8c4c2`，实现候选 `12c4ffa31360269ea65c77e42dd6720642d19aa7`。用户接受删除公开 Rust `BaseIpcConfig::max_pool_memory`，不留兼容字段或 getter；默认赋值、派生一致性校验及缓存派生字段比较退出。resolver 保留原位置的 checked_mul 及溢出错误文案，Python 已验证配置字典继续计算输出该值。Rust 结构体构造、布局、Debug 和缓存诊断少了该派生字段；18 个真实字段的完整配置比较、名称顺序、浮点行为和 none 诊断保持，配置冻结、实际三个预算、C/FFI ABI、wire 与生命周期不变。

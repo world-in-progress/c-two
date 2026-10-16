@@ -168,8 +168,7 @@ The Python transport layer is a thin orchestration shell around a Rust-native co
 | File | Purpose |
 | --- | --- |
 | `registry.py` | SOTA API: `cc.register()`, `cc.connect()`, `cc.close()`, `cc.shutdown()`, `cc.set_server()`, `cc.set_client()` |
-| `protocol.py` | Re-export facade for Rust handshake codec, route info, and flag constants |
-| `wire.py` | `MethodTable` and thin FFI wrappers for wire control functions |
+| `wire.py` | `MethodTable` for Python resource method dispatch |
 | `server/native.py` | `NativeServerBridge` exported as `Server` |
 | `server/scheduler.py` | `ConcurrencyConfig` facade plus thin native route-concurrency adapter for same-process direct calls |
 | `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
@@ -413,7 +412,7 @@ Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Rus
 
 ### Performance-Sensitive Code
 
-Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize zero-copy and single-allocation patterns. Python `wire.py` retains `MethodTable`, `payload_total_size`, and thin FFI wrappers. The thread-local transport skips serialization entirely. SHM segment names are deterministic for lazy peer-side opening. The buddy allocator's `alloc()` and `free_at()` are thread-safe. When changing remote dispatch or scheduler code, keep the SHM request path as `RequestData::Shm` / `RequestData::Handle` to `PyShmBuffer` to Python `memoryview`; do not materialize SHM or handle payloads into Python `bytes` before invoking resource code. Response allocation follows the same boundary: Python server dispatch may return serialized `bytes` or buffer-protocol data, but must not receive native response pools, compare result length against `shm_threshold`, return SHM coordinate tuples, or call `bytes(memoryview)` for transport. Native PyO3/c2-server response preparation must attempt large-buffer SHM writes before materializing owned inline bytes. Thread-local same-process calls must continue to pass Python objects directly instead of being routed through Rust serialized dispatch for symmetry.
+Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize zero-copy and single-allocation patterns. Python `wire.py` retains only `MethodTable`; wire codecs and handshake objects are not exposed by the Python SDK. The five native contract projection functions remain available under their existing names. The thread-local transport skips serialization entirely. SHM segment names are deterministic for lazy peer-side opening. The buddy allocator's `alloc()` and `free_at()` are thread-safe. When changing remote dispatch or scheduler code, keep the SHM request path as `RequestData::Shm` / `RequestData::Handle` to `PyShmBuffer` to Python `memoryview`; do not materialize SHM or handle payloads into Python `bytes` before invoking resource code. Response allocation follows the same boundary: Python server dispatch may return serialized `bytes` or buffer-protocol data, but must not receive native response pools, compare result length against `shm_threshold`, return SHM coordinate tuples, or call `bytes(memoryview)` for transport. Native PyO3/c2-server response preparation must attempt large-buffer SHM writes before materializing owned inline bytes. Thread-local same-process calls must continue to pass Python objects directly instead of being routed through Rust serialized dispatch for symmetry.
 
 ## Environment Variables
 
