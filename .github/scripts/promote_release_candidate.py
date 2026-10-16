@@ -18,8 +18,10 @@ Contract, fail-closed on every deviation:
 - The promoting run itself must be on ``refs/heads/main`` of the canonical
   repository; the trusted validation code is the current ``main`` checkout,
   never the candidate SHA.
-- Every artifact ZIP is downloaded through the authenticated GitHub Actions
-  API, its SHA-256 is checked against the API-reported ``digest``, and it is
+- Candidate ``rc-*`` ZIPs match the producer's collection scope; compiler-cache
+  diagnostics are not release inputs. Each selected ZIP is downloaded through
+  the authenticated GitHub Actions API, its SHA-256 is checked against the
+  API-reported ``digest``, and it is
   extracted only through the reviewed safe-name/safe-member validators in
   ``tools/local_rc/artifact_manifest.py``. A repeated member name across
   artifact ZIPs is accepted only when its SHA-256 is identical.
@@ -1883,7 +1885,9 @@ def command_prepare(options: argparse.Namespace) -> int:
     extraction.mkdir(parents=True, exist_ok=True)
     seen_members: dict[str, tuple[str, str]] = {}
     for artifact in api.run_artifacts(candidate["id"]):
-        download_and_extract_artifact(api, artifact, extraction, seen_members)
+        # Match release-candidate.yml's rc-* collection, excluding diagnostics.
+        if artifact["name"].startswith("rc-"):
+            download_and_extract_artifact(api, artifact, extraction, seen_members)
 
     verify_sidecars(extraction)
     manifest = _load_json_file(extraction / MANIFEST_NAME)

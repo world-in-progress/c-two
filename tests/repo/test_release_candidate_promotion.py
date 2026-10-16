@@ -1286,6 +1286,28 @@ def test_divergent_duplicate_members_across_artifacts_are_rejected(
     assert code == 1
 
 
+@pytest.mark.parametrize("target", ["github-release", "pypi"])
+def test_candidate_collection_excludes_compiler_cache_diagnostics(
+    tmp_path: Path, environment, target: str,
+) -> None:
+    world = _default_world()
+    for artifact_id, platform in ((9001, "aarch64"), (9002, "x86_64")):
+        blob = _zip_bytes({"cmake-version.txt": platform.encode()})
+        world.artifact_zips[artifact_id] = blob
+        world.artifacts_by_run[101].append({
+            "id": artifact_id, "name": f"compiler-cache-native-{platform}",
+            "size_in_bytes": len(blob), "digest": f"sha256:{_sha(blob)}",
+            "expired": False,
+        })
+    api = environment(world)
+    code, plan_path, _ = run_prepare(tmp_path, target=target)
+    assert code == 0
+    assert json.loads(plan_path.read_text())["source_sha"] == SOURCE_SHA
+    assert not (tmp_path / "candidate-download/candidate/cmake-version.txt").exists()
+    assert not any(f"/artifacts/{artifact_id}/zip" in path
+                   for artifact_id in (9001, 9002) for path in api.paths)
+
+
 # ── Plan content and wheel-row coverage ─────────────────────────────────────
 
 
