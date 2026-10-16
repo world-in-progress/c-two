@@ -121,24 +121,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The FastDB version is pinned, not overridable: the repo consumes the
-      # exact registry crates, the app workspaces patch fastdb-sys to one
-      # immutable source rev, and prepare_fastdb_sdk.py verifies the same
-      # pins. A dispatch override could only desynchronize those, so it is
-      # validated against the repository instead of trusted.
+      # Python FastDB and the native Core have independent exact pins. Validate
+      # both from repository metadata; the optional Python extra is what
+      # installed-wheel consumers provision. Native CoreSDK pins stay separate.
       - name: Validate the pinned FastDB version and source revision
         id: fastdb
         run: |
           set -euxo pipefail
           python -m pip install --quiet packaging
           python - <<'PY'
-          import os, pathlib, re
-          version = "0.2.1"
+          import os, pathlib, re, tomllib
+          project = tomllib.loads(pathlib.Path("sdk/python/pyproject.toml").read_text(encoding="utf-8"))
+          extra = project["project"]["optional-dependencies"]["fastdb"]
+          assert extra == ["fastdb4py==0.2.2"], extra
+          version = "0.2.2"
+          core_version = "0.2.1"
           source_rev = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
           codegen = pathlib.Path("core/foundation/c2-codegen/Cargo.toml").read_text(encoding="utf-8")
           pin = re.search(r'^fastdb\s*=\s*"=(?P<version>[0-9][0-9.]*)"$', codegen, re.MULTILINE)
           assert pin is not None, "c2-codegen no longer pins an exact fastdb version"
-          assert pin.group("version") == version, (pin.group("version"), version)
+          assert pin.group("version") == core_version, (pin.group("version"), core_version)
           revs = []
           for path in ("cli/Cargo.toml", "sdk/python/native/Cargo.toml"):
               text = pathlib.Path(path).read_text(encoding="utf-8")
@@ -149,7 +151,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"version={version}\n")
               output.write(f"source_rev={source_rev}\n")
-          print(f"fastdb {version} pinned at {source_rev}")
+          print(f"Python fastdb4py {version}; native FastDB Core {core_version} pinned at {source_rev}")
           PY
 
       - name: Record every public FastDB release file

@@ -75,6 +75,10 @@ UNIX_ENDPOINT_TESTS = frozenset(
     for suffix in suffixes
 )
 UNIX_SOCKET_COUNT_TEST = 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup'
+POSIX_FROZEN_PEER_TESTS = frozenset(
+    f'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[{hosted}-True]'
+    for hosted in ('False', 'True')
+)
 FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
 PLUGIN = "tools.dev.test_python"
 
@@ -220,7 +224,8 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
         raise RunnerError("同一nodeid被执行多次")
     allowed_skips = (
         {**dict.fromkeys(UNIX_ENDPOINT_TESTS, 'Skipped: Unix filesystem root capability'),
-         UNIX_SOCKET_COUNT_TEST: 'Skipped: OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes'}
+         UNIX_SOCKET_COUNT_TEST: 'Skipped: OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes',
+         **dict.fromkeys(POSIX_FROZEN_PEER_TESTS, 'Skipped: SIGSTOP/SIGCONT are POSIX process controls')}
         if sys.platform == 'win32' else
         dict.fromkeys(WINDOWS_ENDPOINT_TESTS, 'Skipped: Windows named-pipe platform contract')
     )
@@ -274,8 +279,8 @@ def capture(command: list[str], environment: dict[str, str]) -> str:
 
 def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
     info = json.loads(capture([options.python, "-c", PROBE], environment).splitlines()[-1])
-    if info["versions"]["fastdb4py"] != "0.2.1":
-        raise RunnerError("需要固定fastdb4py==0.2.1")
+    if info["versions"]["fastdb4py"] != "0.2.2":
+        raise RunnerError("需要固定fastdb4py==0.2.2")
     if not options.c3.is_file():
         raise RunnerError(f"预建c3不存在：{options.c3}")
     if Path(info["python_sdk"]).resolve().parent != (ROOT / "sdk/python/src/c_two").resolve():

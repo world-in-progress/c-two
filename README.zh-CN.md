@@ -28,7 +28,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-本文介绍 **C-Two 0.7.4**，支持 Python 3.10+，依赖 FastDB 0.2.1。
+本文对应正在准备的 **C-Two 0.7.5**，支持 Python 3.10+。普通 Python 调用无 Python 运行时依赖；FastDB 载荷使用可选扩展 `c-two[fastdb]`（`fastdb4py==0.2.2`）。0.7.5 与配套 c3 0.3.4 尚未发布，见[发布准备说明](docs/releases/0.7.5.md)。
 
 ## 特点
 
@@ -45,6 +45,8 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 ```bash
 uv pip install c-two
+# FastDB 载荷：
+uv pip install 'c-two[fastdb]'
 ```
 
 Windows PowerShell 使用相同命令。Linux、macOS 的 c3 安装命令：
@@ -54,6 +56,8 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.
 ```
 
 Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
+
+以上 c3 0.3.3 安装链接对应已发布的 C-Two 0.7.4。验证本分支时请从源码构建 c3；0.7.5 发布后需同时升级到 c3 0.3.4。
 
 源码构建与测试见[开发指南](docs/development.md)。
 

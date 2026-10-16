@@ -6,17 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.7.5] — local preparation, companion c3 0.3.4
+
+### Fixed
+
+- Ordinary Python calls no longer install or import FastDB/NumPy. FastDB
+  Payload contracts select `c-two[fastdb]`, pinned to `fastdb4py==0.2.2`;
+  missing dependencies report that extra explicitly.
+- Outgoing IPC shutdown bounds the DISCONNECT write/ACK exchange to 100 ms
+  per connection, then observes the existing local cleanup barriers. Outcomes
+  add `ipc_clients_abnormally_closed` and `ipc_client_close_details` with
+  addresses/reasons. Server work drain and shutdown deadlines retain their
+  meaning.
+- Registration rejects implementation-only `@cc.on_shutdown` markers instead
+  of silently ignoring them; the CRM contract remains the hook authority.
+- Buddy releases validate the exact allocation instance, rejecting wrong
+  parent/child coordinates and stale identifiers after same-location reuse.
+- Default macOS coordination records survive system temporary-file cleaning;
+  socket paths and strict identity/lifecycle rules are preserved. Failed
+  initialization rolls back only its own newly created, unchanged lease.
+
 ### Changed
 
-- The C/Node memory binding now requires ABI 4 and the complete endpoint-context API. Rebuild the addon, native library and consumers together; ABI 3 libraries are rejected. TypeScript endpoint symbols must provide context capture, and `C2MemFfiEndpointContextUnsupportedError` is removed. C function signatures/layouts, wire formats, configuration freezing and lease lifetimes are unchanged.
+- SHM format 3, IPC handshake 12 and C/FFI ABI 5 require coordinated native
+  upgrades. There are no old-format compatibility paths.
+- Rust encoded services take owned request snapshots. IPC override types use
+  flat fields; nested `BaseIpcConfigOverrides`, stored `max_pool_memory` and
+  peer handshake shadow state are removed. Regenerate/recompile consumers.
+- Obsolete Python wire/handshake projections, three Python `call_prepared`
+  entries, the transfer `buffer` keyword and generated TypeScript Node IPC
+  factories/types are retired. Use FastDB payloads and official connection
+  injection; Python-only pickle and Core byte/preallocation APIs remain.
+- HTTP discovery uses the strictly validated response header as namespace
+  authority. Runtime/test cleanup removes duplicate state while preserving
+  budgets, validation ordering, snapshots, leases and lifecycle authority.
 
-- Rust `ServerIpcConfigOverrides` and `ClientIpcConfigOverrides` now store only flat fields; `BaseIpcConfigOverrides` and their nested `base` fields are removed. Migrate each old pair using `flat.or(base)` so explicit `false` and `0` still win, then recompile downstream Rust code. Python override dictionaries, resolved configuration types and wire formats are unchanged.
-
-- Rust `EncodedService::invoke` now takes an owned `Vec<u8>`, allowing the
-  Python bridge to reuse Core's request snapshot without another byte copy.
-  Update manual implementations and regenerate Rust contract modules with the
-  matching generator, including modules used only by clients. Request lease
-  ordering, CRM fingerprints and wire protocols are unchanged.
+See [upgrade boundaries and preparation status](docs/releases/0.7.5.md).
+The three new Python/runtime fixes leave business CRM fingerprints unchanged;
+SHM, IPC and FFI versions above include the prior accepted allocation repair.
 
 ## [0.7.0] — companion c3 0.3.0
 
