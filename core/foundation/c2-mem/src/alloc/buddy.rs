@@ -824,7 +824,11 @@ mod tests {
             assert_invalid_release_preserves_live_allocator(&alloc, a.offset, a.level, id);
         }
         alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        // This empty start has record 0 while the root and right child are
+        // still used, so only the explicit zero-id check rejects this parent.
+        assert_invalid_release_preserves_live_allocator(&alloc, a.offset, 0, 0);
         alloc.free(b.offset, b.level, b.allocation_id).unwrap();
+        assert_eq!(alloc.free_bytes(), 8192);
     }
 
     #[test]
@@ -1100,6 +1104,7 @@ mod tests {
             )
         };
         assert!(unsafe { BuddyAllocator::attach(ptr, 63) }.is_err());
+        assert!(unsafe { BuddyAllocator::attach(ptr, buffer.len() - 1) }.is_err());
         for (bad_offset, bad_min, bad_levels, bad_total) in [
             (offset + 8, min_block, levels, total_size),
             (offset, 0, levels, total_size),
