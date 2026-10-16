@@ -1,5 +1,13 @@
 # C-Two 局部精简批次记录与收束
 
+## 取消 Drop 测试夹具修复（2026-10-16，完成）
+
+用户单独批准将 `ReceiverDropGuardForTest::drop` 的原 `release.recv()` 放入 `tokio::task::block_in_place`，让 SyncClient 多线程 runtime 在该 Drop 等待期间继续调度。原 entered/release 信号、关闭期限、非终态及重试断言全部保留；只改 `#[cfg(test)]` 代码，生产、API/ABI、wire 和生命周期策略无变化。测试新增 5、删除 1，净增 4 行；没有新增测试框架。
+
+基于 `94a26f1b` 的隔离前后副本使用独立 Cargo target。本次新构建基线的原两测试顺序及完整串行 IPC 都通过，说明此前超时具有调度时序性；此前失败日志与线程采样保留，不把本轮表述成确定性红绿复现。候选原两测试顺序 2 passed，完整 IPC（含 test-support）串行与默认并行各 202 + 7 passed，无失败或忽略项。本轮验证范围为本机 macOS 的受影响完整 IPC 套件，没有重新运行 GitHub Actions，也不把上一批 CI 结果计作本补丁的线上验证。
+
+独立原生审查无 actionable findings，确认唯一 gate 安装点运行在多线程 runtime，信号及 panic 解阻塞语义不变。Host 核对补丁 SHA-256 `5c9f2373e711cc497fb21952722a774874535f92d176e14eeee0383d48379b49` 与测试、审查源码一致；改动文件 rustfmt 与 diff 检查通过。全仓 fmt 检查发现其他五个文件的基线既有格式差异，未扩展修复。所有本批作用域 socket/lease 均为零，无须补做 reap；历史目录快照未变，未使用 buddy。命令、完整日志、二进制哈希、审查及零残留收据位于 `~/.codex/diagnostics/c2-receiver-drop-b5871ea7/`。
+
 ## R13 IPC 拼帧收敛（2026-10-16，完成）
 
 用户确认移除拼帧中间 payload 缓冲。新增无状态 `c2-wire::frame::encode_frame_parts`，现有 `encode_frame` 保持签名并复用同一实现；普通/流式 chunk、SHM 请求元数据及大 inline/SHM 回复直接生成完整帧。成功回复使用已有 `STATUS_SUCCESS` 常量。原长度检查与错误顺序、小回复栈缓冲、整批/逐帧写锁、SendGuard、快照及 lease 释放保持；现有 API/ABI、wire 和生命周期策略不变。
@@ -12,7 +20,7 @@
 
 [GitHub Actions 38781805659](https://github.com/world-in-progress/c-two/actions/runs/38781805659) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。五组平台日志均核对：Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁及 Ubuntu/Python 3.14t 对应门禁，Windows 包含普通用户 wheel 消费者验证。
 
-额外的串行 IPC 验证在基线和候选均出现同一关闭测试超时。最小复现是 `close_reserves_time_to_join_an_aborted_receiver` 后接 `two_concurrent_closes_of_one_blocked_receiver_serialize_and_stay_retryable`；采样显示测试专用 Drop 的同步 recv 阻塞 Tokio worker，目标单跑通过。默认并行基线 203 + 7、候选独立 target 202 + 7 通过；这不表示串行夹具问题已修复。测试专用 `block_in_place` 修正已提出，仍待用户单独确认，没有混入本批。
+额外的串行 IPC 验证在基线和候选均出现同一关闭测试超时。最小复现是 `close_reserves_time_to_join_an_aborted_receiver` 后接 `two_concurrent_closes_of_one_blocked_receiver_serialize_and_stay_retryable`；采样显示测试专用 Drop 的同步 recv 阻塞 Tokio worker，目标单跑通过。默认并行基线 203 + 7、候选独立 target 202 + 7 通过；这不表示串行夹具问题已修复。测试专用 `block_in_place` 修正当时待用户单独确认，没有混入本批；后续独立夹具修复见上节。
 
 补充对照曾因两个快照共享 Cargo target 而复用基线二进制；已由旧测试仍在清单中发现并剔除该候选结果，改用独立 target 重建后确认 202 项新清单。原 native/CLI 及性能产物通过符号、嵌入源码路径和哈希核实属于各自版本。独立审查无发现，审查补丁与 CI/验收源码一致。
 

@@ -5374,7 +5374,11 @@ impl Drop for ReceiverDropGuardForTest {
     fn drop(&mut self) {
         if self.abort.is_aborted() {
             let _ = self.gate.entered.send(());
-            let _ = self.gate.release.recv();
+            // This gate runs on SyncClient's multi-thread runtime; keep its
+            // timer driver available while the receiver Drop remains blocked.
+            tokio::task::block_in_place(|| {
+                let _ = self.gate.release.recv();
+            });
         }
     }
 }
