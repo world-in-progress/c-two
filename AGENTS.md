@@ -118,10 +118,11 @@ Path: `sdk/python/src/c_two/crm/`
 - Resource implementations are plain Python classes and are not decorated.
 - Portable methods declare zero or one input and zero or one output with `@cc.transfer(input=FASTDB_SPEC, output=FASTDB_SPEC)`. Their Python parameter and return type is `fastdb4py.payload.Payload`; C-Two embeds each nested specification as an opaque JSON value and delegates it to FastDB Core.
 - Python-only fallback values use pickle and must not be treated as portable descriptor or codegen inputs.
+- Python FastDB payloads require the optional `c-two[fastdb]` extra, pinned to `fastdb4py==0.2.2`. Ordinary imports, CRM definitions, calls and error wrapping must not import FastDB or NumPy. The dev group selects the extra for full tests; native Core/Rust pins are independent.
 - FastDB retained response owners are selected by call-site `cc.hold(...)`; server-side borrowed inputs are selected only by `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})`.
 - CRM methods can use `@cc.read` or `@cc.write`; writes are the default.
 - `@cc.transfer(input=..., output=...)` is the only portable FastDB binding authoring surface. `@cc.transferable` and `@cc.transfer(buffer='hold')` are obsolete and must not be reintroduced as codec or lifetime selection mechanisms.
-- `@on_shutdown` marks one public method as a shutdown callback. It is not exposed through RPC.
+- `@on_shutdown` marks one public CRM contract method as a shutdown callback. The resource implements it normally; registration rejects implementation-only shutdown markers. It is not exposed through RPC.
 
 ### Client Layer
 
