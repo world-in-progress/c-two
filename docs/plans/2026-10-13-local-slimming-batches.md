@@ -1,5 +1,17 @@
 # C-Two 局部精简批次记录与收束
 
+## R34 服务端 peer SHM 状态收敛（2026-10-16，完成）
+
+用户接受删除公开 Rust Connection 的 remote_segment_names/remote_segment_sizes，init_peer_shm 改为仅接收 prefix；不留兼容入口。退出段名/大小副本、首段尺寸及钳制警告，peer pool 的 segment_size 固定为合法初始化下限 8192。实际映射仍依据帧的 index/generation/span、真实 backing 大小和 allocator header；完整握手解码、身份与代际检查、读取/释放/GC 及生命周期策略保持，Python 接口、C/FFI ABI 和 wire 格式不变。
+
+相对 82c63270，两个源码文件生产净减 37 行、测试净减 72 行，非文档合计净减 109 行。七个状态存储/钳制用例收成一个真实 peer cache 初始化用例；原释放测试改为真实握手、32 KiB 数据读回及释放计数，覆盖空列表及 0/4096/8191/8192/65536/u32::MAX 宣告尺寸，段名刻意与实际 backing 不同。其他真实 dispatch 与 chunk 拒绝释放用例退出重复段清单搭建；未新增框架。
+
+替换测试先在原生产实现通过：connection 8 项及上述七档真实握手 1 项。首次精确筛选器缺少 server:: 前缀选中 0 项，明确不计为通过；修正后记录实际 1 passed。候选本机 macOS 通过 c2-mem 176 + 文档 1、wire 146、server 160、IPC 202 + 7、完整 relay 419，共 1111 项 Rust 测试；重建 native/CLI 后，Python SHM、held/borrowed、HTTP/mesh、跨模式和生命周期回归 194 项通过，合计 1305 项，无跳过。
+
+实现 `bb024930bcea2f332e357c48935c83769fc96510` 的 [GitHub Actions 38835252206](https://github.com/world-in-progress/c-two/actions/runs/38835252206) 首次运行 9/9 成功，绑定 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`。五组源码任务日志分别核对 Ubuntu/Python 3.12、Ubuntu/Python 3.14t、macOS 15、Windows 2022/2025 的适用完整门禁，包含两组 Windows 普通用户 wheel 消费者。Linux 原始 Core 日志确认新握手用例实际通过；run-evidence 的源码 SHA 与候选一致。
+
+独立原生审查无 actionable findings，补丁 SHA-256 为 050bdf233fd66f0068601e2b00769fb0ee11647e2f90e28724ce8350fcec269f，测试、审查、线上候选源哈希一致。Host 逐字确认实际映射/读/释放/GC 函数未变；改动区域格式及 diff 检查通过，其他区域既有格式差异未扩展修改。本批所有隔离作用域 socket/lease 为零，无须补做 reap；历史目录身份快照未变，未使用 buddy。隔离副本仅重定向测试默认路径，交付路径不变。完整日志、来源哈希、差量统计、审查及端点收据位于 ~/.codex/diagnostics/c2-r34-32f1f02a/。
+
 ## 取消 Drop 测试夹具修复（2026-10-16，完成）
 
 用户单独批准将 `ReceiverDropGuardForTest::drop` 的原 `release.recv()` 放入 `tokio::task::block_in_place`，让 SyncClient 多线程 runtime 在该 Drop 等待期间继续调度。原 entered/release 信号、关闭期限、非终态及重试断言全部保留；只改 `#[cfg(test)]` 代码，生产、API/ABI、wire 和生命周期策略无变化。测试新增 5、删除 1，净增 4 行；没有新增测试框架。
