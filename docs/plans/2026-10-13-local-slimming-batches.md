@@ -1,10 +1,18 @@
 # C-Two 局部精简批次记录与收束
 
-## R25 旧 Python prepared-payload 入口退役（2026-10-16，进行中）
+## R25 旧 Python prepared-payload 入口退役（2026-10-16，完成）
 
-执行基线 `3b191b52`。用户确认删除 `CRMProxy.call_prepared`、`CoreClient.call_prepared` 和 `NativePreparedCall.call_prepared`，不留兼容。该链源自旧 FastDB 写入计划，不作为任意自定义编码器的正式能力维护；现行 FastDB Payload 与 Python-only pickle 调用、Core 字节接口、服务端 sink、Rust 预分配及自定义 client/scheduler 适配协议保留，预算、期限、快照和释放语义不变。
+执行基线 `3b191b52`，实现候选 `6afec0f36f4b0a21a3b5edc913814c5f8e05bf0b`。按用户确认的 FastDB 架构边界，删除 `CRMProxy.call_prepared`、`CoreClient.call_prepared` 和 `NativePreparedCall.call_prepared`，不留兼容。旧链原为 FastDB-owned write plan 服务，不将任意自定义编码器作为正式能力维护；现行 FastDB Payload、Python-only pickle、Core 字节接口、服务端 sink、Rust 预分配以及自定义 client/scheduler 适配协议保留。预算、期限、快照、释放、Rust API、C/FFI ABI 与 wire 均未改变。
 
-先将单次消费及计费后失败退款测试迁到 `call(data)` 并在原生产实现通过，再删除三个入口与专属 writer 用例，保留服务端 sink 的真实逃逸 view 安全测试。退出条件为针对性回归、完整 relay、真实跨语言、GitHub Actions 跨平台门禁、端点零残留和独立审查；验收后提交并分别报告生产、测试和文档增减。历史目录不动，不使用 buddy；证据位于 `~/.codex/diagnostics/c2-r25-64a02321/`。
+生产仅删除三个方法共 65 行，无新增运行时分支或抽象。测试新增 18、删除 99，净减 81 行；非文档合计净减 146 行。单次消费用例迁到真实 `call(data)`；原 writer 失败段改为计费后的非法 buffer 失败，保留预算归零、不能再次消费、资源零调用及后续正常调用断言。旧 writer 专属桩和端点用例退出，既有服务端 sink 成功写入、异常与逃逸 view 保活的 Rust 测试保持。公开 Python 方法删除是明确的能力退役，不承诺旧手工 plan 调用等价迁移，也未宣称性能提升。
+
+调整后的两个真实 IPC 用例先在原实现通过，三个 API 缺席断言在基线均按预期失败。候选本机隔离通过 native Rust 8、IPC 202 + 7、完整 relay 416，共 633 项；重建 native/CLI 后 Python 定向 375、真实 TypeScript 及持久连接 15、Rust/Python 跨语言 25、收据校验 40 项通过。完整覆盖 12/12 TypeScript 及 18/18 Rust/Python direct/relay 矩阵；本机 5 项 Windows 专属跳过由线上 Windows 门禁执行。实际加载基线/候选扩展逐一比较三个类的属性集合，仅缺少对应 `call_prepared`。
+
+[GitHub Actions 38879398685](https://github.com/world-in-progress/c-two/actions/runs/38879398685) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。已逐组核对 Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁和 Ubuntu/Python 3.14t 对应门禁；ordinary、portable、TypeScript 分组均通过，两个 Windows 包含普通用户消费者验证。
+
+独立原生静态审查无阻断性发现，固定补丁 SHA-256 为 `2bcf3cb547405a23a38ca04bc5bc369c3e0693d584763539d08e47f55276d9a7`。历史状态措辞的非阻断建议留作后续；错误文案未改。Host 逐字核对两个生产文件除三处删除外完全一致，服务端 sink、正式 serializer、适配协议、Core 与 Rust 预分配文件同基线一致；811 个跟踪文件逐项核对验证副本与候选，仅含记录中的隔离路径映射。
+
+本批 socket/lease 零残留，历史路径快照未变，未使用 buddy。验证复用已验收且哈希一致的 FastDB/TypeScript 包，C-Two native、CLI 和 Node native 包均从本批隔离源码重建；线上独立构建原始默认路径源码。命令、原始日志、源/包哈希、API 对照、跨语言收据、审查及端点验收位于 `~/.codex/diagnostics/c2-r25-64a02321/`。
 
 ## 生成 TypeScript Node IPC 工厂退役（2026-10-16，完成）
 
