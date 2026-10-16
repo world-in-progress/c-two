@@ -9,7 +9,12 @@ from typing import Any, ForwardRef, Union, get_args, get_origin, get_type_hints
 from .contract import crm_contract_identity
 from .meta import MethodAccess, get_method_access
 from .methods import rpc_method_names
-from .payload_plan import DEFAULT_PICKLE_PROTOCOL, PayloadBinding, PayloadPlanKind
+from .payload_plan import (
+    DEFAULT_PICKLE_PROTOCOL,
+    PayloadBinding,
+    PayloadPlanKind,
+    _payload_type,
+)
 
 _DESCRIPTOR_SCHEMA = "c-two.python.crm.descriptor.v2"
 _PORTABLE_CONTRACT_SCHEMA = "c-two.contract.v2"
@@ -273,7 +278,12 @@ def _portable_method_descriptor(
     parameters = _signature_parameters(signature)
     input_binding = _binding(method, "_input_payload_binding")
     output_binding = _binding(method, "_output_payload_binding")
-    payload_type = _payload_type()
+    payload_type = _payload_type(
+        required=(
+            input_binding.kind is PayloadPlanKind.FASTDB
+            or output_binding.kind is PayloadPlanKind.FASTDB
+        ),
+    )
 
     if input_binding.kind is PayloadPlanKind.PYTHON_PICKLE:
         raise ValueError(
@@ -567,9 +577,3 @@ def _canonical_json(value: object) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
-
-
-def _payload_type():
-    from fastdb4py.payload import Payload
-
-    return Payload
