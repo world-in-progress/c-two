@@ -1,6 +1,6 @@
 # C-Two CLI (C3)
 
-This branch prepares c3 **0.3.4** for C-Two **0.7.5**. The versioned installer examples below apply after publication; build from source for local validation.
+C3 **0.3.5** accompanies C-Two **0.7.6** and includes the concurrent shutdown-report fix. See the [release notes](../docs/releases/0.7.6.md).
 
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
@@ -275,14 +275,14 @@ The matching release's `rc-manifest.json` identifies the artifact source.
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.4
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.5
 ```
 
 The installer detects Linux/macOS and x86_64/aarch64. It defaults to
 `/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.4 --bin-dir "$HOME/bin"
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.5 --bin-dir "$HOME/bin"
 ```
 
 ### Windows x64
@@ -291,7 +291,7 @@ Download the PowerShell installer and select the coordinated version explicitly:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.4 -Target x86_64-pc-windows-msvc
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.5 -Target x86_64-pc-windows-msvc
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```
