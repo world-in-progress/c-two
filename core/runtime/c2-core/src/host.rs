@@ -17,7 +17,6 @@ use c2_server::{
     SchedulerSnapshot, Server, ServerIdentity, ServerRuntimeBuilder,
 };
 
-use crate::outcome::RuntimeRouteSpec;
 use crate::{Error, LifecycleError, RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome};
 
 /// One generated method entry validated against an admitted release.
@@ -29,8 +28,12 @@ pub struct MethodDefinition {
 }
 
 /// Opaque-byte service boundary implemented by generated host adapters.
+///
+/// The service receives an owned snapshot, independent of transport storage.
+/// Core retains the request transport lease until invocation returns or unwinds;
+/// adapters must invalidate callback-scoped payload owners before that point.
 pub trait EncodedService: Send + Sync + 'static {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error>;
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error>;
 }
 
 /// Language-neutral execution policy shared by remote dispatch and any
@@ -707,7 +710,7 @@ impl Host {
 
     pub fn register(&self, definition: ServiceDefinition) -> Result<Registration, Error> {
         let route_name = definition.expected.route_name.clone();
-        let (route_spec, runtime_spec) = route_specs(&definition)?;
+        let route_spec = route_spec(&definition)?;
         let callback: Arc<dyn CrmCallback> = Arc::new(CoreCallback {
             service: Arc::clone(&definition.service),
         });
@@ -722,7 +725,6 @@ impl Host {
         let outcome = self.inner.runtime.register_route(
             &self.inner.server,
             route,
-            runtime_spec,
             self.inner.relay_anchor_address.as_deref(),
             self.inner.relay_use_proxy,
         )?;
@@ -986,9 +988,7 @@ impl Runtime {
     }
 }
 
-fn route_specs(
-    definition: &ServiceDefinition,
-) -> Result<(RouteBuildSpec, RuntimeRouteSpec), Error> {
+fn route_spec(definition: &ServiceDefinition) -> Result<RouteBuildSpec, Error> {
     let method_names = definition
         .methods
         .iter()
@@ -1008,19 +1008,7 @@ fn route_specs(
     let route = &definition.expected;
     let limits = SchedulerLimits::try_from_usize(definition.max_pending, definition.max_workers)
         .map_err(|message| method_contract_error("$.concurrency", message))?;
-    let route_spec = RouteBuildSpec {
-        name: route.route_name.clone(),
-        crm_ns: route.crm_ns.clone(),
-        crm_name: route.crm_name.clone(),
-        crm_ver: route.crm_ver.clone(),
-        abi_hash: route.abi_hash.clone(),
-        signature_hash: route.signature_hash.clone(),
-        method_names: method_names.clone(),
-        access_map: access_map.clone(),
-        concurrency_mode: definition.concurrency_mode.into(),
-        limits,
-    };
-    let runtime_spec = RuntimeRouteSpec {
+    Ok(RouteBuildSpec {
         name: route.route_name.clone(),
         crm_ns: route.crm_ns.clone(),
         crm_name: route.crm_name.clone(),
@@ -1030,10 +1018,8 @@ fn route_specs(
         method_names,
         access_map,
         concurrency_mode: definition.concurrency_mode.into(),
-        max_pending: limits.max_pending.map(usize::from),
-        max_workers: limits.max_workers.map(usize::from),
-    };
-    Ok((route_spec, runtime_spec))
+        limits,
+    })
 }
 
 struct CoreCallback {
@@ -1063,7 +1049,7 @@ impl CrmCallback for CoreCallback {
                 ));
             }
         };
-        let result = self.service.invoke(method_idx, &bytes);
+        let result = self.service.invoke(method_idx, bytes);
         if let Err(release_error) = lease.release() {
             return Err(CrmError::UserError(
                 protocol_violation(
@@ -1128,8 +1114,8 @@ mod lifecycle_tests {
         use c2_http::relay::{RelayConfig, RelayServer};
         struct Echo;
         impl EncodedService for Echo {
-            fn invoke(&self, _: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
-                Ok(request.to_vec())
+            fn invoke(&self, _: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+                Ok(request)
             }
         }
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1236,8 +1222,8 @@ mod lifecycle_tests {
         use std::io::{Read, Write};
         struct Echo;
         impl EncodedService for Echo {
-            fn invoke(&self, _: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
-                Ok(request.to_vec())
+            fn invoke(&self, _: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+                Ok(request)
             }
         }
         let runtime = Runtime::new(crate::RuntimeOptions {

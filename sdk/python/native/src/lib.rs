@@ -31,7 +31,7 @@ mod runtime_session_ffi;
 #[cfg(feature = "python")]
 pub(crate) mod shm_buffer;
 #[cfg(feature = "python")]
-mod wire_ffi;
+mod contract_ffi;
 #[cfg(feature = "python")]
 mod writable_sink;
 
@@ -58,6 +58,6 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     route_concurrency_ffi::register_module(m)?;
     runtime_session_ffi::register_module(m)?;
     shm_buffer::register_module(m)?;
-    wire_ffi::register_module(m)?;
+    contract_ffi::register_module(m)?;
     Ok(())
 }

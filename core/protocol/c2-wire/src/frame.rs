@@ -85,13 +85,20 @@ impl FrameHeader {
 ///
 /// Returns a `Vec<u8>` of length `HEADER_SIZE + payload.len()`.
 pub fn encode_frame(request_id: u64, frame_flags: u32, payload: &[u8]) -> Vec<u8> {
-    let payload_len = payload.len();
+    encode_frame_parts(request_id, frame_flags, &[payload])
+}
+
+/// Encode payload fragments into one frame allocation, in slice order.
+pub fn encode_frame_parts(request_id: u64, frame_flags: u32, parts: &[&[u8]]) -> Vec<u8> {
+    let payload_len: usize = parts.iter().map(|part| part.len()).sum();
     let total_len = (12 + payload_len) as u32;
     let mut buf = Vec::with_capacity(HEADER_SIZE + payload_len);
     buf.extend_from_slice(&total_len.to_le_bytes());
     buf.extend_from_slice(&request_id.to_le_bytes());
     buf.extend_from_slice(&frame_flags.to_le_bytes());
-    buf.extend_from_slice(payload);
+    for part in parts {
+        buf.extend_from_slice(part);
+    }
     buf
 }
 

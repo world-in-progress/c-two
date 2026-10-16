@@ -70,11 +70,12 @@ def test_transfer_rejects_arbitrary_custom_codec_types():
                 ...
 
 
-def test_transfer_buffer_hold_is_not_server_borrowing_api():
-    from c_two.crm.transferable import transfer
-
-    with pytest.raises(ValueError, match='input_lifetime'):
-        transfer(buffer='hold')
+@pytest.mark.parametrize('name', ('transfer', 'auto_transfer'))
+@pytest.mark.parametrize('buffer', (None, 'view', 'hold', 'invalid'))
+def test_transfer_rejects_removed_buffer_keyword(name, buffer):
+    module = importlib.import_module('c_two.crm.transferable')
+    with pytest.raises(TypeError, match='buffer'):
+        getattr(module, name)(buffer=buffer)
 
 
 def test_descriptor_normalizes_optional_union_and_ignores_shutdown_without_return_annotation():

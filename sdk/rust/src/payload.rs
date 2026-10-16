@@ -50,29 +50,24 @@ fn invalidate_payload(payload: &Payload) -> Result<(), String> {
 /// invocation. Its `Drop` therefore invalidates the FastDB owner before Core
 /// returns from the callback and releases the request lease.
 pub struct BorrowedPayload {
-    payload: Option<Payload>,
+    payload: Payload,
 }
 
 impl BorrowedPayload {
     pub fn payload(&self) -> &Payload {
-        self.payload
-            .as_ref()
-            .expect("borrowed payload is live until its guard is dropped")
+        &self.payload
     }
 }
 
 impl Drop for BorrowedPayload {
     fn drop(&mut self) {
-        if let Some(payload) = self.payload.take() {
-            let _ = payload.invalidate();
-            drop(payload);
-        }
+        let _ = self.payload.invalidate();
     }
 }
 
 /// Open one generated service input whose lifetime ends with its callback.
 pub fn open_borrowed(spec: &CompiledSpec, bytes: &[u8]) -> Result<BorrowedPayload, PayloadError> {
     Ok(BorrowedPayload {
-        payload: Some(Payload::open_copy(spec, bytes, &OpenOptions::default())?),
+        payload: Payload::open_copy(spec, bytes, &OpenOptions::default())?,
     })
 }

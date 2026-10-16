@@ -19,6 +19,7 @@ pub enum ResponseData {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     },
     /// Reassembled chunked response. The carrier owns the client's
     /// reassembly pool, the handle, and the reassembly budget charge until
@@ -83,6 +84,7 @@ impl ResponseLease {
                 offset,
                 data_size,
                 is_dedicated,
+                ..
             } => {
                 let mut server_pool = self.server_pool.lock();
                 let state = server_pool
@@ -113,12 +115,20 @@ impl ResponseLease {
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             } => {
                 let mut server_pool = self.server_pool.lock();
                 let state = server_pool
                     .as_mut()
                     .ok_or_else(|| "server pool not initialised".to_string())?;
-                state.release_response(seg_idx, generation, offset, data_size, is_dedicated)
+                state.release_response(
+                    seg_idx,
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                    allocation_id,
+                )
             }
             ResponseData::Handle(mut backing) => backing
                 .release()

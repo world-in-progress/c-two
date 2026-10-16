@@ -413,6 +413,12 @@ fn reap_endpoint_credential<'py>(
     reap_dict(py, &result)
 }
 
+struct OpenSweep {
+    // Fields drop in declaration order: the iterator must precede the lease.
+    inner: EndpointSweep,
+    _lease: SweepLease,
+}
+
 /// A bounded, explicitly driven sweep over one endpoint protocol namespace.
 ///
 /// One process may hold one active sweep. The lease is owned by Rust and is
@@ -423,12 +429,10 @@ fn reap_endpoint_credential<'py>(
 /// Python facade never mirrors a budget number or validates one.
 #[pyclass(module = "c_two._native")]
 pub(crate) struct PyEndpointSweep {
-    inner: Option<EndpointSweep>,
-    lease: Option<SweepLease>,
+    open: Option<OpenSweep>,
     default_budget: SweepBudget,
     context: LocalEndpointContext,
     batches: u64,
-    closed: bool,
 }
 
 impl PyEndpointSweep {
@@ -478,12 +482,13 @@ impl PyEndpointSweep {
             }
         };
         Ok(Self {
-            inner: Some(inner),
-            lease: Some(lease),
+            open: Some(OpenSweep {
+                inner,
+                _lease: lease,
+            }),
             default_budget,
             context,
             batches: 0,
-            closed: false,
         })
     }
 }
@@ -609,18 +614,17 @@ impl PyEndpointSweep {
         max_entries: Option<Bound<'py, PyAny>>,
         max_ms: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        self.ensure_open()?;
+        let open = self
+            .open
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("sweep is closed"))?;
         let budget = budget_with_overrides(
             self.default_budget,
             optional_budget_dimension(max_entries.as_ref(), "max_entries", MAX_SWEEP_ENTRIES)?,
             optional_budget_dimension(max_ms.as_ref(), "max_ms", MAX_SWEEP_MS)?,
         );
-        let inner = self
-            .inner
-            .as_mut()
-            .expect("an open sweep owns a native iterator");
         // Directory walking and per-entry native inspection run without the GIL.
-        let batch = py.detach(|| inner.next_batch(budget));
+        let batch = py.detach(|| open.inner.next_batch(budget));
         self.batches += 1;
         batch_dict(py, &batch, self.batches)
     }
@@ -642,21 +646,16 @@ impl PyEndpointSweep {
 
     #[getter]
     fn closed(&self) -> bool {
-        self.closed
+        self.open.is_none()
     }
 
     /// Releases the native iterator and the process maintenance lease.
     ///
     /// Idempotent: a second call is a no-op rather than a second release. The
-    /// iterator is dropped and the lease released one statement apart, so the
-    /// lease is never observable as free while the iterator is still live.
+    /// OpenSweep drops the iterator before releasing the lease, so the lease
+    /// is never observable as free while the iterator is still live.
     fn close(&mut self) {
-        if self.closed {
-            return;
-        }
-        drop(self.inner.take());
-        drop(self.lease.take());
-        self.closed = true;
+        drop(self.open.take());
     }
 
     fn __enter__(&mut self) -> PyResult<()> {
@@ -674,13 +673,13 @@ impl PyEndpointSweep {
     }
 
     fn __repr__(&self) -> String {
-        format!("PyEndpointSweep(closed={})", self.closed)
+        format!("PyEndpointSweep(closed={})", self.closed())
     }
 }
 
 impl PyEndpointSweep {
     fn ensure_open(&self) -> PyResult<()> {
-        if self.closed || self.inner.is_none() {
+        if self.open.is_none() {
             return Err(PyValueError::new_err("sweep is closed"));
         }
         Ok(())

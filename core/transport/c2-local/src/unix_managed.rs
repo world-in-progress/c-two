@@ -2,8 +2,10 @@
 //! per live listener, and identity-checked retirement.
 //!
 //! The namespace is the `managed-v2` directory derived by
-//! [`c2_config::LocalEndpoint`] (default `/tmp/c2-<uidhex>`). Everything in this module
-//! operates on that namespace through verified directory descriptors:
+//! [`c2_config::LocalEndpoint`] (default `/tmp/c2-<uidhex>`). macOS keeps the
+//! default namespace's coordination records in its non-temporary user directory;
+//! other namespaces keep them beside the socket. Both locations are accessed
+//! through verified directory descriptors:
 //!
 //! - `.gate` is the single long-lived coordinator lock. Every open, create,
 //!   delete, and retire of an endpoint lease happens while holding it.
@@ -36,6 +38,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+mod directories;
+use directories::{DirectoryEntries, NamespaceDirectories};
 
 pub(crate) const GATE_NAME: &str = ".gate";
 pub(crate) const MARKER_NAME: &str = ".gate.marker";
@@ -356,7 +361,7 @@ fn directory_error(error: io::Error, create: bool) -> NamespaceError {
 
 /// A verified managed namespace with the fixed coordinator gate held.
 pub(crate) struct ManagedNamespace {
-    directory: EndpointDirectory,
+    directories: NamespaceDirectories,
     gate: File,
 }
 
@@ -378,10 +383,8 @@ impl ManagedNamespace {
         create: bool,
         blocking: bool,
     ) -> Result<Self, NamespaceError> {
-        let default = LocalEndpointContext::default_for_platform().map_err(NamespaceError::Io)?;
-        let create_directory = create && default.unix_root() == Some(root);
-        let directory = EndpointDirectory::open(root, create_directory)
-            .map_err(|error| directory_error(error, create))?;
+        let directories = NamespaceDirectories::open(root, create)?;
+        let directory = &directories.records;
 
         // A marker without its gate must never cause a second coordinator inode
         // to be created. The check happens before any O_CREAT attempt.
@@ -396,7 +399,7 @@ impl ManagedNamespace {
             // A namespace that was never initialized carries no endpoint
             // identity. An empty one is simply absent; one that already holds
             // endpoint objects is the incomplete-initialization boundary.
-            if namespace_has_endpoint_entries(root)? {
+            if has_endpoint_entries(directories.entries()?)? {
                 return Err(NamespaceError::Unverified(
                     EndpointUnverifiedReason::InitializationIncomplete,
                 ));
@@ -415,7 +418,7 @@ impl ManagedNamespace {
         // directory entries that were verified above may already name different
         // directories. Re-check the final directory through its open descriptor
         // and drop the gate without adopting a redirected name.
-        directory.validate().map_err(NamespaceError::Io)?;
+        directories.validate().map_err(NamespaceError::Io)?;
         #[cfg(test)]
         barrier::after_gate(root);
 
@@ -430,7 +433,7 @@ impl ManagedNamespace {
                         EndpointUnverifiedReason::InitializationIncomplete,
                     ));
                 }
-                if namespace_has_endpoint_entries(root)? {
+                if has_endpoint_entries(directories.entries()?)? {
                     // An endpoint exists without a marker: the initialization
                     // identity is incomplete. The gate is a fixed inode and is
                     // never unlinked, not even when this call created it: a
@@ -448,14 +451,17 @@ impl ManagedNamespace {
             }
         }
 
-        Ok(Self { directory, gate })
+        Ok(Self { directories, gate })
     }
 
-    /// The exact directory that must receive this process's socket and lease.
+    /// The exact directory that must receive this process's socket.
     /// Callers bind relative to this descriptor, never to the absolute path it
     /// was opened from.
     fn directory(&self) -> &EndpointDirectory {
-        &self.directory
+        self.directories
+            .sockets
+            .as_deref()
+            .expect("bind has a socket directory")
     }
 
     /// Confirms that the final directory still names its open descriptor and
@@ -463,8 +469,8 @@ impl ManagedNamespace {
     /// the coordinator inode. A renamed or replaced directory invalidates every
     /// operation that would otherwise act on it.
     fn gate_still_named(&self) -> bool {
-        self.directory.path_still_names_open_directory()
-            && gate_entry_is_current(&self.directory, &self.gate)
+        self.directories.validate().is_ok()
+            && gate_entry_is_current(&self.directories.records, &self.gate)
     }
 }
 
@@ -551,18 +557,17 @@ const INIT_SCAN_LIMIT: usize = 64;
 /// unenumerated directory cannot prove "no endpoint objects", and adopting it
 /// would risk writing a first marker into a namespace whose real identity is
 /// simply too large to inspect.
-fn namespace_has_endpoint_entries(root: &Path) -> io::Result<bool> {
-    let mut inspected = 0;
-    for entry in fs::read_dir(root)? {
-        inspected += 1;
-        if inspected > INIT_SCAN_LIMIT {
+fn has_endpoint_entries(
+    entries: impl Iterator<Item = io::Result<fs::DirEntry>>,
+) -> io::Result<bool> {
+    for (index, entry) in entries.enumerate() {
+        if index >= INIT_SCAN_LIMIT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "managed namespace first-initialization scan exceeded its bound",
             ));
         }
-        let entry = entry?;
-        let name = entry.file_name();
+        let name = entry?.file_name();
         let bytes = name.as_bytes();
         if is_endpoint_stem(bytes)
             || bytes
@@ -866,13 +871,13 @@ fn remove_stale_managed_socket(
     names: &EndpointNames,
     lease: &File,
 ) -> io::Result<()> {
-    let Some(socket_stat) = namespace.directory.stat(&names.socket)? else {
+    let Some(socket_stat) = namespace.directories.socket_stat(&names.socket)? else {
         return Ok(());
     };
     if !stat_is(&socket_stat, libc::S_IFSOCK) || socket_stat.st_uid != unsafe { libc::geteuid() } {
         return Err(endpoint_in_use());
     }
-    if probe_listener_is_live(&namespace.directory, &names.socket_os)? {
+    if probe_listener_is_live(namespace.directories.socket_directory()?, &names.socket_os)? {
         return Err(endpoint_in_use());
     }
     let Some(record) = read_record(lease)? else {
@@ -883,7 +888,8 @@ fn remove_stale_managed_socket(
     }
     let opened_lock = fstat(lease.as_raw_fd())?;
     match crate::unix_common::unlink_verified(
-        &namespace.directory,
+        namespace.directories.socket_directory()?,
+        &namespace.directories.records,
         names,
         &opened_lock,
         record.identity,
@@ -909,7 +915,7 @@ fn retire_owned(
         Ok(names) => names,
         Err(error) => return EndpointReapResult::IoError(error),
     };
-    let opened_lock = match verify_lease_entry(&namespace.directory, &names.lock, lease) {
+    let opened_lock = match verify_lease_entry(&namespace.directories.records, &names.lock, lease) {
         Ok(stat) => stat,
         Err(reason) => return EndpointReapResult::Unverified(reason),
     };
@@ -919,7 +925,7 @@ fn retire_owned(
         Ok(None) => return EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidRecord),
         Err(error) => return EndpointReapResult::IoError(error),
     }
-    let socket_stat = match namespace.directory.stat(&names.socket) {
+    let socket_stat = match namespace.directories.socket_stat(&names.socket) {
         Ok(stat) => stat,
         Err(error) => return EndpointReapResult::IoError(error),
     };
@@ -931,7 +937,8 @@ fn retire_owned(
             return EndpointReapResult::StaleTarget;
         }
         match crate::unix_common::unlink_verified(
-            &namespace.directory,
+            namespace.directory(),
+            &namespace.directories.records,
             &names,
             &opened_lock,
             expected.identity,
@@ -940,7 +947,7 @@ fn retire_owned(
             other => return other,
         }
     }
-    match namespace.directory.unlink(&names.lock) {
+    match namespace.directories.records.unlink(&names.lock) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return EndpointReapResult::IoError(error),
@@ -989,6 +996,44 @@ impl Drop for Lease {
     }
 }
 
+/// Rolls back only the lease created by this bind, while its gate and file
+/// descriptor are still held. Existing slots never acquire this authority.
+struct BindLeaseGuard<'a> {
+    namespace: &'a ManagedNamespace,
+    names: &'a EndpointNames,
+    lease: &'a File,
+    created: bool,
+    socket_bound: bool,
+}
+
+impl Drop for BindLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if !self.created
+            || !self.namespace.gate_still_named()
+            || verify_lease_entry(
+                &self.namespace.directories.records,
+                &self.names.lock,
+                self.lease,
+            )
+            .is_err()
+            || try_lock_lease(self.lease).is_err()
+        {
+            return;
+        }
+        // After bind, the socket guard runs first. Preserve the lease if that
+        // socket could not be withdrawn, including an unverified replacement.
+        if self.socket_bound
+            && !matches!(
+                self.namespace.directories.socket_stat(&self.names.socket),
+                Ok(None)
+            )
+        {
+            return;
+        }
+        let _ = self.namespace.directories.records.unlink(&self.names.lock);
+    }
+}
+
 /// A bound managed listener: the socket, its lease handle, and the record
 /// written at bind time.
 pub(crate) struct ManagedListener {
@@ -1003,6 +1048,7 @@ pub(crate) struct ManagedListener {
     // Drop releases the shared OFD flock; this descriptor holds only the inode.
     // Field order releases the lease before this last listener pin closes.
     _gate_pin: File,
+    directories_pin: Option<NamespaceDirectories>,
     #[cfg(test)]
     gate_identity: SocketIdentity,
     cleaned: bool,
@@ -1053,6 +1099,12 @@ impl ManagedListener {
                 return namespace_reap_error(error);
             }
         };
+        if self.directories_pin.as_ref().is_some_and(|directories| {
+            !directories.same_as(&namespace.directories).unwrap_or(false)
+        }) {
+            self.lease.take();
+            return EndpointReapResult::Unverified(EndpointUnverifiedReason::UnsafeDirectory);
+        }
         match self.lease.as_ref() {
             Some(lease) => retire_owned(&namespace, &self.endpoint, lease.file(), &self.record),
             None => EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership),
@@ -1072,7 +1124,11 @@ impl ManagedListener {
         let namespace = ManagedNamespace::open_root(&self.root, false, false);
         self.inner.take();
         if let (Ok(namespace), Some(lease)) = (namespace, self.lease.as_ref()) {
-            let _ = retire_owned(&namespace, &self.endpoint, lease.file(), &self.record);
+            if self.directories_pin.as_ref().is_none_or(|directories| {
+                directories.same_as(&namespace.directories).unwrap_or(false)
+            }) {
+                let _ = retire_owned(&namespace, &self.endpoint, lease.file(), &self.record);
+            }
         }
         // Retire (or a missed gate) leaves the record for the reaper; in both
         // cases the lease flock must not survive this listener.
@@ -1140,33 +1196,77 @@ pub(crate) fn bind_managed_at(
     let namespace = open_root_bounded(root, true).map_err(namespace_bind_error)?;
     let gate_pin = namespace.gate.try_clone()?;
     let names = managed_names(endpoint)?;
-    let lease = namespace
-        .directory
-        .open_file(&names.lock, libc::O_RDWR | libc::O_CREAT, 0o600)?
-        .expect("O_CREAT openat must return a lease file");
-    if let Err(reason) = verify_lease_entry(&namespace.directory, &names.lock, &lease) {
+    namespace
+        .directories
+        .verify_slot(&names.lock)
+        .map_err(namespace_bind_error)?;
+    let (file, created) = match namespace.directories.records.open_file(
+        &names.lock,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    ) {
+        Ok(Some(file)) => (file, true),
+        Ok(None) => unreachable!("O_CREAT openat must return a lease file"),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+            open_lease(&namespace.directories.records, &names.lock)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "managed lease disappeared while opening",
+                )
+            })?,
+            false,
+        ),
+        Err(error) => return Err(error),
+    };
+    // Declared before both rollback guards: unlock only after they finish.
+    let lease = Lease(Some(file));
+    let mut lease_guard = BindLeaseGuard {
+        namespace: &namespace,
+        names: &names,
+        lease: lease.file(),
+        created,
+        socket_bound: false,
+    };
+    if let Err(reason) =
+        verify_lease_entry(&namespace.directories.records, &names.lock, lease.file())
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("managed lease is unverifiable: {reason:?}"),
         ));
     }
-    if let Err(result) = try_lock_lease(&lease) {
+    if let Err(result) = try_lock_lease(lease.file()) {
         return Err(match result {
             EndpointReapResult::Busy => endpoint_in_use(),
             EndpointReapResult::IoError(error) => error,
             _ => endpoint_in_use(),
         });
     }
-    // Arm immediately after flock: every subsequent failure must explicitly
-    // unlock the OFD, even when a dup/fork keeps another descriptor alive.
-    // The socket rollback guard is created later and drops before this lease.
-    let lease = Lease(Some(lease));
     #[cfg(test)]
     if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::LeaseAfterLock) {
         crate::unix_common::fault::retain_duplicate(lease.file());
         return Err(io::Error::other(
             "injected failure immediately after lease lock",
         ));
+    }
+    #[cfg(test)]
+    for (failure, name) in [
+        (
+            crate::unix_common::fault::Failure::LeaseAfterReplacement,
+            names.lock.clone(),
+        ),
+        (
+            crate::unix_common::fault::Failure::LeaseAfterGateReplacement,
+            gate_name(),
+        ),
+    ] {
+        if crate::unix_common::fault::take_if(failure) {
+            namespace
+                .directories
+                .records
+                .replace_entry_with_file_for_test(&name)?;
+            return Err(io::Error::other("injected replacement after lease lock"));
+        }
     }
     remove_stale_managed_socket(&namespace, endpoint, &names, lease.file())?;
     // The socket must be created in the directory this call verified. Re-check
@@ -1180,16 +1280,22 @@ pub(crate) fn bind_managed_at(
         ));
     }
     let socket = bind_in_verified_directory(&namespace, &names)?;
+    lease_guard.socket_bound = true;
     // Everything after a successful bind either completes initialization or
     // withdraws the exact object this call created. The guard never trusts the
     // record it may have failed to write.
-    let mut guard = BoundSocketGuard::capture(&namespace.directory, &names, lease.file())?;
-    set_socket_permissions(&namespace.directory, &names, &guard)?;
-    listen_verified_socket(&socket, &namespace.directory, &names, &guard)?;
+    let mut guard = BoundSocketGuard::capture(
+        namespace.directory(),
+        &namespace.directories.records,
+        &names,
+        lease.file(),
+    )?;
+    set_socket_permissions(namespace.directory(), &names, &guard)?;
+    listen_verified_socket(&socket, namespace.directory(), &names, &guard)?;
     socket.set_nonblocking(true)?;
     let std_listener: std::os::unix::net::UnixListener = socket.into();
     let inner = tokio::net::UnixListener::from_std(std_listener)?;
-    let identity = socket_identity(&namespace.directory, &names)?;
+    let identity = socket_identity(namespace.directories.socket_directory()?, &names)?;
     let record = OwnerRecord {
         address: endpoint.address().to_owned(),
         incarnation: uuid::Uuid::new_v4().into_bytes(),
@@ -1203,7 +1309,7 @@ pub(crate) fn bind_managed_at(
             // record write. The record then cannot describe this bind's socket,
             // and rollback must leave the foreign object in place.
             namespace
-                .directory
+                .directory()
                 .replace_entry_with_file_for_test(&names.socket)?;
         }
     }
@@ -1220,7 +1326,7 @@ pub(crate) fn bind_managed_at(
     }
     // The recorded identity must still name the entry this bind created. A
     // foreign replacement stays in place and is never withdrawn by rollback.
-    match socket_identity(&namespace.directory, &names) {
+    match socket_identity(namespace.directories.socket_directory()?, &names) {
         Ok(current) if current == identity => {}
         Ok(_) => {
             return Err(io::Error::new(
@@ -1230,11 +1336,13 @@ pub(crate) fn bind_managed_at(
         }
         Err(error) => return Err(error),
     }
-    guard.disarm();
-    drop(guard);
     #[cfg(test)]
     let gate_identity =
         SocketIdentity::from_stat(&fstat(namespace.gate.as_raw_fd()).map_err(|error| error)?);
+    guard.disarm();
+    drop(guard);
+    lease_guard.created = false;
+    drop(lease_guard);
     Ok(ManagedListener {
         inner: Some(inner),
         endpoint: endpoint.clone(),
@@ -1243,6 +1351,10 @@ pub(crate) fn bind_managed_at(
         root: root.to_owned(),
         lease: Some(lease),
         _gate_pin: gate_pin,
+        directories_pin: namespace
+            .directories
+            .split()
+            .then(|| namespace.directories.clone()),
         #[cfg(test)]
         gate_identity,
         cleaned: false,
@@ -1268,7 +1380,14 @@ pub(crate) fn read_lease_record(
     let mut lease = stem.as_bytes().to_vec();
     lease.extend_from_slice(LEASE_SUFFIX.as_bytes());
     let name = CString::new(lease).map_err(|_| EndpointUnverifiedReason::InvalidRecord)?;
-    let stat = match namespace.directory.stat(&name) {
+    namespace
+        .directories
+        .verify_slot(&name)
+        .map_err(|error| match error {
+            NamespaceError::Unverified(reason) => reason,
+            _ => EndpointUnverifiedReason::InvalidOwnership,
+        })?;
+    let stat = match namespace.directories.records.stat(&name) {
         Ok(Some(stat)) => stat,
         Ok(None) => return Ok(None),
         Err(_) => return Err(EndpointUnverifiedReason::InvalidOwnership),
@@ -1276,12 +1395,12 @@ pub(crate) fn read_lease_record(
     if let Some(reason) = lease_entry_unverified(&stat) {
         return Err(reason);
     }
-    let file = match open_lease(&namespace.directory, &name) {
+    let file = match open_lease(&namespace.directories.records, &name) {
         Ok(Some(file)) => file,
         Ok(None) => return Ok(None),
         Err(_) => return Err(EndpointUnverifiedReason::InvalidOwnership),
     };
-    let _ = verify_lease_entry(&namespace.directory, &name, &file)?;
+    let _ = verify_lease_entry(&namespace.directories.records, &name, &file)?;
     match read_record(&file) {
         Ok(Some(record)) => Ok(Some(record)),
         Ok(None) => Err(EndpointUnverifiedReason::InvalidRecord),
@@ -1303,7 +1422,10 @@ fn reap_locked(
         Ok(names) => names,
         Err(error) => return EndpointReapResult::IoError(error),
     };
-    let socket_stat = match namespace.directory.stat(&names.socket) {
+    if let Err(error) = namespace.directories.verify_slot(&names.lock) {
+        return namespace_reap_error(error);
+    }
+    let socket_stat = match namespace.directories.socket_stat(&names.socket) {
         Ok(stat) => stat,
         Err(error) => return EndpointReapResult::IoError(error),
     };
@@ -1312,7 +1434,7 @@ fn reap_locked(
             return EndpointReapResult::Unverified(reason);
         }
     }
-    let lease_stat = match namespace.directory.stat(&names.lock) {
+    let lease_stat = match namespace.directories.records.stat(&names.lock) {
         Ok(stat) => stat,
         Err(error) => return EndpointReapResult::IoError(error),
     };
@@ -1325,13 +1447,14 @@ fn reap_locked(
     if let Some(reason) = lease_entry_unverified(&lease_stat) {
         return EndpointReapResult::Unverified(reason);
     }
-    let Some(lease) = (match open_lease(&namespace.directory, &names.lock) {
+    let Some(lease) = (match open_lease(&namespace.directories.records, &names.lock) {
         Ok(lease) => lease,
         Err(error) => return EndpointReapResult::IoError(error),
     }) else {
         return EndpointReapResult::Unverified(EndpointUnverifiedReason::MissingOwnership);
     };
-    let opened_lock = match verify_lease_entry(&namespace.directory, &names.lock, &lease) {
+    let opened_lock = match verify_lease_entry(&namespace.directories.records, &names.lock, &lease)
+    {
         Ok(stat) => stat,
         Err(reason) => return EndpointReapResult::Unverified(reason),
     };
@@ -1355,7 +1478,7 @@ fn reap_locked(
         None => {
             // A valid old record whose socket is already gone may still retire
             // its lease; there is no socket object to compare against.
-            let current = match namespace.directory.stat(&names.lock) {
+            let current = match namespace.directories.records.stat(&names.lock) {
                 Ok(Some(stat)) => stat,
                 Ok(None) => return EndpointReapResult::AlreadyAbsent,
                 Err(error) => return EndpointReapResult::IoError(error),
@@ -1363,7 +1486,7 @@ fn reap_locked(
             if !namespace.gate_still_named() || !same_file(&opened_lock, &current) {
                 return EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership);
             }
-            match namespace.directory.unlink(&names.lock) {
+            match namespace.directories.records.unlink(&names.lock) {
                 Ok(()) => EndpointReapResult::Reaped,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => EndpointReapResult::Reaped,
                 Err(error) => EndpointReapResult::IoError(error),
@@ -1382,7 +1505,8 @@ fn reap_locked(
                 );
             }
             match crate::unix_common::unlink_verified(
-                &namespace.directory,
+                namespace.directory(),
+                &namespace.directories.records,
                 &names,
                 &opened_lock,
                 record.identity,
@@ -1390,7 +1514,7 @@ fn reap_locked(
                 EndpointReapResult::Reaped | EndpointReapResult::AlreadyAbsent => {}
                 other => return other,
             }
-            match namespace.directory.unlink(&names.lock) {
+            match namespace.directories.records.unlink(&names.lock) {
                 Ok(()) => EndpointReapResult::Reaped,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => EndpointReapResult::Reaped,
                 Err(error) => EndpointReapResult::IoError(error),
@@ -1449,7 +1573,7 @@ pub(crate) fn reap_slot(context: &LocalEndpointContext, stem: &OsStr) -> Endpoin
 fn reap_slot_with_directory(
     context: &LocalEndpointContext,
     stem: &OsStr,
-    expected_directory: Option<&EndpointDirectory>,
+    expected_directory: Option<&NamespaceDirectories>,
 ) -> EndpointReapResult {
     let anchor = match context.endpoint("ipc://c2-endpoint-sweep") {
         Ok(endpoint) => endpoint,
@@ -1466,12 +1590,9 @@ fn reap_slot_with_directory(
     // happens between its batch check and this gate open, do not adopt even a
     // complete record in the replacement namespace.
     if let Some(expected) = expected_directory {
-        let same_directory = fstat(expected.fd()).and_then(|expected_stat| {
-            fstat(namespace.directory.fd()).map(|current| same_file(&expected_stat, &current))
-        });
-        match same_directory {
-            Ok(true) if expected.path_still_names_open_directory() => {}
-            Ok(_) => {
+        match expected.same_as(&namespace.directories) {
+            Ok(true) => {}
+            Ok(false) => {
                 return EndpointReapResult::Unverified(EndpointUnverifiedReason::UnsafeDirectory);
             }
             Err(error) => return EndpointReapResult::IoError(error),
@@ -1484,7 +1605,7 @@ fn reap_slot_with_directory(
             // that the slot is already clean.
             let socket = slot_name(stem, "").ok();
             let present = socket
-                .and_then(|name| namespace.directory.stat(&name).ok().flatten())
+                .and_then(|name| namespace.directories.socket_stat(&name).ok().flatten())
                 .is_some();
             return if present {
                 EndpointReapResult::Unverified(EndpointUnverifiedReason::MissingOwnership)
@@ -1542,7 +1663,10 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
         Ok(names) => names,
         Err(error) => return EndpointInspection::IoError(error),
     };
-    let socket_stat = match namespace.directory.stat(&names.socket) {
+    if let Err(error) = namespace.directories.verify_slot(&names.lock) {
+        return namespace_inspection_error(error);
+    }
+    let socket_stat = match namespace.directories.socket_stat(&names.socket) {
         Ok(Some(stat)) => stat,
         Ok(None) => return EndpointInspection::Absent,
         Err(error) => return EndpointInspection::IoError(error),
@@ -1550,7 +1674,7 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
     if let Some(reason) = socket_unverified(&socket_stat) {
         return EndpointInspection::Unverified(reason);
     }
-    let lease_stat = match namespace.directory.stat(&names.lock) {
+    let lease_stat = match namespace.directories.records.stat(&names.lock) {
         Ok(Some(stat)) => stat,
         Ok(None) => {
             return EndpointInspection::Unverified(EndpointUnverifiedReason::MissingOwnership);
@@ -1560,13 +1684,14 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
     if let Some(reason) = lease_entry_unverified(&lease_stat) {
         return EndpointInspection::Unverified(reason);
     }
-    let Some(lease) = (match open_lease(&namespace.directory, &names.lock) {
+    let Some(lease) = (match open_lease(&namespace.directories.records, &names.lock) {
         Ok(lease) => lease,
         Err(error) => return EndpointInspection::IoError(error),
     }) else {
         return EndpointInspection::Unverified(EndpointUnverifiedReason::MissingOwnership);
     };
-    let opened_lock = match verify_lease_entry(&namespace.directory, &names.lock, &lease) {
+    let opened_lock = match verify_lease_entry(&namespace.directories.records, &names.lock, &lease)
+    {
         Ok(stat) => stat,
         Err(reason) => return EndpointInspection::Unverified(reason),
     };
@@ -1580,12 +1705,17 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
     }
     // Re-verify both entries after reading so a concurrent replacement cannot
     // be reported as a present endpoint.
-    let current_socket = match namespace.directory.stat(&names.socket) {
+    let current_socket = match namespace.directories.socket_stat(&names.socket) {
         Ok(Some(stat)) => stat,
         Ok(None) => return EndpointInspection::Absent,
         Err(error) => return EndpointInspection::IoError(error),
     };
-    let current_lock = namespace.directory.stat(&names.lock).ok().flatten();
+    let current_lock = namespace
+        .directories
+        .records
+        .stat(&names.lock)
+        .ok()
+        .flatten();
     if !same_file(&socket_stat, &current_socket)
         || identity_of(&current_socket) != record.identity
         || current_lock.is_none_or(|current| !same_file(&opened_lock, &current))
@@ -1604,8 +1734,8 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
 /// gate is acquired per candidate and never held across the traversal.
 pub(crate) struct ManagedSweep {
     context: LocalEndpointContext,
-    directory: EndpointDirectory,
-    entries: Option<ReadDir>,
+    directories: NamespaceDirectories,
+    entries: Option<DirectoryEntries>,
     finished: bool,
     interrupted: bool,
     _lease: Option<SweepLease>,
@@ -1657,9 +1787,9 @@ impl ManagedSweep {
 
     fn open_root(root: &Path, context: &LocalEndpointContext) -> io::Result<Self> {
         let lease = SweepLease::acquire()?;
-        let directory = EndpointDirectory::open(root, false)?;
-        let entries = fs::read_dir(root)?;
-        if !directory.path_still_names_open_directory() {
+        let directories = NamespaceDirectories::open(root, false).map_err(namespace_bind_error)?;
+        let entries = directories.entries()?;
+        if directories.validate().is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "managed namespace changed while opening sweep",
@@ -1667,7 +1797,7 @@ impl ManagedSweep {
         }
         Ok(Self {
             context: context.clone(),
-            directory,
+            directories,
             entries: Some(entries),
             finished: false,
             interrupted: false,
@@ -1692,7 +1822,7 @@ impl ManagedSweep {
                 ..SweepBatch::default()
             };
         }
-        if !self.directory.path_still_names_open_directory() {
+        if self.directories.validate().is_err() {
             self.finish(true);
             return SweepBatch {
                 round_interrupted: true,
@@ -1724,11 +1854,11 @@ impl ManagedSweep {
                 }
                 Some(Ok(entry)) => {
                     batch.entries_visited += 1;
-                    self.inspect_entry(&entry.file_name(), &mut batch);
+                    self.inspect_entry(&entry, &mut batch);
                 }
             }
         }
-        if !self.directory.path_still_names_open_directory() {
+        if self.directories.validate().is_err() {
             self.finish(true);
             batch.namespace_changed = true;
             batch.round_interrupted = true;
@@ -1737,7 +1867,9 @@ impl ManagedSweep {
         batch
     }
 
-    fn inspect_entry(&self, filename: &OsStr, batch: &mut SweepBatch) {
+    fn inspect_entry(&self, entry: &fs::DirEntry, batch: &mut SweepBatch) {
+        let filename = entry.file_name();
+        let filename = filename.as_os_str();
         if self
             .selected
             .as_ref()
@@ -1749,18 +1881,29 @@ impl ManagedSweep {
         if bytes == GATE_NAME.as_bytes() || bytes == MARKER_NAME.as_bytes() {
             return;
         }
+        let in_records = entry.path().parent() == Some(self.directories.records.path());
         if is_endpoint_stem(bytes) {
+            if self.directories.split() && in_records {
+                return;
+            }
             batch.endpoints_examined += 1;
             let stem = OsStr::from_bytes(bytes);
             self.count(
                 batch,
-                reap_slot_with_directory(&self.context, stem, Some(&self.directory)),
+                reap_slot_with_directory(&self.context, stem, Some(&self.directories)),
                 false,
             );
         } else if let Some(stem) = bytes
             .strip_suffix(LEASE_SUFFIX.as_bytes())
             .filter(|stem| is_endpoint_stem(stem))
         {
+            if self.directories.split() && !in_records {
+                // Historical colocated leases belong to the cold-switch
+                // boundary. Never report one absent by reading the new root.
+                batch.endpoints_examined += 1;
+                batch.unverified += 1;
+                return;
+            }
             // A socket slot is handled through its short entry, which retires
             // both objects. Only a socket-less slot is a lease-only candidate.
             let socket = match CString::new(stem) {
@@ -1770,7 +1913,7 @@ impl ManagedSweep {
                     return;
                 }
             };
-            match self.directory.stat(&socket) {
+            match self.directories.socket_stat(&socket) {
                 Ok(Some(_)) => return,
                 Ok(None) => {}
                 Err(error) => {
@@ -1782,7 +1925,7 @@ impl ManagedSweep {
             let stem = OsStr::from_bytes(stem);
             self.count(
                 batch,
-                reap_slot_with_directory(&self.context, stem, Some(&self.directory)),
+                reap_slot_with_directory(&self.context, stem, Some(&self.directories)),
                 true,
             );
         }
@@ -1824,3 +1967,6 @@ pub(crate) fn test_namespace_root(root: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod split_tests;

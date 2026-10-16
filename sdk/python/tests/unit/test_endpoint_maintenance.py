@@ -13,6 +13,7 @@ executable coverage instead of disappearing from the suite.
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -62,14 +63,50 @@ def native_namespace():
         use_process_relay_anchor=False,
     )
     bridge = session.ensure_server_bridge()
+    address = session.server_address
+    context = session.local_endpoint_context()
+    assert address is not None
+
+    def inspect():
+        deadline = time.monotonic() + 1.0
+        while True:
+            observed = cc.inspect_endpoint(address, context=context)
+            if observed['io_kind'] != 'WouldBlock' or time.monotonic() >= deadline:
+                return observed
+            time.sleep(0.01)
+
     try:
         bridge.start()
     finally:
-        outcome = session.shutdown(timeout_seconds=5.0)
-        assert outcome['completed'], outcome
-    # The native listener removes only its owned socket; its legacy rendezvous
-    # lock follows native retention policy. No scoped sweep selects that slot.
+        try:
+            observed = inspect()
+        finally:
+            outcome = session.shutdown(timeout_seconds=5.0)
+        assert outcome['completed'] and outcome['runtime_barrier_error'] is None, outcome
+        if IS_WINDOWS:
+            assert (observed['status'], observed['reason']) == (
+                'not-applicable', 'kernel-managed',
+            ), observed
+        else:
+            assert observed['status'] in {'present', 'absent'}, observed
+            if observed['status'] == 'present':
+                deadline = time.monotonic() + 1.0
+                while True:
+                    reaped = cc.reap_endpoint(address, observed['credential'], context=context)
+                    if reaped['status'] != 'busy' or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.05)
+                assert reaped['status'] in {'reaped', 'already-absent'}, reaped
+            assert inspect()['status'] == 'absent'
     yield
+
+
+@pytest.fixture
+def empty_sweep_context(tmp_path):
+    """Keep EOF tests independent of entries in the process-default root."""
+    if IS_WINDOWS:
+        return cc.local_endpoint_context()
+    return cc.local_endpoint_context(root=str(tmp_path))
 
 
 def _native_document(address: str = 'ipc://unit-native-endpoint') -> str:
@@ -374,18 +411,31 @@ class TestSweepLease:
         finally:
             first.close()
 
-    def test_close_releases_the_lease(self) -> None:
-        first = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
+    def test_close_releases_only_its_own_lease(self, empty_sweep_context) -> None:
+        first = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
         first.close()
-        assert first.closed is True
-        second = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
-        second.close()
-
-    def test_close_is_idempotent(self) -> None:
-        sweep = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
-        sweep.close()
-        sweep.close()
-        assert sweep.closed is True
+        second = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        protocol = second.protocol
+        try:
+            # End the native round so its own lease cannot hide an incorrect
+            # release of the projection lease by the old owner.
+            assert second.next_batch(max_entries=MAX_SWEEP_ENTRIES, max_ms=MAX_SWEEP_MS)['round_complete'] is True
+            assert second.closed is False
+            first.close()
+            assert first.closed is True
+            del first
+            gc.collect()
+            with pytest.raises(RuntimeError, match='already active'):
+                cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        finally:
+            second.close()
+        assert second.closed is True
+        assert second.protocol == protocol
+        assert second.context == empty_sweep_context
+        with pytest.raises(ValueError, match='sweep is closed'):
+            second._native.__enter__()  # noqa: SLF001
+        with pytest.raises(ValueError, match='sweep is closed'):
+            second.next_batch(max_entries=False)
 
     def test_context_manager_releases_the_lease(self) -> None:
         with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
@@ -430,12 +480,6 @@ class TestSweepLease:
         finally:
             for sweep in sweeps:
                 sweep.close()
-
-    def test_next_batch_after_close_is_rejected(self) -> None:
-        sweep = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
-        sweep.close()
-        with pytest.raises(ValueError):
-            sweep.next_batch()
 
 
 class TestSweepBudget:

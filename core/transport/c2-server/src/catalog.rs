@@ -23,14 +23,6 @@ pub(crate) enum RouteWatchBatch {
 }
 
 #[derive(Debug, Clone)]
-struct RemovedRouteTombstone {
-    route_uid: String,
-    _contract: RouteContractWire,
-    _catalog_revision: u64,
-    _reason: RouteStateReasonWire,
-}
-
-#[derive(Debug, Clone)]
 struct StoredWatchEvent {
     route_name: String,
     contract: RouteContractWire,
@@ -46,7 +38,7 @@ pub(crate) struct RouteCatalog {
     min_watch_revision: u64,
     event_retention: usize,
     routes: BTreeMap<String, RouteRecordWire>,
-    removed: BTreeMap<String, RemovedRouteTombstone>,
+    removed_route_uids: BTreeMap<String, String>,
     events: Vec<StoredWatchEvent>,
 }
 
@@ -68,7 +60,7 @@ impl RouteCatalog {
             min_watch_revision: 1,
             event_retention,
             routes: BTreeMap::new(),
-            removed: BTreeMap::new(),
+            removed_route_uids: BTreeMap::new(),
             events: Vec::new(),
         }
     }
@@ -110,10 +102,10 @@ impl RouteCatalog {
         validate_observed_token(request)?;
         let route_name = request.expected.route_name.as_str();
         let Some(record) = self.routes.get(route_name) else {
-            if let Some(tombstone) = self.removed.get(route_name) {
+            if let Some(route_uid) = self.removed_route_uids.get(route_name) {
                 return Ok(RouteLookupResponse::Removed {
                     route_name: route_name.to_string(),
-                    route_uid: Some(tombstone.route_uid.clone()),
+                    route_uid: Some(route_uid.clone()),
                 });
             }
             return Ok(RouteLookupResponse::NotFound {
@@ -153,7 +145,7 @@ impl RouteCatalog {
         if self.routes.contains_key(&route.name) {
             return Err(format!("route already registered: {}", route.name));
         }
-        self.removed.remove(&route.name);
+        self.removed_route_uids.remove(&route.name);
         self.catalog_revision = self.next_revision()?;
         let state = if admission_open {
             RouteStateWire::Ready
@@ -201,15 +193,8 @@ impl RouteCatalog {
             return Err(format!("route not registered: {route_name}"));
         };
         self.catalog_revision = self.next_revision()?;
-        self.removed.insert(
-            route_name.to_string(),
-            RemovedRouteTombstone {
-                route_uid: record.route_uid.clone(),
-                _contract: record.contract.clone(),
-                _catalog_revision: self.catalog_revision,
-                _reason: reason.clone(),
-            },
-        );
+        self.removed_route_uids
+            .insert(route_name.to_string(), record.route_uid.clone());
         self.push_event(StoredWatchEvent {
             route_name: route_name.to_string(),
             contract: record.contract,
@@ -506,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn list_ready_route_projects_owner_identity_and_catalog_revision() {
+    fn list_and_lookup_project_the_same_current_route() {
         let mut catalog = RouteCatalog::new(owner(), 4096);
         catalog.register_ready(&make_route("grid"), true).unwrap();
 
@@ -514,6 +499,7 @@ mod tests {
         let record = single_route(response);
 
         assert_eq!(record.route_name, "grid");
+        assert_eq!(record.contract, expected_contract("grid"));
         assert_eq!(record.route_uid, "grid-uid-0001");
         assert_eq!(record.route_revision, 1);
         assert_eq!(record.catalog_revision, 1);
@@ -528,25 +514,27 @@ mod tests {
         );
         assert_eq!(record.methods[0].name, "step");
         assert_eq!(record.methods[0].index, 0);
-    }
 
-    #[test]
-    fn lookup_with_stale_observed_token_returns_current_record() {
-        let mut catalog = RouteCatalog::new(owner(), 4096);
-        catalog.register_ready(&make_route("grid"), true).unwrap();
-        let request = RouteLookupRequest {
+        let mut request = RouteLookupRequest {
             expected: expected_contract("grid"),
             observed_route_uid: Some("old-grid-uid".into()),
             observed_route_revision: Some(1),
         };
-
-        match catalog.lookup(&request).unwrap() {
-            RouteLookupResponse::Stale { current } => {
-                assert_eq!(current.route_uid, "grid-uid-0001");
-                assert_eq!(current.catalog_revision, 1);
+        assert_eq!(
+            catalog.lookup(&request).unwrap(),
+            RouteLookupResponse::Stale {
+                current: record.clone()
             }
-            other => panic!("expected stale lookup response, got {other:?}"),
-        }
+        );
+
+        request.expected.abi_hash =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into();
+        request.observed_route_uid = None;
+        request.observed_route_revision = None;
+        assert_eq!(
+            catalog.lookup(&request).unwrap(),
+            RouteLookupResponse::ContractMismatch { current: record }
+        );
     }
 
     #[test]
@@ -582,7 +570,15 @@ mod tests {
         };
         assert!(matches!(events[0], RouteWatchEvent::Added { .. }));
         assert!(matches!(events[1], RouteWatchEvent::Closed { .. }));
-        assert!(matches!(events[2], RouteWatchEvent::Removed { .. }));
+        assert_eq!(
+            events[2],
+            RouteWatchEvent::Removed {
+                route_name: "grid".into(),
+                route_uid: "grid-uid-0001".into(),
+                catalog_revision: 3,
+                reason: RouteStateReasonWire::ExplicitUnregister,
+            }
+        );
     }
 
     #[test]
@@ -612,28 +608,6 @@ mod tests {
         assert_eq!(record.route_name, "grid_c");
         assert_eq!(record.catalog_revision, 3);
         assert_eq!(record.state, RouteStateWire::Ready);
-    }
-
-    #[test]
-    fn contract_mismatch_lookup_is_semantic_not_removed() {
-        let mut catalog = RouteCatalog::new(owner(), 4096);
-        catalog.register_ready(&make_route("grid"), true).unwrap();
-        let mut expected = expected_contract("grid");
-        expected.abi_hash =
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into();
-        let request = RouteLookupRequest {
-            expected,
-            observed_route_uid: None,
-            observed_route_revision: None,
-        };
-
-        match catalog.lookup(&request).unwrap() {
-            RouteLookupResponse::ContractMismatch { current } => {
-                assert_eq!(current.route_name, "grid");
-                assert_eq!(current.contract.abi_hash, ABI_HASH);
-            }
-            other => panic!("expected contract mismatch response, got {other:?}"),
-        }
     }
 
     #[test]

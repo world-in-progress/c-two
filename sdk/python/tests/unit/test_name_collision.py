@@ -11,9 +11,11 @@ import uuid
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
 from c_two.config import settings
-from c_two.transport import Server, ConcurrencyConfig, ConcurrencyMode
+from c_two.transport import ConcurrencyConfig, ConcurrencyMode
 from c_two.transport.registry import _ProcessRegistry
 from c_two.transport.server.native import CRMSlot, NativeServerBridge
 from c_two.transport.wire import MethodTable
@@ -38,7 +40,7 @@ class TestServerNameCollision:
 
     def test_duplicate_name_raises(self):
         """Registering two CRMs under the same name raises ValueError."""
-        server = Server(bind_address=_unique_addr())
+        server = local_server(_unique_addr())
         server.register_crm(Hello, HelloImpl(), name='my_hello')
         with pytest.raises(ValueError, match='already registered'):
             server.register_crm(Hello, HelloImpl(), name='my_hello')
@@ -46,7 +48,7 @@ class TestServerNameCollision:
 
     def test_duplicate_name_different_icrm_raises(self):
         """Different CRM classes under the same name also raises."""
-        server = Server(bind_address=_unique_addr())
+        server = local_server(_unique_addr())
         server.register_crm(Hello, HelloImpl(), name='shared_name')
         with pytest.raises(ValueError, match='already registered'):
             server.register_crm(Counter, CounterImpl(), name='shared_name')
@@ -54,7 +56,7 @@ class TestServerNameCollision:
 
     def test_same_icrm_different_names_ok(self):
         """Same CRM class can be registered under distinct names."""
-        server = Server(bind_address=_unique_addr())
+        server = local_server(_unique_addr())
         server.register_crm(Hello, HelloImpl(), name='hello_a')
         server.register_crm(Hello, HelloImpl(), name='hello_b')
         assert set(server.names) == {'hello_a', 'hello_b'}
@@ -62,7 +64,7 @@ class TestServerNameCollision:
 
     def test_different_icrm_unique_names_ok(self):
         """Different CRM classes with unique names coexist."""
-        server = Server(bind_address=_unique_addr())
+        server = local_server(_unique_addr())
         server.register_crm(Hello, HelloImpl(), name='hello')
         server.register_crm(Counter, CounterImpl(), name='counter')
         assert set(server.names) == {'hello', 'counter'}
@@ -70,7 +72,7 @@ class TestServerNameCollision:
 
     def test_reregister_after_unregister(self):
         """After unregistering, the same name can be reused."""
-        server = Server(bind_address=_unique_addr())
+        server = local_server(_unique_addr())
         server.register_crm(Hello, HelloImpl(), name='reuse_me')
         server.unregister_crm('reuse_me')
         # Should succeed now
@@ -80,7 +82,7 @@ class TestServerNameCollision:
 
     def test_unregister_nonexistent_raises(self):
         """Unregistering a name that was never registered raises KeyError."""
-        server = Server(bind_address=_unique_addr())
+        server = local_server(_unique_addr())
         with pytest.raises(KeyError):
             server.unregister_crm('does_not_exist')
         server.shutdown()
@@ -133,14 +135,11 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge.unregister_crm(
-            'grid',
-            runtime_session=FakeRuntimeSession(),
-            relay_anchor_address='http://relay.test',
-        )
+        bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
+        bridge.unregister_crm('grid')
 
         assert events == [
-            'native_unregister:grid:http://relay.test',
+            'native_unregister:grid:None',
             'crm_shutdown',
         ]
         assert bridge.names == []
@@ -194,7 +193,8 @@ class TestServerNameCollision:
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
         with pytest.raises(KeyError, match='Name not registered in native server'):
-            bridge.unregister_crm('grid', runtime_session=FakeRuntimeSession())
+            bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
+            bridge.unregister_crm('grid')
 
         assert events == ['native_unregister_missing']
         assert bridge.names == ['grid']
@@ -270,13 +270,11 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge.shutdown(
-            runtime_session=FakeRuntimeSession(),
-            relay_anchor_address='http://relay.test',
-        )
+        bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
+        bridge.shutdown()
 
         assert events == [
-            "native_shutdown:['grid']:http://relay.test",
+            "native_shutdown:['grid']:None",
             'crm_shutdown',
         ]
         assert bridge.names == []
@@ -348,7 +346,8 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge.shutdown(runtime_session=FakeRuntimeSession(), timeout=1.25)
+        bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
+        bridge.shutdown(timeout=1.25)
 
         assert events == [
             "native_shutdown:['grid']:None:1.25",
@@ -415,7 +414,8 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge.shutdown(runtime_session=FakeRuntimeSession())
+        bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
+        bridge.shutdown()
 
         assert events == ["native_shutdown:['grid']"]
         assert bridge.names == ['grid']
@@ -455,7 +455,8 @@ class TestServerNameCollision:
         bridge = object.__new__(NativeServerBridge)
         bridge._slots = {}  # noqa: SLF001
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge.shutdown(runtime_session=FakeRuntimeSession())
+        bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
+        bridge.shutdown()
 
         assert events == ['native_shutdown:[]']
 
@@ -523,7 +524,8 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge.shutdown(runtime_session=FakeRuntimeSession())
+        bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
+        bridge.shutdown()
 
         assert events == ["native_shutdown:['grid']"]
         assert bridge.names == ['grid']
@@ -585,13 +587,8 @@ class TestServerNameCollision:
         bridge._make_dispatcher = fake_make_dispatcher  # noqa: SLF001
 
         with pytest.raises(RuntimeError, match='boom'):
-            bridge.register_crm(
-                FakeCRM,
-                FakeCRM(),
-                concurrency=ConcurrencyConfig(max_workers=1),
-                name='grid',
-                runtime_session=FakeRuntimeSession(),
-            )
+            bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
+            bridge.register_crm(FakeCRM, FakeCRM(), concurrency=ConcurrencyConfig(max_workers=1), name='grid')
 
         assert events == ['native_register:read_parallel:None:1:unit.name_collision:FakeCRM:0.1.0']
         assert bridge.names == []
@@ -646,13 +643,13 @@ class TestRegistryNameCollision:
             def names(self) -> list[str]:
                 return ['temp']
 
-            def unregister_crm(self, name: str, **kwargs) -> None:  # noqa: ARG002
-                assert kwargs['runtime_session'] is registry._runtime_session  # noqa: SLF001
+            def unregister_crm(self, name: str) -> None:
+                assert name == 'temp'
                 raise RuntimeError('native unregister failed')
 
-            def shutdown(self, *, runtime_session, relay_anchor_address, timeout):
-                return dict(runtime_session.shutdown(route_names=['temp'],
-                    relay_anchor_address=relay_anchor_address, timeout_seconds=timeout))
+            def shutdown(self, *, timeout):
+                return dict(registry._runtime_session.shutdown(  # noqa: SLF001
+                    route_names=['temp'], timeout_seconds=timeout))
 
         registry._server = FailingServer()  # noqa: SLF001
 

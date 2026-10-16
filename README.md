@@ -28,7 +28,7 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
 
-This README describes **C-Two 0.7.4**, with Python 3.10+ and FastDB 0.2.1.
+This branch prepares **C-Two 0.7.5**, with Python 3.10+. Ordinary Python calls have no Python runtime dependencies; FastDB payloads use the optional `c-two[fastdb]` extra (`fastdb4py==0.2.2`). Version 0.7.5 and companion c3 0.3.4 are not published yet; see the [release preparation notes](docs/releases/0.7.5.md).
 
 ## Features
 
@@ -45,15 +45,19 @@ This README describes **C-Two 0.7.4**, with Python 3.10+ and FastDB 0.2.1.
 
 ```bash
 uv pip install c-two
+# For FastDB payloads:
+uv pip install 'c-two[fastdb]'
 ```
 
 The same command works in Windows PowerShell. For c3 on Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.sh | sh -s -- --version 0.3.3
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.4/c3-installer.sh | sh -s -- --version 0.3.4
 ```
 
-On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
+On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.4/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.4/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
+
+The installer commands above apply after c3 0.3.4 is published. Build c3 from this source branch for local testing; published c3 0.3.3 belongs to C-Two 0.7.4 and cannot speak this candidate's IPC protocol.
 
 For source builds and tests, see the [development guide](docs/development.md).
 

@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
-use crate::relay::authority::{RouteAuthority, RouteCommand};
+use crate::relay::authority::RouteAuthority;
 use crate::relay::peer::{
-    DigestDiffEntry, PROTOCOL_VERSION, PeerEnvelope, PeerMessage, ValidatedDigestDiffEntry,
+    DigestDiffEntry, PROTOCOL_VERSION, PeerEnvelope, PeerMessage, ValidatedRouteStateEnvelope,
     validate_route_state_envelope,
 };
 use crate::relay::state::RelayState;
@@ -70,9 +70,10 @@ pub async fn handle_peer_announce(
     if !check_protocol_version(&envelope) {
         return StatusCode::OK;
     }
-    let envelope = match validate_route_state_envelope(envelope, None) {
-        Ok(validated) => validated.into_envelope(),
-        Err(_) => return StatusCode::OK,
+    let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
+        validate_route_state_envelope(envelope, None)
+    else {
+        return StatusCode::OK;
     };
     let sender_relay_id = envelope.sender_relay_id.clone();
     match envelope.message {
@@ -92,9 +93,9 @@ pub async fn handle_peer_announce(
         } => {
             // Peer wire data never carries owner-private fields; keep peer
             // route storage scrubbed as a second local invariant.
-            let _ = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
+            let _ = RouteAuthority::new(&state).announce_peer(
                 sender_relay_id,
-                entry: Box::new(RouteEntry {
+                RouteEntry {
                     name,
                     relay_id,
                     relay_url,
@@ -111,8 +112,8 @@ pub async fn handle_peer_announce(
                     route_revision,
                     locality: Locality::Peer,
                     registered_at,
-                }),
-            });
+                },
+            );
         }
         PeerMessage::RouteWithdraw {
             name,
@@ -120,13 +121,13 @@ pub async fn handle_peer_announce(
             removed_at,
             removed_revision,
         } => {
-            let _ = RouteAuthority::new(&state).execute(RouteCommand::WithdrawPeer {
+            let _ = RouteAuthority::new(&state).withdraw_peer(
                 sender_relay_id,
                 name,
                 relay_id,
                 removed_at,
                 removed_revision,
-            });
+            );
         }
         _ => {
             if matches!(envelope.message, PeerMessage::Unknown) {
@@ -198,9 +199,10 @@ pub async fn handle_peer_heartbeat(
     if !check_protocol_version(&envelope) {
         return StatusCode::OK;
     }
-    let envelope = match validate_route_state_envelope(envelope, None) {
-        Ok(validated) => validated.into_envelope(),
-        Err(_) => return StatusCode::OK,
+    let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
+        validate_route_state_envelope(envelope, None)
+    else {
+        return StatusCode::OK;
     };
     let sender_relay_id = envelope.sender_relay_id.clone();
     if let PeerMessage::Heartbeat {
@@ -236,9 +238,10 @@ pub async fn handle_peer_leave(
     if !check_protocol_version(&envelope) {
         return StatusCode::OK;
     }
-    let envelope = match validate_route_state_envelope(envelope, None) {
-        Ok(validated) => validated.into_envelope(),
-        Err(_) => return StatusCode::OK,
+    let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
+        validate_route_state_envelope(envelope, None)
+    else {
+        return StatusCode::OK;
     };
     let sender_relay_id = envelope.sender_relay_id.clone();
     if let PeerMessage::RelayLeave { relay_id } = envelope.message {
@@ -249,9 +252,7 @@ pub async fn handle_peer_leave(
         {
             return StatusCode::OK;
         }
-        let _ = RouteAuthority::new(&state).execute(RouteCommand::RemovePeerRoutes {
-            relay_id: relay_id.clone(),
-        });
+        RouteAuthority::new(&state).remove_peer_routes(&relay_id);
         state.unregister_peer(&relay_id);
     }
     StatusCode::OK
@@ -273,10 +274,11 @@ pub async fn handle_peer_digest(
         Ok(validated) => validated,
         Err(_) => return StatusCode::OK.into_response(),
     };
-    let digest_diff_entries = validated.clone().into_digest_diff_entries();
-    let envelope = validated.into_envelope();
-    match envelope.message {
-        PeerMessage::DigestExchange { digest } => {
+    match validated {
+        ValidatedRouteStateEnvelope::Message(PeerEnvelope {
+            message: PeerMessage::DigestExchange { digest },
+            ..
+        }) => {
             let our_digest = state.route_digest();
 
             let peer_map: std::collections::HashMap<(String, String, bool), RouteDigestHash> =
@@ -336,35 +338,9 @@ pub async fn handle_peer_digest(
             );
             Json(response).into_response()
         }
-        PeerMessage::DigestDiff { .. } => {
-            let Some(entries) = digest_diff_entries else {
-                return StatusCode::OK.into_response();
-            };
+        ValidatedRouteStateEnvelope::DigestDiff(entries) => {
             for diff in entries {
-                match diff {
-                    ValidatedDigestDiffEntry::Active(active) => {
-                        let entry = active.into();
-                        let _ = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
-                            sender_relay_id: sender_relay_id.clone(),
-                            entry: Box::new(entry),
-                        });
-                    }
-                    ValidatedDigestDiffEntry::Deleted(deleted) => {
-                        let crate::relay::peer::ValidatedDigestDiffDeleted {
-                            name,
-                            relay_id,
-                            removed_at,
-                            removed_revision,
-                        } = deleted;
-                        let _ = RouteAuthority::new(&state).execute(RouteCommand::WithdrawPeer {
-                            sender_relay_id: sender_relay_id.clone(),
-                            name,
-                            relay_id,
-                            removed_at,
-                            removed_revision,
-                        });
-                    }
-                }
+                let _ = RouteAuthority::new(&state).apply_digest_diff(&sender_relay_id, diff);
             }
             StatusCode::OK.into_response()
         }
@@ -478,10 +454,7 @@ mod tests {
     fn announce_peer_route(state: &RelayState, entry: RouteEntry) {
         let sender_relay_id = entry.relay_id.clone();
         RouteAuthority::new(state)
-            .execute(RouteCommand::AnnouncePeer {
-                sender_relay_id,
-                entry: Box::new(entry),
-            })
+            .announce_peer(sender_relay_id, entry)
             .unwrap();
     }
 
@@ -511,7 +484,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[tokio::test]
@@ -541,7 +514,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     #[tokio::test]
@@ -616,7 +589,7 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
             assert!(
-                state.resolve(&route_name).is_empty(),
+                state.list_routes().is_empty(),
                 "invalid CRM tag should not be stored for {route_name}"
             );
         }
@@ -649,8 +622,9 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let routes = state.resolve("grid");
+        let routes = state.list_routes();
         assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "grid");
         assert_eq!(routes[0].relay_url, "http://relay-b:8080");
     }
 
@@ -681,7 +655,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
         assert!(state.list_routes().is_empty());
     }
 
@@ -738,7 +712,9 @@ mod tests {
                 registered_at: 1000.0,
             },
         );
-        assert_eq!(state.resolve("grid")[0].relay_url, "http://relay-b:8080");
+        assert!(
+            matches!(state.list_routes().as_slice(), [route] if route.name == "grid" && route.relay_url == "http://relay-b:8080")
+        );
 
         let envelope = PeerEnvelope::new(
             "relay-b",
@@ -753,9 +729,8 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            state.resolve("grid")[0].relay_url,
-            "http://relay-b-new:8080"
+        assert!(
+            matches!(state.list_routes().as_slice(), [route] if route.name == "grid" && route.relay_url == "http://relay-b-new:8080")
         );
     }
 
@@ -849,8 +824,8 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(state.resolve("grid").len(), 1);
-        assert!(state.has_peer("relay-b"));
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "grid"));
+        assert!(state.peer_is_alive("relay-b"));
     }
 
     #[tokio::test]
@@ -894,7 +869,8 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "grid"));
+        assert!(state.peer_is_alive("relay-b"));
         assert_eq!(tombstone_count(&state), 0);
     }
 
@@ -961,7 +937,8 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "grid"));
+        assert!(state.peer_is_alive("relay-b"));
         assert_eq!(tombstone_count(&state), 0);
     }
 
@@ -1004,7 +981,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "grid"));
     }
 
     #[tokio::test]
@@ -1061,60 +1038,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn digest_diff_entries_must_belong_to_sender() {
-        let state = test_state();
-        known_peer(&state, "relay-b");
-        let envelope = PeerEnvelope::new(
-            "relay-b",
-            PeerMessage::DigestDiff {
-                entries: vec![active_diff(
-                    "grid",
-                    "relay-c",
-                    "http://relay-c:8080",
-                    "Grid",
-                )],
-            },
-        );
-
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
-            .await
-            .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
-    }
-
-    #[tokio::test]
-    async fn digest_diff_rejects_invalid_crm_tag_fields() {
-        let state = test_state();
-        known_peer(&state, "relay-b");
-        let envelope = PeerEnvelope::new(
-            "relay-b",
-            PeerMessage::DigestDiff {
-                entries: vec![crate::relay::peer::DigestDiffEntry::Active {
-                    name: "grid".into(),
-                    relay_id: "relay-b".into(),
-                    relay_url: "http://relay-b:8080".into(),
-                    crm_ns: "test.ns".into(),
-                    crm_name: "Grid\nInjected".into(),
-                    crm_ver: "0.1.0".into(),
-                    abi_hash: TEST_ABI_HASH.into(),
-                    signature_hash: TEST_SIGNATURE_HASH.into(),
-                    max_payload_size: 1024,
-                    route_uid: "grid-route-uid-0001".into(),
-                    route_revision: 1,
-                    registered_at: 1000.0,
-                    hash: test_hash(),
-                }],
-            },
-        );
-
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
-            .await
-            .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+    async fn digest_diff_rejects_entire_batch_on_invalid_entry() {
+        let mut invalid_crm = active_diff("grid", "relay-b", "http://relay-b:8080", "Grid");
+        if let DigestDiffEntry::Active { crm_name, .. } = &mut invalid_crm {
+            *crm_name = "Grid\nInjected".into();
+        }
+        for invalid in [
+            active_diff("grid", "relay-c", "http://relay-c:8080", "Grid"),
+            invalid_crm,
+        ] {
+            let state = test_state();
+            known_peer(&state, "relay-b");
+            let envelope = PeerEnvelope::new(
+                "relay-b",
+                PeerMessage::DigestDiff {
+                    entries: vec![
+                        active_diff("valid", "relay-b", "http://relay-b:8080", "Grid"),
+                        invalid,
+                    ],
+                },
+            );
+            let response = handle_peer_digest(State(state.clone()), Json(envelope))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(state.list_routes().is_empty());
+            assert_eq!(tombstone_count(&state), 0);
+        }
     }
 
     #[tokio::test]
@@ -1138,8 +1088,9 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let routes = state.resolve("grid");
+        let routes = state.list_routes();
         assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "grid");
         assert_eq!(routes[0].relay_url, "http://relay-b:8080");
     }
 
@@ -1164,7 +1115,7 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
         assert!(state.list_routes().is_empty());
     }
 
@@ -1332,12 +1283,29 @@ mod tests {
             },
         );
 
+        // Other peer endpoints must acknowledge and ignore a valid digest diff.
+        for response in [
+            handle_peer_announce(State(state.clone()), Json(envelope.clone()))
+                .await
+                .into_response(),
+            handle_peer_heartbeat(State(state.clone()), Json(envelope.clone()))
+                .await
+                .into_response(),
+            handle_peer_leave(State(state.clone()), Json(envelope.clone()))
+                .await
+                .into_response(),
+        ] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(matches!(state.list_routes().as_slice(), [route] if route.name == "grid"));
+            assert_eq!(tombstone_count(&state), 0);
+        }
+
         let response = handle_peer_digest(State(state.clone()), Json(envelope))
             .await
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
         assert_eq!(tombstone_count(&state), 1);
     }
 
@@ -1408,9 +1376,10 @@ mod tests {
         let mut receiver = crate::relay::route_table::RouteTable::new("relay-c".into());
         receiver.merge_validated_snapshot(ValidatedFullSync::try_from(envelope).unwrap());
 
-        let resolved = receiver.resolve("grid");
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
-        assert!(resolved[0].ipc_address.is_none());
+        let routes = receiver.list_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "grid");
+        assert_eq!(routes[0].relay_url, "http://relay-a:8080");
+        assert!(routes[0].ipc_address.is_none());
     }
 }

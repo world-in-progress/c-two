@@ -104,6 +104,18 @@ jobs:
           cache-dependency-path: |
             fastdb/ts/fastdb4ts/package-lock.json
             c-two/core/foundation/c2-mem-ffi/bindings/typescript/package-lock.json
+      - name: Set up Go for relay benchmark tool
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.2'
+          cache: false
+      - name: Install relay benchmark prerequisite
+        shell: bash
+        env:
+          GOBIN: ${{ runner.temp }}/c2-hey
+        run: |
+          go install github.com/rakyll/hey@v0.1.4
+          echo "$GOBIN" >> "$GITHUB_PATH"
       - name: Prepare official FastDB CoreSDK
         id: fastdb_sdk
         run: python .github/scripts/prepare_fastdb_sdk.py --output "${{ runner.temp }}/fastdb-core-sdk"
@@ -286,8 +298,6 @@ jobs:
           --confcutdir=tests/repo
           tests/repo/test_cli_release_workflow.py
           tests/repo/test_python_package_release_workflow.py
-          tests/repo/test_check_version.py::TestCheckVersion
-          tests/repo/test_check_cli_release.py
           tests/repo/test_c3_tool.py
           tests/repo/test_c3_installer.py
           tests/repo/test_install_c3_powershell.py

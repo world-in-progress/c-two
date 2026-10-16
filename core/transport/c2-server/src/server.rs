@@ -46,8 +46,8 @@ use c2_wire::flags::{
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_METHODS, MAX_ROUTES, MethodEntry, RouteInfo,
-    decode_handshake, encode_server_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_ROUTES, MethodEntry, RouteInfo, decode_handshake,
+    encode_server_handshake,
 };
 use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES};
 use c2_wire::registration_control::{
@@ -79,8 +79,7 @@ use crate::dispatcher::{
 use crate::heartbeat::run_heartbeat;
 use crate::response::buddy_response_data_size;
 use crate::scheduler::{
-    RouteConcurrencyHandle, Scheduler, SchedulerAcquireError, SchedulerLimits,
-    SchedulerPendingPermit, SchedulerSnapshot,
+    Scheduler, SchedulerAcquireError, SchedulerLimits, SchedulerPendingPermit, SchedulerSnapshot,
 };
 
 const FRAME_FIXED_BODY_LEN: u32 = 12;
@@ -760,10 +759,8 @@ impl Server {
     ) -> Result<BuiltRoute, ServerError> {
         let scheduler =
             Scheduler::with_limits(spec.concurrency_mode, spec.access_map.clone(), spec.limits);
-        let route_handle = RouteConcurrencyHandle::new(scheduler.clone());
         let route = CrmRoute::new(spec, scheduler, callback);
-        validate_route_for_wire(&route)?;
-        Ok(BuiltRoute::new(route, route_handle))
+        BuiltRoute::new(route)
     }
 
     pub async fn reserve_route(
@@ -771,7 +768,6 @@ impl Server {
         route: BuiltRoute,
     ) -> Result<PendingRouteReservation, ServerError> {
         let route = route.into_route();
-        validate_route_for_wire(&route)?;
         let route_name = route.name.clone();
         let _guard = self.route_registration.lock().await;
         let dispatcher = self.dispatcher.read().await;
@@ -849,10 +845,7 @@ impl Server {
 
     #[cfg(test)]
     async fn register_route(&self, route: CrmRoute) -> Result<(), ServerError> {
-        let route_handle = RouteConcurrencyHandle::new(route.scheduler.as_ref().clone());
-        let reservation = self
-            .reserve_route(BuiltRoute::new(route, route_handle))
-            .await?;
+        let reservation = self.reserve_route(BuiltRoute::new(route)?).await?;
         self.commit_reserved_route(reservation).await
     }
 
@@ -1631,29 +1624,6 @@ async fn ping_server_endpoint(endpoint: &LocalEndpoint) -> bool {
         && payload == c2_wire::msg_type::PONG_BYTES
 }
 
-fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
-    c2_contract::validate_named_route_name("route name", &route.name)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    if route.method_names.len() > MAX_METHODS {
-        return Err(ServerError::Protocol(format!(
-            "method count exceeds wire limit: {} > {}",
-            route.method_names.len(),
-            MAX_METHODS
-        )));
-    }
-    for method_name in &route.method_names {
-        c2_contract::validate_contract_text_field("method name", method_name)
-            .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    }
-    c2_contract::validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    c2_contract::validate_contract_hash("abi_hash", &route.abi_hash)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    c2_contract::validate_contract_hash("signature_hash", &route.signature_hash)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    Ok(())
-}
-
 fn validate_server_identity(identity: &ServerIdentity) -> Result<(), ServerError> {
     c2_config::validate_server_id(&identity.server_id).map_err(ServerError::Config)?;
     validate_identity_wire_len("server_id", &identity.server_id).map_err(ServerError::Config)?;
@@ -2155,8 +2125,8 @@ async fn handle_handshake(
     let client_hs = decode_handshake(payload)
         .map_err(|e| ServerError::Protocol(format!("handshake decode: {e:?}")))?;
 
-    // Store client SHM metadata for buddy frame resolution.
-    conn.init_peer_shm(client_hs.prefix, client_hs.segments);
+    // Frames identify peer backings by pool incarnation, index and generation.
+    conn.init_peer_shm(client_hs.prefix);
     conn.set_handshake_done(true);
 
     if client_hs.capability_flags & CAP_CHUNKED != 0 {
@@ -3042,6 +3012,7 @@ fn cleanup_buddy_request_block(conn: &Arc<Connection>, payload: &[u8]) {
         bp.offset,
         bp.data_size,
         bp.is_dedicated,
+        bp.allocation_id,
     );
     schedule_peer_buddy_gc_if_idle(conn, free_result);
 }
@@ -3121,6 +3092,7 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
             offset: bp.offset,
             data_size: bp.data_size,
             is_dedicated: bp.is_dedicated,
+            allocation_id: bp.allocation_id,
         }
     } else {
         // Rare edge case: extra inline args after buddy payload — fall back to copy.
@@ -3155,6 +3127,7 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
             bp.offset,
             bp.data_size,
             bp.is_dedicated,
+            bp.allocation_id,
         );
         schedule_peer_buddy_gc_if_idle(conn, free_result);
         let mut combined = args;
@@ -3453,6 +3426,7 @@ async fn dispatch_chunked_call(
                     bp.offset,
                     bp.data_size,
                     bp.is_dedicated,
+                    bp.allocation_id,
                 );
                 schedule_peer_buddy_gc_if_idle(conn, free_result);
                 shm_data = Some(data);
@@ -3838,6 +3812,7 @@ async fn dispatch_chunked_call(
 // ---------------------------------------------------------------------------
 
 const REPLY_FLAGS: u32 = FLAG_RESPONSE | FLAG_REPLY_V2;
+const SUCCESS_REPLY: [u8; 1] = [c2_wire::control::STATUS_SUCCESS];
 
 fn checked_frame_total_len(payload_len: usize, context: &str) -> Result<u32, String> {
     let total_len = 12usize
@@ -3848,10 +3823,8 @@ fn checked_frame_total_len(payload_len: usize, context: &str) -> Result<u32, Str
 }
 
 fn inline_reply_total_len(data_len: usize) -> Result<u32, String> {
-    let ctrl_len = try_encode_reply_control(&ReplyControl::Success)
-        .map_err(|err| err.to_string())?
-        .len();
-    let payload_len = ctrl_len
+    let payload_len = SUCCESS_REPLY
+        .len()
         .checked_add(data_len)
         .ok_or_else(|| "inline reply frame length overflow".to_string())?;
     checked_frame_total_len(payload_len, "inline reply frame")
@@ -3983,8 +3956,7 @@ async fn write_reply_with_data(
     request_id: u64,
     data: &[u8],
 ) -> Result<(), ResponseSendError> {
-    let ctrl_bytes = try_encode_reply_control(&ReplyControl::Success)
-        .map_err(|err| ResponseSendError::UserVisible(err.to_string()))?;
+    let ctrl_bytes = SUCCESS_REPLY;
     let payload_len = ctrl_bytes.len().checked_add(data.len()).ok_or_else(|| {
         ResponseSendError::UserVisible("inline reply frame length overflow".to_string())
     })?;
@@ -4010,10 +3982,7 @@ async fn write_reply_with_data(
             .map_err(|e| ResponseSendError::Transport(format!("inline reply write failed: {e}")))?;
     } else {
         // Large response: heap Vec (existing path)
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.extend_from_slice(&ctrl_bytes);
-        payload.extend_from_slice(data);
-        let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
+        let frame = frame::encode_frame_parts(request_id, REPLY_FLAGS, &[&ctrl_bytes, data]);
         writer
             .lock()
             .await
@@ -4025,7 +3994,7 @@ async fn write_reply_with_data(
 }
 
 /// Write a success reply via buddy SHM: allocate from response pool, write
-/// data, send 15-byte generation-bearing pointer metadata. The caller chooses inline or chunked
+/// data, send 23-byte generation and allocation-bearing pointer metadata. The caller chooses inline or chunked
 /// fallback when SHM is unavailable.
 async fn write_buddy_reply_with_data(
     response_pool: &parking_lot::RwLock<MemPool>,
@@ -4081,18 +4050,12 @@ async fn write_buddy_reply_with_data(
         offset: alloc.offset,
         data_size,
         is_dedicated: alloc.is_dedicated,
+        allocation_id: alloc.allocation_id,
     };
     let buddy_bytes = encode_buddy_payload(&bp);
-    let ctrl_bytes = try_encode_reply_control(&ReplyControl::Success)
-        .map_err(|err| BuddyReplyError::Fatal(err.to_string()))?;
-
-    let mut payload = Vec::with_capacity(BUDDY_PAYLOAD_SIZE + ctrl_bytes.len());
-    payload.extend_from_slice(&buddy_bytes);
-    payload.extend_from_slice(&ctrl_bytes);
-
     // 4. Send frame with FLAG_BUDDY.
     let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
-    let frame = encode_frame(request_id, flags, &payload);
+    let frame = frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
     if let Err(err) = writer.lock().await.write_all(&frame).await {
         let mut pool = response_pool.write();
         let _ = pool.free(&alloc);
@@ -4188,10 +4151,18 @@ async fn send_response_meta(
             offset,
             data_size,
             is_dedicated,
+            allocation_id,
         } => {
             if u64::from(data_size) > max_payload_size {
                 let mut pool = response_pool.write();
-                let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
+                let _ = pool.free_at(
+                    seg_idx as u32,
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                    allocation_id,
+                );
                 return Err(ResponseSendError::UserVisible(format!(
                     "response payload size {data_size} exceeds max_payload_size {max_payload_size}"
                 )));
@@ -4203,18 +4174,22 @@ async fn send_response_meta(
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             };
             let buddy_bytes = encode_buddy_payload(&bp);
-            let ctrl_bytes = try_encode_reply_control(&ReplyControl::Success)
-                .map_err(|err| ResponseSendError::UserVisible(err.to_string()))?;
-            let mut payload = Vec::with_capacity(BUDDY_PAYLOAD_SIZE + ctrl_bytes.len());
-            payload.extend_from_slice(&buddy_bytes);
-            payload.extend_from_slice(&ctrl_bytes);
             let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
-            let frame = encode_frame(request_id, flags, &payload);
+            let frame =
+                frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
             if let Err(err) = writer.lock().await.write_all(&frame).await {
                 let mut pool = response_pool.write();
-                let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
+                let _ = pool.free_at(
+                    seg_idx as u32,
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                    allocation_id,
+                );
                 return Err(ResponseSendError::Transport(format!(
                     "prepared SHM reply write failed: {err}"
                 )));
@@ -4223,7 +4198,14 @@ async fn send_response_meta(
             // Server-side free for dedicated segments (same as write_buddy_reply_with_data).
             if is_dedicated {
                 let mut pool = response_pool.write();
-                let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, true);
+                let _ = pool.free_at(
+                    seg_idx as u32,
+                    generation,
+                    offset,
+                    data_size,
+                    true,
+                    allocation_id,
+                );
             }
         }
     }
@@ -4557,12 +4539,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_join_retires_socket_after_namespace_gate_contention() {
+        let directory = tempfile::Builder::new()
+            .prefix("c2-shutdown-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&unique_readiness_address("shutdown_gate_contention"))
+            .unwrap();
         let server = Arc::new(
-            Server::new(
-                &unique_readiness_address("shutdown_gate_contention"),
-                ServerIpcConfig::default(),
-            )
-            .unwrap(),
+            Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap(),
         );
         let runner = {
             let server = Arc::clone(&server);
@@ -4615,6 +4601,7 @@ mod tests {
             !socket.exists(),
             "successful shutdown/join must retire its socket"
         );
+        assert!(!socket.with_extension("lease").exists());
     }
 
     #[cfg(unix)]
@@ -4622,12 +4609,16 @@ mod tests {
     async fn shutdown_cleanup_failure_is_terminal_observable_and_restartable() {
         use std::os::unix::fs::FileExt;
 
+        let directory = tempfile::Builder::new()
+            .prefix("c2-shutdown-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&unique_readiness_address("shutdown_bad_record"))
+            .unwrap();
         let server = Arc::new(
-            Server::new(
-                &unique_readiness_address("shutdown_bad_record"),
-                ServerIpcConfig::default(),
-            )
-            .unwrap(),
+            Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap(),
         );
         let runner = {
             let server = Arc::clone(&server);
@@ -4721,6 +4712,7 @@ mod tests {
         restarted.await.unwrap().unwrap();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
         assert!(!socket.exists());
+        assert!(!lease_path.exists());
     }
 
     #[test]
@@ -5247,10 +5239,8 @@ mod tests {
         }
 
         let replacement = make_route("grid");
-        let replacement_handle =
-            RouteConcurrencyHandle::new(replacement.scheduler.as_ref().clone());
         let err = match server
-            .reserve_route(BuiltRoute::new(replacement, replacement_handle))
+            .reserve_route(BuiltRoute::new(replacement).unwrap())
             .await
         {
             Ok(_) => panic!("catalog must reject same-name replacement while old route drains"),
@@ -5262,10 +5252,8 @@ mod tests {
         assert!(unregister_task.await.unwrap());
 
         let replacement = make_route("grid");
-        let replacement_handle =
-            RouteConcurrencyHandle::new(replacement.scheduler.as_ref().clone());
         let reservation = server
-            .reserve_route(BuiltRoute::new(replacement, replacement_handle))
+            .reserve_route(BuiltRoute::new(replacement).unwrap())
             .await
             .expect("same-name reserve should succeed after old route is removed");
         server.abort_reserved_route(reservation).await;
@@ -5285,9 +5273,8 @@ mod tests {
             .expect("server ready");
 
         let route = make_route("late");
-        let route_handle = RouteConcurrencyHandle::new(route.scheduler.as_ref().clone());
         let reservation = server
-            .reserve_route(BuiltRoute::new(route, route_handle))
+            .reserve_route(BuiltRoute::new(route).unwrap())
             .await
             .unwrap();
         server.request_shutdown_signal();
@@ -5348,6 +5335,7 @@ mod tests {
             offset: alloc.offset,
             data_size: 128,
             is_dedicated: alloc.is_dedicated,
+            allocation_id: alloc.allocation_id,
         };
         let scheduler = Scheduler::with_limits(
             ConcurrencyMode::Parallel,
@@ -5383,44 +5371,29 @@ mod tests {
         assert_eq!(reused.offset, alloc.offset);
     }
 
-    #[tokio::test]
-    async fn register_route_rejects_wire_invalid_route_name() {
-        let s = Arc::new(Server::new("ipc://long_route_test", ServerIpcConfig::default()).unwrap());
+    #[test]
+    fn built_route_rejects_wire_invalid_route_name() {
         let route = make_route(&"x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1));
-
-        let err = s.register_route(route).await.unwrap_err();
-
+        let err = BuiltRoute::new(route).err().expect("invalid route name");
         assert!(err.to_string().contains("route name"));
-        assert!(s.dispatcher.read().await.is_empty());
     }
 
-    #[tokio::test]
-    async fn register_route_rejects_invalid_crm_tag_fields() {
-        let s = Server::new("ipc://invalid_crm_tag_route", ServerIpcConfig::default()).unwrap();
+    #[test]
+    fn built_route_rejects_invalid_crm_tag_fields() {
         let mut route = make_route("grid");
         route.crm_name = "Grid\0Injected".to_string();
-
-        let err = s
-            .register_route(route)
-            .await
-            .expect_err("invalid CrmTag must fail before route registration");
-
+        let err = BuiltRoute::new(route).err().expect("invalid CRM tag");
         assert!(err.to_string().contains("control characters"));
     }
 
-    #[tokio::test]
-    async fn register_route_rejects_too_many_methods() {
-        let s =
-            Arc::new(Server::new("ipc://method_count_test", ServerIpcConfig::default()).unwrap());
+    #[test]
+    fn built_route_rejects_too_many_methods() {
         let mut route = make_route("grid");
         route.method_names = (0..=c2_wire::handshake::MAX_METHODS)
             .map(|i| format!("m{i}"))
             .collect();
-
-        let err = s.register_route(route).await.unwrap_err();
-
+        let err = BuiltRoute::new(route).err().expect("too many methods");
         assert!(err.to_string().contains("method count"));
-        assert!(s.dispatcher.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -7099,6 +7072,7 @@ mod tests {
             offset: 4096,
             data_size: 256,
             is_dedicated: false,
+            allocation_id: 1,
         };
         let bp_bytes = encode_buddy_payload(&bp);
         let ctrl_bytes = encode_call_control(&call_identity("grid"), 1).unwrap();
@@ -7119,59 +7093,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_buddy_request_block_frees_unconsumed_peer_block() {
+    async fn handshake_metadata_does_not_control_peer_mapping_or_release() {
         use c2_mem::MemHandle;
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
+        use c2_wire::handshake::encode_client_handshake;
 
-        let mut peer_pool = MemPool::new_with_prefix(
-            PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 1,
-                max_dedicated_segments: 1,
-                dedicated_crash_timeout_secs: 0.0,
-                ..PoolConfig::default()
-            },
-            unique_response_pool_prefix("rq"),
-        );
-        let handle = peer_pool.try_alloc_shm(128).unwrap();
-        let (seg_idx, generation, offset, len) = match handle {
-            MemHandle::Buddy {
+        let mut peer_pool = small_response_pool("rq").into_inner();
+        let server = ordering_test_server("ipc://peer_geometry", 4);
+        let (stream, mut client) = LocalStream::pair().await.unwrap();
+        let (_reader, writer) = stream.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+        let data = vec![0x5a; 32 * 1024];
+
+        // All announcements describe the same real 64 KiB backing. Neither
+        // the name nor a missing, tiny or oversized size defines its geometry.
+        for announced_size in [
+            None,
+            Some(0),
+            Some(4096),
+            Some(8191),
+            Some(8192),
+            Some(65536),
+            Some(u32::MAX),
+        ] {
+            let mut handle = peer_pool.try_alloc_shm(data.len()).unwrap();
+            peer_pool
+                .handle_slice_mut(&mut handle)
+                .copy_from_slice(&data);
+            let (seg_idx, generation, offset, len, allocation_id) = match handle {
+                MemHandle::Buddy {
+                    seg_idx,
+                    generation,
+                    offset,
+                    len,
+                    allocation_id,
+                    ..
+                } => (seg_idx, generation, offset, len, allocation_id),
+                other => panic!("expected buddy request block, got {other:?}"),
+            };
+            let segments = announced_size
+                .map(|size| ("descriptive-only".to_string(), size))
+                .into_iter()
+                .collect::<Vec<_>>();
+            let handshake =
+                encode_client_handshake(&segments, CAP_CHUNKED, peer_pool.prefix()).unwrap();
+            let conn = Arc::new(Connection::new(7));
+            handle_handshake(&server, &conn, &handshake, 0, &writer)
+                .await
+                .unwrap();
+            let (_, flags, _) = read_reply_frame(&mut client).await;
+            assert_eq!(flags, FLAG_HANDSHAKE | FLAG_RESPONSE);
+            assert!(conn.handshake_done() && conn.chunked_capable());
+            assert_eq!(conn.peer_pool_arc().unwrap().read().segment_count(), 0);
+            assert_eq!(
+                conn.read_peer_data(seg_idx, generation, offset, len as u32, false)
+                    .unwrap(),
+                data,
+                "announced_size={announced_size:?}",
+            );
+            assert_eq!(peer_pool.stats().alloc_count, 1);
+            let payload = encode_buddy_payload(&BuddyPayload {
                 seg_idx,
                 generation,
                 offset,
-                len,
-                ..
-            } => (seg_idx, generation, offset, len),
-            other => panic!("expected buddy request block, got {other:?}"),
-        };
-        let segment_name = peer_pool
-            .segment_name(seg_idx as usize)
-            .unwrap()
-            .to_string();
-        let segment_size = peer_pool
-            .segment(seg_idx as usize)
-            .unwrap()
-            .allocator()
-            .data_size() as u32;
-        assert_eq!(peer_pool.stats().alloc_count, 1);
-
-        let conn = Arc::new(Connection::new(7));
-        conn.init_peer_shm(
-            peer_pool.prefix().to_string(),
-            vec![(segment_name, segment_size)],
-        );
-        let payload = encode_buddy_payload(&BuddyPayload {
-            seg_idx,
-            generation,
-            offset,
-            data_size: len as u32,
-            is_dedicated: false,
-        });
-
-        cleanup_buddy_request_block(&conn, &payload);
-
-        assert_eq!(peer_pool.stats().alloc_count, 0);
+                data_size: len as u32,
+                is_dedicated: false,
+                allocation_id,
+            });
+            cleanup_buddy_request_block(&conn, &payload);
+            assert_eq!(peer_pool.stats().alloc_count, 0);
+        }
     }
 
     #[tokio::test]
@@ -7212,6 +7203,7 @@ mod tests {
                         offset,
                         data_size,
                         is_dedicated,
+                        allocation_id,
                     } => {
                         *self.seen.lock().unwrap() = Some(SeenShmRequest {
                             seg_idx,
@@ -7227,6 +7219,7 @@ mod tests {
                             offset,
                             data_size,
                             is_dedicated,
+                            allocation_id,
                         });
                         Ok(ResponseMeta::Inline(b"ok".to_vec()))
                     }
@@ -7263,32 +7256,21 @@ mod tests {
             unique_response_pool_prefix("rqcb"),
         );
         let handle = peer_pool.try_alloc_shm(128).unwrap();
-        let (seg_idx, generation, offset, len) = match handle {
+        let (seg_idx, generation, offset, len, allocation_id) = match handle {
             MemHandle::Buddy {
                 seg_idx,
                 generation,
                 offset,
                 len,
+                allocation_id,
                 ..
-            } => (seg_idx, generation, offset, len),
+            } => (seg_idx, generation, offset, len, allocation_id),
             other => panic!("expected buddy request block, got {other:?}"),
         };
-        let segment_name = peer_pool
-            .segment_name(seg_idx as usize)
-            .unwrap()
-            .to_string();
-        let segment_size = peer_pool
-            .segment(seg_idx as usize)
-            .unwrap()
-            .allocator()
-            .data_size() as u32;
         assert_eq!(peer_pool.stats().alloc_count, 1);
 
         let conn = Arc::new(Connection::new(70));
-        conn.init_peer_shm(
-            peer_pool.prefix().to_string(),
-            vec![(segment_name, segment_size)],
-        );
+        conn.init_peer_shm(peer_pool.prefix().to_string());
 
         let mut payload = encode_buddy_payload(&BuddyPayload {
             seg_idx,
@@ -7296,6 +7278,7 @@ mod tests {
             offset,
             data_size: len as u32,
             is_dedicated: false,
+            allocation_id,
         })
         .to_vec();
         let call_control = encode_call_control(&call_identity("grid"), 0).unwrap();
@@ -8528,16 +8511,6 @@ mod tests {
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
         use c2_wire::chunk::encode_chunk_header;
 
-        fn peer_segments(pool: &MemPool) -> Vec<(String, u32)> {
-            (0..pool.segment_count())
-                .filter_map(|i| {
-                    let name = pool.segment_name(i)?.to_string();
-                    let size = pool.segment(i)?.allocator().data_size() as u32;
-                    Some((name, size))
-                })
-                .collect()
-        }
-
         let mut peer_pool = MemPool::new_with_prefix(
             PoolConfig {
                 segment_size: 64 * 1024,
@@ -8551,14 +8524,15 @@ mod tests {
         );
         let allocate_buddy_frame = |peer_pool: &mut MemPool| -> Vec<u8> {
             let handle = peer_pool.try_alloc_shm(128).unwrap();
-            let (seg_idx, generation, offset, len) = match handle {
+            let (seg_idx, generation, offset, len, allocation_id) = match handle {
                 MemHandle::Buddy {
                     seg_idx,
                     generation,
                     offset,
                     len,
+                    allocation_id,
                     ..
-                } => (seg_idx, generation, offset, len),
+                } => (seg_idx, generation, offset, len, allocation_id),
                 other => panic!("expected buddy request block, got {other:?}"),
             };
             let mut payload = encode_buddy_payload(&BuddyPayload {
@@ -8567,6 +8541,7 @@ mod tests {
                 offset,
                 data_size: len as u32,
                 is_dedicated: false,
+                allocation_id,
             })
             .to_vec();
             payload.extend_from_slice(&encode_chunk_header(1, 2));
@@ -8581,7 +8556,7 @@ mod tests {
         // Refused admission path: the waiting frame is discarded before it
         // decodes its buddy payload, but the peer block must still be freed.
         let refused_payload = allocate_buddy_frame(&mut peer_pool);
-        conn.init_peer_shm(peer_pool.prefix().to_string(), peer_segments(&peer_pool));
+        conn.init_peer_shm(peer_pool.prefix().to_string());
         let mut owner = server.begin_chunk_admission(conn.conn_id(), 41).unwrap();
         let waiter = server.chunk_admission_waiter(conn.conn_id(), 41).unwrap();
         owner.refuse();
@@ -8607,7 +8582,7 @@ mod tests {
 
         // Aborted admission path: same discard, same peer-block return.
         let aborted_payload = allocate_buddy_frame(&mut peer_pool);
-        conn.init_peer_shm(peer_pool.prefix().to_string(), peer_segments(&peer_pool));
+        conn.init_peer_shm(peer_pool.prefix().to_string());
         let owner = server.begin_chunk_admission(conn.conn_id(), 42).unwrap();
         let waiter = server.chunk_admission_waiter(conn.conn_id(), 42).unwrap();
         server.abort_chunk_request(conn.conn_id(), 42);
@@ -8821,6 +8796,7 @@ mod tests {
                 offset: alloc.offset,
                 data_size: 8192,
                 is_dedicated: alloc.is_dedicated,
+                allocation_id: alloc.allocation_id,
             },
             1024,
             4096,
@@ -8873,6 +8849,7 @@ mod tests {
                 offset: alloc.offset,
                 data_size: 8192,
                 is_dedicated: alloc.is_dedicated,
+                allocation_id: alloc.allocation_id,
             },
             1024,
             4096,
@@ -8912,7 +8889,6 @@ mod tests {
         let base = c2_config::BaseIpcConfig {
             pool_segment_size: 64 * 1024,
             max_pool_segments: 2,
-            max_pool_memory: 128 * 1024,
             pool_prewarm_segments: 1,
             ..c2_config::BaseIpcConfig::default()
         };
@@ -8961,7 +8937,6 @@ mod tests {
         let base = c2_config::BaseIpcConfig {
             pool_segment_size: 64 * 1024,
             max_pool_segments: 2,
-            max_pool_memory: 128 * 1024,
             shm_backing_budget_bytes: 0,
             file_backing_budget_bytes: 0,
             ..c2_config::BaseIpcConfig::default()
@@ -8990,7 +8965,6 @@ mod tests {
         let base = c2_config::BaseIpcConfig {
             pool_segment_size: 64 * 1024,
             max_pool_segments: 2,
-            max_pool_memory: 128 * 1024,
             ..c2_config::BaseIpcConfig::default()
         };
         let config = ServerIpcConfig {

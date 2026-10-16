@@ -307,21 +307,15 @@ impl MemPool {
             return Err("cannot allocate 0 bytes".into());
         }
 
-        let max_buddy_block = self.buddy_block_limit();
-
-        if max_buddy_block > 0 && size <= max_buddy_block {
-            // Try buddy allocation.
-            self.alloc_buddy(size).map_err(BackingError::into_message)
-        } else {
-            // Too large for buddy or buddy disabled → dedicated segment.
-            self.alloc_dedicated(size)
-                .map_err(BackingError::into_message)
-        }
+        self.alloc_shm(size).map_err(BackingError::into_message)
     }
 
     /// Free a previously allocated block.
     pub fn free(&mut self, alloc: &PoolAllocation) -> Result<(), String> {
         self.validate_generation(alloc.seg_idx, alloc.generation, alloc.is_dedicated)?;
+        if alloc.is_dedicated && alloc.allocation_id != 0 {
+            return Err("dedicated allocation identity must be zero".into());
+        }
         self.gc_dedicated();
         if alloc.is_dedicated {
             self.free_dedicated(alloc.seg_idx);
@@ -796,8 +790,12 @@ impl MemPool {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     ) -> Result<FreeResult, String> {
         self.validate_generation(seg_idx, generation, is_dedicated)?;
+        if is_dedicated && allocation_id != 0 {
+            return Err("dedicated allocation identity must be zero".into());
+        }
         self.gc_dedicated();
         if is_dedicated {
             let entry = self
@@ -816,7 +814,7 @@ impl MemPool {
                 .next_power_of_two()
                 .max(self.config.min_block_size);
             if let Some(level) = seg.allocator().size_to_level(actual_size) {
-                seg.allocator().free(offset, level as u16)?;
+                seg.allocator().free(offset, level as u16, allocation_id)?;
                 let idx = seg_idx as usize;
                 if seg.allocator().can_retire() {
                     if idx < self.idle_since.len() && self.idle_since[idx].is_none() {
@@ -994,31 +992,8 @@ impl MemPool {
         if size == 0 {
             return Err("cannot allocate 0 bytes".into());
         }
-        let max_buddy = self.buddy_block_limit();
-
-        if max_buddy > 0 && size <= max_buddy {
-            if let Some(a) = self.try_buddy_reuse(size) {
-                return Ok(a.into_buddy_handle(size));
-            }
-            if self.gc_buddy() > 0 {
-                if let Some(a) = self.try_buddy_reuse(size) {
-                    return Ok(a.into_buddy_handle(size));
-                }
-            }
-            if self.segments.len() < self.config.max_segments {
-                if let Some(a) = self.expand_buddy(size) {
-                    return Ok(a.into_buddy_handle(size));
-                }
-            }
-        }
-
-        // Buddy ineligible, pressure-denied, or creation-failed → dedicated
-        // SHM, with file spill only as the final fallback.
-        match self.alloc_dedicated(size) {
-            Ok(alloc) => Ok(MemHandle::Dedicated {
-                seg_idx: alloc.seg_idx as u16,
-                len: size,
-            }),
+        match self.alloc_shm(size) {
+            Ok(alloc) => Ok(alloc.into_handle(size)),
             Err(_) => self
                 .alloc_file_spill(size)
                 .map_err(BackingError::into_message),
@@ -1039,32 +1014,9 @@ impl MemPool {
         if size == 0 {
             return Err("cannot allocate 0 bytes".into());
         }
-        let max_buddy = self.buddy_block_limit();
-
-        if max_buddy > 0 && size <= max_buddy {
-            if let Some(a) = self.try_buddy_reuse(size) {
-                return Ok(a.into_buddy_handle(size));
-            }
-            if self.gc_buddy() > 0 {
-                if let Some(a) = self.try_buddy_reuse(size) {
-                    return Ok(a.into_buddy_handle(size));
-                }
-            }
-            if self.segments.len() < self.config.max_segments {
-                if let Some(a) = self.expand_buddy(size) {
-                    return Ok(a.into_buddy_handle(size));
-                }
-            }
-        }
-
-        // Dedicated SHM only — never FileSpill.
-        match self.alloc_dedicated(size) {
-            Ok(alloc) => Ok(MemHandle::Dedicated {
-                seg_idx: alloc.seg_idx as u16,
-                len: size,
-            }),
-            Err(_) => Err(format!("try_alloc_shm: no SHM capacity for {size} bytes")),
-        }
+        self.alloc_shm(size)
+            .map(|alloc| alloc.into_handle(size))
+            .map_err(|_| format!("try_alloc_shm: no SHM capacity for {size} bytes"))
     }
 
     fn alloc_file_spill(&mut self, size: usize) -> Result<MemHandle, BackingError> {
@@ -1121,7 +1073,6 @@ impl MemPool {
     pub fn copy_handle_data(&self, handle: &MemHandle) -> Result<Vec<u8>, String> {
         self.validate_handle(handle)?;
         if handle.is_empty() {
-            self.validate_handle(handle)?;
             return Ok(Vec::new());
         }
         match handle {
@@ -1247,9 +1198,17 @@ impl MemPool {
                 generation,
                 offset,
                 allocation_size,
+                allocation_id,
                 ..
             } => self
-                .free_at(seg_idx as u32, generation, offset, allocation_size, false)
+                .free_at(
+                    seg_idx as u32,
+                    generation,
+                    offset,
+                    allocation_size,
+                    false,
+                    allocation_id,
+                )
                 .unwrap_or(FreeResult::Normal),
             MemHandle::Dedicated { seg_idx, .. } => {
                 self.free_dedicated(seg_idx as u32);
@@ -1296,28 +1255,31 @@ impl MemPool {
         self.max_buddy_block_size()
     }
 
-    fn alloc_buddy(&mut self, size: usize) -> Result<PoolAllocation, BackingError> {
-        // Layer 1: Reuse an already-mapped segment — permitted under
-        // pressure, with no new backing charge and no OS query.
-        if let Some(a) = self.try_buddy_reuse(size) {
-            return Ok(a);
-        }
-
-        // Layer 1.5: GC before expansion — reclaim idle trailing segments,
-        // then retry reuse.
-        if self.gc_buddy() > 0 {
+    fn alloc_shm(&mut self, size: usize) -> Result<PoolAllocation, BackingError> {
+        let max_buddy = self.buddy_block_limit();
+        if max_buddy > 0 && size <= max_buddy {
+            // Layer 1: Reuse an already-mapped segment — permitted under
+            // pressure, with no new backing charge and no OS query.
             if let Some(a) = self.try_buddy_reuse(size) {
                 return Ok(a);
             }
-        }
 
-        // Layer 2: Create a new segment (the pressure/budget-enforced seam).
-        // A creation failure (for example the SHM object cannot be mapped or
-        // pressure denies the full segment) falls through to Layer 3
-        // dedicated storage instead of failing the allocation outright.
-        if self.segments.len() < self.config.max_segments {
-            if let Some(a) = self.expand_buddy(size) {
-                return Ok(a);
+            // Layer 1.5: GC before expansion — reclaim idle trailing segments,
+            // then retry reuse.
+            if self.gc_buddy() > 0 {
+                if let Some(a) = self.try_buddy_reuse(size) {
+                    return Ok(a);
+                }
+            }
+
+            // Layer 2: Create a new segment (the pressure/budget-enforced seam).
+            // A creation failure (for example the SHM object cannot be mapped or
+            // pressure denies the full segment) falls through to Layer 3
+            // dedicated storage instead of failing the allocation outright.
+            if self.segments.len() < self.config.max_segments {
+                if let Some(a) = self.expand_buddy(size) {
+                    return Ok(a);
+                }
             }
         }
 
@@ -1349,6 +1311,7 @@ impl MemPool {
                 return Some(PoolAllocation {
                     seg_idx: idx as u32,
                     generation: self.generations[idx],
+                    allocation_id: a.allocation_id,
                     offset: a.offset,
                     actual_size: a.actual_size,
                     level: a.level,
@@ -1379,6 +1342,7 @@ impl MemPool {
             return Some(PoolAllocation {
                 seg_idx: idx as u32,
                 generation: self.generations[idx],
+                allocation_id: a.allocation_id,
                 offset: a.offset,
                 actual_size: a.actual_size,
                 level: a.level,
@@ -1464,6 +1428,7 @@ impl MemPool {
         Ok(PoolAllocation {
             seg_idx: idx,
             generation: 0,
+            allocation_id: 0,
             offset: 0,
             actual_size: alloc_size,
             level: 0,
@@ -1474,7 +1439,8 @@ impl MemPool {
     fn free_buddy(&mut self, alloc: &PoolAllocation) -> Result<(), String> {
         let idx = alloc.seg_idx as usize;
         if let Some(seg) = self.segment(idx) {
-            seg.allocator().free(alloc.offset, alloc.level)?;
+            seg.allocator()
+                .free(alloc.offset, alloc.level, alloc.allocation_id)?;
             // Track idle: if segment is now empty, record the time.
             if seg.allocator().alloc_count() == 0
                 && idx < self.idle_since.len()
@@ -1586,14 +1552,21 @@ impl MemPool {
 }
 
 impl PoolAllocation {
-    fn into_buddy_handle(self, len: usize) -> MemHandle {
-        debug_assert!(!self.is_dedicated);
-        MemHandle::Buddy {
-            seg_idx: self.seg_idx as u16,
-            generation: self.generation,
-            offset: self.offset,
-            allocation_size: self.actual_size,
-            len,
+    fn into_handle(self, len: usize) -> MemHandle {
+        if self.is_dedicated {
+            MemHandle::Dedicated {
+                seg_idx: self.seg_idx as u16,
+                len,
+            }
+        } else {
+            MemHandle::Buddy {
+                seg_idx: self.seg_idx as u16,
+                generation: self.generation,
+                allocation_id: self.allocation_id,
+                offset: self.offset,
+                allocation_size: self.actual_size,
+                len,
+            }
         }
     }
 }
@@ -2252,8 +2225,15 @@ mod tests {
                 .contains("live allocations")
         );
         assert_eq!(owner.gc_buddy(), 0);
-        peer.free_at(old.seg_idx, old.generation, old.offset, 32 * 1024, false)
-            .unwrap();
+        peer.free_at(
+            old.seg_idx,
+            old.generation,
+            old.offset,
+            32 * 1024,
+            false,
+            old.allocation_id,
+        )
+        .unwrap();
         assert!(peer.segment(old.seg_idx as usize).is_none());
         assert_eq!(owner.gc_buddy(), 1);
         let fresh = owner.alloc(32 * 1024).unwrap();
@@ -2274,8 +2254,15 @@ mod tests {
                 .contains("stale")
         );
         assert!(
-            peer.free_at(old.seg_idx, old.generation, old.offset, 32 * 1024, false)
-                .is_err()
+            peer.free_at(
+                old.seg_idx,
+                old.generation,
+                old.offset,
+                32 * 1024,
+                false,
+                old.allocation_id
+            )
+            .is_err()
         );
         assert_eq!(
             owner
@@ -2291,6 +2278,7 @@ mod tests {
             fresh.offset,
             32 * 1024,
             false,
+            fresh.allocation_id,
         )
         .unwrap();
         owner.free(&first).unwrap();
@@ -2359,8 +2347,15 @@ mod tests {
         }
         peer.ensure_peer_segment(low.seg_idx, low.generation, 32 * 1024)
             .unwrap();
-        peer.free_at(low.seg_idx, low.generation, low.offset, 32 * 1024, false)
-            .unwrap();
+        peer.free_at(
+            low.seg_idx,
+            low.generation,
+            low.offset,
+            32 * 1024,
+            false,
+            low.allocation_id,
+        )
+        .unwrap();
         assert_eq!(
             peer.data_ptr_at(high.seg_idx, high.generation, high.offset, false)
                 .unwrap(),
@@ -2368,8 +2363,15 @@ mod tests {
         );
         assert_eq!(unsafe { *high_ptr }, 0x56);
         assert_eq!(peer.stats().total_segments, 1);
-        peer.free_at(high.seg_idx, high.generation, high.offset, 32 * 1024, false)
-            .unwrap();
+        peer.free_at(
+            high.seg_idx,
+            high.generation,
+            high.offset,
+            32 * 1024,
+            false,
+            high.allocation_id,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2453,14 +2455,18 @@ mod tests {
         let mut peer = MemPool::open_peer(config, owner.prefix().to_owned());
         peer.ensure_peer_dedicated(allocation.seg_idx, 4096)
             .unwrap();
-        peer.free_at(allocation.seg_idx, 0, 0, 4096, true).unwrap();
+        peer.free_at(allocation.seg_idx, 0, 0, 4096, true, 0)
+            .unwrap();
         peer.gc_dedicated();
         assert!(
             peer.ensure_peer_dedicated(allocation.seg_idx, 4096)
                 .unwrap_err()
                 .contains("already been released")
         );
-        assert!(peer.free_at(allocation.seg_idx, 0, 0, 4096, true).is_err());
+        assert!(
+            peer.free_at(allocation.seg_idx, 0, 0, 4096, true, 0)
+                .is_err()
+        );
         owner.free(&allocation).unwrap();
         owner.gc_dedicated();
         assert!(owner.dedicated_name(allocation.seg_idx).is_none());
@@ -2579,7 +2585,7 @@ mod tests {
 
         // Reader frees → should mark read_done + be immediately removable
         reader_pool
-            .free_at(a.seg_idx, 0, 0, data_size as u32, true)
+            .free_at(a.seg_idx, 0, 0, data_size as u32, true, 0)
             .unwrap();
         reader_pool.gc_dedicated();
         assert!(!reader_pool.dedicated.contains_key(&a.seg_idx));
@@ -2887,22 +2893,19 @@ mod handle_tests {
     }
 
     #[test]
-    fn test_alloc_handle_buddy() {
-        let mut pool = MemPool::new(test_config());
-        let handle = pool.alloc_handle(4096).unwrap();
-        assert!(handle.is_buddy());
-        assert_eq!(handle.len(), 4096);
-        pool.release_handle(handle);
-    }
-
-    #[test]
-    fn test_alloc_handle_dedicated() {
-        let mut pool = MemPool::new(test_config());
-        let handle = pool.alloc_handle(128 * 1024).unwrap();
-        assert!(handle.is_dedicated());
-        assert_eq!(handle.len(), 128 * 1024);
-        let result = pool.release_handle(handle);
-        assert!(matches!(result, FreeResult::DedicatedFreed { .. }));
+    fn test_alloc_handle_backing_kind_and_length() {
+        for (size, is_buddy) in [(4096, true), (128 * 1024, false)] {
+            let mut pool = MemPool::new(test_config());
+            let handle = pool.alloc_handle(size).unwrap();
+            assert_eq!(handle.is_buddy(), is_buddy);
+            assert_eq!(handle.is_dedicated(), !is_buddy);
+            assert_eq!(handle.len(), size);
+            let result = pool.release_handle(handle);
+            assert_eq!(
+                matches!(result, FreeResult::DedicatedFreed { .. }),
+                !is_buddy
+            );
+        }
     }
 
     #[test]
@@ -2970,6 +2973,7 @@ mod handle_tests {
         let handle = MemHandle::Buddy {
             seg_idx: 0,
             generation: pool.segment_generation(0).unwrap(),
+            allocation_id: 64,
             offset: u32::try_from(capacity - 1).unwrap(),
             allocation_size: 4096,
             len: 2,

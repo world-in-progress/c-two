@@ -1,13 +1,36 @@
 from __future__ import annotations
 
 import enum
+import importlib
 import json
 import pickle
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import ModuleType
 
 DEFAULT_PICKLE_PROTOCOL = 4
 SerializedPayload = bytes | bytearray | memoryview
+
+
+def _fastdb_payload_module() -> ModuleType:
+    try:
+        return importlib.import_module("fastdb4py.payload")
+    except ModuleNotFoundError as exc:
+        if (exc.name or "").split(".")[0] not in {"fastdb4py", "numpy"}:
+            raise
+        raise ImportError(
+            "FastDB payloads require the optional FastDB dependencies. "
+            "Install them with: uv pip install 'c-two[fastdb]'",
+        ) from exc
+
+
+def _payload_type(*, required: bool = False) -> type | None:
+    # A real Payload annotation already has its defining module loaded. Ordinary
+    # Python annotations must not import FastDB just to test their identity.
+    if required:
+        return _fastdb_payload_module().Payload
+    return getattr(sys.modules.get("fastdb4py.payload"), "Payload", None)
 
 
 @enum.unique
@@ -81,11 +104,7 @@ class PayloadBinding:
 
     @property
     def supports_scoped_owner(self) -> bool:
-        return (
-            self.kind is PayloadPlanKind.FASTDB
-            and self.deserialize is not None
-            and self.invalidate is not None
-        )
+        return self.kind is PayloadPlanKind.FASTDB
 
 
 def no_payload_binding() -> PayloadBinding:
@@ -117,7 +136,8 @@ def fastdb_payload_binding(
 ) -> PayloadBinding:
     """Compile an opaque nested value through the official FastDB projection."""
 
-    from fastdb4py.payload import CompiledSpec, Payload
+    module = _fastdb_payload_module()
+    CompiledSpec, Payload = module.CompiledSpec, module.Payload
 
     if isinstance(spec_source, CompiledSpec):
         compiled = spec_source.clone()

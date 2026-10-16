@@ -98,8 +98,6 @@ typedef void (*response_pool_destroy_fn)(C2MemFfiResponsePool *);
 typedef C2MemFfiStatus (*response_pool_read_fn)(C2MemFfiResponsePool *, C2MemFfiResponseBlock, uint8_t *, size_t, size_t *);
 typedef C2MemFfiStatus (*response_pool_release_fn)(C2MemFfiResponsePool *, C2MemFfiResponseBlock);
 typedef uint32_t (*abi_version_fn)(void);
-typedef C2MemFfiStatus (*local_endpoint_len_fn)(const char *, size_t *);
-typedef C2MemFfiStatus (*local_endpoint_copy_fn)(const char *, char *, size_t, size_t *);
 typedef C2MemFfiStatus (*endpoint_context_capture_fn)(const char *, C2MemFfiLocalEndpointContext **);
 typedef void (*endpoint_context_free_fn)(C2MemFfiLocalEndpointContext *);
 typedef C2MemFfiStatus (*endpoint_context_name_len_fn)(const C2MemFfiLocalEndpointContext *, const char *, size_t *);
@@ -111,8 +109,6 @@ typedef C2MemFfiStatus (*endpoint_context_connect_unix_fn)(const C2MemFfiLocalEn
 typedef struct C2MemFfiNodeSymbols {
     void *library;
     abi_version_fn abi_version;
-    local_endpoint_len_fn local_endpoint_len;
-    local_endpoint_copy_fn local_endpoint_copy;
     endpoint_context_capture_fn endpoint_context_capture;
     endpoint_context_free_fn endpoint_context_free;
     endpoint_context_name_len_fn endpoint_context_name_len;
@@ -186,6 +182,12 @@ static bool set_named_uint32(napi_env env, napi_value object, const char *name, 
         return false;
     }
     return set_named_value(env, object, name, js_value);
+}
+
+static bool set_named_uint64_bigint(napi_env env, napi_value object, const char *name, uint64_t value) {
+    napi_value js_value;
+    return check_napi(napi_create_bigint_uint64(env, value, &js_value)) &&
+        set_named_value(env, object, name, js_value);
 }
 
 static bool set_named_bool(napi_env env, napi_value object, const char *name, bool value) {
@@ -351,7 +353,8 @@ static bool read_block_common(
     uint8_t *is_dedicated,
     uint32_t *generation,
     uint32_t *offset,
-    uint32_t *byte_length) {
+    uint32_t *byte_length,
+    uint64_t *allocation_id) {
     napi_value property;
     uint32_t temp_u32 = 0;
     bool temp_bool = false;
@@ -382,6 +385,18 @@ static bool read_block_common(
         !read_uint32_arg(env, property, "block.byteLength must be a u32 integer.", byte_length)) {
         return false;
     }
+    bool lossless = false;
+    if (!get_named_property(env, value, "allocationId", &property) ||
+        !check_napi(napi_get_value_bigint_uint64(env, property, allocation_id, &lossless)) ||
+        !lossless) {
+        throw_type_error(env, "block.allocationId must be a lossless u64 bigint.");
+        return false;
+    }
+    if ((*is_dedicated == 0 && *allocation_id == 0) ||
+        (*is_dedicated != 0 && *allocation_id != 0)) {
+        throw_type_error(env, "block.allocationId must be nonzero for buddy memory and zero for dedicated memory.");
+        return false;
+    }
     return true;
 }
 
@@ -391,7 +406,8 @@ static bool read_request_block(napi_env env, napi_value value, C2MemFfiRequestBl
     uint32_t generation = 0;
     uint32_t offset = 0;
     uint32_t byte_length = 0;
-    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length)) {
+    uint64_t allocation_id = 0;
+    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length, &allocation_id)) {
         return false;
     }
     block->segment_index = segment_index;
@@ -400,6 +416,7 @@ static bool read_request_block(napi_env env, napi_value value, C2MemFfiRequestBl
     block->generation = generation;
     block->offset = offset;
     block->byte_length = byte_length;
+    block->allocation_id = allocation_id;
     return true;
 }
 
@@ -409,7 +426,8 @@ static bool read_response_block(napi_env env, napi_value value, C2MemFfiResponse
     uint32_t generation = 0;
     uint32_t offset = 0;
     uint32_t byte_length = 0;
-    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length)) {
+    uint64_t allocation_id = 0;
+    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length, &allocation_id)) {
         return false;
     }
     block->segment_index = segment_index;
@@ -418,6 +436,7 @@ static bool read_response_block(napi_env env, napi_value value, C2MemFfiResponse
     block->generation = generation;
     block->offset = offset;
     block->byte_length = byte_length;
+    block->allocation_id = allocation_id;
     return true;
 }
 
@@ -430,6 +449,7 @@ static napi_value make_request_block(napi_env env, C2MemFfiRequestBlock block) {
         !set_named_uint32(env, object, "generation", block.generation) ||
         !set_named_uint32(env, object, "offset", block.offset) ||
         !set_named_uint32(env, object, "byteLength", block.byte_length) ||
+        !set_named_uint64_bigint(env, object, "allocationId", block.allocation_id) ||
         !set_named_bool(env, object, "dedicated", block.is_dedicated != 0)) {
         return NULL;
     }
@@ -804,15 +824,6 @@ static napi_value response_pool_release(napi_env env, napi_callback_info info) {
     return make_status_result(env, status, NULL);
 }
 
-static bool endpoint_context_supported(const C2MemFfiNodeSymbols *symbols) {
-    return symbols->endpoint_context_capture != NULL &&
-        symbols->endpoint_context_free != NULL &&
-        symbols->endpoint_context_name_len != NULL &&
-        symbols->endpoint_context_name_copy != NULL &&
-        symbols->endpoint_context_namespace_id_len != NULL &&
-        symbols->endpoint_context_namespace_id_copy != NULL;
-}
-
 /* A null address selects the namespace id query on the same captured context. */
 static napi_value endpoint_string_result(
     napi_env env,
@@ -821,9 +832,7 @@ static napi_value endpoint_string_result(
     const char *address) {
     size_t length = 0;
     C2MemFfiStatus status;
-    if (context == NULL) {
-        status = symbols->local_endpoint_len(address, &length);
-    } else if (address != NULL) {
+    if (address != NULL) {
         status = symbols->endpoint_context_name_len(context, address, &length);
     } else {
         status = symbols->endpoint_context_namespace_id_len(context, &length);
@@ -839,9 +848,7 @@ static napi_value endpoint_string_result(
         return throw_error(env, "Out of memory.");
     }
     size_t written = 0;
-    if (context == NULL) {
-        status = symbols->local_endpoint_copy(address, buffer, length + 1, &written);
-    } else if (address != NULL) {
+    if (address != NULL) {
         status = symbols->endpoint_context_name_copy(context, address, buffer, length + 1, &written);
     } else {
         status = symbols->endpoint_context_namespace_id_copy(context, buffer, length + 1, &written);
@@ -871,19 +878,17 @@ static napi_value local_endpoint(napi_env env, napi_callback_info info) {
         return NULL;
     }
     C2MemFfiLocalEndpointContext *context = NULL;
-    if (endpoint_context_supported(symbols)) {
-        C2MemFfiStatus status = symbols->endpoint_context_capture(NULL, &context);
-        if (status != C2_MEM_FFI_STATUS_OK || context == NULL) {
-            free(address);
-            if (context != NULL) symbols->endpoint_context_free(context);
-            if (status == C2_MEM_FFI_STATUS_OK) {
-                return throw_error(env, "Native IPC endpoint capture returned no context.");
-            }
-            return make_status_result(env, status, NULL);
+    C2MemFfiStatus status = symbols->endpoint_context_capture(NULL, &context);
+    if (status != C2_MEM_FFI_STATUS_OK || context == NULL) {
+        free(address);
+        if (context != NULL) symbols->endpoint_context_free(context);
+        if (status == C2_MEM_FFI_STATUS_OK) {
+            return throw_error(env, "Native IPC endpoint capture returned no context.");
         }
+        return make_status_result(env, status, NULL);
     }
     napi_value result = endpoint_string_result(env, symbols, context, address);
-    if (context != NULL) symbols->endpoint_context_free(context);
+    symbols->endpoint_context_free(context);
     free(address);
     return result;
 }
@@ -1086,9 +1091,6 @@ static napi_value endpoint_context_connect(napi_env env, napi_callback_info info
     }
     C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
     if (context == NULL) return NULL;
-    if (context->symbols->endpoint_context_connect_unix == NULL) {
-        return throw_error(env, "Native library does not support directory-relative Unix connections.");
-    }
     char *address = read_string_arg(env, args[0], "IPC address must be a string.");
     if (address == NULL) return NULL;
     EndpointConnectWork *work = (EndpointConnectWork *)calloc(1, sizeof(*work));
@@ -1188,17 +1190,6 @@ static bool load_symbol(napi_env env, void *library, const char *name, void **ou
     return true;
 }
 
-/* Context symbols were appended to ABI 3; older ABI 3 libraries remain valid. */
-static void *optional_symbol(void *library, const char *name) {
-#ifdef _WIN32
-    return (void *)GetProcAddress((HMODULE)library, name);
-#else
-    dlerror();
-    void *symbol = dlsym(library, name);
-    return dlerror() == NULL ? symbol : NULL;
-#endif
-}
-
 static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
 #define LOAD_REQUIRED(field, exported) \
     do { \
@@ -1207,8 +1198,20 @@ static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
         } \
     } while (0)
     LOAD_REQUIRED(abi_version, "c2_mem_ffi_abi_version");
-    LOAD_REQUIRED(local_endpoint_len, "c2_mem_ffi_local_endpoint_len");
-    LOAD_REQUIRED(local_endpoint_copy, "c2_mem_ffi_local_endpoint_copy");
+    uint32_t loaded_abi_version = symbols->abi_version();
+    if (loaded_abi_version != C2_MEM_FFI_ABI_VERSION) {
+        char message[256];
+        snprintf(message, sizeof(message), "c2_mem_ffi ABI version %u is incompatible with expected version %u.", loaded_abi_version, C2_MEM_FFI_ABI_VERSION);
+        throw_error(env, message);
+        return false;
+    }
+    LOAD_REQUIRED(endpoint_context_capture, "c2_mem_ffi_local_endpoint_context_capture");
+    LOAD_REQUIRED(endpoint_context_free, "c2_mem_ffi_local_endpoint_context_free");
+    LOAD_REQUIRED(endpoint_context_name_len, "c2_mem_ffi_local_endpoint_context_name_len");
+    LOAD_REQUIRED(endpoint_context_name_copy, "c2_mem_ffi_local_endpoint_context_name_copy");
+    LOAD_REQUIRED(endpoint_context_namespace_id_len, "c2_mem_ffi_local_endpoint_context_namespace_id_len");
+    LOAD_REQUIRED(endpoint_context_namespace_id_copy, "c2_mem_ffi_local_endpoint_context_namespace_id_copy");
+    LOAD_REQUIRED(endpoint_context_connect_unix, "c2_mem_ffi_local_endpoint_context_connect_unix");
     LOAD_REQUIRED(request_pool_new, "c2_mem_ffi_request_pool_new");
     LOAD_REQUIRED(request_pool_destroy, "c2_mem_ffi_request_pool_destroy");
     LOAD_REQUIRED(request_pool_prefix_len, "c2_mem_ffi_request_pool_prefix_len");
@@ -1226,20 +1229,6 @@ static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
     LOAD_REQUIRED(response_pool_read, "c2_mem_ffi_response_pool_read");
     LOAD_REQUIRED(response_pool_release, "c2_mem_ffi_response_pool_release");
 #undef LOAD_REQUIRED
-    symbols->endpoint_context_capture = (endpoint_context_capture_fn)optional_symbol(
-        symbols->library, "c2_mem_ffi_local_endpoint_context_capture");
-    symbols->endpoint_context_free = (endpoint_context_free_fn)optional_symbol(
-        symbols->library, "c2_mem_ffi_local_endpoint_context_free");
-    symbols->endpoint_context_name_len = (endpoint_context_name_len_fn)optional_symbol(
-        symbols->library, "c2_mem_ffi_local_endpoint_context_name_len");
-    symbols->endpoint_context_name_copy = (endpoint_context_name_copy_fn)optional_symbol(
-        symbols->library, "c2_mem_ffi_local_endpoint_context_name_copy");
-    symbols->endpoint_context_namespace_id_len = (endpoint_context_namespace_id_len_fn)optional_symbol(
-        symbols->library, "c2_mem_ffi_local_endpoint_context_namespace_id_len");
-    symbols->endpoint_context_namespace_id_copy = (endpoint_context_namespace_id_copy_fn)optional_symbol(
-        symbols->library, "c2_mem_ffi_local_endpoint_context_namespace_id_copy");
-    symbols->endpoint_context_connect_unix = (endpoint_context_connect_unix_fn)optional_symbol(
-        symbols->library, "c2_mem_ffi_local_endpoint_context_connect_unix");
     return true;
 }
 
@@ -1281,14 +1270,6 @@ static napi_value load(napi_env env, napi_callback_info info) {
         free(symbols);
         return NULL;
     }
-    uint32_t loaded_abi_version = symbols->abi_version();
-    if (loaded_abi_version != C2_MEM_FFI_ABI_VERSION) {
-        char message[256];
-        snprintf(message, sizeof(message), "c2_mem_ffi ABI version %u is incompatible with expected version %u.", loaded_abi_version, C2_MEM_FFI_ABI_VERSION);
-        close_library(library);
-        free(symbols);
-        return throw_error(env, message);
-    }
     napi_value object;
     if (!check_napi(napi_create_object(env, &object))) {
         close_library(library);
@@ -1298,6 +1279,7 @@ static napi_value load(napi_env env, napi_callback_info info) {
     if (!set_function(env, object, "c2_mem_ffi_request_pool_new", request_pool_new, symbols) ||
         !set_function(env, object, "c2_mem_ffi_abi_version", abi_version_callback, symbols) ||
         !set_function(env, object, "c2_mem_ffi_local_endpoint", local_endpoint, symbols) ||
+        !set_function(env, object, "c2_mem_ffi_local_endpoint_context_capture", endpoint_context_capture, symbols) ||
         !set_function(env, object, "c2_mem_ffi_request_pool_destroy", request_pool_destroy, symbols) ||
         !set_function(env, object, "c2_mem_ffi_request_pool_prefix", request_pool_prefix, symbols) ||
         !set_function(env, object, "c2_mem_ffi_request_pool_segment_count", request_pool_segment_count, symbols) ||
@@ -1311,12 +1293,6 @@ static napi_value load(napi_env env, napi_callback_info info) {
         !set_function(env, object, "c2_mem_ffi_response_pool_destroy", response_pool_destroy, symbols) ||
         !set_function(env, object, "c2_mem_ffi_response_pool_read", response_pool_read, symbols) ||
         !set_function(env, object, "c2_mem_ffi_response_pool_release", response_pool_release, symbols)) {
-        close_library(library);
-        free(symbols);
-        return NULL;
-    }
-    if (endpoint_context_supported(symbols) &&
-        !set_function(env, object, "c2_mem_ffi_local_endpoint_context_capture", endpoint_context_capture, symbols)) {
         close_library(library);
         free(symbols);
         return NULL;

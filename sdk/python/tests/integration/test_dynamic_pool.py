@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
 from c_two.config import ServerIPCOverrides
 from c_two.transport.client.util import ping
@@ -95,7 +97,7 @@ def _setup(
     if ipc_overrides is None:
         ipc_overrides = _pool_overrides()
 
-    server = Server(bind_address=addr, ipc_overrides=ipc_overrides)
+    server = local_server(addr, ipc_overrides=ipc_overrides)
     server.register_crm(IPoolTest, PoolTestCRM(), name='pool')
     server.start()
     _wait_for_server(addr)

@@ -11,8 +11,10 @@ import uuid
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
-from c_two.transport import Server, ConcurrencyConfig, ConcurrencyMode
+from c_two.transport import ConcurrencyConfig, ConcurrencyMode
 from c_two.transport.client.util import ping
 
 from tests.fixtures.ihello import Hello
@@ -41,7 +43,7 @@ def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
 def multi_crm_addr():
     """Start a Server hosting Hello + Counter CRMs."""
     addr = f'ipc://{_unique_region()}'
-    server = Server(bind_address=addr)
+    server = local_server(addr)
     server.register_crm(Hello, HelloImpl(), name='hello')
     server.register_crm(Counter, CounterImpl(initial=100), name='counter')
     server.start()
@@ -54,7 +56,7 @@ def multi_crm_addr():
 def single_then_add_addr():
     """Start with one CRM, add second after start."""
     addr = f'ipc://{_unique_region()}'
-    server = Server(bind_address=addr)
+    server = local_server(addr)
     server.register_crm(Hello, HelloImpl(), name='hello')
     server.start()
     _wait_for_server(addr)
@@ -70,14 +72,14 @@ class TestRegistrationAPI:
 
     def test_register_returns_name(self):
         addr = f'ipc://{_unique_region()}'
-        server = Server(bind_address=addr)
+        server = local_server(addr)
         result = server.register_crm(Hello, HelloImpl(), name='hello')
         assert result == 'hello'
         server.shutdown()
 
     def test_duplicate_name_raises(self):
         addr = f'ipc://{_unique_region()}'
-        server = Server(bind_address=addr)
+        server = local_server(addr)
         server.register_crm(Hello, HelloImpl(), name='hello')
         with pytest.raises(ValueError, match='already registered'):
             server.register_crm(Hello, HelloImpl(), name='hello')
@@ -85,7 +87,7 @@ class TestRegistrationAPI:
 
     def test_names_property(self):
         addr = f'ipc://{_unique_region()}'
-        server = Server(bind_address=addr)
+        server = local_server(addr)
         server.register_crm(Hello, HelloImpl(), name='hello')
         server.register_crm(Counter, CounterImpl(), name='counter')
         assert set(server.names) == {'hello', 'counter'}
@@ -93,7 +95,7 @@ class TestRegistrationAPI:
 
     def test_unregister(self):
         addr = f'ipc://{_unique_region()}'
-        server = Server(bind_address=addr)
+        server = local_server(addr)
         server.register_crm(Hello, HelloImpl(), name='hello')
         server.register_crm(Counter, CounterImpl(), name='counter')
         server.unregister_crm('counter')
@@ -102,7 +104,7 @@ class TestRegistrationAPI:
 
     def test_unregister_unknown_raises(self):
         addr = f'ipc://{_unique_region()}'
-        server = Server(bind_address=addr)
+        server = local_server(addr)
         with pytest.raises(KeyError):
             server.unregister_crm('nonexistent')
         server.shutdown()
@@ -110,7 +112,7 @@ class TestRegistrationAPI:
     def test_no_crm_constructor(self):
         """Server can be created without any initial CRM."""
         addr = f'ipc://{_unique_region()}'
-        server = Server(bind_address=addr)
+        server = local_server(addr)
         assert server.names == []
         server.shutdown()
 
@@ -195,7 +197,7 @@ class TestDynamicRegistration:
     def test_unregister_removes_only_named_route(self):
         """Unregistering one route leaves the other named routes intact."""
         addr = f'ipc://{_unique_region()}'
-        server = Server(bind_address=addr)
+        server = local_server(addr)
         server.register_crm(Hello, HelloImpl(), name='hello')
         server.register_crm(Counter, CounterImpl(), name='counter')
 

@@ -37,6 +37,7 @@ import logging
 import signal
 import sys
 import threading
+from inspect import getattr_static
 from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, TypeVar
@@ -45,6 +46,7 @@ from c_two.crm.bridge import ResourceBridge, normalize_bridge_map
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
 from c_two.crm.methods import rpc_method_names
+from c_two.crm.meta import _SHUTDOWN_ATTR, get_shutdown_method
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.lifecycle import LifecycleConfig
 from c_two.config.settings import settings
@@ -451,6 +453,24 @@ class _ProcessRegistry:
             crm_instance,
             bridge=method_bridge_map,
         )
+        shutdown_method = get_shutdown_method(crm_class)
+        resource_type = type(crm_instance)
+        resource_members = {
+            name for base in resource_type.__mro__ for name in vars(base)
+        }
+        for method_name in sorted(resource_members):
+            method = getattr_static(resource_type, method_name)
+            marked = getattr_static(method, _SHUTDOWN_ATTR, False) is True
+            if isinstance(method, (staticmethod, classmethod)):
+                marked = marked or (
+                    getattr_static(method.__func__, _SHUTDOWN_ATTR, False) is True
+                )
+            if marked and method_name != shutdown_method:
+                raise TypeError(
+                    f'@cc.on_shutdown on resource '
+                    f'{type(crm_instance).__name__}.{method_name} must be '
+                    f'declared with @cc.on_shutdown on CRM {crm_class.__name__}.',
+                )
         validate_input_lifetime_resource_contract(
             crm_class,
             crm_instance,
@@ -481,8 +501,6 @@ class _ProcessRegistry:
                     name=name,
                     bridge=method_bridge_map,
                     input_lifetime=input_lifetime_map,
-                    runtime_session=self._runtime_session,
-                    relay_anchor_address=None,
                 )
 
                 # Start server if not yet running.
@@ -698,15 +716,10 @@ class _ProcessRegistry:
         """
         with self._lock:
             server = self._server
-            runtime_session = self._runtime_session
         if server is None:
             raise KeyError(f'Name not registered: {name!r}')
 
-        outcome = server.unregister_crm(
-            name,
-            runtime_session=runtime_session,
-            relay_anchor_address=None,
-        )
+        outcome = server.unregister_crm(name)
         relay_error = outcome.get('relay_error')
         if relay_error is not None:
             raise _relay_cleanup_exception(dict(relay_error))
@@ -732,8 +745,7 @@ class _ProcessRegistry:
             server = self._server
             runtime_session = self._runtime_session
         if server is not None:
-            outcome = server.shutdown(runtime_session=runtime_session,
-                                      relay_anchor_address=None, timeout=timeout)
+            outcome = server.shutdown(timeout=timeout)
         else:
             outcome = dict(runtime_session.shutdown(route_names=[],
                 relay_anchor_address=None, timeout_seconds=timeout))

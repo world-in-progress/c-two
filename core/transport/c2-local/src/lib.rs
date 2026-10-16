@@ -406,11 +406,19 @@ impl LocalStream {
         );
         let endpoint = LocalEndpoint::from_address(&address)?;
         let mut listener = LocalListener::bind(&endpoint)?;
-        let (client, server) = tokio::try_join!(
+        let connected = tokio::try_join!(
             Self::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
             listener.accept()
-        )?;
-        Ok((client, server))
+        );
+        let closed = tokio::task::spawn_blocking(move || listener.close()).await?;
+        match closed {
+            EndpointReapResult::Reaped
+            | EndpointReapResult::AlreadyAbsent
+            | EndpointReapResult::NotApplicable => connected,
+            other => Err(io::Error::other(format!(
+                "pair listener cleanup failed: {other:?}"
+            ))),
+        }
     }
 }
 

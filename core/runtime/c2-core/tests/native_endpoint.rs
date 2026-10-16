@@ -16,10 +16,10 @@ static TEST_ID: AtomicU64 = AtomicU64::new(0);
 struct Echo;
 
 impl EncodedService for Echo {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         match method_index {
             0 => Ok(Vec::new()),
-            1 => Ok(request.to_vec()),
+            1 => Ok(request),
             other => Err(C2Error::new(
                 ErrorCode::ProtocolViolation,
                 format!("unexpected method index {other}"),
@@ -87,24 +87,47 @@ fn wait_until_pingable(address: &str) {
     panic!("{address} never answered");
 }
 #[test]
-fn runtime_client_config_freezes_after_a_failed_native_connect() {
+fn runtime_client_config_freezes_on_valid_config_even_when_connect_fails() {
     let runtime = Runtime::new(RuntimeOptions {
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
     .unwrap();
-    assert!(!runtime.client_config_frozen());
     let absent = format!("ipc://{}", unique_name("absent"));
     let expected = release().expected_route("unused-route").unwrap();
+    let mut overrides = c2_config::ClientIpcConfigOverrides::default();
+    overrides.pool_segment_size = Some(0);
+    runtime
+        .set_client_ipc_overrides(Some(overrides.clone()))
+        .unwrap();
+    let error = runtime
+        .connect(
+            expected.clone(),
+            Connect::DirectIpc {
+                address: absent.clone(),
+            },
+        )
+        .err()
+        .expect("invalid configuration must fail");
+    assert!(error.to_string().contains("pool_segment_size"), "{error}");
+    assert!(!runtime.client_config_frozen());
+    assert!(runtime.outgoing_memory_stats().is_none());
+
+    overrides.pool_segment_size = Some(2 * 1024 * 1024);
+    runtime.set_client_ipc_overrides(Some(overrides)).unwrap();
     assert!(
         runtime
             .connect(expected, Connect::DirectIpc { address: absent })
             .is_err()
     );
     assert!(runtime.client_config_frozen());
+    assert!(runtime.outgoing_memory_stats().is_some());
     let mut replacement = c2_config::ClientIpcConfigOverrides::default();
-    replacement.base.pool_enabled = Some(false);
-    assert!(runtime.set_client_ipc_overrides(Some(replacement)).is_err());
+    replacement.pool_enabled = Some(false);
+    assert!(matches!(
+        runtime.set_client_ipc_overrides(Some(replacement)),
+        Err(c2_core::LifecycleError::ClientConfigFrozen)
+    ));
 }
 #[test]
 fn native_host_serves_calls_and_admin_shutdown_initiates_draining() {

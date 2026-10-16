@@ -84,6 +84,19 @@ Business-call waiting is independent. `cc.with_call_options` returns a view of a
 
 Unix processes sharing an IPC domain use the same configured root (`cc.set_local_endpoint(root=...)` or `C2_IPC_ROOT`). The application provisions custom roots; `0755` is accepted with verified ownership and protection from other-user mutation. The default is `0700`, and sockets are `0600`. Windows uses current-logon SID Named Pipes and rejects Unix root overrides. See [endpoint configuration](configuration.en.md#local-endpoint-directories) and [lifecycle management](local-endpoint-lifecycle.en.md).
 
+## Low-level server bridge
+
+`c_two.transport.Server` is a bridge bound to one native `RuntimeSession`. Applications normally use `cc.register()` and `cc.shutdown()`. Low-level hosts can obtain a bridge from their explicitly configured session:
+
+```python
+from c_two._native import RuntimeSession
+
+session = RuntimeSession(server_id='local-host', use_process_relay_anchor=False)
+server = session.ensure_server_bridge()
+```
+
+The session owns identity, IPC overrides and relay configuration. `Server(runtime_session, ...)` no longer accepts `bind_address`, `ipc_overrides`, `server_id` or `server_instance_id`; registration, unregister and shutdown no longer accept a replacement session or per-operation relay anchor. Configure independent sessions explicitly rather than inheriting Python process settings. `start()` takes no timeout argument; `shutdown(timeout=...)` retains its Core-owned deadline and completion result. Close the bridge with `shutdown()` when its host is finished.
+
 ## Payload lifetimes
 
 The proven portable receive path opens a **copy-backed** FastDB owner. `cc.hold()` is a lifetime contract, not a zero-copy claim: it retains the C-Two response lease together with the payload owner and guarantees that release invalidates the FastDB owner and its checked views *before* the lease goes back.
@@ -100,6 +113,8 @@ Release is layered: explicit `.release()`, the `with` context manager, and a `__
 `held.unsafe_buffer` exposes the retained raw wire buffer as a `memoryview` escape hatch. Raw NumPy arrays or pointers derived from it bypass FastDB's checked owner/view model and **cannot be revoked mechanically** — materialize values through FastDB before storing them beyond the hold scope.
 
 On the server side, portable inputs are owned by default. Registering with `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})` opts specific methods into call-scoped borrowed inputs: C-Two invalidates the payload and its checked views before releasing the request lease when the call returns or raises. Do not retain a borrowed payload or view after the method returns.
+
+`cc.transfer` accepts only `input` and `output`. The former `buffer` keyword is removed, including `None` and `"view"`; passing it raises `TypeError`. Remove that keyword and select borrowed inputs through registration-level `input_lifetime`. The module-level `auto_transfer` follows the same rule.
 
 ## Entry points
 

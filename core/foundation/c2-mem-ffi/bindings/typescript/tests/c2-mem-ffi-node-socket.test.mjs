@@ -59,3 +59,22 @@ test('socket close before write callback rejects the pending write', async () =>
     connector.close();
   }
 });
+
+test('remote EOF rejects an incomplete read and preserves already buffered bytes', async () => {
+  for (const event of ['end', 'close']) {
+    const { connection, connector, socket } = await connectionWith(() => true);
+    try {
+      socket.emit('data', new Uint8Array([1, 2]));
+      socket.emit('data', new Uint8Array([3]));
+      const pending = connection.readExactly(4);
+      socket.emit(event);
+      await assert.rejects(pending, /ended|closed/);
+      assert.deepEqual(await connection.readExactly(1), new Uint8Array([1]));
+      assert.deepEqual(await connection.readExactly(2), new Uint8Array([2, 3]));
+      await assert.rejects(connection.readExactly(1), /ended|closed/);
+    } finally {
+      await connection.close();
+      connector.close();
+    }
+  }
+});

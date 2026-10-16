@@ -29,7 +29,7 @@ use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer_handlers;
 use crate::relay::route_table::valid_route_name;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
-use crate::relay::types::{ResolvedRouteInfo, RouteEntry, UpstreamEndpointKey};
+use crate::relay::types::{RouteEntry, UpstreamEndpointKey};
 use c2_ipc::{ClientIpcConfig, IpcClient};
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -45,7 +45,6 @@ const REJECTED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct ReadyRequestClient {
     lease: UpstreamLease,
-    route: RouteEntry,
     binding: c2_ipc::RouteBinding,
 }
 
@@ -661,18 +660,6 @@ fn validate_expected_crm_for_route(
     };
     if route_matches_expected_crm(&route, expected) {
         Ok(route)
-    } else {
-        Err(crm_contract_mismatch_response(route_name).into())
-    }
-}
-
-fn validate_expected_crm_for_acquired_route(
-    route_name: &str,
-    route: &RouteEntry,
-    expected: &c2_contract::ExpectedRouteContract,
-) -> ResponseResult<()> {
-    if route_matches_expected_crm(route, expected) {
-        Ok(())
     } else {
         Err(crm_contract_mismatch_response(route_name).into())
     }
@@ -1464,13 +1451,6 @@ async fn handle_resolve(
             route.server_instance_id = None;
         }
     }
-    let routes = routes
-        .into_iter()
-        .map(|route| ResolvedRouteInfo {
-            route,
-            local_endpoint_namespace: state.endpoint_context().namespace_id().to_owned(),
-        })
-        .collect::<Vec<_>>();
     with_local_namespace_response(&state, Json(routes).into_response())
 }
 
@@ -1564,17 +1544,7 @@ async fn handle_probe_in_context(
     run_data_plane_after_precheck_hook(&route_name);
     match acquire_request_client_for_route(state, &advertised_route).await {
         RequestClient::Ready(ready) => {
-            let ReadyRequestClient { lease, route, .. } = *ready;
-            if let Err(response) =
-                validate_expected_crm_for_acquired_route(&route_name, &route, &expected_crm)
-            {
-                drop(lease);
-                return response.into_response();
-            }
-            if let Err(response) = validate_route_token_for_route(&route, &route_token) {
-                drop(lease);
-                return response.into_response();
-            }
+            let ReadyRequestClient { lease, .. } = *ready;
             drop(lease);
             StatusCode::OK.into_response()
         }
@@ -1645,9 +1615,7 @@ async fn call_handler(
             work_state,
             work_route_name,
             method_name,
-            expected_crm,
             advertised_route,
-            route_token,
             content_length,
             body,
             permit,
@@ -1732,27 +1700,20 @@ fn forwarding_capacity_response(route_name: &str, message: impl Into<String>) ->
 }
 
 // This future belongs to the bounded native domain, never to the HTTP handler.
-#[allow(clippy::too_many_arguments)]
 async fn forward_call(
     state: Arc<RelayState>,
     route_name: String,
     method_name: String,
-    expected_crm: c2_contract::ExpectedRouteContract,
     advertised_route: RouteEntry,
-    route_token: ExpectedRouteToken,
     content_length: Option<u64>,
     body: Body,
     mut permit: c2_mem::RetentionPermit,
 ) -> Response {
-    let (lease, acquired_route, binding) =
+    let (lease, binding) =
         match acquire_request_client_for_route(state.clone(), &advertised_route).await {
             RequestClient::Ready(ready) => {
-                let ReadyRequestClient {
-                    lease,
-                    route,
-                    binding,
-                } = *ready;
-                (lease, route, binding)
+                let ReadyRequestClient { lease, binding } = *ready;
+                (lease, binding)
             }
             RequestClient::Stale(route) => return route_stale_response(&route),
             RequestClient::WatchUnavailable { route, reason } => {
@@ -1769,26 +1730,6 @@ async fn forward_call(
                 );
             }
         };
-    if let Err(response) =
-        validate_expected_crm_for_acquired_route(&route_name, &acquired_route, &expected_crm)
-    {
-        drop(lease);
-        return response.into_response();
-    }
-    if let Err(response) = validate_route_token_for_route(&acquired_route, &route_token) {
-        drop(lease);
-        return response.into_response();
-    }
-    if let Some(content_length) = content_length
-        && content_length > acquired_route.max_payload_size
-    {
-        drop(lease);
-        return payload_too_large_response(
-            &route_name,
-            content_length,
-            acquired_route.max_payload_size,
-        );
-    }
     let client = lease.client();
 
     let call_result = match content_length {
@@ -1806,7 +1747,7 @@ async fn forward_call(
             let body = match read_unknown_length_body(
                 &route_name,
                 body,
-                acquired_route.max_payload_size,
+                advertised_route.max_payload_size,
                 &mut permit,
             )
             .await
@@ -1859,12 +1800,12 @@ async fn forward_call(
                     .into_response(),
                 c2_ipc::IpcError::RouteStale { .. } => {
                     drop(lease);
-                    route_stale_response(&acquired_route)
+                    route_stale_response(&advertised_route)
                 }
                 error if matches!(phase, c2_ipc::TransportPhase::PreDispatch) => {
                     if let Some(reason) = semantic_withdrawal_reason(&error) {
                         drop(lease);
-                        remove_unreachable_route_for_error(&state, &acquired_route, &error, reason);
+                        remove_unreachable_route_for_error(&state, &advertised_route, &error, reason);
                     }
                     ipc_route_error_response(&route_name, &error)
                 }
@@ -1934,9 +1875,8 @@ async fn acquire_request_client_for_route(
 ) -> RequestClient {
     let route_name = route.name.clone();
     match state.acquire_upstream_for_route(route).await {
-        Ok((lease, route, binding)) => RequestClient::Ready(Box::new(ReadyRequestClient {
+        Ok((lease, binding)) => RequestClient::Ready(Box::new(ReadyRequestClient {
             lease,
-            route,
             binding,
         })),
         Err(UpstreamAcquireError::NotFound) => RequestClient::NotFound,
@@ -2597,10 +2537,17 @@ mod tests {
                     offset,
                     data_size,
                     is_dedicated,
+                    allocation_id,
                 } => {
                     let mut pool = pool.write();
-                    let _ =
-                        pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
+                    let _ = pool.free_at(
+                        seg_idx as u32,
+                        generation,
+                        offset,
+                        data_size,
+                        is_dedicated,
+                        allocation_id,
+                    );
                     "shm"
                 }
                 RequestData::Handle(backing) => {
@@ -2802,7 +2749,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body[0]["ipc_address"], "ipc://same-owner");
-        assert_eq!(body[0]["local_endpoint_namespace"], context.namespace_id());
+        assert!(body[0].get("local_endpoint_namespace").is_none());
         let mismatch = "f".repeat(64);
         let response = namespace_resolve_response(state.clone(), Some(&mismatch)).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -3528,7 +3475,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(state.resolve("grid").is_empty());
+        assert!(state.list_routes().is_empty());
     }
 
     async fn post_unregister(state: Arc<RelayState>, name: &str, server_id: &str) -> StatusCode {
@@ -4298,7 +4245,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "relay must not advertise a route that the upstream handshake did not export"
         );
 
@@ -4329,7 +4276,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "relay must not advertise caller-claimed CRM metadata for an unexported IPC route"
         );
 
@@ -4367,7 +4314,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "ordinary register must not publish pending routes even with a valid token"
         );
 
@@ -4413,7 +4360,7 @@ mod tests {
         .await;
         assert_eq!(prepare_status, StatusCode::ACCEPTED);
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "prepare-only registration must not publish relay-visible route state"
         );
 
@@ -4422,7 +4369,7 @@ mod tests {
             post_register(state.clone(), "grid", "server-grid", &address).await,
             StatusCode::CREATED
         );
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(state.local_route("grid").is_some());
 
         shutdown_live_server(&server).await;
     }
@@ -4442,10 +4389,9 @@ mod tests {
             StatusCode::CREATED
         );
 
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].crm_ns, "test.echo");
-        assert_eq!(routes[0].crm_ver, "0.1.0");
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.crm_ns, "test.echo");
+        assert_eq!(route.crm_ver, "0.1.0");
 
         shutdown_live_server(&server).await;
     }
@@ -4478,7 +4424,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "relay must not silently ignore malformed claimed CRM contract fields"
         );
 
@@ -4509,7 +4455,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "relay must not advertise a route with caller-claimed CRM metadata that disagrees with the IPC handshake"
         );
 
@@ -4544,10 +4490,9 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].crm_ns, "test.echo");
-        assert_eq!(routes[0].crm_ver, "0.1.0");
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.crm_ns, "test.echo");
+        assert_eq!(route.crm_ver, "0.1.0");
 
         shutdown_live_server(&server).await;
     }
@@ -4598,10 +4543,9 @@ mod tests {
             post_register(state.clone(), "grid", "server-grid", &address).await,
             StatusCode::BAD_REQUEST
         );
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].crm_ns, "test.echo");
-        assert_eq!(routes[0].crm_name, "Echo");
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.crm_ns, "test.echo");
+        assert_eq!(route.crm_name, "Echo");
 
         shutdown_live_server(&server).await;
     }
@@ -4655,9 +4599,8 @@ mod tests {
             .await,
             StatusCode::BAD_GATEWAY
         );
-        assert_eq!(
-            state.resolve("grid").len(),
-            1,
+        assert!(
+            state.local_route("grid").is_some(),
             "generic IPC I/O errors must not withdraw a route"
         );
     }
@@ -4715,7 +4658,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "connected owner route-missing is semantic withdrawal evidence"
         );
 
@@ -5046,7 +4989,6 @@ mod tests {
         let mut upstream_ipc = ClientIpcConfig::default();
         upstream_ipc.base.pool_segment_size = 64 * 1024;
         upstream_ipc.base.max_pool_segments = 2;
-        upstream_ipc.base.max_pool_memory = 128 * 1024;
         upstream_ipc.base.reassembly_segment_size = 64 * 1024;
         upstream_ipc.base.reassembly_max_segments = 2;
         upstream_ipc.base.live_reassembly_budget_bytes = 1024;
@@ -5335,10 +5277,12 @@ mod tests {
         shutdown_live_server(&server).await;
     }
 
-    async fn install_mismatched_route_swap_after_precheck(
+    fn install_route_swap_after_precheck(
         state: Arc<RelayState>,
         route_name: &str,
         new_address: &str,
+        crm_ns: &'static str,
+        crm_name: &'static str,
     ) {
         let state_for_hook = state;
         let route_for_hook = route_name.to_string();
@@ -5356,54 +5300,8 @@ mod tests {
                 "server-new".into(),
                 "server-new-instance".into(),
                 new_address_for_hook,
-                "test.other".into(),
-                "OtherEcho".into(),
-                "0.1.0".into(),
-                TEST_ABI_HASH.to_string(),
-                TEST_SIGNATURE_HASH.to_string(),
-                1024,
-                format!("{route_for_hook}-server-new-uid"),
-                1,
-                None,
-            ) {
-                RegisterCommitResult::Registered { .. }
-                | RegisterCommitResult::SameOwner { .. } => {}
-                RegisterCommitResult::Duplicate { existing_address }
-                | RegisterCommitResult::ConflictingOwner { existing_address } => {
-                    panic!(
-                        "failed to install mismatched route in precheck hook: {existing_address}"
-                    )
-                }
-                RegisterCommitResult::Invalid { reason } => {
-                    panic!("failed to install mismatched route in precheck hook: {reason}")
-                }
-            }
-        });
-    }
-
-    async fn install_same_contract_route_swap_after_precheck(
-        state: Arc<RelayState>,
-        route_name: &str,
-        new_address: &str,
-    ) {
-        let state_for_hook = state;
-        let route_for_hook = route_name.to_string();
-        let new_address_for_hook = new_address.to_string();
-        set_data_plane_after_precheck_hook(route_name.to_string(), move || {
-            if let crate::relay::state::UnregisterResult::Removed { client, .. } =
-                state_for_hook.unregister_upstream(&route_for_hook, "server-old")
-                && let Some(client) = client
-            {
-                tokio::spawn(async move { client.close_shared().await });
-            }
-            match test_commit_registration!(
-                &state_for_hook,
-                route_for_hook.clone(),
-                "server-new".into(),
-                "server-new-instance".into(),
-                new_address_for_hook,
-                "test.echo".into(),
-                "Echo".into(),
+                crm_ns.into(),
+                crm_name.into(),
                 "0.1.0".into(),
                 TEST_ABI_HASH.to_string(),
                 TEST_SIGNATURE_HASH.to_string(),
@@ -5463,8 +5361,13 @@ mod tests {
             post_register(state.clone(), &route_name, "server-old", &old_address).await,
             StatusCode::CREATED
         );
-        install_same_contract_route_swap_after_precheck(state.clone(), &route_name, &new_address)
-            .await;
+        install_route_swap_after_precheck(
+            state.clone(),
+            &route_name,
+            &new_address,
+            "test.echo",
+            "Echo",
+        );
 
         let (status, body) = post_call_response(state.clone(), &route_name, "ping").await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -5482,18 +5385,17 @@ mod tests {
         shutdown_live_server(&new_server).await;
     }
 
-    #[tokio::test]
-    async fn call_revalidates_expected_crm_tag_against_acquired_route_snapshot() {
+    async fn mismatched_route_replacement_after_precheck(probe: bool) {
         let state = test_state();
         let suffix = unique_suffix();
-        let route_name = format!("grid-toctou-call-{suffix}");
+        let route_name = format!("grid-toctou-{suffix}");
         let old_address = format!(
-            "ipc://relay_call_toctou_old_{}_{}",
+            "ipc://relay_toctou_old_{}_{}",
             std::process::id(),
             suffix
         );
         let new_address = format!(
-            "ipc://relay_call_toctou_new_{}_{}",
+            "ipc://relay_toctou_new_{}_{}",
             std::process::id(),
             suffix
         );
@@ -5530,91 +5432,38 @@ mod tests {
             post_register(state.clone(), &route_name, "server-old", &old_address).await,
             StatusCode::CREATED
         );
-        install_mismatched_route_swap_after_precheck(state.clone(), &route_name, &new_address)
-            .await;
-
-        assert_eq!(
-            post_call_with_expected_crm_tag(
-                state.clone(),
-                &route_name,
-                "ping",
-                "test.echo",
-                "Echo",
-                "0.1.0",
-            )
-            .await,
-            StatusCode::CONFLICT
+        install_route_swap_after_precheck(
+            state.clone(),
+            &route_name,
+            &new_address,
+            "test.other",
+            "OtherEcho",
         );
+
+        let (status, body) = if probe {
+            get_probe_response(state.clone(), &route_name).await
+        } else {
+            post_call_response(state.clone(), &route_name, "ping").await
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        let error: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.version, 1);
+        assert_eq!(error.code, 704);
+        assert_eq!(error.name, "RouteStale");
+        assert_eq!(error.details["route"], route_name);
 
         shutdown_live_server(&old_server).await;
         shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
-    async fn probe_revalidates_expected_crm_tag_against_acquired_route_snapshot() {
-        let state = test_state();
-        let suffix = unique_suffix();
-        let route_name = format!("grid-toctou-probe-{suffix}");
-        let old_address = format!(
-            "ipc://relay_probe_toctou_old_{}_{}",
-            std::process::id(),
-            suffix
-        );
-        let new_address = format!(
-            "ipc://relay_probe_toctou_new_{}_{}",
-            std::process::id(),
-            suffix
-        );
-        let old_server = start_live_server_with_identity_and_contracts(
-            &old_address,
-            "server-old",
-            "server-old-instance",
-            &[(
-                &route_name,
-                "test.echo",
-                "Echo",
-                "0.1.0",
-                TEST_ABI_HASH,
-                TEST_SIGNATURE_HASH,
-            )],
-        )
-        .await;
-        let new_server = start_live_server_with_identity_and_contracts(
-            &new_address,
-            "server-new",
-            "server-new-instance",
-            &[(
-                &route_name,
-                "test.other",
-                "OtherEcho",
-                "0.1.0",
-                TEST_ABI_HASH,
-                TEST_SIGNATURE_HASH,
-            )],
-        )
-        .await;
+    async fn call_rejects_contract_replacement_after_precheck() {
+        mismatched_route_replacement_after_precheck(false).await;
+    }
 
-        assert_eq!(
-            post_register(state.clone(), &route_name, "server-old", &old_address).await,
-            StatusCode::CREATED
-        );
-        install_mismatched_route_swap_after_precheck(state.clone(), &route_name, &new_address)
-            .await;
-
-        assert_eq!(
-            get_probe_with_expected_crm_tag(
-                state.clone(),
-                &route_name,
-                "test.echo",
-                "Echo",
-                "0.1.0",
-            )
-            .await,
-            StatusCode::CONFLICT
-        );
-
-        shutdown_live_server(&old_server).await;
-        shutdown_live_server(&new_server).await;
+    #[tokio::test]
+    async fn probe_rejects_contract_replacement_after_precheck() {
+        mismatched_route_replacement_after_precheck(true).await;
     }
 
     #[tokio::test]
@@ -6273,8 +6122,8 @@ mod tests {
             StatusCode::OK,
             "idle-evicted endpoint must reconnect and keep late route usable"
         );
-        assert_eq!(state.resolve("manager").len(), 1);
-        assert_eq!(state.resolve("builder").len(), 1);
+        assert!(state.local_route("manager").is_some());
+        assert!(state.local_route("builder").is_some());
 
         shutdown_live_server(&server).await;
     }
@@ -6354,9 +6203,8 @@ mod tests {
             body.contains("RouteStale"),
             "stale snapshot must not be refreshed by route name: {body}"
         );
-        assert_eq!(
-            state.resolve("builder").len(),
-            1,
+        assert!(
+            state.local_route("builder").is_some(),
             "stale route token must not be treated as generic unreachable"
         );
 
@@ -6377,7 +6225,7 @@ mod tests {
             post_register(state.clone(), "grid", "server-grid", &address).await,
             StatusCode::CREATED
         );
-        assert_eq!(state.resolve("grid").len(), 1);
+        assert!(state.local_route("grid").is_some());
 
         assert!(server.unregister_route("grid").await);
 

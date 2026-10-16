@@ -11,7 +11,7 @@ use c2_config::{ConnectDeadline, ConnectOptions, LocalEndpoint};
 use c2_contract::ExpectedRouteContract;
 use c2_error::ErrorCode;
 use c2_ipc::{ClientPool, IpcError};
-use c2_local::{LocalListener, LocalStream};
+use c2_local::{EndpointCredential, EndpointReapResult, LocalListener, LocalStream};
 use c2_wire::flags;
 use c2_wire::frame::{FrameHeader, decode_frame_body, encode_frame};
 use c2_wire::handshake::{
@@ -72,9 +72,9 @@ fn handshake() -> Vec<u8> {
     encode_frame(0, flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE, &payload)
 }
 
-fn ready_reply() -> Vec<u8> {
+fn ready_reply() -> RouteLookupResponse {
     let expected = expected();
-    encode_route_lookup_response(&RouteLookupResponse::Ready {
+    RouteLookupResponse::Ready {
         current: RouteRecordWire {
             route_name: expected.route_name.clone(),
             route_uid: ROUTE_UID.into(),
@@ -100,8 +100,7 @@ fn ready_reply() -> Vec<u8> {
             state_reason: None,
             lease_deadline_ms: None,
         },
-    })
-    .unwrap()
+    }
 }
 
 async fn read_frame(stream: &mut LocalStream) -> (FrameHeader, Vec<u8>) {
@@ -134,12 +133,13 @@ async fn read_lookup(stream: &mut LocalStream) -> FrameHeader {
     header
 }
 
-async fn reply(stream: &mut LocalStream, header: FrameHeader, payload: &[u8]) {
+async fn reply(stream: &mut LocalStream, header: FrameHeader, response: &RouteLookupResponse) {
+    let payload = encode_route_lookup_response(response).unwrap();
     stream
         .write_all(&encode_frame(
             header.request_id,
             flags::FLAG_CTRL | flags::FLAG_RESPONSE,
-            payload,
+            &payload,
         ))
         .await
         .expect("control reply");
@@ -149,6 +149,7 @@ async fn reply(stream: &mut LocalStream, header: FrameHeader, payload: &[u8]) {
 // No endpoint sweep or cleanup of addresses belonging to other tests is used.
 struct Peer {
     address: String,
+    credential: EndpointCredential,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -174,7 +175,7 @@ impl Peer {
                 .unwrap()
                 .block_on(async {
                     let listener = LocalListener::bind(&endpoint).expect("fixture listener");
-                    ready_tx.send(()).unwrap();
+                    ready_tx.send(listener.credential()).unwrap();
                     tokio::select! {
                         _ = stopped => {},
                         result = tokio::time::timeout(Duration::from_secs(10), serve(listener)) => {
@@ -183,29 +184,48 @@ impl Peer {
                     }
                 });
         });
-        ready_rx
+        let credential = ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("listener readiness");
         Self {
             address,
+            credential,
             stop: Some(stop),
             thread: Some(thread),
         }
     }
 
-    fn finish(mut self) {
-        let _ = self.stop.take().unwrap().send(());
-        self.thread.take().unwrap().join().expect("peer task");
+    fn finish(self) {
+        drop(self);
     }
 }
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        let _ = self.stop.take().unwrap().send(());
+        let joined = self.thread.take().unwrap().join();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let reaped = loop {
+            let outcome = c2_local::reap_endpoint(self.credential.endpoint(), &self.credential);
+            if matches!(outcome, EndpointReapResult::Busy) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            } else {
+                break outcome;
+            }
+        };
+        if thread::panicking() {
+            eprintln!("peer cleanup after panic: {reaped:?}");
+        } else {
+            joined.expect("peer task");
+            assert!(
+                matches!(
+                    reaped,
+                    EndpointReapResult::Reaped
+                        | EndpointReapResult::AlreadyAbsent
+                        | EndpointReapResult::NotApplicable
+                ),
+                "peer endpoint cleanup failed: {reaped:?}"
+            );
         }
     }
 }
@@ -337,7 +357,6 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
     let mut cfg = c2_ipc::ClientIpcConfig::default();
     cfg.base.pool_segment_size = 1024 * 1024;
     cfg.base.max_pool_segments = 1;
-    cfg.base.max_pool_memory = 1024 * 1024;
     cfg.base.pool_prewarm_segments = 1;
     cfg.base.shm_backing_budget_bytes = 1_536_000;
     let started = Instant::now();
@@ -521,74 +540,88 @@ fn transient_handshake_retry_keeps_original_budget() {
 }
 
 #[test]
-fn route_publication_retry_sleep_is_inside_connect_budget() {
-    let lookups = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&lookups);
-    let peer = Peer::spawn(move |mut listener| async move {
-        let mut stream = listener.accept().await.unwrap();
-        read_handshake(&mut stream).await;
-        stream.write_all(&handshake()).await.unwrap();
-        let not_found = encode_route_lookup_response(&RouteLookupResponse::NotFound {
-            route_name: "grid".into(),
-        })
-        .unwrap();
-        loop {
-            let header = read_lookup(&mut stream).await;
-            observed.fetch_add(1, Ordering::SeqCst);
-            reply(&mut stream, header, &not_found).await;
+fn route_acquisition_respects_deadlines_and_last_lookup_result() {
+    for exact_token in [false, true] {
+        for (state, timeout_ms) in [
+            ("paused", 100),
+            ("retrying", 80),
+            ("ready", 3000),
+            ("not-found", 3000),
+            ("mismatch", 3000),
+        ] {
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&lookups);
+            let peer = Peer::spawn(move |mut listener| async move {
+                let mut stream = listener.accept().await.unwrap();
+                read_handshake(&mut stream).await;
+                stream.write_all(&handshake()).await.unwrap();
+                let not_found = RouteLookupResponse::NotFound {
+                    route_name: "grid".into(),
+                };
+                let final_reply = match state {
+                    "ready" => ready_reply(),
+                    "mismatch" => {
+                        let RouteLookupResponse::Ready { mut current } = ready_reply() else {
+                            unreachable!("ready fixture")
+                        };
+                        current.contract.crm_ver = "2.0.0".into();
+                        RouteLookupResponse::ContractMismatch { current }
+                    }
+                    _ => not_found.clone(),
+                };
+                loop {
+                    let header = read_lookup(&mut stream).await;
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
+                    // Hold the retried lookup at an awaited reply so expiry
+                    // cannot race a directory update and report its stage.
+                    if state == "paused" || (state == "retrying" && attempt == 2) {
+                        std::future::pending::<()>().await;
+                    }
+                    // Five configured delays allow a sixth and final lookup.
+                    let response = if attempt < 6 {
+                        &not_found
+                    } else {
+                        &final_reply
+                    };
+                    reply(&mut stream, header, response).await;
+                }
+            });
+            let pool = ClientPool::new(Duration::from_secs(60));
+            let client = pool.acquire(&peer.address, None).unwrap();
+            let budget = deadline(Duration::from_millis(timeout_ms));
+            let started = Instant::now();
+            let result = if exact_token {
+                client.acquire_route_token_with_deadline(&expected(), ROUTE_UID, 1, budget)
+            } else {
+                client.acquire_route_with_deadline(&expected(), budget)
+            };
+            let queries = lookups.load(Ordering::SeqCst);
+            if matches!(state, "paused" | "retrying") {
+                assert_deadline(result.err().expect(state), "route_acquire");
+                assert!(started.elapsed() < Duration::from_millis(250));
+                if state == "paused" {
+                    assert_eq!(queries, 1, "cached token must perform a live lookup");
+                } else {
+                    assert_eq!(queries, 2, "fixture must reach the paused retry");
+                }
+            } else {
+                assert_eq!(queries, 6, "{state}, exact={exact_token}");
+                match state {
+                    "ready" => assert_eq!(result.unwrap().route_uid(), ROUTE_UID),
+                    "mismatch" => assert!(
+                        matches!(result, Err(IpcError::ContractMismatch(message)) if message.contains("2.0.0"))
+                    ),
+                    _ => assert!(
+                        matches!(result, Err(IpcError::RouteNotFound(name)) if name == "grid")
+                    ),
+                }
+            }
+            #[cfg(feature = "test-support")]
+            assert_eq!(client.pending_len_for_test(), 0);
+            assert!(pool.release_if_same(&peer.address, &client));
+            assert_eq!(pool.refcount(&peer.address), 0);
+            peer.finish();
+            pool.close_all(Duration::from_secs(2));
         }
-    });
-    let pool = ClientPool::new(Duration::from_secs(60));
-    let client = pool.acquire(&peer.address, None).unwrap();
-    let started = Instant::now();
-    let error = client
-        .acquire_route_with_deadline(&expected(), deadline(Duration::from_millis(80)))
-        .err()
-        .expect("publication retry must respect caller deadline");
-    assert_deadline(error, "route_acquire");
-    assert!(started.elapsed() < Duration::from_millis(250));
-    assert!(
-        lookups.load(Ordering::SeqCst) >= 2,
-        "fixture must exercise retries"
-    );
-    #[cfg(feature = "test-support")]
-    assert_eq!(client.pending_len_for_test(), 0);
-    assert!(pool.release_if_same(&peer.address, &client));
-    assert_eq!(pool.refcount(&peer.address), 0);
-    peer.finish();
-    pool.close_all(Duration::from_secs(2));
-}
-
-// This is intentionally a composite T2/T9 gate: a matching cached exact token
-// must still await the live authoritative lookup covered by the deadline.
-#[test]
-fn matching_cached_route_token_still_has_live_lookup_deadline() {
-    let (lookup_tx, lookup_rx) = mpsc::channel();
-    let peer = Peer::spawn(move |mut listener| async move {
-        let mut stream = listener.accept().await.unwrap();
-        read_handshake(&mut stream).await;
-        stream.write_all(&handshake()).await.unwrap();
-        read_lookup(&mut stream).await;
-        lookup_tx.send(()).unwrap();
-        std::future::pending::<()>().await;
-    });
-    let pool = ClientPool::new(Duration::from_secs(60));
-    let client = pool.acquire(&peer.address, None).unwrap();
-    let error = client
-        .acquire_route_token_with_deadline(
-            &expected(),
-            ROUTE_UID,
-            1,
-            deadline(Duration::from_millis(100)),
-        )
-        .err()
-        .expect("matching cached token must not bypass the live lookup");
-    lookup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_deadline(error, "route_acquire");
-    #[cfg(feature = "test-support")]
-    assert_eq!(client.pending_len_for_test(), 0);
-    assert!(pool.release_if_same(&peer.address, &client));
-    assert_eq!(pool.refcount(&peer.address), 0);
-    pool.close_all(Duration::from_secs(2));
-    peer.finish();
+    }
 }

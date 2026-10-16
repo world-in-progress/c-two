@@ -71,27 +71,6 @@ export interface C2IpcConnection {
 
 export type C2IpcConnect = (address: string) => C2IpcConnection | Promise<C2IpcConnection>;
 
-export interface C2NodeIpcSocket {
-  write(data: C2ByteArray, callback?: (error?: Error | null) => void): boolean | void;
-  on(event: "data", listener: (chunk: C2ByteArray) => void): this | void;
-  on(event: "error", listener: (error: Error) => void): this | void;
-  on(event: "close", listener: () => void): this | void;
-  once(event: "connect", listener: () => void): this | void;
-  once(event: "error", listener: (error: Error) => void): this | void;
-  once(event: "close", listener: () => void): this | void;
-  end?(): void;
-  destroy?(): void;
-}
-
-export interface C2NodeIpcNet {
-  createConnection(path: string): C2NodeIpcSocket;
-}
-
-export interface C2NodeIpcConnectOptions {
-  readonly net: C2NodeIpcNet;
-  readonly resolveEndpoint: (address: string) => string;
-}
-
 export interface C2IpcShmSegment {
   readonly name: string;
   readonly size: number;
@@ -104,6 +83,7 @@ export interface C2IpcResponseShmBlock {
   readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
+  readonly allocationId: bigint;
   readonly dedicated: boolean;
 }
 
@@ -120,6 +100,7 @@ export interface C2IpcRequestShmBlock {
   readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
+  readonly allocationId: bigint;
   readonly dedicated: boolean;
 }
 
@@ -335,7 +316,6 @@ interface C2IpcHandshake {
   readonly shmSegments: readonly C2IpcShmSegment[];
   readonly capabilityFlags: number;
   readonly serverIdentity: C2ServerIdentity;
-  readonly routes: readonly C2IpcRouteInfo[];
 }
 
 interface C2IpcOpenConnection {
@@ -361,6 +341,7 @@ interface C2IpcBuddyPayload {
   readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
+  readonly allocationId: bigint;
   readonly dedicated: boolean;
 }
 
@@ -1023,10 +1004,10 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
   };
 }
 
-const C2_IPC_HANDSHAKE_VERSION = 11;
+const C2_IPC_HANDSHAKE_VERSION = 12;
 const C2_IPC_FRAME_BODY_HEADER_BYTES = 12;
 const C2_IPC_FRAME_HEADER_BYTES = 16;
-const C2_IPC_BUDDY_PAYLOAD_BYTES = 15;
+const C2_IPC_BUDDY_PAYLOAD_BYTES = 23;
 const C2_IPC_BUDDY_FLAG_DEDICATED = 1 << 0;
 const C2_IPC_REPLY_CHUNK_META_BYTES = 16;
 const C2_IPC_REQUEST_CHUNK_HEADER_BYTES = 4;
@@ -1047,7 +1028,7 @@ const C2_IPC_FLAG_CALL_V2 = 1 << 7;
 const C2_IPC_FLAG_REPLY_V2 = 1 << 8;
 const C2_IPC_FLAG_CHUNKED = 1 << 9;
 const C2_IPC_FLAG_CHUNK_LAST = 1 << 10;
-// Canonical c2-wire MsgType discriminants; these are existing v11 controls.
+// Canonical c2-wire MsgType discriminants for the v12 handshake.
 const C2_IPC_ROUTE_LIST = 0x0e;
 const C2_IPC_ROUTE_LIST_ACK = 0x0f;
 const C2_IPC_ROUTE_LOOKUP = 0x10;
@@ -1058,12 +1039,6 @@ const C2_IPC_REPLY_STATUS_ERROR = 0x01;
 const C2_IPC_REPLY_STATUS_ROUTE_NOT_FOUND = 0x02;
 const C2_TEXT_ENCODER = new TextEncoder();
 const C2_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
-
-interface C2NodeIpcPendingRead {
-  readonly byteLength: number;
-  resolve(value: Uint8Array): void;
-  reject(error: C2IpcTransportError): void;
-}
 
 function requireUint8Array(value: unknown, label: string): Uint8Array {
   if (!(value instanceof Uint8Array)) {
@@ -1094,292 +1069,6 @@ function normalizeIpcConnect<Payload extends C2ResponsePayload>(value: C2IpcTran
     throw new C2IpcTransportError(`${label} connect must be a function.`);
   }
   return value.connect;
-}
-
-export function createNodeIpcConnect(options: C2NodeIpcConnectOptions): C2IpcConnect {
-  const net = normalizeNodeIpcNet(options, "C-Two Node IPC connect options");
-  if (typeof options.resolveEndpoint !== "function") {
-    throw new C2IpcTransportError("C-Two Node IPC requires the native endpoint resolver.");
-  }
-  return async (address: string): Promise<C2IpcConnection> => {
-    validateIpcAddress(address);
-    const socketPath = options.resolveEndpoint(address);
-    if (typeof socketPath !== "string" || socketPath.length === 0) {
-      throw new C2IpcTransportError("C-Two Node IPC socket path must be a non-empty string.");
-    }
-    let socket: C2NodeIpcSocket;
-    try {
-      socket = requireNodeIpcSocket(net.createConnection(socketPath));
-    } catch (error) {
-      if (error instanceof C2IpcTransportError) {
-        throw error;
-      }
-      throw new C2IpcTransportError(`C-Two Node IPC createConnection failed: ${String(error)}`);
-    }
-    return await wrapNodeIpcSocket(socket, socketPath);
-  };
-}
-
-function normalizeNodeIpcNet(options: C2NodeIpcConnectOptions, label: string): C2NodeIpcNet {
-  if (typeof options !== "object" || options === null) {
-    throw new C2IpcTransportError(`${label} must be an object.`);
-  }
-  const net = options.net;
-  if (typeof net !== "object" || net === null || typeof net.createConnection !== "function") {
-    throw new C2IpcTransportError(`${label} net.createConnection must be a function.`);
-  }
-  return net;
-}
-
-function requireNodeIpcSocket(value: unknown): C2NodeIpcSocket {
-  if (typeof value !== "object" || value === null) {
-    throw new C2IpcTransportError("C-Two Node IPC createConnection must return a socket object.");
-  }
-  const socket = value as Partial<C2NodeIpcSocket>;
-  if (typeof socket.write !== "function") {
-    throw new C2IpcTransportError("C-Two Node IPC socket write must be a function.");
-  }
-  if (typeof socket.on !== "function") {
-    throw new C2IpcTransportError("C-Two Node IPC socket on must be a function.");
-  }
-  if (typeof socket.once !== "function") {
-    throw new C2IpcTransportError("C-Two Node IPC socket once must be a function.");
-  }
-  if (socket.end !== undefined && typeof socket.end !== "function") {
-    throw new C2IpcTransportError("C-Two Node IPC socket end must be a function when provided.");
-  }
-  if (socket.destroy !== undefined && typeof socket.destroy !== "function") {
-    throw new C2IpcTransportError("C-Two Node IPC socket destroy must be a function when provided.");
-  }
-  return socket as C2NodeIpcSocket;
-}
-
-async function wrapNodeIpcSocket(socket: C2NodeIpcSocket, socketPath: string): Promise<C2IpcConnection> {
-  const chunks: C2ByteArray[] = [];
-  const pendingReads: C2NodeIpcPendingRead[] = [];
-  let bufferedBytes = 0;
-  let terminalError: C2IpcTransportError | undefined;
-  let terminalAllowsBufferedReads = false;
-  let closeRequested = false;
-
-  const fail = (error: C2IpcTransportError, allowBufferedReads = false): void => {
-    if (terminalError === undefined) {
-      terminalError = error;
-      terminalAllowsBufferedReads = allowBufferedReads;
-    }
-    while (pendingReads.length > 0) {
-      pendingReads.shift()?.reject(terminalError);
-    }
-  };
-
-  const take = (byteLength: number): Uint8Array => {
-    if (byteLength === 0) {
-      return new Uint8Array();
-    }
-    const first = chunks[0];
-    if (first !== undefined && first.byteLength === byteLength) {
-      chunks.shift();
-      bufferedBytes -= byteLength;
-      return first;
-    }
-    if (first !== undefined && first.byteLength > byteLength) {
-      const out = first.subarray(0, byteLength);
-      chunks[0] = first.subarray(byteLength);
-      bufferedBytes -= byteLength;
-      return out;
-    }
-    const out = new Uint8Array(byteLength);
-    let offset = 0;
-    while (offset < byteLength) {
-      const chunk = chunks.shift();
-      if (chunk === undefined) {
-        throw new C2IpcTransportError("C-Two Node IPC internal read buffer underflow.");
-      }
-      const remaining = byteLength - offset;
-      if (chunk.byteLength <= remaining) {
-        out.set(chunk, offset);
-        offset += chunk.byteLength;
-        continue;
-      }
-      out.set(chunk.subarray(0, remaining), offset);
-      chunks.unshift(chunk.subarray(remaining));
-      offset += remaining;
-    }
-    bufferedBytes -= byteLength;
-    return out;
-  };
-
-  const drain = (): void => {
-    while (pendingReads.length > 0 && bufferedBytes >= pendingReads[0].byteLength) {
-      const pending = pendingReads.shift();
-      if (pending !== undefined) {
-        pending.resolve(take(pending.byteLength));
-      }
-    }
-  };
-
-  socket.on("data", (chunk: Uint8Array) => {
-    if (terminalError !== undefined) {
-      return;
-    }
-    let bytes: Uint8Array;
-    try {
-      bytes = requireNodeIpcDataChunk(chunk);
-    } catch (error) {
-      fail(error instanceof C2IpcTransportError ? error : new C2IpcTransportError(String(error)));
-      return;
-    }
-    if (bytes.byteLength === 0) {
-      return;
-    }
-    chunks.push(bytes);
-    bufferedBytes += bytes.byteLength;
-    drain();
-  });
-  socket.on("error", (error: Error) => {
-    fail(new C2IpcTransportError(`C-Two Node IPC socket error: ${String(error)}`));
-  });
-  socket.on("close", () => {
-    const reason = closeRequested
-      ? "C-Two Node IPC socket is closed."
-      : "C-Two Node IPC socket closed before the requested bytes were read.";
-    fail(new C2IpcTransportError(reason), !closeRequested);
-  });
-
-  await waitForNodeIpcConnect(socket, socketPath);
-
-  return {
-    async write(data: Uint8Array): Promise<void> {
-      const bytes = requireUint8Array(data, "C-Two Node IPC write data");
-      if (terminalError !== undefined) {
-        throw terminalError;
-      }
-      await writeNodeIpcSocket(socket, bytes);
-      if (terminalError !== undefined) {
-        throw terminalError;
-      }
-    },
-
-    readExactly(byteLength: number): Uint8Array | Promise<Uint8Array> {
-      if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
-        throw new C2IpcTransportError(`C-Two Node IPC read byteLength ${byteLength} is invalid.`);
-      }
-      if (terminalError !== undefined && !terminalAllowsBufferedReads) {
-        throw terminalError;
-      }
-      if (bufferedBytes >= byteLength) {
-        return take(byteLength);
-      }
-      if (terminalError !== undefined) {
-        throw terminalError;
-      }
-      return new Promise<Uint8Array>((resolve, reject) => {
-        pendingReads.push({ byteLength, resolve, reject });
-        drain();
-        if (terminalError !== undefined) {
-          fail(terminalError);
-        }
-      });
-    },
-
-    async close(): Promise<void> {
-      if (closeRequested) {
-        return;
-      }
-      closeRequested = true;
-      fail(new C2IpcTransportError("C-Two Node IPC socket is closed."));
-      let closeError: unknown;
-      if (socket.end !== undefined) {
-        try {
-          socket.end();
-        } catch (error) {
-          closeError = error;
-        }
-      }
-      if (socket.destroy !== undefined) {
-        try {
-          socket.destroy();
-        } catch (error) {
-          closeError ??= error;
-        }
-      }
-      if (closeError !== undefined) {
-        throw new C2IpcTransportError(`C-Two Node IPC close failed: ${String(closeError)}`);
-      }
-    },
-  };
-}
-
-function requireNodeIpcDataChunk(value: unknown): Uint8Array {
-  if (value instanceof Uint8Array) {
-    return value;
-  }
-  if (value instanceof ArrayBuffer) {
-    return new Uint8Array(value);
-  }
-  throw new C2IpcTransportError("C-Two Node IPC socket data chunk must be a Uint8Array.");
-}
-
-function waitForNodeIpcConnect(socket: C2NodeIpcSocket, socketPath: string): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const finish = (error?: C2IpcTransportError): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      if (error !== undefined) {
-        reject(error);
-        return;
-      }
-      resolve();
-    };
-    try {
-      socket.once("connect", () => finish());
-      socket.once("error", (error: Error) => finish(new C2IpcTransportError(`C-Two Node IPC connect failed for ${socketPath}: ${String(error)}`)));
-      socket.once("close", () => finish(new C2IpcTransportError(`C-Two Node IPC socket closed before connect completed for ${socketPath}.`)));
-    } catch (error) {
-      finish(new C2IpcTransportError(`C-Two Node IPC connect setup failed: ${String(error)}`));
-    }
-  });
-}
-
-function writeNodeIpcSocket(socket: C2NodeIpcSocket, data: Uint8Array): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-    let waitForCallback = false;
-    let callbackCalled = false;
-    let callbackError: Error | null | undefined;
-    const finish = (error?: Error | null): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      if (error !== undefined && error !== null) {
-        reject(new C2IpcTransportError(`C-Two Node IPC socket write failed: ${String(error)}`));
-        return;
-      }
-      resolve();
-    };
-    const callback = (error?: Error | null): void => {
-      callbackCalled = true;
-      callbackError = error;
-      if (waitForCallback) {
-        finish(error);
-      }
-    };
-    let result: boolean | void;
-    try {
-      result = socket.write(data, callback);
-    } catch (error) {
-      finish(error instanceof Error ? error : new Error(String(error)));
-      return;
-    }
-    waitForCallback = result === false;
-    if (!waitForCallback || callbackCalled) {
-      finish(callbackError);
-    }
-  });
 }
 
 function normalizeIpcResponseShmReader(value: C2IpcResponseShmReader | undefined, label: string): C2IpcResponseShmReader | undefined {
@@ -2081,6 +1770,7 @@ function requireIpcRequestShmBlock(value: unknown, expectedByteLength: number, r
   const generation = block.generation;
   const offset = block.offset;
   const byteLength = block.byteLength;
+  const allocationId = block.allocationId;
   const dedicated = block.dedicated;
   if (typeof segmentIndex !== "number" || !Number.isSafeInteger(segmentIndex) || segmentIndex < 0 || segmentIndex > 0xffff) {
     throw new C2IpcTransportError("C-Two IPC requestShmWriter block segmentIndex must be a u16 integer.");
@@ -2103,6 +1793,7 @@ function requireIpcRequestShmBlock(value: unknown, expectedByteLength: number, r
   if (dedicated && offset !== 0) {
     throw new C2IpcTransportError("C-Two IPC requestShmWriter dedicated block offset must be 0.");
   }
+  requireIpcAllocationId(allocationId, dedicated, "requestShmWriter block");
   if (!dedicated) {
     const segment = requestShmWriter.segments[segmentIndex];
     if (segment === undefined) {
@@ -2113,7 +1804,7 @@ function requireIpcRequestShmBlock(value: unknown, expectedByteLength: number, r
       throw new C2IpcTransportError(`C-Two IPC requestShmWriter block range ${offset}+${byteLength} exceeds segment ${segmentIndex} size ${segmentSize}.`);
     }
   }
-  return { segmentIndex, generation, offset, byteLength, dedicated };
+  return { segmentIndex, generation, offset, byteLength, allocationId, dedicated };
 }
 
 function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | undefined {
@@ -2125,6 +1816,7 @@ function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | un
   const generation = block.generation;
   const offset = block.offset;
   const byteLength = block.byteLength;
+  const allocationId = block.allocationId;
   const dedicated = block.dedicated;
   if (
     typeof segmentIndex !== "number" ||
@@ -2144,11 +1836,22 @@ function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | un
     !Number.isSafeInteger(byteLength) ||
     byteLength <= 0 ||
     byteLength > 0xffffffff ||
-    typeof dedicated !== "boolean"
+    typeof dedicated !== "boolean" ||
+    !isIpcAllocationId(allocationId, dedicated)
   ) {
     return undefined;
   }
-  return { segmentIndex, generation, offset, byteLength, dedicated };
+  return { segmentIndex, generation, offset, byteLength, allocationId: allocationId as bigint, dedicated };
+}
+
+function isIpcAllocationId(value: unknown, dedicated: boolean): value is bigint {
+  return typeof value === "bigint" && value >= 0n && value <= 0xffffffffffffffffn && (dedicated ? value === 0n : value !== 0n);
+}
+
+function requireIpcAllocationId(value: unknown, dedicated: boolean, label: string): asserts value is bigint {
+  if (!isIpcAllocationId(value, dedicated)) {
+    throw new C2IpcTransportError(`C-Two IPC ${label} allocationId must be a nonzero u64 bigint for buddy memory or 0n for dedicated memory.`);
+  }
 }
 
 function encodeIpcBuddyPayload(block: C2IpcRequestShmBlock): Uint8Array {
@@ -2158,6 +1861,7 @@ function encodeIpcBuddyPayload(block: C2IpcRequestShmBlock): Uint8Array {
     writeU32LE(block.offset),
     writeU32LE(block.byteLength),
     new Uint8Array([block.dedicated ? C2_IPC_BUDDY_FLAG_DEDICATED : 0]),
+    writeU64LEBigInt(block.allocationId, "allocation_id"),
   ]);
 }
 
@@ -2381,11 +2085,10 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     throw new C2IpcTransportError("C-Two IPC handshake is missing server identity.");
   }
   const routeCount = readU16("route count");
-  const routes: C2IpcRouteInfo[] = [];
   for (let routeIndex = 0; routeIndex < routeCount; routeIndex += 1) {
     const name = readText(`route ${routeIndex} name`);
     const routeUid = readText(`route ${routeIndex} route_uid`);
-    const routeRevision = readU64(`route ${routeIndex} route_revision`);
+    readU64(`route ${routeIndex} route_revision`);
     const crmNs = readText(`route ${routeIndex} crm_ns`);
     const crmName = readText(`route ${routeIndex} crm_name`);
     const crmVer = readText(`route ${routeIndex} crm_ver`);
@@ -2407,25 +2110,11 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     if (maxPayloadSize <= 0) {
       throw new C2IpcTransportError(`C-Two IPC route ${routeIndex} max_payload_size must be positive.`);
     }
-    const methods: C2IpcMethodInfo[] = [];
     for (let methodIndex = 0; methodIndex < methodCount; methodIndex += 1) {
       const methodName = readText(`route ${routeIndex} method ${methodIndex} name`);
-      const index = readU16(`route ${routeIndex} method ${methodIndex} index`);
+      readU16(`route ${routeIndex} method ${methodIndex} index`);
       requireMethodPathValue(methodName);
-      methods.push({ name: methodName, index });
     }
-    routes.push({
-      name,
-      routeUid,
-      routeRevision,
-      crmNs,
-      crmName,
-      crmVer,
-      abiHash,
-      signatureHash,
-      maxPayloadSize,
-      methods,
-    });
   }
   if (offset !== payload.byteLength) {
     throw new C2IpcTransportError("C-Two IPC handshake contains trailing bytes.");
@@ -2435,7 +2124,6 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     shmSegments,
     capabilityFlags,
     serverIdentity: { serverId, serverInstanceId },
-    routes,
   };
 }
 
@@ -2672,11 +2360,14 @@ function decodeIpcBuddyPayload(payload: Uint8Array): C2IpcBuddyPayload {
   if (dedicated ? generation !== 0 : generation === 0) {
     throw new C2IpcTransportError("C-Two IPC buddy generation must be positive; dedicated generation must be 0.");
   }
+  const allocationId = readU64LEBigInt(payload, 15);
+  requireIpcAllocationId(allocationId, dedicated, "buddy payload");
   return {
     segmentIndex: readU16LE(payload, 0),
     generation,
     offset: readU32LE(payload, 6),
     byteLength,
+    allocationId,
     dedicated,
   };
 }
@@ -2699,6 +2390,7 @@ function buildIpcResponseShmBlock(handshake: C2IpcHandshake, buddy: C2IpcBuddyPa
     generation: buddy.generation,
     offset: buddy.offset,
     byteLength: buddy.byteLength,
+    allocationId: buddy.allocationId,
     dedicated: buddy.dedicated,
   };
 }
@@ -3005,6 +2697,19 @@ function writeU64LE(value: number, field: string): Uint8Array {
   const out = new Uint8Array(8);
   new DataView(out.buffer).setBigUint64(0, BigInt(value), true);
   return out;
+}
+
+function writeU64LEBigInt(value: bigint, field: string): Uint8Array {
+  if (typeof value !== "bigint" || value < 0n || value > 0xffffffffffffffffn) {
+    throw new C2IpcTransportError(`C-Two IPC ${field} must be a u64 bigint.`);
+  }
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setBigUint64(0, value, true);
+  return out;
+}
+
+function readU64LEBigInt(value: Uint8Array, offset: number): bigint {
+  return new DataView(value.buffer, value.byteOffset, value.byteLength).getBigUint64(offset, true);
 }
 
 function readU32LE(value: Uint8Array, offset: number): number {

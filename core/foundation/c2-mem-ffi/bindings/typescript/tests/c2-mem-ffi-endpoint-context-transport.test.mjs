@@ -7,7 +7,6 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  C2MemFfiEndpointContextUnsupportedError,
   captureLocalIpcEndpointContext,
   createBundledC2MemFfiNodeRuntime,
   createNodeIpcConnect,
@@ -295,8 +294,7 @@ if (process.argv[2] === '--endpoint-context-child') {
   } catch (error) {
     console.log(JSON.stringify({ kind: 'error', message: String(error),
       phase: error.result?.phase, rawOsError: error.result?.rawOsError,
-      fixtureMessage: error.result?.message,
-      unsupported: error instanceof C2MemFfiEndpointContextUnsupportedError }));
+      fixtureMessage: error.result?.message }));
     process.exitCode = 1;
   }
 } else {
@@ -318,7 +316,7 @@ if (process.argv[2] === '--endpoint-context-child') {
     assert.equal(output.error, undefined, `transport child did not finish: ${output.error}`);
     const result = JSON.parse(output.stdout.trim());
     const deniedBind = result.phase === 'bind' && [1, 13].includes(result.rawOsError);
-    if (explicitContainer === undefined && (deniedBind || result.unsupported)) {
+    if (explicitContainer === undefined && deniedBind) {
       t.skip(`Real transport not run: ${result.message}. Host gate: ${hostCommand}`);
       return;
     }

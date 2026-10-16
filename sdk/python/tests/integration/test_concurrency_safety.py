@@ -13,6 +13,8 @@ import threading
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
 from c_two.transport.server import Server
 from c_two.transport.client.util import ping
@@ -96,7 +98,7 @@ class TestConcurrentCallSafety:
             'pool_segment_size': 1 << 20,  # 1MB
             'max_pool_segments': 2,
         }
-        server = Server(bind_address=addr, ipc_overrides=ipc_overrides)
+        server = local_server(addr, ipc_overrides=ipc_overrides)
         server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
@@ -140,7 +142,7 @@ class TestConcurrentCallSafety:
             'pool_segment_size': 1 << 20,
             'max_pool_segments': 2,
         }
-        server = Server(bind_address=addr, ipc_overrides=ipc_overrides)
+        server = local_server(addr, ipc_overrides=ipc_overrides)
         server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
@@ -184,7 +186,7 @@ class TestDoubleShutdown:
 
     def test_proxy_double_close(self):
         addr = _next_addr()
-        server = Server(bind_address=addr)
+        server = local_server(addr)
         server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
@@ -206,7 +208,7 @@ class TestDoubleShutdown:
             'pool_segment_size': 65536,
             'max_pool_segments': 1,
         }
-        server = Server(bind_address=addr, ipc_overrides=ipc_overrides)
+        server = local_server(addr, ipc_overrides=ipc_overrides)
         server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)

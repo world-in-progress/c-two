@@ -1,6 +1,6 @@
 //! Per-client connection state.
 //!
-//! Tracks handshake status, SHM segments, activity timestamps, and
+//! Tracks handshake status, the peer SHM cache, activity timestamps, and
 //! in-flight request counting for one IPC peer.
 
 use parking_lot::{Mutex, RwLock};
@@ -19,18 +19,12 @@ use c2_mem::{FreeResult, MemPool};
 // Peer SHM state (set once during handshake, read concurrently)
 // ---------------------------------------------------------------------------
 
-/// Minimum buddy segment size required by the allocator (2 × min_block_size).
+/// Valid initialization geometry only; mapped backing headers supply the
+/// peer's actual geometry. This does not allocate or size a peer mapping.
 const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
 
 struct PeerShmState {
     prefix: String,
-    segment_names: Vec<String>,
-    segment_sizes: Vec<u32>,
-    /// First buddy segment size the peer announced, if any. Diagnostic only:
-    /// backings are opened with the frame's advertised data span and the true
-    /// geometry comes from the SHM mapping header, so no local default is ever
-    /// substituted for actual peer geometry.
-    buddy_segment_size: usize,
     /// MemPool opened over the client's SHM segments for data access + free.
     pool: Option<Arc<RwLock<MemPool>>>,
 }
@@ -39,9 +33,6 @@ impl PeerShmState {
     fn new() -> Self {
         Self {
             prefix: String::new(),
-            segment_names: Vec::new(),
-            segment_sizes: Vec::new(),
-            buddy_segment_size: MIN_BUDDY_SEGMENT_SIZE,
             pool: None,
         }
     }
@@ -95,7 +86,7 @@ pub struct Connection {
     handshake_done: AtomicBool,
     chunked_capable: AtomicBool,
 
-    /// Client's SHM pool state — prefix, segment names/sizes, opened MemPool.
+    /// Client's SHM pool incarnation prefix and opened peer cache.
     peer_shm: Mutex<PeerShmState>,
 
     /// Monotonic timestamp of the last frame received/sent.
@@ -165,48 +156,14 @@ impl Connection {
         self.peer_shm.lock().prefix.clone()
     }
 
-    /// Return cloned list of remote segment names.
-    pub fn remote_segment_names(&self) -> Vec<String> {
-        self.peer_shm.lock().segment_names.clone()
-    }
-
-    /// Return cloned list of remote segment sizes.
-    /// Effective buddy segment size after clamping (test-only accessor).
-    #[cfg(test)]
-    pub fn buddy_segment_size(&self) -> usize {
-        self.peer_shm.lock().buddy_segment_size
-    }
-
-    pub fn remote_segment_sizes(&self) -> Vec<u32> {
-        self.peer_shm.lock().segment_sizes.clone()
-    }
-
-    /// Initialise peer SHM state from handshake data.
+    /// Initialise the peer SHM cache from its handshake pool incarnation.
     ///
     /// Always creates a `MemPool` with the peer's prefix so that later
     /// `read_peer_data` / `free_peer_block` can lazy-open segments by
     /// resolving names through MemPool's prefix, index, and generation authority.
-    pub fn init_peer_shm(&self, prefix: String, segments: Vec<(String, u32)>) {
+    pub fn init_peer_shm(&self, prefix: String) {
         let mut state = self.peer_shm.lock();
         state.prefix = prefix;
-        state.segment_names = segments.iter().map(|(n, _)| n.clone()).collect();
-        state.segment_sizes = segments.iter().map(|(_, s)| *s).collect();
-
-        // Derive buddy segment size from first segment, or keep default.
-        if let Some(&(_, size)) = segments.first() {
-            state.buddy_segment_size = size as usize;
-        }
-
-        // Defend against undersized segments from peer handshake.
-        if state.buddy_segment_size < MIN_BUDDY_SEGMENT_SIZE {
-            warn!(
-                conn_id = self.conn_id,
-                segment_size = state.buddy_segment_size,
-                min_required = MIN_BUDDY_SEGMENT_SIZE,
-                "peer buddy segment too small, clamping to minimum",
-            );
-            state.buddy_segment_size = MIN_BUDDY_SEGMENT_SIZE;
-        }
 
         // Receive-side cache: `buddy_enabled` is irrelevant (peer pools never
         // allocate) and `min_retained_segments` is 0 so cached views retire as
@@ -216,7 +173,7 @@ impl Connection {
         // `max_pool_segments` at the same constant) is accepted here while
         // arbitrary counts stay rejected by `ensure_peer_segment`.
         let cfg = PoolConfig {
-            segment_size: state.buddy_segment_size,
+            segment_size: MIN_BUDDY_SEGMENT_SIZE,
             min_block_size: 4096,
             max_segments: MAX_IPC_POOL_SEGMENTS as usize,
             max_dedicated_segments: 4,
@@ -293,6 +250,7 @@ impl Connection {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     ) -> FreeResult {
         let state = self.peer_shm.lock();
         // Lazy-open the segment before freeing.
@@ -310,7 +268,14 @@ impl Connection {
             match pool
                 .validate_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
                 .and_then(|_| {
-                    pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
+                    pool.free_at(
+                        seg_idx as u32,
+                        generation,
+                        offset,
+                        data_size,
+                        is_dedicated,
+                        allocation_id,
+                    )
                 }) {
                 Ok(result) => return result,
                 Err(e) => {
@@ -423,75 +388,16 @@ mod tests {
         assert!(!conn.handshake_done());
         assert!(!conn.chunked_capable());
         assert!(conn.peer_prefix().is_empty());
-        assert!(conn.remote_segment_names().is_empty());
-        assert!(conn.remote_segment_sizes().is_empty());
+        assert!(conn.peer_pool_arc().is_none());
         assert_eq!(conn.inflight_count(), 0);
     }
 
     #[test]
-    fn init_peer_shm_stores_state() {
+    fn init_peer_shm_initializes_unmapped_peer_pool() {
         let conn = Connection::new(1);
-        // segment_size must be >= 2 * min_block_size (4096), so use 8192+.
-        conn.init_peer_shm(
-            "/cc3b_test".into(),
-            vec![("seg0".into(), 8192), ("seg1".into(), 16384)],
-        );
-        assert_eq!(conn.peer_prefix(), "/cc3b_test");
-        assert_eq!(conn.remote_segment_names(), vec!["seg0", "seg1"]);
-        assert_eq!(conn.remote_segment_sizes(), vec![8192, 16384]);
-    }
-
-    #[test]
-    fn init_peer_shm_empty_segments() {
-        let conn = Connection::new(2);
-        conn.init_peer_shm("prefix".into(), vec![]);
+        conn.init_peer_shm("prefix".into());
         assert_eq!(conn.peer_prefix(), "prefix");
-        assert!(conn.remote_segment_names().is_empty());
-    }
-
-    #[test]
-    fn init_peer_shm_clamps_undersized_segment() {
-        // Peer sends segment_size < 2*min_block_size. Should not panic;
-        // init_peer_shm clamps to MIN_BUDDY_SEGMENT_SIZE instead.
-        let conn = Connection::new(3);
-        conn.init_peer_shm("/cc3b_tiny".into(), vec![("seg0".into(), 4096)]);
-        assert_eq!(conn.peer_prefix(), "/cc3b_tiny");
-        assert_eq!(conn.remote_segment_names(), vec!["seg0"]);
-        assert_eq!(
-            conn.buddy_segment_size(),
-            MIN_BUDDY_SEGMENT_SIZE,
-            "undersized segment must be clamped to MIN_BUDDY_SEGMENT_SIZE",
-        );
-    }
-
-    #[test]
-    fn init_peer_shm_clamps_zero_segment() {
-        let conn = Connection::new(4);
-        conn.init_peer_shm("/cc3b_zero".into(), vec![("z0".into(), 0)]);
-        assert_eq!(conn.buddy_segment_size(), MIN_BUDDY_SEGMENT_SIZE,);
-    }
-
-    #[test]
-    fn init_peer_shm_clamps_boundary_below() {
-        // 8191 is 1 below MIN_BUDDY_SEGMENT_SIZE (8192) — must clamp.
-        let conn = Connection::new(5);
-        conn.init_peer_shm("/cc3b_8191".into(), vec![("s0".into(), 8191)]);
-        assert_eq!(conn.buddy_segment_size(), MIN_BUDDY_SEGMENT_SIZE,);
-    }
-
-    #[test]
-    fn init_peer_shm_accepts_boundary_exact() {
-        // 8192 == MIN_BUDDY_SEGMENT_SIZE — should pass through unchanged.
-        let conn = Connection::new(6);
-        conn.init_peer_shm("/cc3b_8192".into(), vec![("s0".into(), 8192)]);
-        assert_eq!(conn.buddy_segment_size(), 8192);
-    }
-
-    #[test]
-    fn init_peer_shm_accepts_large_segment() {
-        let conn = Connection::new(7);
-        conn.init_peer_shm("/cc3b_big".into(), vec![("s0".into(), 65536)]);
-        assert_eq!(conn.buddy_segment_size(), 65536);
+        assert_eq!(conn.peer_pool_arc().unwrap().read().segment_count(), 0);
     }
 
     #[test]

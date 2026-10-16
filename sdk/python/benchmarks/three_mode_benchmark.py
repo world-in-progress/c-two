@@ -21,18 +21,14 @@ from __future__ import annotations
 
 import argparse
 import gc
-import json
 import math
 import os
 import statistics
 import sys
 import time
-import urllib.error
-import urllib.request
 
 import c_two as cc
-from c_two.config.ipc import _resolve_server_ipc_config
-from c_two.crm.contract import CRMContract, crm_contract
+import _relay_support as relay
 from c_two.transport.registry import _ProcessRegistry
 
 # Configurable via CLI --segment-size (bytes)
@@ -96,111 +92,8 @@ WARMUP = 3
 _ipc_counter = 0
 _relay_port = 19960 + (os.getpid() % 100)
 
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
-def _relay_help(relay_url: str) -> str:
-    bind = relay_url.removeprefix('http://').removeprefix('https://')
-    return (
-        f'External c3 relay is not reachable at {relay_url}. '
-        f'Start it first with `c3 relay --bind {bind}` after running '
-        '`python tools/dev/c3_tool.py --build --link` from the source checkout.'
-    )
-
-
-def _require_external_relay(relay_url: str) -> None:
-    try:
-        with _NO_PROXY_OPENER.open(f'{relay_url}/health', timeout=5) as resp:
-            if resp.status >= 400:
-                raise OSError(f'HTTP {resp.status}')
-    except Exception as exc:
-        raise SystemExit(_relay_help(relay_url)) from exc
-
-
-def _post_json(url: str, payload: dict[str, object], timeout: float = 5.0) -> int:
-    data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method='POST',
-        headers={'Content-Type': 'application/json'},
-    )
-    with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
-        if resp.status >= 400:
-            raise OSError(f'HTTP {resp.status}')
-        return resp.status
-
-
-def _register_relay_upstream(
-    relay_url: str,
-    name: str,
-    address: str,
-    server_id: str,
-    server_instance_id: str,
-    expected: CRMContract,
-    max_payload_size: int,
-) -> None:
-    _post_json(
-        f'{relay_url}/_register',
-        {
-            'name': name,
-            'server_id': server_id,
-            'server_instance_id': server_instance_id,
-            'address': address,
-            'crm_ns': expected.crm_ns,
-            'crm_name': expected.crm_name,
-            'crm_ver': expected.crm_ver,
-            'abi_hash': expected.abi_hash,
-            'signature_hash': expected.signature_hash,
-            'max_payload_size': max_payload_size,
-        },
-    )
-
-
-def _unregister_relay_upstream(relay_url: str, name: str, server_id: str) -> None:
-    _post_json(f'{relay_url}/_unregister', {'name': name, 'server_id': server_id})
-
-
-def _best_effort_unregister_relay_upstream(
-    relay_url: str,
-    name: str,
-    server_id: str,
-) -> None:
-    try:
-        _unregister_relay_upstream(relay_url, name, server_id)
-    except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            print(f'Warning: failed to unregister relay route {name!r}: {exc}', file=sys.stderr)
-    except Exception as exc:
-        print(f'Warning: failed to unregister relay route {name!r}: {exc}', file=sys.stderr)
-
-
 def _should_run_relay(_payload_size: int) -> bool:
     return True
-
-
-def _best_effort_unregister_local(name: str) -> None:
-    try:
-        cc.unregister(name)
-    except Exception as exc:
-        print(f'Warning: failed to unregister local route {name!r}: {exc}', file=sys.stderr)
-
-
-def _server_instance_id_for(name: str, address: str, crm_class: type) -> str:
-    expected = crm_contract(crm_class)
-    registry = _ProcessRegistry.get()
-    client = registry._runtime_session.acquire_ipc_client(  # noqa: SLF001
-        address,
-        name,
-        *expected.native_args(),
-    )
-    try:
-        instance_id = client.server_instance_id
-        if not isinstance(instance_id, str) or not instance_id:
-            raise RuntimeError('registered server did not expose server_instance_id')
-        return instance_id
-    finally:
-        registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
 
 
 def _cleanup():
@@ -300,57 +193,24 @@ def bench_relay(payload_size: int) -> float | None:
     _ipc_counter += 1
     _ProcessRegistry.reset()
     relay_url = f'http://127.0.0.1:{_relay_port}'
-    _require_external_relay(relay_url)
     route_name = f'echo_relay_{os.getpid()}_{_ipc_counter}'
-    local_registered = False
-    route_registered = False
-    server_id: str | None = None
 
-    try:
+    with relay.session(relay_url):
         ipc_overrides = {
             'pool_segment_size': _SEGMENT_SIZE,
             'max_pool_segments': _MAX_SEGMENTS,
         }
-        server_config = _resolve_server_ipc_config(ipc_overrides)
-        max_payload_size = int(server_config['max_payload_size'])
         cc.set_server(ipc_overrides=ipc_overrides)
         cc.set_client(ipc_overrides=ipc_overrides)
         cc.register(Echo, EchoImpl(), name=route_name)
-        local_registered = True
-        address = cc.server_address()
-        server_id = cc.server_id()
-        if server_id is None:
-            raise RuntimeError('registered server did not expose server_id')
-        _wait_sock(address)
-        server_instance_id = _server_instance_id_for(route_name, address, Echo)
-        expected = crm_contract(Echo)
-
-        _register_relay_upstream(
-            relay_url,
-            route_name,
-            address,
-            server_id,
-            server_instance_id,
-            expected,
-            max_payload_size,
-        )
-        route_registered = True
 
         payload = b'\xAB' * payload_size
         try:
-            crm = cc.connect(Echo, name=route_name, address=relay_url)
-            result_ms = _measure(crm, payload, _rounds(payload_size))
-            cc.close(crm)
-            return result_ms
+            with cc.connect(Echo, name=route_name, address=relay_url) as crm:
+                return _measure(crm, payload, _rounds(payload_size))
         except Exception as exc:
             print(f'  [relay FAILED: {exc}]', file=sys.stderr)
             return None
-    finally:
-        if route_registered and server_id is not None:
-            _best_effort_unregister_relay_upstream(relay_url, route_name, server_id)
-        if local_registered:
-            _best_effort_unregister_local(route_name)
-        cc.shutdown()
 
 
 # ---------------------------------------------------------------------------

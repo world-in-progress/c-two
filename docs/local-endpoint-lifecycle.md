@@ -4,11 +4,19 @@
 
 本文说明原生端点所有权、运行器接入与回收规则。目录配置见 [配置指南](configuration.md#本地端点位置与平台差异)。
 
-本地端点由 Rust `c2-config` 统一派生，SDK、relay 和 c3 使用同一上下文。Unix 默认路径为 `/tmp/c2-<uidhex>/<32 字符标识>`，最终目录包含 nonce gate/marker 与可退休的监听租约；原 gate inode 保持固定直到监听租约释放。Windows 使用当前登录 SID 的 Named Pipe 和不可继承的内核监听租约。调用方传逻辑 `ipc://` 地址，系统自动选择后端；凭据中的 `managed-v2` / `named-pipe` 是格式元数据。
+本地端点由 Rust `c2-config` 统一派生，SDK、relay 和 c3 使用同一上下文。Unix 默认路径为 `/tmp/c2-<uidhex>/<32 字符标识>`，协调记录包含 nonce gate/marker 与可退休的监听租约；原 gate inode 保持固定直到监听租约释放。Windows 使用当前登录 SID 的 Named Pipe 和不可继承的内核监听租约。调用方传逻辑 `ipc://` 地址，系统自动选择后端；凭据中的 `managed-v2` / `named-pipe` 是格式元数据。
 
 Unix 的最终端点目录由显式代码 `cc.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外用户目录、版本目录或 `.sock` 后缀。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 尝试前冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前登录 SID 的 Named Pipe，明确拒绝 Unix root 配置。
 
-macOS 还会检查目录句柄上的扩展 ACL：只读、遍历和 deny 条目可用；授予新增、删除、修改属性或权限等能力的 allow 条目会被拒绝，包括继承条目。启动失败也会释放本次监听租约，重复文件描述符不会继续占有该租约。
+macOS 还会检查目录句柄上的扩展 ACL：只读、遍历和 deny 条目可用；授予新增、删除、修改属性或权限等能力的 allow 条目会被拒绝，包括继承条目。启动失败会显式释放监听租约锁，重复文件描述符不会继续占有该锁。
+
+macOS 默认命名空间的 socket 路径仍在 `/tmp/c2-<uidhex>`；只有 `.gate`、`.gate.marker` 和 `<标识>.lease` 存放到 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination`。这是系统提供的非临时用户目录，查询发生在原生 I/O 阶段。现存默认目录的路径别名按目录身份共用同一协调器，公开 namespace id 和凭据格式不变；显式别名缺失时仍由应用预建。Linux 与非默认自定义 root 的记录仍与 socket 同目录。
+
+双目录使用同一 gate 锁并分别验证目录与对象身份，监听器还持有原目录句柄直到租约释放。正常 close/Drop 回收自身 socket 和 lease；异常退出后复用精确 reap、有预算的 sweep 或后续 bind。重启或系统清理使 socket 目录消失后，完整且已解锁的 lease 仍可回收，维护接口不会为此重建 socket 目录；存活租约仍拒绝第二次绑定。目录替换、损坏记录继续拒绝删除。
+
+协调记录本身有清理场合：每个端点的 lease 随上述原生收尾撤回，失败回滚只撤回本次创建项；损坏历史 lease 保留待单独处理。gate/marker 是固定协调身份，在线不删除；没有新增后台清扫。切换旧版布局须先停止并禁止重启所有旧进程，将旧 socket 目录完整归档，再由新版初始化同名目录。该操作须单独安排；新版不在线迁移历史记录，也不与旧版共享该命名空间。
+
+Unix bind 初始化失败时，只撤回本次新建且仍由原目录、gate 和文件身份确认的 lease；若已经绑定 socket，须先确认该 socket 已安全撤回。既有 lease、替换项及无法确认身份的对象继续保留。这一回滚利用当前调用仍持有的创建证明，不扩大历史损坏记录的 reap/sweep 权限，也不保证进程在初始化中崩溃后的自动清理。
 
 Unix 凭据统一使用既有 schema 3，记录最终 root、namespace id、incarnation 与 socket 身份；编码、解码和 CLI 读取共用 32 KiB 上限。Windows 保持 kernel-managed schema 1。inspect/reap/sweep 使用凭据捕获的上下文，显式传入不一致的 root 在访问目标前被拒绝。凭据中的 socket 完整路径由原生配置派生，不作为输入字段；凭据自身不授予删除权限。
 
@@ -22,7 +30,7 @@ cc.shutdown(timeout=...) 返回原生结构化完成结果；直连 IPC admin sh
 
 需要续扫时使用 cc.sweep_endpoints(addresses=[本次运行的逻辑地址], max_entries=64, max_ms=10) 的 context manager 和 next_batch()；只在原生报告 round_complete 时记为本轮完成，中断或命名空间变化单独处理。c3 endpoint inspect/reap/sweep 调用同一原生机制，sweep 可重复传 --address，需要非默认 root 时传 --ipc-root（或环境变量 C2_IPC_ROOT）。运行器不拼 OS 路径，不直接 unlink。
 
-Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己的本地上游域上下文，一个 relay 本地域对应一个 root，上游资源与它使用一致配置；不同 root 可运行不同 relay。客户端在发现请求中携带 Core 派生的本地 namespace 标识（不含原始路径，不是授权凭据）；仅当 anchor 在本机、标识与 relay 本地上游上下文匹配且握手身份/契约均匹配时，自定义 root 路由才可能提供直连 IPC 候选，否则只提供 HTTP。namespace 不匹配是路径选择条件，不是路由失效：HTTP 路由保持可用，默认 root 的既有 IPC 快路径不变。Windows 侧由 backend 与当前 logon scope 构成标识，实际权限仍由 OS DACL、握手身份与完整路由契约检查。
+Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己的本地上游域上下文，一个 relay 本地域对应一个 root，上游资源与它使用一致配置；不同 root 可运行不同 relay。客户端在发现请求中携带 Core 派生的本地 namespace 标识（不含原始路径，不是授权凭据）。`/_resolve` 响应的 `x-c2-local-namespace` 头是整批路由的唯一 namespace 来源，JSON 路由不再附加该字段。Rust/Core 客户端只在 anchor 为本机、响应头与本地上下文匹配且握手身份、契约与代际检查均通过时接受 IPC。缺头或不匹配时使用 HTTP，不推定默认 root，也不从旧 JSON 字段恢复 namespace；重复或非法响应头仍拒绝。HTTP 路由不会因 namespace 不匹配被撤销，HTTP-only 调用不要求本地端点能力。Windows 标识由 backend 与当前 logon scope 构成，实际权限仍由 OS DACL、握手身份与完整路由契约检查。
 
 原生路由获取查询服务端当前权威状态，随后固定 route UID/revision 和 server instance。数据连接 idle 驱逐保留资源登记与 owner；旧代理不能借同名替换取得新资源。生成的 TypeScript 持久直连客户端也使用该控制查询和身份固定规则。
 

@@ -19,13 +19,14 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub const SEGMENT_MAGIC: u32 = 0xCC20_0001;
 /// Current allocator version.
 ///
-/// Version 2 widens the spinlock word from `u32` to `u64` (full `u32` holder
-/// PID plus a high panic-poison bit) and shifts the fields after offset 28.
-/// This is a 0.x clean cut: `attach` rejects every other version, including
-/// the version 1 `u32`-word layout.
-pub const SEGMENT_VERSION: u16 = 2;
+/// Version 3 records each live allocation's identity and level. Earlier
+/// layouts cannot validate release identity and are rejected by `attach`.
+pub const SEGMENT_VERSION: u16 = 3;
 /// Header is page-aligned (4KB).
 pub const HEADER_ALIGN: usize = 4096;
+const ALLOCATION_LEVEL_BITS: u32 = 6;
+const ALLOCATION_LEVEL_MASK: u64 = (1 << ALLOCATION_LEVEL_BITS) - 1;
+const MAX_ALLOCATION_SEQUENCE: u64 = u64::MAX >> ALLOCATION_LEVEL_BITS;
 
 /// SHM segment header layout (stored at offset 0 of the SHM region).
 ///
@@ -47,7 +48,8 @@ pub const HEADER_ALIGN: usize = 4096;
 /// 40      4     alloc_count (u32) - atomic, active allocations
 /// 44      4     _pad3 (u32)
 /// 48      8     free_bytes (u64) - atomic, available bytes
-/// 56      ...   bitmap data (variable length, tightly packed)
+/// 56      8     allocation_sequence (u64) - never wraps within a backing
+/// 64      ...   free bitmaps, then one u64 live record per min-block start
 /// ```
 #[repr(C)]
 pub struct SegmentHeader {
@@ -64,6 +66,7 @@ pub struct SegmentHeader {
     pub alloc_count: AtomicU32,
     _pad3: u32,
     pub free_bytes: AtomicU64,
+    pub allocation_sequence: AtomicU64,
     // Bitmap data follows immediately after this struct.
 }
 
@@ -71,10 +74,11 @@ pub struct SegmentHeader {
 // the spinlock and both shared counters land on 8-byte-aligned offsets in the
 // shared mapping on every supported backend (x64, arm64).
 const _: () = {
-    assert!(std::mem::size_of::<SegmentHeader>() == 56);
+    assert!(std::mem::size_of::<SegmentHeader>() == 64);
     assert!(std::mem::offset_of!(SegmentHeader, spinlock) == 32);
     assert!(std::mem::offset_of!(SegmentHeader, spinlock) % std::mem::align_of::<u64>() == 0);
     assert!(std::mem::offset_of!(SegmentHeader, free_bytes) % std::mem::align_of::<u64>() == 0);
+    assert!(std::mem::offset_of!(SegmentHeader, allocation_sequence) == 56);
 };
 
 /// Result of a successful buddy allocation.
@@ -86,6 +90,8 @@ pub struct Allocation {
     pub actual_size: u32,
     /// The buddy level this block belongs to.
     pub level: u16,
+    /// Identity of this allocation within its concrete backing generation.
+    pub allocation_id: u64,
 }
 
 /// Validated geometry for one buddy backing, derived only by
@@ -93,17 +99,13 @@ pub struct Allocation {
 ///
 /// `data_size` is the usable power-of-two data region, bounded by the wire's
 /// `u32` buddy coordinates; `total_size` additionally includes the page-
-/// aligned segment header and level bitmaps and is bounded by one addressable
-/// `isize` mapping span. The header layout/ABI is unchanged — this is the
-/// same formula the previous unchecked computation produced for every
-/// supported geometry, now computed with checked arithmetic and rejected
-/// before any mapping instead of wrapping or panicking inside
-/// [`BuddyAllocator::init`].
+/// aligned header, free bitmaps and allocation records. The data offset must
+/// fit u32 and the complete mapping must fit one addressable `isize` span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuddyLayout {
     /// Usable data region size (power of two, `<= u32::MAX`).
     pub data_size: usize,
-    /// Total SHM mapping size: header + bitmaps + data (`<= isize::MAX`).
+    /// Total mapping size: aligned metadata plus data (`<= isize::MAX`).
     pub total_size: usize,
 }
 
@@ -123,6 +125,8 @@ pub struct BuddyAllocator {
     levels: usize,
     /// Per-level bitmaps (level 0 = largest blocks).
     bitmaps: Vec<LevelBitmap>,
+    /// One record per min-block start; accessed only under `lock`.
+    allocation_records: *mut AtomicU64,
     /// Cross-process spinlock.
     lock: ShmSpinlock,
 }
@@ -134,11 +138,19 @@ impl BuddyAllocator {
     /// Initialize a new buddy allocator on fresh SHM memory.
     ///
     /// # Safety
-    /// `base` must point to a freshly-created SHM region of `total_size` bytes.
+    /// `base` must point to a freshly-created, zeroed SHM region of
+    /// `layout.total_size` bytes, which outlives the allocator.
     /// The caller is responsible for the SHM lifecycle.
-    pub unsafe fn init(base: *mut u8, total_size: usize, min_block: usize) -> Self {
-        assert!(min_block.is_power_of_two());
-        assert!(total_size >= HEADER_ALIGN + min_block);
+    pub unsafe fn init(base: *mut u8, layout: BuddyLayout, min_block: usize) -> Self {
+        assert_eq!(
+            Self::checked_layout(layout.data_size, min_block),
+            Some(layout)
+        );
+        let BuddyLayout {
+            data_size,
+            total_size,
+        } = layout;
+        let data_offset = total_size - data_size;
 
         // R-C3: Verify SHM base address is properly aligned for SegmentHeader.
         assert!(
@@ -158,15 +170,6 @@ impl BuddyAllocator {
             "AtomicU32 must be lock-free for cross-process SHM"
         );
 
-        let data_offset = Self::compute_data_offset(total_size, min_block);
-        let data_size = Self::round_down_pow2(total_size - data_offset);
-
-        // R-I3: Ensure data region offsets fit in u32.
-        assert!(
-            data_size <= u32::MAX as usize,
-            "segment data region exceeds 4GB offset limit"
-        );
-
         // Write header.
         // SAFETY: caller guarantees `base` is a valid, writable SHM pointer
         // with at least `total_size` bytes, aligned for SegmentHeader.
@@ -181,6 +184,7 @@ impl BuddyAllocator {
         header.max_levels = levels as u16;
         header.alloc_count = AtomicU32::new(0);
         header.free_bytes = AtomicU64::new(data_size as u64);
+        header.allocation_sequence = AtomicU64::new(0);
 
         // Initialize spinlock.
         // SAFETY: spinlock offset is within the header region.
@@ -190,7 +194,7 @@ impl BuddyAllocator {
 
         // Initialize bitmaps — SHM is zero-filled by ftruncate, so all bits
         // start as "used" (0). Only level-0 needs one block marked free.
-        let bitmaps = Self::create_bitmaps(base, data_size, min_block, levels);
+        let (bitmaps, allocation_records) = Self::create_bitmaps(base, data_size, levels);
         bitmaps[0].free_one(0);
 
         Self {
@@ -201,6 +205,7 @@ impl BuddyAllocator {
             min_block,
             levels,
             bitmaps,
+            allocation_records,
             lock,
         }
     }
@@ -210,6 +215,9 @@ impl BuddyAllocator {
     /// # Safety
     /// `base` must point to a valid SHM region with a properly initialized header.
     pub unsafe fn attach(base: *mut u8, total_size: usize) -> Result<Self, &'static str> {
+        if total_size < std::mem::size_of::<SegmentHeader>() {
+            return Err("mapping is smaller than the allocator header");
+        }
         // R-C3: Verify alignment for SegmentHeader access in attach path too.
         assert!(
             (base as usize).is_multiple_of(std::mem::align_of::<SegmentHeader>()),
@@ -222,18 +230,38 @@ impl BuddyAllocator {
             return Err("invalid segment magic");
         }
         if header.version != SEGMENT_VERSION {
-            return Err("unsupported segment version (expected 2)");
+            return Err("unsupported segment version (expected 3)");
+        }
+
+        // OS mappings may include page-rounded trailing capacity. Geometry is
+        // defined by the header's logical size, bounded by the actual mapping.
+        let mapped_size = total_size;
+        let total_size =
+            usize::try_from(header.total_size).map_err(|_| "allocator size is not addressable")?;
+        if total_size > mapped_size {
+            return Err("allocator layout exceeds the mapped capacity");
         }
 
         let data_offset = header.data_offset as usize;
         let min_block = header.min_block as usize;
         let levels = header.max_levels as usize;
-        let data_size = Self::round_down_pow2(total_size - data_offset);
+        let data_size = total_size
+            .checked_sub(data_offset)
+            .ok_or("invalid allocator data offset")?;
+        let layout =
+            Self::checked_layout(data_size, min_block).ok_or("invalid allocator geometry")?;
+        if layout.data_size != data_size
+            || layout.total_size != total_size
+            || layout.total_size - layout.data_size != data_offset
+            || levels != Self::count_levels(data_size, min_block)
+        {
+            return Err("allocator metadata layout does not match header");
+        }
 
         // SAFETY: spinlock offset is within the validated header region.
         let lock =
             unsafe { ShmSpinlock::new(base.add(std::mem::offset_of!(SegmentHeader, spinlock))) };
-        let bitmaps = Self::create_bitmaps(base, data_size, min_block, levels);
+        let (bitmaps, allocation_records) = Self::create_bitmaps(base, data_size, levels);
 
         Ok(Self {
             base,
@@ -243,6 +271,7 @@ impl BuddyAllocator {
             min_block,
             levels,
             bitmaps,
+            allocation_records,
             lock,
         })
     }
@@ -275,8 +304,11 @@ impl BuddyAllocator {
     /// Returns a descriptive `Err` — never a panic — when the backing is
     /// unavailable (poisoned or contended past the bounded spin budget) or
     /// when the free itself is invalid (bad level/offset, double free).
-    pub fn free(&self, offset: u32, level: u16) -> Result<(), String> {
-        match self.lock.with_lock(|| self.free_and_merge(offset, level)) {
+    pub fn free(&self, offset: u32, level: u16, allocation_id: u64) -> Result<(), String> {
+        match self
+            .lock
+            .with_lock(|| self.free_and_merge(offset, level, allocation_id))
+        {
             Ok(result) => result,
             Err(err) => Err(format!("buddy free refused: {err}")),
         }
@@ -336,6 +368,13 @@ impl BuddyAllocator {
     // --- Internal methods ---
 
     fn alloc_with_split(&self, target_level: usize, actual_size: usize) -> Option<Allocation> {
+        let header = unsafe { &*(self.base as *const SegmentHeader) };
+        // Exhaustion must refuse before alloc_one changes any free bit.
+        let sequence = header
+            .allocation_sequence
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .filter(|sequence| *sequence <= MAX_ALLOCATION_SEQUENCE)?;
         // Scan from target_level upward to find a free block.
         let mut donor_level = None;
         let mut donor_idx = 0;
@@ -350,16 +389,6 @@ impl BuddyAllocator {
 
         let donor_lvl = donor_level?;
 
-        if donor_lvl == target_level {
-            // Found at exact level, no splitting needed.
-            self.update_stats_alloc(actual_size);
-            return Some(Allocation {
-                offset: self.block_to_offset(target_level, donor_idx),
-                actual_size: actual_size as u32,
-                level: target_level as u16,
-            });
-        }
-
         // Split the donor block down to target level.
         let mut current_idx = donor_idx;
         for lvl in (donor_lvl + 1)..=target_level {
@@ -370,15 +399,23 @@ impl BuddyAllocator {
             current_idx = left_child;
         }
 
+        let offset = self.block_to_offset(target_level, current_idx);
+        let allocation_id = (sequence << ALLOCATION_LEVEL_BITS) | target_level as u64;
+        header
+            .allocation_sequence
+            .store(sequence, Ordering::Relaxed);
+        self.allocation_record(offset)
+            .store(allocation_id, Ordering::Relaxed);
         self.update_stats_alloc(actual_size);
         Some(Allocation {
-            offset: self.block_to_offset(target_level, current_idx),
+            offset,
             actual_size: actual_size as u32,
             level: target_level as u16,
+            allocation_id,
         })
     }
 
-    fn free_and_merge(&self, offset: u32, level: u16) -> Result<(), String> {
+    fn free_and_merge(&self, offset: u32, level: u16, allocation_id: u64) -> Result<(), String> {
         let level = level as usize;
 
         // R-I4: Validate level is within range.
@@ -433,6 +470,15 @@ impl BuddyAllocator {
             ));
         }
 
+        let record = self.allocation_record(offset);
+        if allocation_id == 0
+            || allocation_id & ALLOCATION_LEVEL_MASK != level as u64
+            || record.load(Ordering::Relaxed) != allocation_id
+        {
+            return Err("free: allocation identity does not match the live block".into());
+        }
+
+        record.store(0, Ordering::Relaxed);
         // Mark this block as free.
         self.bitmaps[level].free_one(block_idx);
         self.update_stats_free(block_size);
@@ -458,6 +504,16 @@ impl BuddyAllocator {
         }
 
         Ok(())
+    }
+
+    fn allocation_record(&self, offset: u32) -> &AtomicU64 {
+        // Allocation derives this offset from the checked tree geometry;
+        // free validates alignment and bounds before reaching this lookup.
+        unsafe {
+            &*self
+                .allocation_records
+                .add(offset as usize / self.min_block)
+        }
     }
 
     fn update_stats_alloc(&self, size: usize) {
@@ -514,9 +570,8 @@ impl BuddyAllocator {
     fn create_bitmaps(
         base: *mut u8,
         data_size: usize,
-        _min_block: usize,
         levels: usize,
-    ) -> Vec<LevelBitmap> {
+    ) -> (Vec<LevelBitmap>, *mut AtomicU64) {
         let mut bitmaps = Vec::with_capacity(levels);
         let mut bitmap_ptr = unsafe { base.add(Self::bitmap_data_offset()) };
         let mut block_size = data_size;
@@ -530,15 +585,7 @@ impl BuddyAllocator {
             block_size /= 2;
         }
 
-        bitmaps
-    }
-
-    fn compute_data_offset(total_size: usize, min_block: usize) -> usize {
-        let data_candidate = Self::round_down_pow2(total_size - HEADER_ALIGN);
-        let bitmap_bytes = crate::alloc::bitmap::total_bitmap_bytes(data_candidate, min_block);
-        let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
-        // Round up to page alignment.
-        (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1)
+        (bitmaps, bitmap_ptr.cast())
     }
 
     /// Checked next power of two; `usize::next_power_of_two` would wrap or
@@ -581,11 +628,14 @@ impl BuddyAllocator {
             return None;
         }
         let bitmap_bytes = crate::alloc::bitmap::total_bitmap_bytes(data_size, min_block);
-        let header_need = std::mem::size_of::<SegmentHeader>().checked_add(bitmap_bytes)?;
+        let record_bytes = (data_size / min_block).checked_mul(std::mem::size_of::<u64>())?;
+        let header_need = std::mem::size_of::<SegmentHeader>()
+            .checked_add(bitmap_bytes)?
+            .checked_add(record_bytes)?;
         let align_mask = HEADER_ALIGN - 1;
         let data_offset = header_need.checked_add(align_mask)? & !align_mask;
         let total_size = data_offset.checked_add(data_size)?;
-        if total_size > isize::MAX as usize {
+        if data_offset > u32::MAX as usize || total_size > isize::MAX as usize {
             return None;
         }
         Some(BuddyLayout {
@@ -598,13 +648,6 @@ impl BuddyAllocator {
         crate::alloc::bitmap::num_levels(data_size, min_block)
     }
 
-    fn round_down_pow2(n: usize) -> usize {
-        if n == 0 {
-            return 0;
-        }
-        1 << (usize::BITS - 1 - n.leading_zeros())
-    }
-
     fn bitmap_data_offset() -> usize {
         std::mem::size_of::<SegmentHeader>()
     }
@@ -614,45 +657,209 @@ impl BuddyAllocator {
 mod tests {
     use super::*;
 
-    fn make_allocator(total_size: usize, min_block: usize) -> (BuddyAllocator, Vec<u8>) {
-        let mut buffer = vec![0u8; total_size];
-        let alloc = unsafe { BuddyAllocator::init(buffer.as_mut_ptr(), total_size, min_block) };
+    fn make_allocator(data_size: usize, min_block: usize) -> (BuddyAllocator, Vec<u8>) {
+        let layout = BuddyAllocator::checked_layout(data_size, min_block).unwrap();
+        let mut buffer = vec![0u8; layout.total_size];
+        let alloc = unsafe { BuddyAllocator::init(buffer.as_mut_ptr(), layout, min_block) };
         (alloc, buffer)
     }
 
+    fn assert_invalid_release_preserves_live_allocator(
+        alloc: &BuddyAllocator,
+        offset: u32,
+        level: u16,
+        allocation_id: u64,
+    ) {
+        // These tests own the entire mapping and never access payload bytes.
+        let before = unsafe { std::slice::from_raw_parts(alloc.base, alloc.data_offset) }.to_vec();
+        let result = alloc.free(offset, level, allocation_id);
+        assert!(result.is_err(), "invalid release was accepted: {result:?}");
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(alloc.base, alloc.data_offset) },
+            before,
+            "rejected release changed allocator metadata"
+        );
+        assert!(
+            !alloc.can_retire(),
+            "a live allocation must prevent retirement"
+        );
+    }
+
     #[test]
-    fn checked_layout_preserves_previously_valid_geometries() {
-        // Supported layouts — including the 256 MB pool default — must keep
-        // producing exactly the values the legacy unchecked formula produced.
-        for (capacity, min_block) in [
-            (8192, 4096),
-            (8192, 8192),
-            (64 * 1024, 4096),
-            (256 * 1024 * 1024, 4096),
-            (1usize << 30, 4096),
+    fn r01_rejects_left_child_of_live_allocation() {
+        let (alloc, _buf) = make_allocator(8 * 1024, 4096);
+        let parent = alloc.alloc(8192).unwrap();
+        assert_invalid_release_preserves_live_allocator(
+            &alloc,
+            parent.offset,
+            parent.level + 1,
+            parent.allocation_id,
+        );
+        assert!(alloc.alloc(4096).is_none());
+        alloc
+            .free(parent.offset, parent.level, parent.allocation_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn r01_rejects_right_child_of_live_allocation() {
+        let (alloc, _buf) = make_allocator(8 * 1024, 4096);
+        let parent = alloc.alloc(8192).unwrap();
+        assert_invalid_release_preserves_live_allocator(
+            &alloc,
+            parent.offset + 4096,
+            parent.level + 1,
+            parent.allocation_id,
+        );
+        assert!(alloc.alloc(4096).is_none());
+        alloc
+            .free(parent.offset, parent.level, parent.allocation_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn r01_rejects_parent_of_live_children() {
+        let (alloc, _buf) = make_allocator(8 * 1024, 4096);
+        let left = alloc.alloc(4096).unwrap();
+        let right = alloc.alloc(4096).unwrap();
+        assert_invalid_release_preserves_live_allocator(
+            &alloc,
+            left.offset,
+            left.level - 1,
+            left.allocation_id,
+        );
+        assert!(alloc.alloc(4096).is_none());
+        alloc
+            .free(left.offset, left.level, left.allocation_id)
+            .unwrap();
+        alloc
+            .free(right.offset, right.level, right.allocation_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn r01_rejects_parent_with_one_live_child() {
+        let (alloc, _buf) = make_allocator(8 * 1024, 4096);
+        let left = alloc.alloc(4096).unwrap();
+        assert_invalid_release_preserves_live_allocator(
+            &alloc,
+            left.offset,
+            left.level - 1,
+            left.allocation_id,
+        );
+        let right = alloc.alloc(4096).unwrap();
+        assert_eq!(right.offset, left.offset + left.actual_size);
+        alloc
+            .free(left.offset, left.level, left.allocation_id)
+            .unwrap();
+        alloc
+            .free(right.offset, right.level, right.allocation_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn r01_rejects_released_allocation_after_same_slot_reuse() {
+        let (alloc, _buf) = make_allocator(8 * 1024, 4096);
+        let old = alloc.alloc(8192).unwrap();
+        alloc
+            .free(old.offset, old.level, old.allocation_id)
+            .unwrap();
+        let live = alloc.alloc(8192).unwrap();
+        assert_eq!((old.offset, old.level), (live.offset, live.level));
+        assert_ne!(old.allocation_id, live.allocation_id);
+        assert_invalid_release_preserves_live_allocator(
+            &alloc,
+            old.offset,
+            old.level,
+            old.allocation_id,
+        );
+        assert!(alloc.alloc(4096).is_none());
+        alloc
+            .free(live.offset, live.level, live.allocation_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn checked_layout_includes_allocation_records() {
+        // Handwritten offsets, including metadata larger than the data region.
+        for (capacity, min_block, data_offset) in [
+            (8192, 4096, 4096),
+            (8192, 8192, 4096),
+            (8192, 8, 12288),
+            (64 * 1024, 4096, 4096),
+            (256 * 1024 * 1024, 4096, 544768),
+            (1usize << 30, 4096, 2166784),
         ] {
             let layout = BuddyAllocator::checked_layout(capacity, min_block)
                 .unwrap_or_else(|| panic!("supported geometry {capacity}/{min_block}"));
-            assert!(layout.data_size.is_power_of_two());
-            assert!(layout.data_size >= capacity);
-            assert!(layout.total_size > layout.data_size);
-            assert!(layout.total_size <= isize::MAX as usize);
-
-            // Independent reconstruction of the legacy formula.
-            let bitmap_bytes =
-                crate::alloc::bitmap::total_bitmap_bytes(layout.data_size, min_block);
-            let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
-            let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
+            assert_eq!(layout.data_size, capacity);
             assert_eq!(layout.total_size, data_offset + layout.data_size);
-
-            // init() recovers the same data region from the validated total,
-            // so the header ABI and attach path are unchanged.
-            let init_offset = BuddyAllocator::compute_data_offset(layout.total_size, min_block);
-            assert_eq!(
-                BuddyAllocator::round_down_pow2(layout.total_size - init_offset),
-                layout.data_size
-            );
+            if capacity <= 64 * 1024 {
+                let (alloc, mut buffer) = make_allocator(capacity, min_block);
+                let attached =
+                    unsafe { BuddyAllocator::attach(buffer.as_mut_ptr(), buffer.len()) }.unwrap();
+                assert_eq!(alloc.data_offset, data_offset);
+                assert_eq!(attached.data_size(), capacity);
+                let block = alloc.alloc(capacity).unwrap();
+                attached
+                    .free(block.offset, block.level, block.allocation_id)
+                    .unwrap();
+                assert_eq!(alloc.alloc_count(), 0);
+                assert_eq!(alloc.free_bytes(), capacity as u64);
+                let next = attached.alloc(capacity).unwrap();
+                assert_ne!(next.allocation_id, block.allocation_id);
+                alloc
+                    .free(next.offset, next.level, next.allocation_id)
+                    .unwrap();
+            }
         }
+    }
+
+    #[test]
+    fn r01_rejects_missing_other_and_wrong_level_identities() {
+        let (alloc, _buf) = make_allocator(8192, 4096);
+        let a = alloc.alloc(4096).unwrap();
+        let b = alloc.alloc(4096).unwrap();
+        for id in [0, b.allocation_id, a.allocation_id ^ 1] {
+            assert_invalid_release_preserves_live_allocator(&alloc, a.offset, a.level, id);
+        }
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        // This empty start has record 0 while the root and right child are
+        // still used, so only the explicit zero-id check rejects this parent.
+        assert_invalid_release_preserves_live_allocator(&alloc, a.offset, 0, 0);
+        alloc.free(b.offset, b.level, b.allocation_id).unwrap();
+        assert_eq!(alloc.free_bytes(), 8192);
+    }
+
+    #[test]
+    fn r01_allocation_sequence_exhaustion_never_reuses_identity() {
+        let (alloc, _buf) = make_allocator(8192, 4096);
+        let header = unsafe { &*(alloc.base.cast::<SegmentHeader>()) };
+        alloc
+            .lock
+            .with_lock(|| {
+                header
+                    .allocation_sequence
+                    .store(MAX_ALLOCATION_SEQUENCE - 1, Ordering::Relaxed)
+            })
+            .unwrap();
+        let live = alloc.alloc(4096).unwrap();
+        assert_eq!(
+            live.allocation_id >> ALLOCATION_LEVEL_BITS,
+            MAX_ALLOCATION_SEQUENCE
+        );
+        let before = unsafe { std::slice::from_raw_parts(alloc.base, alloc.data_offset) }.to_vec();
+        assert!(alloc.alloc(4096).is_none());
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(alloc.base, alloc.data_offset) },
+            before
+        );
+        alloc
+            .free(live.offset, live.level, live.allocation_id)
+            .unwrap();
+        assert_eq!(alloc.free_bytes(), 8192);
+        assert!(alloc.can_retire());
+        assert!(alloc.alloc(4096).is_none());
     }
 
     #[test]
@@ -670,6 +877,8 @@ mod tests {
             assert!(BuddyAllocator::checked_layout(four_gib + 5, 4096).is_none());
             // The largest supported power-of-two capacity still validates.
             assert!(BuddyAllocator::checked_layout(1usize << 31, 4096).is_some());
+            // Dense records for 1-byte blocks cannot fit the u32 data offset.
+            assert!(BuddyAllocator::checked_layout(1usize << 31, 1).is_none());
             // Next power of two overflows near usize::MAX.
             assert!(BuddyAllocator::checked_layout(usize::MAX, 4096).is_none());
             assert!(BuddyAllocator::checked_layout((1usize << 63) + 1, 4096).is_none());
@@ -678,36 +887,36 @@ mod tests {
 
     #[test]
     fn test_basic_alloc_free() {
-        let (alloc, _buf) = make_allocator(64 * 1024, 4096); // 64KB total
+        let (alloc, _buf) = make_allocator(32 * 1024, 4096); // 64KB total
         let a = alloc.alloc(4096).expect("alloc 4KB");
         assert_eq!(a.actual_size, 4096);
-        alloc.free(a.offset, a.level).unwrap();
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
         assert_eq!(alloc.alloc_count(), 0);
     }
 
     #[test]
     fn test_multiple_allocs() {
-        let (alloc, _buf) = make_allocator(256 * 1024, 4096); // 256KB total
+        let (alloc, _buf) = make_allocator(128 * 1024, 4096); // 256KB total
         let a = alloc.alloc(4096).unwrap();
         let b = alloc.alloc(4096).unwrap();
         assert_ne!(a.offset, b.offset);
-        alloc.free(a.offset, a.level).unwrap();
-        alloc.free(b.offset, b.level).unwrap();
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        alloc.free(b.offset, b.level, b.allocation_id).unwrap();
         assert_eq!(alloc.alloc_count(), 0);
     }
 
     #[test]
     fn test_power_of_two_rounding() {
-        let (alloc, _buf) = make_allocator(256 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(128 * 1024, 4096);
         // Request 5KB → rounds up to 8KB.
         let a = alloc.alloc(5000).unwrap();
         assert_eq!(a.actual_size, 8192);
-        alloc.free(a.offset, a.level).unwrap();
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
     }
 
     #[test]
     fn test_buddy_merge() {
-        let (alloc, _buf) = make_allocator(128 * 1024, 4096); // 128KB, data ~64KB
+        let (alloc, _buf) = make_allocator(64 * 1024, 4096); // 128KB, data ~64KB
         let initial_free = alloc.free_bytes();
 
         // Allocate two min-blocks that should be buddies.
@@ -715,8 +924,8 @@ mod tests {
         let b = alloc.alloc(4096).unwrap();
 
         // Free both — should merge back.
-        alloc.free(a.offset, a.level).unwrap();
-        alloc.free(b.offset, b.level).unwrap();
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        alloc.free(b.offset, b.level, b.allocation_id).unwrap();
 
         // Free bytes should be restored.
         assert_eq!(alloc.free_bytes(), initial_free);
@@ -724,19 +933,25 @@ mod tests {
 
     #[test]
     fn test_exhaustion_returns_none() {
-        let (alloc, _buf) = make_allocator(16 * 1024, 4096); // Tiny: ~8KB data
+        let (alloc, _buf) = make_allocator(8 * 1024, 4096); // Tiny: ~8KB data
         let data_size = alloc.data_size();
         // Allocate the entire data region.
         let a = alloc.alloc(data_size);
         assert!(a.is_some());
         // Second allocation should fail.
         assert!(alloc.alloc(4096).is_none());
-        alloc.free(a.unwrap().offset, a.unwrap().level).unwrap();
+        alloc
+            .free(
+                a.unwrap().offset,
+                a.unwrap().level,
+                a.unwrap().allocation_id,
+            )
+            .unwrap();
     }
 
     #[test]
     fn test_zero_and_oversized() {
-        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(32 * 1024, 4096);
         assert!(alloc.alloc(0).is_none());
         assert!(alloc.alloc(alloc.data_size() + 1).is_none());
     }
@@ -744,7 +959,7 @@ mod tests {
     #[test]
     fn test_splitting_and_fragmentation() {
         // 128KB total, ~64KB data, 4KB min = up to 16 min-blocks.
-        let (alloc, _buf) = make_allocator(128 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
 
         // Allocate several small blocks.
         let mut allocs = Vec::new();
@@ -758,7 +973,7 @@ mod tests {
         // Free alternating blocks to create fragmentation.
         for (i, a) in allocs.iter().enumerate() {
             if i % 2 == 0 {
-                alloc.free(a.offset, a.level).unwrap();
+                alloc.free(a.offset, a.level, a.allocation_id).unwrap();
             }
         }
 
@@ -769,29 +984,29 @@ mod tests {
 
     #[test]
     fn test_double_free_returns_error() {
-        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(32 * 1024, 4096);
         // Allocate two blocks so the first one's buddy is in use,
         // preventing merge on free (which changes bitmap state).
         let a = alloc.alloc(4096).unwrap();
         let b = alloc.alloc(4096).unwrap();
-        alloc.free(a.offset, a.level).unwrap();
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
         // Second free of the same block should fail.
-        let result = alloc.free(a.offset, a.level);
+        let result = alloc.free(a.offset, a.level, a.allocation_id);
         assert!(result.is_err(), "double free should return error");
         assert!(
             result.unwrap_err().contains("double free"),
             "should report double free"
         );
-        alloc.free(b.offset, b.level).unwrap();
+        alloc.free(b.offset, b.level, b.allocation_id).unwrap();
     }
 
     #[test]
     fn test_double_free_after_merge_returns_error() {
-        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(32 * 1024, 4096);
         let a = alloc.alloc(4096).unwrap();
-        alloc.free(a.offset, a.level).unwrap();
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
 
-        let result = alloc.free(a.offset, a.level);
+        let result = alloc.free(a.offset, a.level, a.allocation_id);
         assert!(
             result.is_err(),
             "double free after merge should return error"
@@ -804,35 +1019,35 @@ mod tests {
 
     #[test]
     fn test_free_invalid_level() {
-        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(32 * 1024, 4096);
         let a = alloc.alloc(4096).unwrap();
-        let result = alloc.free(a.offset, 99);
+        let result = alloc.free(a.offset, 99, a.allocation_id);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("level"),
             "should reject invalid level"
         );
         // Clean up properly.
-        alloc.free(a.offset, a.level).unwrap();
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
     }
 
     #[test]
     fn test_free_invalid_offset() {
-        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(32 * 1024, 4096);
         let a = alloc.alloc(4096).unwrap();
         // Misaligned offset.
-        let result = alloc.free(a.offset + 1, a.level);
+        let result = alloc.free(a.offset + 1, a.level, a.allocation_id);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("not aligned"),
             "should reject misaligned offset"
         );
-        alloc.free(a.offset, a.level).unwrap();
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
     }
 
     #[test]
     fn test_merge_stress_various_free_orders() {
-        let (alloc, _buf) = make_allocator(256 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(128 * 1024, 4096);
         let initial_free = alloc.free_bytes();
 
         // Allocate many small blocks.
@@ -846,7 +1061,7 @@ mod tests {
 
         // Free in reverse order — should still fully merge.
         for a in allocs.iter().rev() {
-            alloc.free(a.offset, a.level).unwrap();
+            alloc.free(a.offset, a.level, a.allocation_id).unwrap();
         }
         assert_eq!(alloc.free_bytes(), initial_free);
         assert_eq!(alloc.alloc_count(), 0);
@@ -854,32 +1069,85 @@ mod tests {
 
     #[test]
     fn test_attach_rejects_old_layout_version() {
-        let total_size = 64 * 1024;
+        let layout = BuddyAllocator::checked_layout(32 * 1024, 4096).unwrap();
+        let total_size = layout.total_size;
         let mut buffer = vec![0u8; total_size];
-        let alloc = unsafe { BuddyAllocator::init(buffer.as_mut_ptr(), total_size, 4096) };
+        let alloc = unsafe { BuddyAllocator::init(buffer.as_mut_ptr(), layout, 4096) };
         drop(alloc);
 
-        // Simulate the version 1 layout, whose lock word was a u32 at a
-        // different offset. Attach must reject it before constructing a
-        // spinlock over the mismatched field.
-        let header = unsafe { &mut *(buffer.as_mut_ptr() as *mut SegmentHeader) };
-        assert_eq!(header.version, SEGMENT_VERSION);
-        header.version = 1;
+        for version in [1, 2] {
+            unsafe {
+                (*buffer.as_mut_ptr().cast::<SegmentHeader>()).version = version;
+            }
+            let err = unsafe { BuddyAllocator::attach(buffer.as_mut_ptr(), total_size) }
+                .err()
+                .expect("attach must reject the old layout version");
+            assert!(
+                err.contains("version"),
+                "old layout was not rejected: {err}"
+            );
+        }
+    }
 
-        let err = unsafe { BuddyAllocator::attach(buffer.as_mut_ptr(), total_size) }
-            .err()
-            .expect("attach must reject the old layout version");
-        assert!(
-            err.contains("version"),
-            "attach must reject the old layout: {err}"
-        );
+    #[test]
+    fn attach_rejects_inconsistent_allocation_record_geometry() {
+        let (alloc, mut buffer) = make_allocator(8192, 8);
+        drop(alloc);
+        let ptr = buffer.as_mut_ptr();
+        let (offset, min_block, levels, total_size) = unsafe {
+            let header = &*ptr.cast::<SegmentHeader>();
+            (
+                header.data_offset,
+                header.min_block,
+                header.max_levels,
+                header.total_size,
+            )
+        };
+        assert!(unsafe { BuddyAllocator::attach(ptr, 63) }.is_err());
+        assert!(unsafe { BuddyAllocator::attach(ptr, buffer.len() - 1) }.is_err());
+        for (bad_offset, bad_min, bad_levels, bad_total) in [
+            (offset + 8, min_block, levels, total_size),
+            (offset, 0, levels, total_size),
+            (offset, 1, levels, total_size),
+            (offset, min_block, levels + 1, total_size),
+            (u32::MAX, min_block, levels, total_size),
+            (offset, min_block, levels, total_size - 1),
+        ] {
+            unsafe {
+                let header = &mut *ptr.cast::<SegmentHeader>();
+                header.data_offset = bad_offset;
+                header.min_block = bad_min;
+                header.max_levels = bad_levels;
+                header.total_size = bad_total;
+            }
+            assert!(unsafe { BuddyAllocator::attach(ptr, buffer.len()) }.is_err());
+        }
+    }
+
+    #[test]
+    fn attach_uses_logical_geometry_with_page_rounded_capacity() {
+        for (capacity, min_block, mapped_size) in
+            [(8192, 4096, 16384), (32768, 4096, 49152), (8192, 8, 32768)]
+        {
+            let (alloc, mut buffer) = make_allocator(capacity, min_block);
+            drop(alloc);
+            buffer.resize(mapped_size, 0);
+            let attached =
+                unsafe { BuddyAllocator::attach(buffer.as_mut_ptr(), buffer.len()) }.unwrap();
+            assert_eq!(attached.data_size(), capacity);
+            let block = attached.alloc(capacity).unwrap();
+            assert!(attached.alloc(min_block).is_none());
+            attached
+                .free(block.offset, block.level, block.allocation_id)
+                .unwrap();
+        }
     }
 
     #[test]
     fn test_alloc_returns_none_and_free_err_when_poisoned() {
         use crate::alloc::spinlock::PID_MASK;
 
-        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(32 * 1024, 4096);
         alloc.lock.poison_panicked(std::process::id());
 
         let free_before = alloc.free_bytes();
@@ -889,7 +1157,7 @@ mod tests {
             alloc.alloc(4096).is_none(),
             "alloc must refuse poisoned backing"
         );
-        let err = alloc.free(0, 1).unwrap_err();
+        let err = alloc.free(0, 1, 0).unwrap_err();
         assert!(
             err.contains("buddy free refused") && err.contains("poisoned"),
             "free should describe the refusal: {err}"
@@ -914,7 +1182,7 @@ mod tests {
 
     #[test]
     fn test_contended_acquire_leaves_allocator_untouched() {
-        let (mut alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let (mut alloc, _buf) = make_allocator(32 * 1024, 4096);
         // Recovery threshold beyond the budget: expiry must happen without
         // ever probing (and without ever touching) the live holder.
         alloc.lock.force_budgets(1_000, 2_000);
@@ -974,13 +1242,13 @@ mod tests {
         let a = alloc
             .alloc(4096)
             .expect("alloc succeeds after holder releases");
-        alloc.free(a.offset, a.level).unwrap();
+        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
         assert_eq!(alloc.alloc_count(), 0);
     }
 
     #[test]
     fn test_panic_in_critical_section_poisons_allocator() {
-        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let (alloc, _buf) = make_allocator(32 * 1024, 4096);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = alloc
@@ -996,7 +1264,7 @@ mod tests {
             alloc.alloc(4096).is_none(),
             "alloc refuses a panicked backing"
         );
-        let err = alloc.free(0, 1).unwrap_err();
+        let err = alloc.free(0, 1, 0).unwrap_err();
         assert!(
             err.contains("panicked"),
             "free should name the panic poison: {err}"
@@ -1010,9 +1278,10 @@ mod tests {
 
     #[test]
     fn test_poison_visible_to_newly_attached_allocator() {
-        let total_size = 64 * 1024;
+        let layout = BuddyAllocator::checked_layout(32 * 1024, 4096).unwrap();
+        let total_size = layout.total_size;
         let mut buffer = vec![0u8; total_size];
-        let creator = unsafe { BuddyAllocator::init(buffer.as_mut_ptr(), total_size, 4096) };
+        let creator = unsafe { BuddyAllocator::init(buffer.as_mut_ptr(), layout, 4096) };
         creator.lock.poison_panicked(std::process::id());
         drop(creator);
 
@@ -1024,7 +1293,7 @@ mod tests {
             "attached allocator must refuse"
         );
         assert!(
-            attached.free(0, 1).unwrap_err().contains("poisoned"),
+            attached.free(0, 1, 0).unwrap_err().contains("poisoned"),
             "attached allocator free must refuse descriptively"
         );
     }
@@ -1052,9 +1321,9 @@ mod tests {
     fn crash_child_main(name: &str) {
         use crate::ShmRegion;
 
-        let total_size = BuddyAllocator::checked_layout(CRASH_TEST_DATA_CAPACITY, 4096)
-            .expect("supported crash-test geometry")
-            .total_size;
+        let layout = BuddyAllocator::checked_layout(CRASH_TEST_DATA_CAPACITY, 4096)
+            .expect("supported crash-test geometry");
+        let total_size = layout.total_size;
         let region = ShmRegion::open(name, total_size).expect("holder child opens shared region");
         let alloc = unsafe {
             BuddyAllocator::attach(region.base_ptr(), region.size()).expect("child attach")
@@ -1091,11 +1360,11 @@ mod tests {
                 .unwrap()
                 .subsec_nanos()
         );
-        let total_size = BuddyAllocator::checked_layout(CRASH_TEST_DATA_CAPACITY, 4096)
-            .expect("supported crash-test geometry")
-            .total_size;
+        let layout = BuddyAllocator::checked_layout(CRASH_TEST_DATA_CAPACITY, 4096)
+            .expect("supported crash-test geometry");
+        let total_size = layout.total_size;
         let region = ShmRegion::create(&name, total_size).expect("parent creates shared region");
-        let mut alloc = unsafe { BuddyAllocator::init(region.base_ptr(), total_size, 4096) };
+        let mut alloc = unsafe { BuddyAllocator::init(region.base_ptr(), layout, 4096) };
         alloc.lock.force_budgets(100_000, 1_000);
 
         // Genuine two-process setup: the holder is a real child process that
@@ -1176,7 +1445,7 @@ mod tests {
             alloc.alloc(4096).is_none(),
             "alloc refuses the dead-held shared segment"
         );
-        let free_err = alloc.free(0, 1).unwrap_err();
+        let free_err = alloc.free(0, 1, 0).unwrap_err();
         assert!(
             free_err.contains("dead holder"),
             "free describes the dead-holder refusal: {free_err}"

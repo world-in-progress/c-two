@@ -10,16 +10,23 @@ mod frame_tests {
     #[test]
     fn encode_decode_roundtrip() {
         let payload = b"hello world";
-        let encoded = encode_frame(42, FLAG_BUDDY | FLAG_CALL_V2, payload);
-        assert_eq!(encoded.len(), HEADER_SIZE + payload.len());
-
-        let (hdr, decoded_payload) = decode_frame(&encoded).unwrap();
-        assert_eq!(hdr.request_id, 42);
-        assert_eq!(hdr.flags, FLAG_BUDDY | FLAG_CALL_V2);
-        assert_eq!(decoded_payload, payload);
-        assert!(hdr.is_buddy());
-        assert!(hdr.is_call_v2());
-        assert!(!hdr.is_response());
+        let golden = b"\x17\0\0\0\x2a\0\0\0\0\0\0\0\xc0\0\0\0hello world";
+        assert_eq!(encode_frame(42, FLAG_BUDDY | FLAG_CALL_V2, payload), golden);
+        for parts in [
+            &[payload.as_slice()][..],
+            &[b"hello ", b"world"],
+            &[b"", b"hello ", b"", b"world", b""],
+        ] {
+            let encoded = encode_frame_parts(42, FLAG_BUDDY | FLAG_CALL_V2, parts);
+            assert_eq!(encoded, golden);
+            let (hdr, decoded_payload) = decode_frame(&encoded).unwrap();
+            assert_eq!(hdr.request_id, 42);
+            assert_eq!(hdr.flags, FLAG_BUDDY | FLAG_CALL_V2);
+            assert_eq!(decoded_payload, payload);
+            assert!(hdr.is_buddy());
+            assert!(hdr.is_call_v2());
+            assert!(!hdr.is_response());
+        }
     }
 
     #[test]
@@ -30,6 +37,12 @@ mod frame_tests {
         assert_eq!(hdr.flags, 0);
         assert!(payload.is_empty());
         assert_eq!(hdr.total_len, 12); // 8B rid + 4B flags
+        for parts in [&[][..], &[b"".as_slice()], &[b"".as_slice(), b""]] {
+            assert_eq!(
+                encode_frame_parts(0, 0, parts),
+                b"\x0c\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+            );
+        }
     }
 
     #[test]
@@ -106,6 +119,7 @@ mod buddy_tests {
             offset: 65536,
             data_size: 1024,
             is_dedicated: false,
+            allocation_id: 0x0807_0605_0403_0201,
         };
         let encoded = encode_buddy_payload(&bp);
         assert_eq!(encoded.len(), BUDDY_PAYLOAD_SIZE);
@@ -123,6 +137,7 @@ mod buddy_tests {
             offset: 0,
             data_size: 256,
             is_dedicated: true,
+            allocation_id: 0,
         };
         let encoded = encode_buddy_payload(&bp);
         assert_eq!(encoded[14], BUDDY_FLAG_DEDICATED);
@@ -134,9 +149,9 @@ mod buddy_tests {
 
     #[test]
     fn canonical_buddy_payload_layout() {
-        // `<HIII B`: segment, generation, offset, size, flags. Distinct bytes
+        // `<HIII B Q`: segment, generation, offset, size, flags, allocation id. Distinct bytes
         // make field-order and truncation mistakes visible in this wire golden.
-        assert_eq!(BUDDY_PAYLOAD_SIZE, 15);
+        assert_eq!(BUDDY_PAYLOAD_SIZE, 23);
 
         let bp = BuddyPayload {
             seg_idx: 0x0201,
@@ -144,10 +159,16 @@ mod buddy_tests {
             offset: 0x0a09_0807,
             data_size: 0x0e0d_0c0b,
             is_dedicated: false,
+            allocation_id: 0x1615_1413_1211_100f,
         };
         let encoded = encode_buddy_payload(&bp);
-        assert_eq!(encoded, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0]);
-        assert_eq!(decode_buddy_payload(&encoded).unwrap(), (bp, 15));
+        assert_eq!(
+            encoded,
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0, 15, 16, 17, 18, 19, 20, 21, 22
+            ]
+        );
+        assert_eq!(decode_buddy_payload(&encoded).unwrap(), (bp, 23));
     }
 
     #[test]
@@ -159,18 +180,19 @@ mod buddy_tests {
                 offset: u32::MAX,
                 data_size: u32::MAX,
                 is_dedicated: false,
+                allocation_id: u64::MAX,
             };
             assert_eq!(
                 decode_buddy_payload(&encode_buddy_payload(&bp)).unwrap(),
-                (bp, 15)
+                (bp, 23)
             );
         }
     }
 
     #[test]
     fn decoder_rejects_zero_buddy_generation() {
-        // Valid 15-byte shape, but only dedicated allocations may use generation 0.
-        let bytes = [0_u8; 15];
+        // Valid 23-byte shape, but only dedicated allocations may use generation 0.
+        let bytes = [0_u8; 23];
         assert!(matches!(
             decode_buddy_payload(&bytes),
             Err(DecodeError::InvalidValue {
@@ -183,7 +205,7 @@ mod buddy_tests {
     #[test]
     fn decoder_rejects_nonzero_dedicated_generation() {
         for generation in [1_u32, u32::MAX] {
-            let mut bytes = [0_u8; 15];
+            let mut bytes = [0_u8; 23];
             bytes[2..6].copy_from_slice(&generation.to_le_bytes());
             bytes[14] = BUDDY_FLAG_DEDICATED;
             assert!(matches!(
@@ -197,7 +219,7 @@ mod buddy_tests {
     #[test]
     fn decoder_rejects_unknown_flags() {
         for flags in [0x02_u8, 0x03, 0x80, 0xff] {
-            let mut bytes = [0_u8; 15];
+            let mut bytes = [0_u8; 23];
             bytes[2] = 1;
             bytes[14] = flags;
             assert!(matches!(
@@ -206,6 +228,35 @@ mod buddy_tests {
                     if value == u64::from(flags)
             ));
         }
+    }
+
+    #[test]
+    fn decoder_rejects_missing_or_wrong_allocation_id() {
+        let mut buddy = [0_u8; BUDDY_PAYLOAD_SIZE];
+        buddy[2] = 1;
+        assert!(matches!(
+            decode_buddy_payload(&buddy),
+            Err(DecodeError::InvalidValue {
+                field: "allocation id",
+                value: 0
+            })
+        ));
+
+        let mut dedicated = [0_u8; BUDDY_PAYLOAD_SIZE];
+        dedicated[14] = BUDDY_FLAG_DEDICATED;
+        dedicated[15] = 1;
+        assert!(matches!(
+            decode_buddy_payload(&dedicated),
+            Err(DecodeError::InvalidValue {
+                field: "allocation id",
+                value: 1
+            })
+        ));
+
+        assert!(matches!(
+            decode_buddy_payload(&buddy[..15]),
+            Err(DecodeError::BufferTooShort { need: 23, have: 15 })
+        ));
     }
 }
 
@@ -229,28 +280,10 @@ mod control_tests {
     }
 
     #[test]
-    fn call_control_roundtrip() {
-        let identity = call_identity("grid");
-        let encoded = encode_call_control(&identity, 42).unwrap();
-        let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
-        assert_eq!(consumed, encoded.len());
-        assert_eq!(decoded.identity, identity);
-        assert_eq!(decoded.method_idx, 42);
-    }
-
-    #[test]
     fn call_control_roundtrip_preserves_route_identity_and_contract() {
-        let identity = RouteCallIdentity {
-            route_name: "grid".into(),
-            route_uid: "route-uid-0001".into(),
-            observed_route_revision: 17,
-            crm_ns: "test.grid".into(),
-            crm_name: "Grid".into(),
-            crm_ver: "0.1.0".into(),
-            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                .into(),
-        };
+        let mut identity = call_identity("grid");
+        identity.route_uid = "route-uid-0001".into();
+        identity.observed_route_revision = 17;
 
         let encoded = encode_call_control(&identity, 42).unwrap();
         let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
@@ -261,34 +294,51 @@ mod control_tests {
     }
 
     #[test]
-    fn call_control_rejects_empty_route_name() {
+    fn call_control_rejects_empty_route_name_before_buffer_capacity() {
         let mut identity = call_identity("grid");
         identity.route_name.clear();
-        assert!(encode_call_control(&identity, 0).is_err());
+        let error = encode_call_control(&identity, 0).unwrap_err();
+        let mut buf = [0xAA; 1];
+        assert_eq!(
+            encode_call_control_into(&mut buf, usize::MAX, &identity, 0),
+            Err(error)
+        );
+        assert_eq!(buf, [0xAA]);
         assert!(decode_call_control(&[0, 0, 0], 0).is_err());
     }
 
     #[test]
     fn call_control_with_offset() {
-        let mut buf = vec![0xAA, 0xBB]; // prefix
         let identity = call_identity("net");
-        buf.extend_from_slice(&encode_call_control(&identity, 7).unwrap());
+        let encoded = encode_call_control(&identity, 7).unwrap();
+        let len = encoded.len();
+        let mut buf = vec![0xAA; len + 4];
+        assert_eq!(encode_call_control_into(&mut buf, 2, &identity, 7), Ok(len));
+        assert_eq!(&buf[2..2 + len], encoded);
+        assert_eq!(&buf[..2], &[0xAA; 2]);
+        assert_eq!(&buf[2 + len..], &[0xAA; 2]);
         let (decoded, consumed) = decode_call_control(&buf, 2).unwrap();
         assert_eq!(decoded.identity, identity);
         assert_eq!(decoded.method_idx, 7);
-        assert_eq!(consumed, buf.len() - 2);
+        assert_eq!(consumed, len);
     }
 
     #[test]
-    fn encode_call_control_into_rejects_short_buffer_without_panic() {
+    fn encode_call_control_into_rejects_short_buffer_without_writing() {
         let identity = call_identity("grid");
         let len = encoded_call_control_len(&identity).unwrap();
-        let mut buf = vec![0u8; len - 1];
-
-        let err = encode_call_control_into(&mut buf, 0, &identity, 0)
-            .expect_err("short call-control buffer must be reported");
-
-        assert!(err.to_string().contains("buffer is too short"), "{err}");
+        let mut buf = vec![0xAA; len - 1];
+        for (offset, have) in [(0, len - 1), (1, len - 2), (usize::MAX, 0)] {
+            assert_eq!(
+                encode_call_control_into(&mut buf, offset, &identity, 0),
+                Err(EncodeError::BufferTooShort {
+                    field: "call_control",
+                    need: len,
+                    have
+                }),
+            );
+            assert!(buf.iter().all(|&byte| byte == 0xAA));
+        }
     }
 
     #[test]
@@ -353,32 +403,68 @@ mod control_tests {
     }
 
     #[test]
-    fn canonical_call_control_fixture_matches() {
-        let identity = call_identity("grid");
-        let mut expected = Vec::new();
-        expected.extend_from_slice(b"\x04grid");
-        expected.extend_from_slice(b"\x0dgrid-uid-0001");
-        expected.extend_from_slice(&1u64.to_le_bytes());
-        expected.extend_from_slice(b"\x09test.grid");
-        expected.extend_from_slice(b"\x04Grid");
-        expected.extend_from_slice(b"\x050.1.0");
-        expected.push(64);
-        expected.extend_from_slice(ABI_HASH.as_bytes());
-        expected.push(64);
-        expected.extend_from_slice(SIG_HASH.as_bytes());
-        expected.extend_from_slice(&5u16.to_le_bytes());
-
-        let encoded = encode_call_control(&identity, 5).unwrap();
-        assert_eq!(encoded, expected);
-    }
-
-    #[test]
     fn call_control_rejects_route_name_longer_than_one_byte_length() {
         let long_name = "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1);
         let mut identity = call_identity("grid");
         identity.route_name = long_name;
         let err = encode_call_control(&identity, 0).unwrap_err();
         assert!(err.to_string().contains("route_name"));
+    }
+
+    #[test]
+    fn call_control_rejects_truncated_method_and_text() {
+        let encoded = encode_call_control(&call_identity("grid"), 42).unwrap();
+        assert_eq!(
+            decode_call_control(&encoded, encoded.len() + 1),
+            Err(crate::frame::DecodeError::BufferTooShort { need: 17, have: 0 })
+        );
+        let err = decode_call_control(&encoded[..encoded.len() - 1], 0).unwrap_err();
+        assert_eq!(err.to_string(), "method_idx: need 2 bytes, have 1");
+
+        // The signature hash is the final text field, so its declared length
+        // cannot consume another field's bytes and mask the text bounds check.
+        let mut malformed = encoded;
+        let hash = SIG_HASH.as_bytes();
+        let hash_start = malformed
+            .windows(hash.len())
+            .position(|w| w == hash)
+            .unwrap();
+        malformed[hash_start - 1] = u8::MAX;
+        let err = decode_call_control(&malformed, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("signature_hash: need 255 bytes")
+        );
+    }
+
+    #[test]
+    fn call_control_accepts_maximum_route_name() {
+        let mut identity = call_identity("grid");
+        identity.route_name = "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES);
+        let encoded = encode_call_control(&identity, 100).unwrap();
+        let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.identity, identity);
+        assert_eq!(decoded.method_idx, 100);
+    }
+
+    #[test]
+    fn reply_control_error_rejects_truncated_header_body_and_offset() {
+        let encoded = try_encode_reply_control(&ReplyControl::Error(b"hello".to_vec())).unwrap();
+        let err = decode_reply_control(&encoded[..3], 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "reply control error_len: need 5 bytes, have 3"
+        );
+        let err = decode_reply_control(&encoded[..encoded.len() - 1], 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "reply control error_data: need 10 bytes, have 9"
+        );
+        assert_eq!(
+            decode_reply_control(&encoded, encoded.len() + 1),
+            Err(crate::frame::DecodeError::BufferTooShort { need: 1, have: 0 })
+        );
     }
 }
 
@@ -552,6 +638,7 @@ mod route_catalog_control_tests {
 }
 
 mod handshake_tests {
+    use crate::control::EncodeError;
     use crate::handshake::*;
 
     const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -647,8 +734,8 @@ mod handshake_tests {
     }
 
     #[test]
-    fn backing_generation_bumps_handshake_version() {
-        assert_eq!(HANDSHAKE_VERSION, 11);
+    fn allocation_identity_bumps_handshake_version() {
+        assert_eq!(HANDSHAKE_VERSION, 12);
 
         let client = encode_client_handshake(&[], CAP_CALL_V2, "")
             .expect("current client handshake encodes");
@@ -660,7 +747,7 @@ mod handshake_tests {
             &test_identity(),
         )
         .expect("current server handshake encodes");
-        for version in [9_u8, 10] {
+        for version in [9_u8, 10, 11] {
             for mut encoded in [client.clone(), server.clone()] {
                 encoded[0] = version;
                 assert!(matches!(
@@ -979,7 +1066,7 @@ mod handshake_tests {
 
     #[test]
     fn server_handshake_rejects_too_many_methods() {
-        let routes = vec![RouteInfo {
+        let mut routes = vec![RouteInfo {
             name: "grid".into(),
             route_uid: "grid-route-uid-0001".into(),
             route_revision: 1,
@@ -1000,6 +1087,138 @@ mod handshake_tests {
         let err =
             encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
         assert!(err.to_string().contains("method count"));
+
+        routes[0].methods.pop();
+        let encoded =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap();
+        assert_eq!(
+            decode_handshake(&encoded).unwrap().routes[0].methods.len(),
+            MAX_METHODS
+        );
+    }
+
+    #[test]
+    fn handshake_segment_count_limit_is_symmetric() {
+        let segments: Vec<_> = (0..MAX_SEGMENTS).map(|i| (format!("s{i}"), 256)).collect();
+        let encoded = encode_client_handshake(&segments, CAP_CALL_V2, "").unwrap();
+        assert_eq!(
+            decode_handshake(&encoded).unwrap().segments.len(),
+            MAX_SEGMENTS
+        );
+
+        let mut excessive = encoded.clone();
+        excessive[2..4].copy_from_slice(&((MAX_SEGMENTS + 1) as u16).to_le_bytes());
+        let err = decode_handshake(&excessive).unwrap_err();
+        assert_eq!(err.to_string(), "segment count: invalid value 17");
+        let mut too_many = segments;
+        too_many.push(("extra".into(), 256));
+        let err = encode_client_handshake(&too_many, CAP_CALL_V2, "").unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::FieldTooLong {
+                field: "segment count",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn handshake_route_and_method_count_limits_are_symmetric() {
+        let routes: Vec<_> = (0..MAX_ROUTES)
+            .map(|i| route(&format!("r{i}"), &[]))
+            .collect();
+        let encoded =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap();
+        assert_eq!(decode_handshake(&encoded).unwrap().routes.len(), MAX_ROUTES);
+        let mut too_many = routes;
+        too_many.push(route("extra", &[]));
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &too_many, "", &test_identity()).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::FieldTooLong {
+                field: "route count",
+                ..
+            }
+        ));
+
+        let mut empty =
+            encode_server_handshake(&[], CAP_CALL_V2, &[], "", &test_identity()).unwrap();
+        let count = empty.len() - 2;
+        empty[count..].copy_from_slice(&((MAX_ROUTES + 1) as u16).to_le_bytes());
+        let err = decode_handshake(&empty).unwrap_err();
+        assert_eq!(err.to_string(), "route count: invalid value 65");
+
+        let mut one = encode_server_handshake(
+            &[],
+            CAP_CALL_V2,
+            &[route("grid", &[])],
+            "",
+            &test_identity(),
+        )
+        .unwrap();
+        let count = one.len() - 2;
+        one[count..].copy_from_slice(&((MAX_METHODS + 1) as u16).to_le_bytes());
+        let err = decode_handshake(&one).unwrap_err();
+        assert_eq!(err.to_string(), "method count: invalid value 257");
+    }
+
+    #[test]
+    fn handshake_rejects_truncated_segment_and_route_fields() {
+        let client = encode_client_handshake(&[("seg".into(), 256)], CAP_CALL_V2, "").unwrap();
+        let err = decode_handshake(&client[..8]).unwrap_err();
+        assert_eq!(err.to_string(), "segment entry: need 5 bytes, have 4");
+        let err = decode_handshake(&client[..9]).unwrap_err();
+        assert_eq!(err.to_string(), "segment name: need 3 bytes, have 0");
+        let err = decode_handshake(&client[..client.len() - 1]).unwrap_err();
+        assert_eq!(err.to_string(), "capability flags: need 2 bytes, have 1");
+
+        let mut server =
+            encode_server_handshake(&[], CAP_CALL_V2, &[], "", &test_identity()).unwrap();
+        server.truncate(server.len() - 2); // replace route count with one incomplete route
+        server.extend_from_slice(&1u16.to_le_bytes());
+        server.extend_from_slice(&[4, b'g']);
+        let err = decode_handshake(&server).unwrap_err();
+        assert_eq!(err.to_string(), "route name: need 4 bytes, have 1");
+
+        let method = encode_server_handshake(
+            &[],
+            CAP_CALL_V2,
+            &[route("grid", &["get"])],
+            "",
+            &test_identity(),
+        )
+        .unwrap();
+        let err = decode_handshake(&method[..method.len() - 1]).unwrap_err();
+        assert_eq!(err.to_string(), "method index: need 2 bytes, have 1");
+    }
+
+    #[test]
+    fn handshake_rejects_zero_max_payload_size_on_encode_and_decode() {
+        let mut invalid = route("grid", &[]);
+        invalid.max_payload_size = 0;
+        let err = encode_server_handshake(&[], CAP_CALL_V2, &[invalid], "", &test_identity())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::InvalidText {
+                field: "max_payload_size",
+                ..
+            }
+        ));
+
+        let mut encoded = encode_server_handshake(
+            &[],
+            CAP_CALL_V2,
+            &[route("grid", &[])],
+            "",
+            &test_identity(),
+        )
+        .unwrap();
+        let payload_start = encoded.len() - 10; // 8-byte maximum followed by 2-byte method count
+        encoded[payload_start..payload_start + 8].fill(0);
+        let err = decode_handshake(&encoded).unwrap_err();
+        assert_eq!(err.to_string(), "max_payload_size: invalid value 0");
     }
 
     #[test]
@@ -1011,8 +1230,8 @@ mod handshake_tests {
 
     #[test]
     fn empty_handshake() {
-        // Version 11, prefix_len=0, 0 segments, cap_flags=0
-        let buf = [11, 0, 0, 0, 0, 0];
+        // Version 12, prefix_len=0, 0 segments, cap_flags=0
+        let buf = [12, 0, 0, 0, 0, 0];
         let decoded = decode_handshake(&buf).unwrap();
         assert_eq!(decoded.prefix, "");
         assert!(decoded.segments.is_empty());
@@ -1064,16 +1283,6 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn canonical_call_control_fixture_decodes() {
-        let identity = call_identity("hello");
-        let bytes = encode_call_control(&identity, 7).unwrap();
-        let (ctrl, consumed) = decode_call_control(&bytes, 0).unwrap();
-        assert_eq!(ctrl.identity, identity);
-        assert_eq!(ctrl.method_idx, 7);
-        assert_eq!(consumed, bytes.len());
-    }
-
-    #[test]
     fn legacy_short_call_control_fixture_is_rejected() {
         let bytes = hex_to_bytes("000000");
         let err = decode_call_control(&bytes, 0)
@@ -1109,13 +1318,14 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_buddy_payload_fixture_decodes() {
-        let bytes = hex_to_bytes("020007000000001000000002000000");
+        let bytes = hex_to_bytes("0200070000000010000000020000000102030405060708");
         let (bp, consumed) = decode_buddy_payload(&bytes).unwrap();
         assert_eq!(bp.seg_idx, 2);
         assert_eq!(bp.generation, 7);
         assert_eq!(bp.offset, 4096);
         assert_eq!(bp.data_size, 512);
         assert!(!bp.is_dedicated);
+        assert_eq!(bp.allocation_id, 0x0807_0605_0403_0201);
         assert_eq!(consumed, BUDDY_PAYLOAD_SIZE);
     }
 
@@ -1124,7 +1334,7 @@ mod cross_lang_tests {
         let bytes = hex_to_bytes("0200001000000002000000");
         assert!(matches!(
             decode_buddy_payload(&bytes),
-            Err(DecodeError::BufferTooShort { need: 15, have: 11 })
+            Err(DecodeError::BufferTooShort { need: 23, have: 11 })
         ));
     }
 
@@ -1142,8 +1352,8 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_client_handshake_fixture_decodes() {
-        // v11: [0b][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
-        let bytes = hex_to_bytes("0b0001000000001004736567300300");
+        // v12: [0c][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
+        let bytes = hex_to_bytes("0c0001000000001004736567300300");
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
@@ -1156,10 +1366,10 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_server_handshake_fixture_decodes() {
-        // v11: client handshake prefix, server identity, then route table
+        // v12: client handshake prefix, server identity, then route table
         // with per-route full CRM tag and contract hashes.
         let bytes = hex_to_bytes(
-            "0b00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "0c00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -1233,9 +1443,10 @@ mod cross_lang_tests {
             offset: 4096,
             data_size: 512,
             is_dedicated: false,
+            allocation_id: 0x0807_0605_0403_0201,
         };
         let encoded = encode_buddy_payload(&bp);
-        let expected = hex_to_bytes("020007000000001000000002000000");
+        let expected = hex_to_bytes("0200070000000010000000020000000102030405060708");
         assert_eq!(encoded.as_slice(), expected.as_slice());
     }
 
@@ -1243,8 +1454,8 @@ mod cross_lang_tests {
     fn rust_encode_matches_canonical_client_handshake_fixture() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
-        // v11: [0b][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
-        let expected = hex_to_bytes("0b0001000000001004736567300300");
+        // v12: [0c][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
+        let expected = hex_to_bytes("0c0001000000001004736567300300");
         assert_eq!(encoded, expected);
     }
 
@@ -1284,10 +1495,10 @@ mod cross_lang_tests {
             &identity,
         )
         .unwrap();
-        // v11: [0b][00 prefix_len] then segments/caps, identity, and route table
+        // v12: [0c][00 prefix_len] then segments/caps, identity, and route table
         // with per-route full CRM tag and contract hash metadata.
         let expected = hex_to_bytes(
-            "0b00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "0c00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

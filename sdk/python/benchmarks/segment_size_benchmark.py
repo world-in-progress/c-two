@@ -101,7 +101,6 @@ def bench_ipc_bytes(payload_size: int, seg_size: int) -> float | None:
         # warmup
         for _ in range(3):
             r = crm.echo(payload)
-            if hasattr(r, 'release'): r.release()
         gc.collect()
 
         latencies = []
@@ -109,7 +108,6 @@ def bench_ipc_bytes(payload_size: int, seg_size: int) -> float | None:
             t0 = time.perf_counter()
             r = crm.echo(payload)
             t1 = time.perf_counter()
-            if hasattr(r, 'release'): r.release()
             latencies.append((t1 - t0) * 1000)
 
         cc.close(crm)
@@ -149,7 +147,6 @@ def bench_ipc_dict(payload_size: int, seg_size: int) -> float | None:
         crm = cc.connect(DictEcho, name='echo_d', address=address)
         for _ in range(3):
             r = crm.echo(payload)
-            if hasattr(r, 'release'): r.release()
         gc.collect()
 
         latencies = []
@@ -157,7 +154,6 @@ def bench_ipc_dict(payload_size: int, seg_size: int) -> float | None:
             t0 = time.perf_counter()
             r = crm.echo(payload)
             t1 = time.perf_counter()
-            if hasattr(r, 'release'): r.release()
             latencies.append((t1 - t0) * 1000)
 
         cc.close(crm)

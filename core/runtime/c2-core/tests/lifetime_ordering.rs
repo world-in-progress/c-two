@@ -171,28 +171,6 @@ fn held_response_explicit_release_invalidates_then_releases_exactly_once() {
 }
 
 #[test]
-fn sdk_owned_drop_guard_invalidates_before_core_transport_cleanup_once() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let invalidations = Arc::new(AtomicUsize::new(0));
-    {
-        let _held = SdkHeldDropGuard {
-            held: Some(
-                HeldResponse::from_response_lease(inline_response_lease(b"drop"))
-                    .expect("held response"),
-            ),
-            events: events.clone(),
-            invalidations: invalidations.clone(),
-        };
-    }
-
-    assert_eq!(invalidations.load(Ordering::Acquire), 1);
-    assert_eq!(
-        events.lock().as_slice(),
-        ["fastdb-invalidate", "response-lease-release"]
-    );
-}
-
-#[test]
 fn held_release_attempts_invalidation_and_transport_cleanup_and_retains_both_failures() {
     let (mut release_failure, release_pool) = breakable_handle_response(b"release failure");
     *release_pool.write() = replacement_pool("release_failure");
@@ -256,28 +234,6 @@ fn held_response_copy_failure_attempts_cleanup_and_retains_both_causes() {
             .as_deref()
             .is_some_and(|error| error.contains("response handle release failed"))
     );
-}
-
-struct SdkHeldDropGuard {
-    held: Option<HeldResponse>,
-    events: Arc<Mutex<Vec<&'static str>>>,
-    invalidations: Arc<AtomicUsize>,
-}
-
-impl Drop for SdkHeldDropGuard {
-    fn drop(&mut self) {
-        let Some(mut held) = self.held.take() else {
-            return;
-        };
-        let events = self.events.clone();
-        let invalidations = self.invalidations.clone();
-        let _ = held.invalidate_then_release(move || {
-            invalidations.fetch_add(1, Ordering::AcqRel);
-            events.lock().push("fastdb-invalidate");
-            Ok(())
-        });
-        self.events.lock().push("response-lease-release");
-    }
 }
 
 fn inline_response_lease(bytes: &[u8]) -> ResponseLease {

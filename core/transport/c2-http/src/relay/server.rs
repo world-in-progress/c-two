@@ -1303,7 +1303,7 @@ mod tests {
                 if message == format!("IPC upstream at {address} does not export route 'grid'")
         ));
         assert!(
-            state.resolve("grid").is_empty(),
+            state.list_routes().is_empty(),
             "relay command path must not advertise an unexported upstream route"
         );
         assert!(
@@ -1337,10 +1337,9 @@ mod tests {
         .unwrap();
 
         result.await.unwrap().unwrap();
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].crm_ns, "test.echo");
-        assert_eq!(routes[0].crm_ver, "0.1.0");
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.crm_ns, "test.echo");
+        assert_eq!(route.crm_ver, "0.1.0");
 
         drop(tx);
         task.await.unwrap();
@@ -1405,10 +1404,9 @@ mod tests {
             RelayControlError::Other(message)
                 if message.contains("CRM contract mismatch")
         ));
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].crm_ns, "test.echo");
-        assert_eq!(routes[0].crm_name, "Echo");
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.crm_ns, "test.echo");
+        assert_eq!(route.crm_name, "Echo");
         assert!(
             disseminator.envelopes().is_empty(),
             "rejected same-owner contract changes must not broadcast route announce"
@@ -1456,10 +1454,9 @@ mod tests {
             err,
             RelayControlError::DuplicateRoute { name } if name == "grid"
         ));
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].server_id.as_deref(), Some("server-old"));
-        assert_eq!(routes[0].ipc_address.as_deref(), Some(old_address.as_str()));
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.server_id.as_deref(), Some("server-old"));
+        assert_eq!(route.ipc_address.as_deref(), Some(old_address.as_str()));
         assert_eq!(
             disseminator.envelopes().len(),
             1,
@@ -1509,10 +1506,9 @@ mod tests {
         .unwrap();
 
         second_result.await.unwrap().unwrap();
-        let routes = state.resolve("grid");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].server_id.as_deref(), Some("server-new"));
-        assert_eq!(routes[0].ipc_address.as_deref(), Some(new_address.as_str()));
+        let route = state.local_route("grid").unwrap().to_route_info();
+        assert_eq!(route.server_id.as_deref(), Some("server-new"));
+        assert_eq!(route.ipc_address.as_deref(), Some(new_address.as_str()));
         assert_eq!(disseminator.envelopes().len(), 2);
 
         drop(tx);
@@ -1705,7 +1701,7 @@ mod tests {
             };
             attestor.close().await;
 
-            let (manager_lease, _, manager_binding) = state
+            let (manager_lease, manager_binding) = state
                 .acquire_upstream_for_route(&manager)
                 .await
                 .unwrap_or_else(|_| panic!("live manager route acquisition failed"));
@@ -1765,7 +1761,7 @@ mod tests {
             };
             drop(manager_lease);
 
-            let (builder_lease, _, builder_binding) = state
+            let (builder_lease, builder_binding) = state
                 .acquire_upstream_for_route(&builder)
                 .await
                 .unwrap_or_else(|_| panic!("live builder route acquisition failed"));
@@ -1821,8 +1817,8 @@ mod tests {
             .expect("production idle sweeper did not evict the idle data client");
             assert!(!manager_client.is_connected());
             assert!(state.matches_owner_token("builder", &owner_token));
-            assert_eq!(state.resolve("manager").len(), 1);
-            assert_eq!(state.resolve("builder").len(), 1);
+            assert!(state.local_route("manager").is_some());
+            assert!(state.local_route("builder").is_some());
             let routes = state.list_routes();
             for route in [&manager, &builder] {
                 let retained = routes
@@ -1848,7 +1844,7 @@ mod tests {
                 let state = state.clone();
                 let expected = builder.clone();
                 call_tasks.spawn(async move {
-                    let (lease, _, binding) =
+                    let (lease, binding) =
                         tokio::time::timeout(CLEANUP, state.acquire_upstream_for_route(&expected))
                             .await
                             .map_err(|_| "concurrent route acquisition timed out")?

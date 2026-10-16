@@ -1,6 +1,6 @@
 use std::fmt;
 
-use c2_core::{Error, HeldResponse, LifecycleError};
+use c2_core::{Error, HeldResponse};
 
 /// A retained SDK value paired with its still-live C-Two response lease.
 ///
@@ -8,8 +8,7 @@ use c2_core::{Error, HeldResponse, LifecycleError};
 /// contract, not a zero-copy claim.
 #[must_use = "held values must remain owned or be explicitly released"]
 pub struct Held<T> {
-    value: Option<T>,
-    response: Option<HeldResponse>,
+    owners: Option<(T, HeldResponse)>,
     invalidate: fn(&T) -> Result<(), String>,
 }
 
@@ -20,19 +19,18 @@ impl<T> Held<T> {
         invalidate: fn(&T) -> Result<(), String>,
     ) -> Self {
         Self {
-            value: Some(value),
-            response: Some(response),
+            owners: Some((value, response)),
             invalidate,
         }
     }
 
     /// Borrow the retained value while this owner remains live.
     pub fn value(&self) -> Option<&T> {
-        self.value.as_ref()
+        self.owners.as_ref().map(|(value, _)| value)
     }
 
     pub fn is_released(&self) -> bool {
-        self.value.is_none() && self.response.is_none()
+        self.owners.is_none()
     }
 
     /// Invalidate the retained value owner before releasing transport storage.
@@ -40,34 +38,13 @@ impl<T> Held<T> {
     /// Both actions are attempted exactly once. Calling `release` again is a
     /// no-op. Prefer this explicit path when cleanup failures must be audited.
     pub fn release(&mut self) -> Result<(), Error> {
-        self.release_inner()
-    }
-
-    fn release_inner(&mut self) -> Result<(), Error> {
-        if self.is_released() {
+        let Some(owners) = self.owners.take() else {
             return Ok(());
-        }
-
-        let value = self.value.take();
-        let Some(mut response) = self.response.take() else {
-            let invalidation_error = value
-                .as_ref()
-                .and_then(|value| (self.invalidate)(value).err());
-            drop(value);
-            return match invalidation_error {
-                Some(invalidation_error) => Err(LifecycleError::HeldResponseRelease {
-                    invalidation_error: Some(invalidation_error),
-                    transport_error: None,
-                }
-                .into()),
-                None => Ok(()),
-            };
         };
-
-        let result = response.invalidate_then_release(|| match value.as_ref() {
-            Some(value) => (self.invalidate)(value),
-            None => Ok(()),
-        });
+        // Separate locals preserve response-before-value drop during unwinding.
+        let value = owners.0;
+        let mut response = owners.1;
+        let result = response.invalidate_then_release(|| (self.invalidate)(&value));
         drop(value);
         drop(response);
         result.map_err(Error::from)
@@ -85,6 +62,39 @@ impl<T> fmt::Debug for Held<T> {
 
 impl<T> Drop for Held<T> {
     fn drop(&mut self) {
-        let _ = self.release_inner();
+        let _ = self.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn failed_invalidation_consumes_held_owners_once() {
+        for panics in [false, true] {
+            let invalidations = Cell::new(0);
+            let mut held = Held::new(
+                (&invalidations, panics),
+                HeldResponse::from_owned_bytes(Vec::new()),
+                |(invalidations, panics)| {
+                    invalidations.set(invalidations.get() + 1);
+                    assert!(!panics, "invalidation panic");
+                    Err("invalidation failed".into())
+                },
+            );
+            let result = catch_unwind(AssertUnwindSafe(|| held.release()));
+            assert_eq!(result.is_err(), panics);
+            if let Ok(result) = result {
+                assert!(result.is_err());
+            }
+            assert!(held.is_released());
+            assert!(held.value().is_none());
+            held.release().expect("already released");
+            drop(held);
+            assert_eq!(invalidations.get(), 1);
+        }
     }
 }

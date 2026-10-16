@@ -446,6 +446,7 @@ mod tests {
                             }
                         }
                     }
+                    crate::tests::close_listener(listener).await;
                 });
         });
         Responder {

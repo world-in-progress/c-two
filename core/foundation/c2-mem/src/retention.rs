@@ -342,13 +342,10 @@ impl RetentionPermit {
             return Ok(());
         }
         let mut inner = lock_inner(&self.state.inner);
-        let totals = self
-            .bytes
-            .checked_add(additional_bytes)
-            .zip(inner.used_retained_bytes.checked_add(additional_bytes));
+        let total = inner.used_retained_bytes.checked_add(additional_bytes);
         let reason = if inner.closed {
             Some(RetentionRejectReason::Closed)
-        } else if totals.is_none_or(|(_, total)| total > inner.max_retained_bytes) {
+        } else if total.is_none_or(|total| total > inner.max_retained_bytes) {
             Some(RetentionRejectReason::RetainedBytesExhausted)
         } else {
             None
@@ -364,8 +361,9 @@ impl RetentionPermit {
                 max_retained_bytes: inner.max_retained_bytes,
             });
         }
-        let (permit_bytes, total) = totals.expect("checked positive growth");
-        self.bytes = permit_bytes;
+        let total = total.expect("checked positive growth");
+        // This permit's charge is part of the checked domain total.
+        self.bytes += additional_bytes;
         inner.used_retained_bytes = total;
         inner.peak_retained_bytes = inner.peak_retained_bytes.max(total);
         Ok(())

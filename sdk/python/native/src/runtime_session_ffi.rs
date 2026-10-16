@@ -826,22 +826,12 @@ impl PyRuntimeSession {
         if let Some(server) = slf.server_bridge.lock().as_ref() {
             return Ok(server.clone_ref(py));
         }
-        let identity = slf
-            .inner
+        slf.inner
             .ensure_server()
             .map_err(runtime_configuration_error_to_py)?;
         let module = py.import("c_two.transport.server.native")?;
         let class = module.getattr("NativeServerBridge")?;
         let kwargs = PyDict::new(py);
-        kwargs.set_item("bind_address", &identity.ipc_address)?;
-        kwargs.set_item("server_id", &identity.server_id)?;
-        kwargs.set_item("server_instance_id", &identity.server_instance_id)?;
-        if let Some(overrides) = slf.inner.server_ipc_overrides() {
-            kwargs.set_item(
-                "ipc_overrides",
-                server_ipc_overrides_to_dict(py, &overrides)?,
-            )?;
-        }
         kwargs.set_item("lease_tracker", slf.lease_tracker())?;
         kwargs.set_item("runtime_session", &slf)?;
         let server = class.call((), Some(&kwargs))?.unbind();
@@ -1489,6 +1479,24 @@ fn shutdown_outcome_to_dict<'py>(
     dict.set_item("route_close_error", outcome.route_close_error)?;
     dict.set_item("runtime_barrier_error", outcome.runtime_barrier_error)?;
     dict.set_item("ipc_client_close_error", outcome.ipc_client_close_error)?;
+    dict.set_item(
+        "ipc_clients_abnormally_closed",
+        outcome.ipc_clients_abnormally_closed,
+    )?;
+    let client_close_details = outcome
+        .ipc_client_close_details
+        .into_iter()
+        .map(|detail| {
+            let item = PyDict::new(py);
+            item.set_item("address", detail.address)?;
+            item.set_item("reason", detail.reason)?;
+            Ok(item.unbind())
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    dict.set_item(
+        "ipc_client_close_details",
+        PyList::new(py, client_close_details)?,
+    )?;
     Ok(dict)
 }
 

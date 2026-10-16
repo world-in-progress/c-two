@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.7.5] — local preparation, companion c3 0.3.4
+
+### Fixed
+
+- Ordinary Python calls no longer install or import FastDB/NumPy. FastDB
+  Payload contracts select `c-two[fastdb]`, pinned to `fastdb4py==0.2.2`;
+  missing dependencies report that extra explicitly.
+- Outgoing IPC shutdown bounds the DISCONNECT write/ACK exchange to 100 ms
+  per connection, then observes the existing local cleanup barriers. Outcomes
+  add `ipc_clients_abnormally_closed` and `ipc_client_close_details` with
+  addresses/reasons. Server work drain and shutdown deadlines retain their
+  meaning.
+- Registration rejects implementation-only `@cc.on_shutdown` markers instead
+  of silently ignoring them; the CRM contract remains the hook authority.
+- Buddy releases validate the exact allocation instance, rejecting wrong
+  parent/child coordinates and stale identifiers after same-location reuse.
+- Default macOS coordination records survive system temporary-file cleaning;
+  socket paths and strict identity/lifecycle rules are preserved. Failed
+  initialization rolls back only its own newly created, unchanged lease.
+
+### Changed
+
+- SHM format 3, IPC handshake 12 and C/FFI ABI 5 require coordinated native
+  upgrades. There are no old-format compatibility paths.
+- Rust encoded services take owned request snapshots. IPC override types use
+  flat fields; nested `BaseIpcConfigOverrides`, stored `max_pool_memory` and
+  peer handshake shadow state are removed. Regenerate/recompile consumers.
+- Obsolete Python wire/handshake projections, three Python `call_prepared`
+  entries, the transfer `buffer` keyword and generated TypeScript Node IPC
+  factories/types are retired. Use FastDB payloads and official connection
+  injection; Python-only pickle and Core byte/preallocation APIs remain.
+- HTTP discovery uses the strictly validated response header as namespace
+  authority. Runtime/test cleanup removes duplicate state while preserving
+  budgets, validation ordering, snapshots, leases and lifecycle authority.
+
+See [upgrade boundaries and preparation status](docs/releases/0.7.5.md).
+The three new Python/runtime fixes leave business CRM fingerprints unchanged;
+SHM, IPC and FFI versions above include the prior accepted allocation repair.
+
 ## [0.7.0] — companion c3 0.3.0
 
 This entry describes Python `c-two` 0.7.0 and its companion CLI `c3` 0.3.0.

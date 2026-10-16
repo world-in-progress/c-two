@@ -30,6 +30,7 @@ enum ShmBufferInner {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     },
 }
 
@@ -74,6 +75,7 @@ impl PyShmBuffer {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     ) -> Self {
         Self {
             inner: Mutex::new(Some(ShmBufferInner::PeerShm {
@@ -83,6 +85,7 @@ impl PyShmBuffer {
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             })),
             lease: Mutex::new(None),
             data_len: data_size as usize,
@@ -162,9 +165,17 @@ impl PyShmBuffer {
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             }) => {
                 let mut p = pool.write();
-                let _ = p.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
+                let _ = p.free_at(
+                    seg_idx as u32,
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                    allocation_id,
+                );
                 Ok(())
             }
             Some(ShmBufferInner::Inline(_)) => Ok(()),
@@ -219,6 +230,7 @@ impl PyShmBuffer {
                 offset,
                 data_size,
                 is_dedicated,
+                ..
             } => {
                 let pool_guard = pool.read();
                 let raw_ptr = pool_guard
@@ -226,7 +238,6 @@ impl PyShmBuffer {
                     .map_err(|e| PyBufferError::new_err(format!("SHM access: {e}")))?;
                 (raw_ptr as *const u8, *data_size as usize)
             }
-
         };
 
         // SAFETY: `pool_guard` (read lock) is released after extracting the raw pointer,
@@ -292,9 +303,17 @@ impl Drop for PyShmBuffer {
                     offset,
                     data_size,
                     is_dedicated,
+                    allocation_id,
                 } => {
                     let mut p = pool.write();
-                    let _ = p.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
+                    let _ = p.free_at(
+                        seg_idx as u32,
+                        generation,
+                        offset,
+                        data_size,
+                        is_dedicated,
+                        allocation_id,
+                    );
                 }
                 ShmBufferInner::Inline(_) => {}
             }

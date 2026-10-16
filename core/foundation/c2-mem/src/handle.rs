@@ -15,6 +15,7 @@ pub enum MemHandle {
     Buddy {
         seg_idx: u16,
         generation: u32,
+        allocation_id: u64,
         offset: u32,
         /// Original buddy block capacity; logical length may shrink after assembly.
         allocation_size: u32,
@@ -72,13 +73,14 @@ impl std::fmt::Debug for MemHandle {
             Self::Buddy {
                 seg_idx,
                 generation,
+                allocation_id,
                 offset,
                 allocation_size,
                 len,
             } => {
                 write!(
                     f,
-                    "MemHandle::Buddy(seg={seg_idx}, gen={generation}, off={offset}, capacity={allocation_size}, len={len})"
+                    "MemHandle::Buddy(seg={seg_idx}, gen={generation}, allocation={allocation_id}, off={offset}, capacity={allocation_size}, len={len})"
                 )
             }
             Self::Dedicated { seg_idx, len } => {
@@ -104,6 +106,7 @@ mod tests {
         let h = MemHandle::Buddy {
             seg_idx: 0,
             generation: 1,
+            allocation_id: 64,
             offset: 1024,
             allocation_size: 4096,
             len: 4096,

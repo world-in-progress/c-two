@@ -172,7 +172,7 @@ async fn public_stop_cleanup_case(acquire_failure: bool) {
         let state = running.state_for_test();
         relay = Some(running);
         let entry = state.local_route("grid").unwrap();
-        let (lease, _, _binding) = state
+        let (lease, _binding) = state
             .acquire_upstream_for_route(&entry)
             .await
             .unwrap_or_else(|_| panic!("attested acquire"));
@@ -516,7 +516,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap();
         let old_entry = state.local_route("grid").unwrap();
-        let (lease, _, _) =
+        let (lease, _) =
             tokio::time::timeout(STEP, state.acquire_upstream_for_route(&old_entry))
                 .await
                 .unwrap()
@@ -562,7 +562,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             !old_client.is_connected(),
             "stale acquire must initiate native disconnect before returning"
         );
-        let (replacement_lease, _, binding) =
+        let (replacement_lease, binding) =
             tokio::time::timeout(STEP, state.acquire_upstream_for_route(&new_entry))
                 .await
                 .unwrap()
@@ -584,7 +584,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
         // Re-observing the precise closing owner cannot target its replacement.
         state.clients.close(&old_client);
         assert!(old_client.close_shared_bounded(STEP).await);
-        let (same_lease, _, same_binding) =
+        let (same_lease, same_binding) =
             tokio::time::timeout(STEP, state.acquire_upstream_for_route(&new_entry))
                 .await
                 .unwrap()

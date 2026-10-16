@@ -1,5 +1,20 @@
 //! c2-ipc unit tests.
 
+pub(crate) async fn close_listener(listener: c2_local::LocalListener) {
+    let outcome = tokio::task::spawn_blocking(move || listener.close())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            c2_local::EndpointReapResult::Reaped
+                | c2_local::EndpointReapResult::AlreadyAbsent
+                | c2_local::EndpointReapResult::NotApplicable
+        ),
+        "listener cleanup failed: {outcome:?}"
+    );
+}
+
 #[cfg(test)]
 mod client_tests {
     use c2_wire::buddy::{BUDDY_PAYLOAD_SIZE, decode_buddy_payload};
@@ -118,7 +133,7 @@ mod client_tests {
     #[test]
     fn test_buddy_frame_encoding() {
         // Build a buddy call frame as call_buddy would:
-        // payload = [15B buddy_payload][call_control]
+        // payload = [23B buddy_payload][call_control]
         // flags   = FLAG_CALL_V2 | FLAG_BUDDY
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
 
@@ -128,10 +143,16 @@ mod client_tests {
             offset: 4096,
             data_size: 8192,
             is_dedicated: false,
+            allocation_id: 0x0807_0605_0403_0201,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
         assert_eq!(buddy_bytes.len(), BUDDY_PAYLOAD_SIZE);
-        assert_eq!(buddy_bytes, [0, 0, 1, 0, 0, 0, 0, 16, 0, 0, 0, 32, 0, 0, 0]);
+        assert_eq!(
+            buddy_bytes,
+            [
+                0, 0, 1, 0, 0, 0, 0, 16, 0, 0, 0, 32, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8
+            ]
+        );
 
         let ctrl = encode_call_control(&call_identity("grid"), 3).unwrap();
         let mut payload = Vec::new();
@@ -155,6 +176,7 @@ mod client_tests {
         assert_eq!(decoded_bp.offset, 4096);
         assert_eq!(decoded_bp.data_size, 8192);
         assert!(!decoded_bp.is_dedicated);
+        assert_eq!(decoded_bp.allocation_id, bp.allocation_id);
         assert_eq!(bp_consumed, BUDDY_PAYLOAD_SIZE);
 
         // Decode call control after buddy payload.
@@ -173,11 +195,14 @@ mod client_tests {
             offset: 0,
             data_size: 1_000_000,
             is_dedicated: true,
+            allocation_id: 0,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
         assert_eq!(
             buddy_bytes,
-            [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x42, 0x0f, 0, 1]
+            [
+                5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x42, 0x0f, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
         );
         let ctrl = encode_call_control(&call_identity("net"), 1).unwrap();
 
@@ -198,80 +223,40 @@ mod client_tests {
 
     #[test]
     fn test_chunked_frame_encoding() {
-        // Simulate a 3-chunk transfer.
         use c2_wire::chunk::encode_chunk_header;
 
-        let route = "grid";
-        let method_idx: u16 = 2;
-        let total_chunks: u16 = 3;
-        let request_id: u64 = 42;
-
-        let ctrl = encode_call_control(&call_identity(route), method_idx).unwrap();
-        let chunk_data = b"chunk_payload_data";
-
-        // ── Chunk 0: [chunk_header][call_control][data] ──
-        let chunk_hdr_0 = encode_chunk_header(0, total_chunks);
-        let mut payload_0 = Vec::new();
-        payload_0.extend_from_slice(&chunk_hdr_0);
-        payload_0.extend_from_slice(&ctrl);
-        payload_0.extend_from_slice(chunk_data);
-
-        let flags_0 = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED;
-        let frame_0 = frame::encode_frame(request_id, flags_0, &payload_0);
-
-        let (hdr_0, fp_0) = frame::decode_frame(&frame_0).unwrap();
-        assert_eq!(hdr_0.request_id, request_id);
-        assert!(hdr_0.is_call_v2());
-        assert!(flags::is_chunked(hdr_0.flags));
-        assert!(!flags::is_chunk_last(hdr_0.flags));
-
-        // Decode chunk header.
-        let (chunk_idx, total, ch_consumed) = decode_chunk_header(fp_0, 0).unwrap();
-        assert_eq!(chunk_idx, 0);
-        assert_eq!(total, 3);
-        assert_eq!(ch_consumed, CHUNK_HEADER_SIZE);
-
-        // Decode call control (present on chunk 0).
-        let (decoded_ctrl, ctrl_consumed) = decode_call_control(fp_0, CHUNK_HEADER_SIZE).unwrap();
-        assert_eq!(decoded_ctrl.identity.route_name, route);
-        assert_eq!(decoded_ctrl.method_idx, method_idx);
-
-        // Remaining is chunk data.
-        let data_start = CHUNK_HEADER_SIZE + ctrl_consumed;
-        assert_eq!(&fp_0[data_start..], chunk_data);
-
-        // ── Chunk 1: [chunk_header][data] (no call_control) ──
-        let chunk_hdr_1 = encode_chunk_header(1, total_chunks);
-        let mut payload_1 = Vec::new();
-        payload_1.extend_from_slice(&chunk_hdr_1);
-        payload_1.extend_from_slice(chunk_data);
-
-        let flags_1 = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED;
-        let frame_1 = frame::encode_frame(request_id, flags_1, &payload_1);
-
-        let (hdr_1, fp_1) = frame::decode_frame(&frame_1).unwrap();
-        assert!(flags::is_chunked(hdr_1.flags));
-        assert!(!flags::is_chunk_last(hdr_1.flags));
-        let (ci_1, tc_1, _) = decode_chunk_header(fp_1, 0).unwrap();
-        assert_eq!(ci_1, 1);
-        assert_eq!(tc_1, 3);
-        assert_eq!(&fp_1[CHUNK_HEADER_SIZE..], chunk_data);
-
-        // ── Chunk 2 (last): [chunk_header][data] + FLAG_CHUNK_LAST ──
-        let chunk_hdr_2 = encode_chunk_header(2, total_chunks);
-        let mut payload_2 = Vec::new();
-        payload_2.extend_from_slice(&chunk_hdr_2);
-        payload_2.extend_from_slice(chunk_data);
-
-        let flags_2 = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED | flags::FLAG_CHUNK_LAST;
-        let frame_2 = frame::encode_frame(request_id, flags_2, &payload_2);
-
-        let (hdr_2, fp_2) = frame::decode_frame(&frame_2).unwrap();
-        assert!(flags::is_chunked(hdr_2.flags));
-        assert!(flags::is_chunk_last(hdr_2.flags));
-        let (ci_2, tc_2, _) = decode_chunk_header(fp_2, 0).unwrap();
-        assert_eq!(ci_2, 2);
-        assert_eq!(tc_2, 3);
+        let ctrl = encode_call_control(&call_identity("grid"), 2).unwrap();
+        let data = [0xABu8; 128];
+        for (idx, count, last) in [(0, 1, true), (0, 3, false), (1, 3, false), (2, 3, true)] {
+            let chunk_header = encode_chunk_header(idx, count);
+            let frame_flags = flags::FLAG_CALL_V2
+                | flags::FLAG_CHUNKED
+                | if last { flags::FLAG_CHUNK_LAST } else { 0 };
+            let encoded = frame::encode_frame_parts(
+                42,
+                frame_flags,
+                &[&chunk_header, if idx == 0 { &ctrl } else { &[] }, &data],
+            );
+            let (header, payload) = frame::decode_frame(&encoded).unwrap();
+            assert_eq!(header.request_id, 42);
+            assert!(header.is_call_v2());
+            assert!(flags::is_chunked(header.flags));
+            assert_eq!(flags::is_chunk_last(header.flags), last);
+            let (actual_idx, actual_count, offset) = decode_chunk_header(payload, 0).unwrap();
+            assert_eq!(
+                (actual_idx, actual_count, offset),
+                (idx, count, CHUNK_HEADER_SIZE)
+            );
+            let control_len = if idx == 0 {
+                let (decoded, consumed) = decode_call_control(payload, offset).unwrap();
+                assert_eq!(decoded.identity.route_name, "grid");
+                assert_eq!(decoded.method_idx, 2);
+                consumed
+            } else {
+                0
+            };
+            assert_eq!(&payload[offset + control_len..], &data);
+        }
     }
 
     #[test]
@@ -383,31 +368,6 @@ mod client_tests {
         assert_eq!(pool.segment_count(), 0);
         assert!(pool.ensure_ready().is_ok());
         assert_eq!(pool.segment_count(), 0);
-    }
-
-    #[test]
-    fn test_chunked_single_chunk() {
-        // Edge case: data exactly at chunk_size boundary → 1 chunk.
-        use c2_wire::chunk::encode_chunk_header;
-
-        let chunk_hdr = encode_chunk_header(0, 1);
-        let ctrl = encode_call_control(&call_identity("route"), 0).unwrap();
-        let data = vec![0xABu8; 128];
-
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&chunk_hdr);
-        payload.extend_from_slice(&ctrl);
-        payload.extend_from_slice(&data);
-
-        let flags_last = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED | flags::FLAG_CHUNK_LAST;
-        let frame_bytes = frame::encode_frame(1, flags_last, &payload);
-
-        let (hdr, fp) = frame::decode_frame(&frame_bytes).unwrap();
-        assert!(flags::is_chunked(hdr.flags));
-        assert!(flags::is_chunk_last(hdr.flags));
-        let (ci, tc, _) = decode_chunk_header(fp, 0).unwrap();
-        assert_eq!(ci, 0);
-        assert_eq!(tc, 1);
     }
 
     // ── SyncClient tests ──────────────────────────────────────────────
@@ -606,6 +566,7 @@ mod response_lease_tests {
                 offset: u32::try_from(segment_capacity - 1).unwrap(),
                 data_size: 2,
                 is_dedicated: false,
+                allocation_id: allocation.allocation_id,
             },
             server_pool,
         );
@@ -658,6 +619,7 @@ mod response_lease_tests {
                 offset: allocation.offset,
                 data_size: u32::try_from(payload.len()).unwrap(),
                 is_dedicated: allocation.is_dedicated,
+                allocation_id: allocation.allocation_id,
             },
             Arc::clone(&server_pool),
         );
@@ -674,6 +636,46 @@ mod response_lease_tests {
                 .alloc_count,
             0
         );
+    }
+
+    #[test]
+    fn response_release_rejects_stale_id_after_same_slot_reuse() {
+        let mut owner = MemPool::new_with_prefix(pool_config(), unique_prefix('i'));
+        let old = owner.alloc(4096).unwrap();
+        owner.free(&old).unwrap();
+        let current = owner.alloc(4096).unwrap();
+        assert_eq!(
+            (current.seg_idx, current.generation, current.offset),
+            (old.seg_idx, old.generation, old.offset)
+        );
+        assert_ne!(current.allocation_id, old.allocation_id);
+
+        let peer = MemPool::open_peer(pool_config(), owner.prefix().to_string());
+        let mut state = ServerPoolState::from_pool_for_test(peer);
+        assert!(
+            state
+                .release_response(
+                    old.seg_idx as u16,
+                    old.generation,
+                    old.offset,
+                    4096,
+                    false,
+                    old.allocation_id
+                )
+                .is_err()
+        );
+        assert_eq!(owner.stats().alloc_count, 1);
+        state
+            .release_response(
+                current.seg_idx as u16,
+                current.generation,
+                current.offset,
+                4096,
+                false,
+                current.allocation_id,
+            )
+            .unwrap();
+        assert_eq!(owner.stats().alloc_count, 0);
     }
 }
 
@@ -862,7 +864,6 @@ mod lazy_policy_roundtrip_tests {
         BaseIpcConfig {
             pool_segment_size: segment_size,
             max_pool_segments: segments,
-            max_pool_memory: segment_size * u64::from(segments),
             ..BaseIpcConfig::default()
         }
     }
@@ -2037,7 +2038,7 @@ mod lazy_policy_roundtrip_tests {
         assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
 
-        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true)
+        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0)
             .expect("peer signals read_done");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !returned.load(Ordering::Acquire) || budget.snapshot().shm.used_bytes != 0 {
@@ -2125,7 +2126,7 @@ mod lazy_policy_roundtrip_tests {
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
         assert!(!returned.load(Ordering::Acquire));
 
-        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true)
+        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0)
             .expect("peer signals read_done");
         // Sample the returned flag and scoped count under the executor lock.
         // Independent reads allow the worker to return the permit and clear
@@ -2583,6 +2584,7 @@ mod lazy_policy_roundtrip_tests {
             generation: u32,
             offset: u32,
             data_size: u32,
+            allocation_id: u64,
         }
 
         let mut held: Vec<HeldReply> = Vec::new();
@@ -2595,6 +2597,7 @@ mod lazy_policy_roundtrip_tests {
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             } = echo_roundtrip(&client, "reply_idx16", &payload).await
             else {
                 panic!("expected buddy SHM reply for request {i}");
@@ -2616,6 +2619,7 @@ mod lazy_policy_roundtrip_tests {
                 generation,
                 offset,
                 data_size,
+                allocation_id,
             });
         }
 
@@ -2646,6 +2650,7 @@ mod lazy_policy_roundtrip_tests {
                         reply.offset,
                         reply.data_size,
                         false,
+                        reply.allocation_id,
                     )
                     .unwrap_or_else(|e| panic!("release of reply failed: {e}"));
             }
@@ -3846,6 +3851,7 @@ mod lazy_policy_roundtrip_tests {
         let (stream_tx, stream_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept client");
+            crate::tests::close_listener(listener).await;
             let mut len_buf = [0u8; 4];
             use tokio::io::AsyncReadExt as _;
             stream
@@ -4804,6 +4810,7 @@ mod lazy_policy_roundtrip_tests {
                     pointer.offset,
                     pointer.data_size,
                     true,
+                    pointer.allocation_id,
                 )
                 .unwrap();
             published_tx.send(()).unwrap();
@@ -4848,6 +4855,7 @@ mod lazy_policy_roundtrip_tests {
                 .await
                 .unwrap();
             drop(old_peer);
+            crate::tests::close_listener(listener).await;
         });
 
         let mut cfg = client_config(small_base(64 * 1024, 1), 1024);

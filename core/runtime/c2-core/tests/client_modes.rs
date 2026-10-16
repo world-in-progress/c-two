@@ -10,6 +10,7 @@ use axum::{
     extract::Path,
     extract::State,
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
 };
 use c2_contract::{ContractRelease, MethodAccess};
@@ -18,7 +19,7 @@ use c2_core::{
     Runtime, RuntimeOptions, ServiceDefinition, normalize_ipc_error,
 };
 use c2_error::{C2Error, ErrorCode};
-use c2_http::client::RelayRouteInfo;
+use c2_http::client::{LOCAL_ENDPOINT_NAMESPACE_HEADER, RelayRouteInfo};
 use c2_http::relay::{RelayConfig, RelayServer};
 use c2_ipc::IpcError;
 use c2_local::{LocalEndpoint, LocalListener};
@@ -33,10 +34,10 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 struct Echo;
 
 impl EncodedService for Echo {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         match method_index {
             0 => Ok(Vec::new()),
-            1 => Ok(request.to_vec()),
+            1 => Ok(request),
             other => Err(C2Error::new(
                 ErrorCode::ProtocolViolation,
                 format!("unexpected method index {other}"),
@@ -168,11 +169,18 @@ impl Drop for RegistryServer {
 async fn resolve_registry(
     State(state): State<RegistryState>,
     Path(route_name): Path<String>,
-) -> Json<Vec<RelayRouteInfo>> {
+) -> impl IntoResponse {
     state.resolve_count.fetch_add(1, Ordering::SeqCst);
     let mut route = state.route;
     route.name = route_name;
-    Json(vec![route])
+    let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+    (
+        [(
+            LOCAL_ENDPOINT_NAMESPACE_HEADER,
+            context.namespace_id().to_owned(),
+        )],
+        Json(vec![route]),
+    )
 }
 
 fn registry_server(route: RelayRouteInfo, resolve_count: Arc<AtomicUsize>) -> RegistryServer {
@@ -1029,7 +1037,7 @@ fn service_error_is_not_replayed() {
     }
 
     impl EncodedService for Fails {
-        fn invoke(&self, _method_index: u16, _request: &[u8]) -> Result<Vec<u8>, C2Error> {
+        fn invoke(&self, _method_index: u16, _request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             Err(
                 C2Error::new(ErrorCode::ResourceFunctionExecuting, "service failed")

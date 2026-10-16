@@ -22,7 +22,6 @@ use c2_http::client::{
 use c2_server::{BuiltRoute, ServerLifecycleState, ServerRouteCloseOutcome};
 
 use crate::call_execution::{CallExecutionContext, CallExecutionObserver};
-use crate::outcome::RuntimeRouteSpec;
 use crate::{
     LifecycleError, RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome,
     ShutdownOutcome, UnregisterOutcome,
@@ -177,7 +176,6 @@ struct RuntimeState {
     call_execution_revision: u64,
     call_execution: Option<CallExecutionContext>,
     call_execution_observer: CallExecutionObserver,
-    client_config_frozen: bool,
     client_config_revision: u64,
     local_endpoint_options: c2_config::LocalEndpointOptions,
     local_endpoint_sources: Option<c2_config::ConfigSources>,
@@ -280,7 +278,6 @@ impl Runtime {
                 call_execution_revision: 0,
                 call_execution: None,
                 call_execution_observer: CallExecutionObserver::new(),
-                client_config_frozen: false,
                 client_config_revision: 0,
                 local_endpoint_options: Default::default(),
                 local_endpoint_sources: None,
@@ -665,7 +662,7 @@ impl Runtime {
         overrides: Option<ClientIpcConfigOverrides>,
     ) -> Result<(), LifecycleError> {
         let mut state = self.state.lock();
-        if state.client_config_frozen {
+        if state.frozen_client_config.is_some() {
             return Err(LifecycleError::ClientConfigFrozen);
         }
         state.client_ipc_overrides = overrides;
@@ -682,7 +679,7 @@ impl Runtime {
     }
 
     pub fn client_config_frozen(&self) -> bool {
-        self.state.lock().client_config_frozen
+        self.state.lock().frozen_client_config.is_some()
     }
 
     pub fn path_counters(&self) -> PathCounters {
@@ -786,7 +783,6 @@ impl Runtime {
             }
             let config = resolved.map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
             state.frozen_client_config = Some(config.clone());
-            state.client_config_frozen = true;
             let pool = state
                 .client_pool
                 .get_or_insert_with(|| {
@@ -971,7 +967,7 @@ impl Runtime {
             target.ensure_no_pending_teardown()?;
             if source.lifecycle_frozen
                 || source.owner_control_consumed
-                || source.client_config_frozen
+                || source.frozen_client_config.is_some()
             {
                 return Err(LifecycleError::Configuration(
                     "cannot transfer lifecycle after Runtime use".into(),
@@ -980,7 +976,7 @@ impl Runtime {
             if target.lifecycle_frozen
                 || target.owner_control_consumed
                 || target.owner_control.is_some()
-                || target.client_config_frozen
+                || target.frozen_client_config.is_some()
                 || target.lifecycle_policy != Default::default()
             {
                 return Err(LifecycleError::Configuration(
@@ -1134,12 +1130,11 @@ impl Runtime {
         &self,
         server: &Arc<c2_server::Server>,
         route: BuiltRoute,
-        spec: RuntimeRouteSpec,
         relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
     ) -> Result<RegisterOutcome, LifecycleError> {
         let identity = self.ensure_server()?;
-        let route_name = spec.name.clone();
+        let route_name = route.name().to_string();
         let route_uid = route.route_uid().to_string();
         let route_revision = route.route_revision();
         let registration_scope = RelayRegistrationScope {
@@ -1151,52 +1146,14 @@ impl Runtime {
         };
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
-        if route.name() != spec.name {
-            return Err(LifecycleError::Server(format!(
-                "route/spec name mismatch: route={:?}, spec={:?}",
-                route.name(),
-                spec.name
-            )));
-        }
-        if route.method_names() != spec.method_names.as_slice() {
-            return Err(LifecycleError::Server(format!(
-                "route/spec method_names mismatch for {route_name}"
-            )));
-        }
-        if route.access_map_snapshot() != spec.access_map {
-            return Err(LifecycleError::Server(format!(
-                "route/spec access map mismatch for {route_name}"
-            )));
-        }
-        if route.crm_ns() != spec.crm_ns
-            || route.crm_name() != spec.crm_name
-            || route.crm_ver() != spec.crm_ver
-            || route.abi_hash() != spec.abi_hash
-            || route.signature_hash() != spec.signature_hash
-        {
-            return Err(LifecycleError::Server(format!(
-                "route/spec crm contract mismatch for {route_name}: route={}/{}/{} hashes={}/{} spec={}/{}/{} hashes={}/{}",
-                route.crm_ns(),
-                route.crm_name(),
-                route.crm_ver(),
-                route.abi_hash(),
-                route.signature_hash(),
-                spec.crm_ns,
-                spec.crm_name,
-                spec.crm_ver,
-                spec.abi_hash,
-                spec.signature_hash,
-            )));
-        }
-        let scheduler_snapshot = route.scheduler_snapshot();
-        if scheduler_snapshot.mode != spec.concurrency_mode
-            || scheduler_snapshot.max_pending != spec.max_pending
-            || scheduler_snapshot.max_workers != spec.max_workers
-        {
-            return Err(LifecycleError::Server(format!(
-                "route/spec scheduler mismatch for {route_name}"
-            )));
-        }
+        let expected = ExpectedRouteContract {
+            route_name: route_name.clone(),
+            crm_ns: route.crm_ns().to_string(),
+            crm_name: route.crm_name().to_string(),
+            crm_ver: route.crm_ver().to_string(),
+            abi_hash: route.abi_hash().to_string(),
+            signature_hash: route.signature_hash().to_string(),
+        };
 
         let rt = Self::server_runtime()?;
         let reservation = rt.block_on(server.reserve_route(route)).map_err(|e| {
@@ -1238,14 +1195,6 @@ impl Runtime {
                 .expect("reservation should exist")
                 .registration_token()
                 .to_string();
-            let expected = ExpectedRouteContract {
-                route_name: spec.name.clone(),
-                crm_ns: spec.crm_ns.clone(),
-                crm_name: spec.crm_name.clone(),
-                crm_ver: spec.crm_ver.clone(),
-                abi_hash: spec.abi_hash.clone(),
-                signature_hash: spec.signature_hash.clone(),
-            };
             if let Err(err) = projection.control.prepare_register(
                 RelayRegistration {
                     expected: &expected,
@@ -1326,14 +1275,6 @@ impl Runtime {
         };
 
         if let Some(projection) = relay_projection.as_ref() {
-            let expected = ExpectedRouteContract {
-                route_name: spec.name.clone(),
-                crm_ns: spec.crm_ns.clone(),
-                crm_name: spec.crm_name.clone(),
-                crm_ver: spec.crm_ver.clone(),
-                abi_hash: spec.abi_hash.clone(),
-                signature_hash: spec.signature_hash.clone(),
-            };
             if let Err(err) = projection.control.register(RelayRegistration {
                 expected: &expected,
                 server_id: &identity.server_id,
@@ -1341,7 +1282,7 @@ impl Runtime {
                 address: &identity.ipc_address,
                 max_payload_size: server.config().max_payload_size,
             }) {
-                let local_removed = rt.block_on(server.unregister_route(&spec.name));
+                let local_removed = rt.block_on(server.unregister_route(&route_name));
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
                     relay_use_proxy,
@@ -1362,7 +1303,7 @@ impl Runtime {
             let route_admission_token = route_admission_token
                 .expect("relay-backed registration should have a route admission token");
             if let Err(err) = rt.block_on(server.open_route_admission(route_admission_token)) {
-                let local_removed = rt.block_on(server.unregister_route(&spec.name));
+                let local_removed = rt.block_on(server.unregister_route(&route_name));
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
                     relay_use_proxy,
@@ -1697,14 +1638,22 @@ impl Runtime {
         // concurrent drain transaction or in-flight detached-close barriers.
         let client_pool = self.state.lock().client_pool.clone();
         if let Some(client_pool) = client_pool {
-            let mut client_close = client_pool.close_all(shutdown_timeout);
+            let mut observation = client_pool.observe_closes();
+            let mut client_close = observation.close_all(shutdown_timeout);
+            outcome
+                .ipc_client_close_details
+                .append(&mut client_close.abnormal);
             if server.is_some() {
                 // This native transaction owns outstanding client barriers as well as routes.
                 // Its callers time out independently; keep retrying actual unconfirmed work.
                 while !client_close.unconfirmed.is_empty() || client_close.error.is_some() {
-                    client_close = client_pool.close_all(Duration::from_secs(1));
+                    client_close = observation.close_all(Duration::from_secs(1));
+                    outcome
+                        .ipc_client_close_details
+                        .append(&mut client_close.abnormal);
                 }
             }
+            outcome.ipc_clients_abnormally_closed = outcome.ipc_client_close_details.len();
             outcome.ipc_clients_drained =
                 client_close.unconfirmed.is_empty() && client_close.error.is_none();
             if client_close.error.is_some() || !client_close.unconfirmed.is_empty() {
@@ -2236,7 +2185,7 @@ mod tests {
 
     use c2_server::config::ServerIpcConfig;
     use c2_server::{
-        AccessLevel, BuiltRoute, ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta,
+        BuiltRoute, ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta,
         RouteBuildSpec, SchedulerLimits,
     };
 
@@ -3039,38 +2988,22 @@ mod tests {
         )
     }
 
-    fn dummy_route_spec(name: &str) -> RuntimeRouteSpec {
-        RuntimeRouteSpec {
-            name: name.to_string(),
-            crm_ns: "test.runtime".to_string(),
-            crm_name: "Runtime".to_string(),
-            crm_ver: "0.1.0".to_string(),
-            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .to_string(),
-            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                .to_string(),
-            method_names: vec!["ping".to_string()],
-            access_map: HashMap::new(),
-            concurrency_mode: ConcurrencyMode::ReadParallel,
-            max_pending: None,
-            max_workers: None,
-        }
-    }
-
     fn dummy_route(server: &Arc<c2_server::Server>, name: &str) -> BuiltRoute {
-        let spec = dummy_route_spec(name);
         server
             .build_route(
                 RouteBuildSpec {
-                    name: spec.name,
-                    crm_ns: spec.crm_ns,
-                    crm_name: spec.crm_name,
-                    crm_ver: spec.crm_ver,
-                    abi_hash: spec.abi_hash,
-                    signature_hash: spec.signature_hash,
-                    method_names: spec.method_names,
-                    access_map: spec.access_map,
-                    concurrency_mode: spec.concurrency_mode,
+                    name: name.to_string(),
+                    crm_ns: "test.runtime".to_string(),
+                    crm_name: "Runtime".to_string(),
+                    crm_ver: "0.1.0".to_string(),
+                    abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                    signature_hash:
+                        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                            .to_string(),
+                    method_names: vec!["ping".to_string()],
+                    access_map: HashMap::new(),
+                    concurrency_mode: ConcurrencyMode::ReadParallel,
                     limits: SchedulerLimits::default(),
                 },
                 Arc::new(NoopCallback),
@@ -3312,52 +3245,6 @@ mod tests {
     }
 
     #[test]
-    fn register_route_rejects_crm_contract_mismatch() {
-        let route_name = unique_route_name("crm-contract-mismatch");
-        let session = Runtime::new(RuntimeOptions {
-            server_id: Some(unique_route_name("crm-contract-session")),
-            use_process_relay_anchor: false,
-            ..Default::default()
-        })
-        .expect("session");
-        let server = test_server("crm-contract-server");
-        let route = dummy_route(&server, &route_name);
-        let mut spec = dummy_route_spec(&route_name);
-        spec.crm_ns = "different.ns".to_string();
-
-        let err = session
-            .register_route(&server, route, spec, None, false)
-            .expect_err("CRM contract mismatch should be rejected before registration");
-        assert!(
-            err.to_string().contains("crm contract mismatch"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn register_route_rejects_access_map_mismatch() {
-        let route_name = unique_route_name("access-map-mismatch");
-        let session = Runtime::new(RuntimeOptions {
-            server_id: Some(unique_route_name("access-map-session")),
-            use_process_relay_anchor: false,
-            ..Default::default()
-        })
-        .expect("session");
-        let server = test_server("access-map-server");
-        let route = dummy_route(&server, &route_name);
-        let mut spec = dummy_route_spec(&route_name);
-        spec.access_map.insert(0, AccessLevel::Read);
-
-        let err = session
-            .register_route(&server, route, spec, None, false)
-            .expect_err("access-map mismatch should be rejected before registration");
-        assert!(
-            err.to_string().contains("access map mismatch"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
     fn unregister_without_relay_does_not_publish_lazy_identity() {
         let route_name = unique_route_name("no-relay-unregister");
         let session = Runtime::new(RuntimeOptions {
@@ -3424,7 +3311,6 @@ mod tests {
         .expect("session");
         let server = test_server("relay-commit-server");
         let route = dummy_route(&server, &route_name);
-        let spec = dummy_route_spec(&route_name);
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake relay");
         let relay_url = format!("http://{}", listener.local_addr().unwrap());
@@ -3445,7 +3331,7 @@ mod tests {
 
         let server_for_thread = Arc::clone(&server);
         let register_thread = thread::spawn(move || {
-            session.register_route(&server_for_thread, route, spec, Some(&relay_url), false)
+            session.register_route(&server_for_thread, route, Some(&relay_url), false)
         });
 
         let request = request_seen_rx
@@ -3504,7 +3390,6 @@ mod tests {
         .expect("session");
         let server = test_server("relay-final-fail-server");
         let route = dummy_route(&server, &route_name);
-        let spec = dummy_route_spec(&route_name);
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake relay");
         let relay_url = format!("http://{}", listener.local_addr().unwrap());
@@ -3527,7 +3412,7 @@ mod tests {
             }
         });
 
-        let result = session.register_route(&server, route, spec, Some(&relay_url), false);
+        let result = session.register_route(&server, route, Some(&relay_url), false);
         relay_thread.join().unwrap();
         let requests = (0..3)
             .map(|_| {
@@ -3584,7 +3469,6 @@ mod tests {
         .expect("session");
         let server = test_server("relay-publish-gate-server");
         let route = dummy_route(&server, &route_name);
-        let spec = dummy_route_spec(&route_name);
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake relay");
         let relay_url = format!("http://{}", listener.local_addr().unwrap());
@@ -3616,7 +3500,7 @@ mod tests {
         let registration_observer = session.clone();
         let server_for_thread = Arc::clone(&server);
         let register_thread = thread::spawn(move || {
-            session.register_route(&server_for_thread, route, spec, Some(&relay_url), false)
+            session.register_route(&server_for_thread, route, Some(&relay_url), false)
         });
 
         let final_request = final_request_rx
@@ -3725,19 +3609,13 @@ mod tests {
         let first_route = dummy_route(&server, &first);
         let first_handle = first_route.route_handle();
         session
-            .register_route(&server, first_route, dummy_route_spec(&first), None, false)
+            .register_route(&server, first_route, None, false)
             .expect("first route should register");
 
         let second_route = dummy_route(&server, &second);
         let second_handle = second_route.route_handle();
         session
-            .register_route(
-                &server,
-                second_route,
-                dummy_route_spec(&second),
-                None,
-                false,
-            )
+            .register_route(&server, second_route, None, false)
             .expect("second route should register");
 
         let first_guard = first_handle
@@ -4008,11 +3886,24 @@ mod tests {
             ..RuntimeOptions::default()
         })
         .expect("session");
-        let server = test_server("direct-shutdown-cleanup-fail-server");
+        let directory = tempfile::Builder::new()
+            .prefix("c2-journal-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&format!(
+                "ipc://{}",
+                unique_route_name("direct-shutdown-cleanup-fail-server")
+            ))
+            .unwrap();
+        let server = Arc::new(
+            c2_server::Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap(),
+        );
         let route = dummy_route(&server, &route_name);
         let handle = route.route_handle();
         session
-            .register_route(&server, route, dummy_route_spec(&route_name), None, false)
+            .register_route(&server, route, None, false)
             .expect("route should register");
         let runner = {
             let server = Arc::clone(&server);
@@ -4050,7 +3941,7 @@ mod tests {
         // Keep the real shutdown draining until after its IPC acknowledgement,
         // so endpoint connection validation still sees the intact lease record.
         let active = handle.blocking_acquire(0).expect("active route guard");
-        let ack = c2_ipc::shutdown(server.ipc_address(), Duration::from_secs(2))
+        let ack = c2_ipc::shutdown_with_endpoint(server.local_endpoint(), Duration::from_secs(2))
             .expect("direct shutdown must be acknowledged");
         assert!(ack.acknowledged && ack.shutdown_started);
         assert!(ack.route_outcomes.is_empty(), "ack is initiation only");
@@ -4070,6 +3961,8 @@ mod tests {
             matches!(reaped, c2_local::EndpointReapResult::Reaped),
             "{reaped:?}"
         );
+        assert!(!std::path::Path::new(server.local_endpoint().os_name()).exists());
+        assert!(!lease_path.exists());
         assert!(
             run_result
                 .unwrap_err()

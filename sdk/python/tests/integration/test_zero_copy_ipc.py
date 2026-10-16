@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import time
 
 import pytest
 
@@ -29,7 +28,6 @@ def _cleanup():
 
 def _setup():
     cc.register(IEchoZC, EchoZC(), name='echo_zc')
-    time.sleep(0.3)
     address = cc.server_address()
     return cc.connect(IEchoZC, name='echo_zc', address=address)
 

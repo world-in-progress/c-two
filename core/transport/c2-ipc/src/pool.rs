@@ -7,8 +7,8 @@
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use c2_config::{ConnectDeadline, LocalEndpoint, LocalEndpointContext, MemoryBudgetLimits};
@@ -105,107 +105,31 @@ fn differing_client_policy_fields(
 ) -> Vec<&'static str> {
     let mut differing = Vec::new();
     macro_rules! compare {
-        ($name:literal, $cached:expr, $requested:expr) => {
-            if $cached != $requested {
-                differing.push($name);
-            }
+        ($cached:expr, $requested:expr; $($field:ident),+ $(,)?) => {
+            $(if $cached.$field != $requested.$field {
+                differing.push(stringify!($field));
+            })+
         };
     }
-    compare!(
-        "pool_enabled",
-        cached.base.pool_enabled,
-        requested.base.pool_enabled
+    compare!(cached.base, requested.base;
+        pool_enabled,
+        pool_segment_size,
+        max_pool_segments,
+        pool_prewarm_segments,
+        pool_min_retained_segments,
+        reassembly_segment_size,
+        reassembly_max_segments,
+        max_total_chunks,
+        chunk_gc_interval_secs,
+        chunk_threshold_ratio,
+        chunk_assembler_timeout_secs,
+        max_reassembly_bytes,
+        chunk_size,
+        shm_backing_budget_bytes,
+        file_backing_budget_bytes,
+        live_reassembly_budget_bytes,
     );
-    compare!(
-        "pool_segment_size",
-        cached.base.pool_segment_size,
-        requested.base.pool_segment_size
-    );
-    compare!(
-        "max_pool_segments",
-        cached.base.max_pool_segments,
-        requested.base.max_pool_segments
-    );
-    compare!(
-        "max_pool_memory",
-        cached.base.max_pool_memory,
-        requested.base.max_pool_memory
-    );
-    compare!(
-        "pool_prewarm_segments",
-        cached.base.pool_prewarm_segments,
-        requested.base.pool_prewarm_segments
-    );
-    compare!(
-        "pool_min_retained_segments",
-        cached.base.pool_min_retained_segments,
-        requested.base.pool_min_retained_segments
-    );
-    compare!(
-        "reassembly_segment_size",
-        cached.base.reassembly_segment_size,
-        requested.base.reassembly_segment_size
-    );
-    compare!(
-        "reassembly_max_segments",
-        cached.base.reassembly_max_segments,
-        requested.base.reassembly_max_segments
-    );
-    compare!(
-        "max_total_chunks",
-        cached.base.max_total_chunks,
-        requested.base.max_total_chunks
-    );
-    compare!(
-        "chunk_gc_interval_secs",
-        cached.base.chunk_gc_interval_secs,
-        requested.base.chunk_gc_interval_secs
-    );
-    compare!(
-        "chunk_threshold_ratio",
-        cached.base.chunk_threshold_ratio,
-        requested.base.chunk_threshold_ratio
-    );
-    compare!(
-        "chunk_assembler_timeout_secs",
-        cached.base.chunk_assembler_timeout_secs,
-        requested.base.chunk_assembler_timeout_secs
-    );
-    compare!(
-        "max_reassembly_bytes",
-        cached.base.max_reassembly_bytes,
-        requested.base.max_reassembly_bytes
-    );
-    compare!(
-        "chunk_size",
-        cached.base.chunk_size,
-        requested.base.chunk_size
-    );
-    compare!(
-        "shm_backing_budget_bytes",
-        cached.base.shm_backing_budget_bytes,
-        requested.base.shm_backing_budget_bytes
-    );
-    compare!(
-        "file_backing_budget_bytes",
-        cached.base.file_backing_budget_bytes,
-        requested.base.file_backing_budget_bytes
-    );
-    compare!(
-        "live_reassembly_budget_bytes",
-        cached.base.live_reassembly_budget_bytes,
-        requested.base.live_reassembly_budget_bytes
-    );
-    compare!(
-        "shm_threshold",
-        cached.shm_threshold,
-        requested.shm_threshold
-    );
-    compare!(
-        "pool_decay_seconds",
-        cached.pool_decay_seconds,
-        requested.pool_decay_seconds
-    );
+    compare!(cached, requested; shm_threshold, pool_decay_seconds);
     if differing.is_empty() {
         differing.push("none");
     }
@@ -494,6 +418,8 @@ struct RetiredClose {
     address: String,
     client: Mutex<Option<Arc<SyncClient>>>,
     state: AtomicU8,
+    // Published before Confirmed, without retaining the client or its SHM.
+    abnormal_reason: OnceLock<&'static str>,
     // Per-record notification avoids Condvar's unbounded re-acquisition of
     // the global coordinator after a caller's timed wait has expired.
     waiters: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
@@ -505,6 +431,7 @@ impl RetiredClose {
             address,
             client: Mutex::new(client),
             state: AtomicU8::new(state as u8),
+            abnormal_reason: OnceLock::new(),
             waiters: Mutex::new(Vec::new()),
         }
     }
@@ -650,7 +577,14 @@ struct CloseTxnState {
     next_ticket: u64,
 }
 
-/// Honest outcome of one cache drain.
+/// One confirmed local IPC close without a normal disconnect ACK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcClientCloseDetail {
+    pub address: String,
+    pub reason: String,
+}
+
+/// Local drain and protocol completion are separate observations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientCacheCloseReport {
     /// Number of cache entries detached for close.
@@ -662,6 +596,9 @@ pub struct ClientCacheCloseReport {
     /// barriers started by discard/sweep/loser cleanup. Nothing is claimed
     /// stopped in this case.
     pub error: Option<String>,
+    /// Clients observed by this drain that confirmed locally closed without
+    /// a normal DISCONNECT_ACK. These do not make the local close unconfirmed.
+    pub abnormal: Vec<IpcClientCloseDetail>,
 }
 
 /// Reference-counted pool of `SyncClient` instances.
@@ -729,6 +666,12 @@ fn close_retired_work(
         client.close_shared(deadline.saturating_duration_since(Instant::now()))
     });
     if confirmed {
+        if let Some(reason) = client
+            .as_ref()
+            .and_then(|client| client.abnormal_close_reason())
+        {
+            let _ = work.record.abnormal_reason.set(reason);
+        }
         // Confirmation, rather than registry-lock availability, releases this
         // exact owner. Retained payloads keep their own pool Arcs and charges.
         work.record.client.lock().take();
@@ -824,6 +767,50 @@ fn run_retired_closes_until(
 ) {
     for ticket in tickets {
         let _ = close_retired_ticket(txn, *ticket, deadline);
+    }
+}
+
+fn observe_retired_closes(txn: &CloseTxnState, observed: &mut HashMap<u64, Arc<RetiredClose>>) {
+    for (ticket, record) in &txn.retired {
+        // Preparing can attach and close between coordinator acquisitions.
+        // Already Confirmed records are history, unless observed earlier.
+        if record.state() != RetiredState::Confirmed {
+            observed.entry(*ticket).or_insert_with(|| record.clone());
+        }
+    }
+}
+
+fn take_observed_abnormal_closes(
+    observed: &mut HashMap<u64, Arc<RetiredClose>>,
+) -> Vec<IpcClientCloseDetail> {
+    let mut abnormal = Vec::new();
+    observed.retain(|_, record| {
+        if record.state() != RetiredState::Confirmed {
+            return true;
+        }
+        if let Some(reason) = record.abnormal_reason.get() {
+            abnormal.push(IpcClientCloseDetail {
+                address: record.address.clone(),
+                reason: (*reason).to_owned(),
+            });
+        }
+        false
+    });
+    abnormal
+}
+
+/// Core keeps this observation across retries of one shutdown transaction.
+/// Completed records are reported once; pending records retain metadata only
+/// after their local close releases the client.
+#[doc(hidden)]
+pub struct ClientCloseObservation<'a> {
+    pool: &'a ClientPool,
+    observed: HashMap<u64, Arc<RetiredClose>>,
+}
+
+impl ClientCloseObservation<'_> {
+    pub fn close_all(&mut self, timeout: Duration) -> ClientCacheCloseReport {
+        self.pool.close_all_observed(timeout, &mut self.observed)
     }
 }
 
@@ -1398,10 +1385,28 @@ impl ClientPool {
     /// during the closing window reject; after this returns, new acquires
     /// (restart/reacquire) proceed under the new epoch.
     pub fn close_all(&self, timeout: Duration) -> ClientCacheCloseReport {
+        self.observe_closes().close_all(timeout)
+    }
+
+    /// Observe one shutdown transaction without replaying completed history.
+    #[doc(hidden)]
+    pub fn observe_closes(&self) -> ClientCloseObservation<'_> {
+        ClientCloseObservation {
+            pool: self,
+            observed: HashMap::new(),
+        }
+    }
+
+    fn close_all_observed(
+        &self,
+        timeout: Duration,
+        observed: &mut HashMap<u64, Arc<RetiredClose>>,
+    ) -> ClientCacheCloseReport {
         let mut report = ClientCacheCloseReport {
             detached: 0,
             unconfirmed: Vec::new(),
             error: None,
+            abnormal: Vec::new(),
         };
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -1411,6 +1416,7 @@ impl ClientPool {
             let (txn_lock, txn_condvar) = &*self.close_txn;
             let mut txn = txn_lock.lock();
             loop {
+                observe_retired_closes(&txn, observed);
                 txn.retired
                     .retain(|_, record| record.state() != RetiredState::Confirmed);
                 if txn.active_generation.is_none()
@@ -1425,6 +1431,7 @@ impl ClientPool {
                 let blocked_by_drain = txn.active_generation.is_some();
                 if now >= deadline {
                     report.error = Some(Self::drain_wait_error(blocked_by_drain));
+                    report.abnormal = take_observed_abnormal_closes(observed);
                     return report;
                 }
                 let result =
@@ -1438,6 +1445,8 @@ impl ClientPool {
                             .any(|record| record.state() == RetiredState::Closing))
                 {
                     report.error = Some(Self::drain_wait_error(txn.active_generation.is_some()));
+                    observe_retired_closes(&txn, observed);
+                    report.abnormal = take_observed_abnormal_closes(observed);
                     return report;
                 }
             }
@@ -1481,6 +1490,7 @@ impl ClientPool {
                 .filter(|(_, record)| record.claim_retry())
                 .map(|(ticket, _)| *ticket)
                 .collect();
+            observe_retired_closes(&txn, observed);
             (drained_tickets, retry_tickets)
         };
         self.close_txn.1.notify_all();
@@ -1501,6 +1511,7 @@ impl ClientPool {
         {
             let (txn_lock, txn_condvar) = &*self.close_txn;
             let mut txn = txn_lock.lock();
+            observe_retired_closes(&txn, observed);
             while txn
                 .retired
                 .values()
@@ -1513,6 +1524,7 @@ impl ClientPool {
                 }
                 let result =
                     txn_condvar.wait_for(&mut txn, (deadline - now).min(Duration::from_millis(5)));
+                observe_retired_closes(&txn, observed);
                 if result.timed_out()
                     && Instant::now() >= deadline
                     && txn
@@ -1539,6 +1551,7 @@ impl ClientPool {
             let mut txn = self.close_txn.0.lock();
             debug_assert_eq!(txn.active_generation, Some(generation));
             txn.active_generation = None;
+            observe_retired_closes(&txn, observed);
             txn.retired
                 .retain(|_, record| record.state() != RetiredState::Confirmed);
             for record in txn
@@ -1556,6 +1569,7 @@ impl ClientPool {
             }
         }
         self.close_txn.1.notify_all();
+        report.abnormal = take_observed_abnormal_closes(observed);
         report
     }
 
@@ -1973,7 +1987,6 @@ mod tests {
         let mut cfg = ClientIpcConfig::default();
         cfg.base.pool_segment_size = 1024 * 1024;
         cfg.base.max_pool_segments = 1;
-        cfg.base.max_pool_memory = 1024 * 1024;
         cfg.base.pool_prewarm_segments = 1;
         cfg.base.shm_backing_budget_bytes = 1_536_000;
         let domain = DomainMemory::from_config(&cfg);
@@ -2444,6 +2457,7 @@ mod tests {
                 })
                 .await
                 .expect("retry handshake fixture must finish");
+                crate::tests::close_listener(listener).await;
             });
         });
         ready_rx
@@ -2496,6 +2510,440 @@ mod tests {
             c2_wire::flags::FLAG_HANDSHAKE | c2_wire::flags::FLAG_RESPONSE,
             &payload,
         )
+    }
+
+    mod close_report {
+        use super::*;
+
+        // Low-level constructors deliberately ignore process environment. Pass
+        // the runner's private namespace explicitly to every real pool fixture.
+        fn test_endpoint_context() -> LocalEndpointContext {
+            #[cfg(unix)]
+            if let Some(root) = std::env::var_os("C2_IPC_ROOT") {
+                return LocalEndpointContext::with_unix_root(std::path::Path::new(&root)).unwrap();
+            }
+            LocalEndpointContext::default_for_platform().unwrap()
+        }
+
+        fn test_endpoint(address: &str) -> LocalEndpoint {
+            test_endpoint_context().endpoint(address).unwrap()
+        }
+
+        fn test_pool(grace_period: Duration) -> ClientPool {
+            ClientPool::with_endpoint_context(grace_period, test_endpoint_context())
+        }
+
+        struct NoAckPeer {
+            address: String,
+            stop: Option<tokio::sync::oneshot::Sender<()>>,
+            runner: Option<thread::JoinHandle<()>>,
+        }
+
+        impl NoAckPeer {
+            fn start() -> Self {
+                let address = unique_ipc_address("pool_close_report");
+                let endpoint = test_endpoint(&address);
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let (stop, mut stopped) = tokio::sync::oneshot::channel();
+                let runner = thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(async move {
+                        let mut listener = LocalListener::bind(&endpoint).unwrap();
+                        ready_tx.send(()).unwrap();
+                        let mut streams = Vec::new();
+                        loop {
+                            tokio::select! {
+                                _ = &mut stopped => break,
+                                accepted = listener.accept() => {
+                                    let mut stream = accepted.unwrap();
+                                    let (header, _) = read_peer_frame(&mut stream).await.unwrap().unwrap();
+                                    assert_ne!(header.flags & c2_wire::flags::FLAG_HANDSHAKE, 0);
+                                    stream.write_all(&grid_handshake_reply_frame()).await.unwrap();
+                                    // Keep real transports open without replying to DISCONNECT.
+                                    streams.push(stream);
+                                }
+                            }
+                        }
+                        drop(streams);
+                        crate::tests::close_listener(listener).await;
+                    });
+                });
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Self {
+                    address,
+                    stop: Some(stop),
+                    runner: Some(runner),
+                }
+            }
+        }
+
+        impl Drop for NoAckPeer {
+            fn drop(&mut self) {
+                self.stop.take();
+                self.runner.take().unwrap().join().unwrap();
+            }
+        }
+
+        fn hold_writer(client: &SyncClient) -> tokio::sync::oneshot::Sender<()> {
+            let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            client.hold_writer_slot_for_test(held_tx, release_rx);
+            held_rx.blocking_recv().unwrap();
+            release_tx
+        }
+
+        fn wait_for_close_waiter(pool: &ClientPool) {
+            // No other thread waits on this Condvar in these fixtures. A true
+            // return proves close_all has inspected the registered records.
+            let watchdog = Instant::now() + Duration::from_secs(2);
+            while !pool.close_txn.1.notify_one() {
+                assert!(
+                    Instant::now() < watchdog,
+                    "close_all did not enter its wait"
+                );
+                thread::yield_now();
+            }
+        }
+
+        fn expected(peer: &NoAckPeer) -> IpcClientCloseDetail {
+            IpcClientCloseDetail {
+                address: peer.address.clone(),
+                reason: "disconnect_ack_timeout".to_owned(),
+            }
+        }
+
+        #[test]
+        fn observed_detached_abnormal_close_is_reported() {
+            let peer = NoAckPeer::start();
+            let pool = Arc::new(test_pool(Duration::ZERO));
+            let client = pool.acquire(&peer.address, None).unwrap();
+            pool.release(&peer.address);
+            let release = hold_writer(&client);
+            let maintenance_pool = pool.clone();
+            let maintenance = thread::spawn(move || {
+                assert!(maintenance_pool.acquire("malformed-no-io", None).is_err());
+            });
+            assert!(pool.wait_until_detached_close_in_flight_for_test(Duration::from_secs(2)));
+            let record = pool
+                .close_txn
+                .0
+                .lock()
+                .retired
+                .values()
+                .find(|record| record.address == peer.address)
+                .unwrap()
+                .clone();
+            assert!(Arc::ptr_eq(record.client.lock().as_ref().unwrap(), &client));
+            let closing_pool = pool.clone();
+            let closer = thread::spawn(move || closing_pool.close_all(Duration::from_secs(3)));
+            wait_for_close_waiter(&pool);
+            assert_eq!(record.state(), RetiredState::Closing);
+            release.send(()).unwrap();
+            maintenance.join().unwrap();
+            let report = closer.join().unwrap();
+            assert_eq!(record.state(), RetiredState::Confirmed);
+            assert!(record.client.lock().is_none());
+            assert_eq!(pool.retired_records_for_test(), 0);
+            assert_eq!(report.detached, 0);
+            assert!(
+                report.error.is_none() && report.unconfirmed.is_empty(),
+                "{report:?}"
+            );
+            assert_eq!(report.abnormal, vec![expected(&peer)]);
+            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
+        }
+
+        #[test]
+        fn abnormal_close_between_shutdown_retries_is_reported_once() {
+            let peer = NoAckPeer::start();
+            let pool = test_pool(Duration::from_secs(60));
+            let client = Arc::new(
+                SyncClient::connect_with_endpoint(
+                    test_endpoint(&peer.address),
+                    None,
+                    ClientIpcConfig::default(),
+                )
+                .unwrap(),
+            );
+            let weak = Arc::downgrade(&client);
+            let work =
+                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
+            let mut observation = pool.observe_closes();
+            let first = observation.close_all(Duration::ZERO);
+            assert_eq!(first.error, Some(ClientPool::drain_wait_error(false)));
+            assert!(first.abnormal.is_empty());
+
+            // Complete and prune after the first attempt returned, before retry.
+            close_retired_work(
+                &pool.close_txn,
+                &work,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+            assert!(pool.close_txn.0.lock().retired.is_empty());
+            assert!(weak.upgrade().is_none(), "observers retain only metadata");
+            let retry = observation.close_all(Duration::from_secs(3));
+            assert!(retry.error.is_none() && retry.unconfirmed.is_empty());
+            assert_eq!(retry.abnormal, vec![expected(&peer)]);
+            assert!(
+                observation
+                    .close_all(Duration::from_secs(3))
+                    .abnormal
+                    .is_empty()
+            );
+            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
+        }
+
+        #[test]
+        fn direct_abnormal_close_is_bounded_and_not_replayed() {
+            let peer = NoAckPeer::start();
+            let pool = test_pool(Duration::from_secs(60));
+            let client = pool.acquire(&peer.address, None).unwrap();
+            let started = Instant::now();
+            let report = pool.close_all(Duration::from_secs(3));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(report.detached, 1);
+            assert!(
+                report.error.is_none() && report.unconfirmed.is_empty(),
+                "{report:?}"
+            );
+            assert_eq!(report.abnormal, vec![expected(&peer)]);
+            assert_eq!(
+                client.abnormal_close_reason(),
+                Some("disconnect_ack_timeout")
+            );
+            assert_eq!(pool.retired_records_for_test(), 0);
+            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
+        }
+
+        #[test]
+        fn completed_historical_abnormal_close_is_not_replayed() {
+            let peer = NoAckPeer::start();
+            let pool = test_pool(Duration::ZERO);
+            let client = pool.acquire(&peer.address, None).unwrap();
+            pool.release(&peer.address);
+            assert!(pool.acquire("malformed-no-io", None).is_err());
+            assert!(client.abnormal_close_reason().is_some());
+            assert_eq!(pool.retired_records_for_test(), 0);
+            let report = pool.close_all(Duration::from_secs(3));
+            assert!(
+                report.error.is_none() && report.unconfirmed.is_empty(),
+                "{report:?}"
+            );
+            assert!(report.abnormal.is_empty());
+
+            // A confirmed record can also remain registered when prune's
+            // nonblocking coordinator acquisition loses to another caller.
+            let client = Arc::new(
+                SyncClient::connect_with_endpoint(
+                    test_endpoint(&peer.address),
+                    None,
+                    ClientIpcConfig::default(),
+                )
+                .unwrap(),
+            );
+            let work =
+                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
+            let coordinator = pool.close_txn.0.lock();
+            close_retired_work(
+                &pool.close_txn,
+                &work,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+            assert_eq!(work.record.state(), RetiredState::Confirmed);
+            assert!(coordinator.retired.contains_key(&work.ticket));
+            drop(coordinator);
+            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
+            assert!(pool.close_txn.0.lock().retired.is_empty());
+        }
+
+        #[test]
+        fn pre_wait_timeout_keeps_already_confirmed_abnormal_detail() {
+            let peer = NoAckPeer::start();
+            let pool = Arc::new(test_pool(Duration::from_secs(60)));
+            let client = Arc::new(
+                SyncClient::connect_with_endpoint(
+                    test_endpoint(&peer.address),
+                    None,
+                    ClientIpcConfig::default(),
+                )
+                .unwrap(),
+            );
+            let weak = Arc::downgrade(&client);
+            let completed =
+                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
+            // Reserve a second barrier without running it until after this
+            // caller times out, so the first close cannot end the pre-wait.
+            let pending = pool.register_close_work(
+                &mut pool.close_txn.0.lock(),
+                "ipc://still-closing",
+                None,
+                RetiredState::Closing,
+            );
+            let closing_pool = pool.clone();
+            let closer = thread::spawn(move || closing_pool.close_all(Duration::from_secs(1)));
+            wait_for_close_waiter(&pool);
+            close_retired_work(
+                &pool.close_txn,
+                &completed,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+            assert!(completed.record.client.lock().is_none());
+            assert!(weak.upgrade().is_none(), "observers retain only metadata");
+            let report = closer.join().unwrap();
+            assert_eq!(report.detached, 0);
+            assert_eq!(report.error, Some(ClientPool::drain_wait_error(false)));
+            assert_eq!(report.abnormal, vec![expected(&peer)]);
+            assert!(!pool.is_draining_for_test());
+            assert_eq!(pool.state.lock().epoch, 0);
+            close_retired_work(&pool.close_txn, &pending, Instant::now()).unwrap();
+            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
+        }
+
+        #[test]
+        fn final_wait_timeout_keeps_late_observed_abnormal_detail() {
+            let peer = NoAckPeer::start();
+            let pool = Arc::new(test_pool(Duration::from_secs(60)));
+            let client = Arc::new(
+                SyncClient::connect_with_endpoint(
+                    test_endpoint(&peer.address),
+                    None,
+                    ClientIpcConfig::default(),
+                )
+                .unwrap(),
+            );
+            let pending = pool.register_close_work(
+                &mut pool.close_txn.0.lock(),
+                "ipc://late-closing",
+                None,
+                RetiredState::Preparing,
+            );
+            // Pause between the initial observation and drain registration.
+            // Preparing does not block claiming a drain generation.
+            let state = pool.state.lock();
+            let closing_pool = pool.clone();
+            let closer = thread::spawn(move || closing_pool.close_all(Duration::from_secs(1)));
+            let watchdog = Instant::now() + Duration::from_secs(2);
+            while !pool.is_draining_for_test() {
+                assert!(Instant::now() < watchdog, "drain was not announced");
+                thread::yield_now();
+            }
+            pending.record.set_state(RetiredState::Closing);
+            drop(state);
+            wait_for_close_waiter(&pool);
+            // Register after the final wait began. Registration notifies
+            // its old waiter under the coordinator; the next waiter proves
+            // this newly registered record has been observed as well.
+            let completed =
+                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
+            wait_for_close_waiter(&pool);
+            close_retired_work(
+                &pool.close_txn,
+                &completed,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+            let report = closer.join().unwrap();
+            assert_eq!(report.detached, 0);
+            assert_eq!(report.error, Some(ClientPool::drain_wait_error(false)));
+            assert_eq!(report.unconfirmed, vec![pending.record.address.clone()]);
+            assert_eq!(report.abnormal, vec![expected(&peer)]);
+            assert!(!pool.is_draining_for_test());
+            assert_eq!(pool.state.lock().epoch, 1);
+            close_retired_work(&pool.close_txn, &pending, Instant::now()).unwrap();
+            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
+        }
+
+        #[test]
+        fn preparing_close_between_observation_and_drain_is_reported() {
+            let peer = NoAckPeer::start();
+            let pool = Arc::new(test_pool(Duration::from_secs(60)));
+            let client = Arc::new(
+                SyncClient::connect_with_endpoint(
+                    test_endpoint(&peer.address),
+                    None,
+                    ClientIpcConfig::default(),
+                )
+                .unwrap(),
+            );
+            let weak = Arc::downgrade(&client);
+            let work = pool.register_close_work(
+                &mut pool.close_txn.0.lock(),
+                &peer.address,
+                None,
+                RetiredState::Preparing,
+            );
+            let record = work.record.clone();
+            let mut fresh = FreshClientGuard {
+                work,
+                coordinator: pool.close_txn.clone(),
+                deadline: ConnectDeadline::default(),
+                done: false,
+            };
+            let state = pool.state.lock();
+            let closing_pool = pool.clone();
+            let closer = thread::spawn(move || closing_pool.close_all(Duration::from_secs(3)));
+            let watchdog = Instant::now() + Duration::from_secs(2);
+            while !pool.is_draining_for_test() {
+                assert!(Instant::now() < watchdog, "drain was not announced");
+                thread::yield_now();
+            }
+            fresh.attach(client);
+            fresh.retire();
+            assert_eq!(record.state(), RetiredState::Confirmed);
+            assert!(pool.close_txn.0.lock().retired.is_empty());
+            assert!(record.client.lock().is_none());
+            assert!(weak.upgrade().is_none(), "observers retain only metadata");
+            drop(state);
+            let report = closer.join().unwrap();
+            assert_eq!(report.detached, 0);
+            assert!(
+                report.error.is_none() && report.unconfirmed.is_empty(),
+                "{report:?}"
+            );
+            assert_eq!(report.abnormal, vec![expected(&peer)]);
+            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
+        }
+
+        #[test]
+        fn same_address_drain_and_retry_have_distinct_close_tickets() {
+            let peer = NoAckPeer::start();
+            let pool = test_pool(Duration::from_secs(60));
+            let active = pool.acquire(&peer.address, None).unwrap();
+            let client = Arc::new(
+                SyncClient::connect_with_endpoint(
+                    test_endpoint(&peer.address),
+                    None,
+                    ClientIpcConfig::default(),
+                )
+                .unwrap(),
+            );
+            let weak = Arc::downgrade(&client);
+            let retry = pool.register_close_work(
+                &mut pool.close_txn.0.lock(),
+                &peer.address,
+                Some(client),
+                RetiredState::UnconfirmedIdle,
+            );
+            let report = pool.close_all(Duration::from_secs(3));
+            assert_eq!(report.detached, 1);
+            assert!(
+                report.error.is_none() && report.unconfirmed.is_empty(),
+                "{report:?}"
+            );
+            assert_eq!(report.abnormal, vec![expected(&peer), expected(&peer)]);
+            assert_eq!(retry.record.state(), RetiredState::Confirmed);
+            assert!(retry.record.client.lock().is_none());
+            assert!(weak.upgrade().is_none());
+            assert!(!active.is_connected());
+            assert!(pool.close_txn.0.lock().retired.is_empty());
+            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
+        }
     }
 
     #[derive(Default)]
@@ -2877,8 +3325,13 @@ mod tests {
                     }
                     watchers.abort_all();
                     while watchers.join_next().await.is_some() {}
+                    crate::tests::close_listener(listener).await;
                 });
             });
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("local listener readiness")
+                .expect("real local listener bind");
             let peer = Self {
                 address,
                 observations,
@@ -2886,10 +3339,6 @@ mod tests {
                 stop: Some(stop),
                 runner: Some(runner),
             };
-            ready_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("local listener readiness")
-                .expect("real local listener bind");
             peer
         }
 
@@ -3122,6 +3571,7 @@ mod tests {
                 for watcher in watchers {
                     watcher.await.unwrap();
                 }
+                crate::tests::close_listener(listener).await;
             });
         });
         listener_ready_rx
@@ -3293,6 +3743,7 @@ mod tests {
 
                 let _ = release_rx.recv();
                 drop(stream);
+                crate::tests::close_listener(listener).await;
             });
         });
         listener_ready_rx
@@ -3378,6 +3829,8 @@ mod tests {
                     Err(_) => false,
                 };
                 let _ = closed_tx.send(closed);
+                drop(stream);
+                crate::tests::close_listener(listener).await;
             });
         });
         listener_ready_rx
@@ -3633,6 +4086,7 @@ mod tests {
                 stream.write_all(&[0_u8, 0]).await.unwrap();
                 let _ = release_rx.recv();
                 drop(stream);
+                crate::tests::close_listener(listener).await;
             });
         });
         listener_ready_rx
@@ -4203,7 +4657,6 @@ mod tests {
         let base = c2_config::BaseIpcConfig {
             pool_segment_size: 65_536,
             max_pool_segments: 1,
-            max_pool_memory: 65_536,
             ..c2_config::BaseIpcConfig::default()
         };
         let canonical = ClientIpcConfig {
@@ -4223,9 +4676,8 @@ mod tests {
             "identical resolved config must reuse the same client"
         );
 
-        // Every variant keeps the budget limits identical to `canonical`
-        // and changes exactly one resolved policy field.
-        let variants: Vec<(&str, ClientIpcConfig)> = vec![
+        // Every variant keeps the budget limits identical to `canonical`.
+        let mut variants: Vec<(&str, ClientIpcConfig)> = vec![
             (
                 "chunk_size",
                 ClientIpcConfig {
@@ -4292,6 +4744,11 @@ mod tests {
             ),
         ];
 
+        let mut combined = canonical.clone();
+        combined.base.chunk_size = 65_536;
+        combined.shm_threshold = 4_096;
+        variants.push(("chunk_size, shm_threshold", combined));
+
         for (field, variant) in variants {
             assert_eq!(
                 variant.memory_budget_limits(),
@@ -4307,7 +4764,10 @@ mod tests {
                 message.contains("different resolved client policy"),
                 "{field}: {message}"
             );
-            assert!(message.contains(field), "{field}: {message}");
+            assert!(
+                message.contains(&format!("differing fields: {field})")),
+                "{message}"
+            );
             // The rejection must not evict or alter the live entry.
             let still_cached = pool
                 .acquire(&address, Some(&canonical))

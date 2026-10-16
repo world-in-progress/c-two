@@ -69,6 +69,7 @@ class TestBasicAllocation:
         alloc = pool.alloc(4096)
         assert alloc.actual_size >= 4096
         assert not alloc.is_dedicated
+        assert alloc.allocation_id > 0
         pool.free(alloc)
         stats = pool.stats()
         assert stats.alloc_count == 0
@@ -83,7 +84,8 @@ class TestBasicAllocation:
     def test_alloc_rounds_up(self, pool):
         alloc = pool.alloc(5000)
         assert alloc.actual_size == 8192
-        pool.free(alloc)
+        pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 5000,
+                     alloc.is_dedicated, alloc.allocation_id)
 
     def test_zero_alloc_fails(self, pool):
         with pytest.raises(RuntimeError):
@@ -130,7 +132,8 @@ class TestDataReadWrite:
         assert result == data
 
         # Free using free_at (simulates remote side).
-        pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, alloc.is_dedicated)
+        pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096,
+                     alloc.is_dedicated, alloc.allocation_id)
         stats = pool.stats()
         assert stats.alloc_count == 0
 
@@ -209,7 +212,8 @@ class TestSegmentManagement:
             assert result == data
 
             # Free from pool2 (cross-process free).
-            pool2.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, False)
+            pool2.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096,
+                          False, alloc.allocation_id)
         finally:
             if pool2 is not None:
                 pool2.destroy()
@@ -234,6 +238,7 @@ class TestDedicatedFallback:
             # This should go to dedicated.
             b = pool.alloc(64 * 1024)
             assert b.is_dedicated
+            assert b.allocation_id == 0
             pool.free(a)
             pool.free(b)
             pool.gc()
@@ -423,7 +428,8 @@ class TestThreadSafety:
                             f'Thread {thread_id}: data mismatch at iter {i}'
                         )
                     pool.free_at(
-                        alloc.seg_idx, alloc.generation, alloc.offset, 4096, alloc.is_dedicated,
+                        alloc.seg_idx, alloc.generation, alloc.offset, 4096,
+                        alloc.is_dedicated, alloc.allocation_id,
                     )
             except Exception as e:
                 errors.append(f'Thread {thread_id}: {e}')
@@ -572,6 +578,43 @@ class TestBuddyPanicSafety:
 class TestDoubleFreeSafety:
     """Test that pool handles double-free and invalid-free gracefully."""
 
+    def test_raw_free_requires_current_allocation_id(self):
+        pool = MemPool(PoolConfig(
+            segment_size=64 * 1024,
+            min_block_size=4096,
+            max_segments=1,
+        ))
+        try:
+            first = pool.alloc(4096)
+            with pytest.raises(TypeError):
+                pool.free_at(first.seg_idx, first.generation, first.offset,
+                             4096, False)
+            with pytest.raises(RuntimeError):
+                pool.free_at(first.seg_idx, first.generation, first.offset,
+                             4096, False, 0)
+            assert pool.stats().alloc_count == 1
+
+            pool.free(first)
+            current = pool.alloc(4096)
+            assert current.allocation_id != first.allocation_id
+            assert (current.seg_idx, current.generation, current.offset) == (
+                first.seg_idx, first.generation, first.offset)
+            pool.write(current, b'still live')
+            before = pool.stats()
+
+            with pytest.raises(RuntimeError):
+                pool.free_at(current.seg_idx, current.generation, current.offset,
+                             4096, False, first.allocation_id)
+            after = pool.stats()
+            assert after.alloc_count == before.alloc_count
+            assert after.buddy_occupied_bytes == before.buddy_occupied_bytes
+            assert after.buddy_idle_bytes == before.buddy_idle_bytes
+            assert pool.read(current, len(b'still live')) == b'still live'
+            pool.free(current)
+            assert pool.stats().alloc_count == 0
+        finally:
+            pool.destroy()
+
     def test_double_free_does_not_corrupt(self):
         """Double-free on the same block must raise or be safely no-op."""
         pool = MemPool(PoolConfig(
@@ -581,10 +624,12 @@ class TestDoubleFreeSafety:
         ))
         try:
             alloc = pool.alloc(4096)
-            pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, alloc.actual_size, False)
+            pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, alloc.actual_size,
+                         False, alloc.allocation_id)
             # Second free — should raise or be safely handled
             try:
-                pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, alloc.actual_size, False)
+                pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, alloc.actual_size,
+                             False, alloc.allocation_id)
             except RuntimeError:
                 pass  # Expected: double-free detected
             # Either way, pool stats should not underflow

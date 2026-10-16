@@ -5,6 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures import local_server
+
+from c_two._native import RuntimeSession
+
 
 BAD_SHUTDOWN_TIMEOUTS = [float('inf'), float('-inf'), float('nan'), -1.0, -0.001, 1e300, float(2**64)]
 
@@ -96,20 +100,39 @@ def test_native_runtime_session_explicit_identity_is_lazy() -> None:
     assert session.server_address == 'ipc://unit-server'
 
 
-def test_native_runtime_session_projects_server_ipc_overrides_copy() -> None:
+@pytest.mark.parametrize('side', ['server', 'client'])
+def test_native_runtime_session_projects_ipc_overrides_copy(side: str) -> None:
     from c_two._native import RuntimeSession
 
-    overrides = {'pool_segment_size': 2 * 1024 * 1024}
-    session = RuntimeSession(
-        server_id='unit-server',
-        server_ipc_overrides=overrides,
-    )
+    expected = {
+        'pool_enabled': False,
+        'pool_segment_size': 2 * 1024 * 1024,
+        'max_pool_segments': 3,
+        'pool_prewarm_segments': 0,
+        'pool_min_retained_segments': 0,
+        'reassembly_segment_size': 16 * 1024 * 1024,
+        'reassembly_max_segments': 4,
+        'max_total_chunks': 128,
+        'chunk_gc_interval': 0.5,
+        'chunk_threshold_ratio': 0.75,
+        'chunk_assembler_timeout': 1.0,
+        'max_reassembly_bytes': 32 * 1024 * 1024,
+        'shm_backing_budget_bytes': 0,
+        'file_backing_budget_bytes': 64 * 1024 * 1024,
+        'live_reassembly_budget_bytes': 0,
+    }
+    overrides = dict(expected, chunk_size=None)
+    option = f'{side}_ipc_overrides'
+    session = RuntimeSession(**{option: overrides})
 
-    projected = session.server_ipc_overrides
-    assert projected == overrides
+    projected = getattr(session, option)
+    assert projected == expected
+    assert list(projected) == list(expected)
 
     overrides['pool_segment_size'] = 4 * 1024 * 1024
-    assert session.server_ipc_overrides == {'pool_segment_size': 2 * 1024 * 1024}
+    overrides['reassembly_segment_size'] = 32 * 1024 * 1024
+    projected.clear()
+    assert getattr(session, option) == expected
 
 
 def test_native_runtime_session_rejects_invalid_server_ids() -> None:
@@ -131,28 +154,24 @@ def test_registry_identity_is_native_owned() -> None:
     assert '_address_for_server_id' not in source
 
 
-def test_runtime_session_passes_server_instance_identity_to_bridge(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-
-    class FakeBridge:
-        def __init__(self, **kwargs: object) -> None:
-            captured.update(kwargs)
-
-    monkeypatch.setattr(
-        'c_two.transport.server.native.NativeServerBridge',
-        FakeBridge,
-    )
-
-    from c_two._native import RuntimeSession
-
-    session = RuntimeSession(shm_threshold=4096)
-    session.ensure_server_bridge()
-
-    assert isinstance(captured['server_id'], str)
-    assert isinstance(captured['server_instance_id'], str)
-    assert captured['server_id']
-    assert captured['server_instance_id']
-    assert captured['server_id'] != captured['server_instance_id']
+def test_runtime_session_bridge_preflight_preserves_errors_and_owner(monkeypatch) -> None:
+    session = RuntimeSession(server_id='bridge-owner', use_process_relay_anchor=False)
+    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'invalid')
+    monkeypatch.setenv('C2_IPC_POOL_DECAY_SECONDS', 'invalid')
+    for key in ('C2_IPC_POOL_SEGMENT_SIZE', 'C2_IPC_POOL_DECAY_SECONDS'):
+        with pytest.raises(ValueError, match=key):
+            session.ensure_server_bridge()
+        assert not session.host_started
+        monkeypatch.delenv(key)
+    server = session.ensure_server_bridge()
+    try:
+        assert session.ensure_server_bridge() is server
+        server.start()
+        assert session.host_started
+        assert session.server_id == 'bridge-owner'
+    finally:
+        assert server.shutdown()['completed']
+    assert not session.host_started
 
 
 def test_failed_server_construction_does_not_publish_identity() -> None:
@@ -574,19 +593,6 @@ def test_direct_ipc_acquire_waits_for_dynamic_route_publication() -> None:
         registrar.shutdown()
 
 
-def test_native_runtime_session_projects_client_ipc_overrides_copy() -> None:
-    from c_two._native import RuntimeSession
-
-    overrides = {'reassembly_segment_size': 16 * 1024 * 1024}
-    session = RuntimeSession(client_ipc_overrides=overrides)
-
-    assert session.client_ipc_overrides == overrides
-    overrides['reassembly_segment_size'] = 32 * 1024 * 1024
-    assert session.client_ipc_overrides == {
-        'reassembly_segment_size': 16 * 1024 * 1024,
-    }
-
-
 def test_native_runtime_session_resolves_client_ipc_config(monkeypatch) -> None:
     from c_two._native import RuntimeSession
 
@@ -751,7 +757,7 @@ def test_set_transport_policy_after_client_only_ipc_connect_warns() -> None:
             return 'pong'
 
     address = 'ipc://unit_policy_client_only'
-    server = Server(bind_address=address)
+    server = local_server(address)
     server.register_crm(ClientOnlyCRM, ClientOnlyImpl(), name='policy-client-only')
     server.start()
     cc.shutdown()
@@ -782,7 +788,7 @@ def test_set_server_after_client_only_connect_preserves_client_freeze() -> None:
             return 'pong'
 
     address = 'ipc://unit_server_after_client'
-    server = Server(bind_address=address)
+    server = local_server(address)
     server.register_crm(
         ServerAfterClientCRM,
         ServerAfterClientImpl(),

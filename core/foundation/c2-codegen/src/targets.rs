@@ -148,14 +148,14 @@ impl<S: Service> c_two::generated::EncodedService for ServiceAdapter<S> {
     fn invoke(
         &self,
         method_index: u16,
-        request: &[u8],
+        request: Vec<u8>,
     ) -> Result<Vec<u8>, c_two::generated::C2Error> {
         let method_name = METHODS
             .get(usize::from(method_index))
             .map(|method| method.name)
             .unwrap_or("<unknown>");
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.invoke_checked(method_index, request)
+            self.invoke_checked(method_index, &request)
         })) {
             Ok(result) => result,
             Err(_) => Err(c_two::generated::normalize_adapter_failure(
@@ -177,7 +177,7 @@ pub fn service_definition<S: Service>(
     service: S,
 ) -> Result<c_two::ServiceDefinition, c_two::Error> {
     let release = contract_release()?;
-    let release_ref = contract_release_ref()?;
+    let release_ref = release.reference();
     let methods = METHODS
         .iter()
         .map(|method| -> Result<c_two::generated::MethodDefinition, c_two::Error> {

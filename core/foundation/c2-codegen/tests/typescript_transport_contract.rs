@@ -66,6 +66,26 @@ impl CompiledTransportProject {
         .publish_new_tree(&generated)
         .expect("publish generated TypeScript");
 
+        std::fs::write(
+            generated.join("typescript/injected_connection.ts"),
+            r#"import { createIpcEncodedTransport, type C2IpcConnect } from "./c_two_contract.js";
+const connect: C2IpcConnect = async () => ({
+  write() {},
+  readExactly(length) { return new Uint8Array(length); },
+});
+createIpcEncodedTransport("ipc://typed-custom", { connect });
+// @ts-expect-error Node factories belong to @c-two/c2-mem-ffi.
+import { createNodeIpcConnect } from "./c_two_contract.js";
+// @ts-expect-error Generated modules expose the generic connection contract.
+import type { C2NodeIpcSocket } from "./c_two_contract.js";
+// @ts-expect-error Generated modules expose the generic connection contract.
+import type { C2NodeIpcNet } from "./c_two_contract.js";
+// @ts-expect-error Generated modules expose the generic connection contract.
+import type { C2NodeIpcConnectOptions } from "./c_two_contract.js";
+"#,
+        )
+        .expect("typed custom connection consumer");
+
         let fastdb_package = tempdir.join("node_modules/fastdb4ts");
         std::fs::create_dir_all(&fastdb_package).expect("FastDB unit stub package");
         std::fs::write(
@@ -458,7 +478,7 @@ const lazyBlock = {
   generation: 1,
   offset: 0,
   byteLength: 4,
-  dedicated: false,
+  allocationId: 1n, dedicated: false,
 };
 const lazyBytes = await reader.read(lazyBlock);
 assert.deepEqual(Array.from(lazyBytes), [0x2a, 0x2a, 0x2a, 0x2a]);
@@ -489,7 +509,7 @@ const advertisedBlock = {
   generation: 2,
   offset: 8,
   byteLength: 4,
-  dedicated: false,
+  allocationId: 1n, dedicated: false,
 };
 await reader.read(advertisedBlock, new Uint8Array(4));
 assert.equal(created[2].segmentSize, 1 << 20);
@@ -502,7 +522,7 @@ const dedicatedBlock = {
   generation: 0,
   offset: 0,
   byteLength: 4,
-  dedicated: true,
+  allocationId: 0n, dedicated: true,
 };
 await reader.read(dedicatedBlock, new Uint8Array(4));
 assert.equal(created[3].segmentSize, bootstrapFloor);
@@ -557,7 +577,7 @@ const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); r
 const text = (s) => Buffer.concat([Buffer.from([Buffer.byteLength(s)]), Buffer.from(s)]);
 const frame = (id, flags, payload) => Buffer.concat([u32(12 + payload.length), u64(id), u32(flags), payload]);
 const handshake = (routes, instance) => Buffer.concat([
-  Buffer.from([11]), text('/serverpool'), u16(0), u16(7), text('server'), text(instance), u16(routes.length),
+  Buffer.from([12]), text('/serverpool'), u16(0), u16(7), text('server'), text(instance), u16(routes.length),
   ...routes.map((r) => Buffer.concat([
     text(r.route_name), text(r.route_uid), u64(r.route_revision),
     text(r.contract.crm_ns), text(r.contract.crm_name), text(r.contract.crm_ver),
@@ -630,7 +650,7 @@ function server() {
               buffered = Buffer.concat([buffered, frame(id, 2 | 256 | 512 | (index === 1 ? 1024 : 0), Buffer.concat([u64(s.responseData.length), u32(2), u32(index), data]))]);
             }
           } else if (s.shmReply) {
-            const buddy = Buffer.concat([u16(0), u32(1), u32(0), u32(s.responseData.length), Buffer.from([0])]);
+            const buddy = Buffer.concat([u16(0), u32(1), u32(0), u32(s.responseData.length), Buffer.from([0]), u64(s.responseAllocationId ?? 1n)]);
             buffered = Buffer.concat([buffered, frame(id, 2 | 256 | 64, Buffer.concat([buddy, Buffer.from([0])]))]);
           } else {
             buffered = Buffer.concat([buffered, frame(id, 2 | 256, body)]);
@@ -870,10 +890,14 @@ test('provider allocator, SHM release and chunk framing remain on the same share
       async read(block, destination) {
         assert.equal(block.prefix, '/serverpool');
         assert.equal(block.generation, 1);
+        assert.equal(block.allocationId, 9007199254740993n);
         shmEvents.push('read');
         destination.set(s.responseData);
       },
-      async release() {shmEvents.push('response-release');},
+      async release(block) {
+        assert.equal(block.allocationId, 9007199254740993n);
+        shmEvents.push('response-release');
+      },
     },
   });
   assert.deepEqual(Array.from((await call(t)).view), [42, 43, 44]);
@@ -881,7 +905,7 @@ test('provider allocator, SHM release and chunk framing remain on the same share
   assert.deepEqual(Array.from((await t.call('manager', CONTRACT, 'ping', new Uint8Array(7))).view), [42, 43, 44]);
   assert.equal(s.callFlags.filter((flags) => flags & 512).length, 4);
   assert.equal(s.callFlags.at(-1), 128 | 512 | 1024);
-  s.chunkedReply = false; s.shmReply = true;
+  s.chunkedReply = false; s.shmReply = true; s.responseAllocationId = 9007199254740993n;
   assert.deepEqual(Array.from((await call(t)).view), [42, 43, 44]);
   assert.deepEqual(shmEvents, ['read', 'response-release']);
   assert.deepEqual(allocations.map((p) => p.byteLength), [3, 3, 3]);
@@ -895,7 +919,7 @@ test('provider allocator, SHM release and chunk framing remain on the same share
       prefix: '/requestpool', segments: [{name: '/requestpool_b0000', size: 1048576}],
       async write(payload) {
         requestEvents.push('write');
-        return {segmentIndex: 0, generation: 1, offset: 0, byteLength: payload.byteLength, dedicated: false};
+        return {segmentIndex: 0, generation: 1, offset: 0, byteLength: payload.byteLength, allocationId: 0xffffffffffffffffn, dedicated: false};
       },
       async markConsumed() {requestEvents.push('consumed');},
       async release() {requestEvents.push('request-release');},
@@ -904,8 +928,34 @@ test('provider allocator, SHM release and chunk framing remain on the same share
   s.shmReply = false;
   await request.call('manager', CONTRACT, 'ping', new Uint8Array(7));
   assert.equal(s.callFlags.at(-1), 128 | 64);
+  assert.equal(s.calls.at(-1).subarray(0, 23).toString('hex'), '000001000000000000000700000000ffffffffffffffff');
   assert.deepEqual(requestEvents, ['write', 'consumed']);
   await request.close();
+
+  for (const allocationId of [undefined, 0n, -1n, 1, 0x1_0000_0000_0000_0000n]) {
+    const invalidWriter = transport(s, {
+      requestShmThreshold: 0,
+      requestShmWriter: {
+        prefix: '/requestpool', segments: [{name: '/requestpool_b0000', size: 1048576}],
+        write(payload) {
+          return {segmentIndex: 0, generation: 1, offset: 0, byteLength: payload.byteLength, allocationId, dedicated: false};
+        },
+        release() {},
+      },
+    });
+    await assert.rejects(() => invalidWriter.call('manager', CONTRACT, 'ping', new Uint8Array(7)), /allocationId/);
+    await invalidWriter.close();
+  }
+
+  s.shmReply = true; s.responseAllocationId = 0n;
+  const invalidResponse = transport(s, {
+    responseShmReader: {
+      read() { throw new Error('invalid ID reached reader'); },
+      release() { throw new Error('invalid ID reached release'); },
+    },
+  });
+  await assert.rejects(() => call(invalidResponse), /allocationId/);
+  await invalidResponse.close();
 });
 "#,
     );

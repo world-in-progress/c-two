@@ -494,6 +494,7 @@ impl ServerPoolState {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     ) -> Result<(), String> {
         self.ensure_segment(seg_idx, generation, data_size, is_dedicated)?;
         self.pool
@@ -512,6 +513,7 @@ impl ServerPoolState {
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             )
             .map_err(|error| format!("response SHM release failed: {error}"))?;
         Ok(())
@@ -1466,6 +1468,18 @@ impl Drop for RequestBlock {
 /// final writer clear).
 const DEFAULT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+// DISCONNECT is a courtesy exchange, never the local close barrier. Share
+// this short window between its write and ACK so an unresponsive peer cannot
+// consume the caller's server/work-drain budget.
+const DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+const DISCONNECT_NOT_CONNECTED: u8 = 0;
+const DISCONNECT_PENDING: u8 = 1;
+const DISCONNECT_ACKNOWLEDGED: u8 = 2;
+const DISCONNECT_WRITE_FAILED: u8 = 3;
+const DISCONNECT_WRITE_TIMEOUT: u8 = 4;
+const DISCONNECT_ACK_TIMEOUT: u8 = 5;
+const DISCONNECT_PEER_CLOSED: u8 = 6;
+
 /// A chunk failure's stage, independent of allocator diagnostic text.
 #[derive(Debug)]
 pub enum ChunkError {
@@ -1879,7 +1893,6 @@ impl RouteBinding {
 #[derive(Debug, Default)]
 pub(crate) struct RouteDirectory {
     routes: HashMap<String, MethodTable>,
-    catalog_revision: u64,
     dirty: bool,
 }
 
@@ -1894,7 +1907,6 @@ impl RouteDirectory {
             self.routes
                 .insert(route.name.clone(), MethodTable::from_route(route));
         }
-        self.catalog_revision = 0;
         self.dirty = false;
     }
 
@@ -1903,12 +1915,10 @@ impl RouteDirectory {
         for record in response.routes {
             self.apply_record(record);
         }
-        self.catalog_revision = response.catalog_revision;
         self.dirty = false;
     }
 
     fn apply_record(&mut self, record: RouteRecordWire) {
-        self.catalog_revision = self.catalog_revision.max(record.catalog_revision);
         match record.state {
             RouteStateWire::Ready => {
                 self.routes
@@ -2346,6 +2356,7 @@ where
 /// own incarnation, never a new connection's state.
 struct ReceiveConnectionState {
     connected: Arc<AtomicBool>,
+    disconnect: Arc<AtomicU8>,
 }
 
 impl ReceiveConnectionState {
@@ -2371,7 +2382,6 @@ pub struct IpcClient {
     pending: Arc<StdMutex<PendingMap>>,
     rid_counter: Arc<AtomicU32>,
     pub(crate) route_directory: Arc<RwLock<RouteDirectory>>,
-    server_segments: Vec<(String, u32)>,
     pub(crate) server_identity: Option<c2_wire::handshake::ServerIdentity>,
     /// Server SHM pool state for reading buddy reply responses.
     pub(crate) server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
@@ -2393,6 +2403,9 @@ pub struct IpcClient {
     /// tasks finish. Reconnect must wait for that same transaction to finish.
     close_incomplete: AtomicBool,
     connected: Arc<AtomicBool>,
+    /// Protocol observation for this connection incarnation, independent of
+    /// local task/pool cleanup. A retry must retain the original close reason.
+    disconnect: Arc<AtomicU8>,
     /// Transport-owned request pool.
     ///
     /// `Some` while this client owns the pool. A confirmed close detaches the
@@ -2553,7 +2566,6 @@ impl IpcClient {
             pending: Arc::new(StdMutex::new(HashMap::new())),
             rid_counter: Arc::new(AtomicU32::new(1)),
             route_directory: Arc::new(RwLock::new(RouteDirectory::new())),
-            server_segments: Vec::new(),
             server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: Arc::new(StdMutex::new(None)),
@@ -2566,6 +2578,7 @@ impl IpcClient {
             close_gate: tokio::sync::Mutex::new(()),
             close_incomplete: AtomicBool::new(false),
             connected: Arc::new(AtomicBool::new(false)),
+            disconnect: Arc::new(AtomicU8::new(DISCONNECT_NOT_CONNECTED)),
             pool: StdMutex::new(pool),
             pool_transport_owned,
             pool_injected,
@@ -2880,6 +2893,7 @@ impl IpcClient {
         // The old receive guard must never publish into a later incarnation.
         // The gate above still requires its task to be joined before reconnect.
         self.connected = Arc::new(AtomicBool::new(false));
+        self.disconnect = Arc::new(AtomicU8::new(DISCONNECT_NOT_CONNECTED));
         let endpoint = self
             .endpoint
             .as_ref()
@@ -3008,7 +3022,6 @@ impl IpcClient {
             .ok_or_else(|| IpcError::Protocol("server handshake missing server identity".into()))?;
 
         connect_directory_write(&self.route_directory)?.seed_from_handshake(&hs.routes);
-        self.server_segments = hs.segments.clone();
         self.server_identity = Some(server_identity);
 
         // Open server SHM segments into a ServerPoolState for buddy response reads.
@@ -3131,8 +3144,10 @@ impl IpcClient {
         let server_pool = self.server_pool.clone();
         let writer_clone = self.writer.clone();
         self.connected.store(true, Ordering::Release);
+        self.disconnect.store(DISCONNECT_PENDING, Ordering::Release);
         let connection = ReceiveConnectionState {
             connected: Arc::clone(&self.connected),
+            disconnect: Arc::clone(&self.disconnect),
         };
         let chunk_registry = connect_metadata_lock(&self.chunk_registry, "ipc_metadata_wait")?
             .clone()
@@ -3983,6 +3998,7 @@ impl IpcClient {
             offset: alloc.offset,
             data_size: data_size as u32,
             is_dedicated: alloc.is_dedicated,
+            allocation_id: alloc.allocation_id,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
 
@@ -3995,12 +4011,6 @@ impl IpcClient {
             }
         };
 
-        // Assemble frame payload: [11B buddy][call_control]
-        let payload_len = buddy_bytes.len() + ctrl.len();
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.extend_from_slice(&buddy_bytes);
-        payload.extend_from_slice(&ctrl);
-
         if let Err(error) = IpcCallControl::check_preparation(control) {
             let _ = block.release();
             return Err(error);
@@ -4011,7 +4021,7 @@ impl IpcClient {
         let rid = register_unary_pending(&self.pending, &self.rid_counter, tx);
 
         let flags = flags::FLAG_CALL_V2 | flags::FLAG_BUDDY;
-        let frame = frame::encode_frame(rid as u64, flags, &payload);
+        let frame = frame::encode_frame_parts(rid as u64, flags, &[&buddy_bytes, &ctrl]);
 
         // Per-call cancellation guard: a caller dropped before a terminal
         // branch either removes this call's pending entry (nothing was
@@ -4166,16 +4176,11 @@ impl IpcClient {
                 let chunk_hdr = encode_chunk_header(i as u16, total_chunks as u16);
 
                 // Chunk 0 includes call_control; subsequent chunks are data-only.
-                let payload_len =
-                    chunk_hdr.len() + if i == 0 { ctrl.len() } else { 0 } + chunk_data.len();
-                let mut payload = Vec::with_capacity(payload_len);
-                payload.extend_from_slice(&chunk_hdr);
-                if i == 0 {
-                    payload.extend_from_slice(&ctrl);
-                }
-                payload.extend_from_slice(chunk_data);
-
-                let frame_bytes = frame::encode_frame(rid as u64, frame_flags, &payload);
+                let frame_bytes = frame::encode_frame_parts(
+                    rid as u64,
+                    frame_flags,
+                    &[&chunk_hdr, if i == 0 { &ctrl } else { &[] }, chunk_data],
+                );
                 self.write_frame_parts(writer, &[&frame_bytes]).await?;
             }
             Ok(())
@@ -4399,15 +4404,11 @@ impl IpcClient {
             frame_flags |= flags::FLAG_CHUNK_LAST;
         }
         let chunk_hdr = encode_chunk_header(chunk_idx as u16, total_chunks as u16);
-        let payload_len = chunk_hdr.len() + ctrl.map_or(0, <[u8]>::len) + chunk_data.len();
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.extend_from_slice(&chunk_hdr);
-        if let Some(ctrl) = ctrl {
-            payload.extend_from_slice(ctrl);
-        }
-        payload.extend_from_slice(chunk_data);
-
-        let frame_bytes = frame::encode_frame(rid as u64, frame_flags, &payload);
+        let frame_bytes = frame::encode_frame_parts(
+            rid as u64,
+            frame_flags,
+            &[&chunk_hdr, ctrl.unwrap_or(&[]), chunk_data],
+        );
         let mut writer_guard = self.writer.lock().await;
         let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
         writer.write_all(&frame_bytes).await?;
@@ -4616,15 +4617,8 @@ impl IpcClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
-        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
-        let mut last_not_found = None;
-
-        for attempt in 0..attempts {
-            if attempt > 0 {
-                let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt - 1];
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-
+        let mut delays = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.iter();
+        loop {
             let result = match self.lookup_route_contract(expected).await {
                 Err(IpcError::CatalogCompacted { .. } | IpcError::WatchUnavailable(_)) => {
                     self.rebuild_route_directory().await?;
@@ -4634,19 +4628,15 @@ impl IpcClient {
             };
 
             match result {
-                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
-                    last_not_found = Some(route_name);
-                }
-                Err(IpcError::RouteNotFound(route_name)) => {
-                    return Err(IpcError::RouteNotFound(route_name));
+                Err(err @ IpcError::RouteNotFound(_)) => {
+                    let Some(&delay_ms) = delays.next() else {
+                        return Err(err);
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
                 other => return other,
             }
         }
-
-        Err(IpcError::RouteNotFound(
-            last_not_found.unwrap_or_else(|| expected.route_name.clone()),
-        ))
     }
 
     /// Ensure the connected server currently exports a route matching the
@@ -4718,31 +4708,19 @@ impl IpcClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<RouteBinding, IpcError> {
-        let mut last_unbound = None;
-
-        for delay_ms in ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS
-            .iter()
-            .copied()
-            .map(Some)
-            .chain(std::iter::once(None))
-        {
+        let mut delays = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.iter();
+        loop {
             self.lookup_route_contract_for_acquire(expected).await?;
             match self.bind_cached_route(expected) {
-                Ok(binding) => return Ok(binding),
-                Err(IpcError::RouteNotFound(route_name)) if delay_ms.is_some() => {
-                    last_unbound = Some(IpcError::RouteNotFound(route_name));
+                Err(err @ (IpcError::RouteNotFound(_) | IpcError::WatchUnavailable(_))) => {
+                    let Some(&delay_ms) = delays.next() else {
+                        return Err(err);
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
-                Err(IpcError::WatchUnavailable(reason)) if delay_ms.is_some() => {
-                    last_unbound = Some(IpcError::WatchUnavailable(reason));
-                }
-                Err(err) => return Err(err),
-            }
-            if let Some(delay_ms) = delay_ms {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                other => return other,
             }
         }
-
-        Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
     }
 
     /// Attest a route for relay registration without requiring call admission.
@@ -4863,31 +4841,19 @@ impl IpcClient {
     ) -> Result<RouteBinding, IpcError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
-        let mut last_unbound = None;
-
-        for delay_ms in ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS
-            .iter()
-            .copied()
-            .map(Some)
-            .chain(std::iter::once(None))
-        {
+        let mut delays = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.iter();
+        loop {
             self.lookup_route_contract_for_acquire(expected).await?;
             match self.bind_cached_route_token(expected, route_uid, route_revision) {
-                Ok(binding) => return Ok(binding),
-                Err(IpcError::RouteNotFound(route_name)) if delay_ms.is_some() => {
-                    last_unbound = Some(IpcError::RouteNotFound(route_name));
+                Err(err @ (IpcError::RouteNotFound(_) | IpcError::WatchUnavailable(_))) => {
+                    let Some(&delay_ms) = delays.next() else {
+                        return Err(err);
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
-                Err(IpcError::WatchUnavailable(reason)) if delay_ms.is_some() => {
-                    last_unbound = Some(IpcError::WatchUnavailable(reason));
-                }
-                Err(err) => return Err(err),
-            }
-            if let Some(delay_ms) = delay_ms {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                other => return other,
             }
         }
-
-        Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
     }
 
     /// CRM tag advertised by a route, if present.
@@ -4956,6 +4922,27 @@ impl IpcClient {
         self.connected.load(Ordering::Acquire)
     }
 
+    /// Only confirmed local closes consume this observation. A missing ACK
+    /// does not imply that receive work, pending allocations or leases drained.
+    pub(crate) fn abnormal_close_reason(&self) -> Option<&'static str> {
+        match self.disconnect.load(Ordering::Acquire) {
+            DISCONNECT_WRITE_FAILED => Some("disconnect_write_failed"),
+            DISCONNECT_WRITE_TIMEOUT => Some("disconnect_write_timeout"),
+            DISCONNECT_ACK_TIMEOUT => Some("disconnect_ack_timeout"),
+            DISCONNECT_PEER_CLOSED => Some("peer_closed_without_disconnect_ack"),
+            _ => None,
+        }
+    }
+
+    fn record_abnormal_disconnect(&self, reason: u8) {
+        let _ = self.disconnect.compare_exchange(
+            DISCONNECT_PENDING,
+            reason,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     /// Manually override the connection flag.
     ///
     /// Intended for test scenarios where a real handshake is not
@@ -5001,6 +4988,9 @@ impl IpcClient {
     /// Receiver teardown and pending settlement retain busy carriers in their
     /// connection owners for retry. This bounds contended cleanup waits, not
     /// OS scheduling or mapping destruction as a hard real-time guarantee.
+    /// The best-effort DISCONNECT write/ACK has its own 100 ms window inside
+    /// that deadline. Forced transport closure can still confirm local drain;
+    /// its protocol reason is retained separately for the owning cache.
     pub async fn close_shared_bounded(&self, timeout: std::time::Duration) -> bool {
         use tokio::time::timeout_at;
 
@@ -5009,6 +4999,7 @@ impl IpcClient {
             .unwrap_or_else(|| {
                 tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365)
             });
+        let disconnect_deadline = deadline.min(tokio::time::Instant::now() + DISCONNECT_GRACE);
         self.connected.store(false, Ordering::Release);
 
         // Serialize close barriers: only one closer manipulates the writer
@@ -5044,31 +5035,39 @@ impl IpcClient {
             }
         }
 
-        // Bound both writer-lock acquisition and the disconnect exchange. A
+        // Bound both writer-lock acquisition and the courtesy disconnect. A
         // cancelled partial write aborts its stream instead of leaving a frame
         // prefix for a later writer to reuse.
-        if timeout_at(deadline, async {
+        let disconnect_write = timeout_at(disconnect_deadline, async {
             let mut guard = self.writer.lock().await;
             if let Some(writer) = guard.as_mut() {
                 let frame = frame::encode_frame(0, flags::FLAG_SIGNAL, &[SIG_DISCONNECT]);
-                let _ = writer.write_all(&frame).await;
+                writer.write_all(&frame).await?;
             }
+            Ok::<_, std::io::Error>(())
         })
-        .await
-        .is_err()
-        {
-            confirmed = false;
+        .await;
+        if !matches!(disconnect_write, Ok(Ok(()))) {
+            self.record_abnormal_disconnect(if disconnect_write.is_err() {
+                DISCONNECT_WRITE_TIMEOUT
+            } else {
+                DISCONNECT_WRITE_FAILED
+            });
             // The writer slot is stuck (for example a blocked bulk write
             // holding the lock). Abort the stream now so that writer fails
-            // and releases the lock instead of pinning the whole deadline.
-            self.abort_stream_for_close(false);
+            // and releases the lock. Local drain is still confirmed only by
+            // the original task, writer and allocation barriers below.
+            confirmed &= self.abort_stream_for_close(false);
         }
 
-        // The receive loop ends on DISCONNECT_ACK or peer EOF. Reserve up to
-        // one second of the original deadline for its abort/join, as before.
+        // The receive loop ends on DISCONNECT_ACK or peer EOF. Never wait on
+        // the peer beyond the courtesy window; retain the original deadline
+        // and its reserved join time for actual local cleanup.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let graceful_deadline = deadline - remaining.min(std::time::Duration::from_secs(1));
+        let graceful_deadline =
+            disconnect_deadline.min(deadline - remaining.min(std::time::Duration::from_secs(1)));
         if !join_close_task(&self.recv_handle, graceful_deadline, |task| task).await {
+            self.record_abnormal_disconnect(DISCONNECT_ACK_TIMEOUT);
             if !self.abort_stream_for_close(false) {
                 confirmed = false;
             }
@@ -5083,6 +5082,7 @@ impl IpcClient {
                 confirmed = false;
             }
         }
+        self.record_abnormal_disconnect(DISCONNECT_PEER_CLOSED);
         if !self.abort_stream_for_close(true) {
             confirmed = false;
         }
@@ -5293,6 +5293,7 @@ fn try_release_unclaimed_response(
             generation,
             offset,
             data_size,
+            allocation_id,
             is_dedicated,
         } => {
             let Some(mut pool) = server_pool.try_lock() else {
@@ -5301,7 +5302,14 @@ fn try_release_unclaimed_response(
             let state = pool
                 .as_mut()
                 .ok_or_else(|| "server pool not initialised".to_string())?;
-            state.release_response(*seg_idx, *generation, *offset, *data_size, *is_dedicated)?;
+            state.release_response(
+                *seg_idx,
+                *generation,
+                *offset,
+                *data_size,
+                *is_dedicated,
+                *allocation_id,
+            )?;
             Ok(true)
         }
     }
@@ -5431,7 +5439,11 @@ impl Drop for ReceiverDropGuardForTest {
     fn drop(&mut self) {
         if self.abort.is_aborted() {
             let _ = self.gate.entered.send(());
-            let _ = self.gate.release.recv();
+            // This gate runs on SyncClient's multi-thread runtime; keep its
+            // timer driver available while the receiver Drop remains blocked.
+            tokio::task::block_in_place(|| {
+                let _ = self.gate.release.recv();
+            });
         }
     }
 }
@@ -5563,6 +5575,11 @@ async fn recv_loop_inner(
                         }
                     }
                     SIG_DISCONNECT_ACK => {
+                        if let Some(connection) = connection.as_ref() {
+                            connection
+                                .disconnect
+                                .store(DISCONNECT_ACKNOWLEDGED, Ordering::Release);
+                        }
                         break; // Server acknowledged disconnect — exit cleanly.
                     }
                     _ => {} // Ignore unknown signals.
@@ -5783,6 +5800,7 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
                 offset: bp.offset,
                 data_size: bp.data_size,
                 is_dedicated: bp.is_dedicated,
+                allocation_id: bp.allocation_id,
             }),
             ReplyControl::RouteNotFound(route) => Err(IpcError::RouteNotFound(route)),
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
@@ -5962,6 +5980,7 @@ mod tests {
                 actual_size: 4096,
                 level: 0,
                 is_dedicated: false,
+                allocation_id: 1,
             },
         );
         let request = block.try_dispatch(None).unwrap();
@@ -7243,6 +7262,7 @@ mod tests {
                     .expect("send first chunk");
                 streams.push(stream);
             }
+            crate::tests::close_listener(listener).await;
             let _ = peer_released.await;
         });
 
@@ -8220,6 +8240,7 @@ mod tests {
         let mut listener = c2_local::LocalListener::bind(&endpoint).expect("test listener");
         let peer = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept client");
+            crate::tests::close_listener(listener).await;
             let mut len_buf = [0u8; 4];
             stream
                 .read_exact(&mut len_buf)
@@ -8340,8 +8361,10 @@ mod pending_disconnect_tests {
         // without an OS listener. The delayed task owns only the old flag.
         let mut client = IpcClient::new("not-an-ipc-address");
         let old = Arc::clone(&client.connected);
+        let old_disconnect = Arc::clone(&client.disconnect);
         let connection = ReceiveConnectionState {
             connected: Arc::clone(&old),
+            disconnect: Arc::clone(&old_disconnect),
         };
         let receiver = tokio::spawn(async move {
             let _connection = connection;
@@ -8349,6 +8372,12 @@ mod pending_disconnect_tests {
         });
         assert!(matches!(client.connect().await, Err(IpcError::Config(_))));
         assert!(!Arc::ptr_eq(&old, &client.connected));
+        assert!(!Arc::ptr_eq(&old_disconnect, &client.disconnect));
+        old_disconnect.store(DISCONNECT_ACKNOWLEDGED, Ordering::Release);
+        assert_eq!(
+            client.disconnect.load(Ordering::Acquire),
+            DISCONNECT_NOT_CONNECTED
+        );
         client.force_connected(true);
         old.store(true, Ordering::Release);
         // Covers cancellation before the receiver's first poll as well as a
@@ -8379,6 +8408,7 @@ mod pending_disconnect_tests {
         let connected = Arc::new(AtomicBool::new(true));
         let connection = ReceiveConnectionState {
             connected: Arc::clone(&connected),
+            disconnect: Arc::new(AtomicU8::new(DISCONNECT_PENDING)),
         };
         let drain = tokio::spawn(async move {
             drain_pending_on_disconnect(

@@ -113,21 +113,16 @@ pub struct CallControl {
 /// Return the encoded v2 call-control size for `identity`.
 pub fn encoded_call_control_len(identity: &RouteCallIdentity) -> Result<usize, EncodeError> {
     validate_route_call_identity(identity)?;
-    Ok(1 + identity.route_name.len()
-        + 1
+    // Seven text-length bytes, one u64 revision and one u16 method index.
+    Ok(7 + 8
+        + 2
+        + identity.route_name.len()
         + identity.route_uid.len()
-        + 8
-        + 1
         + identity.crm_ns.len()
-        + 1
         + identity.crm_name.len()
-        + 1
         + identity.crm_ver.len()
-        + 1
         + identity.abi_hash.len()
-        + 1
-        + identity.signature_hash.len()
-        + 2)
+        + identity.signature_hash.len())
 }
 
 /// Encode v2 call control.
@@ -137,21 +132,21 @@ pub fn encode_call_control(
 ) -> Result<Vec<u8>, EncodeError> {
     let len = encoded_call_control_len(identity)?;
     let mut buf = Vec::with_capacity(len);
-    push_text(&mut buf, "route_name", &identity.route_name)?;
-    push_text(&mut buf, "route_uid", &identity.route_uid)?;
+    push_text(&mut buf, &identity.route_name);
+    push_text(&mut buf, &identity.route_uid);
     buf.extend_from_slice(&identity.observed_route_revision.to_le_bytes());
-    push_text(&mut buf, "crm_ns", &identity.crm_ns)?;
-    push_text(&mut buf, "crm_name", &identity.crm_name)?;
-    push_text(&mut buf, "crm_ver", &identity.crm_ver)?;
-    push_text(&mut buf, "abi_hash", &identity.abi_hash)?;
-    push_text(&mut buf, "signature_hash", &identity.signature_hash)?;
+    push_text(&mut buf, &identity.crm_ns);
+    push_text(&mut buf, &identity.crm_name);
+    push_text(&mut buf, &identity.crm_ver);
+    push_text(&mut buf, &identity.abi_hash);
+    push_text(&mut buf, &identity.signature_hash);
     buf.extend_from_slice(&method_idx.to_le_bytes());
     Ok(buf)
 }
 
 /// Encode v2 call control directly into a buffer at `offset`.
 ///
-/// Returns the number of bytes written (1 + name_len + 2).
+/// Returns the number of bytes written.
 pub fn encode_call_control_into(
     buf: &mut [u8],
     offset: usize,
@@ -161,15 +156,15 @@ pub fn encode_call_control_into(
     let len = encoded_call_control_len(identity)?;
     check_write_capacity(buf, offset, len, "call_control")?;
     let mut cursor = offset;
-    cursor = write_text(buf, cursor, "route_name", &identity.route_name)?;
-    cursor = write_text(buf, cursor, "route_uid", &identity.route_uid)?;
+    cursor = write_text(buf, cursor, &identity.route_name);
+    cursor = write_text(buf, cursor, &identity.route_uid);
     buf[cursor..cursor + 8].copy_from_slice(&identity.observed_route_revision.to_le_bytes());
     cursor += 8;
-    cursor = write_text(buf, cursor, "crm_ns", &identity.crm_ns)?;
-    cursor = write_text(buf, cursor, "crm_name", &identity.crm_name)?;
-    cursor = write_text(buf, cursor, "crm_ver", &identity.crm_ver)?;
-    cursor = write_text(buf, cursor, "abi_hash", &identity.abi_hash)?;
-    cursor = write_text(buf, cursor, "signature_hash", &identity.signature_hash)?;
+    cursor = write_text(buf, cursor, &identity.crm_ns);
+    cursor = write_text(buf, cursor, &identity.crm_name);
+    cursor = write_text(buf, cursor, &identity.crm_ver);
+    cursor = write_text(buf, cursor, &identity.abi_hash);
+    cursor = write_text(buf, cursor, &identity.signature_hash);
     buf[cursor..cursor + 2].copy_from_slice(&method_idx.to_le_bytes());
     Ok(len)
 }
@@ -280,20 +275,15 @@ fn validate_route_uid(value: &str) -> Result<(), String> {
 
 fn validate_route_call_identity(identity: &RouteCallIdentity) -> Result<(), EncodeError> {
     validate_call_route_key("route_name", &identity.route_name)?;
-    validate_text_len("route_name", &identity.route_name)?;
     validate_route_uid(&identity.route_uid).map_err(|reason| EncodeError::InvalidText {
         field: "route_uid",
         reason,
     })?;
-    validate_text_len("route_uid", &identity.route_uid)?;
     c2_contract::validate_crm_tag(&identity.crm_ns, &identity.crm_name, &identity.crm_ver)
         .map_err(|err| EncodeError::InvalidText {
             field: "crm tag",
             reason: err.to_string(),
         })?;
-    validate_text_len("crm_ns", &identity.crm_ns)?;
-    validate_text_len("crm_name", &identity.crm_name)?;
-    validate_text_len("crm_ver", &identity.crm_ver)?;
     c2_contract::validate_contract_hash("abi_hash", &identity.abi_hash).map_err(|err| {
         EncodeError::InvalidText {
             field: "abi_hash",
@@ -309,38 +299,19 @@ fn validate_route_call_identity(identity: &RouteCallIdentity) -> Result<(), Enco
     Ok(())
 }
 
-fn validate_text_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
-    let actual = value.len();
-    if actual > MAX_CALL_TEXT_BYTES {
-        return Err(EncodeError::FieldTooLong {
-            field,
-            max: MAX_CALL_TEXT_BYTES,
-            actual,
-        });
-    }
-    Ok(())
-}
-
-fn push_text(buf: &mut Vec<u8>, field: &'static str, value: &str) -> Result<(), EncodeError> {
-    validate_text_len(field, value)?;
+// Callers validate every text field before writing.
+fn push_text(buf: &mut Vec<u8>, value: &str) {
     buf.push(value.len() as u8);
     buf.extend_from_slice(value.as_bytes());
-    Ok(())
 }
 
-fn write_text(
-    buf: &mut [u8],
-    offset: usize,
-    field: &'static str,
-    value: &str,
-) -> Result<usize, EncodeError> {
-    validate_text_len(field, value)?;
-    check_write_capacity(buf, offset, 1 + value.len(), field)?;
+// The caller validates every field and the complete output range first.
+fn write_text(buf: &mut [u8], offset: usize, value: &str) -> usize {
     buf[offset] = value.len() as u8;
     let start = offset + 1;
     let end = start + value.len();
     buf[start..end].copy_from_slice(value.as_bytes());
-    Ok(end)
+    end
 }
 
 fn check_write_capacity(

@@ -2,6 +2,8 @@
 
 > **Historical / superseded:** Retained as implementation evidence only. The current portable-payload authority is the [`2026-07-24 design`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../superpowers/plans/2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
 
+The three Python `call_prepared` client entry points were retired in [R25](2026-10-13-local-slimming-batches.md). This historical plan consumed FastDB-owned writers; it did not establish arbitrary custom codecs as a formal portable path. Current clients pass encoded buffers through the Core call preparation interface; server-side sinks and Rust IPC preallocation remain available.
+
 > **For agentic workers:** This is a C-Two integration plan. Do not implement FastDB binary layout parsing, layer import, or DB build logic in C-Two. Those capabilities belong in the sibling FastDB repository.
 
 **Date:** 2026-05-26

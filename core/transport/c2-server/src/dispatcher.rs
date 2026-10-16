@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 use c2_mem::MemPool;
 use c2_wire::chunk::ReassemblyBacking;
+use c2_wire::handshake::MAX_METHODS;
+
+use crate::server::ServerError;
 
 use crate::scheduler::{
     AccessLevel, ConcurrencyMode, RouteConcurrencyHandle, Scheduler, SchedulerLimits,
@@ -44,6 +47,7 @@ pub enum ResponseMeta {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     },
     /// Owned response bytes awaiting native transport selection.
     ///
@@ -68,6 +72,7 @@ pub enum RequestData {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
+        allocation_id: u64,
     },
     /// Inline bytes from a local IPC frame.
     Inline(Vec<u8>),
@@ -88,6 +93,7 @@ impl RequestData {
                 offset,
                 data_size,
                 is_dedicated,
+                ..
             } => pool
                 .read()
                 .copy_data_at(
@@ -114,6 +120,7 @@ impl RequestData {
                 offset,
                 data_size,
                 is_dedicated,
+                allocation_id,
             } => {
                 let mut pool = pool.write();
                 pool.validate_data_at(
@@ -130,6 +137,7 @@ impl RequestData {
                     offset,
                     data_size,
                     is_dedicated,
+                    allocation_id,
                 )
                 .map_err(|error| format!("request SHM release failed: {error}"))?;
                 Ok(())
@@ -271,11 +279,31 @@ pub struct BuiltRoute {
 }
 
 impl BuiltRoute {
-    pub(crate) fn new(route: CrmRoute, route_handle: RouteConcurrencyHandle) -> Self {
-        Self {
+    pub(crate) fn new(route: CrmRoute) -> Result<Self, ServerError> {
+        c2_contract::validate_named_route_name("route name", &route.name)
+            .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        if route.method_names.len() > MAX_METHODS {
+            return Err(ServerError::Protocol(format!(
+                "method count exceeds wire limit: {} > {}",
+                route.method_names.len(),
+                MAX_METHODS
+            )));
+        }
+        for method_name in &route.method_names {
+            c2_contract::validate_contract_text_field("method name", method_name)
+                .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        }
+        c2_contract::validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver)
+            .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        c2_contract::validate_contract_hash("abi_hash", &route.abi_hash)
+            .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        c2_contract::validate_contract_hash("signature_hash", &route.signature_hash)
+            .map_err(|e| ServerError::Protocol(e.to_string()))?;
+        let route_handle = RouteConcurrencyHandle::new(route.scheduler.as_ref().clone());
+        Ok(Self {
             route,
             route_handle,
-        }
+        })
     }
 
     pub(crate) fn into_route(self) -> CrmRoute {
@@ -575,6 +603,7 @@ mod tests {
             offset: allocation.offset,
             data_size: u32::try_from(payload.len()).unwrap(),
             is_dedicated: allocation.is_dedicated,
+            allocation_id: allocation.allocation_id,
         });
 
         assert_eq!(lease.copy_bytes().unwrap(), payload);
@@ -601,6 +630,7 @@ mod tests {
                 offset: allocation.offset,
                 data_size: u32::try_from(payload.len()).unwrap(),
                 is_dedicated: allocation.is_dedicated,
+                allocation_id: allocation.allocation_id,
             };
 
             assert_eq!(
@@ -628,6 +658,7 @@ mod tests {
             offset: u32::try_from(capacity - 1).unwrap(),
             data_size: 2,
             is_dedicated: false,
+            allocation_id: allocation.allocation_id,
         };
 
         assert!(

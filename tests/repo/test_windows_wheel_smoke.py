@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
@@ -14,6 +15,34 @@ def load_smoke():
     smoke = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(smoke)
     return smoke
+
+
+@pytest.mark.parametrize("declaration", [
+    "Provides-Extra: fastdb\n",
+    "Requires-Dist: fastdb4py==0.2.2\nProvides-Extra: fastdb\n",
+    "Requires-Dist: fastdb4py==0.2.2; extra == 'fastdb'\n"
+    "Requires-Dist: other-package\nProvides-Extra: fastdb\n",
+    "Requires-Dist: fastdb4py==0.2.1; extra == 'fastdb'\nProvides-Extra: fastdb\n",
+    "Requires-Dist: fastdb4py==0.2.2; extra == 'fastdb'\n",
+])
+def test_wheel_rejects_incorrect_optional_dependency_metadata(tmp_path, declaration):
+    path = tmp_path / "c_two.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("c_two-0.7.5.dist-info/METADATA",
+                         "Name: c-two\nVersion: 0.7.5\n" + declaration)
+    with pytest.raises(ValueError, match="no default dependencies"):
+        load_smoke().wheel(path, "c-two", fastdb_version="0.2.2")
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_wheel_accepts_exact_fastdb_extra(tmp_path, quote):
+    path = tmp_path / "c_two.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("c_two-0.7.5.dist-info/METADATA",
+                         "Name: c-two\nVersion: 0.7.5\nProvides-Extra: fastdb\n"
+                         f"Requires-Dist: fastdb4py==0.2.2 ; extra == {quote}fastdb{quote}\n")
+    _, metadata = load_smoke().wheel(path, "c-two", fastdb_version="0.2.2")
+    assert metadata["version"] == "0.7.5"
 
 
 def test_dead_host_broken_stdin_does_not_leave_relay_alive():

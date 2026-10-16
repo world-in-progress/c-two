@@ -105,40 +105,21 @@ impl PeerEnvelope {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ValidatedRouteStateEnvelope {
-    envelope: PeerEnvelope,
-    digest_diff_entries: Option<Vec<ValidatedDigestDiffEntry>>,
+#[derive(Debug)]
+pub(crate) enum ValidatedRouteStateEnvelope {
+    Message(PeerEnvelope),
+    DigestDiff(Vec<ValidatedDigestDiffEntry>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum ValidatedDigestDiffEntry {
-    Active(ValidatedDigestDiffActive),
-    Deleted(ValidatedDigestDiffDeleted),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ValidatedDigestDiffActive {
-    pub name: String,
-    pub relay_id: String,
-    pub relay_url: String,
-    pub crm_ns: String,
-    pub crm_name: String,
-    pub crm_ver: String,
-    pub abi_hash: String,
-    pub signature_hash: String,
-    pub max_payload_size: u64,
-    pub route_uid: String,
-    pub route_revision: u64,
-    pub registered_at: f64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ValidatedDigestDiffDeleted {
-    pub name: String,
-    pub relay_id: String,
-    pub removed_at: f64,
-    pub removed_revision: u64,
+    Active(RouteEntry),
+    Deleted {
+        name: String,
+        relay_id: String,
+        removed_at: f64,
+        removed_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,41 +134,8 @@ pub enum PeerRouteStateError {
     InvalidDigestDiff { reason: String },
 }
 
-impl ValidatedRouteStateEnvelope {
-    pub(crate) fn into_envelope(self) -> PeerEnvelope {
-        self.envelope
-    }
-
-    pub(crate) fn into_digest_diff_entries(self) -> Option<Vec<ValidatedDigestDiffEntry>> {
-        self.digest_diff_entries
-    }
-}
-
-impl From<ValidatedDigestDiffActive> for RouteEntry {
-    fn from(active: ValidatedDigestDiffActive) -> Self {
-        Self {
-            name: active.name,
-            relay_id: active.relay_id,
-            relay_url: active.relay_url,
-            server_id: None,
-            server_instance_id: None,
-            ipc_address: None,
-            crm_ns: active.crm_ns,
-            crm_name: active.crm_name,
-            crm_ver: active.crm_ver,
-            abi_hash: active.abi_hash,
-            signature_hash: active.signature_hash,
-            max_payload_size: active.max_payload_size,
-            route_uid: active.route_uid,
-            route_revision: active.route_revision,
-            locality: Locality::Peer,
-            registered_at: active.registered_at,
-        }
-    }
-}
-
 pub fn validate_route_state_envelope(
-    envelope: PeerEnvelope,
+    mut envelope: PeerEnvelope,
     expected_sender: Option<&str>,
 ) -> Result<ValidatedRouteStateEnvelope, PeerRouteStateError> {
     if envelope.protocol_version < ROUTE_HASH_PEER_VERSION {
@@ -215,7 +163,7 @@ pub fn validate_route_state_envelope(
         });
     }
 
-    let digest_diff_entries = match &envelope.message {
+    match &mut envelope.message {
         PeerMessage::RouteAnnounce {
             name,
             relay_id,
@@ -230,7 +178,7 @@ pub fn validate_route_state_envelope(
             route_revision,
             registered_at,
         } => {
-            if relay_id != &envelope.sender_relay_id
+            if relay_id.as_str() != envelope.sender_relay_id
                 || !valid_active_route_fields(
                     name,
                     relay_id,
@@ -250,7 +198,6 @@ pub fn validate_route_state_envelope(
                     reason: "invalid route announcement".to_string(),
                 });
             }
-            None
         }
         PeerMessage::RouteWithdraw {
             name,
@@ -258,40 +205,35 @@ pub fn validate_route_state_envelope(
             removed_at,
             removed_revision,
         } => {
-            if relay_id != &envelope.sender_relay_id
+            if relay_id.as_str() != envelope.sender_relay_id
                 || !valid_deleted_route_fields(name, relay_id, *removed_at, *removed_revision)
             {
                 return Err(PeerRouteStateError::InvalidRouteWithdraw {
                     reason: "invalid route withdrawal".to_string(),
                 });
             }
-            None
         }
         PeerMessage::RelayLeave { relay_id } => {
-            if relay_id != &envelope.sender_relay_id || !valid_wire_relay_id(relay_id) {
+            if relay_id.as_str() != envelope.sender_relay_id || !valid_wire_relay_id(relay_id) {
                 return Err(PeerRouteStateError::InvalidRelayLeave {
                     reason: "invalid relay leave".to_string(),
                 });
             }
-            None
         }
         PeerMessage::DigestExchange { digest } => {
             validate_digest_entries(digest)?;
-            None
         }
-        PeerMessage::DigestDiff { entries } => Some(validate_digest_diff_entries(
-            &envelope.sender_relay_id,
-            entries,
-        )?),
-        PeerMessage::RelayJoin { .. } | PeerMessage::Heartbeat { .. } | PeerMessage::Unknown => {
-            None
+        PeerMessage::DigestDiff { entries } => {
+            return validate_digest_diff_entries(
+                &envelope.sender_relay_id,
+                std::mem::take(entries),
+            )
+            .map(ValidatedRouteStateEnvelope::DigestDiff);
         }
+        PeerMessage::RelayJoin { .. } | PeerMessage::Heartbeat { .. } | PeerMessage::Unknown => {}
     };
 
-    Ok(ValidatedRouteStateEnvelope {
-        envelope,
-        digest_diff_entries,
-    })
+    Ok(ValidatedRouteStateEnvelope::Message(envelope))
 }
 
 fn validate_digest_entries(entries: &[DigestEntry]) -> Result<(), PeerRouteStateError> {
@@ -313,11 +255,12 @@ fn validate_digest_entries(entries: &[DigestEntry]) -> Result<(), PeerRouteState
 
 fn validate_digest_diff_entries(
     sender_relay_id: &str,
-    entries: &[DigestDiffEntry],
+    entries: Vec<DigestDiffEntry>,
 ) -> Result<Vec<ValidatedDigestDiffEntry>, PeerRouteStateError> {
     let mut validated = Vec::with_capacity(entries.len());
     for entry in entries {
-        let expected_hash = route_digest_hash_for_diff_entry(entry)?;
+        // The hash helper admits all static fields before computing the hash.
+        let expected_hash = route_digest_hash_for_diff_entry(&entry)?;
         match entry {
             DigestDiffEntry::Active {
                 name,
@@ -334,43 +277,29 @@ fn validate_digest_diff_entries(
                 registered_at,
                 hash,
             } => {
-                if relay_id != sender_relay_id
-                    || !valid_active_route_fields(
-                        name,
-                        relay_id,
-                        relay_url,
-                        crm_ns,
-                        crm_name,
-                        crm_ver,
-                        abi_hash,
-                        signature_hash,
-                        *max_payload_size,
-                        route_uid,
-                        *route_revision,
-                        *registered_at,
-                    )
-                    || hash != &expected_hash
-                {
+                if relay_id != sender_relay_id || hash != expected_hash {
                     return Err(PeerRouteStateError::InvalidDigestDiff {
                         reason: format!("invalid active diff for route {name}/{relay_id}"),
                     });
                 }
-                validated.push(ValidatedDigestDiffEntry::Active(
-                    ValidatedDigestDiffActive {
-                        name: name.clone(),
-                        relay_id: relay_id.clone(),
-                        relay_url: relay_url.clone(),
-                        crm_ns: crm_ns.clone(),
-                        crm_name: crm_name.clone(),
-                        crm_ver: crm_ver.clone(),
-                        abi_hash: abi_hash.clone(),
-                        signature_hash: signature_hash.clone(),
-                        max_payload_size: *max_payload_size,
-                        route_uid: route_uid.clone(),
-                        route_revision: *route_revision,
-                        registered_at: *registered_at,
-                    },
-                ));
+                validated.push(ValidatedDigestDiffEntry::Active(RouteEntry {
+                    name,
+                    relay_id,
+                    relay_url,
+                    server_id: None,
+                    server_instance_id: None,
+                    ipc_address: None,
+                    crm_ns,
+                    crm_name,
+                    crm_ver,
+                    abi_hash,
+                    signature_hash,
+                    max_payload_size,
+                    route_uid,
+                    route_revision,
+                    locality: Locality::Peer,
+                    registered_at,
+                }));
             }
             DigestDiffEntry::Deleted {
                 name,
@@ -379,22 +308,17 @@ fn validate_digest_diff_entries(
                 removed_revision,
                 hash,
             } => {
-                if relay_id != sender_relay_id
-                    || !valid_deleted_route_fields(name, relay_id, *removed_at, *removed_revision)
-                    || hash != &expected_hash
-                {
+                if relay_id != sender_relay_id || hash != expected_hash {
                     return Err(PeerRouteStateError::InvalidDigestDiff {
                         reason: format!("invalid deleted diff for route {name}/{relay_id}"),
                     });
                 }
-                validated.push(ValidatedDigestDiffEntry::Deleted(
-                    ValidatedDigestDiffDeleted {
-                        name: name.clone(),
-                        relay_id: relay_id.clone(),
-                        removed_at: *removed_at,
-                        removed_revision: *removed_revision,
-                    },
-                ));
+                validated.push(ValidatedDigestDiffEntry::Deleted {
+                    name,
+                    relay_id,
+                    removed_at,
+                    removed_revision,
+                });
             }
         }
     }

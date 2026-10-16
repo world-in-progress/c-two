@@ -149,7 +149,7 @@ impl RelayAwareHttpClient {
         c2_contract::validate_expected_route_contract(&expected)
             .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
         // HTTP construction must not require a local logon SID or resolve an IPC
-        // root. Legacy local selection derives the platform default lazily.
+        // root. Local selection derives the platform default lazily.
         Ok(Self {
             local_endpoint_context: None,
             default_local_endpoint_context: OnceLock::new(),
@@ -199,17 +199,10 @@ impl RelayAwareHttpClient {
     }
 
     fn namespace_allows_local_ipc(&self, namespace: Option<&str>) -> bool {
-        let Some(context) = self.local_ipc_context() else {
-            return false;
-        };
-        match namespace {
-            Some(namespace) => namespace == context.namespace_id(),
-            None => self
-                .default_local_endpoint_context
-                .get_or_init(|| LocalEndpointContext::default_for_platform().ok())
-                .as_ref()
-                .is_some_and(|default| context == default),
-        }
+        namespace.is_some_and(|namespace| {
+            self.local_ipc_context()
+                .is_some_and(|context| namespace == context.namespace_id())
+        })
     }
 
     pub fn route_name(&self) -> &str {
@@ -1417,7 +1410,7 @@ mod tests {
         Path(name): Path<String>,
     ) -> Response {
         state.resolve_count.fetch_add(1, Ordering::SeqCst);
-        Json(vec![
+        let body = Json(vec![
             route_info(name.clone(), state.live_url.clone()),
             RelayRouteInfo {
                 relay_url: state.stale_url.clone(),
@@ -1426,8 +1419,16 @@ mod tests {
                 server_instance_id: Some("inst-local-grid".to_string()),
                 ..route_info(name, state.stale_url.clone())
             },
-        ])
-        .into_response()
+        ]);
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        (
+            [(
+                super::super::LOCAL_ENDPOINT_NAMESPACE_HEADER,
+                context.namespace_id(),
+            )],
+            body,
+        )
+            .into_response()
     }
 
     async fn registry_resolve_only_failed_local_ipc(
@@ -1435,14 +1436,22 @@ mod tests {
         Path(name): Path<String>,
     ) -> Response {
         state.resolve_count.fetch_add(1, Ordering::SeqCst);
-        Json(vec![RelayRouteInfo {
+        let body = Json(vec![RelayRouteInfo {
             relay_url: state.stale_url.clone(),
             ipc_address: Some("ipc://local-grid".to_string()),
             server_id: Some("local-grid".to_string()),
             server_instance_id: Some("inst-local-grid".to_string()),
             ..route_info(name, state.stale_url.clone())
-        }])
-        .into_response()
+        }]);
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        (
+            [(
+                super::super::LOCAL_ENDPOINT_NAMESPACE_HEADER,
+                context.namespace_id(),
+            )],
+            body,
+        )
+            .into_response()
     }
 
     async fn registry_resolve_contract_changes(
@@ -1663,35 +1672,11 @@ mod tests {
         assert!(!client.namespace_allows_local_ipc(Some(&"f".repeat(64))));
     }
 
-    #[test]
-    fn immutable_namespace_expectation_preserves_platform_default_legacy_mapping() {
-        let context = LocalEndpointContext::default_for_platform().unwrap();
-        let client = RelayAwareHttpClient::new(
-            "http://127.0.0.1:9",
-            expected_contract(),
-            false,
-            RelayAwareClientConfig::default(),
-        )
-        .unwrap();
-        assert!(client.namespace_allows_local_ipc(None));
-        assert!(client.namespace_allows_local_ipc(Some(context.namespace_id())));
-        assert!(!client.namespace_allows_local_ipc(Some(&"f".repeat(64))));
-        #[cfg(unix)]
-        {
-            let custom =
-                LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-ns-test"))
-                    .unwrap();
-            let client = client.with_local_endpoint_context(&custom);
-            assert!(!client.namespace_allows_local_ipc(None));
-            assert!(!client.namespace_allows_local_ipc(Some(context.namespace_id())));
-            assert!(client.namespace_allows_local_ipc(Some(custom.namespace_id())));
-        }
-    }
-
     async fn assert_namespace_selection(
         context: &LocalEndpointContext,
-        response_namespace: Option<String>,
-        expect_ipc: bool,
+        response_namespaces: Vec<axum::http::HeaderValue>,
+        body_namespace: String,
+        expected: Result<bool, &str>,
     ) {
         use super::super::LOCAL_ENDPOINT_NAMESPACE_HEADER;
         let probes = Arc::new(AtomicUsize::new(0));
@@ -1717,24 +1702,27 @@ mod tests {
             "/_resolve/{name}",
             get(move |headers: HeaderMap| {
                 let expected_namespace = expected_namespace.clone();
-                let response_namespace = response_namespace.clone();
+                let response_namespaces = response_namespaces.clone();
+                let body_namespace = body_namespace.clone();
                 let resolved_url = resolved_url.clone();
                 async move {
                     assert_eq!(
                         headers.get(LOCAL_ENDPOINT_NAMESPACE_HEADER).unwrap(),
                         expected_namespace.as_str()
                     );
-                    let mut response = Json(vec![RelayRouteInfo {
+                    let mut body = serde_json::to_value(vec![RelayRouteInfo {
                         ipc_address: Some("ipc://local-grid".into()),
                         server_id: Some("local-grid".into()),
                         server_instance_id: Some("inst-local-grid".into()),
                         ..route_info("grid".into(), resolved_url)
                     }])
-                    .into_response();
-                    if let Some(namespace) = response_namespace {
+                    .unwrap();
+                    body[0]["local_endpoint_namespace"] = json!(body_namespace);
+                    let mut response = Json(body).into_response();
+                    for namespace in response_namespaces {
                         response
                             .headers_mut()
-                            .insert(LOCAL_ENDPOINT_NAMESPACE_HEADER, namespace.parse().unwrap());
+                            .append(LOCAL_ENDPOINT_NAMESPACE_HEADER, namespace);
                     }
                     response
                 }
@@ -1749,49 +1737,80 @@ mod tests {
         )
         .unwrap()
         .with_local_endpoint_context(context);
-        let target = client.resolve_target_async().await.unwrap();
-        assert_eq!(
-            matches!(target, RelayResolvedTarget::Ipc { .. }),
-            expect_ipc
-        );
-        assert_eq!(probes.load(Ordering::SeqCst), usize::from(!expect_ipc));
-        // Mismatch and missing custom metadata preserve the same HTTP route and token.
-        if !expect_ipc {
-            assert_eq!(target.as_url(), live_url);
-            assert_eq!(
-                client.call_async("step", b"namespace").await.unwrap(),
-                b"ok:namespace"
-            );
+        let result = client.resolve_target_async().await;
+        match expected {
+            Ok(expect_ipc) => {
+                let target = result.unwrap();
+                assert_eq!(
+                    matches!(target, RelayResolvedTarget::Ipc { .. }),
+                    expect_ipc
+                );
+                assert_eq!(probes.load(Ordering::SeqCst), usize::from(!expect_ipc));
+                if !expect_ipc {
+                    assert_eq!(target.as_url(), live_url);
+                    assert_eq!(
+                        client.call_async("step", b"namespace").await.unwrap(),
+                        b"ok:namespace"
+                    );
+                }
+            }
+            Err(message) => {
+                assert!(
+                    matches!(result, Err(HttpError::Transport(ref error)) if error.contains(message)),
+                    "{result:?}"
+                );
+                assert_eq!(probes.load(Ordering::SeqCst), 0);
+            }
         }
         registry_handle.abort();
         live_handle.abort();
+        let _ = registry_handle.await;
+        let _ = live_handle.await;
     }
 
-    // Kept cross-platform: Windows default SID metadata and legacy compatibility
-    // use the same public negotiation, including explicit mismatch -> HTTP.
+    // Windows uses the real current-logon namespace; Unix also exercises a custom root.
     #[tokio::test]
-    async fn default_namespace_new_and_old_relay_compatibility() {
-        let context = LocalEndpointContext::default_for_platform().unwrap();
-        assert_namespace_selection(&context, Some(context.namespace_id().to_owned()), true).await;
-        assert_namespace_selection(&context, None, true).await;
-        let mismatch = if context.namespace_id() == "a".repeat(64) {
-            "b"
-        } else {
-            "a"
+    async fn namespace_header_alone_selects_ipc_and_missing_or_mismatched_keeps_http() {
+        for context in [
+            LocalEndpointContext::default_for_platform().unwrap(),
+            #[cfg(unix)]
+            LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-ns-test")).unwrap(),
+        ] {
+            let namespace = context.namespace_id();
+            let mismatch = if namespace == "a".repeat(64) {
+                "b"
+            } else {
+                "a"
+            }
+            .repeat(64);
+            for (headers, body_namespace, expected) in [
+                (vec![namespace.parse().unwrap()], mismatch.clone(), Ok(true)),
+                (vec![namespace.parse().unwrap()], "invalid".into(), Ok(true)),
+                (vec![], namespace.to_owned(), Ok(false)),
+                (
+                    vec![mismatch.parse().unwrap()],
+                    namespace.to_owned(),
+                    Ok(false),
+                ),
+                (
+                    vec!["invalid".parse().unwrap()],
+                    namespace.to_owned(),
+                    Err("invalid local endpoint namespace"),
+                ),
+                (
+                    vec![axum::http::HeaderValue::from_bytes(b"\xff").unwrap()],
+                    namespace.to_owned(),
+                    Err("invalid local endpoint namespace header"),
+                ),
+                (
+                    vec![namespace.parse().unwrap(); 2],
+                    namespace.to_owned(),
+                    Err("repeated local endpoint namespace header"),
+                ),
+            ] {
+                assert_namespace_selection(&context, headers, body_namespace, expected).await;
+            }
         }
-        .repeat(64);
-        assert_namespace_selection(&context, Some(mismatch), false).await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn custom_namespace_requires_matching_metadata_and_keeps_http_route() {
-        let context =
-            LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-ns-test")).unwrap();
-        assert_namespace_selection(&context, Some(context.namespace_id().to_owned()), true).await;
-        assert_namespace_selection(&context, None, false).await;
-        let other = LocalEndpointContext::default_for_platform().unwrap();
-        assert_namespace_selection(&context, Some(other.namespace_id().to_owned()), false).await;
     }
 
     #[tokio::test]

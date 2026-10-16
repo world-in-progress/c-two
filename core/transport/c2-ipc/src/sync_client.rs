@@ -518,6 +518,10 @@ impl SyncClient {
         self.rt.block_on(self.inner.close_shared_bounded(timeout))
     }
 
+    pub(crate) fn abnormal_close_reason(&self) -> Option<&'static str> {
+        self.inner.abnormal_close_reason()
+    }
+
     /// Whether the client is connected.
     pub fn is_connected(&self) -> bool {
         self.inner.is_connected()
@@ -821,7 +825,6 @@ pub(crate) mod tests {
                 pool_enabled: false,
                 pool_segment_size: 2 * 1024 * 1024,
                 max_pool_segments: 2,
-                max_pool_memory: 4 * 1024 * 1024,
                 pool_prewarm_segments: 0,
                 pool_min_retained_segments: 1,
                 reassembly_segment_size: 1024 * 1024,
@@ -1031,7 +1034,6 @@ pub(crate) mod tests {
             base: BaseIpcConfig {
                 pool_segment_size: 65_536,
                 max_pool_segments: 1,
-                max_pool_memory: 65_536,
                 ..BaseIpcConfig::default()
             },
             ..ClientIpcConfig::default()
@@ -1132,7 +1134,7 @@ pub(crate) mod tests {
 
     #[test]
     fn prealloc_selection_race_frees_only_the_owning_pool() {
-        let (_runtime, _server, address) = start_race_server("prealloc_race_pool_free");
+        let (runtime, server, address) = start_race_server("prealloc_race_pool_free");
         let client = Arc::new(
             SyncClient::connect(&address, None, race_client_config()).expect("connect race client"),
         );
@@ -1170,11 +1172,14 @@ pub(crate) mod tests {
             "the replacement pool's live canary must never be freed by stale coordinates"
         );
         companion.join().expect("companion thread");
+        runtime
+            .block_on(server.shutdown_and_wait(Duration::from_secs(5)))
+            .expect("race server should shut down");
     }
 
     #[test]
     fn prealloc_selection_race_fill_failure_frees_only_the_owning_pool() {
-        let (_runtime, _server, address) = start_race_server("prealloc_race_fill");
+        let (runtime, server, address) = start_race_server("prealloc_race_fill");
         let client = Arc::new(
             SyncClient::connect(&address, None, race_client_config()).expect("connect race client"),
         );
@@ -1200,6 +1205,9 @@ pub(crate) mod tests {
             "the replacement pool's live canary must never be freed by stale coordinates"
         );
         companion.join().expect("companion thread");
+        runtime
+            .block_on(server.shutdown_and_wait(Duration::from_secs(5)))
+            .expect("race server should shut down");
     }
 
     /// A panicking fill callback must not leak the allocation.

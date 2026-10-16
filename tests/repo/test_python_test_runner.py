@@ -144,6 +144,10 @@ def test_only_declared_windows_setup_skip_is_not_applicable(
     ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'setup', 'Skipped: missing native', False),
     ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[unknown]', 'setup', 'Skipped: Unix filesystem root capability', False),
     ('win32', 'unexpected::test_case', 'setup', 'Skipped: Unix filesystem root capability', False),
+    ('win32', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[False-True]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', True),
+    ('win32', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[True-True]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', True),
+    ('win32', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[False-False]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', False),
+    ('linux', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[False-True]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', False),
 ])
 def test_windows_platform_skip_allowlist(tmp_path, monkeypatch, platform, nodeid, phase, reason, accepted):
     monkeypatch.setattr(runner.sys, 'platform', platform)
@@ -364,7 +368,7 @@ def test_main_preflight_failure_preserves_failure_receipt(tmp_path: Path, monkey
 
 
 def test_actual_missing_c3_is_rejected_before_test_collection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(runner, 'capture', lambda *args: json.dumps({'versions': {'fastdb4py': '0.2.1'}}))
+    monkeypatch.setattr(runner, 'capture', lambda *args: json.dumps({'versions': {'fastdb4py': '0.2.2'}}))
     with pytest.raises(runner.RunnerError, match='预建c3不存在'):
         runner.preflight(SimpleNamespace(python=sys.executable, c3=tmp_path / 'missing'), {})
 

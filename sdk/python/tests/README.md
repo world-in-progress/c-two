@@ -57,7 +57,9 @@ Python 3.10 is the supported minimum; a skipped interpreter check is not a passi
 | `integration/test_portable_payload_cross_language.py`, `integration/test_portable_payload_matrix.py` | Rust/Python portable payloads and the exact 18-row matrix |
 | `integration/test_typescript_real_calls.py` | Generated TypeScript calls and payload lifetimes |
 
-The SDK socket-count regression runs on Unix. Rust pool tests use actual local streams and peer EOF on Unix and Windows Named Pipes; Windows evidence comes from the Windows Native workflow. `protocol_address` currently supplies only unique logical `ipc://` addresses. Same-process and HTTP cases have dedicated fixtures.
+The SDK socket-count regression runs on Unix. Rust pool tests use actual local streams and peer EOF on Unix and Windows Named Pipes; Windows evidence comes from the Windows Native workflow. `unique_ipc_address` supplies unique logical `ipc://` addresses. Same-process and HTTP cases have dedicated fixtures.
+
+Temporary listeners must complete an explicit close, or be reaped through their captured native credential after cancellation and join. Check shutdown errors and endpoint removal; process exit alone does not prove cleanup. Restrict maintenance to the current test's endpoints and require no new socket or lease entries after the run.
 
 Cross-language checks require the development prerequisites above:
 

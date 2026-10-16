@@ -170,44 +170,6 @@ impl PyNativePreparedCall {
         Self::finish(py, encoded)
     }
 
-    fn call_prepared(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<PyCoreResponse> {
-        let mut prepared = self.take()?;
-        if let Some(nbytes) = prepared_plan_nbytes(plan)? {
-            prepared
-                .charge_input(nbytes as u64)
-                .map_err(core_error_to_py)?;
-            // write_into is user code and stays on this caller/GIL thread.
-            // Its destination owns its memory, even if a view escapes.
-            let request = materialize_python_payload_plan(py, plan, nbytes)?;
-            return Self::finish(py, prepared.encode_vec(request).map_err(core_error_to_py)?);
-        }
-        if let Ok(bytes) = plan.cast_exact::<PyBytes>() {
-            let owner = bytes.clone().unbind();
-            let encoded = prepared
-                .encode(bytes.as_bytes().len(), move || {
-                    Ok(Python::attach(|py| {
-                        let bytes = owner.bind(py).as_bytes();
-                        // Immutable bytes remain pinned by owner while the native
-                        // copy releases the GIL. The expired waiter can reacquire
-                        // Python independently of a still-running native copy.
-                        py.detach(|| bytes.to_vec())
-                    }))
-                })
-                .map_err(core_error_to_py)?;
-            return Self::finish(py, encoded);
-        }
-        let continuation = Self {
-            inner: Mutex::new(Some(prepared)),
-        };
-        if PyBuffer::<u8>::get(plan).is_ok() {
-            return continuation.call(py, plan);
-        }
-        // Unknown-size Python serialization remains on the caller. The same
-        // preparation is charged against its original D before native copying.
-        let materialized = plan.call_method0("to_bytes")?;
-        continuation.call(py, &materialized)
-    }
-
     fn close(&self) {
         let closed = self.inner.lock().take();
         drop(closed);
@@ -274,15 +236,6 @@ impl PyCoreClient {
         data: &Bound<'_, PyAny>,
     ) -> PyResult<PyCoreResponse> {
         self.begin_call(py, method_name)?.call(py, data)
-    }
-
-    fn call_prepared(
-        &self,
-        py: Python<'_>,
-        method_name: &str,
-        plan: &Bound<'_, PyAny>,
-    ) -> PyResult<PyCoreResponse> {
-        self.begin_call(py, method_name)?.call_prepared(py, plan)
     }
 
     fn close(&self) {
@@ -476,9 +429,9 @@ struct PyCoreRequestBuffer {
 }
 
 impl PyCoreRequestBuffer {
-    fn new(bytes: &[u8]) -> Self {
+    fn new(bytes: Vec<u8>) -> Self {
         Self {
-            bytes: bytes.to_vec(),
+            bytes,
             released: AtomicBool::new(false),
             exports: AtomicU32::new(0),
             lease: Mutex::new(None),
@@ -587,7 +540,7 @@ impl PyCoreService {
 }
 
 impl EncodedService for PyCoreService {
-    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         Python::attach(|py| {
             let request = Py::new(py, PyCoreRequestBuffer::new(request))
                 .map_err(|error| python_error_to_c2(py, error))?;
@@ -766,6 +719,52 @@ mod payload_tests {
             c"payload_test",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn request_snapshot_moves_into_python_and_outlives_service_return() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = module(
+                py,
+                r#"
+def dispatch(route, method, request):
+    global view
+    view = memoryview(request)
+    if method:
+        raise ValueError('dispatch failed')
+"#,
+            );
+            let service = PyCoreService::new(
+                "request-owner".into(),
+                module.getattr("dispatch").unwrap().unbind(),
+            );
+            for method in [0, 1] {
+                let request = vec![b'x'; 32];
+                let address = request.as_ptr();
+                assert_eq!(service.invoke(method, request).is_err(), method == 1);
+                let view = module.getattr("view").unwrap();
+                let owner = view.getattr("obj").unwrap();
+                let owner = owner.cast::<PyCoreRequestBuffer>().unwrap().borrow();
+                assert_eq!(owner.bytes.as_ptr(), address);
+                assert_eq!(
+                    view.call_method0("tobytes")
+                        .unwrap()
+                        .extract::<Vec<u8>>()
+                        .unwrap(),
+                    vec![b'x'; 32],
+                );
+                assert!(
+                    owner
+                        .release()
+                        .unwrap_err()
+                        .is_instance_of::<PyBufferError>(py)
+                );
+                view.call_method0("release").unwrap();
+                owner.release().unwrap();
+                assert!(owner.__len__().is_err());
+            }
+        });
     }
 
     #[test]

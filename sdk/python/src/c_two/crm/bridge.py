@@ -33,10 +33,6 @@ def bridge(
     input: Callable[..., Any] | None = None,
     output: Callable[[Any], Any] | None = None,
 ) -> ResourceBridge:
-    if input is not None and not callable(input):
-        raise TypeError('bridge input must be callable.')
-    if output is not None and not callable(output):
-        raise TypeError('bridge output must be callable.')
     return ResourceBridge(input=input, output=output)
 
 

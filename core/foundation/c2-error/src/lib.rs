@@ -5,9 +5,47 @@ use serde::{Deserialize, Serialize};
 const ERROR_WIRE_MAGIC: &[u8; 4] = b"C2E1";
 pub const ERROR_WIRE_VERSION: u16 = 1;
 
-#[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ErrorCode {
+macro_rules! define_error_codes {
+    ($($variant:ident = $value:literal),+ $(,)?) => {
+        #[repr(u16)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum ErrorCode {
+            $($variant = $value,)+
+        }
+
+        const ERROR_CODE_REGISTRY: &[ErrorCodeEntry] = &[
+            $(ErrorCodeEntry {
+                code: ErrorCode::$variant,
+                name: stringify!($variant),
+            },)+
+        ];
+
+        impl ErrorCode {
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => stringify!($variant),)+
+                }
+            }
+
+            pub fn registry() -> &'static [ErrorCodeEntry] {
+                ERROR_CODE_REGISTRY
+            }
+        }
+
+        impl TryFrom<u16> for ErrorCode {
+            type Error = ();
+
+            fn try_from(value: u16) -> Result<Self, Self::Error> {
+                match value {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(()),
+                }
+            }
+        }
+    };
+}
+
+define_error_codes! {
     Unknown = 0,
     ResourceInputDeserializing = 1,
     ResourceOutputSerializing = 2,
@@ -42,166 +80,9 @@ pub struct ErrorCodeEntry {
     pub name: &'static str,
 }
 
-const ERROR_CODE_REGISTRY: &[ErrorCodeEntry] = &[
-    ErrorCodeEntry {
-        code: ErrorCode::Unknown,
-        name: "Unknown",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ResourceInputDeserializing,
-        name: "ResourceInputDeserializing",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ResourceOutputSerializing,
-        name: "ResourceOutputSerializing",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ResourceFunctionExecuting,
-        name: "ResourceFunctionExecuting",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ResourceInputFromBuffer,
-        name: "ResourceInputFromBuffer",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ClientInputSerializing,
-        name: "ClientInputSerializing",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ClientOutputDeserializing,
-        name: "ClientOutputDeserializing",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ClientCallingResource,
-        name: "ClientCallingResource",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ClientOutputFromBuffer,
-        name: "ClientOutputFromBuffer",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ResourceNotFound,
-        name: "ResourceNotFound",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ResourceUnavailable,
-        name: "ResourceUnavailable",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ResourceAlreadyRegistered,
-        name: "ResourceAlreadyRegistered",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::RouteStale,
-        name: "RouteStale",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::RegistryUnavailable,
-        name: "RegistryUnavailable",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::WriteConflict,
-        name: "WriteConflict",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ResourceClosed,
-        name: "ResourceClosed",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ResourceRemoved,
-        name: "ResourceRemoved",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ContractMismatch,
-        name: "ContractMismatch",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::IdentityMismatch,
-        name: "IdentityMismatch",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::RouteCatalogCompacted,
-        name: "RouteCatalogCompacted",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::RouteWatchUnavailable,
-        name: "RouteWatchUnavailable",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::ProtocolViolation,
-        name: "ProtocolViolation",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::FallbackDenied,
-        name: "FallbackDenied",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::CallDeadlineExceeded,
-        name: "CallDeadlineExceeded",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::UnsupportedCallMode,
-        name: "UnsupportedCallMode",
-    },
-    ErrorCodeEntry {
-        code: ErrorCode::CallCapacityExceeded,
-        name: "CallCapacityExceeded",
-    },
-];
-
-impl ErrorCode {
-    pub fn name(self) -> &'static str {
-        ERROR_CODE_REGISTRY
-            .iter()
-            .find(|entry| entry.code == self)
-            .map(|entry| entry.name)
-            .expect("c2-error registry must include every ErrorCode variant")
-    }
-
-    pub fn registry() -> &'static [ErrorCodeEntry] {
-        ERROR_CODE_REGISTRY
-    }
-}
-
 impl From<ErrorCode> for u16 {
     fn from(code: ErrorCode) -> Self {
         code as u16
-    }
-}
-
-impl TryFrom<u16> for ErrorCode {
-    type Error = ();
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(ErrorCode::Unknown),
-            1 => Ok(ErrorCode::ResourceInputDeserializing),
-            2 => Ok(ErrorCode::ResourceOutputSerializing),
-            3 => Ok(ErrorCode::ResourceFunctionExecuting),
-            4 => Ok(ErrorCode::ResourceInputFromBuffer),
-            5 => Ok(ErrorCode::ClientInputSerializing),
-            6 => Ok(ErrorCode::ClientOutputDeserializing),
-            7 => Ok(ErrorCode::ClientCallingResource),
-            8 => Ok(ErrorCode::ClientOutputFromBuffer),
-            701 => Ok(ErrorCode::ResourceNotFound),
-            702 => Ok(ErrorCode::ResourceUnavailable),
-            703 => Ok(ErrorCode::ResourceAlreadyRegistered),
-            704 => Ok(ErrorCode::RouteStale),
-            705 => Ok(ErrorCode::RegistryUnavailable),
-            706 => Ok(ErrorCode::WriteConflict),
-            707 => Ok(ErrorCode::ResourceClosed),
-            708 => Ok(ErrorCode::ResourceRemoved),
-            709 => Ok(ErrorCode::ContractMismatch),
-            710 => Ok(ErrorCode::IdentityMismatch),
-            711 => Ok(ErrorCode::RouteCatalogCompacted),
-            712 => Ok(ErrorCode::RouteWatchUnavailable),
-            713 => Ok(ErrorCode::ProtocolViolation),
-            714 => Ok(ErrorCode::FallbackDenied),
-            715 => Ok(ErrorCode::CallDeadlineExceeded),
-            716 => Ok(ErrorCode::UnsupportedCallMode),
-            717 => Ok(ErrorCode::CallCapacityExceeded),
-            _ => Err(()),
-        }
     }
 }
 
@@ -365,108 +246,55 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn canonical_error_codes_match_wire_values() {
-        assert_eq!(u16::from(ErrorCode::Unknown), 0);
-        assert_eq!(u16::from(ErrorCode::ResourceInputDeserializing), 1);
-        assert_eq!(u16::from(ErrorCode::ResourceOutputSerializing), 2);
-        assert_eq!(u16::from(ErrorCode::ResourceFunctionExecuting), 3);
-        assert_eq!(u16::from(ErrorCode::ResourceInputFromBuffer), 4);
-        assert_eq!(u16::from(ErrorCode::ClientInputSerializing), 5);
-        assert_eq!(u16::from(ErrorCode::ClientOutputDeserializing), 6);
-        assert_eq!(u16::from(ErrorCode::ClientCallingResource), 7);
-        assert_eq!(u16::from(ErrorCode::ClientOutputFromBuffer), 8);
-        assert_eq!(u16::from(ErrorCode::ResourceNotFound), 701);
-        assert_eq!(u16::from(ErrorCode::ResourceUnavailable), 702);
-        assert_eq!(u16::from(ErrorCode::ResourceAlreadyRegistered), 703);
-        assert_eq!(u16::from(ErrorCode::RouteStale), 704);
-        assert_eq!(u16::from(ErrorCode::RegistryUnavailable), 705);
-        assert_eq!(u16::from(ErrorCode::WriteConflict), 706);
-        assert_eq!(u16::from(ErrorCode::ResourceClosed), 707);
-        assert_eq!(u16::from(ErrorCode::ResourceRemoved), 708);
-        assert_eq!(u16::from(ErrorCode::ContractMismatch), 709);
-        assert_eq!(u16::from(ErrorCode::IdentityMismatch), 710);
-        assert_eq!(u16::from(ErrorCode::RouteCatalogCompacted), 711);
-        assert_eq!(u16::from(ErrorCode::RouteWatchUnavailable), 712);
-        assert_eq!(u16::from(ErrorCode::ProtocolViolation), 713);
-        assert_eq!(u16::from(ErrorCode::FallbackDenied), 714);
-        assert_eq!(u16::from(ErrorCode::CallDeadlineExceeded), 715);
-        assert_eq!(u16::from(ErrorCode::UnsupportedCallMode), 716);
-        assert_eq!(u16::from(ErrorCode::CallCapacityExceeded), 717);
+    fn error_code_registry_matches_canonical_wire_values() {
+        use ErrorCode::*;
+
+        let expected: [(ErrorCode, u16, &str); 26] = [
+            (Unknown, 0, "Unknown"),
+            (ResourceInputDeserializing, 1, "ResourceInputDeserializing"),
+            (ResourceOutputSerializing, 2, "ResourceOutputSerializing"),
+            (ResourceFunctionExecuting, 3, "ResourceFunctionExecuting"),
+            (ResourceInputFromBuffer, 4, "ResourceInputFromBuffer"),
+            (ClientInputSerializing, 5, "ClientInputSerializing"),
+            (ClientOutputDeserializing, 6, "ClientOutputDeserializing"),
+            (ClientCallingResource, 7, "ClientCallingResource"),
+            (ClientOutputFromBuffer, 8, "ClientOutputFromBuffer"),
+            (ResourceNotFound, 701, "ResourceNotFound"),
+            (ResourceUnavailable, 702, "ResourceUnavailable"),
+            (ResourceAlreadyRegistered, 703, "ResourceAlreadyRegistered"),
+            (RouteStale, 704, "RouteStale"),
+            (RegistryUnavailable, 705, "RegistryUnavailable"),
+            (WriteConflict, 706, "WriteConflict"),
+            (ResourceClosed, 707, "ResourceClosed"),
+            (ResourceRemoved, 708, "ResourceRemoved"),
+            (ContractMismatch, 709, "ContractMismatch"),
+            (IdentityMismatch, 710, "IdentityMismatch"),
+            (RouteCatalogCompacted, 711, "RouteCatalogCompacted"),
+            (RouteWatchUnavailable, 712, "RouteWatchUnavailable"),
+            (ProtocolViolation, 713, "ProtocolViolation"),
+            (FallbackDenied, 714, "FallbackDenied"),
+            (CallDeadlineExceeded, 715, "CallDeadlineExceeded"),
+            (UnsupportedCallMode, 716, "UnsupportedCallMode"),
+            (CallCapacityExceeded, 717, "CallCapacityExceeded"),
+        ];
+        let registry = ErrorCode::registry();
+        assert_eq!(registry.len(), expected.len());
+        for (entry, (variant, value, name)) in registry.iter().zip(expected) {
+            assert_eq!(entry.code, variant);
+            assert_eq!(u16::from(variant), value);
+            assert_eq!(entry.name, name);
+            assert_eq!(variant.name(), name);
+            assert_eq!(ErrorCode::try_from(value), Ok(variant));
+        }
+        for value in [9, 700, 718, 9999, u16::MAX] {
+            assert_eq!(ErrorCode::try_from(value), Err(()));
+        }
     }
 
     #[test]
     fn c2_error_display_uses_code_name_and_message() {
         let err = C2Error::new(ErrorCode::ResourceAlreadyRegistered, "grid exists");
         assert_eq!(err.to_string(), "ResourceAlreadyRegistered: grid exists");
-    }
-
-    #[test]
-    fn error_code_registry_exposes_names_and_codes_from_crate() {
-        let registry: Vec<_> = ErrorCode::registry()
-            .iter()
-            .map(|entry| (entry.name, u16::from(entry.code)))
-            .collect();
-
-        assert_eq!(
-            registry,
-            vec![
-                ("Unknown", 0),
-                ("ResourceInputDeserializing", 1),
-                ("ResourceOutputSerializing", 2),
-                ("ResourceFunctionExecuting", 3),
-                ("ResourceInputFromBuffer", 4),
-                ("ClientInputSerializing", 5),
-                ("ClientOutputDeserializing", 6),
-                ("ClientCallingResource", 7),
-                ("ClientOutputFromBuffer", 8),
-                ("ResourceNotFound", 701),
-                ("ResourceUnavailable", 702),
-                ("ResourceAlreadyRegistered", 703),
-                ("RouteStale", 704),
-                ("RegistryUnavailable", 705),
-                ("WriteConflict", 706),
-                ("ResourceClosed", 707),
-                ("ResourceRemoved", 708),
-                ("ContractMismatch", 709),
-                ("IdentityMismatch", 710),
-                ("RouteCatalogCompacted", 711),
-                ("RouteWatchUnavailable", 712),
-                ("ProtocolViolation", 713),
-                ("FallbackDenied", 714),
-                ("CallDeadlineExceeded", 715),
-                ("UnsupportedCallMode", 716),
-                ("CallCapacityExceeded", 717),
-            ],
-        );
-        assert_eq!(ErrorCode::WriteConflict.name(), "WriteConflict");
-    }
-
-    #[test]
-    fn error_code_registry_has_unique_codes_names_and_full_variant_coverage() {
-        let registry = ErrorCode::registry();
-        assert_eq!(registry.len(), 26);
-
-        let mut codes: Vec<u16> = registry.iter().map(|entry| u16::from(entry.code)).collect();
-        codes.sort_unstable();
-        codes.dedup();
-        assert_eq!(codes.len(), registry.len());
-
-        let mut names: Vec<&str> = registry.iter().map(|entry| entry.name).collect();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), registry.len());
-    }
-
-    #[test]
-    fn from_buffer_error_codes_round_trip_from_wire_values() {
-        assert_eq!(
-            ErrorCode::try_from(4),
-            Ok(ErrorCode::ResourceInputFromBuffer),
-        );
-        assert_eq!(
-            ErrorCode::try_from(8),
-            Ok(ErrorCode::ClientOutputFromBuffer),
-        );
     }
 
     #[test]

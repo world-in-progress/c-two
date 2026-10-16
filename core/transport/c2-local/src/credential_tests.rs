@@ -108,7 +108,7 @@ async fn managed_credential_records_directory_without_socket_path() {
         round_tripped.endpoint().os_name(),
         credential.endpoint().os_name()
     );
-    drop(listener);
+    super::tests::close_listener(listener);
 }
 
 #[cfg(unix)]
@@ -133,7 +133,7 @@ async fn rejects_unknown_fields_unknown_schema_and_oversize() {
         &format!("{{\"schemaVersion\":2,\"address\":\"{padding}\"}}"),
         &[EndpointCredentialErrorKind::TooLarge],
     );
-    drop(listener);
+    super::tests::close_listener(listener);
 }
 
 #[cfg(unix)]
@@ -154,7 +154,7 @@ async fn rejects_missing_required_fields() {
             ],
         );
     }
-    drop(listener);
+    super::tests::close_listener(listener);
 }
 
 #[cfg(unix)]
@@ -188,7 +188,7 @@ async fn unix_requires_incarnation_and_rejects_superseded_schemas() {
         }),
         &[EndpointCredentialErrorKind::InvalidValue],
     );
-    drop(listener);
+    super::tests::close_listener(listener);
 }
 
 #[cfg(unix)]
@@ -223,7 +223,7 @@ async fn rejects_checked_integer_and_identity_violations() {
             &[EndpointCredentialErrorKind::InvalidValue],
         );
     }
-    drop(listener);
+    super::tests::close_listener(listener);
 }
 
 #[cfg(unix)]
@@ -268,7 +268,7 @@ async fn rejects_address_protocol_and_platform_mismatches() {
             EndpointCredentialErrorKind::IncarnationRequired,
         ],
     );
-    drop(listener);
+    super::tests::close_listener(listener);
 }
 
 #[cfg(unix)]
@@ -286,7 +286,7 @@ async fn rejects_trailing_garbage_and_non_object_documents() {
         &format!("{json}{{}}"),
         &[EndpointCredentialErrorKind::MalformedJson],
     );
-    drop(listener);
+    super::tests::close_listener(listener);
 }
 
 #[cfg(unix)]
@@ -325,7 +325,7 @@ async fn decoding_does_not_create_filesystem_state() {
         "decoding must not create target socket, locks, or markers"
     );
     drop(round_tripped);
-    drop(listener);
+    super::tests::close_listener(listener);
 }
 
 #[cfg(unix)]
@@ -385,8 +385,8 @@ async fn a_credential_for_another_endpoint_is_stale_not_authority() {
     let inspected = inspect_managed_when_gate_available(other.endpoint()).await;
     assert_eq!(inspected.to_json().unwrap(), other.to_json().unwrap());
     // The other listener still closes its own object cleanly.
-    let _ = other_listener.close();
-    drop(listener);
+    super::tests::close_listener(other_listener);
+    super::tests::close_listener(listener);
 }
 
 // --- Platform-neutral strict-parse rules -------------------------------------

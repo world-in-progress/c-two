@@ -78,6 +78,7 @@ where
         offset: alloc.offset,
         data_size,
         is_dedicated: alloc.is_dedicated,
+        allocation_id: alloc.allocation_id,
     }))
 }
 
@@ -145,6 +146,7 @@ mod tests {
             offset,
             data_size,
             is_dedicated,
+            allocation_id: _,
         } = meta
         else {
             panic!("expected ShmAlloc response metadata");

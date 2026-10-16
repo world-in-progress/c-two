@@ -10,7 +10,6 @@ import {
   C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS,
   C2_MEM_FFI_MAX_SHM_PREFIX_BYTES,
   C2MemFfiBindingError,
-  C2MemFfiEndpointContextUnsupportedError,
   captureLocalIpcEndpointContextFromSymbols,
   createC2MemFfiRequestPoolFromSymbols,
   createC2MemFfiNativeRequestBackend,
@@ -332,7 +331,7 @@ test('native capture failure is remembered after first attempt and partial owner
   assert.equal(captures, 1); assert.equal(closes, 1);
 });
 
-test('Node connector rejects unsupported root/context capability while old ABI 3 default endpoint remains usable', async () => {
+test('Node connector rejects missing context symbols before resolving or opening a socket', async () => {
   const fixture = endpointSymbolsFixture();
   delete fixture.symbols.c2_mem_ffi_local_endpoint_context_capture;
   let socketOpens = 0;
@@ -340,18 +339,15 @@ test('Node connector rejects unsupported root/context capability while old ABI 3
     nativeSymbols: fixture.symbols,
     createConnection() { socketOpens += 1; return connectedContextSocket(); },
   };
-  const connection = await createNodeIpcConnect(options)('ipc://legacy-abi3');
-  await connection.close();
-  assert.deepEqual(fixture.atomicAddresses, ['ipc://legacy-abi3']);
-  assert.throws(() => captureLocalIpcEndpointContextFromSymbols(fixture.symbols), C2MemFfiEndpointContextUnsupportedError);
-  await assert.rejects(
-    () => createNodeIpcConnect({ ...options, ipcRoot: 'requested-root' })('ipc://legacy-abi3'),
-    (error) => error instanceof C2MemFfiEndpointContextUnsupportedError
-      && error.code === 'C2_ENDPOINT_CONTEXT_UNSUPPORTED'
-      && /ABI version 3 does not guarantee/.test(error.message),
-  );
-  assert.equal(socketOpens, 1);
-  assert.deepEqual(fixture.atomicAddresses, ['ipc://legacy-abi3']);
+  const missingContext = /must provide c2_mem_ffi_local_endpoint_context_capture/;
+  assert.throws(() => captureLocalIpcEndpointContextFromSymbols(fixture.symbols), missingContext);
+  for (const ipcRoot of [undefined, 'requested-root']) {
+    const connect = createNodeIpcConnect({ ...options, ipcRoot });
+    await assert.rejects(() => connect('ipc://missing-context'), missingContext);
+    connect.close();
+  }
+  assert.equal(socketOpens, 0);
+  assert.deepEqual(fixture.atomicAddresses, []);
 });
 
 test('Node connector validates conflicts and native capture output before opening a socket', async () => {
@@ -389,7 +385,7 @@ test('Node connector validates conflicts and native capture output before openin
   assert.equal(closeCount, 2);
   await assert.rejects(
     () => createNodeIpcConnect({ nativeSymbols: { ...fixture.symbols, c2_mem_ffi_abi_version: () => 2 } })('ipc://wrong-abi'),
-    /ABI version 2.*expected version 3/,
+    /ABI version 2.*expected version 5/,
   );
 });
 
@@ -525,7 +521,7 @@ test('createNodeIpcConnect rejects sockets that close before connect', async () 
 });
 
 test('c2-mem-ffi symbol adapters validate ABI version before creating pools', async () => {
-  assert.equal(C2_MEM_FFI_ABI_VERSION, 3);
+  assert.equal(C2_MEM_FFI_ABI_VERSION, 5);
   let createCount = 0;
   const symbols = {
     c2_mem_ffi_abi_version() {
@@ -549,7 +545,7 @@ test('c2-mem-ffi symbol adapters validate ABI version before creating pools', as
       return { status: 0, value: 4096 };
     },
     c2_mem_ffi_request_pool_write() {
-      return { status: 0, value: { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false } };
+      return { status: 0, value: { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false } };
     },
     c2_mem_ffi_request_pool_release() {
       return { status: 0 };
@@ -566,7 +562,7 @@ test('c2-mem-ffi symbol adapters validate ABI version before creating pools', as
       maxSegments: 1,
       minBlockSize: 512,
     }),
-    /ABI version 2.*expected version 3/,
+    /ABI version 4.*expected version 5/,
   );
   assert.equal(createCount, 0);
 });
@@ -589,7 +585,7 @@ test('c2-mem-ffi native response backend delegates read and release', async () =
 
     offset: 128,
     byteLength: 3,
-    dedicated: false,
+    allocationId: 1n, dedicated: false,
   };
   const destination = new Uint8Array(3);
 
@@ -619,7 +615,7 @@ test('c2-mem-ffi native response backend rejects malformed dedicated coordinates
 
       offset: 1,
       byteLength: 3,
-      dedicated: true,
+      allocationId: 0n, dedicated: true,
     }, new Uint8Array(3)),
     C2MemFfiBindingError,
   );
@@ -643,7 +639,7 @@ test('c2-mem-ffi native response backend rejects blocks outside advertised segme
 
       offset: 15,
       byteLength: 2,
-      dedicated: false,
+      allocationId: 1n, dedicated: false,
     }, new Uint8Array(2)),
     /exceeds advertised segment/,
   );
@@ -658,7 +654,7 @@ test('c2-mem-ffi native request backend snapshots metadata and delegates ownersh
     segments,
     write(payload) {
       calls.push(['write', Array.from(payload)]);
-      return { segmentIndex: 0, generation: 7, offset: 64, byteLength: payload.byteLength, dedicated: false };
+      return { segmentIndex: 0, generation: 7, offset: 64, byteLength: payload.byteLength, allocationId: 1n, dedicated: false };
     },
     release(block) {
       calls.push(['release', block.offset]);
@@ -671,11 +667,11 @@ test('c2-mem-ffi native request backend snapshots metadata and delegates ownersh
 
   const block = await backend.writeRequest(new Uint8Array([1, 2, 3]));
   await backend.markRequestConsumed(block);
-  await backend.releaseRequest({ segmentIndex: 0, generation: 7, offset: 128, byteLength: 2, dedicated: false });
+  await backend.releaseRequest({ segmentIndex: 0, generation: 7, offset: 128, byteLength: 2, allocationId: 1n, dedicated: false });
 
   assert.equal(backend.prefix, '/cc2n0001');
   assert.deepEqual(backend.segments, [{ name: '/cc2n0001_b0000', size: 4096 }]);
-  assert.deepEqual(block, { segmentIndex: 0, generation: 7, offset: 64, byteLength: 3, dedicated: false });
+  assert.deepEqual(block, { segmentIndex: 0, generation: 7, offset: 64, byteLength: 3, allocationId: 1n, dedicated: false });
   assert.deepEqual(calls, [
     ['write', [1, 2, 3]],
     ['forgetConsumed', 64],
@@ -689,7 +685,7 @@ test('c2-mem-ffi native request backend releases invalid returned blocks locally
     prefix: '/cc2n0002',
     segments: [{ name: '/cc2n0002_b0000', size: 16 }],
     write(payload) {
-      return { segmentIndex: 0, generation: 7, offset: 15, byteLength: payload.byteLength, dedicated: false };
+      return { segmentIndex: 0, generation: 7, offset: 15, byteLength: payload.byteLength, allocationId: 1n, dedicated: false };
     },
     release(block) {
       releases.push(block);
@@ -701,7 +697,7 @@ test('c2-mem-ffi native request backend releases invalid returned blocks locally
     () => backend.writeRequest(new Uint8Array([1, 2])),
     /exceeds advertised segment/,
   );
-  assert.deepEqual(releases, [{ segmentIndex: 0, generation: 7, offset: 15, byteLength: 2, dedicated: false }]);
+  assert.deepEqual(releases, [{ segmentIndex: 0, generation: 7, offset: 15, byteLength: 2, allocationId: 1n, dedicated: false }]);
 });
 
 test('c2-mem-ffi native request backend rejects invalid metadata at construction', () => {
@@ -713,7 +709,7 @@ test('c2-mem-ffi native request backend rejects invalid metadata at construction
       prefix: '/' + 'x'.repeat(255),
       segments: [{ name: '/cc2n_prefix_that_is_too_long_b0000', size: 4096 }],
       write() {
-        return { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false };
+        return { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false };
       },
       release() {},
       forgetConsumed() {},
@@ -725,7 +721,7 @@ test('c2-mem-ffi native request backend rejects invalid metadata at construction
       prefix: '/cc2n0004',
       segments: [{ name: '/wrong/name', size: 4096 }],
       write() {
-        return { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false };
+        return { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false };
       },
       release() {},
       forgetConsumed() {},
@@ -741,7 +737,7 @@ test('c2-mem-ffi native backends close pools idempotently', async () => {
     prefix: '/cc2n0003',
     segments: [{ name: '/cc2n0003_b0000', size: 4096 }],
     write(payload) {
-      return { segmentIndex: 0, generation: 7, offset: 0, byteLength: payload.byteLength, dedicated: false };
+      return { segmentIndex: 0, generation: 7, offset: 0, byteLength: payload.byteLength, allocationId: 1n, dedicated: false };
     },
     release() {},
     forgetConsumed() {},
@@ -774,7 +770,7 @@ test('c2-mem-ffi native backends reject calls after close', async () => {
     segments: [{ name: '/cc2n0005_b0000', size: 4096 }],
     write(payload) {
       requestWriteCount += 1;
-      return { segmentIndex: 0, generation: 7, offset: 0, byteLength: payload.byteLength, dedicated: false };
+      return { segmentIndex: 0, generation: 7, offset: 0, byteLength: payload.byteLength, allocationId: 1n, dedicated: false };
     },
     release() {},
     forgetConsumed() {},
@@ -803,7 +799,7 @@ test('c2-mem-ffi native backends reject calls after close', async () => {
 
       offset: 0,
       byteLength: 1,
-      dedicated: false,
+      allocationId: 1n, dedicated: false,
     }, new Uint8Array(1)),
     /closed/,
   );
@@ -841,7 +837,7 @@ test('c2-mem-ffi request pool symbol adapter discovers metadata and delegates li
     },
     c2_mem_ffi_request_pool_write(pool, payload) {
       calls.push(['write', pool, Array.from(payload)]);
-      return { status: 0, value: { segmentIndex: 1, generation: 7, offset: 32, byteLength: payload.byteLength, dedicated: false } };
+      return { status: 0, value: { segmentIndex: 1, generation: 7, offset: 32, byteLength: payload.byteLength, allocationId: 1n, dedicated: false } };
     },
     c2_mem_ffi_request_pool_release(pool, block) {
       calls.push(['release', pool, block.offset]);
@@ -867,7 +863,7 @@ test('c2-mem-ffi request pool symbol adapter discovers metadata and delegates li
   ]);
   const block = await pool.write(new Uint8Array([1, 2, 3]));
   await pool.forgetConsumed(block);
-  await pool.release({ segmentIndex: 0, generation: 7, offset: 64, byteLength: 1, dedicated: false });
+  await pool.release({ segmentIndex: 0, generation: 7, offset: 64, byteLength: 1, allocationId: 1n, dedicated: false });
   await pool.close();
   await pool.close();
 
@@ -953,7 +949,7 @@ test('c2-mem-ffi request pool symbol adapter rejects invalid ownership blocks be
       return { status: 0, value: 16 };
     },
     c2_mem_ffi_request_pool_write() {
-      return { status: 0, value: { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false } };
+      return { status: 0, value: { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false } };
     },
     c2_mem_ffi_request_pool_release() {
       releaseCount += 1;
@@ -971,17 +967,23 @@ test('c2-mem-ffi request pool symbol adapter rejects invalid ownership blocks be
   });
 
   await assert.rejects(
-    () => request.release({ segmentIndex: 0, generation: 0, offset: 1, byteLength: 1, dedicated: true }),
+    () => request.release({ segmentIndex: 0, generation: 0, offset: 1, byteLength: 1, allocationId: 0n, dedicated: true }),
     /dedicated/,
   );
   await assert.rejects(
-    () => request.release({ segmentIndex: 0, generation: 7, offset: 15, byteLength: 2, dedicated: false }),
+    () => request.release({ segmentIndex: 0, generation: 7, offset: 15, byteLength: 2, allocationId: 1n, dedicated: false }),
     /exceeds advertised segment/,
   );
   await assert.rejects(
-    () => request.forgetConsumed({ segmentIndex: 1, generation: 7, offset: 0, byteLength: 1, dedicated: false }),
+    () => request.forgetConsumed({ segmentIndex: 1, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false }),
     /not advertised/,
   );
+  for (const allocationId of [undefined, 1, -1n, 0n, 0x1_0000_0000_0000_0000n]) {
+    await assert.rejects(
+      () => request.release({ segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false, allocationId }),
+      /allocationId/,
+    );
+  }
   await request.close();
 
   assert.equal(releaseCount, 0);
@@ -1018,7 +1020,7 @@ test('c2-mem-ffi response pool symbol adapter delegates read, release, and close
     minBlockSize: 512,
   });
   const destination = new Uint8Array(3);
-  const block = { segmentIndex: 0, generation: 7, offset: 32, byteLength: 3, dedicated: false };
+  const block = { segmentIndex: 0, generation: 7, offset: 32, byteLength: 3, allocationId: 1n, dedicated: false };
   await pool.read(block, destination);
   await pool.release(block);
   await pool.close();
@@ -1053,16 +1055,20 @@ test('c2-mem-ffi response pool symbol adapter rejects invalid blocks before pool
   });
 
   await assert.rejects(
-    () => response.read({ segmentIndex: 0, generation: 0, offset: 1, byteLength: 1, dedicated: true }, new Uint8Array(1)),
+    () => response.read({ segmentIndex: 0, generation: 0, offset: 1, byteLength: 1, allocationId: 0n, dedicated: true }, new Uint8Array(1)),
     /dedicated/,
   );
   await assert.rejects(
-    () => response.read({ segmentIndex: 0, generation: 7, offset: 0, byteLength: 2, dedicated: false }, new Uint8Array(1)),
+    () => response.read({ segmentIndex: 0, generation: 7, offset: 0, byteLength: 2, allocationId: 1n, dedicated: false }, new Uint8Array(1)),
     /destination length/,
   );
   await assert.rejects(
-    () => response.release({ segmentIndex: 0, generation: 0, offset: 1, byteLength: 1, dedicated: true }),
+    () => response.release({ segmentIndex: 0, generation: 0, offset: 1, byteLength: 1, allocationId: 0n, dedicated: true }),
     /dedicated/,
+  );
+  await assert.rejects(
+    () => response.release({ segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false }),
+    /allocationId/,
   );
   await response.close();
 
@@ -1098,7 +1104,7 @@ test('c2-mem-ffi response pool symbol adapter reports release status failures', 
 
     try {
       await assert.rejects(
-        () => response.release({ segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false }),
+        () => response.release({ segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false }),
         releaseCase.expected,
       );
     } finally {
@@ -1148,7 +1154,7 @@ test('c2-mem-ffi symbol adapters reject non-ok statuses and calls after close', 
   );
   await request.close();
   await assert.rejects(
-    () => request.release({ segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false }),
+    () => request.release({ segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false }),
     /closed/,
   );
 
@@ -1171,7 +1177,7 @@ test('c2-mem-ffi symbol adapters reject non-ok statuses and calls after close', 
     minBlockSize: 512,
   });
 
-  const responseBlock = { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false };
+  const responseBlock = { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false };
   await assert.rejects(
     () => response.read(responseBlock, new Uint8Array(1)),
     /INSUFFICIENT_BUFFER/,
@@ -1242,7 +1248,7 @@ test('c2-mem-ffi symbol adapters report unknown status codes explicitly', async 
     minBlockSize: 512,
   });
 
-  const responseBlock = { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false };
+  const responseBlock = { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false };
   await assert.rejects(
     () => responseRead.read(responseBlock, new Uint8Array(1)),
     /UNKNOWN\(99\)/,
@@ -1304,7 +1310,7 @@ test('c2-mem-ffi request pool symbol adapter reports ownership status failures',
         return { status: 0, value: 4096 };
       },
       c2_mem_ffi_request_pool_write(_pool, payload) {
-        return { status: 0, value: { segmentIndex: 0, generation: 7, offset: 0, byteLength: payload.byteLength, dedicated: false } };
+        return { status: 0, value: { segmentIndex: 0, generation: 7, offset: 0, byteLength: payload.byteLength, allocationId: 1n, dedicated: false } };
       },
       c2_mem_ffi_request_pool_release() {
         return { status: ownershipCase.releaseStatus };
@@ -1319,7 +1325,7 @@ test('c2-mem-ffi request pool symbol adapter reports ownership status failures',
       minBlockSize: 512,
     });
 
-    const block = { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false };
+    const block = { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false };
     try {
       if (ownershipCase.op === 'release') {
         await assert.rejects(
@@ -1359,7 +1365,7 @@ test('c2-mem-ffi request pool symbol adapter releases invalid ok blocks locally'
       return { status: 0, value: 16 };
     },
     c2_mem_ffi_request_pool_write(_pool, payload) {
-      return { status: 0, value: { segmentIndex: 0, generation: 7, offset: 15, byteLength: payload.byteLength, dedicated: false } };
+      return { status: 0, value: { segmentIndex: 0, generation: 7, offset: 15, byteLength: payload.byteLength, allocationId: 1n, dedicated: false } };
     },
     c2_mem_ffi_request_pool_release(_pool, block) {
       releases.push(block);
@@ -1379,5 +1385,5 @@ test('c2-mem-ffi request pool symbol adapter releases invalid ok blocks locally'
     () => request.write(new Uint8Array([1, 2])),
     /exceeds advertised segment/,
   );
-  assert.deepEqual(releases, [{ segmentIndex: 0, generation: 7, offset: 15, byteLength: 2, dedicated: false }]);
+  assert.deepEqual(releases, [{ segmentIndex: 0, generation: 7, offset: 15, byteLength: 2, allocationId: 1n, dedicated: false }]);
 });

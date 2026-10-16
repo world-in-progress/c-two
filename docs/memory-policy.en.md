@@ -30,9 +30,11 @@ New buddy or dedicated backing also passes an OS memory-pressure heuristic. The 
 
 ## Allocation and transport fallback
 
-Client requests choose inline or checked chunk transfer when request-pool SHM is not selected. SHM selection depends on `shm_threshold` (4 KiB by default) and wire representation limits. SHM requests write into the local request pool and transmit the 15-byte `BuddyPayload` coordinates and generation; the peer lazily opens the exact prefix, index and generation. If SHM is unavailable because of budget, pressure or representation limits, small requests fall back to inline and larger requests use checked chunks. The default chunk size is 128 KiB, bounded by chunk-count and reassembly limits.
+Client requests choose inline or checked chunk transfer when request-pool SHM is not selected. SHM selection depends on `shm_threshold` (4 KiB by default) and wire representation limits. SHM requests write into the local request pool and transmit the 23-byte `BuddyPayload` coordinates, generation and allocation id; the peer lazily opens the exact prefix, index and generation. If SHM is unavailable because of budget, pressure or representation limits, small requests fall back to inline and larger requests use checked chunks. The default chunk size is 128 KiB, bounded by chunk-count and reassembly limits.
 
 Server responses up to `shm_threshold` use inline frames. Larger responses try buddy reuse, buddy expansion and dedicated SHM before checked chunk fallback. Payloads that cannot fit buddy wire metadata also use the checked fallback.
+
+SHM header version 3 records each buddy allocation's level and non-wrapping id under the existing allocator lock. Release must match that live record before changing free bits or counters, rejecting parent, child and stale-id releases. Logical sizes still round up to the allocation level, and trimming preserves the original release capacity. Records add 8 bytes per minimum block: the default 256 MiB / 4 KiB backing and its creation budget grow by 512 KiB. IPC handshake 12 and C/FFI ABI 5 reject the retired formats.
 
 Receiver assembly reserves full capacity, `total_chunks × chunk_size`, before accepting the storage. Allocation tries buddy reuse, reuse after GC, buddy expansion, dedicated SHM and finally file mmap. Completion may trim logical length while the capacity charge remains until storage release. Resources receive the complete assembled input; chunk transfer does not provide incremental resource input.
 

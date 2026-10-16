@@ -9,6 +9,8 @@ pub struct PoolAllocation {
     pub seg_idx: u32,
     /// Concrete backing incarnation within this segment slot; dedicated is 0.
     pub generation: u32,
+    /// Allocation instance within the backing; dedicated allocations use 0.
+    pub allocation_id: u64,
     /// Offset within the segment's data region.
     pub offset: u32,
     /// Actual allocated size.

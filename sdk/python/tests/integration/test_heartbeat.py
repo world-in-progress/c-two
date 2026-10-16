@@ -9,6 +9,8 @@ import time
 
 import pytest
 
+from tests.fixtures import local_server
+
 import c_two as cc
 from c_two.transport import Server
 from c_two.transport.client.util import _endpoint_name_from_address, ping
@@ -45,7 +47,7 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
 
 
 def _hello_server(address: str, *, ipc_overrides: dict[str, object]) -> Server:
-    server = Server(bind_address=address, ipc_overrides=ipc_overrides)
+    server = local_server(address, ipc_overrides=ipc_overrides)
     server.register_crm(Hello, HelloImpl(), name='hello')
     return server
 

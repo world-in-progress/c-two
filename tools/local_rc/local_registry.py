@@ -146,15 +146,6 @@ def scan_source_path_dependencies(repository: Path) -> list[str]:
     return findings
 
 
-def require_versioned_source_paths(repository: Path) -> None:
-    findings = scan_source_path_dependencies(repository)
-    if findings:
-        raise RegistryError(
-            "first-party path dependencies are not release-ready:\n"
-            + "\n".join(findings)
-        )
-
-
 def render_rust_consumer_manifest() -> str:
     return f"""\
 [package]
@@ -278,12 +269,6 @@ def inspect_normalized_manifest(archive: Path) -> dict[str, Any]:
     if "[patch." in lowered or "\n[replace]" in lowered:
         raise RegistryError(f"{archive} normalized manifest has a source escape")
     return document
-
-
-def inspect_all_normalized_manifests(
-    archives: Iterable[Path],
-) -> list[dict[str, Any]]:
-    return [inspect_normalized_manifest(path) for path in archives]
 
 
 def _index_path(registry_dir: Path, name: str) -> Path:
@@ -652,15 +637,6 @@ def build_local_registry(
     for archive in archives:
         inspect_normalized_manifest(archive)
         add_crate_archive(registry_dir, archive)
-
-
-def normalized_manifest_bytes(
-    archive: Path,
-) -> bytes:
-    """Return normalized Cargo.toml bytes for retained audit evidence."""
-
-    source, _ = _load_crate_manifest(archive)
-    return source.encode("utf-8")
 
 
 def rewrite_path_dependencies_as_versions(source: str) -> str:
