@@ -1,5 +1,17 @@
 # C-Two 局部精简批次记录与收束
 
+## C07 relay namespace 响应单一来源（2026-10-16，完成）
+
+执行基线 `11e1582a`，实现候选 `e18d401fbe2ac53cfa9dc81e21d3892622786e9d`。用户接受 HTTP 发现协议语义变化：`/_resolve` 仅以严格校验的响应头 `x-c2-local-namespace` 提供整批 namespace，删除逐行 JSON 包装、汇总冲突状态与客户端缺头时的默认域推断。旧 JSON 字段不再读取、校验或回退；缺头或不匹配走 HTTP，重复/非法头仍拒绝。请求过滤、probe 头、HTTP-only 惰性、身份/完整契约/代际检查与释放语义保留；Rust 公开签名、C/FFI ABI 和 IPC wire 不变。
+
+生产新增 15、删除 86，净减 71 行；测试新增 112、删除 110，净增 2 行；非文档合计净减 69 行。删去重复的 JSON 合并与 namespace 白盒覆盖，复用现有真实 HTTP 夹具覆盖默认/自定义 root 各七种响应，包括旧 JSON 冲突与非法值、缺头、错域、非法文本/字节及重复头；保留实际 HTTP 调用、IPC 选择与零 probe 断言。模拟 relay 增加真实服务端已发送的响应头，使身份和失败回退测试继续进入 IPC。未新增框架或声明性能提升。
+
+夹具调整先在旧生产实现通过 HTTP client 89 和 Core client modes 15 项；新协议断言在基线 namespace 回归中出现两项预期失败，分别证明旧 JSON 冲突仍否决 IPC、服务端仍发送逐行字段。候选本机隔离通过完整 relay 416、Core 201、Python 277 项，含真实 relay 双 root 同名端点选路及冻结/身份边界；Core 四个 ignored 项为父测试显式启动的子进程入口，Python 五个 Windows 专属项交给 CI。Python 首轮 276 通过、1 失败，原因是验证副本只重定向了原生默认目录，漏改一处测试路径期望；补齐该隔离映射后原用例通过，仓内默认目录、断言和期限未改，首次日志保留。最终新增的非法旧 JSON 值矩阵已单独复核通过。
+
+[GitHub Actions 38842069727](https://github.com/world-in-progress/c-two/actions/runs/38842069727) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。已逐组核对日志：Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁，以及 Ubuntu/Python 3.14t 对应门禁；ordinary、portable、TypeScript 分组均通过，两个 Windows 包含普通用户消费者验证。
+
+两次独立原生只读审查完成；第一轮非阻塞建议已加入现有矩阵，最终补丁 `c22b46c6cd486ad4f4a4d1e64d25de2a67de85d5b646b3e22839fc9c14c6939f` 无 actionable findings。本批作用域 socket/lease 均为零，历史路径快照未变，未使用 buddy。隔离副本仅替换本批测试默认路径及对应期望；完整命令、初始失败、构建哈希、审查、计数和端点收据位于 `~/.codex/diagnostics/c2-c07-d9814e51/`。
+
 ## R29 call-control 私有写入校验收敛（2026-10-16，完成）
 
 执行基线为 `73fba191`。用户批准只删除已被公开入口覆盖的私有检查：身份校验中五处重复长度检查退出，`push_text` / `write_text` 不再复验长度或逐字段容量、也不再返回 `Result`；固定长度开销明确为七个长度字节、八字节 revision 和两字节 method index。公开入口身份校验、整段容量检查、错误顺序与文案、失败时缓冲不变、IPC 跨 await 校验均保留；公开签名、错误枚举、API/ABI 和 wire 格式不变。
