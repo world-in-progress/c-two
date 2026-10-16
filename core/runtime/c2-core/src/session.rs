@@ -1638,7 +1638,8 @@ impl Runtime {
         // concurrent drain transaction or in-flight detached-close barriers.
         let client_pool = self.state.lock().client_pool.clone();
         if let Some(client_pool) = client_pool {
-            let mut client_close = client_pool.close_all(shutdown_timeout);
+            let mut observation = client_pool.observe_closes();
+            let mut client_close = observation.close_all(shutdown_timeout);
             outcome
                 .ipc_client_close_details
                 .append(&mut client_close.abnormal);
@@ -1646,7 +1647,7 @@ impl Runtime {
                 // This native transaction owns outstanding client barriers as well as routes.
                 // Its callers time out independently; keep retrying actual unconfirmed work.
                 while !client_close.unconfirmed.is_empty() || client_close.error.is_some() {
-                    client_close = client_pool.close_all(Duration::from_secs(1));
+                    client_close = observation.close_all(Duration::from_secs(1));
                     outcome
                         .ipc_client_close_details
                         .append(&mut client_close.abnormal);
