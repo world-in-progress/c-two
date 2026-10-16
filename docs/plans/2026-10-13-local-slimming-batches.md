@@ -1,5 +1,11 @@
 # C-Two 局部精简批次记录与收束
 
+## 生成 TypeScript Node IPC 工厂退役（2026-10-16，进行中）
+
+执行基线 `dc7cfd24`。用户批准删除生成模块的 `createNodeIpcConnect`、三个专属公开类型及其内部 socket 状态链，不留兼容入口。通用 `C2IpcConnect` / `C2IpcConnection` 注入及官方 `@c-two/c2-mem-ffi` 连接器保留；配置冻结、HTTP-only 惰性加载、身份和生命周期语义、Rust API、C/FFI ABI 与 wire 不变。
+
+先在原实现补验通用连接的严格 TypeScript 编译、官方连接器的半帧 EOF 与缓冲读回，再删除生成端重复实现并更新既有 API 断言。退出条件为针对性回归、完整 relay、真实跨语言与持久连接、GitHub Actions 跨平台门禁、独立审查及本批 socket/lease 零残留；验收后提交并记录生产、测试与文档的实际增减。历史目录不动，不使用 buddy；证据位于 `~/.codex/diagnostics/c2-ts-node-5674d433/`。
+
 ## Python wire/handshake 投影链退役（2026-10-16，完成）
 
 执行基线 `9561055d`，实现候选 `bb46d0a2e89d82eea04fbb47d20ca6e120ffe190`。用户接受删除低层 Python API：4 个协议 PyClass、13 个 codec、35 个常量导出以及 `transport.protocol` 退出，不留兼容入口；`transport.wire` 仅保留 `MethodTable`。5 个合同函数原样移至 `contract_ffi.rs`，现有 `_native` 名称和注册顺序保持，其中 4 个仍由 Python descriptor 生产路径调用，独立合同验证入口也保留。Rust API、C/FFI ABI、wire、身份检查与生命周期保持；`mem_ffi` 仍使用 `c2-wire`，依赖未删。

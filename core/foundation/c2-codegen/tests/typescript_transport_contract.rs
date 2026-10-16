@@ -66,6 +66,26 @@ impl CompiledTransportProject {
         .publish_new_tree(&generated)
         .expect("publish generated TypeScript");
 
+        std::fs::write(
+            generated.join("typescript/injected_connection.ts"),
+            r#"import { createIpcEncodedTransport, type C2IpcConnect } from "./c_two_contract.js";
+const connect: C2IpcConnect = async () => ({
+  write() {},
+  readExactly(length) { return new Uint8Array(length); },
+});
+createIpcEncodedTransport("ipc://typed-custom", { connect });
+// @ts-expect-error Node factories belong to @c-two/c2-mem-ffi.
+import { createNodeIpcConnect } from "./c_two_contract.js";
+// @ts-expect-error Generated modules expose the generic connection contract.
+import type { C2NodeIpcSocket } from "./c_two_contract.js";
+// @ts-expect-error Generated modules expose the generic connection contract.
+import type { C2NodeIpcNet } from "./c_two_contract.js";
+// @ts-expect-error Generated modules expose the generic connection contract.
+import type { C2NodeIpcConnectOptions } from "./c_two_contract.js";
+"#,
+        )
+        .expect("typed custom connection consumer");
+
         let fastdb_package = tempdir.join("node_modules/fastdb4ts");
         std::fs::create_dir_all(&fastdb_package).expect("FastDB unit stub package");
         std::fs::write(

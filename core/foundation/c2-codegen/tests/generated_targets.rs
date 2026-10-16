@@ -83,7 +83,6 @@ fn every_target_contains_a_c_two_owned_contract_module() {
                 "createIpcEncodedTransport",
                 "createHttpRelayEncodedTransport",
                 "createRelayAwareHttpEncodedTransport",
-                "createNodeIpcConnect",
                 "createNativeRequestShmWriter",
                 "createNativeResponseShmReader",
             ] {
