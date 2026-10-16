@@ -2125,8 +2125,8 @@ async fn handle_handshake(
     let client_hs = decode_handshake(payload)
         .map_err(|e| ServerError::Protocol(format!("handshake decode: {e:?}")))?;
 
-    // Store client SHM metadata for buddy frame resolution.
-    conn.init_peer_shm(client_hs.prefix, client_hs.segments);
+    // Frames identify peer backings by pool incarnation, index and generation.
+    conn.init_peer_shm(client_hs.prefix);
     conn.set_handshake_done(true);
 
     if client_hs.capability_flags & CAP_CHUNKED != 0 {
@@ -7063,59 +7063,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_buddy_request_block_frees_unconsumed_peer_block() {
+    async fn handshake_metadata_does_not_control_peer_mapping_or_release() {
         use c2_mem::MemHandle;
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
+        use c2_wire::handshake::encode_client_handshake;
 
-        let mut peer_pool = MemPool::new_with_prefix(
-            PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 1,
-                max_dedicated_segments: 1,
-                dedicated_crash_timeout_secs: 0.0,
-                ..PoolConfig::default()
-            },
-            unique_response_pool_prefix("rq"),
-        );
-        let handle = peer_pool.try_alloc_shm(128).unwrap();
-        let (seg_idx, generation, offset, len) = match handle {
-            MemHandle::Buddy {
+        let mut peer_pool = small_response_pool("rq").into_inner();
+        let server = ordering_test_server("ipc://peer_geometry", 4);
+        let (stream, mut client) = LocalStream::pair().await.unwrap();
+        let (_reader, writer) = stream.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+        let data = vec![0x5a; 32 * 1024];
+
+        // All announcements describe the same real 64 KiB backing. Neither
+        // the name nor a missing, tiny or oversized size defines its geometry.
+        for announced_size in [
+            None,
+            Some(0),
+            Some(4096),
+            Some(8191),
+            Some(8192),
+            Some(65536),
+            Some(u32::MAX),
+        ] {
+            let mut handle = peer_pool.try_alloc_shm(data.len()).unwrap();
+            peer_pool
+                .handle_slice_mut(&mut handle)
+                .copy_from_slice(&data);
+            let (seg_idx, generation, offset, len) = match handle {
+                MemHandle::Buddy {
+                    seg_idx,
+                    generation,
+                    offset,
+                    len,
+                    ..
+                } => (seg_idx, generation, offset, len),
+                other => panic!("expected buddy request block, got {other:?}"),
+            };
+            let segments = announced_size
+                .map(|size| ("descriptive-only".to_string(), size))
+                .into_iter()
+                .collect::<Vec<_>>();
+            let handshake =
+                encode_client_handshake(&segments, CAP_CHUNKED, peer_pool.prefix()).unwrap();
+            let conn = Arc::new(Connection::new(7));
+            handle_handshake(&server, &conn, &handshake, 0, &writer)
+                .await
+                .unwrap();
+            let (_, flags, _) = read_reply_frame(&mut client).await;
+            assert_eq!(flags, FLAG_HANDSHAKE | FLAG_RESPONSE);
+            assert!(conn.handshake_done() && conn.chunked_capable());
+            assert_eq!(conn.peer_pool_arc().unwrap().read().segment_count(), 0);
+            assert_eq!(
+                conn.read_peer_data(seg_idx, generation, offset, len as u32, false)
+                    .unwrap(),
+                data,
+                "announced_size={announced_size:?}",
+            );
+            assert_eq!(peer_pool.stats().alloc_count, 1);
+            let payload = encode_buddy_payload(&BuddyPayload {
                 seg_idx,
                 generation,
                 offset,
-                len,
-                ..
-            } => (seg_idx, generation, offset, len),
-            other => panic!("expected buddy request block, got {other:?}"),
-        };
-        let segment_name = peer_pool
-            .segment_name(seg_idx as usize)
-            .unwrap()
-            .to_string();
-        let segment_size = peer_pool
-            .segment(seg_idx as usize)
-            .unwrap()
-            .allocator()
-            .data_size() as u32;
-        assert_eq!(peer_pool.stats().alloc_count, 1);
-
-        let conn = Arc::new(Connection::new(7));
-        conn.init_peer_shm(
-            peer_pool.prefix().to_string(),
-            vec![(segment_name, segment_size)],
-        );
-        let payload = encode_buddy_payload(&BuddyPayload {
-            seg_idx,
-            generation,
-            offset,
-            data_size: len as u32,
-            is_dedicated: false,
-        });
-
-        cleanup_buddy_request_block(&conn, &payload);
-
-        assert_eq!(peer_pool.stats().alloc_count, 0);
+                data_size: len as u32,
+                is_dedicated: false,
+            });
+            cleanup_buddy_request_block(&conn, &payload);
+            assert_eq!(peer_pool.stats().alloc_count, 0);
+        }
     }
 
     #[tokio::test]
@@ -7217,22 +7232,10 @@ mod tests {
             } => (seg_idx, generation, offset, len),
             other => panic!("expected buddy request block, got {other:?}"),
         };
-        let segment_name = peer_pool
-            .segment_name(seg_idx as usize)
-            .unwrap()
-            .to_string();
-        let segment_size = peer_pool
-            .segment(seg_idx as usize)
-            .unwrap()
-            .allocator()
-            .data_size() as u32;
         assert_eq!(peer_pool.stats().alloc_count, 1);
 
         let conn = Arc::new(Connection::new(70));
-        conn.init_peer_shm(
-            peer_pool.prefix().to_string(),
-            vec![(segment_name, segment_size)],
-        );
+        conn.init_peer_shm(peer_pool.prefix().to_string());
 
         let mut payload = encode_buddy_payload(&BuddyPayload {
             seg_idx,
@@ -8472,16 +8475,6 @@ mod tests {
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
         use c2_wire::chunk::encode_chunk_header;
 
-        fn peer_segments(pool: &MemPool) -> Vec<(String, u32)> {
-            (0..pool.segment_count())
-                .filter_map(|i| {
-                    let name = pool.segment_name(i)?.to_string();
-                    let size = pool.segment(i)?.allocator().data_size() as u32;
-                    Some((name, size))
-                })
-                .collect()
-        }
-
         let mut peer_pool = MemPool::new_with_prefix(
             PoolConfig {
                 segment_size: 64 * 1024,
@@ -8525,7 +8518,7 @@ mod tests {
         // Refused admission path: the waiting frame is discarded before it
         // decodes its buddy payload, but the peer block must still be freed.
         let refused_payload = allocate_buddy_frame(&mut peer_pool);
-        conn.init_peer_shm(peer_pool.prefix().to_string(), peer_segments(&peer_pool));
+        conn.init_peer_shm(peer_pool.prefix().to_string());
         let mut owner = server.begin_chunk_admission(conn.conn_id(), 41).unwrap();
         let waiter = server.chunk_admission_waiter(conn.conn_id(), 41).unwrap();
         owner.refuse();
@@ -8551,7 +8544,7 @@ mod tests {
 
         // Aborted admission path: same discard, same peer-block return.
         let aborted_payload = allocate_buddy_frame(&mut peer_pool);
-        conn.init_peer_shm(peer_pool.prefix().to_string(), peer_segments(&peer_pool));
+        conn.init_peer_shm(peer_pool.prefix().to_string());
         let owner = server.begin_chunk_admission(conn.conn_id(), 42).unwrap();
         let waiter = server.chunk_admission_waiter(conn.conn_id(), 42).unwrap();
         server.abort_chunk_request(conn.conn_id(), 42);
