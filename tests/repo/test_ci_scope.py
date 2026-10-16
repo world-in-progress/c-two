@@ -68,4 +68,5 @@ def test_workflow_keeps_required_names_and_uses_full_diff():
     assert jobs["required"]["name"] == "test (py${{ matrix.python }})"
     assert jobs["required"]["if"] == "always()"
     assert "workflow-policy" in jobs["required"]["needs"]
+    assert set(jobs["source"]["needs"]) == {"changes", "workflow-policy"}
     assert "if" not in jobs["workflow-policy"]

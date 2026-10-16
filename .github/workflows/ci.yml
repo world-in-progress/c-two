@@ -69,7 +69,7 @@ jobs:
         run: python .github/scripts/ci_scope.py
 
   source:
-    needs: changes
+    needs: [changes, workflow-policy]
     if: needs.changes.outputs.source == 'true'
     name: source (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}

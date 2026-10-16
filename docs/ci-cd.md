@@ -29,6 +29,8 @@ Workflow policy always runs the pinned, hash-checked actionlint binary and
 automatically discovers all `tests/repo/` tests. Python tools come from the
 locked `ci-policy` dependency group, which installs neither C-Two nor its
 runtime dependencies. The development group includes that same tool group.
+The source matrix starts only after policy succeeds, so a tooling or workflow
+failure is rejected before expensive native jobs begin.
 The protected check names remain
 `test (py3.12)` and `test (py3.14t)`. Their always-running aggregation requires
 policy success and either successful source checks or an intentional scope
