@@ -1,10 +1,18 @@
 # C-Two 局部精简批次记录与收束
 
-## 生成 TypeScript Node IPC 工厂退役（2026-10-16，进行中）
+## 生成 TypeScript Node IPC 工厂退役（2026-10-16，完成）
 
-执行基线 `dc7cfd24`。用户批准删除生成模块的 `createNodeIpcConnect`、三个专属公开类型及其内部 socket 状态链，不留兼容入口。通用 `C2IpcConnect` / `C2IpcConnection` 注入及官方 `@c-two/c2-mem-ffi` 连接器保留；配置冻结、HTTP-only 惰性加载、身份和生命周期语义、Rust API、C/FFI ABI 与 wire 不变。
+执行基线 `dc7cfd24`，实现候选 `9a50c7e88a67a590b351a92cb19faedb0dfd36b1`。用户接受删除生成模块的 `createNodeIpcConnect`、`C2NodeIpcSocket`、`C2NodeIpcNet`、`C2NodeIpcConnectOptions` 及专属 socket 缓冲/等待状态链，不留兼容入口。通用 `C2IpcConnect` / `C2IpcConnection` 注入保留，官方 `@c-two/c2-mem-ffi` 连接器生产源码逐字不变；配置冻结、HTTP-only 惰性加载、身份与生命周期、Rust API、C/FFI ABI 和 wire 保持。
 
-先在原实现补验通用连接的严格 TypeScript 编译、官方连接器的半帧 EOF 与缓冲读回，再删除生成端重复实现并更新既有 API 断言。退出条件为针对性回归、完整 relay、真实跨语言与持久连接、GitHub Actions 跨平台门禁、独立审查及本批 socket/lease 零残留；验收后提交并记录生产、测试与文档的实际增减。历史目录不动，不使用 buddy；证据位于 `~/.codex/diagnostics/c2-ts-node-5674d433/`。
+生产仅删除 313 行；测试新增 39、删除 1，净增 38 行；非文档合计净减 275 行。三个删除区间之外的生成传输代码逐字不变，未新增框架、依赖或替代状态。现有编译夹具补通用注入及四项旧导出拒绝，官方 socket 用例补半帧 EOF 拒绝与剩余缓冲读回；旧导出存在断言退出，现有真实协议与连接测试保留。两份历史文档注明旧工厂退役及当前官方连接器的注入方式，不声明运行性能提升。
+
+补测先在原实现通过生成传输 7 项、官方 socket 4 项；四个退役导出的负对照均按预期失败。候选本机隔离通过 codegen 32、完整 relay 416、Node 60 项；重建 native/CLI 后 Python 定向 157、真实 TypeScript 及持久连接 15、Rust/Python 跨语言 25、收据校验 40 项通过。包含完整 12/12 TypeScript direct/relay 及 18/18 Rust/Python 矩阵；持久连接验证迟注册、丢失回复不重放、重连、路由替换和进程重启身份边界。Node 1 项、Python 5 项本机 Windows 专属跳过由线上 Windows 门禁覆盖。
+
+[GitHub Actions 38869121561](https://github.com/world-in-progress/c-two/actions/runs/38869121561) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。已逐组核对 Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁和 Ubuntu/Python 3.14t 对应门禁；ordinary、portable、TypeScript 分组均通过，两个 Windows 包含普通用户消费者验证。
+
+本地负对照首次因诊断命令漏传动态库搜索路径而未执行；补齐启动环境后得到四项预期拒绝。首轮 Node 为 58 通过、2 失败，均因隔离副本漏改默认路径正则期望；补齐两处精确映射后全组 60 通过、1 Windows 专属跳过。原日志保留，仓内路径、断言和期限没有修改或放宽。验证复用此前已验收且哈希一致的 FastDB/TypeScript 包，C-Two native 包及生成器均从本批隔离源码重建；线上独立构建原始默认路径源码。
+
+独立原生审查指出的一处旧阶段文档时态已修正，第二次独立复核确认仅文档差异、原审代码与测试补丁逐字一致，无遗留发现；最终补丁 SHA-256 为 `324acea25c5d206d30571fdd3a087a264d7f1db45f08c9a8d8b143201fcd6433`。本批 socket/lease 零残留，历史路径快照未变，未使用 buddy。811 个跟踪文件逐项核对验证副本与候选一致，仅含记录中的隔离路径映射；命令、原始日志、源/包哈希、跨语言收据、两轮审查及端点验收位于 `~/.codex/diagnostics/c2-ts-node-5674d433/`。
 
 ## Python wire/handshake 投影链退役（2026-10-16，完成）
 
