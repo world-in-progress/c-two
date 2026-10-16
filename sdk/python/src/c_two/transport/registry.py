@@ -454,8 +454,12 @@ class _ProcessRegistry:
             bridge=method_bridge_map,
         )
         shutdown_method = get_shutdown_method(crm_class)
-        for method_name in dir(type(crm_instance)):
-            method = getattr_static(type(crm_instance), method_name)
+        resource_type = type(crm_instance)
+        resource_members = {
+            name for base in resource_type.__mro__ for name in vars(base)
+        }
+        for method_name in sorted(resource_members):
+            method = getattr_static(resource_type, method_name)
             marked = getattr_static(method, _SHUTDOWN_ATTR, False) is True
             if isinstance(method, (staticmethod, classmethod)):
                 marked = marked or (

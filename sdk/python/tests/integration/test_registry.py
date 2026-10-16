@@ -160,7 +160,16 @@ class TestRegisterConnect:
             def __cc_on_shutdown__(self):
                 raise AssertionError('registration must not evaluate marker properties')
 
-        class Resource:
+        class ResourceMeta(type):
+            def __dir__(cls):
+                return [*super().__dir__(), 'dynamic_attribute']
+
+            def __getattr__(cls, name):
+                if name == 'dynamic_attribute':
+                    return object()
+                raise AttributeError(name)
+
+        class Resource(metaclass=ResourceMeta):
             cleaned = 0
             unrelated_value = UnrelatedValue()
 
