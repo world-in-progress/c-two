@@ -1,6 +1,7 @@
 """Prepare an exact-tested-candidate promotion without ever publishing.
 
-This is step 2 of the release plan: the Release Candidate workflow builds and
+This is step 2 of the release plan: the ``Release Candidate`` workflow — an
+explicit ``workflow_dispatch`` on canonical ``main`` only — builds and
 validates byte-exact artifacts bound to one source commit, and this script
 promotes those retained bytes — it never rebuilds, never executes candidate
 code, and never mutates remote state. Publication (GitHub release assets,
@@ -9,12 +10,31 @@ returns exit code 0 with a plan.
 
 Contract, fail-closed on every deviation:
 
-- Both gates must have a *successful main-push* run for the exact same source
-  SHA: the ``Release Candidate`` workflow (release-candidate.yml) and the
-  ``Source Validation`` workflow (ci.yml) with full-scope artifacts
-  from ``ubuntu-24.04``, ``macos-15``, ``windows-2022`` and ``windows-2025``.
-  A gate that is still running defers (exit 75) so the late completion re-triggers promotion; a
-  failed or missing gate fails.
+- Promotion is explicit only. ``prepare`` requires ``--candidate-run-id``
+  naming one successful ``workflow_dispatch`` ``Release Candidate`` run on
+  ``refs/heads/main`` of the canonical repository; push-era candidates,
+  PR/fork/merge-group runs, and version scanning are all rejected. There is
+  no automatic ``workflow_run`` listener, no deferred exit code, and no
+  already-published skip: a gate that has not completed successfully is an
+  explicit incomplete-gate failure, never a deferred or faked success.
+- The candidate's ``rc-manifest.json`` (schema ``c-two.release-candidate.v1``,
+  sidecar-verified by ``release_candidate.py``) and ``rc-context.json`` must
+  record ``event: workflow_dispatch`` on ``refs/heads/main``, and the context
+  must bind exactly one successful ``Source Validation`` run through
+  ``source_validation_run_id`` (selected by ``check-source``). That bound run
+  — a canonical ``main`` push or explicit dispatch for the exact same source
+  SHA — is the only accepted source of the four full-scope platform artifacts
+  (``ubuntu-24.04``, ``macos-15``, ``windows-2022``, ``windows-2025``) and
+  their receipts. Evidence is never mixed across runs, and a different
+  Source Validation run for the same source cannot substitute the bound one.
+- ``check-source --source-sha`` is the read-only companion the Release
+  Candidate workflow uses to fill ``source_validation_run_id``: it reads only
+  GitHub metadata (workflow-run listings and job listings, never artifact
+  downloads) and returns the newest successful canonical-main Source
+  Validation run whose complete job inventory carries the four platform
+  ``py3.12`` full source jobs plus the Ubuntu ``py3.14t`` source job — a
+  policy-only green run is not a full gate — as JSON ``{"source_sha",
+  "run_id", "run_url"}``.
 - The promoting run itself must be on ``refs/heads/main`` of the canonical
   repository; the trusted validation code is the current ``main`` checkout,
   never the candidate SHA.
@@ -54,43 +74,19 @@ Contract, fail-closed on every deviation:
   fail; tags are never moved and assets are never clobbered. ``--dry-run``
   performs the identical read-only verification, including all remote
   comparisons, and never publishes.
-- ``--skip-already-published`` (passed only for automatic ``workflow_run``
-  promotions, never manual dispatches) finishes as an explicit
-  no-publication skip plan when the target version — the ``c3`` version for
-  GitHub releases, the ``c_two`` version for PyPI, decided independently — is
-  already fully published. The skip is decided by an authenticated read-only
-  preflight before any candidate artifact is downloaded: the version is read
-  from the source tree at the candidate SHA exactly the way the Release
-  Candidate workflow derives it, then the remote state is validated. A
-  GitHub-release skip requires a published (non-draft, non-prerelease)
-  release behind a tag at a different commit, every canonical asset present
-  with positive size and an API sha256 digest, and the published
-  ``rc-manifest.json`` — the only asset downloaded, digest-verified — bound
-  to that tag's commit with every canonical asset's API digest and byte size
-  bound to that manifest (sidecars through the canonical checksum format).
-  A PyPI skip requires the exact 30-row
-  5-platform x 6-ABI wheel inventory plus the sdist under the version's own
-  names with digests, and asserts nothing about whose bytes the registry
-  holds: a complete registry version is immutable, so there is nothing to
-  publish either way. Skips mutate no tag, release, or registry state.
-  Incomplete, renamed, foreign, malformed, empty, or unbound remote state
-  still fails closed, and a manual dispatch that hits the same collision
-  fails as before.
 
-Exit codes: ``0`` plan ready, ``75`` deferred (other gate still running),
-``1`` validation failure with diagnostics on stderr.
+Exit codes: ``0`` plan ready, ``1`` validation failure with diagnostics on
+stderr.
 """
 from __future__ import annotations
 
 import argparse
-import base64
 import importlib.util
 import json
 import os
 import re
 import stat
 import sys
-import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -125,13 +121,15 @@ CANDIDATE_WORKFLOW_FILE = "release-candidate.yml"
 CANDIDATE_WORKFLOW_NAME = "Release Candidate"
 SOURCE_VALIDATION_WORKFLOW_FILE = "ci.yml"
 SOURCE_VALIDATION_WORKFLOW_NAME = "Source Validation"
+# Candidates exist only as explicit canonical-main dispatches; the source
+# gate additionally still accepts canonical main pushes.
+CANDIDATE_EVENT = "workflow_dispatch"
+SOURCE_GATE_EVENTS = ("push", "workflow_dispatch")
 MANIFEST_SCHEMA = "c-two.release-candidate.v1"
 MANIFEST_NAME = "rc-manifest.json"
 CONTEXT_SCHEMA = "c-two.release-candidate.context.v1"
 PLAN_SCHEMA = "c-two.release-promotion-plan.v1"
 PYPI_HOST = "https://pypi.org"
-EXIT_DEFERRED = 75
-SKIP_ACTION = "skip-already-published"
 
 CLI_TARGETS = (
     "x86_64-unknown-linux-gnu",
@@ -145,9 +143,6 @@ EXPECTED_CLI_NAMES = tuple(
     f"c3-{target}{'.exe' if target == WINDOWS_TARGET else ''}" for target in CLI_TARGETS
 )
 EXPECTED_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14", "3.14t")
-# The wheel population one published c_two version carries on PyPI
-# (5 platforms x 6 interpreter/ABI rows) plus exactly one sdist.
-EXPECTED_WHEEL_ROWS = len(CLI_TARGETS) * len(EXPECTED_PYTHONS)
 # Advertised row -> exact tag pair. A free-threaded 3.14t wheel is
 # interpreter cp314 with ABI cp314t (c_two-...-cp314-cp314t-<plat>.whl); it
 # must never be confused with the GIL build's cp314-cp314 pair.
@@ -178,6 +173,13 @@ SOURCE_VALIDATION_LANES = {
     "windows-2022": "windows",
     "windows-2025": "windows",
 }
+# The complete source-job inventory check-source demands from one successful
+# run: the four platform py3.12 full lanes plus the Ubuntu py3.14t lane.
+CHECK_SOURCE_REQUIRED_JOBS = (
+    *(f"source ({label}, py3.12)" for label in SOURCE_VALIDATION_LANES),
+    "source (ubuntu-24.04, py3.14t)",
+    "workflow policy",
+)
 # Frozen FastDB source pin of the Source Validation gates; cross-checked against
 # the trusted checkout's ci.yml so silent pin drift fails closed.
 SOURCE_VALIDATION_FASTDB_CORE_VERSION = "0.2.1"
@@ -199,10 +201,6 @@ SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 class PromotionError(RuntimeError):
     """A fail-closed condition: the candidate must not be promoted."""
-
-
-class DeferredPromotion(RuntimeError):
-    """The other gate is still running; a later event re-triggers promotion."""
 
 
 def _url_origin(url: str) -> tuple[str, str | None, int | None]:
@@ -321,49 +319,93 @@ def _require(condition: object, message: str) -> None:
         raise PromotionError(message)
 
 
-def _newest(runs: list[dict[str, Any]]) -> dict[str, Any]:
-    return max(runs, key=lambda run: (run.get("run_number") or 0, run.get("id") or 0))
+def validate_gate_run(
+    api: GitHubApi, run: dict[str, Any], workflow_file: str, workflow_name: str,
+    source_sha: str, allowed_events: tuple[str, ...],
+) -> None:
+    """Fail closed unless this run is a canonical-main gate run for the exact SHA."""
+    run_id = run.get("id")
+    _require(run.get("name") == workflow_name,
+             f"{workflow_name} run {run_id} has unexpected name {run.get('name')!r}")
+    _require(run.get("event") in allowed_events,
+             f"{workflow_name} run {run_id} event {run.get('event')!r} is not one of "
+             f"{list(allowed_events)}")
+    _require(run.get("head_branch") == "main" and run.get("head_sha") == source_sha,
+             f"{workflow_name} run {run_id} provenance mismatch")
+    _require(str(run.get("path", "")).split("@", 1)[0] == f".github/workflows/{workflow_file}",
+             f"{workflow_name} run {run_id} workflow path mismatch")
+    _require(run.get("repository", {}).get("full_name") == api.repository
+             and run.get("head_repository", {}).get("full_name") == api.repository,
+             f"{workflow_name} run {run_id} repository mismatch")
 
 
-def resolve_gate(api: GitHubApi, workflow_file: str, workflow_name: str, source_sha: str) -> list[dict[str, Any]]:
-    """Return the successful main-push runs of one gate for the exact source SHA."""
-    runs = api.workflow_runs(workflow_file, event="push", branch="main", head_sha=source_sha)
+def require_gate_success(workflow_name: str, run: dict[str, Any]) -> None:
+    """A gate must have completed successfully; a pending gate is an explicit failure."""
+    run_id = run.get("id")
+    status = run.get("status")
+    _require(status == "completed",
+             f"{workflow_name} run {run_id} is still {status!r}; the gate is incomplete — "
+             "promotion never reports success while a gate is pending; rerun it after the "
+             "run finishes")
+    _require(run.get("conclusion") == "success",
+             f"{workflow_name} run {run_id} conclusion {run.get('conclusion')!r} is not success")
+
+
+def find_full_source_validation_run(api: GitHubApi, source_sha: str) -> dict[str, Any]:
+    """The newest successful canonical-main Source Validation run with the full job inventory.
+
+    Reads only run and job metadata, never artifact bytes. Successful runs
+    whose job inventory lacks one of the four platform ``py3.12`` full source
+    jobs or the Ubuntu ``py3.14t`` source job — policy-only green runs — do
+    not qualify as full gates; when nothing qualifies, the failure explains
+    whether runs are pending, failed, or merely policy-only.
+    """
+    runs: list[dict[str, Any]] = []
+    seen_ids: set[Any] = set()
+    for event in SOURCE_GATE_EVENTS:
+        for run in api.workflow_runs(
+            SOURCE_VALIDATION_WORKFLOW_FILE, event=event, branch="main", head_sha=source_sha,
+        ):
+            if run.get("id") in seen_ids:
+                continue
+            seen_ids.add(run.get("id"))
+            runs.append(run)
     for run in runs:
-        _require(
-            run.get("name") == workflow_name,
-            f"{workflow_name} run {run.get('id')} has unexpected name {run.get('name')!r}",
-        )
-        _require(run.get("event") == "push" and run.get("head_branch") == "main"
-                 and run.get("head_sha") == source_sha,
-                 f"{workflow_name} run {run.get('id')} provenance mismatch")
-        _require(str(run.get("path", "")).split("@", 1)[0] == f".github/workflows/{workflow_file}",
-                 f"{workflow_name} run {run.get('id')} workflow path mismatch")
-        _require(run.get("repository", {}).get("full_name") == api.repository
-                 and run.get("head_repository", {}).get("full_name") == api.repository,
-                 f"{workflow_name} run {run.get('id')} repository mismatch")
-    successful = [
-        run for run in runs
-        if run.get("status") == "completed" and run.get("conclusion") == "success"
-    ]
+        validate_gate_run(
+            api, run, SOURCE_VALIDATION_WORKFLOW_FILE, SOURCE_VALIDATION_WORKFLOW_NAME,
+            source_sha, SOURCE_GATE_EVENTS)
+    successful = sorted(
+        (run for run in runs
+         if run.get("status") == "completed" and run.get("conclusion") == "success"),
+        key=lambda run: (run.get("run_number") or 0, run.get("id") or 0), reverse=True,
+    )
+    for run in successful:
+        try:
+            require_passed_jobs(api, run["id"], set(CHECK_SOURCE_REQUIRED_JOBS))
+        except PromotionError:
+            continue
+        return run
+    if any(run.get("status") != "completed" for run in runs):
+        identifiers = ", ".join(
+            f"{run.get('id')}={run.get('status')}"
+            for run in runs if run.get("status") != "completed")
+        raise PromotionError(
+            f"Source Validation run(s) {identifiers} for {source_sha} are still running; the "
+            "source gate is incomplete — rerun check-source after they finish")
     if successful:
-        return successful
-    in_flight = [run for run in runs if run.get("status") != "completed"]
-    if in_flight:
-        identifiers = ", ".join(str(run.get("id")) for run in in_flight)
-        raise DeferredPromotion(
-            f"{workflow_name} run(s) {identifiers} for {source_sha} are still running; "
-            "deferring promotion until both gates complete"
-        )
+        identifiers = ", ".join(str(run.get("id")) for run in successful)
+        raise PromotionError(
+            f"successful Source Validation run(s) {identifiers} for {source_sha} lack the "
+            f"complete source job inventory {list(CHECK_SOURCE_REQUIRED_JOBS)}; a "
+            "policy-only green run is not a full source gate")
     if runs:
         outcomes = ", ".join(f"{run.get('id')}={run.get('conclusion')}" for run in runs)
         raise PromotionError(
-            f"{workflow_name} main-push run(s) for {source_sha} did not succeed: {outcomes}"
-        )
+            f"Source Validation run(s) for {source_sha} did not succeed: {outcomes}")
     raise PromotionError(
-        f"no {workflow_name} main-push run exists for {source_sha}; promotion requires "
-        "successful main-push runs of both Release Candidate and Source Validation for the "
-        "exact same source commit"
-    )
+        f"no successful Source Validation run exists for {source_sha} on canonical main "
+        f"(events {list(SOURCE_GATE_EVENTS)}); the full source gate must pass before "
+        "promotion")
 
 
 def require_passed_jobs(api: GitHubApi, run_id: int, names: set[str]) -> None:
@@ -490,14 +532,20 @@ def wheel_platform_matches_target(platform: str, target: str) -> bool:
     return prefix_ok and platform.endswith("_" + architecture)
 
 
-def verify_manifest_binding(manifest: dict[str, Any], extraction: Path, source_sha: str) -> dict[str, Any]:
-    """Re-hash every manifest entry against the extracted bytes and enforce the inventory."""
+def verify_manifest_binding(
+    manifest: dict[str, Any], extraction: Path, source_sha: str,
+) -> tuple[dict[str, Any], int]:
+    """Re-hash every manifest entry against the extracted bytes and enforce the inventory.
+
+    Returns the verified version metadata plus the ``source_validation_run_id``
+    the candidate context binds its Source Validation evidence to.
+    """
     _require(manifest.get("schema") == MANIFEST_SCHEMA,
              f"rc-manifest schema {manifest.get('schema')!r} is not {MANIFEST_SCHEMA}")
     _require(manifest.get("source_commit_sha") == source_sha,
              f"rc-manifest source {manifest.get('source_commit_sha')!r} does not match {source_sha}")
-    _require(manifest.get("event") == "push",
-             f"rc-manifest event {manifest.get('event')!r} is not a push candidate")
+    _require(manifest.get("event") == CANDIDATE_EVENT,
+             f"rc-manifest event {manifest.get('event')!r} is not a {CANDIDATE_EVENT} candidate")
     _require(manifest.get("ref") == EXPECT_REF,
              f"rc-manifest ref {manifest.get('ref')!r} is not {EXPECT_REF}")
     meta = manifest.get("meta")
@@ -590,6 +638,15 @@ def verify_manifest_binding(manifest: dict[str, Any], extraction: Path, source_s
     _require(isinstance(context, dict) and context.get("schema") == CONTEXT_SCHEMA,
              "rc-context.json schema mismatch")
     _require(context.get("source_commit_sha") == source_sha, "rc-context source SHA mismatch")
+    _require(context.get("event") == CANDIDATE_EVENT,
+             f"rc-context event {context.get('event')!r} is not a {CANDIDATE_EVENT} candidate")
+    _require(context.get("ref") == EXPECT_REF,
+             f"rc-context ref {context.get('ref')!r} is not {EXPECT_REF}")
+    source_run_id = context.get("source_validation_run_id")
+    _require(isinstance(source_run_id, int) and not isinstance(source_run_id, bool)
+             and source_run_id > 0,
+             "rc-context source_validation_run_id is missing or malformed; the candidate "
+             "must bind the exact successful Source Validation run chosen by check-source")
     _require(context.get("c_two_version") == c_two_version, "rc-context c_two_version mismatch")
     _require(context.get("c3_version") == c3_version, "rc-context c3_version mismatch")
     _require(context.get("fastdb_version") == meta["fastdb_version"],
@@ -597,10 +654,12 @@ def verify_manifest_binding(manifest: dict[str, Any], extraction: Path, source_s
     _require(context.get("fastdb_source_rev") == meta["fastdb_source_rev"],
              "rc-context fastdb_source_rev mismatch")
     _require(context.get("pull_request_head_sha") is None,
-             "rc-context records a pull_request_head_sha; only push candidates are promotable")
-    return {"c_two_version": c_two_version, "c3_version": c3_version,
-            "fastdb_version": meta["fastdb_version"],
-            "fastdb_source_rev": meta["fastdb_source_rev"]}
+             "rc-context records a pull_request_head_sha; only main dispatch candidates "
+             "are promotable")
+    versions = {"c_two_version": c_two_version, "c3_version": c3_version,
+                "fastdb_version": meta["fastdb_version"],
+                "fastdb_source_rev": meta["fastdb_source_rev"]}
+    return versions, source_run_id
 
 
 def map_wheel_rows(
@@ -608,7 +667,7 @@ def map_wheel_rows(
 ) -> dict[tuple[str, str, str], str]:
     """Map each wheel filename to its exact ``(target, interpreter, abi)`` row.
 
-    Shared by the verified-manifest inventory and the PyPI preflight: any
+    Shared by the verified-manifest inventory and the registry comparison: any
     name that is not exactly one advertised row of the version's
     5-platform x 6-ABI matrix — an invalid filename, wrong distribution or
     version, an ambiguous tag pair or platform, or a duplicate row — fails
@@ -1069,32 +1128,36 @@ def _verify_python_run_receipt(receipt_name: str, payload: Any, source_c3_sha: s
 
 
 def verify_source_validation(
-    api: GitHubApi, source_sha: str, successful_runs: list[dict[str, Any]], download_root: Path
+    api: GitHubApi, source_sha: str, source_run: dict[str, Any], download_root: Path,
 ) -> dict[str, Any]:
-    """Re-validate full-scope source evidence for all four platform/runner lanes."""
+    """Re-validate full-scope source evidence for all four platform/runner lanes.
+
+    Every lane's full-scope artifact must come from the single Source
+    Validation run bound by the candidate context through
+    ``source_validation_run_id``; evidence is never mixed across runs.
+    """
     fastdb_pin = _source_fastdb_pin()
-    artifacts_by_label: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
-    for run in sorted(successful_runs, key=lambda item: item.get("id") or 0, reverse=True):
-        for artifact in api.run_artifacts(run["id"]):
-            for label in SOURCE_VALIDATION_LANES:
-                if artifact.get("name") == f"source-{label}-py3.12-full-{source_sha}":
-                    artifacts_by_label.setdefault(label, (run, artifact))
-    missing = [label for label in SOURCE_VALIDATION_LANES if label not in artifacts_by_label]
-    _require(
-        not missing,
-        f"Source Validation full-scope artifacts missing for {missing}; promotion requires "
-        f"source-<label>-py3.12-full-{source_sha} from successful main-push runs",
-    )
+    run_id = source_run.get("id")
+    require_passed_jobs(api, run_id, set(CHECK_SOURCE_REQUIRED_JOBS))
+    artifacts = api.run_artifacts(run_id)
+    artifacts_by_label: dict[str, dict[str, Any]] = {}
+    for label in SOURCE_VALIDATION_LANES:
+        expected_name = f"source-{label}-py3.12-full-{source_sha}"
+        matches = [entry for entry in artifacts if entry.get("name") == expected_name]
+        _require(len(matches) == 1,
+                 f"Source Validation run {run_id} retains {len(matches)} {expected_name} "
+                 "artifacts; the run bound by rc-context.json must carry exactly one "
+                 "full-scope artifact per platform")
+        artifacts_by_label[label] = matches[0]
 
     validated: dict[str, Any] = {}
     for label, target_platform in SOURCE_VALIDATION_LANES.items():
         expected_gates = expected_source_full_gates(target_platform)
-        run, artifact = artifacts_by_label[label]
+        artifact = artifacts_by_label[label]
         destination = download_root / "source-validation" / label
         # Each runner image extracts into its own directory; the duplicate
         # check is scoped to one destination.
         seen_members: dict[str, tuple[str, str]] = {}
-        require_passed_jobs(api, run["id"], {f"source ({label}, py3.12)"})
         download_and_extract_artifact(api, artifact, destination, seen_members, allow_nested=True)
 
         evidence = _load_json_file(destination / "run-evidence.json")
@@ -1229,32 +1292,13 @@ def verify_source_validation(
 
         validated[label] = {
             "platform": target_platform,
-            "run_id": run.get("id"),
-            "run_url": run.get("html_url"),
+            "run_id": source_run.get("id"),
+            "run_url": source_run.get("html_url"),
             "artifact": artifact.get("name"),
             "gates_passed": len(applicable),
             "source_c3_sha256": source_c3_sha,
         }
     return validated
-
-
-def expected_release_asset_names() -> set[str]:
-    """The canonical asset population of one published c3 release, by name.
-
-    Mirrors exactly what ``stage_github_release_assets`` stages: every CLI
-    executable with its sidecar, the canonical installer assets, the FastDB
-    license evidence, and the candidate manifest. Used to decide — without
-    staging or downloading bytes — whether an existing release for an
-    already-tagged version is complete and foreign-free.
-    """
-    names: set[str] = set()
-    for cli_name in EXPECTED_CLI_NAMES:
-        names.add(cli_name)
-        names.add(_sidecar_name(cli_name))
-    names.update(EXPECTED_INSTALLER_NAMES)
-    names.update(FASTDB_LICENSE_ASSETS)
-    names.add(MANIFEST_NAME)
-    return names
 
 
 def stage_github_release_assets(
@@ -1340,185 +1384,12 @@ def resolve_tag_commit(api: GitHubApi, tag: str) -> str | None:
     raise PromotionError(f"tag {tag} points at unsupported object type {obj.get('type')!r}")
 
 
-def _published_asset_bindings(
-    manifest: dict[str, Any], manifest_sha: str, manifest_bytes: int,
-) -> dict[str, tuple[str, int]]:
-    """Expected ``(sha256, bytes)`` for every canonical release asset, derived
-    from the published rc-manifest.json.
-
-    The executables, canonical installers, and FastDB license evidence bind
-    directly to their manifest entries; the five executable sidecars bind to
-    release_candidate.py's canonical checksum format ``f'{sha256}  {name}\\n'``
-    derived from those entries; rc-manifest.json binds to its own
-    just-verified digest. Missing, duplicate, or malformed manifest entries
-    fail closed.
-    """
-    bindings: dict[str, tuple[str, int]] = {MANIFEST_NAME: (manifest_sha, manifest_bytes)}
-
-    def collect(entries: Any, kind: str, names: Iterable[str]) -> None:
-        _require(isinstance(entries, list), f"published {MANIFEST_NAME} {kind} list is missing")
-        by_name: dict[str, dict[str, Any]] = {}
-        for entry in entries:
-            _require(isinstance(entry, dict),
-                     f"published {MANIFEST_NAME} {kind} entry is not an object")
-            name = entry.get("name")
-            _require(isinstance(name, str) and name,
-                     f"published {MANIFEST_NAME} {kind} entry has no name")
-            _require(name not in by_name,
-                     f"published {MANIFEST_NAME} lists {name} twice under {kind}")
-            by_name[name] = entry
-        for name in names:
-            entry = by_name.get(name)
-            _require(entry is not None,
-                     f"published {MANIFEST_NAME} has no {kind} entry for {name}")
-            sha = entry.get("sha256")
-            size = entry.get("bytes")
-            _require(isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha),
-                     f"published {MANIFEST_NAME} {kind} entry {name} has no sha256 digest")
-            _require(isinstance(size, int) and not isinstance(size, bool) and size > 0,
-                     f"published {MANIFEST_NAME} {kind} entry {name} has no positive byte size")
-            bindings[name] = (sha, size)
-
-    collect(manifest.get("cli"), "cli", EXPECTED_CLI_NAMES)
-    collect(manifest.get("installers"), "installers", EXPECTED_INSTALLER_NAMES)
-    collect(manifest.get("fastdb_proof"), "fastdb_proof", FASTDB_LICENSE_ASSETS)
-    for name in EXPECTED_CLI_NAMES:
-        sha, _ = bindings[name]
-        # release_candidate.py writes text in native mode. The Windows-built
-        # executable's sidecar therefore has CRLF; Unix builds use LF.
-        newline = "\r\n" if name == f"c3-{WINDOWS_TARGET}.exe" else "\n"
-        sidecar = f"{sha}  {name}{newline}".encode()
-        bindings[_sidecar_name(name)] = (sha256_bytes(sidecar), len(sidecar))
-    return bindings
-
-
-def _release_skip_state(
-    api: GitHubApi, tag: str, title: str, tag_commit: str, source_sha: str,
-) -> dict[str, Any]:
-    """Classify a version whose tag already points at a different commit.
-
-    The single skip validator, shared by the early preflight and the
-    post-verification race path. The skip requires a published (non-draft,
-    non-prerelease), correctly named release carrying every canonical asset,
-    and the retained published ``rc-manifest.json`` — the only asset
-    downloaded, verified against its API digest — bound to the tagged source
-    commit with every canonical asset's API digest and byte size bound to
-    that manifest (sidecars through the canonical checksum format). A missing
-    release, a renamed or unpublished one, malformed, foreign, empty, or
-    undigested assets, an unbound manifest, or an altered executable,
-    installer, license, or sidecar stay fail-closed: the version cannot be
-    completed from a different source and its tag must never move.
-    """
-    status, release = api.get_json(f"/repos/{api.repository}/releases/tags/{tag}")
-    _require(
-        status == 200 and isinstance(release, dict),
-        f"tag {tag} already points at {tag_commit} but carries no release; the version is "
-        "incompletely published and needs manual resolution; refusing to move the tag",
-    )
-    _require(release.get("name") == title,
-             f"existing release for {tag} is named {release.get('name')!r}, expected {title!r}")
-    _require(release.get("tag_name") == tag,
-             f"existing release for {tag} reports tag_name {release.get('tag_name')!r}")
-    _require(
-        release.get("draft") is not True and release.get("prerelease") is not True,
-        f"release {tag} is not a published release (draft={release.get('draft')!r}, "
-        f"prerelease={release.get('prerelease')!r}); refusing to skip an unpublished release",
-    )
-    remote: dict[str, dict[str, Any]] = {}
-    for asset in release.get("assets", []):
-        _require(isinstance(asset, dict), f"release {tag} carries a malformed asset entry")
-        name = asset.get("name")
-        _require(isinstance(name, str) and name, f"release {tag} carries an unnamed asset")
-        remote[name] = asset
-    expected = expected_release_asset_names()
-    foreign = sorted(set(remote) - expected)
-    _require(not foreign, f"release {tag} carries foreign assets {foreign}; refusing to touch them")
-    missing = sorted(expected - set(remote))
-    _require(
-        not missing,
-        f"release {tag} is missing assets {missing}; the version was published from "
-        f"{tag_commit} and cannot be completed from {source_sha}",
-    )
-    # Bind the published release to the tagged source: download only the
-    # retained manifest, verify its API digest, and require its recorded
-    # source commit and c3 version to match the tag.
-    manifest_asset = remote[MANIFEST_NAME]
-    status, blob = api.get_bytes(
-        f"/repos/{api.repository}/releases/assets/{manifest_asset.get('id')}",
-        accept="application/octet-stream",
-    )
-    _require(status == 200, f"cannot download the published {MANIFEST_NAME} from {tag}")
-    manifest_digest = manifest_asset["digest"][len("sha256:"):]
-    _require(sha256_bytes(blob) == manifest_digest,
-             f"published {MANIFEST_NAME} bytes do not match their API digest")
-    try:
-        published_manifest = json.loads(blob.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise PromotionError(f"published {MANIFEST_NAME} is not valid JSON: {error}") from error
-    version = tag[len(TAG_PREFIX):]
-    _require(isinstance(published_manifest, dict)
-             and published_manifest.get("schema") == MANIFEST_SCHEMA,
-             f"published {MANIFEST_NAME} schema is not {MANIFEST_SCHEMA}")
-    _require(
-        published_manifest.get("source_commit_sha") == tag_commit,
-        f"published {MANIFEST_NAME} records source "
-        f"{published_manifest.get('source_commit_sha')!r}, not the tagged commit {tag_commit}; "
-        "the release is not bound to its tag",
-    )
-    meta = published_manifest.get("meta")
-    _require(isinstance(meta, dict) and meta.get("c3_version") == version,
-             f"published {MANIFEST_NAME} does not record c3 version {version}")
-    # Bind every canonical asset's API digest and size to the manifest: a
-    # replaced executable, installer, license, or sidecar cannot match the
-    # bytes the published manifest recorded.
-    bindings = _published_asset_bindings(published_manifest, manifest_digest, len(blob))
-    for name in sorted(expected):
-        asset = remote[name]
-        size = asset.get("size")
-        digest = asset.get("digest")
-        _require(isinstance(size, int) and not isinstance(size, bool) and size > 0,
-                 f"release {tag} asset {name} has no positive size")
-        _require(isinstance(digest, str) and digest.startswith("sha256:"),
-                 f"release {tag} asset {name} lacks an API sha256 digest")
-        expected_sha, expected_size = bindings[name]
-        _require(
-            size == expected_size,
-            f"release {tag} asset {name} is {size} bytes; the published manifest binds "
-            f"{expected_size}",
-        )
-        _require(
-            digest == f"sha256:{expected_sha}",
-            f"release {tag} asset {name} digest does not match the published manifest",
-        )
-    return {
-        "tag": tag,
-        "title": title,
-        "tag_exists": True,
-        "tag_commit": tag_commit,
-        "release_exists": True,
-        "published_from": tag_commit,
-        "action": SKIP_ACTION,
-        "assets": [],
-        "candidate_bytes_compared": False,
-        "manifest_sha256": manifest_digest,
-        "reason": (
-            f"tag {tag} points at {tag_commit} and its published release is complete and "
-            f"bound to that source through {MANIFEST_NAME}, with every asset digest bound "
-            f"to it; the version was already released from that commit, not the candidate "
-            f"{source_sha}"
-        ),
-    }
-
-
 def github_release_state(
     api: GitHubApi, tag: str, title: str, source_sha: str, assets: list[dict[str, Any]],
-    *, allow_skip: bool = False,
 ) -> dict[str, Any]:
     """Classify each planned asset against the existing release; never clobber or move tags."""
     tag_commit = resolve_tag_commit(api, tag)
     if tag_commit is not None and tag_commit != source_sha:
-        if allow_skip:
-            return _release_skip_state(api, tag, title, tag_commit, source_sha)
         raise PromotionError(
             f"tag {tag} already points at {tag_commit}, not the candidate source {source_sha}; "
             "refusing to move an existing tag"
@@ -1597,7 +1468,7 @@ def _pypi_version_listing(project: str, version: str) -> dict[str, str] | None:
 
 
 def pypi_state(
-    project: str, version: str, files: list[dict[str, Any]], *, allow_skip: bool = False,
+    project: str, version: str, files: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Compare the staged dist files with the registry; only byte-equal files may be skipped."""
     published = _pypi_version_listing(project, version)
@@ -1619,24 +1490,9 @@ def pypi_state(
             entry["disposition"] = "conflict"
     conflicts = [entry for entry in files if entry["disposition"] == "conflict"]
     if conflicts:
-        # A published PyPI version is immutable: when the registry already
-        # holds the exact complete inventory, an automatic promotion finishes
-        # as an explicit skip instead of failing. Any missing file keeps the
-        # fail-closed clobber refusal.
-        if allow_skip and not any(entry["disposition"] == "upload" for entry in files):
-            for entry in files:
-                entry["disposition"] = SKIP_ACTION
-            return {
-                "project": project,
-                "version": version,
-                "action": SKIP_ACTION,
-                "files": files,
-                "reason": (
-                    f"PyPI {project} {version} already publishes the complete "
-                    f"{len(files)}-file inventory with bytes differing from this candidate; "
-                    "a published version is immutable, so there is nothing to publish"
-                ),
-            }
+        # A published PyPI version is immutable: files the registry already
+        # holds under different bytes can never be completed from this
+        # candidate, so the collision always fails closed.
         first = conflicts[0]
         raise PromotionError(
             f"PyPI {project} {version} already publishes {first['name']} with different "
@@ -1648,106 +1504,6 @@ def pypi_state(
             "action": "upload" if to_upload else "none", "files": files}
 
 
-def _source_file_text(api: GitHubApi, source_sha: str, path: str) -> str:
-    """Read one repository file at the candidate source SHA (authenticated)."""
-    status, payload = api.get_json(f"/repos/{api.repository}/contents/{path}?ref={source_sha}")
-    _require(
-        status == 200 and isinstance(payload, dict)
-        and payload.get("encoding") == "base64" and isinstance(payload.get("content"), str),
-        f"cannot read {path} at {source_sha} through the authenticated API",
-    )
-    try:
-        return base64.b64decode(payload["content"]).decode("utf-8")
-    except (ValueError, UnicodeError) as error:
-        raise PromotionError(f"invalid base64 contents for {path} at {source_sha}: {error}") from error
-
-
-def _parse_c3_version(text: str) -> str:
-    """Mirror the Release Candidate workflow's cli/Cargo.toml version read."""
-    match = re.search(r'^version = "(.+)"$', text, re.MULTILINE)
-    _require(match is not None, "cli/Cargo.toml at the candidate source has no version field")
-    return match.group(1)
-
-
-def _parse_c_two_version(text: str) -> str:
-    """Mirror the Release Candidate workflow's sdk/python/pyproject.toml read."""
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as error:
-        raise PromotionError(
-            f"sdk/python/pyproject.toml at the candidate source is invalid TOML: {error}"
-        ) from error
-    project = data.get("project")
-    version = project.get("version") if isinstance(project, dict) else None
-    _require(isinstance(version, str) and version,
-             "sdk/python/pyproject.toml at the candidate source has no project.version")
-    return version
-
-
-def preflight_already_published(
-    api: GitHubApi, options: argparse.Namespace, source_sha: str
-) -> dict[str, Any] | None:
-    """Decide the automatic already-published skip before any artifact download.
-
-    The target version is read from the source tree at the candidate SHA
-    exactly the way the Release Candidate workflow derives it, so the
-    preflight never guesses a version the tested bytes do not carry. The
-    GitHub-release skip additionally downloads exactly one small asset — the
-    published ``rc-manifest.json`` — to bind the release to the tagged
-    source. A PyPI skip never compares the candidate's bytes: it asserts only
-    that the registry version is complete under the exact wheel matrix, and a
-    complete registry version is immutable regardless of whose bytes it
-    holds. Returns a skip fragment (carrying ``versions`` and ``action``) or
-    None when the promotion must continue to full verification.
-    """
-    if options.target == "github-release":
-        version = _parse_c3_version(_source_file_text(api, source_sha, "cli/Cargo.toml"))
-        tag = f"{TAG_PREFIX}{version}"
-        tag_commit = resolve_tag_commit(api, tag)
-        if tag_commit is None or tag_commit == source_sha:
-            # Unreleased version, or a same-source rerun: normal promotion.
-            return None
-        skip = _release_skip_state(api, tag, f"c3 {version}", tag_commit, source_sha)
-        skip["versions"] = {"c3_version": version}
-        return skip
-    version = _parse_c_two_version(
-        _source_file_text(api, source_sha, "sdk/python/pyproject.toml"))
-    published = _pypi_version_listing(options.pypi_project, version)
-    if published is None:
-        return None
-    wheel_prefix = f"c_two-{version}-"
-    sdist_name = f"c_two-{version}.tar.gz"
-    wheels = sorted(
-        name for name in published
-        if name.startswith(wheel_prefix) and name.endswith(".whl"))
-    foreign = sorted(
-        name for name in published if name != sdist_name and name not in wheels)
-    _require(not foreign,
-             f"PyPI {options.pypi_project} {version} already publishes foreign files {foreign}")
-    # Exact inventory, not a prefix count: every published wheel must map to
-    # one row of the version's 5-platform x 6-ABI matrix with no duplicates
-    # or unmappable names; a malformed matrix fails closed here.
-    rows = map_wheel_rows(wheels, version)
-    if len(rows) != EXPECTED_WHEEL_ROWS or sdist_name not in published:
-        # Incomplete: a same-source retry may legitimately complete it, so
-        # continue to full verification and the byte-exact classification.
-        return None
-    return {
-        "versions": {"c_two_version": version},
-        "action": SKIP_ACTION,
-        "project": options.pypi_project,
-        "version": version,
-        "published_files": len(published),
-        "candidate_bytes_compared": False,
-        "reason": (
-            f"PyPI {options.pypi_project} {version} already publishes the exact "
-            f"{EXPECTED_WHEEL_ROWS}-row platform/ABI wheel inventory plus the sdist; a "
-            "published version is immutable, so there is nothing to publish. This skip "
-            "does not assert that the published bytes equal this candidate's"
-        ),
-    }
-
-
 def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> None:
     versions = plan["versions"]
     candidate = plan["candidate_run"]
@@ -1757,7 +1513,7 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "Promoted from the exact tested release-candidate bytes; nothing was rebuilt for this release.",
         "",
         f"- c3 version: `{versions['c3_version']}` (Python package `c-two=={versions['c_two_version']}`)",
-        f"- Source commit: `{plan['source_sha']}` (canonical `main` push)",
+        f"- Source commit: `{plan['source_sha']}` (Release Candidate dispatch on canonical `main`)",
         f"- Native FastDB Core: `{SOURCE_VALIDATION_FASTDB_CORE_VERSION}`, statically linked "
         f"from source `{versions['fastdb_source_rev']}`",
         f"- Optional Python FastDB: `fastdb4py=={versions['fastdb_version']}`; "
@@ -1767,6 +1523,8 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "Validation provenance:",
         "",
         f"- Release Candidate run: {candidate['url']}",
+        f"- Source Validation bound run: "
+        f"{next(iter(plan['source_validation'].values()))['run_url']}",
     ]
     for label, entry in sorted(plan["source_validation"].items()):
         lines.append(f"- Source Validation full-scope run ({label}, py3.12, {entry['gates_passed']} gates): "
@@ -1794,8 +1552,8 @@ def command_prepare(options: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    # Manual dispatch must publish only from canonical main; workflow_run
-    # events already carry the default branch here.
+    # Promotion is an explicit canonical-main dispatch; no workflow_run
+    # listener reaches this code anymore.
     ref = os.environ.get("GITHUB_REF", "")
     if ref != EXPECT_REF:
         print(
@@ -1811,74 +1569,22 @@ def command_prepare(options: argparse.Namespace) -> int:
         os.environ.get("GITHUB_API_URL", "https://api.github.com"), repository, token
     )
 
-    source_sha = options.source_sha
-    if options.candidate_run_id is not None:
-        status, run = api.get_json(f"/repos/{repository}/actions/runs/{options.candidate_run_id}")
-        _require(status == 200 and isinstance(run, dict),
-                 f"candidate run {options.candidate_run_id} not found")
-        _require(run.get("name") == CANDIDATE_WORKFLOW_NAME,
-                 f"run {options.candidate_run_id} is {run.get('name')!r}, not {CANDIDATE_WORKFLOW_NAME}")
-        _require(run.get("event") == "push", "candidate run must be a push run")
-        _require(run.get("head_branch") == "main", "candidate run must be on main")
-        _require(run.get("status") == "completed" and run.get("conclusion") == "success",
-                 f"candidate run conclusion {run.get('conclusion')!r} is not success")
-        run_sha = run.get("head_sha")
-        _require(SHA_PATTERN.match(run_sha or ""), "candidate run head_sha is malformed")
-        if source_sha:
-            _require(source_sha == run_sha,
-                     f"candidate run {options.candidate_run_id} source {run_sha} != requested {source_sha}")
-        source_sha = run_sha
-
-    if not source_sha:
-        print("error: provide --source-sha or --candidate-run-id", file=sys.stderr)
-        return 1
-    _require(bool(SHA_PATTERN.match(source_sha)), f"source SHA {source_sha!r} is malformed")
-
-    try:
-        candidate_runs = resolve_gate(api, CANDIDATE_WORKFLOW_FILE, CANDIDATE_WORKFLOW_NAME, source_sha)
-        source_runs = resolve_gate(api, SOURCE_VALIDATION_WORKFLOW_FILE, SOURCE_VALIDATION_WORKFLOW_NAME, source_sha)
-    except DeferredPromotion as deferred:
-        print(f"deferred: {deferred}", file=sys.stderr)
-        return EXIT_DEFERRED
-    except PromotionError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
-
-    candidate = _newest(candidate_runs)
-    if options.candidate_run_id is not None:
-        _require(
-            any(run.get("id") == options.candidate_run_id for run in candidate_runs),
-            f"candidate run {options.candidate_run_id} is not a successful main-push "
-            f"run for {source_sha}",
-        )
-        candidate = next(run for run in candidate_runs if run.get("id") == options.candidate_run_id)
+    candidate_run_id = options.candidate_run_id
+    status, run = api.get_json(f"/repos/{repository}/actions/runs/{candidate_run_id}")
+    _require(status == 200 and isinstance(run, dict),
+             f"candidate run {candidate_run_id} not found")
+    run_sha = run.get("head_sha")
+    _require(SHA_PATTERN.match(run_sha or ""), "candidate run head_sha is malformed")
+    if options.source_sha:
+        _require(options.source_sha == run_sha,
+                 f"candidate run {candidate_run_id} source {run_sha} != requested {options.source_sha}")
+    source_sha = run_sha
+    validate_gate_run(api, run, CANDIDATE_WORKFLOW_FILE, CANDIDATE_WORKFLOW_NAME,
+                      source_sha, (CANDIDATE_EVENT,))
+    require_gate_success(CANDIDATE_WORKFLOW_NAME, run)
+    candidate = run
 
     require_passed_jobs(api, candidate["id"], {"context", "manifest"})
-
-    if options.skip_already_published:
-        skip = preflight_already_published(api, options, source_sha)
-        if skip is not None:
-            versions = skip.pop("versions")
-            plan: dict[str, Any] = {
-                "schema": PLAN_SCHEMA,
-                "target": options.target,
-                "repository": repository,
-                "dry_run": bool(options.dry_run),
-                "source_sha": source_sha,
-                "versions": versions,
-                "candidate_run": {"id": candidate.get("id"), "url": candidate.get("html_url")},
-                "skip": skip,
-            }
-            Path(options.plan_output).write_text(
-                json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-            )
-            print(f"no publication: {skip['reason']}")
-            print(
-                f"promotion plan {options.plan_output}: target={options.target} "
-                f"source={source_sha[:12]} candidate_run={candidate.get('id')} "
-                f"action={skip['action']}" + (" [dry run]" if options.dry_run else "")
-            )
-            return 0
 
     download_dir = Path(options.download_dir)
     extraction = download_dir / "candidate"
@@ -1892,11 +1598,21 @@ def command_prepare(options: argparse.Namespace) -> int:
     verify_sidecars(extraction)
     manifest = _load_json_file(extraction / MANIFEST_NAME)
     _require(isinstance(manifest, dict), "rc-manifest.json is not an object")
-    versions = verify_manifest_binding(manifest, extraction, source_sha)
+    versions, source_run_id = verify_manifest_binding(manifest, extraction, source_sha)
     manifest_sha = sha256_file(extraction / MANIFEST_NAME)
     wheel_by_row = verify_wheel_rows(manifest["wheels"], versions["c_two_version"])
     verify_candidate_receipts(extraction, manifest, source_sha, wheel_by_row)
-    source_validation = verify_source_validation(api, source_sha, source_runs, download_dir)
+
+    # The Source Validation evidence comes only from the run the candidate
+    # context bound by identity; a different run for the same source never
+    # substitutes it and receipts are never mixed across runs.
+    status, source_run = api.get_json(f"/repos/{repository}/actions/runs/{source_run_id}")
+    _require(status == 200 and isinstance(source_run, dict),
+             f"Source Validation run {source_run_id} bound by rc-context.json not found")
+    validate_gate_run(api, source_run, SOURCE_VALIDATION_WORKFLOW_FILE,
+                      SOURCE_VALIDATION_WORKFLOW_NAME, source_sha, SOURCE_GATE_EVENTS)
+    require_gate_success(SOURCE_VALIDATION_WORKFLOW_NAME, source_run)
+    source_validation = verify_source_validation(api, source_sha, source_run, download_dir)
 
     staging = download_dir / "staging"
     plan: dict[str, Any] = {
@@ -1915,36 +1631,24 @@ def command_prepare(options: argparse.Namespace) -> int:
         title = f"c3 {versions['c3_version']}"
         assets = stage_github_release_assets(extraction, manifest, staging, download_dir)
         # Read-only remote comparison runs identically in dry runs; only the
-        # caller's publishing steps are suppressed. A tag that moved to a
-        # different commit since the preflight classifies as a skip here too.
-        plan["github_release"] = github_release_state(
-            api, tag, title, source_sha, assets, allow_skip=options.skip_already_published)
+        # caller's publishing steps are suppressed.
+        plan["github_release"] = github_release_state(api, tag, title, source_sha, assets)
     else:
         files = stage_pypi_files(extraction, manifest, staging / "dist", download_dir)
-        plan["pypi"] = pypi_state(
-            options.pypi_project, versions["c_two_version"], files,
-            allow_skip=options.skip_already_published)
-        if plan["pypi"]["action"] == SKIP_ACTION:
-            # Nothing may be published for an already-complete registry
-            # version; drop every staged copy so no upload path can see them.
-            for entry in plan["pypi"]["files"]:
+        plan["pypi"] = pypi_state(options.pypi_project, versions["c_two_version"], files)
+        # The publishing action consumes the staging directory directly, so it
+        # must hold exactly the registry-missing files; verified-existing
+        # copies are removed from staging, never from the extracted sources.
+        for entry in plan["pypi"]["files"]:
+            if entry["disposition"] == "verified-existing":
                 staged_file = download_dir / entry["staged_path"]
                 if staged_file.is_file():
                     staged_file.unlink()
-        else:
-            # The publishing action consumes the staging directory directly, so it
-            # must hold exactly the registry-missing files; verified-existing
-            # copies are removed from staging, never from the extracted sources.
-            for entry in plan["pypi"]["files"]:
-                if entry["disposition"] == "verified-existing":
-                    staged_file = download_dir / entry["staged_path"]
-                    if staged_file.is_file():
-                        staged_file.unlink()
-            staged = sorted(path.name for path in (staging / "dist").iterdir())
-            expected = sorted(entry["name"] for entry in plan["pypi"]["files"]
-                              if entry["disposition"] == "upload")
-            _require(staged == expected,
-                     f"PyPI staging holds {staged}, expected exactly the missing files {expected}")
+        staged = sorted(path.name for path in (staging / "dist").iterdir())
+        expected = sorted(entry["name"] for entry in plan["pypi"]["files"]
+                          if entry["disposition"] == "upload")
+        _require(staged == expected,
+                 f"PyPI staging holds {staged}, expected exactly the missing files {expected}")
 
     Path(options.plan_output).write_text(
         json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1960,6 +1664,47 @@ def command_prepare(options: argparse.Namespace) -> int:
     return 0
 
 
+def command_check_source(options: argparse.Namespace) -> int:
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if repository != options.expect_repository:
+        print(
+            f"error: refusing to check from repository {repository!r}; "
+            f"source checks are only valid on {options.expect_repository}",
+            file=sys.stderr,
+        )
+        return 1
+    ref = os.environ.get("GITHUB_REF", "")
+    if ref != EXPECT_REF:
+        print(
+            f"error: refusing to check from ref {ref!r}; only {EXPECT_REF} names canonical main",
+            file=sys.stderr,
+        )
+        return 1
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        print("error: GITHUB_TOKEN is required for authenticated run provenance", file=sys.stderr)
+        return 1
+    source_sha = options.source_sha
+    _require(bool(SHA_PATTERN.match(source_sha)), f"source SHA {source_sha!r} is malformed")
+
+    api = GitHubApi(
+        os.environ.get("GITHUB_API_URL", "https://api.github.com"), repository, token
+    )
+    run = find_full_source_validation_run(api, source_sha)
+    Path(options.plan_output).write_text(
+        json.dumps(
+            {"source_sha": source_sha, "run_id": run.get("id"), "run_url": run.get("html_url")},
+            indent=2, sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"source check {options.plan_output}: source={source_sha[:12]} "
+        f"source_validation_run={run.get('id')} ({run.get('event')})"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1967,22 +1712,29 @@ def main(argv: list[str] | None = None) -> int:
         "prepare", help="Download, verify, and stage an exact-tested-candidate promotion"
     )
     prepare.add_argument("--target", choices=("github-release", "pypi"), required=True)
-    prepare.add_argument("--candidate-run-id", type=int, default=None)
-    prepare.add_argument("--source-sha", default=None)
+    prepare.add_argument("--candidate-run-id", type=int, required=True,
+                         help="The exact successful Release Candidate workflow_dispatch run "
+                              "on canonical main whose retained bytes are promoted")
+    prepare.add_argument("--source-sha", default=None,
+                         help="Optional cross-check; must equal the candidate run's head SHA")
     prepare.add_argument("--expect-repository", default=EXPECT_REPOSITORY)
     prepare.add_argument("--download-dir", default="candidate-download")
     prepare.add_argument("--plan-output", default="promotion-plan.json")
     prepare.add_argument("--release-body-output", default=None)
     prepare.add_argument("--pypi-project", default="c-two")
-    prepare.add_argument("--skip-already-published", action="store_true",
-                         help="Automatic workflow_run mode: when the target version is already "
-                              "fully published from an older source, finish as an explicit "
-                              "no-publication skip instead of failing; manual dispatches must "
-                              "not pass this flag so collisions stay fail-closed")
     prepare.add_argument("--dry-run", action="store_true",
                          help="Identical read-only verification including remote comparison; "
                               "the caller still performs no publishing")
     prepare.set_defaults(handler=command_prepare)
+    check_source = subparsers.add_parser(
+        "check-source",
+        help="Read-only: resolve the successful full Source Validation run for one source SHA "
+             "using only GitHub metadata (no artifact downloads)",
+    )
+    check_source.add_argument("--source-sha", required=True)
+    check_source.add_argument("--expect-repository", default=EXPECT_REPOSITORY)
+    check_source.add_argument("--plan-output", default="source-check.json")
+    check_source.set_defaults(handler=command_check_source)
     options = parser.parse_args(argv)
     try:
         return options.handler(options)

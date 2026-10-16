@@ -4,25 +4,29 @@ workflow contracts.
 The promotion must be a byte-exact, fail-closed preparation step: unsafe ZIP
 members, API digest mismatches, inventory deviations, provenance gaps, and
 remote-state conflicts must all refuse promotion, while idempotent reruns
-skip only byte-identical remote assets. Fixtures mirror the real candidate
-receipt schemas (``c-two.installed-wheel-smoke.v1`` rows with FastDB
-decisions, ``cp314``/``cp314t`` tag pairs) and the Source Validation evidence
-recorded by tools/ci/source_validation.py. The publish-layout tests simulate the
+skip only byte-identical remote assets. Promotion is explicit only: the
+candidate is one successful ``workflow_dispatch`` ``Release Candidate`` run
+named by ``--candidate-run-id``, and its ``rc-context.json`` binds the exact
+successful ``Source Validation`` run (a canonical main push or dispatch)
+through ``source_validation_run_id`` — evidence is never mixed across runs
+and pending gates fail as incomplete, never deferred success. ``check-source``
+exercises the read-only metadata-only companion that fills that binding.
+Fixtures mirror the real candidate receipt schemas
+(``c-two.installed-wheel-smoke.v1`` rows with FastDB decisions,
+``cp314``/``cp314t`` tag pairs) and the Source Validation evidence recorded
+by tools/ci/source_validation.py. The publish-layout tests simulate the
 GitHub artifact roundtrip and drive the workflow's actual publish shell with
 a fake ``gh``. Nothing here touches the network or publishes.
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import io
 import json
-import os
 import re
 import stat
 import subprocess
-import sys
 import urllib.error
 import urllib.request
 import zipfile
@@ -85,7 +89,9 @@ def _run(run_id: int, name: str, sha: str = SOURCE_SHA, **overrides: Any) -> dic
     run = {
         "id": run_id,
         "name": name,
-        "event": "push",
+        # Candidates exist only as explicit main dispatches; source gates are
+        # canonical main pushes by default (dispatch variants are built per test).
+        "event": "workflow_dispatch" if name == "Release Candidate" else "push",
         "head_branch": "main",
         "head_sha": sha,
         "status": "completed",
@@ -278,7 +284,8 @@ def _smoke_body(
 class CandidateBuilder:
     """Builds a structurally exact synthetic candidate plus its manifest."""
 
-    def __init__(self) -> None:
+    def __init__(self, source_validation_run_id: int = 201) -> None:
+        self.source_validation_run_id = source_validation_run_id
         self.members: dict[str, bytes] = {}
         self.cli: list[dict[str, Any]] = []
         self.wheels: list[dict[str, Any]] = []
@@ -364,9 +371,10 @@ class CandidateBuilder:
         self._record_receipt("rc-context.json", {
             "schema": "c-two.release-candidate.context.v1",
             "source_commit_sha": SOURCE_SHA,
-            "event": "push",
+            "event": "workflow_dispatch",
             "ref": "refs/heads/main",
             "pull_request_head_sha": None,
+            "source_validation_run_id": self.source_validation_run_id,
             "c_two_version": C_TWO_VERSION,
             "c3_version": C3_VERSION,
             "fastdb_version": FASTDB_VERSION,
@@ -528,7 +536,7 @@ class CandidateBuilder:
         return {
             "schema": promote.MANIFEST_SCHEMA,
             "source_commit_sha": SOURCE_SHA,
-            "event": "push",
+            "event": "workflow_dispatch",
             "ref": "refs/heads/main",
             "meta": {
                 "c_two_version": C_TWO_VERSION,
@@ -591,13 +599,31 @@ class FakeApi(promote.GitHubApi):
         repo = f"/repos/{REPOSITORY}"
         if "/actions/workflows/" in path and "/runs?" in path:
             workflow_file = path.split("/actions/workflows/", 1)[1].split("/runs", 1)[0]
+            params = dict(
+                param.split("=", 1)
+                for param in path.split("/runs?", 1)[1].split("&"))
             runs = world.runs_by_workflow.get(workflow_file, [])
-            return 200, {"workflow_runs": [dict(run) for run in runs]}
+
+            def matches(run: dict[str, Any]) -> bool:
+                if "event" in params and run.get("event") != params["event"]:
+                    return False
+                if "branch" in params and run.get("head_branch") != params["branch"]:
+                    return False
+                if "head_sha" in params and run.get("head_sha") != params["head_sha"]:
+                    return False
+                return True
+
+            return 200, {"workflow_runs": [dict(run) for run in runs if matches(run)]}
         if "/actions/runs/" in path and "/jobs?" in path:
             run_id = int(path.split("/actions/runs/", 1)[1].split("/jobs", 1)[0])
             run = world.runs_by_id[run_id]
-            names = (["context", "manifest"] if run["name"] == "Release Candidate"
-                     else [f"source ({label}, py3.12)" for label in run["runner_labels"]])
+            if run["name"] == "Release Candidate":
+                names = ["context", "manifest"]
+            else:
+                names = [f"source ({label}, py3.12)" for label in run["runner_labels"]]
+                if "ubuntu-24.04" in run["runner_labels"]:
+                    names.append("source (ubuntu-24.04, py3.14t)")
+                names.append("workflow policy")
             jobs = getattr(world, "jobs_by_run", {}).get(run_id, [
                 {"name": name, "status": "completed", "conclusion": "success"} for name in names])
             return 200, {"jobs": jobs}
@@ -608,18 +634,6 @@ class FakeApi(promote.GitHubApi):
         if match:
             run = world.runs_by_id.get(int(match.group(1)))
             return (200, dict(run)) if run else (404, None)
-        if path.startswith(f"{repo}/contents/"):
-            file_path, _, query = path[len(f"{repo}/contents/"):].partition("?")
-            assert f"ref={SOURCE_SHA}" in query, (
-                f"preflight must read {file_path} at the candidate source SHA")
-            text = world.repo_files.get(file_path)
-            if text is None:
-                return 404, None
-            return 200, {
-                "type": "file",
-                "encoding": "base64",
-                "content": base64.b64encode(text.encode()).decode(),
-            }
         if path.startswith(f"{repo}/git/ref/tags/"):
             reference = world.tag_refs.get(path.rsplit("/", 1)[1])
             return (200, dict(reference)) if reference else (404, None)
@@ -749,15 +763,6 @@ class World:
         self.release_asset_bytes: dict[int, bytes] = {}
         self.pypi: dict[str, Any] | None = None
         self.source_c3_sha: dict[str, str] = {}
-        # Repository files at the candidate source SHA, read by the
-        # already-published preflight exactly like the RC workflow reads them.
-        self.repo_files: dict[str, str] = {
-            "cli/Cargo.toml": f'[package]\nname = "c2-cli"\nversion = "{C3_VERSION}"\n',
-            "sdk/python/pyproject.toml": (
-                '[project]\nname = "c-two"\n'
-                f'version = "{C_TWO_VERSION}"\nrequires-python = ">=3.10"\n'
-            ),
-        }
         self._add_candidate_artifacts()
 
     def set_source_runs(self, *runs: dict[str, Any]) -> None:
@@ -911,8 +916,17 @@ def _published_release_inventory(tag_sha: str) -> dict[str, Any]:
     return {"manifest": manifest, "manifest_bytes": manifest_bytes, "api": api}
 
 
-def _published_release_manifest(tag_sha: str) -> bytes:
-    return _published_release_inventory(tag_sha)["manifest_bytes"]
+def _canonical_release_asset_names() -> set[str]:
+    """The canonical asset population of one published c3 release, by name."""
+    names = {
+        name
+        for target in CLI_TARGETS
+        for name in (_cli_name(target), f"{_cli_name(target)}.sha256")
+    }
+    names.update(("c3-installer.sh", "c3-installer.ps1"))
+    names.update(("fastdb-LICENSE", "fastdb-THIRD_PARTY_NOTICES.txt"))
+    names.add(promote.MANIFEST_NAME)
+    return names
 
 
 def _published_release_world(*, tag_sha: str = OTHER_SHA) -> World:
@@ -926,7 +940,7 @@ def _published_release_world(*, tag_sha: str = OTHER_SHA) -> World:
     inventory = _published_release_inventory(tag_sha)
     world.release_asset_bytes[4100] = inventory["manifest_bytes"]
     assets = []
-    for index, name in enumerate(sorted(promote.expected_release_asset_names())):
+    for index, name in enumerate(sorted(_canonical_release_asset_names())):
         metadata = inventory["api"][name]
         assets.append({
             "id": 4100 if name == promote.MANIFEST_NAME else 4000 + index,
@@ -973,6 +987,7 @@ def run_prepare(
     tmp_path: Path,
     *,
     target: str = "github-release",
+    candidate_run_id: int = 101,
     extra: list[str] | None = None,
     dry_run: bool = False,
 ) -> tuple[int, Path, Path]:
@@ -985,9 +1000,18 @@ def run_prepare(
         argv += ["--release-body-output", str(body)]
     if dry_run:
         argv.append("--dry-run")
-    argv += ["--source-sha", SOURCE_SHA]
+    argv += ["--candidate-run-id", str(candidate_run_id)]
     argv += extra or []
     return promote.main(argv), plan, body
+
+
+def run_check_source(
+    tmp_path: Path, *, extra: list[str] | None = None,
+) -> tuple[int, Path]:
+    plan = tmp_path / "source-check.json"
+    argv = ["check-source", "--source-sha", SOURCE_SHA, "--plan-output", str(plan)]
+    argv += extra or []
+    return promote.main(argv), plan
 
 
 # ── Authenticated GitHub API redirects ────────────────────────────────────────
@@ -1112,16 +1136,22 @@ def test_github_artifact_redirect_refuses_http_downgrade(
 # ── Sequencing and provenance ────────────────────────────────────────────────
 
 
-def test_defers_when_the_other_gate_is_still_running(tmp_path: Path, environment) -> None:
+def test_pending_source_gate_reports_incomplete_and_fails(
+    tmp_path: Path, environment, capsys,
+) -> None:
     world = World()
     world.set_source_runs(
         _run(201, "Source Validation", status="in_progress", conclusion=None),
     )
     api = environment(world)
     code, plan, _ = run_prepare(tmp_path)
-    assert code == promote.EXIT_DEFERRED
+    assert code == 1
     assert not plan.exists()
-    assert any("/actions/workflows/ci.yml/runs" in path for path in api.paths)
+    # The bound run is fetched by identity; there is no deferral exit and no
+    # run scanning.
+    assert f"/repos/{REPOSITORY}/actions/runs/201" in api.paths
+    assert not any("/actions/workflows/" in path for path in api.paths)
+    assert "incomplete" in capsys.readouterr().err
 
 
 def test_failed_or_missing_gate_fails_closed(tmp_path: Path, environment) -> None:
@@ -1169,7 +1199,20 @@ def test_pull_request_candidates_are_rejected(tmp_path: Path, environment) -> No
     world.runs_by_id[101] = pr_run
     world.runs_by_workflow["release-candidate.yml"] = [pr_run]
     environment(world)
-    code, plan, _ = run_prepare(tmp_path, extra=["--candidate-run-id", "101"])
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1
+    assert not plan.exists()
+
+
+def test_push_candidates_are_rejected(tmp_path: Path, environment) -> None:
+    """Push-era candidate runs have no compatibility window: only explicit
+    main dispatches may be promoted."""
+    world = _default_world()
+    push_run = _run(101, "Release Candidate", event="push")
+    world.runs_by_id[101] = push_run
+    world.runs_by_workflow["release-candidate.yml"] = [push_run]
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
     assert code == 1
     assert not plan.exists()
 
@@ -1180,16 +1223,232 @@ def test_source_sha_mismatch_between_requested_run_and_sha_fails(tmp_path: Path,
     world.runs_by_id[101] = other
     world.runs_by_workflow["release-candidate.yml"] = [other]
     environment(world)
-    code, plan, _ = run_prepare(
-        tmp_path, extra=["--candidate-run-id", "101", "--source-sha", SOURCE_SHA])
+    code, plan, _ = run_prepare(tmp_path, extra=["--source-sha", SOURCE_SHA])
     assert code == 1
 
 
 def test_candidate_run_id_resolves_source_sha(tmp_path: Path, environment) -> None:
     environment(_default_world())
-    code, plan, _ = run_prepare(tmp_path, extra=["--candidate-run-id", "101"])
+    code, plan, _ = run_prepare(tmp_path)
     assert code == 0
     assert json.loads(plan.read_text())["source_sha"] == SOURCE_SHA
+
+
+# ── Source-run binding from the candidate context ────────────────────────────
+
+
+def test_promotion_binds_the_context_named_source_validation_run(
+    tmp_path: Path, environment,
+) -> None:
+    api = environment(_default_world())
+    code, plan_path, _ = run_prepare(tmp_path)
+    assert code == 0
+    plan = json.loads(plan_path.read_text())
+    lanes = plan["source_validation"]
+    assert set(lanes) == set(promote.SOURCE_VALIDATION_LANES)
+    # All four platform lanes share the single bound run, fetched by identity.
+    assert {entry["run_id"] for entry in lanes.values()} == {201}
+    assert f"/repos/{REPOSITORY}/actions/runs/201" in api.paths
+    assert not any("/actions/workflows/" in path for path in api.paths)
+
+
+def test_context_named_source_run_must_exist(tmp_path: Path, environment, capsys) -> None:
+    builder = CandidateBuilder(source_validation_run_id=999)
+    world = World(candidate=builder)
+    world.set_source_runs(_run(201, "Source Validation"))
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    assert "999" in capsys.readouterr().err
+
+
+def test_context_named_failed_run_is_not_substituted_by_another_success(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    """The bound run is used even when another successful full run exists for
+    the same source; there is no fallback scan."""
+    builder = CandidateBuilder(source_validation_run_id=202)
+    world = World(candidate=builder)
+    world.set_source_runs(
+        _run(201, "Source Validation"),
+        _run(202, "Source Validation", conclusion="failure"),
+    )
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    err = capsys.readouterr().err
+    assert "202" in err and "not success" in err
+
+
+def test_context_named_policy_only_source_run_is_rejected(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    """A green run without the full source jobs cannot carry the promotion
+    even when its SHA matches and a complete sibling run exists."""
+    builder = CandidateBuilder(source_validation_run_id=202)
+    world = World(candidate=builder)
+    world.set_source_runs(_run(201, "Source Validation"), _run(202, "Source Validation"))
+    world.jobs_by_run = {202: [
+        {"name": "changes", "status": "completed", "conclusion": "success"}]}
+    world.artifacts_by_run.pop(202, None)
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    assert "202" in capsys.readouterr().err
+
+
+# ── check-source: read-only full-source-run resolution ───────────────────────
+
+
+def test_check_source_writes_only_github_metadata(tmp_path: Path, environment) -> None:
+    api = environment(_default_world())
+    code, plan = run_check_source(tmp_path)
+    assert code == 0
+    assert json.loads(plan.read_text()) == {
+        "source_sha": SOURCE_SHA,
+        "run_id": 201,
+        "run_url": f"https://github.com/{REPOSITORY}/actions/runs/201",
+    }
+    # Run listings and job listings only: no artifact bytes are ever touched.
+    assert api.paths
+    assert all("/actions/artifacts/" not in path and not path.endswith("/zip")
+               for path in api.paths)
+    assert any("/actions/workflows/ci.yml/runs" in path for path in api.paths)
+    assert any("/actions/runs/201/jobs" in path for path in api.paths)
+
+
+def test_check_source_accepts_an_explicit_dispatch_source_run(
+    tmp_path: Path, environment,
+) -> None:
+    world = _default_world()
+    world.set_source_runs(_run(201, "Source Validation", event="workflow_dispatch"))
+    environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 0
+    assert json.loads(plan.read_text())["run_id"] == 201
+
+
+def test_check_source_skips_policy_only_green_runs(tmp_path: Path, environment) -> None:
+    """The newest green run is ignored when its job inventory is policy-only;
+    the newest run that actually executed the full source lanes is returned."""
+    world = _default_world()
+    world.set_source_runs(_run(201, "Source Validation"), _run(202, "Source Validation"))
+    world.jobs_by_run = {202: [
+        {"name": "changes", "status": "completed", "conclusion": "success"}]}
+    environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 0
+    assert json.loads(plan.read_text())["run_id"] == 201
+
+
+def test_check_source_rejects_a_policy_only_green_run_as_the_full_gate(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    world = _default_world()
+    world.jobs_by_run = {201: [
+        {"name": "changes", "status": "completed", "conclusion": "success"}]}
+    environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 1 and not plan.exists()
+    assert "policy-only" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("victim", promote.CHECK_SOURCE_REQUIRED_JOBS)
+def test_check_source_requires_the_complete_source_job_inventory(
+    tmp_path: Path, environment, capsys, victim,
+) -> None:
+    world = _default_world()
+    world.jobs_by_run = {201: [
+        {"name": name, "status": "completed", "conclusion": "success"}
+        for name in promote.CHECK_SOURCE_REQUIRED_JOBS if name != victim]}
+    environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 1 and not plan.exists()
+    assert victim in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("victim", ["source (ubuntu-24.04, py3.14t)", "workflow policy"])
+def test_promotion_rechecks_nonartifact_source_jobs(tmp_path, environment, capsys, victim):
+    world = _default_world()
+    world.jobs_by_run = {201: [
+        {"name": name, "status": "completed", "conclusion": "success"}
+        for name in promote.CHECK_SOURCE_REQUIRED_JOBS if name != victim]}
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    assert victim in capsys.readouterr().err
+
+
+def test_check_source_reports_pending_runs_as_incomplete(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    world = World()
+    world.set_source_runs(
+        _run(201, "Source Validation", status="in_progress", conclusion=None))
+    environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 1 and not plan.exists()
+    err = capsys.readouterr().err
+    assert "201=in_progress" in err and "still running" in err
+
+
+def test_check_source_failed_runs_fail_closed(tmp_path: Path, environment) -> None:
+    world = World()
+    world.set_source_runs(_run(201, "Source Validation", conclusion="failure"))
+    environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 1 and not plan.exists()
+
+
+def test_check_source_no_runs_fails_closed(tmp_path: Path, environment) -> None:
+    world = World()
+    world.set_source_runs()
+    environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 1 and not plan.exists()
+
+
+@pytest.mark.parametrize("override", [
+    {"head_branch": "feature"},
+    {"event": "merge_group"},
+    {"event": "pull_request"},
+    {"head_sha": OTHER_SHA},
+    {"path": ".github/workflows/spoof.yml"},
+    {"name": "Windows Native"},
+    {"repository": {"full_name": "attacker/c-two"}},
+    {"head_repository": {"full_name": "attacker/c-two"}},
+])
+def test_check_source_rejects_off_canonical_runs(
+    tmp_path: Path, environment, override,
+) -> None:
+    """Off-main, fork, merge-group, spoofed-path, and foreign-repository runs
+    are filtered out by the canonical query or fail provenance validation."""
+    world = _default_world()
+    world.runs_by_id[201].update(override)
+    environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 1 and not plan.exists()
+
+
+@pytest.mark.parametrize("field, value", [
+    ("GITHUB_REPOSITORY", "attacker/c-two"),
+    ("GITHUB_REF", "refs/heads/feature"),
+    ("GITHUB_TOKEN", ""),
+])
+def test_check_source_requires_canonical_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field, value,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
+    monkeypatch.setenv("GITHUB_REF", promote.EXPECT_REF)
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv(field, value)
+
+    def explode(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("no API access is permitted outside the canonical environment")
+
+    monkeypatch.setattr(promote, "GitHubApi", explode)
+    code, plan = run_check_source(tmp_path)
+    assert code == 1 and not plan.exists()
 
 
 # ── ZIP safety and API digests ───────────────────────────────────────────────
@@ -1344,6 +1603,7 @@ def test_happy_path_github_release_plan(tmp_path: Path, environment) -> None:
             asset["sha256"] for asset in release["assets"]}
     body = body_path.read_text()
     assert "actions/runs/101" in body
+    assert "Source Validation bound run:" in body and "actions/runs/201" in body
     assert "Windows 11 desktop is not verified" in body
     assert "debug c3 build" in body
     assert api.paths
@@ -1424,6 +1684,9 @@ def test_wheel_rows_must_cover_five_platforms_six_abies(tmp_path: Path, environm
         "receipt-counts-tampered",
         "foreign-member",
         "pr-candidate-context",
+        "push-manifest-event",
+        "push-context-event",
+        "missing-source-run-binding",
         "two-fastdb-sdists",
     ],
 )
@@ -1456,6 +1719,16 @@ def test_inventory_and_manifest_deviations_fail_closed(
         context = json.loads(builder.members["rc-context.json"])
         context["pull_request_head_sha"] = OTHER_SHA
         builder._rewrite_json("rc-context.json", context)
+    elif mutation == "push-manifest-event":
+        manifest["event"] = "push"
+    elif mutation == "push-context-event":
+        context = json.loads(builder.members["rc-context.json"])
+        context["event"] = "push"
+        builder._rewrite_json("rc-context.json", context)
+    elif mutation == "missing-source-run-binding":
+        context = json.loads(builder.members["rc-context.json"])
+        context.pop("source_validation_run_id")
+        builder._rewrite_json("rc-context.json", context)
     elif mutation == "two-fastdb-sdists":
         extra = builder._put("fastdb4py-0.2.1.post.tar.gz", b"second sdist")
         manifest["fastdb_proof"].append(extra)
@@ -1466,7 +1739,7 @@ def test_inventory_and_manifest_deviations_fail_closed(
     )
     if mutation in ("wrong-cli-name", "fastdb-license-missing", "manifest-digest-lies",
                     "receipt-counts-tampered", "duplicate-wheel-row", "drop-one-wheel",
-                    "two-fastdb-sdists"):
+                    "push-manifest-event", "two-fastdb-sdists"):
         world.replace_manifest(manifest)
     environment(world)
     code, plan, _ = run_prepare(tmp_path)
@@ -1657,7 +1930,7 @@ def test_missing_source_lane_artifact_fails_closed(tmp_path, environment, capsys
     environment(world)
     code, plan, _ = run_prepare(tmp_path)
     assert code == 1 and not plan.exists()
-    assert f"artifacts missing for ['{label}']" in capsys.readouterr().err
+    assert f"source-{label}-py3.12-full-{SOURCE_SHA}" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
@@ -1666,10 +1939,10 @@ def test_missing_source_lane_artifact_fails_closed(tmp_path, environment, capsys
 def test_source_lane_job_must_complete_successfully(tmp_path, environment, capsys, label, status, conclusion):
     world = _default_world()
     world.jobs_by_run = {201: [
-        {"name": f"source ({lane}, py3.12)",
-         "status": status if lane == label else "completed",
-         "conclusion": conclusion if lane == label else "success"}
-        for lane in promote.SOURCE_VALIDATION_LANES]}
+        {"name": name,
+         "status": status if name == f"source ({label}, py3.12)" else "completed",
+         "conclusion": conclusion if name == f"source ({label}, py3.12)" else "success"}
+        for name in promote.CHECK_SOURCE_REQUIRED_JOBS]}
     environment(world)
     code, plan, _ = run_prepare(tmp_path)
     assert code == 1 and not plan.exists()
@@ -2040,425 +2313,43 @@ def test_dry_run_performs_the_full_read_only_remote_comparison(
     assert any("/git/ref/tags/" in path for path in api.paths)
 
 
-# ── Automatic already-published skip ─────────────────────────────────────────
+# ── Remote collisions with published versions ───────────────────────────────
 
 
-def test_automatic_cli_skips_when_c3_version_already_released_from_older_source(
+def test_collision_with_release_published_from_older_source_fails_closed(
     tmp_path: Path, environment
 ) -> None:
-    """The observed post-merge noise: both gates pass for a main push without
-    a version bump, but c3-v0.2.0 already points at the prior release SHA. The
-    automatic run must finish as an explicit no-publication skip, decided by
-    the early preflight before any candidate artifact download."""
-    api = environment(_published_release_world())
-    code, plan, _ = run_prepare(tmp_path, extra=["--skip-already-published"])
-    assert code == 0
-    payload = json.loads(plan.read_text())
-    assert payload["schema"] == "c-two.release-promotion-plan.v1"
-    assert payload["skip"]["action"] == "skip-already-published"
-    assert payload["skip"]["published_from"] == OTHER_SHA
-    assert payload["skip"]["manifest_sha256"] == _sha(_published_release_manifest(OTHER_SHA))
-    assert payload["skip"]["candidate_bytes_compared"] is False
-    assert payload["versions"] == {"c3_version": C3_VERSION}
-    assert payload["source_sha"] == SOURCE_SHA
-    assert payload["candidate_run"]["id"] == 101
-    # The skip was decided from authenticated reads plus exactly one small
-    # download — the published rc-manifest.json that binds the release to the
-    # tagged source — and no candidate artifact ZIPs were downloaded.
-    assert any(f"/contents/cli/Cargo.toml?ref={SOURCE_SHA}" in path for path in api.paths)
-    assert any("/git/ref/tags/c3-v0.2.0" in path for path in api.paths)
-    asset_downloads = [path for path in api.paths if "/releases/assets/" in path]
-    assert asset_downloads == [f"/repos/{REPOSITORY}/releases/assets/4100"]
-    assert not any("/actions/artifacts/" in path for path in api.paths)
-
-
-def test_manual_dispatch_collision_with_older_release_still_fails(
-    tmp_path: Path, environment
-) -> None:
-    """Without the automatic-only flag the same state fails closed: a manual
-    promotion attempt must be told about the collision, not skip it."""
+    """A version already released from a different source is a hard collision:
+    the tag must never move and the promotion fails closed."""
     environment(_published_release_world())
     code, plan, _ = run_prepare(tmp_path)
     assert code == 1
     assert not plan.exists()
 
 
-@pytest.mark.parametrize(
-    "mutate", ["missing-asset", "foreign-asset", "no-release", "renamed-release"]
-)
-def test_automatic_skip_refuses_incomplete_or_foreign_older_release(
-    tmp_path: Path, environment, mutate: str
-) -> None:
-    """Only a complete, correctly named, foreign-free release may be skipped;
-    incomplete or foreign state needs manual resolution either way."""
-    world = _published_release_world()
-    release = world.releases["c3-v0.2.0"]
-    if mutate == "missing-asset":
-        release["assets"].pop()
-    elif mutate == "foreign-asset":
-        release["assets"].append({"id": 4800, "name": "rogue-asset.bin"})
-    elif mutate == "no-release":
-        world.releases.pop("c3-v0.2.0")
-    elif mutate == "renamed-release":
-        release["name"] = "c3 0.9.9"
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path, extra=["--skip-already-published"])
-    assert code == 1
-    assert not plan.exists()
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        "draft",
-        "prerelease",
-        "zero-size",
-        "missing-digest",
-        "manifest-digest-lie",
-        "manifest-source-mismatch",
-        "manifest-schema-mismatch",
-    ],
-)
-def test_automatic_skip_requires_published_digest_bound_release(
-    tmp_path: Path, environment, mutate: str
-) -> None:
-    """The skip validator demands a published (non-draft, non-prerelease)
-    release whose every canonical asset has positive size and an API sha256
-    digest, and whose retained rc-manifest.json is digest-verified and bound
-    to the tagged source commit."""
-    world = _published_release_world()
-    release = world.releases["c3-v0.2.0"]
-    manifest_asset = next(a for a in release["assets"] if a["name"] == promote.MANIFEST_NAME)
-
-    def rebind(manifest_bytes: bytes) -> None:
-        world.release_asset_bytes[manifest_asset["id"]] = manifest_bytes
-        manifest_asset["size"] = len(manifest_bytes)
-        manifest_asset["digest"] = f"sha256:{_sha(manifest_bytes)}"
-
-    if mutate == "draft":
-        release["draft"] = True
-    elif mutate == "prerelease":
-        release["prerelease"] = True
-    elif mutate == "zero-size":
-        next(a for a in release["assets"] if a["name"] != promote.MANIFEST_NAME)["size"] = 0
-    elif mutate == "missing-digest":
-        next(a for a in release["assets"] if a["name"] != promote.MANIFEST_NAME).pop("digest")
-    elif mutate == "manifest-digest-lie":
-        manifest_asset["digest"] = f"sha256:{_digest('0')}"
-    elif mutate == "manifest-source-mismatch":
-        # A manifest bound to the candidate SHA cannot prove the release came
-        # from the tagged commit.
-        rebind(_published_release_manifest(SOURCE_SHA))
-    elif mutate == "manifest-schema-mismatch":
-        payload = json.loads(_published_release_manifest(OTHER_SHA))
-        payload["schema"] = "c-two.release-candidate.v0"
-        rebind(json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n")
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path, extra=["--skip-already-published"])
-    assert code == 1
-    assert not plan.exists()
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        "replaced-windows-exe",
-        "wrong-sidecar",
-        "wrong-windows-line-ending",
-        "altered-installer",
-        "altered-license",
-        "manifest-missing-cli-entry",
-        "manifest-duplicate-cli-entry",
-        "manifest-entry-without-digest",
-    ],
-)
-def test_automatic_skip_binds_published_assets_to_the_manifest(
-    tmp_path: Path, environment, mutate: str
-) -> None:
-    """Every canonical asset's API digest and byte size must match the
-    published rc-manifest.json: a replaced executable, a wrong sidecar, an
-    altered installer or license, or a missing/duplicate/malformed manifest
-    entry all fail closed."""
-    world = _published_release_world()
-    release = world.releases["c3-v0.2.0"]
-    by_name = {asset["name"]: asset for asset in release["assets"]}
-    manifest_asset = by_name[promote.MANIFEST_NAME]
-
-    def rebind_manifest(payload: dict[str, Any]) -> None:
-        blob = json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n"
-        world.release_asset_bytes[manifest_asset["id"]] = blob
-        manifest_asset["size"] = len(blob)
-        manifest_asset["digest"] = f"sha256:{_sha(blob)}"
-
-    payload = json.loads(world.release_asset_bytes[manifest_asset["id"]])
-    windows_exe = _cli_name(WINDOWS_TARGET)
-    if mutate == "replaced-windows-exe":
-        # A consistently self-described but different asset: the published
-        # manifest still binds the originally released bytes.
-        replacement = b"replaced-windows-executable"
-        by_name[windows_exe]["size"] = len(replacement)
-        by_name[windows_exe]["digest"] = f"sha256:{_sha(replacement)}"
-    elif mutate == "wrong-sidecar":
-        wrong = f"{_digest('0')}  {windows_exe}\r\n".encode()
-        by_name[f"{windows_exe}.sha256"]["size"] = len(wrong)
-        by_name[f"{windows_exe}.sha256"]["digest"] = f"sha256:{_sha(wrong)}"
-    elif mutate == "wrong-windows-line-ending":
-        sha = next(entry["sha256"] for entry in payload["cli"]
-                   if entry["name"] == windows_exe)
-        wrong = f"{sha}  {windows_exe}\n".encode()
-        by_name[f"{windows_exe}.sha256"]["size"] = len(wrong)
-        by_name[f"{windows_exe}.sha256"]["digest"] = f"sha256:{_sha(wrong)}"
-    elif mutate == "altered-installer":
-        by_name["c3-installer.ps1"]["digest"] = f"sha256:{_digest('1')}"
-    elif mutate == "altered-license":
-        by_name["fastdb-LICENSE"]["size"] += 1
-    elif mutate == "manifest-missing-cli-entry":
-        payload["cli"] = [e for e in payload["cli"] if e["name"] != windows_exe]
-        rebind_manifest(payload)
-    elif mutate == "manifest-duplicate-cli-entry":
-        payload["cli"].append(dict(payload["cli"][0]))
-        rebind_manifest(payload)
-    elif mutate == "manifest-entry-without-digest":
-        payload["installers"][0].pop("sha256")
-        rebind_manifest(payload)
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path, extra=["--skip-already-published"])
-    assert code == 1
-    assert not plan.exists()
-
-
-def test_automatic_cli_publishes_new_versions_even_with_the_skip_flag(
+def test_collision_with_pypi_version_published_from_other_bytes_fails_closed(
     tmp_path: Path, environment
 ) -> None:
-    """An unreleased version takes the normal full-verification upload path;
-    the flag only adds the already-published skip outcome."""
-    api = environment(_default_world())
-    code, plan, _ = run_prepare(tmp_path, extra=["--skip-already-published"])
-    assert code == 0
-    payload = json.loads(plan.read_text())
-    assert "skip" not in payload
-    assert payload["github_release"]["action"] == "upload"
-    assert any("/actions/artifacts/" in path for path in api.paths)
-
-
-def test_automatic_cli_same_source_retry_is_not_a_skip(
-    tmp_path: Path, environment
-) -> None:
-    """A tag already pointing at the candidate source is a byte-exact retry:
-    a partial release is completed, never skipped."""
-    environment(_default_world())
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 0
-    assets = json.loads(plan.read_text())["github_release"]["assets"]
-
-    partial = _default_world()
-    partial.tag_refs["c3-v0.2.0"] = {
-        "ref": "refs/tags/c3-v0.2.0", "object": {"sha": SOURCE_SHA, "type": "commit"}}
-    partial.releases["c3-v0.2.0"] = {
-        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "assets": []}
-    kept = assets[:5]
-    for index, asset in enumerate(kept):
-        partial.releases["c3-v0.2.0"]["assets"].append(
-            {"id": 5200 + index, "name": asset["name"]})
-        partial.release_asset_bytes[5200 + index] = (
-            tmp_path / "candidate-download" / asset["staged_path"]).read_bytes()
-    environment(partial)
-    code, plan, _ = run_prepare(tmp_path, extra=["--skip-already-published"])
-    assert code == 0
-    rerun = json.loads(plan.read_text())
-    assert rerun["github_release"]["action"] == "upload"
-    assert {a["name"] for a in rerun["github_release"]["assets"]
-            if a["disposition"] == "upload"} == \
-        {a["name"] for a in assets} - {a["name"] for a in kept}
-
-
-def test_automatic_python_skips_when_c_two_version_already_fully_published(
-    tmp_path: Path, environment
-) -> None:
-    """The Python twin of the observed noise: c-two 0.6.0 already on PyPI.
-    The automatic run skips explicitly before downloading, and the skip makes
-    no claim about whose bytes the registry holds."""
-    api = environment(_published_pypi_world())
-    code, plan, _ = run_prepare(tmp_path, target="pypi", extra=["--skip-already-published"])
-    assert code == 0
-    payload = json.loads(plan.read_text())
-    assert payload["skip"]["action"] == "skip-already-published"
-    assert payload["versions"] == {"c_two_version": C_TWO_VERSION}
-    assert payload["skip"]["published_files"] == 31
-    assert payload["skip"]["candidate_bytes_compared"] is False
-    assert "does not assert" in payload["skip"]["reason"]
-    assert any("/contents/sdk/python/pyproject.toml" in path for path in api.paths)
-    assert not any("/actions/artifacts/" in path for path in api.paths)
-
-
-@pytest.mark.parametrize(
-    "replacement",
-    [
-        "duplicate-row",
-        "unknown-platform",
-        "no-abi-pair",
-    ],
-)
-def test_automatic_pypi_preflight_requires_the_exact_wheel_matrix(
-    tmp_path: Path, environment, replacement: str
-) -> None:
-    """Thirty same-prefix names are not enough: the registry inventory must
-    be the exact 5-platform x 6-ABI matrix for the version. Replacing one
-    required wheel with another same-prefix wheel fails closed before any
-    download."""
-    world = _published_pypi_world()
-    victim = _wheel_name("aarch64-apple-darwin", "3.12")
-    replacement_name = {
-        # A second linux x86_64 cp312 wheel: duplicate matrix row.
-        "duplicate-row":
-            f"c_two-{C_TWO_VERSION}-cp312-cp312-manylinux_2_39_x86_64.whl",
-        # A platform no CLI target maps to.
-        "unknown-platform":
-            f"c_two-{C_TWO_VERSION}-cp312-cp312-win_arm64.whl",
-        # A pure-Python tag with no advertised ABI pair.
-        "no-abi-pair":
-            f"c_two-{C_TWO_VERSION}-py3-none-any.whl",
-    }[replacement]
-    for entry in world.pypi["urls"]:
-        if entry["filename"] == victim:
-            entry["filename"] = replacement_name
-    api = environment(world)
-    code, plan, _ = run_prepare(tmp_path, target="pypi", extra=["--skip-already-published"])
-    assert code == 1
-    assert not plan.exists()
-    assert not any("/actions/artifacts/" in path for path in api.paths)
-
-
-@pytest.mark.parametrize("digest", ["", "0" * 63, "G" * 64])
-def test_automatic_pypi_preflight_rejects_malformed_digest(
-    tmp_path: Path, environment, digest: str
-) -> None:
-    world = _published_pypi_world()
-    world.pypi["urls"][0]["digests"]["sha256"] = digest
-    api = environment(world)
-    code, plan, _ = run_prepare(tmp_path, target="pypi", extra=["--skip-already-published"])
-    assert code == 1
-    assert not plan.exists()
-    assert not any("/actions/artifacts/" in path for path in api.paths)
-
-
-def test_manual_dispatch_pypi_collision_with_published_version_still_fails(
-    tmp_path: Path, environment
-) -> None:
+    """A published registry version is immutable: differing bytes can never be
+    completed from this candidate and the collision fails closed."""
     environment(_published_pypi_world())
     code, plan, _ = run_prepare(tmp_path, target="pypi")
     assert code == 1
     assert not plan.exists()
 
 
-def test_automatic_python_publishes_new_versions_even_with_the_skip_flag(
+def test_remote_classifiers_fail_closed_on_published_versions(
     tmp_path: Path, environment
 ) -> None:
-    environment(_default_world())
-    code, plan, _ = run_prepare(tmp_path, target="pypi", extra=["--skip-already-published"])
-    assert code == 0
-    payload = json.loads(plan.read_text())
-    assert "skip" not in payload
-    assert payload["pypi"]["action"] == "upload"
-
-
-def test_automatic_python_same_source_partial_retry_still_completes(
-    tmp_path: Path, environment
-) -> None:
-    """An incomplete registry version is not a skip: byte-identical files stay
-    verified-existing and the missing ones are still uploaded."""
-    environment(_default_world())
-    code, plan, _ = run_prepare(tmp_path, target="pypi")
-    assert code == 0
-    files = json.loads(plan.read_text())["pypi"]["files"]
-
-    partial = _default_world()
-    partial.pypi = {"urls": [
-        {"filename": files[0]["name"], "digests": {"sha256": files[0]["sha256"]}}]}
-    environment(partial)
-    code, plan, _ = run_prepare(tmp_path, target="pypi", extra=["--skip-already-published"])
-    assert code == 0
-    payload = json.loads(plan.read_text())
-    assert payload["pypi"]["action"] == "upload"
-    missing = [entry["name"] for entry in payload["pypi"]["files"]
-               if entry["disposition"] == "upload"]
-    assert missing == [entry["name"] for entry in files[1:]]
-
-
-def test_automatic_python_incomplete_mismatched_registry_fails_closed(
-    tmp_path: Path, environment
-) -> None:
-    """A partially published version whose bytes differ from the candidate can
-    be completed by neither path: fail closed even for automatic runs."""
-    world = _default_world()
-    world.pypi = {"urls": [
-        {"filename": _wheel_name(CLI_TARGETS[0], PYTHONS[0]),
-         "digests": {"sha256": _digest("0")}}]}
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path, target="pypi", extra=["--skip-already-published"])
-    assert code == 1
-    assert not plan.exists()
-
-
-def test_automatic_python_foreign_registry_files_fail_before_any_download(
-    tmp_path: Path, environment
-) -> None:
-    world = _default_world()
-    world.pypi = {"urls": [
-        {"filename": "foreign-0.6.0-py3-none-any.whl", "digests": {"sha256": _digest("1")}}]}
-    api = environment(world)
-    code, plan, _ = run_prepare(tmp_path, target="pypi", extra=["--skip-already-published"])
-    assert code == 1
-    assert not plan.exists()
-    assert not any("/actions/artifacts/" in path for path in api.paths)
-
-
-def test_cli_and_python_targets_skip_independently(tmp_path: Path, environment) -> None:
-    """The c3 and c-two versions decide independently: a published CLI release
-    does not stop the Python publication, and a published PyPI version does
-    not stop the CLI release."""
-    environment(_published_release_world())
-    code, plan, _ = run_prepare(tmp_path, extra=["--skip-already-published"])
-    assert code == 0
-    assert json.loads(plan.read_text())["skip"]["action"] == "skip-already-published"
-
-    environment(_published_release_world())
-    code, plan, _ = run_prepare(tmp_path, target="pypi", extra=["--skip-already-published"])
-    assert code == 0
-    payload = json.loads(plan.read_text())
-    assert "skip" not in payload and payload["pypi"]["action"] == "upload"
-
-    environment(_published_pypi_world())
-    code, plan, _ = run_prepare(tmp_path, target="pypi", extra=["--skip-already-published"])
-    assert code == 0
-    assert json.loads(plan.read_text())["skip"]["action"] == "skip-already-published"
-
-    environment(_published_pypi_world())
-    code, plan, _ = run_prepare(tmp_path, extra=["--skip-already-published"])
-    assert code == 0
-    payload = json.loads(plan.read_text())
-    assert "skip" not in payload and payload["github_release"]["action"] == "upload"
-
-
-def test_post_verification_classifiers_skip_only_when_allowed(
-    tmp_path: Path, environment
-) -> None:
-    """The remote-state classifiers honor allow_skip themselves, so a tag that
-    moves after the preflight still ends as a skip for automatic runs, while
-    manual dispatches (no allowance) fail closed on the same state."""
+    """The remote-state classifiers themselves never clobber: a tag moved to
+    another commit and registry files held under different bytes both refuse."""
     api = environment(_published_release_world())
     assets = [
         {"name": name, "staged_path": f"staging/{name}", "sha256": _digest("9"), "bytes": 1}
-        for name in sorted(promote.expected_release_asset_names())
+        for name in sorted(_canonical_release_asset_names())
     ]
-    state = promote.github_release_state(
-        api, "c3-v0.2.0", "c3 0.2.0", SOURCE_SHA, assets, allow_skip=True)
-    assert state["action"] == "skip-already-published"
-    assert state["published_from"] == OTHER_SHA
     with pytest.raises(promote.PromotionError, match="refusing to move an existing tag"):
-        promote.github_release_state(
-            api, "c3-v0.2.0", "c3 0.2.0", SOURCE_SHA,
-            [dict(asset) for asset in assets], allow_skip=False)
+        promote.github_release_state(api, "c3-v0.2.0", "c3 0.2.0", SOURCE_SHA, assets)
 
     environment(_published_pypi_world())
     files = [
@@ -2471,107 +2362,8 @@ def test_post_verification_classifiers_skip_only_when_allowed(
     files.append({"name": f"c_two-{C_TWO_VERSION}.tar.gz",
                   "staged_path": f"staging/dist/c_two-{C_TWO_VERSION}.tar.gz",
                   "sha256": _digest("8"), "bytes": 1})
-    state = promote.pypi_state("c-two", C_TWO_VERSION, files, allow_skip=True)
-    assert state["action"] == "skip-already-published"
     with pytest.raises(promote.PromotionError, match="refusing to clobber"):
-        promote.pypi_state("c-two", C_TWO_VERSION,
-                           [dict(entry) for entry in files], allow_skip=False)
-
-    partial = _default_world()
-    partial.pypi = {"urls": [
-        {"filename": files[0]["name"], "digests": {"sha256": _digest("7")}}]}
-    environment(partial)
-    with pytest.raises(promote.PromotionError, match="refusing to clobber"):
-        promote.pypi_state("c-two", C_TWO_VERSION,
-                           [dict(entry) for entry in files], allow_skip=True)
-
-
-def _prepare_reporter_snippet(workflow_name: str, step_name: str) -> str:
-    """Extract the prepare step's output-parser heredoc from one workflow."""
-    step = _extract_step(_workflow_text(workflow_name), step_name)
-    lines = step["run"].splitlines()
-    start = lines.index("python - <<'PY'")
-    end = lines.index("PY", start + 1)
-    return "\n".join(lines[start + 1:end])
-
-
-def _run_reporter(
-    snippet: str, workspace: Path, plan: dict[str, Any],
-) -> subprocess.CompletedProcess:
-    (workspace / "promotion-plan.json").write_text(json.dumps(plan))
-    output = workspace / "outputs.txt"
-    reporter_env = dict(os.environ, GITHUB_OUTPUT=str(output))
-    return subprocess.run(
-        [sys.executable, "-c", snippet], cwd=workspace, env=reporter_env,
-        capture_output=True, text=True,
-    )
-
-
-def test_cli_workflow_reporter_handles_early_and_late_skip_plans(tmp_path: Path) -> None:
-    """The prepare step's output parser reads the skip reason from the
-    selected group: early skips store it under plan["skip"], late race skips
-    under github_release — neither shape may raise."""
-    snippet = _prepare_reporter_snippet(
-        "cli-release.yml", "Verify the tested candidate and stage release bytes")
-    early_group = {
-        "action": "skip-already-published", "tag": "c3-v0.2.0", "title": "c3 0.2.0",
-        "tag_exists": True, "release_exists": True, "published_from": OTHER_SHA,
-        "reason": "early preflight skip reason",
-    }
-    late_group = {
-        "tag": "c3-v0.2.0", "title": "c3 0.2.0", "tag_exists": True,
-        "tag_commit": OTHER_SHA, "release_exists": True, "published_from": OTHER_SHA,
-        "action": "skip-already-published", "assets": [],
-        "reason": "late race skip reason",
-    }
-    for group_key, group, expected in (
-        ("skip", early_group, "early preflight skip reason"),
-        ("github_release", late_group, "late race skip reason"),
-    ):
-        workspace = tmp_path / group_key
-        workspace.mkdir()
-        plan = {"schema": "c-two.release-promotion-plan.v1",
-                "source_sha": SOURCE_SHA, group_key: group}
-        result = _run_reporter(snippet, workspace, plan)
-        assert result.returncode == 0, result.stderr
-        assert f"No publication: {expected}" in result.stdout
-        outputs = (workspace / "outputs.txt").read_text()
-        assert "action=skip-already-published" in outputs
-        assert "tag=c3-v0.2.0" in outputs
-        assert "release_exists=true" in outputs
-
-
-def test_python_workflow_reporter_handles_early_and_late_skip_plans(
-    tmp_path: Path,
-) -> None:
-    """The Python prepare parser reads the skip reason from the selected
-    group: early skips store it under plan["skip"], late race skips under
-    pypi — neither shape may raise."""
-    snippet = _prepare_reporter_snippet(
-        "python-package-release.yml",
-        "Verify the tested candidate and stage distribution files")
-    early_group = {
-        "action": "skip-already-published", "reason": "early pypi skip reason",
-    }
-    late_group = {
-        "project": "c-two", "version": C_TWO_VERSION,
-        "action": "skip-already-published", "files": [],
-        "reason": "late pypi race skip reason",
-    }
-    for group_key, group, expected in (
-        ("skip", early_group, "early pypi skip reason"),
-        ("pypi", late_group, "late pypi race skip reason"),
-    ):
-        workspace = tmp_path / group_key
-        workspace.mkdir()
-        plan = {"schema": "c-two.release-promotion-plan.v1",
-                "source_sha": SOURCE_SHA, group_key: group}
-        result = _run_reporter(snippet, workspace, plan)
-        assert result.returncode == 0, result.stderr
-        assert f"No publication: {expected}" in result.stdout
-        outputs = (workspace / "outputs.txt").read_text()
-        assert "action=skip-already-published" in outputs
-        assert f"source_sha={SOURCE_SHA}" in outputs
+        promote.pypi_state("c-two", C_TWO_VERSION, files)
 
 
 # ── Publish layout roundtrip and fake-gh harness ────────────────────────────
@@ -2770,18 +2562,36 @@ def test_successful_run_cannot_hide_skipped_manifest_job(tmp_path, environment):
     assert code == 1
 
 
-@pytest.mark.parametrize("workflow_file,workflow_name,run_id", [
-    ("release-candidate.yml", "Release Candidate", 101), ("ci.yml", "Source Validation", 201)])
+@pytest.mark.parametrize("workflow_file,workflow_name,run_id,allowed_events", [
+    ("release-candidate.yml", "Release Candidate", 101, (promote.CANDIDATE_EVENT,)),
+    ("ci.yml", "Source Validation", 201, promote.SOURCE_GATE_EVENTS)])
 @pytest.mark.parametrize("override", [{"event": "pull_request"}, {"event": "merge_group"},
                                        {"head_branch": "feature"}, {"head_sha": OTHER_SHA},
                                        {"path": ".github/workflows/spoof.yml"}, {"name": "Windows Native"},
                                        {"repository": {"full_name": "attacker/c-two"}},
                                        {"head_repository": {"full_name": "attacker/c-two"}}])
-def test_gate_rechecks_provenance_returned_by_the_api(override, workflow_file, workflow_name, run_id):
+def test_gate_rechecks_provenance_returned_by_the_api(
+    override, workflow_file, workflow_name, run_id, allowed_events,
+):
     world = _default_world()
     world.runs_by_id[run_id].update(override)
     with pytest.raises(promote.PromotionError):
-        promote.resolve_gate(FakeApi(world), workflow_file, workflow_name, SOURCE_SHA)
+        promote.validate_gate_run(
+            FakeApi(world), world.runs_by_id[run_id], workflow_file, workflow_name,
+            SOURCE_SHA, allowed_events)
+
+
+def test_candidate_gate_rejects_push_events_but_source_gate_accepts_them():
+    world = _default_world()
+    push_candidate = dict(world.runs_by_id[101], event="push")
+    with pytest.raises(promote.PromotionError, match="event"):
+        promote.validate_gate_run(
+            FakeApi(world), push_candidate, "release-candidate.yml", "Release Candidate",
+            SOURCE_SHA, (promote.CANDIDATE_EVENT,))
+    push_source = dict(world.runs_by_id[201], event="push")
+    promote.validate_gate_run(
+        FakeApi(world), push_source, "ci.yml", "Source Validation",
+        SOURCE_SHA, promote.SOURCE_GATE_EVENTS)
 
 
 @pytest.mark.parametrize("workflow_name,group,collection,relative", [
