@@ -1,5 +1,48 @@
 # C-Two 局部精简批次记录与收束
 
+## 纯瘦身收束与当前剩余清单（2026-10-16）
+
+用户确认收束纯瘦身，停止按减行数继续挑批次。最后一个实现提交为 `6afec0f3`（R25 三个 Python prepared-call 入口退役），验收记录提交为 `3382b3ba`。本次筛选基于 `3382b3ba`，没有新的生产代码或测试修改；下表中的行数是静态方案估算，不是已实现的净减量。既有验证仍只绑定各批实现提交，不因本次文档更新扩大结论。
+
+本节是当前状态；后文 2026-10-14 的收束表和 B1–B19 记录保留各阶段的历史事实。完成的子项不代表同编号下所有候选已经完成。剩余项均未获新的实现授权；R01 单独进入复现与方案评估，见 [R01 独立评估](2026-10-16-r01-allocation-release-evaluation.md)。
+
+### 本次筛选后不再单独开批的项目
+
+| 项目 | 当前结论与暂缓理由 | 重新启动条件 |
+| --- | --- | --- |
+| C01 · 私有不可变合同 | 同一本地值的语法重验可删约 18–25 行；受检构造器、六个访问接口和调用点迁移预计使生产代码净增约 20–40 行，测试还需迁移。远端合同、live token、UID/revision、实例与重连校验仍有职责。 | 有独立的公开 Rust 接口设计目标；不能为局部去重改公开字段。 |
+| C02 · 提前 RequestLease | 显式释放保证请求 backing 先于 route/execution permit 归还，chunk 错误路径还须在等待回复前释放。提前包装仍需显式释放和 callback 所有权移交，净减接近零，取消测试增加。 | 单独证明具体取消泄漏或所有权缺陷，再按正确性修复设计；保留跨 await 的 Catalog/Dispatcher 身份检查。 |
+| R14 · handle 只读校验复用 | 私有只读指针 helper 预计使生产减 40–55 行；补齐无效空 handle、allocation 长度、过期世代与错误顺序后，整体预计只减 0–35 行。原始指针借用边界也增加审查负担。 | 与有证据的所有权修复自然合并时再评估；不单独引入 CheckedSpan、缓存或锁证明框架。 |
+| C07 · Python direction/结果形状 | 服务端假 CRM 实例与双向 wrapper 的重新设计需要明确 callable 协议，并处理公开 direction、直接调用、自定义带 binding 方法及测试迁移。整体净收益未证明。普通未包装继承方法不满足 descriptor binding 接纳，不能误称已有正式可运行能力。 | 先决定公开 Python 调用约定；不混入已完成的 HTTP namespace 子项，也不重新把任意自定义编码器作为正式 portable 能力。 |
+| R21 · Resource 模板链 | 生成器仍输出装饰并继承 CRM 的旧模型，AST fallback 读取未保存的 ast_node。整链可毛删约 613 行，但会撤销公开模板生成能力；现有 c2-codegen 不提供等价 Resource skeleton。 | 单独决定修复工具或退役功能；不能把工具层删除记为生产运行时收益。 |
+
+上述判断已做调用链、引入历史和独立原生只读复核。没有形成候选实现或运行新的完整回归，不声明性能提升。
+
+### 其余未完成或明确保留的范围
+
+| 项目 | 剩余范围及处理边界 |
+| --- | --- |
+| R01 | 独立正确性评估中。重新验证错误子块/父块释放及分配重用；区分当前活块匹配与分配实例身份，先提出最小范围与格式影响，确认后实施。 |
+| R02–R04 | 唯一写所有权、shutdown 发送不确定性、登记开放代际仍是独立 P1。不能因现有测试/CI 通过关闭，也不随 R01 自动实施。 |
+| R05–R07、R17–R18 | SHM 布局接纳、导出/释放同步、失败释放的 owner/charge、端点 I/O 分类及 observer 恢复，按各自反例修复。R01 如调整共享布局，只承接该布局安全接纳所必需的边界。 |
+| R09、R10 | relay 配置快照可能改变读取/错误观察时点；注册快照局部去重约 20 行，独立 borrowed 校验、动态 Resource 方法查找及错误顺序有真实职责。继续暂缓。R08 原环境拒绝语义的解析收敛和 R30 已批准子项已经完成。 |
+| R12、R28 剩余 | 已完成可证明的同值重验删除、登记事实与 validated relay 表示收敛；跨 await 的 authority、owner/locality、代际、peer 活性和错误接纳继续保留。新增删除需另证局部不变量。 |
+| R13 剩余 | 请求所有权移动和 IPC 拼帧已完成；响应快照、初始转换及 SHM prepare/send 合并仍需证明快照、取消、panic 和 free/free_at 差异，测试成本与性能收益尚未支持下一批。 |
+| R14 其他、R15、C03、C04 | bitmap 锁证明、GC admission 进度、chunk assembly/pending permit 代际，以及轮询改通知。分别按正确性或性能目标设计，不为精简删除跨进程锁、回收进度、预算与唤醒保护。 |
+| R16 | Node 接收容量须与 readExactly 进度一起设计；直接 pause 可能卡住合法大帧，按容量正确性另立项。 |
+| R19、R20 | CLI 畸形成功响应和示例加载失败后的覆盖行为，属于错误/数据保护修复，不作为纯瘦身执行。 |
+| R22 剩余 | benchmark selector、旧 sweep 和测量标签仅为工具整理。已完成的 SDK 登记/撤回与强制 HTTP 实跑保持。 |
+| R25 剩余 | 三个旧 call_prepared 入口已退役；FastDB 正式路径、Python-only pickle、Core bytes、服务端 sink、Rust 预分配及当前 client/scheduler 适配边界保留。新的协议收窄需独立决定。R23 bridge、R24 旧 buffer 参数链已完成。 |
+| R26 | relay journal 明确保留；旧快照及删除原因有独有信息，未来 watch/list history 尚未退役，也没有支持删除的成本测量。 |
+| R29、R32、R33 剩余 | codegen 同次缓存/typed projection、结构化错误与凭据内部序列化、Python 错误常量及孤立 wrap_error。生成 release 复用、call-control 写入去重和 Rust 错误码单一声明已完成；余项净收益不足，Transport 内外层错误、外部 JSON/wire 与错误顺序仍要保留。 |
+| R34、R35 | peer SHM 私有副本已退出；RouteAck 是尚未退役的公开预留协议，禁用 heartbeat 的任务优化净收益未证实。C05 ABI 4 完整端点能力子项已完成，不借机删除预分配能力。 |
+| R36、R38、R39、C06 剩余 | 已完成的死状态、不可达尾部和 readiness 后等待不再重开；真实等待、维护 EOF/错误退出、操作错误映射和外部 chunk 配置接纳仍有职责。私有 proof 或专属结果类型须先证明整体收益。 |
+| T01–T07 剩余 | 源码词串门禁、假 owner、阻塞读取、重连/GC 负例及默认值证明，随对应正确性事项替换；不为测试行数牺牲行为覆盖。已迁移的真实生命周期、协议边界和手写 golden 不回退。 |
+| 已完成且无新剩余子项 | R11 登记事实、R27 FIFO 后的死计数、R30 已批准配置子项、R31 owner/冻结事实配对、R37 旧发布脚本等，维持各批验收状态。 |
+| 本机历史目录 | 不清理、不重建、不冷切换，也不将未知路径消失认定为原生回收成功。新实验仅处理本次自己创建且可精确识别的资源。 |
+
+后续破坏性 API/ABI/协议变更继续要求对确切实现提交运行 GitHub Actions 的适用 Linux、macOS、Windows 门禁；协议变更不保留旧表示兼容。纯文档收束没有触发新 CI，也没有使用 hey-my-buddy。
+
 ## R25 旧 Python prepared-payload 入口退役（2026-10-16，完成）
 
 执行基线 `3b191b52`，实现候选 `6afec0f36f4b0a21a3b5edc913814c5f8e05bf0b`。按用户确认的 FastDB 架构边界，删除 `CRMProxy.call_prepared`、`CoreClient.call_prepared` 和 `NativePreparedCall.call_prepared`，不留兼容。旧链原为 FastDB-owned write plan 服务，不将任意自定义编码器作为正式能力维护；现行 FastDB Payload、Python-only pickle、Core 字节接口、服务端 sink、Rust 预分配以及自定义 client/scheduler 适配协议保留。预算、期限、快照、释放、Rust API、C/FFI ABI 与 wire 均未改变。
