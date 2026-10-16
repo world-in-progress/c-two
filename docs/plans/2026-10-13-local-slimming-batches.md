@@ -1,5 +1,17 @@
 # C-Two 局部精简批次记录与收束
 
+## R30 派生配置状态与缓存诊断收敛（2026-10-16，完成）
+
+执行基线 `2fc8c4c2`，实现候选 `12c4ffa31360269ea65c77e42dd6720642d19aa7`。用户接受删除公开 Rust `BaseIpcConfig::max_pool_memory`，不留兼容字段或 getter；默认赋值、派生一致性校验及缓存派生字段比较退出。resolver 保留原位置的 checked_mul 及溢出错误文案，Python 已验证配置字典继续计算输出该值。Rust 结构体构造、布局、Debug 和缓存诊断少了该派生字段；18 个真实字段的完整配置比较、名称顺序、浮点行为和 none 诊断保持，配置冻结、实际三个预算、C/FFI ABI、wire 与生命周期不变。
+
+生产新增 31、删除 116，净减 85 行；测试新增 22、删除 38，净减 16 行；非文档合计净减 101 行。缓存诊断复用原有局部宏，以一次字段声明替代名称/两侧字段的重复书写；测试删除派生字段同步赋值、专属计算 helper 和不可再构造的派生字段失配。现有真实池用例增强精确诊断和双字段顺序；既有 Python mapping 用例使用三组独立手写乘积期望。未新增框架或声明性能提升。
+
+调整后的基线通过配置 135、真实缓存 1、Python 配置 106 项。候选本机隔离通过配置 135、IPC 202 + 7、server 160、Core 201、完整 relay 416，共 1121 项 Rust 测试；Core 四个 ignored 项为父测试显式启动的子进程入口。从候选重建 native/CLI 后，Python 配置、真实 runtime、代理、relay/mesh、跨模式、生命周期及端点回归 383 项通过；本地 5 个 Windows 专属项由线上 Windows 门禁覆盖，无非预期失败。 临时差分探针分别编译基线/候选真实诊断函数，对 18 个字段逐项、组合顺序、四种 NaN 和正负零等共 25 组比较得到一致结果，探针未进入仓库。
+
+[GitHub Actions 38851142449](https://github.com/world-in-progress/c-two/actions/runs/38851142449) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。已逐组核对日志：Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁，以及 Ubuntu/Python 3.14t 对应门禁；ordinary、portable、TypeScript 分组均通过，两个 Windows 包含普通用户消费者验证。
+
+独立原生只读审查无 actionable findings，固定补丁 SHA-256 为 `c7da289b51cf762d2e85ff30b43538c1aade722d9d06e14abac6cb6aaba94c2d`。本批作用域 socket/lease 零残留，历史路径快照未变，未使用 buddy。隔离副本仅重定向测试默认路径及对应期望；完整命令、构建哈希、差分结果、审查、计数和端点收据位于 `~/.codex/diagnostics/c2-r30-derived-0435c3f9/`。
+
 ## C07 relay namespace 响应单一来源（2026-10-16，完成）
 
 执行基线 `11e1582a`，实现候选 `e18d401fbe2ac53cfa9dc81e21d3892622786e9d`。用户接受 HTTP 发现协议语义变化：`/_resolve` 仅以严格校验的响应头 `x-c2-local-namespace` 提供整批 namespace，删除逐行 JSON 包装、汇总冲突状态与客户端缺头时的默认域推断。旧 JSON 字段不再读取、校验或回退；缺头或不匹配走 HTTP，重复/非法头仍拒绝。请求过滤、probe 头、HTTP-only 惰性、身份/完整契约/代际检查与释放语义保留；Rust 公开签名、C/FFI ABI 和 IPC wire 不变。
