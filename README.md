@@ -52,12 +52,12 @@ uv pip install 'c-two[fastdb]'
 The same command works in Windows PowerShell. For c3 on Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.sh | sh -s -- --version 0.3.3
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.4/c3-installer.sh | sh -s -- --version 0.3.4
 ```
 
-On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
+On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.4/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.4/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
-These c3 0.3.3 installer links belong to published C-Two 0.7.4. Build c3 from this source branch for testing; upgrade to companion c3 0.3.4 when 0.7.5 is published.
+The installer commands above apply after c3 0.3.4 is published. Build c3 from this source branch for local testing; published c3 0.3.3 belongs to C-Two 0.7.4 and cannot speak this candidate's IPC protocol.
 
 For source builds and tests, see the [development guide](docs/development.md).
 

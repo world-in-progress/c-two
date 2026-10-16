@@ -52,12 +52,12 @@ uv pip install 'c-two[fastdb]'
 Windows PowerShell 使用相同命令。Linux、macOS 的 c3 安装命令：
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.sh | sh -s -- --version 0.3.3
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.4/c3-installer.sh | sh -s -- --version 0.3.4
 ```
 
-Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
+Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.4/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.4/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
 
-以上 c3 0.3.3 安装链接对应已发布的 C-Two 0.7.4。验证本分支时请从源码构建 c3；0.7.5 发布后需同时升级到 c3 0.3.4。
+以上安装命令供 c3 0.3.4 发布后使用。本地验证请从本分支构建 c3；已发布的 c3 0.3.3 对应 C-Two 0.7.4，不能使用本候选的 IPC 协议。
 
 源码构建与测试见[开发指南](docs/development.md)。
 
