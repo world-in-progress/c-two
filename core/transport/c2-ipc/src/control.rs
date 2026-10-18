@@ -29,7 +29,8 @@ pub(crate) fn endpoint_error(error: io::Error) -> IpcError {
 
 enum Exchange {
     Absent,
-    NoReply,
+    NotSent,
+    DispatchUncertain,
     Reply(u32, Vec<u8>),
 }
 
@@ -60,8 +61,17 @@ async fn exchange(
     timeout: Duration,
     signal: &[u8],
 ) -> Result<Exchange, IpcError> {
+    let mut write_started = false;
     let operation = async {
-        let mut stream = match LocalStream::connect(endpoint, timeout).await {
+        let connection = LocalStream::connect(endpoint, timeout);
+        #[cfg(test)]
+        let connection = async {
+            if test_seam::take_connect_refusal(endpoint.address()) {
+                return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+            }
+            connection.await
+        };
+        let mut stream = match connection.await {
             Ok(stream) => stream,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Exchange::Absent);
@@ -71,24 +81,32 @@ async fn exchange(
             }
             // On macOS, ConnectionRefused can mean a live listener's backlog
             // is full. It cannot prove that a server has stopped.
-            Err(_) => return Ok(Exchange::NoReply),
+            Err(_) => return Ok(Exchange::NotSent),
         };
         let frame = frame::encode_frame(0, FLAG_SIGNAL, signal);
+        // A failed or cancelled write can already have delivered the request.
+        write_started = true;
         if stream
             .write_all_with_timeout(&frame, timeout)
             .await
             .is_err()
         {
-            return Ok(Exchange::NoReply);
+            return Ok(Exchange::DispatchUncertain);
         }
         Ok(match read_reply(&mut stream).await {
             Ok((flags, payload)) => Exchange::Reply(flags, payload),
-            Err(_) => Exchange::NoReply,
+            Err(_) => Exchange::DispatchUncertain,
         })
     };
     tokio::time::timeout(timeout, operation)
         .await
-        .unwrap_or(Ok(Exchange::NoReply))
+        .unwrap_or_else(|_| {
+            Ok(if write_started {
+                Exchange::DispatchUncertain
+            } else {
+                Exchange::NotSent
+            })
+        })
 }
 
 // Synchronous probes can run on a thread that already has a Tokio runtime.
@@ -113,7 +131,7 @@ fn blocking<T: Send + 'static>(
 
 /// Test-only seams for the control probes.
 ///
-/// Both seams are keyed by the exact logical address, so a watcher or a
+/// These seams are keyed by the exact logical address, so a watcher or a
 /// fault-injection entry only affects the probe that registered it. There is no
 /// unattributed global hook: other tests in this binary, and their endpoints,
 /// are never observed or changed.
@@ -125,6 +143,24 @@ mod test_seam {
 
     static ABSENT_WATCHERS: OnceLock<Mutex<Vec<(String, mpsc::Sender<()>)>>> = OnceLock::new();
     static ABSENT_RETRY_DISABLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    static CONNECT_REFUSALS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+    /// Exercise the connect-error branch before any control write is attempted.
+    pub(super) fn refuse_connect_once(address: &str) {
+        CONNECT_REFUSALS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert(address.to_owned());
+    }
+
+    pub(super) fn take_connect_refusal(address: &str) -> bool {
+        CONNECT_REFUSALS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .remove(address)
+    }
 
     /// Reports the next `Exchange::Absent` for `address` exactly once.
     pub(super) fn watch_first_absent(address: &str) -> mpsc::Receiver<()> {
@@ -218,7 +254,7 @@ pub fn ping_with_endpoint(endpoint: &LocalEndpoint, timeout: Duration) -> Result
                     }
                     tokio::time::sleep(remaining.min(Duration::from_millis(10))).await
                 }
-                Exchange::NoReply => {
+                Exchange::NotSent | Exchange::DispatchUncertain => {
                     tokio::time::sleep(remaining.min(Duration::from_millis(10))).await
                 }
             }
@@ -273,6 +309,8 @@ pub fn shutdown_with_context(
 
 /// Initiate shutdown of exactly this endpoint. The acknowledgement still proves
 /// initiation only; completion is observed through the server's native barrier.
+/// After a write attempt, a lost acknowledgement returns unconfirmed without
+/// resending; the original server may already have accepted the request.
 pub fn shutdown_with_endpoint(
     endpoint: &LocalEndpoint,
     timeout: Duration,
@@ -301,7 +339,8 @@ pub fn shutdown_with_endpoint(
                     }
                     return Ok(decode_shutdown_ack(&payload).unwrap_or_else(|_| unacknowledged()));
                 }
-                Exchange::NoReply => {
+                Exchange::DispatchUncertain => return Ok(unacknowledged()),
+                Exchange::NotSent => {
                     tokio::time::sleep(remaining.min(Duration::from_millis(10))).await
                 }
             }
@@ -570,9 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_ack_only_proves_initiation_and_retries_dropped_exchange() {
-        for discard_first in [false, true] {
-            let address = address(if discard_first { "retry" } else { "initiate" });
+    fn shutdown_ack_only_proves_initiation_and_retries_before_sending() {
+        for refuse_first in [false, true] {
+            let address = address(if refuse_first { "retry" } else { "initiate" });
+            if refuse_first {
+                test_seam::refuse_connect_once(&address);
+            }
             let expected = DirectShutdownAck {
                 acknowledged: true,
                 shutdown_started: true,
@@ -581,7 +623,7 @@ mod tests {
             };
             let responder = responder(
                 address.clone(),
-                discard_first,
+                false,
                 encode_shutdown_initiate().to_vec(),
                 encode_shutdown_ack(&expected).unwrap(),
             );
@@ -589,8 +631,80 @@ mod tests {
             responder.bind();
             let result = shutdown(&address, PROBE_BUDGET).unwrap();
             responder.stop();
+            assert!(!test_seam::take_connect_refusal(&address));
             assert!(result.acknowledged && result.shutdown_started && !result.server_stopped);
             assert!(result.route_outcomes.is_empty());
         }
+    }
+
+    #[test]
+    fn ping_retries_after_a_dropped_reply() {
+        let address = address("ping-dropped");
+        let responder = responder(
+            address.clone(),
+            true,
+            PING_BYTES.to_vec(),
+            PONG_BYTES.to_vec(),
+        );
+        responder.wait_ready();
+        responder.bind();
+        let result = ping(&address, PROBE_BUDGET);
+        responder.stop();
+        assert!(result.unwrap());
+    }
+
+    async fn shutdown_does_not_replay_to_replacement(hold_reply: bool) {
+        let address = address(if hold_reply {
+            "shutdown-timeout"
+        } else {
+            "shutdown-eof"
+        });
+        let endpoint = local_endpoint_from_ipc_address(&address).unwrap();
+        let mut first = LocalListener::bind(&endpoint).unwrap();
+        let mut probe = tokio::task::spawn_blocking(move || shutdown(&address, PROBE_BUDGET));
+        let mut original = first.accept().await.unwrap();
+        assert_eq!(
+            read_reply(&mut original).await.unwrap().1,
+            encode_shutdown_initiate()
+        );
+        crate::tests::close_listener(first).await;
+        let mut replacement = LocalListener::bind(&endpoint).unwrap();
+        let original = hold_reply.then_some(original);
+        let (resent, result) = tokio::select! {
+            biased;
+            accepted = replacement.accept() => {
+                let mut stream = accepted.unwrap();
+                assert_eq!(read_reply(&mut stream).await.unwrap().1, encode_shutdown_initiate());
+                let ack = DirectShutdownAck {
+                    acknowledged: true,
+                    shutdown_started: true,
+                    server_stopped: false,
+                    route_outcomes: Vec::new(),
+                };
+                stream.write_all(&frame::encode_frame(0, FLAG_SIGNAL | FLAG_RESPONSE,
+                    &encode_shutdown_ack(&ack).unwrap())).await.unwrap();
+                (true, probe.await.unwrap())
+            }
+            result = &mut probe => (false, result.unwrap()),
+        };
+        drop(original);
+        crate::tests::close_listener(replacement).await;
+        assert!(
+            !resent,
+            "a replacement listener received the shutdown replay"
+        );
+        let result = result.unwrap();
+        assert!(!result.acknowledged && !result.shutdown_started && !result.server_stopped);
+        assert!(result.route_outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_ack_eof_does_not_replay_to_replacement() {
+        shutdown_does_not_replay_to_replacement(false).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_outer_timeout_does_not_replay_to_replacement() {
+        shutdown_does_not_replay_to_replacement(true).await;
     }
 }

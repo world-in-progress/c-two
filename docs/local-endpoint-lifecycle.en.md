@@ -30,6 +30,8 @@ The default `Persistent` lifecycle keeps resources available after ordinary clie
 
 `cc.shutdown(timeout=...)` reports native structured completion. A direct IPC admin shutdown ACK proves initiation, without proving that callbacks have drained or shutdown hooks can run. With `completed=False`, the session, bridge, routes and hooks remain available for observing the same transaction again. Listener closure, active work and retained payload leases are separate facts. Endpoint cleanup does not release held or borrowed payloads; their own lease release invalidates FastDB checked views.
 
+Direct IPC admin shutdown retries transient connection failures only before attempting to write the control request. After writing starts, a write failure, lost ACK or timeout returns the existing unconfirmed result without reconnecting and resending; an unconfirmed result does not prove that the server did not execute the request. A replacement instance at the same address therefore cannot receive a replay from this call. Ping retains its probe retries; initial endpoint absence handling and the original total budget are unchanged.
+
 ## Exact cleanup and bounded sweeps
 
 After readiness, call `cc.inspect_endpoint(address)` and save the `EndpointCredential` from a `present` result. `present` describes the observed object without proving process liveness. `WouldBlock` indicates coordinator contention and cannot establish death. After normal exit, or after `kill()` plus an OS `wait()` confirms exit, call `cc.reap_endpoint(address, credential)`. An old credential cannot remove a new incarnation.
