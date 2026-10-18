@@ -465,6 +465,7 @@ Requires Python 3.10 or newer. Keep Python 3.10 compatibility intentional: downs
 
 - Read the existing code before changing it.
 - Prefer `rg` and `rg --files` for repository searches.
+- After testing or a task finishes, promptly remove rebuildable artifacts no longer needed by ongoing work, including Cargo target directories, native libraries, dist bundles, wheels and package archives in temporary validation directories and worktrees. Confirm that no active build, test or runtime still uses them. Preserve source, Git state, test logs, receipts and explicitly retained deliverables; historical IPC directories and coordination files are not build-cleanup targets. Do not accumulate copies of build outputs across completed batches.
 - Keep Python SDKs as glue around Rust mechanisms. Do not move shared transport, resolver, route fallback, or protocol mechanisms into Python SDK code.
 - Use Rust core crates for cross-language behavior so later SDKs do not have to reimplement mechanisms independently.
 - Do not treat the Python SDK as the reference implementation for generic runtime behavior. If behavior is language-neutral, prefer a Rust-core owner with thin SDK facades.
