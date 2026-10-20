@@ -3239,8 +3239,9 @@ mod tests {
                 "relay data-plane must not call IPC bypass API: {forbidden}"
             );
         }
+        let request_path = body.split_once("    match call_result {").unwrap().0;
         assert!(
-            !body.contains("to_bytes("),
+            !request_path.contains("to_bytes("),
             "relay data-plane must not materialize request bodies before IPC forwarding"
         );
         for forbidden in [

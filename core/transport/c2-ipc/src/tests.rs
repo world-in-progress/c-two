@@ -619,8 +619,13 @@ mod response_lease_tests {
 
         assert_eq!(lease.copy_bytes().unwrap(), payload);
         lease.release().unwrap();
-        drop(server_pool);
-        assert_eq!(producer.stats().alloc_count, 1);
+        if expected_dedicated {
+            // The peer sets read_done; the producer owns the dedicated free.
+            producer.release_handle(handle).unwrap();
+            producer.gc_dedicated();
+            assert_eq!(producer.stats().dedicated_segments, 0);
+        }
+        assert_eq!(producer.stats().alloc_count, 0);
     }
 
     #[test]
@@ -3233,6 +3238,74 @@ mod lazy_policy_roundtrip_tests {
         server_rt.block_on(stop_server(&server));
     }
 
+    #[test]
+    fn prealloc_rejects_another_clients_block_before_publication() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (callback, seen) = echo_callback();
+        let base = small_base(64 * 1024, 2);
+        let server = runtime.block_on(start_echo_server(
+            "prealloc_owner",
+            server_config(base.clone(), 1024),
+            callback,
+        ));
+        let config = client_config(base, 1024);
+        let mut a = crate::SyncClient::connect(server.ipc_address(), None, config.clone()).unwrap();
+        let mut b = crate::SyncClient::connect(server.ipc_address(), None, config).unwrap();
+        let binding_a = a
+            .acquire_route(&expected_contract("prealloc_owner"))
+            .unwrap();
+        let binding_b = b
+            .acquire_route(&expected_contract("prealloc_owner"))
+            .unwrap();
+        let block_a = a.pool_alloc_and_write(&[1; 4096]).unwrap();
+        let block_b = b.pool_alloc_and_write(&[2; 4096]).unwrap();
+        let coords = |block: &crate::RequestBlock| {
+            let allocation = block.allocation();
+            (
+                allocation.seg_idx,
+                allocation.generation,
+                allocation.offset,
+                allocation.allocation_id,
+            )
+        };
+        assert_eq!(coords(&block_a), coords(&block_b));
+        let result = b.call_bound_prealloc(&binding_b, "echo", &block_a);
+        let rejected =
+            matches!(&result, Err(IpcError::Pool(message)) if message.contains("request pool"));
+        let received =
+            result.map(|response| b.lease_response(response).into_owned_bytes().unwrap());
+        let calls_after_rejection = seen.lock().len();
+        let allocations = (
+            a.request_pool().unwrap().lock().stats().alloc_count,
+            b.request_pool().unwrap().lock().stats().alloc_count,
+        );
+        if rejected {
+            let response = b.call_bound_prealloc(&binding_b, "echo", &block_b).unwrap();
+            assert_eq!(
+                b.lease_response(response).into_owned_bytes().unwrap(),
+                [2; 4096]
+            );
+            let fresh = a.pool_alloc_and_write(&[3; 4096]).unwrap();
+            let response = a.call_bound_prealloc(&binding_a, "echo", &fresh).unwrap();
+            assert_eq!(
+                a.lease_response(response).into_owned_bytes().unwrap(),
+                [3; 4096]
+            );
+        }
+        drop(block_a);
+        drop(block_b);
+        a.close();
+        b.close();
+        runtime.block_on(stop_server(&server));
+        assert!(rejected, "foreign block reached the server: {received:?}");
+        assert_eq!(calls_after_rejection, 0);
+        assert_eq!(
+            allocations,
+            (0, 1),
+            "failure must release only the original owner"
+        );
+    }
+
     /// A confirmed close detaches idle owner pools so a closed-but-retained
     /// client stops pinning unused mappings and their charge; a reconnect
     /// rebuilds fresh incarnations on the same frozen budget.
@@ -3729,7 +3802,7 @@ mod lazy_policy_roundtrip_tests {
             started = &mut started_rx => {
                 started.expect("callback must start (frame dispatched)");
             }
-            result = client.call_with_prealloc(&identity, method_idx, &block, payload.len()) => {
+            result = client.call_with_prealloc(&identity, method_idx, &block) => {
                 panic!("the call must not complete while the callback stalls: {result:?}");
             }
         }
@@ -4012,7 +4085,7 @@ mod lazy_policy_roundtrip_tests {
 
         let err = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+            client.call_with_prealloc(&identity, method_idx, &block),
         )
         .await
         .expect("a released block must be rejected promptly")
@@ -4068,7 +4141,7 @@ mod lazy_policy_roundtrip_tests {
 
         // Drive the first call to the stalling server: its frame was
         // dispatched and the call parks waiting for the response.
-        let first = client.call_with_prealloc(&identity, method_idx, &block, payload.len());
+        let first = client.call_with_prealloc(&identity, method_idx, &block);
         tokio::pin!(first);
         let mut started_rx = started_rx;
         tokio::select! {
@@ -4079,7 +4152,7 @@ mod lazy_policy_roundtrip_tests {
 
         let err = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+            client.call_with_prealloc(&identity, method_idx, &block),
         )
         .await
         .expect("a re-dispatch must be rejected promptly")
@@ -4144,7 +4217,7 @@ mod lazy_policy_roundtrip_tests {
         held_rx.await.expect("writer slot must be held");
 
         let identity = raw_peer_identity();
-        let call = client.call_with_prealloc(&identity, 0, &block, payload.len());
+        let call = client.call_with_prealloc(&identity, 0, &block);
         tokio::pin!(call);
         use futures_util::FutureExt;
         assert!(
@@ -4398,8 +4471,7 @@ mod lazy_policy_roundtrip_tests {
             release: park_release,
         }));
 
-        let mut call =
-            Box::pin(client.call_with_prealloc(&identity, method_idx, &block, payload.len()));
+        let mut call = Box::pin(client.call_with_prealloc(&identity, method_idx, &block));
         let mut prefix_rx = prefix_rx;
         tokio::select! {
             _ = &mut prefix_rx => {}
@@ -4498,7 +4570,7 @@ mod lazy_policy_roundtrip_tests {
         }));
 
         let identity = raw_peer_identity();
-        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block, payload.len()));
+        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block));
         let mut prefix_rx = prefix_rx;
         tokio::select! {
             _ = &mut prefix_rx => {}
@@ -4854,7 +4926,7 @@ mod lazy_policy_roundtrip_tests {
             let block = Arc::clone(&block);
             std::thread::spawn(move || {
                 let err = old
-                    .call_bound_prealloc(&binding, "echo", &block, 160 * 1024)
+                    .call_bound_prealloc(&binding, "echo", &block)
                     .expect_err("the live request must receive Closed");
                 closed_tx.send((err, old.is_connected())).unwrap();
             })
@@ -4986,7 +5058,7 @@ mod lazy_policy_roundtrip_tests {
         block.write_at(0, &payload).expect("fill the block");
 
         let identity = raw_peer_identity();
-        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block, payload.len()));
+        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block));
         use futures_util::FutureExt as _;
         assert!(
             call.as_mut().now_or_never().is_none(),
@@ -5288,7 +5360,7 @@ mod lazy_policy_roundtrip_tests {
         let spawn_failure = crate::client::dedicated_retire_test_control::fail_worker_spawn();
         let err = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+            client.call_with_prealloc(&identity, method_idx, &block),
         )
         .await
         .expect("the call must fail promptly")
@@ -5316,7 +5388,7 @@ mod lazy_policy_roundtrip_tests {
         block.write_at(0, &payload).expect("fill the block");
         let response = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+            client.call_with_prealloc(&identity, method_idx, &block),
         )
         .await
         .expect("retry must complete")
@@ -5416,7 +5488,7 @@ mod lazy_policy_roundtrip_tests {
             );
             match timeout(
                 Duration::from_secs(5),
-                client.call_with_prealloc(&identity, method_idx, &second_block, 4096),
+                client.call_with_prealloc(&identity, method_idx, &second_block),
             )
             .await
             {
@@ -5456,7 +5528,7 @@ mod lazy_policy_roundtrip_tests {
         let _ = release_tx.send(());
         let response = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &retry_block, 4096),
+            client.call_with_prealloc(&identity, method_idx, &retry_block),
         )
         .await
         .expect("retry must complete")

@@ -44,7 +44,7 @@ Host 在仓库外使用真实 `c2-mem` path dependency，编译了带 `#![forbid
 | 表面 | 计划变化 |
 | --- | --- |
 | 公开 Rust `c2-mem` | 破坏性变更：不能再手造/修改坐标型 MemHandle；长度更新收窄；raw 访问/释放调用须在明确不安全前提下使用。正常分配、借用、写入、收缩和释放有一个 owner 入口，不留旧签名兼容 |
-| 公开 Rust `c2-server` / `c2-ipc` | SHM 变体、低层手工准备响应、lease 的 pool 绑定及公开 raw 方法发生变化；外部低层消费者须迁移。现有高层 Rust SDK 的 connect/call/held 和生成合同签名不需要改变 |
+| 公开 Rust `c2-server` / `c2-ipc` | SHM 变体、低层手工准备响应、lease 的 pool 绑定及公开 raw 方法发生变化；`SyncClient::connect/connect_with_endpoint` 移入 `Option<MemPool>`，`call_bound_prealloc` 删除重复长度参数并使用块的原始请求长度。外部低层消费者须迁移。现有高层 Rust SDK 的 connect/call/held 和生成合同签名不需要改变 |
 | Python | 正式 FastDB、pickle、Core bytes 与高层调用接口保持。低层 PoolAlloc/raw 地址是现有坐标能力，不因 Rust owner 迁移获得新的唯一写保证；绑定内部 raw 调用与安全说明同步更新，不新增 Python owner 注册表 |
 | C/FFI 与 Node/TypeScript | 预计维持 ABI 5、现有符号与 descriptor 布局。C 函数本来就是 Rust `unsafe extern C` 边界；补齐并核对原有独占访问、存活期和移交责任，保留现有内部锁/所有权表，不能用 C 边界包装出任意 safe Rust 访问 |
 | SHM / IPC wire | 维持 SHM 3、IPC 12；现有 identity 字段足够，计划不增加表示或兼容分支 |
@@ -87,7 +87,7 @@ Host 在仓库外使用真实 `c2-mem` path dependency，编译了带 `#![forbid
 | 基线反例 | 正向消费者可编译；独立非法所有权/原始访问/上层构造案例在旧实现被接纳，目标断言如实报红；保留源码与日志 | 已完成：1 个合法正例、2 个借用/移动控制例、13 个漏洞反例；初始 10 条门禁如实报红，补充 3 条逐例在基线编译通过 |
 | 所有权迁移 | 私有 owner、raw 边界、发布/接收载体及全部直接消费者一次迁移；定向回归通过 | 定向通过：334 项 memory/wire、1 项文档测试、16 条编译探针、3 项 prepared reply 和持有回复跨重连 |
 | 候选验证 | 完整 relay、真实跨语言/持久连接、同环境性能与布局对照；socket/lease 零残留 | 进行中 |
-| 线上与独立审查 | 确切候选的适用 GitHub Actions 全部门禁及独立边界审查通过，处理全部阻断发现 | 待开始 |
+| 线上与独立审查 | 确切候选的适用 GitHub Actions 全部门禁及独立边界审查通过，处理全部阻断发现 | 首轮发现预分配边界遗漏，已修正工作稿；原 CI 取消，等待新候选验证 |
 | 收尾 | 最终验收记录、实际代码增量和开销；清理不再使用的本次构建产物后提交 | 待开始 |
 
 本次诊断根目录为 `~/.codex/diagnostics/c2-r02-implementation-20261021-1zef_zmt/`。本机完整回归在隔离副本中仅重定向默认测试命名空间及对应路径期望，保留替换清单和源码哈希；GitHub Actions 验证未替换的候选源码。历史目录只核对原目录元数据，不扫描内部对象，也不参与任何清理。
@@ -99,3 +99,7 @@ Host 在仓库外使用真实 `c2-mem` path dependency，编译了带 `#![forbid
 本地 owner 身份从初稿的 UUID 比较收敛为不复用的进程内 `u64` 序号，使用 checked atomic update 在耗尽时拒绝继续创建；每个 pool 一次，不在每次分配上做原子操作。已有 UUID 仍只用于原 OS 命名和协议身份，没有改 SHM/IPC/C ABI。`MemHandle` 保留真实 `PoolAllocation` 元数据；`alloc_shm_handle()` 直接复用原 `alloc()` 的 GC、预算和错误路径。纯指针查询保持 safe，底层未检查偏移的 `add` 改成不解引用的 `wrapping_add`；实际 raw 读、释放、映射接纳承担明确 unsafe 前提。
 
 生产实现草稿的独立任务未予验收。Host 预审发现新增的 `try_release_handle(&mut MemHandle)` 在成功释放后仍保留可用 owner，并发现 GC、原始槽位和多余测试包装层未收敛；停止该任务、保存未验证补丁后由 Host 修正。最终工作稿不包含这一接口、第二套 RequestBlock handle 锁或 test_raw 包装层。`ReassemblyBacking` 继续在其原有私有 state 中执行释放，失败保留 owner/charge，成功后按原顺序 drop；普通 `release_handle` 的既有失败策略保持，R07 未夹带修复。独立审查及完整候选验收尚待完成。
+
+首轮固定候选 `047cd58b` 的独立审查发现三条预分配入口尚未封闭。补充基线证据确认：共享注入池在 fill callback 内 destroy、发布时扩大长度仍可编译；真实双客户端测试中，A 的块经 B 发布会读取 B 池内相同坐标的数据。前两条不执行危险内存访问；后一条使用独立块与正常复制，结束时先关闭连接和服务器，再报告预期红例。候选改为移动注入池、从 owner 取长度、在 writer 锁内核对请求池归属后才执行原 dispatch/permit 事务。错误释放继续回到块的原池，未新增 payload 拷贝、owner 锁或状态机。
+
+完整 Core 回归同时发现两处测试迁移问题：响应 lease 的 buddy 释放断言错误，以及禁止请求物化的文本检查误匹配新的响应 `into_bytes()`。已恢复 buddy 真实分配计数归零、dedicated 经 read_done 后原生释放回收的断言，并将文本检查限定到请求转发段；未跳过测试或改变生产 relay 逻辑。首轮候选未验收，GitHub Actions run `39470524323` 已取消。

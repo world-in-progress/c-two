@@ -183,10 +183,11 @@ const _: () = {
 };
 
 impl SyncClient {
-    /// Connect to a server with optional pool for SHM transfers.
+    /// Connect, taking ownership of an optional pool for SHM transfers.
+    /// No mutable pool alias may survive while a fill callback borrows its storage.
     pub fn connect(
         address: &str,
-        pool: Option<Arc<Mutex<MemPool>>>,
+        pool: Option<MemPool>,
         config: ClientIpcConfig,
     ) -> Result<Self, IpcError> {
         Self::connect_with_endpoint(
@@ -199,7 +200,7 @@ impl SyncClient {
     /// Connect using the caller's already-derived, immutable platform endpoint.
     pub fn connect_with_endpoint(
         endpoint: c2_config::LocalEndpoint,
-        pool: Option<Arc<Mutex<MemPool>>>,
+        pool: Option<MemPool>,
         config: ClientIpcConfig,
     ) -> Result<Self, IpcError> {
         let rt = get_or_create_runtime();
@@ -214,11 +215,13 @@ impl SyncClient {
     /// Share construction with pure policy tests without performing connection I/O.
     fn client_for_endpoint(
         endpoint: c2_config::LocalEndpoint,
-        pool: Option<Arc<Mutex<MemPool>>>,
+        pool: Option<MemPool>,
         config: ClientIpcConfig,
     ) -> IpcClient {
         match pool {
-            Some(pool) => IpcClient::with_endpoint_and_pool(endpoint, pool, config),
+            Some(pool) => {
+                IpcClient::with_endpoint_and_pool(endpoint, Arc::new(Mutex::new(pool)), config)
+            }
             None => IpcClient::with_endpoint(endpoint, config),
         }
     }
@@ -438,14 +441,15 @@ impl SyncClient {
         let _ = block.release();
     }
 
-    /// Synchronous CRM call with pre-allocated SHM data through an immutable route binding.
+    /// Publish the block's original requested length through its allocating
+    /// connection and an immutable route binding.
     pub fn call_bound_prealloc(
         &self,
         binding: &RouteBinding,
         method_name: &str,
         block: &RequestBlock,
-        data_size: usize,
     ) -> Result<ResponseData, IpcError> {
+        let data_size = block.len();
         let (method_idx, identity) = match (|| {
             let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
             let data_size_u64 = u64::try_from(data_size).unwrap_or(u64::MAX);
@@ -463,10 +467,8 @@ impl SyncClient {
                 return Err(err);
             }
         };
-        self.rt.block_on(
-            self.inner
-                .call_with_prealloc(&identity, method_idx, block, data_size),
-        )
+        self.rt
+            .block_on(self.inner.call_with_prealloc(&identity, method_idx, block))
     }
 
     /// The transport-owned request pool this client currently holds, if any.
@@ -894,16 +896,15 @@ pub(crate) mod tests {
     fn sync_client_factory_with_external_pool_preserves_snapshot_and_policy_gate() {
         let endpoint = factory_test_endpoint();
         let config = factory_test_config();
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+        let pool = MemPool::new_with_prefix_and_budget(
             config.base.primary_pool_config(&config.pool_tuning()),
             "sync-factory-injected".into(),
             c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits()),
-        )));
-        let client =
-            SyncClient::client_for_endpoint(endpoint.clone(), Some(pool.clone()), config.clone());
+        );
+        let client = SyncClient::client_for_endpoint(endpoint.clone(), Some(pool), config.clone());
         assert_eq!(client.config(), &config);
         assert_eq!(client.local_endpoint().unwrap(), &endpoint);
-        assert!(Arc::ptr_eq(&client.request_pool().unwrap(), &pool));
+        let pool = client.request_pool().unwrap();
         assert!(!pool.lock().config().buddy_enabled);
 
         // Both injected-pool rejections occur before OS connection or allocation.
@@ -917,19 +918,16 @@ pub(crate) mod tests {
             config.validate().unwrap();
             let mut pool_config = config.base.primary_pool_config(&config.pool_tuning());
             pool_config.buddy_enabled = buddy_enabled;
-            let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+            let pool = MemPool::new_with_prefix_and_budget(
                 pool_config,
                 "sync-factory-rejected".into(),
                 c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits()),
-            )));
-            let mut client = SyncClient::client_for_endpoint(
-                endpoint.clone(),
-                Some(pool.clone()),
-                config.clone(),
             );
+            let mut client =
+                SyncClient::client_for_endpoint(endpoint.clone(), Some(pool), config.clone());
             assert_eq!(client.config(), &config);
             assert_eq!(client.local_endpoint().unwrap(), &endpoint);
-            assert!(Arc::ptr_eq(&client.request_pool().unwrap(), &pool));
+            let pool = client.request_pool().unwrap();
             let error = get_or_create_runtime()
                 .block_on(client.connect())
                 .unwrap_err();
@@ -992,7 +990,7 @@ pub(crate) mod tests {
             .bind_cached_route(&expected)
             .expect("cached test route should bind");
         let err = client
-            .call_bound_prealloc(&binding, "ping", &alloc, 5)
+            .call_bound_prealloc(&binding, "ping", &alloc)
             .unwrap_err();
 
         assert!(err.to_string().contains("max_payload_size"));

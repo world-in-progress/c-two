@@ -80,6 +80,14 @@ const CASES: &[(&str, Probe)] = &[
         "vuln_dedicated_rebind_after_destroy",
         Probe::Fails(&["E0133"]),
     ),
+    (
+        "vuln_injected_pool_destroy_during_fill",
+        Probe::Fails(&["E0308"]),
+    ),
+    (
+        "vuln_prealloc_published_span_expansion",
+        Probe::Fails(&["E0061"]),
+    ),
 ];
 
 struct Temp(PathBuf);

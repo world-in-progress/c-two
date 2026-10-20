@@ -1430,6 +1430,10 @@ impl RequestBlock {
         &self.release.alloc
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.release.handle.len()
+    }
+
     /// Whether the allocation lives in a dedicated (non-buddy) segment.
     pub fn is_dedicated(&self) -> bool {
         self.release.alloc.is_dedicated
@@ -3903,7 +3907,7 @@ impl IpcClient {
         // releases through the owning pool while it is still armed.
         block.write_at(0, data)?;
 
-        self.call_with_prealloc_controlled(identity, method_idx, &block, data.len(), control)
+        self.call_with_prealloc_controlled(identity, method_idx, &block, control)
             .await
     }
 
@@ -3983,7 +3987,7 @@ impl IpcClient {
         // Preparation errors above are proven unpublished. Once the actual
         // send function takes over, preserve its existing error classification
         // and conservative ownership of any partially published buddy frame.
-        self.call_with_prealloc(identity, method_idx, &block, data_size)
+        self.call_with_prealloc(identity, method_idx, &block)
             .await
             .map_err(classified_call_error)
     }
@@ -4012,9 +4016,8 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         block: &RequestBlock,
-        data_size: usize,
     ) -> Result<ResponseData, IpcError> {
-        self.call_with_prealloc_controlled(identity, method_idx, block, data_size, None)
+        self.call_with_prealloc_controlled(identity, method_idx, block, None)
             .await
     }
 
@@ -4023,9 +4026,9 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         block: &RequestBlock,
-        data_size: usize,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, IpcError> {
+        let data_size = block.len();
         if data_size > u32::MAX as usize {
             let _ = block.release();
             return Err(IpcError::Config(format!(
@@ -4077,6 +4080,16 @@ impl IpcClient {
         let send_result: Result<(), IpcError> = async {
             let mut writer_guard = self.writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
+            if !self
+                .pool
+                .lock()
+                .as_ref()
+                .is_some_and(|pool| Arc::ptr_eq(pool, &block.release.pool))
+            {
+                return Err(IpcError::Pool(
+                    "request block belongs to a different request pool".into(),
+                ));
+            }
             // Before publication, a dedicated block must hold a bounded
             // retention slot. Saturation (or an unavailable retire worker)
             // fails the call while it is still unpublished, so the defined
@@ -7892,7 +7905,7 @@ mod tests {
             .expect("allocation attempt")
             .expect("the replacement pool serves the next allocation");
         let err = client
-            .call_with_prealloc(&prealloc_race_identity(), 0, &current, 32)
+            .call_with_prealloc(&prealloc_race_identity(), 0, &current)
             .await
             .expect_err("the confirmed close cleared the writer");
         assert!(matches!(err, IpcError::Closed), "unexpected error: {err:?}");
@@ -8305,7 +8318,7 @@ mod tests {
         abort.abort();
 
         let err = client
-            .call_with_prealloc(&prealloc_race_identity(), 0, &block, payload.len())
+            .call_with_prealloc(&prealloc_race_identity(), 0, &block)
             .await
             .expect_err("the aborted stream must fail the frame write");
         assert!(
