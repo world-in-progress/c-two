@@ -12,7 +12,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use c2_config::{CallExecutionLimits, ClientIpcConfig, LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, RouteBinding};
-use c2_mem::MemPool;
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
     RouteBuildSpec, SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
@@ -107,7 +106,7 @@ struct Probe {
     release: [parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>; 2],
     input_kind: AtomicUsize,
     response_kind: AtomicUsize,
-    response_pool: parking_lot::Mutex<Option<Arc<parking_lot::RwLock<MemPool>>>>,
+    response_pool: parking_lot::Mutex<Option<Arc<c2_server::ResponsePool>>>,
 }
 
 impl CrmCallback for Probe {
@@ -116,7 +115,7 @@ impl CrmCallback for Probe {
         _: &str,
         method: u16,
         input: RequestData,
-        response_pool: Arc<parking_lot::RwLock<MemPool>>,
+        response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         let kind = match &input {
             RequestData::Inline(_) => 1,
@@ -1151,7 +1150,7 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
             let pool = fixture.probe.response_pool.lock().as_ref().unwrap().clone();
             eventually(|| pool.read().stats().alloc_count == 0).await;
             if carrier == Carrier::Dedicated {
-                eventually(|| { pool.write().gc_dedicated(); fixture.server.memory_budget_snapshot().budget.shm.used_bytes == 0 }).await;
+                eventually(|| { unsafe { pool.write() }.gc_dedicated(); fixture.server.memory_budget_snapshot().budget.shm.used_bytes == 0 }).await;
             }
         }
         let memory = fixture.state.upstream_memory_snapshot();

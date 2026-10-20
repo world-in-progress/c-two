@@ -1012,7 +1012,7 @@ mod tests {
             _: &str,
             method: u16,
             request: c2_server::RequestData,
-            _: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            _: Arc<c2_server::ResponsePool>,
         ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
             let mut owner = c2_server::RequestLease::new(request);
             if method == 0 {
@@ -1362,7 +1362,7 @@ mod tests {
                 }
             }
             drop(lease_b);
-            let pool = client.request_pool_for_test().unwrap();
+            let pool = unsafe { client.request_pool_for_test() }.unwrap();
             let allocations = pool.lock().stats().alloc_count;
             assert!(allocations > 0, "inflight A owns a real SHM request");
             if watch_unavailable {
@@ -1549,7 +1549,7 @@ mod tests {
             _route_name: &str,
             _method_idx: u16,
             request: c2_server::RequestData,
-            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
             let transport = match &request {
                 c2_server::RequestData::Shm(shm) if shm.is_dedicated() => "dedicated",

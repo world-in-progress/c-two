@@ -125,7 +125,7 @@ The production call APIs are route-bound:
 
 ```rust
 call_bound(binding: &RouteBinding, method: &str, payload: &[u8])
-call_bound_prealloc(binding: &RouteBinding, method: &str, alloc, data_size)
+call_bound_prealloc(binding: &RouteBinding, method: &str, block: &RequestBlock)
 call_bound_sized_stream(binding: &RouteBinding, method: &str, len, stream)
 ```
 

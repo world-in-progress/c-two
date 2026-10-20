@@ -235,7 +235,7 @@ pub struct Server {
     chunk_registry: Arc<c2_wire::chunk::ChunkRegistry>,
     /// **parking_lot sync RwLock** — guards SHM memory pool; blocking `.read()`
     /// / `.write()` (no `.await`).  Safe to hold briefly inside tokio tasks.
-    response_pool: Arc<parking_lot::RwLock<MemPool>>,
+    response_pool: Arc<crate::ResponsePool>,
     /// Shared transport memory context charged by the response pool, the
     /// reassembly pool inside `chunk_registry`, and response prewarm. One
     /// server direction, one budget; it owns only accounting counters and is
@@ -508,7 +508,7 @@ impl Server {
             conn_counter: AtomicU64::new(0),
             route_registration: Mutex::new(()),
             chunk_registry,
-            response_pool: Arc::new(parking_lot::RwLock::new(response_pool)),
+            response_pool: Arc::new(crate::ResponsePool::new(response_pool)),
             memory_budget,
             pending_routes: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_requests,
@@ -1269,7 +1269,7 @@ impl Server {
     }
 
     /// Get a shared reference to the response pool (for zero-copy dispatch).
-    pub fn response_pool_arc(&self) -> Arc<parking_lot::RwLock<MemPool>> {
+    pub fn response_pool_arc(&self) -> Arc<crate::ResponsePool> {
         Arc::clone(&self.response_pool)
     }
 
@@ -1366,7 +1366,7 @@ impl Server {
                         let stats = gc_server.chunk_registry.gc_sweep();
                         let released_route_pending = gc_server.sweep_stale_chunk_route_pending();
                         {
-                            let mut response_pool = gc_server.response_pool.write();
+                            let mut response_pool = gc_server.response_pool.inner.write();
                             response_pool.gc_buddy();
                             response_pool.gc_dedicated();
                         }
@@ -3997,7 +3997,7 @@ async fn write_reply_with_data(
 /// data, send 23-byte generation and allocation-bearing pointer metadata. The caller chooses inline or chunked
 /// fallback when SHM is unavailable.
 async fn write_buddy_reply_with_data(
-    response_pool: &parking_lot::RwLock<MemPool>,
+    response_pool: &crate::ResponsePool,
     writer: &Arc<Mutex<LocalWriteHalf>>,
     request_id: u64,
     data: &[u8],
@@ -4012,7 +4012,7 @@ async fn write_buddy_reply_with_data(
 
     // 1. Allocate from the response pool as the unique write owner.
     let handle = {
-        let mut pool = response_pool.write();
+        let mut pool = response_pool.inner.write();
         pool.alloc_shm_handle(data.len())
     };
     let mut handle = match handle {
@@ -4039,7 +4039,7 @@ async fn write_buddy_reply_with_data(
     };
     if !write_ok {
         {
-            let mut pool = response_pool.write();
+            let mut pool = response_pool.inner.write();
             // Only this exact owner may authorize the raw release.
             if pool.validate_handle(&handle).is_ok() {
                 let _ = unsafe { pool.free(&allocation) };
@@ -4062,7 +4062,7 @@ async fn write_buddy_reply_with_data(
     let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
     let frame = frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
     if let Err(err) = writer.lock().await.write_all(&frame).await {
-        let mut pool = response_pool.write();
+        let mut pool = response_pool.inner.write();
         // Only this exact owner may authorize the raw release.
         if pool.validate_handle(&handle).is_ok() {
             let _ = unsafe { pool.free(&allocation) };
@@ -4076,7 +4076,7 @@ async fn write_buddy_reply_with_data(
     //    now. A published buddy backing transfers its cross-process release
     //    to the client, so its owner value is dropped without freeing.
     if handle.is_dedicated() {
-        let mut pool = response_pool.write();
+        let mut pool = response_pool.inner.write();
         // Only this exact owner may authorize the raw release.
         if pool.validate_handle(&handle).is_ok() {
             let _ = unsafe { pool.free(&allocation) };
@@ -4132,7 +4132,7 @@ async fn write_chunked_reply(
 
 /// Dispatch a `ResponseMeta` to the appropriate reply path.
 async fn send_response_meta(
-    response_pool: &parking_lot::RwLock<MemPool>,
+    response_pool: &crate::ResponsePool,
     writer: &Arc<Mutex<LocalWriteHalf>>,
     request_id: u64,
     meta: ResponseMeta,
@@ -4159,7 +4159,7 @@ async fn send_response_meta(
         ResponseMeta::ShmAlloc(prepared) => {
             let data_size = prepared.data_size();
             if u64::from(data_size) > max_payload_size {
-                let mut pool = response_pool.write();
+                let mut pool = response_pool.inner.write();
                 let _ = prepared.release_through(&mut pool);
                 return Err(ResponseSendError::UserVisible(format!(
                     "response payload size {data_size} exceeds max_payload_size {max_payload_size}"
@@ -4190,7 +4190,7 @@ async fn send_response_meta(
             let frame =
                 frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
             if let Err(err) = writer.lock().await.write_all(&frame).await {
-                let mut pool = response_pool.write();
+                let mut pool = response_pool.inner.write();
                 let _ = prepared.release_through(&mut pool);
                 return Err(ResponseSendError::Transport(format!(
                     "prepared SHM reply write failed: {err}"
@@ -4202,7 +4202,7 @@ async fn send_response_meta(
             // cross-process release to the receiving client: dropping the
             // owner here without freeing hands over exactly that.
             if prepared.is_dedicated() {
-                let mut pool = response_pool.write();
+                let mut pool = response_pool.inner.write();
                 let _ = prepared.release_through(&mut pool);
             } else {
                 // Consume the owner at the publish boundary: the value is
@@ -4217,7 +4217,7 @@ async fn send_response_meta(
 
 /// Choose buddy SHM or inline reply based on data size and threshold.
 async fn smart_reply_with_data(
-    response_pool: &parking_lot::RwLock<MemPool>,
+    response_pool: &crate::ResponsePool,
     writer: &Arc<Mutex<LocalWriteHalf>>,
     request_id: u64,
     data: &[u8],
@@ -4422,8 +4422,8 @@ mod tests {
         format!("/c2sw{:04x}{:04x}", std::process::id() as u16, n as u16) + label
     }
 
-    fn small_response_pool(label: &str) -> parking_lot::RwLock<MemPool> {
-        parking_lot::RwLock::new(MemPool::new_with_prefix(
+    fn small_response_pool(label: &str) -> crate::ResponsePool {
+        crate::ResponsePool::new(MemPool::new_with_prefix(
             PoolConfig {
                 segment_size: 64 * 1024,
                 min_block_size: 4096,
@@ -5022,7 +5022,7 @@ mod tests {
             _: &str,
             _: u16,
             _request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            _response_pool: Arc<crate::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(b"echo".to_vec()))
         }
@@ -5432,7 +5432,7 @@ mod tests {
                 _: &str,
                 _: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(ResponseMeta::Inline(b"should-not-run".to_vec()))
@@ -5494,7 +5494,7 @@ mod tests {
                 _: &str,
                 _: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(ResponseMeta::Inline(b"should-not-run".to_vec()))
@@ -5568,7 +5568,7 @@ mod tests {
                 _: &str,
                 _: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(current, Ordering::SeqCst);
@@ -5681,7 +5681,7 @@ mod tests {
                 route_name: &str,
                 _: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 if route_name == "grid_a" {
                     self.route_a_started.fetch_add(1, Ordering::SeqCst);
@@ -5859,7 +5859,7 @@ mod tests {
                 route_name: &str,
                 _: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 if route_name == "grid_a" {
                     self.route_a_started.fetch_add(1, Ordering::SeqCst);
@@ -6088,7 +6088,7 @@ mod tests {
                 _: &str,
                 _: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 self.started.fetch_add(1, Ordering::SeqCst);
 
@@ -6219,7 +6219,7 @@ mod tests {
                 route_name: &str,
                 _: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 if route_name == "grid_a" {
                     self.route_a_started.fetch_add(1, Ordering::SeqCst);
@@ -6331,7 +6331,7 @@ mod tests {
                 route_name: &str,
                 _: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 if route_name == "grid_a" {
                     self.route_a_started.fetch_add(1, Ordering::SeqCst);
@@ -6488,7 +6488,7 @@ mod tests {
                 _: &str,
                 _: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 self.started.fetch_add(1, Ordering::SeqCst);
 
@@ -7100,7 +7100,7 @@ mod tests {
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
         use c2_wire::handshake::encode_client_handshake;
 
-        let mut peer_pool = small_response_pool("rq").into_inner();
+        let mut peer_pool = small_response_pool("rq").inner.into_inner();
         let server = ordering_test_server("ipc://peer_geometry", 4);
         let (stream, mut client) = LocalStream::pair().await.unwrap();
         let (_reader, writer) = stream.into_split();
@@ -7191,7 +7191,7 @@ mod tests {
                 route_name: &str,
                 method_idx: u16,
                 request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 assert_eq!(route_name, "grid");
                 assert_eq!(method_idx, 0);
@@ -7646,7 +7646,7 @@ mod tests {
             _: &str,
             _: u16,
             request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            _response_pool: Arc<crate::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let bytes = RequestLease::new(request)
@@ -8789,7 +8789,7 @@ mod tests {
     async fn prepared_reply_rejects_a_foreign_pool_before_transport() {
         let origin = small_response_pool("r02origin");
         let target = small_response_pool("r02target");
-        let mut live = target.write().alloc_shm_handle(8192).unwrap();
+        let mut live = target.inner.write().alloc_shm_handle(8192).unwrap();
         target.read().handle_slice_mut(&mut live)[0] = 0x5A;
         let prepared = crate::response::try_prepare_shm_response(&origin, 1024, 8192, |dst| {
             dst.fill(0xA5);
@@ -8805,8 +8805,8 @@ mod tests {
         assert_eq!(target.read().handle_slice(&live)[0], 0x5A);
         assert_eq!(target.read().stats().alloc_count, 1);
         assert_eq!(origin.read().stats().alloc_count, 1);
-        target.write().release_handle(live).unwrap();
-        origin.write().destroy();
+        target.inner.write().release_handle(live).unwrap();
+        origin.inner.write().destroy();
     }
 
     #[tokio::test]
@@ -8974,6 +8974,7 @@ mod tests {
 
         let response_pool = server.response_pool_arc();
         let handle = response_pool
+            .inner
             .write()
             .alloc_handle(4096)
             .expect("response allocation");
@@ -8994,10 +8995,11 @@ mod tests {
         assert_eq!(observer.used_bytes(), charged);
 
         response_pool
+            .inner
             .write()
             .release_handle(handle)
             .expect("release");
-        response_pool.write().gc_buddy();
+        response_pool.inner.write().gc_buddy();
         assert_eq!(
             observer.used_bytes(),
             0,

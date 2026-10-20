@@ -219,9 +219,7 @@ impl SyncClient {
         config: ClientIpcConfig,
     ) -> IpcClient {
         match pool {
-            Some(pool) => {
-                IpcClient::with_endpoint_and_pool(endpoint, Arc::new(Mutex::new(pool)), config)
-            }
+            Some(pool) => IpcClient::with_endpoint_and_pool(endpoint, pool, config),
             None => IpcClient::with_endpoint(endpoint, config),
         }
     }
@@ -508,7 +506,7 @@ impl SyncClient {
     /// slots detached within `timeout`. Live RequestBlocks, held carriers and
     /// dedicated-retire jobs retain their exact pools and budget charges.
     /// IPC-owned cleanup-lock contention returns `false` with the cleanup
-    /// owners reachable for a later close; injected pools remain external.
+    /// owners reachable for a later close; injected pools remain attached.
     /// Busy connection cleanup stays owned for retry. This is not a hard
     /// real-time bound on OS scheduling or mapping destruction.
     pub fn close_shared(&self, timeout: std::time::Duration) -> bool {
@@ -802,7 +800,7 @@ pub(crate) mod tests {
             },
             ..ClientIpcConfig::default()
         };
-        let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default())));
+        let pool = MemPool::new(c2_mem::PoolConfig::default());
         let client = SyncClient {
             inner: IpcClient::with_pool("ipc://sync_selector", pool, config),
             rt: get_or_create_runtime().handle().clone(),
@@ -943,8 +941,9 @@ pub(crate) mod tests {
             shm_threshold: 1,
             ..ClientIpcConfig::default()
         };
-        let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default())));
-        let inner = IpcClient::with_pool("ipc://sync_payload_limit", pool.clone(), config);
+        let pool = MemPool::new(c2_mem::PoolConfig::default());
+        let inner = IpcClient::with_pool("ipc://sync_payload_limit", pool, config);
+        let pool = inner.request_pool().unwrap();
         inner.route_directory.write().insert_table(
             "grid".to_string(),
             MethodTable::from_entries(
@@ -1211,19 +1210,20 @@ pub(crate) mod tests {
     /// pool instead of stranding the charge until the client is dropped.
     #[test]
     fn pool_alloc_and_fill_panic_releases_the_allocation() {
-        let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig {
+        let pool = MemPool::new(c2_mem::PoolConfig {
             segment_size: 65_536,
             max_segments: 1,
             ..c2_mem::PoolConfig::default()
-        })));
+        });
         let inner = IpcClient::with_pool(
             "ipc://fill_panic_release",
-            Arc::clone(&pool),
+            pool,
             ClientIpcConfig {
                 shm_threshold: 1,
                 ..ClientIpcConfig::default()
             },
         );
+        let pool = inner.request_pool().unwrap();
         let client = SyncClient {
             inner,
             rt: get_or_create_runtime().handle().clone(),

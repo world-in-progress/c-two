@@ -380,7 +380,7 @@ pub trait CrmCallback: Send + Sync + 'static {
         route_name: &str,
         method_idx: u16,
         request: RequestData,
-        response_pool: Arc<parking_lot::RwLock<MemPool>>,
+        response_pool: Arc<crate::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError>;
 }
 
@@ -652,7 +652,7 @@ mod tests {
             _route: &str,
             _method_idx: u16,
             _request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            _response_pool: Arc<crate::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(b"echo".to_vec()))
         }
@@ -856,7 +856,7 @@ mod tests {
         assert_eq!(route.method_names.len(), 2);
 
         // invoke the callback through the route
-        let pool = Arc::new(parking_lot::RwLock::new(
+        let pool = Arc::new(crate::ResponsePool::new(
             MemPool::new(PoolConfig::default()),
         ));
         let result = route
@@ -965,13 +965,13 @@ mod tests {
                 _route: &str,
                 _method_idx: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 Err(CrmError::InternalError("method not found".into()))
             }
         }
 
-        let pool = Arc::new(parking_lot::RwLock::new(
+        let pool = Arc::new(crate::ResponsePool::new(
             MemPool::new(PoolConfig::default()),
         ));
         let cb: Arc<dyn CrmCallback> = Arc::new(FailCallback);

@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use c2_config::{ClientIpcConfig, RelayConfig};
 use c2_ipc::{IpcClient, IpcError, ResponseData, RouteBinding};
-use c2_mem::{BudgetSnapshot, DedicatedSegment, MemPool};
+use c2_mem::{BudgetSnapshot, DedicatedSegment};
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
     RouteBuildSpec, SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
@@ -129,7 +129,7 @@ impl CrmCallback for Probe {
         _route: &str,
         method: u16,
         request: RequestData,
-        _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+        _response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         let kind = match &request {
             RequestData::Shm(shm) if shm.is_dedicated() => {

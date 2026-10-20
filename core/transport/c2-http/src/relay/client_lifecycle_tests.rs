@@ -27,7 +27,7 @@ impl CrmCallback for InlineReply {
         _: &str,
         _: u16,
         input: RequestData,
-        _: Arc<parking_lot::RwLock<MemPool>>,
+        _: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         assert!(matches!(
             &input,
@@ -199,8 +199,10 @@ async fn public_stop_cleanup_case(acquire_failure: bool) {
         tokio::time::timeout(STEP, probe.entered.notified())
             .await
             .unwrap();
-        let holder =
-            PoolHolder::start(client.request_pool_for_test().expect("actual request pool")).await;
+        let holder = PoolHolder::start(
+            unsafe { client.request_pool_for_test() }.expect("actual request pool"),
+        )
+        .await;
         release.send(()).unwrap();
         let response = tokio::time::timeout(STEP, call).await.unwrap().unwrap();
         assert_eq!(response.as_ref(), &[9; 32]);
@@ -239,7 +241,7 @@ async fn public_stop_cleanup_case(acquire_failure: bool) {
         let _stopped = tokio::time::timeout(STEP, stopping).await.unwrap().unwrap();
         assert_eq!(client.pending_len_for_test(), 0);
         assert_eq!(state.clients.outstanding(), 0);
-        assert!(client.request_pool_for_test().is_none());
+        assert!(unsafe { client.request_pool_for_test() }.is_none());
     })
     .catch_unwind()
     .await;

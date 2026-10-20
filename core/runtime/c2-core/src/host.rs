@@ -1032,7 +1032,7 @@ impl CrmCallback for CoreCallback {
         _route_name: &str,
         method_idx: u16,
         request: RequestData,
-        _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+        _response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         let mut lease = RequestLease::new(request);
         let bytes = match lease.copy_bytes() {

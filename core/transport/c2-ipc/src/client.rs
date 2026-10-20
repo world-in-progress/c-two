@@ -300,8 +300,12 @@ mod connect_lock_deadline_tests {
         let config = ClientIpcConfig::default();
         let memory_budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
         let pool = IpcClient::own_pool_from_config(&config, &memory_budget);
-        let mut client =
-            IpcClient::with_pool("ipc://no-injected-pool-lock-test", pool.clone(), config);
+        let mut client = IpcClient::with_pool(
+            "ipc://no-injected-pool-lock-test",
+            Arc::try_unwrap(pool).ok().unwrap().into_inner(),
+            config,
+        );
+        let pool = client.request_pool().unwrap();
         let holder = contention_test::hold_mutex(pool.clone());
         let (result, ()) = observe(holder, || async {
             client.connect_with_deadline(budget()).await
@@ -2817,17 +2821,17 @@ impl IpcClient {
         )
     }
 
-    /// Create a new IPC client with an externally owned SHM pool.
+    /// Create a new IPC client taking ownership of a caller-configured SHM pool.
     ///
     /// The pool is used for outgoing SHM allocations when data exceeds
-    /// `config.shm_threshold`. Because the pool is shared state the transport
-    /// does not own, [`connect`](Self::connect) validates it against the
+    /// `config.shm_threshold`. The injected configuration remains caller-selected,
+    /// so [`connect`](Self::connect) validates it against the
     /// configured buddy policy and memory-budget limits *before* any
     /// connection I/O: a config that disables `pool_enabled` rejects a
     /// buddy-enabled pool (the policy must not be bypassed),
-    /// `pool_prewarm_segments` is rejected because the transport never maps
-    /// memory into a pool it does not own — prewarm external pools explicitly
-    /// with `MemPool::ensure_buddy_segments` — and the pool must carry an
+    /// `pool_prewarm_segments` is rejected for injected pools: prewarm explicitly
+    /// with `MemPool::ensure_buddy_segments` before moving the pool into the client.
+    /// The pool must carry an
     /// owner-creation budget whose limits equal the config's
     /// `memory_budget_limits()`. The client's reassembly pool charges that
     /// same budget, so one injected context stays the single policy for the
@@ -2835,21 +2839,26 @@ impl IpcClient {
     /// injected peer pool carries no owner-creation budget and is rejected
     /// rather than paired with a fresh invented context. A policy-matching
     /// pool (including a buddy-disabled one, which keeps dedicated SHM
-    /// requests) connects normally. The pool's own configuration and
-    /// allocations are never mutated or destroyed by the transport;
-    /// maintenance only calls the pool's public GC API.
-    pub fn with_pool(address: &str, pool: Arc<StdMutex<MemPool>>, config: ClientIpcConfig) -> Self {
-        Self::with_pool_endpoint(Self::default_endpoint(address), pool, config)
+    /// requests) connects normally. The pool stays attached across close;
+    /// maintenance uses its original GC policy. Moving it into the client prevents a mutable alias from replacing
+    /// the identity advertised by the handshake.
+    pub fn with_pool(address: &str, pool: MemPool, config: ClientIpcConfig) -> Self {
+        Self::with_pool_endpoint(
+            Self::default_endpoint(address),
+            Arc::new(StdMutex::new(pool)),
+            config,
+        )
     }
 
-    /// Use a frozen endpoint with an externally owned pool. The same injected-pool
+    /// Use a frozen endpoint with a caller-configured pool moved into the client.
+    /// The same injected-pool
     /// policy and budget checks as [`Self::with_pool`] apply before connection I/O.
     pub fn with_endpoint_and_pool(
         endpoint: LocalEndpoint,
-        pool: Arc<StdMutex<MemPool>>,
+        pool: MemPool,
         config: ClientIpcConfig,
     ) -> Self {
-        Self::with_pool_endpoint(Ok(endpoint), pool, config)
+        Self::with_pool_endpoint(Ok(endpoint), Arc::new(StdMutex::new(pool)), config)
     }
 
     fn with_pool_endpoint(
@@ -5286,7 +5295,11 @@ impl IpcClient {
     /// Exact request-pool owner for bounded lock-contention tests. This is
     /// absent from default builds and never substitutes for release authority.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn request_pool_for_test(&self) -> Option<Arc<StdMutex<MemPool>>> {
+    ///
+    /// # Safety
+    /// Test code must not replace or destroy the pool or invalidate any live
+    /// request allocation. The handle is solely for observation/lock contention.
+    pub unsafe fn request_pool_for_test(&self) -> Option<Arc<StdMutex<MemPool>>> {
         self.request_pool()
     }
 
@@ -6022,12 +6035,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_injected_pool_preserves_external_authority() {
+    async fn close_preserves_injected_pool_and_budget() {
         let config = ClientIpcConfig::default();
         let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
         let external = IpcClient::own_pool_from_config(&config, &budget);
         let prefix = external.lock().prefix().to_string();
-        let client = IpcClient::with_pool("ipc://close-injected", Arc::clone(&external), config);
+        let client = IpcClient::with_pool(
+            "ipc://close-injected",
+            Arc::try_unwrap(external).ok().unwrap().into_inner(),
+            config,
+        );
+        let external = client.request_pool().unwrap();
         let holder = contention_test::hold_mutex(Arc::clone(&external));
         let (confirmed, ()) = observe(holder, || async {
             client

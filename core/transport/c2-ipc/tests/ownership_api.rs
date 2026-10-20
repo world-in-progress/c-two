@@ -88,6 +88,14 @@ const CASES: &[(&str, Probe)] = &[
         "vuln_prealloc_published_span_expansion",
         Probe::Fails(&["E0061"]),
     ),
+    (
+        "vuln_async_injected_pool_replacement",
+        Probe::Fails(&["E0308"]),
+    ),
+    (
+        "vuln_server_response_pool_replacement",
+        Probe::Fails(&["E0133"]),
+    ),
 ];
 
 struct Temp(PathBuf);

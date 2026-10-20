@@ -27,3 +27,5 @@ pub use server::{
     ServerIdentity, ServerLifecycleState, ServerMemorySnapshot, ServerRouteCloseOutcome,
     ServerShutdownCompletion,
 };
+
+pub use response::ResponsePool;

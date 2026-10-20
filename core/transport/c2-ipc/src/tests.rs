@@ -399,9 +399,7 @@ mod client_tests {
         assert!(!c1.is_connected());
 
         // IpcClient::with_pool uses custom config.
-        let pool = std::sync::Arc::new(parking_lot::Mutex::new(c2_mem::MemPool::new(
-            c2_mem::PoolConfig::default(),
-        )));
+        let pool = c2_mem::MemPool::new(c2_mem::PoolConfig::default());
         let c2 = crate::client::IpcClient::with_pool("ipc://test_prop_2", pool, cfg);
         assert!(!c2.is_connected());
     }
@@ -686,7 +684,7 @@ mod lazy_policy_roundtrip_tests {
         AccessLevel, ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease,
         ResponseMeta, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
     };
-    use parking_lot::{Mutex, RwLock};
+    use parking_lot::Mutex;
     use tokio::time::timeout;
 
     use crate::client::{
@@ -763,7 +761,7 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            _response_pool: Arc<RwLock<MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
             let request = RequestLease::new(request);
@@ -800,11 +798,12 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            response_pool: Arc<RwLock<MemPool>>,
+            response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             let request = RequestLease::new(request);
             {
-                let mut pool = response_pool.write();
+                // SAFETY: this fixture owns its held allocations; it never replaces the server pool.
+                let mut pool = unsafe { response_pool.write() };
                 let mut held = self.held.lock();
                 while held.len() < self.hog_count {
                     held.push(pool.alloc(self.hog_size).map_err(CrmError::InternalError)?);
@@ -1174,7 +1173,7 @@ mod lazy_policy_roundtrip_tests {
             _route: &str,
             _method: u16,
             request: RequestData,
-            _pool: Arc<RwLock<MemPool>>,
+            _pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             let first = {
                 let mut seen = self.seen.lock();
@@ -1704,7 +1703,8 @@ mod lazy_policy_roundtrip_tests {
         // Release the hogged dedicated segments.
         {
             let response_pool = server.response_pool_arc();
-            let mut pool = response_pool.write();
+            // SAFETY: this fixture owns its held allocations; it never replaces the server pool.
+            let mut pool = unsafe { response_pool.write() };
             for alloc in held.lock().drain(..) {
                 // SAFETY: test holds sole release authority for its own allocation.
                 unsafe { pool.free(&alloc) }.unwrap();
@@ -2180,12 +2180,13 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            response_pool: Arc<RwLock<MemPool>>,
+            response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
             let request = RequestLease::new(request);
             {
-                let mut pool = response_pool.write();
+                // SAFETY: this fixture owns its held allocations; it never replaces the server pool.
+                let mut pool = unsafe { response_pool.write() };
                 let mut held = self.held.lock();
                 while held.len() < self.hog_count {
                     held.push(pool.alloc(self.hog_size).map_err(CrmError::InternalError)?);
@@ -2213,7 +2214,7 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            _response_pool: Arc<RwLock<MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
             if let RequestData::Shm(carrier) = &request {
@@ -2234,7 +2235,7 @@ mod lazy_policy_roundtrip_tests {
         // connection I/O, so the error is the policy error, not an I/O error.
         let mut client = IpcClient::with_pool(
             &unique_address("policy_mismatch"),
-            Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default()))),
+            MemPool::new(c2_mem::PoolConfig::default()),
             client_config(
                 BaseIpcConfig {
                     pool_enabled: false,
@@ -2256,7 +2257,7 @@ mod lazy_policy_roundtrip_tests {
     async fn injected_pool_with_prewarm_config_is_rejected_before_io() {
         let mut client = IpcClient::with_pool(
             &unique_address("prewarm_injected"),
-            Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default()))),
+            MemPool::new(c2_mem::PoolConfig::default()),
             client_config(
                 BaseIpcConfig {
                     pool_prewarm_segments: 1,
@@ -2303,12 +2304,11 @@ mod lazy_policy_roundtrip_tests {
             },
             1024,
         );
-        // A policy-matching externally owned pool: buddy-disabled, built from
+        // A policy-matching injected pool: buddy-disabled, built from
         // the same centralized projection the transport itself uses.
-        let injected = Arc::new(Mutex::new(MemPool::new(
-            config.base.primary_pool_config(&config.pool_tuning()),
-        )));
-        let mut client = IpcClient::with_pool(server.ipc_address(), Arc::clone(&injected), config);
+        let injected = MemPool::new(config.base.primary_pool_config(&config.pool_tuning()));
+        let mut client = IpcClient::with_pool(server.ipc_address(), injected, config);
+        let injected = client.request_pool().unwrap();
         client.connect().await.unwrap();
 
         let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -2324,7 +2324,7 @@ mod lazy_policy_roundtrip_tests {
         );
         assert_eq!(response_bytes(&client, response), payload);
 
-        // The externally owned pool was never mutated: same policy, no buddy
+        // The injected pool keeps its configuration: same policy, no buddy
         // mappings, and the settled dedicated request retired promptly — the
         // response proves the peer set `read_done`, so the owner entry is
         // already reclaimed here rather than lingering until a later GC.
@@ -2427,7 +2427,8 @@ mod lazy_policy_roundtrip_tests {
         // Release the hogged server-side allocations and shut down.
         {
             let response_pool = server.response_pool_arc();
-            let mut pool = response_pool.write();
+            // SAFETY: this fixture owns its held allocations; it never replaces the server pool.
+            let mut pool = unsafe { response_pool.write() };
             for alloc in held.lock().drain(..) {
                 // SAFETY: test holds sole release authority for its own allocation.
                 unsafe { pool.free(&alloc) }.unwrap();
@@ -2881,16 +2882,12 @@ mod lazy_policy_roundtrip_tests {
     async fn injected_pool_with_divergent_budget_is_rejected_before_io() {
         let cfg = client_config(small_base(64 * 1024, 4), 1024);
         let injected_budget = c2_mem::MemoryBudget::new(1, 2, 3);
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+        let pool = MemPool::new_with_prefix_and_budget(
             cfg.base.primary_pool_config(&cfg.pool_tuning()),
             "/cc3i00000000000001".to_string(),
             injected_budget.clone(),
-        )));
-        let mut client = IpcClient::with_pool(
-            "ipc://budget_mismatch_never_connects",
-            Arc::clone(&pool),
-            cfg,
         );
+        let mut client = IpcClient::with_pool("ipc://budget_mismatch_never_connects", pool, cfg);
         let error = client
             .connect()
             .await
@@ -2913,11 +2910,8 @@ mod lazy_policy_roundtrip_tests {
             c2_mem::config::PoolConfig::default(),
             "/cc3peer00000000001".to_string(),
         );
-        let mut client = IpcClient::with_pool(
-            "ipc://peer_pool_without_budget_never_connects",
-            Arc::new(Mutex::new(peer)),
-            cfg,
-        );
+        let mut client =
+            IpcClient::with_pool("ipc://peer_pool_without_budget_never_connects", peer, cfg);
         let error = client
             .connect()
             .await
@@ -3406,7 +3400,7 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            _response_pool: Arc<RwLock<MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
             if let Some(started) = self.started.lock().take() {
@@ -4367,7 +4361,7 @@ mod lazy_policy_roundtrip_tests {
         let budget = c2_mem::MemoryBudget::from_limits(&cfg.memory_budget_limits());
         let mut pool_config = cfg.base.primary_pool_config(&cfg.pool_tuning());
         pool_config.dedicated_crash_timeout_secs = 0.25;
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+        let pool = MemPool::new_with_prefix_and_budget(
             pool_config,
             format!(
                 "/cc3crash{:08x}{:08x}",
@@ -4375,9 +4369,8 @@ mod lazy_policy_roundtrip_tests {
                 ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
             ),
             budget.clone(),
-        )));
-        let mut client = IpcClient::with_pool(server.ipc_address(), Arc::clone(&pool), cfg);
-        drop(pool);
+        );
+        let mut client = IpcClient::with_pool(server.ipc_address(), pool, cfg);
         client.connect().await.unwrap();
 
         let binding = client
@@ -5101,7 +5094,7 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            _response_pool: Arc<RwLock<MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
             let _ = self.release.lock().recv_timeout(Duration::from_secs(10));
@@ -6702,7 +6695,7 @@ mod endpoint_context_transport_tests {
             _: &str,
             _: u16,
             _: RequestData,
-            _: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            _: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(vec![self.0]))
         }

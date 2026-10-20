@@ -2530,7 +2530,7 @@ mod tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             let marker = match &request {
                 RequestData::Inline(_) => "inline",
@@ -2596,7 +2596,7 @@ mod tests {
             _route_name: &str,
             _method_idx: u16,
             _request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(self.marker.to_vec()))
         }
@@ -4930,7 +4930,7 @@ mod tests {
                 _route_name: &str,
                 method_idx: u16,
                 request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+                _response_pool: Arc<c2_server::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 // Consume through the real owner even when the HTTP request
                 // reached us as SHM. No transport coordinates are discarded.

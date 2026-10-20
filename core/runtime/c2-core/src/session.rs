@@ -2969,7 +2969,7 @@ mod tests {
             _route_name: &str,
             _method_idx: u16,
             _request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Empty)
         }

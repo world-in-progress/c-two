@@ -44,7 +44,7 @@ Host 在仓库外使用真实 `c2-mem` path dependency，编译了带 `#![forbid
 | 表面 | 计划变化 |
 | --- | --- |
 | 公开 Rust `c2-mem` | 破坏性变更：不能再手造/修改坐标型 MemHandle；长度更新收窄；raw 访问/释放调用须在明确不安全前提下使用。正常分配、借用、写入、收缩和释放有一个 owner 入口，不留旧签名兼容 |
-| 公开 Rust `c2-server` / `c2-ipc` | SHM 变体、低层手工准备响应、lease 的 pool 绑定及公开 raw 方法发生变化；`SyncClient::connect/connect_with_endpoint` 移入 `Option<MemPool>`，`call_bound_prealloc` 删除重复长度参数并使用块的原始请求长度。外部低层消费者须迁移。现有高层 Rust SDK 的 connect/call/held 和生成合同签名不需要改变 |
+| 公开 Rust `c2-server` / `c2-ipc` | SHM 变体、低层手工准备响应、lease 的 pool 绑定及公开 raw 方法发生变化；`IpcClient` 的注入构造器移入 `MemPool`，`SyncClient::connect/connect_with_endpoint` 移入 `Option<MemPool>`；`call_bound_prealloc` 删除重复长度参数。`CrmCallback` 和 `Server::response_pool_arc` 提供固定的 `ResponsePool`，原始可变访问为 unsafe，正式准备响应仍走原 helper。外部低层消费者须迁移。高层 Rust SDK 的 connect/call/held 和生成合同签名不改变 |
 | Python | 正式 FastDB、pickle、Core bytes 与高层调用接口保持。低层 PoolAlloc/raw 地址是现有坐标能力，不因 Rust owner 迁移获得新的唯一写保证；绑定内部 raw 调用与安全说明同步更新，不新增 Python owner 注册表 |
 | C/FFI 与 Node/TypeScript | 预计维持 ABI 5、现有符号与 descriptor 布局。C 函数本来就是 Rust `unsafe extern C` 边界；补齐并核对原有独占访问、存活期和移交责任，保留现有内部锁/所有权表，不能用 C 边界包装出任意 safe Rust 访问 |
 | SHM / IPC wire | 维持 SHM 3、IPC 12；现有 identity 字段足够，计划不增加表示或兼容分支 |
@@ -103,3 +103,5 @@ Host 在仓库外使用真实 `c2-mem` path dependency，编译了带 `#![forbid
 首轮固定候选 `047cd58b` 的独立审查发现三条预分配入口尚未封闭。补充基线证据确认：共享注入池在 fill callback 内 destroy、发布时扩大长度仍可编译；真实双客户端测试中，A 的块经 B 发布会读取 B 池内相同坐标的数据。前两条不执行危险内存访问；后一条使用独立块与正常复制，结束时先关闭连接和服务器，再报告预期红例。候选改为移动注入池、从 owner 取长度、在 writer 锁内核对请求池归属后才执行原 dispatch/permit 事务。错误释放继续回到块的原池，未新增 payload 拷贝、owner 锁或状态机。
 
 完整 Core 回归同时发现两处测试迁移问题：响应 lease 的 buddy 释放断言错误，以及禁止请求物化的文本检查误匹配新的响应 `into_bytes()`。已恢复 buddy 真实分配计数归零、dedicated 经 read_done 后原生释放回收的断言，并将文本检查限定到请求转发段；未跳过测试或改变生产 relay 逻辑。首轮候选未验收，GitHub Actions run `39470524323` 已取消。
+
+第二轮审查确认，`Arc` 相同仍不足以证明容器里的池没有被替换：公开异步注入入口和 callback 响应池可保留原池、换入另一池，造成握手与发布不一致。新增两条基线编译反例确认该 safe 入口，未执行重叠引用。异步注入现与同步入口一样移动 pool；服务端用仅包裹原 `RwLock<MemPool>` 的 `ResponsePool` 固定容器内容，safe 读取和正式准备 helper 保留，raw 可变操作及 test-support 的原始请求池访问须明确 unsafe。没有新增池、锁或计费状态。候选 `baa3025d` 虽已通过本地完整 Core/relay、Rust SDK 和原生绑定，仍因审查阻断撤回，Actions run `39473694958` 已取消；后续须验证新的确切候选。

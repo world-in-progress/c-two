@@ -248,9 +248,11 @@ Memory subsystem:
   constructors. A reconnect gives its receive task and replies a new pool
   container while retained replies keep the old one. Request preallocation
   keeps its existing Armed/Dispatched/Released transaction; it must not gain
-  a second release state machine. `SyncClient` takes ownership of an injected
+  a second release state machine. `IpcClient` and `SyncClient` take ownership of an injected
   pool; preallocated publication uses the block's requested length and checks
-  the connection's request-pool identity before dispatch.
+  the connection's request-pool identity before dispatch. Server callbacks
+  receive the fixed `ResponsePool` owner; normal response preparation uses
+  `try_prepare_shm_response`, while raw mutable pool access requires `unsafe`.
 - `c2-mem` owns SDK-visible buffer lease accounting. Lease tracking records metadata and retention state only; it must not read payload bytes, allocate a second buffer, or replace `MemPool::free_at()` / `release_handle()` as the memory release authority.
 - Each owner pool appends a fresh PID/UUID incarnation to its logical label. `MemPool` alone derives bounded OS backing names; SDKs must not concatenate prefix/index suffixes.
 - Buddy references carry a checked `u32` backing generation and `u64 allocation_id` in handshake protocol version 12. Receiver pools use `MemPool::open_peer()` and lazy-open the exact prefix/index/generation; handshake segment names are descriptive metadata. Every buddy release must match the original allocation id and level under the shared allocator lock, so a released id cannot free a new allocation at the same offset. Dedicated descriptors use allocation id 0. A live allocation prevents retirement.

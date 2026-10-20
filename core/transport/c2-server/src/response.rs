@@ -4,6 +4,38 @@ use c2_mem::MemPool;
 
 use crate::dispatcher::{PreparedShmResponse, ResponseMeta};
 
+/// The server's fixed response-pool owner.
+///
+/// Callbacks may inspect its configuration or prepare a response through
+/// [`try_prepare_shm_response`]. Safe access cannot replace the pool advertised
+/// to connected peers or release a backing still owned by a prepared response.
+pub struct ResponsePool {
+    pub(crate) inner: parking_lot::RwLock<MemPool>,
+}
+
+impl ResponsePool {
+    pub(crate) fn new(pool: MemPool) -> Self {
+        Self {
+            inner: parking_lot::RwLock::new(pool),
+        }
+    }
+
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, MemPool> {
+        self.inner.read()
+    }
+
+    /// Raw access for integrations that manage pool storage themselves.
+    ///
+    /// # Safety
+    /// The caller must preserve the advertised pool identity and every live
+    /// allocation's access/release authority. In particular it must not replace
+    /// or destroy the pool, or free a backing, while the server, a callback,
+    /// a prepared response or a connected peer can still use that storage.
+    pub unsafe fn write(&self) -> parking_lot::RwLockWriteGuard<'_, MemPool> {
+        self.inner.write()
+    }
+}
+
 /// Return the buddy response wire `data_size` when the payload length is
 /// representable by the current buddy payload metadata.
 pub(crate) fn buddy_response_data_size(len: usize) -> Option<u32> {
@@ -17,7 +49,7 @@ pub(crate) fn buddy_response_data_size(len: usize) -> Option<u32> {
 /// failure is therefore not a CRM failure. Errors are reserved for cases where
 /// an allocation was made but the payload could not be copied safely.
 pub fn try_prepare_shm_response<F>(
-    response_pool: &parking_lot::RwLock<MemPool>,
+    response_pool: &ResponsePool,
     shm_threshold: u64,
     len: usize,
     write_into: F,
@@ -37,7 +69,7 @@ where
     // failure returns None so the caller falls back to owned inline bytes
     // and native transport selection.
     let mut handle = {
-        let mut pool = response_pool.write();
+        let mut pool = response_pool.inner.write();
         match pool.alloc_shm_handle(len) {
             Ok(handle) => handle,
             Err(_) => return Ok(None),
@@ -48,7 +80,7 @@ where
         .shm_allocation()
         .expect("SHM response backing carries coordinates");
     if coordinates.seg_idx > u16::MAX as u32 {
-        let mut pool = response_pool.write();
+        let mut pool = response_pool.inner.write();
         // Only this exact owner may authorize the raw release.
         if pool.validate_handle(&handle).is_ok() {
             let _ = unsafe { pool.free(&coordinates) };
@@ -69,7 +101,7 @@ where
     };
 
     if let Err(err) = write_result {
-        let mut pool = response_pool.write();
+        let mut pool = response_pool.inner.write();
         // Only this exact owner may authorize the raw release.
         if pool.validate_handle(&handle).is_ok() {
             let _ = unsafe { pool.free(&coordinates) };
@@ -86,8 +118,8 @@ where
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use super::ResponsePool;
     use c2_mem::{MemPool, PoolConfig};
-    use parking_lot::RwLock;
 
     use crate::ResponseMeta;
 
@@ -98,8 +130,8 @@ mod tests {
         format!("/c2r{:04x}{:04x}", std::process::id() as u16, id) + label
     }
 
-    fn test_pool() -> RwLock<MemPool> {
-        RwLock::new(MemPool::new_with_prefix(
+    fn test_pool() -> ResponsePool {
+        ResponsePool::new(MemPool::new_with_prefix(
             PoolConfig {
                 segment_size: 64 * 1024,
                 min_block_size: 4096,
@@ -161,7 +193,10 @@ mod tests {
         assert_eq!(actual, payload.as_slice());
         drop(pool_guard);
         // The prepared owner releases cleanly through the response pool.
-        pool.write().release_handle(prepared.into_handle()).unwrap();
+        pool.inner
+            .write()
+            .release_handle(prepared.into_handle())
+            .unwrap();
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
@@ -180,7 +215,7 @@ mod tests {
 
     #[test]
     fn allocation_failure_falls_back_to_owned_inline_path() {
-        let pool = RwLock::new(MemPool::new_with_prefix(
+        let pool = ResponsePool::new(MemPool::new_with_prefix(
             PoolConfig {
                 segment_size: 64 * 1024,
                 min_block_size: 4096,

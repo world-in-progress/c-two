@@ -1573,7 +1573,7 @@ mod tests {
                 _route_name: &str,
                 _method_idx: u16,
                 request: c2_server::RequestData,
-                _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+                _response_pool: Arc<c2_server::ResponsePool>,
             ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
                 let mut request = c2_server::RequestLease::new(request);
                 assert!(request.copy_bytes().unwrap().is_empty());
