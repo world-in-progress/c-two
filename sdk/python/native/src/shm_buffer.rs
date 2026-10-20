@@ -168,14 +168,16 @@ impl PyShmBuffer {
                 allocation_id,
             }) => {
                 let mut p = pool.write();
-                let _ = p.free_at(
-                    seg_idx as u32,
-                    generation,
-                    offset,
-                    data_size,
-                    is_dedicated,
-                    allocation_id,
-                );
+                let _ = unsafe {
+                    p.free_at(
+                        seg_idx as u32,
+                        generation,
+                        offset,
+                        data_size,
+                        is_dedicated,
+                        allocation_id,
+                    )
+                };
                 Ok(())
             }
             Some(ShmBufferInner::Inline(_)) => Ok(()),
@@ -306,14 +308,16 @@ impl Drop for PyShmBuffer {
                     allocation_id,
                 } => {
                     let mut p = pool.write();
-                    let _ = p.free_at(
-                        seg_idx as u32,
-                        generation,
-                        offset,
-                        data_size,
-                        is_dedicated,
-                        allocation_id,
-                    );
+                    let _ = unsafe {
+                        p.free_at(
+                            seg_idx as u32,
+                            generation,
+                            offset,
+                            data_size,
+                            is_dedicated,
+                            allocation_id,
+                        )
+                    };
                 }
                 ShmBufferInner::Inline(_) => {}
             }

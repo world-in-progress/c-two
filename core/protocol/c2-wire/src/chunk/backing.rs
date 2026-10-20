@@ -3,7 +3,7 @@
 //! [`ReassemblyBacking`] is the single owner of one live chunk-reassembly
 //! allocation. It bundles, in one move-only value:
 //!
-//! - the owner pool [`Arc`] and captured incarnation, checked together as
+//! - the owner pool [`Arc`] and the handle's captured identity, checked together as
 //!   the release authority for buddy/dedicated backing,
 //! - the allocated [`MemHandle`] (file-spill mappings are self-owned by the
 //!   handle value), and
@@ -48,16 +48,10 @@ pub fn checked_capacity(total_chunks: usize, chunk_size: usize) -> Result<usize,
 struct BackingState {
     handle: MemHandle,
     reservation: BudgetReservation,
-    owner_incarnation: String,
 }
 
 impl BackingState {
     fn validate_access(&self, pool: &MemPool) -> Result<(), String> {
-        // File mappings are held by the handle itself, independently of the
-        // pool container. Only SHM coordinates require the original owner.
-        if !self.handle.is_file_spill() {
-            pool.validate_owner_incarnation(&self.owner_incarnation)?;
-        }
         pool.validate_handle(&self.handle)
     }
 }
@@ -119,7 +113,7 @@ impl ReassemblyBacking {
         })?;
         // One pool write critical section covers charge and allocation so no
         // other allocator can consume the admitted bytes in between.
-        let (handle, reservation, owner_incarnation) = {
+        let (handle, reservation) = {
             let budget = guard
                 .budget()
                 .ok_or_else(|| "reassembly pool carries no owner budget context".to_string())?;
@@ -127,7 +121,7 @@ impl ReassemblyBacking {
                 .reserve(BudgetKind::Reassembly, capacity_bytes)
                 .map_err(|e| e.to_string())?;
             match guard.alloc_handle(capacity) {
-                Ok(handle) => (handle, reservation, guard.prefix().to_owned()),
+                Ok(handle) => (handle, reservation),
                 // The reservation guard drops with this error return and
                 // refunds the charge; no backing was created.
                 Err(e) => return Err(e),
@@ -139,7 +133,6 @@ impl ReassemblyBacking {
             state: Some(BackingState {
                 handle,
                 reservation,
-                owner_incarnation,
             }),
         })
     }
@@ -207,10 +200,10 @@ impl ReassemblyBacking {
     /// Diagnostic accessor for cleanup proofs (for example Windows
     /// delete-on-close); mutating or releasing stays with the carrier.
     pub fn file_spill_path(&self) -> Option<std::path::PathBuf> {
-        match self.state.as_ref().map(|s| &s.handle) {
-            Some(MemHandle::FileSpill { path, .. }) => Some(path.clone()),
-            _ => None,
-        }
+        self.state
+            .as_ref()
+            .and_then(|s| s.handle.file_spill_path())
+            .map(std::path::Path::to_path_buf)
     }
 
     /// Write chunk data at an absolute byte offset inside the allocation.
@@ -275,7 +268,7 @@ impl ReassemblyBacking {
                 handle.len()
             ));
         }
-        handle.set_len(new_len);
+        handle.trim_to(new_len)?;
         Ok(())
     }
 
@@ -326,36 +319,27 @@ impl ReassemblyBacking {
         state
             .validate_access(pool)
             .map_err(|e| format!("reassembly release validation failed: {e}"))?;
-        match &state.handle {
-            MemHandle::Buddy {
-                seg_idx,
-                generation,
-                offset,
-                allocation_size,
-                allocation_id,
-                ..
-            } => {
-                pool.free_at(
-                    u32::from(*seg_idx),
-                    *generation,
-                    *offset,
-                    *allocation_size,
-                    false,
-                    *allocation_id,
-                )
-                .map_err(|e| format!("reassembly backing release failed: {e}"))?;
-            }
-            MemHandle::Dedicated { seg_idx, len } => {
-                let data_size = u32::try_from(*len).map_err(|_| {
+        if let Some(a) = state.handle.shm_allocation() {
+            let size = if a.is_dedicated {
+                u32::try_from(state.handle.len()).map_err(|_| {
                     "dedicated reassembly length exceeds the wire address space".to_string()
-                })?;
-                pool.free_at(u32::from(*seg_idx), 0, 0, data_size, true, 0)
-                    .map_err(|e| format!("reassembly backing release failed: {e}"))?;
+                })?
+            } else {
+                a.actual_size
+            };
+            // SAFETY: this private state is the only owner, validated under the same
+            // pool lock. A failed free keeps it intact; success consumes it below.
+            unsafe {
+                pool.free_at(
+                    a.seg_idx,
+                    a.generation,
+                    a.offset,
+                    size,
+                    a.is_dedicated,
+                    a.allocation_id,
+                )
             }
-            MemHandle::FileSpill { .. } => {
-                // Self-owned mapping: it closes when the handle value
-                // drops below, before the reservation refunds.
-            }
+            .map_err(|e| format!("reassembly backing release failed: {e}"))?;
         }
         // Storage release accepted. Drop the handle value (closing any file
         // mapping) first, then refund exactly the charged capacity.
@@ -617,16 +601,8 @@ mod tests {
     }
 
     fn coordinates(handle: &MemHandle) -> (u16, u32, u32) {
-        match handle {
-            MemHandle::Buddy {
-                seg_idx,
-                generation,
-                offset,
-                ..
-            } => (*seg_idx, *generation, *offset),
-            MemHandle::Dedicated { seg_idx, .. } => (*seg_idx, 0, 0),
-            MemHandle::FileSpill { .. } => panic!("test requires SHM backing"),
-        }
+        let a = handle.shm_allocation().expect("test requires SHM backing");
+        (a.seg_idx as u16, a.generation, a.offset)
     }
 
     fn colliding_replacement_is_rejected(buddy_enabled: bool) {
@@ -695,7 +671,7 @@ mod tests {
             pool.read().copy_handle_data(&fresh).unwrap(),
             vec![0x22; size]
         );
-        pool.write().release_handle(fresh);
+        pool.write().release_handle(fresh).unwrap();
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
@@ -722,8 +698,10 @@ mod tests {
             .unwrap();
         // The peer has the same mapped bytes and valid coordinates, but it
         // cannot take the owner carrier's release authority.
-        peer.validate_handle(&backing.live_state().unwrap().handle)
-            .unwrap();
+        assert!(
+            peer.validate_handle(&backing.live_state().unwrap().handle)
+                .is_err()
+        );
         let owner = std::mem::replace(&mut *pool.write(), peer);
         assert_eq!(pool.read().prefix(), prefix);
         assert!(backing.copy_bytes().is_err());
@@ -765,7 +743,7 @@ mod tests {
             pool.read().copy_handle_data(&fresh).unwrap(),
             vec![0x22; 512]
         );
-        pool.write().release_handle(fresh);
+        pool.write().release_handle(fresh).unwrap();
         assert_eq!(pool.read().stats().alloc_count, 0);
         // Dropping the detached owner closes its SHM. The failed carrier drop
         // intentionally cannot promise a refund: its charge remains retained.

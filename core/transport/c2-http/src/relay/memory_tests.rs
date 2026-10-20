@@ -132,13 +132,11 @@ impl CrmCallback for Probe {
         _response_pool: Arc<parking_lot::RwLock<MemPool>>,
     ) -> Result<ResponseMeta, CrmError> {
         let kind = match &request {
-            RequestData::Shm {
-                is_dedicated: true, ..
-            } => {
+            RequestData::Shm(shm) if shm.is_dedicated() => {
                 self.shm_calls.fetch_add(1, Ordering::SeqCst);
                 "dedicated"
             }
-            RequestData::Shm { .. } => "buddy",
+            RequestData::Shm(_) => "buddy",
             RequestData::Handle(_) => {
                 self.handle_calls.fetch_add(1, Ordering::SeqCst);
                 "handle"
@@ -273,11 +271,10 @@ impl Upstream {
     }
 
     async fn acquire(&self, state: &RelayState) -> (UpstreamLease, Arc<IpcClient>, RouteBinding) {
-        let (lease, binding) =
-            match bounded(state.acquire_upstream_for_route(&self.entry)).await {
-                Ok(value) => value,
-                Err(_) => panic!("real attested upstream acquisition failed"),
-            };
+        let (lease, binding) = match bounded(state.acquire_upstream_for_route(&self.entry)).await {
+            Ok(value) => value,
+            Err(_) => panic!("real attested upstream acquisition failed"),
+        };
         assert_eq!(binding.route_uid(), self.entry.route_uid);
         assert_eq!(binding.route_revision(), self.entry.route_revision);
         let client = lease.client();

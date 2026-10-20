@@ -670,10 +670,7 @@ mod tests {
 
     impl TrackedResponse {
         fn new(drops: Arc<AtomicUsize>, cleanup: impl FnOnce() + Send + Sync + 'static) -> Self {
-            let lease = c2_ipc::ResponseLease::new(
-                c2_ipc::ResponseData::Inline(vec![9; 4096]),
-                Arc::new(Mutex::new(None)),
-            );
+            let lease = c2_ipc::ResponseLease::new(c2_ipc::ResponseData::Inline(vec![9; 4096]));
             Self {
                 held: Some(HeldResponse::from_response_lease(lease).unwrap()),
                 drops,

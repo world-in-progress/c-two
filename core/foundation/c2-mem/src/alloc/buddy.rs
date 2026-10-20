@@ -304,7 +304,9 @@ impl BuddyAllocator {
     /// Returns a descriptive `Err` — never a panic — when the backing is
     /// unavailable (poisoned or contended past the bounded spin budget) or
     /// when the free itself is invalid (bad level/offset, double free).
-    pub fn free(&self, offset: u32, level: u16, allocation_id: u64) -> Result<(), String> {
+    /// # Safety
+    /// Own the exact allocation and end all accesses through every mapping before release.
+    pub unsafe fn free(&self, offset: u32, level: u16, allocation_id: u64) -> Result<(), String> {
         match self
             .lock
             .with_lock(|| self.free_and_merge(offset, level, allocation_id))
@@ -340,7 +342,9 @@ impl BuddyAllocator {
 
     /// Get a pointer to the data at the given offset within the data region.
     pub fn data_ptr(&self, offset: u32) -> *mut u8 {
-        unsafe { self.base.add(self.data_offset + offset as usize) }
+        self.base
+            .wrapping_add(self.data_offset)
+            .wrapping_add(offset as usize)
     }
 
     /// Get the data region size.
@@ -672,7 +676,7 @@ mod tests {
     ) {
         // These tests own the entire mapping and never access payload bytes.
         let before = unsafe { std::slice::from_raw_parts(alloc.base, alloc.data_offset) }.to_vec();
-        let result = alloc.free(offset, level, allocation_id);
+        let result = unsafe { alloc.free(offset, level, allocation_id) };
         assert!(result.is_err(), "invalid release was accepted: {result:?}");
         assert_eq!(
             unsafe { std::slice::from_raw_parts(alloc.base, alloc.data_offset) },
@@ -696,9 +700,7 @@ mod tests {
             parent.allocation_id,
         );
         assert!(alloc.alloc(4096).is_none());
-        alloc
-            .free(parent.offset, parent.level, parent.allocation_id)
-            .unwrap();
+        unsafe { alloc.free(parent.offset, parent.level, parent.allocation_id) }.unwrap();
     }
 
     #[test]
@@ -712,9 +714,7 @@ mod tests {
             parent.allocation_id,
         );
         assert!(alloc.alloc(4096).is_none());
-        alloc
-            .free(parent.offset, parent.level, parent.allocation_id)
-            .unwrap();
+        unsafe { alloc.free(parent.offset, parent.level, parent.allocation_id) }.unwrap();
     }
 
     #[test]
@@ -729,12 +729,8 @@ mod tests {
             left.allocation_id,
         );
         assert!(alloc.alloc(4096).is_none());
-        alloc
-            .free(left.offset, left.level, left.allocation_id)
-            .unwrap();
-        alloc
-            .free(right.offset, right.level, right.allocation_id)
-            .unwrap();
+        unsafe { alloc.free(left.offset, left.level, left.allocation_id) }.unwrap();
+        unsafe { alloc.free(right.offset, right.level, right.allocation_id) }.unwrap();
     }
 
     #[test]
@@ -749,21 +745,15 @@ mod tests {
         );
         let right = alloc.alloc(4096).unwrap();
         assert_eq!(right.offset, left.offset + left.actual_size);
-        alloc
-            .free(left.offset, left.level, left.allocation_id)
-            .unwrap();
-        alloc
-            .free(right.offset, right.level, right.allocation_id)
-            .unwrap();
+        unsafe { alloc.free(left.offset, left.level, left.allocation_id) }.unwrap();
+        unsafe { alloc.free(right.offset, right.level, right.allocation_id) }.unwrap();
     }
 
     #[test]
     fn r01_rejects_released_allocation_after_same_slot_reuse() {
         let (alloc, _buf) = make_allocator(8 * 1024, 4096);
         let old = alloc.alloc(8192).unwrap();
-        alloc
-            .free(old.offset, old.level, old.allocation_id)
-            .unwrap();
+        unsafe { alloc.free(old.offset, old.level, old.allocation_id) }.unwrap();
         let live = alloc.alloc(8192).unwrap();
         assert_eq!((old.offset, old.level), (live.offset, live.level));
         assert_ne!(old.allocation_id, live.allocation_id);
@@ -774,9 +764,7 @@ mod tests {
             old.allocation_id,
         );
         assert!(alloc.alloc(4096).is_none());
-        alloc
-            .free(live.offset, live.level, live.allocation_id)
-            .unwrap();
+        unsafe { alloc.free(live.offset, live.level, live.allocation_id) }.unwrap();
     }
 
     #[test]
@@ -801,16 +789,12 @@ mod tests {
                 assert_eq!(alloc.data_offset, data_offset);
                 assert_eq!(attached.data_size(), capacity);
                 let block = alloc.alloc(capacity).unwrap();
-                attached
-                    .free(block.offset, block.level, block.allocation_id)
-                    .unwrap();
+                unsafe { attached.free(block.offset, block.level, block.allocation_id) }.unwrap();
                 assert_eq!(alloc.alloc_count(), 0);
                 assert_eq!(alloc.free_bytes(), capacity as u64);
                 let next = attached.alloc(capacity).unwrap();
                 assert_ne!(next.allocation_id, block.allocation_id);
-                alloc
-                    .free(next.offset, next.level, next.allocation_id)
-                    .unwrap();
+                unsafe { alloc.free(next.offset, next.level, next.allocation_id) }.unwrap();
             }
         }
     }
@@ -823,11 +807,11 @@ mod tests {
         for id in [0, b.allocation_id, a.allocation_id ^ 1] {
             assert_invalid_release_preserves_live_allocator(&alloc, a.offset, a.level, id);
         }
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
         // This empty start has record 0 while the root and right child are
         // still used, so only the explicit zero-id check rejects this parent.
         assert_invalid_release_preserves_live_allocator(&alloc, a.offset, 0, 0);
-        alloc.free(b.offset, b.level, b.allocation_id).unwrap();
+        unsafe { alloc.free(b.offset, b.level, b.allocation_id) }.unwrap();
         assert_eq!(alloc.free_bytes(), 8192);
     }
 
@@ -854,9 +838,7 @@ mod tests {
             unsafe { std::slice::from_raw_parts(alloc.base, alloc.data_offset) },
             before
         );
-        alloc
-            .free(live.offset, live.level, live.allocation_id)
-            .unwrap();
+        unsafe { alloc.free(live.offset, live.level, live.allocation_id) }.unwrap();
         assert_eq!(alloc.free_bytes(), 8192);
         assert!(alloc.can_retire());
         assert!(alloc.alloc(4096).is_none());
@@ -890,7 +872,7 @@ mod tests {
         let (alloc, _buf) = make_allocator(32 * 1024, 4096); // 64KB total
         let a = alloc.alloc(4096).expect("alloc 4KB");
         assert_eq!(a.actual_size, 4096);
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
         assert_eq!(alloc.alloc_count(), 0);
     }
 
@@ -900,8 +882,8 @@ mod tests {
         let a = alloc.alloc(4096).unwrap();
         let b = alloc.alloc(4096).unwrap();
         assert_ne!(a.offset, b.offset);
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
-        alloc.free(b.offset, b.level, b.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
+        unsafe { alloc.free(b.offset, b.level, b.allocation_id) }.unwrap();
         assert_eq!(alloc.alloc_count(), 0);
     }
 
@@ -911,7 +893,7 @@ mod tests {
         // Request 5KB → rounds up to 8KB.
         let a = alloc.alloc(5000).unwrap();
         assert_eq!(a.actual_size, 8192);
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
     }
 
     #[test]
@@ -924,8 +906,8 @@ mod tests {
         let b = alloc.alloc(4096).unwrap();
 
         // Free both — should merge back.
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
-        alloc.free(b.offset, b.level, b.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
+        unsafe { alloc.free(b.offset, b.level, b.allocation_id) }.unwrap();
 
         // Free bytes should be restored.
         assert_eq!(alloc.free_bytes(), initial_free);
@@ -940,13 +922,14 @@ mod tests {
         assert!(a.is_some());
         // Second allocation should fail.
         assert!(alloc.alloc(4096).is_none());
-        alloc
-            .free(
+        unsafe {
+            alloc.free(
                 a.unwrap().offset,
                 a.unwrap().level,
                 a.unwrap().allocation_id,
             )
-            .unwrap();
+        }
+        .unwrap();
     }
 
     #[test]
@@ -973,7 +956,7 @@ mod tests {
         // Free alternating blocks to create fragmentation.
         for (i, a) in allocs.iter().enumerate() {
             if i % 2 == 0 {
-                alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+                unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
             }
         }
 
@@ -989,24 +972,24 @@ mod tests {
         // preventing merge on free (which changes bitmap state).
         let a = alloc.alloc(4096).unwrap();
         let b = alloc.alloc(4096).unwrap();
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
         // Second free of the same block should fail.
-        let result = alloc.free(a.offset, a.level, a.allocation_id);
+        let result = unsafe { alloc.free(a.offset, a.level, a.allocation_id) };
         assert!(result.is_err(), "double free should return error");
         assert!(
             result.unwrap_err().contains("double free"),
             "should report double free"
         );
-        alloc.free(b.offset, b.level, b.allocation_id).unwrap();
+        unsafe { alloc.free(b.offset, b.level, b.allocation_id) }.unwrap();
     }
 
     #[test]
     fn test_double_free_after_merge_returns_error() {
         let (alloc, _buf) = make_allocator(32 * 1024, 4096);
         let a = alloc.alloc(4096).unwrap();
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
 
-        let result = alloc.free(a.offset, a.level, a.allocation_id);
+        let result = unsafe { alloc.free(a.offset, a.level, a.allocation_id) };
         assert!(
             result.is_err(),
             "double free after merge should return error"
@@ -1021,14 +1004,14 @@ mod tests {
     fn test_free_invalid_level() {
         let (alloc, _buf) = make_allocator(32 * 1024, 4096);
         let a = alloc.alloc(4096).unwrap();
-        let result = alloc.free(a.offset, 99, a.allocation_id);
+        let result = unsafe { alloc.free(a.offset, 99, a.allocation_id) };
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("level"),
             "should reject invalid level"
         );
         // Clean up properly.
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
     }
 
     #[test]
@@ -1036,13 +1019,13 @@ mod tests {
         let (alloc, _buf) = make_allocator(32 * 1024, 4096);
         let a = alloc.alloc(4096).unwrap();
         // Misaligned offset.
-        let result = alloc.free(a.offset + 1, a.level, a.allocation_id);
+        let result = unsafe { alloc.free(a.offset + 1, a.level, a.allocation_id) };
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("not aligned"),
             "should reject misaligned offset"
         );
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
     }
 
     #[test]
@@ -1061,7 +1044,7 @@ mod tests {
 
         // Free in reverse order — should still fully merge.
         for a in allocs.iter().rev() {
-            alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+            unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
         }
         assert_eq!(alloc.free_bytes(), initial_free);
         assert_eq!(alloc.alloc_count(), 0);
@@ -1137,9 +1120,7 @@ mod tests {
             assert_eq!(attached.data_size(), capacity);
             let block = attached.alloc(capacity).unwrap();
             assert!(attached.alloc(min_block).is_none());
-            attached
-                .free(block.offset, block.level, block.allocation_id)
-                .unwrap();
+            unsafe { attached.free(block.offset, block.level, block.allocation_id) }.unwrap();
         }
     }
 
@@ -1157,7 +1138,7 @@ mod tests {
             alloc.alloc(4096).is_none(),
             "alloc must refuse poisoned backing"
         );
-        let err = alloc.free(0, 1, 0).unwrap_err();
+        let err = unsafe { alloc.free(0, 1, 0) }.unwrap_err();
         assert!(
             err.contains("buddy free refused") && err.contains("poisoned"),
             "free should describe the refusal: {err}"
@@ -1242,7 +1223,7 @@ mod tests {
         let a = alloc
             .alloc(4096)
             .expect("alloc succeeds after holder releases");
-        alloc.free(a.offset, a.level, a.allocation_id).unwrap();
+        unsafe { alloc.free(a.offset, a.level, a.allocation_id) }.unwrap();
         assert_eq!(alloc.alloc_count(), 0);
     }
 
@@ -1264,7 +1245,7 @@ mod tests {
             alloc.alloc(4096).is_none(),
             "alloc refuses a panicked backing"
         );
-        let err = alloc.free(0, 1, 0).unwrap_err();
+        let err = unsafe { alloc.free(0, 1, 0) }.unwrap_err();
         assert!(
             err.contains("panicked"),
             "free should name the panic poison: {err}"
@@ -1293,7 +1274,9 @@ mod tests {
             "attached allocator must refuse"
         );
         assert!(
-            attached.free(0, 1, 0).unwrap_err().contains("poisoned"),
+            unsafe { attached.free(0, 1, 0) }
+                .unwrap_err()
+                .contains("poisoned"),
             "attached allocator free must refuse descriptively"
         );
     }
@@ -1445,7 +1428,7 @@ mod tests {
             alloc.alloc(4096).is_none(),
             "alloc refuses the dead-held shared segment"
         );
-        let free_err = alloc.free(0, 1, 0).unwrap_err();
+        let free_err = unsafe { alloc.free(0, 1, 0) }.unwrap_err();
         assert!(
             free_err.contains("dead holder"),
             "free describes the dead-holder refusal: {free_err}"

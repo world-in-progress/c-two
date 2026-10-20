@@ -31,10 +31,7 @@ impl CrmCallback for InlineReply {
     ) -> Result<ResponseMeta, CrmError> {
         assert!(matches!(
             &input,
-            RequestData::Shm {
-                is_dedicated: true,
-                ..
-            }
+            RequestData::Shm(shm) if shm.is_dedicated()
         ));
         let mut owner = RequestLease::new(input);
         assert_eq!(
@@ -516,11 +513,10 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap();
         let old_entry = state.local_route("grid").unwrap();
-        let (lease, _) =
-            tokio::time::timeout(STEP, state.acquire_upstream_for_route(&old_entry))
-                .await
-                .unwrap()
-                .unwrap_or_else(|_| panic!("initial real acquisition"));
+        let (lease, _) = tokio::time::timeout(STEP, state.acquire_upstream_for_route(&old_entry))
+            .await
+            .unwrap()
+            .unwrap_or_else(|_| panic!("initial real acquisition"));
         let old_client = lease.client();
         drop(lease);
         assert!(old_client.is_connected());
@@ -575,12 +571,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            reply
-                .into_bytes_with_pool(replacement.server_pool_arc())
-                .unwrap(),
-            b"echo"
-        );
+        assert_eq!(reply.into_bytes().unwrap(), b"echo");
         // Re-observing the precise closing owner cannot target its replacement.
         state.clients.close(&old_client);
         assert!(old_client.close_shared_bounded(STEP).await);
@@ -595,12 +586,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            reply
-                .into_bytes_with_pool(replacement.server_pool_arc())
-                .unwrap(),
-            b"echo"
-        );
+        assert_eq!(reply.into_bytes().unwrap(), b"echo");
         drop(same_lease);
         drop(replacement_lease);
         assert!(state.local_route("grid").is_some());

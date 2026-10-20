@@ -1404,12 +1404,7 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("B semantic rejection must preserve A result");
-            assert_eq!(
-                response
-                    .into_bytes_with_pool(client.server_pool_arc())
-                    .unwrap(),
-                b"completed"
-            );
+            assert_eq!(response.into_bytes().unwrap(), b"completed");
             assert_eq!(
                 retained_allocations, allocations,
                 "B rejection must retain A's request carrier"
@@ -1557,13 +1552,8 @@ mod tests {
             _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
         ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
             let transport = match &request {
-                c2_server::RequestData::Shm {
-                    is_dedicated: true, ..
-                } => "dedicated",
-                c2_server::RequestData::Shm {
-                    is_dedicated: false,
-                    ..
-                } => "buddy",
+                c2_server::RequestData::Shm(shm) if shm.is_dedicated() => "dedicated",
+                c2_server::RequestData::Shm(_) => "buddy",
                 c2_server::RequestData::Handle(_) => "chunked",
                 c2_server::RequestData::Inline(_) => "inline",
             };

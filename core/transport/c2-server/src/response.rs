@@ -2,7 +2,7 @@
 
 use c2_mem::MemPool;
 
-use crate::dispatcher::ResponseMeta;
+use crate::dispatcher::{PreparedShmResponse, ResponseMeta};
 
 /// Return the buddy response wire `data_size` when the payload length is
 /// representable by the current buddy payload metadata.
@@ -33,53 +33,53 @@ where
         None => return Ok(None),
     };
 
-    let alloc = {
+    // Allocate the backing as the unique write owner. SHM-only: a tier
+    // failure returns None so the caller falls back to owned inline bytes
+    // and native transport selection.
+    let mut handle = {
         let mut pool = response_pool.write();
-        match pool.alloc(len) {
-            Ok(alloc) => alloc,
+        match pool.alloc_shm_handle(len) {
+            Ok(handle) => handle,
             Err(_) => return Ok(None),
         }
     };
 
-    if alloc.seg_idx > u16::MAX as u32 {
+    let coordinates = handle
+        .shm_allocation()
+        .expect("SHM response backing carries coordinates");
+    if coordinates.seg_idx > u16::MAX as u32 {
         let mut pool = response_pool.write();
-        let _ = pool.free(&alloc);
+        // Only this exact owner may authorize the raw release.
+        if pool.validate_handle(&handle).is_ok() {
+            let _ = unsafe { pool.free(&coordinates) };
+        }
         return Err(format!(
             "response segment index {} exceeds buddy response wire limit {}",
-            alloc.seg_idx,
+            coordinates.seg_idx,
             u16::MAX
         ));
     }
 
     let write_result = {
         let pool = response_pool.read();
-        let ptr = match pool.data_ptr(&alloc) {
-            Ok(ptr) => ptr,
-            Err(err) => {
-                drop(pool);
-                let mut pool = response_pool.write();
-                let _ = pool.free(&alloc);
-                return Err(format!("response allocation data pointer failed: {err}"));
-            }
-        };
-        let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-        write_into(dst)
+        match pool.validate_handle(&handle) {
+            Ok(()) => write_into(pool.handle_slice_mut(&mut handle)),
+            Err(err) => Err(format!("response allocation data pointer failed: {err}")),
+        }
     };
 
     if let Err(err) = write_result {
         let mut pool = response_pool.write();
-        let _ = pool.free(&alloc);
+        // Only this exact owner may authorize the raw release.
+        if pool.validate_handle(&handle).is_ok() {
+            let _ = unsafe { pool.free(&coordinates) };
+        }
         return Err(err);
     }
 
-    Ok(Some(ResponseMeta::ShmAlloc {
-        seg_idx: alloc.seg_idx as u16,
-        generation: alloc.generation,
-        offset: alloc.offset,
-        data_size,
-        is_dedicated: alloc.is_dedicated,
-        allocation_id: alloc.allocation_id,
-    }))
+    Ok(Some(ResponseMeta::ShmAlloc(PreparedShmResponse::new(
+        handle, data_size,
+    ))))
 }
 
 #[cfg(test)]
@@ -140,24 +140,29 @@ mod tests {
         .unwrap()
         .expect("large payload should allocate response SHM");
 
-        let ResponseMeta::ShmAlloc {
-            seg_idx,
-            generation,
-            offset,
-            data_size,
-            is_dedicated,
-            allocation_id: _,
-        } = meta
-        else {
+        let ResponseMeta::ShmAlloc(prepared) = meta else {
             panic!("expected ShmAlloc response metadata");
         };
+        assert_eq!(prepared.data_size() as usize, payload.len());
+        let allocation = prepared.shm_allocation().unwrap();
 
         let pool_guard = pool.read();
+        // SAFETY: the helper allocated and filled this exact span in this
+        // same pool inside this test; it stays live for this copy.
         let ptr = pool_guard
-            .data_ptr_at(seg_idx as u32, generation, offset, is_dedicated)
+            .data_ptr_at(
+                allocation.seg_idx,
+                allocation.generation,
+                allocation.offset,
+                allocation.is_dedicated,
+            )
             .unwrap();
-        let actual = unsafe { std::slice::from_raw_parts(ptr, data_size as usize) };
+        let actual = unsafe { std::slice::from_raw_parts(ptr, prepared.data_size() as usize) };
         assert_eq!(actual, payload.as_slice());
+        drop(pool_guard);
+        // The prepared owner releases cleanly through the response pool.
+        pool.write().release_handle(prepared.into_handle()).unwrap();
+        assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     #[test]

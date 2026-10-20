@@ -12,7 +12,8 @@ pub mod server;
 pub use config::ServerIpcConfig;
 pub use connection::Connection;
 pub use dispatcher::{
-    BuiltRoute, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta, RouteBuildSpec,
+    BuiltRoute, CrmCallback, CrmError, PeerShmRequest, PreparedShmResponse, RequestData,
+    RequestLease, ResponseMeta, RouteBuildSpec,
 };
 pub use heartbeat::{HeartbeatResult, run_heartbeat};
 pub use runtime::{ServerRuntimeBuilder, ServerRuntimeOptions};

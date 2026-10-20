@@ -5,10 +5,8 @@
 use c2_mem::{MemHandle, MemPool, PoolConfig};
 
 fn copy_of(source: &MemHandle) -> MemHandle {
-    match source {
-        MemHandle::Buddy { seg_idx, generation, allocation_id, offset, allocation_size, len } =>
-            MemHandle::Buddy { seg_idx: *seg_idx, generation: *generation, allocation_id: *allocation_id, offset: *offset, allocation_size: *allocation_size, len: *len },
-        _ => unreachable!("probe allocates from the buddy tier"),
+    MemHandle {
+        backing: source.backing,
     }
 }
 

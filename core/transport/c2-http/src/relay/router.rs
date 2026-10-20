@@ -1773,7 +1773,7 @@ async fn forward_call(
     match call_result {
         Ok(result) => materialized_response_or_error(
             &route_name,
-            result.into_bytes_with_pool(client.server_pool_arc()),
+            result.into_bytes(),
             state.config().remote_payload_chunk_size,
         ),
         Err(error) => {
@@ -1805,7 +1805,12 @@ async fn forward_call(
                 error if matches!(phase, c2_ipc::TransportPhase::PreDispatch) => {
                     if let Some(reason) = semantic_withdrawal_reason(&error) {
                         drop(lease);
-                        remove_unreachable_route_for_error(&state, &advertised_route, &error, reason);
+                        remove_unreachable_route_for_error(
+                            &state,
+                            &advertised_route,
+                            &error,
+                            reason,
+                        );
                     }
                     ipc_route_error_response(&route_name, &error)
                 }
@@ -1875,10 +1880,9 @@ async fn acquire_request_client_for_route(
 ) -> RequestClient {
     let route_name = route.name.clone();
     match state.acquire_upstream_for_route(route).await {
-        Ok((lease, binding)) => RequestClient::Ready(Box::new(ReadyRequestClient {
-            lease,
-            binding,
-        })),
+        Ok((lease, binding)) => {
+            RequestClient::Ready(Box::new(ReadyRequestClient { lease, binding }))
+        }
         Err(UpstreamAcquireError::NotFound) => RequestClient::NotFound,
         Err(UpstreamAcquireError::Stale { route }) => RequestClient::Stale(Box::new(route)),
         Err(UpstreamAcquireError::WatchUnavailable { route, reason }) => {
@@ -2528,34 +2532,14 @@ mod tests {
             request: RequestData,
             _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
         ) -> Result<ResponseMeta, CrmError> {
-            let marker = match request {
+            let marker = match &request {
                 RequestData::Inline(_) => "inline",
-                RequestData::Shm {
-                    pool,
-                    seg_idx,
-                    generation,
-                    offset,
-                    data_size,
-                    is_dedicated,
-                    allocation_id,
-                } => {
-                    let mut pool = pool.write();
-                    let _ = pool.free_at(
-                        seg_idx as u32,
-                        generation,
-                        offset,
-                        data_size,
-                        is_dedicated,
-                        allocation_id,
-                    );
-                    "shm"
-                }
-                RequestData::Handle(backing) => {
-                    let mut backing = backing;
-                    let _ = backing.release();
-                    "handle"
-                }
+                RequestData::Shm(_) => "shm",
+                RequestData::Handle(_) => "handle",
             };
+            c2_server::RequestLease::new(request)
+                .release()
+                .map_err(CrmError::InternalError)?;
             Ok(ResponseMeta::Inline(marker.as_bytes().to_vec()))
         }
     }
@@ -3062,9 +3046,7 @@ mod tests {
                 .unwrap();
             let response = ipc.call_bound(&binding, "ping", b"").await.unwrap();
             assert_eq!(
-                response
-                    .into_bytes_with_pool(ipc.server_pool_arc())
-                    .unwrap(),
+                response.into_bytes().unwrap(),
                 if index == 0 {
                     b"root-a".to_vec()
                 } else {
@@ -5389,16 +5371,8 @@ mod tests {
         let state = test_state();
         let suffix = unique_suffix();
         let route_name = format!("grid-toctou-{suffix}");
-        let old_address = format!(
-            "ipc://relay_toctou_old_{}_{}",
-            std::process::id(),
-            suffix
-        );
-        let new_address = format!(
-            "ipc://relay_toctou_new_{}_{}",
-            std::process::id(),
-            suffix
-        );
+        let old_address = format!("ipc://relay_toctou_old_{}_{}", std::process::id(), suffix);
+        let new_address = format!("ipc://relay_toctou_new_{}_{}", std::process::id(), suffix);
         let old_server = start_live_server_with_identity_and_contracts(
             &old_address,
             "server-old",

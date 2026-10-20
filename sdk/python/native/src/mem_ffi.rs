@@ -333,7 +333,7 @@ impl PyMemPool {
             is_dedicated: alloc.is_dedicated,
             allocation_id: alloc.allocation_id,
         };
-        pool.free(&pa).map_err(PyRuntimeError::new_err)?;
+        unsafe { pool.free(&pa) }.map_err(PyRuntimeError::new_err)?;
         Ok(())
     }
 
@@ -450,8 +450,8 @@ impl PyMemPool {
         allocation_id: u64,
     ) -> PyResult<()> {
         let mut pool = self.pool.write();
-        let _ = pool
-            .free_at(
+        let _ = unsafe {
+            pool.free_at(
                 seg_idx,
                 generation,
                 offset,
@@ -459,7 +459,8 @@ impl PyMemPool {
                 is_dedicated,
                 allocation_id,
             )
-            .map_err(PyRuntimeError::new_err)?;
+        }
+        .map_err(PyRuntimeError::new_err)?;
         Ok(())
     }
 

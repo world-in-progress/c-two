@@ -73,8 +73,8 @@ use crate::chunk_ordering::{
 use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
 use crate::dispatcher::{
-    BuiltRoute, CrmCallback, CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta,
-    RouteBuildSpec, cleanup_request,
+    BuiltRoute, CrmCallback, CrmError, CrmRoute, Dispatcher, PeerShmRequest, RequestData,
+    ResponseMeta, RouteBuildSpec, cleanup_request,
 };
 use crate::heartbeat::run_heartbeat;
 use crate::response::buddy_response_data_size;
@@ -3085,15 +3085,15 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
 
     // 4. Build request — zero-copy SHM or fallback to inline if extra args present.
     let request = if extra_args.is_empty() {
-        RequestData::Shm {
-            pool: peer_pool,
-            seg_idx: bp.seg_idx,
-            generation: bp.generation,
-            offset: bp.offset,
-            data_size: bp.data_size,
-            is_dedicated: bp.is_dedicated,
-            allocation_id: bp.allocation_id,
-        }
+        RequestData::Shm(PeerShmRequest::admit(
+            peer_pool,
+            bp.seg_idx,
+            bp.generation,
+            bp.offset,
+            bp.data_size,
+            bp.is_dedicated,
+            bp.allocation_id,
+        ))
     } else {
         // Rare edge case: extra inline args after buddy payload — fall back to copy.
         warn!(
@@ -4010,26 +4010,28 @@ async fn write_buddy_reply_with_data(
         ))
     })?;
 
-    // 1. Allocate from response pool.
-    let alloc = {
+    // 1. Allocate from the response pool as the unique write owner.
+    let handle = {
         let mut pool = response_pool.write();
-        pool.alloc(data.len())
+        pool.alloc_shm_handle(data.len())
     };
-    let alloc = match alloc {
-        Ok(a) => a,
+    let mut handle = match handle {
+        Ok(h) => h,
         Err(e) => {
             return Err(BuddyReplyError::Fallback(format!("alloc failed: {e}")));
         }
     };
 
-    // 2. Write data to SHM (single lock scope).
+    let allocation = handle
+        .shm_allocation()
+        .expect("SHM reply backing carries coordinates");
+
+    // 2. Write data through the owner handle (single lock scope).
     let write_ok = {
         let pool = response_pool.read();
-        match pool.data_ptr(&alloc) {
-            Ok(ptr) => {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-                }
+        match pool.validate_handle(&handle) {
+            Ok(()) => {
+                pool.handle_slice_mut(&mut handle).copy_from_slice(data);
                 true
             }
             Err(_) => false,
@@ -4038,19 +4040,22 @@ async fn write_buddy_reply_with_data(
     if !write_ok {
         {
             let mut pool = response_pool.write();
-            let _ = pool.free(&alloc);
+            // Only this exact owner may authorize the raw release.
+            if pool.validate_handle(&handle).is_ok() {
+                let _ = unsafe { pool.free(&allocation) };
+            }
         }
         return Err(BuddyReplyError::Fallback("data_ptr failed".into()));
     }
 
-    // 3. Encode buddy payload + reply control.
+    // 3. Encode buddy payload + reply control from the owner projection.
     let bp = BuddyPayload {
-        seg_idx: alloc.seg_idx as u16,
-        generation: alloc.generation,
-        offset: alloc.offset,
+        seg_idx: u16::try_from(allocation.seg_idx).expect("wire segment index"),
+        generation: allocation.generation,
+        offset: allocation.offset,
         data_size,
-        is_dedicated: alloc.is_dedicated,
-        allocation_id: alloc.allocation_id,
+        is_dedicated: allocation.is_dedicated,
+        allocation_id: allocation.allocation_id,
     };
     let buddy_bytes = encode_buddy_payload(&bp);
     // 4. Send frame with FLAG_BUDDY.
@@ -4058,18 +4063,24 @@ async fn write_buddy_reply_with_data(
     let frame = frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
     if let Err(err) = writer.lock().await.write_all(&frame).await {
         let mut pool = response_pool.write();
-        let _ = pool.free(&alloc);
+        // Only this exact owner may authorize the raw release.
+        if pool.validate_handle(&handle).is_ok() {
+            let _ = unsafe { pool.free(&allocation) };
+        }
         return Err(BuddyReplyError::Fatal(format!(
             "buddy reply write failed: {err}"
         )));
     }
 
-    // 5. Server-side free for dedicated segments: the client will lazy-open
-    //    and read from SHM before gc_delay expires.  Buddy allocs use SHM
-    //    atomics so the client's free_at is already cross-process visible.
-    if alloc.is_dedicated {
+    // 5. Dedicated backings keep a server-side lifecycle: release the owner
+    //    now. A published buddy backing transfers its cross-process release
+    //    to the client, so its owner value is dropped without freeing.
+    if handle.is_dedicated() {
         let mut pool = response_pool.write();
-        let _ = pool.free(&alloc);
+        // Only this exact owner may authorize the raw release.
+        if pool.validate_handle(&handle).is_ok() {
+            let _ = unsafe { pool.free(&allocation) };
+        }
     }
 
     Ok(())
@@ -4145,36 +4156,34 @@ async fn send_response_meta(
         ResponseMeta::Empty => {
             write_reply_with_data(writer, request_id, &[]).await?;
         }
-        ResponseMeta::ShmAlloc {
-            seg_idx,
-            generation,
-            offset,
-            data_size,
-            is_dedicated,
-            allocation_id,
-        } => {
+        ResponseMeta::ShmAlloc(prepared) => {
+            let data_size = prepared.data_size();
             if u64::from(data_size) > max_payload_size {
                 let mut pool = response_pool.write();
-                let _ = pool.free_at(
-                    seg_idx as u32,
-                    generation,
-                    offset,
-                    data_size,
-                    is_dedicated,
-                    allocation_id,
-                );
+                let _ = prepared.release_through(&mut pool);
                 return Err(ResponseSendError::UserVisible(format!(
                     "response payload size {data_size} exceeds max_payload_size {max_payload_size}"
                 )));
             }
-            // CRM already wrote into our response pool — send buddy pointer.
+            prepared
+                .validate_pool(&response_pool.read())
+                .map_err(|error| {
+                    ResponseSendError::UserVisible(format!(
+                        "prepared SHM response owner mismatch: {error}"
+                    ))
+                })?;
+            // CRM already wrote into our response pool — send the backing's
+            // read-only coordinates in the reply frame.
+            let allocation = prepared
+                .shm_allocation()
+                .expect("prepared SHM response carries an SHM allocation");
             let bp = BuddyPayload {
-                seg_idx,
-                generation,
-                offset,
+                seg_idx: u16::try_from(allocation.seg_idx).expect("wire segment index"),
+                generation: allocation.generation,
+                offset: allocation.offset,
                 data_size,
-                is_dedicated,
-                allocation_id,
+                is_dedicated: allocation.is_dedicated,
+                allocation_id: allocation.allocation_id,
             };
             let buddy_bytes = encode_buddy_payload(&bp);
             let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
@@ -4182,30 +4191,24 @@ async fn send_response_meta(
                 frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
             if let Err(err) = writer.lock().await.write_all(&frame).await {
                 let mut pool = response_pool.write();
-                let _ = pool.free_at(
-                    seg_idx as u32,
-                    generation,
-                    offset,
-                    data_size,
-                    is_dedicated,
-                    allocation_id,
-                );
+                let _ = prepared.release_through(&mut pool);
                 return Err(ResponseSendError::Transport(format!(
                     "prepared SHM reply write failed: {err}"
                 )));
             }
 
-            // Server-side free for dedicated segments (same as write_buddy_reply_with_data).
-            if is_dedicated {
+            // Dedicated backings keep a server-side lifecycle; release the
+            // consumed owner now. A published buddy backing transfers the
+            // cross-process release to the receiving client: dropping the
+            // owner here without freeing hands over exactly that.
+            if prepared.is_dedicated() {
                 let mut pool = response_pool.write();
-                let _ = pool.free_at(
-                    seg_idx as u32,
-                    generation,
-                    offset,
-                    data_size,
-                    true,
-                    allocation_id,
-                );
+                let _ = prepared.release_through(&mut pool);
+            } else {
+                // Consume the owner at the publish boundary: the value is
+                // dropped without freeing, so the only remaining release
+                // authority is the receiving client's read-then-release.
+                drop(prepared.into_handle());
             }
         }
     }
@@ -4547,9 +4550,8 @@ mod tests {
             .unwrap()
             .endpoint(&unique_readiness_address("shutdown_gate_contention"))
             .unwrap();
-        let server = Arc::new(
-            Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap(),
-        );
+        let server =
+            Arc::new(Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap());
         let runner = {
             let server = Arc::clone(&server);
             tokio::spawn(async move { server.run().await })
@@ -4617,9 +4619,8 @@ mod tests {
             .unwrap()
             .endpoint(&unique_readiness_address("shutdown_bad_record"))
             .unwrap();
-        let server = Arc::new(
-            Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap(),
-        );
+        let server =
+            Arc::new(Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap());
         let runner = {
             let server = Arc::clone(&server);
             tokio::spawn(async move { server.run().await })
@@ -5327,16 +5328,18 @@ mod tests {
             format!("/cc2s{:04x}{:04x}", std::process::id() as u16, 0xaceu16,),
         )));
         pool.write().ensure_ready().unwrap();
-        let alloc = pool.write().alloc(128).unwrap();
-        let request = RequestData::Shm {
-            pool: Arc::clone(&pool),
-            seg_idx: alloc.seg_idx as u16,
-            generation: alloc.generation,
-            offset: alloc.offset,
-            data_size: 128,
-            is_dedicated: alloc.is_dedicated,
-            allocation_id: alloc.allocation_id,
-        };
+        let mut owned = pool.write().alloc_handle(128).unwrap();
+        pool.write().handle_slice_mut(&mut owned).fill(7);
+        let alloc = owned.shm_allocation().unwrap();
+        let request = RequestData::Shm(PeerShmRequest::admit(
+            Arc::clone(&pool),
+            alloc.seg_idx as u16,
+            alloc.generation,
+            alloc.offset,
+            128,
+            alloc.is_dedicated,
+            alloc.allocation_id,
+        ));
         let scheduler = Scheduler::with_limits(
             ConcurrencyMode::Parallel,
             HashMap::new(),
@@ -7094,7 +7097,6 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_metadata_does_not_control_peer_mapping_or_release() {
-        use c2_mem::MemHandle;
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
         use c2_wire::handshake::encode_client_handshake;
 
@@ -7120,17 +7122,16 @@ mod tests {
             peer_pool
                 .handle_slice_mut(&mut handle)
                 .copy_from_slice(&data);
-            let (seg_idx, generation, offset, len, allocation_id) = match handle {
-                MemHandle::Buddy {
-                    seg_idx,
-                    generation,
-                    offset,
-                    len,
-                    allocation_id,
-                    ..
-                } => (seg_idx, generation, offset, len, allocation_id),
-                other => panic!("expected buddy request block, got {other:?}"),
-            };
+            let len = handle.len() as u32;
+            let allocation = handle
+                .shm_allocation()
+                .expect("buddy request backing coordinates");
+            let (seg_idx, generation, offset, allocation_id) = (
+                allocation.seg_idx as u16,
+                allocation.generation,
+                allocation.offset,
+                allocation.allocation_id,
+            );
             let segments = announced_size
                 .map(|size| ("descriptive-only".to_string(), size))
                 .into_iter()
@@ -7167,7 +7168,6 @@ mod tests {
 
     #[tokio::test]
     async fn buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization() {
-        use c2_mem::MemHandle;
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
         use c2_wire::control::encode_call_control;
         use std::sync::Mutex as StdMutex;
@@ -7196,31 +7196,18 @@ mod tests {
                 assert_eq!(route_name, "grid");
                 assert_eq!(method_idx, 0);
                 match request {
-                    RequestData::Shm {
-                        pool,
-                        seg_idx,
-                        generation,
-                        offset,
-                        data_size,
-                        is_dedicated,
-                        allocation_id,
-                    } => {
+                    RequestData::Shm(carrier) => {
+                        let (generation, offset, data_size, _allocation_id) = carrier.coordinates();
                         *self.seen.lock().unwrap() = Some(SeenShmRequest {
-                            seg_idx,
+                            seg_idx: carrier.seg_idx(),
                             generation,
                             offset,
                             data_size,
-                            is_dedicated,
+                            is_dedicated: carrier.is_dedicated(),
                         });
-                        cleanup_request(RequestData::Shm {
-                            pool,
-                            seg_idx,
-                            generation,
-                            offset,
-                            data_size,
-                            is_dedicated,
-                            allocation_id,
-                        });
+                        // The carrier moves on to cleanup unchanged: no
+                        // reconstruction from bare coordinates exists.
+                        cleanup_request(RequestData::Shm(carrier));
                         Ok(ResponseMeta::Inline(b"ok".to_vec()))
                     }
                     other => {
@@ -7256,17 +7243,17 @@ mod tests {
             unique_response_pool_prefix("rqcb"),
         );
         let handle = peer_pool.try_alloc_shm(128).unwrap();
-        let (seg_idx, generation, offset, len, allocation_id) = match handle {
-            MemHandle::Buddy {
-                seg_idx,
-                generation,
-                offset,
-                len,
-                allocation_id,
-                ..
-            } => (seg_idx, generation, offset, len, allocation_id),
-            other => panic!("expected buddy request block, got {other:?}"),
-        };
+        assert!(handle.is_buddy());
+        let len = handle.len() as u32;
+        let allocation = handle
+            .shm_allocation()
+            .expect("buddy request backing coordinates");
+        let (seg_idx, generation, offset, allocation_id) = (
+            allocation.seg_idx as u16,
+            allocation.generation,
+            allocation.offset,
+            allocation.allocation_id,
+        );
         assert_eq!(peer_pool.stats().alloc_count, 1);
 
         let conn = Arc::new(Connection::new(70));
@@ -8507,7 +8494,6 @@ mod tests {
     /// its buddy-backed peer block instead of leaking the SHM allocation.
     #[tokio::test]
     async fn discarded_waiting_buddy_chunk_returns_its_peer_block() {
-        use c2_mem::MemHandle;
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
         use c2_wire::chunk::encode_chunk_header;
 
@@ -8524,17 +8510,17 @@ mod tests {
         );
         let allocate_buddy_frame = |peer_pool: &mut MemPool| -> Vec<u8> {
             let handle = peer_pool.try_alloc_shm(128).unwrap();
-            let (seg_idx, generation, offset, len, allocation_id) = match handle {
-                MemHandle::Buddy {
-                    seg_idx,
-                    generation,
-                    offset,
-                    len,
-                    allocation_id,
-                    ..
-                } => (seg_idx, generation, offset, len, allocation_id),
-                other => panic!("expected buddy request block, got {other:?}"),
-            };
+            assert!(handle.is_buddy());
+            let len = handle.len() as u32;
+            let allocation = handle
+                .shm_allocation()
+                .expect("buddy request backing coordinates");
+            let (seg_idx, generation, offset, allocation_id) = (
+                allocation.seg_idx as u16,
+                allocation.generation,
+                allocation.offset,
+                allocation.allocation_id,
+            );
             let mut payload = encode_buddy_payload(&BuddyPayload {
                 seg_idx,
                 generation,
@@ -8783,30 +8769,44 @@ mod tests {
     #[tokio::test]
     async fn prepared_shm_reply_write_failure_frees_allocated_response_block() {
         let pool = small_response_pool("b");
-        let alloc = pool.write().alloc(8192).unwrap();
+        let prepared = crate::response::try_prepare_shm_response(&pool, 1024, 8192, |dst| {
+            dst.fill(b'x');
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
         let writer = closed_writer().await;
 
-        let err = send_response_meta(
-            &pool,
-            &writer,
-            7,
-            ResponseMeta::ShmAlloc {
-                seg_idx: alloc.seg_idx as u16,
-                generation: alloc.generation,
-                offset: alloc.offset,
-                data_size: 8192,
-                is_dedicated: alloc.is_dedicated,
-                allocation_id: alloc.allocation_id,
-            },
-            1024,
-            4096,
-            16 * 1024,
-        )
-        .await
-        .unwrap_err();
+        let err = send_response_meta(&pool, &writer, 7, prepared, 1024, 4096, 16 * 1024)
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("prepared SHM reply write failed"));
         assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_reply_rejects_a_foreign_pool_before_transport() {
+        let origin = small_response_pool("r02origin");
+        let target = small_response_pool("r02target");
+        let mut live = target.write().alloc_shm_handle(8192).unwrap();
+        target.read().handle_slice_mut(&mut live)[0] = 0x5A;
+        let prepared = crate::response::try_prepare_shm_response(&origin, 1024, 8192, |dst| {
+            dst.fill(0xA5);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        let writer = closed_writer().await;
+        let error = send_response_meta(&target, &writer, 7, prepared, 1024, 4096, 16 * 1024)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("owner mismatch"));
+        assert_eq!(target.read().handle_slice(&live)[0], 0x5A);
+        assert_eq!(target.read().stats().alloc_count, 1);
+        assert_eq!(origin.read().stats().alloc_count, 1);
+        target.write().release_handle(live).unwrap();
+        origin.write().destroy();
     }
 
     #[tokio::test]
@@ -8836,27 +8836,17 @@ mod tests {
     #[tokio::test]
     async fn prepared_shm_response_over_max_payload_is_rejected_and_freed() {
         let pool = small_response_pool("d");
-        let alloc = pool.write().alloc(8192).unwrap();
+        let prepared = crate::response::try_prepare_shm_response(&pool, 1024, 8192, |dst| {
+            dst.fill(b'x');
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
         let writer = closed_writer().await;
 
-        let err = send_response_meta(
-            &pool,
-            &writer,
-            7,
-            ResponseMeta::ShmAlloc {
-                seg_idx: alloc.seg_idx as u16,
-                generation: alloc.generation,
-                offset: alloc.offset,
-                data_size: 8192,
-                is_dedicated: alloc.is_dedicated,
-                allocation_id: alloc.allocation_id,
-            },
-            1024,
-            4096,
-            4096,
-        )
-        .await
-        .unwrap_err();
+        let err = send_response_meta(&pool, &writer, 7, prepared, 1024, 4096, 4096)
+            .await
+            .unwrap_err();
 
         assert!(
             err.to_string()
@@ -8983,9 +8973,9 @@ mod tests {
         );
 
         let response_pool = server.response_pool_arc();
-        let alloc = response_pool
+        let handle = response_pool
             .write()
-            .alloc(4096)
+            .alloc_handle(4096)
             .expect("response allocation");
         let charged = observer.used_bytes();
         assert!(
@@ -9003,7 +8993,10 @@ mod tests {
         drop(server);
         assert_eq!(observer.used_bytes(), charged);
 
-        response_pool.write().free(&alloc).expect("release");
+        response_pool
+            .write()
+            .release_handle(handle)
+            .expect("release");
         response_pool.write().gc_buddy();
         assert_eq!(
             observer.used_bytes(),

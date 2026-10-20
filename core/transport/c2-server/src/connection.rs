@@ -51,7 +51,8 @@ impl PeerShmState {
                 return Err("dedicated generation must be zero".into());
             }
             let name = MemPool::dedicated_segment_name(&self.prefix, seg_idx);
-            pool.open_dedicated_at(seg_idx, &name, data_size)
+            // SAFETY: the private peer cache and canonical name come from one handshake.
+            unsafe { pool.open_dedicated_at(seg_idx, &name, data_size) }
         } else {
             // Open with exactly the frame's data span: the mapped region must
             // hold the advertised payload, and the allocator header supplies
@@ -146,7 +147,8 @@ impl Connection {
 
     /// Get a shared reference to the peer's MemPool (for ShmBuffer construction).
     /// Returns None if handshake hasn't completed yet.
-    pub fn peer_pool_arc(&self) -> Option<Arc<RwLock<MemPool>>> {
+    #[cfg(test)]
+    pub(crate) fn peer_pool_arc(&self) -> Option<Arc<RwLock<MemPool>>> {
         let state = self.peer_shm.lock();
         state.pool.clone()
     }
@@ -204,7 +206,7 @@ impl Connection {
 
     /// Ensure the peer's SHM segment is mapped and return the pool Arc.
     /// Combines `ensure_peer_segment` + `peer_pool_arc` under one lock.
-    pub fn ensure_and_get_peer_pool(
+    pub(crate) fn ensure_and_get_peer_pool(
         &self,
         seg_idx: u16,
         generation: u32,
@@ -223,7 +225,12 @@ impl Connection {
     ///
     /// Lazy-opens the segment if it hasn't been seen before — the name is
     /// derived by MemPool from its prefix, index, and generation.
-    pub fn read_peer_data(
+    ///
+    /// Crate-private: only the server's frame-receive paths may pass peer
+    /// coordinates through this raw seam; every admission funnels into a
+    /// [`crate::PeerShmRequest`] carrier that owns the read/release
+    /// authority for its block.
+    pub(crate) fn read_peer_data(
         &self,
         seg_idx: u16,
         generation: u32,
@@ -236,14 +243,21 @@ impl Connection {
         state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated)?;
         let pool_arc = state.pool.as_ref().ok_or("peer pool not initialised")?;
         let pool = pool_arc.read();
-        pool.copy_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
+        // SAFETY: the coordinates come from a frame decoded on this exact
+        // connection; the peer completed and published the write
+        // (write-then-publish protocol) and no other local access to the
+        // block exists.
+        unsafe { pool.copy_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated) }
     }
 
     /// Free a buddy block in the peer's SHM pool.
     ///
     /// Lazy-opens the segment if not yet mapped.
     /// Returns `FreeResult` so callers can trigger deferred GC on idle segments.
-    pub fn free_peer_block(
+    ///
+    /// Crate-private: same frame-admission boundary as
+    /// [`Connection::read_peer_data`].
+    pub(crate) fn free_peer_block(
         &self,
         seg_idx: u16,
         generation: u32,
@@ -268,14 +282,19 @@ impl Connection {
             match pool
                 .validate_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
                 .and_then(|_| {
-                    pool.free_at(
-                        seg_idx as u32,
-                        generation,
-                        offset,
-                        data_size,
-                        is_dedicated,
-                        allocation_id,
-                    )
+                    // SAFETY: the coordinates come from a frame received on
+                    // this connection and the server is the sole releaser
+                    // for the peer's block (read-then-release protocol).
+                    unsafe {
+                        pool.free_at(
+                            seg_idx as u32,
+                            generation,
+                            offset,
+                            data_size,
+                            is_dedicated,
+                            allocation_id,
+                        )
+                    }
                 }) {
                 Ok(result) => return result,
                 Err(e) => {

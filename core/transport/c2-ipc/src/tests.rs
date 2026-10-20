@@ -437,6 +437,7 @@ mod response_lease_tests {
     use c2_mem::{MemPool, PoolConfig};
     use parking_lot::{Mutex, RwLock};
 
+    use crate::response::ServerShmResponse;
     use crate::{ResponseData, ResponseLease, ServerPoolState};
 
     const SEGMENT_SIZE: usize = 64 * 1024;
@@ -473,10 +474,7 @@ mod response_lease_tests {
 
     #[test]
     fn inline_response_copy_and_release_are_independent_and_idempotent() {
-        let mut lease = ResponseLease::new(
-            ResponseData::Inline(b"inline response".to_vec()),
-            Arc::new(Mutex::new(None)),
-        );
+        let mut lease = ResponseLease::new(ResponseData::Inline(b"inline response".to_vec()));
 
         assert_eq!(lease.copy_bytes().unwrap(), b"inline response");
         assert!(!lease.is_released());
@@ -502,8 +500,7 @@ mod response_lease_tests {
                 ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
             backing.write_at(0, &payload).unwrap();
             backing.trim_to(logical_len).unwrap();
-            let mut lease =
-                ResponseLease::new(ResponseData::Handle(backing), Arc::new(Mutex::new(None)));
+            let mut lease = ResponseLease::new(ResponseData::Handle(backing));
 
             assert_eq!(lease.copy_bytes().unwrap(), payload[..logical_len]);
             assert_eq!(pool.read().stats().alloc_count, 1);
@@ -531,8 +528,7 @@ mod response_lease_tests {
             backing.trim_to(logical_len).unwrap();
             #[cfg(windows)]
             let path = backing.file_spill_path().unwrap();
-            let mut lease =
-                ResponseLease::new(ResponseData::Handle(backing), Arc::new(Mutex::new(None)));
+            let mut lease = ResponseLease::new(ResponseData::Handle(backing));
             #[cfg(windows)]
             assert!(path.exists());
             assert_eq!(lease.copy_bytes().unwrap(), payload[..logical_len]);
@@ -559,17 +555,15 @@ mod response_lease_tests {
         let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
             reader,
         ))));
-        let lease = ResponseLease::new(
-            ResponseData::Shm {
-                seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
-                generation: allocation.generation,
-                offset: u32::try_from(segment_capacity - 1).unwrap(),
-                data_size: 2,
-                is_dedicated: false,
-                allocation_id: allocation.allocation_id,
-            },
+        let lease = ResponseLease::new(ResponseData::Shm(ServerShmResponse::admit(
             server_pool,
-        );
+            u16::try_from(allocation.seg_idx).unwrap(),
+            allocation.generation,
+            u32::try_from(segment_capacity - 1).unwrap(),
+            2,
+            false,
+            allocation.allocation_id,
+        )));
 
         assert!(
             lease
@@ -580,7 +574,8 @@ mod response_lease_tests {
         drop(lease);
 
         assert_eq!(producer.stats().alloc_count, 1);
-        producer.free(&allocation).unwrap();
+        // SAFETY: test holds sole release authority for its own allocation.
+        unsafe { producer.free(&allocation) }.unwrap();
     }
 
     #[test]
@@ -590,7 +585,7 @@ mod response_lease_tests {
         let pool = empty_reassembly_pool('c');
         let mut handle = ReassemblyBacking::admit(Arc::clone(&pool), 1, 16).unwrap();
         handle.write_at(0, b"combined failure").unwrap();
-        let lease = ResponseLease::new(ResponseData::Handle(handle), Arc::new(Mutex::new(None)));
+        let lease = ResponseLease::new(ResponseData::Handle(handle));
         *pool.write() = MemPool::new_with_prefix(pool_config(), unique_prefix('z'));
 
         let error = lease.into_owned_bytes().unwrap_err();
@@ -601,48 +596,39 @@ mod response_lease_tests {
     fn assert_shm_response(payload: Vec<u8>, expected_dedicated: bool, label: char) {
         let prefix = unique_prefix(label);
         let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());
-        let allocation = producer.alloc(payload.len()).unwrap();
-        assert_eq!(allocation.is_dedicated, expected_dedicated);
-        let pointer = producer.data_ptr(&allocation).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer, payload.len());
-        }
+        let mut handle = producer.try_alloc_shm(payload.len()).unwrap();
+        assert_eq!(handle.is_dedicated(), expected_dedicated);
+        producer
+            .handle_slice_mut(&mut handle)
+            .copy_from_slice(&payload);
+        let allocation = handle.shm_allocation().unwrap();
 
         let reader = MemPool::open_peer(pool_config(), producer.prefix().to_string());
         let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
             reader,
         ))));
-        let mut lease = ResponseLease::new(
-            ResponseData::Shm {
-                seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
-                generation: allocation.generation,
-                offset: allocation.offset,
-                data_size: u32::try_from(payload.len()).unwrap(),
-                is_dedicated: allocation.is_dedicated,
-                allocation_id: allocation.allocation_id,
-            },
+        let mut lease = ResponseLease::new(ResponseData::Shm(ServerShmResponse::admit(
             Arc::clone(&server_pool),
-        );
+            u16::try_from(allocation.seg_idx).unwrap(),
+            allocation.generation,
+            allocation.offset,
+            u32::try_from(payload.len()).unwrap(),
+            allocation.is_dedicated,
+            allocation.allocation_id,
+        )));
 
         assert_eq!(lease.copy_bytes().unwrap(), payload);
         lease.release().unwrap();
-        assert_eq!(
-            server_pool
-                .lock()
-                .as_ref()
-                .unwrap()
-                .pool
-                .stats()
-                .alloc_count,
-            0
-        );
+        drop(server_pool);
+        assert_eq!(producer.stats().alloc_count, 1);
     }
 
     #[test]
     fn response_release_rejects_stale_id_after_same_slot_reuse() {
         let mut owner = MemPool::new_with_prefix(pool_config(), unique_prefix('i'));
         let old = owner.alloc(4096).unwrap();
-        owner.free(&old).unwrap();
+        // SAFETY: test holds sole release authority for its own allocation.
+        unsafe { owner.free(&old) }.unwrap();
         let current = owner.alloc(4096).unwrap();
         assert_eq!(
             (current.seg_idx, current.generation, current.offset),
@@ -747,8 +733,8 @@ mod lazy_policy_roundtrip_tests {
     fn request_kind(request: &RequestData) -> &'static str {
         match request {
             RequestData::Inline(_) => "inline",
-            RequestData::Shm { is_dedicated, .. } => {
-                if *is_dedicated {
+            RequestData::Shm(carrier) => {
+                if carrier.is_dedicated() {
                     "shm_dedicated"
                 } else {
                     "shm_buddy"
@@ -906,10 +892,8 @@ mod lazy_policy_roundtrip_tests {
         .unwrap()
     }
 
-    fn response_bytes(client: &IpcClient, response: ResponseData) -> Vec<u8> {
-        response
-            .into_bytes_with_pool(&client.server_pool_arc().clone())
-            .unwrap()
+    fn response_bytes(_client: &IpcClient, response: ResponseData) -> Vec<u8> {
+        response.into_bytes().unwrap()
     }
 
     // Fake callback state is a transport seam, not a Core deadline model.
@@ -1361,7 +1345,7 @@ mod lazy_policy_roundtrip_tests {
             .unwrap()
             .unwrap();
         assert_eq!(client.pending_len_for_test(), 0);
-        let mut lease = ResponseLease::new(response, Arc::clone(client.server_pool_arc()));
+        let mut lease = ResponseLease::new(response);
         assert_eq!(lease.copy_bytes().unwrap(), payload);
         lease.release().unwrap();
         lease.release().unwrap();
@@ -1637,16 +1621,11 @@ mod lazy_policy_roundtrip_tests {
 
         // The reply came back as dedicated SHM coordinates, not inline bytes:
         // with buddy disabled the response pool allocated dedicated segments.
-        let ResponseData::Shm {
-            is_dedicated,
-            data_size,
-            ..
-        } = &response
-        else {
+        let ResponseData::Shm(carrier) = &response else {
             panic!("expected SHM response, got {response:?}");
         };
-        assert!(*is_dedicated, "response must use dedicated SHM");
-        assert_eq!(*data_size as usize, payload.len());
+        assert!(carrier.is_dedicated(), "response must use dedicated SHM");
+        assert_eq!(carrier.data_size() as usize, payload.len());
         assert_eq!(response_bytes(&client, response), payload);
 
         // No buddy segments were ever mapped on either side.
@@ -1722,7 +1701,8 @@ mod lazy_policy_roundtrip_tests {
             let response_pool = server.response_pool_arc();
             let mut pool = response_pool.write();
             for alloc in held.lock().drain(..) {
-                pool.free(&alloc).unwrap();
+                // SAFETY: test holds sole release authority for its own allocation.
+                unsafe { pool.free(&alloc) }.unwrap();
             }
         }
 
@@ -1808,19 +1788,14 @@ mod lazy_policy_roundtrip_tests {
 
         // The reply arrived as buddy SHM from the server's lazily created
         // 64 KiB response pool, which the client lazy-opened symmetrically.
-        let ResponseData::Shm {
-            is_dedicated,
-            data_size,
-            ..
-        } = &response
-        else {
+        let ResponseData::Shm(carrier) = &response else {
             panic!("expected SHM response, got {response:?}");
         };
         assert!(
-            !*is_dedicated,
+            !carrier.is_dedicated(),
             "buddy-enabled pools must serve buddy replies"
         );
-        assert_eq!(*data_size as usize, payload.len());
+        assert_eq!(carrier.data_size() as usize, payload.len());
         assert_eq!(response_bytes(&client, response), payload);
 
         assert_eq!(own_pool_segment_count(&client), 1);
@@ -1970,21 +1945,26 @@ mod lazy_policy_roundtrip_tests {
             ),
             budget.clone(),
         )));
-        let alloc = pool.lock().alloc(4096).expect("real dedicated allocation");
-        assert!(alloc.is_dedicated);
+        let handle = pool
+            .lock()
+            .try_alloc_shm(4096)
+            .expect("real dedicated allocation");
+        assert!(handle.is_dedicated());
+        let coordinates = handle.shm_allocation().unwrap();
+        let seg_idx = coordinates.seg_idx;
         let prefix = pool.lock().prefix().to_string();
         let name = pool
             .lock()
-            .dedicated_name(alloc.seg_idx)
+            .dedicated_name(seg_idx)
             .expect("dedicated backing name")
             .to_string();
         let mut peer = MemPool::open_peer(config, prefix);
-        peer.open_dedicated_at(alloc.seg_idx, &name, 4096)
+        unsafe { peer.open_dedicated_at(seg_idx, &name, 4096) }
             .expect("peer opens the request backing");
         let charged = budget.snapshot().shm.used_bytes;
         assert!(charged > 0);
 
-        let block = Arc::new(RequestBlock::new(Arc::clone(&pool), alloc));
+        let block = Arc::new(RequestBlock::new(Arc::clone(&pool), handle));
         let (permit, returned) = control::reserve_permit();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -2035,11 +2015,12 @@ mod lazy_policy_roundtrip_tests {
             !control::can_reserve(),
             "one retained backing fills capacity"
         );
-        assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
+        assert!(pool.lock().dedicated_awaiting_retirement(&coordinates));
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
 
-        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0)
-            .expect("peer signals read_done");
+        // SAFETY: the test acts as the receiving peer for this admitted
+        // dedicated block — the sole releaser signalling read_done.
+        unsafe { peer.free_at(seg_idx, 0, 0, 4096, true, 0) }.expect("peer signals read_done");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !returned.load(Ordering::Acquire) || budget.snapshot().shm.used_bytes != 0 {
             assert!(std::time::Instant::now() < deadline, "retirement timed out");
@@ -2097,7 +2078,7 @@ mod lazy_policy_roundtrip_tests {
             .expect("dedicated backing name")
             .to_string();
         let mut peer = MemPool::open_peer(config, prefix);
-        peer.open_dedicated_at(alloc.seg_idx, &name, 4096)
+        unsafe { peer.open_dedicated_at(alloc.seg_idx, &name, 4096) }
             .expect("peer opens the request backing");
         let charged = budget.snapshot().shm.used_bytes;
         assert!(charged > 0, "the retained backing must be charged");
@@ -2126,7 +2107,9 @@ mod lazy_policy_roundtrip_tests {
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
         assert!(!returned.load(Ordering::Acquire));
 
-        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0)
+        // SAFETY: the test acts as the receiving peer and sole releaser of
+        // this admitted dedicated block, signalling read_done.
+        unsafe { peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0) }
             .expect("peer signals read_done");
         // Sample the returned flag and scoped count under the executor lock.
         // Independent reads allow the worker to return the permit and clear
@@ -2228,8 +2211,8 @@ mod lazy_policy_roundtrip_tests {
             _response_pool: Arc<RwLock<MemPool>>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
-            if let RequestData::Shm { seg_idx, .. } = &request {
-                self.seen_seg_idx.lock().push(*seg_idx);
+            if let RequestData::Shm(carrier) = &request {
+                self.seen_seg_idx.lock().push(carrier.seg_idx());
             }
             let request = RequestLease::new(request);
             let bytes = request.copy_bytes().map_err(CrmError::InternalError)?;
@@ -2327,11 +2310,11 @@ mod lazy_policy_roundtrip_tests {
         let response = echo_roundtrip(&client, "disabled_injected", &payload).await;
 
         assert_eq!(*seen_kinds.lock(), vec!["shm_dedicated"]);
-        let ResponseData::Shm { is_dedicated, .. } = &response else {
+        let ResponseData::Shm(carrier) = &response else {
             panic!("expected SHM response, got {response:?}");
         };
         assert!(
-            *is_dedicated,
+            carrier.is_dedicated(),
             "disabled injected pool must serve dedicated SHM"
         );
         assert_eq!(response_bytes(&client, response), payload);
@@ -2441,7 +2424,8 @@ mod lazy_policy_roundtrip_tests {
             let response_pool = server.response_pool_arc();
             let mut pool = response_pool.write();
             for alloc in held.lock().drain(..) {
-                pool.free(&alloc).unwrap();
+                // SAFETY: test holds sole release authority for its own allocation.
+                unsafe { pool.free(&alloc) }.unwrap();
             }
         }
         client.close().await;
@@ -2519,10 +2503,10 @@ mod lazy_policy_roundtrip_tests {
         let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
         let response = echo_roundtrip(&client, "dedicated_gc", &payload).await;
         assert_eq!(*seen_kinds.lock(), vec!["shm_dedicated"]);
-        let ResponseData::Shm { is_dedicated, .. } = &response else {
+        let ResponseData::Shm(carrier) = &response else {
             panic!("expected SHM response, got {response:?}");
         };
-        assert!(*is_dedicated);
+        assert!(carrier.is_dedicated());
 
         // Before the client releases the reply, the server's creator-side
         // dedicated entry deterministically lingers: freed_at is set but
@@ -2579,48 +2563,29 @@ mod lazy_policy_roundtrip_tests {
         );
         client.connect().await.unwrap();
 
-        struct HeldReply {
-            seg_idx: u16,
-            generation: u32,
-            offset: u32,
-            data_size: u32,
-            allocation_id: u64,
-        }
-
-        let mut held: Vec<HeldReply> = Vec::new();
+        // Held replies keep their full receive carrier: the read/release
+        // authority stays bound to the pool state the frame was admitted on.
+        let mut held: Vec<ResponseLease> = Vec::new();
         let mut max_seg_idx = 0u16;
         for i in 0..34u32 {
             let payload: Vec<u8> = (0..32 * 1024u32).map(|j| ((i + j) % 251) as u8).collect();
-            let ResponseData::Shm {
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                is_dedicated,
-                allocation_id,
-            } = echo_roundtrip(&client, "reply_idx16", &payload).await
-            else {
+            let response = echo_roundtrip(&client, "reply_idx16", &payload).await;
+            let ResponseData::Shm(carrier) = response else {
                 panic!("expected buddy SHM reply for request {i}");
             };
-            assert!(!is_dedicated, "buddy-enabled pool must serve buddy replies");
-            max_seg_idx = max_seg_idx.max(seg_idx);
+            assert!(
+                !carrier.is_dedicated(),
+                "buddy-enabled pool must serve buddy replies"
+            );
+            max_seg_idx = max_seg_idx.max(carrier.seg_idx());
             // Read correctness through the lazy client peer cache: this copy
             // exercises seg_idx 16, which a 16-entry cache would reject.
-            let copied = {
-                let mut server_pool = client.server_pool_arc().lock();
-                let state = server_pool.as_mut().unwrap();
-                state
-                    .copy_response(seg_idx, generation, offset, data_size, false)
-                    .unwrap_or_else(|e| panic!("copy of reply {i} failed: {e}"))
-            };
+            let lease = ResponseLease::new(ResponseData::Shm(carrier));
+            let copied = lease
+                .copy_bytes()
+                .unwrap_or_else(|e| panic!("copy of reply {i} failed: {e}"));
             assert_eq!(copied, payload, "reply {i} bytes must round-trip");
-            held.push(HeldReply {
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                allocation_id,
-            });
+            held.push(lease);
         }
 
         assert_eq!(max_seg_idx, 16, "34 held replies must reach buddy index 16");
@@ -2631,7 +2596,6 @@ mod lazy_policy_roundtrip_tests {
                 .lock()
                 .as_ref()
                 .unwrap()
-                .pool
                 .segment_count(),
             17,
             "client peer cache must hold all lazily opened server segments"
@@ -2639,27 +2603,15 @@ mod lazy_policy_roundtrip_tests {
 
         // Free correctness: releasing every held reply frees the server's
         // buddy blocks cross-process.
-        {
-            let mut server_pool = client.server_pool_arc().lock();
-            let state = server_pool.as_mut().unwrap();
-            for reply in &held {
-                state
-                    .release_response(
-                        reply.seg_idx,
-                        reply.generation,
-                        reply.offset,
-                        reply.data_size,
-                        false,
-                        reply.allocation_id,
-                    )
-                    .unwrap_or_else(|e| panic!("release of reply failed: {e}"));
-            }
+        for mut lease in held {
+            lease
+                .release()
+                .unwrap_or_else(|e| panic!("release of reply failed: {e}"));
         }
         wait_until(5, || {
             server.response_pool_arc().read().stats().alloc_count == 0
         })
         .await;
-        drop(held);
 
         client.close().await;
         stop_server(&server).await;
@@ -2709,9 +2661,7 @@ mod lazy_policy_roundtrip_tests {
                 .await
                 .expect("call must not hang")
                 .unwrap();
-                let bytes = response
-                    .into_bytes_with_pool(&client.server_pool_arc().clone())
-                    .unwrap();
+                let bytes = response.into_bytes().unwrap();
                 assert_eq!(bytes, payload, "request {i} must echo back");
             }));
         }
@@ -3015,7 +2965,7 @@ mod lazy_policy_roundtrip_tests {
             .budget()
             .unwrap()
             .clone();
-        let lease = ResponseLease::new(response, Arc::clone(client.server_pool_arc()));
+        let lease = ResponseLease::new(response);
         assert_eq!(lease.copy_bytes().unwrap(), payload);
         let held_budget = budget.snapshot();
         assert_eq!(
@@ -3313,7 +3263,9 @@ mod lazy_policy_roundtrip_tests {
 
         let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 229) as u8).collect();
         let response = echo_roundtrip(&client, "budget_detach_reconnect", &payload).await;
-        assert_eq!(response_bytes(&client, response), payload);
+        let first_response_pool = Arc::clone(client.server_pool_arc());
+        let mut held = ResponseLease::new(response);
+        assert_eq!(held.copy_bytes().unwrap(), payload);
         assert!(
             budget.snapshot().shm.used_bytes > 0,
             "real request backing must be charged before close"
@@ -3339,6 +3291,12 @@ mod lazy_policy_roundtrip_tests {
 
         // Reconnect rebuilds fresh pool incarnations on the same budget.
         client.connect().await.unwrap();
+        assert!(
+            !Arc::ptr_eq(client.server_pool_arc(), &first_response_pool),
+            "a reconnect must not replace a retained reply's pool state"
+        );
+        assert_eq!(held.copy_bytes().unwrap(), payload);
+        held.release().unwrap();
         let second_pool = client.request_pool().expect("reconnect recreates the pool");
         assert_ne!(
             second_pool.lock().prefix(),
@@ -3625,9 +3583,8 @@ mod lazy_policy_roundtrip_tests {
             .lock()
             .alloc(8192)
             .expect("the old owner's allocator must stay consistent");
-        old_pool
-            .lock()
-            .free(&probe)
+        // SAFETY: test releases its own probe allocation on its own pool.
+        unsafe { old_pool.lock().free(&probe) }
             .expect("probe free must round-trip on the old owner");
         assert_eq!(
             fresh_pool.lock().stats().alloc_count,
@@ -4784,27 +4741,32 @@ mod lazy_policy_roundtrip_tests {
             let (control, _) = decode_call_control(payload, consumed).unwrap();
             assert_eq!(control.identity.route_uid, "terminal-grid-1");
             let mut memory = MemPool::open_peer(c2_mem::PoolConfig::default(), prefix.clone());
-            memory
-                .open_dedicated_at(
+            unsafe {
+                memory.open_dedicated_at(
                     u32::from(pointer.seg_idx),
                     &MemPool::dedicated_segment_name(&prefix, u32::from(pointer.seg_idx)),
                     pointer.data_size as usize,
                 )
-                .unwrap();
+            }
+            .unwrap();
+            // SAFETY: this test block acts as the receiving peer for its
+            // own admitted dedicated allocation: sole reader, sole releaser.
             assert_eq!(
-                memory
-                    .copy_data_at(
+                unsafe {
+                    memory.copy_data_at(
                         u32::from(pointer.seg_idx),
                         pointer.generation,
                         pointer.offset,
                         pointer.data_size,
                         true,
                     )
-                    .unwrap(),
+                }
+                .unwrap(),
                 vec![7; 160 * 1024]
             );
-            memory
-                .free_at(
+            // SAFETY: same sole-releaser proof for the read_done free.
+            unsafe {
+                memory.free_at(
                     u32::from(pointer.seg_idx),
                     pointer.generation,
                     pointer.offset,
@@ -4812,7 +4774,8 @@ mod lazy_policy_roundtrip_tests {
                     true,
                     pointer.allocation_id,
                 )
-                .unwrap();
+            }
+            .unwrap();
             published_tx.send(()).unwrap();
             terminate_rx.await.unwrap();
             // Keep this real peer alive: termination comes from the protocol,

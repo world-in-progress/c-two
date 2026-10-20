@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use c2_core::{HeldResponse, LifecycleError};
-use c2_ipc::{ResponseData, ResponseLease, ServerPoolState};
+use c2_ipc::{ResponseData, ResponseLease};
 use c2_mem::{MemPool, PoolConfig};
 use c2_server::{RequestData, RequestLease};
 use parking_lot::{Mutex, RwLock};
@@ -211,10 +211,7 @@ fn held_response_copy_failure_attempts_cleanup_and_retains_both_causes() {
     handle
         .write_at(0, b"copy and release")
         .expect("handle write");
-    let lease = ResponseLease::new(
-        ResponseData::Handle(handle),
-        Arc::new(Mutex::new(None::<ServerPoolState>)),
-    );
+    let lease = ResponseLease::new(ResponseData::Handle(handle));
     *pool.write() = replacement_pool("copy_failure");
 
     let error = match HeldResponse::from_response_lease(lease) {
@@ -237,10 +234,7 @@ fn held_response_copy_failure_attempts_cleanup_and_retains_both_causes() {
 }
 
 fn inline_response_lease(bytes: &[u8]) -> ResponseLease {
-    ResponseLease::new(
-        ResponseData::Inline(bytes.to_vec()),
-        Arc::new(Mutex::new(None::<ServerPoolState>)),
-    )
+    ResponseLease::new(ResponseData::Inline(bytes.to_vec()))
 }
 
 fn breakable_handle_response(bytes: &[u8]) -> (HeldResponse, Arc<RwLock<MemPool>>) {
@@ -249,10 +243,7 @@ fn breakable_handle_response(bytes: &[u8]) -> (HeldResponse, Arc<RwLock<MemPool>
         c2_wire::chunk::ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len().max(1))
             .expect("handle admission");
     handle.write_at(0, bytes).expect("handle write");
-    let lease = ResponseLease::new(
-        ResponseData::Handle(handle),
-        Arc::new(Mutex::new(None::<ServerPoolState>)),
-    );
+    let lease = ResponseLease::new(ResponseData::Handle(handle));
     (
         HeldResponse::from_response_lease(lease).expect("held handle response"),
         pool,

@@ -4,7 +4,7 @@
 //! executed. `Compiles` is the legal owner round-trip and proves the
 //! consumer's dependencies resolve, so a rejection can never hide behind a
 //! missing crate or unresolved import. `Fails(&codes)` requires rejection
-//! with at least one listed rustc error code: the controls are rejected by
+//! with only the listed rustc error codes: the controls are rejected by
 //! today's borrow/move rules, while each `vuln_*` names the codes the
 //! approved R02 migration is expected to produce; on the unmodified
 //! baseline the `vuln_*` fixtures still compile, so the test stays red
@@ -20,18 +20,66 @@ enum Probe {
 
 const CASES: &[(&str, Probe)] = &[
     ("positive_owner_roundtrip", Probe::Compiles),
-    ("control_same_handle_double_mut_borrow", Probe::Fails(&["E0499"])),
-    ("control_move_handle_during_borrow", Probe::Fails(&["E0505", "E0502"])),
-    ("vuln_same_pool_duplicate_handle_double_write", Probe::Fails(&["E0603", "E0616"])),
-    ("vuln_same_pool_duplicate_handle_read_write", Probe::Fails(&["E0603", "E0616"])),
-    ("vuln_second_mapping_double_write", Probe::Fails(&["E0603", "E0616"])),
-    ("vuln_shared_allocator_free_during_borrow", Probe::Fails(&["E0603", "E0133"])),
-    ("vuln_peer_free_at_during_owner_borrow", Probe::Fails(&["E0603", "E0133"])),
-    ("vuln_raw_coordinate_copy_during_borrow", Probe::Fails(&["E0603", "E0133"])),
-    ("vuln_request_data_shm_bare_coordinates", Probe::Fails(&["E0603", "E0616"])),
-    ("vuln_response_data_shm_bare_coordinates", Probe::Fails(&["E0603", "E0616"])),
-    ("vuln_response_meta_shm_alloc_publication", Probe::Fails(&["E0603", "E0616"])),
-    ("vuln_connection_server_pool_raw_access", Probe::Fails(&["E0603", "E0133", "E0616"])),
+    (
+        "control_same_handle_double_mut_borrow",
+        Probe::Fails(&["E0499"]),
+    ),
+    (
+        "control_move_handle_during_borrow",
+        Probe::Fails(&["E0505", "E0502"]),
+    ),
+    (
+        "vuln_same_pool_duplicate_handle_double_write",
+        Probe::Fails(&["E0616", "E0451"]),
+    ),
+    (
+        "vuln_same_pool_duplicate_handle_read_write",
+        Probe::Fails(&["E0616", "E0451"]),
+    ),
+    (
+        "vuln_second_mapping_double_write",
+        Probe::Fails(&["E0616", "E0451"]),
+    ),
+    (
+        "vuln_shared_allocator_free_during_borrow",
+        Probe::Fails(&["E0133"]),
+    ),
+    (
+        "vuln_peer_free_at_during_owner_borrow",
+        Probe::Fails(&["E0133"]),
+    ),
+    (
+        "vuln_raw_coordinate_copy_during_borrow",
+        Probe::Fails(&["E0133"]),
+    ),
+    (
+        "vuln_request_data_shm_bare_coordinates",
+        Probe::Fails(&["E0624"]),
+    ),
+    (
+        "vuln_response_data_shm_bare_coordinates",
+        Probe::Fails(&["E0624"]),
+    ),
+    (
+        "vuln_response_meta_shm_alloc_publication",
+        Probe::Fails(&["E0624"]),
+    ),
+    (
+        "vuln_connection_server_pool_raw_access",
+        Probe::Fails(&["E0624", "E0616"]),
+    ),
+    (
+        "vuln_client_pool_slot_substitution",
+        Probe::Fails(&["E0599"]),
+    ),
+    (
+        "vuln_connection_pool_replacement",
+        Probe::Fails(&["E0599", "E0624"]),
+    ),
+    (
+        "vuln_dedicated_rebind_after_destroy",
+        Probe::Fails(&["E0133"]),
+    ),
 ];
 
 struct Temp(PathBuf);
@@ -53,9 +101,10 @@ fn r02_unique_write_ownership_boundary_gate() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let session = Temp(
-        std::env::temp_dir().join(format!("c2-r02-ownership-gate-{}-{unique}", std::process::id())),
-    );
+    let session = Temp(std::env::temp_dir().join(format!(
+        "c2-r02-ownership-gate-{}-{unique}",
+        std::process::id()
+    )));
     let consumer = session.0.join("consumer");
     std::fs::create_dir_all(consumer.join("src")).expect("consumer directories");
     std::fs::write(
@@ -73,7 +122,11 @@ fn r02_unique_write_ownership_boundary_gate() {
     .expect("consumer manifest");
     // Seed locked versions from the tested Core workspace so --offline only
     // has to add the temporary root package.
-    std::fs::copy(repository.join("core/Cargo.lock"), consumer.join("Cargo.lock")).expect("seed lock");
+    std::fs::copy(
+        repository.join("core/Cargo.lock"),
+        consumer.join("Cargo.lock"),
+    )
+    .expect("seed lock");
 
     let mut failures = Vec::new();
     for (index, (name, expectation)) in CASES.iter().enumerate() {
@@ -82,7 +135,8 @@ fn r02_unique_write_ownership_boundary_gate() {
                 .join("tests/fixtures/ownership")
                 .join(format!("{name}.rs")),
         )
-        .unwrap_or_else(|error| panic!("missing fixture {name}: {error}"));        std::fs::write(consumer.join("src/main.rs"), source).expect("probe source");
+        .unwrap_or_else(|error| panic!("missing fixture {name}: {error}"));
+        std::fs::write(consumer.join("src/main.rs"), source).expect("probe source");
         let mut arguments = vec!["check", "--quiet", "--offline"];
         // The first case (positive control) settles the consumer lock; the
         // rest run against the frozen lock.
@@ -94,24 +148,36 @@ fn r02_unique_write_ownership_boundary_gate() {
             .current_dir(&consumer)
             .env("CARGO_TARGET_DIR", session.0.join("target"))
             .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TERM_COLOR", "never")
             .output()
             .expect("nested cargo check");
         let stderr = String::from_utf8_lossy(&output.stderr);
         let ok = match expectation {
             Probe::Compiles => output.status.success(),
             Probe::Fails(codes) => {
-                !output.status.success() && codes.iter().any(|code| stderr.contains(code))
+                let errors: Vec<_> = stderr
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("error[")?.split_once(']'))
+                    .map(|(code, _)| code)
+                    .collect();
+                !output.status.success()
+                    && !errors.is_empty()
+                    && errors.iter().all(|code| codes.contains(code))
             }
         };
         let exit = output.status.code().unwrap_or(-1);
         println!("[r02-gate] {name}: exit={exit} ok={ok}");
         if !ok {
-            let errors: Vec<&str> =
-                stderr.lines().filter(|line| line.contains("error")).take(4).collect();
+            let errors: Vec<&str> = stderr
+                .lines()
+                .filter(|line| line.contains("error"))
+                .take(4)
+                .collect();
             println!("[r02-gate] {name} diagnostics: {}", errors.join("\n"));
             failures.push(*name);
         }
     }
+    std::fs::remove_dir_all(&session.0).expect("remove ownership probe build artifacts");
     assert!(
         failures.is_empty(),
         "R02 ownership gate failures: {failures:?}\n\

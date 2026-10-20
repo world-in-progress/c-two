@@ -10,7 +10,7 @@ use c2_mem::MemPool;
 
 use crate::client::{
     ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RequestBlock,
-    RequestTransportKind, RouteBinding, ServerPoolState, choose_request_transport,
+    RequestTransportKind, RouteBinding, choose_request_transport,
 };
 use crate::response::{ResponseData, ResponseLease};
 
@@ -371,13 +371,13 @@ impl SyncClient {
             .select_request_pool()
             .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
         let mut pool = pool_arc.lock();
-        let alloc = pool
-            .alloc(data.len())
+        let handle = pool
+            .alloc_shm_handle(data.len())
             .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
-        let ptr = match pool.data_ptr(&alloc) {
+        let ptr = match pool.data_ptr(&handle.shm_allocation().expect("SHM allocation")) {
             Ok(ptr) => ptr,
             Err(e) => {
-                let _ = pool.free(&alloc);
+                let _ = pool.release_handle(handle);
                 return Err(IpcError::Pool(format!("data_ptr failed: {e}")));
             }
         };
@@ -385,7 +385,7 @@ impl SyncClient {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
         drop(pool);
-        Ok(RequestBlock::new(pool_arc, alloc))
+        Ok(RequestBlock::new(pool_arc, handle))
     }
 
     /// Allocate from the client SHM pool and let the caller fill the block.
@@ -408,20 +408,20 @@ impl SyncClient {
             .inner
             .select_request_pool()
             .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
-        let (alloc, ptr) = {
+        let (handle, ptr) = {
             let mut pool = pool_arc.lock();
-            let alloc = pool
-                .alloc(data_size)
+            let handle = pool
+                .alloc_shm_handle(data_size)
                 .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
-            match pool.data_ptr(&alloc) {
-                Ok(ptr) => (alloc, ptr),
+            match pool.data_ptr(&handle.shm_allocation().expect("SHM allocation")) {
+                Ok(ptr) => (handle, ptr),
                 Err(e) => {
-                    let _ = pool.free(&alloc);
+                    let _ = pool.release_handle(handle);
                     return Err(IpcError::Pool(format!("data_ptr failed: {e}")));
                 }
             }
         };
-        let block = RequestBlock::new(pool_arc, alloc);
+        let block = RequestBlock::new(pool_arc, handle);
         let destination = unsafe { std::slice::from_raw_parts_mut(ptr, data_size) };
         if let Err(err) = fill(destination) {
             let _ = block.release();
@@ -469,11 +469,6 @@ impl SyncClient {
         )
     }
 
-    /// Get a reference to the server SHM pool (for FFI layer).
-    pub fn server_pool_arc(&self) -> Arc<Mutex<Option<ServerPoolState>>> {
-        self.inner.server_pool.clone()
-    }
-
     /// The transport-owned request pool this client currently holds, if any.
     ///
     /// `None` for clients without a config-owned pool and after a confirmed
@@ -495,7 +490,7 @@ impl SyncClient {
     /// Reassembled handles carry their own pool and budget charge inside the
     /// [`c2_wire::chunk::ReassemblyBacking`] carrier.
     pub fn lease_response(&self, response: ResponseData) -> ResponseLease {
-        ResponseLease::new(response, self.server_pool_arc())
+        ResponseLease::new(response)
     }
 
     /// Synchronous close.

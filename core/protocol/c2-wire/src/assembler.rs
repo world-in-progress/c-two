@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(after.buddy_expanded_allocs, before.buddy_expanded_allocs);
         assert_eq!(after.dedicated_allocs, 0);
         assert_eq!(after.file_spill_allocs, 0);
-        guard.release_handle(handle);
+        guard.release_handle(handle).unwrap();
         assert_eq!(guard.stats().alloc_count, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }

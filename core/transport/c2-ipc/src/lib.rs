@@ -33,5 +33,5 @@ pub use control::{
     shutdown_with_context, shutdown_with_endpoint,
 };
 pub use pool::{ClientCacheMemorySnapshot, ClientPool};
-pub use response::{ResponseData, ResponseLease};
+pub use response::{ResponseData, ResponseLease, ServerShmResponse};
 pub use sync_client::{IpcCallError, SyncClient, TransportPhase};

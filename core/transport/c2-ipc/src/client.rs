@@ -414,9 +414,9 @@ use c2_wire::route_catalog_control::{
 };
 
 use c2_mem::config::PoolConfig;
-use c2_mem::{MemPool, PoolAllocation};
+use c2_mem::{MemHandle, MemPool, PoolAllocation};
 
-use crate::response::ResponseData;
+use crate::response::{ResponseData, ServerShmResponse};
 
 pub use c2_config::ClientIpcConfig;
 
@@ -426,9 +426,14 @@ const ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200]
 
 /// State for reading server's SHM response data.
 /// Mirrors `PeerShmState` in c2-server/connection.rs.
+///
+/// The pool and its coordinate seams are crate-private: response copies and
+/// releases go through the [`crate::response::ServerShmResponse`] carrier
+/// minted at the reply-decode admission path, never through bare
+/// coordinates.
 pub struct ServerPoolState {
     prefix: String,
-    pub pool: MemPool,
+    pool: MemPool,
 }
 
 impl ServerPoolState {
@@ -454,8 +459,11 @@ impl ServerPoolState {
                 return Err("dedicated generation must be zero".into());
             }
             let name = MemPool::dedicated_segment_name(&self.prefix, u32::from(seg_idx));
-            self.pool
-                .open_dedicated_at(u32::from(seg_idx), &name, data_size as usize)
+            // SAFETY: this private peer cache uses the name derived from its handshake.
+            unsafe {
+                self.pool
+                    .open_dedicated_at(u32::from(seg_idx), &name, data_size as usize)
+            }
         } else {
             self.pool
                 .ensure_peer_segment(u32::from(seg_idx), generation, data_size as usize)
@@ -464,7 +472,10 @@ impl ServerPoolState {
 
     /// Copy response bytes after lazily opening and validating the advertised
     /// shared-memory span. Transport ownership is unchanged.
-    pub fn copy_response(
+    ///
+    /// Crate-private: only the response carrier's copy path may pass
+    /// coordinates through this seam.
+    pub(crate) fn copy_response(
         &mut self,
         seg_idx: u16,
         generation: u32,
@@ -473,21 +484,28 @@ impl ServerPoolState {
         is_dedicated: bool,
     ) -> Result<Vec<u8>, String> {
         self.ensure_segment(seg_idx, generation, data_size, is_dedicated)?;
-        self.pool
-            .copy_data_at(
+        // SAFETY: the coordinates come from a reply frame admitted on this
+        // exact pool state; the server completed and published the write and
+        // the carrier is the only local authority for the block.
+        unsafe {
+            self.pool.copy_data_at(
                 u32::from(seg_idx),
                 generation,
                 offset,
                 data_size,
                 is_dedicated,
             )
-            .map_err(|error| format!("response SHM copy failed: {error}"))
+        }
+        .map_err(|error| format!("response SHM copy failed: {error}"))
     }
 
     /// Release response storage only after validating the complete advertised
     /// span. This prevents an invalid size from deriving a different buddy
     /// allocation level.
-    pub fn release_response(
+    ///
+    /// Crate-private: only the response carrier's release path may pass
+    /// coordinates through this seam.
+    pub(crate) fn release_response(
         &mut self,
         seg_idx: u16,
         generation: u32,
@@ -506,8 +524,10 @@ impl ServerPoolState {
                 is_dedicated,
             )
             .map_err(|error| format!("response SHM release failed: validation failed: {error}"))?;
-        self.pool
-            .free_at(
+        // SAFETY: the span was just validated against the live backing and
+        // the carrier is the sole release authority for this admitted block.
+        unsafe {
+            self.pool.free_at(
                 u32::from(seg_idx),
                 generation,
                 offset,
@@ -515,8 +535,15 @@ impl ServerPoolState {
                 is_dedicated,
                 allocation_id,
             )
-            .map_err(|error| format!("response SHM release failed: {error}"))?;
+        }
+        .map_err(|error| format!("response SHM release failed: {error}"))?;
         Ok(())
+    }
+
+    /// Mapped buddy segments in this client's peer cache (in-crate probes).
+    #[cfg(test)]
+    pub(crate) fn segment_count(&self) -> usize {
+        self.pool.segment_count()
     }
 
     #[cfg(test)]
@@ -783,8 +810,9 @@ pub(crate) mod dedicated_retire_test_control {
         let (permit, returned) = reserve_permit();
         {
             let mut guard = pool.lock();
-            guard
-                .free(&alloc)
+            // SAFETY: test control holds the sole release authority for this
+            // allocation it just created on this exact pool.
+            unsafe { guard.free(&alloc) }
                 .expect("test retained backing must free through its owning pool");
             guard.gc_dedicated();
             assert!(
@@ -1134,6 +1162,7 @@ fn dedicated_retire_backing(job: DedicatedRetireJob) {
 pub(crate) struct RequestReleaseState {
     pool: Arc<StdMutex<MemPool>>,
     alloc: PoolAllocation,
+    handle: MemHandle,
     phase: AtomicU8,
     /// Retention slot granted before the dedicated block was published (or
     /// `None` for buddy blocks and unpublished states). Consumed by the
@@ -1283,7 +1312,10 @@ impl RequestReleaseState {
         // Acquire all cleanup locks before changing phase or consuming the
         // permit. Released means settlement has finished, including its
         // retention handoff, rather than merely that one observer started it.
-        pool.free(&self.alloc)
+        pool.validate_handle(&self.handle)
+            .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))?;
+        // SAFETY: the private phase/permit transaction is the sole release authority.
+        unsafe { pool.free(&self.alloc) }
             .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))?;
         let mut permit = permit_slot.take();
         if observed == Self::PHASE_DISPATCHED {
@@ -1378,11 +1410,13 @@ impl std::fmt::Debug for RequestBlock {
 }
 
 impl RequestBlock {
-    pub(crate) fn new(pool: Arc<StdMutex<MemPool>>, alloc: PoolAllocation) -> Self {
+    pub(crate) fn new(pool: Arc<StdMutex<MemPool>>, handle: MemHandle) -> Self {
+        let alloc = handle.shm_allocation().expect("request allocation is SHM");
         Self {
             release: Arc::new(RequestReleaseState {
                 pool,
                 alloc,
+                handle,
                 phase: AtomicU8::new(RequestReleaseState::PHASE_ARMED),
                 permit: StdMutex::new(None),
                 #[cfg(test)]
@@ -1404,6 +1438,8 @@ impl RequestBlock {
     /// Copy `data` into the block at `offset` through the owning pool.
     pub(crate) fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), IpcError> {
         let pool = self.release.pool.lock();
+        pool.validate_handle(&self.release.handle)
+            .map_err(|error| IpcError::Shm(format!("buddy data_ptr failed: {error}")))?;
         let ptr = pool
             .data_ptr(&self.release.alloc)
             .map_err(|error| IpcError::Shm(format!("buddy data_ptr failed: {error}")))?;
@@ -2035,13 +2071,10 @@ impl PendingResponse {
         true
     }
 
-    fn try_settle(&mut self, server_pool: &Arc<StdMutex<Option<ServerPoolState>>>) -> bool {
+    fn try_settle(&mut self) -> bool {
         let request_released = self.try_release_request();
         if let Some(response) = self.response.as_mut() {
-            if !matches!(
-                try_release_unclaimed_response(response, server_pool),
-                Ok(true)
-            ) {
+            if !matches!(try_release_unclaimed_response(response), Ok(true)) {
                 return false;
             }
         }
@@ -3001,11 +3034,13 @@ impl IpcClient {
             }
         }
 
+        // One container per handshake; old receive leases keep their original pool.
+        let server_pool = Arc::new(StdMutex::new(None));
         // Perform handshake.
         let hs = with_connect_deadline(deadline, "handshake", async {
             tokio::time::timeout(
                 DEFAULT_CONNECT_TIMEOUT,
-                self.do_handshake(&mut writer, reader),
+                self.do_handshake(&mut writer, reader, Arc::clone(&server_pool)),
             )
             .await
             .map_err(|_| {
@@ -3051,11 +3086,18 @@ impl IpcClient {
                 ..PoolConfig::default()
             };
             let pool = MemPool::open_peer(cfg, hs.prefix.clone());
-            *connect_metadata_lock(&self.server_pool, "ipc_metadata_wait")? =
-                Some(ServerPoolState {
-                    prefix: hs.prefix.clone(),
-                    pool,
-                });
+            // Observe the existing metadata wait within the connect budget.
+            // Each handshake installs a fresh container; retained replies keep
+            // their original pool when this client reconnects.
+            drop(connect_metadata_lock(
+                &self.server_pool,
+                "ipc_metadata_wait",
+            )?);
+            *connect_metadata_lock(&server_pool, "ipc_metadata_wait")? = Some(ServerPoolState {
+                prefix: hs.prefix.clone(),
+                pool,
+            });
+            self.server_pool = server_pool;
         }
 
         let mut ready_writer = with_connect_deadline(deadline, "ipc_ready", async {
@@ -3080,6 +3122,7 @@ impl IpcClient {
         &self,
         writer: &mut LocalWriteHalf,
         mut reader: LocalReadHalf,
+        server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     ) -> Result<Handshake, IpcError> {
         // Build segment list and prefix from pool (if available). The list may
         // legitimately be empty: lazy pools announce no backings and the server
@@ -3141,7 +3184,6 @@ impl IpcClient {
 
         // Spawn recv loop with the reader.
         let pending = self.pending.clone();
-        let server_pool = self.server_pool.clone();
         let writer_clone = self.writer.clone();
         self.connected.store(true, Ordering::Release);
         self.disconnect.store(DISCONNECT_PENDING, Ordering::Release);
@@ -3238,7 +3280,7 @@ impl IpcClient {
             .clone()
             .map(|registry| Arc::downgrade(&registry));
         let pending = Arc::downgrade(&self.pending);
-        let server_pool = Arc::downgrade(&self.server_pool);
+        let _server_pool = Arc::downgrade(&self.server_pool);
         #[cfg(test)]
         let tick_counter = Arc::clone(&self.maintenance_ticks);
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
@@ -3278,8 +3320,8 @@ impl IpcClient {
                                 pool.gc_dedicated();
                             }
                         }
-                        if let (Some(pending), Some(server_pool)) = (pending.upgrade(), server_pool.upgrade()) {
-                            try_drain_pending(&pending, &server_pool, false, None);
+                        if let Some(pending) = pending.upgrade() {
+                            try_drain_pending(&pending, false, None);
                         }
                     }
                 }
@@ -3293,7 +3335,8 @@ impl IpcClient {
     }
 
     /// Get a reference to the server SHM pool (for materialising SHM responses).
-    pub fn server_pool_arc(&self) -> &Arc<StdMutex<Option<ServerPoolState>>> {
+    #[cfg(test)]
+    pub(crate) fn server_pool_arc(&self) -> &Arc<StdMutex<Option<ServerPoolState>>> {
         &self.server_pool
     }
 
@@ -3851,10 +3894,10 @@ impl IpcClient {
         // data write so cancellation or an error can never strand it.
         let block = {
             let mut pool = pool_arc.lock();
-            let alloc = pool
-                .alloc(data.len())
+            let handle = pool
+                .alloc_shm_handle(data.len())
                 .map_err(|e| IpcError::Shm(format!("buddy alloc failed: {e}")))?;
-            RequestBlock::new(Arc::clone(&pool_arc), alloc)
+            RequestBlock::new(Arc::clone(&pool_arc), handle)
         };
         // Write data into the SHM region; a failure drops the block, which
         // releases through the owning pool while it is still armed.
@@ -3879,9 +3922,9 @@ impl IpcClient {
             return Ok(None);
         };
         // The guard must drop before the owned `Arc` moves into the token.
-        let alloc = pool_arc.lock().alloc(data_size);
-        match alloc {
-            Ok(alloc) => Ok(Some(RequestBlock::new(pool_arc, alloc))),
+        let handle = pool_arc.lock().alloc_shm_handle(data_size);
+        match handle {
+            Ok(handle) => Ok(Some(RequestBlock::new(pool_arc, handle))),
             Err(_) => Ok(None),
         }
     }
@@ -5100,12 +5143,7 @@ impl IpcClient {
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        confirmed &= try_drain_pending(
-            &self.pending,
-            &self.server_pool,
-            true,
-            Some(deadline.into_std()),
-        );
+        confirmed &= try_drain_pending(&self.pending, true, Some(deadline.into_std()));
         if confirmed {
             confirmed = match self.chunk_registry.try_lock() {
                 Some(slot) => slot.as_ref().is_none_or(|registry| {
@@ -5281,37 +5319,11 @@ const SIG_DISCONNECT_ACK: u8 = 0x09;
 /// reply is simply dropped, while SHM and reassembly-handle backings are
 /// released through the exact response pools so the server-side allocation
 /// is returned instead of leaking.
-fn try_release_unclaimed_response(
-    response: &mut ResponseData,
-    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
-) -> Result<bool, String> {
+fn try_release_unclaimed_response(response: &mut ResponseData) -> Result<bool, String> {
     match response {
         ResponseData::Inline(_) => Ok(true),
         ResponseData::Handle(backing) => backing.try_release(),
-        ResponseData::Shm {
-            seg_idx,
-            generation,
-            offset,
-            data_size,
-            allocation_id,
-            is_dedicated,
-        } => {
-            let Some(mut pool) = server_pool.try_lock() else {
-                return Ok(false);
-            };
-            let state = pool
-                .as_mut()
-                .ok_or_else(|| "server pool not initialised".to_string())?;
-            state.release_response(
-                *seg_idx,
-                *generation,
-                *offset,
-                *data_size,
-                *is_dedicated,
-                *allocation_id,
-            )?;
-            Ok(true)
-        }
+        ResponseData::Shm(carrier) => carrier.try_release(),
     }
 }
 
@@ -5319,7 +5331,6 @@ fn try_release_unclaimed_response(
 /// closes live waiters too. No busy entry is removed and then dropped.
 fn try_drain_pending(
     pending: &StdMutex<PendingMap>,
-    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
     close_waiters: bool,
     deadline: Option<std::time::Instant>,
 ) -> bool {
@@ -5333,7 +5344,7 @@ fn try_drain_pending(
         if close_waiters || entry.tx.as_ref().is_some_and(|tx| tx.is_closed()) {
             entry.close_waiter();
         }
-        entry.tx.is_some() || !entry.try_settle(server_pool)
+        entry.tx.is_some() || !entry.try_settle()
     });
     if close_waiters {
         pending.is_empty()
@@ -5346,7 +5357,6 @@ async fn complete_unary_pending(
     pending: &Arc<StdMutex<PendingMap>>,
     rid: u32,
     result: Result<ResponseData, IpcError>,
-    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
 ) {
     {
         let mut pending = pending.lock();
@@ -5362,7 +5372,7 @@ async fn complete_unary_pending(
         if let Some(Ok(response)) = undelivered {
             entry.response = Some(response);
         }
-        if entry.try_settle(server_pool) {
+        if entry.try_settle() {
             pending.remove(&rid);
         }
     }
@@ -5375,7 +5385,7 @@ async fn complete_unary_pending(
             let mut pending = pending.lock();
             match pending.get_mut(&rid) {
                 Some(entry) if entry.response.is_some() => {
-                    if entry.try_settle(server_pool) {
+                    if entry.try_settle() {
                         pending.remove(&rid);
                         false
                     } else {
@@ -5591,13 +5601,7 @@ async fn recv_loop_inner(
         let rid = hdr.request_id as u32;
 
         if hdr.is_response() && hdr.is_ctrl() {
-            complete_unary_pending(
-                &pending,
-                rid,
-                Ok(ResponseData::Inline(recv_buf.clone())),
-                &server_pool,
-            )
-            .await;
+            complete_unary_pending(&pending, rid, Ok(ResponseData::Inline(recv_buf.clone()))).await;
             continue;
         }
 
@@ -5620,7 +5624,6 @@ async fn recv_loop_inner(
                             &pending,
                             rid,
                             Err(IpcError::Chunk(ChunkError::Protocol(message))),
-                            &server_pool,
                         )
                         .await;
                         continue;
@@ -5645,13 +5648,7 @@ async fn recv_loop_inner(
                     // request id, then complete the correlated caller.
                     eprintln!("Warning: reply chunk assembler creation failed: {e}");
                     abort_reply_assembly(&chunk_registry, conn_id, rid).await;
-                    complete_unary_pending(
-                        &pending,
-                        rid,
-                        Err(IpcError::Chunk(e.into())),
-                        &server_pool,
-                    )
-                    .await;
+                    complete_unary_pending(&pending, rid, Err(IpcError::Chunk(e.into()))).await;
                     continue;
                 }
             }
@@ -5666,7 +5663,6 @@ async fn recv_loop_inner(
                                     &pending,
                                     rid,
                                     Ok(ResponseData::Handle(finished.backing)),
-                                    &server_pool,
                                 )
                                 .await;
                             }
@@ -5677,7 +5673,6 @@ async fn recv_loop_inner(
                                     Err(IpcError::Chunk(ChunkError::Protocol(format!(
                                         "chunked reply finish error: {e}"
                                     )))),
-                                    &server_pool,
                                 )
                                 .await;
                             }
@@ -5697,7 +5692,6 @@ async fn recv_loop_inner(
                         Err(IpcError::Chunk(ChunkError::Protocol(format!(
                             "chunked reply feed error: {e}"
                         )))),
-                        &server_pool,
                     )
                     .await;
                 }
@@ -5706,10 +5700,10 @@ async fn recv_loop_inner(
         }
 
         // Decode non-chunked response.
-        let result = decode_response(&hdr, &recv_buf);
+        let result = decode_response(&hdr, &recv_buf, &server_pool);
 
         // Dispatch to pending caller.
-        complete_unary_pending(&pending, rid, result, &server_pool).await;
+        complete_unary_pending(&pending, rid, result).await;
     }
 
     // The guard also runs this nonblocking assembly cleanup when a close or
@@ -5721,7 +5715,6 @@ async fn recv_loop_inner(
     // still observes the Closed result).
     drain_pending_on_disconnect(
         &pending,
-        &server_pool,
         connection.as_ref(),
         #[cfg(any(test, feature = "test-support"))]
         pending_drain_seam,
@@ -5733,7 +5726,6 @@ async fn recv_loop_inner(
 /// close aborts/joins the task and takes over the same pending-map owners.
 async fn drain_pending_on_disconnect(
     pending: &StdMutex<PendingMap>,
-    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
     connection: Option<&ReceiveConnectionState>,
     #[cfg(any(test, feature = "test-support"))] pending_drain_seam: Option<PendingDrainSeam>,
 ) {
@@ -5750,7 +5742,7 @@ async fn drain_pending_on_disconnect(
     } else {
         None
     };
-    let drained = try_drain_pending(pending, server_pool, true, None);
+    let drained = try_drain_pending(pending, true, None);
     #[cfg(any(test, feature = "test-support"))]
     if let Some(attempted) = attempted {
         let _ = attempted.send(drained);
@@ -5762,7 +5754,7 @@ async fn drain_pending_on_disconnect(
     let mut drained = drained;
     while !drained {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        drained = try_drain_pending(pending, server_pool, true, None);
+        drained = try_drain_pending(pending, true, None);
     }
 }
 
@@ -5774,7 +5766,11 @@ async fn abort_reply_assembly(registry: &ChunkRegistry, conn_id: u64, rid: u32) 
     }
 }
 
-fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, IpcError> {
+fn decode_response(
+    hdr: &FrameHeader,
+    payload: &[u8],
+    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
+) -> Result<ResponseData, IpcError> {
     let is_v2 = hdr.is_reply_v2();
     let is_buddy = hdr.is_buddy();
 
@@ -5794,14 +5790,18 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
         let (ctrl, _) = decode_reply_control(payload, ctrl_start)?;
 
         match ctrl {
-            ReplyControl::Success => Ok(ResponseData::Shm {
-                seg_idx: bp.seg_idx,
-                generation: bp.generation,
-                offset: bp.offset,
-                data_size: bp.data_size,
-                is_dedicated: bp.is_dedicated,
-                allocation_id: bp.allocation_id,
-            }),
+            // Admission: the decoded coordinates are bound to this client's
+            // live server pool state; copying and releasing run through the
+            // carrier for the rest of its life.
+            ReplyControl::Success => Ok(ResponseData::Shm(ServerShmResponse::admit(
+                Arc::clone(server_pool),
+                bp.seg_idx,
+                bp.generation,
+                bp.offset,
+                bp.data_size,
+                bp.is_dedicated,
+                bp.allocation_id,
+            ))),
             ReplyControl::RouteNotFound(route) => Err(IpcError::RouteNotFound(route)),
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
         }
@@ -5969,20 +5969,12 @@ mod tests {
 
         let client = IpcClient::with_config("ipc://close-permit-mutex", ClientIpcConfig::default());
         // Only the dispatched-buddy phase/permit handoff is exercised here:
-        // its release deliberately never reads or frees these coordinates.
-        // Real backing and budget retention are covered by owner_* tests.
-        let block = RequestBlock::new(
-            client.request_pool().unwrap(),
-            PoolAllocation {
-                seg_idx: 0,
-                generation: 1,
-                offset: 0,
-                actual_size: 4096,
-                level: 0,
-                is_dedicated: false,
-                allocation_id: 1,
-            },
-        );
+        // its release deliberately consumes the owner without freeing (the
+        // peer owns the cross-process free). Real backing and budget
+        // retention are covered by owner_* tests.
+        let pool_arc = client.request_pool().unwrap();
+        let handle = pool_arc.lock().try_alloc_shm(4096).unwrap();
+        let block = RequestBlock::new(pool_arc, handle);
         let request = block.try_dispatch(None).unwrap();
         let (tx, rx) = oneshot::channel();
         let mut entry = PendingResponse::unary(tx);
@@ -6057,10 +6049,7 @@ mod tests {
         assert!(finished.backing.is_file_spill());
         assert_eq!(finished.backing.capacity_bytes(), 16 * 1024);
         assert_eq!(finished.backing.len(), 8192 + 100);
-        let mut lease = ResponseLease::new(
-            ResponseData::Handle(finished.backing),
-            Arc::clone(&client.server_pool),
-        );
+        let mut lease = ResponseLease::new(ResponseData::Handle(finished.backing));
         let old_pool = Arc::downgrade(registry.pool());
         let charged = budget.snapshot();
         assert_eq!(charged.shm.used_bytes, 0);
@@ -6153,7 +6142,7 @@ mod tests {
             }
             let holder = park_carrier_callback(held);
             let pending = Arc::clone(&client.pending);
-            let server_pool = Arc::clone(&client.server_pool);
+            let _server_pool = Arc::clone(&client.server_pool);
             let cleanup = ConnectionAssemblyCleanup {
                 registry: Arc::clone(&registry),
                 conn_id: client.conn_id,
@@ -6164,13 +6153,8 @@ mod tests {
                     *client.recv_handle.lock() = Some(tokio::spawn(async move {
                         let _cleanup = cleanup;
                         let _ = entered_tx.send(());
-                        complete_unary_pending(
-                            &pending,
-                            22,
-                            Ok(ResponseData::Handle(response)),
-                            &server_pool,
-                        )
-                        .await;
+                        complete_unary_pending(&pending, 22, Ok(ResponseData::Handle(response)))
+                            .await;
                     }));
                     entered_rx.await.unwrap(); // task reached its cooperative cleanup wait
                     let initial_retained = client.pending.lock().len();
@@ -6610,7 +6594,8 @@ mod tests {
 
         fn end_reader(&mut self) -> Result<(), String> {
             if !self.read_done {
-                self.peer.free(&self.alloc)?;
+                // SAFETY: test fixture is the sole owner of its allocation.
+                unsafe { self.peer.free(&self.alloc) }?;
                 self.read_done = true;
             }
             if !self.dispatched {
@@ -6751,12 +6736,7 @@ mod tests {
                 reader?;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 loop {
-                    try_drain_pending(
-                        &self.client.pending,
-                        &self.client.server_pool,
-                        true,
-                        Some(deadline),
-                    );
+                    try_drain_pending(&self.client.pending, true, Some(deadline));
                     if self.retired() {
                         return Ok(());
                     }
@@ -6815,7 +6795,7 @@ mod tests {
                         drop(block);
                         let owners = weak_request.strong_count();
                         let pending = Arc::clone(&client.pending);
-                        let server_pool = Arc::clone(&client.server_pool);
+                        let _server_pool = Arc::clone(&client.server_pool);
                         let cleanup = ConnectionAssemblyCleanup {
                             registry: client.chunk_registry_arc().unwrap(),
                             conn_id: client.conn_id,
@@ -6824,13 +6804,12 @@ mod tests {
                         *client.recv_handle.lock() = Some(tokio::spawn(async move {
                             let _cleanup = cleanup;
                             if footer {
-                                try_drain_pending(&pending, &server_pool, true, None);
+                                try_drain_pending(&pending, true, None);
                             } else {
                                 complete_unary_pending(
                                     &pending,
                                     43,
                                     Ok(ResponseData::Inline(vec![9])),
-                                    &server_pool,
                                 )
                                 .await;
                             }
@@ -6885,11 +6864,19 @@ mod tests {
                 drop(pool);
 
                 assert_eq!(budget.snapshot().shm.used_bytes, charged);
+                // SAFETY: the fixture's peer acts as the receiving reader for
+                // this admitted dedicated block, before its single read_done.
                 assert_eq!(
-                    fixture
-                        .peer
-                        .copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, true)
-                        .unwrap(),
+                    unsafe {
+                        fixture.peer.copy_data_at(
+                            alloc.seg_idx,
+                            alloc.generation,
+                            alloc.offset,
+                            8192,
+                            true,
+                        )
+                    }
+                    .unwrap(),
                     &[27; 8192]
                 );
                 fixture.end_reader().unwrap(); // the sole reader's real read_done
@@ -6926,14 +6913,18 @@ mod tests {
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
         // The caller still owns an armed block, including the right to fill it.
         block.write_at(0, &vec![9; 8192]).unwrap();
-        let alloc = *block.allocation();
+        // SAFETY: the test reads its own armed block through its owner pool.
         assert_eq!(
-            block
-                .release
-                .pool
-                .lock()
-                .copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, false,)
-                .unwrap(),
+            unsafe {
+                block.release.pool.lock().copy_data_at(
+                    block.allocation().seg_idx,
+                    block.allocation().generation,
+                    block.allocation().offset,
+                    8192,
+                    false,
+                )
+            }
+            .unwrap(),
             vec![9; 8192]
         );
 
@@ -7024,11 +7015,18 @@ mod tests {
                     charged,
                     "retire authority must keep the charge"
                 );
+                // SAFETY: receiving-reader copy of the admitted block.
                 assert_eq!(
-                    fixture
-                        .peer
-                        .copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, true)
-                        .unwrap(),
+                    unsafe {
+                        fixture.peer.copy_data_at(
+                            alloc.seg_idx,
+                            alloc.generation,
+                            alloc.offset,
+                            8192,
+                            true,
+                        )
+                    }
+                    .unwrap(),
                     vec![17; 8192]
                 );
                 fixture.end_reader().unwrap(); // the sole reader's real read_done
@@ -7148,17 +7146,18 @@ mod tests {
                         .dedicated_awaiting_retirement(&next_fixture.alloc)
                 );
                 assert!(next_fixture.budget.snapshot().shm.used_bytes > 0);
+                // SAFETY: receiving-reader copy of the admitted block.
                 assert_eq!(
-                    next_fixture
-                        .peer
-                        .copy_data_at(
+                    unsafe {
+                        next_fixture.peer.copy_data_at(
                             next_fixture.alloc.seg_idx,
                             next_fixture.alloc.generation,
                             next_fixture.alloc.offset,
                             8192,
-                            true
+                            true,
                         )
-                        .unwrap(),
+                    }
+                    .unwrap(),
                     &[37; 8192]
                 );
                 next_fixture.end_reader().unwrap();
@@ -8413,7 +8412,6 @@ mod pending_disconnect_tests {
         let drain = tokio::spawn(async move {
             drain_pending_on_disconnect(
                 &loop_pending,
-                &Arc::new(StdMutex::new(None)),
                 Some(&connection),
                 Some(PendingDrainSeam {
                     entered: entered_tx,

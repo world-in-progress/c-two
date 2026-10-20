@@ -4,22 +4,20 @@
 
 use std::sync::Arc;
 
-use c2_ipc::{ResponseData, ResponseLease, ServerPoolState};
+use c2_ipc::{ResponseData, ResponseLease, ServerPoolState, ServerShmResponse};
 use parking_lot::Mutex;
 
 fn main() {
     let server_pool: Arc<Mutex<Option<ServerPoolState>>> = Arc::new(Mutex::new(None));
-    let mut lease = ResponseLease::new(
-        ResponseData::Shm {
-            seg_idx: 0,
-            generation: 1,
-            offset: 0,
-            data_size: 4096,
-            is_dedicated: false,
-            allocation_id: 7,
-        },
-        Arc::clone(&server_pool),
-    );
+    let mut lease = ResponseLease::new(ResponseData::Shm(ServerShmResponse::admit(
+        server_pool,
+        0,
+        1,
+        0,
+        4096,
+        false,
+        7,
+    )));
     let _ = lease.copy_bytes();
     let _ = lease.release();
 }

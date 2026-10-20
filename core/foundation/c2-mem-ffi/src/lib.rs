@@ -80,14 +80,16 @@ impl Drop for C2MemFfiResponsePool {
         if let Ok(mut state) = self.inner.lock() {
             let blocks: Vec<_> = state.read_blocks.drain().collect();
             for block in blocks {
-                let _ = state.pool.free_at(
-                    block.segment_index as u32,
-                    block.generation,
-                    block.offset,
-                    block.byte_length,
-                    block.is_dedicated,
-                    block.allocation_id,
-                );
+                let _ = unsafe {
+                    state.pool.free_at(
+                        block.segment_index as u32,
+                        block.generation,
+                        block.offset,
+                        block.byte_length,
+                        block.is_dedicated,
+                        block.allocation_id,
+                    )
+                };
             }
         }
     }
@@ -811,7 +813,7 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_write(
                 Ok(())
             });
         if copy_result.is_err() {
-            let _ = state.pool.free(&alloc);
+            let _ = unsafe { state.pool.free(&alloc) };
         } else {
             let segment_index =
                 u16::try_from(alloc.seg_idx).map_err(|_| C2MemFfiStatus::PoolError)?;
@@ -824,7 +826,7 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_write(
                 allocation_id: alloc.allocation_id,
             });
             if !inserted {
-                let _ = state.pool.free(&alloc);
+                let _ = unsafe { state.pool.free(&alloc) };
                 return Err(C2MemFfiStatus::PoolError);
             }
         }
@@ -894,9 +896,8 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_release(
         if !state.local_blocks.remove(&key) {
             return Err(C2MemFfiStatus::InvalidArgument);
         }
-        if state
-            .pool
-            .free_at(
+        if unsafe {
+            state.pool.free_at(
                 block.segment_index as u32,
                 block.generation,
                 block.offset,
@@ -904,7 +905,8 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_release(
                 block.is_dedicated != 0,
                 block.allocation_id,
             )
-            .is_err()
+        }
+        .is_err()
         {
             state.local_blocks.insert(key);
             return Err(C2MemFfiStatus::InvalidArgument);
@@ -931,9 +933,8 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_forget_consumed(
             return Err(C2MemFfiStatus::InvalidArgument);
         }
         if block.is_dedicated != 0 {
-            if state
-                .pool
-                .free_at(
+            if unsafe {
+                state.pool.free_at(
                     block.segment_index as u32,
                     block.generation,
                     block.offset,
@@ -941,7 +942,8 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_forget_consumed(
                     true,
                     block.allocation_id,
                 )
-                .is_err()
+            }
+            .is_err()
             {
                 state.local_blocks.insert(key);
                 return Err(C2MemFfiStatus::InvalidArgument);
@@ -1069,9 +1071,8 @@ pub unsafe extern "C" fn c2_mem_ffi_response_pool_release(
         let result = (|| {
             ensure_response_segment(&mut state, block)?;
             validate_response_range(&state, block)?;
-            if state
-                .pool
-                .free_at(
+            if unsafe {
+                state.pool.free_at(
                     block.segment_index as u32,
                     block.generation,
                     block.offset,
@@ -1079,7 +1080,8 @@ pub unsafe extern "C" fn c2_mem_ffi_response_pool_release(
                     block.is_dedicated != 0,
                     block.allocation_id,
                 )
-                .is_err()
+            }
+            .is_err()
             {
                 return Err(C2MemFfiStatus::InvalidArgument);
             }
@@ -2368,8 +2370,8 @@ static void use_response_api(void) {
             C2MemFfiStatus::Ok
         );
         assert!(
-            server
-                .free_at(
+            unsafe {
+                server.free_at(
                     block.segment_index as u32,
                     block.generation,
                     block.offset,
@@ -2377,7 +2379,8 @@ static void use_response_api(void) {
                     block.is_dedicated != 0,
                     block.allocation_id,
                 )
-                .is_err()
+            }
+            .is_err()
         );
         assert_eq!(
             unsafe { c2_mem_ffi_response_pool_release(handle.0, block) },
@@ -2436,7 +2439,7 @@ static void use_response_api(void) {
             unsafe { c2_mem_ffi_response_pool_release(handle.0, second) },
             C2MemFfiStatus::Ok
         );
-        assert!(server.free(&alloc).is_err());
+        assert!(unsafe { server.free(&alloc) }.is_err());
     }
 
     #[test]
@@ -2466,8 +2469,8 @@ static void use_response_api(void) {
         }
 
         assert!(
-            server
-                .free_at(
+            unsafe {
+                server.free_at(
                     block.segment_index as u32,
                     block.generation,
                     block.offset,
@@ -2475,7 +2478,8 @@ static void use_response_api(void) {
                     block.is_dedicated != 0,
                     block.allocation_id,
                 )
-                .is_err()
+            }
+            .is_err()
         );
     }
 
@@ -2491,8 +2495,8 @@ static void use_response_api(void) {
             C2MemFfiStatus::Ok
         );
         assert!(
-            server
-                .free_at(
+            unsafe {
+                server.free_at(
                     block.segment_index as u32,
                     block.generation,
                     block.offset,
@@ -2500,7 +2504,8 @@ static void use_response_api(void) {
                     block.is_dedicated != 0,
                     block.allocation_id,
                 )
-                .is_err()
+            }
+            .is_err()
         );
         assert_eq!(
             unsafe { c2_mem_ffi_response_pool_release(handle.0, block) },
@@ -2535,8 +2540,8 @@ static void use_response_api(void) {
             C2MemFfiStatus::Ok
         );
         assert!(
-            server
-                .free_at(
+            unsafe {
+                server.free_at(
                     block.segment_index as u32,
                     block.generation,
                     block.offset,
@@ -2544,7 +2549,8 @@ static void use_response_api(void) {
                     block.is_dedicated != 0,
                     block.allocation_id,
                 )
-                .is_err()
+            }
+            .is_err()
         );
     }
 
@@ -2681,7 +2687,7 @@ static void use_response_api(void) {
             unsafe { c2_mem_ffi_response_pool_release(handle.0, block) },
             C2MemFfiStatus::Ok
         );
-        server.free(&first).unwrap();
+        unsafe { server.free(&first) }.unwrap();
     }
 
     #[test]
@@ -2724,8 +2730,8 @@ static void use_response_api(void) {
             C2MemFfiStatus::Ok
         );
         assert!(
-            server
-                .free_at(
+            unsafe {
+                server.free_at(
                     block.segment_index as u32,
                     block.generation,
                     block.offset,
@@ -2733,7 +2739,8 @@ static void use_response_api(void) {
                     false,
                     block.allocation_id,
                 )
-                .is_err(),
+            }
+            .is_err(),
             "peer release must reach the owner allocator"
         );
     }
