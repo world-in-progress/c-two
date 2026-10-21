@@ -96,6 +96,10 @@ const CASES: &[(&str, Probe)] = &[
         "vuln_server_response_pool_replacement",
         Probe::Fails(&["E0133"]),
     ),
+    (
+        "vuln_response_read_guard_recovers_write_lock",
+        Probe::Fails(&["E0308"]),
+    ),
 ];
 
 struct Temp(PathBuf);

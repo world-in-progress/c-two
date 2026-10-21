@@ -105,3 +105,5 @@ Host 在仓库外使用真实 `c2-mem` path dependency，编译了带 `#![forbid
 完整 Core 回归同时发现两处测试迁移问题：响应 lease 的 buddy 释放断言错误，以及禁止请求物化的文本检查误匹配新的响应 `into_bytes()`。已恢复 buddy 真实分配计数归零、dedicated 经 read_done 后原生释放回收的断言，并将文本检查限定到请求转发段；未跳过测试或改变生产 relay 逻辑。首轮候选未验收，GitHub Actions run `39470524323` 已取消。
 
 第二轮审查确认，`Arc` 相同仍不足以证明容器里的池没有被替换：公开异步注入入口和 callback 响应池可保留原池、换入另一池，造成握手与发布不一致。新增两条基线编译反例确认该 safe 入口，未执行重叠引用。异步注入现与同步入口一样移动 pool；服务端用仅包裹原 `RwLock<MemPool>` 的 `ResponsePool` 固定容器内容，safe 读取和正式准备 helper 保留，raw 可变操作及 test-support 的原始请求池访问须明确 unsafe。没有新增池、锁或计费状态。候选 `baa3025d` 虽已通过本地完整 Core/relay、Rust SDK 和原生绑定，仍因审查阻断撤回，Actions run `39473694958` 已取消；后续须验证新的确切候选。
+
+第三轮审查继续封闭只读 guard 的原锁泄露：`parking_lot` 的普通 `RwLockReadGuard::rwlock` 可还原可写容器，故 `ResponsePool::read` 改为复用原锁的 `MappedRwLockReadGuard`。新增对应外部反例，保留精确类型诊断。核对辅助诊断脚本时发现 `copy2` 保留时间戳可能让 Cargo 复用旧探针，已用逐例重新写入源码的方式重验整组基线：合法正例通过，2 个控制例按预期拒绝，18 个漏洞反例均被旧 API 接纳；以新的完整审计记录替代零散编译记录。仓内正式门禁一直使用重新写入方式。Python 的响应物化门禁同步更新到 `result.into_bytes()`，其错误阶段和禁止静默吞错的断言不变。

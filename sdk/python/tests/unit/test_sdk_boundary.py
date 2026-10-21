@@ -1039,7 +1039,7 @@ def test_relay_router_does_not_silence_response_materialization_errors():
     call_handler = production[production.index("async fn call_handler"):]
     call_handler = call_handler[:call_handler.index("async fn acquire_request_client")]
 
-    assert "into_bytes_with_pool" in call_handler
+    assert "result.into_bytes()" in call_handler
     materialization = call_handler[call_handler.index("fn materialized_response_or_error"):]
     assert "resource_unavailable_response_with_phase" in materialization
     assert '"dispatch_uncertain"' in materialization

@@ -20,8 +20,11 @@ impl ResponsePool {
         }
     }
 
-    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, MemPool> {
-        self.inner.read()
+    #[inline]
+    pub fn read(&self) -> parking_lot::MappedRwLockReadGuard<'_, MemPool> {
+        // An ordinary read guard exposes RwLockReadGuard::rwlock, which would
+        // let safe callers recover the mutable lock and replace this owner.
+        parking_lot::RwLockReadGuard::map(self.inner.read(), |pool| pool)
     }
 
     /// Raw access for integrations that manage pool storage themselves.
