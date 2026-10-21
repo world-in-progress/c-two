@@ -400,18 +400,18 @@ dependencies = [
 
 [[package]]
 name = "fastdb"
-version = "0.2.2"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2d6c03d577441fc46478294dceeb94d3010cbf059bc47062768355e1a5b9ba5"
+checksum = "2d8611385e839abe45afda547d2669995510e71eca4446f88daa6bf5a7129e06"
 dependencies = [
  "fastdb-sys",
 ]
 
 [[package]]
 name = "fastdb-sys"
-version = "0.2.2"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45e3dc80e8effa09020e9e7a1bc78a9bfeda1d43c45f7adbb624198f9c8c74e5"
+checksum = "41b69f369cb78adf60ffa56e6c911614e05a4aa46085fc3a6e7e952a4069fae4"
 
 [[package]]
 name = "fastrand"
