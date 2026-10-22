@@ -327,11 +327,15 @@ fn directory_policy_io_error(
     condition: &str,
     source: io::Error,
 ) -> io::Error {
-    let message = directory_policy_error(path, stat, &format!("{condition}: {source}"));
     io::Error::new(
-        message.kind(),
+        io::ErrorKind::PermissionDenied,
         crate::ContextIoError {
-            message: message.to_string(),
+            message: format!(
+                "endpoint directory {} owner {} mode {:04o}: {condition}: {source}",
+                path.display(),
+                stat.st_uid,
+                stat.st_mode as libc::mode_t & 0o7777,
+            ),
             source,
         },
     )

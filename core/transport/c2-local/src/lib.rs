@@ -187,7 +187,7 @@ impl From<&io::Error> for EndpointIoError {
             .and_then(|source| source.downcast_ref::<ContextIoError>())
             .map_or(error, |context| &context.source);
         Self {
-            kind: error.kind(),
+            kind: source.kind(),
             raw_os_error: source.raw_os_error(),
         }
     }

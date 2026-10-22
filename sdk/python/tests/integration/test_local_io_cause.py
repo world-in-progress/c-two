@@ -144,8 +144,10 @@ invalid = ctypes.c_void_p(-1).value
 
 
 @pytest.mark.skipif(not IS_WINDOWS, reason='Windows named pipes')
-@pytest.mark.parametrize('case', ['missing', 'denied', 'busy'])
-def test_windows_connect_cause_and_busy_deadline(case) -> None:
+@pytest.mark.parametrize('case, timeout', [
+    ('missing', 2), ('denied', 2), ('busy', 0.2), ('busy', None), ('busy', 10),
+])
+def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
     result = _run_isolated(COMMON + WIN32 + textwrap.dedent(f'''
         address = 'ipc://io-' + {uuid.uuid4().hex!r}
         name = cc.local_endpoint_context().endpoint_name(address)
@@ -181,7 +183,7 @@ def test_windows_connect_cause_and_busy_deadline(case) -> None:
             started = time.monotonic()
             try:
                 client = cc.connect(Echo, name='io', address=address,
-                                    timeout=0.2 if {case!r} == 'busy' else 2)
+                                    timeout={timeout!r})
             except _native.CoreError as exc:
                 error = diagnostic(exc)
             except cc.error.CallDeadlineExceeded as exc:
@@ -205,6 +207,12 @@ def test_windows_connect_cause_and_busy_deadline(case) -> None:
     if case != 'busy':
         _assert_io(report, 'connect', 'not_found' if case == 'missing' else 'permission_denied',
                    2 if case == 'missing' else 5)
+    elif timeout in (None, 10):
+        error = report['error']
+        assert (error['category'], error['transport_kind'], error['transport_phase'],
+                error['fallback_eligible']) == ('transport', 'ipc', 'pre_dispatch', True), report
+        assert all(error[key] is None for key in ('io_kind', 'raw_os_error', 'io_operation')), report
+        assert 4.5 <= report['elapsed'] < 8, report
     else:
         error = report['error']
         assert error['category'] == 'semantic' and error['name'] == 'CallDeadlineExceeded', report

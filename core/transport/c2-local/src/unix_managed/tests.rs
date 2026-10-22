@@ -2754,6 +2754,7 @@ fn final_directory_symlink_and_replacement_are_refused_with_context() {
     let moved = root.with_file_name("moved");
     let directory = EndpointDirectory::open(root, false).unwrap();
     std::fs::rename(root, &moved).unwrap();
+    let missing_path = directory.validate().unwrap_err();
     std::os::unix::fs::symlink(&moved, root).unwrap();
     let error = EndpointDirectory::open(root, false).err().unwrap();
     let message = error.to_string();
@@ -2778,6 +2779,11 @@ fn final_directory_symlink_and_replacement_are_refused_with_context() {
     );
     assert!(moved.is_dir());
     assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+    // The policy still rejects the missing identity; diagnostics retain the OS cause.
+    assert_eq!(missing_path.kind(), io::ErrorKind::PermissionDenied);
+    let cause = crate::EndpointIoError::from(&missing_path);
+    assert_eq!(cause.kind, io::ErrorKind::NotFound);
+    assert_eq!(cause.raw_os_error, Some(libc::ENOENT));
 }
 
 #[test]

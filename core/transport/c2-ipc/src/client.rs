@@ -3043,7 +3043,16 @@ impl IpcClient {
         let stream = with_connect_deadline(deadline, "os_connect", async {
             LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT)
                 .await
-                .map_err(IpcError::Connect)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::TimedOut
+                        && error.raw_os_error().is_none()
+                    {
+                        // The local phase guard is a deadline, not an OS failure.
+                        IpcError::Io(error)
+                    } else {
+                        IpcError::Connect(error)
+                    }
+                })
         })
         .await?;
         let publisher = ConnectionPublisher::new();
