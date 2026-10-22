@@ -445,6 +445,15 @@ pub struct HostOptions {
     shutdown_timeout: Duration,
     lifecycle: c2_config::ServerLifecyclePolicy,
     lifecycle_explicit: bool,
+    #[cfg(test)]
+    startup_gate: Option<Arc<StartupGateForTest>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct StartupGateForTest {
+    entered: std::sync::mpsc::SyncSender<Arc<Server>>,
+    proceed: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl Default for HostOptions {
@@ -456,6 +465,8 @@ impl Default for HostOptions {
             shutdown_timeout: Duration::from_secs(5),
             lifecycle: c2_config::ServerLifecyclePolicy::Persistent,
             lifecycle_explicit: false,
+            #[cfg(test)]
+            startup_gate: None,
         }
     }
 }
@@ -939,9 +950,16 @@ impl Runtime {
         let weak_inner = Arc::downgrade(&inner);
         let run_server = Arc::clone(&server);
         let owner_startup_timeout = options.startup_timeout;
+        #[cfg(test)]
+        let startup_gate = options.startup_gate.clone();
         let thread = std::thread::Builder::new()
             .name(format!("c2-host-{}", server.server_id()))
             .spawn(move || {
+                #[cfg(test)]
+                if let Some(gate) = startup_gate {
+                    let _ = gate.entered.send(Arc::clone(&run_server));
+                    let _ = gate.proceed.lock().recv();
+                }
                 let Some(mut receiver) = owner_receiver else {
                     // Persistent policy: the accept loop alone decides
                     // nothing about lifecycle; explicit shutdown does.
@@ -1119,6 +1137,59 @@ fn protocol_violation(message: &str, cause: String, release_error: Option<String
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn host_startup_deadline_is_configurable_and_not_a_configuration_error() {
+        let mut observed_errors = Vec::new();
+        for configured in [None, Some(Duration::from_millis(20))] {
+            let runtime = Runtime::new(crate::RuntimeOptions {
+                use_process_relay_anchor: false,
+                ..Default::default()
+            })
+            .unwrap();
+            let (entered, observed) = std::sync::mpsc::sync_channel(1);
+            let (proceed, delayed) = std::sync::mpsc::channel();
+            let mut options = HostOptions::default().without_relay();
+            if let Some(timeout) = configured {
+                options = options.with_startup_timeout(timeout);
+            }
+            let timeout = options.startup_timeout;
+            options.startup_gate = Some(Arc::new(StartupGateForTest {
+                entered,
+                proceed: Mutex::new(delayed),
+            }));
+            let started = Instant::now();
+            let worker = std::thread::spawn(move || runtime.host(options));
+            let server = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+            // Hold the actual host thread before bind until its caller expires.
+            // Dropping `proceed` also releases it if any assertion unwinds.
+            let wait_runtime = Runtime::server_runtime().unwrap();
+            wait_runtime.block_on(async {
+                tokio::time::timeout(timeout + Duration::from_secs(5), server.wait_for_shutdown_requested())
+                    .await
+                    .unwrap();
+            });
+            let elapsed = started.elapsed();
+            proceed.send(()).unwrap();
+            let error = match worker.join().unwrap() {
+                Ok(host) => {
+                    host.shutdown();
+                    panic!("delayed startup unexpectedly succeeded");
+                }
+                Err(error) => error,
+            };
+            assert!(elapsed >= timeout);
+            assert!(!server.is_running());
+            eprintln!("configured={timeout:?}, elapsed={elapsed:?}, error={error}");
+            observed_errors.push(error);
+        }
+        for error in observed_errors {
+            assert!(
+                !error.to_string().contains("config error"),
+                "startup deadline was misclassified: {error}",
+            );
+        }
+    }
 
     #[test]
     fn live_owner_watcher_does_not_keep_a_dropped_host_alive() {
