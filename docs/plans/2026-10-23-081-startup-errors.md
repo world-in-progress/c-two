@@ -30,3 +30,5 @@ Python 3.12 的候选定向回归为 101 passed、6 个 Windows 专属场景在 
 隔离回归还暴露了旧 `client_modes` 夹具的目录不一致：Runtime 读取了 runner 的自定义根目录，但模拟 relay header、低层 listener 和 inspector pool 仍选择平台默认目录。修复前基线 `4cc46e9e` 在同一私有根目录复现；夹具改为传递同一原生上下文并显式 close listener 后，原 15 个断言全部通过，私有根目录零 socket/lease 残留。首次失败运行落入默认命名空间的一个 `freeze-stall` 测试端点，经记录地址、日志创建时间窗口、测试进程已退出及记录摘要确认归属，再通过原生 inspect/reap 精确回收；未批量清理历史条目。该测试修正单独提交为 `4437fdab`，不计作生产修复。
 
 首轮 PR 完整门禁发现一个本批遗漏：内存观察测试的 `FailingSwapSession` 替身没有新增的 `startup_timeout` 投影，导致构造失败路径在原断言之前遇到 AttributeError。macOS 定向运行复现同一失败；只补 `startup_timeout = None` 后，原内存观察文件和启动配置测试共 17 项通过。生产代码及原断言未改，失败门禁保留为诊断证据。
+
+macOS 门禁另有一次 incarnation 测试的单次 inspect 返回 `io-error`，原断言未输出具体原因。隔离占住本轮新建目录的 gate 后，已发布的 0.8.0 与当前 0.8.1 都使原测试在同一断言以 `WouldBlock` 失败；两次原生 shutdown 后零 socket/lease 残留。这证明共享目录竞争是原测试未隔离的已存在条件，不能倒推原 CI 未记录的具体 errno。该 Unix 分支改为复用已有子进程助手及独立临时根，原身份断言保留并附诊断；Windows 分支保持。全文件 59 项通过，在模拟其他 worker 持有共享 gate 时隔离分支也通过且零残留。未增加生产重试、轮询或放宽检查。
