@@ -28,9 +28,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-**C-Two 0.7.6** 支持 Python 3.10+。普通 Python 调用无 Python 运行时依赖；FastDB 载荷使用可选扩展 `c-two[fastdb]`（`fastdb4py==0.2.2`）。本补丁修复并发关停时的报告竞态，见[更新记录](docs/releases/0.7.6.md)。
-
-未发布开发源码已将 Python、Rust、原生源码构建及官方 CoreSDK 的 FastDB 依赖统一升级到 0.2.3。SDK 准备脚本可识别其 Windows ARM64 bundle；C-Two 发行平台和验证范围仍以已发布版本的记录为准。
+**C-Two 0.8.0** 支持 Python 3.10+。普通 Python 调用无 Python 运行时依赖；FastDB 载荷使用可选扩展 `c-two[fastdb]`（`fastdb4py==0.2.3`）。本版增加闲置连接终态通知、显式所有者接管和结构化本地 OS 错误，并收敛原生所有权及响应处理。见[更新与迁移说明](docs/releases/0.8.0.md)。
 
 ## 特点
 
@@ -40,6 +38,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 - **按契约路由**：客户端匹配路由名称、CRM 身份和契约哈希。Relay 发现选择经过验证的本机 IPC 路径或 HTTP 目标；`c3` 独立运行 relay，并支持 relay mesh。
 - **原生内存传输**：IPC 使用按需 buddy 池、独占共享内存、检查过的分块传输及文件溢出。通过预算和空闲回收控制大载荷的内存与文件用量。详见[内存策略](docs/memory-policy.md)。
 - **明确的载荷生命周期**：`cc.hold()` 保留响应租约，资源注册可选择借用输入；释放时先使 FastDB owner 和 checked view 失效，再释放传输存储。详见 [Python 载荷用法](docs/python-usage.md)。
+- **连接观察**：客户端和服务端无需在途调用即可获知物理 IPC 连接终态；原因只描述连接事实，不证明进程已经退出。
 - **资源生命周期管理**：资源采用 `Persistent` 或控制器持有的 `OwnerBound` 生命周期；原生 shutdown 排空工作，限定范围的端点维护清理已确认退出的端点。详见[生命周期指南](docs/local-endpoint-lifecycle.md)。
 - **统一 Rust core**：Python 与 Rust 共用路由、传输、内存、错误和生命周期机制。原生 c3 CLI 在 Linux、macOS、Windows x64 上提供 relay、契约工具和端点维护。
 
@@ -54,12 +53,12 @@ uv pip install 'c-two[fastdb]'
 Windows PowerShell 使用相同命令。Linux、macOS 的 c3 安装命令：
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.5/c3-installer.sh | sh -s -- --version 0.3.5
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.sh | sh -s -- --version 0.4.0
 ```
 
-Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.5/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.5/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
+Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
 
-C3 0.3.5 配套 C-Two 0.7.6，IPC 与共享内存格式沿用 C-Two 0.7.5 / c3 0.3.4；c3 0.3.3 和 C-Two 0.7.4 使用旧格式。
+C3 0.4.0 配套 C-Two 0.8.0。IPC 12、SHM 3 和 C/FFI ABI 5 保持，所有者控制使用独立的版本 1。所有者接口及低层 Rust API 有破坏性变更，不留兼容别名；所有者控制器与宿主应一起升级，Rust 消费者需重新编译。
 
 源码构建与测试见[开发指南](docs/development.md)。
 

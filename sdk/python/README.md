@@ -2,19 +2,17 @@
 
 C-Two exposes stateful Python resources through typed CRM contracts over same-process calls, local IPC, or an external HTTP relay. This package projects the shared Rust runtime into Python.
 
-This branch prepares Python C-Two **0.7.5** and companion c3 **0.3.4**; neither is published by this change. See the [release preparation notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.7.5.md).
-
-After publication:
+Python C-Two **0.8.0** pairs with c3 **0.4.0**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.8.0.md).
 
 ```bash
-uv pip install 'c-two==0.7.5'
+uv pip install 'c-two==0.8.0'
 # Only for FastDB Payload contracts:
-uv pip install 'c-two[fastdb]==0.7.5'
+uv pip install 'c-two[fastdb]==0.8.0'
 ```
 
 The base package has no Python runtime dependencies. Ordinary CRM definition,
 registration, direct/IPC/relay calls and errors do not load FastDB or NumPy.
-The `fastdb` extra pins `fastdb4py==0.2.2`; using FastDB payloads without it
+The `fastdb` extra pins `fastdb4py==0.2.3`; using FastDB payloads without it
 reports the extra to install. The exact pin selects the validated 0.x binding
 instead of allowing an untested later native interface.
 
@@ -24,12 +22,9 @@ Local IPC uses Unix domain sockets or current-logon-SID Windows Named Pipes. Uni
 
 IPC uses lazy buddy pools, idle decay and finite backing/reassembly budgets; `pool_enabled=False` skips buddy. `cc.memory_stats()` observes native accounting; held responses and borrowed inputs retain independent leases. The standalone relay has its own upstream policy. See the [memory guide](https://github.com/world-in-progress/c-two/blob/main/docs/memory-policy.en.md).
 
-The historical [0.7.4 publication record](https://github.com/world-in-progress/c-two/blob/main/docs/reports/0.7.4-publication.md) identifies published sources, Linux/macOS and Windows Server 2022/2025 x64 gates, and verification of public artifacts. Windows 11 desktop, Windows ARM64 and Windows services are outside this validation.
+Physical IPC connection observations work without a pending call. OwnerBound hosts support explicit, single-use recovery tickets during the original grace period. Bind/connect failures preserve `io_kind`, `raw_os_error` and `io_operation` on native `CoreError`. These features share the Rust implementation on macOS, Linux and Windows x64; see the lifecycle guide for API examples.
 
 ## Development
-
-The unreleased development source pins FastDB 0.2.3 across its bindings and
-Core SDK. Published C-Two versions above retain their recorded dependencies.
 
 Use canonical main for source development and run commands from the repository root. The matching c3 release's `rc-manifest.json` identifies release source:
 
