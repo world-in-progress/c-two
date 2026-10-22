@@ -124,7 +124,9 @@ def _wheel_name(target: str, python: str) -> str:
 
 def _fastdb_wheel_name(target: str, python: str) -> str:
     interpreter, abi = promote.PYTHON_ABI_PAIRS[python]
-    return f"fastdb4py-{FASTDB_VERSION}-{interpreter}-{abi}-{PLATFORM_TAGS[target]}.whl"
+    # The macOS Intel sdist build retains this tag; its receipt proves that target.
+    platform = "macosx_15_0_universal2" if target == "x86_64-apple-darwin" else PLATFORM_TAGS[target]
+    return f"fastdb4py-{FASTDB_VERSION}-{interpreter}-{abi}-{platform}.whl"
 
 
 def _matrix_receipt(c3_sha: str | None = None) -> dict[str, Any]:
@@ -1627,6 +1629,44 @@ def test_happy_path_github_release_plan(tmp_path: Path, environment) -> None:
     assert all(path.startswith("/repos/") for path in api.paths)
 
 
+def test_c_two_wheels_still_require_a_single_target() -> None:
+    name = f"c_two-{C_TWO_VERSION}-cp312-cp312-macosx_15_0_universal2.whl"
+    with pytest.raises(promote.PromotionError, match="exactly one CLI target"):
+        promote.map_wheel_rows([name], C_TWO_VERSION)
+
+
+@pytest.mark.parametrize("target", ["aarch64-apple-darwin", WINDOWS_ARM64_TARGET])
+def test_fastdb_provisioning_cannot_substitute_another_targets_proof(
+    tmp_path: Path, environment, capsys, target: str,
+) -> None:
+    builder = CandidateBuilder()
+    other = json.loads(builder.members["fastdb-x86_64-apple-darwin.json"])
+    builder._rewrite_json(f"fastdb-{target}.json", other)
+    world = World(candidate=builder)
+    world.set_source_runs(_run(201, "Source Validation"))
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    assert "FastDB proof wheel" in capsys.readouterr().err
+
+
+def test_fastdb_provisioning_missing_wheel_with_null_digest_is_rejected(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    builder = CandidateBuilder()
+    receipt = f"fastdb-{WINDOWS_ARM64_TARGET}.json"
+    decision = json.loads(builder.members[receipt])
+    decision["filename"] = decision["filename"].replace("-cp312", "-1-cp312", 1)
+    decision["sha256"] = None
+    builder._rewrite_json(receipt, decision)
+    world = World(candidate=builder)
+    world.set_source_runs(_run(201, "Source Validation"))
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    assert "not a distinct retained wheel" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("core_version, accepted", [("0.2.3", True), ("0.2.1", False)])
 def test_python_fastdb_version_is_independent_of_native_core(
     tmp_path: Path, environment, monkeypatch, core_version, accepted,
@@ -1717,7 +1757,18 @@ def test_windows_arm64_inventory_deviations_fail_closed(tmp_path, environment, c
         builder.drop_member(_fastdb_wheel_name(target, "3.12"))
         replacement = (_fastdb_wheel_name(WINDOWS_TARGET, "3.12").replace("-cp312", "-1-cp312", 1)
                        if mutation == "wrong-fastdb-platform" else _fastdb_wheel_name(target, "3.11"))
-        builder.fastdb_proof.append(builder._put(replacement, b"incorrect FastDB proof row"))
+        entry = builder._put(replacement, b"incorrect FastDB proof row")
+        builder.fastdb_proof.append(entry)
+        # Keep provenance and receipt identities consistent so the row's
+        # platform/ABI check, rather than a missing hash binding, rejects it.
+        listing = json.loads(builder.members["rc-fastdb-public.json"])
+        listing["files"].append({"filename": replacement, "sha256": entry["sha256"],
+                                 "packagetype": "bdist_wheel"})
+        builder._rewrite_json("rc-fastdb-public.json", listing)
+        receipt_name = f"fastdb-{target}.json"
+        decision = json.loads(builder.members[receipt_name])
+        decision.update(filename=replacement, sha256=entry["sha256"])
+        builder._rewrite_json(receipt_name, decision)
     else:
         # Keep 35 unique, hash-bound wheel filenames so the exact matrix,
         # rather than a count or sidecar check, must reject the replacement.
