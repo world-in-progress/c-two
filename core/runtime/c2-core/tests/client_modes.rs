@@ -22,7 +22,7 @@ use c2_error::{C2Error, ErrorCode};
 use c2_http::client::{LOCAL_ENDPOINT_NAMESPACE_HEADER, RelayRouteInfo};
 use c2_http::relay::{RelayConfig, RelayServer};
 use c2_ipc::IpcError;
-use c2_local::{LocalEndpoint, LocalListener};
+use c2_local::LocalListener;
 use tokio::io::AsyncReadExt;
 
 const DESCRIPTOR: &str =
@@ -88,6 +88,14 @@ fn runtime_options(server_id: String, relay_url: Option<String>) -> RuntimeOptio
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     }
+}
+
+fn endpoint_context() -> c2_config::LocalEndpointContext {
+    c2_config::ConfigResolver::resolve_local_endpoint(
+        Default::default(),
+        c2_config::ConfigSources::from_process(),
+    )
+    .expect("test endpoint context")
 }
 
 // Every relay-configuration reader and writer in this test process shares
@@ -173,7 +181,7 @@ async fn resolve_registry(
     state.resolve_count.fetch_add(1, Ordering::SeqCst);
     let mut route = state.route;
     route.name = route_name;
-    let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+    let context = endpoint_context();
     (
         [(
             LOCAL_ENDPOINT_NAMESPACE_HEADER,
@@ -329,7 +337,7 @@ impl Drop for MalformedIpcServer {
 
 fn malformed_ipc_server() -> MalformedIpcServer {
     let address = format!("ipc://{}", unique_name("malformed-handshake"));
-    let endpoint = LocalEndpoint::from_address(&address).expect("IPC endpoint");
+    let endpoint = endpoint_context().endpoint(&address).expect("IPC endpoint");
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let thread = std::thread::spawn(move || {
@@ -362,6 +370,10 @@ fn malformed_ipc_server() -> MalformedIpcServer {
                     let _ = stream.read(&mut extra).await;
                 }) => result.expect("malformed IPC exchange must finish"),
             }
+            assert!(matches!(
+                listener.close(),
+                c2_local::EndpointReapResult::Reaped | c2_local::EndpointReapResult::NotApplicable
+            ));
         });
     });
     ready_rx
@@ -852,7 +864,10 @@ fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
     // client pool. Runtime-owned caches stay private (no public escape
     // hatch), and a plain ClientPool::acquire/release pair serves the
     // inspection without any lifecycle coupling.
-    let inspector_pool = c2_ipc::ClientPool::new(Duration::from_secs(60));
+    let inspector_pool = c2_ipc::ClientPool::with_endpoint_context(
+        Duration::from_secs(60),
+        runtime.local_endpoint_context().unwrap(),
+    );
     let inspector = inspector_pool
         .acquire(&address, Some(&c2_ipc::ClientIpcConfig::default()))
         .expect("inspect local route token");
@@ -1206,7 +1221,7 @@ fn first_connection_attempt_freezes_client_config_atomically_before_connect_io()
     // this test joins the file-wide env isolation guard.
     let _environment = relay_env_lock();
     let address = format!("ipc://{}", unique_name("freeze-stall"));
-    let endpoint = LocalEndpoint::from_address(&address).unwrap();
+    let endpoint = endpoint_context().endpoint(&address).unwrap();
     let (listener_ready_tx, listener_ready_rx) = std::sync::mpsc::channel();
     let (handshake_read_tx, handshake_read_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -1230,6 +1245,10 @@ fn first_connection_attempt_freezes_client_config_atomically_before_connect_io()
             // the test releases the peer.
             let _ = release_rx.recv();
             drop(stream);
+            assert!(matches!(
+                listener.close(),
+                c2_local::EndpointReapResult::Reaped | c2_local::EndpointReapResult::NotApplicable
+            ));
         });
     });
     listener_ready_rx
