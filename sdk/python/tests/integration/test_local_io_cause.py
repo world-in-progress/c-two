@@ -60,7 +60,7 @@ def _assert_io(report: dict, operation: str, kind: str, raw: int | None) -> None
     ('missing', 'connect', 'not_found', errno.ENOENT),
     ('refused', 'connect', 'connection_refused', errno.ECONNREFUSED),
     ('inaccessible', 'connect', 'permission_denied', errno.EACCES),
-])
+], ids=['unwritable', 'not_directory', 'missing', 'refused', 'inaccessible'])
 def test_unix_local_io_cause(case, operation, kind, raw) -> None:
     if case in ('unwritable', 'inaccessible') and os.geteuid() == 0:
         pytest.skip('permission experiments require a non-root effective uid')
@@ -143,7 +143,7 @@ invalid = ctypes.c_void_p(-1).value
 '''
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason='Windows named pipes')
+@pytest.mark.skipif(not IS_WINDOWS, reason='Windows named-pipe platform contract')
 @pytest.mark.parametrize('case, timeout', [
     ('missing', 2), ('denied', 2), ('busy', 0.2), ('busy', None), ('busy', 10),
 ])
@@ -223,7 +223,7 @@ def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
         assert 0.15 <= report['elapsed'] < 2, report
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason='Windows listener lease')
+@pytest.mark.skipif(not IS_WINDOWS, reason='Windows named-pipe platform contract')
 def test_windows_real_listener_conflict_has_no_raw_system_code() -> None:
     address = f'ipc://io-{uuid.uuid4().hex}'
     contender = COMMON + textwrap.dedent(f'''

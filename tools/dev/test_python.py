@@ -45,6 +45,9 @@ WINDOWS_ENDPOINT_TESTS = frozenset((
         f"[{source}-{probe}]"
         for source in ("environment", "dotenv") for probe in ("ping", "shutdown")
     ),
+    *(f"tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[{case}]"
+      for case in ("missing-2", "denied-2", "busy-0.2", "busy-None", "busy-10")),
+    "tests/integration/test_local_io_cause.py::test_windows_real_listener_conflict_has_no_raw_system_code",
 ))
 # Frozen platform cases, including exact parameter IDs. A matching reason on
 # any other test remains a failure; unavailable prerequisites are never allowed.
@@ -73,6 +76,9 @@ UNIX_ENDPOINT_TESTS = frozenset(
         ('integration', 'test_sweep_captures_code_context_once_and_keeps_it_across_env_flip', ('',)),
     )
     for suffix in suffixes
+) | frozenset(
+    f'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[{case}]'
+    for case in ('unwritable', 'not_directory', 'missing', 'refused', 'inaccessible')
 )
 UNIX_SOCKET_COUNT_TEST = 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup'
 POSIX_FROZEN_PEER_TESTS = frozenset(
