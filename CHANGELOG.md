@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- Breaking low-level Rust chunk API: `ChunkRegistry<C>` owns each assembly and
+  its required context together. `take` / `take_id` replace `finish` / `abort_id`;
+  `set_route_info`, `FinishedChunk` and Rust assembler route fields are removed
+  without aliases. GC returns route permits with their assembly instead of a
+  later reconciliation sweep. Python metadata access, admission and release
+  ordering, IPC 12, SHM 3 and C/FFI ABI 5 retain their contracts.
 - Breaking Rust error API: `ServerLifecycleState::Failed` and `LifecycleError::Server` now carry `ServerFailure`; `ServerError::Bind` / `Failed` and `IpcError::Connect` identify local endpoint failures. Core and the Rust SDK expose `LocalIoCause` through the existing error chain. There are no compatibility variants; IPC 12, SHM 3 and C/FFI ABI 5 are unchanged.
 - Development dependencies now pin FastDB 0.2.3 across Python, Rust,
   TypeScript validation and the verified Core SDK. SDK preparation also
