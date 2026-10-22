@@ -74,11 +74,11 @@ use crate::chunk_ordering::{
 use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
 use crate::dispatcher::{
-    BuiltRoute, CrmCallback, CrmError, CrmRoute, Dispatcher, PeerShmRequest, RequestData,
-    ResponseMeta, RouteBuildSpec, cleanup_request,
+    BuiltRoute, CrmCallback, CrmError, CrmRoute, Dispatcher, PeerShmRequest, PreparedShmResponse,
+    RequestData, ResponseMeta, RouteBuildSpec, cleanup_request,
 };
 use crate::heartbeat::run_heartbeat;
-use crate::response::buddy_response_data_size;
+use crate::response::try_prepare_shm_response;
 use crate::scheduler::{
     Scheduler, SchedulerAcquireError, SchedulerLimits, SchedulerPendingPermit, SchedulerSnapshot,
 };
@@ -4006,20 +4006,6 @@ fn ensure_response_meta_len(
 }
 
 #[derive(Debug)]
-enum BuddyReplyError {
-    Fallback(String),
-    Fatal(String),
-}
-
-impl std::fmt::Display for BuddyReplyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Fallback(message) | Self::Fatal(message) => f.write_str(message),
-        }
-    }
-}
-
-#[derive(Debug)]
 enum ResponseSendError {
     UserVisible(String),
     Transport(String),
@@ -4139,62 +4125,24 @@ async fn write_reply_with_data(
     Ok(())
 }
 
-/// Write a success reply via buddy SHM: allocate from response pool, write
-/// data, send 23-byte generation and allocation-bearing pointer metadata. The caller chooses inline or chunked
-/// fallback when SHM is unavailable.
-async fn write_buddy_reply_with_data(
+/// Send a filled SHM owner once; publication never falls back to another transport.
+async fn send_prepared_shm_response(
     response_pool: &crate::ResponsePool,
     writer: &Arc<Mutex<LocalWriteHalf>>,
     request_id: u64,
-    data: &[u8],
-) -> Result<(), BuddyReplyError> {
-    let data_size = buddy_response_data_size(data.len()).ok_or_else(|| {
-        BuddyReplyError::Fallback(format!(
-            "response payload size {} exceeds buddy response wire limit {}",
-            data.len(),
-            u32::MAX
-        ))
-    })?;
-
-    // 1. Allocate from the response pool as the unique write owner.
-    let handle = {
-        let mut pool = response_pool.inner.write();
-        pool.alloc_shm_handle(data.len())
-    };
-    let mut handle = match handle {
-        Ok(h) => h,
-        Err(e) => {
-            return Err(BuddyReplyError::Fallback(format!("alloc failed: {e}")));
-        }
-    };
-
-    let allocation = handle
+    prepared: PreparedShmResponse,
+) -> Result<(), ResponseSendError> {
+    let data_size = prepared.data_size();
+    prepared
+        .validate_pool(&response_pool.read())
+        .map_err(|error| {
+            ResponseSendError::UserVisible(format!("prepared SHM response owner mismatch: {error}"))
+        })?;
+    // CRM already wrote into our response pool — send the backing's
+    // read-only coordinates in the reply frame.
+    let allocation = prepared
         .shm_allocation()
-        .expect("SHM reply backing carries coordinates");
-
-    // 2. Write data through the owner handle (single lock scope).
-    let write_ok = {
-        let pool = response_pool.read();
-        match pool.validate_handle(&handle) {
-            Ok(()) => {
-                pool.handle_slice_mut(&mut handle).copy_from_slice(data);
-                true
-            }
-            Err(_) => false,
-        }
-    };
-    if !write_ok {
-        {
-            let mut pool = response_pool.inner.write();
-            // Only this exact owner may authorize the raw release.
-            if pool.validate_handle(&handle).is_ok() {
-                let _ = unsafe { pool.free(&allocation) };
-            }
-        }
-        return Err(BuddyReplyError::Fallback("data_ptr failed".into()));
-    }
-
-    // 3. Encode buddy payload + reply control from the owner projection.
+        .expect("prepared SHM response carries an SHM allocation");
     let bp = BuddyPayload {
         seg_idx: u16::try_from(allocation.seg_idx).expect("wire segment index"),
         generation: allocation.generation,
@@ -4204,31 +4152,29 @@ async fn write_buddy_reply_with_data(
         allocation_id: allocation.allocation_id,
     };
     let buddy_bytes = encode_buddy_payload(&bp);
-    // 4. Send frame with FLAG_BUDDY.
     let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
     let frame = frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
     if let Err(err) = writer.lock().await.write_all(&frame).await {
         let mut pool = response_pool.inner.write();
-        // Only this exact owner may authorize the raw release.
-        if pool.validate_handle(&handle).is_ok() {
-            let _ = unsafe { pool.free(&allocation) };
-        }
-        return Err(BuddyReplyError::Fatal(format!(
-            "buddy reply write failed: {err}"
+        let _ = prepared.release_through(&mut pool);
+        return Err(ResponseSendError::Transport(format!(
+            "prepared SHM reply write failed: {err}"
         )));
     }
 
-    // 5. Dedicated backings keep a server-side lifecycle: release the owner
-    //    now. A published buddy backing transfers its cross-process release
-    //    to the client, so its owner value is dropped without freeing.
-    if handle.is_dedicated() {
+    // Dedicated backings keep a server-side lifecycle; release the
+    // consumed owner now. A published buddy backing transfers the
+    // cross-process release to the receiving client: dropping the
+    // owner here without freeing hands over exactly that.
+    if prepared.is_dedicated() {
         let mut pool = response_pool.inner.write();
-        // Only this exact owner may authorize the raw release.
-        if pool.validate_handle(&handle).is_ok() {
-            let _ = unsafe { pool.free(&allocation) };
-        }
+        let _ = prepared.release_through(&mut pool);
+    } else {
+        // Consume the owner at the publish boundary: the value is
+        // dropped without freeing, so the only remaining release
+        // authority is the receiving client's read-then-release.
+        drop(prepared.into_handle());
     }
-
     Ok(())
 }
 
@@ -4311,51 +4257,7 @@ async fn send_response_meta(
                     "response payload size {data_size} exceeds max_payload_size {max_payload_size}"
                 )));
             }
-            prepared
-                .validate_pool(&response_pool.read())
-                .map_err(|error| {
-                    ResponseSendError::UserVisible(format!(
-                        "prepared SHM response owner mismatch: {error}"
-                    ))
-                })?;
-            // CRM already wrote into our response pool — send the backing's
-            // read-only coordinates in the reply frame.
-            let allocation = prepared
-                .shm_allocation()
-                .expect("prepared SHM response carries an SHM allocation");
-            let bp = BuddyPayload {
-                seg_idx: u16::try_from(allocation.seg_idx).expect("wire segment index"),
-                generation: allocation.generation,
-                offset: allocation.offset,
-                data_size,
-                is_dedicated: allocation.is_dedicated,
-                allocation_id: allocation.allocation_id,
-            };
-            let buddy_bytes = encode_buddy_payload(&bp);
-            let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
-            let frame =
-                frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
-            if let Err(err) = writer.lock().await.write_all(&frame).await {
-                let mut pool = response_pool.inner.write();
-                let _ = prepared.release_through(&mut pool);
-                return Err(ResponseSendError::Transport(format!(
-                    "prepared SHM reply write failed: {err}"
-                )));
-            }
-
-            // Dedicated backings keep a server-side lifecycle; release the
-            // consumed owner now. A published buddy backing transfers the
-            // cross-process release to the receiving client: dropping the
-            // owner here without freeing hands over exactly that.
-            if prepared.is_dedicated() {
-                let mut pool = response_pool.inner.write();
-                let _ = prepared.release_through(&mut pool);
-            } else {
-                // Consume the owner at the publish boundary: the value is
-                // dropped without freeing, so the only remaining release
-                // authority is the receiving client's read-then-release.
-                drop(prepared.into_handle());
-            }
+            send_prepared_shm_response(response_pool, writer, request_id, prepared).await?;
         }
     }
     Ok(())
@@ -4371,16 +4273,16 @@ async fn smart_reply_with_data(
     chunk_size: usize,
 ) -> Result<(), ResponseSendError> {
     if data.len() as u64 > shm_threshold {
-        // Try buddy SHM first only when the buddy wire metadata can represent
-        // the payload. Larger responses must go straight to chunked fallback.
-        if buddy_response_data_size(data.len()).is_some() {
-            match write_buddy_reply_with_data(response_pool, writer, request_id, data).await {
-                Ok(()) => return Ok(()),
-                Err(BuddyReplyError::Fallback(_)) => {}
-                Err(BuddyReplyError::Fatal(message)) => {
-                    return Err(ResponseSendError::Transport(message));
-                }
+        match try_prepare_shm_response(response_pool, shm_threshold, data.len(), |dst| {
+            dst.copy_from_slice(data);
+            Ok(())
+        }) {
+            Ok(Some(prepared)) => {
+                return send_prepared_shm_response(response_pool, writer, request_id, prepared)
+                    .await;
             }
+            // Preserve pre-write fallback. Once prepared, a write error returns above.
+            Ok(None) | Err(_) => {}
         }
 
         // SHM failed or is not representable. Use chunked for large data and
@@ -9969,54 +9871,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_shm_reply_write_failure_releases_only_its_allocation() {
-        for len in [8193, 64 * 1024 + 1] {
-            let pool = small_response_pool("a");
-            let live = pool.inner.write().alloc_shm_handle(4096).unwrap();
-            let writer = closed_writer().await;
-            let payload = b"x".repeat(len);
-
-            let err = smart_reply_with_data(&pool, &writer, 7, &payload, 1024, 4096)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(&err, ResponseSendError::Transport(_)));
-            assert!(err.to_string().contains("buddy reply write failed"));
-            let stats = pool.read().stats();
-            assert_eq!(stats.alloc_count, 1);
-            assert_eq!(stats.buddy_occupied_bytes, 4096);
-            assert_eq!(stats.dedicated_active_count, 0);
-            assert_eq!(stats.dedicated_allocs, u64::from(len > 64 * 1024));
-            pool.inner.write().release_handle(live).unwrap();
-            assert_eq!(pool.read().stats().alloc_count, 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn prepared_shm_reply_write_failure_releases_only_its_allocation() {
-        for len in [8193, 64 * 1024 + 1] {
-            let pool = small_response_pool("b");
-            let live = pool.inner.write().alloc_shm_handle(4096).unwrap();
-            let prepared = crate::response::try_prepare_shm_response(&pool, 1024, len, |dst| {
-                dst.fill(b'x');
-                Ok(())
-            })
-            .unwrap()
-            .unwrap();
-            let writer = closed_writer().await;
-
-            let err = send_response_meta(&pool, &writer, 7, prepared, 1024, 4096, 128 * 1024)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(err, ResponseSendError::Transport(_)));
-            let stats = pool.read().stats();
-            assert_eq!(stats.alloc_count, 1);
-            assert_eq!(stats.buddy_occupied_bytes, 4096);
-            assert_eq!(stats.dedicated_active_count, 0);
-            assert_eq!(stats.dedicated_allocs, u64::from(len > 64 * 1024));
-            pool.inner.write().release_handle(live).unwrap();
-            assert_eq!(pool.read().stats().alloc_count, 0);
+    async fn shm_reply_write_failure_releases_only_its_allocation() {
+        for prepared in [false, true] {
+            for len in [8193, 64 * 1024 + 1] {
+                let pool = small_response_pool("writefail");
+                let live = pool.inner.write().alloc_shm_handle(4096).unwrap();
+                let writer = closed_writer().await;
+                let meta = if prepared {
+                    ResponseMeta::ShmAlloc(
+                        try_prepare_shm_response(&pool, 1024, len, |dst| {
+                            dst.fill(b'x');
+                            Ok(())
+                        })
+                        .unwrap()
+                        .unwrap(),
+                    )
+                } else {
+                    ResponseMeta::Inline(b"x".repeat(len))
+                };
+                let err = send_response_meta(&pool, &writer, 7, meta, 1024, 4096, 128 * 1024)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(&err, ResponseSendError::Transport(_)));
+                assert!(err.to_string().contains("prepared SHM reply write failed"));
+                let stats = pool.read().stats();
+                assert_eq!(stats.alloc_count, 1);
+                assert_eq!(stats.buddy_occupied_bytes, 4096);
+                assert_eq!(stats.dedicated_active_count, 0);
+                assert_eq!(stats.dedicated_allocs, u64::from(len > 64 * 1024));
+                pool.inner.write().release_handle(live).unwrap();
+                assert_eq!(pool.read().stats().alloc_count, 0);
+            }
         }
     }
 
@@ -10066,12 +9951,14 @@ mod tests {
             let (reader, half) = stream.into_split();
             let writer = Arc::new(Mutex::new(half));
             let meta = if prepared {
-                crate::response::try_prepare_shm_response(&pool, 1024, 8193, |dst| {
-                    dst.fill(b'x');
-                    Ok(())
-                })
-                .unwrap()
-                .unwrap()
+                ResponseMeta::ShmAlloc(
+                    try_prepare_shm_response(&pool, 1024, 8193, |dst| {
+                        dst.fill(b'x');
+                        Ok(())
+                    })
+                    .unwrap()
+                    .unwrap(),
+                )
             } else {
                 ResponseMeta::Inline(b"x".repeat(8193))
             };
@@ -10106,9 +9993,17 @@ mod tests {
         .unwrap()
         .unwrap();
         let writer = closed_writer().await;
-        let error = send_response_meta(&target, &writer, 7, prepared, 1024, 4096, 16 * 1024)
-            .await
-            .unwrap_err();
+        let error = send_response_meta(
+            &target,
+            &writer,
+            7,
+            ResponseMeta::ShmAlloc(prepared),
+            1024,
+            4096,
+            16 * 1024,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("owner mismatch"));
         assert_eq!(target.read().handle_slice(&live)[0], 0x5A);
         assert_eq!(target.read().stats().alloc_count, 1);
@@ -10152,9 +10047,17 @@ mod tests {
         .unwrap();
         let writer = closed_writer().await;
 
-        let err = send_response_meta(&pool, &writer, 7, prepared, 1024, 4096, 4096)
-            .await
-            .unwrap_err();
+        let err = send_response_meta(
+            &pool,
+            &writer,
+            7,
+            ResponseMeta::ShmAlloc(prepared),
+            1024,
+            4096,
+            4096,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             err.to_string()

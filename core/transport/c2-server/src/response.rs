@@ -2,7 +2,7 @@
 
 use c2_mem::MemPool;
 
-use crate::dispatcher::{PreparedShmResponse, ResponseMeta};
+use crate::dispatcher::PreparedShmResponse;
 
 /// The server's fixed response-pool owner.
 ///
@@ -56,7 +56,7 @@ pub fn try_prepare_shm_response<F>(
     shm_threshold: u64,
     len: usize,
     write_into: F,
-) -> Result<Option<ResponseMeta>, String>
+) -> Result<Option<PreparedShmResponse>, String>
 where
     F: FnOnce(&mut [u8]) -> Result<(), String>,
 {
@@ -112,9 +112,7 @@ where
         return Err(err);
     }
 
-    Ok(Some(ResponseMeta::ShmAlloc(PreparedShmResponse::new(
-        handle, data_size,
-    ))))
+    Ok(Some(PreparedShmResponse::new(handle, data_size)))
 }
 
 #[cfg(test)]
@@ -168,38 +166,18 @@ mod tests {
         let pool = test_pool();
         let payload = b"x".repeat(8192);
 
-        let meta = super::try_prepare_shm_response(&pool, 1024, payload.len(), |dst| {
+        let prepared = super::try_prepare_shm_response(&pool, 1024, payload.len(), |dst| {
             dst.copy_from_slice(&payload);
             Ok(())
         })
         .unwrap()
         .expect("large payload should allocate response SHM");
 
-        let ResponseMeta::ShmAlloc(prepared) = meta else {
-            panic!("expected ShmAlloc response metadata");
-        };
         assert_eq!(prepared.data_size() as usize, payload.len());
-        let allocation = prepared.shm_allocation().unwrap();
-
-        let pool_guard = pool.read();
-        // SAFETY: the helper allocated and filled this exact span in this
-        // same pool inside this test; it stays live for this copy.
-        let ptr = pool_guard
-            .data_ptr_at(
-                allocation.seg_idx,
-                allocation.generation,
-                allocation.offset,
-                allocation.is_dedicated,
-            )
-            .unwrap();
-        let actual = unsafe { std::slice::from_raw_parts(ptr, prepared.data_size() as usize) };
-        assert_eq!(actual, payload.as_slice());
-        drop(pool_guard);
+        let handle = prepared.into_handle();
+        assert_eq!(pool.read().handle_slice(&handle), payload.as_slice());
         // The prepared owner releases cleanly through the response pool.
-        pool.inner
-            .write()
-            .release_handle(prepared.into_handle())
-            .unwrap();
+        pool.inner.write().release_handle(handle).unwrap();
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
 

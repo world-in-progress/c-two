@@ -157,15 +157,11 @@ impl CrmCallback for Probe {
             )
             .map_err(CrmError::InternalError)?
             .expect("selected SHM response carrier must actually allocate");
-            if let ResponseMeta::ShmAlloc(prepared_shm) = &prepared {
-                self.response_kind.store(
-                    if prepared_shm.is_dedicated() { 3 } else { 2 },
-                    Ordering::SeqCst,
-                );
-            } else {
-                panic!("response helper did not produce SHM carrier");
-            }
-            Ok(prepared)
+            self.response_kind.store(
+                if prepared.is_dedicated() { 3 } else { 2 },
+                Ordering::SeqCst,
+            );
+            Ok(ResponseMeta::ShmAlloc(prepared))
         } else {
             // The server cannot allocate SHM; production framing selects
             // chunked delivery, whose relay receive owner must use file spill.
