@@ -124,7 +124,9 @@ def _wheel_name(target: str, python: str) -> str:
 
 def _fastdb_wheel_name(target: str, python: str) -> str:
     interpreter, abi = promote.PYTHON_ABI_PAIRS[python]
-    return f"fastdb4py-{FASTDB_VERSION}-{interpreter}-{abi}-{PLATFORM_TAGS[target]}.whl"
+    # The macOS Intel sdist build retains this tag; its receipt proves that target.
+    platform = "macosx_15_0_universal2" if target == "x86_64-apple-darwin" else PLATFORM_TAGS[target]
+    return f"fastdb4py-{FASTDB_VERSION}-{interpreter}-{abi}-{platform}.whl"
 
 
 def _matrix_receipt(c3_sha: str | None = None) -> dict[str, Any]:
