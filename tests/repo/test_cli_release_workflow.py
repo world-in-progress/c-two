@@ -150,12 +150,12 @@ def test_cli_release_publishes_installer_assets_under_stable_names():
     assert '"fastdb-THIRD_PARTY_NOTICES.txt"' in script
 
 
-def test_cli_release_body_links_provenance_without_desktop_claims():
+def test_cli_release_body_links_provenance_and_arm64_coverage():
     script = (
         _repo_root() / ".github" / "scripts" / "promote_release_candidate.py"
     ).read_text(encoding="utf-8")
 
-    assert "Windows 11 desktop is not verified" in script
+    assert "Windows 11 ARM64" in script
     assert "Source Validation full-scope run" in script
 
 
@@ -204,7 +204,7 @@ def test_ci_validates_source_on_pr_merge_group_and_main_push():
         assert event in ci_text
     assert "branches: [main]" in ci_text
     assert "tools/ci/source_validation.py" in ci_text
-    for label in ("ubuntu-24.04", "macos-15", "windows-2022", "windows-2025"):
+    for label in ("ubuntu-24.04", "macos-15", "windows-2022", "windows-2025", "windows-11-arm"):
         assert label in ci_text
     assert "3.12" in ci_text
     assert "3.14t" in ci_text

@@ -92,7 +92,7 @@ def test_promotion_stages_only_c_two_packages_never_fastdb_proof():
     ).read_text(encoding="utf-8")
 
     assert 'refusing to publish {entry[\'name\']} as a C-Two package' in script
-    assert "expected 31 PyPI files" in script
+    assert "expected 36 PyPI files" in script
 
 
 def test_python_pyproject_has_no_cli_entrypoint_or_packaged_binary():

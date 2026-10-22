@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import time
 from typing import Any, Sequence
 
@@ -330,8 +331,8 @@ def source_mode_environment(base: dict[str, str]) -> dict[str, str]:
     environment = dict(base)
     environment[FASTDB_LINK_MODE_ENV] = "source"
     environment.pop(FASTDB_SYSTEM_LIB_DIR_ENV, None)
-    # CMake compiler launchers work with Ninja on MSVC. FastDB's Python wheel
-    # uses its own VS -A x64 build, so this is scoped only to Rust app gates.
+    # CMake compiler launchers work with Ninja on MSVC. Keep this setting
+    # scoped to Rust app gates, separate from Python dependency builds.
     if os.name == "nt":
         environment["CMAKE_GENERATOR"] = "Ninja"
     return environment
@@ -377,7 +378,9 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
     fastdb_typescript = "../fastdb/ts/fastdb4ts"
     c2_mem_typescript = "core/foundation/c2-mem-ffi/bindings/typescript"
     selected = [
-        ("python310-install", ["uv", "python", "install", "3.10"], ()),
+        # Syntax-only coverage uses x64 on Windows; no native ARM64 3.10
+        # interpreter exists. All runtime gates use the selected native Python.
+        ("python310-install", ["uv", "python", "install", "3.10-windows-x86_64-none" if target_platform == "windows" else "3.10"], ()),
         ("fastdb-npm-install", npm_command("ci", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", fastdb_typescript), ()),
         # The persistent generated-client regression is part of the ordinary
         # suite, before the payload matrix's independent WASM/package build.
@@ -429,9 +432,9 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
         ("python-native-test", ["cargo", "test", "--locked", "--manifest-path", "sdk/python/native/Cargo.toml"], ("python-build",)),
         ("source-harness-tests", ["uv", "run", "--no-sync", "pytest",
                                    "tests/repo/test_source_validation.py", "tests/repo/test_windows_wheel_smoke.py",
-                                   "tests/repo/test_ipc_memory_benchmark.py",
+                                   "tests/repo/test_ipc_memory_benchmark.py", "tests/repo/test_install_c3_powershell.py",
                                    "-q", "--timeout=30", f"--junitxml={output / 'source-harness-tests.xml'}"],
-         ("python-build",)),
+         ("python-build", "cli-artifact")),
         # The matrix spawns real worker processes, so launch it only after the
         # harness tests proved the worker-dispatch protections and python-build
         # established the venv the driver passes to every child through its
@@ -549,7 +552,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if options.scope != LOCAL_PLATFORM_SCOPE:
         toolchains.update({
             "uv": ["uv", "--version"], "cmake": ["cmake", "--version"],
-            "swig": ["swig", "-version"], "node": ["node", "--version"],
+            "swig": ["swig", "-version"], "node": ["node", "-p", "JSON.stringify({version:process.version,arch:process.arch})"],
             "npm": npm_command("--version"),
             "emscripten": [sys.executable, str(Path(os.environ.get("EMSDK", "../emsdk")) / "upstream/emscripten/emcc.py"), "--version"],
         })
@@ -568,7 +571,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "workflow_sha": os.environ.get("C2_WORKFLOW_SHA"),
         "run_id": os.environ.get("GITHUB_RUN_ID"),
         "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-        "runner": {"requested_label": os.environ.get("C2_RUNNER_LABEL"), "os": platform.platform(), "machine": platform.machine(), "image": os.environ.get("ImageOS"), "image_version": os.environ.get("ImageVersion")},
+        "runner": {"requested_label": os.environ.get("C2_RUNNER_LABEL"), "os": platform.platform(), "machine": platform.machine(), "python_platform": sysconfig.get_platform(), "image": os.environ.get("ImageOS"), "image_version": os.environ.get("ImageVersion")},
         "toolchains": {name: capture(command, ROOT) for name, command in toolchains.items()},
         "steps": [], "artifacts": [],
     }

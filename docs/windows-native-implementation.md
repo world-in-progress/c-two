@@ -8,9 +8,12 @@ The active dependency pins now select FastDB 0.2.3, source
 `abba785ef2a7d3fbee1bbc608393a3e6c7b042c4`, for Python, Rust, native source builds
 and the official CoreSDK. The existing SDK preparation helper also recognizes
 its `aarch64-pc-windows-msvc` bundle and requires the same verified
-`lib/fastdb.dll` and `lib/fastdb.lib` pair as Windows x64. This dependency
-selection does not add a C-Two release platform or establish C-Two ARM64 runtime
-validation. Published 0.7.6 keeps its historical `fastdb4py==0.2.2` extra; the
+`lib/fastdb.dll` and `lib/fastdb.lib` pair as Windows x64. C-Two's release gates
+now include native Windows 11 ARM64 source validation, five Python ABI rows
+from 3.11 through 3.14t, an ARM64 c3 executable and standard-user consumers.
+The gates check native Python, Rust and Node architecture before execution;
+FastDB availability alone is not accepted as runtime evidence.
+Published 0.7.6 keeps its historical `fastdb4py==0.2.2` extra; the
 source/run records below retain their actual FastDB inputs.
 
 ## Historical validation status (2026-10-07)
@@ -91,6 +94,6 @@ This contract must be proven by a test retaining an old peer mapping while the p
 - The next correction shares the existing process-environment lock between test readers and writers, and gives never-found/known-removed relay fixtures deterministic 404/410 paths. No production behavior or failure assertion is weakened. Host checks pass all 13 client-mode tests and the three affected relay tests; see [environment isolation](reports/windows-proxy-test-isolation.md) and [route withdrawal](reports/windows-route-removal-tests.md). Native Windows confirmation is pending the next run.
 - Final run [36034972057](https://github.com/Dsssyc/c-two/actions/runs/36034972057), on C-Two `5cf96eafc4674f7961beb15b7a976cfee7f238d0` and the same FastDB repair source, passes all four jobs. Each OS passes 22/22 full gates, 513 local-platform tests, 954 Core tests, 829 Python tests, strict 18-row Rust/Python and 12-row TypeScript receipts, and both installed-wheel consumers. Lifecycle and account/process/workspace cleanup pass. Downloaded ZIP digests, all recorded internal hashes and the retained executable's equality with every matrix/wheel receipt were verified. See [final validation](reports/windows-native-final-validation.md) for the exact evidence and release boundaries.
 
-## Outstanding environment coverage
+## Historical coverage boundary (0.7 baseline)
 
 Windows Server 2022/2025 x64 hosted execution and non-administrator consumers are verified. Windows 11 desktop, Windows services, Windows ARM64 and a real Windows/Linux two-machine relay remain separate, unexecuted targets. Development wheel execution here uses CPython 3.12; minimum-supported Python 3.10 coverage here is a syntax check. The coordinated 0.7 package matrix executes its own Python ABI gates, recorded with the release manifest. No result is inferred for these other environments from the hosted pass.

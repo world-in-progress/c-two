@@ -6,8 +6,11 @@ import hashlib
 import http.server
 import os
 import shutil
+import socket
+import socketserver
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 from pathlib import Path
@@ -89,6 +92,11 @@ class _ReleaseMirror:
         self.requested: list[str] = []
         mirror = self
 
+        class _Server(http.server.ThreadingHTTPServer):
+            def server_bind(self) -> None:
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address
+
         class _Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 mirror.requested.append(self.path)
@@ -106,7 +114,7 @@ class _ReleaseMirror:
             def log_message(self, format: str, *args: object) -> None:
                 return
 
-        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._server = _Server(("127.0.0.1", 0), _Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -134,6 +142,17 @@ def test_installer_has_no_powershell_syntax_errors():
     assert "parse-ok" in result.stdout
 
 
+def test_release_mirror_does_not_require_dns(monkeypatch):
+    def unavailable(*args):
+        raise AssertionError("loopback mirror must not query DNS")
+    monkeypatch.setattr(socket, "getfqdn", unavailable)
+    mirror = _ReleaseMirror({})
+    try:
+        assert mirror.base_url.startswith("http://127.0.0.1:")
+    finally:
+        mirror.close()
+
+
 def test_installer_help_uses_valid_keywords_and_documents_options():
     result = _run_pwsh(f"Get-Help -Name '{_installer()}' -Full")
 
@@ -150,26 +169,26 @@ def test_installer_help_uses_valid_keywords_and_documents_options():
     assert ".Environment" not in installer_text
 
 
-def test_installer_resolves_windows_x64_target_from_overrides():
-    x86_64 = _run_installer(
+@pytest.mark.parametrize("architecture,target", [
+    ("x64", "x86_64"), ("AMD64", "x86_64"), ("x86_64", "x86_64"),
+    ("ARM64", "aarch64"), ("aarch64", "aarch64"),
+])
+def test_installer_resolves_windows_target_from_overrides(architecture, target):
+    detected = _run_installer(
         "-PrintTarget",
-        env={"C3_INSTALLER_OS": "windows", "C3_INSTALLER_ARCH": "x86_64"},
+        env={"C3_INSTALLER_OS": "windows", "C3_INSTALLER_ARCH": architecture},
     )
-    amd64 = _run_installer(
-        "-PrintTarget",
-        env={"C3_INSTALLER_OS": "windows", "C3_INSTALLER_ARCH": "AMD64"},
-    )
-    from_env = _run_installer("-PrintTarget", env={"C3_TARGET": "x86_64-pc-windows-msvc"})
+    expected = f"{target}-pc-windows-msvc"
+    from_env = _run_installer("-PrintTarget", env={"C3_TARGET": expected})
 
-    assert x86_64.stdout.strip() == "x86_64-pc-windows-msvc"
-    assert amd64.stdout.strip() == "x86_64-pc-windows-msvc"
-    assert from_env.stdout.strip() == "x86_64-pc-windows-msvc"
+    assert detected.stdout.strip() == expected
+    assert from_env.stdout.strip() == expected
 
 
 def test_installer_rejects_unsupported_target_overrides():
     bad_arch = _run_installer(
         "-PrintTarget",
-        env={"C3_INSTALLER_OS": "windows", "C3_INSTALLER_ARCH": "aarch64"},
+        env={"C3_INSTALLER_OS": "windows", "C3_INSTALLER_ARCH": "x86"},
         check=False,
     )
     bad_os = _run_installer(
@@ -184,13 +203,31 @@ def test_installer_rejects_unsupported_target_overrides():
     assert "unsupported operating system" in bad_os.stderr
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="fixture is not a runnable Windows PE")
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell host architectures")
+@pytest.mark.parametrize("shell", ["pwsh", "System32", "SysWOW64"])
+def test_powershell_selects_native_os_target(shell):
+    powershell = (pwsh if shell == "pwsh" else
+                  Path(os.environ["SystemRoot"]) / shell / "WindowsPowerShell/v1.0/powershell.exe")
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(_installer()), "-PrintTarget"],
+        env={key: value for key, value in os.environ.items() if not key.startswith("C3_")},
+        capture_output=True, text=True, timeout=30,
+    )
+    architecture = "aarch64" if sysconfig.get_platform() == "win-arm64" else "x86_64"
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"{architecture}-pc-windows-msvc"
+
+
 def test_installer_downloads_verifies_and_installs_from_release_base(tmp_path):
-    payload = b"MZ fake windows c3 binary"
+    architecture = "aarch64" if sysconfig.get_platform() == "win-arm64" else "x86_64"
+    target = f"{architecture}-pc-windows-msvc"
+    asset_name = f"c3-{target}.exe"
+    payload = (Path(os.environ["CTWO_TEST_C3_BIN"]).read_bytes() if sys.platform == "win32"
+               else b"MZ fake windows c3 binary")
     mirror = _ReleaseMirror(
         {
-            f"/{_ASSET_NAME}": payload,
-            f"/{_ASSET_NAME}.sha256": _sidecar(payload),
+            f"/{asset_name}": payload,
+            f"/{asset_name}.sha256": _sidecar(payload, asset_name),
         }
     )
     bin_dir = tmp_path / "bin"
@@ -201,7 +238,7 @@ def test_installer_downloads_verifies_and_installs_from_release_base(tmp_path):
             "-BinDir",
             str(bin_dir),
             env={
-                "C3_TARGET": "x86_64-pc-windows-msvc",
+                "C3_TARGET": target,
                 "C3_RELEASE_BASE_URL": mirror.base_url,
             },
         )
@@ -209,10 +246,13 @@ def test_installer_downloads_verifies_and_installs_from_release_base(tmp_path):
     finally:
         mirror.close()
 
-    assert requested == [f"/{_ASSET_NAME}", f"/{_ASSET_NAME}.sha256"]
+    assert requested == [f"/{asset_name}", f"/{asset_name}.sha256"]
     assert (bin_dir / "c3.exe").read_bytes() == payload
     assert "Installed c3 to" in result.stdout
-    assert result.stdout.strip().endswith("Installed c3 to " + str(bin_dir / "c3.exe"))
+    if sys.platform == "win32":
+        assert "c3 " in result.stdout
+    else:
+        assert result.stdout.strip().endswith("Installed c3 to " + str(bin_dir / "c3.exe"))
     assert _leftover_temp_dirs() == []
 
 

@@ -267,6 +267,7 @@ verification are in the [Windows guide](../docs/windows-native-usage.md):
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 - `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
 
 Unix assets are named `c3-${target}`; Windows uses `c3-${target}.exe`.
 Each has a matching `.sha256`; installers verify it before installation.
@@ -285,21 +286,24 @@ The installer detects Linux/macOS and x86_64/aarch64. It defaults to
 curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.4.0 --bin-dir "$HOME/bin"
 ```
 
-### Windows x64
+### Windows x64 / ARM64
 
 Download the PowerShell installer and select the coordinated version explicitly:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.4.0 -Target x86_64-pc-windows-msvc
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.4.0
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```
 
-PowerShell 5.1 is supported. The default per-user directory is
+PowerShell 5.1 is supported. Automatic architecture detection uses Windows
+`IsWow64Process2` (Windows 10 / Windows Server version 1709 or later), including
+from emulated shells. The default per-user directory is
 `$env:LOCALAPPDATA\Programs\c3`; `-BinDir` selects another directory.
 The installer verifies SHA-256 and copies the binary to `c3.exe`, without
 requiring an administrator or persistently registering PATH. The example adds
-it to the current session only. Windows ARM64 has no release exe target.
+it to the current session only. Architecture selection follows the operating
+system, including when PowerShell runs through x64 emulation on Windows ARM64.
 For direct exe download, checksum verification and relay execution, see
 [Windows installation](../docs/windows-native-usage.md#install-python-and-c3).

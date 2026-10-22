@@ -28,7 +28,7 @@ name: Release Candidate
 # to that immutable commit and its successful full source-validation run.
 
 # A candidate is built once, on an explicit release qualification request.
-# PRs and ordinary main pushes run Source Validation without packaging 30 wheels.
+# PRs and ordinary main pushes run Source Validation without packaging 35 wheels.
 on:
   workflow_dispatch:
 
@@ -253,6 +253,16 @@ jobs:
               - { label: "3.13", versions: ["3.13"] }
               - { label: "3.14", versions: ["3.14"] }
               - { label: "3.14t", versions: ["3.14t"] }
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            fastdb-mode: wheel
+            # CPython and FastDB publish native Windows ARM64 from 3.11.
+            abi-groups:
+              - { label: "3.11", versions: ["3.11"] }
+              - { label: "3.12", versions: ["3.12"] }
+              - { label: "3.13", versions: ["3.13"] }
+              - { label: "3.14", versions: ["3.14"] }
+              - { label: "3.14t", versions: ["3.14t"] }
     uses: ./.github/workflows/release-candidate-native.yml
     with:
       source-sha: ${{ needs.context.outputs.source_sha }}
@@ -317,7 +327,7 @@ jobs:
           PY
 
       # Inventory binds the exact source sha, versions, and per-artifact
-      # SHA-256 digests; enforces the exact 5-target x 6-ABI row set with
+      # SHA-256 digests; enforces the exact 35-row platform/ABI set with
       # wheel/CLI hash cross-binding against the retained bytes and the
       # verified published FastDB metadata; requires every receipt with a
       # status to be passing (no "skipped" rows); and keeps FastDB proof
@@ -337,16 +347,17 @@ jobs:
             --meta "fastdb_version=${{ needs.context.outputs.fastdb_version }}" \
             --meta "fastdb_source_rev=${{ needs.context.outputs.fastdb_source_rev }}" \
             --meta "fastdb_sdist_sha256=${{ needs.context.outputs.fastdb_sdist_sha256 }}" \
-            --expect-cli 5 \
-            --expect-wheels 30 \
+            --expect-cli 6 \
+            --expect-wheels 35 \
             --expect-sdist 1 \
-            --expect-fastdb-proof 8 \
+            --expect-fastdb-proof 9 \
             --expect-installers 2 \
             --require-cli-name c3-x86_64-unknown-linux-gnu \
             --require-cli-name c3-aarch64-unknown-linux-gnu \
             --require-cli-name c3-aarch64-apple-darwin \
             --require-cli-name c3-x86_64-apple-darwin \
             --require-cli-name c3-x86_64-pc-windows-msvc.exe \
+            --require-cli-name c3-aarch64-pc-windows-msvc.exe \
             --wheel-prefix "c_two-${{ needs.context.outputs.c_two_version }}-" \
             --expect-wheel-name c_two \
             --expect-wheel-version "${{ needs.context.outputs.c_two_version }}" \
@@ -369,10 +380,10 @@ jobs:
             --expect-json-prefix sdist- \
             --expect-json-count rc-context=1 \
             --expect-json-count rc-fastdb-public=1 \
-            --expect-json-count fastdb-=6 \
-            --expect-json-count smoke-=5 \
-            --expect-json-count abi-=30 \
-            --expect-json-count standard-user-=2 \
+            --expect-json-count fastdb-=7 \
+            --expect-json-count smoke-=6 \
+            --expect-json-count abi-=35 \
+            --expect-json-count standard-user-=4 \
             --expect-json-count sdist-=2
 
       - uses: actions/upload-artifact@v4

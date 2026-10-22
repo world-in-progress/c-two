@@ -40,7 +40,7 @@ A **CRM contract** declares the callable methods and their namespace/version. A 
 - **Explicit payload lifetimes:** `cc.hold()` retains response leases, while registration can select borrowed input lifetimes. Release invalidates FastDB owners and checked views before releasing transport storage. See [Python payload usage](docs/python-usage.md).
 - **Connection observations:** client and server APIs report physical IPC connection termination without an in-flight call. Reasons describe transport facts, not proof of process death.
 - **Resource lifecycle management:** Resources use `Persistent` or controller-owned `OwnerBound` lifecycles; native shutdown drains work, and scoped endpoint maintenance cleans up confirmed exits. See [lifecycle integration](docs/local-endpoint-lifecycle.en.md).
-- **Shared Rust core:** Python and Rust use the same routing, transport, memory, error and lifecycle mechanisms. The native c3 CLI handles relay, contract tools and endpoint maintenance on Linux, macOS and Windows x64.
+- **Shared Rust core:** Python and Rust use the same routing, transport, memory, error and lifecycle mechanisms. The native c3 CLI handles relay, contract tools and endpoint maintenance on Linux, macOS and Windows x64 and ARM64.
 
 ## Install
 
@@ -56,7 +56,7 @@ The same command works in Windows PowerShell. For c3 on Linux or macOS:
 curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.sh | sh -s -- --version 0.4.0
 ```
 
-On Windows x64, use the [executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-x86_64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
+On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
 C3 0.4.0 accompanies C-Two 0.8.0. IPC 12, SHM 3 and C/FFI ABI 5 remain unchanged; owner control has its own version 1. The owner API and low-level Rust APIs change without compatibility aliases. Upgrade cooperating owner controllers and hosts together and recompile Rust consumers.
 

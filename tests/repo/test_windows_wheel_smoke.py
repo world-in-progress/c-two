@@ -17,6 +17,30 @@ def load_smoke():
     return smoke
 
 
+@pytest.mark.parametrize("platform,machine", [("win-amd64", 0x8664), ("win-arm64", 0xAA64)])
+def test_windows_architecture_checks_actual_pe_bytes(tmp_path, platform, machine):
+    header = bytearray(70)
+    header[:2] = b"MZ"
+    header[60:64] = (64).to_bytes(4, "little")
+    header[64:68] = b"PE\0\0"
+    header[68:70] = machine.to_bytes(2, "little")
+    cli = tmp_path / "c3.exe"
+    cli.write_bytes(header)
+    package = tmp_path / "misleading_name.whl"
+    with zipfile.ZipFile(package, "w") as archive:
+        archive.writestr("c_two/_native.pyd", header)
+    smoke = load_smoke()
+    facts = smoke.windows_architecture((cli, package), platform)
+    assert set(facts["pe_machines"].values()) == {machine}
+    header[68:70] = (0x8664 if machine == 0xAA64 else 0xAA64).to_bytes(2, "little")
+    cli.write_bytes(header)
+    with pytest.raises(ValueError, match="PE machine"):
+        smoke.windows_architecture((cli, package), platform)
+    cli.write_bytes(b"MZ truncated")
+    with pytest.raises(ValueError, match="Invalid PE header"):
+        smoke.windows_architecture((cli,), platform)
+
+
 @pytest.mark.parametrize("declaration", [
     "Provides-Extra: fastdb\n",
     "Requires-Dist: fastdb4py==0.2.2\nProvides-Extra: fastdb\n",

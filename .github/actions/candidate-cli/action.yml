@@ -13,9 +13,11 @@ runs:
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: "3.12"
+        architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
 
     - uses: dtolnay/rust-toolchain@stable
       with:
+        toolchain: ${{ runner.os == 'Windows' && runner.arch == 'ARM64' && 'stable-aarch64-pc-windows-msvc' || 'stable' }}
         targets: ${{ inputs.target }}
 
     - uses: ./.github/actions/setup-cpp-cache
@@ -32,6 +34,8 @@ runs:
     - name: Set up MSVC environment
       if: runner.os == 'Windows'
       uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
 
     - name: Build c3 (manylinux container)
       if: runner.os == 'Linux'
@@ -82,6 +86,7 @@ runs:
       shell: pwsh
       env:
         FASTDB_PAYLOAD_LINK_MODE: source
+        CMAKE_GENERATOR: Ninja
       run: |
         cargo build --manifest-path cli/Cargo.toml --release --target ${{ inputs.target }}
         if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -106,6 +111,8 @@ runs:
         RC_TARGET: ${{ inputs.target }}
       run: |
         $ErrorActionPreference = 'Stop'
+        $detected = & ./cli/install-c3.ps1 -PrintTarget
+        if ($detected -ne $env:RC_TARGET) { throw "installer selected $detected instead of $env:RC_TARGET" }
         New-Item -ItemType Directory -Force -Path cli-dist | Out-Null
         Copy-Item "cli/target/${{ inputs.target }}/release/c3.exe" "cli-dist/c3-$($env:RC_TARGET).exe"
         python .github/scripts/release_candidate.py checksum "cli-dist/c3-$($env:RC_TARGET).exe"

@@ -278,19 +278,23 @@ def test_inspect_sdist_requires_identity_members_and_matching_metadata(rc, tmp_p
 SOURCE_SHA = "a" * 40
 SDIST_PAYLOAD = b"fastdb-sdist"
 SDIST_SHA = hashlib.sha256(SDIST_PAYLOAD).hexdigest()
-# Two targets x three advertised pythons keep the fixture small while the
-# workflow uses the same validation with 5 x 6.
-TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin")
+# Three targets keep the fixture small while covering the Windows ARM64
+# exclusion of Python 3.10 in the real 35-row matrix.
+TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "aarch64-pc-windows-msvc")
 PYTHONS = ("3.10", "3.11", "3.12")
+ABI_ROWS = tuple((target, python) for target in TARGETS for python in PYTHONS
+                 if (target, python) != ("aarch64-pc-windows-msvc", "3.10"))
 PLATFORM_BY_TARGET = {
     "x86_64-unknown-linux-gnu": "manylinux_2_28_x86_64",
     "aarch64-apple-darwin": "macosx_11_0_arm64",
+    "aarch64-pc-windows-msvc": "win_arm64",
 }
 # x86_64 rows consume published FastDB wheels; aarch64 rows (like Linux ARM64
 # and macOS Intel in the real matrix) build the verified sdist per row.
 FASTDB_MODE_BY_TARGET = {
     "x86_64-unknown-linux-gnu": "wheel",
     "aarch64-apple-darwin": "sdist",
+    "aarch64-pc-windows-msvc": "wheel",
 }
 
 
@@ -304,6 +308,10 @@ def sidecar_for_tree(path: Path) -> Path:
     return path
 
 
+def cli_name(target: str) -> str:
+    return f"c3-{target}{'.exe' if target.endswith('windows-msvc') else ''}"
+
+
 def candidate_tree(tmp_path: Path) -> Path:
     """A coherent miniature candidate mirroring the real receipt shapes."""
     root = tmp_path / "candidate"
@@ -314,11 +322,13 @@ def candidate_tree(tmp_path: Path) -> Path:
         sidecar_for_tree(write(root, name, payload))
 
     for target in TARGETS:
-        retain(f"c3-{target}", f"cli:{target}".encode())
+        retain(cli_name(target), f"cli:{target}".encode())
 
     wheel_sha: dict[str, str] = {}
     for target in TARGETS:
         for python in PYTHONS:
+            if (target, python) not in ABI_ROWS:
+                continue
             tag = "cp" + python.replace(".", "")
             name = f"c_two-0.6.0-{tag}-{tag}-{PLATFORM_BY_TARGET[target]}.whl"
             retain(name, f"wheel:{target}:{python}".encode())
@@ -327,16 +337,17 @@ def candidate_tree(tmp_path: Path) -> Path:
 
     listing_files: list[dict] = []
     published_fastdb_sha: dict[str, str] = {}
-    for python in PYTHONS:
+    for target, python in ABI_ROWS:
+        if FASTDB_MODE_BY_TARGET[target] != "wheel":
+            continue
         tag = "cp" + python.replace(".", "")
-        name = f"fastdb4py-0.2.1-{tag}-{tag}-manylinux_2_28_x86_64.whl"
-        payload = f"published:{python}".encode()
+        name = f"fastdb4py-0.2.1-{tag}-{tag}-{PLATFORM_BY_TARGET[target]}.whl"
+        payload = f"published:{target}:{python}".encode()
         published_fastdb_sha[name] = digest_of(payload)
         listing_files.append({"filename": name, "packagetype": "bdist_wheel",
                               "sha256": published_fastdb_sha[name]})
-        # Like the real provisioning job, only the cp312 published wheel is
-        # retained on disk; the other published wheels live in the verified
-        # listing metadata that per-row decisions are checked against.
+        # Only provisioning's cp312 wheels are retained; other ABI decisions
+        # bind the published listing metadata.
         if python == "3.12":
             retain(name, payload)
     listing_files.append({"filename": "fastdb4py-0.2.1.tar.gz", "packagetype": "sdist",
@@ -354,7 +365,7 @@ def candidate_tree(tmp_path: Path) -> Path:
     def fastdb_decision(target: str, python: str) -> dict:
         if FASTDB_MODE_BY_TARGET[target] == "wheel":
             tag = "cp" + python.replace(".", "")
-            name = f"fastdb4py-0.2.1-{tag}-{tag}-manylinux_2_28_x86_64.whl"
+            name = f"fastdb4py-0.2.1-{tag}-{tag}-{PLATFORM_BY_TARGET[target]}.whl"
             return {"mode": "wheel", "filename": name, "sha256": published_fastdb_sha[name]}
         decision = {"mode": "sdist", "filename": "fastdb4py-0.2.1.tar.gz", "sha256": SDIST_SHA}
         if python == "3.12":
@@ -370,6 +381,8 @@ def candidate_tree(tmp_path: Path) -> Path:
 
     for target in TARGETS:
         for python in PYTHONS:
+            if (target, python) not in ABI_ROWS:
+                continue
             tag = "cp" + python.replace(".", "")
             decision = fastdb_decision(target, python)
             if decision["mode"] == "sdist" and python == "3.12":
@@ -393,7 +406,7 @@ def candidate_tree(tmp_path: Path) -> Path:
                      "sha256": wheel_sha[
                          f"c_two-0.6.0-{tag}-{tag}-{PLATFORM_BY_TARGET[target]}.whl"],
                      "bytes": 6, "distribution": "c-two", "version": "0.6.0"},
-                    {"name": f"c3-{target}", "sha256": digest_of(f"cli:{target}".encode()),
+                    {"name": cli_name(target), "sha256": digest_of(f"cli:{target}".encode()),
                      "bytes": 7},
                 ],
                 "row": {"target": target, "python": python, "fastdb_mode": decision["mode"]},
@@ -407,10 +420,10 @@ def candidate_tree(tmp_path: Path) -> Path:
     # Provisioning receipts: the wheel-mode target's published decision and
     # the sdist-mode target's built-wheel decision (which legitimizes the
     # retained built FastDB wheel in the proof inventory).
-    retain("fastdb-x86_64-unknown-linux-gnu.json", json.dumps({"schema": "c-two.fastdb-release.resolution.v1", **fastdb_decision(
-        "x86_64-unknown-linux-gnu", "3.12")}, indent=2).encode())
-    retain("fastdb-aarch64-apple-darwin.json", json.dumps({"schema": "c-two.fastdb-release.resolution.v1", **fastdb_decision(
-        "aarch64-apple-darwin", "3.12")}, indent=2).encode())
+    for target in TARGETS:
+        retain(f"fastdb-{target}.json", json.dumps({
+            "schema": "c-two.fastdb-release.resolution.v1",
+            **fastdb_decision(target, "3.12")}, indent=2).encode())
 
     retain("rc-context.json", json.dumps(
         {"schema": "c-two.release-candidate.context.v1",
@@ -438,15 +451,15 @@ def manifest_args(root: Path, output: Path) -> list[str]:
         "--event", "push", "--ref", "refs/heads/dev-feature",
         "--meta", "c_two_version=0.6.0", "--meta", "c3_version=0.2.0",
         "--expect-cli", str(len(TARGETS)),
-        "--expect-wheels", str(len(TARGETS) * len(PYTHONS)),
+        "--expect-wheels", str(len(ABI_ROWS)),
         "--expect-sdist", "1",
-        "--expect-fastdb-proof", "5",
+        "--expect-fastdb-proof", "6",
         "--wheel-prefix", "c_two-0.6.0-",
         "--expect-wheel-name", "c_two",
         "--expect-wheel-version", "0.6.0",
     ]
     for target in TARGETS:
-        args += ["--require-cli-name", f"c3-{target}"]
+        args += ["--require-cli-name", cli_name(target)]
     for python in PYTHONS:
         args += ["--expect-abi-python", python]
     for prefix in ("rc-context", "abi-", "smoke-", "sdist-"):
@@ -456,9 +469,9 @@ def manifest_args(root: Path, output: Path) -> list[str]:
     args += [
         "--expect-json-count", "rc-context=1",
         "--expect-json-count", "rc-fastdb-public=1",
-        "--expect-json-count", "fastdb-=2",
+        "--expect-json-count", "fastdb-=3",
         "--expect-json-count", "smoke-=1",
-        "--expect-json-count", f"abi-={len(TARGETS) * len(PYTHONS)}",
+        "--expect-json-count", f"abi-={len(ABI_ROWS)}",
         "--expect-json-count", "sdist-=2",
     ]
     return args
@@ -484,10 +497,10 @@ def test_manifest_binds_the_full_candidate_matrix(rc, tmp_path):
     assert manifest["schema"] == "c-two.release-candidate.v1"
     assert manifest["source_commit_sha"] == SOURCE_SHA
     assert manifest["counts"]["cli"] == len(TARGETS)
-    assert manifest["counts"]["wheels"] == len(TARGETS) * len(PYTHONS)
+    assert manifest["counts"]["wheels"] == len(ABI_ROWS)
     assert manifest["counts"]["sdist"] == 1
-    assert manifest["counts"]["fastdb_proof"] == 5
-    assert manifest["counts"]["abi_rows"] == len(TARGETS) * len(PYTHONS)
+    assert manifest["counts"]["fastdb_proof"] == 6
+    assert manifest["counts"]["abi_rows"] == len(ABI_ROWS)
     # Product wheels are only the c_two ones; FastDB inputs stay separate.
     assert all(wheel["name"].startswith("c_two-0.6.0-") for wheel in manifest["wheels"])
     assert output.with_name("rc-manifest.json.sha256").is_file()
@@ -560,8 +573,8 @@ def test_manifest_fails_on_duplicate_and_missing_abi_rows(rc, tmp_path, capsys):
           json.dumps(duplicate, indent=2).encode())
     sidecar_for_tree(root / "abi-x86_64-unknown-linux-gnu-3.10-again.json")
     args = manifest_args(root, root / "rc-manifest.json")
-    expected = f"abi-={len(TARGETS) * len(PYTHONS)}"
-    args[args.index(expected)] = f"abi-={len(TARGETS) * len(PYTHONS) + 1}"
+    expected = f"abi-={len(ABI_ROWS)}"
+    args[args.index(expected)] = f"abi-={len(ABI_ROWS) + 1}"
     assert rc.main(args) == 1
     assert "duplicate ABI row x86_64-unknown-linux-gnu/3.10" in capsys.readouterr().err
 
@@ -596,7 +609,7 @@ def test_manifest_fails_when_a_retained_wheel_is_not_consumed(rc, tmp_path, caps
     sidecar_for_tree(write(root, extra, b"wheel"))
     args = manifest_args(root, root / "rc-manifest.json")
     count_index = args.index("--expect-wheels")
-    args[count_index + 1] = str(len(TARGETS) * len(PYTHONS) + 1)
+    args[count_index + 1] = str(len(ABI_ROWS) + 1)
     assert rc.main(args) == 1
     assert f"retained wheel {extra} is not consumed by any ABI row" in capsys.readouterr().err
 
@@ -608,7 +621,7 @@ def test_manifest_fails_when_fastdb_proof_is_not_verified_metadata(rc, tmp_path,
     stray = "fastdb4py-0.2.1-cp313-cp313-manylinux_2_28_x86_64.whl"
     sidecar_for_tree(write(root, stray, b"stray"))
     args = manifest_args(root, root / "rc-manifest.json")
-    args[args.index("--expect-fastdb-proof") + 1] = "6"
+    args[args.index("--expect-fastdb-proof") + 1] = "7"
     assert rc.main(args) == 1
     errors = capsys.readouterr().err
     assert f"retained FastDB wheel {stray}" in errors
@@ -682,6 +695,40 @@ def test_manifest_rejects_a_wheel_for_another_target(rc, tmp_path, capsys):
     rewrite_receipt(root, name, swap)
     assert rc.main(manifest_args(root, root / "rc-manifest.json")) == 1
     assert "wheel platform does not match" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mutation", ["missing-cli", "missing-abi", "wrong-platform", "python-3.10"])
+def test_manifest_rejects_incomplete_or_invented_windows_arm64_rows(rc, tmp_path, capsys, mutation):
+    root = candidate_tree(tmp_path)
+    target = "aarch64-pc-windows-msvc"
+    name = f"abi-{target}-3.11.json"
+    args = manifest_args(root, root / "rc-manifest.json")
+    if mutation in ("missing-cli", "missing-abi"):
+        victim = cli_name(target) if mutation == "missing-cli" else name
+        (root / victim).unlink()
+        (root / f"{victim}.sha256").unlink()
+        expected = (f"missing required CLI artifact {victim}" if mutation == "missing-cli"
+                    else f"missing ABI row {target}/3.11")
+    else:
+        receipt = load_receipt(root, name)
+        wheel = receipt["artifacts"][1]
+        original = root / wheel["name"]
+        replacement = (wheel["name"].replace("win_arm64", "win_amd64")
+                       if mutation == "wrong-platform" else
+                       wheel["name"].replace("cp311", "cp310"))
+        sidecar_for_tree(write(root, replacement, original.read_bytes()))
+        original.unlink()
+        original.with_name(original.name + ".sha256").unlink()
+        wheel["name"] = replacement
+        if mutation == "python-3.10":
+            receipt["row"]["python"] = "3.10"
+            receipt["wheel_abi"] = {"interpreter": "cp310", "abi": "cp310"}
+        (root / name).write_text(json.dumps(receipt), encoding="utf-8")
+        sidecar_for_tree(root / name)
+        expected = ("wheel platform does not match row target" if mutation == "wrong-platform"
+                    else f"unexpected ABI row {target}/3.10")
+    assert rc.main(args) == 1
+    assert expected in capsys.readouterr().err
 
 
 def test_checksum_commands_need_only_the_standard_library(tmp_path):
@@ -806,7 +853,8 @@ def test_target_workflows_keep_the_complete_abi_inventory_and_local_dependencies
     root = yaml.safe_load((_ROOT / ".github/workflows/release-candidate.yml").read_text())
     versions = {"3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"}
     targets = {"x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
-               "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"}
+               "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc",
+               "aarch64-pc-windows-msvc"}
     rows = []
     for family, consumer in (("native", "build-wheels-native"), ("linux", "abi-import-linux")):
         caller = root["jobs"][family]
@@ -823,7 +871,9 @@ def test_target_workflows_keep_the_complete_abi_inventory_and_local_dependencies
                 assert caller["with"]["abi-groups"] == "${{ toJSON(matrix.abi-groups) }}"
                 assert job["strategy"]["matrix"]["include"] == "${{ fromJSON(inputs.abi-groups) }}"
                 groups = platform["abi-groups"]
-                assert len(groups) == (6 if platform["target"].endswith("windows-msvc") else 2)
+                group_count = (5 if platform["target"] == "aarch64-pc-windows-msvc" else
+                               6 if platform["target"].endswith("windows-msvc") else 2)
+                assert len(groups) == group_count
                 actual_versions = [version for group in groups for version in group["versions"]]
                 calls = [step for step in job["steps"] if step.get("uses") == "./.github/actions/candidate-native-abi"]
                 assert {step["with"]["python"] for step in calls} == versions
@@ -833,7 +883,9 @@ def test_target_workflows_keep_the_complete_abi_inventory_and_local_dependencies
             else:
                 actual_versions = job["strategy"]["matrix"]["python"]
             rows.extend((platform["target"], version) for version in actual_versions)
-    assert len(rows) == 30 and set(rows) == {(target, version) for target in targets for version in versions}
+    expected = {(target, version) for target in targets for version in versions
+                if (target, version) != ("aarch64-pc-windows-msvc", "3.10")}
+    assert len(rows) == 35 and set(rows) == expected
     assert set(root["jobs"]["manifest"]["needs"]) == {"context", "native", "linux"}
 
 

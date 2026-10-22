@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -215,6 +216,31 @@ def artifact(path: Path) -> dict[str, object]:
             "bytes": path.stat().st_size}
 
 
+def windows_architecture(paths: tuple[Path, ...], python_platform: str) -> dict[str, object]:
+    """Reject x64 binaries that could otherwise run under ARM64 emulation."""
+    expected = {"win-amd64": 0x8664, "win-arm64": 0xAA64}[python_platform]
+    machines = {}
+    for path in paths:
+        if path.suffix == ".whl":
+            with zipfile.ZipFile(path) as archive:
+                binaries = {name: archive.read(name) for name in archive.namelist()
+                            if name.endswith((".pyd", ".dll"))}
+        else:
+            binaries = {path.name: path.read_bytes()}
+        if not binaries:
+            raise ValueError(f"No native binaries in {path.name}")
+        for name, data in binaries.items():
+            offset = int.from_bytes(data[60:64], "little")
+            header = data[offset:offset + 6]
+            if len(data) < 64 or data[:2] != b"MZ" or len(header) != 6 or header[:4] != b"PE\0\0":
+                raise ValueError(f"Invalid PE header: {name}")
+            machine = int.from_bytes(header[4:6], "little")
+            if machine != expected:
+                raise ValueError(f"PE machine {machine:#x} does not match {python_platform}: {name}")
+            machines[f"{path.name}/{name}" if path.suffix == ".whl" else name] = machine
+    return {"python_platform": python_platform, "pe_machines": machines}
+
+
 def wheel(path: Path, distribution: str, *, fastdb_version: str | None = None) -> tuple[Path, dict[str, object]]:
     candidates = sorted(path.glob("*.whl")) if path.is_dir() else [path]
     if len(candidates) != 1 or not candidates[0].is_file():
@@ -395,6 +421,8 @@ def main() -> int:
         ctwo, ctwo_info = wheel(options.c_two_wheel, "c-two", fastdb_version=str(fastdb_info["version"]))
         c3 = options.c3.resolve(strict=True)
         receipt["artifacts"] = [fastdb_info, ctwo_info, artifact(c3)]
+        if os.name == "nt":
+            receipt["native_architecture"] = windows_architecture((fastdb, ctwo, c3), sysconfig.get_platform())
         with tempfile.TemporaryDirectory(prefix="c-two wheel 安装 ") as directory:
             work = Path(directory)
             environment = clean_environment()

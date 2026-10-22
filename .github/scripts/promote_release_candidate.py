@@ -23,15 +23,15 @@ Contract, fail-closed on every deviation:
   must bind exactly one successful ``Source Validation`` run through
   ``source_validation_run_id`` (selected by ``check-source``). That bound run
   — a canonical ``main`` push or explicit dispatch for the exact same source
-  SHA — is the only accepted source of the four full-scope platform artifacts
-  (``ubuntu-24.04``, ``macos-15``, ``windows-2022``, ``windows-2025``) and
+  SHA — is the only accepted source of the five full-scope platform artifacts
+  (``ubuntu-24.04``, ``macos-15``, ``windows-2022``, ``windows-2025``, ``windows-11-arm``) and
   their receipts. Evidence is never mixed across runs, and a different
   Source Validation run for the same source cannot substitute the bound one.
 - ``check-source --source-sha`` is the read-only companion the Release
   Candidate workflow uses to fill ``source_validation_run_id``: it reads only
   GitHub metadata (workflow-run listings and job listings, never artifact
   downloads) and returns the newest successful canonical-main Source
-  Validation run whose complete job inventory carries the four platform
+  Validation run whose complete job inventory carries the five platform
   ``py3.12`` full source jobs plus the Ubuntu ``py3.14t`` source job — a
   policy-only green run is not a full gate — as JSON ``{"source_sha",
   "run_id", "run_url"}``.
@@ -47,7 +47,7 @@ Contract, fail-closed on every deviation:
   artifact ZIPs is accepted only when its SHA-256 is identical.
 - The candidate's ``rc-manifest.json`` (schema ``c-two.release-candidate.v1``,
   sidecar-verified by ``release_candidate.py``) is re-hashed entry by entry
-  against the extracted bytes: 5 exact CLI names, 30 unique platform/ABI
+  against the extracted bytes: 6 exact CLI names, 35 unique platform/ABI
   wheel rows, 1 sdist, canonical installer assets, FastDB proof inputs,
   versions/source identity, and the executed receipts that bind the tested
   bytes. The receipt reader mirrors the reviewed candidate contract:
@@ -137,10 +137,11 @@ CLI_TARGETS = (
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
 )
-WINDOWS_TARGET = "x86_64-pc-windows-msvc"
+WINDOWS_TARGETS = ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")
 EXPECTED_CLI_NAMES = tuple(
-    f"c3-{target}{'.exe' if target == WINDOWS_TARGET else ''}" for target in CLI_TARGETS
+    f"c3-{target}{'.exe' if target in WINDOWS_TARGETS else ''}" for target in CLI_TARGETS
 )
 EXPECTED_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14", "3.14t")
 # Advertised row -> exact tag pair. A free-threaded 3.14t wheel is
@@ -154,13 +155,15 @@ PYTHON_ABI_PAIRS = {
     "3.14": ("cp314", "cp314"),
     "3.14t": ("cp314", "cp314t"),
 }
+EXPECTED_ABI_ROWS = {(target, python) for target in CLI_TARGETS for python in EXPECTED_PYTHONS
+                     if rc_helper.target_supports_python(target, python)}
 EXPECTED_RECEIPT_PREFIX_COUNTS = {
     "rc-context": 1,
     "rc-fastdb-public": 1,
-    "fastdb-": 6,
-    "smoke-": 5,
-    "abi-": 30,
-    "standard-user-": 2,
+    "fastdb-": 7,
+    "smoke-": 6,
+    "abi-": 35,
+    "standard-user-": 4,
     "sdist-": 2,
 }
 # Installers are retained by the candidate under their canonical release
@@ -172,9 +175,10 @@ SOURCE_VALIDATION_LANES = {
     "macos-15": "macos",
     "windows-2022": "windows",
     "windows-2025": "windows",
+    "windows-11-arm": "windows",
 }
 # The complete source-job inventory check-source demands from one successful
-# run: the four platform py3.12 full lanes plus the Ubuntu py3.14t lane.
+# run: the five platform py3.12 full lanes plus the Ubuntu py3.14t lane.
 CHECK_SOURCE_REQUIRED_JOBS = (
     *(f"source ({label}, py3.12)" for label in SOURCE_VALIDATION_LANES),
     "source (ubuntu-24.04, py3.14t)",
@@ -355,7 +359,7 @@ def find_full_source_validation_run(api: GitHubApi, source_sha: str) -> dict[str
     """The newest successful canonical-main Source Validation run with the full job inventory.
 
     Reads only run and job metadata, never artifact bytes. Successful runs
-    whose job inventory lacks one of the four platform ``py3.12`` full source
+    whose job inventory lacks one of the five platform ``py3.12`` full source
     jobs or the Ubuntu ``py3.14t`` source job — policy-only green runs — do
     not qualify as full gates; when nothing qualifies, the failure explains
     whether runs are pending, failed, or merely policy-only.
@@ -513,8 +517,10 @@ def python_abi_pair(python: str) -> tuple[str, str]:
 
 def wheel_platform_matches_target(platform: str, target: str) -> bool:
     """Mirror of the candidate contract's platform-to-target matching rule."""
-    if target == WINDOWS_TARGET:
+    if target == "x86_64-pc-windows-msvc":
         return platform == "win_amd64"
+    if target == "aarch64-pc-windows-msvc":
+        return platform == "win_arm64"
     architectures = {
         "x86_64-unknown-linux-gnu": ("linux", "x86_64"),
         "aarch64-unknown-linux-gnu": ("linux", "aarch64"),
@@ -589,14 +595,15 @@ def verify_manifest_binding(
     sdist = rehash(manifest.get("sdist"), "sdist")
     fastdb_proof = rehash(manifest.get("fastdb_proof"), "fastdb_proof")
     installers = rehash(manifest.get("installers"), "installers")
-    rehash(manifest.get("receipts"), "receipts")
+    receipts = rehash(manifest.get("receipts"), "receipts")
 
     _require({entry["name"] for entry in cli} == set(EXPECTED_CLI_NAMES),
              f"CLI inventory is not exactly {sorted(EXPECTED_CLI_NAMES)}: "
              f"{sorted(entry['name'] for entry in cli)}")
     wheel_names = [entry["name"] for entry in wheels]
-    _require(len(wheel_names) == 30 and len(set(wheel_names)) == 30,
-             f"expected 30 unique wheels, found {len(wheel_names)} "
+    _require(len(wheel_names) == len(EXPECTED_ABI_ROWS)
+             and len(set(wheel_names)) == len(EXPECTED_ABI_ROWS),
+             f"expected {len(EXPECTED_ABI_ROWS)} unique wheels, found {len(wheel_names)} "
              f"({len(set(wheel_names))} unique)")
     wheel_prefix = f"c_two-{c_two_version}-"
     for name in wheel_names:
@@ -613,6 +620,8 @@ def verify_manifest_binding(
             "retain c3-installer.sh / c3-installer.ps1 and include them in rc-manifest.json"
         )
     proof_names = {entry["name"] for entry in fastdb_proof}
+    _require(len(proof_names) == 9,
+             f"expected 9 FastDB proof artifacts, found {len(proof_names)}")
     for license_name in FASTDB_LICENSE_ASSETS:
         _require(license_name in proof_names,
                  f"FastDB upstream license evidence {license_name} is missing from the candidate")
@@ -621,11 +630,33 @@ def verify_manifest_binding(
     _require(len(retained_sdists) == 1,
              f"expected exactly one retained FastDB sdist, found "
              f"{[entry['name'] for entry in retained_sdists]}")
+    proof_targets: list[str] = []
+    for entry in fastdb_proof:
+        if not entry["name"].endswith(".whl"):
+            continue
+        try:
+            distribution, version, _, tags = parse_wheel_filename(entry["name"])
+        except InvalidWheelFilename as error:
+            raise PromotionError(f"invalid FastDB proof wheel {entry['name']}: {error}") from error
+        _require(distribution == "fastdb4py" and str(version) == meta["fastdb_version"],
+                 f"FastDB proof wheel {entry['name']} distribution/version mismatch")
+        targets = {target for target in CLI_TARGETS
+                   if any((tag.interpreter, tag.abi) == ("cp312", "cp312")
+                          and wheel_platform_matches_target(tag.platform, target) for tag in tags)}
+        _require(len(targets) == 1, f"FastDB proof wheel {entry['name']} is not one cp312 target row")
+        proof_targets.extend(targets)
+    _require(sorted(proof_targets) == sorted(CLI_TARGETS),
+             "FastDB proof wheels must cover every CLI target exactly once on cp312")
 
     counts = manifest.get("counts")
     _require(isinstance(counts, dict), "rc-manifest counts are missing")
     _require(counts.get("receipts_by_prefix") == EXPECTED_RECEIPT_PREFIX_COUNTS,
              f"receipt prefix counts {counts.get('receipts_by_prefix')!r} do not match "
+             f"{EXPECTED_RECEIPT_PREFIX_COUNTS}")
+    actual_receipt_counts = {prefix: sum(entry["name"].startswith(prefix) for entry in receipts)
+                             for prefix in EXPECTED_RECEIPT_PREFIX_COUNTS}
+    _require(actual_receipt_counts == EXPECTED_RECEIPT_PREFIX_COUNTS,
+             f"retained receipt prefix counts {actual_receipt_counts!r} do not match "
              f"{EXPECTED_RECEIPT_PREFIX_COUNTS}")
 
     unclassified = sorted(
@@ -669,13 +700,14 @@ def map_wheel_rows(
 
     Shared by the verified-manifest inventory and the registry comparison: any
     name that is not exactly one advertised row of the version's
-    5-platform x 6-ABI matrix — an invalid filename, wrong distribution or
+    35-row matrix — an invalid filename, wrong distribution or
     version, an ambiguous tag pair or platform, or a duplicate row — fails
     closed. Rows are keyed by the exact ``(interpreter, abi)`` tag pair so
     the GIL ``cp314-cp314`` and free-threaded ``cp314-cp314t`` builds stay
     distinct.
     """
     allowed_pairs = set(PYTHON_ABI_PAIRS.values())
+    expected_rows = {(target, *PYTHON_ABI_PAIRS[python]) for target, python in EXPECTED_ABI_ROWS}
     by_row: dict[tuple[str, str, str], str] = {}
     for name in wheel_names:
         try:
@@ -696,6 +728,8 @@ def map_wheel_rows(
         _require(len(targets) == 1,
                  f"wheel {name} does not map to exactly one CLI target platform")
         key = (targets.pop(), *pair)
+        _require(key in expected_rows,
+                 f"wheel {name} is outside the expected platform/ABI matrix")
         _require(key not in by_row,
                  f"duplicate wheel row for {key[0]} {key[1]}-{key[2]}")
         by_row[key] = name
@@ -703,14 +737,14 @@ def map_wheel_rows(
 
 
 def verify_wheel_rows(wheels: list[dict[str, Any]], c_two_version: str) -> dict[str, str]:
-    """Require the 30 unique target x interpreter wheel rows (5 platforms x 6 ABIs)."""
+    """Require 35 wheel rows: six ABIs per target except Windows ARM64's five."""
     by_row = map_wheel_rows((entry["name"] for entry in wheels), c_two_version)
     python_by_pair = {pair: python for python, pair in PYTHON_ABI_PAIRS.items()}
-    coverage = {(target, python) for target in CLI_TARGETS for python in EXPECTED_PYTHONS}
+    coverage = EXPECTED_ABI_ROWS
     have = {(target, python_by_pair[(interpreter, abi)])
             for target, interpreter, abi in by_row}
     _require(have == coverage,
-             f"wheel rows are not the exact 30-row matrix; missing {sorted(coverage - have)}, "
+             f"wheel rows are not the exact 35-row matrix; missing {sorted(coverage - have)}, "
              f"unexpected {sorted(have - coverage)}")
     return {f"{target}/{python}": by_row[(target, *PYTHON_ABI_PAIRS[python])]
             for target, python in coverage}
@@ -782,6 +816,20 @@ def _validate_fastdb_decision(receipt_name: str, decision: Any, context: dict[st
         raise PromotionError(f"receipt {receipt_name} fastdb decision has no wheel/sdist mode")
 
 
+def _verify_windows_architecture(receipt_name: str, payload: dict[str, Any], python_platform: str) -> None:
+    facts = payload.get("native_architecture", {})
+    _require(facts.get("python_platform") == python_platform,
+             f"{receipt_name} did not use native {python_platform} Python")
+    expected = {"win-amd64": 0x8664, "win-arm64": 0xAA64}[python_platform]
+    machines = facts.get("pe_machines")
+    _require(isinstance(machines, dict) and machines and set(machines.values()) == {expected},
+             f"{receipt_name} PE machines do not match {python_platform}")
+    for artifact in payload["artifacts"]:
+        name = artifact["name"]
+        _require(any(member == name or member.startswith(name + "/") for member in machines),
+                 f"{receipt_name} lacks native PE evidence for {name}")
+
+
 def _bind_smoke_artifacts(
     receipt_name: str, payload: dict[str, Any], manifest: dict[str, Any],
     context: dict[str, Any], *, cli_name: str | None, wheel_name: str | None,
@@ -817,6 +865,9 @@ def _bind_smoke_artifacts(
         cli_inventory = {entry["name"]: entry["sha256"] for entry in manifest["cli"]}
         _require(cli_inventory.get(cli_name) == cli.get("sha256"),
                  f"receipt {receipt_name} CLI bytes do not match the retained {cli_name}")
+        if cli_name.endswith("-pc-windows-msvc.exe"):
+            _verify_windows_architecture(receipt_name, payload,
+                                         "win-arm64" if "aarch64" in cli_name else "win-amd64")
     if decision is not None:
         _validate_fastdb_decision(receipt_name, decision, context)
         if decision["mode"] == "wheel":
@@ -867,23 +918,23 @@ def verify_candidate_receipts(
 
     # Provisioning wheels and per-ABI wheels are separate builds. Bind each
     # retained provisioning wheel to its own source-checked decision receipt.
-    for path in sorted(extraction.glob("fastdb-*.json")):
-        decision = load(path.name)
+    for receipt_name in ("fastdb-sdist.json", *(f"fastdb-{target}.json" for target in CLI_TARGETS)):
+        decision = load(receipt_name)
         _require(decision.get("schema") == "c-two.fastdb-release.resolution.v1"
                  and decision.get("project") == "fastdb4py"
                  and decision.get("version") == manifest["meta"]["fastdb_version"],
-                 f"{path.name} provisioning identity mismatch")
-        if path.name == "fastdb-sdist.json":
+                 f"{receipt_name} provisioning identity mismatch")
+        if receipt_name == "fastdb-sdist.json":
             _require(decision.get("mode") == "sdist" and
                      decision.get("sha256") == context["retained_fastdb_sdist"]["sha256"],
                      "source-only FastDB receipt does not bind the retained sdist")
         else:
-            _validate_fastdb_decision(path.name, decision, context)
+            _validate_fastdb_decision(receipt_name, decision, context)
             if decision["mode"] == "sdist":
                 built = decision["built_wheel"]
                 built_identities.add((built["name"], built["sha256"]))
 
-    # 30 executed ABI rows: installed-wheel-smoke receipts bound to their row.
+    # 35 executed ABI rows: installed-wheel-smoke receipts bound to their row.
     rows: dict[tuple[str, str], str] = {}
     for path in sorted(extraction.glob("abi-*.json")):
         payload = load(path.name)
@@ -894,8 +945,9 @@ def verify_candidate_receipts(
         _require(payload.get("source_commit_sha") == source_sha,
                  f"receipt {path.name} source_commit_sha is not the candidate source")
         row = payload.get("row")
-        _require(isinstance(row, dict) and row.get("target") in CLI_TARGETS
-                 and row.get("python") in EXPECTED_PYTHONS,
+        _require(isinstance(row, dict)
+                 and row.get("target") in CLI_TARGETS and row.get("python") in EXPECTED_PYTHONS
+                 and (row.get("target"), row.get("python")) in EXPECTED_ABI_ROWS,
                  f"receipt {path.name} row {row!r} is outside the expected matrix")
         key = (row["target"], row["python"])
         _require(key not in rows, f"duplicate ABI row receipt for {key[0]}/{key[1]}")
@@ -910,7 +962,7 @@ def verify_candidate_receipts(
         decision = payload.get("fastdb")
         ctwo = _bind_smoke_artifacts(
             path.name, payload, manifest, context,
-            cli_name=f"c3-{key[0]}{'.exe' if key[0] == WINDOWS_TARGET else ''}",
+            cli_name=f"c3-{key[0]}{'.exe' if key[0] in WINDOWS_TARGETS else ''}",
             wheel_name=wheel_by_row[f"{key[0]}/{key[1]}"],
             decision=decision,
         )
@@ -923,12 +975,12 @@ def verify_candidate_receipts(
         if decision["mode"] == "sdist":
             built = decision["built_wheel"]
             built_identities.add((built["name"], built["sha256"]))
-    expected_rows = {(target, python) for target in CLI_TARGETS for python in EXPECTED_PYTHONS}
+    expected_rows = EXPECTED_ABI_ROWS
     _require(set(rows) == expected_rows,
              f"ABI rows cover {len(rows)} of {len(expected_rows)}; missing "
              f"{sorted(expected_rows - set(rows))}")
 
-    # 5 lifecycle smokes on the cp312 wheel of each target.
+    # 6 lifecycle smokes on the cp312 wheel of each target.
     for target in CLI_TARGETS:
         receipt_name = f"smoke-{target}.json"
         payload = load(receipt_name)
@@ -940,37 +992,39 @@ def verify_candidate_receipts(
         _verify_lifecycle_cleanup(receipt_name, payload)
         _bind_smoke_artifacts(
             receipt_name, payload, manifest, context,
-            cli_name=f"c3-{target}{'.exe' if target == WINDOWS_TARGET else ''}",
+            cli_name=f"c3-{target}{'.exe' if target in WINDOWS_TARGETS else ''}",
             wheel_name=wheel_by_row[f"{target}/3.12"],
         )
 
     # Windows standard-user lifecycle/cleanup, ordinary + wrapper.
-    standard = load("standard-user-x86_64-pc-windows-msvc.json")
-    _require(standard.get("schema") == SMOKE_SCHEMA, "standard-user receipt schema mismatch")
-    _require(standard.get("status") == "passed",
-             f"standard-user receipt status {standard.get('status')!r} is not passed")
-    _require(standard.get("source_commit_sha") == source_sha,
-             "standard-user receipt source_commit_sha is not the candidate source")
-    identity = standard.get("identity")
-    _require(isinstance(identity, dict) and identity.get("administrator") is False,
-             "standard-user receipt was not run by a non-administrator identity")
-    _verify_lifecycle_cleanup("standard-user-x86_64-pc-windows-msvc.json", standard)
-    _bind_smoke_artifacts(
-        "standard-user-x86_64-pc-windows-msvc.json", standard, manifest, context,
-        cli_name=f"c3-{WINDOWS_TARGET}.exe",
-        wheel_name=wheel_by_row[f"{WINDOWS_TARGET}/3.12"],
-    )
-    wrapper = load("standard-user-x86_64-pc-windows-msvc.json.wrapper.json")
-    _require(wrapper.get("schema") == STANDARD_USER_WRAPPER_SCHEMA,
-             "standard-user wrapper schema mismatch")
-    _require(wrapper.get("status") == "passed",
-             f"standard-user wrapper status {wrapper.get('status')!r} is not passed")
-    _require(not wrapper.get("errors"), f"standard-user wrapper errors {wrapper.get('errors')!r}")
-    wrapper_cleanup = wrapper.get("cleanup")
-    _require(isinstance(wrapper_cleanup, dict), "standard-user wrapper has no cleanup record")
-    for key in ("processes_exited", "workspace_removed", "account_removed"):
-        _require(wrapper_cleanup.get(key) is True,
-                 f"standard-user wrapper cleanup.{key} is not true")
+    for target in WINDOWS_TARGETS:
+        receipt_name = f"standard-user-{target}.json"
+        standard = load(receipt_name)
+        _require(standard.get("schema") == SMOKE_SCHEMA, "standard-user receipt schema mismatch")
+        _require(standard.get("status") == "passed",
+                 f"standard-user receipt status {standard.get('status')!r} is not passed")
+        _require(standard.get("source_commit_sha") == source_sha,
+                 "standard-user receipt source_commit_sha is not the candidate source")
+        identity = standard.get("identity")
+        _require(isinstance(identity, dict) and identity.get("administrator") is False,
+                 "standard-user receipt was not run by a non-administrator identity")
+        _verify_lifecycle_cleanup(receipt_name, standard)
+        _bind_smoke_artifacts(
+            receipt_name, standard, manifest, context,
+            cli_name=f"c3-{target}.exe",
+            wheel_name=wheel_by_row[f"{target}/3.12"],
+        )
+        wrapper = load(receipt_name + ".wrapper.json")
+        _require(wrapper.get("schema") == STANDARD_USER_WRAPPER_SCHEMA,
+                 "standard-user wrapper schema mismatch")
+        _require(wrapper.get("status") == "passed",
+                 f"standard-user wrapper status {wrapper.get('status')!r} is not passed")
+        _require(not wrapper.get("errors"), f"standard-user wrapper errors {wrapper.get('errors')!r}")
+        wrapper_cleanup = wrapper.get("cleanup")
+        _require(isinstance(wrapper_cleanup, dict), "standard-user wrapper has no cleanup record")
+        for key in ("processes_exited", "workspace_removed", "account_removed"):
+            _require(wrapper_cleanup.get(key) is True,
+                     f"standard-user wrapper cleanup.{key} is not true")
 
     # sdist member-tree inspection plus the isolated repaired-wheel proof.
     sdist_entry = manifest["sdist"][0]
@@ -1130,7 +1184,7 @@ def _verify_python_run_receipt(receipt_name: str, payload: Any, source_c3_sha: s
 def verify_source_validation(
     api: GitHubApi, source_sha: str, source_run: dict[str, Any], download_root: Path,
 ) -> dict[str, Any]:
-    """Re-validate full-scope source evidence for all four platform/runner lanes.
+    """Re-validate full-scope source evidence for all five platform/runner lanes.
 
     Every lane's full-scope artifact must come from the single Source
     Validation run bound by the candidate context through
@@ -1171,6 +1225,13 @@ def verify_source_validation(
         runner = evidence.get("runner")
         _require(isinstance(runner, dict) and runner.get("requested_label") == label,
                  f"{label} evidence runner label mismatch: {runner!r}")
+        if label == "windows-11-arm":
+            _require(runner.get("python_platform") == "win-arm64",
+                     f"{label} source Python is not native ARM64")
+            rustc = evidence.get("toolchains", {}).get("rustc", {})
+            _require(rustc.get("exit_code") == 0
+                     and "host: aarch64-pc-windows-msvc" in rustc.get("output", "").splitlines(),
+                     f"{label} source Rust host is not native ARM64")
         sources = evidence.get("sources")
         _require(isinstance(sources, dict), f"{label} evidence sources are missing")
         for name, expected_sha in (("c-two", source_sha), ("fastdb", fastdb_pin)):
@@ -1260,6 +1321,9 @@ def verify_source_validation(
                  f"{label} portable matrix has {len(matrix.get('rows', []))} rows, expected 18")
         _require(len(typescript.get("rows", [])) == 12,
                  f"{label} TypeScript receipt has {len(typescript.get('rows', []))} rows, expected 12")
+        if label == "windows-11-arm":
+            _require(typescript.get("runtime", {}).get("arch") == "arm64",
+                     f"{label} TypeScript did not use native ARM64 Node")
         # Bind the source debug c3 to its own matrix and wheel receipts;
         # released candidate executables have their separate byte identities.
         relay_c3 = {row.get("c3_sha256") for row in matrix.get("rows", []) if row.get("c3_sha256")}
@@ -1274,10 +1338,13 @@ def verify_source_validation(
             expect_admin=True if target_platform == "windows" else None,
             source_c3_sha=source_c3_sha, c3_name=c3_name)
         if target_platform == "windows":
+            python_platform = "win-arm64" if label == "windows-11-arm" else "win-amd64"
+            _verify_windows_architecture(f"{label}/{SOURCE_WHEEL_RECEIPT}", ordinary, python_platform)
             standard = _load_json_file(destination / SOURCE_STANDARD_USER_RECEIPT)
             _verify_source_wheel_receipt(
                 f"{label}/{SOURCE_STANDARD_USER_RECEIPT}", standard,
                 expect_admin=False, source_c3_sha=source_c3_sha, c3_name=c3_name)
+            _verify_windows_architecture(f"{label}/{SOURCE_STANDARD_USER_RECEIPT}", standard, python_platform)
             wrapper = _load_json_file(destination / SOURCE_STANDARD_USER_WRAPPER)
             _require(isinstance(wrapper, dict) and wrapper.get("schema") == STANDARD_USER_WRAPPER_SCHEMA,
                      f"{label} standard-user wrapper schema mismatch")
@@ -1361,7 +1428,7 @@ def stage_pypi_files(
         target.write_bytes(source.read_bytes())
         files.append({"name": entry["name"], "staged_path": target.relative_to(staged_root).as_posix(),
                       "sha256": sha256_file(target), "bytes": target.stat().st_size})
-    _require(len(files) == 31, f"expected 31 PyPI files, staged {len(files)}")
+    _require(len(files) == 36, f"expected 36 PyPI files, staged {len(files)}")
     return files
 
 
@@ -1531,13 +1598,15 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
                      f"{entry['run_url']}")
     lines += [
         "",
-        "Validated coverage: 30 executed Python ABI rows (5 platforms x 6 interpreters, "
-        "including the free-threaded cp314-cp314t build), 5 installed-wheel lifecycle smokes, "
-        "2 Windows standard-user lifecycle/cleanup receipts, an isolated auditwheel-repaired "
+        "Validated coverage: 35 executed Python ABI rows (6 platforms, with Python 3.10–3.14 "
+        "and free-threaded cp314-cp314t except Windows ARM64 starts at 3.11), "
+        "6 installed-wheel lifecycle smokes, "
+        "4 Windows standard-user lifecycle/cleanup receipts, an isolated auditwheel-repaired "
         "sdist build/import/lifecycle proof, and the 18-row Rust/Python portable matrix plus "
-        "12-row TypeScript real-call receipt on Ubuntu 24.04, macOS 15 and Windows Server 2022/2025 CI runners "
+        "12-row TypeScript real-call receipt on Ubuntu 24.04, macOS 15, Windows Server 2022/2025 "
+        "and Windows 11 ARM64 CI runners "
         "(the Source Validation gates exercise each lane's own debug c3 build; the released executables "
-        "are the exact tested release candidates). Windows 11 desktop is not verified.",
+        "are the exact tested release candidates).",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")

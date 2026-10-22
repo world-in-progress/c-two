@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import shutil
 import subprocess
 import sys
@@ -416,10 +415,10 @@ class TypeScriptArtifacts:
             assert contract_modules[payload].is_file()
 
         shutil.copyfile(NODE_FIXTURE, node_root / NODE_FIXTURE.name)
-        node_version = _run_checked(
-            [node_binary, "--version"],
+        node_runtime = json.loads(_run_checked(
+            [node_binary, "-p", "JSON.stringify({version:process.version,platform:process.platform,arch:process.arch})"],
             cwd=node_root,
-        ).stdout.strip()
+        ).stdout)
         cause = json.loads(
             (
                 REPOSITORY
@@ -435,9 +434,9 @@ class TypeScriptArtifacts:
             generated_tree_sha256=generated_tree_sha256,
             fastdb4ts_sha256=sha256_file(fastdb_archive),
             c2_mem_ffi_sha256=sha256_file(c2_mem_archive),
-            node_version=node_version,
-            platform_name=sys.platform,
-            architecture=platform.machine(),
+            node_version=node_runtime["version"],
+            platform_name=node_runtime["platform"],
+            architecture=node_runtime["arch"],
             digest_mismatch_cause=cause,
         )
 
