@@ -1,0 +1,285 @@
+{
+  "schema": "c-two.release-acceptance.v1",
+  "stage": "published",
+  "versions": {
+    "python": "0.8.0",
+    "c3": "0.4.0"
+  },
+  "artifact_source": "96fe6583118025c0dc1ecbad7685fee5e315b87d",
+  "artifact_tree": "68a767836ca06754b6d03d22b0a7cf05e483256e",
+  "native_fastdb_source": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+  "prs": [
+    188,
+    189,
+    190,
+    191
+  ],
+  "r13_delta": {
+    "production": -104,
+    "tests": 59,
+    "total": -45
+  },
+  "gate_repairs_delta": {
+    "workflow": 3,
+    "tests": 59,
+    "total": 62
+  },
+  "security_delta": 7,
+  "release_docs_and_versions_delta": 100,
+  "arm64_delta": {
+    "build_ci": {
+      "added": 271,
+      "deleted": 90,
+      "net": 181
+    },
+    "docs": {
+      "added": 36,
+      "deleted": 19,
+      "net": 17
+    },
+    "installer": {
+      "added": 22,
+      "deleted": 2,
+      "net": 20
+    },
+    "tests": {
+      "added": 429,
+      "deleted": 181,
+      "net": 248
+    }
+  },
+  "security": {
+    "fixed_alerts": [
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46
+    ],
+    "open_alerts": 0,
+    "pillow": "13.0.0",
+    "certifi": "2026.10.19"
+  },
+  "arm64_pr_validation": {
+    "conclusion": "success",
+    "headSha": "cef3ec6c019319b9d98ef4a86083b04aba8a369c",
+    "jobs": [
+      {
+        "name": "changes",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119845570774
+      },
+      {
+        "name": "workflow policy",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119845663067
+      },
+      {
+        "name": "source (ubuntu-24.04, py3.14t)",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119846656178
+      },
+      {
+        "name": "source (windows-2025, py3.12)",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119846656241
+      },
+      {
+        "name": "source (ubuntu-24.04, py3.12)",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119846656254
+      },
+      {
+        "name": "source (windows-2022, py3.12)",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119846656324
+      },
+      {
+        "name": "source (windows-11-arm, py3.12)",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119846656554
+      },
+      {
+        "name": "source (macos-15, py3.12)",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119846656887
+      },
+      {
+        "name": "test (py3.14t)",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119860292850
+      },
+      {
+        "name": "test (py3.12)",
+        "status": "completed",
+        "conclusion": "success",
+        "databaseId": 119860292902
+      }
+    ],
+    "status": "completed",
+    "url": "https://github.com/world-in-progress/c-two/actions/runs/39784956099"
+  },
+  "arm64_native_evidence": {
+    "runner": "windows-11-arm",
+    "machine": "ARM64",
+    "python_platform": "win-arm64",
+    "rust_host": "aarch64-pc-windows-msvc",
+    "node": {
+      "version": "v22.23.4",
+      "arch": "arm64"
+    },
+    "source_gates": 26,
+    "all_source_gates_passed": true,
+    "portable_rows": 18,
+    "typescript_rows": 12,
+    "python_suite": "passed",
+    "python_process_cleanup": true,
+    "typescript_cleanup": {
+      "host_processes_stopped": true,
+      "node_processes_stopped": true,
+      "relay_processes_stopped": true,
+      "response_readers_closed": true
+    },
+    "receipt_sha256": {
+      "run-evidence.json": "03fb5587de164f07a9362f4cd5497f59bccbf581d1a1f787592b21ecd53b0bbe",
+      "python-suite/run.json": "0362d17f49faae29f9bf232292e042408ceab97c69b001254dbd7791e24a6277",
+      "python-suite/portable.v1.json": "9265d80409ec6dbe33b9b8cc37bacb574da226479c910a80152d7f94c4efb9a6",
+      "python-suite/typescript.v1.json": "c8f411c54a207a297deb6659034a6febc65f99a61ae7f054f2ef1dc8c2c10df4"
+    }
+  },
+  "reviews": {
+    "r13": "accepted; no blocker",
+    "arm64_full": "accepted; scoped corrections re-reviewed",
+    "native_installer": "cef3ec6 independently reviewed and accepted after actual PS5.1 fix",
+    "docs": "accepted; public-name/link checks retained",
+    "promotion_verifier": "exact 0c1cb3fe accepted after null-digest counterexample repair"
+  },
+  "failed_runs_retained": [
+    39747130417,
+    39765733646,
+    39768822249,
+    39776906375,
+    39783190033,
+    {
+      "run": 39805206978,
+      "kind": "Python publication dry-run",
+      "reason": "universal2 target inference rejected valid FastDB proof"
+    },
+    {
+      "run": 39805218769,
+      "kind": "CLI publication dry-run",
+      "reason": "same verifier regression"
+    }
+  ],
+  "superseded_unpublished_candidate": 39759351933,
+  "historical_ipc_directories": "untouched",
+  "performance_claim": "structural convergence only; no measured speedup claimed",
+  "deferred": [
+    "two owner control-session refactors",
+    "R06/R07 and unrelated memory/lifecycle changes"
+  ],
+  "source_validation": {
+    "run": 39790864318,
+    "status": "completed",
+    "conclusion": "success",
+    "source": "96fe6583118025c0dc1ecbad7685fee5e315b87d",
+    "required_jobs": 10
+  },
+  "candidate": {
+    "run": 39799778643,
+    "source": "96fe6583118025c0dc1ecbad7685fee5e315b87d",
+    "status": "completed",
+    "conclusion": "success",
+    "successful_jobs": 38,
+    "single_sdist_job_omitted_by_design": true,
+    "manifest_sha256": "e1a56d223b9e46ff8d1d08be27426b22626b1ccd2b45a78f417771bc3419129c",
+    "counts": {
+      "wheels": 35,
+      "sdist": 1,
+      "cli": 6,
+      "installers": 2,
+      "fastdb_proof": 9,
+      "receipts": 56
+    }
+  },
+  "docs_followup": {
+    "source": "55de954b94eda47d0b3d545c7ddc66e2c71ab2d9",
+    "files": 17,
+    "added": 70,
+    "deleted": 72,
+    "net": -2,
+    "public_python_names_checked": 49,
+    "markdown_links_checked": 157,
+    "ci": 39794812493
+  },
+  "promotion_verifier": {
+    "source": "bf26c1e5b1350ff06467048f626a963ac1f9e562",
+    "reviewed_head": "0c1cb3fe15483762d30ae9bdc55749fdd11b3877",
+    "ci": 39810872778,
+    "local_tests_passed": 481,
+    "verifier_net": 5,
+    "tests_net": 51,
+    "total_net": 56,
+    "counterexamples": [
+      "macOS universal2 valid artifact rejected before receipt binding",
+      "missing name with null digest accepted before membership check"
+    ],
+    "independent_review": "accepted; final exact head has no blocker",
+    "artifact_bytes_changed": false
+  },
+  "publication": {
+    "python": {
+      "version": "0.8.0",
+      "run": 39812412013,
+      "url": "https://pypi.org/project/c-two/0.8.0/",
+      "verified_files": 36,
+      "filenames_sizes_sha256_match_candidate": true,
+      "yanked_files": 0
+    },
+    "cli": {
+      "version": "0.4.0",
+      "run": 39812418310,
+      "url": "https://github.com/world-in-progress/c-two/releases/tag/c3-v0.4.0",
+      "verified_assets": 17,
+      "filenames_sizes_sha256_match_candidate": true,
+      "tag_source": "96fe6583118025c0dc1ecbad7685fee5e315b87d"
+    },
+    "dry_runs": [
+      39811783634,
+      39811789896
+    ],
+    "verifier_source": "bf26c1e5b1350ff06467048f626a963ac1f9e562",
+    "same_candidate_bytes": true,
+    "rebuilt_during_promotion": false
+  },
+  "published_smoke": {
+    "python": "0.8.0; ordinary installation; connection/owner APIs exposed; FastDB, NumPy and PyArrow not imported",
+    "c3": "0.4.0; native macOS ARM64 binary digest matches release plan",
+    "temporary_environment_and_binary_removed": true
+  },
+  "cleanup": {
+    "windows_owned_root_removed": true,
+    "windows_evidence_files_retained": 32,
+    "windows_last_cleanup_bytes": 37705449,
+    "rust_toolchain_retained": true,
+    "local_temporary_artifact_bytes": 89931737,
+    "completed_worktree_ignored_artifact_bytes": 221290721,
+    "source_logs_receipts_and_history_bundle_retained": true,
+    "historical_endpoint_directories": "untouched",
+    "existing_stashes": "both retained"
+  }
+}
