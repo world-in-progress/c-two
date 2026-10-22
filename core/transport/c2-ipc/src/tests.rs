@@ -2371,7 +2371,7 @@ mod lazy_policy_roundtrip_tests {
         // abort it and release its reassembly-pool bytes.
         client
             .require_chunk_registry()
-            .insert(42_42, 7, 2, 4096)
+            .insert(42_42, 7, 2, 4096, ())
             .expect("stale assembly insert");
         assert_eq!(client.require_chunk_registry().active_count(), 1);
 
@@ -6008,7 +6008,10 @@ mod chunk_reply_admission_tests {
             .collect()
     }
 
-    fn budgeted_registry(reassembly_limit: u64, label: &str) -> (Arc<ChunkRegistry>, MemoryBudget) {
+    fn budgeted_registry(
+        reassembly_limit: u64,
+        label: &str,
+    ) -> (Arc<ChunkRegistry<()>>, MemoryBudget) {
         let budget = MemoryBudget::new(1 << 20, 1 << 20, reassembly_limit);
         let pool = Arc::new(parking_lot::RwLock::new(
             MemPool::new_with_prefix_and_budget(
@@ -6052,7 +6055,7 @@ mod chunk_reply_admission_tests {
         _handle: tokio::task::JoinHandle<()>,
     }
 
-    async fn drive_recv_loop(registry: Arc<ChunkRegistry>) -> DrivenRecvLoop {
+    async fn drive_recv_loop(registry: Arc<ChunkRegistry<()>>) -> DrivenRecvLoop {
         let (client, server) = LocalStream::pair().await.unwrap();
         let (client_read, client_write) = client.into_split();
         let (probe_read, probe_write) = server.into_split();

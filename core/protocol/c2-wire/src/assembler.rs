@@ -31,10 +31,6 @@ pub struct ChunkAssembler {
     written_end: usize,
     backing: ReassemblyBacking,
     received_flags: Vec<bool>,
-    /// Route name extracted from the first chunk (server-side).
-    pub route_name: Option<String>,
-    /// Method index extracted from the first chunk (server-side).
-    pub method_idx: Option<u16>,
 }
 
 /// Checked immutable geometry. Only the canonical checks can create this token.
@@ -121,8 +117,6 @@ impl ChunkAssembler {
             written_end: 0,
             backing,
             received_flags: vec![false; total_chunks],
-            route_name: None,
-            method_idx: None,
         })
     }
 

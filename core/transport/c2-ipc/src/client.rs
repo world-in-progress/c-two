@@ -2496,7 +2496,7 @@ pub struct IpcClient {
     /// `None` only for an injected pool without an owner-creation budget
     /// before `connect` rejects that pairing; a confirmed close replaces an
     /// idle registry with a fresh lazy incarnation on the same domain budget.
-    pub(crate) chunk_registry: StdMutex<Option<Arc<ChunkRegistry>>>,
+    pub(crate) chunk_registry: StdMutex<Option<Arc<ChunkRegistry<()>>>>,
     /// Unique connection identifier for the chunk registry.
     conn_id: u64,
     /// At most one cancellable maintenance task per connection; `None` while
@@ -2609,7 +2609,7 @@ impl IpcClient {
         pool_injected: bool,
         pool_transport_owned: bool,
         memory_budget: Option<c2_mem::MemoryBudget>,
-        chunk_registry: Option<Arc<ChunkRegistry>>,
+        chunk_registry: Option<Arc<ChunkRegistry<()>>>,
     ) -> Self {
         // Construction freezes the native endpoint; reconnect never derives it again.
         Self {
@@ -2717,12 +2717,12 @@ impl IpcClient {
 
     /// The chunk registry, if a confirmed close has not detached it.
     #[cfg(test)]
-    pub(crate) fn chunk_registry_arc(&self) -> Option<Arc<ChunkRegistry>> {
+    pub(crate) fn chunk_registry_arc(&self) -> Option<Arc<ChunkRegistry<()>>> {
         self.chunk_registry.lock().clone()
     }
 
     #[cfg(test)]
-    pub(crate) fn require_chunk_registry(&self) -> Arc<ChunkRegistry> {
+    pub(crate) fn require_chunk_registry(&self) -> Arc<ChunkRegistry<()>> {
         self.chunk_registry_arc().expect(
             "client chunk registry is unavailable: this client was built around an injected \
              pool without an owner-creation memory budget, so connect is rejected; build it \
@@ -2734,7 +2734,7 @@ impl IpcClient {
     fn build_chunk_registry(
         config: &ClientIpcConfig,
         budget: &c2_mem::MemoryBudget,
-    ) -> Arc<ChunkRegistry> {
+    ) -> Arc<ChunkRegistry<()>> {
         let counter = REASSEMBLY_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3a{:08x}{:08x}", std::process::id(), counter);
         // Reassembly follows the same buddy policy: with buddy disabled the
@@ -5531,7 +5531,7 @@ async fn complete_unary_pending(
 /// before it reaches its normal footer. Completed response handles are no
 /// longer in the registry and remain owned by their response leases.
 struct ConnectionAssemblyCleanup {
-    registry: Arc<ChunkRegistry>,
+    registry: Arc<ChunkRegistry<()>>,
     conn_id: u64,
     connection: Option<ConnectionPublisher>,
 }
@@ -5593,7 +5593,7 @@ pub(crate) async fn recv_loop(
     pending: Arc<StdMutex<PendingMap>>,
     server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     writer: Arc<Mutex<Option<LocalWriteHalf>>>,
-    chunk_registry: Arc<ChunkRegistry>,
+    chunk_registry: Arc<ChunkRegistry<()>>,
     conn_id: u64,
 ) {
     recv_loop_inner(
@@ -5619,7 +5619,7 @@ async fn recv_loop_inner(
     pending: Arc<StdMutex<PendingMap>>,
     server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     writer: Arc<Mutex<Option<LocalWriteHalf>>>,
-    chunk_registry: Arc<ChunkRegistry>,
+    chunk_registry: Arc<ChunkRegistry<()>>,
     conn_id: u64,
     connection: Option<ReceiveConnectionState>,
     #[cfg(test)] mut partial_header_pending: Option<std::sync::mpsc::Sender<()>>,
@@ -5806,12 +5806,15 @@ async fn recv_loop_inner(
             match chunk_registry.feed(conn_id, rid as u64, chunk_idx as usize, chunk_data) {
                 Ok(complete) => {
                     if complete {
-                        match chunk_registry.finish(conn_id, rid as u64) {
+                        match chunk_registry
+                            .take(conn_id, rid as u64)
+                            .and_then(|(assembler, ())| assembler.finish())
+                        {
                             Ok(finished) => {
                                 complete_unary_pending(
                                     &pending,
                                     rid,
-                                    Ok(ResponseData::Handle(finished.backing)),
+                                    Ok(ResponseData::Handle(finished)),
                                 )
                                 .await;
                             }
@@ -5907,7 +5910,7 @@ async fn drain_pending_on_disconnect(
     }
 }
 
-async fn abort_reply_assembly(registry: &ChunkRegistry, conn_id: u64, rid: u32) {
+async fn abort_reply_assembly(registry: &ChunkRegistry<()>, conn_id: u64, rid: u32) {
     while !registry.try_abort(conn_id, u64::from(rid)) {
         // The original registry entry remains the release owner at this await.
         // Close may abort this wait and retry that same connection's cleanup.
@@ -6192,18 +6195,19 @@ mod tests {
         let client = IpcClient::with_config("ipc://close-file-carrier", config);
         let budget = client.memory_budget.as_ref().unwrap().clone();
         let registry = client.chunk_registry_arc().unwrap();
-        registry.insert(client.conn_id, 44, 2, 8192).unwrap();
+        registry.insert(client.conn_id, 44, 2, 8192, ()).unwrap();
         assert!(
             !registry
                 .feed(client.conn_id, 44, 0, &vec![22; 8192])
                 .unwrap()
         );
         assert!(registry.feed(client.conn_id, 44, 1, &[44; 100]).unwrap());
-        let finished = registry.finish(client.conn_id, 44).unwrap();
-        assert!(finished.backing.is_file_spill());
-        assert_eq!(finished.backing.capacity_bytes(), 16 * 1024);
-        assert_eq!(finished.backing.len(), 8192 + 100);
-        let mut lease = ResponseLease::new(ResponseData::Handle(finished.backing));
+        let (assembler, ()) = registry.take(client.conn_id, 44).unwrap();
+        let finished = assembler.finish().unwrap();
+        assert!(finished.is_file_spill());
+        assert_eq!(finished.capacity_bytes(), 16 * 1024);
+        assert_eq!(finished.len(), 8192 + 100);
+        let mut lease = ResponseLease::new(ResponseData::Handle(finished));
         let old_pool = Arc::downgrade(registry.pool());
         let charged = budget.snapshot();
         assert_eq!(charged.shm.used_bytes, 0);
@@ -6282,12 +6286,14 @@ mod tests {
                 IpcClient::with_config("ipc://close-unclaimed-file", file_close_test_config());
             let registry = client.chunk_registry_arc().unwrap();
             let budget = client.memory_budget.as_ref().unwrap().clone();
-            registry.insert(client.conn_id, 11, 1, 8192).unwrap();
+            registry.insert(client.conn_id, 11, 1, 8192, ()).unwrap();
             registry.feed(client.conn_id, 11, 0, &[11; 8192]).unwrap();
-            let held = registry.finish(client.conn_id, 11).unwrap().backing;
-            registry.insert(client.conn_id, 22, 1, 8192).unwrap();
+            let (assembler, ()) = registry.take(client.conn_id, 11).unwrap();
+            let held = assembler.finish().unwrap();
+            registry.insert(client.conn_id, 22, 1, 8192, ()).unwrap();
             registry.feed(client.conn_id, 22, 0, &[22; 8192]).unwrap();
-            let response = registry.finish(client.conn_id, 22).unwrap().backing;
+            let (assembler, ()) = registry.take(client.conn_id, 22).unwrap();
+            let response = assembler.finish().unwrap();
             assert!(held.is_file_spill() && response.is_file_spill());
             if known_waiter {
                 let (tx, rx) = oneshot::channel();
@@ -6393,10 +6399,11 @@ mod tests {
         let client = IpcClient::with_config("ipc://close-maintenance-file", config);
         let registry = client.chunk_registry_arc().unwrap();
         let budget = client.memory_budget.as_ref().unwrap().clone();
-        registry.insert(client.conn_id, 11, 1, 8192).unwrap();
+        registry.insert(client.conn_id, 11, 1, 8192, ()).unwrap();
         registry.feed(client.conn_id, 11, 0, &[11; 8192]).unwrap();
-        let held = registry.finish(client.conn_id, 11).unwrap().backing;
-        registry.insert(client.conn_id, 22, 2, 8192).unwrap();
+        let (assembler, ()) = registry.take(client.conn_id, 11).unwrap();
+        let held = assembler.finish().unwrap();
+        registry.insert(client.conn_id, 22, 2, 8192, ()).unwrap();
         registry.feed(client.conn_id, 22, 0, &[22; 8192]).unwrap();
         let holder = park_carrier_callback(held);
         let ((confirmed, charged, remaining, terminal), mut held) = observe(holder, || async {
@@ -6484,20 +6491,21 @@ mod tests {
         let client = IpcClient::with_config("ipc://close-receiver-file-cleanup", config);
         let budget = client.memory_budget.as_ref().unwrap().clone();
         let registry = client.chunk_registry_arc().unwrap();
-        registry.insert(client.conn_id, 11, 1, 8192).unwrap();
+        registry.insert(client.conn_id, 11, 1, 8192, ()).unwrap();
         assert!(registry.feed(client.conn_id, 11, 0, &[11; 8192]).unwrap());
-        let finished = registry.finish(client.conn_id, 11).unwrap();
-        assert!(finished.backing.is_file_spill());
-        registry.insert(client.conn_id, 22, 2, 8192).unwrap();
+        let (assembler, ()) = registry.take(client.conn_id, 11).unwrap();
+        let finished = assembler.finish().unwrap();
+        assert!(finished.is_file_spill());
+        registry.insert(client.conn_id, 22, 2, 8192, ()).unwrap();
         assert!(!registry.feed(client.conn_id, 22, 0, &[22; 8192]).unwrap());
 
         // The long-lived guard belongs to a real, completed carrier's public
         // callback. No private lock or forged allocation coordinates are used.
-        assert_eq!(finished.backing.copy_bytes().unwrap(), &[11; 8192]);
+        assert_eq!(finished.copy_bytes().unwrap(), &[11; 8192]);
         let charged = budget.snapshot();
         assert_eq!(charged.file.used_bytes, 24 * 1024);
         assert_eq!(charged.reassembly.used_bytes, 24 * 1024);
-        let holder = park_carrier_callback(finished.backing);
+        let holder = park_carrier_callback(finished);
         let ((confirmed, still_charged, remaining, receiver_terminal), mut held) =
             observe(holder, || async {
                 let (receiver_ready_tx, receiver_ready_rx) = oneshot::channel();

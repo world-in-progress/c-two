@@ -282,7 +282,7 @@ pub struct Server {
     connection_event_source: ConnectionEventSource,
     route_registration: Mutex<()>,
     /// Sharded chunk reassembly lifecycle manager.
-    chunk_registry: Arc<c2_wire::chunk::ChunkRegistry>,
+    chunk_registry: Arc<c2_wire::chunk::ChunkRegistry<ChunkRouteAdmission>>,
     /// **parking_lot sync RwLock** — guards SHM memory pool; blocking `.read()`
     /// / `.write()` (no `.await`).  Safe to hold briefly inside tokio tasks.
     response_pool: Arc<crate::ResponsePool>,
@@ -295,7 +295,6 @@ pub struct Server {
     owner_control: Option<Arc<dyn crate::owner_control::OwnerControlHandler>>,
     pending_requests: Arc<Semaphore>,
     chunk_processing_permits: Arc<Semaphore>,
-    chunk_route_pending: parking_lot::Mutex<HashMap<(u64, u64), ChunkRouteAdmission>>,
     /// Bounded per-request first-chunk admission ordering (see
     /// [`crate::chunk_ordering`]). Created at frame dispatch and resolved by the
     /// first chunk's task, its abort paths, or connection cleanup.
@@ -587,7 +586,6 @@ impl Server {
             owner_control: None,
             pending_requests,
             chunk_processing_permits,
-            chunk_route_pending: parking_lot::Mutex::new(HashMap::new()),
             chunk_admission_gate,
             active_connections: parking_lot::Mutex::new(HashMap::new()),
             active_connections_notify: Notify::new(),
@@ -635,30 +633,6 @@ impl Server {
             .map_err(|_| self.config.max_total_chunks)
     }
 
-    fn store_chunk_route_pending(
-        &self,
-        conn_id: u64,
-        request_id: u64,
-        admission: ChunkRouteAdmission,
-    ) -> Result<(), ChunkRouteAdmission> {
-        let mut pending = self.chunk_route_pending.lock();
-        if pending.contains_key(&(conn_id, request_id)) {
-            return Err(admission);
-        }
-        pending.insert((conn_id, request_id), admission);
-        Ok(())
-    }
-
-    fn take_chunk_route_pending(
-        &self,
-        conn_id: u64,
-        request_id: u64,
-    ) -> Option<ChunkRouteAdmission> {
-        self.chunk_route_pending
-            .lock()
-            .remove(&(conn_id, request_id))
-    }
-
     /// Tear down a failed/aborted chunk request.
     ///
     /// Order is the correctness argument:
@@ -666,15 +640,12 @@ impl Server {
     ///    first-chunk task still parked in route admission wakes here and can
     ///    no longer win the admission commit; the fence keeps the gate entry in
     ///    place so a same-key successor generation cannot begin mid-teardown.
-    /// 2. Release the stored route admission, then abort exactly the assembly
-    ///    generation that stored it (identity-checked, so this cannot touch a
-    ///    successor's same-key assembly).
+    /// 2. Remove the assembly and admission together, releasing the backing
+    ///    before the pending permit outside the registry lock.
     /// 3. Drop the fence, allowing a successor generation to begin.
     fn abort_chunk_request(&self, conn_id: u64, request_id: u64) {
         let reclaim = self.chunk_admission_gate.abort_key((conn_id, request_id));
-        if let Some(admission) = self.take_chunk_route_pending(conn_id, request_id) {
-            self.chunk_registry.abort_id(admission.assembly);
-        }
+        self.chunk_registry.abort(conn_id, request_id);
         drop(reclaim);
     }
 
@@ -705,36 +676,12 @@ impl Server {
         // the commit rolls itself back through its publication guard.
         let aborted_ordering = self.chunk_admission_gate.abort_connection(conn_id);
         self.chunk_registry.cleanup_connection(conn_id);
-        self.chunk_route_pending
-            .lock()
-            .retain(|(pending_conn_id, _), _| *pending_conn_id != conn_id);
         if aborted_ordering > 0 {
             debug!(
                 conn_id,
                 aborted_ordering, "aborted pending chunk admission ordering on disconnect"
             );
         }
-    }
-
-    fn sweep_stale_chunk_route_pending(&self) -> usize {
-        let stale_keys = {
-            let pending = self.chunk_route_pending.lock();
-            pending
-                .keys()
-                .filter(|(conn_id, request_id)| {
-                    !self.chunk_registry.contains(*conn_id, *request_id)
-                })
-                .copied()
-                .collect::<Vec<_>>()
-        };
-        if stale_keys.is_empty() {
-            return 0;
-        }
-        let mut pending = self.chunk_route_pending.lock();
-        for key in &stale_keys {
-            pending.remove(key);
-        }
-        stale_keys.len()
     }
 
     fn register_active_connection(&self, conn: Arc<Connection>) {
@@ -1515,7 +1462,6 @@ impl Server {
                 tokio::select! {
                     _ = interval.tick() => {
                         let stats = gc_server.chunk_registry.gc_sweep();
-                        let released_route_pending = gc_server.sweep_stale_chunk_route_pending();
                         {
                             let mut response_pool = gc_server.response_pool.inner.write();
                             response_pool.gc_buddy();
@@ -1530,7 +1476,7 @@ impl Server {
                             info!(
                                 expired = stats.expired,
                                 freed = stats.freed_bytes,
-                                released_route_pending,
+                                released_route_pending = stats.expired,
                                 "chunk GC sweep"
                             );
                         }
@@ -2793,10 +2739,6 @@ struct RouteExecutionAdmission {
 }
 
 struct ChunkRouteAdmission {
-    /// Identity of the assembly generation that stored this admission. Teardown
-    /// releases exactly this generation through `ChunkRegistry::abort_id`, so a
-    /// stale request teardown can never abort a successor's same-key assembly.
-    assembly: c2_wire::chunk::ChunkAssemblyId,
     route: Arc<CrmRoute>,
     method_idx: u16,
     pending_permit: SchedulerPendingPermit,
@@ -3600,69 +3542,21 @@ async fn fail_chunked_request(
     .await;
 }
 
-/// Unpublished first-chunk admission publication.
-///
-/// A first chunk publishes two pieces of request state before it can commit its
-/// admission ordering entry: the registry assembly and the stored route
-/// admission (which owns the route pending permit). This guard owns both until
-/// [`ChunkPublicationGuard::commit`]; on any other exit (cancellation, panic, a
-/// concurrent terminal abort that wins the commit race, or a publish failure)
-/// Drop rolls them back exactly once.
-///
-/// Rollback order matters: the stored route admission is taken while the
-/// assembly is still registered, so the key-scoped permit take cannot reach a
-/// successor generation's record (a successor's insert cannot succeed until the
-/// assembly it would replace is gone). The assembly abort is identity-checked,
-/// so it can never release a successor's same-key assembly.
+/// Roll back an uncommitted first chunk by its exact assembly generation.
+/// The admission gate still fences publication; rollback releases the pending
+/// permit before the backing, including cancellation and a losing commit.
 struct ChunkPublicationGuard<'a> {
     server: &'a Server,
-    conn_id: u64,
-    request_id: u64,
     assembly: Option<c2_wire::chunk::ChunkAssemblyId>,
-    committed: bool,
-}
-
-impl<'a> ChunkPublicationGuard<'a> {
-    fn new(server: &'a Server, conn_id: u64, request_id: u64) -> Self {
-        Self {
-            server,
-            conn_id,
-            request_id,
-            assembly: None,
-            committed: false,
-        }
-    }
-
-    /// Note a successful registry admission. Until `commit`, Drop releases it.
-    fn publish_assembly(&mut self, assembly: c2_wire::chunk::ChunkAssemblyId) {
-        self.assembly = Some(assembly);
-    }
-
-    /// The admitted request now owns everything this guard published.
-    fn commit(&mut self) {
-        self.committed = true;
-    }
 }
 
 impl Drop for ChunkPublicationGuard<'_> {
     fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        // A generation that never admitted an assembly has no published state
-        // of its own: leave whatever assembly / stored admission already exists
-        // for this key to the request-teardown path (`abort_chunk_request`),
-        // which releases it before this owner's gate entry disappears.
-        if self.assembly.is_some() {
-            // Take the stored route admission first: the assembly is still
-            // registered, so a same-key successor cannot have stored its own
-            // record yet. Then abort exactly this generation's assembly.
-            let _ = self
-                .server
-                .take_chunk_route_pending(self.conn_id, self.request_id);
-        }
-        if let Some(assembly) = self.assembly.take() {
-            self.server.chunk_registry.abort_id(assembly);
+        if let Some(assembly) = self.assembly.take()
+            && let Some((assembler, admission)) = self.server.chunk_registry.take_id(assembly)
+        {
+            drop(admission);
+            drop(assembler);
         }
     }
 }
@@ -3903,26 +3797,25 @@ async fn dispatch_chunked_call(
             return;
         }
 
-        // Staged publication: the registry assembly and the stored route
-        // admission below are owned by this guard until the admission commit
-        // succeeds. Cancellation, panic, a losing commit race, or a publish
-        // failure rolls back exactly this generation (identity-checked assembly
-        // abort, stored route admission returned) so no unpublished work stays
-        // charged, and it can never touch a successor's same-key state.
-        let mut publication = ChunkPublicationGuard::new(server, conn.conn_id(), request_id);
+        // Assembly and route admission publish together. A rejected insert
+        // returns the permit, which stays live through the error reply await.
         let assembly = match server.chunk_registry.insert(
             conn.conn_id(),
             request_id,
             total_chunks as usize,
             chunk_size,
+            ChunkRouteAdmission {
+                route: route_admission.route,
+                method_idx: ctrl.method_idx,
+                pending_permit: route_admission.pending_permit,
+            },
         ) {
             Ok(assembly) => assembly,
-            Err(e) => {
+            Err((e, _admission)) => {
                 // Correlate the admission failure back to the pending caller
                 // instead of logging and leaving it waiting. The message
                 // carries the budget cell and size detail from the admission
                 // error.
-                drop(publication);
                 let code = match &e {
                     ChunkAdmissionError::Capacity(_) => ErrorCode::ResourceUnavailable,
                     ChunkAdmissionError::Protocol(_) | ChunkAdmissionError::Duplicate { .. } => {
@@ -3942,37 +3835,10 @@ async fn dispatch_chunked_call(
                 return;
             }
         };
-        publication.publish_assembly(assembly);
-        server.chunk_registry.set_route_info(
-            conn.conn_id(),
-            request_id,
-            ctrl.identity.route_name.clone(),
-            ctrl.method_idx,
-        );
-        let stored = server.store_chunk_route_pending(
-            conn.conn_id(),
-            request_id,
-            ChunkRouteAdmission {
-                assembly,
-                route: route_admission.route,
-                method_idx: ctrl.method_idx,
-                pending_permit: route_admission.pending_permit,
-            },
-        );
-        if stored.is_err() {
-            drop(publication);
-            fail_chunked_request(
-                server,
-                conn,
-                writer,
-                request_id,
-                admission_owner.take(),
-                ErrorCode::ResourceUnavailable,
-                "chunked call route admission was unexpectedly duplicated".to_string(),
-            )
-            .await;
-            return;
-        }
+        let mut publication = ChunkPublicationGuard {
+            server,
+            assembly: Some(assembly),
+        };
         // Admission commit: the atomic Pending → Admitted transition is the
         // linearization point. Losing it means a terminal outcome was published
         // concurrently; the guard rolls this generation's publications back and
@@ -3985,7 +3851,7 @@ async fn dispatch_chunked_call(
             drop(publication);
             return;
         }
-        publication.commit();
+        publication.assembly = None;
     }
 
     // 4. Get chunk data.
@@ -4019,23 +3885,24 @@ async fn dispatch_chunked_call(
 
     // 6. If complete, finish and dispatch.
     if complete {
-        let chunk_admission = match server.take_chunk_route_pending(conn.conn_id(), request_id) {
-            Some(admission) => admission,
-            None => {
-                fail_chunked_request(
-                    server,
-                    conn,
-                    writer,
-                    request_id,
-                    admission_owner.take(),
-                    ErrorCode::ResourceUnavailable,
-                    "chunked call missing route admission".to_string(),
-                )
-                .await;
-                return;
-            }
-        };
-        let finished = match server.chunk_registry.finish(conn.conn_id(), request_id) {
+        let (assembler, chunk_admission) =
+            match server.chunk_registry.take(conn.conn_id(), request_id) {
+                Ok(owned) => owned,
+                Err(_) => {
+                    fail_chunked_request(
+                        server,
+                        conn,
+                        writer,
+                        request_id,
+                        admission_owner.take(),
+                        ErrorCode::ResourceUnavailable,
+                        "chunked call missing route admission".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+        let backing = match assembler.finish() {
             Ok(f) => f,
             Err(e) => {
                 fail_chunked_request(
@@ -4051,11 +3918,6 @@ async fn dispatch_chunked_call(
                 return;
             }
         };
-        let c2_wire::chunk::FinishedChunk {
-            backing,
-            route_name,
-            method_idx,
-        } = finished;
         // The carrier owns the reassembly pool, handle, and budget charge;
         // its release ordering (storage through the pool authority first,
         // charge refund after) applies on every path below.
@@ -4069,51 +3931,7 @@ async fn dispatch_chunked_call(
             }
         };
         drop(chunk_processing_permit);
-        let (route_name, method_idx) = match (route_name, method_idx) {
-            (Some(route_name), Some(method_idx)) => (route_name, method_idx),
-            (route_name, method_idx) => {
-                cleanup_request(request);
-                warn!(
-                    conn_id = conn.conn_id(),
-                    request_id,
-                    has_route_name = route_name.is_some(),
-                    has_method_idx = method_idx.is_some(),
-                    "chunked call missing route metadata"
-                );
-                write_reply(
-                    writer,
-                    request_id,
-                    &ReplyControl::Error(error_wire(
-                        ErrorCode::ResourceInputDeserializing,
-                        "chunked call missing route metadata",
-                    )),
-                )
-                .await;
-                return;
-            }
-        };
-        if route_name != chunk_admission.route.name || method_idx != chunk_admission.method_idx {
-            cleanup_request(request);
-            warn!(
-                conn_id = conn.conn_id(),
-                request_id,
-                expected_route = chunk_admission.route.name,
-                expected_method_idx = chunk_admission.method_idx,
-                actual_route = route_name,
-                actual_method_idx = method_idx,
-                "chunked call route metadata drifted from stored admission"
-            );
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::Error(error_wire(
-                    ErrorCode::ResourceInputDeserializing,
-                    "chunked call route metadata drifted from admission",
-                )),
-            )
-            .await;
-            return;
-        }
+        let method_idx = chunk_admission.method_idx;
 
         // FlightGuard: increments on create, decrements on drop.
         let _flight = crate::connection::FlightGuard::new(conn);
@@ -8737,59 +8555,6 @@ mod tests {
         assert_eq!(peer_pool.stats().alloc_count, 0);
     }
 
-    // -- chunked reassembly via ChunkRegistry --
-
-    #[test]
-    fn chunked_reassembly_via_registry() {
-        use parking_lot::RwLock;
-        use std::sync::Arc;
-
-        let reassembly_cfg = c2_mem::config::PoolConfig {
-            segment_size: 64 * 1024,
-            min_block_size: 4096,
-            max_segments: 2,
-            max_dedicated_segments: 2,
-            dedicated_crash_timeout_secs: 0.0,
-            buddy_idle_decay_secs: 0.0,
-            spill_threshold: 1.0,
-            spill_dir: std::env::temp_dir().join("c2_srv_chunk_test"),
-            ..PoolConfig::default()
-        };
-        let pool = Arc::new(RwLock::new(c2_mem::MemPool::new(reassembly_cfg)));
-        let registry = c2_wire::chunk::ChunkRegistry::new(
-            pool.clone(),
-            c2_wire::chunk::ChunkConfig::default(),
-        );
-
-        let conn_id = 99u64;
-        let request_id = 42u64;
-        let total_chunks = 3usize;
-        let chunk_size = 8usize;
-
-        registry
-            .insert(conn_id, request_id, total_chunks, chunk_size)
-            .unwrap();
-        registry.set_route_info(conn_id, request_id, "grid".into(), 0);
-
-        // Feed chunks.
-        assert!(!registry.feed(conn_id, request_id, 0, b"aaaaaaaa").unwrap());
-        assert!(!registry.feed(conn_id, request_id, 1, b"bbbbbbbb").unwrap());
-        assert!(registry.feed(conn_id, request_id, 2, b"cc").unwrap());
-
-        // Finish.
-        let mut finished = registry.finish(conn_id, request_id).unwrap();
-        assert_eq!(finished.route_name.as_deref(), Some("grid"));
-        assert_eq!(finished.method_idx, Some(0));
-        assert_eq!(finished.backing.len(), 18); // 8+8+2
-        let slice = finished.backing.copy_bytes().unwrap();
-        assert_eq!(&slice[0..8], b"aaaaaaaa");
-        assert_eq!(&slice[8..16], b"bbbbbbbb");
-        assert_eq!(&slice[16..18], b"cc");
-        // The carrier owns the pool; releasing it frees the backing.
-        finished.backing.release().unwrap();
-        assert_eq!(pool.read().stats().alloc_count, 0);
-    }
-
     #[tokio::test]
     async fn first_chunked_chunk_holds_route_pending_until_feed_error_aborts() {
         use crate::scheduler::{SchedulerAcquireError, SchedulerLimits};
@@ -9005,23 +8770,49 @@ mod tests {
         payload.extend_from_slice(&encode_call_control(&call_identity("grid"), 0).unwrap());
         payload.extend_from_slice(&[0x42u8; 512]);
 
-        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
-        dispatch_chunked_call(
-            &server,
-            &conn,
-            21,
-            FLAG_CHUNKED,
-            &payload,
-            &writer,
-            chunk_permit,
-            chunk_frame_ordering(&server, conn.conn_id(), 21, FLAG_CHUNKED, &payload).unwrap(),
-        )
-        .await;
+        for (request_id, cancel_reply) in [(21, false), (22, true)] {
+            let writer_guard = writer.lock().await;
+            let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
+            let mut dispatch = Box::pin(dispatch_chunked_call(
+                &server,
+                &conn,
+                request_id,
+                FLAG_CHUNKED,
+                &payload,
+                &writer,
+                chunk_permit,
+                chunk_frame_ordering(&server, conn.conn_id(), request_id, FLAG_CHUNKED, &payload)
+                    .unwrap(),
+            ));
+            assert!(
+                owner_admission_poll_once(dispatch.as_mut())
+                    .await
+                    .is_pending()
+            );
 
-        // No assembly was published and the route admission permit was
-        // released by the correlated rejection.
-        assert!(!server.chunk_registry.contains(conn.conn_id(), 21));
-        assert!(scheduler.try_acquire(0).is_ok());
+            // Refusal already removed the ordering entry; the held writer is
+            // the remaining await. Its error reply still owns route capacity.
+            assert_eq!(server.chunk_admission_gate.len(), 0);
+            assert!(!server.chunk_registry.contains(conn.conn_id(), request_id));
+            assert!(matches!(
+                scheduler.try_acquire(0),
+                Err(SchedulerAcquireError::Capacity {
+                    field: "max_pending",
+                    limit: 1,
+                })
+            ));
+            if cancel_reply {
+                drop(dispatch);
+                assert!(scheduler.try_acquire(0).is_ok());
+                drop(writer_guard);
+            } else {
+                drop(writer_guard);
+                tokio::time::timeout(Duration::from_secs(5), dispatch)
+                    .await
+                    .expect("error reply completes after writer unlock");
+            }
+            assert!(scheduler.try_acquire(0).is_ok());
+        }
 
         // Read the correlated error reply frame for request 21.
         let mut header = [0u8; c2_wire::frame::HEADER_SIZE];
@@ -9214,7 +9005,6 @@ mod tests {
             "later chunks must not publish or discard an assembly before first-chunk admission"
         );
         assert_eq!(server.chunk_registry.active_count(), 0);
-        assert!(server.chunk_route_pending.lock().is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // Control liveness while the route gate is stalled: the receive loop
@@ -9251,7 +9041,6 @@ mod tests {
         assert_eq!(server.chunk_admission_gate.len(), 0);
         assert_eq!(server.chunk_registry.active_count(), 0);
         assert!(!server.chunk_registry.contains(conn_id, 77));
-        assert!(server.chunk_route_pending.lock().is_empty());
         assert_eq!(server.chunk_processing_permits.available_permits(), 3);
         assert!(scheduler.try_acquire(0).is_ok());
 
@@ -9310,7 +9099,6 @@ mod tests {
         })
         .await;
         assert!(!server.chunk_registry.contains(conn_id, 88));
-        assert!(server.chunk_route_pending.lock().is_empty());
         assert!(scheduler.try_acquire(0).is_ok());
 
         drop(client);
@@ -9372,7 +9160,6 @@ mod tests {
         })
         .await;
         assert!(!server.chunk_registry.contains(conn_id, 99));
-        assert!(server.chunk_route_pending.lock().is_empty());
         drop(dispatcher_guard);
     }
 
@@ -9426,7 +9213,6 @@ mod tests {
             "incomplete assembly registered with route admission",
             || {
                 server.chunk_registry.active_count() == 1
-                    && server.chunk_route_pending.lock().len() == 1
                     && server.chunk_admission_gate.len() == 0
                     && server.chunk_processing_permits.available_permits() == 3
             },
@@ -9459,12 +9245,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(90)).await;
         let stats = server.chunk_registry.gc_sweep();
         assert_eq!(stats.expired, 1);
-        let swept = server.sweep_stale_chunk_route_pending();
-        assert_eq!(swept, 1);
 
         assert_eq!(server.chunk_registry.active_count(), 0);
         assert!(!server.chunk_registry.contains(conn_id, 55));
-        assert!(server.chunk_route_pending.lock().is_empty());
         assert_eq!(server.chunk_admission_gate.len(), 0);
         assert_eq!(server.chunk_processing_permits.available_permits(), 3);
         assert!(scheduler.try_acquire(0).is_ok());
@@ -9601,7 +9384,6 @@ mod tests {
 
         let conn_id = server.active_connection_ids()[0];
         assert!(!server.chunk_registry.contains(conn_id, 61));
-        assert!(server.chunk_route_pending.lock().is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no callback after refusal");
         assert!(
             scheduler.try_acquire(0).is_ok(),
@@ -9689,7 +9471,6 @@ mod tests {
 
         let conn_id = server.active_connection_ids()[0];
         assert!(!server.chunk_registry.contains(conn_id, 62));
-        assert!(server.chunk_route_pending.lock().is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         drop(client);
@@ -9750,7 +9531,6 @@ mod tests {
 
         let conn_id = server.active_connection_ids()[0];
         assert!(!server.chunk_registry.contains(conn_id, 81));
-        assert!(server.chunk_route_pending.lock().is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         drop(client);
@@ -9787,7 +9567,6 @@ mod tests {
             .expect("write first chunk");
         wait_until("assembly published after admission", || {
             server.chunk_registry.active_count() == 1
-                && server.chunk_route_pending.lock().len() == 1
         })
         .await;
         let conn_id = server.active_connection_ids()[0];
@@ -9813,7 +9592,6 @@ mod tests {
             "duplicate refusal released the published generation",
             || {
                 server.chunk_registry.active_count() == 0
-                    && server.chunk_route_pending.lock().is_empty()
                     && server.chunk_processing_permits.available_permits() == 3
                     && server.chunk_admission_gate.len() == 0
             },
@@ -9866,7 +9644,7 @@ mod tests {
                     server_id: "chunk_commit_fence".into(),
                     server_instance_id: "chunk_commit_fence-instance".into(),
                 },
-                reassembly_pool,
+                Arc::clone(&reassembly_pool),
             )
             .unwrap(),
         );
@@ -9917,13 +9695,75 @@ mod tests {
         assert!(!server.chunk_registry.contains(conn.conn_id(), 31));
         assert_eq!(server.chunk_registry.active_count(), 0);
         assert_eq!(server.chunk_registry.total_bytes(), 0);
-        assert!(server.chunk_route_pending.lock().is_empty());
         assert!(
             scheduler.try_acquire(0).is_ok(),
             "the route pending permit must be returned"
         );
         assert_eq!(server.chunk_admission_gate.len(), 0);
         assert_eq!(server.chunk_processing_permits.available_permits(), 4);
+
+        // Observe the two release orders while the real pool prevents backing
+        // release. Run synchronous teardown off the Tokio worker.
+        for rollback in [false, true] {
+            let admission = reserve_route_execution(&server, &call_identity("grid"), 0)
+                .await
+                .ok()
+                .expect("route admission for release-order probe");
+            let assembly = server
+                .chunk_registry
+                .insert(
+                    conn.conn_id(),
+                    31,
+                    2,
+                    512,
+                    ChunkRouteAdmission {
+                        route: admission.route,
+                        method_idx: 0,
+                        pending_permit: admission.pending_permit,
+                    },
+                )
+                .unwrap_or_else(|(error, _)| panic!("{error}"));
+            let pool_guard = reassembly_pool.try_write().expect("idle reassembly pool");
+            let cleanup = {
+                let server = Arc::clone(&server);
+                tokio::task::spawn_blocking(move || {
+                    if rollback {
+                        drop(ChunkPublicationGuard {
+                            server: &server,
+                            assembly: Some(assembly),
+                        });
+                    } else {
+                        server.abort_chunk_request(assembly.conn_id(), 31);
+                    }
+                })
+            };
+            wait_until("assembly detached before backing release", || {
+                server.chunk_registry.active_count() == 0
+            })
+            .await;
+            assert!(!cleanup.is_finished());
+            assert_eq!(pool_guard.stats().alloc_count, 1);
+            assert_eq!(
+                budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
+                1024
+            );
+            match scheduler.try_acquire(0) {
+                Ok(guard) if rollback => drop(guard),
+                Err(SchedulerAcquireError::Capacity {
+                    field: "max_pending",
+                    limit: 1,
+                }) if !rollback => {}
+                other => panic!("unexpected capacity during rollback={rollback}: {other:?}"),
+            }
+            drop(pool_guard);
+            tokio::time::timeout(Duration::from_secs(5), cleanup)
+                .await
+                .expect("teardown completes after pool unlock")
+                .unwrap();
+            assert_eq!(reassembly_pool.read().stats().alloc_count, 0);
+            assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
+            assert!(scheduler.try_acquire(0).is_ok());
+        }
     }
 
     /// A later chunk whose admission ends in Refused/Aborted must still return
@@ -10096,67 +9936,6 @@ mod tests {
 
         drop(client);
         handler.await.expect("connection handler completes");
-    }
-
-    #[tokio::test]
-    async fn chunked_gc_sweep_releases_stale_route_pending_capacity() {
-        use crate::scheduler::{SchedulerAcquireError, SchedulerLimits};
-        use c2_wire::chunk::encode_chunk_header;
-        use c2_wire::control::encode_call_control;
-        use std::num::NonZeroUsize;
-
-        let server = Arc::new(
-            Server::new("ipc://chunk_route_pending_gc", ServerIpcConfig::default()).unwrap(),
-        );
-        let mut route = make_host_route(&server, "grid");
-        let scheduler = Scheduler::with_admission(
-            ConcurrencyMode::Parallel,
-            HashMap::new(),
-            SchedulerLimits {
-                max_pending: Some(NonZeroUsize::new(1).unwrap()),
-                max_workers: Some(NonZeroUsize::new(1).unwrap()),
-            },
-            Arc::clone(&server.admission),
-        );
-        route.scheduler = Arc::new(scheduler.clone());
-        server.register_route(route).await.unwrap();
-
-        let conn = Arc::new(Connection::new(99));
-        let writer = closed_writer().await;
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&encode_chunk_header(0, 2));
-        payload.extend_from_slice(&encode_call_control(&call_identity("grid"), 0).unwrap());
-        payload.extend_from_slice(b"abcd");
-
-        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
-        dispatch_chunked_call(
-            &server,
-            &conn,
-            11,
-            FLAG_CHUNKED,
-            &payload,
-            &writer,
-            chunk_permit,
-            chunk_frame_ordering(&server, conn.conn_id(), 11, FLAG_CHUNKED, &payload).unwrap(),
-        )
-        .await;
-
-        assert!(server.chunk_registry.contains(conn.conn_id(), 11));
-        assert!(matches!(
-            scheduler.try_acquire(0),
-            Err(SchedulerAcquireError::Capacity {
-                field: "max_pending",
-                limit: 1,
-            })
-        ));
-
-        server.chunk_registry.abort(conn.conn_id(), 11);
-        assert_eq!(server.sweep_stale_chunk_route_pending(), 1);
-
-        let guard = scheduler
-            .try_acquire(0)
-            .expect("GC stale sweep should release route pending capacity");
-        drop(guard);
     }
 
     #[test]
