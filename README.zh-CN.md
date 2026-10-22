@@ -103,13 +103,13 @@ finally:
 | 直连 IPC | [资源端](examples/python/ipc_resource.py)、[客户端](examples/python/ipc_client.py) |
 | Relay | [资源端](examples/python/relay_resource.py)、[客户端](examples/python/relay_client.py)、[mesh](examples/python/relay_mesh/README.md) |
 | 配置：代码、环境变量与 `.env` | [配置指南](docs/configuration.md) |
-| Python 契约、跨语言载荷与 hold | [Python SDK 指南](docs/python-usage.md) |
-| Rust SDK | [Rust SDK 指南](sdk/rust/README.md) |
+| Python 契约、跨语言载荷与 API 索引 | [Python SDK 指南](docs/python-usage.md) |
+| Rust SDK 与 API 迁移 | [Rust SDK 指南](sdk/rust/README.md) |
 | Relay 与契约工具 | [c3 CLI 指南](cli/README.md) |
-| 端点目录与生命周期 | [生命周期指南](docs/local-endpoint-lifecycle.md) |
+| 连接、所有者与端点 API | [生命周期指南](docs/local-endpoint-lifecycle.md) |
 | Windows | [构建与使用](docs/windows-native-usage.md) |
 | 环境变量 | [.env.example](.env.example) |
-| 开发 | [构建与测试](docs/development.md)、[贡献指南](CONTRIBUTING.md) |
+| 开发 | [构建与测试](docs/development.md)、[CI 与发行](docs/ci-cd.md)、[贡献指南](CONTRIBUTING.md) |
 
 ## 许可证
 

@@ -103,13 +103,13 @@ For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_ancho
 | Direct IPC | [resource](examples/python/ipc_resource.py), [client](examples/python/ipc_client.py) |
 | Relay | [resource](examples/python/relay_resource.py), [client](examples/python/relay_client.py), [mesh](examples/python/relay_mesh/README.md) |
 | Configuration: code, environment and `.env` | [Configuration guide](docs/configuration.en.md) |
-| Python contracts, portable payloads and hold | [Python SDK guide](docs/python-usage.md) |
-| Rust SDK | [Rust SDK guide](sdk/rust/README.md) |
+| Python contracts, portable payloads and API index | [Python SDK guide](docs/python-usage.md) |
+| Rust SDK and API migration | [Rust SDK guide](sdk/rust/README.md) |
 | Relay and contract tools | [c3 CLI guide](cli/README.md) |
-| Endpoint directories and lifecycle | [Lifecycle guide](docs/local-endpoint-lifecycle.en.md) |
+| Connection, owner and endpoint APIs | [Lifecycle guide](docs/local-endpoint-lifecycle.en.md) |
 | Windows | [Build and usage](docs/windows-native-usage.md) |
 | Environment variables | [.env.example](.env.example) |
-| Development | [Build and tests](docs/development.md), [contributing](CONTRIBUTING.md) |
+| Development | [Build and tests](docs/development.md), [CI and releases](docs/ci-cd.md), [contributing](CONTRIBUTING.md) |
 
 ## License
 

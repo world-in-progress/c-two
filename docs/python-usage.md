@@ -126,7 +126,11 @@ The main user surface, shown throughout the guides. The top-level `cc` namespace
 - Calls: `cc.with_call_options` (per-call deadline views, see [remote connections and deadlines](#remote-connections-and-deadlines))
 - Registry: `cc.register`, `cc.connect`, `cc.close`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.set_transport_policy`, `cc.set_local_endpoint`
 - Contracts: `cc.export_contract_descriptor`, `cc.export_contract_release_ref`, `cc.compile_contract_artifacts`, `cc.infer_crm_from_resource`
-- Lifecycle and maintenance: `cc.LifecycleConfig`, `cc.owner_control_pair`, `cc.spawn_owned_child`, `cc.adopt_owner_stdin`, `cc.inspect_endpoint`, `cc.reap_endpoint`, `cc.sweep_endpoints`
-- Monitoring: `cc.hold_stats`, `cc.memory_stats`, `cc.call_execution_snapshot` (read-only)
+- Lifecycle and ownership: `cc.LifecycleConfig`, `cc.owner_control_pair`, `cc.spawn_owned_child`, `cc.adopt_owner_stdin`, `cc.OwnerControl`, `cc.OwnerRecoveryTicket`, `cc.prepare_owner_takeover`, `cc.PreparedOwnerTakeover`, `cc.OwnerStatus`, `cc.OwnerControlError`
+- Endpoint maintenance: `cc.inspect_endpoint`, `cc.reap_endpoint`, `cc.sweep_endpoints`
+- Connection observations: `cc.connection_observation`, `cc.connection_events`, `cc.ConnectionObservation`, `cc.ConnectionClosed`, `cc.ConnectionEvent`, `cc.ConnectionEvents`, `cc.ConnectionEventsLagged`
+- Monitoring: `cc.hold_stats`, `cc.memory_stats`, `cc.call_execution_snapshot`, `cc.native_lifecycle_snapshot`, `cc.native_terminal_outcome` (read-only)
 
 Process-level IPC policy, call admission limits and relay settings are documented in the [configuration guide](configuration.en.md).
+
+The [lifecycle API guide](local-endpoint-lifecycle.en.md) specifies observation return values, timeout/end/lag behavior, owner ticket issuance and revocation, the single-commit takeover sequence and error outcomes. Its [bind/connect section](local-endpoint-lifecycle.en.md#bind-and-connect-failures) documents the structured OS fields on native `CoreError`. These observations do not prove process exit or authorize replay or cleanup.

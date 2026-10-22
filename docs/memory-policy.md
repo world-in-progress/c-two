@@ -145,4 +145,5 @@ c3 relay --bind 127.0.0.1:8080 \
 - `docs/reports/memory-budget-contract.md` 与 `docs/plans/2026-09-26-memory-policy.md` — 目标契约与计划背景。
 - [内存阶段验收](reports/memory-native-final-validation.md) — 该阶段固定源码与开发产物证据，保留其历史状态。
 - [0.7.0 统一验收](reports/canonical-local-endpoint-validation.md) — 该版本唯一端点的确切源码、Windows/Linux 门禁与开发产物哈希，保留为历史记录。
-- [0.7.4 发布记录](reports/0.7.4-publication.zh-CN.md) — 当前发布源码、平台门禁与公开产物验证。
+- [0.8.0 发布说明](releases/0.8.0.md) — 当前所有权、分块准入与回复路径变化。
+- [0.7.4 发布记录](reports/0.7.4-publication.zh-CN.md) — 保留该版本的源码、平台门禁与公开产物验证。

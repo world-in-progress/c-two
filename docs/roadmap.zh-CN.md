@@ -1,10 +1,10 @@
 # C-Two 当前路线图
 
-状态更新：2026-10-10；产品排序沿用 7 月设计优先级。
+状态更新：2026-10-22；产品排序沿用 7 月设计优先级。
 
-这是 C-Two 0.x 的当前维护路线图，以 Python 0.7.4 / c3 0.3.3 为源码基线。FastDB 固定 0.2.1。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。源码变化、已执行门禁和发布状态见[0.7.4 说明](releases/0.7.4.zh-CN.md)与[验证记录](reports/0.7.4-final-validation.zh-CN.md)。
+这是 C-Two 0.x 的当前维护路线图，以 Python 0.8.0 / c3 0.4.0 为源码基线。FastDB 固定 0.2.3。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。当前 API 边界和发行范围见[0.8.0 发布与迁移说明](releases/0.8.0.md)。
 
-当前端点、生命周期与内存源码证据见[统一验收](reports/canonical-local-endpoint-validation.md)，用法见[生命周期接入](local-endpoint-lifecycle.md)与[内存策略](memory-policy.md)。这是开发源码验证；30 wheel + sdist 与 5 CLI target 正式候选矩阵保留各自绑定源码的发行收据。
+当前用法见[生命周期接入](local-endpoint-lifecycle.md)与[内存策略](memory-policy.md)。正式候选矩阵为 35 wheel、1 sdist 和 6 CLI target，包含原生 Windows ARM64。[CI 与发行流程](ci-cd.md)区分源码验证、包验证与发布；各次发行保留确切源码与产物收据。
 
 Portable-payload 架构与历史本地候选参考为：
 
@@ -14,9 +14,9 @@ Portable-payload 架构与历史本地候选参考为：
 
 `docs/plans/`、`docs/reviews/` 与较早日期的 `docs/superpowers/` 文档只保留历史证据；除非本路线图明确引用，否则不再是当前权威。
 
-## 0.7.4 维护
+## 0.8.0 维护
 
-[实施记录](plans/0.7.4.zh-CN.md)覆盖自定义端点权限、当前路由获取、持久 TypeScript IPC、低风险内部精简及可选连接期限。同源 Linux、macOS 与 Windows 门禁通过；[最终验证记录](reports/0.7.4-final-validation.zh-CN.md)保留精确源对、审查状态与产物证据。
+[当前瘦身记录](plans/2026-10-13-local-slimming-batches.md)跟踪所有权与运行时收敛。[发布说明](releases/0.8.0.md)涵盖物理连接通知、显式所有者恢复、结构化本地 OS 原因、分块准入和 SHM 回复收敛。两份控制会话重构继续暂缓。[0.7.4 实施](plans/0.7.4.zh-CN.md)与[验证记录](reports/0.7.4-final-validation.zh-CN.md)保留为历史证据。
 
 ## 状态定义
 
@@ -38,12 +38,12 @@ Portable-payload 架构与历史本地候选参考为：
 | Artifact composition | Rust `c2-codegen` 委托 nested specification、保留 structured FastDB error、校验 identity/hash、确定性组合 C-Two 与 FastDB artifacts，并在不存在的 destination 原子发布完整 regular-file tree。 |
 | Language projection | 用户面 Rust SDK 为 `c-two` / `c_two`，与 Python 复用 `c2-core` runtime；generated Rust/Python artifact 已 compile/import 并完成双向调用。生成的 TypeScript 已执行严格 12 行 Node direct/relay 互操作；浏览器 runtime 仍未闭环。 |
 | Runtime payload proof | Record、object-graph 与 no-payload method 已通过 Rust client → Python resource、Python client → Rust resource、Rust client → Rust resource。覆盖 scalar/`str`/`wstr`/bytes/list/null、sharing/cycle、materialize、structured mismatch error 与 checked invalidation。 |
-| 本地端点与生命周期 | 唯一 OS 派生、默认 Persistent、显式 OwnerBound 与精确/scoped 原生维护已实现并通过 hosted 验证；发行门禁与证据见发布说明。 |
+| 本地端点与生命周期 | 唯一 OS 派生、Persistent/OwnerBound、物理连接通知、显式一次性所有者恢复及结构化 bind/connect 原因在 Linux、macOS 和 Windows x64/ARM64 共用 Core；精确/scoped 原生维护保留身份校验。发行门禁与证据见发布说明。 |
 | IPC 内存策略 | lazy buddy、idle decay 与三个有限方向预算已实现；HTTP 缓冲治理、更广的取消/队列遥测仍未闭环。 |
 | 真实 backing 边界 | 已证明的 Rust/Python receive adapter 是 copy-backed。`cc.hold()` 与 borrowed-input policy 负责 owner/lease invalidation，不代表已直接构造到最终 response shared memory。 |
 | Python-only prototype | 没有 portable binding 的普通 Python method 仍可在本地使用 pickle；portable descriptor export/codegen 会诊断并拒绝它们。 |
 
-历史 7 月本地候选使用当时的 FastDB 源码与包 metadata，并未出版。当前依赖为正式 FastDB 0.2.1，原生源码固定 `4f99f86a662b0e950a0dd29800c25a1c9fca4def`；旧报告保留各自确切输入，不作为当前产物证明。
+历史 7 月本地候选使用当时的 FastDB 源码与包 metadata，并未出版。当前依赖为正式 FastDB 0.2.3，原生源码固定 `abba785ef2a7d3fbee1bbc608393a3e6c7b042c4`；旧报告保留各自确切输入，不作为当前产物证明。
 
 ## 有序产品工作
 
@@ -51,7 +51,7 @@ Portable-payload 架构与历史本地候选参考为：
 
 | 顺序 | Workstream | 为何在这里 | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Immutable FastDB package distribution | FastDB 0.2.1 已发布；Python 0.7.0 / c3 0.3.0 使用同一源码的协调发行门禁；官方 C-Two Rust/TypeScript 分发仍未闭环。 | 经授权的 FastDB Rust/Python/TypeScript artifacts 可按 immutable identity 获取；C-Two 固定它们并通过 clean-environment package、codegen、runtime 与 interoperability gates。 |
+| 1 | Immutable FastDB package distribution | FastDB 0.2.3 已发布；Python 0.8.0 / c3 0.4.0 使用同一源码的协调发行门禁；官方 C-Two Rust/TypeScript 分发仍未闭环。 | 经授权的 FastDB Rust/Python/TypeScript artifacts 可按 immutable identity 获取；C-Two 固定它们并通过 clean-environment package、codegen、runtime 与 interoperability gates。 |
 | 2 | Contract compatibility | Exact release matching 是安全底线；semver/range 规则必须建立在稳定 release content 上。 | Rust-owned 规则拒绝 ambiguity 与 ABI-incompatible match，并在各 SDK 投影同一行为。 |
 | 3 | Call metadata 与 admission hooks | 上层需要 transport-consistent identity/policy mechanism，但 policy 不属于 C-Two。 | Thread-local、IPC 与 relay call 携带有界 metadata；hook 可准入/拒绝；下游系统仍是 policy authority。 |
 | 4 | Dry-run mechanism | Impact analysis 依赖同一个显式 metadata/admission boundary。 | Dry-run 明确评估内容、禁止的副作用与 unsupported method failure。 |

@@ -34,6 +34,20 @@ returns `CallDeadlineExceeded` with `operation=connect` and
 `transport_phase=pre_dispatch`. Business-call options remain independent;
 see [connection configuration](../../docs/configuration.en.md#connection-deadlines).
 
+## Lifecycle and diagnostic APIs
+
+| Entry point | Contract |
+| --- | --- |
+| `Client::connection_observation()` / generated client method | Returns the current physical IPC observation. `snapshot()` reads its terminal record; async `wait_closed(Option<Duration>)` waits without retaining the connection. Thread-local and HTTP clients reject this operation. |
+| `Runtime::connection_events()` | Subscribes to future accepted IPC connections without starting a host. Async `recv()` returns `Ok(None)` when the source ends; lag returns `ConnectionEventsError::Lagged` and ends that subscription. |
+| `owner_control_pair()` | Returns `OwnerControl` and the one-use `OwnerBootstrap` for a trusted launcher. `recovery_ticket(timeout)` issues the current recovery grant; `revoke_recovery(timeout)` revokes it. |
+| `Runtime::prepare_owner_takeover(ticket)` | Freezes the configured endpoint context. Save `successor_ticket().export()` before one `commit(timeout)`; a successful commit returns the new `OwnerControl`. `inspect(timeout)` observes state without proving commit success. |
+| `Error::local_io_cause()` | Returns `Option<LocalIoCause>` for actual bind/connect failures. Its operation and `EndpointIoError` retain the OS cause; non-I/O errors have none. |
+
+Timeouts above use `Option<Duration>`. The [lifecycle guide](../../docs/local-endpoint-lifecycle.en.md) specifies ticket protection, original grace deadlines, `NotSent`/`Indeterminate` outcomes and observation ordering. The [0.8.0 Rust migration notes](../../docs/releases/0.8.0.md#rust-migration-and-transport-behavior) cover removed low-level APIs, move-only allocation owners, `ChunkRegistry<C>`, SHM response preparation and structured lifecycle failures. IPC 12, SHM 3 and C/FFI ABI 5 remain unchanged from 0.7.6.
+
+## Portable payloads
+
 Portable payloads keep their owner-qualified name:
 
 ```rust
