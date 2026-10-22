@@ -1650,6 +1650,23 @@ def test_fastdb_provisioning_cannot_substitute_another_targets_proof(
     assert "FastDB proof wheel" in capsys.readouterr().err
 
 
+def test_fastdb_provisioning_missing_wheel_with_null_digest_is_rejected(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    builder = CandidateBuilder()
+    receipt = f"fastdb-{WINDOWS_ARM64_TARGET}.json"
+    decision = json.loads(builder.members[receipt])
+    decision["filename"] = decision["filename"].replace("-cp312", "-1-cp312", 1)
+    decision["sha256"] = None
+    builder._rewrite_json(receipt, decision)
+    world = World(candidate=builder)
+    world.set_source_runs(_run(201, "Source Validation"))
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    assert "not a distinct retained wheel" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("core_version, accepted", [("0.2.3", True), ("0.2.1", False)])
 def test_python_fastdb_version_is_independent_of_native_core(
     tmp_path: Path, environment, monkeypatch, core_version, accepted,
