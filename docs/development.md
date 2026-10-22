@@ -30,6 +30,10 @@ The workspace dev group includes `c-two[fastdb]` and pins Python
 `fastdb4py==0.2.3`. Bare installs omit FastDB and NumPy; the native CoreSDK
 and Rust source pins above also select 0.2.3.
 
+Banner generation uses the separate `banner` dependency group with patched
+Pillow 13 and Python 3.11+: `uv run --python 3.11 --group banner tools/dev/generate_banner.py`.
+Pillow is not required by the SDK or its test suite; those retain Python 3.10 support.
+
 Full interoperability tests also require Node 22, CMake/Ninja and Emscripten
 5.0.2 (with `emcmake` on `PATH`). Install both sets of TypeScript dependencies
 and the minimum Python interpreter before running those suites:

@@ -252,7 +252,7 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
 
 PROBE = """
 import hashlib, importlib.metadata, json, sys
-import pytest, xdist, pytest_timeout, numpy, pandas, pyarrow, httpx, PIL
+import pytest, xdist, pytest_timeout, numpy, pandas, pyarrow, httpx
 import c_two, c_two._native as native
 from fastdb4py.payload import Payload
 from pathlib import Path
