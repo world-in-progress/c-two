@@ -23,7 +23,7 @@
 
 基线反例已完成。仅 `cfg(test)` 的 Host 线程屏障阻挡真实启动，默认期限在约 5.013 秒、显式 20 毫秒在约 22.6 毫秒触发，两者都错误地显示 `config error`，原生关闭已完成且本轮端点根零 socket/lease 残留。Python 3.12 基线有 3 个预期失败：`cc.set_server(startup_timeout=0)` 不接纳参数，以及真实权限不足、非目录 bind 错误仍含配置标签；原 I/O 字段断言通过。此实验复现期限与分类，未把人工阻挡等同于已查明下游 CI 拥塞的具体来源。
 
-独立设计复核完成，要求补齐 owner fence 超时信息穿过 ServerFailure、Core 原子配置冻结、RuntimeSession 替换时的期限迁移，以及超时后的原生收尾。启动等待预算与随后清理耗时分开说明。用户补充的 Windows 11 重复绑定误分类作为下游报告记录；本轮 Windows 候选实测尚未完成。候选 `88b8d88d` 的独立只读实现审查无阻断，两处 Rust 指南中的结构体字段和变体清单已补齐；跨平台验收和发布继续推进。
+独立设计复核完成，要求补齐 owner fence 超时信息穿过 ServerFailure、Core 原子配置冻结、RuntimeSession 替换时的期限迁移，以及超时后的原生收尾。启动等待预算与随后清理耗时分开说明。候选 `88b8d88d` 的独立只读实现审查无阻断，两处 Rust 指南中的结构体字段和变体清单已补齐。Windows 11 开发机完成启动、系统原因、连接观察、所有者、完整 relay 和真实跨语言验证；最终候选及主线的三系统 GitHub Actions 全部门禁通过，包含原生 Windows ARM64。
 
 Python 3.12 的候选定向回归为 101 passed、6 个 Windows 专属场景在 macOS 上按原平台条件跳过；这些场景仍须在 Windows 实跑。测试覆盖参数接纳、非法值不修改配置、零期限、session 替换保留设置、失败后的冻结与完整 shutdown 后重配、配置错误优先级及真实 IPC 调用。原生测试已覆盖 Runtime 值继承、显式 Rust 值优先、owner 围栏超时穿过 watch、就绪和 ping 不重启预算。
 
@@ -32,3 +32,5 @@ Python 3.12 的候选定向回归为 101 passed、6 个 Windows 专属场景在 
 首轮 PR 完整门禁发现一个本批遗漏：内存观察测试的 `FailingSwapSession` 替身没有新增的 `startup_timeout` 投影，导致构造失败路径在原断言之前遇到 AttributeError。macOS 定向运行复现同一失败；只补 `startup_timeout = None` 后，原内存观察文件和启动配置测试共 17 项通过。生产代码及原断言未改，失败门禁保留为诊断证据。
 
 macOS 门禁另有一次 incarnation 测试的单次 inspect 返回 `io-error`，原断言未输出具体原因。隔离占住本轮新建目录的 gate 后，已发布的 0.8.0 与当前 0.8.1 都使原测试在同一断言以 `WouldBlock` 失败；两次原生 shutdown 后零 socket/lease 残留。这证明共享目录竞争是原测试未隔离的已存在条件，不能倒推原 CI 未记录的具体 errno。该 Unix 分支改为复用已有子进程助手及独立临时根，原身份断言保留并附诊断；Windows 分支保持。全文件 59 项通过，在模拟其他 worker 持有共享 gate 时隔离分支也通过且零残留。未增加生产重试、轮询或放宽检查。
+
+0.8.1 已从主线 `ff256e6a7538a8a0a81dcd19dfc640cce40f48a3` 的已验证候选发布，PyPI 的 35 个 wheel 和 1 个 sdist 全部与晋升计划名称、大小及 SHA-256 一致，其中 5 个为 Windows ARM64。macOS 从官方 PyPI 安装后的启动配置、结构化失败、真实 IPC 和关闭验收通过，隔离根目录零 socket/lease 残留。本轮临时构建与安装环境已清理；R16 尚未实施。完整来源、门禁、审查、增量和清理记录见 [发布验收](../reports/2026-10-23-081-startup-release-acceptance.md)。
