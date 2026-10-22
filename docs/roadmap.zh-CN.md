@@ -71,7 +71,7 @@ Portable-payload 架构与历史本地候选参考为：
 | Portable-payload benchmark | 当前有 correctness proof，但没有审阅后的显式 `Payload` throughput claim。 | 可复现 benchmark 记录 workload、environment、distribution、copy/direct/staged facts 与 retained-owner behavior。 |
 | Artifact publication hardening | 当前只支持 new-tree publication，不是 power-loss 或 hostile-parent durability receipt。 | Versioned prior-manifest/update protocol 与 platform-specific durable/no-follow publication 通过 fault/race tests。 |
 
-所有 active limit、原因、影响、owner、dependency 与 executable closure criteria 都记录在[延后能力 Issue](./issues/contract-release-deferred-capabilities.md)。
+7 月 [deferred-capabilities 记录](./issues/contract-release-deferred-capabilities.md)保留原始理由、owner 和验收条件。其当时未完成的包分发、Host timeout 与分配所有权条目属于历史状态；当前运行时结论见[工作记录](plans/2026-10-13-local-slimming-batches.md)与[0.8.0 说明](releases/0.8.0.md)，产品优先级以上表为准。
 
 ## Handoff 规则
 

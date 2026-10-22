@@ -75,7 +75,7 @@ These tracks must not be smuggled into unrelated feature work or used to oversta
 | Portable-payload benchmark | The current suite has correctness proof but no reviewed explicit-`Payload` throughput claim. | A reproducible benchmark records workload, environment, distributions, copy/direct/staged facts, and retained-owner behavior. |
 | Artifact publication hardening | Publication is new-tree-only and not a power-loss or hostile-parent durability receipt. | A versioned prior-manifest/update protocol and platform-specific durable/no-follow publication pass fault and race tests. |
 
-Every active limit, reason, impact, owner, dependency, and executable closure criterion lives in the [deferred-capabilities issue](./issues/contract-release-deferred-capabilities.md).
+The [July deferred-capabilities record](./issues/contract-release-deferred-capabilities.md) preserves original reasons, owners and closure criteria. Its then-open package, host-timeout and allocation-ownership rows are historical; current runtime dispositions are in the [work record](plans/2026-10-13-local-slimming-batches.md) and [0.8.0 notes](releases/0.8.0.md), while the product work above remains the current priority list.
 
 ## Handoff Rules
 

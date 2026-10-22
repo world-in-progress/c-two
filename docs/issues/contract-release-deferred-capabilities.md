@@ -1,8 +1,10 @@
 # Contract Release Deferred Capabilities
 
 **Date:** 2026-07-24
-**Status:** Open
-**Scope:** Capabilities intentionally not provided by the route-independent `ContractRelease` and active portable-payload composition slices
+**Status:** Historical candidate baseline; current status is maintained in the [roadmap](../roadmap.md) and [0.8.0 release notes](../releases/0.8.0.md).
+**Scope:** Capabilities and closure criteria recorded for the 2026-07-24 route-independent `ContractRelease` and portable-payload composition candidate
+
+The tables below preserve that candidate's exact source and then-open findings. They do not describe current dependency availability, platform coverage or runtime APIs. Later work replaced the package pins, host lifecycle and allocation-ownership boundaries; use the current release notes and [runtime work record](../plans/2026-10-13-local-slimming-batches.md) for their disposition. Unimplemented product directions remain listed in the roadmap; historical closure criteria here do not establish current completion or publication.
 
 ## Implemented Baseline
 
