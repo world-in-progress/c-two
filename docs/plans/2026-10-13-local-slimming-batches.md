@@ -60,7 +60,7 @@
 
 固定基线 `0f63d97e9ab951957490108de83b17b81580578d`，先补行为覆盖的快照为 `89b20a0fe6efc5345765096e435fd491d1600413`，最终实现为 `4cf80c707ed4cf605d0ce4a0ccb98ca27484c474`。普通字节回复复用既有 `try_prepare_shm_response` 和 `PreparedShmResponse`，删除第二套 buddy 分配、复制、元数据与写失败释放链。prepared 发送分支抽为一个具体私有函数；未增加框架、状态机、后台任务或兼容入口。
 
-用户接受低层 Rust 返回类型改为 `Option<PreparedShmResponse>`、普通回复采用既有 `free_at` 的 GC 空闲记账时点和统一诊断文案。max_payload 先于错池检查，分配失败仅在写前回退，写失败直接返回；原池身份、快照、预算、写锁及取消边界、buddy 交接与 dedicated 释放语义保留。ABI 5、IPC 12、SHM 3 与业务 wire 未改。
+用户接受低层 Rust 返回类型改为 `Result<Option<PreparedShmResponse>, String>`、普通回复采用既有 `free_at` 的 GC 空闲记账时点和统一诊断文案。max_payload 先于错池检查，分配失败仅在写前回退，写失败直接返回；原池身份、快照、预算、写锁及取消边界、buddy 交接与 dedicated 释放语义保留。ABI 5、IPC 12、SHM 3 与业务 wire 未改。
 
 基线实际覆盖普通/预制、buddy/dedicated 写失败、非整幂长度与旁存分配、完整分块字节以及真实写锁前取消。候选将两个失败测试合并为四种组合，保留所有实质断言。基线已证实写锁前取消保留未发布分配直到 pool 收尾，候选保留该行为；其修复需要单独所有权方案，不扩入本批。
 

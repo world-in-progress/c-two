@@ -14,7 +14,7 @@ In an activated Python environment, explicitly select the documented version:
 uv pip install 'c-two==0.8.0'
 ```
 
-The [c3 0.4.0 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.4.0) provides `c3-x86_64-pc-windows-msvc.exe`, its `.exe.sha256` checksum and `c3-installer.ps1`. Download and verify the standalone executable before running it:
+For the published [c3 0.4.0 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.4.0), download `c3-x86_64-pc-windows-msvc.exe`, its `.exe.sha256` checksum and optionally `c3-installer.ps1`. Verify the standalone executable before running it:
 
 ```powershell
 $releaseBase = 'https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0'

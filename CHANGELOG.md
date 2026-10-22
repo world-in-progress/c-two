@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ### Changed
 
 - Ordinary SHM replies reuse `PreparedShmResponse` preparation and sending.
-  The low-level Rust preparation API returns `Option<PreparedShmResponse>`;
+  The low-level Rust preparation API returns `Result<Option<PreparedShmResponse>, String>`;
   ordinary release uses the existing `free_at` bookkeeping and shared error
   messages. Sending failures never trigger fallback or replay.
 - Allocation owners are move-only and pool-bound; low-level raw memory access

@@ -4,6 +4,8 @@ C-Two exposes stateful Python resources through typed CRM contracts over same-pr
 
 Python C-Two **0.8.0** pairs with c3 **0.4.0**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.8.0.md).
 
+Install the matching published versions:
+
 ```bash
 uv pip install 'c-two==0.8.0'
 # Only for FastDB Payload contracts:

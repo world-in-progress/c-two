@@ -2,7 +2,7 @@
 
 Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
 
-## Unreleased development source (2026-10-21)
+## C-Two 0.8.0 source (2026-10-22)
 
 The active dependency pins now select FastDB 0.2.3, source
 `abba785ef2a7d3fbee1bbc608393a3e6c7b042c4`, for Python, Rust, native source builds
@@ -13,7 +13,7 @@ selection does not add a C-Two release platform or establish C-Two ARM64 runtime
 validation. Published 0.7.6 keeps its historical `fastdb4py==0.2.2` extra; the
 source/run records below retain their actual FastDB inputs.
 
-## Current status (2026-10-07)
+## Historical validation status (2026-10-07)
 
 Python c-two 0.7.0 and c3 0.3.0 are the coordinated runtime baseline,
 with FastDB 0.2.1 as the official dependency. The release notes describe the
