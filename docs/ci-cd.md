@@ -1,16 +1,13 @@
 # CI and release qualification
 
-Daily validation, release qualification and publication are separate stages.
-A normal pull request or main-branch push does not build the 30-wheel release
-matrix and cannot publish anything. Publishing promotes verified bytes; it
-does not compile them again.
+Daily validation, release qualification and publication are separate stages. A normal pull request or main-branch push does not build the 35-wheel release matrix and cannot publish anything. Publishing promotes verified bytes; it does not compile them again.
 
 | Stage | Trigger | Required evidence | Can publish? |
 | --- | --- | --- | --- |
 | Source Validation | PR, merge queue, main push, explicit full run | Workflow policy; full source matrix when runtime inputs change | No |
 | Release Candidate | Explicit dispatch on canonical main | Successful full source run for the exact commit, then all package and installed-consumer receipts | No |
 | CLI Release | Explicit candidate run ID | Candidate and pinned source receipts, asset inventory and hashes, remote-state checks | c3 assets only |
-| Python Package Release | Explicit candidate run ID | The same source and candidate proof, all 31 Python distributions and hashes | PyPI only |
+| Python Package Release | Explicit candidate run ID | The same source and candidate proof, all 36 Python distributions and hashes | PyPI only |
 
 Both publication workflows default to a dry run. They have no `push`, tag or
 `workflow_run` trigger. A source-test completion cannot start publication, and
@@ -36,10 +33,7 @@ The protected check names remain
 policy success and either successful source checks or an intentional scope
 decision to omit them. A failed scope decision cannot produce a green gate.
 
-Full source coverage retains Linux, macOS, Windows 2022, Windows 2025 and
-free-threaded Python, including relay, cross-language and endpoint-cleanup
-checks. A policy-only green run is never sufficient for a release candidate.
-To qualify a commit whose daily checks did not need native compilation:
+Full source coverage includes Linux, macOS, Windows Server 2022/2025 x64, Windows 11 ARM64 and free-threaded Python, including relay, cross-language and endpoint-cleanup checks. ARM64 uses native Rust, Python and Node consumers and builds the pinned Arrow/PyArrow prerequisite for grid examples. A policy-only green run is never sufficient for a release candidate. To qualify a commit whose daily checks did not need native compilation:
 
 ```bash
 gh workflow run ci.yml --ref main -F force_full=true
@@ -52,14 +46,7 @@ by OS, architecture, runner, Python and toolchain. Lockfile/version changes may
 reuse unchanged dependencies, but Cargo revalidates fingerprints and all
 applicable tests still execute. Cache hits are never test evidence.
 
-Validation commands share one 45-minute aggregate budget. Each child command
-is bounded by the lesser of its phase limit and the remaining budget. A
-timeout first interrupts the driver and allows up to 40 seconds for its
-existing child cleanup before forcing the owned process group to stop. The
-50-minute validation-step and 60-minute job limits leave time for cleanup
-and evidence upload. A failure retains its real exit code and full log. Cargo
-panics and Python assertions are shown in the console and step summary even
-when later successful commands would otherwise push them out of the log tail.
+Validation commands share one 45-minute aggregate budget. Each child command is bounded by the lesser of its phase limit and the remaining budget. A timeout first interrupts the driver and allows up to 40 seconds for its existing child cleanup before forcing the owned process group to stop. The validation step has a 50-minute limit; the job has a 90-minute limit to include native prerequisites, cleanup and evidence upload. A failure retains its real exit code and full log. Cargo panics and Python assertions are shown in the console and step summary even when later successful commands would otherwise push them out of the log tail.
 
 ## Build one release candidate
 
@@ -69,12 +56,7 @@ After full source validation succeeds, dispatch:
 gh workflow run release-candidate.yml --ref main
 ```
 
-The first job checks canonical repository/main provenance and all required
-full source jobs before any package compilation. Its exact source-validation
-run ID is written into `rc-context.json`. Every build and receipt uses the
-dispatch commit, not a later moving branch head. The existing Linux/native
-reusable workflows produce and verify the complete 30-wheel, 5-c3 and sdist
-inventory, installed-wheel and cross-language checks, and 47 receipts.
+The first job checks canonical repository/main provenance and all required full source jobs before any package compilation. Its exact source-validation run ID is written into `rc-context.json`. Every build and receipt uses the dispatch commit, not a later moving branch head. The existing Linux/native reusable workflows produce and verify 35 wheels, 6 c3 binaries, 1 sdist, 2 installers and 56 receipts. Windows ARM64 covers Python 3.11–3.14 and 3.14t; the other five targets also cover 3.10. Installed consumers validate native architecture, cross-language calls and cleanup, including standard-user checks on both Windows architectures.
 
 Only a successful candidate is eligible for promotion. Keep its run ID;
 do not start another candidate build to publish it. Explicit candidate builds

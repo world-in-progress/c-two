@@ -40,7 +40,7 @@ c3.exe --version
 ```
 
 The installer supports PowerShell 5.1 and needs no administrator privileges.
-Automatic architecture detection uses `IsWow64Process2` (Windows 10 / Windows Server version 1709 or later), so an emulated PowerShell still selects the native executable.
+Automatic architecture detection uses [`IsWow64Process2`](https://learn.microsoft.com/en-us/windows/win32/api/wow64apiset/nf-wow64apiset-iswow64process2) (Windows 10 version 1709 / Windows Server 2016 version 1709 or later), so an emulated PowerShell still selects the native executable.
 It copies the verified executable to `c3.exe` in
 `$env:LOCALAPPDATA\Programs\c3`, or a directory selected by `-BinDir`.
 It does not persistently register PATH; the example updates this session only.
@@ -76,6 +76,6 @@ $env:FASTDB_PAYLOAD_LINK_MODE = 'system'
 
 ## Validation scope
 
-The [0.7.4 publication record](reports/0.7.4-publication.md) records the published source pair and full Windows Server 2022/2025 x64 gates, including strict 18-row Rust/Python and 12-row TypeScript receipts and ordinary/non-administrator wheel consumers. The [FD follow-up](reports/0.7.4-fd-leak-regression.md) covers actual Named Pipe close and idle-replacement regressions on both Windows runners. Release manifests identify the actual package source; documentation commits are separate from artifact source commits.
+The [0.8.0 release notes](releases/0.8.0.md) describe current Windows x64/ARM64 coverage and API changes. The [0.7.4 publication record](reports/0.7.4-publication.md) retains that release's source pair and full Windows Server 2022/2025 x64 gates, including strict 18-row Rust/Python and 12-row TypeScript receipts and ordinary/non-administrator wheel consumers. The [FD follow-up](reports/0.7.4-fd-leak-regression.md) covers actual Named Pipe close and idle-replacement regressions on both Windows runners. Release manifests identify the actual package source; documentation commits are separate from artifact source commits.
 
 The 0.8.0 development record additionally includes Windows 11 x64 developer-machine tests; hosted Source Validation requires Windows Server 2022/2025 x64 and Windows 11 ARM64. Windows services and a real Windows/Linux relay link are outside those claims. Release evidence records the exact source and passing native lanes. See the [implementation report](windows-native-implementation.md) for platform coverage.

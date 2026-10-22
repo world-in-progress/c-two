@@ -20,7 +20,7 @@ Unix bind 初始化失败时，只撤回本次新建且仍由原目录、gate �
 
 Unix 凭据统一使用既有 schema 3，记录最终 root、namespace id、incarnation 与 socket 身份；编码、解码和 CLI 读取共用 32 KiB 上限。Windows 保持 kernel-managed schema 1。inspect/reap/sweep 使用凭据捕获的上下文，显式传入不一致的 root 在访问目标前被拒绝。凭据中的 socket 完整路径由原生配置派生，不作为输入字段；凭据自身不授予删除权限。
 
-以下 owner 接口和 grace 语义对应当前未发布开发源码，平台验收以固定候选记录为准。默认生命周期为 `Persistent`，常驻服务直到显式关闭；普通业务连接断开、idle 驱逐、relay 重连不结束服务。只为一个控制器独占管理整个 Runtime 的专用子进程选择 `OwnerBound`。`control, receiver = cc.owner_control_pair()` 返回 `OwnerControl` 和一次性 `NativeOwnerBootstrap`；Rust 对应 `OwnerControl` 和 `OwnerBootstrap`。控制器保存 control，用 `cc.spawn_owned_child(receiver, program, args)` 只向目标子进程转移 bootstrap；`receiver` 是保留的参数名。子进程显式调用 `bootstrap = cc.adopt_owner_stdin()`，并在 `register()` 前设置 `cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(owner_missing_grace_seconds=3.0), owner_control=bootstrap)`。
+以下 owner 接口和 grace 语义适用于 C-Two 0.8.0，升级范围见[发布与迁移说明](releases/0.8.0.md)。默认生命周期为 `Persistent`，常驻服务直到显式关闭；普通业务连接断开、idle 驱逐、relay 重连不结束服务。只为一个控制器独占管理整个 Runtime 的专用子进程选择 `OwnerBound`。`control, receiver = cc.owner_control_pair()` 返回 `OwnerControl` 和一次性 `NativeOwnerBootstrap`；Rust 对应 `OwnerControl` 和 `OwnerBootstrap`。控制器保存 control，用 `cc.spawn_owned_child(receiver, program, args)` 只向目标子进程转移 bootstrap；`receiver` 是保留的参数名。子进程显式调用 `bootstrap = cc.adopt_owner_stdin()`，并在 `register()` 前设置 `cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(owner_missing_grace_seconds=3.0), owner_control=bootstrap)`。
 
 初始关系使用私有双向通道，由 Core 在 readiness 前 arm；Unix 为非阻塞 CLOEXEC socketpair，Windows 为当前登录 SID 的本地双向 byte-mode Named Pipe，bootstrap 转交子进程后才注册 reactor/IOCP。继承来源由可信 launcher 保证，不能将普通业务 stdin 或任意句柄升级为 owner 能力。启动后不能通过再次 attach bootstrap 绕过票据；终态后重新启动 OwnerBound 主机需要新的 Runtime 和 bootstrap，旧票据不能为新 server instance 续权。readiness 前的票据请求只能在原请求预算内等到端点就绪后发行。
 
@@ -72,7 +72,7 @@ Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己�
 
 ## 绑定与连接失败
 
-未发布源码中的 Python `CoreError` 提供 `io_operation`（`bind` 或 `connect`）、`io_kind`（`permission_denied`、`not_found`、`connection_refused`、`address_in_use`、`other`）及 `raw_os_error`（原始 errno/Win32 码，无系统码时为 `None`）。这些字段描述实际本地操作；配置、握手、合同及期限失败没有本地原因，三个字段均为 `None`。Windows PIPE_BUSY 等待沿用原连接预算，期限耗尽不冒充 OS 错误；C-Two listener lease 冲突可以是 `address_in_use` 且没有 Win32 码。
+C-Two 0.8.0 中的 Python `CoreError` 提供 `io_operation`（`bind` 或 `connect`）、`io_kind`（`permission_denied`、`not_found`、`connection_refused`、`address_in_use`、`other`）及 `raw_os_error`（原始 errno/Win32 码，无系统码时为 `None`）。这些字段描述实际本地操作；配置、握手、合同及期限失败没有本地原因，三个字段均为 `None`。Windows PIPE_BUSY 等待沿用原连接预算，期限耗尽不冒充 OS 错误；C-Two listener lease 冲突可以是 `address_in_use` 且没有 Win32 码。
 
 Rust Core 与 SDK 错误通过 `local_io_cause() -> Option<LocalIoCause>` 暴露原因，`operation()` 和 `error()` 分别提供操作及已有 `EndpointIoError`。原 readiness watch 传递 `ServerFailure { message, bind_error }`，替换 `ServerLifecycleState::Failed` 与 `LifecycleError::Server` 的字符串负载。低层穷尽匹配需要包含 `IpcError::Connect`、`ServerError::Bind` / `Failed`；Rust 调用者需要重新编译，没有旧负载或兼容入口。ABI 与协议版本不变。
 

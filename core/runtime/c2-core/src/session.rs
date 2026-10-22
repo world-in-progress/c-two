@@ -522,7 +522,8 @@ impl Runtime {
     }
 
     /// Prepare a single owner takeover in the Runtime's current endpoint context.
-    /// This neither starts a host nor freezes or changes the endpoint root.
+    /// This freezes the existing endpoint configuration without starting a host
+    /// or adopting a root from the ticket.
     pub fn prepare_owner_takeover(
         &self,
         ticket: crate::OwnerRecoveryTicket,
