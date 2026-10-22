@@ -91,3 +91,25 @@ IPC 样本波动明显，不能据此宣称吞吐优化或零开销。实现阶�
 2026-10-22 按追加要求补测 Windows 开发机。开发机没有 Rust 工具链，因此由[定向 CI 39630296353](https://github.com/Dsssyc/c-two/actions/runs/39630296353)构建实现 `b346e2b3` 对应的测试程序；CI 源 `8d5266aa` 仅额外包含验证工作流和文档。9 个受影响用例在 CI 通过后，同一 SHA256 的程序经 SSH 在 `Dsssyc-x86-PC`（Windows 11 Pro x64，build 26200）实际执行，9/9 通过、退出码全部为 0。全部测试进程已退出，任务临时目录及 40,242,410 文件字节已清理。首次 PowerShell 驱动未取得退出码，单项测试日志已通过；改用 System.Diagnostics.Process 完整采集后确认上述结果，未修改生产代码、测试断言或系统应用控制策略。
 
 本次本机 target 已清理 426,199,152 文件字节，Linux 容器及其编译目录已自动移除；保留源码、日志和收据。正常 gate/marker 保留，历史目录未作为测试或清理对象。本地分支、HEAD、标签未变，未发版。
+
+## 非 Hello 拒绝期限修复
+
+2026-10-22 按单独批准的最小范围，将 `OwnerSupervisor::candidate` 的非 Hello → Malformed 回复移入现有 setup future，仍在 expire/status 前执行，复用同一绝对 deadline 和 biased shutdown select；取消后由原 OwnerSession Drop 释放。没有增加定时器、状态或抽象，API、ABI、协议与身份、准入、错误及释放语义不变。两份会话重构继续暂缓。
+
+本批基线为 `00270c6a0d6138ccc02fd2ef94a63279bcbabf1c`，实现候选为 `3312a3d6a91a29caf783909dc67da4ef0e26fa14`。生产 `+9/-9`，净增 **0 行**；测试 `+81/-4`，净增 **77 行**。文档与证据 `+65/-0`，净增 65 行。新增原生流背压测试，在未修复生产基线上确实以 `rejection escaped the setup deadline` 失败，再在候选通过；已有协议集成测试增加首操作 GetRecoveryTicket 被 Malformed 拒绝后，原票据仍可接管的样本。背压是显式注入的前置条件，不把它描述为普通未读首回复已导致生产阻塞。
+
+| 环境 | owner 单测 | 生命周期 | relay 接入 | 完整 c2-http relay |
+| --- | ---: | ---: | ---: | ---: |
+| macOS arm64 | 22 | 38 | 7 | 416 |
+| Linux arm64 容器 | 22 | 38 | 7 | 416 |
+| Windows 11 x64 开发机 | 22 | 35 | 3 | 411 |
+| Windows 2022 CI | 22 | 35 | 3 | 411 |
+| Windows 2025 CI | 22 | 35 | 3 | 411 |
+
+所有门禁退出码为 0。relay 接入的 Unix 2 个、Windows 1 个 ignored 条目是由父测试显式执行的子进程夹具；其余计数差异来自既有 Unix 平台用例，本批没有新增跳过或放宽断言。macOS 在隔离副本替换两处默认命名空间字面量，两个改动源码文件与候选逐字相同；Linux 与 Windows 使用未替换的候选。[Windows CI](https://github.com/Dsssyc/c-two/actions/runs/39712853886) 的工作流快照为 `c8e485eb`，明确检出上述实现 SHA。首次 CI 工作流因 job env 不支持 runner 表达式而在编译前拒绝，修正步骤位置后运行；该临时工作流不进入本地交付改动。
+
+Windows 开发机首次构建被 Smart App Control 拦截，错误 4551，事件 3033/3077 指向 libc 构建程序；未执行到 C-Two 测试。用户关闭该设置后，核实状态为 Off，以相同源码归档重新构建并通过上述四组测试。没有改测试、编译依赖或生产实现来绕过拦截。
+
+macOS/Linux 本次 socket/lease 均为 0；Windows 既有原生关闭/重绑定断言通过，全部测试进程退出，任务临时文件为 0。已清理 macOS 构建及本次命名空间 530,482,948 字节、本地源码归档 6,422,233 字节、Windows 两次构建目录 941,381,892 字节；Linux 容器及 CI target 已清理，Windows 工具链保留。历史目录未作为检查或清理对象。
+
+新版 hey-my-buddy 独立审查 `55d59240-fdd4-4f4b-97fc-db5c5e089334` 对固定候选无阻塞发现，Host 核对空补丁后验收并回收只读工作树。原始日志哈希、逐平台结果与清理数据见[机器记录](evidence/2026-10-22-owner-setup-deadline.json)。本地 HEAD、分支和标签保持原值，未发版。
