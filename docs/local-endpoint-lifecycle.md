@@ -72,9 +72,11 @@ Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己�
 
 ## 绑定与连接失败
 
+从 0.8.1 起，启动期限通过 `CoreError.lifecycle_kind='startup_timeout'`、`startup_stage` 和 `timeout_seconds` 识别；本地 bind 失败的消息不再加错误的 `config error` 前缀，原 OS 字段保持。注册前可用 `cc.set_server(startup_timeout=...)` 设置等待预算；有限默认值、冻结与收尾边界见[启动期限说明](configuration.md#服务启动期限)。
+
 C-Two 0.8.0 中的 Python `CoreError` 提供 `io_operation`（`bind` 或 `connect`）、`io_kind`（`permission_denied`、`not_found`、`connection_refused`、`address_in_use`、`other`）及 `raw_os_error`（原始 errno/Win32 码，无系统码时为 `None`）。这些字段描述实际本地操作；配置、握手、合同及期限失败没有本地原因，三个字段均为 `None`。Windows PIPE_BUSY 等待沿用原连接预算，期限耗尽不冒充 OS 错误；C-Two listener lease 冲突可以是 `address_in_use` 且没有 Win32 码。
 
-Rust Core 与 SDK 错误通过 `local_io_cause() -> Option<LocalIoCause>` 暴露原因，`operation()` 和 `error()` 分别提供操作及已有 `EndpointIoError`。原 readiness watch 传递 `ServerFailure { message, bind_error }`，替换 `ServerLifecycleState::Failed` 与 `LifecycleError::Server` 的字符串负载。低层穷尽匹配需要包含 `IpcError::Connect`、`ServerError::Bind` / `Failed`；Rust 调用者需要重新编译，没有旧负载或兼容入口。ABI 与协议版本不变。
+Rust Core 与 SDK 错误通过 `local_io_cause() -> Option<LocalIoCause>` 暴露原因，`operation()` 和 `error()` 分别提供操作及已有 `EndpointIoError`。原 readiness watch 传递 `ServerFailure { message, bind_error, startup_timeout }`，替换 `ServerLifecycleState::Failed` 与 `LifecycleError::Server` 的字符串负载。低层穷尽匹配需要包含 `IpcError::Connect`、`ServerError::Bind` / `Failed` / `StartupTimeout`；Core 通过 `LifecycleError::StartupTimeout` 暴露启动期限。Rust 调用者需要重新编译，没有旧负载或兼容入口。ABI 与协议版本不变。
 
 目录上下文保留原始 OS kind/code，外层目录策略仍按原规则拒绝。可读消息、错误顺序、重试分类和期限含义保持原样。原因字段不能证明进程死亡，也不授予启动、回退或清理权限；控制者仍须遵循已有监听所有权与严格身份回收机制。端点维护 API 沿用现有 ErrorKind 文本格式。
 

@@ -17,9 +17,11 @@ import gc
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -330,6 +332,22 @@ def test_reap_requires_an_endpoint_credential() -> None:
 
 
 def test_reap_does_not_accept_a_decoded_credential_for_a_new_incarnation() -> None:
+    if IS_WINDOWS:
+        _assert_new_incarnation_preserved()
+        return
+    from tests.unit.test_endpoint_context import _run_isolated
+
+    # Incarnation checks need a private namespace: inspection intentionally
+    # returns WouldBlock if another test owns the shared coordinator gate.
+    with tempfile.TemporaryDirectory(prefix='c2-inc-', dir='/tmp') as root:
+        _run_isolated(f'''
+            import runpy
+            runpy.run_path({str(Path(__file__).resolve())!r})['_assert_new_incarnation_preserved']()
+        ''', C2_IPC_ROOT=root)
+        assert all(not p.is_socket() and not p.name.endswith('.lease') for p in Path(root).iterdir())
+
+
+def _assert_new_incarnation_preserved() -> None:
     # A decoded old credential must never authorize removal of a newer native
     # incarnation. The native gate compares the recorded incarnation with the
     # live record, so a stale document is a `stale-target` (or a platform
@@ -364,20 +382,20 @@ def test_reap_does_not_accept_a_decoded_credential_for_a_new_incarnation() -> No
         cc.register(ScopeProbe, ProbeResource(), name='scope-probe')
         address = cc.server_address()
         first = cc.inspect_endpoint(address)
-        assert first['status'] == 'present'
+        assert first['status'] == 'present', first
         old = cc.EndpointCredential.from_json(first['credential'].to_json())
         cc.shutdown()
         cc.set_server(server_id=server_id)
         cc.register(ScopeProbe, ProbeResource(), name='scope-probe')
         assert cc.server_address() == address
         second = cc.inspect_endpoint(address)
-        assert second['status'] == 'present'
+        assert second['status'] == 'present', second
         current = second['credential']
         assert current.to_json() != old.to_json()
         result = cc.reap_endpoint(address, old)
         assert result['status'] in {'busy', 'stale-target'}
         after = cc.inspect_endpoint(address)
-        assert after['status'] == 'present'
+        assert after['status'] == 'present', after
         assert after['credential'].to_json() == current.to_json()
     finally:
         cc.shutdown()

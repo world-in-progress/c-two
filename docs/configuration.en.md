@@ -35,6 +35,7 @@ cc.set_transport_policy(
 )
 cc.set_server(
     server_id='my-server',
+    startup_timeout=30.0,
     ipc_overrides={'max_payload_size': 64 * 1024 * 1024, 'pool_enabled': False},
 )
 cc.set_client(ipc_overrides={'pool_enabled': False})
@@ -45,6 +46,7 @@ Typed overrides are `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverr
 | Purpose | Code entry point | Environment | Default |
 | --- | --- | --- | --- |
 | Relay registration and discovery | `cc.set_relay_anchor(url)` | `C2_RELAY_ANCHOR_ADDRESS` | No relay |
+| Server startup wait | `cc.set_server(startup_timeout=...)` | — | 5 seconds |
 | SHM/inline threshold | `cc.set_transport_policy(shm_threshold=...)` | `C2_SHM_THRESHOLD` | 4 KiB |
 | Remote payload batch size | `cc.set_transport_policy(remote_payload_chunk_size=...)` | `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB |
 | Server frame limit | `set_server(ipc_overrides={'max_frame_size': ...})` | `C2_IPC_MAX_FRAME_SIZE` | 2 GiB |
@@ -53,6 +55,14 @@ Typed overrides are `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverr
 | Resource execution threads | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | Host parallelism, clamped to 4–64 |
 
 An explicit `address='ipc://...'` uses local IPC independently of relay discovery. The relay anchor handles registration and discovery; HTTP calls use the relay URL selected by resolution. Remote batch size controls C-Two payload batches, without specifying TCP packets or HTTP frames.
+
+## Server startup deadlines
+
+`cc.set_server(startup_timeout=seconds)` configures the Core startup wait before the first registration. The native `RuntimeSession` constructor and `set_server_options` accept the same keyword. Values must be finite, non-negative seconds representable by the native clock; zero expires immediately. Omitted/`None` selects the existing finite five-second default, not unlimited waiting. This default bounds unattended startup; it is not a performance guarantee for a busy runner. Applications should choose their deployment budget explicitly.
+
+Core owns and freezes server configuration on the first Host start attempt, including failure. The setting survives pre-use RuntimeSession replacement by `set_transport_policy`. A completed `cc.shutdown()` creates a fresh session that can be configured again. Rust resolution is explicit `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > five seconds. Readiness and its direct IPC ping share the wait budget; owner startup fencing uses the configured duration too. Configuration/contract validation precedes this wait, and cleanup after expiry retains its separate shutdown budget, so this is not a total wall-clock limit on `cc.register()`.
+
+Startup expiry raises native `CoreError` with `category='lifecycle'`, `lifecycle_kind='startup_timeout'`, `startup_stage` (`readiness`, `responsiveness` or `owner_control`) and `timeout_seconds`. Its `io_operation`, `io_kind` and `raw_os_error` are `None`. Local bind failures retain their original structured OS cause and no longer carry the misleading `config error` message prefix. These diagnostics do not authorize retry, takeover or endpoint cleanup.
 
 ## IPC memory, chunks and heartbeat
 

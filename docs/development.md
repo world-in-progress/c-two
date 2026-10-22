@@ -2,7 +2,7 @@
 
 For a shared macOS/Windows local entry with explicit dependency preparation, capability checks and retained test evidence, see the [local development test sidecar](local-development-testing.md). The existing CI and release gates remain separate.
 
-For source development, check out canonical main from [world-in-progress/c-two](https://github.com/world-in-progress/c-two). Use the matching c3 release's `rc-manifest.json` to identify release source; a development checkout is not a release artifact.
+For source development, check out canonical main from [world-in-progress/c-two](https://github.com/world-in-progress/c-two). The c3 release's `rc-manifest.json` identifies that CLI release's source; Python patch-release provenance is recorded with its release notes and can name a later source. A development checkout is not a release artifact.
 
 ```bash
 git clone https://github.com/world-in-progress/c-two.git

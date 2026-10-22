@@ -441,8 +441,8 @@ impl PyOwnedChild {
     /// Wait with a finite deadline. Timeout leaves the process and handle live.
     #[pyo3(signature = (timeout=30.0))]
     fn wait(&self, py: Python<'_>, timeout: f64) -> PyResult<i32> {
-        let timeout = crate::runtime_session_ffi::checked_shutdown_timeout(timeout)
-            .map_err(PyValueError::new_err)?;
+        let timeout =
+            crate::runtime_session_ffi::checked_timeout(timeout).map_err(PyValueError::new_err)?;
         if Instant::now().checked_add(timeout).is_none() {
             return Err(PyValueError::new_err(
                 "timeout exceeds the native wait deadline range",

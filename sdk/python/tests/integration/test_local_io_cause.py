@@ -34,7 +34,8 @@ class Resource:
 def diagnostic(error):
     return {key: getattr(error, key, None) for key in (
         'category', 'lifecycle_kind', 'transport_kind', 'transport_phase',
-        'fallback_eligible', 'io_kind', 'raw_os_error', 'io_operation', 'name', 'details',
+        'fallback_eligible', 'io_kind', 'raw_os_error', 'io_operation', 'name', 'details', 'message',
+        'startup_stage', 'timeout_seconds',
     )}
 '''
 
@@ -51,6 +52,7 @@ def _assert_io(report: dict, operation: str, kind: str, raw: int | None) -> None
     assert (error['io_kind'], error['raw_os_error'], error['io_operation']) == (
         kind, raw, operation,
     ), error
+    assert 'config error' not in error['message'], error
 
 
 @UNIX_ONLY

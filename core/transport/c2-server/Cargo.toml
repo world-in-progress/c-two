@@ -19,5 +19,8 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros",
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(unix)'.dev-dependencies]
 tempfile = "3"

@@ -369,6 +369,7 @@ def test_failed_session_replacement_preserves_previous_and_own_observations() ->
         server_id = None
         server_id_override = None
         server_ipc_overrides = None
+        startup_timeout = None
         client_ipc_overrides = None
         fail_next_construction = False
 

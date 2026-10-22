@@ -441,10 +441,19 @@ enum RelaySelection {
 pub struct HostOptions {
     relay: RelaySelection,
     relay_use_proxy: Option<bool>,
-    startup_timeout: Duration,
+    startup_timeout: Option<Duration>,
     shutdown_timeout: Duration,
     lifecycle: c2_config::ServerLifecyclePolicy,
     lifecycle_explicit: bool,
+    #[cfg(test)]
+    startup_gate: Option<Arc<StartupGateForTest>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct StartupGateForTest {
+    entered: std::sync::mpsc::SyncSender<Arc<Server>>,
+    proceed: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl Default for HostOptions {
@@ -452,10 +461,12 @@ impl Default for HostOptions {
         Self {
             relay: RelaySelection::Inherit,
             relay_use_proxy: None,
-            startup_timeout: Duration::from_secs(5),
+            startup_timeout: None,
             shutdown_timeout: Duration::from_secs(5),
             lifecycle: c2_config::ServerLifecyclePolicy::Persistent,
             lifecycle_explicit: false,
+            #[cfg(test)]
+            startup_gate: None,
         }
     }
 }
@@ -476,8 +487,11 @@ impl HostOptions {
         self
     }
 
+    /// Override this Host's startup wait budget. Otherwise inherit Runtime
+    /// configuration, falling back to a finite five-second default.
+    /// Native cleanup after expiry retains its separate shutdown budget.
     pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
-        self.startup_timeout = timeout;
+        self.startup_timeout = Some(timeout);
         self
     }
 
@@ -844,7 +858,7 @@ impl Runtime {
         } else {
             self.lifecycle_policy()
         };
-        self.freeze_lifecycle_policy(policy)?;
+        let startup_timeout = self.freeze_host_options(policy, options.startup_timeout)?;
         let options = options.with_lifecycle(policy);
         let identity = self.ensure_server()?;
         let config = self.server_ipc_config()?;
@@ -938,10 +952,17 @@ impl Runtime {
         // alive, and the thread always ends within bounded shutdown waits.
         let weak_inner = Arc::downgrade(&inner);
         let run_server = Arc::clone(&server);
-        let owner_startup_timeout = options.startup_timeout;
+        let owner_startup_timeout = startup_timeout;
+        #[cfg(test)]
+        let startup_gate = options.startup_gate.clone();
         let thread = std::thread::Builder::new()
             .name(format!("c2-host-{}", server.server_id()))
             .spawn(move || {
+                #[cfg(test)]
+                if let Some(gate) = startup_gate {
+                    let _ = gate.entered.send(Arc::clone(&run_server));
+                    let _ = gate.proceed.lock().recv();
+                }
                 let Some(mut receiver) = owner_receiver else {
                     // Persistent policy: the accept loop alone decides
                     // nothing about lifecycle; explicit shutdown does.
@@ -963,17 +984,26 @@ impl Runtime {
                         crate::owner_bound::OwnerArmOutcome::Alive(session) => session,
                         crate::owner_bound::OwnerArmOutcome::Closed => {
                             receiver.close();
-                            let _ = run_server.reject_start_attempt(
+                            let _ = run_server.reject_start_attempt(ServerFailure::new(
                                 "owner control capability was already closed before the host became ready"
                                     .to_string(),
-                            );
+                            ));
                             return ThreadOutcome::PreReadyRefused;
                         }
                         crate::owner_bound::OwnerArmOutcome::IoError(message) => {
                             receiver.close();
-                            let _ = run_server.reject_start_attempt(format!(
+                            let _ = run_server.reject_start_attempt(ServerFailure::new(format!(
                                 "owner control watcher failed before the host became ready: {message}"
-                            ));
+                            )));
+                            return ThreadOutcome::PreReadyRefused;
+                        }
+                        crate::owner_bound::OwnerArmOutcome::StartupTimeout => {
+                            receiver.close();
+                            let error = c2_server::ServerError::StartupTimeout(crate::ServerStartupTimeout {
+                                stage: crate::ServerStartupStage::OwnerControl,
+                                timeout: owner_startup_timeout,
+                            });
+                            let _ = run_server.reject_start_attempt((&error).into());
                             return ThreadOutcome::PreReadyRefused;
                         }
                     };
@@ -1010,9 +1040,7 @@ impl Runtime {
             .map_err(|error| LifecycleError::Server(ServerFailure::new(error.to_string())))?;
         *inner.thread.lock() = Some(thread);
         let wait_runtime = Runtime::server_runtime()?;
-        if let Err(error) =
-            wait_runtime.block_on(server.wait_until_responsive(options.startup_timeout))
-        {
+        if let Err(error) = wait_runtime.block_on(server.wait_until_responsive(startup_timeout)) {
             let _ = wait_runtime.block_on(server.shutdown_and_wait(options.shutdown_timeout));
             if let Some(thread) = inner.thread.lock().take() {
                 if thread.is_finished() {
@@ -1119,6 +1147,112 @@ fn protocol_violation(message: &str, cause: String, release_error: Option<String
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn unrepresentable_startup_timeout_does_not_freeze_configuration() {
+        let runtime = Runtime::new(crate::RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let result = runtime.host(HostOptions::default().with_startup_timeout(Duration::MAX));
+        assert!(matches!(
+            result,
+            Err(Error::Lifecycle(LifecycleError::Configuration(_)))
+        ));
+        assert!(runtime.server_id().is_none());
+        runtime
+            .set_server_options(
+                Some("still-configurable".into()),
+                None,
+                Some(Duration::from_secs(30)),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.server_startup_timeout(),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn host_startup_deadline_is_configurable_and_not_a_configuration_error() {
+        let mut observed_errors = Vec::new();
+        for (stored, configured, timeout) in [
+            (None, None, Duration::from_secs(5)),
+            (
+                Some(Duration::from_millis(20)),
+                None,
+                Duration::from_millis(20),
+            ),
+            (
+                Some(Duration::ZERO),
+                Some(Duration::from_secs(5)),
+                Duration::from_secs(5),
+            ),
+        ] {
+            let runtime = Runtime::new(crate::RuntimeOptions {
+                use_process_relay_anchor: false,
+                server_startup_timeout: stored,
+                ..Default::default()
+            })
+            .unwrap();
+            let (entered, observed) = std::sync::mpsc::sync_channel(1);
+            let (proceed, delayed) = std::sync::mpsc::channel();
+            let mut options = HostOptions::default().without_relay();
+            if let Some(timeout) = configured {
+                options = options.with_startup_timeout(timeout);
+            }
+            options.startup_gate = Some(Arc::new(StartupGateForTest {
+                entered,
+                proceed: Mutex::new(delayed),
+            }));
+            let started = Instant::now();
+            let host_runtime = runtime.clone();
+            let worker = std::thread::spawn(move || host_runtime.host(options));
+            let server = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(matches!(
+                runtime.set_server_options(None, None, Some(Duration::from_secs(30))),
+                Err(LifecycleError::ConfigFrozen)
+            ));
+            // Hold the actual host thread before bind until its caller expires.
+            // Dropping `proceed` also releases it if any assertion unwinds.
+            let wait_runtime = Runtime::server_runtime().unwrap();
+            wait_runtime.block_on(async {
+                tokio::time::timeout(
+                    timeout + Duration::from_secs(5),
+                    server.wait_for_shutdown_requested(),
+                )
+                .await
+                .unwrap();
+            });
+            let elapsed = started.elapsed();
+            proceed.send(()).unwrap();
+            let error = match worker.join().unwrap() {
+                Ok(host) => {
+                    host.shutdown();
+                    panic!("delayed startup unexpectedly succeeded");
+                }
+                Err(error) => error,
+            };
+            assert!(elapsed >= timeout);
+            assert!(!server.is_running());
+            eprintln!("configured={timeout:?}, elapsed={elapsed:?}, error={error}");
+            assert!(matches!(
+                runtime.set_server_options(None, None, None),
+                Err(LifecycleError::ConfigFrozen)
+            ));
+            observed_errors.push((error, timeout));
+        }
+        for (error, expected) in observed_errors {
+            assert!(
+                matches!(error, Error::Lifecycle(LifecycleError::StartupTimeout(crate::ServerStartupTimeout {
+                stage: crate::ServerStartupStage::Readiness,
+                timeout,
+            })) if timeout == expected),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn live_owner_watcher_does_not_keep_a_dropped_host_alive() {
@@ -1357,7 +1491,7 @@ mod lifecycle_tests {
         assert!(runtime.clear_server_identity().is_err());
         assert!(
             runtime
-                .set_server_options(Some("forbidden-new-identity".into()), None)
+                .set_server_options(Some("forbidden-new-identity".into()), None, None)
                 .is_err()
         );
         release_tx.send(()).unwrap();

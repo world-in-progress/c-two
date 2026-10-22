@@ -25,9 +25,10 @@ pub use c2_core::{
     LocalEndpointOptions, LocalIoCause, MemoryCellStats, MemoryScopeStats, ObservedPath,
     ObservedRoute, PathCounters, Registration, RouteConcurrency, RouteConcurrencyError,
     RouteConcurrencyGuard, RouteConcurrencySnapshot, Runtime, RuntimeIdentity, RuntimeMemoryStats,
-    RuntimeOptions, ServerFailure, ServiceConcurrencyMode, ServiceDefinition, SweepBatch,
-    SweepBudget, direct_ipc_endpoint, direct_ipc_endpoint_with_context, inspect_endpoint,
-    ping_direct_ipc, ping_direct_ipc_with_context, reap_endpoint, shutdown_direct_ipc,
+    RuntimeOptions, ServerFailure, ServerStartupStage, ServerStartupTimeout,
+    ServiceConcurrencyMode, ServiceDefinition, SweepBatch, SweepBudget, direct_ipc_endpoint,
+    direct_ipc_endpoint_with_context, inspect_endpoint, ping_direct_ipc,
+    ping_direct_ipc_with_context, reap_endpoint, shutdown_direct_ipc,
     shutdown_direct_ipc_with_context,
 };
 pub use error::Error;

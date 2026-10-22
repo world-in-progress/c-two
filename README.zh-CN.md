@@ -28,7 +28,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-**C-Two 0.8.0** 支持 Python 3.10+。普通 Python 调用无 Python 运行时依赖；FastDB 载荷使用可选扩展 `c-two[fastdb]`（`fastdb4py==0.2.3`）。本版增加闲置连接终态通知、显式所有者接管和结构化本地 OS 错误，并收敛原生所有权及响应处理。见[更新与迁移说明](docs/releases/0.8.0.md)。
+**C-Two 0.8.1** 支持 Python 3.10+。普通 Python 调用无 Python 运行时依赖；FastDB 载荷使用可选扩展 `c-two[fastdb]`（`fastdb4py==0.2.3`）。本次修复通过 `cc.set_server(startup_timeout=...)` 开放服务启动预算，并将启动期限与本地 I/O 失败从配置错误中区分出来。见[更新说明](docs/releases/0.8.1.md)。
 
 ## 特点
 
@@ -58,7 +58,7 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.
 
 Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
 
-C3 0.4.0 配套 C-Two 0.8.0。IPC 12、SHM 3 和 C/FFI ABI 5 保持，所有者控制使用独立的版本 1。所有者接口及低层 Rust API 有破坏性变更，不留兼容别名；所有者控制器与宿主应一起升级，Rust 消费者需重新编译。
+C3 0.4.0 可配合 C-Two 0.8.x 使用。IPC 12、SHM 3 和 C/FFI ABI 5 保持，所有者控制使用独立的版本 1。从 0.7.x 升级时请遵循 [0.8.0 迁移说明](docs/releases/0.8.0.md)，将所有者控制器与宿主一起升级，并重新编译 Rust 消费者。
 
 源码构建与测试见[开发指南](docs/development.md)。
 

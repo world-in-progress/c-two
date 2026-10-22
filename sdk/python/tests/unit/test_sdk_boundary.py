@@ -875,8 +875,8 @@ def test_python_native_server_start_wait_uses_core_responsive_fence():
         root / "core" / "transport" / "c2-server" / "src" / "server.rs"
     ).read_text(encoding="utf-8")
 
-    assert "wait_until_responsive(options.startup_timeout)" in core_host
-    assert "wait_until_ready(options.startup_timeout)" not in core_host
+    assert "wait_until_responsive(startup_timeout)" in core_host
+    assert "wait_until_ready(startup_timeout)" not in core_host
     assert "pub async fn wait_until_responsive(&self, timeout: Duration)" in core_server
 
 

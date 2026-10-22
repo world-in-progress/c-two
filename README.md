@@ -28,7 +28,7 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
 
-**C-Two 0.8.0** supports Python 3.10+. Ordinary Python calls have no Python runtime dependencies; FastDB payloads use the optional `c-two[fastdb]` extra (`fastdb4py==0.2.3`). This release adds idle connection observations, explicit owner recovery and structured local OS errors, and consolidates native ownership and response handling. See the [release and migration notes](docs/releases/0.8.0.md).
+**C-Two 0.8.1** supports Python 3.10+. Ordinary Python calls have no Python runtime dependencies; FastDB payloads use the optional `c-two[fastdb]` extra (`fastdb4py==0.2.3`). This patch exposes the server startup budget through `cc.set_server(startup_timeout=...)` and distinguishes startup expiry and local I/O failures from configuration errors. See the [release notes](docs/releases/0.8.1.md).
 
 ## Features
 
@@ -58,7 +58,7 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.
 
 On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
-C3 0.4.0 accompanies C-Two 0.8.0. IPC 12, SHM 3 and C/FFI ABI 5 remain unchanged; owner control has its own version 1. The owner API and low-level Rust APIs change without compatibility aliases. Upgrade cooperating owner controllers and hosts together and recompile Rust consumers.
+C3 0.4.0 works with C-Two 0.8.x. IPC 12, SHM 3 and C/FFI ABI 5 remain unchanged; owner control has its own version 1. When upgrading from 0.7.x, follow the [0.8.0 migration notes](docs/releases/0.8.0.md), upgrade cooperating owner controllers and hosts together, and recompile Rust consumers.
 
 For source builds and tests, see the [development guide](docs/development.md).
 

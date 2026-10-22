@@ -131,6 +131,7 @@ pub enum ServerError {
     Io(std::io::Error),
     Bind(std::io::Error),
     Failed(ServerFailure),
+    StartupTimeout(ServerStartupTimeout),
     Config(String),
     Protocol(String),
 }
@@ -139,7 +140,8 @@ impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) | Self::Bind(e) => write!(f, "IO error: {e}"),
-            Self::Failed(failure) => write!(f, "config error: {failure}"),
+            Self::Failed(failure) => failure.fmt(f),
+            Self::StartupTimeout(timeout) => timeout.fmt(f),
             Self::Config(msg) => write!(f, "config error: {msg}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
         }
@@ -151,16 +153,55 @@ impl std::error::Error for ServerError {
         match self {
             Self::Io(error) | Self::Bind(error) => Some(error),
             Self::Failed(failure) => Some(failure),
+            Self::StartupTimeout(timeout) => Some(timeout),
             _ => None,
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerStartupStage {
+    Readiness,
+    Responsiveness,
+    OwnerControl,
+}
+
+impl ServerStartupStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Readiness => "readiness",
+            Self::Responsiveness => "responsiveness",
+            Self::OwnerControl => "owner_control",
+        }
+    }
+}
+
+/// A local startup deadline, never a business-wire or OS I/O failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerStartupTimeout {
+    pub stage: ServerStartupStage,
+    pub timeout: Duration,
+}
+
+impl std::fmt::Display for ServerStartupTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "server startup timed out after {:.3}s during {}",
+            self.timeout.as_secs_f64(),
+            self.stage.as_str()
+        )
+    }
+}
+
+impl std::error::Error for ServerStartupTimeout {}
 
 /// One clonable failure shared by lifecycle waiters; no independent error slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerFailure {
     pub message: String,
     pub bind_error: Option<c2_local::EndpointIoError>,
+    pub startup_timeout: Option<ServerStartupTimeout>,
 }
 
 impl ServerFailure {
@@ -168,20 +209,27 @@ impl ServerFailure {
         Self {
             message,
             bind_error: None,
+            startup_timeout: None,
         }
     }
 }
 
 impl From<&ServerError> for ServerFailure {
     fn from(error: &ServerError) -> Self {
+        if let ServerError::Failed(failure) = error {
+            return failure.clone();
+        }
         let bind_error = match error {
             ServerError::Bind(source) => Some(source.into()),
-            ServerError::Failed(failure) => failure.bind_error,
             _ => None,
         };
         Self {
             message: error.to_string(),
             bind_error,
+            startup_timeout: match error {
+                ServerError::StartupTimeout(timeout) => Some(*timeout),
+                _ => None,
+            },
         }
     }
 }
@@ -1196,22 +1244,22 @@ impl Server {
         };
 
         tokio::time::timeout(timeout, wait).await.map_err(|_| {
-            ServerError::Config(format!(
-                "server did not become ready within {:.3}s",
-                timeout.as_secs_f64(),
-            ))
+            ServerError::StartupTimeout(ServerStartupTimeout {
+                stage: ServerStartupStage::Readiness,
+                timeout,
+            })
         })?
     }
 
     pub async fn wait_until_responsive(&self, timeout: Duration) -> Result<(), ServerError> {
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         self.wait_until_ready(timeout).await?;
         loop {
             if started.elapsed() >= timeout {
-                return Err(ServerError::Config(format!(
-                    "server became ready but did not answer direct IPC ping within {:.3}s",
-                    timeout.as_secs_f64(),
-                )));
+                return Err(ServerError::StartupTimeout(ServerStartupTimeout {
+                    stage: ServerStartupStage::Responsiveness,
+                    timeout,
+                }));
             }
             let remaining = timeout.saturating_sub(started.elapsed());
             let probe_timeout = remaining.min(Duration::from_millis(100));
@@ -1221,7 +1269,12 @@ impl Server {
             {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(
+                timeout
+                    .saturating_sub(started.elapsed())
+                    .min(Duration::from_millis(10)),
+            )
+            .await;
         }
     }
 
@@ -1651,12 +1704,12 @@ impl Server {
     /// must refuse to serve before readiness — for example an owner-bound
     /// host whose controller capability is already gone. It never touches a
     /// server that is running or already terminal.
-    pub fn reject_start_attempt(&self, message: String) -> Result<(), ServerError> {
+    pub fn reject_start_attempt(&self, failure: ServerFailure) -> Result<(), ServerError> {
         match self.lifecycle_state() {
             ServerLifecycleState::Starting | ServerLifecycleState::Stopping
                 if !self.run_entered.load(Ordering::Acquire) =>
             {
-                self.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new(message)));
+                self.set_lifecycle_state(ServerLifecycleState::Failed(failure));
                 Ok(())
             }
             state => Err(ServerError::Config(format!(
@@ -4549,10 +4602,43 @@ mod tests {
             .await
             .expect_err("server that was never started must time out");
 
-        assert!(err.to_string().contains("did not become ready"));
+        assert!(
+            matches!(err, ServerError::StartupTimeout(ServerStartupTimeout {
+            stage: ServerStartupStage::Readiness,
+            timeout,
+        }) if timeout == Duration::from_millis(1))
+        );
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Initialized);
         assert!(!server.is_ready());
         assert!(!server.is_running());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_ready_and_ping_share_the_startup_budget() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("ready_ping_budget"),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let publish = server.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(35)).await;
+            publish.set_lifecycle_state(ServerLifecycleState::Ready);
+        });
+        let started = tokio::time::Instant::now();
+        let timeout = Duration::from_millis(40);
+        let error = server.wait_until_responsive(timeout).await.unwrap_err();
+        assert!(
+            matches!(error, ServerError::StartupTimeout(ServerStartupTimeout {
+            stage: ServerStartupStage::Responsiveness,
+            timeout: budget,
+        }) if budget == timeout)
+        );
+        // Virtual time proves that publishing Ready does not restart the budget.
+        assert!(started.elapsed() >= timeout && started.elapsed() < Duration::from_millis(45));
+        server.finalize_runtime_stopped();
     }
 
     #[tokio::test]
@@ -5015,6 +5101,8 @@ mod tests {
             panic!("readiness waiters must retain the same bind failure");
         };
         assert_eq!(a, b);
+        assert!(!a.message.contains("config error"));
+        assert!(a.startup_timeout.is_none());
         let cause = a.bind_error.expect("actual bind cause");
         assert_eq!(cause.kind, std::io::ErrorKind::AddrInUse);
         assert_eq!(
