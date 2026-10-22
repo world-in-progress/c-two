@@ -40,7 +40,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 - **明确的载荷生命周期**：`cc.hold()` 保留响应租约，资源注册可选择借用输入；释放时先使 FastDB owner 和 checked view 失效，再释放传输存储。详见 [Python 载荷用法](docs/python-usage.md)。
 - **连接观察**：客户端和服务端无需在途调用即可获知物理 IPC 连接终态；原因只描述连接事实，不证明进程已经退出。
 - **资源生命周期管理**：资源采用 `Persistent` 或控制器持有的 `OwnerBound` 生命周期；原生 shutdown 排空工作，限定范围的端点维护清理已确认退出的端点。详见[生命周期指南](docs/local-endpoint-lifecycle.md)。
-- **统一 Rust core**：Python 与 Rust 共用路由、传输、内存、错误和生命周期机制。原生 c3 CLI 在 Linux、macOS、Windows x64 上提供 relay、契约工具和端点维护。
+- **统一 Rust core**：Python 与 Rust 共用路由、传输、内存、错误和生命周期机制。原生 c3 CLI 在 Linux、macOS、Windows x64 / ARM64 上提供 relay、契约工具和端点维护。
 
 ## 安装
 
@@ -56,7 +56,7 @@ Windows PowerShell 使用相同命令。Linux、macOS 的 c3 安装命令：
 curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.sh | sh -s -- --version 0.4.0
 ```
 
-Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
+Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
 
 C3 0.4.0 配套 C-Two 0.8.0。IPC 12、SHM 3 和 C/FFI ABI 5 保持，所有者控制使用独立的版本 1。所有者接口及低层 Rust API 有破坏性变更，不留兼容别名；所有者控制器与宿主应一起升级，Rust 消费者需重新编译。
 

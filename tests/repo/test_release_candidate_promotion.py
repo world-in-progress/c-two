@@ -63,14 +63,19 @@ FASTDB_VERSION = "0.2.3"
 FASTDB_CORE_VERSION = "0.2.3"
 FASTDB_SOURCE_REV = promote.SOURCE_VALIDATION_FASTDB_SHA
 CLI_TARGETS = promote.CLI_TARGETS
-WINDOWS_TARGET = promote.WINDOWS_TARGET
+WINDOWS_TARGET = "x86_64-pc-windows-msvc"
+WINDOWS_ARM64_TARGET = "aarch64-pc-windows-msvc"
+WINDOWS_TARGETS = (WINDOWS_TARGET, WINDOWS_ARM64_TARGET)
 PYTHONS = promote.EXPECTED_PYTHONS
+PYTHONS_BY_TARGET = {target: PYTHONS[1:] if target == WINDOWS_ARM64_TARGET else PYTHONS
+                     for target in CLI_TARGETS}
 PLATFORM_TAGS = {
     "x86_64-unknown-linux-gnu": "manylinux_2_17_x86_64.manylinux2014_x86_64",
     "aarch64-unknown-linux-gnu": "manylinux_2_17_aarch64.manylinux2014_aarch64",
     "aarch64-apple-darwin": "macosx_11_0_arm64",
     "x86_64-apple-darwin": "macosx_11_0_x86_64",
     "x86_64-pc-windows-msvc": "win_amd64",
+    "aarch64-pc-windows-msvc": "win_arm64",
 }
 # Targets whose FastDB dependency is built from the published sdist; the
 # other targets consume published wheels directly.
@@ -109,7 +114,7 @@ def _run(run_id: int, name: str, sha: str = SOURCE_SHA, **overrides: Any) -> dic
 
 
 def _cli_name(target: str) -> str:
-    return f"c3-{target}{'.exe' if target == WINDOWS_TARGET else ''}"
+    return f"c3-{target}{'.exe' if target in WINDOWS_TARGETS else ''}"
 
 
 def _wheel_name(target: str, python: str) -> str:
@@ -255,6 +260,8 @@ def _smoke_body(
         "held_view_invalidated": True,
     }
     relay = dict(check, pid=112, transport="relay", observed_mode="http")
+    windows_platform = "win-arm64" if any("win_arm64" in item["name"] for item in artifacts) else "win-amd64"
+    machine = 0xAA64 if windows_platform == "win-arm64" else 0x8664
     return {
         "schema": "c-two.installed-wheel-smoke.v1",
         "status": "passed",
@@ -269,6 +276,8 @@ def _smoke_body(
                     "temporary_directory_removed": True},
         "identity": {"administrator": administrator},
         "artifacts": artifacts,
+        "native_architecture": {"python_platform": windows_platform,
+                                "pe_machines": {item["name"]: machine for item in artifacts}},
         "installed_packages": [
             {"name": "c-two", "version": C_TWO_VERSION},
             {"name": "fastdb4py", "version": FASTDB_VERSION},
@@ -321,7 +330,7 @@ class CandidateBuilder:
             self.cli.append(entry)
             self.cli_by_name[entry["name"]] = entry
         for target in CLI_TARGETS:
-            for python in PYTHONS:
+            for python in PYTHONS_BY_TARGET[target]:
                 name = _wheel_name(target, python)
                 data = f"wheel-bytes-{target}-{python}".encode()
                 self.wheel_data[name] = data
@@ -356,7 +365,7 @@ class CandidateBuilder:
         for target in CLI_TARGETS:
             if target in SDIST_MODE_TARGETS:
                 continue
-            for python in PYTHONS:
+            for python in PYTHONS_BY_TARGET[target]:
                 if python == "3.12":
                     continue
                 name = _fastdb_wheel_name(target, python)
@@ -402,9 +411,9 @@ class CandidateBuilder:
                 decision = {**base, "mode": "wheel", "filename": retained["name"], "sha256": retained["sha256"]}
             self._record_receipt(f"fastdb-{target}.json", decision)
 
-        # 30 executed ABI rows: installed-wheel-smoke receipts bound to rows.
+        # 35 executed ABI rows: installed-wheel-smoke receipts bound to rows.
         for target in CLI_TARGETS:
-            for python in PYTHONS:
+            for python in PYTHONS_BY_TARGET[target]:
                 cli = self.cli_by_name[_cli_name(target)]
                 ctwo_name = self.wheel_by_row[f"{target}/{python}"]
                 ctwo_data = self.wheel_data[ctwo_name]
@@ -450,7 +459,7 @@ class CandidateBuilder:
                 receipt["fastdb"] = decision
                 self._record_receipt(f"abi-{target}-{python}.json", receipt)
 
-        # 5 lifecycle smokes on the cp312 wheel of each target (no decision
+        # 6 lifecycle smokes on the cp312 wheel of each target (no decision
         # binding: the plain smoke helper records only the consumed entries).
         for target in CLI_TARGETS:
             cli = self.cli_by_name[_cli_name(target)]
@@ -466,22 +475,22 @@ class CandidateBuilder:
             ]))
 
         # Windows standard-user lifecycle/cleanup, ordinary + wrapper.
-        windows_cli = self.cli_by_name[_cli_name(WINDOWS_TARGET)]
-        windows_ctwo = self.wheel_by_row[f"{WINDOWS_TARGET}/3.12"]
-        retained = self.retained_fastdb[WINDOWS_TARGET]
-        standard = _smoke_body(
-            administrator=False,
-            artifacts=[
-                {"name": retained["name"], "sha256": retained["sha256"],
-                 "bytes": retained["bytes"], "distribution": "fastdb4py",
-                 "version": FASTDB_VERSION},
-                _wheel_entry(windows_ctwo, self.wheel_data[windows_ctwo], "c-two", C_TWO_VERSION),
-                {"name": windows_cli["name"], "sha256": windows_cli["sha256"],
-                 "bytes": windows_cli["bytes"]},
-            ])
-        self._record_receipt("standard-user-x86_64-pc-windows-msvc.json", standard)
-        self._record_receipt(
-            "standard-user-x86_64-pc-windows-msvc.json.wrapper.json", {
+        for target in WINDOWS_TARGETS:
+            windows_cli = self.cli_by_name[_cli_name(target)]
+            windows_ctwo = self.wheel_by_row[f"{target}/3.12"]
+            retained = self.retained_fastdb[target]
+            standard = _smoke_body(
+                administrator=False,
+                artifacts=[
+                    {"name": retained["name"], "sha256": retained["sha256"],
+                     "bytes": retained["bytes"], "distribution": "fastdb4py",
+                     "version": FASTDB_VERSION},
+                    _wheel_entry(windows_ctwo, self.wheel_data[windows_ctwo], "c-two", C_TWO_VERSION),
+                    {"name": windows_cli["name"], "sha256": windows_cli["sha256"],
+                     "bytes": windows_cli["bytes"]},
+                ])
+            self._record_receipt(f"standard-user-{target}.json", standard)
+            self._record_receipt(f"standard-user-{target}.json.wrapper.json", {
                 "schema": "c-two.standard-user-wrapper.v1",
                 "status": "passed",
                 "errors": [],
@@ -688,6 +697,8 @@ def _build_source_members(label: str) -> tuple[dict[str, bytes], str]:
     c3_name = "c3.exe" if target_platform == "windows" else "c3"
     platform_tag = {"linux": "linux_x86_64", "macos": "macosx_11_0_arm64",
                     "windows": "win_amd64"}[target_platform]
+    if label == "windows-11-arm":
+        platform_tag = "win_arm64"
     fastdb_name = f"fastdb4py-{FASTDB_VERSION}-cp312-cp312-{platform_tag}.whl"
     ctwo_name = f"c_two-0.6.0-cp312-cp312-{platform_tag}.whl"
     members: dict[str, bytes] = {
@@ -707,6 +718,9 @@ def _build_source_members(label: str) -> tuple[dict[str, bytes], str]:
                            artifacts=artifacts)
     members[promote.MATRIX_RECEIPT_NAME] = _source_receipt_bytes(_matrix_receipt(c3_sha=_sha(source_c3)))
     members[promote.TYPESCRIPT_RECEIPT_NAME] = _source_receipt_bytes(_typescript_receipt(c3_sha=_sha(source_c3)))
+    if label == "windows-11-arm":
+        _mutate_source_json(members, promote.TYPESCRIPT_RECEIPT_NAME,
+                            lambda receipt: receipt["runtime"].update(arch="arm64"))
     members[promote.SOURCE_WHEEL_RECEIPT] = _source_receipt_bytes(ordinary)
     members[promote.PYTHON_RUN_RECEIPT_NAME] = _source_receipt_bytes({
         "schema": "c-two.python-test-run.v1", "status": "passed", "workers": 2,
@@ -736,7 +750,9 @@ def _build_source_members(label: str) -> tuple[dict[str, bytes], str]:
             "fastdb": {"expected_sha": promote.SOURCE_VALIDATION_FASTDB_SHA,
                        "actual_sha": promote.SOURCE_VALIDATION_FASTDB_SHA, "verified": True},
         },
-        "runner": {"requested_label": label, "os": target_platform, "machine": "test-arch"},
+        "runner": {"requested_label": label, "os": target_platform, "machine": "test-arch",
+                   "python_platform": "win-arm64" if label == "windows-11-arm" else "test-platform"},
+        "toolchains": {"rustc": {"exit_code": 0, "output": "host: aarch64-pc-windows-msvc"}},
         "artifacts": [{"path": name, "sha256": _sha(data), "bytes": len(data)}
                       for name, data in members.items()],
     }
@@ -861,9 +877,9 @@ def _default_world() -> World:
 
 def _published_release_inventory(tag_sha: str) -> dict[str, Any]:
     """A realistic published rc-manifest.json plus the exact API asset
-    metadata (size, sha256 digest) its bytes bind: the five CLI executables,
+    metadata (size, sha256 digest) its bytes bind: the six CLI executables,
     the canonical installers, the FastDB license evidence from fastdb_proof,
-    the five canonical sidecars, and the manifest itself."""
+    the six canonical sidecars, and the manifest itself."""
     cli = []
     for target in CLI_TARGETS:
         name = _cli_name(target)
@@ -960,7 +976,7 @@ def _published_pypi_world() -> World:
     urls = [
         {"filename": _wheel_name(target, python), "digests": {"sha256": _digest("e")}}
         for target in CLI_TARGETS
-        for python in PYTHONS
+        for python in PYTHONS_BY_TARGET[target]
     ]
     urls.append({"filename": f"c_two-{C_TWO_VERSION}.tar.gz",
                  "digests": {"sha256": _digest("e")}})
@@ -1245,8 +1261,8 @@ def test_promotion_binds_the_context_named_source_validation_run(
     assert code == 0
     plan = json.loads(plan_path.read_text())
     lanes = plan["source_validation"]
-    assert set(lanes) == set(promote.SOURCE_VALIDATION_LANES)
-    # All four platform lanes share the single bound run, fetched by identity.
+    assert set(lanes) == {"ubuntu-24.04", "macos-15", "windows-2022", "windows-2025", "windows-11-arm"}
+    # All five platform lanes share the single bound run, fetched by identity.
     assert {entry["run_id"] for entry in lanes.values()} == {201}
     assert f"/repos/{REPOSITORY}/actions/runs/201" in api.paths
     assert not any("/actions/workflows/" in path for path in api.paths)
@@ -1604,7 +1620,8 @@ def test_happy_path_github_release_plan(tmp_path: Path, environment) -> None:
     body = body_path.read_text()
     assert "actions/runs/101" in body
     assert "Source Validation bound run:" in body and "actions/runs/201" in body
-    assert "Windows 11 desktop is not verified" in body
+    assert "Windows 11 ARM64 CI runners" in body
+    assert "35 executed Python ABI rows" in body
     assert "debug c3 build" in body
     assert api.paths
     assert all(path.startswith("/repos/") for path in api.paths)
@@ -1650,10 +1667,14 @@ def test_free_threaded_wheel_rows_use_real_tag_pairs(tmp_path: Path, environment
     assert not plan.exists()
 
 
-def test_wheel_rows_must_cover_five_platforms_six_abies(tmp_path: Path, environment) -> None:
+def test_wheel_rows_must_cover_the_exact_35_row_matrix(tmp_path: Path, environment) -> None:
     builder = CandidateBuilder()
+    assert set(CLI_TARGETS) == {
+        "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin",
+        "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"}
+    assert len(builder.wheels) == 35 and len(builder.fastdb_proof) == 9
     # Swap the macOS arm64 3.14 row for a second linux x86_64 3.14 wheel:
-    # still 30 unique filenames, but one platform/ABI row is left uncovered.
+    # still 35 unique filenames, but one platform/ABI row is left uncovered.
     victim = builder.wheel_by_row["aarch64-apple-darwin/3.14"]
     builder.drop_member(victim)
     duplicate = (f"c_two-{C_TWO_VERSION}-cp314-cp314-"
@@ -1667,6 +1688,55 @@ def test_wheel_rows_must_cover_five_platforms_six_abies(tmp_path: Path, environm
     environment(world)
     code, plan, _ = run_prepare(tmp_path)
     assert code == 1
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing-cli", "missing-wheel", "wrong-platform", "python-3.10", "missing-fastdb-proof",
+    "wrong-fastdb-platform", "wrong-fastdb-abi", "missing-fastdb-receipt", "renamed-fastdb-receipt",
+    "missing-smoke", "missing-standard-user", "missing-wrapper", "missing-abi",
+])
+def test_windows_arm64_inventory_deviations_fail_closed(tmp_path, environment, capsys, mutation):
+    builder = CandidateBuilder()
+    target = WINDOWS_ARM64_TARGET
+    wheel = builder.wheel_by_row[f"{target}/3.11"]
+    missing = {
+        "missing-cli": _cli_name(target), "missing-wheel": wheel,
+        "missing-fastdb-proof": _fastdb_wheel_name(target, "3.12"),
+        "missing-fastdb-receipt": f"fastdb-{target}.json",
+        "missing-smoke": f"smoke-{target}.json", "missing-standard-user": f"standard-user-{target}.json",
+        "missing-wrapper": f"standard-user-{target}.json.wrapper.json", "missing-abi": f"abi-{target}-3.11.json",
+    }
+    if mutation in missing:
+        builder.drop_member(missing[mutation])
+    elif mutation == "renamed-fastdb-receipt":
+        name = f"fastdb-{target}.json"
+        decision = json.loads(builder.members[name])
+        builder.drop_member(name)
+        builder._record_receipt("fastdb-unrelated-target.json", decision)
+    elif mutation.startswith("wrong-fastdb-"):
+        builder.drop_member(_fastdb_wheel_name(target, "3.12"))
+        replacement = (_fastdb_wheel_name(WINDOWS_TARGET, "3.12").replace("-cp312", "-1-cp312", 1)
+                       if mutation == "wrong-fastdb-platform" else _fastdb_wheel_name(target, "3.11"))
+        builder.fastdb_proof.append(builder._put(replacement, b"incorrect FastDB proof row"))
+    else:
+        # Keep 35 unique, hash-bound wheel filenames so the exact matrix,
+        # rather than a count or sidecar check, must reject the replacement.
+        builder.drop_member(wheel)
+        replacement = (wheel.replace("-cp311-cp311-win_arm64", "-1-cp311-cp311-win_amd64")
+                       if mutation == "wrong-platform" else wheel.replace("cp311", "cp310"))
+        builder.wheels.append(builder._put(replacement, b"incorrect ARM64 row"))
+    world = World(candidate=builder)
+    world.set_source_runs(_run(201, "Source Validation"))
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    error = capsys.readouterr().err
+    if mutation == "wrong-platform":
+        assert "duplicate wheel row" in error
+    elif mutation == "python-3.10":
+        assert "outside the expected platform/ABI matrix" in error
+    elif mutation.startswith("wrong-fastdb-"):
+        assert "FastDB proof wheel" in error
 
 
 # ── Inventory and manifest deviations ────────────────────────────────────────
@@ -1712,7 +1782,7 @@ def test_inventory_and_manifest_deviations_fail_closed(
     elif mutation == "manifest-digest-lies":
         manifest["wheels"][3]["sha256"] = _digest("0")
     elif mutation == "receipt-counts-tampered":
-        manifest["counts"]["receipts_by_prefix"]["abi-"] = 29
+        manifest["counts"]["receipts_by_prefix"]["abi-"] = 34
     elif mutation == "foreign-member":
         builder.members["rogue-file.txt"] = b"unreviewed"
     elif mutation == "pr-candidate-context":
@@ -1787,6 +1857,12 @@ def _mutated_receipt_world(receipt_name: str, mutate) -> World:
          lambda p: p["identity"].update(administrator=True)),
         ("standard-user-x86_64-pc-windows-msvc.json.wrapper.json",
          lambda p: p["cleanup"].update(account_removed=False)),
+        ("standard-user-aarch64-pc-windows-msvc.json",
+         lambda p: p["identity"].update(administrator=True)),
+        ("standard-user-aarch64-pc-windows-msvc.json.wrapper.json",
+         lambda p: p["cleanup"].update(account_removed=False)),
+        ("abi-aarch64-pc-windows-msvc-3.11.json",
+         lambda p: p["row"].update(python="3.10")),
         ("abi-x86_64-pc-windows-msvc-3.10.json", lambda p: p.pop("base_install")),
         ("smoke-aarch64-apple-darwin.json", lambda p: p["base_install"].update(optional_modules_loaded=True)),
         ("smoke-x86_64-unknown-linux-gnu.json", lambda p: p["base_install"].update(optional_dependencies_present=True)),
@@ -1910,6 +1986,47 @@ def test_missing_2025_source_artifact_fails_closed(tmp_path: Path, environment) 
     environment(world)
     code, plan, _ = run_prepare(tmp_path)
     assert code == 1
+
+
+def test_missing_arm64_source_artifact_cannot_use_another_run(tmp_path, environment, capsys):
+    world = World()
+    world.set_source_runs(_run(201, "Source Validation"), _run(202, "Source Validation"))
+    name = f"source-windows-11-arm-py3.12-full-{SOURCE_SHA}"
+    world.artifacts_by_run[201] = [entry for entry in world.artifacts_by_run[201]
+                                   if entry["name"] != name]
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    assert name in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("wrong", ["python", "rust", "node", "pe", "missing-pe"])
+def test_arm64_source_rejects_emulated_or_unproven_consumers(tmp_path, environment, wrong):
+    world = _default_world()
+
+    def change(members):
+        if wrong in {"python", "rust"}:
+            def evidence(body):
+                if wrong == "python":
+                    body["runner"]["python_platform"] = "win-amd64"
+                else:
+                    body["toolchains"]["rustc"]["output"] = "host: x86_64-pc-windows-msvc"
+            _mutate_source_json(members, "run-evidence.json", evidence)
+        elif wrong == "node":
+            _mutate_source_json(members, promote.TYPESCRIPT_RECEIPT_NAME,
+                                lambda body: body["runtime"].update(arch="x64"))
+        else:
+            def consumer(body):
+                if wrong == "missing-pe":
+                    body.pop("native_architecture")
+                else:
+                    body["native_architecture"]["pe_machines"]["c3.exe"] = 0x8664
+            _mutate_source_json(members, promote.SOURCE_WHEEL_RECEIPT, consumer)
+
+    world.mutate_source_artifacts(change, label="windows-11-arm")
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
 
 
 def test_source_fastdb_pin_drift_fails_closed(
@@ -2073,7 +2190,7 @@ def test_source_wheel_identity_cleanup_and_c3_binding(tmp_path, environment, cap
     assert label in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("label", ["windows-2022", "windows-2025"])
+@pytest.mark.parametrize("label", ["windows-2022", "windows-2025", "windows-11-arm"])
 @pytest.mark.parametrize("mutate", ["identity", "processes", "directory", "borrowed", "held", "c3",
                                      "wrapper-failed", "wrapper-errors", "wrapper-processes",
                                      "wrapper-workspace", "wrapper-account"])
@@ -2247,7 +2364,7 @@ def test_pypi_idempotency_is_byte_exact_and_stages_only_missing(
     code, plan, _ = run_prepare(tmp_path, target="pypi")
     assert code == 0
     files = json.loads(plan.read_text())["pypi"]["files"]
-    assert len(files) == 31
+    assert len(files) == 36
     assert all(entry["name"].startswith("c_two-0.6.0") for entry in files)
     staged_dir = tmp_path / "candidate-download/staging/dist"
     assert sorted(path.name for path in staged_dir.iterdir()) == \
@@ -2357,7 +2474,7 @@ def test_remote_classifiers_fail_closed_on_published_versions(
          "staged_path": f"staging/dist/{_wheel_name(target, python)}",
          "sha256": _digest("8"), "bytes": 1}
         for target in CLI_TARGETS
-        for python in PYTHONS
+        for python in PYTHONS_BY_TARGET[target]
     ]
     files.append({"name": f"c_two-{C_TWO_VERSION}.tar.gz",
                   "staged_path": f"staging/dist/c_two-{C_TWO_VERSION}.tar.gz",

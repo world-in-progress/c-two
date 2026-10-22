@@ -33,12 +33,14 @@ if (-not $BinDir) { $BinDir = if ($env:C3_INSTALL_DIR) { $env:C3_INSTALL_DIR } e
 function Get-DetectedTarget {
     $os = if ($env:C3_INSTALLER_OS) { $env:C3_INSTALLER_OS.ToLowerInvariant() } else { "windows" }
     $arch = if ($env:C3_INSTALLER_ARCH) { $env:C3_INSTALLER_ARCH.ToLowerInvariant() } else {
-        [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
+        [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
     }
     switch ($arch) {
         "x64" { $arch = "x86_64" }
         "amd64" { $arch = "x86_64" }
         "x86_64" { $arch = "x86_64" }
+        "arm64" { $arch = "aarch64" }
+        "aarch64" { $arch = "aarch64" }
         default { Fail "unsupported CPU architecture: $arch" }
     }
     switch ($os) {

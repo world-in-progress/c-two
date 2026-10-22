@@ -136,17 +136,17 @@ runs:
           -CTwoWheel (Get-Item -LiteralPath $env:CTWO_WHEEL).FullName `
           -C3 (Get-Item -LiteralPath $env:C3_PATH).FullName `
           -SourceSha $env:SOURCE_SHA `
-          -Receipt "$PWD/standard-user-x86_64-pc-windows-msvc.json"
+          -Receipt "$PWD/standard-user-${{ inputs.target }}.json"
         if ($LASTEXITCODE -ne 0) { exit 1 }
-        $wrapper = Get-Content standard-user-x86_64-pc-windows-msvc.json.wrapper.json -Raw | ConvertFrom-Json
+        $wrapper = Get-Content standard-user-${{ inputs.target }}.json.wrapper.json -Raw | ConvertFrom-Json
         if ($wrapper.status -ne 'passed') { throw "standard-user wrapper status: $($wrapper.status)" }
-        python .github/scripts/release_candidate.py checksum standard-user-x86_64-pc-windows-msvc.json standard-user-x86_64-pc-windows-msvc.json.wrapper.json
+        python .github/scripts/release_candidate.py checksum standard-user-${{ inputs.target }}.json standard-user-${{ inputs.target }}.json.wrapper.json
         if ($LASTEXITCODE -ne 0) { exit 1 }
 
     - uses: actions/upload-artifact@v4
       if: runner.os == 'Windows'
       with:
-        name: rc-standard-user-windows
+        name: rc-standard-user-${{ inputs.target }}
         path: |
           standard-user-*.json
           standard-user-*.json.sha256

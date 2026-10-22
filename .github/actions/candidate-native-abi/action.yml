@@ -24,6 +24,7 @@ runs:
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: ${{ inputs.python }}
+        architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
     - name: Record the row interpreter
       shell: bash
       run: |
@@ -32,9 +33,12 @@ runs:
         RC_PYTHON_EXE="$(python -c 'import sys; print(sys.executable)')"
         export RC_PYTHON_EXE
         echo "path=$RC_PYTHON_EXE" >> "$GITHUB_OUTPUT"
-        python -c 'import platform, sys
+        python -c 'import os, platform, sys
+        sys.path.insert(0, ".github/scripts")
+        from release_candidate import wheel_platform_matches_target
         from packaging.tags import sys_tags
         first = next(iter(sys_tags()))
+        assert wheel_platform_matches_target(first.platform, os.environ["RC_TARGET"]), first
         print(f"row interpreter {first.interpreter}-{first.abi} ({platform.python_version()})")'
       env:
         RC_TARGET: ${{ inputs.target }}

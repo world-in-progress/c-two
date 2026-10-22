@@ -32,6 +32,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- Windows ARM64 release wheels for Python 3.11–3.14 and 3.14t, plus the
+  native `c3-aarch64-pc-windows-msvc.exe`. Source and package gates run on
+  `windows-11-arm`, including cross-language calls and standard-user cleanup.
+  The PowerShell installer selects the OS architecture even under emulation.
 - Rust and Python expose read-only physical IPC connection observations and
   bounded server connection events on Unix sockets and Windows Named Pipes.
   Idle peers are observed by the existing receive loop; waiting requires no

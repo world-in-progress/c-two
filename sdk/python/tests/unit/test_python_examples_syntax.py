@@ -63,7 +63,7 @@ def _python310() -> str | None:
         return None
 
     result = subprocess.run(
-        [uv, "python", "find", "3.10"],
+        [uv, "python", "find", "3.10-windows-x86_64-none" if os.name == "nt" else "3.10"],
         capture_output=True,
         text=True,
         timeout=10,

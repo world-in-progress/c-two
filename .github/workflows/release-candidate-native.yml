@@ -59,9 +59,16 @@ jobs:
           ref: ${{ inputs.source-sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ runner.os == 'Windows' && runner.arch == 'ARM64' && 'stable-aarch64-pc-windows-msvc' || 'stable' }}
           targets: ${{ inputs.target }}
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Use the selected MSVC architecture for native dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
       - uses: ./.github/actions/setup-cpp-cache
         if: runner.os == 'macOS'
       - uses: Swatinem/rust-cache@v2

@@ -316,6 +316,8 @@ def _python_abi_pair(python: str) -> tuple[str, str]:
 def wheel_platform_matches_target(platform: str, target: str) -> bool:
     if target == "x86_64-pc-windows-msvc":
         return platform == "win_amd64"
+    if target == "aarch64-pc-windows-msvc":
+        return platform == "win_arm64"
     architectures = {
         "x86_64-unknown-linux-gnu": ("linux", "x86_64"),
         "aarch64-unknown-linux-gnu": ("linux", "aarch64"),
@@ -329,6 +331,11 @@ def wheel_platform_matches_target(platform: str, target: str) -> bool:
     prefix_ok = (platform.startswith(("linux_", "manylinux"))
                  if system == "linux" else platform.startswith("macosx_"))
     return prefix_ok and platform.endswith("_" + architecture)
+
+
+def target_supports_python(target: str, python: str) -> bool:
+    # Windows ARM64 CPython distributions start at 3.11.
+    return (target, python) != ("aarch64-pc-windows-msvc", "3.10")
 
 
 def _validate_fastdb_decisions(problems: list[str], decisions: list[tuple[str, dict]],
@@ -433,7 +440,8 @@ def _validate_candidate_bindings(options: argparse.Namespace, problems: list[str
         for entry in cli:
             stem = entry["name"][:-len(".exe")] if entry["name"].endswith(".exe") else entry["name"]
             targets.add(stem[len("c3-"):])
-        expected = {(target, python) for target in targets for python in options.expect_abi_python}
+        expected = {(target, python) for target in targets for python in options.expect_abi_python
+                    if target_supports_python(target, python)}
         for key in sorted(expected - set(rows)):
             problems.append(f"missing ABI row {key[0]}/{key[1]}")
         for key in sorted(set(rows) - expected):
@@ -721,7 +729,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest.add_argument("--expect-json-prefix", action="append", default=[],
                           help="Receipt name prefix that every JSON receipt must match")
     manifest.add_argument("--expect-json-count", action="append", default=[],
-                          help="prefix=count exact receipt count, such as smoke-=5")
+                          help="prefix=count exact receipt count, such as smoke-=6")
     manifest.set_defaults(handler=command_manifest)
 
     options = parser.parse_args(argv)
