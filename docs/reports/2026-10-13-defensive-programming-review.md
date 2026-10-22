@@ -3,7 +3,7 @@
 审查日期：2026-10-13。固定输入：`2ffe356f15d8ce1c8fad9e08a91ffff808d34dad`，本轮开始时本地 `main` 与远端 `upstream/main` 一致，工作树干净。本文记录审查结果和建议，不代表这些问题已经修复。
 
 
-当前状态同步于 2026-10-21：纯瘦身已按用户要求收束，R01 [精确分配释放身份](../plans/2026-10-16-r01-allocation-release-evaluation.md)、R02 [唯一写所有权](2026-10-21-r02-unique-write-ownership-acceptance.md)及 R03 shutdown 发送阶段均已实施并完成验收；R04 仍待处理，R06/R07 未混入 R02。当前剩余范围及暂缓理由以[批次记录顶部](../plans/2026-10-13-local-slimming-batches.md)为准，2026-10-14 的阶段净量另见[历史收束记录](../plans/2026-10-13-local-slimming-batches.md#closeout)。以下原审查正文、源码链接及复现限制仍绑定 `2ffe356f`，不代表当前实现状态；部分完成条目不视为整项完成。
+当前状态同步于 2026-10-22：纯瘦身已按用户要求收束，R01 [精确分配释放身份](../plans/2026-10-16-r01-allocation-release-evaluation.md)、R02 [唯一写所有权](2026-10-21-r02-unique-write-ownership-acceptance.md)、R03 shutdown 发送阶段及 R04 [准入竞态修复](2026-10-21-admission-race-repair.md)均已实施并完成各自验收；R06/R07 未混入 R02。当前剩余范围及暂缓理由以[批次记录顶部](../plans/2026-10-13-local-slimming-batches.md)为准，2026-10-14 的阶段净量另见[历史收束记录](../plans/2026-10-13-local-slimming-batches.md#closeout)。以下原审查正文、源码链接及复现限制仍绑定 `2ffe356f`，不代表当前实现状态；部分完成条目不视为整项完成。
 二轮复核已完成，删除边界以[历史动机与回归复核](2026-10-13-defensive-programming-regression-reassessment.md)为准。R26 relay journal 已撤回直接删除建议；R34 的预留协议/公开观察面、R39 的 chunk 接纳，以及 T02/T06/T07 的部分测试删除建议已修正。以下不是可整批机械删除的清单。
 
 目前最值得改造的是分配所有权、路由开放状态和一次接纳后的内部表示。部分代码多次检查长度、名字或布尔状态，却没有建立真正需要的身份与所有权不变量；另一部分代码的防御分支只因旧测试桩、旧接口或重复状态而存在。建议把合法状态收敛到类型和拥有型对象中，再删除失去用途的检查与测试。
