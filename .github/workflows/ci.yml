@@ -197,15 +197,17 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $prefix = Join-Path $env:RUNNER_TEMP 'arrow-native'
           $build = Join-Path $env:RUNNER_TEMP 'arrow-build'
+          # Match Arrow's MSVC ARM64 CI: xsimd lacks MSVC ARM64 intrinsics.
           cmake -S ../arrow/cpp -B $build --preset ninja-release-python-minimal `
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DARROW_DEPENDENCY_SOURCE=BUNDLED -DARROW_BUILD_STATIC=OFF
+            -DARROW_DEPENDENCY_SOURCE=BUNDLED -DARROW_BUILD_STATIC=OFF -DARROW_SIMD_LEVEL=NONE
           if ($LASTEXITCODE -ne 0) { throw 'Arrow configure failed' }
           cmake --build $build --target install --parallel 2
           if ($LASTEXITCODE -ne 0) { throw 'Arrow build failed' }
           "CMAKE_PREFIX_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "PYARROW_BUNDLE_ARROW_CPP=ON" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SKBUILD_CMAKE_ARGS=-DARROW_SIMD_LEVEL=NONE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Remove-Item -LiteralPath $build -Recurse -Force
       - name: Cache the pinned Emscripten SDK
         id: emsdk_cache
