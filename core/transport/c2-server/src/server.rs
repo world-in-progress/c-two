@@ -9649,6 +9649,13 @@ mod tests {
                 budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
                 1024
             );
+            if rollback {
+                // Registry detachment precedes the lock-free permit drop.
+                // Wait for that drop while backing release remains blocked.
+                tokio::time::timeout(Duration::from_secs(5), scheduler.wait_drained_async())
+                    .await
+                    .expect("rollback releases its permit before the backing");
+            }
             match scheduler.try_acquire(0) {
                 Ok(guard) if rollback => drop(guard),
                 Err(SchedulerAcquireError::Capacity {

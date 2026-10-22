@@ -9,6 +9,8 @@ controller/service process behaviour lives in
 from __future__ import annotations
 
 import time
+import tempfile
+from contextlib import ExitStack
 import pickle
 import sys
 
@@ -371,85 +373,92 @@ def test_failed_spawn_consumes_the_transferred_receiver():
 
 
 def test_takeover_tickets_and_real_thread_guard_survive_pause_resume(monkeypatch):
-    from c_two.error import ResourceUnavailable
+    with ExitStack() as scope:
+        if sys.platform != 'win32':
+            # This test expects a server refusal, so unrelated xdist workers
+            # must not contend for its nonblocking namespace identity gate.
+            root = scope.enter_context(tempfile.TemporaryDirectory(prefix='c2-owner-', dir='/tmp'))
+            cc.set_local_endpoint(root=root)
+            scope.callback(cc.set_local_endpoint)
+        from c_two.error import ResourceUnavailable
 
-    @cc.crm(namespace='test.owner.takeover', version='1.0.0')
-    class Echo:
-        def echo(self, value: int) -> int: ...
+        @cc.crm(namespace='test.owner.takeover', version='1.0.0')
+        class Echo:
+            def echo(self, value: int) -> int: ...
 
-    class Resource:
-        calls = 0
+        class Resource:
+            calls = 0
 
-        def echo(self, value):
-            self.calls += 1
-            return value
+            def echo(self, value):
+                self.calls += 1
+                return value
 
-    owner, bootstrap = cc.owner_control_pair()
-    successor = None
-    proxy = None
-    address = None
-    old_guard = None
-    try:
-        cc.set_server(lifecycle=LifecycleConfig.owner_bound(10), owner_control=bootstrap)
-        resource = Resource()
-        cc.register(Echo, resource, name='takeover-echo')
-        address = cc.server_address()
-        proxy = cc.connect(Echo, name='takeover-echo')
-        scheduler = proxy.client._scheduler
-        assert not scheduler.is_unconstrained
-        first = owner.recovery_ticket(timeout=3)
-        assert owner.recovery_ticket(timeout=3).export() == first.export()
-        for opaque in (owner, bootstrap, first):
-            with pytest.raises(TypeError):
-                pickle.dumps(opaque)
-        assert 'redacted' in repr(first)
-        owner.revoke_recovery(timeout=3)
-        owner.revoke_recovery(timeout=3)
-        current = owner.recovery_ticket(timeout=3)
-        assert current.export() != first.export()
-        prepared = cc.prepare_owner_takeover(cc.OwnerRecoveryTicket.from_bytes(current.export()))
-        assert prepared.inspect(timeout=3).phase == 'armed'
-        saved = prepared.successor_ticket.export()
-        # Hold the actual native guard before EOF; it must not cross the whole
-        # pause/resume interval, even though a new permit will be accepted.
-        old_guard = scheduler.execution_guard(scheduler.method_idx('echo'))
-        owner.close()
-        deadline = time.monotonic() + 3
-        while cc.native_lifecycle_snapshot()['phase'] != 'owner_missing':
-            assert time.monotonic() < deadline
-            time.sleep(.005)
-        with pytest.raises(cc.OwnerControlError) as revoked:
-            cc.prepare_owner_takeover(first).commit(timeout=3)
-        assert revoked.value.kind == 'invalid_grant'
-        successor = prepared.commit(timeout=3)
-        assert successor.recovery_ticket(timeout=3).export() == saved
-        with monkeypatch.context() as patch:
-            patch.setattr(scheduler, 'execution_guard', lambda _: old_guard)
-            with pytest.raises(ResourceUnavailable):
-                proxy.echo(11)
-        assert resource.calls == 0
-        assert scheduler.snapshot().pending == 0
-        assert proxy.echo(23) == 23
-        assert resource.calls == 1
-        with pytest.raises(cc.OwnerControlError) as replay:
-            prepared.commit(timeout=3)
-        assert replay.value.kind == 'not_sent'
-        successor.request_shutdown(timeout=3)
-    finally:
-        if proxy is not None:
-            cc.close(proxy)
-        if old_guard is not None:
-            old_guard.__exit__(None, None, None)
-        cc.shutdown(timeout=5)
-        owner.close()
-        if successor is not None:
-            successor.close()
-        if address is not None:
-            inspected = cc.inspect_endpoint(address)
-            if sys.platform == 'win32':
-                from c_two.transport.client.util import ping
-                assert inspected['status'] == 'not-applicable'
-                assert inspected['reason'] == 'kernel-managed'
-                assert not ping(address, timeout=1), 'stopped owner still has an IPC listener'
-            else:
-                assert inspected['status'] == 'absent'
+        owner, bootstrap = cc.owner_control_pair()
+        successor = None
+        proxy = None
+        address = None
+        old_guard = None
+        try:
+            cc.set_server(lifecycle=LifecycleConfig.owner_bound(10), owner_control=bootstrap)
+            resource = Resource()
+            cc.register(Echo, resource, name='takeover-echo')
+            address = cc.server_address()
+            proxy = cc.connect(Echo, name='takeover-echo')
+            scheduler = proxy.client._scheduler
+            assert not scheduler.is_unconstrained
+            first = owner.recovery_ticket(timeout=3)
+            assert owner.recovery_ticket(timeout=3).export() == first.export()
+            for opaque in (owner, bootstrap, first):
+                with pytest.raises(TypeError):
+                    pickle.dumps(opaque)
+            assert 'redacted' in repr(first)
+            owner.revoke_recovery(timeout=3)
+            owner.revoke_recovery(timeout=3)
+            current = owner.recovery_ticket(timeout=3)
+            assert current.export() != first.export()
+            prepared = cc.prepare_owner_takeover(cc.OwnerRecoveryTicket.from_bytes(current.export()))
+            assert prepared.inspect(timeout=3).phase == 'armed'
+            saved = prepared.successor_ticket.export()
+            # Hold the actual native guard before EOF; it must not cross the whole
+            # pause/resume interval, even though a new permit will be accepted.
+            old_guard = scheduler.execution_guard(scheduler.method_idx('echo'))
+            owner.close()
+            deadline = time.monotonic() + 3
+            while cc.native_lifecycle_snapshot()['phase'] != 'owner_missing':
+                assert time.monotonic() < deadline
+                time.sleep(.005)
+            with pytest.raises(cc.OwnerControlError) as revoked:
+                cc.prepare_owner_takeover(first).commit(timeout=3)
+            assert revoked.value.kind == 'invalid_grant'
+            successor = prepared.commit(timeout=3)
+            assert successor.recovery_ticket(timeout=3).export() == saved
+            with monkeypatch.context() as patch:
+                patch.setattr(scheduler, 'execution_guard', lambda _: old_guard)
+                with pytest.raises(ResourceUnavailable):
+                    proxy.echo(11)
+            assert resource.calls == 0
+            assert scheduler.snapshot().pending == 0
+            assert proxy.echo(23) == 23
+            assert resource.calls == 1
+            with pytest.raises(cc.OwnerControlError) as replay:
+                prepared.commit(timeout=3)
+            assert replay.value.kind == 'not_sent'
+            successor.request_shutdown(timeout=3)
+        finally:
+            if proxy is not None:
+                cc.close(proxy)
+            if old_guard is not None:
+                old_guard.__exit__(None, None, None)
+            cc.shutdown(timeout=5)
+            owner.close()
+            if successor is not None:
+                successor.close()
+            if address is not None:
+                inspected = cc.inspect_endpoint(address)
+                if sys.platform == 'win32':
+                    from c_two.transport.client.util import ping
+                    assert inspected['status'] == 'not-applicable'
+                    assert inspected['reason'] == 'kernel-managed'
+                    assert not ping(address, timeout=1), 'stopped owner still has an IPC listener'
+                else:
+                    assert inspected['status'] == 'absent'

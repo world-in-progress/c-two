@@ -53,7 +53,9 @@ Python resource servers using `cc.serve()` accept Ctrl+C; automated subprocess s
 ## Build from source
 
 Use canonical main for source development. The matching c3 release's `rc-manifest.json` identifies release source; main is a development checkout convention.
-Use a Developer PowerShell targeting your native x64 or ARM64 architecture with the MSVC C++ toolchain, CMake, Git, stable Rust and uv available. Python and Rust resolve FastDB 0.2.3 from their registries; Python requires the optional `fastdb` extra. The Python extension and c3 use source-mode native builds. The Rust binding also requires the matching Core SDK: extract `fastdb-core-0.2.3-x86_64-pc-windows-msvc.tar.gz` or `fastdb-core-0.2.3-aarch64-pc-windows-msvc.tar.gz` from that release and configure its absolute `lib` directory below. The full source-based interoperability checks additionally use the sibling FastDB release checkout for fixtures and TypeScript sources; Python consumers use the published wheel:
+Use a Developer PowerShell targeting your native x64 or ARM64 architecture with the MSVC C++ toolchain, CMake, Ninja, Git, stable Rust and uv available. Python and Rust resolve FastDB 0.2.3 from their registries; Python requires the optional `fastdb` extra. The Python extension and c3 use source-mode native builds. The Rust binding also requires the matching Core SDK: extract `fastdb-core-0.2.3-x86_64-pc-windows-msvc.tar.gz` or `fastdb-core-0.2.3-aarch64-pc-windows-msvc.tar.gz` from that release and configure its absolute `lib` directory below. The full source-based interoperability checks additionally use the sibling FastDB release checkout for fixtures and TypeScript sources; Python consumers use the published wheel:
+
+The full development dependency group includes PyArrow for grid example tests. Windows ARM64 has no wheel for the locked PyArrow version: before `uv sync`, follow the pinned Arrow prerequisite step in [Source Validation](../.github/workflows/ci.yml), including its minimal preset, `ARROW_SIMD_LEVEL=NONE`, `CMAKE_PREFIX_PATH`, `PYARROW_BUNDLE_ARROW_CPP` and `SKBUILD_CMAKE_ARGS` settings. Arrow is an example dependency; installing the released C-Two wheel or CLI does not require this build.
 
 ```powershell
 git clone https://github.com/world-in-progress/fastdb.git
@@ -63,6 +65,7 @@ Set-Location c-two
 $env:FASTDB_PAYLOAD_SYSTEM_LIB_DIR = 'C:\path\to\fastdb-core-sdk\lib'
 $env:PATH = "$env:FASTDB_PAYLOAD_SYSTEM_LIB_DIR;$env:PATH"
 $env:FASTDB_PAYLOAD_LINK_MODE = 'source'
+$env:CMAKE_GENERATOR = 'Ninja'
 uv sync --python 3.12
 cargo build --locked --manifest-path cli/Cargo.toml --bin c3
 .\cli\target\debug\c3.exe --version
