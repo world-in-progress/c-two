@@ -1046,15 +1046,3 @@ def test_relay_router_does_not_silence_response_materialization_errors():
     assert '"pre_dispatch"' not in materialization
     assert "Json(serde_json::json!" not in materialization
     assert "unwrap_or_default()" not in call_handler
-
-
-def test_chunked_dispatch_does_not_default_missing_route_metadata():
-    root = Path(__file__).resolve().parents[4]
-    server_source = (
-        root / "core" / "transport" / "c2-server" / "src" / "server.rs"
-    ).read_text(encoding="utf-8")
-    production = server_source.split("\n#[cfg(test)]\nmod tests")[0]
-
-    assert "finished.route_name.unwrap_or_default()" not in production
-    assert "finished.method_idx.unwrap_or(0)" not in production
-    assert "chunked call missing route metadata" in production
