@@ -23,6 +23,7 @@ pub mod sync_client;
 #[cfg(test)]
 mod tests;
 
+pub use c2_local::{ConnectionClosed, ConnectionEndReason, ConnectionObservation};
 pub use c2_wire::shutdown_control::{DirectShutdownAck, ShutdownControlRouteOutcome};
 pub use client::{
     ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RequestBlock, RouteBinding,
@@ -34,4 +35,6 @@ pub use control::{
 };
 pub use pool::{ClientCacheMemorySnapshot, ClientPool};
 pub use response::{ResponseData, ResponseLease, ServerShmResponse};
+#[doc(hidden)]
+pub use sync_client::shared_io_handle;
 pub use sync_client::{IpcCallError, SyncClient, TransportPhase};

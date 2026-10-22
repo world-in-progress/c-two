@@ -182,8 +182,8 @@ CHECK_SOURCE_REQUIRED_JOBS = (
 )
 # Frozen FastDB source pin of the Source Validation gates; cross-checked against
 # the trusted checkout's ci.yml so silent pin drift fails closed.
-SOURCE_VALIDATION_FASTDB_CORE_VERSION = "0.2.1"
-SOURCE_VALIDATION_FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+SOURCE_VALIDATION_FASTDB_CORE_VERSION = "0.2.3"
+SOURCE_VALIDATION_FASTDB_SHA = "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4"
 SMOKE_SCHEMA = "c-two.installed-wheel-smoke.v1"
 STANDARD_USER_WRAPPER_SCHEMA = "c-two.standard-user-wrapper.v1"
 SDIST_INSPECT_SCHEMA = "c-two.release-candidate.sdist-inspection.v1"

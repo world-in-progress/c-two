@@ -557,7 +557,7 @@ def prepare_release_fixtures(destination: Path) -> None:
     data = helper.fetch_release_manifest(None)
     manifest = helper.verify_release_manifest(data)
     (destination / helper.RELEASE_MANIFEST_NAME).write_bytes(data)
-    for target in ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin', 'x86_64-pc-windows-msvc'):
+    for target in helper.LIBRARY_BY_TARGET:
         entry = helper.core_bundle_entry(manifest, target)
         downloaded = helper.fetch_core_bundle(entry, None, destination / 'verification')
         downloaded.replace(destination / entry['name'])

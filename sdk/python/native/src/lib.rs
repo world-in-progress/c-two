@@ -9,6 +9,10 @@ mod codegen_ffi;
 #[cfg(feature = "python")]
 mod config_ffi;
 #[cfg(feature = "python")]
+mod connection_ffi;
+#[cfg(feature = "python")]
+mod contract_ffi;
+#[cfg(feature = "python")]
 mod control_ffi;
 #[cfg(feature = "python")]
 mod core_error_ffi;
@@ -31,8 +35,6 @@ mod runtime_session_ffi;
 #[cfg(feature = "python")]
 pub(crate) mod shm_buffer;
 #[cfg(feature = "python")]
-mod contract_ffi;
-#[cfg(feature = "python")]
 mod writable_sink;
 
 #[cfg(feature = "python")]
@@ -48,6 +50,7 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     error_ffi::register_module(m)?;
     core_error_ffi::register_module(m)?;
     core_ffi::register_module(m)?;
+    connection_ffi::register_module(m)?;
     control_ffi::register_module(m)?;
     config_ffi::register_module(m)?;
     codegen_ffi::register_module(m)?;

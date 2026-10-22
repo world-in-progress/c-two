@@ -23,7 +23,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-fastdb = ["fastdb4py==0.2.2"]
+fastdb = ["fastdb4py==0.2.3"]
 
 [build-system]
 requires = ["maturin>=1.7,<2.0"]

@@ -166,6 +166,7 @@ struct ShutdownTransaction {
 }
 
 struct RuntimeState {
+    connection_event_source: c2_local::ConnectionEventSource,
     server_id_override: Option<String>,
     server_ipc_overrides: Option<ServerIpcConfigOverrides>,
     client_ipc_overrides: Option<ClientIpcConfigOverrides>,
@@ -200,7 +201,7 @@ struct RuntimeState {
     /// deliberately not part of [`RuntimeOptions`]: the capability never
     /// travels through cloneable option data, argv, environment variables,
     /// or logs.
-    owner_control: Option<c2_local::OwnerControlReceiver>,
+    owner_control: Option<c2_local::OwnerBootstrap>,
     /// Set once an owner-bound host consumed the capability; later attach or
     /// consume attempts are rejected.
     owner_control_consumed: bool,
@@ -262,12 +263,23 @@ impl Drop for RuntimeState {
 }
 
 impl Runtime {
+    /// Subscribe to future accepted IPC connections without starting a host or
+    /// resolving configuration. The receiver retains metadata alone.
+    pub fn connection_events(&self) -> c2_local::ConnectionEvents {
+        self.connection_event_source().subscribe()
+    }
+
+    pub(crate) fn connection_event_source(&self) -> c2_local::ConnectionEventSource {
+        self.state.lock().connection_event_source.clone()
+    }
+
     pub fn new(options: RuntimeOptions) -> Result<Self, LifecycleError> {
         if let Some(server_id) = options.server_id.as_deref() {
             validate_server_id(server_id)?;
         }
         Ok(Self {
             state: Arc::new(Mutex::new(RuntimeState {
+                connection_event_source: c2_local::ConnectionEventSource::new(),
                 server_id_override: options.server_id,
                 server_ipc_overrides: options.server_ipc_overrides,
                 client_ipc_overrides: options.client_ipc_overrides,
@@ -507,6 +519,18 @@ impl Runtime {
 
     pub fn local_endpoint_frozen(&self) -> bool {
         self.state.lock().frozen_local_endpoint.is_some()
+    }
+
+    /// Prepare a single owner takeover in the Runtime's current endpoint context.
+    /// This neither starts a host nor freezes or changes the endpoint root.
+    pub fn prepare_owner_takeover(
+        &self,
+        ticket: crate::OwnerRecoveryTicket,
+    ) -> Result<crate::PreparedOwnerTakeover, crate::OwnerControlError> {
+        let context = self.freeze_local_endpoint_context().map_err(|_| {
+            crate::OwnerControlError::new(crate::OwnerControlErrorKind::Unavailable)
+        })?;
+        crate::PreparedOwnerTakeover::prepare(ticket, &context)
     }
 
     pub(crate) fn freeze_local_endpoint_context(
@@ -953,6 +977,7 @@ impl Runtime {
     /// are checked before moving the opaque receiver, so a refused handoff
     /// leaves the source usable. Lock order is stable even for opposing calls.
     /// A host-frozen or consumed capability can never be transferred or reused.
+    /// Subscriptions to the future host follow this same pre-use handoff.
     pub fn transfer_unstarted_lifecycle_to(
         &self,
         replacement: &Runtime,
@@ -985,6 +1010,10 @@ impl Runtime {
             }
             target.lifecycle_policy = source.lifecycle_policy;
             target.owner_control = source.owner_control.take();
+            // Pre-use SDK configuration replaces the Runtime, but preserves
+            // subscriptions to that same future host. A full shutdown does
+            // not use this handoff and ends the old event source normally.
+            target.connection_event_source = std::mem::take(&mut source.connection_event_source);
             // The retired source cannot adopt another capability after moving
             // its original receiver. Closing it remains a hostless operation.
             if target.owner_control.is_some() {
@@ -1028,10 +1057,10 @@ impl Runtime {
     }
 
     /// Attach one private native capability, outside cloneable configuration data.
-    /// Once a Host consumes it, reattachment and takeover are rejected.
+    /// Once a Host consumes it, a new attachment is rejected; recovery uses a ticket.
     pub fn attach_owner_control(
         &self,
-        receiver: c2_local::OwnerControlReceiver,
+        receiver: c2_local::OwnerBootstrap,
     ) -> Result<(), LifecycleError> {
         let mut state = self.state.lock();
         if state.owner_control_consumed {
@@ -1042,7 +1071,7 @@ impl Runtime {
         }
         if state.owner_control.is_some() {
             return Err(LifecycleError::Configuration(
-                "owner control capability already attached; a Runtime accepts exactly one owner control receiver"
+                "owner control capability already attached; a Runtime accepts exactly one owner bootstrap"
                     .to_string(),
             ));
         }
@@ -1067,9 +1096,7 @@ impl Runtime {
     /// attached capability fails here, before the host can publish readiness.
     /// A second consume attempt also fails, so one Runtime can never run two
     /// owner-bound hosts from one capability.
-    pub(crate) fn consume_owner_control(
-        &self,
-    ) -> Result<c2_local::OwnerControlReceiver, LifecycleError> {
+    pub(crate) fn consume_owner_control(&self) -> Result<c2_local::OwnerBootstrap, LifecycleError> {
         let mut state = self.state.lock();
         match state.owner_control.take() {
             Some(receiver) => {
@@ -1282,7 +1309,8 @@ impl Runtime {
                 address: &identity.ipc_address,
                 max_payload_size: server.config().max_payload_size,
             }) {
-                let local_removed = rt.block_on(server.unregister_route(&route_name));
+                let local_removed =
+                    self.rollback_closed_registration(&rt, server, &registration_scope);
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
                     relay_use_proxy,
@@ -1303,7 +1331,8 @@ impl Runtime {
             let route_admission_token = route_admission_token
                 .expect("relay-backed registration should have a route admission token");
             if let Err(err) = rt.block_on(server.open_route_admission(route_admission_token)) {
-                let local_removed = rt.block_on(server.unregister_route(&route_name));
+                let local_removed =
+                    self.rollback_closed_registration(&rt, server, &registration_scope);
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
                     relay_use_proxy,
@@ -1334,6 +1363,35 @@ impl Runtime {
         })
     }
 
+    fn rollback_closed_registration(
+        &self,
+        rt: &tokio::runtime::Runtime,
+        server: &c2_server::Server,
+        scope: &RelayRegistrationScope,
+    ) -> bool {
+        let key = format!("{}:{:p}", server.server_instance_id(), server);
+        let mut state = self.state.lock();
+        let Some(current) = state.registration_scopes.get_mut(&key) else {
+            return false;
+        };
+        if current.get(&scope.name) != Some(scope) {
+            return false;
+        }
+        // Every Core registration publishes its scope before native commit.
+        // Holding this existing lock excludes a replacement between identity
+        // validation and removal. This path only owns a never-opened route:
+        // no callback can be draining, and Host::register still retains the
+        // ServiceDefinition, so unregister cannot run a service destructor.
+        let local_removed = server.registered_route_identity(&scope.name)
+            == Some((scope.route_uid.clone(), scope.route_revision))
+            && rt.block_on(server.unregister_route(&scope.name));
+        current.remove(&scope.name);
+        if current.is_empty() {
+            state.registration_scopes.remove(&key);
+        }
+        local_removed
+    }
+
     pub(crate) fn unregister_route(
         &self,
         server: &Arc<c2_server::Server>,
@@ -1344,7 +1402,9 @@ impl Runtime {
         let route_name = name.to_string();
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
-        let scopes = self.capture_registration_scopes(server, std::slice::from_ref(&route_name));
+        let mut scopes =
+            self.capture_registration_scopes(server, std::slice::from_ref(&route_name));
+        scopes.retain(|name, _| name == &route_name);
         let rt = Self::server_runtime()?;
         let local_removed = rt.block_on(server.unregister_route(&route_name));
         if !local_removed {
@@ -3376,10 +3436,61 @@ mod tests {
 
     #[test]
     fn relay_register_failure_after_prepare_rolls_back_and_preserves_cleanup_error() {
-        use std::io::{Read, Write};
+        check_relay_final_failure(FinalInterference::None);
+    }
+
+    #[test]
+    fn old_relay_final_failure_preserves_core_registered_same_name_replacement() {
+        check_relay_final_failure(FinalInterference::Replace);
+    }
+
+    #[test]
+    fn unrelated_unregister_preserves_pending_registration_rollback() {
+        check_relay_final_failure(FinalInterference::UnregisterOther);
+    }
+
+    enum FinalInterference {
+        None,
+        Replace,
+        UnregisterOther,
+    }
+
+    fn check_relay_final_failure(interference: FinalInterference) {
+        use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
         use std::sync::mpsc;
         use std::thread;
+
+        fn read_request(stream: &mut std::net::TcpStream) -> String {
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    reader.read_line(&mut line).unwrap(),
+                    0,
+                    "incomplete HTTP headers"
+                );
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            request.push_str(std::str::from_utf8(&body).unwrap());
+            request
+        }
 
         let route_name = unique_route_name("relay-final-fail");
         let session = Runtime::new(RuntimeOptions {
@@ -3393,64 +3504,173 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake relay");
         let relay_url = format!("http://{}", listener.local_addr().unwrap());
-        let (request_tx, request_rx) = mpsc::channel();
+        listener.set_nonblocking(true).unwrap();
+        let (final_seen_tx, final_seen_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         let relay_thread = thread::spawn(move || {
-            for response in [
+            let mut requests = Vec::new();
+            for (index, response) in [
                 "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
                 "HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Length: 12\r\n\r\nfinal failed",
                 "HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Length: 14\r\n\r\ncleanup failed",
-            ] {
-                let (mut stream, _) = listener.accept().expect("accept relay request");
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).expect("read relay request");
-                request_tx
-                    .send(String::from_utf8_lossy(&buf[..n]).to_string())
-                    .unwrap();
+            ].into_iter().enumerate() {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline => {
+                            thread::park_timeout(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept relay request {index}: {error}"),
+                    }
+                };
+                requests.push(read_request(&mut stream));
+                if index == 1 {
+                    final_seen_tx.send(()).unwrap();
+                    // The final response depends on an explicit release,
+                    // never on the timing of the replacement registration.
+                    release_rx.recv().expect("release final response");
+                }
                 stream
                     .write_all(response.as_bytes())
                     .expect("write relay response");
             }
+            requests
         });
 
-        let result = session.register_route(&server, route, Some(&relay_url), false);
-        relay_thread.join().unwrap();
-        let requests = (0..3)
-            .map(|_| {
-                request_rx
-                    .recv_timeout(std::time::Duration::from_secs(2))
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
+        let registering_session = session.clone();
+        let registering_server = Arc::clone(&server);
+        let register_thread = thread::spawn(move || {
+            registering_session.register_route(&registering_server, route, Some(&relay_url), false)
+        });
+        let final_seen = final_seen_rx.recv_timeout(Duration::from_secs(5));
+        let rt = Runtime::server_runtime().expect("runtime");
+        let pending = rt.block_on(server.route_scheduler_snapshot(&route_name));
+        let old_scope = session
+            .capture_registration_scopes(&server, std::slice::from_ref(&route_name))
+            .remove(&route_name);
+        let replacement = if matches!(interference, FinalInterference::Replace) {
+            // Both removal and replacement go through Core's real transactions,
+            // including the saved registration scope; no raw server insertion.
+            let removal = session.unregister_route(&server, &route_name, None, false);
+            let registration =
+                session.register_route(&server, dummy_route(&server, &route_name), None, false);
+            Some((removal, registration))
+        } else {
+            None
+        };
+        let sibling = if matches!(interference, FinalInterference::UnregisterOther) {
+            let name = unique_route_name("unrelated");
+            let registration =
+                session.register_route(&server, dummy_route(&server, &name), None, false);
+            let removal = session.unregister_route(&server, &name, None, false);
+            Some((registration, removal))
+        } else {
+            None
+        };
+        let released = release_tx.send(());
+        let result = register_thread.join();
+        let requests = relay_thread.join();
+        let remaining_identity = server.registered_route_identity(&route_name);
+        let remaining_scheduler = rt.block_on(server.route_scheduler_snapshot(&route_name));
+        let remaining_scope = session
+            .capture_registration_scopes(&server, std::slice::from_ref(&route_name))
+            .remove(&route_name);
+        let shutdown = session.shutdown(
+            Some(&server),
+            vec![route_name.clone()],
+            None,
+            false,
+            None,
+            Duration::from_secs(5),
+        );
 
+        // Finish native cleanup and join both workers before the expected red.
+        assert!(shutdown.runtime_barrier_error.is_none(), "{shutdown:?}");
+        assert!(shutdown.route_close_error.is_none(), "{shutdown:?}");
+        assert!(shutdown.relay_errors.is_empty(), "{shutdown:?}");
+        final_seen.unwrap();
+        released.unwrap();
+        if let Some((registration, removal)) = sibling {
+            assert!(registration.is_ok(), "{registration:?}");
+            assert!(removal.unwrap().local_removed);
+        }
+        assert!(
+            pending.unwrap().closed,
+            "final publish must start with admission closed"
+        );
+        let requests = requests.unwrap();
         assert!(requests[0].contains("\"prepare_only\":true"));
         assert!(!requests[1].contains("\"prepare_only\":true"));
         assert!(requests[2].contains("/_unregister"));
+        let cleanup_scope: RelayRegistrationScope =
+            serde_json::from_str(requests[2].split_once("\r\n\r\n").unwrap().1).unwrap();
+        let old_scope = old_scope.unwrap();
+        assert_eq!(
+            cleanup_scope, old_scope,
+            "cleanup must target the failed registration"
+        );
 
-        let failure = match result {
+        let failure = match result.unwrap() {
             Err(LifecycleError::RegisterFailure(failure)) => failure,
             other => panic!("unexpected register result: {other:?}"),
         };
+        assert_eq!(failure.route_name, route_name);
         assert_eq!(failure.failure_source, "relay_register");
         assert_eq!(failure.status_code, Some(409));
+        assert_eq!(failure.error_message, "final failed");
         let rollback = failure
             .rollback
             .expect("rollback outcome should be preserved");
         assert_eq!(rollback.route_name, route_name);
-        assert!(rollback.local_removed);
         assert!(rollback.active_drained);
         assert_eq!(rollback.closed_reason, "registration_rollback");
         assert_eq!(rollback.close_error, None);
         let relay_cleanup_error = failure
             .relay_cleanup_error
             .expect("relay cleanup failure should be preserved");
+        assert_eq!(relay_cleanup_error.route_name, route_name);
         assert_eq!(relay_cleanup_error.status_code, Some(409));
         assert_eq!(relay_cleanup_error.message, "cleanup failed");
 
-        let rt = Runtime::server_runtime().expect("runtime");
-        assert!(
-            !rt.block_on(server.contains_route(&route_name)),
-            "relay final publish failure must roll back local route"
-        );
+        if let Some((removal, replacement)) = replacement {
+            assert!(removal.unwrap().local_removed);
+            let replacement = replacement.unwrap();
+            assert_ne!(replacement.route_uid, old_scope.route_uid);
+            assert!(!replacement.relay_registered);
+            assert_eq!(
+                remaining_identity,
+                Some((replacement.route_uid.clone(), replacement.route_revision)),
+                "old final failure must preserve the Core-registered replacement"
+            );
+            assert!(
+                !remaining_scheduler.unwrap().closed,
+                "replacement must still admit work"
+            );
+            assert_eq!(
+                remaining_scope,
+                Some(RelayRegistrationScope {
+                    name: replacement.route_name,
+                    server_id: replacement.server_id,
+                    server_instance_id: replacement.server_instance_id,
+                    route_uid: replacement.route_uid,
+                    route_revision: replacement.route_revision,
+                }),
+                "old final failure must preserve the replacement's Core scope"
+            );
+            assert!(
+                !rollback.local_removed,
+                "rollback cannot report removal of the replacement"
+            );
+        } else {
+            assert!(rollback.local_removed);
+            assert!(
+                remaining_identity.is_none(),
+                "relay final failure must roll back its own route"
+            );
+            assert!(remaining_scheduler.is_none());
+        }
     }
 
     #[test]

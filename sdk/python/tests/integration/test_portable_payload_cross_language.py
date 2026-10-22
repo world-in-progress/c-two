@@ -169,7 +169,7 @@ publish = false
 
 [dependencies]
 c-two = {{ version = "0.1.0", path = {_path_dependency(REPOSITORY / "sdk/rust")} }}
-fastdb = "=0.2.1"
+fastdb = "=0.2.3"
 """
     (work / "Cargo.toml").write_text(manifest, encoding="utf-8")
 

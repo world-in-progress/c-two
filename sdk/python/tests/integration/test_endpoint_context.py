@@ -412,7 +412,7 @@ def test_common_owner_bound_transfer_default_context_and_business_disconnect() -
             assert cc.native_lifecycle_snapshot()['phase'] == 'armed'
             assert cc.native_terminal_outcome() is None
             assert resource.hooks == 0
-            keepalive.shutdown()
+            keepalive.close()
             deadline = time.monotonic() + 5
             while cc.native_terminal_outcome() is None:
                 assert time.monotonic() < deadline, 'owner EOF did not drain'
@@ -422,7 +422,7 @@ def test_common_owner_bound_transfer_default_context_and_business_disconnect() -
             assert resource.hooks == 1
             assert cc.local_endpoint_context() == context
         finally:
-            keepalive.shutdown()
+            keepalive.close()
             cc.shutdown(timeout=5)
     '''))
 

@@ -30,6 +30,8 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **C-Two 0.7.6** 支持 Python 3.10+。普通 Python 调用无 Python 运行时依赖；FastDB 载荷使用可选扩展 `c-two[fastdb]`（`fastdb4py==0.2.2`）。本补丁修复并发关停时的报告竞态，见[更新记录](docs/releases/0.7.6.md)。
 
+未发布开发源码已将 Python、Rust、原生源码构建及官方 CoreSDK 的 FastDB 依赖统一升级到 0.2.3。SDK 准备脚本可识别其 Windows ARM64 bundle；C-Two 发行平台和验证范围仍以已发布版本的记录为准。
+
 ## 特点
 
 - **本地与远程调用**：同进程直接传递 Python 对象，同机 IPC 使用 Unix domain socket 或 Windows Named Pipe，跨机器使用 HTTP relay。显式 IPC 连接独立于 relay 发现。

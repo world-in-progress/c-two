@@ -22,7 +22,7 @@ permissions:
   pull-requests: read
 
 env:
-  FASTDB_SOURCE_SHA: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
+  FASTDB_SOURCE_SHA: abba785ef2a7d3fbee1bbc608393a3e6c7b042c4
   EMSDK_SOURCE_SHA: c817c0ca4ba889ee24a185fd954cff7de1bd8afa
   EMSDK_VERSION: "5.0.2"
   CARGO_TERM_COLOR: never

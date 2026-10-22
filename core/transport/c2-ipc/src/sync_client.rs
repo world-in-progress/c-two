@@ -148,6 +148,15 @@ pub(crate) fn ensure_runtime_with_deadline(
     initialize_runtime(&GLOBAL_RUNTIME, &RUNTIME_INIT, deadline).map(|_| ())
 }
 
+/// Core's dedicated owner-control streams use the existing client I/O executor.
+#[doc(hidden)]
+pub fn shared_io_handle(
+    deadline: c2_config::ConnectDeadline,
+) -> Result<tokio::runtime::Handle, IpcError> {
+    initialize_runtime(&GLOBAL_RUNTIME, &RUNTIME_INIT, deadline)
+        .map(|runtime| runtime.handle().clone())
+}
+
 /// Return the shared tokio runtime, creating it on first call.
 ///
 /// The runtime uses 2 worker threads — sufficient for client I/O.
@@ -520,6 +529,11 @@ impl SyncClient {
     /// Whether the client is connected.
     pub fn is_connected(&self) -> bool {
         self.inner.is_connected()
+    }
+
+    /// Observe the existing physical connection without connecting/reconnecting.
+    pub fn connection_observation(&self) -> Option<c2_local::ConnectionObservation> {
+        self.inner.connection_observation()
     }
 
     /// Get the route table for a named route.

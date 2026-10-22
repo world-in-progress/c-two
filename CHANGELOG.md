@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Changed
+
+- Development dependencies now pin FastDB 0.2.3 across Python, Rust,
+  TypeScript validation and the verified Core SDK. SDK preparation also
+  recognizes the official Windows ARM64 bundle. Portable payload semantics
+  and FastDB ABI-117 are unchanged.
+- Breaking low-level owner API: `owner_control_pair()` now returns `OwnerControl` and Rust `OwnerBootstrap` / Python `NativeOwnerBootstrap`, replacing the single-direction API without compatibility aliases. Explicit recovery tickets and one-use prepared takeover replace the old ownership relationship; `close()` starts grace, while `request_shutdown()` requests drain. Ordinary OwnerBound admin shutdown receives a negative ACK; Persistent and trusted in-process shutdown retain their behavior.
+- OwnerMissing grace now preserves published Ready routes and their UID/revision while calls report `ResourceUnavailable`. Takeover must commit before the original monotonic deadline, consumes the old grant and advances the owner epoch; failed attempts cannot extend grace. Lost confirmation requires explicit recovery with saved tickets, without automatic replay or old/new-key fallback. Owner control uses independent version 1; IPC 12, SHM 3, C/FFI ABI 5 and business frames are unchanged.
+
+### Added
+
+- Rust and Python expose read-only physical IPC connection observations and
+  bounded server connection events on Unix sockets and Windows Named Pipes.
+  Idle peers are observed by the existing receive loop; waiting requires no
+  business call. Terminal reasons describe transport facts, not process death
+  or completion of resource and payload cleanup.
+
+### Fixed
+
+- A relay registration response arriving after owner loss or shutdown cannot
+  reopen route admission with an obsolete registration token.
+
 ## [0.7.5] — local preparation, companion c3 0.3.4
 
 ### Fixed

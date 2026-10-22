@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use c2_local::{
-    AbortHandle, DEFAULT_CONNECT_TIMEOUT, LocalEndpoint, LocalReadHalf, LocalStream, LocalWriteHalf,
+    AbortHandle, ConnectionEndReason, ConnectionObservation, ConnectionPublisher,
+    DEFAULT_CONNECT_TIMEOUT, LocalEndpoint, LocalReadHalf, LocalStream, LocalWriteHalf,
 };
 use futures_util::{Stream, StreamExt};
 use tokio::io::AsyncReadExt;
@@ -2393,16 +2394,17 @@ where
 
 /// One connection incarnation's receive-task state. Constructed before spawn,
 /// so aborting even an unpolled task publishes termination. Reconnect installs
-/// a fresh flag after joining the old tasks; an old guard can only clear its
+/// a fresh publisher after joining the old tasks; an old guard can only close its
 /// own incarnation, never a new connection's state.
 struct ReceiveConnectionState {
-    connected: Arc<AtomicBool>,
+    publisher: ConnectionPublisher,
     disconnect: Arc<AtomicU8>,
 }
 
 impl ReceiveConnectionState {
     fn disconnect(&self) {
-        self.connected.store(false, Ordering::Release);
+        self.publisher
+            .close(ConnectionEndReason::LocalClose, "receive_task_drop", None);
     }
 }
 
@@ -2443,9 +2445,10 @@ pub struct IpcClient {
     /// A partial close may leave cleanup-only pending entries even after both
     /// tasks finish. Reconnect must wait for that same transaction to finish.
     close_incomplete: AtomicBool,
-    connected: Arc<AtomicBool>,
-    /// Protocol observation for this connection incarnation, independent of
-    /// local task/pool cleanup. A retry must retain the original close reason.
+    connection: RwLock<Option<ConnectionPublisher>>,
+    /// DISCONNECT write/ACK transaction, separate from transport termination:
+    /// local_close is published before the courtesy ACK can arrive. A retry
+    /// must retain this transaction's original abnormal-close diagnosis.
     disconnect: Arc<AtomicU8>,
     /// Transport-owned request pool.
     ///
@@ -2618,7 +2621,7 @@ impl IpcClient {
             pending_drain_seam: StdMutex::new(None),
             close_gate: tokio::sync::Mutex::new(()),
             close_incomplete: AtomicBool::new(false),
-            connected: Arc::new(AtomicBool::new(false)),
+            connection: RwLock::new(None),
             disconnect: Arc::new(AtomicU8::new(DISCONNECT_NOT_CONNECTED)),
             pool: StdMutex::new(pool),
             pool_transport_owned,
@@ -2938,7 +2941,7 @@ impl IpcClient {
         }
         // The old receive guard must never publish into a later incarnation.
         // The gate above still requires its task to be joined before reconnect.
-        self.connected = Arc::new(AtomicBool::new(false));
+        *self.connection.get_mut() = None;
         self.disconnect = Arc::new(AtomicU8::new(DISCONNECT_NOT_CONNECTED));
         let endpoint = self
             .endpoint
@@ -3032,6 +3035,13 @@ impl IpcClient {
             Ok(LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT).await?)
         })
         .await?;
+        let publisher = ConnectionPublisher::new();
+        let stream = stream.with_connection_publisher(publisher.clone());
+        *self.connection.get_mut() = Some(publisher.clone());
+        let connection = ReceiveConnectionState {
+            publisher,
+            disconnect: Arc::clone(&self.disconnect),
+        };
         *connect_metadata_lock(&self.abort, "ipc_metadata_wait")? = Some(stream.abort_handle());
         let (reader, mut writer) = stream.into_split();
 
@@ -3053,7 +3063,7 @@ impl IpcClient {
         let hs = with_connect_deadline(deadline, "handshake", async {
             tokio::time::timeout(
                 DEFAULT_CONNECT_TIMEOUT,
-                self.do_handshake(&mut writer, reader, Arc::clone(&server_pool)),
+                self.do_handshake(&mut writer, reader, Arc::clone(&server_pool), connection),
             )
             .await
             .map_err(|_| {
@@ -3120,8 +3130,8 @@ impl IpcClient {
         *ready_writer = Some(writer);
         drop(ready_writer);
 
-        // Handshake published readiness before spawning the receive task.
-        // Do not restore it here: that task may already have observed EOF.
+        // The receive task may already have observed EOF. Finishing connect
+        // must never clear that connection's terminal record.
 
         // One cancellable maintenance task per connection: periodic idle
         // retirement for the client's owner pools plus stale chunk sweeps.
@@ -3136,6 +3146,7 @@ impl IpcClient {
         writer: &mut LocalWriteHalf,
         mut reader: LocalReadHalf,
         server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
+        connection: ReceiveConnectionState,
     ) -> Result<Handshake, IpcError> {
         // Build segment list and prefix from pool (if available). The list may
         // legitimately be empty: lazy pools announce no backings and the server
@@ -3162,15 +3173,38 @@ impl IpcClient {
         let payload = encode_client_handshake(&segments, cap_flags, &prefix)
             .map_err(|e| IpcError::Protocol(e.to_string()))?;
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &payload);
-        writer.write_all(&frame_bytes).await?;
+        writer.write_all(&frame_bytes).await.inspect_err(|error| {
+            connection.publisher.close_io("handshake_write", error);
+        })?;
 
         // Read handshake response.
         let mut header_buf = [0u8; HEADER_SIZE];
-        reader.read_exact(&mut header_buf).await?;
-        let (total_len, body_rest) = frame::decode_total_len(&header_buf)?;
-        let (hdr, _hdr_payload) = frame::decode_frame_body(body_rest, total_len)?;
+        reader
+            .read_exact(&mut header_buf)
+            .await
+            .inspect_err(|error| {
+                connection
+                    .publisher
+                    .close_read_error("handshake_read", error);
+            })?;
+        let (total_len, body_rest) = frame::decode_total_len(&header_buf).inspect_err(|_| {
+            connection
+                .publisher
+                .close(ConnectionEndReason::ProtocolError, "handshake_frame", None);
+        })?;
+        let (hdr, _hdr_payload) =
+            frame::decode_frame_body(body_rest, total_len).inspect_err(|_| {
+                connection.publisher.close(
+                    ConnectionEndReason::ProtocolError,
+                    "handshake_frame",
+                    None,
+                );
+            })?;
 
         if !hdr.is_handshake() {
+            connection
+                .publisher
+                .close(ConnectionEndReason::ProtocolError, "handshake_frame", None);
             return Err(IpcError::Protocol(
                 "Server response is not a handshake frame".into(),
             ));
@@ -3179,17 +3213,40 @@ impl IpcClient {
         let payload_len = hdr.payload_len();
         let mut payload_buf = vec![0u8; payload_len];
         if payload_len > 0 {
-            reader.read_exact(&mut payload_buf).await?;
+            reader
+                .read_exact(&mut payload_buf)
+                .await
+                .inspect_err(|error| {
+                    connection
+                        .publisher
+                        .close_read_error("handshake_read", error);
+                })?;
         }
 
-        let hs = decode_handshake(&payload_buf)?;
+        let hs = decode_handshake(&payload_buf).inspect_err(|_| {
+            connection.publisher.close(
+                ConnectionEndReason::ProtocolError,
+                "handshake_decode",
+                None,
+            );
+        })?;
 
         if hs.capability_flags & CAP_CALL_V2 == 0 {
+            connection.publisher.close(
+                ConnectionEndReason::ProtocolError,
+                "handshake_capability",
+                None,
+            );
             return Err(IpcError::Protocol(
                 "Server does not support v2 call frames".into(),
             ));
         }
         if hs.server_identity.is_none() {
+            connection.publisher.close(
+                ConnectionEndReason::ProtocolError,
+                "handshake_identity",
+                None,
+            );
             return Err(IpcError::Protocol(
                 "server handshake missing server identity".into(),
             ));
@@ -3198,12 +3255,7 @@ impl IpcClient {
         // Spawn recv loop with the reader.
         let pending = self.pending.clone();
         let writer_clone = self.writer.clone();
-        self.connected.store(true, Ordering::Release);
         self.disconnect.store(DISCONNECT_PENDING, Ordering::Release);
-        let connection = ReceiveConnectionState {
-            connected: Arc::clone(&self.connected),
-            disconnect: Arc::clone(&self.disconnect),
-        };
         let chunk_registry = connect_metadata_lock(&self.chunk_registry, "ipc_metadata_wait")?
             .clone()
             .ok_or_else(|| {
@@ -4984,7 +5036,19 @@ impl IpcClient {
 
     /// Whether the client has an active connection.
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Acquire)
+        self.connection
+            .read()
+            .as_ref()
+            .is_some_and(|publisher| !publisher.is_closed())
+    }
+
+    /// The current physical connection, including its terminal record. This
+    /// does not connect/reconnect; a client with no physical connection has None.
+    pub fn connection_observation(&self) -> Option<ConnectionObservation> {
+        self.connection
+            .read()
+            .as_ref()
+            .map(ConnectionPublisher::observation)
     }
 
     /// Only confirmed local closes consume this observation. A missing ACK
@@ -5008,12 +5072,22 @@ impl IpcClient {
         );
     }
 
-    /// Manually override the connection flag.
+    /// Manually override connection state for transport tests.
     ///
     /// Intended for test scenarios where a real handshake is not
     /// performed.  Production code should rely on [`connect`] / [`close`].
     pub fn force_connected(&self, val: bool) {
-        self.connected.store(val, Ordering::Release);
+        let mut connection = self.connection.write();
+        if val {
+            if connection
+                .as_ref()
+                .is_none_or(ConnectionPublisher::is_closed)
+            {
+                *connection = Some(ConnectionPublisher::new());
+            }
+        } else if let Some(publisher) = connection.as_ref() {
+            publisher.close(ConnectionEndReason::LocalClose, "force_connected", None);
+        }
     }
 
     /// Close the client.
@@ -5065,7 +5139,9 @@ impl IpcClient {
                 tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365)
             });
         let disconnect_deadline = deadline.min(tokio::time::Instant::now() + DISCONNECT_GRACE);
-        self.connected.store(false, Ordering::Release);
+        if let Some(publisher) = self.connection.read().as_ref() {
+            publisher.close(ConnectionEndReason::LocalClose, "client_close", None);
+        }
 
         // Serialize close barriers: only one closer manipulates the writer
         // slot and the receive-task handle at a time. Waiting for the gate is
@@ -5313,6 +5389,9 @@ impl IpcClient {
 
 impl Drop for IpcClient {
     fn drop(&mut self) {
+        if let Some(publisher) = self.connection.get_mut().as_ref() {
+            publisher.close(ConnectionEndReason::LocalClose, "client_drop", None);
+        }
         // Non-blocking best effort. The receive task owns the reader; abort
         // the stream and maintenance task so neither can keep pool Arcs alive
         // indefinitely after the client owner disappears. Confirmed shutdown
@@ -5434,10 +5513,14 @@ async fn complete_unary_pending(
 struct ConnectionAssemblyCleanup {
     registry: Arc<ChunkRegistry>,
     conn_id: u64,
+    connection: Option<ConnectionPublisher>,
 }
 
 impl Drop for ConnectionAssemblyCleanup {
     fn drop(&mut self) {
+        if let Some(publisher) = self.connection.as_ref() {
+            publisher.close(ConnectionEndReason::LocalClose, "receive_task_drop", None);
+        }
         self.registry.try_cleanup_connection(self.conn_id);
     }
 }
@@ -5539,6 +5622,7 @@ async fn recv_loop_inner(
     let cleanup = ConnectionAssemblyCleanup {
         registry: Arc::clone(&chunk_registry),
         conn_id,
+        connection: connection.as_ref().map(|state| state.publisher.clone()),
     };
     let mut header_buf = [0u8; HEADER_SIZE];
     let mut recv_buf = Vec::with_capacity(4096); // reusable buffer
@@ -5572,7 +5656,10 @@ async fn recv_loop_inner(
         };
         #[cfg(not(test))]
         let read_header = reader.read_exact(&mut header_buf).await;
-        if read_header.is_err() {
+        if let Err(error) = read_header {
+            if let Some(connection) = connection.as_ref() {
+                connection.publisher.close_read_error("read_header", &error);
+            }
             break; // Connection closed.
         }
         let (total_len, body_rest) = match frame::decode_total_len(&header_buf) {
@@ -5591,8 +5678,15 @@ async fn recv_loop_inner(
             recv_buf.reserve(payload_len - recv_buf.capacity());
         }
         recv_buf.resize(payload_len, 0);
-        if payload_len > 0 && reader.read_exact(&mut recv_buf).await.is_err() {
-            break;
+        if payload_len > 0 {
+            if let Err(error) = reader.read_exact(&mut recv_buf).await {
+                if let Some(connection) = connection.as_ref() {
+                    connection
+                        .publisher
+                        .close_read_error("read_payload", &error);
+                }
+                break;
+            }
         }
 
         // Handle signal frames.
@@ -5607,11 +5701,20 @@ async fn recv_loop_inner(
                         );
                         let mut guard = writer.lock().await;
                         if let Some(w) = guard.as_mut() {
-                            let _ = w.write_all(&pong).await;
+                            if let Err(error) = w.write_all(&pong).await {
+                                if let Some(connection) = connection.as_ref() {
+                                    connection.publisher.close_io("pong_write", &error);
+                                }
+                            }
                         }
                     }
                     SIG_DISCONNECT_ACK => {
                         if let Some(connection) = connection.as_ref() {
+                            connection.publisher.close(
+                                ConnectionEndReason::LocalClose,
+                                "disconnect_ack",
+                                None,
+                            );
                             connection
                                 .disconnect
                                 .store(DISCONNECT_ACKNOWLEDGED, Ordering::Release);
@@ -6177,6 +6280,7 @@ mod tests {
             let cleanup = ConnectionAssemblyCleanup {
                 registry: Arc::clone(&registry),
                 conn_id: client.conn_id,
+                connection: None,
             };
             let ((setup, confirmed, charged, terminal, retained), mut held) =
                 observe(holder, || async {
@@ -6418,6 +6522,7 @@ mod tests {
                     let cleanup = ConnectionAssemblyCleanup {
                         registry: Arc::clone(&registry),
                         conn_id: client.conn_id,
+                        connection: None,
                     };
                     *client.recv_handle.lock() = Some(tokio::spawn(async move {
                         let _cleanup = cleanup;
@@ -6830,6 +6935,7 @@ mod tests {
                         let cleanup = ConnectionAssemblyCleanup {
                             registry: client.chunk_registry_arc().unwrap(),
                             conn_id: client.conn_id,
+                            connection: None,
                         };
                         let (done_tx, done_rx) = oneshot::channel();
                         *client.recv_handle.lock() = Some(tokio::spawn(async move {
@@ -8387,35 +8493,133 @@ mod pending_disconnect_tests {
 
     #[tokio::test]
     async fn aborted_receiver_state_cannot_clear_a_new_connection_incarnation() {
-        // An invalid endpoint exercises connect's real incarnation reset
-        // without an OS listener. The delayed task owns only the old flag.
-        let mut client = IpcClient::new("not-an-ipc-address");
-        let old = Arc::clone(&client.connected);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let address = format!(
+            "ipc://observation_reconnect_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        );
+        let endpoint = LocalEndpoint::from_address(&address).unwrap();
+        let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
+        let peer = tokio::spawn(async move {
+            let identity = c2_wire::handshake::ServerIdentity {
+                server_id: "observation-reconnect-server".into(),
+                server_instance_id: "observation-reconnect-instance".into(),
+            };
+            let handshake = c2_wire::handshake::encode_server_handshake(
+                &[],
+                CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+                &[],
+                "",
+                &identity,
+            )
+            .unwrap();
+            let handshake =
+                frame::encode_frame(0, flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE, &handshake);
+            for _ in 0..2 {
+                let mut stream = listener.accept().await.unwrap();
+                let mut length = [0; 4];
+                stream.read_exact(&mut length).await.unwrap();
+                let mut body = vec![0; u32::from_le_bytes(length) as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                assert!(
+                    frame::decode_frame_body(&body, body.len() as u32)
+                        .unwrap()
+                        .0
+                        .is_handshake()
+                );
+                stream.write_all(&handshake).await.unwrap();
+                let mut disconnect = [0; HEADER_SIZE + 1];
+                stream.read_exact(&mut disconnect).await.unwrap();
+                let (header, payload) = frame::decode_frame(&disconnect).unwrap();
+                assert!(header.is_signal());
+                assert_eq!(payload, &[SIG_DISCONNECT]);
+                stream
+                    .write_all(&frame::encode_frame(
+                        0,
+                        flags::FLAG_RESPONSE | flags::FLAG_SIGNAL,
+                        &[SIG_DISCONNECT_ACK],
+                    ))
+                    .await
+                    .unwrap();
+            }
+            crate::tests::close_listener(listener).await;
+        });
+
+        let mut client = IpcClient::new(&address);
+        client.connect().await.expect("first real handshake");
+        let old = client.connection_observation().unwrap();
+        let old_abort = client.abort.lock().as_ref().unwrap().clone();
         let old_disconnect = Arc::clone(&client.disconnect);
         let connection = ReceiveConnectionState {
-            connected: Arc::clone(&old),
+            publisher: client.connection.read().as_ref().unwrap().clone(),
             disconnect: Arc::clone(&old_disconnect),
         };
         let receiver = tokio::spawn(async move {
             let _connection = connection;
             std::future::pending::<()>().await;
         });
-        assert!(matches!(client.connect().await, Err(IpcError::Config(_))));
-        assert!(!Arc::ptr_eq(&old, &client.connected));
+        assert!(old.snapshot().is_none());
+        assert!(
+            client
+                .close_shared_bounded(std::time::Duration::from_secs(2))
+                .await
+        );
+        let closed = old
+            .snapshot()
+            .expect("real close publishes old terminal record");
+        assert_eq!(closed.reason(), ConnectionEndReason::LocalClose);
+        assert_eq!(closed.operation(), "client_close");
+        assert_eq!(
+            old_disconnect.load(Ordering::Acquire),
+            DISCONNECT_ACKNOWLEDGED
+        );
+
+        client
+            .connect()
+            .await
+            .expect("real reconnect after close barrier");
+        let new = client.connection_observation().unwrap();
+        assert_ne!(old.connection_id(), new.connection_id());
         assert!(!Arc::ptr_eq(&old_disconnect, &client.disconnect));
-        old_disconnect.store(DISCONNECT_ACKNOWLEDGED, Ordering::Release);
         assert_eq!(
             client.disconnect.load(Ordering::Acquire),
-            DISCONNECT_NOT_CONNECTED
+            DISCONNECT_PENDING
         );
-        client.force_connected(true);
-        old.store(true, Ordering::Release);
-        // Covers cancellation before the receiver's first poll as well as a
-        // parked receiver. Its destructor cannot clear the client's new flag.
+        // Both old I/O authority and a delayed old receiver destructor remain
+        // bound to the first physical stream after the actual reconnect.
+        old_abort.abort();
+        old_disconnect.store(DISCONNECT_PEER_CLOSED, Ordering::Release);
         receiver.abort();
         assert!(receiver.await.unwrap_err().is_cancelled());
-        assert!(!old.load(Ordering::Acquire));
+        assert_eq!(
+            old.wait_closed(Some(std::time::Duration::ZERO)).await,
+            Some(closed)
+        );
+        assert!(new.snapshot().is_none());
         assert!(client.is_connected());
+        assert_eq!(
+            client.disconnect.load(Ordering::Acquire),
+            DISCONNECT_PENDING
+        );
+        assert!(
+            client
+                .close_shared_bounded(std::time::Duration::from_secs(2))
+                .await
+        );
+        assert_eq!(
+            client.disconnect.load(Ordering::Acquire),
+            DISCONNECT_ACKNOWLEDGED
+        );
+        assert_eq!(old.snapshot(), Some(closed));
+        assert_ne!(
+            old.snapshot().unwrap().connection_id(),
+            new.snapshot().unwrap().connection_id()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     /// Exercise the exact terminal drain without requiring an OS listener.
@@ -8435,9 +8639,10 @@ mod pending_disconnect_tests {
         let (resume_tx, resume_rx) = oneshot::channel();
         let (attempted_tx, attempted_rx) = oneshot::channel();
         let loop_pending = Arc::clone(&pending);
-        let connected = Arc::new(AtomicBool::new(true));
+        let publisher = ConnectionPublisher::new();
+        let observation = publisher.observation();
         let connection = ReceiveConnectionState {
-            connected: Arc::clone(&connected),
+            publisher,
             disconnect: Arc::new(AtomicU8::new(DISCONNECT_PENDING)),
         };
         let drain = tokio::spawn(async move {
@@ -8454,7 +8659,7 @@ mod pending_disconnect_tests {
         });
         entered_rx.await.expect("terminal drain entered");
         assert!(
-            !connected.load(Ordering::Acquire),
+            observation.snapshot().is_some(),
             "termination must be visible before waking callers or waiting for settlement"
         );
         let guard = pending.lock();
@@ -8471,6 +8676,158 @@ mod pending_disconnect_tests {
             "terminal pending owners were stranded"
         );
         assert!(matches!(live_rx.await, Ok(Err(IpcError::Closed))));
+    }
+
+    #[tokio::test]
+    async fn idle_receiver_observes_peer_eof_without_pending_calls() {
+        let client = Arc::new(IpcClient::with_config(
+            "ipc://observation-idle-pair",
+            ClientIpcConfig::default(),
+        ));
+        assert!(client.connection_observation().is_none());
+        let weak_client = Arc::downgrade(&client);
+        let weak_pool = Arc::downgrade(&client.request_pool().unwrap());
+        let (stream, peer) = LocalStream::pair().await.unwrap();
+        *client.abort.lock() = Some(stream.abort_handle());
+        let (reader, writer) = stream.into_split();
+        *client.writer.lock().await = Some(writer);
+        let publisher = ConnectionPublisher::new();
+        let observation = publisher.observation();
+        *client.connection.write() = Some(publisher.clone());
+        let connection = ReceiveConnectionState {
+            publisher,
+            disconnect: Arc::clone(&client.disconnect),
+        };
+        *client.recv_handle.lock() = Some(tokio::spawn(recv_loop_inner(
+            reader,
+            Arc::clone(&client.pending),
+            Arc::clone(&client.server_pool),
+            Arc::clone(&client.writer),
+            client.chunk_registry_arc().unwrap(),
+            client.conn_id,
+            Some(connection),
+            None,
+            None,
+            None,
+        )));
+        assert_eq!(client.pending_len_for_test(), 0);
+        drop(peer);
+        let closed = observation
+            .wait_closed(Some(std::time::Duration::from_secs(2)))
+            .await
+            .expect("idle read must observe the closed peer");
+        assert_eq!(closed.reason(), ConnectionEndReason::PeerEof);
+        assert_eq!(closed.operation(), "read_header");
+        assert!(!client.is_connected());
+        assert!(
+            client
+                .close_shared_bounded(std::time::Duration::from_secs(2))
+                .await
+        );
+        drop(client);
+        assert!(weak_client.upgrade().is_none());
+        assert!(weak_pool.upgrade().is_none());
+        assert_eq!(observation.snapshot(), Some(closed));
+    }
+
+    #[tokio::test]
+    async fn local_terminal_does_not_short_circuit_disconnect_ack() {
+        let client = IpcClient::new("ipc://observation-close-ack-pair");
+        let (stream, mut peer) = LocalStream::pair().await.unwrap();
+        *client.abort.lock() = Some(stream.abort_handle());
+        let (reader, writer) = stream.into_split();
+        *client.writer.lock().await = Some(writer);
+        let publisher = ConnectionPublisher::new();
+        let observation = publisher.observation();
+        *client.connection.write() = Some(publisher.clone());
+        client
+            .disconnect
+            .store(DISCONNECT_PENDING, Ordering::Release);
+        let connection = ReceiveConnectionState {
+            publisher,
+            disconnect: Arc::clone(&client.disconnect),
+        };
+        *client.recv_handle.lock() = Some(tokio::spawn(recv_loop_inner(
+            reader,
+            Arc::clone(&client.pending),
+            Arc::clone(&client.server_pool),
+            Arc::clone(&client.writer),
+            client.chunk_registry_arc().unwrap(),
+            client.conn_id,
+            Some(connection),
+            None,
+            None,
+            None,
+        )));
+        let peer_observation = observation.clone();
+        let peer = tokio::spawn(async move {
+            let mut disconnect = [0_u8; 17];
+            peer.read_exact(&mut disconnect).await.unwrap();
+            assert_eq!(disconnect[16], SIG_DISCONNECT);
+            assert_eq!(
+                peer_observation.snapshot().unwrap().reason(),
+                ConnectionEndReason::LocalClose
+            );
+            peer.write_all(&frame::encode_frame(
+                0,
+                flags::FLAG_RESPONSE | flags::FLAG_SIGNAL,
+                &[SIG_DISCONNECT_ACK],
+            ))
+            .await
+            .unwrap();
+            // Keep the Named Pipe alive until the client consumes the ACK and
+            // closes its stream; write completion alone is not peer consumption.
+            let mut byte = [0_u8; 1];
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), peer.read(&mut byte)).await;
+        });
+        assert!(
+            client
+                .close_shared_bounded(std::time::Duration::from_secs(2))
+                .await
+        );
+        assert_eq!(
+            client.disconnect.load(Ordering::Acquire),
+            DISCONNECT_ACKNOWLEDGED
+        );
+        assert_eq!(client.abnormal_close_reason(), None);
+        let closed = observation.snapshot().unwrap();
+        assert_eq!(closed.reason(), ConnectionEndReason::LocalClose);
+        assert_eq!(closed.operation(), "client_close");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unpolled_receiver_publishes_terminal_on_abort() {
+        let client = IpcClient::new("ipc://observation-unpolled-pair");
+        let (stream, _peer) = LocalStream::pair().await.unwrap();
+        let (reader, writer) = stream.into_split();
+        *client.writer.lock().await = Some(writer);
+        let publisher = ConnectionPublisher::new();
+        let observation = publisher.observation();
+        let connection = ReceiveConnectionState {
+            publisher,
+            disconnect: Arc::clone(&client.disconnect),
+        };
+        let receiver = tokio::spawn(recv_loop_inner(
+            reader,
+            Arc::clone(&client.pending),
+            Arc::clone(&client.server_pool),
+            Arc::clone(&client.writer),
+            client.chunk_registry_arc().unwrap(),
+            client.conn_id,
+            Some(connection),
+            None,
+            None,
+            None,
+        ));
+        // The current-thread runtime cannot poll the spawned future before
+        // this abort: its pre-spawn ReceiveConnectionState is the fence.
+        receiver.abort();
+        assert!(receiver.await.unwrap_err().is_cancelled());
+        let closed = observation.snapshot().expect("unpolled receive guard");
+        assert_eq!(closed.reason(), ConnectionEndReason::LocalClose);
+        assert_eq!(closed.operation(), "receive_task_drop");
     }
 }
 
@@ -8556,6 +8913,9 @@ mod connect_deadline_tests {
     #[tokio::test]
     async fn partial_control_write_deadline_aborts_actual_local_stream() {
         let (stream, mut peer) = c2_local::LocalStream::pair().await.unwrap();
+        let publisher = ConnectionPublisher::new();
+        let observation = publisher.observation();
+        let stream = stream.with_connection_publisher(publisher);
         let abort = stream.abort_handle();
         let (reader, writer) = stream.into_split();
         let client = IpcClient::new("ipc://control-partial-real");
@@ -8592,6 +8952,13 @@ mod connect_deadline_tests {
             abort.is_aborted(),
             "partial control frame must isolate its stream"
         );
+        // No receive task exists in this fixture: cancellation must publish
+        // before that task could report ConnectionAborted as a read error.
+        let closed = observation
+            .snapshot()
+            .expect("control sender publishes close");
+        assert_eq!(closed.reason(), ConnectionEndReason::LocalClose);
+        assert_eq!(closed.operation(), "local_abort");
         assert_eq!(client.pending_len_for_test(), 1);
         assert!(client.pending.lock().contains_key(&other));
         client.pending.lock().remove(&other);

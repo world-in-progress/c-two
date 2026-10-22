@@ -13,15 +13,14 @@ import pytest
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPOSITORY / ".github" / "scripts" / "prepare_fastdb_sdk.py"
-# The Host provided the official v0.2.1 release assets read-only under /tmp for
-# local verification. They are not present on CI runners; the hermetic tests
-# below build synthetic releases instead of downloading anything.
-PROVIDED_RELEASE_FIXTURES = Path("/tmp/fastdb-021-main-candidate/release")
+# Optional official release assets are supplied explicitly for local verification.
+# Hermetic tests below build synthetic releases without downloading anything.
+WINDOWS_TARGETS = ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")
 
 
-def provided_release_fixtures() -> Path:
+def provided_release_fixtures() -> Path | None:
     configured = os.environ.get("C2_DEV_FASTDB_RELEASE_FIXTURES")
-    return Path(configured).expanduser().resolve() if configured else PROVIDED_RELEASE_FIXTURES
+    return Path(configured).expanduser().resolve() if configured else None
 
 
 def test_configured_release_fixtures_can_use_native_path(tmp_path, monkeypatch):
@@ -49,7 +48,7 @@ def default_members(target: str) -> dict[str, bytes]:
         "LICENSE": b"synthetic license\n",
         "include/fastdb_payload.h": b"/* synthetic header */\n",
     }
-    if target == "x86_64-pc-windows-msvc":
+    if target in WINDOWS_TARGETS:
         members["lib/fastdb.dll"] = b"MZ" + bytes(64)
         members["lib/fastdb.lib"] = b"synthetic import library" * 4
     elif target == "aarch64-apple-darwin":
@@ -83,7 +82,7 @@ def bundle_manifest_for(
             for path, data in sorted(members.items())
         ],
     }
-    if target == "x86_64-pc-windows-msvc":
+    if target in WINDOWS_TARGETS:
         manifest["windows_runtime_dll"] = "lib/fastdb.dll"
         manifest["windows_import_library"] = "lib/fastdb.lib"
     return manifest
@@ -167,13 +166,14 @@ def failure_message(module, capsys) -> str:
 
 def test_real_release_fixtures_prepare_every_published_target(tmp_path):
     fixtures = provided_release_fixtures()
-    if not fixtures.is_dir():
+    if fixtures is None or not fixtures.is_dir():
         pytest.skip(f"provided release fixtures are absent: {fixtures}")
     module = load_helper()
     for target, library in (
         ("x86_64-unknown-linux-gnu", "libfastdb.so"),
         ("aarch64-apple-darwin", "libfastdb.dylib"),
         ("x86_64-pc-windows-msvc", "fastdb.dll"),
+        ("aarch64-pc-windows-msvc", "fastdb.dll"),
     ):
         output = tmp_path / target
         assert module.main([
@@ -184,7 +184,7 @@ def test_real_release_fixtures_prepare_every_published_target(tmp_path):
         lib_dir = output / "lib"
         assert (lib_dir / library).is_file()
         assert (output / "manifest.json").is_file()
-        if target == "x86_64-pc-windows-msvc":
+        if target in WINDOWS_TARGETS:
             assert (lib_dir / "fastdb.lib").is_file()
         # The fixture directory must be consumed read-only.
         assert not any(path.suffix == ".download" for path in fixtures.iterdir())
@@ -192,7 +192,7 @@ def test_real_release_fixtures_prepare_every_published_target(tmp_path):
 
 def test_real_release_fixture_tampering_is_rejected(tmp_path):
     fixtures = provided_release_fixtures()
-    if not fixtures.is_dir():
+    if fixtures is None or not fixtures.is_dir():
         pytest.skip(f"provided release fixtures are absent: {fixtures}")
     module = load_helper()
     manifest = json.loads((fixtures / "release-manifest.json").read_bytes())
@@ -357,25 +357,42 @@ def test_unsafe_archive_members_are_rejected_before_extraction(synthetic_release
         assert not output.exists() or not any(output.iterdir())
 
 
-def test_windows_bundle_requires_dll_and_import_library(synthetic_release, tmp_path, capsys):
+@pytest.mark.parametrize("target", WINDOWS_TARGETS)
+def test_windows_bundle_requires_dll_and_import_library(synthetic_release, tmp_path, capsys, target):
     module, release_dir = synthetic_release(
-        target="x86_64-pc-windows-msvc", omit_members=("lib/fastdb.dll",)
+        target=target, omit_members=("lib/fastdb.dll",)
     )
     assert run_prepare(
         module, "--from-dir", str(release_dir), "--output", str(tmp_path / "sdk-dll"),
-        target="x86_64-pc-windows-msvc",
+        target=target,
     ) == 1
     assert "lib/fastdb.dll" in failure_message(module, capsys)
 
     module, release_dir = synthetic_release(
-        target="x86_64-pc-windows-msvc", omit_members=("lib/fastdb.lib",)
+        target=target, omit_members=("lib/fastdb.lib",)
     )
     assert run_prepare(
         module, "--from-dir", str(release_dir), "--output", str(tmp_path / "sdk-lib"),
-        target="x86_64-pc-windows-msvc",
+        target=target,
     ) == 1
     message = failure_message(module, capsys)
     assert "windows_import_library" in message and "fastdb.lib" in message
+
+
+@pytest.mark.parametrize("target", WINDOWS_TARGETS)
+@pytest.mark.parametrize("field", ["windows_runtime_dll", "windows_import_library"])
+def test_windows_bundle_rejects_wrong_declared_library_path(
+    synthetic_release, tmp_path, capsys, target, field
+):
+    members = default_members(target)
+    manifest = bundle_manifest_for(target, members)
+    manifest[field] = "lib/other.dll"
+    module, release_dir = synthetic_release(target=target, bundle_manifest=manifest)
+    assert run_prepare(
+        module, "--from-dir", str(release_dir), "--output", str(tmp_path / "sdk"),
+        target=target,
+    ) == 1
+    assert field in failure_message(module, capsys)
 
 
 def test_bundle_manifest_field_mismatches_are_rejected(synthetic_release, tmp_path, capsys):
@@ -426,6 +443,8 @@ def test_host_target_detection_mappings(monkeypatch):
     assert host("Linux", "x86_64") == "x86_64-unknown-linux-gnu"
     assert host("Darwin", "arm64") == "aarch64-apple-darwin"
     assert host("Windows", "AMD64") == "x86_64-pc-windows-msvc"
+    assert host("Windows", "ARM64") == "aarch64-pc-windows-msvc"
+    assert host("Windows", "aarch64") == "aarch64-pc-windows-msvc"
     with pytest.raises(module.PrepareError):
         host("Darwin", "x86_64")
 
@@ -478,10 +497,11 @@ def test_emit_github_environment_for_linux_composes_loader_path(
     assert outputs["version"] == SYNTHETIC_VERSION
 
 
+@pytest.mark.parametrize("target", WINDOWS_TARGETS)
 def test_emit_github_environment_for_windows_appends_loader_path(
-    synthetic_release, tmp_path
+    synthetic_release, tmp_path, target
 ):
-    module, release_dir = synthetic_release(target="x86_64-pc-windows-msvc")
+    module, release_dir = synthetic_release(target=target)
     env_file = tmp_path / "github-env"
     path_file = tmp_path / "github-path"
     assert run_prepare(
@@ -492,7 +512,7 @@ def test_emit_github_environment_for_windows_appends_loader_path(
         "--github-env-file", str(env_file),
         "--github-path-file", str(path_file),
         "--github-output-file", str(tmp_path / "github-output"),
-        target="x86_64-pc-windows-msvc",
+        target=target,
     ) == 0
     environment = env_file.read_text().splitlines()
     assert "FASTDB_PAYLOAD_LINK_MODE=system" in environment

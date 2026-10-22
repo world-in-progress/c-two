@@ -8,6 +8,7 @@ mod call_execution;
 mod call_scope;
 mod client;
 mod connect_deadline;
+mod connection_observation;
 mod control;
 pub mod error;
 mod host;
@@ -16,6 +17,7 @@ mod lifetime;
 pub mod memory;
 mod outcome;
 mod owner_bound;
+mod owner_control;
 mod session;
 
 pub use c2_config::{ConnectOptions, ConnectTimeoutError};
@@ -48,12 +50,19 @@ pub use identity::{
 // re-exports it so SDKs and the CLI share one implementation instead of
 // writing their own paths, parsers, or management loops.
 pub use c2_local::{
-    ENDPOINT_CREDENTIAL_MAX_BYTES, ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential,
-    EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
-    EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, LocalEndpoint,
-    SweepBatch, SweepBudget, inspect_endpoint, reap_endpoint,
+    ConnectionClosed, ConnectionEndReason, ConnectionEvent, ConnectionEvents,
+    ConnectionEventsError, ConnectionObservation, ENDPOINT_CREDENTIAL_MAX_BYTES,
+    ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential, EndpointCredentialError,
+    EndpointCredentialErrorKind, EndpointInspection, EndpointIoError, EndpointReapResult,
+    EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, LocalEndpoint, SweepBatch,
+    SweepBudget, inspect_endpoint, reap_endpoint,
 };
 pub use call_execution::{CallExecutionObservation, CallExecutionObserver};
+// Blocking waits for the connection-observation surface stay with Core's
+// single runtime authority; SDKs project parameters and results only.
+pub use connection_observation::{
+    ConnectionEventWait, recv_connection_event, wait_connection_closed,
+};
 pub use memory::{
     MemoryCellStats, MemoryScopeStats, RetiredMemoryObservation, RetiredScopeReport,
     RetirementHandoff, RuntimeMemoryStats, scope,
@@ -71,7 +80,11 @@ pub use c2_config::{
     EnvFilePolicy, EnvMap, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
     MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace,
 };
-pub use c2_local::{OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair};
+pub use c2_local::OwnerBootstrap;
+pub use owner_control::{
+    OwnerControl, OwnerControlError, OwnerControlErrorKind, OwnerPhase, OwnerRecoveryTicket,
+    OwnerStatus, PreparedOwnerTakeover, owner_control_pair,
+};
 
 /// Read-only counters for the Runtime finite-call input retention domain.
 pub use c2_mem::RetentionSnapshot as CallExecutionSnapshot;

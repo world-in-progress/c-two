@@ -107,6 +107,11 @@ impl ContractClient {
     pub fn expected_route(&self) -> &c_two::ExpectedRouteContract {
         self.client.expected_route()
     }
+
+    /// Read the already-acquired physical IPC connection without reconnecting.
+    pub fn connection_observation(&self) -> Result<c_two::ConnectionObservation, c_two::Error> {
+        self.client.connection_observation()
+    }
 "#,
     );
     for method in methods {

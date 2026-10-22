@@ -87,10 +87,10 @@ jobs:
           import os, pathlib, re, tomllib
           project = tomllib.loads(pathlib.Path("sdk/python/pyproject.toml").read_text(encoding="utf-8"))
           extra = project["project"]["optional-dependencies"]["fastdb"]
-          assert extra == ["fastdb4py==0.2.2"], extra
-          version = "0.2.2"
-          core_version = "0.2.1"
-          source_rev = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+          assert extra == ["fastdb4py==0.2.3"], extra
+          version = "0.2.3"
+          core_version = "0.2.3"
+          source_rev = "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4"
           codegen = pathlib.Path("core/foundation/c2-codegen/Cargo.toml").read_text(encoding="utf-8")
           pin = re.search(r'^fastdb\s*=\s*"=(?P<version>[0-9][0-9.]*)"$', codegen, re.MULTILINE)
           assert pin is not None, "c2-codegen no longer pins an exact fastdb version"

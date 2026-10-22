@@ -30,6 +30,8 @@ A **CRM contract** declares the callable methods and their namespace/version. A 
 
 **C-Two 0.7.6** supports Python 3.10+. Ordinary Python calls have no Python runtime dependencies; FastDB payloads use the optional `c-two[fastdb]` extra (`fastdb4py==0.2.2`). This patch fixes a concurrent shutdown-report race; see the [release notes](docs/releases/0.7.6.md).
 
+Unreleased development source pins FastDB 0.2.3 across Python, Rust, native source builds and the official CoreSDK. Its Windows ARM64 bundle is recognized by the SDK preparation helper; C-Two release platforms and validation claims remain as documented for the published release.
+
 ## Features
 
 - **Local and remote calls:** same-process calls pass Python objects directly; same-host IPC uses Unix domain sockets or Windows Named Pipes; cross-machine calls use HTTP relay. Explicit IPC connections work independently of relay discovery.

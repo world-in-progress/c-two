@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use c2_config::MAX_IPC_POOL_SEGMENTS;
+use c2_local::{ConnectionEndReason, ConnectionObservation, ConnectionPublisher};
 use c2_mem::config::PoolConfig;
 use c2_mem::{FreeResult, MemPool};
 
@@ -84,6 +85,7 @@ impl Drop for FlightGuard<'_> {
 /// Per-client connection state.
 pub struct Connection {
     conn_id: u64,
+    ordinary_protocol: AtomicBool,
     handshake_done: AtomicBool,
     chunked_capable: AtomicBool,
 
@@ -99,9 +101,8 @@ pub struct Connection {
     /// Notified whenever `inflight` drops to zero.
     idle_notify: Notify,
 
-    /// Set when the read loop has closed and queued not-started work should stop.
-    cancelled: AtomicBool,
-    cancel_notify: Notify,
+    /// Terminal transport authority; queued work cancellation derives from it.
+    publisher: ConnectionPublisher,
 }
 
 impl Connection {
@@ -110,21 +111,55 @@ impl Connection {
     /// All fields start at their default/empty state; `last_activity` is set
     /// to the current instant.
     pub fn new(conn_id: u64) -> Self {
+        let connection = Self::with_publisher(conn_id, ConnectionPublisher::new());
+        connection.select_ordinary_protocol();
+        connection
+    }
+
+    pub(crate) fn observed(publisher: ConnectionPublisher) -> Self {
+        Self::with_publisher(publisher.observation().connection_id(), publisher)
+    }
+
+    fn with_publisher(conn_id: u64, publisher: ConnectionPublisher) -> Self {
         Self {
             conn_id,
+            ordinary_protocol: AtomicBool::new(false),
             handshake_done: AtomicBool::new(false),
             chunked_capable: AtomicBool::new(false),
             peer_shm: Mutex::new(PeerShmState::new()),
             last_activity: Mutex::new(Instant::now()),
             inflight: AtomicI32::new(0),
             idle_notify: Notify::new(),
-            cancelled: AtomicBool::new(false),
-            cancel_notify: Notify::new(),
+            publisher,
         }
     }
 
     pub fn conn_id(&self) -> u64 {
         self.conn_id
+    }
+
+    pub(crate) fn ordinary_protocol(&self) -> bool {
+        self.ordinary_protocol.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn select_ordinary_protocol(&self) {
+        self.ordinary_protocol.store(true, Ordering::Release);
+    }
+
+    pub fn connection_observation(&self) -> ConnectionObservation {
+        self.publisher.observation()
+    }
+
+    pub(crate) fn end(&self, reason: ConnectionEndReason, operation: &'static str) {
+        self.publisher.close(reason, operation, None);
+    }
+
+    pub(crate) fn end_read(&self, operation: &'static str, error: &std::io::Error) {
+        self.publisher.close_read_error(operation, error);
+    }
+
+    pub(crate) fn end_io(&self, operation: &'static str, error: &std::io::Error) {
+        self.publisher.close_io(operation, error);
     }
 
     pub fn handshake_done(&self) -> bool {
@@ -343,28 +378,15 @@ impl Connection {
     }
 
     pub(crate) fn cancel_queued_work(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.cancel_notify.notify_waiters();
+        self.end(ConnectionEndReason::LocalClose, "connection_cancel");
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.publisher.is_closed()
     }
 
     pub(crate) async fn wait_cancelled(&self) {
-        if self.is_cancelled() {
-            return;
-        }
-        loop {
-            let notified = self.cancel_notify.notified();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-            if self.is_cancelled() {
-                return;
-            }
-        }
+        self.connection_observation().wait_closed(None).await;
     }
 
     /// Current number of in-flight requests.

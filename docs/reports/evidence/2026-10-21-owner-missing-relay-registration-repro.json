@@ -1,0 +1,162 @@
+{
+  "schema": "c-two.isolated-owner-race-evidence.v1",
+  "date": "2026-10-21",
+  "scope": "Reproduction and proposed design only; no production implementation.",
+  "platform": {
+    "system": "Darwin",
+    "release": "27.0.0",
+    "machine": "arm64",
+    "linux_tested": false,
+    "windows_tested": false
+  },
+  "current_source": "0acf784f6742487cd619a7d419379f693434a337",
+  "published_source": "fe43f20257947c466d8908d7e47d5a36ead35f99",
+  "published_artifact": {
+    "version": "0.7.6",
+    "wheel": "c_two-0.7.6-cp313-cp313-macosx_11_0_arm64.whl",
+    "sha256": "68d8d74be5bffbf4829bff467468eaa210e619a56945045cb163b4855504f4f8"
+  },
+  "fixture": "Controlled loopback HTTP relay prepare/final responses; actual native OwnerBound EOF and actual IPC service calls. This is not full c3 relay validation.",
+  "sequence": [
+    "Register a seed route through successful prepare/final publication.",
+    "Reserve and locally commit late route closed; hold its final relay response.",
+    "Confirm late route refuses calls.",
+    "Close actual owner-control keepalive and observe OwnerMissing.",
+    "Release final success or final failure response.",
+    "Call late route through actual IPC; count callback execution.",
+    "Perform native shutdown and endpoint checks before asserting the invariant."
+  ],
+  "grace_seconds": 10,
+  "cases": [
+    {
+      "candidate": "published-0.7.6",
+      "case": "normal",
+      "exit_code": 0,
+      "expected_red": false,
+      "phase_before_final_response": "armed",
+      "phase_after_final_response": "armed",
+      "late_call": {
+        "accepted": true,
+        "value": 73
+      },
+      "callback_count": 1,
+      "shutdown_completed": true,
+      "socket_lease_residuals": [],
+      "receipt_sha256": "44df2ebaf09c3dd06eae2b09fbd2fd2d90b1bdf228293157e786368592ccf45d"
+    },
+    {
+      "candidate": "published-0.7.6",
+      "case": "owner-eof",
+      "exit_code": 1,
+      "expected_red": true,
+      "phase_before_final_response": "owner_missing",
+      "phase_after_final_response": "owner_missing",
+      "late_call": {
+        "accepted": true,
+        "value": 73
+      },
+      "callback_count": 1,
+      "shutdown_completed": true,
+      "socket_lease_residuals": [],
+      "receipt_sha256": "aa5602735ce402edb3de87103c27dc16d86e0a317b8bb0c2b41ed4a057ff572e"
+    },
+    {
+      "candidate": "published-0.7.6",
+      "case": "failed-final",
+      "exit_code": 0,
+      "expected_red": false,
+      "phase_before_final_response": "owner_missing",
+      "phase_after_final_response": "owner_missing",
+      "late_call": {
+        "accepted": false,
+        "error": "ResourceRemoved",
+        "message": "ERROR_RESOURCE_REMOVED: route removed: late"
+      },
+      "callback_count": 0,
+      "shutdown_completed": true,
+      "socket_lease_residuals": [],
+      "receipt_sha256": "ad1a4b158e14cdfb71afc9c7ba7a9520c8d13c6eb629a35754e3f1e5d80d976b"
+    },
+    {
+      "candidate": "current-source",
+      "case": "native-control",
+      "expected_red": false,
+      "after_phase": "Armed",
+      "before_phase": "Armed",
+      "before_refused": true,
+      "callback_count": 1,
+      "executed": true,
+      "lose_owner": false,
+      "registered": true,
+      "route_close_error": null,
+      "shutdown_barrier_error": null,
+      "socket_lease_residuals": [],
+      "source": "0acf784f6742487cd619a7d419379f693434a337",
+      "receipt_sha256": "e637702546eb89562d2afe8aa340363997cc55dba9dee8e7bf03697f16ec42fb"
+    },
+    {
+      "candidate": "current-source",
+      "case": "native-race",
+      "expected_red": true,
+      "after_phase": "OwnerMissing",
+      "before_phase": "OwnerMissing",
+      "before_refused": true,
+      "callback_count": 1,
+      "executed": true,
+      "lose_owner": true,
+      "registered": true,
+      "route_close_error": null,
+      "shutdown_barrier_error": null,
+      "socket_lease_residuals": [],
+      "source": "0acf784f6742487cd619a7d419379f693434a337",
+      "receipt_sha256": "1d5e43a29d77e40f9a1668da54598efd84d758abfd2dc94cec3cac35dd44551f"
+    }
+  ],
+  "source_verification": {
+    "commit": "0acf784f6742487cd619a7d419379f693434a337",
+    "tracked_paths": 845,
+    "changed_paths": [
+      "core/runtime/c2-core/tests/owner_bound_lifecycle.rs"
+    ],
+    "production_unchanged": true,
+    "fixture_sha256": "2f4a9d30b906aa9b72654171c2bfb6772d0284e840fd5862de49a54d3afadc93",
+    "log_sha256": "2cdc7426978d0a27cff3c536bd9b3c10b9aa22d1ee86c02bb4774e8bbca6ab9f"
+  },
+  "native_test_command": "cargo test --locked --offline --manifest-path core/Cargo.toml -p c2-core --test owner_bound_lifecycle isolated_owner_race:: -- --nocapture --test-threads=1",
+  "native_test_exit": 101,
+  "native_tests_passed": 1,
+  "native_expected_red_tests": 1,
+  "retained_fixtures": {
+    "python_script_sha256": "abf5d85d37afe6410d9be364796ed2e97741a6534db85bbf2bfc05f4d781d211",
+    "python_contract_sha256": "ffbd53b18a2478a8085c640a272e3aa0c41443c54909001f8213aafb6e924e7a",
+    "rust_appended_module_sha256": "2f4a9d30b906aa9b72654171c2bfb6772d0284e840fd5862de49a54d3afadc93"
+  },
+  "cleanup": {
+    "removed": [
+      {
+        "path": "target",
+        "logical_bytes": 351285839
+      },
+      {
+        "path": "package",
+        "logical_bytes": 11016885
+      },
+      {
+        "path": "c_two-0.7.6-cp313-cp313-macosx_11_0_arm64.whl",
+        "logical_bytes": 4159557
+      }
+    ],
+    "logical_bytes_removed": 366462281,
+    "free_bytes_before": 93707239424,
+    "free_bytes_after": 94069190656,
+    "source_logs_retained": true,
+    "historical_directories_accessed": false,
+    "socket_lease_residuals": []
+  },
+  "limitations": [
+    "Only macOS arm64 exercised this new race reproduction.",
+    "Owner loss is actual owner-channel EOF, not controller SIGKILL in these five cases.",
+    "Notification and takeover behavior is not implemented or validated by this experiment.",
+    "Raw fixtures, source export and logs are retained externally; no archives or native build products enter Git."
+  ]
+}

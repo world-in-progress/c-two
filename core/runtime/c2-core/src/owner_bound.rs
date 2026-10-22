@@ -1,26 +1,18 @@
-//! Native OwnerBound host lifecycle for explicitly managed service processes.
-//!
-//! A controller creates the private owner control pair
-//! ([`c2_local::owner_control_pair`]), keeps the keepalive endpoint, and hands
-//! the receiver to one Runtime through [`Runtime::attach_owner_control`](crate::Runtime::attach_owner_control).
-//! Starting a host with the [`OwnerBound`](c2_config::ServerLifecyclePolicy::OwnerBound)
-//! policy consumes that capability before the host can publish readiness, so
-//! a policy name alone never creates an owner-bound server.
-//!
-//! The watcher is armed on the host's own runtime thread before the accept
-//! loop runs, which is before readiness can be published. When the controller
-//! closes (EOF) or the watcher itself fails, new business admission closes
-//! immediately — never after the grace window — and after the bounded grace
-//! the existing native drain, route journal, and shutdown barrier take over.
-//! The first version does not reconnect and does not support takeover.
+//! One owner epoch, one recovery grant, and the existing host drain transaction.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use c2_config::ServerLifecyclePolicy;
-use c2_local::OwnerControlReceiver;
-use c2_server::Server;
+use c2_local::{EndpointContextBinding, OwnerBootstrap};
+use c2_server::owner_control::{OwnerControlHandler, OwnerMessage, OwnerReadError, OwnerSession};
+use c2_server::{OwnerAdmissionControl, Server, ServerIdentity};
+use c2_wire::owner_control::{
+    OwnerPhaseWire, OwnerRejection, OwnerRequest, OwnerResponse, OwnerStatusWire, OwnerTicketWire,
+};
 use parking_lot::Mutex;
+use subtle::ConstantTimeEq;
+use tokio::sync::Notify;
 
 /// Observable lifecycle phase of one host.
 ///
@@ -87,72 +79,71 @@ pub struct HostLifecycleSnapshot {
     pub client_held_leases: HostClientHeldLeases,
 }
 
-/// Shared phase cell between the host handle and the host's runtime thread.
+struct OwnerState {
+    phase: HostLifecyclePhase,
+    epoch: u64,
+    grant: Option<[u8; 32]>,
+    deadline: Option<Instant>,
+    binding: Option<EndpointContextBinding>,
+}
+
+/// The lifecycle snapshot and protocol supervisor read the same state.
 #[derive(Clone)]
 pub(crate) struct HostLifecycleCell {
-    phase: Arc<Mutex<HostLifecyclePhase>>,
+    state: Arc<Mutex<OwnerState>>,
+    changed: Arc<Notify>,
 }
 
 impl HostLifecycleCell {
     pub(crate) fn new(policy: &ServerLifecyclePolicy) -> Self {
-        let phase = if policy.is_owner_bound() {
-            HostLifecyclePhase::Armed
-        } else {
-            HostLifecyclePhase::Persistent
-        };
         Self {
-            phase: Arc::new(Mutex::new(phase)),
+            state: Arc::new(Mutex::new(OwnerState {
+                phase: if policy.is_owner_bound() {
+                    HostLifecyclePhase::Armed
+                } else {
+                    HostLifecyclePhase::Persistent
+                },
+                epoch: 1,
+                grant: None,
+                deadline: None,
+                binding: None,
+            })),
+            changed: Arc::new(Notify::new()),
         }
     }
 
     pub(crate) fn phase(&self) -> HostLifecyclePhase {
-        self.phase.lock().clone()
+        self.state.lock().phase.clone()
     }
 
-    pub(crate) fn set_phase(&self, phase: HostLifecyclePhase) {
-        *self.phase.lock() = phase;
-    }
-
-    /// Record the terminal phase from a completed shutdown transaction,
-    /// preserving a sticky watcher IO-error diagnosis.
-    ///
-    /// A transaction whose native barrier or route close reported an error is
-    /// structured-incomplete: the phase stays `Draining` instead of claiming
-    /// `Finished`, because nothing may mark undrained work as done.
     pub(crate) fn finish_from_outcome(&self, outcome: &crate::ShutdownOutcome) {
-        let mut phase = self.phase.lock();
-        if matches!(&*phase, HostLifecyclePhase::WatcherIoError(_)) {
-            return;
+        let mut state = self.state.lock();
+        state.grant = None;
+        state.deadline = None;
+        if !matches!(state.phase, HostLifecyclePhase::WatcherIoError(_))
+            && outcome.runtime_barrier_error.is_none()
+            && outcome.route_close_error.is_none()
+        {
+            state.phase = HostLifecyclePhase::Finished;
         }
-        let completed =
-            outcome.runtime_barrier_error.is_none() && outcome.route_close_error.is_none();
-        if completed {
-            *phase = HostLifecyclePhase::Finished;
-        }
+        self.changed.notify_waiters();
     }
 }
 
-/// Result of the single arming poll performed before readiness.
 pub(crate) enum OwnerArmOutcome {
-    /// The watcher registration is live and the controller end is still open.
-    Alive,
-    /// The controller end was already closed before the host armed.
+    Alive(OwnerSession),
     Closed,
-    /// The watcher itself failed before the host armed.
     IoError(String),
 }
 
-/// Establish the watcher and probe the native endpoint before polling the accept loop.
-pub(crate) async fn arm_owner_watch(receiver: &mut OwnerControlReceiver) -> OwnerArmOutcome {
-    match receiver.prepare().await {
-        Ok(true) => OwnerArmOutcome::Alive,
-        Ok(false) => OwnerArmOutcome::Closed,
+pub(crate) async fn arm_owner_watch(bootstrap: &mut OwnerBootstrap) -> OwnerArmOutcome {
+    match bootstrap.activate().await {
+        Ok(stream) => OwnerArmOutcome::Alive(OwnerSession::new(stream)),
+        Err(error) if peer_ended(&error) => OwnerArmOutcome::Closed,
         Err(error) => OwnerArmOutcome::IoError(error.to_string()),
     }
 }
 
-/// Fence only capability establishment, before any accept loop has been polled.
-/// Cancelling this future never cancels a running Server drain.
 pub(crate) async fn arm_owner_watch_with_fence<F>(
     prepare: F,
     server: &Server,
@@ -169,155 +160,494 @@ where
     }
 }
 
-/// Why the owner supervision ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OwnerWatchEvent {
-    /// The controller endpoint closed (EOF). This is the control channel
-    /// only: business stream EOF, idle eviction, ping failure, cancellation,
-    /// and relay reconnects never produce this event.
-    OwnerEof,
-    /// The watcher itself failed and owner observation is gone.
-    WatcherError(String),
+/// The construction-only admission authority never leaves this Core owner.
+/// All owner mutations lock state before admission; neither lock crosses await.
+pub(crate) struct OwnerSupervisor {
+    lifecycle: HostLifecycleCell,
+    admission: OwnerAdmissionControl,
+    server: OnceLock<Weak<Server>>,
+    identity: ServerIdentity,
+    address: String,
+    grace: Duration,
 }
 
-/// Supervise the owner control channel after arming and drive the
-/// OwnerMissing → Draining sequence.
-///
-/// Completes after requesting shutdown. The coordinator continues polling the actual run
-/// future until it finishes; caller deadlines never cancel that drain.
-pub(crate) async fn supervise_owner(
-    receiver: &mut OwnerControlReceiver,
-    server: &Arc<Server>,
-    lifecycle: &HostLifecycleCell,
-    owner_missing_grace: Duration,
-) -> OwnerWatchEvent {
-    let event = match receiver.wait_closed().await {
-        Ok(()) => OwnerWatchEvent::OwnerEof,
-        Err(error) => OwnerWatchEvent::WatcherError(error.to_string()),
-    };
-    let (admission_reason, shutdown_reason, phase) = match &event {
-        OwnerWatchEvent::OwnerEof => (
-            c2_server::OWNER_MISSING_ADMISSION_REASON,
-            c2_server::OWNER_BOUND_SHUTDOWN_REASON,
-            HostLifecyclePhase::OwnerMissing,
-        ),
-        OwnerWatchEvent::WatcherError(message) => (
-            c2_server::OWNER_WATCHER_ERROR_ADMISSION_REASON,
-            c2_server::OWNER_WATCHER_ERROR_SHUTDOWN_REASON,
-            HostLifecyclePhase::WatcherIoError(message.clone()),
-        ),
-    };
-    // Close new business admission immediately. The grace window only delays
-    // the drain transaction; it never delays admission closure.
-    server.close_business_admission(admission_reason).await;
-    lifecycle.set_phase(phase);
-    tokio::time::sleep(owner_missing_grace).await;
-    if !matches!(lifecycle.phase(), HostLifecyclePhase::WatcherIoError(_)) {
-        lifecycle.set_phase(HostLifecyclePhase::Draining);
+impl OwnerSupervisor {
+    pub(crate) fn new(
+        lifecycle: HostLifecycleCell,
+        admission: OwnerAdmissionControl,
+        identity: ServerIdentity,
+        address: String,
+        grace: Duration,
+    ) -> Self {
+        Self {
+            lifecycle,
+            admission,
+            server: OnceLock::new(),
+            identity,
+            address,
+            grace,
+        }
     }
-    // Hand the shutdown to the run loop with an owner-bound journal reason so
-    // the recorded route closes stay distinguishable from an explicit direct
-    // IPC stop, then observe the native transaction with a bounded wait.
-    server.request_shutdown_signal_with_reason(shutdown_reason);
-    event
+
+    pub(crate) fn attach_server(&self, server: &Arc<Server>) {
+        assert!(self.server.set(Arc::downgrade(server)).is_ok());
+    }
+
+    fn server(&self) -> Arc<Server> {
+        self.server
+            .get()
+            .expect("owner supervisor attached before start")
+            .upgrade()
+            .expect("owner session runs inside its server lifetime")
+    }
+
+    fn status(&self, state: &OwnerState) -> Result<OwnerStatusWire, OwnerRejection> {
+        let binding = state.binding.as_ref().ok_or(OwnerRejection::Unavailable)?;
+        binding.validate().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                OwnerRejection::Unavailable
+            } else {
+                OwnerRejection::IdentityMismatch
+            }
+        })?;
+        Ok(OwnerStatusWire {
+            address: self.address.clone(),
+            server_id: self.identity.server_id.clone(),
+            server_instance_id: self.identity.server_instance_id.clone(),
+            epoch: state.epoch,
+            context_binding: binding.digest(),
+            phase: match state.phase {
+                HostLifecyclePhase::Armed => OwnerPhaseWire::Armed,
+                HostLifecyclePhase::OwnerMissing => OwnerPhaseWire::OwnerMissing,
+                HostLifecyclePhase::Draining => OwnerPhaseWire::Draining,
+                HostLifecyclePhase::WatcherIoError(_) => OwnerPhaseWire::WatcherIoError,
+                HostLifecyclePhase::Finished | HostLifecyclePhase::Persistent => {
+                    OwnerPhaseWire::Finished
+                }
+            },
+        })
+    }
+
+    /// The clock is checked at the commit point, independently of timer scheduling.
+    fn expire(&self, state: &mut OwnerState, now: Instant) -> bool {
+        if state.deadline.is_some_and(|deadline| now >= deadline) {
+            let reason = if matches!(state.phase, HostLifecyclePhase::WatcherIoError(_)) {
+                c2_server::OWNER_WATCHER_ERROR_SHUTDOWN_REASON
+            } else {
+                state.phase = HostLifecyclePhase::Draining;
+                c2_server::OWNER_BOUND_SHUTDOWN_REASON
+            };
+            state.deadline = None;
+            state.grant = None;
+            self.server().request_shutdown_signal_with_reason(reason);
+            self.lifecycle.changed.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn ended(&self, epoch: u64, error: Option<String>) {
+        let mut state = self.lifecycle.state.lock();
+        if state.epoch != epoch || !matches!(state.phase, HostLifecyclePhase::Armed) {
+            return;
+        }
+        if !self.admission.pause() {
+            state.phase = HostLifecyclePhase::Draining;
+            state.grant = None;
+            state.deadline = None;
+            self.lifecycle.changed.notify_waiters();
+            return;
+        }
+        state.phase = match error {
+            Some(message) => {
+                state.grant = None;
+                HostLifecyclePhase::WatcherIoError(message)
+            }
+            None => HostLifecyclePhase::OwnerMissing,
+        };
+        state.deadline = Some(Instant::now() + self.grace);
+        self.lifecycle.changed.notify_waiters();
+    }
+
+    fn shutdown_observed(&self) {
+        let mut state = self.lifecycle.state.lock();
+        state.grant = None;
+        state.deadline = None;
+        if !matches!(
+            state.phase,
+            HostLifecyclePhase::WatcherIoError(_) | HostLifecyclePhase::Finished
+        ) {
+            state.phase = HostLifecyclePhase::Draining;
+        }
+        self.lifecycle.changed.notify_waiters();
+    }
+
+    fn command(&self, epoch: u64, request: OwnerRequest) -> OwnerResponse {
+        let mut state = self.lifecycle.state.lock();
+        let result = (|| {
+            if epoch != state.epoch || !matches!(state.phase, HostLifecyclePhase::Armed) {
+                return Err(OwnerRejection::InvalidGrant);
+            }
+            if !self.server().is_running() {
+                return Err(OwnerRejection::ShuttingDown);
+            }
+            // A replaced namespace cannot issue authority for the old listener.
+            let status = self.status(&state)?;
+            Ok(match request {
+                OwnerRequest::Hello => OwnerResponse::Status(status),
+                OwnerRequest::GetRecoveryTicket => {
+                    if state.grant.is_none() {
+                        let mut secret = [0; 32];
+                        getrandom::fill(&mut secret).map_err(|_| OwnerRejection::Unavailable)?;
+                        state.grant = Some(secret);
+                    }
+                    OwnerResponse::RecoveryTicket(OwnerTicketWire {
+                        address: status.address,
+                        server_id: status.server_id,
+                        server_instance_id: status.server_instance_id,
+                        epoch: status.epoch,
+                        context_binding: status.context_binding,
+                        secret: state.grant.unwrap(),
+                    })
+                }
+                OwnerRequest::RevokeRecovery => {
+                    state.grant = None;
+                    OwnerResponse::Revoked
+                }
+                OwnerRequest::RequestShutdown => {
+                    state.grant = None;
+                    state.phase = HostLifecyclePhase::Draining;
+                    self.server()
+                        .request_shutdown_signal_with_reason(c2_server::DIRECT_IPC_SHUTDOWN_REASON);
+                    self.lifecycle.changed.notify_waiters();
+                    OwnerResponse::ShutdownInitiated
+                }
+                OwnerRequest::Takeover { .. } => return Err(OwnerRejection::OwnerPresent),
+            })
+        })();
+        result.unwrap_or_else(OwnerResponse::Rejected)
+    }
+
+    fn takeover(
+        &self,
+        session: &OwnerSession,
+        ticket: OwnerTicketWire,
+        successor_secret: [u8; 32],
+        setup_deadline: Instant,
+    ) -> Result<(u64, OwnerStatusWire), OwnerRejection> {
+        let mut state = self.lifecycle.state.lock();
+        if self.expire(&mut state, Instant::now()) {
+            return Err(OwnerRejection::GraceExpired);
+        }
+        match state.phase {
+            HostLifecyclePhase::OwnerMissing => {}
+            HostLifecyclePhase::Armed => return Err(OwnerRejection::OwnerPresent),
+            _ => return Err(OwnerRejection::ShuttingDown),
+        }
+        let status = self.status(&state)?;
+        if ticket.address != status.address
+            || ticket.server_id != status.server_id
+            || ticket.server_instance_id != status.server_instance_id
+            || ticket.context_binding != status.context_binding
+        {
+            return Err(OwnerRejection::IdentityMismatch);
+        }
+        if ticket.epoch != state.epoch
+            || !state
+                .grant
+                .is_some_and(|secret| bool::from(secret.ct_eq(&ticket.secret)))
+        {
+            return Err(OwnerRejection::InvalidGrant);
+        }
+        if session.is_closed() {
+            return Err(OwnerRejection::Unavailable);
+        }
+        let next_epoch = state
+            .epoch
+            .checked_add(1)
+            .ok_or(OwnerRejection::Unavailable)?;
+        // resume and terminal shutdown share the existing admission lock. A
+        // shutdown which wins that lock cannot be reopened by this transaction.
+        let deadline = state
+            .deadline
+            .expect("OwnerMissing has its original grace deadline")
+            .min(setup_deadline);
+        if !self.admission.resume(deadline) {
+            if self.expire(&mut state, Instant::now()) {
+                return Err(OwnerRejection::GraceExpired);
+            }
+            if Instant::now() >= setup_deadline {
+                return Err(OwnerRejection::Unavailable);
+            }
+            return Err(OwnerRejection::ShuttingDown);
+        }
+        state.epoch = next_epoch;
+        state.grant = Some(successor_secret);
+        state.deadline = None;
+        state.phase = HostLifecyclePhase::Armed;
+        self.lifecycle.changed.notify_waiters();
+        let mut status = status;
+        status.epoch = next_epoch;
+        status.phase = OwnerPhaseWire::Armed;
+        Ok((next_epoch, status))
+    }
+
+    async fn active(self: &Arc<Self>, session: &mut OwnerSession, epoch: u64) {
+        let server = self.server();
+        loop {
+            let message = tokio::select! {
+                biased;
+                _ = stopping(&server) => { self.shutdown_observed(); return; }
+                result = session.read() => result,
+            };
+            match message {
+                Ok(message) => {
+                    let terminal_request = matches!(message.request, OwnerRequest::RequestShutdown);
+                    let response = session.respond(message, |request| self.command(epoch, request));
+                    let result = if terminal_request {
+                        response.await
+                    } else {
+                        tokio::select! {
+                            _ = stopping(&server) => { self.shutdown_observed(); return; }
+                            result = response => result,
+                        }
+                    };
+                    match result {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.ended(epoch, (!peer_ended(&error)).then(|| error.to_string()));
+                            return;
+                        }
+                    }
+                }
+                Err(OwnerReadError::Io(error)) => {
+                    self.ended(epoch, (!peer_ended(&error)).then(|| error.to_string()));
+                    return;
+                }
+                Err(OwnerReadError::Protocol { error, .. }) => {
+                    self.ended(epoch, Some(error.to_string()));
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn candidate(
+        self: Arc<Self>,
+        mut session: OwnerSession,
+        first: OwnerMessage,
+        deadline: Instant,
+    ) {
+        if Instant::now() >= deadline {
+            return;
+        }
+        if !matches!(first.request, OwnerRequest::Hello) {
+            let _ = session
+                .reply(
+                    first.request_id,
+                    &OwnerResponse::Rejected(OwnerRejection::Malformed),
+                )
+                .await;
+            return;
+        }
+        let server = self.server();
+        let setup = async {
+            let status = {
+                let mut state = self.lifecycle.state.lock();
+                self.expire(&mut state, Instant::now());
+                self.status(&state)
+            };
+            let continuing =
+                matches!(&status, Ok(status) if status.phase == OwnerPhaseWire::OwnerMissing);
+            let response = status
+                .map(OwnerResponse::Status)
+                .unwrap_or_else(OwnerResponse::Rejected);
+            session.reply(first.request_id, &response).await.ok()?;
+            if !continuing {
+                return None;
+            }
+            let message = session.read().await.ok()?;
+            let result = match message.request {
+                OwnerRequest::Takeover {
+                    ticket,
+                    successor_secret,
+                } => self.takeover(&session, ticket, successor_secret, deadline),
+                _ => Err(OwnerRejection::Malformed),
+            };
+            match result {
+                Ok((epoch, status)) => {
+                    // Ownership and supervision exist before writing the ACK.
+                    // A lost ACK enters normal grace for this new epoch.
+                    let relationship = OwnerRelationship {
+                        owner: &self,
+                        epoch,
+                    };
+                    session
+                        .reply(message.request_id, &OwnerResponse::TakenOver(status))
+                        .await
+                        .ok()?;
+                    Some(relationship)
+                }
+                Err(reason) => {
+                    let _ = session
+                        .reply(message.request_id, &OwnerResponse::Rejected(reason))
+                        .await;
+                    None
+                }
+            }
+        };
+        let adopted = tokio::select! {
+            biased;
+            _ = server.wait_for_shutdown_requested() => None,
+            result = tokio::time::timeout_at(deadline.into(), setup) => result.ok().flatten(),
+        };
+        if let Some(relationship) = adopted {
+            self.active(&mut session, relationship.epoch).await;
+        }
+    }
+
+    /// One deadline observer for all epochs; stale wakeups recheck the current
+    /// state, and no attempt can move an already running grace deadline.
+    async fn watch_deadline(&self) {
+        let server = self.server();
+        loop {
+            let changed = self.lifecycle.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let deadline = {
+                let mut state = self.lifecycle.state.lock();
+                if self.expire(&mut state, Instant::now()) {
+                    return;
+                }
+                state.deadline
+            };
+            tokio::select! {
+                _ = stopping(&server) => { self.shutdown_observed(); return; }
+                _ = &mut changed => {}
+                _ = async { if let Some(deadline) = deadline { tokio::time::sleep_until(deadline.into()).await; } else { std::future::pending::<()>().await; } } => {}
+            }
+        }
+    }
+
+    pub(crate) async fn supervise(self: Arc<Self>, mut bootstrap: OwnerSession) {
+        let server = self.server();
+        // run() binds the endpoint before publishing readiness. A private
+        // controller may write early, but no unbound ticket can be issued.
+        let ready = async {
+            loop {
+                let changed = self.lifecycle.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.lifecycle.state.lock().binding.is_some() {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = stopping(&server) => { self.shutdown_observed(); return; }
+            _ = ready => {}
+        }
+        let active = async {
+            let _relationship = OwnerRelationship {
+                owner: &self,
+                epoch: 1,
+            };
+            self.active(&mut bootstrap, 1).await;
+        };
+        tokio::pin!(active);
+        tokio::select! {
+            _ = &mut active => self.watch_deadline().await,
+            _ = self.watch_deadline() => active.await,
+        }
+    }
+}
+
+impl OwnerControlHandler for OwnerSupervisor {
+    fn bound(&self, binding: EndpointContextBinding) -> std::io::Result<()> {
+        // Bind captured this identity under its native namespace lock. Moving
+        // that snapshot into Core neither grants a capability nor reopens it.
+        // Every command that issues or uses a grant validates the current pins.
+        self.lifecycle.state.lock().binding = Some(binding);
+        self.lifecycle.changed.notify_waiters();
+        Ok(())
+    }
+
+    fn setup_deadline(&self, started: Instant) -> Instant {
+        let setup = started + c2_local::DEFAULT_CONNECT_TIMEOUT;
+        self.lifecycle
+            .state
+            .lock()
+            .deadline
+            .map_or(setup, |grace| setup.min(grace))
+    }
+
+    fn serve(
+        self: Arc<Self>,
+        session: OwnerSession,
+        first: OwnerMessage,
+        deadline: Instant,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(self.candidate(session, first, deadline))
+    }
+}
+
+struct OwnerRelationship<'a> {
+    owner: &'a OwnerSupervisor,
+    epoch: u64,
+}
+impl Drop for OwnerRelationship<'_> {
+    fn drop(&mut self) {
+        self.owner.ended(self.epoch, None);
+    }
+}
+
+fn peer_ended(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
+async fn stopping(server: &Server) {
+    tokio::select! {
+        _ = server.wait_for_shutdown_requested() => {},
+        _ = server.wait_until_terminal() => {},
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn preclosed_probe_does_not_depend_on_reactor_delivery() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (keepalive, mut receiver) = c2_local::owner_control_pair().unwrap();
-        drop(keepalive);
-        assert!(matches!(
-            runtime.block_on(arm_owner_watch(&mut receiver)),
-            OwnerArmOutcome::Closed
-        ));
-    }
-    #[test]
-    fn watcher_error_diagnosis_survives_draining_and_completion() {
+    fn watcher_error_diagnosis_survives_completion() {
         let cell = HostLifecycleCell::new(&ServerLifecyclePolicy::Persistent);
-        cell.set_phase(HostLifecyclePhase::WatcherIoError("invalid control".into()));
+        cell.state.lock().phase = HostLifecyclePhase::WatcherIoError("invalid control".into());
         cell.finish_from_outcome(&crate::ShutdownOutcome::default());
         assert_eq!(
             cell.phase(),
             HostLifecyclePhase::WatcherIoError("invalid control".into())
         );
     }
+
     #[test]
-    fn actual_watcher_io_failure_closes_admission_and_is_sticky() {
+    fn preclosed_bootstrap_is_refused_before_ready() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let (_keepalive, mut receiver) = c2_local::owner_control_pair().unwrap();
-        receiver.shutdown();
-        let server = Arc::new(
-            Server::new(
-                &format!("ipc://watch-error-{}", uuid::Uuid::new_v4().simple()),
-                c2_server::config::ServerIpcConfig::default(),
-            )
-            .unwrap(),
-        );
-        let policy = ServerLifecyclePolicy::owner_bound(Duration::ZERO).unwrap();
-        let cell = HostLifecycleCell::new(&policy);
-        let event = runtime.block_on(supervise_owner(
-            &mut receiver,
-            &server,
-            &cell,
-            Duration::ZERO,
-        ));
-        assert!(matches!(event, OwnerWatchEvent::WatcherError(_)));
-        assert!(server.business_admission_closed());
+        let (controller, mut bootstrap) = c2_local::owner_endpoint_pair().unwrap();
+        drop(controller);
         assert!(matches!(
-            cell.phase(),
-            HostLifecyclePhase::WatcherIoError(_)
+            runtime.block_on(arm_owner_watch(&mut bootstrap)),
+            OwnerArmOutcome::Closed
         ));
-        cell.finish_from_outcome(&crate::ShutdownOutcome::default());
-        assert!(matches!(
-            cell.phase(),
-            HostLifecyclePhase::WatcherIoError(_)
-        ));
-    }
-    #[test]
-    fn pending_pre_ready_establishment_is_cancelled_by_deadline_and_shutdown() {
-        for shutdown in [false, true] {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let server = Arc::new(
-                Server::new(
-                    &format!("ipc://pending-arm-{}", uuid::Uuid::new_v4().simple()),
-                    c2_server::config::ServerIpcConfig::default(),
-                )
-                .unwrap(),
-            );
-            server.begin_start_attempt().unwrap();
-            if shutdown {
-                server.request_shutdown_signal_with_reason("shutdown");
-            }
-            let started = std::time::Instant::now();
-            let result = runtime.block_on(arm_owner_watch_with_fence(
-                std::future::pending(),
-                &server,
-                Duration::from_millis(20),
-            ));
-            let OwnerArmOutcome::IoError(message) = result else {
-                panic!("pending prepare cannot arm");
-            };
-            server.reject_start_attempt(message).unwrap();
-            assert!(started.elapsed() < Duration::from_secs(1));
-            assert!(matches!(
-                server.lifecycle_state(),
-                c2_server::ServerLifecycleState::Failed(_)
-            ));
-            assert!(!server.is_running());
-            runtime.block_on(server.wait_until_terminal()).unwrap();
-        }
     }
 }

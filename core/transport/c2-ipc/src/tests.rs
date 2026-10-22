@@ -2324,18 +2324,16 @@ mod lazy_policy_roundtrip_tests {
         );
         assert_eq!(response_bytes(&client, response), payload);
 
-        // The injected pool keeps its configuration: same policy, no buddy
-        // mappings, and the settled dedicated request retired promptly — the
-        // response proves the peer set `read_done`, so the owner entry is
-        // already reclaimed here rather than lingering until a later GC.
+        // read_done permits retirement, but receiver settlement is deliberately
+        // nonblocking when the shared retire executor is busy. Observe the
+        // existing close barrier before asserting that owner cleanup finished.
+        assert!(client.close_shared_bounded(Duration::from_secs(2)).await);
         {
             let pool = injected.lock();
             assert!(!pool.config().buddy_enabled);
             assert_eq!(pool.segment_count(), 0);
             assert_eq!(pool.stats().dedicated_segments, 0);
         }
-        client.close().await;
-        assert_eq!(injected.lock().segment_count(), 0);
         stop_server(&server).await;
     }
 
@@ -4496,7 +4494,7 @@ mod lazy_policy_roundtrip_tests {
     /// call may append to the corrupt stream, the pending entry drains with
     /// a correct settle, and the buddy block stays conservatively charged
     /// until pool destruction returns it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn partial_frame_write_cancellation_poisons_the_stream() {
         check_partial_frame_write_cancellation(false).await;
     }
@@ -4537,6 +4535,7 @@ mod lazy_policy_roundtrip_tests {
             None
         };
         client.connect().await.expect("connect");
+        let observation = client.connection_observation().unwrap();
         let mut peer = peer_rx.await.expect("peer stream");
         let pool = client.request_pool().expect("transport-owned request pool");
         let budget = pool
@@ -4580,7 +4579,16 @@ mod lazy_policy_roundtrip_tests {
             .expect("prefix read");
 
         // Caller cancellation after the partial write.
+        assert!(observation.snapshot().is_none());
         drop(call);
+        // The current-thread variant cannot resume its reader between Drop
+        // and this snapshot. The send abort itself must publish the cause.
+        let closed = observation
+            .snapshot()
+            .expect("sender publishes before abort");
+        assert_eq!(closed.reason(), c2_local::ConnectionEndReason::LocalClose);
+        assert_eq!(closed.operation(), "local_abort");
+        assert!(!client.is_connected());
 
         // A follow-up call must fail instead of appending to the partial
         // frame on the same stream.
@@ -4632,6 +4640,7 @@ mod lazy_policy_roundtrip_tests {
         assert!(budget.snapshot().cell(c2_mem::BudgetKind::Shm).used_bytes > 0);
         let retained_bytes = budget.snapshot().shm.used_bytes;
         assert!(client.close_shared_bounded(Duration::from_secs(2)).await);
+        assert_eq!(observation.snapshot(), Some(closed));
         assert!(client.request_pool().is_none());
         assert_eq!(
             pool.lock().stats().alloc_count,
@@ -5029,8 +5038,22 @@ mod lazy_policy_roundtrip_tests {
     /// connection must not carry per-call residue.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_call_waiting_for_the_writer_leaves_no_pending_entry() {
-        let cfg = client_config(small_base(64 * 1024, 2), 1024);
-        let client = IpcClient::with_config("ipc://pending_entry_cleanup", cfg);
+        let base = small_base(64 * 1024, 2);
+        let (callback, _) = echo_callback();
+        let server = start_echo_server(
+            "pending_entry_cleanup",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let observation = client.connection_observation().unwrap();
+        let binding = client
+            .acquire_route(&expected_contract("pending_entry_cleanup"))
+            .await
+            .unwrap();
+        let (method_idx, identity, _) = binding.call_target_for("echo").unwrap();
         let pool = client.request_pool().expect("transport-owned request pool");
 
         let writer_slot = client.writer_slot_for_test();
@@ -5050,8 +5073,7 @@ mod lazy_policy_roundtrip_tests {
             .expect("a request pool is selected");
         block.write_at(0, &payload).expect("fill the block");
 
-        let identity = raw_peer_identity();
-        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block));
+        let mut call = Box::pin(client.call_with_prealloc(&identity, method_idx, &block));
         use futures_util::FutureExt as _;
         assert!(
             call.as_mut().now_or_never().is_none(),
@@ -5071,11 +5093,17 @@ mod lazy_policy_roundtrip_tests {
             "cancellation before the write must remove the pending entry immediately"
         );
         assert_eq!(pool.lock().stats().alloc_count, 1, "the block is armed");
+        assert!(observation.snapshot().is_none());
+        assert!(client.is_connected());
         let _ = block.release();
         assert_eq!(pool.lock().stats().alloc_count, 0);
 
         let _ = unhold_tx.send(());
+        let response = echo_roundtrip(&client, "pending_entry_cleanup", b"still healthy").await;
+        assert_eq!(response_bytes(&client, response), b"still healthy");
+        assert!(observation.snapshot().is_none());
         client.close_shared().await;
+        stop_server(&server).await;
     }
 
     // ── Reply-wait cancellation, late replies, and bounded retire capacity ─
@@ -5132,6 +5160,7 @@ mod lazy_policy_roundtrip_tests {
         .await;
         let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
         client.connect().await.unwrap();
+        let observation = client.connection_observation().unwrap();
         let budget = client
             .request_pool()
             .expect("dedicated-capable request pool")
@@ -5165,6 +5194,7 @@ mod lazy_policy_roundtrip_tests {
             client.is_connected(),
             "cancelling a reply wait must not tear down the healthy connection"
         );
+        assert!(observation.snapshot().is_none());
         assert_eq!(
             client.pending_len_for_test(),
             0,
@@ -5189,6 +5219,7 @@ mod lazy_policy_roundtrip_tests {
             server.response_pool_arc().read().stats().alloc_count == 0
         })
         .await;
+        assert!(observation.snapshot().is_none());
         client.close_shared().await;
         stop_server(&server).await;
     }

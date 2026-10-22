@@ -121,6 +121,25 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
+    /// Observe this physical IPC connection without connecting or reconnecting.
+    /// Other logical views may share it; closing one view need not end it.
+    pub fn connection_observation(&self) -> Result<c2_local::ConnectionObservation, Error> {
+        match &self.inner.transport {
+            ClientInner::Ipc(client) => client.client.connection_observation().ok_or_else(|| {
+                c2_error::C2Error::new(
+                    c2_error::ErrorCode::ResourceClosed,
+                    "IPC client has no physical connection",
+                )
+                .into()
+            }),
+            ClientInner::Http(..) => Err(c2_error::C2Error::new(
+                c2_error::ErrorCode::UnsupportedCallMode,
+                "connection observation requires a physical IPC connection",
+            )
+            .into()),
+        }
+    }
+
     pub fn expected_route(&self) -> &ExpectedRouteContract {
         &self.inner.expected
     }

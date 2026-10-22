@@ -110,7 +110,8 @@ class TestHeartbeatIntegration:
         finally:
             server.shutdown()
 
-    def test_dead_client_detected_by_heartbeat(self):
+    @pytest.mark.parametrize('ordinary', [False, True], ids=['unclassified', 'ordinary'])
+    def test_dead_client_detected_by_heartbeat(self, ordinary):
         """A raw socket (no PONG capability) is detected within timeout.
 
         This tests low-level transport behavior — the server must detect
@@ -129,8 +130,10 @@ class TestHeartbeatIntegration:
                 [sys.executable, '-c', r"""
 import errno
 import socket
+import struct
 import sys
 
+ordinary = sys.argv[2] == 'ordinary'
 if sys.platform == 'win32':
     connection = open(sys.argv[1], 'r+b', buffering=0)
     read = connection.read
@@ -141,6 +144,14 @@ else:
     read = connection.recv
 received = bytearray()
 try:
+    if ordinary:
+        # Handwritten existing SIGNAL/PING frame selects the ordinary role.
+        # Do not respond to the later server heartbeat PINGs.
+        request = struct.pack('<IQI', 13, 7, 1 << 11) + b'\x01'
+        if sys.platform == 'win32':
+            assert connection.write(request) == len(request)
+        else:
+            connection.sendall(request)
     while True:
         try:
             chunk = read(4096)
@@ -155,10 +166,19 @@ try:
         received.extend(chunk)
 finally:
     connection.close()
-# The server sent a PING before retiring the non-responsive connection.
-assert len(received) >= 17, received
-assert received[16] == 1, received
-""", _endpoint_name_from_address(address)],
+if ordinary:
+    # PONG proves the role was selected; a later unanswered PING still expires
+    # under the original heartbeat deadline. Scheduler order can interleave them.
+    assert len(received) % 17 == 0, received
+    frames = [struct.unpack_from('<IQIB', received, offset)
+              for offset in range(0, len(received), 17)]
+    assert (13, 7, (1 << 11) | 2, 2) in frames, frames
+    assert any(length == 13 and flags == 1 << 11 and signal == 1
+               for length, _request_id, flags, signal in frames), frames
+else:
+    # Unknown roles retain the original timeout, without unsolicited business PINGs.
+    assert not received, received
+""", _endpoint_name_from_address(address), 'ordinary' if ordinary else 'unclassified'],
                 capture_output=True,
                 text=True,
                 timeout=5.0,

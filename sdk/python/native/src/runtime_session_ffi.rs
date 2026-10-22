@@ -32,7 +32,9 @@ use crate::core_error_ffi::{
 use crate::core_ffi::{PyCoreClient, PyCoreService};
 use crate::endpoint_ffi::PyLocalEndpointContext;
 use crate::lease_ffi::{PyBufferLeaseTracker, lease_stats_dict};
-use crate::owner_ffi::PyNativeOwnerReceiver;
+use crate::owner_ffi::{
+    PyNativeOwnerBootstrap, PyOwnerRecoveryTicket, PyPreparedOwnerTakeover, owner_error,
+};
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 
 pub(crate) fn checked_shutdown_timeout(seconds: f64) -> Result<Duration, &'static str> {
@@ -322,6 +324,12 @@ impl PyRuntimeSession {
 
 #[pymethods]
 impl PyRuntimeSession {
+    fn connection_events(&self) -> crate::connection_ffi::PyConnectionEvents {
+        crate::connection_ffi::PyConnectionEvents {
+            inner: self.inner.connection_events(),
+        }
+    }
+
     #[new]
     #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true, max_outstanding_calls=None, retained_input_budget_bytes=None))]
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
@@ -904,7 +912,17 @@ impl PyRuntimeSession {
     /// attach after a host consumed the capability, and a capability that is
     /// already closed are all rejected by Core before any host can publish
     /// readiness, so a policy name alone can never create an owner-bound host.
-    fn attach_owner_control(&self, receiver: &PyNativeOwnerReceiver) -> PyResult<()> {
+    fn prepare_owner_takeover(
+        &self,
+        py: Python<'_>,
+        ticket: &PyOwnerRecoveryTicket,
+    ) -> PyResult<PyPreparedOwnerTakeover> {
+        py.detach(|| self.inner.prepare_owner_takeover(ticket.inner.clone()))
+            .map(|inner| PyPreparedOwnerTakeover { inner })
+            .map_err(|error| owner_error(py, error))
+    }
+
+    fn attach_owner_control(&self, receiver: &PyNativeOwnerBootstrap) -> PyResult<()> {
         let host_guard = self.host.lock();
         if host_guard.is_some() || self.inner.owner_control_consumed() {
             return Err(PyRuntimeError::new_err(

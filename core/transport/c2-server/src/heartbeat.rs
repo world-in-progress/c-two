@@ -77,13 +77,20 @@ pub async fn run_heartbeat(
                 idle_secs = format!("{idle:.1}"),
                 "heartbeat timeout — closing connection"
             );
+            conn.end(
+                c2_local::ConnectionEndReason::HeartbeatTimeout,
+                "heartbeat_timeout",
+            );
             abort.abort();
             return HeartbeatResult::TimedOut;
         }
 
-        if idle >= config.heartbeat_interval_secs {
+        // Before the peer's first frame, retain the same timeout but do not
+        // inject a business Ping into a possible owner-control session.
+        if conn.ordinary_protocol() && idle >= config.heartbeat_interval_secs {
             let mut w = writer.lock().await;
-            if w.write_all(&ping_frame).await.is_err() {
+            if let Err(error) = w.write_all(&ping_frame).await {
+                conn.end_io("heartbeat_write", &error);
                 warn!(conn_id = conn.conn_id(), "heartbeat write failed");
                 return HeartbeatResult::WriteError;
             }
@@ -189,7 +196,12 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_timeout_returns() {
         use tokio::io::AsyncReadExt;
-        let conn = Arc::new(Connection::new(1));
+        let source = c2_local::ConnectionEventSource::new();
+        let mut events = source.subscribe();
+        let publisher = source.open_connection();
+        let conn = Arc::new(Connection::observed(publisher.clone()));
+        conn.select_ordinary_protocol();
+        let observation = conn.connection_observation();
         let config = ServerIpcConfig {
             heartbeat_interval_secs: 0.05,
             heartbeat_timeout_secs: 0.10,
@@ -197,18 +209,49 @@ mod tests {
         };
 
         let (sock_a, mut sock_b) = c2_local::LocalStream::pair().await.unwrap();
-        let (_read_a, write_half) = sock_a.into_split();
+        let (mut read_a, write_half) = sock_a.with_connection_publisher(publisher).into_split();
         let writer = Arc::new(Mutex::new(write_half));
+        let reader_conn = Arc::clone(&conn);
+        let reader = tokio::spawn(async move {
+            let mut byte = [0];
+            let error = read_a.read_exact(&mut byte).await.unwrap_err();
+            reader_conn.end_read("heartbeat_competing_reader", &error);
+        });
+        let flight = crate::connection::FlightGuard::new(&conn);
+        conn.touch();
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(2), run_heartbeat(conn, writer, &config))
-                .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_heartbeat(Arc::clone(&conn), writer, &config),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
             "heartbeat should return before outer timeout"
         );
         assert_eq!(result.unwrap(), HeartbeatResult::TimedOut);
+        let closed = observation
+            .snapshot()
+            .expect("heartbeat publishes before abort");
+        assert_eq!(closed.operation(), "heartbeat_timeout");
+        assert_eq!(
+            conn.inflight_count(),
+            1,
+            "Closed does not drain active work"
+        );
+        tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        conn.cancel_queued_work();
+        assert_eq!(
+            observation.snapshot().unwrap().reason(),
+            c2_local::ConnectionEndReason::HeartbeatTimeout
+        );
+        assert_eq!(observation.snapshot(), Some(closed));
+        drop(flight);
+        conn.wait_idle().await;
         let mut received = Vec::new();
         tokio::time::timeout(Duration::from_secs(1), sock_b.read_to_end(&mut received))
             .await
@@ -219,5 +262,17 @@ mod tests {
             "peer must receive a PING before timeout"
         );
         assert!(received.chunks_exact(17).all(|frame| frame[16] == 0x01));
+        drop(source);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            Some(c2_local::ConnectionEvent::Opened(_))
+        ));
+        assert!(
+            matches!(events.recv().await.unwrap(), Some(c2_local::ConnectionEvent::Closed(record)) if record == closed)
+        );
+        assert!(
+            events.recv().await.unwrap().is_none(),
+            "heartbeat, reader and Drop publish only once"
+        );
     }
 }

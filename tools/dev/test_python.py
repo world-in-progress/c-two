@@ -79,7 +79,7 @@ POSIX_FROZEN_PEER_TESTS = frozenset(
     f'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[{hosted}-True]'
     for hosted in ('False', 'True')
 )
-FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+FASTDB_SHA = "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4"
 PLUGIN = "tools.dev.test_python"
 
 
@@ -279,8 +279,8 @@ def capture(command: list[str], environment: dict[str, str]) -> str:
 
 def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
     info = json.loads(capture([options.python, "-c", PROBE], environment).splitlines()[-1])
-    if info["versions"]["fastdb4py"] != "0.2.2":
-        raise RunnerError("需要固定fastdb4py==0.2.2")
+    if info["versions"]["fastdb4py"] != "0.2.3":
+        raise RunnerError("需要固定fastdb4py==0.2.3")
     if not options.c3.is_file():
         raise RunnerError(f"预建c3不存在：{options.c3}")
     if Path(info["python_sdk"]).resolve().parent != (ROOT / "sdk/python/src/c_two").resolve():

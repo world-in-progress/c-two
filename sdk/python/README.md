@@ -28,6 +28,9 @@ The historical [0.7.4 publication record](https://github.com/world-in-progress/c
 
 ## Development
 
+The unreleased development source pins FastDB 0.2.3 across its bindings and
+Core SDK. Published C-Two versions above retain their recorded dependencies.
+
 Use canonical main for source development and run commands from the repository root. The matching c3 release's `rc-manifest.json` identifies release source:
 
 ```bash
@@ -42,13 +45,13 @@ Prerequisites:
 - Python 3.14.3t when testing free-threading support
 - Rust toolchain
 - `uv`
-- for full interoperability tests: the FastDB `v0.2.1` source checkout at `../fastdb`
+- for full interoperability tests: the FastDB `v0.2.3` source checkout at `../fastdb`
 
 The default workspace dev group selects `c-two[fastdb]` and resolves
-`fastdb4py==0.2.2` from PyPI. Bare package installation omits it. The Python native extension and
-c3 pin FastDB source `4f99f86a662b0e950a0dd29800c25a1c9fca4def` for their source-mode static
+`fastdb4py==0.2.3` from PyPI. Bare package installation omits it. The Python native extension and
+c3 pin FastDB source `abba785ef2a7d3fbee1bbc608393a3e6c7b042c4` for their source-mode static
 builds. Core and Rust SDK tests use the published Rust bindings with the matching
-[FastDB Core SDK](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1)
+[FastDB Core SDK](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.3)
 in system link mode. Golden specs and TypeScript interoperability fixtures still
 need the sibling source checkout; it is not a Python package override.
 

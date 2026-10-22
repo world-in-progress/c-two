@@ -178,6 +178,13 @@ impl PyNativePreparedCall {
 
 #[pymethods]
 impl PyCoreClient {
+    fn connection_observation(&self) -> PyResult<crate::connection_ffi::PyConnectionObservation> {
+        self.client()?
+            .connection_observation()
+            .map(|inner| crate::connection_ffi::PyConnectionObservation { inner })
+            .map_err(core_error_to_py)
+    }
+
     #[getter]
     fn mode(&self) -> &'static str {
         match self.observed_path {

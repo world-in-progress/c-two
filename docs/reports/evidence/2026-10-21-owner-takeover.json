@@ -1,0 +1,411 @@
+{
+  "schema": "c-two.owner-takeover-acceptance.v1",
+  "date": "2026-10-21",
+  "baseline": "1a8b4bf620a3a7d6e0090a7df2bf2523846a6739",
+  "implementation": "ea511c7a00be024134bade2cc3e5a137f06a96fe",
+  "fastdb": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+  "preserved_versions": {
+    "ipc": 12,
+    "shm": 3,
+    "c_mem_ffi_abi": 5
+  },
+  "business_wire_changed": false,
+  "owner_control_version": 1,
+  "owner_control_max_payload_bytes": 4096,
+  "retired_owner_interfaces_have_compatibility_paths": false,
+  "local_git": {
+    "head": "0acf784f6742487cd619a7d419379f693434a337",
+    "branch": "socu/r02-unique-write",
+    "branches_and_tags_moved": false,
+    "push_scope": "Dsssyc/c-two:socu/owner-takeover-ci only",
+    "released": false
+  },
+  "baseline_counterexamples": {
+    "test_snapshot": "12cd3f5ca5a09b01f77e9b6e83c530ac378d0b74",
+    "platform": "macOS arm64",
+    "expected_failures": [
+      "live_owner_refuses_pre_handshake_ipc_shutdown",
+      "live_owner_refuses_handshaken_ipc_shutdown",
+      "owner_missing_grace_keeps_route_ready_and_returns_resource_unavailable"
+    ],
+    "socket_residue": 0,
+    "lease_residue": 0
+  },
+  "ci": {
+    "implementation": "ea511c7a00be024134bade2cc3e5a137f06a96fe",
+    "fastdb": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+    "run_id": 39618680376,
+    "run_url": "https://github.com/Dsssyc/c-two/actions/runs/39618680376",
+    "job_count": 9,
+    "all_jobs": "success",
+    "applicable_gate_total": 118,
+    "platforms": [
+      {
+        "platform": "linux312",
+        "gates_passed": 25,
+        "python_steps_cleaned": 7,
+        "ordinary_passed": 1241,
+        "ordinary_skipped": 5,
+        "portable_passed": 25,
+        "portable_skipped": 0,
+        "rust_python_matrix_rows": 18,
+        "typescript_passed": 14,
+        "typescript_skipped": 0,
+        "typescript_matrix_rows": 12,
+        "memory_matrix_rows": 9,
+        "installed_wheel": "passed and cleaned"
+      },
+      {
+        "platform": "macos",
+        "gates_passed": 25,
+        "python_steps_cleaned": 7,
+        "ordinary_passed": 1241,
+        "ordinary_skipped": 5,
+        "portable_passed": 25,
+        "portable_skipped": 0,
+        "rust_python_matrix_rows": 18,
+        "typescript_passed": 14,
+        "typescript_skipped": 0,
+        "typescript_matrix_rows": 12,
+        "memory_matrix_rows": 9,
+        "installed_wheel": "passed and cleaned"
+      },
+      {
+        "platform": "windows2022",
+        "gates_passed": 26,
+        "python_steps_cleaned": 7,
+        "ordinary_passed": 1204,
+        "ordinary_skipped": 42,
+        "portable_passed": 25,
+        "portable_skipped": 0,
+        "rust_python_matrix_rows": 18,
+        "typescript_passed": 14,
+        "typescript_skipped": 0,
+        "typescript_matrix_rows": 12,
+        "memory_matrix_rows": 9,
+        "installed_wheel": "passed and cleaned",
+        "windows_standard_user": "passed and cleaned"
+      },
+      {
+        "platform": "windows2025",
+        "gates_passed": 26,
+        "python_steps_cleaned": 7,
+        "ordinary_passed": 1204,
+        "ordinary_skipped": 42,
+        "portable_passed": 25,
+        "portable_skipped": 0,
+        "rust_python_matrix_rows": 18,
+        "typescript_passed": 14,
+        "typescript_skipped": 0,
+        "typescript_matrix_rows": 12,
+        "memory_matrix_rows": 9,
+        "installed_wheel": "passed and cleaned",
+        "windows_standard_user": "passed and cleaned"
+      },
+      {
+        "platform": "linux314t",
+        "gates_passed": 16,
+        "python_steps_cleaned": 7,
+        "ordinary_passed": 1241,
+        "ordinary_skipped": 5,
+        "portable_passed": 25,
+        "portable_skipped": 0,
+        "rust_python_matrix_rows": 18,
+        "typescript_passed": 14,
+        "typescript_skipped": 0,
+        "typescript_matrix_rows": 12
+      }
+    ]
+  },
+  "windows_core_checks_each": {
+    "local": 45,
+    "owner_lifecycle": 35,
+    "http_relay": 411
+  },
+  "reviews": [
+    {
+      "run_id": "26e851ac-5700-4091-b60b-a6d7c1903e58",
+      "input": "d664b18120d6e3b63bd42af3ee240e9dda123e68",
+      "artifact_id": "63ebef74-8d2a-46f6-bb9f-199996193bd6"
+    },
+    {
+      "run_id": "18e8cae4-8606-4c04-87de-9dbeef400273",
+      "input": "9fcde4962ab591a4d4a5f732522ddc8335f13137",
+      "artifact_id": "6ad48ed7-9f9b-4bb6-a20a-5cad66bec267"
+    },
+    {
+      "run_id": "09226571-8dfe-40a8-b704-483159f379d3",
+      "input": "1bac59797d18f94174792353b6f463672f7ef01d",
+      "artifact_id": "5533389b-70d3-46b5-a9a0-52f78e83cf76"
+    },
+    {
+      "run_id": "5139b07a-52c6-411f-9757-30915936462a",
+      "input": "9007c4e25c8ac9393ed56b6ad1489034038c24a2",
+      "artifact_id": "292fafce-66bc-4db0-a11b-71258841927f"
+    },
+    {
+      "run_id": "e7685dd4-f601-437e-9d1d-55c834e1aa32",
+      "input": "9459b0c928e84c4882c5bc506999a14714e39422",
+      "artifact_id": "6931e92f-083e-4082-aa77-d459511dbdf8"
+    },
+    {
+      "run_id": "f8bd7c63-356f-4b57-bf29-8d83184e0f34",
+      "input": "90dbc3e038a2585076c00d068701b4060fbc3b64",
+      "artifact_id": "6795c4a1-429f-4f9c-af70-0425ad363136"
+    },
+    {
+      "run_id": "ea486d0f-4cf2-46a6-b3a7-b30cdabc6522",
+      "input": "ea511c7a00be024134bade2cc3e5a137f06a96fe",
+      "artifact_id": "50574998-6eb3-482c-8264-cbd2d11da5a6"
+    }
+  ],
+  "review_status": "all listed read-only deliverables accepted; findings repaired; final handoff review has no blockers",
+  "slimming_review": {
+    "run_ids": [
+      "d718c5ef-db1d-419c-9a06-54dac6ad37c2",
+      "78141ea1-0d0c-45fd-8ca6-b8a823ecdc99"
+    ],
+    "applied": true,
+    "actual_production_net": -14,
+    "actual_tests_net": -79,
+    "actual_total_net": -93,
+    "scope": [
+      "Unix synchronous activation uses a local watcher",
+      "11 repeated owner test setups share one concrete initializer; teardown stays explicit"
+    ],
+    "not_adopted": [
+      "OwnerStatus wire alias changes nominal Rust type and Debug",
+      "cross-crate parameterized frame reader for marginal reduction",
+      "new test lifecycle harness"
+    ],
+    "base": "fe406326bf36ade401b7dd8e764b36ccd8631589",
+    "implementation": "b346e2b3303f0a0fa90f90bf68481897fb55e0be",
+    "implementation_review_run_id": "b91cb68f-ca33-475f-b7f2-daa5c0abbca9",
+    "implementation_review_artifact_id": "d601dcc2-ab9d-475f-9619-9565bc99bfa4",
+    "platforms": [
+      "macOS arm64",
+      "Linux aarch64 container"
+    ],
+    "native_tests_per_platform": 10,
+    "lifecycle_tests_per_platform": 38,
+    "failed_or_skipped": 0,
+    "socket_residue": 0,
+    "lease_residue": 0,
+    "windows_implementation_changed": false,
+    "all_other_test_source_byte_identical": true,
+    "local_target_file_bytes_removed": 426199152,
+    "linux_container_removed": true,
+    "full_ci_rerun": false,
+    "pushed": true,
+    "log_sha256": {
+      "macos-native": "aebb57adfc9df00b2792bed81fd789d76a7fb7990e15a9ac5a10b03ce3e34186",
+      "macos-lifecycle": "d011d4a07fd4e4e9765c07c6092134ce682735b1e4c1d9e4a5609dc169581ce0",
+      "linux-native": "ef410bb5de8332a12efe3cb2adddd03364647562bfc6acd348fd9e4dc0ad8aad",
+      "linux-lifecycle": "947d0ba35cb607fc3814b80736ce82893e7ff52192ad0a706e79487a26feb78a"
+    },
+    "windows_targeted_validation": {
+      "date": "2026-10-22",
+      "implementation": "b346e2b3303f0a0fa90f90bf68481897fb55e0be",
+      "ci_source": "8d5266aa14c3d4a3568c9c551d6270ea1bd9c3f8",
+      "ci_run_id": 39630296353,
+      "ci_url": "https://github.com/Dsssyc/c-two/actions/runs/39630296353",
+      "ci_tests_passed": 9,
+      "developer_host": "Dsssyc-x86-PC",
+      "developer_os": "Windows 11 Pro x64 build 26200",
+      "developer_tests_passed": 9,
+      "all_exit_codes_zero": true,
+      "all_test_processes_exited": true,
+      "task_tmp_files_remaining": 0,
+      "lease_files_remaining": 0,
+      "temporary_directory_removed": true,
+      "file_bytes_removed": 40242410,
+      "binary_sha256": "1ba064a10ba21cb674a7d9eb81252b1b7bea8af6dfa1244a7ef848cfd5394f34",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "production_changes": false,
+      "system_policy_changes": false,
+      "capture_note": "Initial Start-Process observation lacked exit code despite a passing test log; System.Diagnostics.Process then recorded all nine exits.",
+      "evidence_sha256": "56146c61af3438b8f0fffaa15b35343d81d97060f2bee67839d941c593b33a38"
+    }
+  },
+  "delta_at_acceptance_snapshot_fe406326": {
+    "documentation": {
+      "added": 557,
+      "deleted": 20,
+      "net": 537
+    },
+    "build_configuration": {
+      "added": 21,
+      "deleted": 3,
+      "net": 18
+    },
+    "production_and_examples": {
+      "added": 3799,
+      "deleted": 1032,
+      "net": 2767
+    },
+    "tests": {
+      "added": 4997,
+      "deleted": 832,
+      "net": 4165
+    }
+  },
+  "delta_method": "Rust cfg(test)/test AST ranges count as tests; whole test paths including *_tests.rs count as tests; manifests and lockfiles separate; SDK examples count with production",
+  "performance": {
+    "baseline": "1a8b4bf620a3a7d6e0090a7df2bf2523846a6739",
+    "candidate": "9fcde4962ab591a4d4a5f732522ddc8335f13137",
+    "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "method": "median of all per-call samples across 3 alternating A/B process rounds; Rust release, Python dev native",
+    "rows": [
+      {
+        "language": "python_local",
+        "mode": "owner_bound",
+        "bytes": null,
+        "baseline_us": 7.1384902666666665,
+        "candidate_us": 7.9079389,
+        "delta_us": 0.7694486333333339,
+        "delta_percent": 10.778870665780559
+      },
+      {
+        "language": "python_local",
+        "mode": "persistent",
+        "bytes": null,
+        "baseline_us": 7.049108333333334,
+        "candidate_us": 8.162297233333334,
+        "delta_us": 1.1131889,
+        "delta_percent": 15.791910797228482
+      },
+      {
+        "language": "rust_ipc",
+        "mode": "owner_bound",
+        "bytes": 4194304,
+        "baseline_us": 1136.618,
+        "candidate_us": 1122.2916666666667,
+        "delta_us": -14.326333333333196,
+        "delta_percent": -1.2604351975187056
+      },
+      {
+        "language": "rust_ipc",
+        "mode": "owner_bound",
+        "bytes": 64,
+        "baseline_us": 30.893,
+        "candidate_us": 37.451792000000005,
+        "delta_us": 6.558792000000004,
+        "delta_percent": 21.230673615382134
+      },
+      {
+        "language": "rust_ipc",
+        "mode": "owner_bound",
+        "bytes": 65536,
+        "baseline_us": 97.83958,
+        "candidate_us": 89.11042,
+        "delta_us": -8.729159999999993,
+        "delta_percent": -8.921910744097627
+      },
+      {
+        "language": "rust_ipc",
+        "mode": "persistent",
+        "bytes": 4194304,
+        "baseline_us": 1230.4826666666668,
+        "candidate_us": 1167.40625,
+        "delta_us": -63.07641666666677,
+        "delta_percent": -5.126152393315586
+      },
+      {
+        "language": "rust_ipc",
+        "mode": "persistent",
+        "bytes": 64,
+        "baseline_us": 42.099459,
+        "candidate_us": 39.196417000000004,
+        "delta_us": -2.9030419999999992,
+        "delta_percent": -6.895675310221916
+      },
+      {
+        "language": "rust_ipc",
+        "mode": "persistent",
+        "bytes": 65536,
+        "baseline_us": 114.72959,
+        "candidate_us": 97.17625,
+        "delta_us": -17.553340000000006,
+        "delta_percent": -15.299749611238045
+      }
+    ],
+    "endpoint_absent_all": true
+  },
+  "owner_control_cost": {
+    "measurement": "implementation-stage macOS Python dev native, not final-source cross-platform benchmark",
+    "median_ns": {
+      "get_ticket": 481437.0,
+      "revoke": 472167.0,
+      "prepare": 787708.5,
+      "commit": 3247812.0
+    },
+    "issue_samples": 100,
+    "revoke_samples": 100,
+    "takeover_samples": 20,
+    "endpoint_absent": true
+  },
+  "windows_private_pair_requested_buffer_bytes": 8192,
+  "endpoint_audit": {
+    "scope": "only this task owned namespaces; read-only audit",
+    "roots": {
+      "socket_root": {
+        "sockets": [],
+        "leases": []
+      },
+      "coordinator": {
+        "sockets": [],
+        "leases": []
+      },
+      "task_tmp": {
+        "sockets": [],
+        "leases": []
+      },
+      "task_external_tmp": {
+        "sockets": [],
+        "leases": []
+      }
+    }
+  },
+  "cleanup": {
+    "targets_removed": true,
+    "isolated_venv_wheels_native_libraries_sdk_and_benchmarks_removed": true,
+    "historical_objects_reaped_or_migrated": false,
+    "retained": [
+      "source",
+      "logs",
+      "immutable review receipts",
+      "review artifacts"
+    ]
+  },
+  "execution_deviation": {
+    "cancelled_worker_run": "5d9eadce-b194-4813-a5f1-c4c1f28a60a0",
+    "nonisolated_worker_test_outputs_counted_as_acceptance": false,
+    "unaccepted_draft_integrated_as_delivered": false
+  },
+  "prior_ci": {
+    "failed_runs": [
+      39597387037,
+      39612054566
+    ],
+    "superseded_runs": [
+      39594758037,
+      39609958962
+    ],
+    "focused_windows_success": 39616827006,
+    "focused_result_used_as_full_acceptance": false
+  },
+  "evidence_sha256": {
+    "baseline-red-evidence.json": "9c6b630d4a7cd0b79b790b88e8d9d3bea4ab41c3869ae879106b710e752bedb5",
+    "performance.json": "46330adfb7a984c2600baeb804aba1dda2237ff9ac41041a80bd16a8704c65cd",
+    "owner-control-cost.json": "7fc768f6930d4e397a41699b878ed01e62ae13cc58fd59c3e50035bca9b3fb54",
+    "accepted-ci-run.json": "fd64d08a37c7137a9bb318b033b63129c45fc9cbbdd5fecc8af9cf7d152a1851",
+    "accepted-matrix-summary.json": "5c800c301db46628c3364175b9dcf6d52e5211a30bb33c883ad0a050fe07af3e",
+    "accepted-artifact-hashes.json": "18d7e007375da4dc9beb481b0e9db7029ca296adfebb43f5f737b84982026b91",
+    "windows-terminal-native-probe.json": "1bf903101ee8efb9776b3919e3a011c8942ff1372dd283a6a48dae6a60c153d3",
+    "windows-terminal-native-cleanup.json": "a48a54ff2d30436811b841360795a79ea8aa9d440696680f9456abba88eb9bac",
+    "windows-quota-native-probe.json": "fc178781fc0cbf758bc4678081a5d2fab559e93196ab57ae05a89162e903c4aa",
+    "endpoint-acceptance-zero.json": "c8fd12cf23afa5e4cae1886c9e8eaf84c5c204a56df434e46b146e82b1559324",
+    "final-build-products-cleanup.json": "7c812dc271e451980563b0b431e3b02495a9a420ef7143343aeb8914f156bbf1",
+    "slim-review-preview.patch": "2ad163a532a0689fd577dc3b0ff9b77d388f812d1e3a65135ed370e1072b3d53"
+  }
+}

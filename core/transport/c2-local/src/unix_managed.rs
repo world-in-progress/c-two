@@ -37,7 +37,10 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
+
+use sha2::{Digest, Sha256};
 
 mod directories;
 use directories::{DirectoryEntries, NamespaceDirectories};
@@ -383,6 +386,28 @@ impl ManagedNamespace {
         create: bool,
         blocking: bool,
     ) -> Result<Self, NamespaceError> {
+        Self::open_root_locked(
+            root,
+            create,
+            if blocking {
+                libc::LOCK_EX
+            } else {
+                libc::LOCK_EX | libc::LOCK_NB
+            },
+        )
+    }
+
+    /// Identity readers share the existing coordinator. They create nothing;
+    /// every namespace mutation keeps the original exclusive-lock path.
+    fn open_existing_shared(root: &Path) -> Result<Self, NamespaceError> {
+        Self::open_root_locked(root, false, libc::LOCK_SH | libc::LOCK_NB)
+    }
+
+    fn open_root_locked(
+        root: &Path,
+        create: bool,
+        operation: libc::c_int,
+    ) -> Result<Self, NamespaceError> {
         let directories = NamespaceDirectories::open(root, create)?;
         let directory = &directories.records;
 
@@ -408,7 +433,7 @@ impl ManagedNamespace {
         }
 
         let gate = open_gate(&directory, create && marker_stat.is_none())?;
-        lock_gate(&gate, blocking)?;
+        lock_gate(&gate, operation)?;
         if !gate_entry_is_current(&directory, &gate) {
             return Err(NamespaceError::Unverified(
                 EndpointUnverifiedReason::CoordinatorReplaced,
@@ -474,6 +499,151 @@ impl ManagedNamespace {
     }
 }
 
+/// Native context identity, captured only while the verified namespace gate is held.
+/// The gate pin is independently opened read-only, so it never shares a flock or a lease.
+#[derive(Clone)]
+pub(crate) struct ContextBinding {
+    root: PathBuf,
+    directories: NamespaceDirectories,
+    gate_pin: Arc<File>,
+    nonce: [u8; 16],
+    digest: [u8; 32],
+}
+
+impl ContextBinding {
+    pub(crate) fn capture(endpoint: &LocalEndpoint) -> io::Result<Self> {
+        let root = endpoint.context().unix_root().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "not a Unix endpoint context")
+        })?;
+        let namespace =
+            ManagedNamespace::open_existing_shared(root).map_err(context_binding_error)?;
+        Self::from_namespace(root, &namespace)
+    }
+
+    fn from_namespace(root: &Path, namespace: &ManagedNamespace) -> io::Result<Self> {
+        namespace.directories.validate()?;
+        if !namespace.gate_still_named() {
+            return Err(changed_context());
+        }
+        validate_marker(&namespace.directories.records, &namespace.gate)
+            .map_err(context_binding_error)?;
+        // Do not dup the locked file description: an independent read-only open is the pin.
+        let gate_pin = namespace
+            .directories
+            .records
+            .open_file(&gate_name(), libc::O_RDONLY, 0)?
+            .ok_or_else(changed_context)?;
+        verify_gate_file(&gate_pin).map_err(context_binding_error)?;
+        let original = fstat(namespace.gate.as_raw_fd())?;
+        let pinned = fstat(gate_pin.as_raw_fd())?;
+        let nonce = gate_nonce(&namespace.gate).map_err(context_binding_error)?;
+        if !same_file(&original, &pinned)
+            || gate_nonce(&gate_pin).map_err(context_binding_error)? != nonce
+        {
+            return Err(changed_context());
+        }
+        let digest = context_digest(&namespace.directories, &pinned, nonce)?;
+        // Fence both roles and the marker again after opening the independent gate pin.
+        namespace.directories.validate()?;
+        if !gate_entry_is_current(&namespace.directories.records, &gate_pin) {
+            return Err(changed_context());
+        }
+        validate_marker(&namespace.directories.records, &gate_pin)
+            .map_err(context_binding_error)?;
+        Ok(Self {
+            root: root.to_owned(),
+            directories: namespace.directories.clone(),
+            gate_pin: Arc::new(gate_pin),
+            nonce,
+            digest,
+        })
+    }
+
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        // Check the old pins first. Reopening the original pathname must never authorize a
+        // replacement directory, even if that replacement is a valid managed namespace.
+        self.directories.validate()?;
+        verify_gate_file(&self.gate_pin).map_err(context_binding_error)?;
+        if !gate_entry_is_current(&self.directories.records, &self.gate_pin)
+            || gate_nonce(&self.gate_pin).map_err(context_binding_error)? != self.nonce
+        {
+            return Err(changed_context());
+        }
+        let namespace =
+            ManagedNamespace::open_existing_shared(&self.root).map_err(context_binding_error)?;
+        if !self.directories.same_as(&namespace.directories)?
+            || !same_file(
+                &fstat(self.gate_pin.as_raw_fd())?,
+                &fstat(namespace.gate.as_raw_fd())?,
+            )
+            || gate_nonce(&namespace.gate).map_err(context_binding_error)? != self.nonce
+            || context_digest(
+                &namespace.directories,
+                &fstat(namespace.gate.as_raw_fd())?,
+                self.nonce,
+            )? != self.digest
+        {
+            return Err(changed_context());
+        }
+        validate_marker(&self.directories.records, &self.gate_pin)
+            .map_err(context_binding_error)?;
+        self.directories.validate()
+    }
+}
+
+fn context_digest(
+    directories: &NamespaceDirectories,
+    gate: &libc::stat,
+    nonce: [u8; 16],
+) -> io::Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    digest.update(b"c2.owner.unix-context.v1\0");
+    // Even a colocated namespace encodes two roles. Paths and directory ctime are excluded:
+    // aliases share the native identity and ordinary socket/lease churn must not change it.
+    for (role, directory) in [
+        (b"sockets\0".as_slice(), directories.socket_directory()?),
+        (b"records\0".as_slice(), directories.records.as_ref()),
+    ] {
+        let stat = fstat(directory.fd())?;
+        digest.update(role);
+        digest.update((stat.st_dev as u64).to_le_bytes());
+        digest.update((stat.st_ino as u64).to_le_bytes());
+        digest.update(stat.st_uid.to_le_bytes());
+    }
+    digest.update(b"gate\0");
+    digest.update((gate.st_dev as u64).to_le_bytes());
+    digest.update((gate.st_ino as u64).to_le_bytes());
+    digest.update(nonce);
+    Ok(digest.finalize().into())
+}
+
+fn changed_context() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "native endpoint context identity changed",
+    )
+}
+
+fn context_binding_error(error: NamespaceError) -> io::Error {
+    match error {
+        NamespaceError::Absent => {
+            io::Error::new(io::ErrorKind::NotFound, "endpoint context is absent")
+        }
+        NamespaceError::Busy => {
+            io::Error::new(io::ErrorKind::WouldBlock, "endpoint context gate is busy")
+        }
+        NamespaceError::Unverified(reason) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("endpoint context is unverifiable: {reason:?}"),
+        ),
+        NamespaceError::Io(error) => error,
+    }
+}
+
 fn open_gate(directory: &EndpointDirectory, create: bool) -> Result<File, NamespaceError> {
     if create {
         match directory.open_file(
@@ -515,12 +685,7 @@ fn verify_gate_file(file: &File) -> Result<(), NamespaceError> {
     Ok(())
 }
 
-fn lock_gate(gate: &File, blocking: bool) -> Result<(), NamespaceError> {
-    let operation = if blocking {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_EX | libc::LOCK_NB
-    };
+fn lock_gate(gate: &File, operation: libc::c_int) -> Result<(), NamespaceError> {
     if unsafe { libc::flock(gate.as_raw_fd(), operation) } == 0 {
         return Ok(());
     }
@@ -1049,6 +1214,7 @@ pub(crate) struct ManagedListener {
     // Field order releases the lease before this last listener pin closes.
     _gate_pin: File,
     directories_pin: Option<NamespaceDirectories>,
+    context_binding: Option<ContextBinding>,
     #[cfg(test)]
     gate_identity: SocketIdentity,
     cleaned: bool,
@@ -1056,7 +1222,10 @@ pub(crate) struct ManagedListener {
 
 impl ManagedListener {
     pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        bind_managed(endpoint)
+        bind_managed(endpoint, false)
+    }
+    pub(crate) fn bind_with_context_binding(endpoint: &LocalEndpoint) -> io::Result<Self> {
+        bind_managed(endpoint, true)
     }
     pub(crate) fn credential(&self) -> EndpointCredential {
         EndpointCredential::unix_managed(
@@ -1064,6 +1233,16 @@ impl ManagedListener {
             self.identity,
             self.record.incarnation,
         )
+    }
+
+    pub(crate) fn context_binding(&self) -> io::Result<ContextBinding> {
+        let binding = self.context_binding.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "listener has no owner context pin",
+            )
+        })?;
+        Ok(binding.clone())
     }
 
     pub(crate) async fn accept(&mut self) -> io::Result<tokio::net::UnixStream> {
@@ -1173,19 +1352,28 @@ impl Drop for ManagedListener {
 }
 
 /// Binds a managed-v2 endpoint under the fixed coordinator gate.
-pub(crate) fn bind_managed(endpoint: &LocalEndpoint) -> io::Result<ManagedListener> {
+fn bind_managed(endpoint: &LocalEndpoint, capture_context: bool) -> io::Result<ManagedListener> {
     let root = Path::new(endpoint.os_name()).parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "endpoint has no namespace directory",
         )
     })?;
-    bind_managed_at(endpoint, root)
+    bind_at(endpoint, root, capture_context)
 }
 
+#[cfg(test)]
 pub(crate) fn bind_managed_at(
     endpoint: &LocalEndpoint,
     root: &Path,
+) -> io::Result<ManagedListener> {
+    bind_at(endpoint, root, false)
+}
+
+fn bind_at(
+    endpoint: &LocalEndpoint,
+    root: &Path,
+    capture_context: bool,
 ) -> io::Result<ManagedListener> {
     if Path::new(endpoint.os_name()).parent() != Some(root) {
         return Err(io::Error::new(
@@ -1339,6 +1527,9 @@ pub(crate) fn bind_managed_at(
     #[cfg(test)]
     let gate_identity =
         SocketIdentity::from_stat(&fstat(namespace.gate.as_raw_fd()).map_err(|error| error)?);
+    let context_binding = capture_context
+        .then(|| ContextBinding::from_namespace(root, &namespace))
+        .transpose()?;
     guard.disarm();
     drop(guard);
     lease_guard.created = false;
@@ -1355,6 +1546,7 @@ pub(crate) fn bind_managed_at(
             .directories
             .split()
             .then(|| namespace.directories.clone()),
+        context_binding,
         #[cfg(test)]
         gate_identity,
         cleaned: false,
