@@ -21,7 +21,7 @@ mod owner_control;
 mod session;
 
 pub use c2_config::{ConnectOptions, ConnectTimeoutError};
-pub use c2_server::ServerFailure;
+pub use c2_server::{ServerFailure, ServerStartupStage, ServerStartupTimeout};
 pub use call_scope::{CallScope, CallScopeError, CallState};
 pub use client::{
     Client, Connect, EncodedCall, EncodedClient, HeldResponse, ObservedPath, ObservedRoute,

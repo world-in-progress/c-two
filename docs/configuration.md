@@ -39,6 +39,7 @@ cc.set_transport_policy(
 )
 cc.set_server(
     server_id='my-server',
+    startup_timeout=30.0,
     ipc_overrides={
         'max_payload_size': 64 * 1024 * 1024,
         'pool_enabled': False,
@@ -52,6 +53,7 @@ Typed overrides 为 `BaseIPCOverrides`、`ServerIPCOverrides`、`ClientIPCOverri
 | 用途 | 代码入口 | 环境变量 | 默认值 |
 | --- | --- | --- | --- |
 | Relay 注册与名称发现 | `cc.set_relay_anchor(url)` | `C2_RELAY_ANCHOR_ADDRESS` | 无 relay |
+| 服务启动等待 | `cc.set_server(startup_timeout=...)` | — | 5 秒 |
 | SHM/inline 分界 | `cc.set_transport_policy(shm_threshold=...)` | `C2_SHM_THRESHOLD` | 4 KiB |
 | 远程载荷分块大小 | `cc.set_transport_policy(remote_payload_chunk_size=...)` | `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB |
 | 单个服务端 frame 限额 | `set_server(ipc_overrides={'max_frame_size': ...})` | `C2_IPC_MAX_FRAME_SIZE` | 2 GiB |
@@ -60,6 +62,14 @@ Typed overrides 为 `BaseIPCOverrides`、`ServerIPCOverrides`、`ClientIPCOverri
 | Resource 执行线程 | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | Host 并行度，限制在 4–64 |
 
 显式 `address='ipc://...'` 连接直接使用本地端点。Relay anchor 负责注册和发现，HTTP 调用使用解析结果中的目标 relay URL。远程分块大小控制 C-Two 载荷批次，不等同于 TCP 包或 HTTP frame 大小。
+
+## 服务启动期限
+
+在首次注册前用 `cc.set_server(startup_timeout=秒数)` 设置 Core 的启动等待预算。原生 `RuntimeSession` 构造器和 `set_server_options` 接受同名参数。数值必须有限、非负且能由原生时钟表示；零表示立即到期。省略或 `None` 使用原有的 5 秒有限默认值，不表示无限等待。保留默认值是为了约束无人配置时的启动等待，不保证繁忙运行器能在 5 秒内就绪；应用应明确选择自己的部署预算。
+
+Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；启动前通过 `set_transport_policy` 替换 RuntimeSession 时会保留该设置。完整 `cc.shutdown()` 后产生的新 session 可以重新配置。Rust 的优先级为显式 `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > 5 秒。就绪和后续直连 IPC ping 共用等待预算，所有者启动围栏也使用该配置时长。配置、合同验证发生在等待之前；超时后的原生收尾仍使用独立的 shutdown 预算，因此这不是 `cc.register()` 的总墙钟时限。
+
+启动到期产生原生 `CoreError`：`category='lifecycle'`、`lifecycle_kind='startup_timeout'`，并携带 `startup_stage`（`readiness`、`responsiveness` 或 `owner_control`）及 `timeout_seconds`。三个本地 I/O 字段 `io_operation`、`io_kind`、`raw_os_error` 均为 `None`。真实 bind 失败保持原结构化系统原因，消息不再添加错误的 `config error` 前缀。这些诊断不提供重试、接管或清理端点的权限。
 
 ## IPC 内存、分块与心跳
 

@@ -163,6 +163,11 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
             LifecycleError::Server(_) => {
                 set_attr(value, "lifecycle_kind", "server");
             }
+            LifecycleError::StartupTimeout(timeout) => {
+                set_attr(value, "lifecycle_kind", "startup_timeout");
+                set_attr(value, "startup_stage", timeout.stage.as_str());
+                set_attr(value, "timeout_seconds", timeout.timeout.as_secs_f64());
+            }
             LifecycleError::Relay(_) => {
                 set_attr(value, "lifecycle_kind", "relay");
             }

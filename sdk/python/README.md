@@ -2,14 +2,14 @@
 
 C-Two exposes stateful Python resources through typed CRM contracts over same-process calls, local IPC, or an external HTTP relay. This package projects the shared Rust runtime into Python.
 
-Python C-Two **0.8.0** pairs with c3 **0.4.0**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.8.0.md).
+Python C-Two **0.8.1** pairs with c3 **0.4.0**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.8.1.md).
 
 Install the matching published versions:
 
 ```bash
-uv pip install 'c-two==0.8.0'
+uv pip install 'c-two==0.8.1'
 # Only for FastDB Payload contracts:
-uv pip install 'c-two[fastdb]==0.8.0'
+uv pip install 'c-two[fastdb]==0.8.1'
 ```
 
 The base package has no Python runtime dependencies. Ordinary CRM definition,
@@ -22,13 +22,15 @@ Local IPC uses Unix domain sockets or current-logon-SID Windows Named Pipes. Uni
 
 `cc.connect(..., timeout=...)` bounds connection acquisition across pool waiting, handshake and route discovery. `cc.with_call_options(proxy, timeout=...)` sets business-call waiting separately. Custom Unix endpoint directories can use `0755` when the current user owns them and other identities cannot modify them; Windows uses its SID-scoped pipe namespace. See [connection deadlines](https://github.com/world-in-progress/c-two/blob/main/docs/configuration.en.md#connection-deadlines) and [endpoint configuration](https://github.com/world-in-progress/c-two/blob/main/docs/configuration.en.md#local-endpoint-directories).
 
+`cc.set_server(startup_timeout=30.0)` sets the native startup wait before registration. Omitted/`None` retains the finite five-second default; zero expires immediately. Startup expiry is identified by `CoreError.lifecycle_kind == 'startup_timeout'`, with `startup_stage` and `timeout_seconds`; bind I/O failures keep their OS fields without a configuration-error label. See [server startup deadlines](https://github.com/world-in-progress/c-two/blob/main/docs/configuration.en.md#server-startup-deadlines) for freezing and cleanup semantics.
+
 IPC uses lazy buddy pools, idle decay and finite backing/reassembly budgets; `pool_enabled=False` skips buddy. `cc.memory_stats()` observes native accounting; held responses and borrowed inputs retain independent leases. The standalone relay has its own upstream policy. See the [memory guide](https://github.com/world-in-progress/c-two/blob/main/docs/memory-policy.en.md).
 
 Physical IPC connection observations work without a pending call. OwnerBound hosts support explicit, single-use recovery tickets during the original grace period. Bind/connect failures preserve `io_kind`, `raw_os_error` and `io_operation` on native `CoreError`. These features share the Rust implementation on macOS, Linux and Windows x64 and ARM64; see the lifecycle guide for API examples.
 
 ## Development
 
-Use canonical main for source development and run commands from the repository root. The matching c3 release's `rc-manifest.json` identifies release source:
+Use canonical main for source development and run commands from the repository root. Python patch-release provenance is recorded with its release notes; the c3 release's `rc-manifest.json` identifies that CLI release's source, which can differ from a later Python patch:
 
 ```bash
 git clone https://github.com/world-in-progress/c-two.git

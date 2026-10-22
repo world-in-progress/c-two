@@ -8,7 +8,7 @@ use c2_http::client::HttpError;
 use c2_ipc::IpcError;
 use c2_ipc::client::ChunkError;
 use c2_local::EndpointIoError;
-use c2_server::{ServerError, ServerFailure};
+use c2_server::{ServerError, ServerFailure, ServerStartupTimeout};
 
 use crate::RegisterFailureOutcome;
 
@@ -38,6 +38,7 @@ pub enum LifecycleError {
     ResponseCopy(String),
     Configuration(String),
     Server(ServerFailure),
+    StartupTimeout(ServerStartupTimeout),
     Relay(String),
 }
 
@@ -93,6 +94,7 @@ impl fmt::Display for LifecycleError {
                 write!(formatter, "runtime configuration error: {message}")
             }
             Self::Server(message) => write!(formatter, "server error: {message}"),
+            Self::StartupTimeout(timeout) => timeout.fmt(formatter),
             Self::Relay(message) => write!(formatter, "relay error: {message}"),
         }
     }
@@ -102,6 +104,7 @@ impl StdError for LifecycleError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Server(failure) => Some(failure),
+            Self::StartupTimeout(timeout) => Some(timeout),
             _ => None,
         }
     }
@@ -109,7 +112,14 @@ impl StdError for LifecycleError {
 
 impl From<ServerError> for LifecycleError {
     fn from(error: ServerError) -> Self {
-        Self::Server((&error).into())
+        match error {
+            ServerError::StartupTimeout(timeout)
+            | ServerError::Failed(ServerFailure {
+                startup_timeout: Some(timeout),
+                ..
+            }) => Self::StartupTimeout(timeout),
+            other => Self::Server((&other).into()),
+        }
     }
 }
 

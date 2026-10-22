@@ -35,6 +35,7 @@ def diagnostic(error):
     return {key: getattr(error, key, None) for key in (
         'category', 'lifecycle_kind', 'transport_kind', 'transport_phase',
         'fallback_eligible', 'io_kind', 'raw_os_error', 'io_operation', 'name', 'details', 'message',
+        'startup_stage', 'timeout_seconds',
     )}
 '''
 

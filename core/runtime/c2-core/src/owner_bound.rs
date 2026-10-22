@@ -134,6 +134,7 @@ pub(crate) enum OwnerArmOutcome {
     Alive(OwnerSession),
     Closed,
     IoError(String),
+    StartupTimeout,
 }
 
 pub(crate) async fn arm_owner_watch(bootstrap: &mut OwnerBootstrap) -> OwnerArmOutcome {
@@ -155,7 +156,7 @@ where
     tokio::select! {
         biased;
         _ = server.wait_for_shutdown_requested() => OwnerArmOutcome::IoError("owner control establishment cancelled by shutdown".into()),
-        _ = tokio::time::sleep(timeout) => OwnerArmOutcome::IoError("owner control establishment exceeded startup deadline".into()),
+        _ = tokio::time::sleep(timeout) => OwnerArmOutcome::StartupTimeout,
         outcome = prepare => outcome,
     }
 }
@@ -625,6 +626,38 @@ async fn stopping(server: &Server) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_fence_timeout_survives_the_lifecycle_watch() {
+        let server = Server::new("ipc://owner-startup-fence", Default::default()).unwrap();
+        server.begin_start_attempt().unwrap();
+        let timeout = Duration::from_millis(1);
+        let outcome = arm_owner_watch_with_fence(std::future::pending(), &server, timeout).await;
+        assert!(matches!(outcome, OwnerArmOutcome::StartupTimeout));
+        let expected = crate::ServerStartupTimeout {
+            stage: crate::ServerStartupStage::OwnerControl,
+            timeout,
+        };
+        let error = c2_server::ServerError::StartupTimeout(expected);
+        server.reject_start_attempt((&error).into()).unwrap();
+        let error = crate::LifecycleError::from(
+            server
+                .wait_until_ready(Duration::from_secs(1))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(error, crate::LifecycleError::StartupTimeout(expected));
+        assert_eq!(error.local_io_cause(), None);
+
+        server.begin_start_attempt().unwrap();
+        server.request_shutdown_signal_with_reason(c2_server::OWNER_BOUND_SHUTDOWN_REASON);
+        let cancelled =
+            arm_owner_watch_with_fence(std::future::pending(), &server, Duration::ZERO).await;
+        assert!(
+            matches!(cancelled, OwnerArmOutcome::IoError(message) if message.contains("cancelled by shutdown"))
+        );
+        server.finalize_runtime_stopped();
+    }
 
     #[tokio::test]
     async fn non_hello_rejection_obeys_setup_deadline_under_backpressure() {

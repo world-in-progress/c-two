@@ -37,7 +37,7 @@ use crate::owner_ffi::{
 };
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 
-pub(crate) fn checked_shutdown_timeout(seconds: f64) -> Result<Duration, &'static str> {
+pub(crate) fn checked_timeout(seconds: f64) -> Result<Duration, &'static str> {
     const INVALID: &str =
         "timeout_seconds must be finite, non-negative, and representable as a Duration";
     if !seconds.is_finite() || seconds < 0.0 {
@@ -48,7 +48,7 @@ pub(crate) fn checked_shutdown_timeout(seconds: f64) -> Result<Duration, &'stati
 
 #[cfg(test)]
 mod shutdown_timeout_tests {
-    use super::checked_shutdown_timeout;
+    use super::checked_timeout;
     use std::time::Duration;
 
     #[test]
@@ -62,19 +62,16 @@ mod shutdown_timeout_tests {
             1e300,
             u64::MAX as f64,
         ] {
-            assert!(checked_shutdown_timeout(seconds).is_err(), "{seconds:?}");
+            assert!(checked_timeout(seconds).is_err(), "{seconds:?}");
         }
     }
 
     #[test]
     fn zero_and_normal_timeouts_remain_valid() {
-        assert_eq!(checked_shutdown_timeout(0.0), Ok(Duration::ZERO));
-        assert_eq!(checked_shutdown_timeout(-0.0), Ok(Duration::ZERO));
-        assert_eq!(
-            checked_shutdown_timeout(0.125),
-            Ok(Duration::from_millis(125))
-        );
-        assert_eq!(checked_shutdown_timeout(5.0), Ok(Duration::from_secs(5)));
+        assert_eq!(checked_timeout(0.0), Ok(Duration::ZERO));
+        assert_eq!(checked_timeout(-0.0), Ok(Duration::ZERO));
+        assert_eq!(checked_timeout(0.125), Ok(Duration::from_millis(125)));
+        assert_eq!(checked_timeout(5.0), Ok(Duration::from_secs(5)));
     }
 }
 
@@ -86,7 +83,7 @@ mod connect_attempt_tests {
     fn relay_override_host_lock_expires_before_owner_releases_and_recovers() {
         Python::initialize();
         let session = Arc::new(
-            PyRuntimeSession::new(None, None, None, None, None, false, None, None).unwrap(),
+            PyRuntimeSession::new(None, None, None, None, None, false, None, None, None).unwrap(),
         );
         let host = session.host.lock();
         let worker_session = session.clone();
@@ -331,7 +328,7 @@ impl PyRuntimeSession {
     }
 
     #[new]
-    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true, max_outstanding_calls=None, retained_input_budget_bytes=None))]
+    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true, max_outstanding_calls=None, retained_input_budget_bytes=None, startup_timeout=None))]
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn new(
         server_id: Option<String>,
@@ -342,6 +339,7 @@ impl PyRuntimeSession {
         use_process_relay_anchor: bool,
         max_outstanding_calls: Option<u64>,
         retained_input_budget_bytes: Option<u64>,
+        startup_timeout: Option<f64>,
     ) -> PyResult<Self> {
         let server_ipc_overrides = server_ipc_overrides
             .map(|value| parse_server_ipc_overrides(Some(value)))
@@ -349,9 +347,14 @@ impl PyRuntimeSession {
         let client_ipc_overrides = client_ipc_overrides
             .map(|value| parse_client_ipc_overrides(Some(value)))
             .transpose()?;
+        let server_startup_timeout = startup_timeout
+            .map(checked_timeout)
+            .transpose()
+            .map_err(PyValueError::new_err)?;
         let inner = Runtime::new(RuntimeOptions {
             server_id,
             server_ipc_overrides,
+            server_startup_timeout,
             client_ipc_overrides,
             shm_threshold,
             remote_payload_chunk_size,
@@ -705,11 +708,21 @@ impl PyRuntimeSession {
             .transpose()
     }
 
+    #[getter]
+    fn startup_timeout(&self) -> Option<f64> {
+        self.inner
+            .server_startup_timeout()
+            .map(|timeout| timeout.as_secs_f64())
+    }
+
+    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, startup_timeout=None))]
     fn set_server_options(
         &self,
         server_id: Option<String>,
         server_ipc_overrides: Option<&Bound<'_, PyAny>>,
+        startup_timeout: Option<f64>,
     ) -> PyResult<()> {
+        // Preserve frozen-before-parsing precedence; Core also fences the commit.
         if self.host.lock().is_some() {
             return Err(PyRuntimeError::new_err(
                 "server options are frozen after the Core host starts",
@@ -718,8 +731,12 @@ impl PyRuntimeSession {
         let server_ipc_overrides = server_ipc_overrides
             .map(|value| parse_server_ipc_overrides(Some(value)))
             .transpose()?;
+        let startup_timeout = startup_timeout
+            .map(checked_timeout)
+            .transpose()
+            .map_err(PyValueError::new_err)?;
         self.inner
-            .set_server_options(server_id, server_ipc_overrides)
+            .set_server_options(server_id, server_ipc_overrides, startup_timeout)
             .map_err(runtime_configuration_error_to_py)?;
         self.server_bridge.lock().take();
         Ok(())
@@ -1058,7 +1075,7 @@ impl PyRuntimeSession {
         timeout_seconds: f64,
     ) -> PyResult<Bound<'py, PyDict>> {
         // Validate before taking the Host or changing any session state.
-        let timeout = checked_shutdown_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
+        let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
         let _ = relay_anchor_address;
         let host = self.host.lock().clone();
         if let Some(route_names) = route_names.filter(|_| {
@@ -1580,7 +1597,7 @@ fn parse_lifecycle_policy(
                     "owner_bound requires an explicit owner_missing_grace_seconds window",
                 )
             })?;
-            let grace = checked_shutdown_timeout(seconds).map_err(PyValueError::new_err)?;
+            let grace = checked_timeout(seconds).map_err(PyValueError::new_err)?;
             ServerLifecyclePolicy::owner_bound(grace).map_err(PyValueError::new_err)
         }
         Some(other) => Err(PyValueError::new_err(format!(

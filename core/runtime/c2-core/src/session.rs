@@ -44,6 +44,15 @@ fn unlimited_lifecycle_error(error: crate::Error) -> LifecycleError {
     }
 }
 
+fn validate_startup_timeout(timeout: Option<Duration>) -> Result<(), LifecycleError> {
+    if timeout.is_some_and(|timeout| Instant::now().checked_add(timeout).is_none()) {
+        return Err(LifecycleError::Configuration(
+            "startup_timeout exceeds the monotonic clock range".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn connect_stage_check(deadline: ConnectDeadline, stage: &'static str) -> Result<(), crate::Error> {
     deadline
         .check(stage)
@@ -79,6 +88,8 @@ pub struct RuntimeIdentity {
 pub struct RuntimeOptions {
     pub server_id: Option<String>,
     pub server_ipc_overrides: Option<ServerIpcConfigOverrides>,
+    /// Startup wait budget inherited by HostOptions without an explicit override.
+    pub server_startup_timeout: Option<Duration>,
     pub client_ipc_overrides: Option<ClientIpcConfigOverrides>,
     pub shm_threshold: Option<u64>,
     pub remote_payload_chunk_size: Option<u64>,
@@ -91,6 +102,7 @@ impl Default for RuntimeOptions {
         Self {
             server_id: None,
             server_ipc_overrides: None,
+            server_startup_timeout: None,
             client_ipc_overrides: None,
             shm_threshold: None,
             remote_payload_chunk_size: None,
@@ -169,6 +181,7 @@ struct RuntimeState {
     connection_event_source: c2_local::ConnectionEventSource,
     server_id_override: Option<String>,
     server_ipc_overrides: Option<ServerIpcConfigOverrides>,
+    server_startup_timeout: Option<Duration>,
     client_ipc_overrides: Option<ClientIpcConfigOverrides>,
     shm_threshold: Option<u64>,
     remote_payload_chunk_size: Option<u64>,
@@ -277,11 +290,13 @@ impl Runtime {
         if let Some(server_id) = options.server_id.as_deref() {
             validate_server_id(server_id)?;
         }
+        validate_startup_timeout(options.server_startup_timeout)?;
         Ok(Self {
             state: Arc::new(Mutex::new(RuntimeState {
                 connection_event_source: c2_local::ConnectionEventSource::new(),
                 server_id_override: options.server_id,
                 server_ipc_overrides: options.server_ipc_overrides,
+                server_startup_timeout: options.server_startup_timeout,
                 client_ipc_overrides: options.client_ipc_overrides,
                 shm_threshold: options.shm_threshold,
                 remote_payload_chunk_size: options.remote_payload_chunk_size,
@@ -662,18 +677,28 @@ impl Runtime {
         self.state.lock().server_ipc_overrides.clone()
     }
 
+    pub fn server_startup_timeout(&self) -> Option<Duration> {
+        self.state.lock().server_startup_timeout
+    }
+
     pub fn set_server_options(
         &self,
         server_id: Option<String>,
         server_ipc_overrides: Option<ServerIpcConfigOverrides>,
+        startup_timeout: Option<Duration>,
     ) -> Result<(), LifecycleError> {
         if let Some(server_id) = server_id.as_deref() {
             validate_server_id(server_id)?;
         }
+        validate_startup_timeout(startup_timeout)?;
         let mut state = self.state.lock();
         state.ensure_no_pending_teardown()?;
+        if state.lifecycle_frozen {
+            return Err(LifecycleError::ConfigFrozen);
+        }
         state.server_id_override = server_id;
         state.server_ipc_overrides = server_ipc_overrides;
+        state.server_startup_timeout = startup_timeout;
         state.identity = None;
         Ok(())
     }
@@ -1041,10 +1066,11 @@ impl Runtime {
         self.state.lock().lifecycle_policy
     }
 
-    pub(crate) fn freeze_lifecycle_policy(
+    pub(crate) fn freeze_host_options(
         &self,
         policy: c2_config::ServerLifecyclePolicy,
-    ) -> Result<(), LifecycleError> {
+        startup_timeout: Option<Duration>,
+    ) -> Result<Duration, LifecycleError> {
         let mut state = self.state.lock();
         state.ensure_no_pending_teardown()?;
         if state.lifecycle_frozen && state.lifecycle_policy != policy {
@@ -1052,9 +1078,13 @@ impl Runtime {
                 "server lifecycle policy is frozen".into(),
             ));
         }
+        let startup_timeout = startup_timeout
+            .or(state.server_startup_timeout)
+            .unwrap_or(Duration::from_secs(5));
+        validate_startup_timeout(Some(startup_timeout))?;
         state.lifecycle_policy = policy;
         state.lifecycle_frozen = true;
-        Ok(())
+        Ok(startup_timeout)
     }
 
     /// Attach one private native capability, outside cloneable configuration data.
@@ -3117,6 +3147,7 @@ mod tests {
     #[test]
     fn explicit_server_id_derives_ipc_address() {
         let session = Runtime::new(RuntimeOptions {
+            server_startup_timeout: None,
             server_id: Some("unit-server".to_string()),
             server_ipc_overrides: None,
             client_ipc_overrides: None,
@@ -3144,6 +3175,7 @@ mod tests {
     fn invalid_server_id_is_rejected() {
         for bad in ["", " ", "bad/name", "bad\\name", ".", "..", "bad\nid"] {
             let err = Runtime::new(RuntimeOptions {
+                server_startup_timeout: None,
                 server_id: Some(bad.to_string()),
                 server_ipc_overrides: None,
                 client_ipc_overrides: None,
@@ -3177,6 +3209,7 @@ mod tests {
     #[test]
     fn clear_server_identity_preserves_explicit_override() {
         let session = Runtime::new(RuntimeOptions {
+            server_startup_timeout: None,
             server_id: Some("unit-retry".to_string()),
             server_ipc_overrides: None,
             client_ipc_overrides: None,
@@ -3206,6 +3239,7 @@ mod tests {
             ..Default::default()
         };
         let session = Runtime::new(RuntimeOptions {
+            server_startup_timeout: None,
             server_id: Some("unit-server-overrides".to_string()),
             server_ipc_overrides: Some(overrides),
             client_ipc_overrides: None,
@@ -3230,6 +3264,7 @@ mod tests {
             ..Default::default()
         };
         let session = Runtime::new(RuntimeOptions {
+            server_startup_timeout: None,
             server_id: None,
             server_ipc_overrides: None,
             client_ipc_overrides: Some(overrides),
@@ -4254,6 +4289,7 @@ mod tests {
     #[test]
     fn runtime_memory_stats_observe_without_freezing_and_track_outgoing_domain() {
         let session = Runtime::new(RuntimeOptions {
+            server_startup_timeout: None,
             server_id: None,
             server_ipc_overrides: None,
             client_ipc_overrides: Some(ClientIpcConfigOverrides {
@@ -4313,6 +4349,7 @@ mod tests {
     #[test]
     fn outgoing_domain_observer_outlives_runtime_shutdown_without_touching_others() {
         let runtime_a = Runtime::new(RuntimeOptions {
+            server_startup_timeout: None,
             server_id: None,
             server_ipc_overrides: None,
             client_ipc_overrides: Some(ClientIpcConfigOverrides {
@@ -4326,6 +4363,7 @@ mod tests {
         })
         .expect("runtime a");
         let runtime_b = Runtime::new(RuntimeOptions {
+            server_startup_timeout: None,
             server_id: None,
             server_ipc_overrides: None,
             client_ipc_overrides: Some(ClientIpcConfigOverrides {

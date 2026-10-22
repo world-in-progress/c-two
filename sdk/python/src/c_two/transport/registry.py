@@ -298,6 +298,7 @@ class _ProcessRegistry:
                     or runtime_session.server_id_override
                 ),
                 'server_ipc_overrides': runtime_session.server_ipc_overrides,
+                'startup_timeout': runtime_session.startup_timeout,
                 'client_ipc_overrides': runtime_session.client_ipc_overrides,
                 **kwargs,
             }
@@ -338,6 +339,7 @@ class _ProcessRegistry:
         ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
         lifecycle: LifecycleConfig | None = None,
         owner_control: NativeOwnerBootstrap | None = None,
+        startup_timeout: float | None = None,
     ) -> None:
         """Configure IPC server and its native lifecycle. Call before register().
 
@@ -347,6 +349,10 @@ class _ProcessRegistry:
             Explicit server identity.
         ipc_overrides:
             Typed server IPC override mapping.
+        startup_timeout:
+            Native startup wait budget in seconds. ``None`` uses Rust's
+            five-second default; zero expires immediately. Must be finite
+            and non-negative. Cleanup after expiry has its own shutdown budget.
         lifecycle:
             Typed :class:`~c_two.config.LifecycleConfig`. Rust validates the
             policy and its bounded grace window before it is frozen. Naming the
@@ -360,6 +366,10 @@ class _ProcessRegistry:
         """
         with self._lock:
             if self._server is not None:
+                if startup_timeout is not None:
+                    self._runtime_session.set_server_options(
+                        server_id, ipc_overrides, startup_timeout,
+                    )
                 if lifecycle is not None:
                     self._runtime_session.set_lifecycle_policy(*lifecycle.native_args())
                 if owner_control is not None:
@@ -372,7 +382,7 @@ class _ProcessRegistry:
                     stacklevel=3,
                 )
                 return
-            self._runtime_session.set_server_options(server_id, ipc_overrides)
+            self._runtime_session.set_server_options(server_id, ipc_overrides, startup_timeout)
             if lifecycle is not None:
                 self._runtime_session.set_lifecycle_policy(*lifecycle.native_args())
             if owner_control is not None:
@@ -976,6 +986,7 @@ def set_server(
     ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
     lifecycle: LifecycleConfig | None = None,
     owner_control: NativeOwnerBootstrap | None = None,
+    startup_timeout: float | None = None,
 ) -> None:
     """Configure IPC server and its native lifecycle. Call before register().
 
@@ -986,6 +997,7 @@ def set_server(
         ipc_overrides=ipc_overrides,
         lifecycle=lifecycle,
         owner_control=owner_control,
+        startup_timeout=startup_timeout,
     )
 
 

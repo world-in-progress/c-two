@@ -7,8 +7,7 @@ use pyo3::types::{PyDict, PyList};
 use crate::endpoint_ffi::{PyLocalEndpointContext, resolve_context};
 
 pub(crate) fn timeout_duration(timeout_seconds: f64) -> PyResult<Duration> {
-    crate::runtime_session_ffi::checked_shutdown_timeout(timeout_seconds)
-        .map_err(PyValueError::new_err)
+    crate::runtime_session_ffi::checked_timeout(timeout_seconds).map_err(PyValueError::new_err)
 }
 
 #[pyfunction]

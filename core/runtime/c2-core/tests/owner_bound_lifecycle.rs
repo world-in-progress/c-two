@@ -137,7 +137,11 @@ fn owner_host(runtime: &Runtime, grace: Duration) -> (c2_core::OwnerControl, c2_
     let (owner, bootstrap) = owner_control_pair().unwrap();
     runtime.attach_owner_control(bootstrap).unwrap();
     let host = runtime
-        .host(HostOptions::default().without_relay().with_owner_bound(grace))
+        .host(
+            HostOptions::default()
+                .without_relay()
+                .with_owner_bound(grace),
+        )
         .unwrap();
     (owner, host)
 }
@@ -551,7 +555,9 @@ fn owner_protocol_oversized_tag_is_rejected_before_body_on_first_and_later_frame
                     .copy_from_slice(&(12 + MAX_OWNER_PAYLOAD_SIZE as u32 + 1).to_le_bytes());
                 // The deliberately invalid frame closes the peer immediately;
                 // observe that rejection instead of flushing a closed pipe.
-                AsyncWriteExt::write_all(&mut stream, &prefix).await.unwrap();
+                AsyncWriteExt::write_all(&mut stream, &prefix)
+                    .await
+                    .unwrap();
                 expect_owner_peer_close(&mut stream, Instant::now() + Duration::from_millis(500))
                     .await;
             });
@@ -658,6 +664,7 @@ fn owner_protocol_fragmented_and_silent_setup_share_one_deadline_without_heartbe
                 heartbeat_timeout_secs: Some(0.0),
                 ..Default::default()
             }),
+            None,
         )
         .unwrap();
     let controller_runtime = runtime_in(&root);
@@ -1562,7 +1569,7 @@ fn owner_ticket_rejects_another_private_root_with_the_same_logical_address() {
     let server_id = unique_name("takeover-same-address");
     for runtime in &runtimes {
         runtime
-            .set_server_options(Some(server_id.clone()), None)
+            .set_server_options(Some(server_id.clone()), None, None)
             .unwrap();
     }
     let (owner_a, bootstrap_a) = owner_control_pair().unwrap();

@@ -24,3 +24,7 @@
 基线反例已完成。仅 `cfg(test)` 的 Host 线程屏障阻挡真实启动，默认期限在约 5.013 秒、显式 20 毫秒在约 22.6 毫秒触发，两者都错误地显示 `config error`，原生关闭已完成且本轮端点根零 socket/lease 残留。Python 3.12 基线有 3 个预期失败：`cc.set_server(startup_timeout=0)` 不接纳参数，以及真实权限不足、非目录 bind 错误仍含配置标签；原 I/O 字段断言通过。此实验复现期限与分类，未把人工阻挡等同于已查明下游 CI 拥塞的具体来源。
 
 独立设计复核完成，要求补齐 owner fence 超时信息穿过 ServerFailure、Core 原子配置冻结、RuntimeSession 替换时的期限迁移，以及超时后的原生收尾。启动等待预算与随后清理耗时分开说明。用户补充的 Windows 11 重复绑定误分类作为下游报告记录；本轮 Windows 候选实测尚未完成。生产修复、完整验收和发布继续推进。
+
+Python 3.12 的候选定向回归为 101 passed、6 个 Windows 专属场景在 macOS 上按原平台条件跳过；这些场景仍须在 Windows 实跑。测试覆盖参数接纳、非法值不修改配置、零期限、session 替换保留设置、失败后的冻结与完整 shutdown 后重配、配置错误优先级及真实 IPC 调用。原生测试已覆盖 Runtime 值继承、显式 Rust 值优先、owner 围栏超时穿过 watch、就绪和 ping 不重启预算。
+
+隔离回归还暴露了旧 `client_modes` 夹具的目录不一致：Runtime 读取了 runner 的自定义根目录，但模拟 relay header、低层 listener 和 inspector pool 仍选择平台默认目录。修复前基线 `4cc46e9e` 在同一私有根目录复现；夹具改为传递同一原生上下文并显式 close listener 后，原 15 个断言全部通过，私有根目录零 socket/lease 残留。首次失败运行落入默认命名空间的一个 `freeze-stall` 测试端点，经记录地址、日志创建时间窗口、测试进程已退出及记录摘要确认归属，再通过原生 inspect/reap 精确回收；未批量清理历史条目。该测试修正单独提交为 `4437fdab`，不计作生产修复。
