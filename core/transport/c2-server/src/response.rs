@@ -122,8 +122,6 @@ mod tests {
     use super::ResponsePool;
     use c2_mem::{MemPool, PoolConfig};
 
-    use crate::ResponseMeta;
-
     static TEST_POOL_ID: AtomicU32 = AtomicU32::new(0);
 
     fn unique_prefix(label: &str) -> String {
