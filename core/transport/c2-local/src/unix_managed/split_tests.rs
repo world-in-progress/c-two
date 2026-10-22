@@ -471,3 +471,103 @@ async fn split_lost_socket_root_keeps_live_lease_and_alias_reap() {
     assert!(matches!(restarted.close(), EndpointReapResult::Reaped));
     fixture.assert_only_coordinator();
 }
+
+#[tokio::test]
+async fn binding_split_aliases_share_native_digest_and_pin_both_directory_roles() {
+    let fixture = SplitFixture::new();
+    let endpoint = fixture.endpoint(&fixture.sockets, "binding-split-alias");
+    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+    let binding = listener.context_binding().unwrap();
+    let alias = LocalEndpointContext::with_unix_root(&fixture.alias)
+        .unwrap()
+        .endpoint(endpoint.address())
+        .unwrap();
+    let captured = crate::EndpointContextBinding::capture(&alias).unwrap();
+    assert_eq!(binding.digest(), captured.digest());
+    assert!(binding.0.directories.split());
+    let another = crate::LocalListener::bind_with_context_binding(
+        &fixture.endpoint(&fixture.sockets, "binding-split-churn"),
+    )
+    .unwrap();
+    assert_eq!(
+        another.context_binding().unwrap().digest(),
+        binding.digest()
+    );
+    assert!(matches!(another.close(), EndpointReapResult::Reaped));
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    binding.validate().unwrap();
+    captured.validate().unwrap();
+    fixture.assert_only_coordinator();
+}
+
+#[tokio::test]
+async fn binding_split_single_and_double_directory_replacements_are_refused() {
+    for (replace_sockets, replace_records) in [(true, false), (false, true), (true, true)] {
+        let fixture = SplitFixture::new();
+        let endpoint = fixture.endpoint(&fixture.sockets, "binding-split-replace");
+        let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+        let binding = listener.context_binding().unwrap();
+        let mut replacements = Vec::new();
+        for path in [
+            replace_sockets.then_some(&fixture.sockets),
+            replace_records.then_some(&fixture.records),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let original = path.with_extension("original");
+            fs::rename(path, &original).unwrap();
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            replacements.push((path, original));
+        }
+        assert!(binding.validate().is_err());
+        assert!(listener.context_binding().unwrap().validate().is_err());
+        if replace_records {
+            assert!(crate::EndpointContextBinding::capture(&endpoint).is_err());
+            assert!(!fixture.records.join(GATE_NAME).exists());
+            assert!(!fixture.records.join(MARKER_NAME).exists());
+        } else {
+            // A fresh capture has no old pin. Its changed digest cannot match the original
+            // listener/ticket; it does not create or repair the old coordinator metadata.
+            assert_ne!(
+                crate::EndpointContextBinding::capture(&endpoint)
+                    .unwrap()
+                    .digest(),
+                binding.digest()
+            );
+        }
+        for (path, original) in replacements {
+            fs::remove_dir(path).unwrap();
+            fs::rename(original, path).unwrap();
+        }
+        binding.validate().unwrap();
+        assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+        fixture.assert_only_coordinator();
+    }
+}
+
+#[tokio::test]
+async fn binding_split_missing_marker_is_not_recreated() {
+    let fixture = SplitFixture::new();
+    let endpoint = fixture.endpoint(&fixture.sockets, "binding-split-marker");
+    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+    let binding = listener.context_binding().unwrap();
+    let marker = fixture.records.join(MARKER_NAME);
+    let original = fs::read(&marker).unwrap();
+    fs::remove_file(&marker).unwrap();
+    assert!(binding.validate().is_err());
+    assert!(listener.context_binding().unwrap().validate().is_err());
+    assert!(crate::EndpointContextBinding::capture(&endpoint).is_err());
+    assert!(!marker.exists());
+    let mut restored = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&marker)
+        .unwrap();
+    restored.write_all(&original).unwrap();
+    binding.validate().unwrap();
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    fixture.assert_only_coordinator();
+}

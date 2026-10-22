@@ -135,7 +135,7 @@ fn close_client(client: crate::relay::client_lifecycle::ManagedClient) {
 fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
     matches!(
         error,
-        c2_ipc::IpcError::Io(err)
+        c2_ipc::IpcError::Io(err) | c2_ipc::IpcError::Connect(err)
             if matches!(
                 err.kind(),
                 std::io::ErrorKind::ConnectionRefused
@@ -1573,7 +1573,7 @@ mod tests {
                 _route_name: &str,
                 _method_idx: u16,
                 request: c2_server::RequestData,
-                _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+                _response_pool: Arc<c2_server::ResponsePool>,
             ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
                 let mut request = c2_server::RequestLease::new(request);
                 assert!(request.copy_bytes().unwrap().is_empty());

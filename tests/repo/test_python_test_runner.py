@@ -111,6 +111,9 @@ def test_collection_skip_stops_before_execution(tmp_path: Path, monkeypatch: pyt
     ('darwin', 'unexpected::test_skip', 'setup', 'Skipped: Windows named-pipe platform contract', False),
     ('darwin', 'tests/unit/test_endpoint_context.py::test_admin_probes_surface_windows_root_not_applicable[other-ping]',
      'setup', 'Skipped: Windows named-pipe platform contract', False),
+    ('linux', 'tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[busy-None]', 'setup', 'Skipped: Windows named-pipe platform contract', True),
+    ('win32', 'tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[busy-None]', 'setup', 'Skipped: Windows named-pipe platform contract', False),
+    ('linux', 'tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[busy-unknown]', 'setup', 'Skipped: Windows named-pipe platform contract', False),
 ])
 def test_only_declared_windows_setup_skip_is_not_applicable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -148,6 +151,10 @@ def test_only_declared_windows_setup_skip_is_not_applicable(
     ('win32', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[True-True]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', True),
     ('win32', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[False-False]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', False),
     ('linux', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[False-True]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', False),
+    *(('win32', f'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[{case}]', 'setup', 'Skipped: Unix filesystem root capability', True)
+      for case in ('unwritable', 'not_directory', 'missing', 'refused', 'inaccessible')),
+    ('linux', 'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[unwritable]', 'setup', 'Skipped: Unix filesystem root capability', False),
+    ('win32', 'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[unwritable]', 'setup', 'Skipped: permission experiments require a non-root effective uid', False),
 ])
 def test_windows_platform_skip_allowlist(tmp_path, monkeypatch, platform, nodeid, phase, reason, accepted):
     monkeypatch.setattr(runner.sys, 'platform', platform)
@@ -368,7 +375,7 @@ def test_main_preflight_failure_preserves_failure_receipt(tmp_path: Path, monkey
 
 
 def test_actual_missing_c3_is_rejected_before_test_collection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(runner, 'capture', lambda *args: json.dumps({'versions': {'fastdb4py': '0.2.2'}}))
+    monkeypatch.setattr(runner, 'capture', lambda *args: json.dumps({'versions': {'fastdb4py': '0.2.3'}}))
     with pytest.raises(runner.RunnerError, match='预建c3不存在'):
         runner.preflight(SimpleNamespace(python=sys.executable, c3=tmp_path / 'missing'), {})
 

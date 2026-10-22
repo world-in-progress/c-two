@@ -57,11 +57,14 @@ impl From<RouteConcurrencySnapshot> for PyRouteConcurrencySnapshot {
 
 fn acquire_error_to_py(py: Python<'_>, err: RouteConcurrencyError) -> PyErr {
     match err {
-        RouteConcurrencyError::Closed => {
-            let exc = PyRuntimeError::new_err("route closed");
-            let error_bytes =
-                c2_error::C2Error::new(c2_error::ErrorCode::ResourceClosed, "route closed")
-                    .to_wire_bytes();
+        RouteConcurrencyError::Closed | RouteConcurrencyError::Unavailable => {
+            let code = match err {
+                RouteConcurrencyError::Closed => c2_error::ErrorCode::ResourceClosed,
+                _ => c2_error::ErrorCode::ResourceUnavailable,
+            };
+            let message = err.to_string();
+            let exc = PyRuntimeError::new_err(message.clone());
+            let error_bytes = c2_error::C2Error::new(code, message).to_wire_bytes();
             if let Err(attr_err) = exc
                 .value(py)
                 .setattr("error_bytes", PyBytes::new(py, &error_bytes))
@@ -102,12 +105,17 @@ impl PyRouteConcurrency {
 
 #[pymethods]
 impl PyRouteConcurrencyGuard {
-    fn __enter__<'py>(slf: PyRefMut<'py, Self>) -> PyResult<PyRefMut<'py, Self>> {
-        if slf.inner.is_none() {
+    fn __enter__<'py>(mut slf: PyRefMut<'py, Self>) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let Some(mut guard) = slf.inner.take() else {
             return Err(PyRuntimeError::new_err(
                 "route concurrency guard already released",
             ));
-        }
+        };
+        // A pause can race execution_guard() returning, including while Python
+        // waits to enter its context. Failed entry drops the existing guard.
+        guard.commit().map_err(|err| acquire_error_to_py(py, err))?;
+        slf.inner = Some(guard);
         Ok(slf)
     }
 

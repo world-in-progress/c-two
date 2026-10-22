@@ -399,9 +399,7 @@ mod client_tests {
         assert!(!c1.is_connected());
 
         // IpcClient::with_pool uses custom config.
-        let pool = std::sync::Arc::new(parking_lot::Mutex::new(c2_mem::MemPool::new(
-            c2_mem::PoolConfig::default(),
-        )));
+        let pool = c2_mem::MemPool::new(c2_mem::PoolConfig::default());
         let c2 = crate::client::IpcClient::with_pool("ipc://test_prop_2", pool, cfg);
         assert!(!c2.is_connected());
     }
@@ -437,6 +435,7 @@ mod response_lease_tests {
     use c2_mem::{MemPool, PoolConfig};
     use parking_lot::{Mutex, RwLock};
 
+    use crate::response::ServerShmResponse;
     use crate::{ResponseData, ResponseLease, ServerPoolState};
 
     const SEGMENT_SIZE: usize = 64 * 1024;
@@ -473,10 +472,7 @@ mod response_lease_tests {
 
     #[test]
     fn inline_response_copy_and_release_are_independent_and_idempotent() {
-        let mut lease = ResponseLease::new(
-            ResponseData::Inline(b"inline response".to_vec()),
-            Arc::new(Mutex::new(None)),
-        );
+        let mut lease = ResponseLease::new(ResponseData::Inline(b"inline response".to_vec()));
 
         assert_eq!(lease.copy_bytes().unwrap(), b"inline response");
         assert!(!lease.is_released());
@@ -502,8 +498,7 @@ mod response_lease_tests {
                 ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
             backing.write_at(0, &payload).unwrap();
             backing.trim_to(logical_len).unwrap();
-            let mut lease =
-                ResponseLease::new(ResponseData::Handle(backing), Arc::new(Mutex::new(None)));
+            let mut lease = ResponseLease::new(ResponseData::Handle(backing));
 
             assert_eq!(lease.copy_bytes().unwrap(), payload[..logical_len]);
             assert_eq!(pool.read().stats().alloc_count, 1);
@@ -531,8 +526,7 @@ mod response_lease_tests {
             backing.trim_to(logical_len).unwrap();
             #[cfg(windows)]
             let path = backing.file_spill_path().unwrap();
-            let mut lease =
-                ResponseLease::new(ResponseData::Handle(backing), Arc::new(Mutex::new(None)));
+            let mut lease = ResponseLease::new(ResponseData::Handle(backing));
             #[cfg(windows)]
             assert!(path.exists());
             assert_eq!(lease.copy_bytes().unwrap(), payload[..logical_len]);
@@ -559,17 +553,15 @@ mod response_lease_tests {
         let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
             reader,
         ))));
-        let lease = ResponseLease::new(
-            ResponseData::Shm {
-                seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
-                generation: allocation.generation,
-                offset: u32::try_from(segment_capacity - 1).unwrap(),
-                data_size: 2,
-                is_dedicated: false,
-                allocation_id: allocation.allocation_id,
-            },
+        let lease = ResponseLease::new(ResponseData::Shm(ServerShmResponse::admit(
             server_pool,
-        );
+            u16::try_from(allocation.seg_idx).unwrap(),
+            allocation.generation,
+            u32::try_from(segment_capacity - 1).unwrap(),
+            2,
+            false,
+            allocation.allocation_id,
+        )));
 
         assert!(
             lease
@@ -580,7 +572,8 @@ mod response_lease_tests {
         drop(lease);
 
         assert_eq!(producer.stats().alloc_count, 1);
-        producer.free(&allocation).unwrap();
+        // SAFETY: test holds sole release authority for its own allocation.
+        unsafe { producer.free(&allocation) }.unwrap();
     }
 
     #[test]
@@ -590,7 +583,7 @@ mod response_lease_tests {
         let pool = empty_reassembly_pool('c');
         let mut handle = ReassemblyBacking::admit(Arc::clone(&pool), 1, 16).unwrap();
         handle.write_at(0, b"combined failure").unwrap();
-        let lease = ResponseLease::new(ResponseData::Handle(handle), Arc::new(Mutex::new(None)));
+        let lease = ResponseLease::new(ResponseData::Handle(handle));
         *pool.write() = MemPool::new_with_prefix(pool_config(), unique_prefix('z'));
 
         let error = lease.into_owned_bytes().unwrap_err();
@@ -601,48 +594,44 @@ mod response_lease_tests {
     fn assert_shm_response(payload: Vec<u8>, expected_dedicated: bool, label: char) {
         let prefix = unique_prefix(label);
         let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());
-        let allocation = producer.alloc(payload.len()).unwrap();
-        assert_eq!(allocation.is_dedicated, expected_dedicated);
-        let pointer = producer.data_ptr(&allocation).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer, payload.len());
-        }
+        let mut handle = producer.try_alloc_shm(payload.len()).unwrap();
+        assert_eq!(handle.is_dedicated(), expected_dedicated);
+        producer
+            .handle_slice_mut(&mut handle)
+            .copy_from_slice(&payload);
+        let allocation = handle.shm_allocation().unwrap();
 
         let reader = MemPool::open_peer(pool_config(), producer.prefix().to_string());
         let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
             reader,
         ))));
-        let mut lease = ResponseLease::new(
-            ResponseData::Shm {
-                seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
-                generation: allocation.generation,
-                offset: allocation.offset,
-                data_size: u32::try_from(payload.len()).unwrap(),
-                is_dedicated: allocation.is_dedicated,
-                allocation_id: allocation.allocation_id,
-            },
+        let mut lease = ResponseLease::new(ResponseData::Shm(ServerShmResponse::admit(
             Arc::clone(&server_pool),
-        );
+            u16::try_from(allocation.seg_idx).unwrap(),
+            allocation.generation,
+            allocation.offset,
+            u32::try_from(payload.len()).unwrap(),
+            allocation.is_dedicated,
+            allocation.allocation_id,
+        )));
 
         assert_eq!(lease.copy_bytes().unwrap(), payload);
         lease.release().unwrap();
-        assert_eq!(
-            server_pool
-                .lock()
-                .as_ref()
-                .unwrap()
-                .pool
-                .stats()
-                .alloc_count,
-            0
-        );
+        if expected_dedicated {
+            // The peer sets read_done; the producer owns the dedicated free.
+            producer.release_handle(handle).unwrap();
+            producer.gc_dedicated();
+            assert_eq!(producer.stats().dedicated_segments, 0);
+        }
+        assert_eq!(producer.stats().alloc_count, 0);
     }
 
     #[test]
     fn response_release_rejects_stale_id_after_same_slot_reuse() {
         let mut owner = MemPool::new_with_prefix(pool_config(), unique_prefix('i'));
         let old = owner.alloc(4096).unwrap();
-        owner.free(&old).unwrap();
+        // SAFETY: test holds sole release authority for its own allocation.
+        unsafe { owner.free(&old) }.unwrap();
         let current = owner.alloc(4096).unwrap();
         assert_eq!(
             (current.seg_idx, current.generation, current.offset),
@@ -695,7 +684,7 @@ mod lazy_policy_roundtrip_tests {
         AccessLevel, ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease,
         ResponseMeta, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
     };
-    use parking_lot::{Mutex, RwLock};
+    use parking_lot::Mutex;
     use tokio::time::timeout;
 
     use crate::client::{
@@ -747,8 +736,8 @@ mod lazy_policy_roundtrip_tests {
     fn request_kind(request: &RequestData) -> &'static str {
         match request {
             RequestData::Inline(_) => "inline",
-            RequestData::Shm { is_dedicated, .. } => {
-                if *is_dedicated {
+            RequestData::Shm(carrier) => {
+                if carrier.is_dedicated() {
                     "shm_dedicated"
                 } else {
                     "shm_buddy"
@@ -772,7 +761,7 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            _response_pool: Arc<RwLock<MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
             let request = RequestLease::new(request);
@@ -809,11 +798,12 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            response_pool: Arc<RwLock<MemPool>>,
+            response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             let request = RequestLease::new(request);
             {
-                let mut pool = response_pool.write();
+                // SAFETY: this fixture owns its held allocations; it never replaces the server pool.
+                let mut pool = unsafe { response_pool.write() };
                 let mut held = self.held.lock();
                 while held.len() < self.hog_count {
                     held.push(pool.alloc(self.hog_size).map_err(CrmError::InternalError)?);
@@ -906,10 +896,8 @@ mod lazy_policy_roundtrip_tests {
         .unwrap()
     }
 
-    fn response_bytes(client: &IpcClient, response: ResponseData) -> Vec<u8> {
-        response
-            .into_bytes_with_pool(&client.server_pool_arc().clone())
-            .unwrap()
+    fn response_bytes(_client: &IpcClient, response: ResponseData) -> Vec<u8> {
+        response.into_bytes().unwrap()
     }
 
     // Fake callback state is a transport seam, not a Core deadline model.
@@ -1185,7 +1173,7 @@ mod lazy_policy_roundtrip_tests {
             _route: &str,
             _method: u16,
             request: RequestData,
-            _pool: Arc<RwLock<MemPool>>,
+            _pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             let first = {
                 let mut seen = self.seen.lock();
@@ -1361,7 +1349,7 @@ mod lazy_policy_roundtrip_tests {
             .unwrap()
             .unwrap();
         assert_eq!(client.pending_len_for_test(), 0);
-        let mut lease = ResponseLease::new(response, Arc::clone(client.server_pool_arc()));
+        let mut lease = ResponseLease::new(response);
         assert_eq!(lease.copy_bytes().unwrap(), payload);
         lease.release().unwrap();
         lease.release().unwrap();
@@ -1637,16 +1625,11 @@ mod lazy_policy_roundtrip_tests {
 
         // The reply came back as dedicated SHM coordinates, not inline bytes:
         // with buddy disabled the response pool allocated dedicated segments.
-        let ResponseData::Shm {
-            is_dedicated,
-            data_size,
-            ..
-        } = &response
-        else {
+        let ResponseData::Shm(carrier) = &response else {
             panic!("expected SHM response, got {response:?}");
         };
-        assert!(*is_dedicated, "response must use dedicated SHM");
-        assert_eq!(*data_size as usize, payload.len());
+        assert!(carrier.is_dedicated(), "response must use dedicated SHM");
+        assert_eq!(carrier.data_size() as usize, payload.len());
         assert_eq!(response_bytes(&client, response), payload);
 
         // No buddy segments were ever mapped on either side.
@@ -1720,9 +1703,11 @@ mod lazy_policy_roundtrip_tests {
         // Release the hogged dedicated segments.
         {
             let response_pool = server.response_pool_arc();
-            let mut pool = response_pool.write();
+            // SAFETY: this fixture owns its held allocations; it never replaces the server pool.
+            let mut pool = unsafe { response_pool.write() };
             for alloc in held.lock().drain(..) {
-                pool.free(&alloc).unwrap();
+                // SAFETY: test holds sole release authority for its own allocation.
+                unsafe { pool.free(&alloc) }.unwrap();
             }
         }
 
@@ -1808,19 +1793,14 @@ mod lazy_policy_roundtrip_tests {
 
         // The reply arrived as buddy SHM from the server's lazily created
         // 64 KiB response pool, which the client lazy-opened symmetrically.
-        let ResponseData::Shm {
-            is_dedicated,
-            data_size,
-            ..
-        } = &response
-        else {
+        let ResponseData::Shm(carrier) = &response else {
             panic!("expected SHM response, got {response:?}");
         };
         assert!(
-            !*is_dedicated,
+            !carrier.is_dedicated(),
             "buddy-enabled pools must serve buddy replies"
         );
-        assert_eq!(*data_size as usize, payload.len());
+        assert_eq!(carrier.data_size() as usize, payload.len());
         assert_eq!(response_bytes(&client, response), payload);
 
         assert_eq!(own_pool_segment_count(&client), 1);
@@ -1970,21 +1950,26 @@ mod lazy_policy_roundtrip_tests {
             ),
             budget.clone(),
         )));
-        let alloc = pool.lock().alloc(4096).expect("real dedicated allocation");
-        assert!(alloc.is_dedicated);
+        let handle = pool
+            .lock()
+            .try_alloc_shm(4096)
+            .expect("real dedicated allocation");
+        assert!(handle.is_dedicated());
+        let coordinates = handle.shm_allocation().unwrap();
+        let seg_idx = coordinates.seg_idx;
         let prefix = pool.lock().prefix().to_string();
         let name = pool
             .lock()
-            .dedicated_name(alloc.seg_idx)
+            .dedicated_name(seg_idx)
             .expect("dedicated backing name")
             .to_string();
         let mut peer = MemPool::open_peer(config, prefix);
-        peer.open_dedicated_at(alloc.seg_idx, &name, 4096)
+        unsafe { peer.open_dedicated_at(seg_idx, &name, 4096) }
             .expect("peer opens the request backing");
         let charged = budget.snapshot().shm.used_bytes;
         assert!(charged > 0);
 
-        let block = Arc::new(RequestBlock::new(Arc::clone(&pool), alloc));
+        let block = Arc::new(RequestBlock::new(Arc::clone(&pool), handle));
         let (permit, returned) = control::reserve_permit();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -2035,11 +2020,12 @@ mod lazy_policy_roundtrip_tests {
             !control::can_reserve(),
             "one retained backing fills capacity"
         );
-        assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
+        assert!(pool.lock().dedicated_awaiting_retirement(&coordinates));
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
 
-        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0)
-            .expect("peer signals read_done");
+        // SAFETY: the test acts as the receiving peer for this admitted
+        // dedicated block — the sole releaser signalling read_done.
+        unsafe { peer.free_at(seg_idx, 0, 0, 4096, true, 0) }.expect("peer signals read_done");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !returned.load(Ordering::Acquire) || budget.snapshot().shm.used_bytes != 0 {
             assert!(std::time::Instant::now() < deadline, "retirement timed out");
@@ -2097,7 +2083,7 @@ mod lazy_policy_roundtrip_tests {
             .expect("dedicated backing name")
             .to_string();
         let mut peer = MemPool::open_peer(config, prefix);
-        peer.open_dedicated_at(alloc.seg_idx, &name, 4096)
+        unsafe { peer.open_dedicated_at(alloc.seg_idx, &name, 4096) }
             .expect("peer opens the request backing");
         let charged = budget.snapshot().shm.used_bytes;
         assert!(charged > 0, "the retained backing must be charged");
@@ -2126,7 +2112,9 @@ mod lazy_policy_roundtrip_tests {
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
         assert!(!returned.load(Ordering::Acquire));
 
-        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0)
+        // SAFETY: the test acts as the receiving peer and sole releaser of
+        // this admitted dedicated block, signalling read_done.
+        unsafe { peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true, 0) }
             .expect("peer signals read_done");
         // Sample the returned flag and scoped count under the executor lock.
         // Independent reads allow the worker to return the permit and clear
@@ -2192,12 +2180,13 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            response_pool: Arc<RwLock<MemPool>>,
+            response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
             let request = RequestLease::new(request);
             {
-                let mut pool = response_pool.write();
+                // SAFETY: this fixture owns its held allocations; it never replaces the server pool.
+                let mut pool = unsafe { response_pool.write() };
                 let mut held = self.held.lock();
                 while held.len() < self.hog_count {
                     held.push(pool.alloc(self.hog_size).map_err(CrmError::InternalError)?);
@@ -2225,11 +2214,11 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            _response_pool: Arc<RwLock<MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
-            if let RequestData::Shm { seg_idx, .. } = &request {
-                self.seen_seg_idx.lock().push(*seg_idx);
+            if let RequestData::Shm(carrier) = &request {
+                self.seen_seg_idx.lock().push(carrier.seg_idx());
             }
             let request = RequestLease::new(request);
             let bytes = request.copy_bytes().map_err(CrmError::InternalError)?;
@@ -2246,7 +2235,7 @@ mod lazy_policy_roundtrip_tests {
         // connection I/O, so the error is the policy error, not an I/O error.
         let mut client = IpcClient::with_pool(
             &unique_address("policy_mismatch"),
-            Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default()))),
+            MemPool::new(c2_mem::PoolConfig::default()),
             client_config(
                 BaseIpcConfig {
                     pool_enabled: false,
@@ -2268,7 +2257,7 @@ mod lazy_policy_roundtrip_tests {
     async fn injected_pool_with_prewarm_config_is_rejected_before_io() {
         let mut client = IpcClient::with_pool(
             &unique_address("prewarm_injected"),
-            Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default()))),
+            MemPool::new(c2_mem::PoolConfig::default()),
             client_config(
                 BaseIpcConfig {
                     pool_prewarm_segments: 1,
@@ -2315,39 +2304,36 @@ mod lazy_policy_roundtrip_tests {
             },
             1024,
         );
-        // A policy-matching externally owned pool: buddy-disabled, built from
+        // A policy-matching injected pool: buddy-disabled, built from
         // the same centralized projection the transport itself uses.
-        let injected = Arc::new(Mutex::new(MemPool::new(
-            config.base.primary_pool_config(&config.pool_tuning()),
-        )));
-        let mut client = IpcClient::with_pool(server.ipc_address(), Arc::clone(&injected), config);
+        let injected = MemPool::new(config.base.primary_pool_config(&config.pool_tuning()));
+        let mut client = IpcClient::with_pool(server.ipc_address(), injected, config);
+        let injected = client.request_pool().unwrap();
         client.connect().await.unwrap();
 
         let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
         let response = echo_roundtrip(&client, "disabled_injected", &payload).await;
 
         assert_eq!(*seen_kinds.lock(), vec!["shm_dedicated"]);
-        let ResponseData::Shm { is_dedicated, .. } = &response else {
+        let ResponseData::Shm(carrier) = &response else {
             panic!("expected SHM response, got {response:?}");
         };
         assert!(
-            *is_dedicated,
+            carrier.is_dedicated(),
             "disabled injected pool must serve dedicated SHM"
         );
         assert_eq!(response_bytes(&client, response), payload);
 
-        // The externally owned pool was never mutated: same policy, no buddy
-        // mappings, and the settled dedicated request retired promptly — the
-        // response proves the peer set `read_done`, so the owner entry is
-        // already reclaimed here rather than lingering until a later GC.
+        // read_done permits retirement, but receiver settlement is deliberately
+        // nonblocking when the shared retire executor is busy. Observe the
+        // existing close barrier before asserting that owner cleanup finished.
+        assert!(client.close_shared_bounded(Duration::from_secs(2)).await);
         {
             let pool = injected.lock();
             assert!(!pool.config().buddy_enabled);
             assert_eq!(pool.segment_count(), 0);
             assert_eq!(pool.stats().dedicated_segments, 0);
         }
-        client.close().await;
-        assert_eq!(injected.lock().segment_count(), 0);
         stop_server(&server).await;
     }
 
@@ -2385,7 +2371,7 @@ mod lazy_policy_roundtrip_tests {
         // abort it and release its reassembly-pool bytes.
         client
             .require_chunk_registry()
-            .insert(42_42, 7, 2, 4096)
+            .insert(42_42, 7, 2, 4096, ())
             .expect("stale assembly insert");
         assert_eq!(client.require_chunk_registry().active_count(), 1);
 
@@ -2439,9 +2425,11 @@ mod lazy_policy_roundtrip_tests {
         // Release the hogged server-side allocations and shut down.
         {
             let response_pool = server.response_pool_arc();
-            let mut pool = response_pool.write();
+            // SAFETY: this fixture owns its held allocations; it never replaces the server pool.
+            let mut pool = unsafe { response_pool.write() };
             for alloc in held.lock().drain(..) {
-                pool.free(&alloc).unwrap();
+                // SAFETY: test holds sole release authority for its own allocation.
+                unsafe { pool.free(&alloc) }.unwrap();
             }
         }
         client.close().await;
@@ -2519,10 +2507,10 @@ mod lazy_policy_roundtrip_tests {
         let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
         let response = echo_roundtrip(&client, "dedicated_gc", &payload).await;
         assert_eq!(*seen_kinds.lock(), vec!["shm_dedicated"]);
-        let ResponseData::Shm { is_dedicated, .. } = &response else {
+        let ResponseData::Shm(carrier) = &response else {
             panic!("expected SHM response, got {response:?}");
         };
-        assert!(*is_dedicated);
+        assert!(carrier.is_dedicated());
 
         // Before the client releases the reply, the server's creator-side
         // dedicated entry deterministically lingers: freed_at is set but
@@ -2579,48 +2567,29 @@ mod lazy_policy_roundtrip_tests {
         );
         client.connect().await.unwrap();
 
-        struct HeldReply {
-            seg_idx: u16,
-            generation: u32,
-            offset: u32,
-            data_size: u32,
-            allocation_id: u64,
-        }
-
-        let mut held: Vec<HeldReply> = Vec::new();
+        // Held replies keep their full receive carrier: the read/release
+        // authority stays bound to the pool state the frame was admitted on.
+        let mut held: Vec<ResponseLease> = Vec::new();
         let mut max_seg_idx = 0u16;
         for i in 0..34u32 {
             let payload: Vec<u8> = (0..32 * 1024u32).map(|j| ((i + j) % 251) as u8).collect();
-            let ResponseData::Shm {
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                is_dedicated,
-                allocation_id,
-            } = echo_roundtrip(&client, "reply_idx16", &payload).await
-            else {
+            let response = echo_roundtrip(&client, "reply_idx16", &payload).await;
+            let ResponseData::Shm(carrier) = response else {
                 panic!("expected buddy SHM reply for request {i}");
             };
-            assert!(!is_dedicated, "buddy-enabled pool must serve buddy replies");
-            max_seg_idx = max_seg_idx.max(seg_idx);
+            assert!(
+                !carrier.is_dedicated(),
+                "buddy-enabled pool must serve buddy replies"
+            );
+            max_seg_idx = max_seg_idx.max(carrier.seg_idx());
             // Read correctness through the lazy client peer cache: this copy
             // exercises seg_idx 16, which a 16-entry cache would reject.
-            let copied = {
-                let mut server_pool = client.server_pool_arc().lock();
-                let state = server_pool.as_mut().unwrap();
-                state
-                    .copy_response(seg_idx, generation, offset, data_size, false)
-                    .unwrap_or_else(|e| panic!("copy of reply {i} failed: {e}"))
-            };
+            let lease = ResponseLease::new(ResponseData::Shm(carrier));
+            let copied = lease
+                .copy_bytes()
+                .unwrap_or_else(|e| panic!("copy of reply {i} failed: {e}"));
             assert_eq!(copied, payload, "reply {i} bytes must round-trip");
-            held.push(HeldReply {
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                allocation_id,
-            });
+            held.push(lease);
         }
 
         assert_eq!(max_seg_idx, 16, "34 held replies must reach buddy index 16");
@@ -2631,7 +2600,6 @@ mod lazy_policy_roundtrip_tests {
                 .lock()
                 .as_ref()
                 .unwrap()
-                .pool
                 .segment_count(),
             17,
             "client peer cache must hold all lazily opened server segments"
@@ -2639,27 +2607,15 @@ mod lazy_policy_roundtrip_tests {
 
         // Free correctness: releasing every held reply frees the server's
         // buddy blocks cross-process.
-        {
-            let mut server_pool = client.server_pool_arc().lock();
-            let state = server_pool.as_mut().unwrap();
-            for reply in &held {
-                state
-                    .release_response(
-                        reply.seg_idx,
-                        reply.generation,
-                        reply.offset,
-                        reply.data_size,
-                        false,
-                        reply.allocation_id,
-                    )
-                    .unwrap_or_else(|e| panic!("release of reply failed: {e}"));
-            }
+        for mut lease in held {
+            lease
+                .release()
+                .unwrap_or_else(|e| panic!("release of reply failed: {e}"));
         }
         wait_until(5, || {
             server.response_pool_arc().read().stats().alloc_count == 0
         })
         .await;
-        drop(held);
 
         client.close().await;
         stop_server(&server).await;
@@ -2709,9 +2665,7 @@ mod lazy_policy_roundtrip_tests {
                 .await
                 .expect("call must not hang")
                 .unwrap();
-                let bytes = response
-                    .into_bytes_with_pool(&client.server_pool_arc().clone())
-                    .unwrap();
+                let bytes = response.into_bytes().unwrap();
                 assert_eq!(bytes, payload, "request {i} must echo back");
             }));
         }
@@ -2926,16 +2880,12 @@ mod lazy_policy_roundtrip_tests {
     async fn injected_pool_with_divergent_budget_is_rejected_before_io() {
         let cfg = client_config(small_base(64 * 1024, 4), 1024);
         let injected_budget = c2_mem::MemoryBudget::new(1, 2, 3);
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+        let pool = MemPool::new_with_prefix_and_budget(
             cfg.base.primary_pool_config(&cfg.pool_tuning()),
             "/cc3i00000000000001".to_string(),
             injected_budget.clone(),
-        )));
-        let mut client = IpcClient::with_pool(
-            "ipc://budget_mismatch_never_connects",
-            Arc::clone(&pool),
-            cfg,
         );
+        let mut client = IpcClient::with_pool("ipc://budget_mismatch_never_connects", pool, cfg);
         let error = client
             .connect()
             .await
@@ -2958,11 +2908,8 @@ mod lazy_policy_roundtrip_tests {
             c2_mem::config::PoolConfig::default(),
             "/cc3peer00000000001".to_string(),
         );
-        let mut client = IpcClient::with_pool(
-            "ipc://peer_pool_without_budget_never_connects",
-            Arc::new(Mutex::new(peer)),
-            cfg,
-        );
+        let mut client =
+            IpcClient::with_pool("ipc://peer_pool_without_budget_never_connects", peer, cfg);
         let error = client
             .connect()
             .await
@@ -3015,7 +2962,7 @@ mod lazy_policy_roundtrip_tests {
             .budget()
             .unwrap()
             .clone();
-        let lease = ResponseLease::new(response, Arc::clone(client.server_pool_arc()));
+        let lease = ResponseLease::new(response);
         assert_eq!(lease.copy_bytes().unwrap(), payload);
         let held_budget = budget.snapshot();
         assert_eq!(
@@ -3283,6 +3230,74 @@ mod lazy_policy_roundtrip_tests {
         server_rt.block_on(stop_server(&server));
     }
 
+    #[test]
+    fn prealloc_rejects_another_clients_block_before_publication() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (callback, seen) = echo_callback();
+        let base = small_base(64 * 1024, 2);
+        let server = runtime.block_on(start_echo_server(
+            "prealloc_owner",
+            server_config(base.clone(), 1024),
+            callback,
+        ));
+        let config = client_config(base, 1024);
+        let mut a = crate::SyncClient::connect(server.ipc_address(), None, config.clone()).unwrap();
+        let mut b = crate::SyncClient::connect(server.ipc_address(), None, config).unwrap();
+        let binding_a = a
+            .acquire_route(&expected_contract("prealloc_owner"))
+            .unwrap();
+        let binding_b = b
+            .acquire_route(&expected_contract("prealloc_owner"))
+            .unwrap();
+        let block_a = a.pool_alloc_and_write(&[1; 4096]).unwrap();
+        let block_b = b.pool_alloc_and_write(&[2; 4096]).unwrap();
+        let coords = |block: &crate::RequestBlock| {
+            let allocation = block.allocation();
+            (
+                allocation.seg_idx,
+                allocation.generation,
+                allocation.offset,
+                allocation.allocation_id,
+            )
+        };
+        assert_eq!(coords(&block_a), coords(&block_b));
+        let result = b.call_bound_prealloc(&binding_b, "echo", &block_a);
+        let rejected =
+            matches!(&result, Err(IpcError::Pool(message)) if message.contains("request pool"));
+        let received =
+            result.map(|response| b.lease_response(response).into_owned_bytes().unwrap());
+        let calls_after_rejection = seen.lock().len();
+        let allocations = (
+            a.request_pool().unwrap().lock().stats().alloc_count,
+            b.request_pool().unwrap().lock().stats().alloc_count,
+        );
+        if rejected {
+            let response = b.call_bound_prealloc(&binding_b, "echo", &block_b).unwrap();
+            assert_eq!(
+                b.lease_response(response).into_owned_bytes().unwrap(),
+                [2; 4096]
+            );
+            let fresh = a.pool_alloc_and_write(&[3; 4096]).unwrap();
+            let response = a.call_bound_prealloc(&binding_a, "echo", &fresh).unwrap();
+            assert_eq!(
+                a.lease_response(response).into_owned_bytes().unwrap(),
+                [3; 4096]
+            );
+        }
+        drop(block_a);
+        drop(block_b);
+        a.close();
+        b.close();
+        runtime.block_on(stop_server(&server));
+        assert!(rejected, "foreign block reached the server: {received:?}");
+        assert_eq!(calls_after_rejection, 0);
+        assert_eq!(
+            allocations,
+            (0, 1),
+            "failure must release only the original owner"
+        );
+    }
+
     /// A confirmed close detaches idle owner pools so a closed-but-retained
     /// client stops pinning unused mappings and their charge; a reconnect
     /// rebuilds fresh incarnations on the same frozen budget.
@@ -3313,7 +3328,9 @@ mod lazy_policy_roundtrip_tests {
 
         let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 229) as u8).collect();
         let response = echo_roundtrip(&client, "budget_detach_reconnect", &payload).await;
-        assert_eq!(response_bytes(&client, response), payload);
+        let first_response_pool = Arc::clone(client.server_pool_arc());
+        let mut held = ResponseLease::new(response);
+        assert_eq!(held.copy_bytes().unwrap(), payload);
         assert!(
             budget.snapshot().shm.used_bytes > 0,
             "real request backing must be charged before close"
@@ -3339,6 +3356,12 @@ mod lazy_policy_roundtrip_tests {
 
         // Reconnect rebuilds fresh pool incarnations on the same budget.
         client.connect().await.unwrap();
+        assert!(
+            !Arc::ptr_eq(client.server_pool_arc(), &first_response_pool),
+            "a reconnect must not replace a retained reply's pool state"
+        );
+        assert_eq!(held.copy_bytes().unwrap(), payload);
+        held.release().unwrap();
         let second_pool = client.request_pool().expect("reconnect recreates the pool");
         assert_ne!(
             second_pool.lock().prefix(),
@@ -3375,7 +3398,7 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            _response_pool: Arc<RwLock<MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
             if let Some(started) = self.started.lock().take() {
@@ -3625,9 +3648,8 @@ mod lazy_policy_roundtrip_tests {
             .lock()
             .alloc(8192)
             .expect("the old owner's allocator must stay consistent");
-        old_pool
-            .lock()
-            .free(&probe)
+        // SAFETY: test releases its own probe allocation on its own pool.
+        unsafe { old_pool.lock().free(&probe) }
             .expect("probe free must round-trip on the old owner");
         assert_eq!(
             fresh_pool.lock().stats().alloc_count,
@@ -3772,7 +3794,7 @@ mod lazy_policy_roundtrip_tests {
             started = &mut started_rx => {
                 started.expect("callback must start (frame dispatched)");
             }
-            result = client.call_with_prealloc(&identity, method_idx, &block, payload.len()) => {
+            result = client.call_with_prealloc(&identity, method_idx, &block) => {
                 panic!("the call must not complete while the callback stalls: {result:?}");
             }
         }
@@ -4055,7 +4077,7 @@ mod lazy_policy_roundtrip_tests {
 
         let err = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+            client.call_with_prealloc(&identity, method_idx, &block),
         )
         .await
         .expect("a released block must be rejected promptly")
@@ -4111,7 +4133,7 @@ mod lazy_policy_roundtrip_tests {
 
         // Drive the first call to the stalling server: its frame was
         // dispatched and the call parks waiting for the response.
-        let first = client.call_with_prealloc(&identity, method_idx, &block, payload.len());
+        let first = client.call_with_prealloc(&identity, method_idx, &block);
         tokio::pin!(first);
         let mut started_rx = started_rx;
         tokio::select! {
@@ -4122,7 +4144,7 @@ mod lazy_policy_roundtrip_tests {
 
         let err = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+            client.call_with_prealloc(&identity, method_idx, &block),
         )
         .await
         .expect("a re-dispatch must be rejected promptly")
@@ -4187,7 +4209,7 @@ mod lazy_policy_roundtrip_tests {
         held_rx.await.expect("writer slot must be held");
 
         let identity = raw_peer_identity();
-        let call = client.call_with_prealloc(&identity, 0, &block, payload.len());
+        let call = client.call_with_prealloc(&identity, 0, &block);
         tokio::pin!(call);
         use futures_util::FutureExt;
         assert!(
@@ -4337,7 +4359,7 @@ mod lazy_policy_roundtrip_tests {
         let budget = c2_mem::MemoryBudget::from_limits(&cfg.memory_budget_limits());
         let mut pool_config = cfg.base.primary_pool_config(&cfg.pool_tuning());
         pool_config.dedicated_crash_timeout_secs = 0.25;
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+        let pool = MemPool::new_with_prefix_and_budget(
             pool_config,
             format!(
                 "/cc3crash{:08x}{:08x}",
@@ -4345,9 +4367,8 @@ mod lazy_policy_roundtrip_tests {
                 ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
             ),
             budget.clone(),
-        )));
-        let mut client = IpcClient::with_pool(server.ipc_address(), Arc::clone(&pool), cfg);
-        drop(pool);
+        );
+        let mut client = IpcClient::with_pool(server.ipc_address(), pool, cfg);
         client.connect().await.unwrap();
 
         let binding = client
@@ -4441,8 +4462,7 @@ mod lazy_policy_roundtrip_tests {
             release: park_release,
         }));
 
-        let mut call =
-            Box::pin(client.call_with_prealloc(&identity, method_idx, &block, payload.len()));
+        let mut call = Box::pin(client.call_with_prealloc(&identity, method_idx, &block));
         let mut prefix_rx = prefix_rx;
         tokio::select! {
             _ = &mut prefix_rx => {}
@@ -4474,7 +4494,7 @@ mod lazy_policy_roundtrip_tests {
     /// call may append to the corrupt stream, the pending entry drains with
     /// a correct settle, and the buddy block stays conservatively charged
     /// until pool destruction returns it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn partial_frame_write_cancellation_poisons_the_stream() {
         check_partial_frame_write_cancellation(false).await;
     }
@@ -4515,6 +4535,7 @@ mod lazy_policy_roundtrip_tests {
             None
         };
         client.connect().await.expect("connect");
+        let observation = client.connection_observation().unwrap();
         let mut peer = peer_rx.await.expect("peer stream");
         let pool = client.request_pool().expect("transport-owned request pool");
         let budget = pool
@@ -4541,7 +4562,7 @@ mod lazy_policy_roundtrip_tests {
         }));
 
         let identity = raw_peer_identity();
-        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block, payload.len()));
+        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block));
         let mut prefix_rx = prefix_rx;
         tokio::select! {
             _ = &mut prefix_rx => {}
@@ -4558,7 +4579,16 @@ mod lazy_policy_roundtrip_tests {
             .expect("prefix read");
 
         // Caller cancellation after the partial write.
+        assert!(observation.snapshot().is_none());
         drop(call);
+        // The current-thread variant cannot resume its reader between Drop
+        // and this snapshot. The send abort itself must publish the cause.
+        let closed = observation
+            .snapshot()
+            .expect("sender publishes before abort");
+        assert_eq!(closed.reason(), c2_local::ConnectionEndReason::LocalClose);
+        assert_eq!(closed.operation(), "local_abort");
+        assert!(!client.is_connected());
 
         // A follow-up call must fail instead of appending to the partial
         // frame on the same stream.
@@ -4610,6 +4640,7 @@ mod lazy_policy_roundtrip_tests {
         assert!(budget.snapshot().cell(c2_mem::BudgetKind::Shm).used_bytes > 0);
         let retained_bytes = budget.snapshot().shm.used_bytes;
         assert!(client.close_shared_bounded(Duration::from_secs(2)).await);
+        assert_eq!(observation.snapshot(), Some(closed));
         assert!(client.request_pool().is_none());
         assert_eq!(
             pool.lock().stats().alloc_count,
@@ -4784,27 +4815,32 @@ mod lazy_policy_roundtrip_tests {
             let (control, _) = decode_call_control(payload, consumed).unwrap();
             assert_eq!(control.identity.route_uid, "terminal-grid-1");
             let mut memory = MemPool::open_peer(c2_mem::PoolConfig::default(), prefix.clone());
-            memory
-                .open_dedicated_at(
+            unsafe {
+                memory.open_dedicated_at(
                     u32::from(pointer.seg_idx),
                     &MemPool::dedicated_segment_name(&prefix, u32::from(pointer.seg_idx)),
                     pointer.data_size as usize,
                 )
-                .unwrap();
+            }
+            .unwrap();
+            // SAFETY: this test block acts as the receiving peer for its
+            // own admitted dedicated allocation: sole reader, sole releaser.
             assert_eq!(
-                memory
-                    .copy_data_at(
+                unsafe {
+                    memory.copy_data_at(
                         u32::from(pointer.seg_idx),
                         pointer.generation,
                         pointer.offset,
                         pointer.data_size,
                         true,
                     )
-                    .unwrap(),
+                }
+                .unwrap(),
                 vec![7; 160 * 1024]
             );
-            memory
-                .free_at(
+            // SAFETY: same sole-releaser proof for the read_done free.
+            unsafe {
+                memory.free_at(
                     u32::from(pointer.seg_idx),
                     pointer.generation,
                     pointer.offset,
@@ -4812,7 +4848,8 @@ mod lazy_policy_roundtrip_tests {
                     true,
                     pointer.allocation_id,
                 )
-                .unwrap();
+            }
+            .unwrap();
             published_tx.send(()).unwrap();
             terminate_rx.await.unwrap();
             // Keep this real peer alive: termination comes from the protocol,
@@ -4891,7 +4928,7 @@ mod lazy_policy_roundtrip_tests {
             let block = Arc::clone(&block);
             std::thread::spawn(move || {
                 let err = old
-                    .call_bound_prealloc(&binding, "echo", &block, 160 * 1024)
+                    .call_bound_prealloc(&binding, "echo", &block)
                     .expect_err("the live request must receive Closed");
                 closed_tx.send((err, old.is_connected())).unwrap();
             })
@@ -5001,8 +5038,22 @@ mod lazy_policy_roundtrip_tests {
     /// connection must not carry per-call residue.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_call_waiting_for_the_writer_leaves_no_pending_entry() {
-        let cfg = client_config(small_base(64 * 1024, 2), 1024);
-        let client = IpcClient::with_config("ipc://pending_entry_cleanup", cfg);
+        let base = small_base(64 * 1024, 2);
+        let (callback, _) = echo_callback();
+        let server = start_echo_server(
+            "pending_entry_cleanup",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let observation = client.connection_observation().unwrap();
+        let binding = client
+            .acquire_route(&expected_contract("pending_entry_cleanup"))
+            .await
+            .unwrap();
+        let (method_idx, identity, _) = binding.call_target_for("echo").unwrap();
         let pool = client.request_pool().expect("transport-owned request pool");
 
         let writer_slot = client.writer_slot_for_test();
@@ -5022,8 +5073,7 @@ mod lazy_policy_roundtrip_tests {
             .expect("a request pool is selected");
         block.write_at(0, &payload).expect("fill the block");
 
-        let identity = raw_peer_identity();
-        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block, payload.len()));
+        let mut call = Box::pin(client.call_with_prealloc(&identity, method_idx, &block));
         use futures_util::FutureExt as _;
         assert!(
             call.as_mut().now_or_never().is_none(),
@@ -5043,11 +5093,17 @@ mod lazy_policy_roundtrip_tests {
             "cancellation before the write must remove the pending entry immediately"
         );
         assert_eq!(pool.lock().stats().alloc_count, 1, "the block is armed");
+        assert!(observation.snapshot().is_none());
+        assert!(client.is_connected());
         let _ = block.release();
         assert_eq!(pool.lock().stats().alloc_count, 0);
 
         let _ = unhold_tx.send(());
+        let response = echo_roundtrip(&client, "pending_entry_cleanup", b"still healthy").await;
+        assert_eq!(response_bytes(&client, response), b"still healthy");
+        assert!(observation.snapshot().is_none());
         client.close_shared().await;
+        stop_server(&server).await;
     }
 
     // ── Reply-wait cancellation, late replies, and bounded retire capacity ─
@@ -5066,7 +5122,7 @@ mod lazy_policy_roundtrip_tests {
             _route_name: &str,
             _method_idx: u16,
             request: RequestData,
-            _response_pool: Arc<RwLock<MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.seen_kinds.lock().push(request_kind(&request));
             let _ = self.release.lock().recv_timeout(Duration::from_secs(10));
@@ -5104,6 +5160,7 @@ mod lazy_policy_roundtrip_tests {
         .await;
         let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
         client.connect().await.unwrap();
+        let observation = client.connection_observation().unwrap();
         let budget = client
             .request_pool()
             .expect("dedicated-capable request pool")
@@ -5137,6 +5194,7 @@ mod lazy_policy_roundtrip_tests {
             client.is_connected(),
             "cancelling a reply wait must not tear down the healthy connection"
         );
+        assert!(observation.snapshot().is_none());
         assert_eq!(
             client.pending_len_for_test(),
             0,
@@ -5161,6 +5219,7 @@ mod lazy_policy_roundtrip_tests {
             server.response_pool_arc().read().stats().alloc_count == 0
         })
         .await;
+        assert!(observation.snapshot().is_none());
         client.close_shared().await;
         stop_server(&server).await;
     }
@@ -5325,7 +5384,7 @@ mod lazy_policy_roundtrip_tests {
         let spawn_failure = crate::client::dedicated_retire_test_control::fail_worker_spawn();
         let err = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+            client.call_with_prealloc(&identity, method_idx, &block),
         )
         .await
         .expect("the call must fail promptly")
@@ -5353,7 +5412,7 @@ mod lazy_policy_roundtrip_tests {
         block.write_at(0, &payload).expect("fill the block");
         let response = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+            client.call_with_prealloc(&identity, method_idx, &block),
         )
         .await
         .expect("retry must complete")
@@ -5453,7 +5512,7 @@ mod lazy_policy_roundtrip_tests {
             );
             match timeout(
                 Duration::from_secs(5),
-                client.call_with_prealloc(&identity, method_idx, &second_block, 4096),
+                client.call_with_prealloc(&identity, method_idx, &second_block),
             )
             .await
             {
@@ -5493,7 +5552,7 @@ mod lazy_policy_roundtrip_tests {
         let _ = release_tx.send(());
         let response = timeout(
             Duration::from_secs(5),
-            client.call_with_prealloc(&identity, method_idx, &retry_block, 4096),
+            client.call_with_prealloc(&identity, method_idx, &retry_block),
         )
         .await
         .expect("retry must complete")
@@ -5949,7 +6008,10 @@ mod chunk_reply_admission_tests {
             .collect()
     }
 
-    fn budgeted_registry(reassembly_limit: u64, label: &str) -> (Arc<ChunkRegistry>, MemoryBudget) {
+    fn budgeted_registry(
+        reassembly_limit: u64,
+        label: &str,
+    ) -> (Arc<ChunkRegistry<()>>, MemoryBudget) {
         let budget = MemoryBudget::new(1 << 20, 1 << 20, reassembly_limit);
         let pool = Arc::new(parking_lot::RwLock::new(
             MemPool::new_with_prefix_and_budget(
@@ -5993,7 +6055,7 @@ mod chunk_reply_admission_tests {
         _handle: tokio::task::JoinHandle<()>,
     }
 
-    async fn drive_recv_loop(registry: Arc<ChunkRegistry>) -> DrivenRecvLoop {
+    async fn drive_recv_loop(registry: Arc<ChunkRegistry<()>>) -> DrivenRecvLoop {
         let (client, server) = LocalStream::pair().await.unwrap();
         let (client_read, client_write) = client.into_split();
         let (probe_read, probe_write) = server.into_split();
@@ -6667,7 +6729,7 @@ mod endpoint_context_transport_tests {
             _: &str,
             _: u16,
             _: RequestData,
-            _: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            _: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(vec![self.0]))
         }

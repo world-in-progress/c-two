@@ -24,11 +24,11 @@ import sys
 import tarfile
 import urllib.request
 
-RELEASE_VERSION = "0.2.1"
-EXPECTED_SOURCE_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+RELEASE_VERSION = "0.2.3"
+EXPECTED_SOURCE_SHA = "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4"
 RELEASE_MANIFEST_NAME = "release-manifest.json"
 RELEASE_MANIFEST_SHA256 = (
-    "a741c33ef2caa9925f7aa496a4ec81dc16c642f02a29bcef471e95264a1e7ded"
+    "a4cd7dd1a0634ab5ed15585c7064275ad68afebe7cd50a97139ec0d8b46a6f16"
 )
 RELEASE_REPOSITORY = "world-in-progress/fastdb"
 RELEASE_MANIFEST_SCHEMA = "fastdb.release-manifest.v1"
@@ -46,6 +46,7 @@ LIBRARY_BY_TARGET = {
     "x86_64-unknown-linux-gnu": "libfastdb.so",
     "aarch64-apple-darwin": "libfastdb.dylib",
     "x86_64-pc-windows-msvc": "fastdb.dll",
+    "aarch64-pc-windows-msvc": "fastdb.dll",
 }
 WINDOWS_RUNTIME_DLL_MEMBER = "lib/fastdb.dll"
 WINDOWS_IMPORT_LIBRARY_MEMBER = "lib/fastdb.lib"
@@ -68,6 +69,8 @@ def detect_host_target() -> str:
         return "aarch64-apple-darwin"
     if system in {"cygwin", "msys", "windows"} and machine in {"amd64", "x86_64"}:
         return "x86_64-pc-windows-msvc"
+    if system in {"cygwin", "msys", "windows"} and machine in {"aarch64", "arm64"}:
+        return "aarch64-pc-windows-msvc"
     raise PrepareError(
         f"no published FastDB CoreSDK matches this host ({system}/{machine}); "
         f"supported targets are: {', '.join(sorted(LIBRARY_BY_TARGET))}"
@@ -300,7 +303,7 @@ def verify_bundle_manifest(bundle: dict, target: str) -> list[dict]:
             f"internal bundle manifest is missing the shared library member "
             f"{library_member!r} for target {target}"
         )
-    if target == "x86_64-pc-windows-msvc":
+    if target.endswith("-pc-windows-msvc"):
         for field, expected_member in (
             ("windows_runtime_dll", WINDOWS_RUNTIME_DLL_MEMBER),
             ("windows_import_library", WINDOWS_IMPORT_LIBRARY_MEMBER),
@@ -403,7 +406,7 @@ def emit_github_setup(
         value = f"{lib_dir}{os.pathsep}{existing}" if existing else str(lib_dir)
         environment_lines.append(f"{loader_variable}={value}")
     append_lines(env_file, environment_lines)
-    if target == "x86_64-pc-windows-msvc":
+    if target.endswith("-pc-windows-msvc"):
         if path_file is None:
             raise PrepareError(
                 "--emit-github for Windows requires --github-path-file or the "

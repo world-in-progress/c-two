@@ -32,13 +32,13 @@ Enforcement points: `BuddySegment::create` validates and consumes `layout.total_
 
 ## Where charges happen and how they are released
 
-All owner creation entry points (`ensure_ready`/`ensure_buddy_segments` prewarm, `alloc`, `alloc_handle`, `try_alloc_shm`) funnel into three private seams in `pool.rs`, and each seam validates geometry, reserves, then maps:
+All owner creation entry points (`ensure_ready`/`ensure_buddy_segments` prewarm, `alloc`, `alloc_shm_handle`, `alloc_handle`, `try_alloc_shm`) funnel into three private seams in `pool.rs`, and each seam validates geometry, reserves, then maps:
 
 | Seam | Cell | Charged bytes | Guard owner |
 | --- | --- | --- | --- |
 | `create_segment` (buddy) | `Shm` | `BuddyLayout::total_size` from `checked_layout` — header and bitmap metadata included, identical to what `BuddySegment::create` maps | `BuddySegment` |
 | `alloc_dedicated` | `Shm` | `DedicatedSegment::required_shm_size(size)` — checked page-aligned header + payload | `DedicatedSegment` |
-| `alloc_file_spill` | `File` | requested backing length `size` (the file's `set_len`) | `SpillMapping` inside `MemHandle::FileSpill` |
+| `alloc_file_spill` | `File` | requested backing length `size` (the file's `set_len`) | `SpillMapping` inside the private file-spill backing of `MemHandle` |
 
 Guard attachment is crate-private and single-shot: each guard field is set exactly once, immediately after a budgeted creation succeeds and before the owner is published into the pool, taking a non-optional `BudgetReservation`; a second attachment trips an explicit panic ("a backing carries at most one owner-creation reservation") rather than silently dropping the live charge, and there is no public way to clear, replace, or reset a guard. The guard field is declared after the region/mapping/file field in each owner struct, so Rust's declaration-order field drop returns the charge after the region is unmapped (and after the spill file handle closes). That drop ordering is a source-level invariant of this crate, not something the test suite executes on every OS.
 

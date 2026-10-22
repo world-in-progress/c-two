@@ -519,10 +519,8 @@ fn assert_external_crate_rejected(name: &str, source: &str, expected_stderr: &st
 
 #[test]
 fn owner_lifecycle_facade_uses_the_exact_core_capability_types() {
-    let pair: fn() -> std::io::Result<(
-        c2_core::OwnerControlKeepalive,
-        c2_core::OwnerControlReceiver,
-    )> = c_two::owner_control_pair;
+    let pair: fn() -> std::io::Result<(c2_core::OwnerControl, c2_core::OwnerBootstrap)> =
+        c_two::owner_control_pair;
     assert_eq!(
         std::any::TypeId::of::<c_two::ServerLifecyclePolicy>(),
         std::any::TypeId::of::<c2_core::ServerLifecyclePolicy>(),
@@ -531,7 +529,7 @@ fn owner_lifecycle_facade_uses_the_exact_core_capability_types() {
         std::any::TypeId::of::<c_two::HostLifecycleSnapshot>(),
         std::any::TypeId::of::<c2_core::HostLifecycleSnapshot>(),
     );
-    let (mut keepalive, receiver) = pair().expect("native capability pair");
+    let (keepalive, receiver) = pair().expect("native capability pair");
     let runtime = Runtime::new(RuntimeOptions::default()).expect("runtime");
     runtime
         .set_lifecycle_policy(c_two::ServerLifecyclePolicy::owner_bound(Duration::ZERO).unwrap())
@@ -540,7 +538,7 @@ fn owner_lifecycle_facade_uses_the_exact_core_capability_types() {
         .attach_owner_control(receiver)
         .expect("Core takes receiver");
     assert!(runtime.owner_control_attached());
-    keepalive.shutdown();
+    keepalive.close();
 }
 
 #[test]

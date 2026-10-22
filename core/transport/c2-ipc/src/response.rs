@@ -1,4 +1,4 @@
-//! Unified response data — either inline bytes, SHM coordinates, or a reassembled handle.
+//! Unified response data — either inline bytes, a bound SHM receive carrier, or a reassembled handle.
 
 use std::sync::Arc;
 
@@ -12,26 +12,109 @@ use crate::client::ServerPoolState;
 pub enum ResponseData {
     /// Local IPC inline data (already in Rust heap).
     Inline(Vec<u8>),
-    /// SHM buddy/dedicated data (coordinates only — no copy yet).
-    Shm {
-        seg_idx: u16,
-        generation: u32,
-        offset: u32,
-        data_size: u32,
-        is_dedicated: bool,
-        allocation_id: u64,
-    },
+    /// SHM buddy/dedicated block received from the server. The carrier binds
+    /// the frame's coordinates to the client's exact server pool state; it
+    /// is minted only at the reply-decode admission path and is the only
+    /// local read/release authority for the block.
+    Shm(ServerShmResponse),
     /// Reassembled chunked response. The carrier owns the client's
     /// reassembly pool, the handle, and the reassembly budget charge until
     /// release; trimming and holding keep the full capacity charged.
     Handle(ReassemblyBacking),
 }
 
+/// Move-only receive carrier for one admitted server SHM response block.
+///
+/// Constructed only where a reply frame is decoded against this client's
+/// live server pool state. There is no public constructor from bare
+/// coordinates: copying and releasing through this carrier are the safe
+/// surface, and a [`ResponseLease`] owns the carrier.
+pub struct ServerShmResponse {
+    server_pool: Arc<Mutex<Option<ServerPoolState>>>,
+    seg_idx: u16,
+    generation: u32,
+    offset: u32,
+    data_size: u32,
+    is_dedicated: bool,
+    allocation_id: u64,
+}
+
+impl std::fmt::Debug for ServerShmResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ServerShmResponse(seg={}, gen={}, off={}, size={}, ded={})",
+            self.seg_idx, self.generation, self.offset, self.data_size, self.is_dedicated
+        )
+    }
+}
+
+impl ServerShmResponse {
+    /// Admit one received SHM response block. Crate-private: only the reply
+    /// decode path that actually received the frame may call this.
+    pub(crate) fn admit(
+        server_pool: Arc<Mutex<Option<ServerPoolState>>>,
+        seg_idx: u16,
+        generation: u32,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+        allocation_id: u64,
+    ) -> Self {
+        Self {
+            server_pool,
+            seg_idx,
+            generation,
+            offset,
+            data_size,
+            is_dedicated,
+            allocation_id,
+        }
+    }
+
+    /// Whether the backing is a dedicated (non-buddy) segment.
+    pub fn is_dedicated(&self) -> bool {
+        self.is_dedicated
+    }
+
+    /// The server's segment index (diagnostics and transport probes).
+    pub fn seg_idx(&self) -> u16 {
+        self.seg_idx
+    }
+
+    /// Advertised payload length.
+    pub fn data_size(&self) -> u32 {
+        self.data_size
+    }
+
+    /// Try to settle the backing without blocking on the pool lock.
+    ///
+    /// `Ok(false)` means the pool lock was contended and nothing happened.
+    /// Used by the receive loop when a reply arrives whose waiter is gone.
+    pub(crate) fn try_release(&self) -> Result<bool, String> {
+        let Some(mut server_pool) = self.server_pool.try_lock() else {
+            return Ok(false);
+        };
+        let state = server_pool
+            .as_mut()
+            .ok_or_else(|| "server pool not initialised".to_string())?;
+        state.release_response(
+            self.seg_idx,
+            self.generation,
+            self.offset,
+            self.data_size,
+            self.is_dedicated,
+            self.allocation_id,
+        )?;
+        Ok(true)
+    }
+}
+
 impl ResponseData {
     pub fn len(&self) -> usize {
         match self {
             ResponseData::Inline(v) => v.len(),
-            ResponseData::Shm { data_size, .. } => *data_size as usize,
+            ResponseData::Shm(carrier) => carrier.data_size() as usize,
             ResponseData::Handle(h) => h.len(),
         }
     }
@@ -42,31 +125,26 @@ impl ResponseData {
 
     /// Materialize response into owned bytes, reading from SHM if needed.
     ///
-    /// Used by the relay which must copy data before forwarding over HTTP.
-    pub fn into_bytes_with_pool(
-        self,
-        server_pool: &Arc<Mutex<Option<ServerPoolState>>>,
-    ) -> Result<Vec<u8>, String> {
-        ResponseLease::new(self, Arc::clone(server_pool)).into_owned_bytes()
+    /// The SHM carrier carries the exact server pool state it was admitted
+    /// with; the caller cannot substitute another pool.
+    pub fn into_bytes(self) -> Result<Vec<u8>, String> {
+        ResponseLease::new(self).into_owned_bytes()
     }
 }
 
 /// Owns one response transport allocation independently from its copied bytes.
 ///
-/// SDK callers obtain this through their Core client. The public constructor is
-/// the low-level boundary used by transport-independent Core orchestration and
-/// tests; reassembled handles carry their own pool and budget charge inside
-/// the [`ReassemblyBacking`] carrier.
+/// SDK callers obtain this through their Core client. The SHM carrier binds
+/// its own pool state; reassembled handles carry their own pool and budget
+/// charge inside the [`ReassemblyBacking`] carrier.
 pub struct ResponseLease {
     response: Option<ResponseData>,
-    server_pool: Arc<Mutex<Option<ServerPoolState>>>,
 }
 
 impl ResponseLease {
-    pub fn new(response: ResponseData, server_pool: Arc<Mutex<Option<ServerPoolState>>>) -> Self {
+    pub fn new(response: ResponseData) -> Self {
         Self {
             response: Some(response),
-            server_pool,
         }
     }
 
@@ -78,19 +156,18 @@ impl ResponseLease {
             .ok_or_else(|| "response lease is already released".to_string())?;
         match response {
             ResponseData::Inline(bytes) => Ok(bytes.clone()),
-            ResponseData::Shm {
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                is_dedicated,
-                ..
-            } => {
-                let mut server_pool = self.server_pool.lock();
+            ResponseData::Shm(carrier) => {
+                let mut server_pool = carrier.server_pool.lock();
                 let state = server_pool
                     .as_mut()
                     .ok_or_else(|| "server pool not initialised".to_string())?;
-                state.copy_response(*seg_idx, *generation, *offset, *data_size, *is_dedicated)
+                state.copy_response(
+                    carrier.seg_idx,
+                    carrier.generation,
+                    carrier.offset,
+                    carrier.data_size,
+                    carrier.is_dedicated,
+                )
             }
             ResponseData::Handle(backing) => backing
                 .copy_bytes()
@@ -109,25 +186,18 @@ impl ResponseLease {
         };
         match response {
             ResponseData::Inline(_) => Ok(()),
-            ResponseData::Shm {
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                is_dedicated,
-                allocation_id,
-            } => {
-                let mut server_pool = self.server_pool.lock();
+            ResponseData::Shm(carrier) => {
+                let mut server_pool = carrier.server_pool.lock();
                 let state = server_pool
                     .as_mut()
                     .ok_or_else(|| "server pool not initialised".to_string())?;
                 state.release_response(
-                    seg_idx,
-                    generation,
-                    offset,
-                    data_size,
-                    is_dedicated,
-                    allocation_id,
+                    carrier.seg_idx,
+                    carrier.generation,
+                    carrier.offset,
+                    carrier.data_size,
+                    carrier.is_dedicated,
+                    carrier.allocation_id,
                 )
             }
             ResponseData::Handle(mut backing) => backing

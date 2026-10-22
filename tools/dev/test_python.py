@@ -45,6 +45,9 @@ WINDOWS_ENDPOINT_TESTS = frozenset((
         f"[{source}-{probe}]"
         for source in ("environment", "dotenv") for probe in ("ping", "shutdown")
     ),
+    *(f"tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[{case}]"
+      for case in ("missing-2", "denied-2", "busy-0.2", "busy-None", "busy-10")),
+    "tests/integration/test_local_io_cause.py::test_windows_real_listener_conflict_has_no_raw_system_code",
 ))
 # Frozen platform cases, including exact parameter IDs. A matching reason on
 # any other test remains a failure; unavailable prerequisites are never allowed.
@@ -73,13 +76,16 @@ UNIX_ENDPOINT_TESTS = frozenset(
         ('integration', 'test_sweep_captures_code_context_once_and_keeps_it_across_env_flip', ('',)),
     )
     for suffix in suffixes
+) | frozenset(
+    f'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[{case}]'
+    for case in ('unwritable', 'not_directory', 'missing', 'refused', 'inaccessible')
 )
 UNIX_SOCKET_COUNT_TEST = 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup'
 POSIX_FROZEN_PEER_TESTS = frozenset(
     f'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[{hosted}-True]'
     for hosted in ('False', 'True')
 )
-FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+FASTDB_SHA = "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4"
 PLUGIN = "tools.dev.test_python"
 
 
@@ -246,7 +252,7 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
 
 PROBE = """
 import hashlib, importlib.metadata, json, sys
-import pytest, xdist, pytest_timeout, numpy, pandas, pyarrow, httpx, PIL
+import pytest, xdist, pytest_timeout, numpy, pandas, pyarrow, httpx
 import c_two, c_two._native as native
 from fastdb4py.payload import Payload
 from pathlib import Path
@@ -279,8 +285,8 @@ def capture(command: list[str], environment: dict[str, str]) -> str:
 
 def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
     info = json.loads(capture([options.python, "-c", PROBE], environment).splitlines()[-1])
-    if info["versions"]["fastdb4py"] != "0.2.2":
-        raise RunnerError("需要固定fastdb4py==0.2.2")
+    if info["versions"]["fastdb4py"] != "0.2.3":
+        raise RunnerError("需要固定fastdb4py==0.2.3")
     if not options.c3.is_file():
         raise RunnerError(f"预建c3不存在：{options.c3}")
     if Path(info["python_sdk"]).resolve().parent != (ROOT / "sdk/python/src/c_two").resolve():

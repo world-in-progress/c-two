@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::Notify;
+use crate::admission::{AdmissionGate, AdmissionState};
 
 /// Method access level (from CRM contract `@cc.read` / `@cc.write`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,7 @@ pub struct SchedulerSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerAcquireError {
     Closed,
+    Unavailable,
     Capacity { field: &'static str, limit: usize },
 }
 
@@ -81,6 +82,7 @@ impl std::fmt::Display for SchedulerAcquireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Closed => write!(f, "route closed"),
+            Self::Unavailable => write!(f, "host admission unavailable"),
             Self::Capacity { field, limit } => {
                 write!(f, "route concurrency capacity exceeded: {field}={limit}")
             }
@@ -108,14 +110,12 @@ struct SchedulerState {
     queue: VecDeque<QueuedPermit>,
 }
 
-#[derive(Debug)]
 struct SchedulerInner {
     mode: ConcurrencyMode,
     access_map: HashMap<u16, AccessLevel>,
     limits: SchedulerLimits,
     state: Mutex<SchedulerState>,
-    cvar: Condvar,
-    notify: Arc<Notify>,
+    admission: Arc<AdmissionGate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,14 +141,24 @@ pub struct RouteConcurrencyHandle {
 pub struct SchedulerGuard {
     inner: Arc<SchedulerInner>,
     access: HeldAccess,
+    admission_generation: u64,
+    committed: bool,
 }
 
-#[derive(Debug)]
 pub(crate) struct SchedulerPendingPermit {
     inner: Arc<SchedulerInner>,
     access: HeldAccess,
     ticket: u64,
+    admission_generation: u64,
     completed: bool,
+}
+
+impl std::fmt::Debug for SchedulerPendingPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchedulerPendingPermit")
+            .field("ticket", &self.ticket)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for SchedulerGuard {
@@ -161,8 +171,19 @@ impl std::fmt::Debug for SchedulerGuard {
 
 impl SchedulerInner {
     fn notify_all(&self) {
-        self.cvar.notify_all();
-        self.notify.notify_waiters();
+        self.admission.notify.notify_waiters();
+    }
+
+    fn check_admission(
+        &self,
+        admission: &AdmissionState,
+        state: &SchedulerState,
+        generation: u64,
+    ) -> Result<(), SchedulerAcquireError> {
+        if state.closed {
+            return Err(SchedulerAcquireError::Closed);
+        }
+        admission.check(generation)
     }
 
     fn worker_slots_available(&self, state: &SchedulerState) -> usize {
@@ -224,10 +245,25 @@ impl Scheduler {
         Self::with_limits(mode, access_map, SchedulerLimits::default())
     }
 
+    #[cfg(test)]
     pub fn with_limits(
         mode: ConcurrencyMode,
         access_map: HashMap<u16, AccessLevel>,
         limits: SchedulerLimits,
+    ) -> Self {
+        Self::with_admission(
+            mode,
+            access_map,
+            limits,
+            Arc::new(AdmissionGate::new(false)),
+        )
+    }
+
+    pub(crate) fn with_admission(
+        mode: ConcurrencyMode,
+        access_map: HashMap<u16, AccessLevel>,
+        limits: SchedulerLimits,
+        admission: Arc<AdmissionGate>,
     ) -> Self {
         Self {
             inner: Arc::new(SchedulerInner {
@@ -235,13 +271,13 @@ impl Scheduler {
                 access_map,
                 limits,
                 state: Mutex::new(SchedulerState::default()),
-                cvar: Condvar::new(),
-                notify: Arc::new(Notify::new()),
+                admission,
             }),
         }
     }
 
     pub fn snapshot(&self) -> SchedulerSnapshot {
+        let admission = self.inner.admission.lock();
         let state = self.inner.state.lock().unwrap();
         SchedulerSnapshot {
             mode: self.inner.mode,
@@ -249,8 +285,8 @@ impl Scheduler {
             max_workers: self.inner.limits.max_workers.map(NonZeroUsize::get),
             pending: state.pending,
             active_workers: state.active_workers,
-            closed: state.closed,
-            is_unconstrained: self.is_unconstrained_with_state(&state),
+            closed: state.closed || admission.is_closed(),
+            is_unconstrained: self.is_unconstrained_with_state(&admission, &state),
         }
     }
 
@@ -259,12 +295,17 @@ impl Scheduler {
     }
 
     pub fn is_unconstrained(&self) -> bool {
-        let state = self.inner.state.lock().unwrap();
-        self.is_unconstrained_with_state(&state)
+        self.snapshot().is_unconstrained
     }
 
-    fn is_unconstrained_with_state(&self, state: &SchedulerState) -> bool {
-        self.inner.mode == ConcurrencyMode::Parallel
+    fn is_unconstrained_with_state(
+        &self,
+        admission: &AdmissionState,
+        state: &SchedulerState,
+    ) -> bool {
+        !self.inner.admission.owner_bound
+            && !admission.is_closed()
+            && self.inner.mode == ConcurrencyMode::Parallel
             && self.inner.limits.max_pending.is_none()
             && self.inner.limits.max_workers.is_none()
             && !state.closed
@@ -277,19 +318,23 @@ impl Scheduler {
     }
 
     pub(crate) async fn wait_drained_async(&self) {
-        if self.is_drained() {
-            return;
-        }
         loop {
-            let notified = self.inner.notify.notified();
+            let notified = self.inner.admission.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.is_drained() {
                 return;
             }
             notified.await;
-            if self.is_drained() {
-                return;
-            }
         }
+    }
+
+    pub(crate) fn belongs_to(&self, admission: &Arc<AdmissionGate>) -> bool {
+        Arc::ptr_eq(&self.inner.admission, admission)
+    }
+
+    pub(crate) fn route_closed(&self) -> bool {
+        self.inner.state.lock().unwrap().closed
     }
 
     fn is_drained(&self) -> bool {
@@ -329,12 +374,30 @@ impl Scheduler {
         &self,
         method_idx: u16,
     ) -> Result<SchedulerPendingPermit, SchedulerAcquireError> {
-        let access = self.held_access(method_idx);
-        let mut state = self.inner.state.lock().unwrap();
+        self.reserve_pending_with_generation(method_idx, None)
+    }
 
-        if state.closed {
-            return Err(SchedulerAcquireError::Closed);
-        }
+    pub(crate) fn reserve_pending_in_generation(
+        &self,
+        method_idx: u16,
+        generation: u64,
+    ) -> Result<SchedulerPendingPermit, SchedulerAcquireError> {
+        self.reserve_pending_with_generation(method_idx, Some(generation))
+    }
+
+    fn reserve_pending_with_generation(
+        &self,
+        method_idx: u16,
+        generation: Option<u64>,
+    ) -> Result<SchedulerPendingPermit, SchedulerAcquireError> {
+        let access = self.held_access(method_idx);
+        let admission = self.inner.admission.lock();
+        let mut state = self.inner.state.lock().unwrap();
+        self.inner.check_admission(
+            &admission,
+            &state,
+            generation.unwrap_or(admission.generation),
+        )?;
         if let Some(limit) = self.inner.limits.max_pending
             && state.pending >= limit.get()
         {
@@ -353,6 +416,7 @@ impl Scheduler {
             inner: Arc::clone(&self.inner),
             access,
             ticket,
+            admission_generation: admission.generation,
             completed: false,
         })
     }
@@ -386,7 +450,8 @@ impl Scheduler {
     {
         let sched = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _guard = sched.blocking_acquire(method_idx)?;
+            let mut guard = sched.blocking_acquire(method_idx)?;
+            guard.commit()?;
             Ok(f())
         })
         .await
@@ -417,90 +482,48 @@ impl RouteConcurrencyHandle {
 
 impl SchedulerPendingPermit {
     #[cfg(test)]
-    pub(crate) fn try_activate(self) -> Result<SchedulerGuard, SchedulerAcquireError> {
-        self.activate(false)
+    pub(crate) fn try_activate(mut self) -> Result<SchedulerGuard, SchedulerAcquireError> {
+        if let Some(guard) = self.activate_ready()? {
+            return Ok(guard);
+        }
+        let state = self.inner.state.lock().unwrap();
+        let field = if self.inner.worker_slots_available(&state) > 0 {
+            "mode"
+        } else {
+            "max_workers"
+        };
+        Err(SchedulerAcquireError::Capacity {
+            field,
+            limit: self.inner.limits.max_workers.map_or(1, NonZeroUsize::get),
+        })
     }
 
     pub(crate) fn blocking_activate(self) -> Result<SchedulerGuard, SchedulerAcquireError> {
-        self.activate(true)
+        futures_executor::block_on(self.async_activate())
     }
 
     pub(crate) async fn async_activate(mut self) -> Result<SchedulerGuard, SchedulerAcquireError> {
+        let inner = Arc::clone(&self.inner);
         loop {
-            let notified = {
-                let mut state = self.inner.state.lock().unwrap();
-                if state.closed {
-                    state.pending -= 1;
-                    self.inner.remove_queued(&mut state, self.ticket);
-                    self.completed = true;
-                    self.inner.notify_all();
-                    return Err(SchedulerAcquireError::Closed);
-                }
-
-                if self.inner.can_activate(&state, self.ticket, self.access) {
-                    self.inner.remove_queued(&mut state, self.ticket);
-                    match self.access {
-                        HeldAccess::Parallel => {}
-                        HeldAccess::Read => state.active_readers += 1,
-                        HeldAccess::Write => state.writer_active = true,
-                    }
-                    state.active_workers += 1;
-                    self.completed = true;
-
-                    return Ok(SchedulerGuard {
-                        inner: Arc::clone(&self.inner),
-                        access: self.access,
-                    });
-                }
-
-                Arc::clone(&self.inner.notify).notified_owned()
-            };
+            let notified = inner.admission.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(guard) = self.activate_ready()? {
+                return Ok(guard);
+            }
             notified.await;
         }
     }
 
-    fn activate(mut self, wait_for_mode: bool) -> Result<SchedulerGuard, SchedulerAcquireError> {
-        let inner = Arc::clone(&self.inner);
-        let mut state = inner.state.lock().unwrap();
-        if state.closed {
-            state.pending -= 1;
-            inner.remove_queued(&mut state, self.ticket);
-            self.completed = true;
-            inner.notify_all();
-            return Err(SchedulerAcquireError::Closed);
+    fn activate_ready(&mut self) -> Result<Option<SchedulerGuard>, SchedulerAcquireError> {
+        let admission = self.inner.admission.lock();
+        let mut state = self.inner.state.lock().unwrap();
+        self.inner
+            .check_admission(&admission, &state, self.admission_generation)?;
+        if !self.inner.can_activate(&state, self.ticket, self.access) {
+            return Ok(None);
         }
-
-        loop {
-            let workers_available = inner.worker_slots_available(&state) > 0;
-            let can_activate = inner.can_activate(&state, self.ticket, self.access);
-
-            if can_activate {
-                break;
-            }
-            if !wait_for_mode {
-                let field = if workers_available {
-                    "mode"
-                } else {
-                    "max_workers"
-                };
-                let limit = self.inner.limits.max_workers.map_or(1, NonZeroUsize::get);
-                state.pending -= 1;
-                inner.remove_queued(&mut state, self.ticket);
-                self.completed = true;
-                inner.notify_all();
-                return Err(SchedulerAcquireError::Capacity { field, limit });
-            }
-            state = inner.cvar.wait(state).unwrap();
-            if state.closed {
-                state.pending -= 1;
-                inner.remove_queued(&mut state, self.ticket);
-                self.completed = true;
-                inner.notify_all();
-                return Err(SchedulerAcquireError::Closed);
-            }
-        }
-
-        inner.remove_queued(&mut state, self.ticket);
+        self.inner.remove_queued(&mut state, self.ticket);
         match self.access {
             HeldAccess::Parallel => {}
             HeldAccess::Read => state.active_readers += 1,
@@ -508,11 +531,12 @@ impl SchedulerPendingPermit {
         }
         state.active_workers += 1;
         self.completed = true;
-
-        Ok(SchedulerGuard {
+        Ok(Some(SchedulerGuard {
             inner: Arc::clone(&self.inner),
             access: self.access,
-        })
+            admission_generation: self.admission_generation,
+            committed: false,
+        }))
     }
 }
 
@@ -531,23 +555,37 @@ impl Drop for SchedulerPendingPermit {
 }
 
 impl SchedulerGuard {
-    pub(crate) fn is_closed(&self) -> bool {
-        self.inner.state.lock().unwrap().closed
+    /// Commit immediately before the resource callback, after all queue waits.
+    /// This serializes with host pause and route close. Once committed, work
+    /// retains the original guard/drain accounting even if the host pauses.
+    pub fn commit(&mut self) -> Result<(), SchedulerAcquireError> {
+        if self.committed {
+            return Ok(());
+        }
+        let admission = self.inner.admission.lock();
+        let state = self.inner.state.lock().unwrap();
+        self.inner
+            .check_admission(&admission, &state, self.admission_generation)?;
+        self.committed = true;
+        Ok(())
     }
 
-    pub(crate) async fn wait_closed(&self) {
-        if self.is_closed() {
-            return;
-        }
+    pub(crate) fn check_admission(&self) -> Result<(), SchedulerAcquireError> {
+        let admission = self.inner.admission.lock();
+        let state = self.inner.state.lock().unwrap();
+        self.inner
+            .check_admission(&admission, &state, self.admission_generation)
+    }
+
+    pub(crate) async fn wait_rejected(&self) -> SchedulerAcquireError {
         loop {
-            let notified = self.inner.notify.notified();
-            if self.is_closed() {
-                return;
+            let notified = self.inner.admission.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Err(err) = self.check_admission() {
+                return err;
             }
             notified.await;
-            if self.is_closed() {
-                return;
-            }
         }
     }
 }

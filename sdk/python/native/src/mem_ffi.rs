@@ -333,7 +333,7 @@ impl PyMemPool {
             is_dedicated: alloc.is_dedicated,
             allocation_id: alloc.allocation_id,
         };
-        pool.free(&pa).map_err(PyRuntimeError::new_err)?;
+        unsafe { pool.free(&pa) }.map_err(PyRuntimeError::new_err)?;
         Ok(())
     }
 
@@ -450,8 +450,8 @@ impl PyMemPool {
         allocation_id: u64,
     ) -> PyResult<()> {
         let mut pool = self.pool.write();
-        let _ = pool
-            .free_at(
+        let _ = unsafe {
+            pool.free_at(
                 seg_idx,
                 generation,
                 offset,
@@ -459,7 +459,8 @@ impl PyMemPool {
                 is_dedicated,
                 allocation_id,
             )
-            .map_err(PyRuntimeError::new_err)?;
+        }
+        .map_err(PyRuntimeError::new_err)?;
         Ok(())
     }
 
@@ -722,11 +723,14 @@ impl Drop for PyMemHandle {
 /// Thread-safe via `frozen` + interior `Mutex`.
 #[pyclass(name = "ChunkAssembler", frozen)]
 pub struct PyChunkAssembler {
-    state: Mutex<AssemblerInner>,
+    state: Mutex<Option<AssemblerInner>>,
 }
 
 struct AssemblerInner {
-    inner: Option<ChunkAssembler>,
+    inner: ChunkAssembler,
+    // Metadata for Python's manual assembler, consumed with its storage owner.
+    route_name: Option<String>,
+    method_idx: Option<u16>,
 }
 
 #[pymethods]
@@ -745,7 +749,11 @@ impl PyChunkAssembler {
         )
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         Ok(Self {
-            state: Mutex::new(AssemblerInner { inner: Some(asm) }),
+            state: Mutex::new(Some(AssemblerInner {
+                inner: asm,
+                route_name: None,
+                method_idx: None,
+            })),
         })
     }
 
@@ -753,7 +761,6 @@ impl PyChunkAssembler {
     fn set_route_name(&self, name: String) -> PyResult<()> {
         let mut state = self.state.lock();
         state
-            .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?
             .route_name = Some(name);
@@ -764,7 +771,6 @@ impl PyChunkAssembler {
     fn set_method_idx(&self, idx: u16) -> PyResult<()> {
         let mut state = self.state.lock();
         state
-            .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?
             .method_idx = Some(idx);
@@ -774,23 +780,23 @@ impl PyChunkAssembler {
     #[getter]
     fn route_name(&self) -> Option<String> {
         let state = self.state.lock();
-        state.inner.as_ref().and_then(|a| a.route_name.clone())
+        state.as_ref().and_then(|a| a.route_name.clone())
     }
 
     #[getter]
     fn method_idx(&self) -> Option<u16> {
         let state = self.state.lock();
-        state.inner.as_ref().and_then(|a| a.method_idx)
+        state.as_ref().and_then(|a| a.method_idx)
     }
 
     /// Feed a chunk. Returns True when all chunks received.
     fn feed_chunk(&self, chunk_idx: usize, data: &[u8]) -> PyResult<bool> {
         let mut state = self.state.lock();
         let asm = state
-            .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
-        asm.feed_chunk(chunk_idx, data)
+        asm.inner
+            .feed_chunk(chunk_idx, data)
             .map_err(PyRuntimeError::new_err)
     }
 
@@ -798,26 +804,24 @@ impl PyChunkAssembler {
     fn is_complete(&self) -> bool {
         let state = self.state.lock();
         state
-            .inner
             .as_ref()
-            .map(|a| a.is_complete())
+            .map(|a| a.inner.is_complete())
             .unwrap_or(false)
     }
 
     #[getter]
     fn received(&self) -> usize {
         let state = self.state.lock();
-        state.inner.as_ref().map(|a| a.received()).unwrap_or(0)
+        state.as_ref().map(|a| a.inner.received()).unwrap_or(0)
     }
 
     /// Finish reassembly → PyMemHandle owning the backing carrier.
     fn finish(&self) -> PyResult<PyMemHandle> {
         let mut state = self.state.lock();
         let asm = state
-            .inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
-        let backing = asm.finish().map_err(PyRuntimeError::new_err)?;
+        let backing = asm.inner.finish().map_err(PyRuntimeError::new_err)?;
         Ok(PyMemHandle {
             state: Mutex::new(MemHandleInner {
                 backing: Some(backing),
@@ -828,7 +832,7 @@ impl PyChunkAssembler {
     /// Abort reassembly, releasing buffer and its budget charge.
     fn abort(&self) -> PyResult<()> {
         let mut state = self.state.lock();
-        drop(state.inner.take());
+        drop(state.take());
         Ok(())
     }
 }
@@ -836,7 +840,7 @@ impl PyChunkAssembler {
 impl Drop for PyChunkAssembler {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        drop(state.inner.take());
+        drop(state.take());
     }
 }
 

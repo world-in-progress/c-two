@@ -2,13 +2,14 @@
 //!
 //! [`ChunkRegistry`] is a thread-safe, sharded manager for in-flight chunked
 //! reassemblies. It wraps [`ChunkAssembler`] instances with tracking metadata
-//! and provides `insert` / `feed` / `finish` / `abort` lifecycle operations.
+//! and provides `insert` / `feed` / `take` / `abort` lifecycle operations.
 //!
 //! Admission is finite: `insert` reserves the checked assembly capacity from
 //! the pool's canonical reassembly budget before any storage is allocated,
 //! and the resulting charge stays live — through `finish` (including its
 //! logical trim), queueing as a request/response backing, and held results —
-//! until the [`ReassemblyBacking`] carrier actually releases the storage.
+//! until the [`ReassemblyBacking`](crate::chunk::ReassemblyBacking) carrier
+//! actually releases the storage.
 
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -17,7 +18,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::assembler::ChunkAssembler;
-use crate::chunk::backing::ReassemblyBacking;
 use c2_mem::MemPool;
 use tracing::warn;
 
@@ -34,24 +34,13 @@ pub struct GcStats {
     pub freed_bytes: u64,
 }
 
-/// Result of a successful [`ChunkRegistry::finish`] call.
-///
-/// `backing` is the single ownership carrier for the reassembled storage: it
-/// keeps the pool, the handle, and the reassembly budget charge together
-/// until it is released or dropped.
-pub struct FinishedChunk {
-    pub backing: ReassemblyBacking,
-    pub route_name: Option<String>,
-    pub method_idx: Option<u16>,
-}
-
 /// Identity of one admitted assembly generation.
 ///
 /// The registry admits at most one assembly per `(conn_id, request_id)` key at
 /// a time, but a key can be admitted again after its predecessor finished,
 /// aborted, or timed out. The generation makes an entry addressable: teardown
 /// code that only holds the coordinates of the generation it published can
-/// release exactly that generation through [`ChunkRegistry::abort_id`] and
+/// take exactly that generation through [`ChunkRegistry::take_id`] and
 /// never a successor's same-key entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkAssemblyId {
@@ -78,16 +67,18 @@ impl ChunkAssemblyId {
 }
 
 /// Per-assembly tracking wrapper around [`ChunkAssembler`].
-struct TrackedAssembler {
+struct TrackedAssembler<C> {
+    // Storage and its charge are released before the associated admission.
     inner: ChunkAssembler,
+    context: C,
     generation: u64,
     last_activity: Instant,
     total_bytes: u64,
 }
 
 /// Sharded chunk reassembly lifecycle manager.
-pub struct ChunkRegistry {
-    shards: [Mutex<HashMap<(u64, u64), TrackedAssembler>>; SHARD_COUNT],
+pub struct ChunkRegistry<C> {
+    shards: [Mutex<HashMap<(u64, u64), TrackedAssembler<C>>>; SHARD_COUNT],
     pool: Arc<RwLock<MemPool>>,
     config: ChunkConfig,
     active_count: AtomicUsize,
@@ -99,7 +90,7 @@ pub struct ChunkRegistry {
     admission_wait_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
-impl ChunkRegistry {
+impl<C> ChunkRegistry<C> {
     /// Create a new registry backed by `pool` with the given `config`.
     ///
     /// The pool's [`MemPool::budget`] reassembly cell is the canonical
@@ -119,7 +110,7 @@ impl ChunkRegistry {
         }
     }
 
-    fn shard(&self, conn_id: u64) -> &Mutex<HashMap<(u64, u64), TrackedAssembler>> {
+    fn shard(&self, conn_id: u64) -> &Mutex<HashMap<(u64, u64), TrackedAssembler<C>>> {
         &self.shards[conn_id as usize % SHARD_COUNT]
     }
 
@@ -159,14 +150,16 @@ impl ChunkRegistry {
     ///
     /// On success the returned [`ChunkAssemblyId`] identifies this exact
     /// admission generation for identity-checked teardown
-    /// ([`ChunkRegistry::abort_id`]).
+    /// ([`ChunkRegistry::take_id`]). The context is published with the assembly;
+    /// rejection returns it so the caller retains control of its lifetime.
     pub fn insert(
         &self,
         conn_id: u64,
         request_id: u64,
         total_chunks: usize,
         chunk_size: usize,
-    ) -> Result<ChunkAssemblyId, ChunkAdmissionError> {
+        context: C,
+    ) -> Result<ChunkAssemblyId, (ChunkAdmissionError, C)> {
         // Soft-limit check: GC sweep first, then warn but never reject. The
         // hard admission bound is the reassembly budget cell.
         if self.active_count() >= self.config.soft_limit as usize
@@ -187,10 +180,13 @@ impl ChunkRegistry {
             // a finished carrier can hold a pool read guard and call contains().
             let mut shard = self.shard(conn_id).lock();
             if shard.contains_key(&(conn_id, request_id)) {
-                return Err(ChunkAdmissionError::Duplicate {
-                    conn_id,
-                    request_id,
-                });
+                return Err((
+                    ChunkAdmissionError::Duplicate {
+                        conn_id,
+                        request_id,
+                    },
+                    context,
+                ));
             }
 
             #[cfg(test)]
@@ -198,12 +194,15 @@ impl ChunkRegistry {
                 probe();
             }
 
-            let geometry = ChunkAssembler::check_geometry(
+            let geometry = match ChunkAssembler::check_geometry(
                 total_chunks,
                 chunk_size,
                 self.config.max_chunks_per_request,
                 self.config.max_bytes_per_request,
-            )?;
+            ) {
+                Ok(geometry) => geometry,
+                Err(error) => return Err((error, context)),
+            };
             let Some(pool_guard) = self.pool.try_write() else {
                 drop(shard);
                 #[cfg(test)]
@@ -220,14 +219,21 @@ impl ChunkRegistry {
             // Both guards belong to this attempt. The constructor consumes the
             // pool guard without reacquiring it; reserve/allocate/publish remains
             // one atomic shard decision when the pool is available.
-            let assembler =
-                ChunkAssembler::new_with_guard(Arc::clone(&self.pool), pool_guard, geometry)?;
+            let assembler = match ChunkAssembler::new_with_guard(
+                Arc::clone(&self.pool),
+                pool_guard,
+                geometry,
+            ) {
+                Ok(assembler) => assembler,
+                Err(error) => return Err((error, context)),
+            };
             let alloc_bytes = assembler.capacity_bytes();
             let generation = self.generations.fetch_add(1, Ordering::Relaxed);
 
             let now = Instant::now();
             let tracked = TrackedAssembler {
                 inner: assembler,
+                context,
                 generation,
                 last_activity: now,
                 total_bytes: alloc_bytes,
@@ -244,42 +250,6 @@ impl ChunkRegistry {
                 generation,
             });
         }
-    }
-
-    /// Admit the first reply chunk using its decoded wire metadata.
-    /// Decoding alone accepts zero fields; validate them here before any
-    /// reservation, then use the same atomic registry admission authority.
-    pub fn insert_reply(
-        &self,
-        conn_id: u64,
-        request_id: u64,
-        total_size: u64,
-        total_chunks: usize,
-        first_data_len: usize,
-    ) -> Result<ChunkAssemblyId, ChunkAdmissionError> {
-        if total_size == 0 {
-            return Err(ChunkAdmissionError::Protocol(
-                "total_size must be > 0".to_string(),
-            ));
-        }
-        if first_data_len == 0 {
-            return Err(ChunkAdmissionError::Protocol(
-                "chunk_size must be > 0".to_string(),
-            ));
-        }
-        if total_chunks == 1 && u64::try_from(first_data_len).map_or(true, |len| len > total_size) {
-            return Err(ChunkAdmissionError::Protocol(format!(
-                "first chunk data length {first_data_len} exceeds declared total_size {total_size}"
-            )));
-        }
-        let chunk_size = if total_chunks > 1 {
-            first_data_len
-        } else {
-            usize::try_from(total_size).map_err(|_| {
-                ChunkAdmissionError::Protocol("total_size exceeds addressable capacity".to_string())
-            })?
-        };
-        self.insert(conn_id, request_id, total_chunks, chunk_size)
     }
 
     /// Feed a data chunk into an existing assembly.
@@ -302,36 +272,13 @@ impl ChunkRegistry {
         Ok(complete)
     }
 
-    /// Store route metadata on an in-flight assembly (server-side use).
-    pub fn set_route_info(
-        &self,
-        conn_id: u64,
-        request_id: u64,
-        route_name: String,
-        method_idx: u16,
-    ) {
-        let mut shard = self.shard(conn_id).lock();
-        if let Some(tracked) = shard.get_mut(&(conn_id, request_id)) {
-            tracked.inner.route_name = Some(route_name);
-            tracked.inner.method_idx = Some(method_idx);
-        }
-    }
-
-    /// Finish a completed assembly and return its owned backing carrier.
+    /// Remove an assembly and its context together, outside the shard lock.
     ///
-    /// The entry is removed from the registry regardless of success or
-    /// failure. On success the returned [`ReassemblyBacking`] keeps the full
-    /// capacity charged until it is released; on failure (including an
-    /// incomplete assembly) the backing storage is released through the pool
-    /// authority and the charge refunds exactly once.
-    ///
-    /// A file-spill backing is returned as-is. Consumers accept every
-    /// [`c2_mem::MemHandle`] variant through the carrier, so completed
-    /// reassembly storage stays where the memory-pressure decision put it
-    /// instead of being copied into SHM.
-    pub fn finish(&self, conn_id: u64, request_id: u64) -> Result<FinishedChunk, String> {
-        // Remove from shard and move the counters while still holding the
-        // shard lock; the pool work below happens after the lock is gone.
+    /// The caller owns both even when `ChunkAssembler::finish` fails, allowing
+    /// an admission context to remain live through an error reply. Registry
+    /// counters end here; the backing keeps its full capacity charged through
+    /// finish/trim until storage release, including file-spill storage.
+    pub fn take(&self, conn_id: u64, request_id: u64) -> Result<(ChunkAssembler, C), String> {
         let tracked = {
             let mut shard = self.shard(conn_id).lock();
             let Some(tracked) = shard.remove(&(conn_id, request_id)) else {
@@ -342,26 +289,14 @@ impl ChunkRegistry {
                 .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
             tracked
         };
-
-        let mut inner = tracked.inner;
-        let route_name = inner.route_name.take();
-        let method_idx = inner.method_idx.take();
-        // finish() releases storage and refunds the charge on its own error
-        // paths; the registry counters above describe in-flight entries only
-        // and intentionally stop here while the budget charge stays live.
-        let backing = inner.finish()?;
-        Ok(FinishedChunk {
-            backing,
-            route_name,
-            method_idx,
-        })
+        Ok((tracked.inner, tracked.context))
     }
 
     /// Abort an in-flight assembly, releasing all resources.
     ///
     /// Unconditional by key: this is the connection-teardown / timeout cleanup
     /// verb, used where the caller cannot or must not keep a generation
-    /// identity. Use [`ChunkRegistry::abort_id`] for rollback of one exact
+    /// identity. Use [`ChunkRegistry::take_id`] for rollback of one exact
     /// admission generation.
     pub fn abort(&self, conn_id: u64, request_id: u64) {
         let removed = {
@@ -381,13 +316,13 @@ impl ChunkRegistry {
         drop(removed);
     }
 
-    /// Abort exactly the admission generation named by `id`.
+    /// Take exactly the admission generation named by `id`.
     ///
     /// Identity-checked rollback: if the key has since been re-admitted (a
     /// replacement generation with its own charge), this is a no-op for that
-    /// replacement. Storage release and charge refund happen on drop, outside
-    /// the shard lock.
-    pub fn abort_id(&self, id: ChunkAssemblyId) {
+    /// replacement. The caller receives the assembly and context outside the
+    /// shard lock and controls their rollback release order.
+    pub fn take_id(&self, id: ChunkAssemblyId) -> Option<(ChunkAssembler, C)> {
         let removed = {
             let mut shard = self.shard(id.conn_id).lock();
             let key = (id.conn_id, id.request_id);
@@ -404,9 +339,7 @@ impl ChunkRegistry {
                 })
             }
         };
-        // Backing release and charge refund happen on drop, outside the shard
-        // lock.
-        drop(removed);
+        removed.map(|tracked| (tracked.inner, tracked.context))
     }
 
     /// Sweep expired assemblies across all shards.
@@ -524,18 +457,20 @@ impl ChunkRegistry {
 
     fn try_drain_shard(
         &self,
-        shard: &Mutex<HashMap<(u64, u64), TrackedAssembler>>,
-        matches: impl Fn(&(u64, u64), &TrackedAssembler) -> bool,
+        shard: &Mutex<HashMap<(u64, u64), TrackedAssembler<C>>>,
+        matches: impl Fn(&(u64, u64), &TrackedAssembler<C>) -> bool,
         deadline: Option<Instant>,
     ) -> (bool, GcStats) {
+        // Declared before the guard so unwinding also drops contexts unlocked.
+        let mut removed = Vec::new();
         let Some(mut shard) = shard.try_lock() else {
             return (false, GcStats::default());
         };
         let mut complete = true;
         let mut stats = GcStats::default();
-        shard.retain(|key, tracked| {
+        for (_, tracked) in shard.extract_if(|key, tracked| {
             if !matches(key, tracked) {
-                return true;
+                return false;
             }
             // Never probe a lock then perform a blocking Drop. try_release
             // validates and mutates under its acquired pool guard; a retained
@@ -544,17 +479,62 @@ impl ChunkRegistry {
                 || !matches!(tracked.inner.try_release(), Ok(true))
             {
                 complete = false;
-                return true;
+                return false;
             }
             self.active_count.fetch_sub(1, Ordering::Relaxed);
             self.total_bytes
                 .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
             stats.expired += 1;
             stats.freed_bytes += tracked.total_bytes;
-            false
-        });
+            true
+        }) {
+            removed.push(tracked);
+        }
         stats.remaining = shard.len();
+        drop(shard);
+        // Only successfully released entries leave the table; context Drop
+        // runs after both shard and pool guards are gone.
+        drop(removed);
         (complete, stats)
+    }
+}
+
+impl ChunkRegistry<()> {
+    /// Admit the first reply chunk using its decoded wire metadata.
+    /// Decoding alone accepts zero fields; validate them here before any
+    /// reservation, then use the same atomic registry admission authority.
+    pub fn insert_reply(
+        &self,
+        conn_id: u64,
+        request_id: u64,
+        total_size: u64,
+        total_chunks: usize,
+        first_data_len: usize,
+    ) -> Result<ChunkAssemblyId, ChunkAdmissionError> {
+        if total_size == 0 {
+            return Err(ChunkAdmissionError::Protocol(
+                "total_size must be > 0".to_string(),
+            ));
+        }
+        if first_data_len == 0 {
+            return Err(ChunkAdmissionError::Protocol(
+                "chunk_size must be > 0".to_string(),
+            ));
+        }
+        if total_chunks == 1 && u64::try_from(first_data_len).map_or(true, |len| len > total_size) {
+            return Err(ChunkAdmissionError::Protocol(format!(
+                "first chunk data length {first_data_len} exceeds declared total_size {total_size}"
+            )));
+        }
+        let chunk_size = if total_chunks > 1 {
+            first_data_len
+        } else {
+            usize::try_from(total_size).map_err(|_| {
+                ChunkAdmissionError::Protocol("total_size exceeds addressable capacity".to_string())
+            })?
+        };
+        self.insert(conn_id, request_id, total_chunks, chunk_size, ())
+            .map_err(|(error, ())| error)
     }
 }
 
@@ -617,26 +597,27 @@ mod tests {
         let pool = test_pool();
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
         let data = b"hello world!";
-        reg.insert(1, 100, 1, data.len()).unwrap();
+        reg.insert(1, 100, 1, data.len(), ()).unwrap();
         assert!(reg.contains(1, 100));
         assert_eq!(reg.active_count(), 1);
         assert_eq!(reg.total_bytes(), data.len() as u64);
         let complete = reg.feed(1, 100, 0, data).unwrap();
         assert!(complete);
-        let mut finished = reg.finish(1, 100).unwrap();
+        let (assembler, ()) = reg.take(1, 100).unwrap();
+        let mut finished = assembler.finish().unwrap();
         assert!(!reg.contains(1, 100));
-        assert_eq!(finished.backing.len(), data.len());
+        assert_eq!(finished.len(), data.len());
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
-        assert_eq!(finished.backing.copy_bytes().unwrap(), data);
-        finished.backing.release().unwrap();
+        assert_eq!(finished.copy_bytes().unwrap(), data);
+        finished.release().unwrap();
     }
 
     #[test]
     fn abort_frees_resources_and_returns_charge_once() {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        reg.insert(1, 200, 3, 1024).unwrap();
+        reg.insert(1, 200, 3, 1024, ()).unwrap();
         assert_eq!(reg.active_count(), 1);
         assert_eq!(reassembly_used(&budget), 3 * 1024);
         reg.abort(1, 200);
@@ -648,32 +629,32 @@ mod tests {
     }
 
     #[test]
-    fn abort_id_releases_only_its_own_generation() {
+    fn take_id_releases_only_its_own_generation() {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
         // First generation is admitted, then removed; a replacement generation
         // is admitted under the same key with its own charge.
-        let first = reg.insert(1, 250, 1, 256).unwrap();
+        let first = reg.insert(1, 250, 1, 256, ()).unwrap();
         reg.abort(1, 250);
-        let replacement = reg.insert(1, 250, 2, 256).unwrap();
+        let replacement = reg.insert(1, 250, 2, 256, ()).unwrap();
         assert_ne!(first.generation(), replacement.generation());
         assert_eq!(reg.active_count(), 1);
         assert_eq!(reassembly_used(&budget), 512);
 
         // A stale generation's rollback must not touch the replacement.
-        reg.abort_id(first);
+        drop(reg.take_id(first));
         assert!(reg.contains(1, 250));
         assert_eq!(reg.active_count(), 1);
         assert_eq!(reassembly_used(&budget), 512);
 
         // The matching generation releases exactly its own charge.
-        reg.abort_id(replacement);
+        drop(reg.take_id(replacement));
         assert!(!reg.contains(1, 250));
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
         assert_eq!(reassembly_used(&budget), 0);
         // Repeated identity abort stays a no-op.
-        reg.abort_id(replacement);
+        drop(reg.take_id(replacement));
         assert_eq!(reg.active_count(), 0);
     }
 
@@ -681,16 +662,20 @@ mod tests {
     fn finish_error_path_returns_charge_once() {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        reg.insert(1, 300, 3, 1024).unwrap();
+        let context = Arc::new(());
+        reg.insert(1, 300, 3, 1024, context.clone()).unwrap();
         // Feed only 1 of 3 chunks — finish should fail and refund once.
         reg.feed(1, 300, 0, &[0u8; 1024]).unwrap();
-        let result = reg.finish(1, 300);
-        assert!(result.is_err());
+        let (assembler, retained) = reg.take(1, 300).unwrap();
+        assert!(assembler.finish().is_err());
+        assert_eq!(Arc::strong_count(&context), 2);
+        drop(retained);
+        assert_eq!(Arc::strong_count(&context), 1);
         // Resources and charge freed exactly once; the pool stays usable.
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
         assert_eq!(reassembly_used(&budget), 0);
-        reg.insert(1, 301, 1, 1024).unwrap();
+        reg.insert(1, 301, 1, 1024, context.clone()).unwrap();
         reg.abort(1, 301);
         assert_eq!(reassembly_used(&budget), 0);
     }
@@ -699,11 +684,11 @@ mod tests {
     fn duplicate_insert_rejects_and_returns_new_charge_once() {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        reg.insert(1, 500, 2, 64).unwrap();
+        reg.insert(1, 500, 2, 64, ()).unwrap();
         assert_eq!(reg.active_count(), 1);
         assert_eq!(reassembly_used(&budget), 128);
         // Second insert for same key must fail and keep exactly one charge.
-        let err = reg.insert(1, 500, 3, 128).unwrap_err().to_string();
+        let err = reg.insert(1, 500, 3, 128, ()).unwrap_err().0.to_string();
         assert!(err.contains("duplicate"), "expected duplicate error: {err}");
         assert_eq!(reg.active_count(), 1);
         assert_eq!(reassembly_used(&budget), 128);
@@ -719,7 +704,7 @@ mod tests {
     fn invalid_chunk_feed_aborts_entry_charge_once() {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        reg.insert(1, 510, 2, 64).unwrap();
+        reg.insert(1, 510, 2, 64, ()).unwrap();
         assert_eq!(reassembly_used(&budget), 128);
         // Duplicate chunk index is an invalid chunk: caller aborts.
         reg.feed(1, 510, 0, &[1u8; 64]).unwrap();
@@ -733,49 +718,93 @@ mod tests {
         let pool = test_pool();
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
         let chunk_size = 128;
-        reg.insert(1, 400, 4, chunk_size).unwrap();
+        reg.insert(1, 400, 4, chunk_size, ()).unwrap();
         // Feed out of order: 3, 1, 0, 2
         assert!(!reg.feed(1, 400, 3, &[3u8; 64]).unwrap());
         assert!(!reg.feed(1, 400, 1, &[1u8; 128]).unwrap());
         assert!(!reg.feed(1, 400, 0, &[0u8; 128]).unwrap());
         assert!(reg.feed(1, 400, 2, &[2u8; 128]).unwrap());
-        let mut finished = reg.finish(1, 400).unwrap();
+        let (assembler, ()) = reg.take(1, 400).unwrap();
+        let mut finished = assembler.finish().unwrap();
         // Logical length must be trimmed to actual data (last chunk is 64, not 128).
-        assert_eq!(finished.backing.len(), 128 * 3 + 64); // 448, not 512
+        assert_eq!(finished.len(), 128 * 3 + 64); // 448, not 512
         // Verify data integrity
-        let slice = finished.backing.copy_bytes().unwrap();
+        let slice = finished.copy_bytes().unwrap();
         assert_eq!(&slice[0..128], &[0u8; 128]);
         assert_eq!(&slice[128..256], &[1u8; 128]);
         assert_eq!(&slice[256..384], &[2u8; 128]);
         assert_eq!(&slice[384..384 + 64], &[3u8; 64]);
-        finished.backing.release().unwrap();
+        finished.release().unwrap();
     }
 
     #[test]
-    fn gc_sweep_expires_stale_and_returns_charge_once() {
+    fn cleanup_releases_backing_before_context_outside_locks() {
+        struct Context {
+            registry: std::sync::Weak<ChunkRegistry<Context>>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for Context {
+            fn drop(&mut self) {
+                let registry = self.registry.upgrade().unwrap();
+                assert!(registry.shard(1).try_lock().is_some());
+                assert_eq!(registry.pool.try_write().unwrap().stats().alloc_count, 0);
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let (pool, budget) = budgeted_pool(1 << 20);
         let cfg = ChunkConfig {
             assembler_timeout: Duration::from_millis(50),
             ..ChunkConfig::default()
         };
-        let reg = ChunkRegistry::new(pool, cfg);
-        reg.insert(1, 1, 1, 1024).unwrap();
-        assert_eq!(reassembly_used(&budget), 1024);
-        std::thread::sleep(Duration::from_millis(80));
-        let stats = reg.gc_sweep();
-        assert_eq!(stats.expired, 1);
-        assert_eq!(reg.active_count(), 0);
-        assert_eq!(reg.total_bytes(), 0);
-        assert_eq!(reassembly_used(&budget), 0);
+        let reg = Arc::new(ChunkRegistry::new(pool.clone(), cfg));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        for (index, action) in ["abort", "disconnect", "gc", "try_cleanup"]
+            .iter()
+            .enumerate()
+        {
+            reg.insert(
+                1,
+                1,
+                1,
+                1024,
+                Context {
+                    registry: Arc::downgrade(&reg),
+                    dropped: dropped.clone(),
+                },
+            )
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+            assert_eq!(reassembly_used(&budget), 1024);
+            match *action {
+                "abort" => reg.abort(1, 1),
+                "disconnect" => reg.cleanup_connection(1),
+                "gc" => {
+                    std::thread::sleep(Duration::from_millis(80));
+                    assert_eq!(reg.gc_sweep().expired, 1);
+                }
+                "try_cleanup" => {
+                    let held_pool = pool.read();
+                    assert!(!reg.try_cleanup_connection(1));
+                    assert_eq!(dropped.load(Ordering::SeqCst), index);
+                    assert_eq!(reassembly_used(&budget), 1024);
+                    drop(held_pool);
+                    assert!(reg.try_cleanup_connection(1));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(dropped.load(Ordering::SeqCst), index + 1);
+            assert_eq!(reg.active_count(), 0);
+            assert_eq!(reg.total_bytes(), 0);
+            assert_eq!(reassembly_used(&budget), 0);
+        }
     }
 
     #[test]
     fn disconnect_cleanup_returns_charge_once() {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        reg.insert(1, 100, 1, 1024).unwrap();
-        reg.insert(1, 200, 2, 512).unwrap();
-        reg.insert(2, 100, 1, 256).unwrap();
+        reg.insert(1, 100, 1, 1024, ()).unwrap();
+        reg.insert(1, 200, 2, 512, ()).unwrap();
+        reg.insert(2, 100, 1, 256, ()).unwrap();
         assert_eq!(reassembly_used(&budget), 1024 + 1024 + 256);
         reg.cleanup_connection(1);
         assert_eq!(reg.active_count(), 1);
@@ -783,8 +812,9 @@ mod tests {
         // Conn 2's assembly survives and completes.
         let complete = reg.feed(2, 100, 0, &[42u8; 256]).unwrap();
         assert!(complete);
-        let mut finished = reg.finish(2, 100).unwrap();
-        finished.backing.release().unwrap();
+        let (assembler, ()) = reg.take(2, 100).unwrap();
+        let mut finished = assembler.finish().unwrap();
+        finished.release().unwrap();
         assert_eq!(reassembly_used(&budget), 0);
     }
 
@@ -796,7 +826,7 @@ mod tests {
             ..ChunkConfig::default()
         };
         let reg = ChunkRegistry::new(pool.clone(), cfg);
-        reg.insert(1, 1, 3, 1024).unwrap();
+        reg.insert(1, 1, 3, 1024, ()).unwrap();
         // Make the entry stale without relying on a scheduler waking within
         // a narrow expiry window. A feed must replace this old activity time.
         let stale = Instant::now() - Duration::from_secs(120);
@@ -826,13 +856,13 @@ mod tests {
             ..ChunkConfig::default()
         };
         let reg = ChunkRegistry::new(pool.clone(), cfg);
-        reg.insert(1, 1, 1, 64).unwrap();
-        reg.insert(1, 2, 1, 64).unwrap();
+        reg.insert(1, 1, 1, 64, ()).unwrap();
+        reg.insert(1, 2, 1, 64, ()).unwrap();
         assert_eq!(reg.active_count(), 2);
         // Let both expire.
         std::thread::sleep(Duration::from_millis(30));
         // This insert exceeds soft_limit (2) → triggers gc_sweep internally.
-        reg.insert(1, 3, 1, 64).unwrap();
+        reg.insert(1, 3, 1, 64, ()).unwrap();
         // GC should have cleaned up the 2 expired ones; only the new one remains.
         assert!(reg.active_count() <= 2);
         // Cleanup remaining.
@@ -843,19 +873,20 @@ mod tests {
     fn finished_and_trimmed_backing_stays_charged() {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
-        reg.insert(1, 600, 4, 128).unwrap();
+        reg.insert(1, 600, 4, 128, ()).unwrap();
         assert!(!reg.feed(1, 600, 0, &[0u8; 128]).unwrap());
         assert!(!reg.feed(1, 600, 1, &[1u8; 128]).unwrap());
         assert!(!reg.feed(1, 600, 2, &[2u8; 128]).unwrap());
         assert!(reg.feed(1, 600, 3, &[3u8; 64]).unwrap());
-        let finished = reg.finish(1, 600).unwrap();
+        let (assembler, ()) = reg.take(1, 600).unwrap();
+        let finished = assembler.finish().unwrap();
         // Registry-level accounting dropped at finish…
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
         // …but the budget charge for the full capacity stays live through the
         // trim and until the carrier is released.
         assert_eq!(reassembly_used(&budget), 4 * 128);
-        assert_eq!(finished.backing.len(), 3 * 128 + 64);
+        assert_eq!(finished.len(), 3 * 128 + 64);
         drop(finished);
         assert_eq!(reassembly_used(&budget), 0);
     }
@@ -865,13 +896,11 @@ mod tests {
         let (pool, budget) = budgeted_pool(1 << 20);
         let registry_pool_view = pool.clone();
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        reg.insert(1, 610, 2, 256).unwrap();
-        reg.set_route_info(1, 610, "grid".into(), 3);
+        reg.insert(1, 610, 2, 256, ()).unwrap();
         assert!(!reg.feed(1, 610, 0, &[9u8; 256]).unwrap());
         assert!(reg.feed(1, 610, 1, &[8u8; 128]).unwrap());
-        let finished = reg.finish(1, 610).unwrap();
-        assert_eq!(finished.route_name.as_deref(), Some("grid"));
-        assert_eq!(finished.method_idx, Some(3));
+        let (assembler, ()) = reg.take(1, 610).unwrap();
+        let finished = assembler.finish().unwrap();
 
         // Registry and the outer pool Arc handle are gone (client/registry
         // shutdown). The carrier keeps the pool alive, the content readable,
@@ -879,7 +908,7 @@ mod tests {
         drop(reg);
         drop(registry_pool_view);
         assert_eq!(reassembly_used(&budget), 512);
-        let mut backing = finished.backing;
+        let mut backing = finished;
         assert_eq!(backing.len(), 384);
         assert_eq!(&backing.copy_bytes().unwrap()[0..256], &[9u8; 256]);
         assert_eq!(&backing.copy_bytes().unwrap()[256..384], &[8u8; 128]);
@@ -893,7 +922,7 @@ mod tests {
         let (pool, budget) = budgeted_pool(256);
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
         // 3 × 128 = 384 > 256: rejected with the cell and size named.
-        let err = reg.insert(1, 620, 3, 128).unwrap_err().to_string();
+        let err = reg.insert(1, 620, 3, 128, ()).unwrap_err().0.to_string();
         assert!(
             err.contains("'reassembly'"),
             "error must name the cell: {err}"
@@ -914,16 +943,16 @@ mod tests {
         assert_eq!(snap.reassembly.rejected_bytes, 384);
 
         // Zero geometry is rejected without any budget interaction.
-        let err = reg.insert(1, 621, 1, 0).unwrap_err().to_string();
+        let err = reg.insert(1, 621, 1, 0, ()).unwrap_err().0.to_string();
         assert!(err.contains("chunk_size must be > 0"));
-        let err = reg.insert(1, 622, 0, 128).unwrap_err().to_string();
+        let err = reg.insert(1, 622, 0, 128, ()).unwrap_err().0.to_string();
         assert!(err.contains("total_chunks must be > 0"));
         assert_eq!(budget.snapshot().reassembly.rejected_allocations, 1);
 
         // After one admitted assembly fills the cell, a second is rejected.
-        reg.insert(1, 623, 2, 128).unwrap();
+        reg.insert(1, 623, 2, 128, ()).unwrap();
         assert_eq!(reassembly_used(&budget), 256);
-        let err = reg.insert(1, 624, 1, 128).unwrap_err().to_string();
+        let err = reg.insert(1, 624, 1, 128, ()).unwrap_err().0.to_string();
         assert!(err.contains("'reassembly'"));
         assert_eq!(reg.active_count(), 1);
         reg.abort(1, 623);
@@ -948,17 +977,17 @@ mod tests {
 
         // Exactly four 256-byte assemblies fit; the fifth is rejected no
         // matter which registry tries.
-        reg_a.insert(1, 1, 2, 128).unwrap(); // 256
-        reg_b.insert(2, 1, 2, 128).unwrap(); // 512
-        reg_a.insert(1, 2, 2, 128).unwrap(); // 768
-        reg_b.insert(2, 2, 2, 128).unwrap(); // 1024 = limit
+        reg_a.insert(1, 1, 2, 128, ()).unwrap(); // 256
+        reg_b.insert(2, 1, 2, 128, ()).unwrap(); // 512
+        reg_a.insert(1, 2, 2, 128, ()).unwrap(); // 768
+        reg_b.insert(2, 2, 2, 128, ()).unwrap(); // 1024 = limit
         assert_eq!(reassembly_used(&budget), 1024);
-        assert!(reg_a.insert(1, 3, 1, 1).is_err());
-        assert!(reg_b.insert(2, 3, 1, 1).is_err());
+        assert!(reg_a.insert(1, 3, 1, 1, ()).is_err());
+        assert!(reg_b.insert(2, 3, 1, 1, ()).is_err());
         // Releasing one admission frees room for exactly one more.
         reg_a.abort(1, 1);
         assert_eq!(reassembly_used(&budget), 768);
-        reg_b.insert(2, 3, 2, 128).unwrap();
+        reg_b.insert(2, 3, 2, 128, ()).unwrap();
         assert_eq!(reassembly_used(&budget), 1024);
         reg_a.abort(1, 2);
         reg_a.abort(1, 2);
@@ -1004,7 +1033,7 @@ mod tests {
             let budget = budget.clone();
             let barrier = admit_barrier.clone();
             handles.push(thread::spawn(move || {
-                reg.insert(t as u64, 1, 4, ASSEMBLY_BYTES / 4)
+                reg.insert(t as u64, 1, 4, ASSEMBLY_BYTES / 4, ())
                     .expect("exactly the seats must fit");
                 // The shared live-byte bound holds at every observation.
                 assert!(reassembly_used(&budget) <= LIMIT);
@@ -1025,8 +1054,8 @@ mod tests {
             let barrier = reject_barrier.clone();
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                let err = reg
-                    .insert((t + 100) as u64, 2, 4, ASSEMBLY_BYTES / 4)
+                let (err, ()) = reg
+                    .insert((t + 100) as u64, 2, 4, ASSEMBLY_BYTES / 4, ())
                     .expect_err("a fully charged cell must reject");
                 assert!(
                     err.to_string().contains("'reassembly'"),
@@ -1055,7 +1084,7 @@ mod tests {
         assert_eq!(reassembly_used(&budget), 0);
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
-        reg.insert(200, 1, 4, ASSEMBLY_BYTES / 4)
+        reg.insert(200, 1, 4, ASSEMBLY_BYTES / 4, ())
             .expect("freed budget must admit again");
         assert_eq!(reassembly_used(&budget), ASSEMBLY_BYTES as u64);
         reg.abort(200, 1);
@@ -1071,11 +1100,12 @@ mod tests {
             let reg = reg.clone();
             let h = thread::spawn(move || {
                 for req_id in 0u64..10 {
-                    reg.insert(conn_id, req_id, 1, 64).unwrap();
+                    reg.insert(conn_id, req_id, 1, 64, ()).unwrap();
                     reg.feed(conn_id, req_id, 0, &[conn_id as u8; 64]).unwrap();
-                    let mut finished = reg.finish(conn_id, req_id).unwrap();
-                    assert_eq!(finished.backing.copy_bytes().unwrap(), &[conn_id as u8; 64]);
-                    finished.backing.release().unwrap();
+                    let (assembler, ()) = reg.take(conn_id, req_id).unwrap();
+                    let mut finished = assembler.finish().unwrap();
+                    assert_eq!(finished.copy_bytes().unwrap(), &[conn_id as u8; 64]);
+                    finished.release().unwrap();
                 }
             });
             handles.push(h);
@@ -1098,10 +1128,11 @@ mod tests {
             let h = thread::spawn(move || {
                 for i in 0u64..20 {
                     let req_id = thread_idx * 1000 + i;
-                    reg.insert(conn_id, req_id, 1, 64).unwrap();
+                    reg.insert(conn_id, req_id, 1, 64, ()).unwrap();
                     reg.feed(conn_id, req_id, 0, &[0u8; 64]).unwrap();
-                    let mut finished = reg.finish(conn_id, req_id).unwrap();
-                    finished.backing.release().unwrap();
+                    let (assembler, ()) = reg.take(conn_id, req_id).unwrap();
+                    let mut finished = assembler.finish().unwrap();
+                    finished.release().unwrap();
                 }
             });
             handles.push(h);
@@ -1160,7 +1191,7 @@ mod tests {
         let pool = spill_pool();
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
         let chunk_size = 128;
-        reg.insert(1, 700, 3, chunk_size).unwrap();
+        reg.insert(1, 700, 3, chunk_size, ()).unwrap();
         // The reassembly allocation itself must already be file-backed.
         assert_no_shm_mappings(&pool);
 
@@ -1169,14 +1200,16 @@ mod tests {
         assert!(!reg.feed(1, 700, 0, &[0u8; 128]).unwrap());
         assert!(reg.feed(1, 700, 1, &[1u8; 128]).unwrap());
 
-        let mut finished = reg.finish(1, 700).unwrap();
+        let (assembler, ()) = reg.take(1, 700).unwrap();
+
+        let mut finished = assembler.finish().unwrap();
 
         // The completed reassembly must keep its file backing — no promotion.
-        assert!(finished.backing.is_file_spill());
+        assert!(finished.is_file_spill());
         // Logical length trimmed to actual data, not the full allocation.
-        assert_eq!(finished.backing.len(), 128 + 128 + 64);
+        assert_eq!(finished.len(), 128 + 128 + 64);
         // Data integrity across the file-backed mapping.
-        let slice = finished.backing.copy_bytes().unwrap();
+        let slice = finished.copy_bytes().unwrap();
         assert_eq!(&slice[0..128], &[0u8; 128]);
         assert_eq!(&slice[128..256], &[1u8; 128]);
         assert_eq!(&slice[256..320], &[2u8; 64]);
@@ -1186,7 +1219,7 @@ mod tests {
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
 
-        finished.backing.release().unwrap();
+        finished.release().unwrap();
         assert_no_shm_mappings(&pool);
     }
 
@@ -1196,25 +1229,26 @@ mod tests {
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
 
         // Held result: charge survives registry drop and release refunds once.
-        reg.insert(1, 710, 2, 512).unwrap();
+        reg.insert(1, 710, 2, 512, ()).unwrap();
         assert!(reg.contains(1, 710));
         assert!(!reg.feed(1, 710, 0, &[7u8; 512]).unwrap());
         assert!(reg.feed(1, 710, 1, &[6u8; 256]).unwrap());
-        let held = reg.finish(1, 710).unwrap();
-        assert!(held.backing.is_file_spill());
+        let (assembler, ()) = reg.take(1, 710).unwrap();
+        let held = assembler.finish().unwrap();
+        assert!(held.is_file_spill());
         assert_eq!(reassembly_used(&budget), 1024);
         drop(reg);
-        let slice = held.backing.copy_bytes().unwrap();
+        let slice = held.copy_bytes().unwrap();
         assert_eq!(&slice[0..512], &[7u8; 512]);
         assert_eq!(&slice[512..768], &[6u8; 256]);
         let mut held = held;
-        held.backing.release().unwrap();
+        held.release().unwrap();
         assert_eq!(reassembly_used(&budget), 0);
 
         // Abort path on a fresh file-backed registry.
         let (pool, budget) = budgeted_spill_pool(1 << 20);
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
-        reg.insert(1, 711, 2, 1024).unwrap();
+        reg.insert(1, 711, 2, 1024, ()).unwrap();
         reg.feed(1, 711, 0, &[7u8; 1024]).unwrap();
         reg.abort(1, 711);
         assert_eq!(reg.active_count(), 0);
@@ -1223,12 +1257,13 @@ mod tests {
         assert_no_shm_mappings(&pool);
 
         // A fresh file-backed assembly still works with real content.
-        reg.insert(1, 712, 1, 1024).unwrap();
+        reg.insert(1, 712, 1, 1024, ()).unwrap();
         assert!(reg.feed(1, 712, 0, &[9u8; 1024]).unwrap());
-        let mut finished = reg.finish(1, 712).unwrap();
-        assert!(finished.backing.is_file_spill());
-        assert_eq!(finished.backing.copy_bytes().unwrap(), &[9u8; 1024]);
-        finished.backing.release().unwrap();
+        let (assembler, ()) = reg.take(1, 712).unwrap();
+        let mut finished = assembler.finish().unwrap();
+        assert!(finished.is_file_spill());
+        assert_eq!(finished.copy_bytes().unwrap(), &[9u8; 1024]);
+        finished.release().unwrap();
         assert_no_shm_mappings(&pool);
     }
 
@@ -1236,20 +1271,25 @@ mod tests {
     fn finish_error_path_releases_file_backed_assembly() {
         let (pool, budget) = budgeted_spill_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        reg.insert(1, 720, 3, 512).unwrap();
+        reg.insert(1, 720, 3, 512, ()).unwrap();
         // Feed only 1 of 3 chunks — finish must fail without leaking storage.
         reg.feed(1, 720, 0, &[3u8; 512]).unwrap();
-        assert!(reg.finish(1, 720).is_err());
+        assert!(
+            reg.take(1, 720)
+                .and_then(|(assembler, ())| assembler.finish())
+                .is_err()
+        );
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
         assert_eq!(reassembly_used(&budget), 0);
 
         // A fresh assembly after the failed finish still works.
-        reg.insert(1, 721, 1, 512).unwrap();
+        reg.insert(1, 721, 1, 512, ()).unwrap();
         assert!(reg.feed(1, 721, 0, &[4u8; 512]).unwrap());
-        let mut finished = reg.finish(1, 721).unwrap();
-        assert!(finished.backing.is_file_spill());
-        finished.backing.release().unwrap();
+        let (assembler, ()) = reg.take(1, 721).unwrap();
+        let mut finished = assembler.finish().unwrap();
+        assert!(finished.is_file_spill());
+        finished.release().unwrap();
         assert_eq!(reassembly_used(&budget), 0);
     }
 
@@ -1261,7 +1301,7 @@ mod tests {
             ..ChunkConfig::default()
         };
         let reg = ChunkRegistry::new(pool.clone(), cfg);
-        reg.insert(1, 730, 2, 512).unwrap();
+        reg.insert(1, 730, 2, 512, ()).unwrap();
         reg.feed(1, 730, 0, &[5u8; 512]).unwrap();
         std::thread::sleep(Duration::from_millis(80));
         let stats = reg.gc_sweep();
@@ -1276,13 +1316,14 @@ mod tests {
     fn try_cleanup_file_retains_connection_charge_and_other_owners() {
         let (pool, budget) = budgeted_spill_pool(1 << 20);
         let reg = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
-        reg.insert(1, 11, 1, 512).unwrap();
+        reg.insert(1, 11, 1, 512, ()).unwrap();
         reg.feed(1, 11, 0, &[11; 512]).unwrap();
-        let held = reg.finish(1, 11).unwrap().backing;
-        let partial = reg.insert(1, 22, 2, 1024).unwrap();
+        let (assembler, ()) = reg.take(1, 11).unwrap();
+        let held = assembler.finish().unwrap();
+        let partial = reg.insert(1, 22, 2, 1024, ()).unwrap();
         reg.feed(1, 22, 0, &[22; 1024]).unwrap();
         let other_conn = 1 + SHARD_COUNT as u64; // share a shard, not an owner
-        reg.insert(other_conn, 22, 1, 1024).unwrap();
+        reg.insert(other_conn, 22, 1, 1024, ()).unwrap();
         reg.feed(other_conn, 22, 0, &[33; 1024]).unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1333,7 +1374,8 @@ mod tests {
         assert_eq!(reg.active_count(), 1);
         assert_eq!(reg.total_bytes(), 1024);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 1536);
-        let mut other = reg.finish(other_conn, 22).unwrap().backing;
+        let (assembler, ()) = reg.take(other_conn, 22).unwrap();
+        let mut other = assembler.finish().unwrap();
         assert_eq!(other.copy_bytes().unwrap(), &[33; 1024]);
         other.release().unwrap();
         assert_eq!(held.copy_bytes().unwrap(), &[11; 512]);
@@ -1352,11 +1394,12 @@ mod tests {
                 ..ChunkConfig::default()
             },
         ));
-        reg.insert(1, 11, 1, 512).unwrap();
+        reg.insert(1, 11, 1, 512, ()).unwrap();
         reg.feed(1, 11, 0, &[11; 512]).unwrap();
-        let held = reg.finish(1, 11).unwrap().backing;
-        reg.insert(1, 22, 2, 1024).unwrap();
-        reg.insert(2, 33, 2, 1024).unwrap();
+        let (assembler, ()) = reg.take(1, 11).unwrap();
+        let held = assembler.finish().unwrap();
+        reg.insert(1, 22, 2, 1024, ()).unwrap();
+        reg.insert(2, 33, 2, 1024, ()).unwrap();
         let (callback_ready_tx, callback_ready_rx) = std::sync::mpsc::channel();
         let (callback_release_tx, callback_release_rx) = std::sync::mpsc::channel();
         let callback_holder = thread::spawn(move || {
@@ -1463,7 +1506,7 @@ mod tests {
             .collect();
 
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
-        let err = reg.insert(1, 740, 2, 512).unwrap_err().to_string();
+        let err = reg.insert(1, 740, 2, 512, ()).unwrap_err().0.to_string();
         assert!(err.contains("'reassembly'"));
         assert_eq!(budget.snapshot().reassembly.rejected_allocations, 1);
 
@@ -1483,7 +1526,7 @@ mod tests {
     fn typed_file_registry(
         live_limit: u64,
         file_limit: u64,
-    ) -> (Arc<ChunkRegistry>, Arc<RwLock<MemPool>>, MemoryBudget) {
+    ) -> (Arc<ChunkRegistry<()>>, Arc<RwLock<MemPool>>, MemoryBudget) {
         let budget = MemoryBudget::new(0, file_limit, live_limit);
         let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
             PoolConfig {
@@ -1502,7 +1545,7 @@ mod tests {
     }
 
     fn raw_reply(
-        reg: &ChunkRegistry,
+        reg: &ChunkRegistry<()>,
         rid: u64,
         size: u64,
         chunks: u32,
@@ -1533,7 +1576,7 @@ mod tests {
                 "{error:?}"
             );
         }
-        let overflow = reg.insert(1, 1, 2, usize::MAX).unwrap_err();
+        let (overflow, ()) = reg.insert(1, 1, 2, usize::MAX, ()).unwrap_err();
         assert!(matches!(overflow, ChunkAdmissionError::Protocol(_)));
         assert!(overflow.to_string().contains("geometry overflow"));
         assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
@@ -1602,11 +1645,12 @@ mod tests {
         ));
         assert_eq!(budget.snapshot().reassembly.rejected_allocations, 1);
         assert!(reg.feed(1, 11, 1, &[0x22; 64]).unwrap());
-        let mut finished = reg.finish(1, 11).unwrap();
-        let bytes = finished.backing.copy_bytes().unwrap();
+        let (assembler, ()) = reg.take(1, 11).unwrap();
+        let mut finished = assembler.finish().unwrap();
+        let bytes = finished.copy_bytes().unwrap();
         assert_eq!(&bytes[..64], &[0x11; 64]);
         assert_eq!(&bytes[64..], &[0x22; 64]);
-        finished.backing.release().unwrap();
+        finished.release().unwrap();
         assert_eq!(reassembly_used(&budget), 0);
         assert_no_shm_mappings(&pool);
     }
@@ -1762,7 +1806,8 @@ mod tests {
         let (reg, pool, budget) = typed_file_registry(1024, 4096);
         raw_reply(&reg, 11, 64, 1, 64).unwrap();
         assert!(reg.feed(1, 11, 0, &[0x11; 64]).unwrap());
-        let carrier = reg.finish(1, 11).unwrap().backing;
+        let (assembler, ()) = reg.take(1, 11).unwrap();
+        let carrier = assembler.finish().unwrap();
         assert!(carrier.is_file_spill());
         let read_gate = Arc::new(std::sync::Barrier::new(2));
         let insert_gate = Arc::new(std::sync::Barrier::new(2));
@@ -1796,7 +1841,7 @@ mod tests {
             }
         }));
         let inserting = reg.clone();
-        let writer = std::thread::spawn(move || inserting.insert(1, 22, 1, 64));
+        let writer = std::thread::spawn(move || inserting.insert(1, 22, 1, 64, ()));
         insert_observed
             .recv_timeout(Duration::from_secs(2))
             .unwrap();

@@ -121,6 +121,25 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
+    /// Observe this physical IPC connection without connecting or reconnecting.
+    /// Other logical views may share it; closing one view need not end it.
+    pub fn connection_observation(&self) -> Result<c2_local::ConnectionObservation, Error> {
+        match &self.inner.transport {
+            ClientInner::Ipc(client) => client.client.connection_observation().ok_or_else(|| {
+                c2_error::C2Error::new(
+                    c2_error::ErrorCode::ResourceClosed,
+                    "IPC client has no physical connection",
+                )
+                .into()
+            }),
+            ClientInner::Http(..) => Err(c2_error::C2Error::new(
+                c2_error::ErrorCode::UnsupportedCallMode,
+                "connection observation requires a physical IPC connection",
+            )
+            .into()),
+        }
+    }
+
     pub fn expected_route(&self) -> &ExpectedRouteContract {
         &self.inner.expected
     }
@@ -723,7 +742,7 @@ fn observed_ipc_route(connection: &PooledIpcClient) -> ObservedRoute {
 fn is_stale_pooled_session_error(error: &c2_ipc::IpcError) -> bool {
     match error {
         c2_ipc::IpcError::Closed => true,
-        c2_ipc::IpcError::Io(io_error) => matches!(
+        c2_ipc::IpcError::Io(io_error) | c2_ipc::IpcError::Connect(io_error) => matches!(
             io_error.kind(),
             ErrorKind::UnexpectedEof
                 | ErrorKind::ConnectionReset
@@ -769,7 +788,9 @@ fn retain_local_ipc_cause(mut resolution: Error, direct: &Error) -> Error {
                 .source()
                 .and_then(|source| source.downcast_ref::<c2_ipc::IpcError>())
             {
-                Some(c2_ipc::IpcError::Io(error)) => format!("io:{:?}", error.kind()),
+                Some(c2_ipc::IpcError::Io(error) | c2_ipc::IpcError::Connect(error)) => {
+                    format!("io:{:?}", error.kind())
+                }
                 Some(c2_ipc::IpcError::Closed) => "ipc:closed".into(),
                 _ => "transport:ipc".into(),
             };

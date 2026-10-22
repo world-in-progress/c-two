@@ -11,7 +11,7 @@ use crate::buddy_segment::BuddySegment;
 use crate::budget::{BudgetError, BudgetKind, BudgetReservation, MemoryBudget};
 use crate::config::{PoolAllocation, PoolConfig, PoolStats};
 use crate::dedicated::DedicatedSegment;
-use crate::handle::MemHandle;
+use crate::handle::{HandleBacking, MemHandle, PoolIncarnation};
 use crate::pressure::{PressureDecision, PressureEngine};
 use crate::spill;
 use base64::Engine;
@@ -83,6 +83,7 @@ pub struct MemPool {
     dedicated: HashMap<u32, DedicatedEntry>,
     /// Base name prefix for SHM segments (includes PID).
     name_prefix: String,
+    incarnation: PoolIncarnation,
     /// Next dedicated segment index (offset from max_segments to avoid collision).
     next_dedicated_idx: u32,
     /// When each buddy segment became fully idle (alloc_count == 0).
@@ -188,6 +189,7 @@ impl MemPool {
             is_peer,
             dedicated: HashMap::new(),
             name_prefix,
+            incarnation: PoolIncarnation::new(),
             next_dedicated_idx: 256,
             idle_since: Vec::new(),
             budget,
@@ -310,8 +312,16 @@ impl MemPool {
         self.alloc_shm(size).map_err(BackingError::into_message)
     }
 
+    /// Allocate a unique SHM owner with `alloc`'s GC timing and error semantics.
+    pub fn alloc_shm_handle(&mut self, size: usize) -> Result<MemHandle, String> {
+        self.alloc(size)
+            .map(|a| a.into_handle(size, self.incarnation))
+    }
+
     /// Free a previously allocated block.
-    pub fn free(&mut self, alloc: &PoolAllocation) -> Result<(), String> {
+    /// # Safety
+    /// The caller owns this exact allocation and has ended every payload access across all mappings. No other owner may release it.
+    pub unsafe fn free(&mut self, alloc: &PoolAllocation) -> Result<(), String> {
         self.validate_generation(alloc.seg_idx, alloc.generation, alloc.is_dedicated)?;
         if alloc.is_dedicated && alloc.allocation_id != 0 {
             return Err("dedicated allocation identity must be zero".into());
@@ -713,7 +723,8 @@ impl MemPool {
         }
         self.gc_dedicated();
         let name = Self::dedicated_segment_name(&self.name_prefix, seg_idx);
-        self.open_dedicated_at(seg_idx, &name, min_size)
+        // SAFETY: only a peer cache reaches this branch, using its canonical backing name.
+        unsafe { self.open_dedicated_at(seg_idx, &name, min_size) }
     }
 
     fn validate_generation(
@@ -740,7 +751,9 @@ impl MemPool {
     /// Used by the server to lazy-open peer dedicated segments, where the
     /// index must match the producer's `seg_idx` from the wire frame.
     /// No-op if the index already exists in the map.
-    pub fn open_dedicated_at(
+    /// # Safety
+    /// The name and index must belong to this peer pool. An owner pool must not import another backing in place of a live or retired owner handle.
+    pub unsafe fn open_dedicated_at(
         &mut self,
         idx: u32,
         name: &str,
@@ -783,7 +796,9 @@ impl MemPool {
     ///
     /// This recomputes the buddy level from the data size, enabling cross-process
     /// freeing where the remote side only knows (offset, data_size) from the wire.
-    pub fn free_at(
+    /// # Safety
+    /// The caller has the sole release authority for the published allocation and every payload borrow has ended, including peer mappings.
+    pub unsafe fn free_at(
         &mut self,
         seg_idx: u32,
         generation: u32,
@@ -814,7 +829,7 @@ impl MemPool {
                 .next_power_of_two()
                 .max(self.config.min_block_size);
             if let Some(level) = seg.allocator().size_to_level(actual_size) {
-                seg.allocator().free(offset, level as u16, allocation_id)?;
+                unsafe { seg.allocator().free(offset, level as u16, allocation_id) }?;
                 let idx = seg_idx as usize;
                 if seg.allocator().can_retire() {
                     if idx < self.idle_since.len() && self.idle_since[idx].is_none() {
@@ -882,7 +897,9 @@ impl MemPool {
 
     /// Copy bytes from mapped shared-memory coordinates after validating that
     /// the complete span belongs to the selected segment's data region.
-    pub fn copy_data_at(
+    /// # Safety
+    /// The span belongs to a live published allocation. No writer or release may race the copy through any mapping.
+    pub unsafe fn copy_data_at(
         &self,
         seg_idx: u32,
         generation: u32,
@@ -993,7 +1010,7 @@ impl MemPool {
             return Err("cannot allocate 0 bytes".into());
         }
         match self.alloc_shm(size) {
-            Ok(alloc) => Ok(alloc.into_handle(size)),
+            Ok(alloc) => Ok(alloc.into_handle(size, self.incarnation)),
             Err(_) => self
                 .alloc_file_spill(size)
                 .map_err(BackingError::into_message),
@@ -1015,7 +1032,7 @@ impl MemPool {
             return Err("cannot allocate 0 bytes".into());
         }
         self.alloc_shm(size)
-            .map(|alloc| alloc.into_handle(size))
+            .map(|alloc| alloc.into_handle(size, self.incarnation))
             .map_err(|_| format!("try_alloc_shm: no SHM capacity for {size} bytes"))
     }
 
@@ -1035,36 +1052,27 @@ impl MemPool {
             Err(e) => return Err(BackingError::Other(format!("file spill failed: {e}"))),
         };
         self.counters.file_spill_allocs = self.counters.file_spill_allocs.saturating_add(1);
-        Ok(MemHandle::FileSpill {
-            mmap: mmap.with_budget_guard(guard),
-            path,
-            len: size,
+        Ok(MemHandle {
+            backing: HandleBacking::FileSpill {
+                mmap: mmap.with_budget_guard(guard),
+                path,
+                len: size,
+            },
         })
     }
 
     /// Read-only slice from a handle.
     pub fn handle_slice<'a>(&'a self, handle: &'a MemHandle) -> &'a [u8] {
         self.validate_handle(handle).expect("invalid memory handle");
-        match handle {
-            MemHandle::Buddy {
-                seg_idx,
-                generation: _,
-                offset,
-                len,
-                ..
+        match &handle.backing {
+            HandleBacking::Shm {
+                allocation, len, ..
             } => {
-                let ptr = self
-                    .segment(*seg_idx as usize)
-                    .expect("validated backing")
-                    .allocator()
-                    .data_ptr(*offset);
+                let ptr = self.data_ptr(allocation).expect("validated backing");
+                // SAFETY: the private owner and this pool remain borrowed for the slice lifetime.
                 unsafe { std::slice::from_raw_parts(ptr, *len) }
             }
-            MemHandle::Dedicated { seg_idx, len } => {
-                let ptr = self.dedicated[&(*seg_idx as u32)].segment.data_ptr();
-                unsafe { std::slice::from_raw_parts(ptr, *len) }
-            }
-            MemHandle::FileSpill { mmap, len, .. } => &mmap[..*len],
+            HandleBacking::FileSpill { mmap, len, .. } => &mmap[..*len],
         }
     }
 
@@ -1072,118 +1080,61 @@ impl MemPool {
     /// against the mapped backing region.
     pub fn copy_handle_data(&self, handle: &MemHandle) -> Result<Vec<u8>, String> {
         self.validate_handle(handle)?;
-        if handle.is_empty() {
-            return Ok(Vec::new());
-        }
-        match handle {
-            MemHandle::Buddy {
-                seg_idx,
-                generation,
-                offset,
-                len,
-                ..
-            } => self.copy_data_at(
-                u32::from(*seg_idx),
-                *generation,
-                *offset,
-                u32::try_from(*len)
-                    .map_err(|_| "buddy handle length exceeds the wire address space")?,
-                false,
-            ),
-            MemHandle::Dedicated { seg_idx, len } => self.copy_data_at(
-                u32::from(*seg_idx),
-                0,
-                0,
-                u32::try_from(*len)
-                    .map_err(|_| "dedicated handle length exceeds the wire address space")?,
-                true,
-            ),
-            MemHandle::FileSpill { mmap, len, .. } => {
-                if *len == 0 {
-                    return Err("file-spill copy span must not be empty".into());
-                }
-                let bytes = mmap.get(..*len).ok_or_else(|| {
-                    format!(
-                        "file-spill copy span of {} bytes is outside file-spill mapping of {} bytes",
-                        len,
-                        mmap.len()
-                    )
-                })?;
-                Ok(bytes.to_vec())
-            }
-        }
+        Ok(self.handle_slice(handle).to_vec())
     }
 
     /// Validate a handle's complete logical span without copying its contents.
     pub fn validate_handle(&self, handle: &MemHandle) -> Result<(), String> {
-        match handle {
-            MemHandle::Buddy {
-                seg_idx,
-                generation,
-                offset,
-                len,
-                allocation_size,
-                ..
+        self.validate_handle_owner(handle)?;
+        match &handle.backing {
+            HandleBacking::Shm {
+                allocation: a, len, ..
             } => {
-                if *len > *allocation_size as usize {
+                if !a.is_dedicated && *len > a.actual_size as usize {
                     return Err("logical length is outside the buddy allocation".into());
                 }
-                self.checked_data_pointer(
-                    u32::from(*seg_idx),
-                    *generation,
-                    *offset,
-                    u32::try_from(*len)
-                        .map_err(|_| "buddy handle length exceeds the wire address space")?,
-                    false,
-                )
-                .map(|_| ())
-            }
-            MemHandle::Dedicated { seg_idx, len } => self
-                .checked_data_pointer(
-                    u32::from(*seg_idx),
-                    0,
-                    0,
-                    u32::try_from(*len)
-                        .map_err(|_| "dedicated handle length exceeds the wire address space")?,
-                    true,
-                )
-                .map(|_| ()),
-            MemHandle::FileSpill { mmap, len, .. } => {
-                mmap.get(..*len).ok_or_else(|| {
-                    format!(
-                        "file-spill copy span of {} bytes is outside file-spill mapping of {} bytes",
-                        len,
-                        mmap.len()
-                    )
+                let len = u32::try_from(*len).map_err(|_| {
+                    if a.is_dedicated {
+                        "dedicated handle length exceeds the wire address space"
+                    } else {
+                        "buddy handle length exceeds the wire address space"
+                    }
                 })?;
+                self.checked_data_pointer(a.seg_idx, a.generation, a.offset, len, a.is_dedicated)
+                    .map(|_| ())
+            }
+            HandleBacking::FileSpill { mmap, len, .. } => {
+                mmap.get(..*len).ok_or_else(|| format!(
+                    "file-spill copy span of {} bytes is outside file-spill mapping of {} bytes", len, mmap.len()))?;
                 Ok(())
             }
         }
     }
 
+    fn validate_handle_owner(&self, handle: &MemHandle) -> Result<(), String> {
+        if let HandleBacking::Shm { owner, .. } = &handle.backing {
+            if self.is_peer {
+                return Err("peer pools never own allocation handles".into());
+            }
+            if *owner != self.incarnation {
+                return Err("pool owner incarnation mismatch".into());
+            }
+        }
+        Ok(())
+    }
+
     /// Mutable slice from a handle.
     pub fn handle_slice_mut<'a>(&'a self, handle: &'a mut MemHandle) -> &'a mut [u8] {
         self.validate_handle(handle).expect("invalid memory handle");
-        match handle {
-            MemHandle::Buddy {
-                seg_idx,
-                generation: _,
-                offset,
-                len,
-                ..
+        match &mut handle.backing {
+            HandleBacking::Shm {
+                allocation, len, ..
             } => {
-                let ptr = self
-                    .segment(*seg_idx as usize)
-                    .expect("validated backing")
-                    .allocator()
-                    .data_ptr(*offset);
+                let ptr = self.data_ptr(allocation).expect("validated backing");
+                // SAFETY: the unforgeable owner is exclusively borrowed; distinct owners name distinct allocations.
                 unsafe { std::slice::from_raw_parts_mut(ptr, *len) }
             }
-            MemHandle::Dedicated { seg_idx, len } => {
-                let ptr = self.dedicated[&(*seg_idx as u32)].segment.data_ptr();
-                unsafe { std::slice::from_raw_parts_mut(ptr, *len) }
-            }
-            MemHandle::FileSpill { mmap, len, .. } => &mut mmap[..*len],
+            HandleBacking::FileSpill { mmap, len, .. } => &mut mmap[..*len],
         }
     }
 
@@ -1191,34 +1142,31 @@ impl MemPool {
     ///
     /// Returns `FreeResult` so callers can trigger deferred GC.
     /// For `FileSpill`, always returns `Normal` (OS handles cleanup via Drop).
-    pub fn release_handle(&mut self, handle: MemHandle) -> FreeResult {
-        match handle {
-            MemHandle::Buddy {
-                seg_idx,
-                generation,
-                offset,
-                allocation_size,
-                allocation_id,
-                ..
-            } => self
-                .free_at(
-                    seg_idx as u32,
-                    generation,
-                    offset,
-                    allocation_size,
-                    false,
-                    allocation_id,
-                )
-                .unwrap_or(FreeResult::Normal),
-            MemHandle::Dedicated { seg_idx, .. } => {
-                self.free_dedicated(seg_idx as u32);
-                FreeResult::DedicatedFreed { seg_idx }
+    pub fn release_handle(&mut self, handle: MemHandle) -> Result<FreeResult, String> {
+        self.validate_handle_owner(&handle)?;
+        Ok(match handle.backing {
+            HandleBacking::Shm { allocation: a, .. } if !a.is_dedicated => {
+                // SAFETY: consuming the owner ends all safe payload borrows. Preserve the existing failure policy.
+                unsafe {
+                    self.free_at(
+                        a.seg_idx,
+                        a.generation,
+                        a.offset,
+                        a.actual_size,
+                        false,
+                        a.allocation_id,
+                    )
+                }
+                .unwrap_or(FreeResult::Normal)
             }
-            MemHandle::FileSpill { .. } => {
-                // MmapMut dropped here → munmap; file already unlinked
-                FreeResult::Normal
+            HandleBacking::Shm { allocation: a, .. } => {
+                self.free_dedicated(a.seg_idx);
+                FreeResult::DedicatedFreed {
+                    seg_idx: a.seg_idx as u16,
+                }
             }
-        }
+            HandleBacking::FileSpill { .. } => FreeResult::Normal,
+        })
     }
 
     // --- Internal methods ---
@@ -1439,8 +1387,11 @@ impl MemPool {
     fn free_buddy(&mut self, alloc: &PoolAllocation) -> Result<(), String> {
         let idx = alloc.seg_idx as usize;
         if let Some(seg) = self.segment(idx) {
-            seg.allocator()
-                .free(alloc.offset, alloc.level, alloc.allocation_id)?;
+            // SAFETY: the caller holds the raw allocation's release authority.
+            unsafe {
+                seg.allocator()
+                    .free(alloc.offset, alloc.level, alloc.allocation_id)?;
+            }
             // Track idle: if segment is now empty, record the time.
             if seg.allocator().alloc_count() == 0
                 && idx < self.idle_since.len()
@@ -1552,21 +1503,13 @@ impl MemPool {
 }
 
 impl PoolAllocation {
-    fn into_handle(self, len: usize) -> MemHandle {
-        if self.is_dedicated {
-            MemHandle::Dedicated {
-                seg_idx: self.seg_idx as u16,
+    fn into_handle(self, len: usize, owner: PoolIncarnation) -> MemHandle {
+        MemHandle {
+            backing: HandleBacking::Shm {
+                allocation: self,
+                owner,
                 len,
-            }
-        } else {
-            MemHandle::Buddy {
-                seg_idx: self.seg_idx as u16,
-                generation: self.generation,
-                allocation_id: self.allocation_id,
-                offset: self.offset,
-                allocation_size: self.actual_size,
-                len,
-            }
+            },
         }
     }
 }
@@ -1657,7 +1600,7 @@ mod tests {
         assert!(!a.is_dedicated);
         assert_eq!(pool.segment_count(), 1);
 
-        pool.free(&a).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
         let stats = pool.stats();
         assert_eq!(stats.alloc_count, 0);
     }
@@ -1688,8 +1631,8 @@ mod tests {
         let a = pool.alloc(4096).unwrap();
         let b = pool.alloc(4096).unwrap();
         assert_ne!(a.offset, b.offset);
-        pool.free(&a).unwrap();
-        pool.free(&b).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
+        unsafe { pool.free(&b) }.unwrap();
     }
 
     #[test]
@@ -1711,8 +1654,8 @@ mod tests {
         let b = pool.alloc(32 * 1024).unwrap();
         assert!(pool.segment_count() >= 2 || b.is_dedicated);
 
-        pool.free(&a).unwrap();
-        pool.free(&b).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
+        unsafe { pool.free(&b) }.unwrap();
     }
 
     #[test]
@@ -1730,7 +1673,7 @@ mod tests {
         let a = pool.alloc(64 * 1024).unwrap();
         assert!(a.is_dedicated);
 
-        pool.free(&a).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
         pool.gc_dedicated();
     }
 
@@ -1746,7 +1689,7 @@ mod tests {
         );
         assert!(stats.alloc_count >= 1);
         assert!(stats.utilization_ratio > 0.0);
-        pool.free(&a).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
         let stats = pool.stats();
         assert_eq!(stats.buddy_occupied_bytes, 0);
         assert_eq!(stats.utilization_ratio, 0.0);
@@ -1762,7 +1705,7 @@ mod tests {
             assert_eq!(*ptr, 0xAB);
             assert_eq!(*ptr.add(99), 0xAB);
         }
-        pool.free(&a).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
     }
 
     #[test]
@@ -1776,17 +1719,19 @@ mod tests {
             }
 
             assert_eq!(
-                pool.copy_data_at(
-                    allocation.seg_idx,
-                    allocation.generation,
-                    allocation.offset,
-                    u32::try_from(payload.len()).unwrap(),
-                    allocation.is_dedicated,
-                )
+                unsafe {
+                    pool.copy_data_at(
+                        allocation.seg_idx,
+                        allocation.generation,
+                        allocation.offset,
+                        u32::try_from(payload.len()).unwrap(),
+                        allocation.is_dedicated,
+                    )
+                }
                 .unwrap(),
                 payload,
             );
-            pool.free(&allocation).unwrap();
+            unsafe { pool.free(&allocation) }.unwrap();
         }
     }
 
@@ -1800,13 +1745,15 @@ mod tests {
             .allocator()
             .data_size();
         assert!(
-            pool.copy_data_at(
-                buddy.seg_idx,
-                buddy.generation,
-                u32::try_from(buddy_capacity - 1).unwrap(),
-                2,
-                false,
-            )
+            unsafe {
+                pool.copy_data_at(
+                    buddy.seg_idx,
+                    buddy.generation,
+                    u32::try_from(buddy_capacity - 1).unwrap(),
+                    2,
+                    false,
+                )
+            }
             .unwrap_err()
             .contains("outside buddy segment")
         );
@@ -1822,25 +1769,25 @@ mod tests {
             .contains("outside buddy segment")
         );
         assert!(
-            pool.copy_data_at(buddy.seg_idx, buddy.generation, buddy.offset, 0, false)
+            unsafe { pool.copy_data_at(buddy.seg_idx, buddy.generation, buddy.offset, 0, false) }
                 .unwrap_err()
                 .contains("must not be empty")
         );
-        pool.free(&buddy).unwrap();
+        unsafe { pool.free(&buddy) }.unwrap();
 
         let dedicated = pool.alloc(128 * 1024).unwrap();
         assert!(dedicated.is_dedicated);
         assert!(
-            pool.copy_data_at(dedicated.seg_idx, 0, 1, 1, true)
+            unsafe { pool.copy_data_at(dedicated.seg_idx, 0, 1, 1, true) }
                 .unwrap_err()
                 .contains("offset must be zero")
         );
         assert!(
-            pool.copy_data_at(dedicated.seg_idx, 0, 0, u32::MAX, true)
+            unsafe { pool.copy_data_at(dedicated.seg_idx, 0, 0, u32::MAX, true) }
                 .unwrap_err()
                 .contains("outside dedicated segment")
         );
-        pool.free(&dedicated).unwrap();
+        unsafe { pool.free(&dedicated) }.unwrap();
     }
 
     #[test]
@@ -1960,7 +1907,7 @@ mod tests {
 
         // Free all blocks.
         for a in &allocs {
-            pool.free(a).unwrap();
+            unsafe { pool.free(a) }.unwrap();
         }
 
         // GC should reclaim trailing idle segments (but keep at least 1).
@@ -1970,7 +1917,7 @@ mod tests {
 
         // Pool should still be usable.
         let a = pool.alloc(4096).unwrap();
-        pool.free(&a).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
     }
 
     #[test]
@@ -1996,7 +1943,7 @@ mod tests {
         // Free only blocks from the first segment (keep second non-empty).
         // Actually, just keep one block alive — gc should not reclaim.
         for a in allocs.iter().skip(1) {
-            pool.free(a).unwrap();
+            unsafe { pool.free(a) }.unwrap();
         }
 
         let removed = pool.gc_buddy();
@@ -2005,7 +1952,7 @@ mod tests {
         assert!(pool.segment_count() >= 1);
         let _ = removed;
 
-        pool.free(&allocs[0]).unwrap();
+        unsafe { pool.free(&allocs[0]) }.unwrap();
     }
 
     #[test]
@@ -2028,7 +1975,7 @@ mod tests {
 
         // Fill segment 0 to force segment 1 creation.
         let big = pool.config.segment_size;
-        pool.free(&a0).unwrap();
+        unsafe { pool.free(&a0) }.unwrap();
         let a_big = pool.alloc(big).unwrap();
         assert_eq!(a_big.seg_idx, 0);
         let a1 = pool.alloc(4096).unwrap();
@@ -2044,7 +1991,7 @@ mod tests {
         assert!(a_ded.is_dedicated);
 
         // Buddy segment 2.
-        pool.free(&a1).unwrap();
+        unsafe { pool.free(&a1) }.unwrap();
         let a1_big = pool.alloc(big).unwrap();
         assert_eq!(a1_big.seg_idx, 1);
         let a2 = pool.alloc(4096).unwrap();
@@ -2055,10 +2002,10 @@ mod tests {
             MemPool::buddy_segment_name(pool.prefix(), 2, a2.generation)
         );
 
-        pool.free(&a_ded).unwrap();
-        pool.free(&a_big).unwrap();
-        pool.free(&a1_big).unwrap();
-        pool.free(&a2).unwrap();
+        unsafe { pool.free(&a_ded) }.unwrap();
+        unsafe { pool.free(&a_big) }.unwrap();
+        unsafe { pool.free(&a1_big) }.unwrap();
+        unsafe { pool.free(&a2) }.unwrap();
     }
 
     #[test]
@@ -2070,7 +2017,7 @@ mod tests {
         });
 
         let a0 = pool.alloc(4096).unwrap();
-        pool.free(&a0).unwrap();
+        unsafe { pool.free(&a0) }.unwrap();
 
         let big = pool.config.segment_size * 2;
         let d0 = pool.alloc(big).unwrap();
@@ -2085,8 +2032,8 @@ mod tests {
         let dname1 = pool.dedicated_name(257).unwrap();
         assert_eq!(dname1, MemPool::dedicated_segment_name(pool.prefix(), 257));
 
-        pool.free(&d0).unwrap();
-        pool.free(&d1).unwrap();
+        unsafe { pool.free(&d0) }.unwrap();
+        unsafe { pool.free(&d1) }.unwrap();
     }
 
     #[test]
@@ -2128,8 +2075,8 @@ mod tests {
         let a = pool.alloc(32 * 1024).unwrap();
         let b = pool.alloc(32 * 1024).unwrap();
         assert!(pool.segment_count() >= 2);
-        pool.free(&a).unwrap();
-        pool.free(&b).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
+        unsafe { pool.free(&b) }.unwrap();
         // Despite idleness, decay window prevents reclamation.
         let reclaimed = pool.gc_buddy();
         assert_eq!(reclaimed, 0);
@@ -2153,8 +2100,8 @@ mod tests {
         let b = pool.alloc(32 * 1024).unwrap();
         let seg_before = pool.segment_count();
         assert!(seg_before >= 2);
-        pool.free(&a).unwrap();
-        pool.free(&b).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
+        unsafe { pool.free(&b) }.unwrap();
         let reclaimed = pool.gc_buddy();
         assert!(
             reclaimed >= 1,
@@ -2177,7 +2124,7 @@ mod tests {
         let old = pool.alloc(32 * 1024).unwrap();
         let old_name = pool.segment_name(old.seg_idx as usize).unwrap().to_owned();
         let old_view = BuddySegment::open(&old_name, 32 * 1024).unwrap();
-        pool.free(&old).unwrap();
+        unsafe { pool.free(&old) }.unwrap();
         assert_eq!(pool.gc_buddy(), 1);
         let new = pool.alloc(32 * 1024).unwrap();
         assert_eq!(new.seg_idx, old.seg_idx);
@@ -2185,7 +2132,7 @@ mod tests {
         assert_eq!(old_view.allocator().alloc_count(), 0);
         assert!(new.generation > old.generation);
         assert!(pool.data_ptr(&old).is_err());
-        assert!(pool.free(&old).is_err());
+        assert!(unsafe { pool.free(&old) }.is_err());
         assert_eq!(
             pool.segment(new.seg_idx as usize)
                 .unwrap()
@@ -2193,8 +2140,8 @@ mod tests {
                 .alloc_count(),
             1
         );
-        pool.free(&new).unwrap();
-        pool.free(&first).unwrap();
+        unsafe { pool.free(&new) }.unwrap();
+        unsafe { pool.free(&first) }.unwrap();
     }
 
     #[test]
@@ -2215,7 +2162,7 @@ mod tests {
             *owner.data_ptr(&old).unwrap() = 0x21;
         }
         assert_eq!(
-            peer.copy_data_at(old.seg_idx, old.generation, old.offset, 1, false)
+            unsafe { peer.copy_data_at(old.seg_idx, old.generation, old.offset, 1, false) }
                 .unwrap(),
             [0x21]
         );
@@ -2225,14 +2172,16 @@ mod tests {
                 .contains("live allocations")
         );
         assert_eq!(owner.gc_buddy(), 0);
-        peer.free_at(
-            old.seg_idx,
-            old.generation,
-            old.offset,
-            32 * 1024,
-            false,
-            old.allocation_id,
-        )
+        unsafe {
+            peer.free_at(
+                old.seg_idx,
+                old.generation,
+                old.offset,
+                32 * 1024,
+                false,
+                old.allocation_id,
+            )
+        }
         .unwrap();
         assert!(peer.segment(old.seg_idx as usize).is_none());
         assert_eq!(owner.gc_buddy(), 1);
@@ -2244,7 +2193,7 @@ mod tests {
             *owner.data_ptr(&fresh).unwrap() = 0x63;
         }
         assert_eq!(
-            peer.copy_data_at(fresh.seg_idx, fresh.generation, fresh.offset, 1, false)
+            unsafe { peer.copy_data_at(fresh.seg_idx, fresh.generation, fresh.offset, 1, false) }
                 .unwrap(),
             [0x63]
         );
@@ -2254,14 +2203,16 @@ mod tests {
                 .contains("stale")
         );
         assert!(
-            peer.free_at(
-                old.seg_idx,
-                old.generation,
-                old.offset,
-                32 * 1024,
-                false,
-                old.allocation_id
-            )
+            unsafe {
+                peer.free_at(
+                    old.seg_idx,
+                    old.generation,
+                    old.offset,
+                    32 * 1024,
+                    false,
+                    old.allocation_id,
+                )
+            }
             .is_err()
         );
         assert_eq!(
@@ -2272,16 +2223,18 @@ mod tests {
                 .alloc_count(),
             1
         );
-        peer.free_at(
-            fresh.seg_idx,
-            fresh.generation,
-            fresh.offset,
-            32 * 1024,
-            false,
-            fresh.allocation_id,
-        )
+        unsafe {
+            peer.free_at(
+                fresh.seg_idx,
+                fresh.generation,
+                fresh.offset,
+                32 * 1024,
+                false,
+                fresh.allocation_id,
+            )
+        }
         .unwrap();
-        owner.free(&first).unwrap();
+        unsafe { owner.free(&first) }.unwrap();
     }
 
     #[test]
@@ -2294,14 +2247,14 @@ mod tests {
         let size = owner.config.segment_size;
         let first = owner.alloc(size).unwrap();
         let old = owner.alloc(size).unwrap();
-        owner.free(&old).unwrap();
+        unsafe { owner.free(&old) }.unwrap();
         owner.gc_buddy();
         owner.generations[1] = u32::MAX;
         // Buddy generation exhaustion is a buddy-tier failure: the allocation
         // must fall through to dedicated storage rather than fail outright.
         let exhausted = owner.alloc(size).unwrap();
         assert!(exhausted.is_dedicated);
-        owner.free(&exhausted).unwrap();
+        unsafe { owner.free(&exhausted) }.unwrap();
         owner.gc_dedicated();
         owner.next_dedicated_idx = u16::MAX as u32;
         let last = owner.alloc(size * 2).unwrap();
@@ -2312,8 +2265,8 @@ mod tests {
                 .unwrap_err()
                 .contains("index exhausted")
         );
-        owner.free(&last).unwrap();
-        owner.free(&first).unwrap();
+        unsafe { owner.free(&last) }.unwrap();
+        unsafe { owner.free(&first) }.unwrap();
     }
 
     #[test]
@@ -2347,14 +2300,16 @@ mod tests {
         }
         peer.ensure_peer_segment(low.seg_idx, low.generation, 32 * 1024)
             .unwrap();
-        peer.free_at(
-            low.seg_idx,
-            low.generation,
-            low.offset,
-            32 * 1024,
-            false,
-            low.allocation_id,
-        )
+        unsafe {
+            peer.free_at(
+                low.seg_idx,
+                low.generation,
+                low.offset,
+                32 * 1024,
+                false,
+                low.allocation_id,
+            )
+        }
         .unwrap();
         assert_eq!(
             peer.data_ptr_at(high.seg_idx, high.generation, high.offset, false)
@@ -2363,14 +2318,16 @@ mod tests {
         );
         assert_eq!(unsafe { *high_ptr }, 0x56);
         assert_eq!(peer.stats().total_segments, 1);
-        peer.free_at(
-            high.seg_idx,
-            high.generation,
-            high.offset,
-            32 * 1024,
-            false,
-            high.allocation_id,
-        )
+        unsafe {
+            peer.free_at(
+                high.seg_idx,
+                high.generation,
+                high.offset,
+                32 * 1024,
+                false,
+                high.allocation_id,
+            )
+        }
         .unwrap();
     }
 
@@ -2455,19 +2412,15 @@ mod tests {
         let mut peer = MemPool::open_peer(config, owner.prefix().to_owned());
         peer.ensure_peer_dedicated(allocation.seg_idx, 4096)
             .unwrap();
-        peer.free_at(allocation.seg_idx, 0, 0, 4096, true, 0)
-            .unwrap();
+        unsafe { peer.free_at(allocation.seg_idx, 0, 0, 4096, true, 0) }.unwrap();
         peer.gc_dedicated();
         assert!(
             peer.ensure_peer_dedicated(allocation.seg_idx, 4096)
                 .unwrap_err()
                 .contains("already been released")
         );
-        assert!(
-            peer.free_at(allocation.seg_idx, 0, 0, 4096, true, 0)
-                .is_err()
-        );
-        owner.free(&allocation).unwrap();
+        assert!(unsafe { peer.free_at(allocation.seg_idx, 0, 0, 4096, true, 0) }.is_err());
+        unsafe { owner.free(&allocation) }.unwrap();
         owner.gc_dedicated();
         assert!(owner.dedicated_name(allocation.seg_idx).is_none());
     }
@@ -2536,7 +2489,7 @@ mod tests {
         let seg_idx = a.seg_idx;
 
         // Creator frees → freed_at set, but read_done still 0
-        pool.free(&a).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
 
         // GC should NOT remove (read_done == 0, timeout not reached)
         pool.gc_dedicated();
@@ -2578,15 +2531,11 @@ mod tests {
 
         // Open in a second pool (simulates reader/peer side)
         let mut reader_pool = test_pool(config);
-        reader_pool
-            .open_dedicated_at(a.seg_idx, &seg_name, data_size)
-            .unwrap();
+        unsafe { reader_pool.open_dedicated_at(a.seg_idx, &seg_name, data_size) }.unwrap();
         assert!(reader_pool.dedicated.contains_key(&a.seg_idx));
 
         // Reader frees → should mark read_done + be immediately removable
-        reader_pool
-            .free_at(a.seg_idx, 0, 0, data_size as u32, true, 0)
-            .unwrap();
+        unsafe { reader_pool.free_at(a.seg_idx, 0, 0, data_size as u32, true, 0) }.unwrap();
         reader_pool.gc_dedicated();
         assert!(!reader_pool.dedicated.contains_key(&a.seg_idx));
 
@@ -2600,7 +2549,7 @@ mod tests {
                 .is_read_done()
         );
 
-        creator_pool.free(&a).unwrap();
+        unsafe { creator_pool.free(&a) }.unwrap();
         creator_pool.gc_dedicated();
         assert!(!creator_pool.dedicated.contains_key(&a.seg_idx));
     }
@@ -2610,7 +2559,7 @@ mod tests {
         let mut pool = test_pool(small_config());
         let h = pool.try_alloc_shm(4096).unwrap();
         assert!(h.is_buddy());
-        pool.release_handle(h);
+        pool.release_handle(h).unwrap();
     }
 
     #[test]
@@ -2691,9 +2640,9 @@ mod tests {
         );
         assert_eq!(pool.segment_count(), 0);
 
-        pool.free(&a).unwrap();
-        pool.release_handle(h);
-        pool.release_handle(s);
+        unsafe { pool.free(&a) }.unwrap();
+        pool.release_handle(h).unwrap();
+        pool.release_handle(s).unwrap();
     }
 
     #[test]
@@ -2708,7 +2657,7 @@ mod tests {
         let handle = pool.alloc_handle(4096).unwrap();
         assert!(handle.is_file_spill());
         assert_eq!(pool.segment_count(), 0);
-        pool.release_handle(handle);
+        pool.release_handle(handle).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2732,9 +2681,9 @@ mod tests {
         assert!(s.is_dedicated());
 
         drop(squatter);
-        pool.free(&a).unwrap();
-        pool.release_handle(h);
-        pool.release_handle(s);
+        unsafe { pool.free(&a) }.unwrap();
+        pool.release_handle(h).unwrap();
+        pool.release_handle(s).unwrap();
     }
 
     #[test]
@@ -2757,7 +2706,7 @@ mod tests {
         assert!(!a.is_dedicated);
         let old_generation = a.generation;
         let old_name = pool.segment_name(0).unwrap().to_owned();
-        pool.free(&a).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
 
         // Idle decay 0 → GC may retire the last idle segment.
         assert_eq!(pool.gc_buddy(), 1);
@@ -2770,9 +2719,9 @@ mod tests {
         assert!(b.generation > old_generation);
         assert_ne!(pool.segment_name(0).unwrap(), old_name);
         assert!(pool.data_ptr(&a).is_err());
-        assert!(pool.free(&a).is_err());
+        assert!(unsafe { pool.free(&a) }.is_err());
 
-        pool.free(&b).unwrap();
+        unsafe { pool.free(&b) }.unwrap();
     }
 
     #[test]
@@ -2797,7 +2746,7 @@ mod tests {
         }
         assert!(pool.segment_count() >= 3);
         for a in &allocs {
-            pool.free(a).unwrap();
+            unsafe { pool.free(a) }.unwrap();
         }
 
         assert!(pool.gc_buddy() > 0);
@@ -2828,7 +2777,7 @@ mod tests {
         assert!(pool.segment_count() >= 2);
 
         // Free only the trailing segment's block; the first stays live.
-        pool.free(&filler).unwrap();
+        unsafe { pool.free(&filler) }.unwrap();
         assert!(pool.gc_buddy() >= 1);
         // Segment 0 still backs a live allocation.
         assert!(pool.data_ptr(&held).is_ok());
@@ -2841,7 +2790,7 @@ mod tests {
         assert_eq!(pool.segment_count(), 1);
         assert_eq!(unsafe { *pool.data_ptr(&held).unwrap() }, 0x7A);
 
-        pool.free(&held).unwrap();
+        unsafe { pool.free(&held) }.unwrap();
         assert_eq!(pool.gc_buddy(), 1);
         assert_eq!(pool.segment_count(), 0);
     }
@@ -2900,7 +2849,7 @@ mod handle_tests {
             assert_eq!(handle.is_buddy(), is_buddy);
             assert_eq!(handle.is_dedicated(), !is_buddy);
             assert_eq!(handle.len(), size);
-            let result = pool.release_handle(handle);
+            let result = pool.release_handle(handle).unwrap();
             assert_eq!(
                 matches!(result, FreeResult::DedicatedFreed { .. }),
                 !is_buddy
@@ -2919,7 +2868,7 @@ mod handle_tests {
         let mut pool = MemPool::new(config);
         let handle = pool.alloc_handle(4096).unwrap();
         assert!(handle.is_file_spill());
-        pool.release_handle(handle);
+        pool.release_handle(handle).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2934,7 +2883,7 @@ mod handle_tests {
             &pool.copy_handle_data(&handle).unwrap()[..pattern.len()],
             pattern
         );
-        pool.release_handle(handle);
+        pool.release_handle(handle).unwrap();
     }
 
     #[test]
@@ -2954,40 +2903,58 @@ mod handle_tests {
             &pool.copy_handle_data(&handle).unwrap()[..pattern.len()],
             pattern
         );
-        handle.set_len(8193);
-        assert!(
-            pool.copy_handle_data(&handle)
-                .unwrap_err()
-                .contains("outside file-spill mapping")
+        assert!(handle.trim_to(8193).unwrap_err().contains("cannot grow"));
+        assert_eq!(handle.len(), 8192);
+        assert_eq!(
+            &pool.copy_handle_data(&handle).unwrap()[..pattern.len()],
+            pattern
         );
-        handle.set_len(8192);
-        pool.release_handle(handle);
+        pool.release_handle(handle).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_copy_handle_data_rejects_publicly_constructed_out_of_bounds_handle() {
-        let mut pool = MemPool::new(test_config());
-        pool.ensure_buddy_segments(1).unwrap();
-        let capacity = pool.segment(0).unwrap().allocator().data_size();
-        let handle = MemHandle::Buddy {
-            seg_idx: 0,
-            generation: pool.segment_generation(0).unwrap(),
-            allocation_id: 64,
-            offset: u32::try_from(capacity - 1).unwrap(),
-            allocation_size: 4096,
-            len: 2,
-        };
-        assert!(
-            pool.copy_handle_data(&handle)
-                .unwrap_err()
-                .contains("outside buddy segment")
-        );
-        assert!(
-            pool.validate_handle(&handle)
-                .unwrap_err()
-                .contains("outside buddy segment")
-        );
+    fn owner_access_rejects_foreign_and_peer_pools() {
+        for size in [4096, 128 * 1024] {
+            let mut owner = MemPool::new(test_config());
+            let mut handle = owner.alloc_shm_handle(size).unwrap();
+            let allocation = handle.shm_allocation().unwrap();
+            owner.handle_slice_mut(&mut handle)[0] = 0x11;
+            let mut other = MemPool::new(test_config());
+            let mut survivor = other.alloc_shm_handle(size).unwrap();
+            other.handle_slice_mut(&mut survivor)[0] = 0x22;
+            let peer = MemPool::open_peer(test_config(), owner.prefix().to_owned());
+            assert!(peer.validate_handle(&handle).is_err());
+            assert!(other.copy_handle_data(&handle).is_err());
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    other.handle_slice_mut(&mut handle)[0] = 0x33;
+                }))
+                .is_err()
+            );
+            assert!(other.release_handle(handle).is_err());
+            assert_eq!(other.handle_slice(&survivor)[0], 0x22);
+            assert_eq!(owner.stats().alloc_count, 1);
+            // The rejected release consumed the owner value but not its storage.
+            // SAFETY: no handle or payload borrow survives; this test owns the original allocation.
+            unsafe { owner.free(&allocation) }.unwrap();
+            other.release_handle(survivor).unwrap();
+        }
+    }
+
+    #[test]
+    fn destroy_does_not_reauthorize_old_handles() {
+        for size in [4096, 128 * 1024] {
+            let mut pool = MemPool::new(test_config());
+            let old = pool.alloc_shm_handle(size).unwrap();
+            pool.destroy();
+            let mut fresh = pool.alloc_shm_handle(size).unwrap();
+            pool.handle_slice_mut(&mut fresh)[0] = 0x5A;
+            assert!(pool.validate_handle(&old).is_err());
+            pool.release_handle(old).unwrap();
+            assert_eq!(pool.handle_slice(&fresh)[0], 0x5A);
+            pool.release_handle(fresh).unwrap();
+        }
     }
 
     #[test]
@@ -2997,10 +2964,10 @@ mod handle_tests {
             let initial = 32 * 1024;
             let mut handle = pool.try_alloc_shm(initial).unwrap();
             let capacity = pool.segment(0).unwrap().allocator().data_size() as u64;
-            handle.set_len(length);
+            handle.trim_to(length).unwrap();
             assert_eq!(pool.handle_slice(&handle).len(), length);
             assert_eq!(pool.copy_handle_data(&handle).unwrap().len(), length);
-            pool.release_handle(handle);
+            pool.release_handle(handle).unwrap();
             assert_eq!(pool.stats().alloc_count, 0);
             assert_eq!(pool.stats().buddy_idle_bytes, capacity);
         }
@@ -3151,13 +3118,13 @@ mod budget_tests {
 
         // Freeing then reusing blocks inside the existing segment adds no
         // charge; only a second mapped segment would.
-        pool.free(&a).unwrap();
-        pool.free(&b).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
+        unsafe { pool.free(&b) }.unwrap();
         let reused = pool.alloc(4096).unwrap();
         assert_eq!(pool.segment_count(), 1);
         assert_eq!(budget.snapshot().shm.used_bytes, backing);
         assert_eq!(budget.snapshot().shm.peak_bytes, backing);
-        pool.free(&reused).unwrap();
+        unsafe { pool.free(&reused) }.unwrap();
     }
 
     #[test]
@@ -3189,8 +3156,8 @@ mod budget_tests {
                 .contains("memory budget cell 'shm'")
         );
         assert_eq!(shared.snapshot().shm.used_bytes, backing * 2);
-        pool_a.free(&a).unwrap();
-        pool_b.free(&b).unwrap();
+        unsafe { pool_a.free(&a) }.unwrap();
+        unsafe { pool_b.free(&b) }.unwrap();
 
         // Existing owner constructors carry distinct private canonical budgets.
         let mut private_a = MemPool::new_with_prefix(config.clone(), unique_prefix());
@@ -3210,8 +3177,8 @@ mod budget_tests {
             private_b.budget().unwrap().snapshot().shm.used_bytes,
             backing
         );
-        private_a.free(&a).unwrap();
-        private_b.free(&b).unwrap();
+        unsafe { private_a.free(&a) }.unwrap();
+        unsafe { private_b.free(&b) }.unwrap();
 
         // Peer pools never charge owner-creation budget.
         let peer = MemPool::open_peer(config, unique_prefix());
@@ -3246,7 +3213,7 @@ mod budget_tests {
         assert_eq!(budget.snapshot().shm.used_bytes, dedicated_backing);
 
         // Creator free marks freed_at but waits for peer read_done / GC.
-        pool.free(&alloc).unwrap();
+        unsafe { pool.free(&alloc) }.unwrap();
         assert_eq!(
             budget.snapshot().shm.used_bytes,
             dedicated_backing,
@@ -3281,7 +3248,7 @@ mod budget_tests {
 
         // Freed but unread: awaiting retirement until read_done or the
         // crash-timeout policy reclaims the entry.
-        pool.free(&alloc).unwrap();
+        unsafe { pool.free(&alloc) }.unwrap();
         assert!(pool.dedicated_awaiting_retirement(&alloc));
         pool.gc_dedicated();
         assert!(
@@ -3303,7 +3270,7 @@ mod budget_tests {
         // A buddy allocation never reports awaiting retirement.
         let buddy = pool.alloc(4096).unwrap();
         assert!(!buddy.is_dedicated);
-        pool.free(&buddy).unwrap();
+        unsafe { pool.free(&buddy) }.unwrap();
         assert!(!pool.dedicated_awaiting_retirement(&buddy));
     }
 
@@ -3352,7 +3319,7 @@ mod budget_tests {
         pool.handle_slice_mut(&mut handle)[..4].copy_from_slice(b"hold");
 
         // Logical trim must not release the mapping's charge.
-        handle.set_len(4);
+        handle.trim_to(4).unwrap();
         assert_eq!(budget.snapshot().file.used_bytes, 8192);
 
         // Move the handle, then drop the pool entirely.
@@ -3364,15 +3331,10 @@ mod budget_tests {
             "file charge must persist while the mapping is live"
         );
 
-        // The mapping is still readable after the pool is gone.
-        match &moved {
-            MemHandle::FileSpill { mmap, len, .. } => {
-                assert_eq!(len, &4);
-                assert_eq!(&mmap[..4], b"hold");
-            }
-            other => panic!("unexpected handle {other:?}"),
-        }
-        drop(moved);
+        // File spill owns its mapping, independently of either owner or peer pool identity.
+        let mut peer = MemPool::open_peer(budget_config(), "unused-peer-prefix".into());
+        assert_eq!(peer.copy_handle_data(&moved).unwrap(), b"hold");
+        peer.release_handle(moved).unwrap();
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3432,7 +3394,7 @@ mod budget_tests {
         );
         assert_eq!(budget.snapshot().shm.used_bytes, dedicated_backing);
         assert_eq!(pool.segment_count(), 0);
-        pool.free(&alloc).unwrap();
+        unsafe { pool.free(&alloc) }.unwrap();
     }
 
     #[test]
@@ -3473,8 +3435,8 @@ mod budget_tests {
         assert_eq!(budget.snapshot().shm.used_bytes, backing * 2);
 
         // Free + GC reclaims the trailing idle segment and returns its charge.
-        pool.free(&a).unwrap();
-        pool.free(&b).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
+        unsafe { pool.free(&b) }.unwrap();
         assert_eq!(pool.gc_buddy(), 1);
         assert_eq!(budget.snapshot().shm.used_bytes, backing);
 
@@ -3487,7 +3449,7 @@ mod budget_tests {
         let d = pool.alloc(20000).unwrap();
         let dedicated_backing = DedicatedSegment::required_shm_size(20000).unwrap() as u64;
         assert_eq!(budget.snapshot().shm.used_bytes, dedicated_backing);
-        pool.free(&d).unwrap();
+        unsafe { pool.free(&d) }.unwrap();
         assert_eq!(budget.snapshot().shm.used_bytes, dedicated_backing);
         pool.dedicated
             .get(&d.seg_idx)
@@ -3757,7 +3719,7 @@ mod pressure_seam_tests {
         assert_eq!(stats.pressure_denied_backings, 1);
         assert_eq!(stats.dedicated_allocs, 1);
         assert_eq!(stats.buddy_expanded_allocs, 0);
-        pool.free(&alloc).unwrap();
+        unsafe { pool.free(&alloc) }.unwrap();
     }
 
     #[test]
@@ -3786,9 +3748,9 @@ mod pressure_seam_tests {
         );
         let s = pool.try_alloc_shm(4096).unwrap();
         assert!(s.is_dedicated());
-        pool.free(&a).unwrap();
-        pool.release_handle(h);
-        pool.release_handle(s);
+        unsafe { pool.free(&a) }.unwrap();
+        pool.release_handle(h).unwrap();
+        pool.release_handle(s).unwrap();
 
         // Forced threshold zero: SHM creation always denied. alloc_handle
         // takes file backing; SHM-only entry points return capacity errors.
@@ -3837,8 +3799,8 @@ mod pressure_seam_tests {
         let a = pool.alloc(4096).unwrap();
         let b = pool.alloc(4096).unwrap();
         assert!(!a.is_dedicated && !b.is_dedicated);
-        pool.free(&a).unwrap();
-        pool.free(&b).unwrap();
+        unsafe { pool.free(&a) }.unwrap();
+        unsafe { pool.free(&b) }.unwrap();
         let charged = budget.snapshot().shm.used_bytes;
         assert_eq!(charged, buddy_total(&config));
 
@@ -3852,7 +3814,7 @@ mod pressure_seam_tests {
         assert_eq!(stats.buddy_reused_allocs, 2);
         assert_eq!(stats.buddy_expanded_allocs, 1);
         assert_eq!(stats.pressure_denied_backings, 0);
-        pool.free(&reused).unwrap();
+        unsafe { pool.free(&reused) }.unwrap();
     }
 
     #[test]
@@ -3971,12 +3933,12 @@ mod pressure_seam_tests {
         assert_eq!(stats.buddy_idle_bytes, 4096);
         assert_eq!(stats.buddy_data_bytes, 8192);
         assert!((stats.utilization_ratio - 0.5).abs() < 1e-9);
-        pool.free(&block).unwrap();
+        unsafe { pool.free(&block) }.unwrap();
         assert_eq!(pool.stats().utilization_ratio, 0.0);
 
         let reused = pool.alloc(4096).unwrap();
         assert_eq!(pool.stats().buddy_reused_allocs, 1);
-        pool.free(&reused).unwrap();
+        unsafe { pool.free(&reused) }.unwrap();
 
         // Dedicated lifecycle: active, then pending-free (read_done unset),
         // then reclaimed — mapped capacity must include pending entries.
@@ -3991,7 +3953,7 @@ mod pressure_seam_tests {
         assert_eq!(stats.dedicated_mapped_bytes, backing);
         assert_eq!(stats.alloc_count, 1);
 
-        pool.free(&dedicated_alloc).unwrap();
+        unsafe { pool.free(&dedicated_alloc) }.unwrap();
         stats = pool.stats();
         assert_eq!(stats.dedicated_active_count, 0);
         assert_eq!(stats.dedicated_active_bytes, 0);

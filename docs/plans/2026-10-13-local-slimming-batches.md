@@ -1,10 +1,19 @@
 # C-Two 局部精简批次记录与收束
 
-## 纯瘦身收束与当前剩余清单（2026-10-16）
+## 纯瘦身收束与当前剩余清单（2026-10-22 同步）
 
-用户确认收束纯瘦身，停止按减行数继续挑批次。纯瘦身最后一个实现提交为 `6afec0f3`（R25 三个 Python prepared-call 入口退役），验收记录提交为 `3382b3ba`。收束时的筛选基于 `3382b3ba`，当时没有新的生产代码或测试修改；下表中的行数是静态方案估算，不是已实现的净减量。后续 R01 正确性修复单列记录，不计作瘦身收益。既有验证仍只绑定各批实现提交。
+用户确认收束纯瘦身，停止按减行数继续挑批次。纯瘦身最后一个实现提交为 `6afec0f3`（R25 三个 Python prepared-call 入口退役），验收记录提交为 `3382b3ba`。收束时的筛选基于 `3382b3ba`，当时没有新的生产代码或测试修改；下表中的行数是静态方案估算，不是已实现的净减量。后续 R01、R02、R03 正确性修复单列记录，不计作瘦身收益。既有验证仍只绑定各批实现提交。
 
-本节是当前状态；后文 2026-10-14 的收束表和 B1–B19 记录保留各阶段的历史事实。完成的子项不代表同编号下所有候选已经完成。纯瘦身余项未获新的实现授权；R01 已按单独批准的方案实施，见 [R01 设计与验收](2026-10-16-r01-allocation-release-evaluation.md)。
+本节是当前状态；后文 2026-10-14 的收束表和 B1–B19 记录保留各阶段的历史事实。完成的子项不代表同编号下所有候选已经完成。纯瘦身余项仍按项确认；C03 已按本次批准边界完成，见下文。R01、R02、R03 已按各自批准的方案实施，见 [R01 设计与验收](2026-10-16-r01-allocation-release-evaluation.md)、[R02 验收](../reports/2026-10-21-r02-unique-write-ownership-acceptance.md)及下文 R03 验收记录。R06/R07 未随 R02 扩展实施。
+
+按快照 `862f6fa9` 的验收记录，原清单 39 个 R 条目分类如下。R04 已由准入竞态修复 B 及随后所有者接管的三系统验收覆盖，本次纠正过期状态，不重复记实施量。C01–C07 设计候选及 T01–T07 测试建议与这些条目交叉，不重复计入完成数；其中 C03、C05、C07 已交付批准的局部子项。随后完成的 bind/connect 系统原因保留不等同于 R17 的 inspect/reap 修复；C03 也未完成 R14/R15 的其他范围，以下计数不变。
+
+| 状态 | 数量 | 条目 |
+| --- | ---: | --- |
+| 已完成，当前无剩余子项 | 12 | R01、R02、R03、R04、R08、R11、R23、R24、R27、R30、R31、R37 |
+| 已完成部分子项 | 13 | R12、R13、R14、R22、R25、R28、R29、R32、R33、R34、R36、R38、R39 |
+| 尚未实施，待修复或评估 | 13 | R05–R07、R09、R10、R15–R21、R35 |
+| 明确保留 | 1 | R26 |
 
 ### 本次筛选后不再单独开批的项目
 
@@ -22,13 +31,15 @@
 
 | 项目 | 剩余范围及处理边界 |
 | --- | --- |
-| R01 | 精确释放身份已实施并完成本机、跨平台和独立审查验收；采用 SHM 3 / IPC 12 / C ABI 5，不留旧格式兼容。读取/唯一写别名及失败释放 owner 仍属 R02/R07。 |
-| R02–R04 | 唯一写所有权、shutdown 发送不确定性、登记开放代际仍是独立 P1。不能因现有测试/CI 通过关闭，也不随 R01 自动实施。 |
-| R05–R07、R17–R18 | SHM 布局接纳、导出/释放同步、失败释放的 owner/charge、端点 I/O 分类及 observer 恢复，按各自反例修复。R01 如调整共享布局，只承接该布局安全接纳所必需的边界。 |
+| R01 | 精确释放身份已实施并完成本机、跨平台和独立审查验收；采用 SHM 3 / IPC 12 / C ABI 5，不留旧格式兼容。safe Rust 读取/唯一写别名已由 R02 修复；失败释放 owner 仍属 R07。 |
+| R03 | shutdown 发送阶段修复已验收：发送前失败可重试，开始控制写后丢确认不再重放；首次端点不存在的处理、ping、原总预算和 ACK 仅 initiate 的语义保持。 |
+| R02 | 唯一写所有权已按完整边界验收：真实分配 owner、接收/发布载体与原 pool 绑定，raw 访问明确 unsafe，封闭可替换 pool 及只读 guard 还原写锁入口。低层 Rust API 无兼容迁移，SHM 3 / IPC 12 / C ABI 5 保持；不替代 R06/R07。 |
+| R04 | 已完成：token 绑定 server instance、UID/revision 与准入代次，关门使旧 token 失效，接管恢复不能复活；同名替换及 owner_missing 后迟到 relay final 的反例有独立覆盖。见[准入修复验收](../reports/2026-10-21-admission-race-repair.md)及[三系统复核](../reports/2026-10-22-release-foundation-review.md)。 |
+| R05–R07、R17–R18 | SHM 布局接纳、导出/释放同步、失败释放的 owner/charge、端点 I/O 分类及 observer 恢复，按各自反例修复。R01 已承接 SHM 3 布局安全接纳所需的边界；R05 须据新布局重新复核，不能直接套用旧反例或视为整项完成。 |
 | R09、R10 | relay 配置快照可能改变读取/错误观察时点；注册快照局部去重约 20 行，独立 borrowed 校验、动态 Resource 方法查找及错误顺序有真实职责。继续暂缓。R08 原环境拒绝语义的解析收敛和 R30 已批准子项已经完成。 |
 | R12、R28 剩余 | 已完成可证明的同值重验删除、登记事实与 validated relay 表示收敛；跨 await 的 authority、owner/locality、代际、peer 活性和错误接纳继续保留。新增删除需另证局部不变量。 |
-| R13 剩余 | 请求所有权移动和 IPC 拼帧已完成；响应快照、初始转换及 SHM prepare/send 合并仍需证明快照、取消、panic 和 free/free_at 差异，测试成本与性能收益尚未支持下一批。 |
-| R14 其他、R15、C03、C04 | bitmap 锁证明、GC admission 进度、chunk assembly/pending permit 代际，以及轮询改通知。分别按正确性或性能目标设计，不为精简删除跨进程锁、回收进度、预算与唤醒保护。 |
+| R13 剩余 | 请求所有权移动和 IPC 拼帧已完成；本次 SHM prepare/send 合并已实施，进入三端与发布门禁验收，见下文。响应快照、初始转换及写锁前取消的未发布分配收尾仍须独立评估，不计作本批修复。 |
+| R14 其他、R15、C03、C04 | C03 的 chunk assembly/pending permit 单一所有权子项已完成，代际与准入围栏保留。bitmap 锁证明、GC admission 进度及轮询改通知仍暂缓。不为精简删除跨进程锁、回收进度、预算与唤醒保护。 |
 | R16 | Node 接收容量须与 readExactly 进度一起设计；直接 pause 可能卡住合法大帧，按容量正确性另立项。 |
 | R19、R20 | CLI 畸形成功响应和示例加载失败后的覆盖行为，属于错误/数据保护修复，不作为纯瘦身执行。 |
 | R22 剩余 | benchmark selector、旧 sweep 和测量标签仅为工具整理。已完成的 SDK 登记/撤回与强制 HTTP 实跑保持。 |
@@ -41,7 +52,80 @@
 | 已完成且无新剩余子项 | R11 登记事实、R27 FIFO 后的死计数、R30 已批准配置子项、R31 owner/冻结事实配对、R37 旧发布脚本等，维持各批验收状态。 |
 | 本机历史目录 | 不清理、不重建、不冷切换，也不将未知路径消失认定为原生回收成功。新实验仅处理本次自己创建且可精确识别的资源。 |
 
-后续破坏性 API/ABI/协议变更继续要求对确切实现提交运行 GitHub Actions 的适用 Linux、macOS、Windows 门禁；协议变更不保留旧表示兼容。纯文档收束没有触发新 CI，也没有使用 hey-my-buddy。
+后续破坏性 API/ABI/协议变更继续要求对确切实现提交运行 GitHub Actions 的适用 Linux、macOS、Windows 门禁；协议变更不保留旧表示兼容。2026-10-16 的纯文档收束没有触发新 CI，也没有使用 hey-my-buddy；后续修复各自记录验证与审查。
+
+2026-10-22：两份控制会话重构方案继续暂缓。Claude 提出的本地 bind/connect 结构化 OS 原因已按[验收记录](../reports/2026-10-22-local-io-cause.md)完成：实现候选 `57b1cab9`，真实三系统、完整 relay、跨语言及 [GitHub Actions 9/9 门禁](https://github.com/Dsssyc/c-two/actions/runs/39722345497)通过，端点验收与产物清理完成。该项与 R17 的 inspect/reap 错误折叠不是同一入口，不将其计作 R17 已完成，也不把诊断增量计作瘦身收益。
+
+### R13 · SHM 响应准备与发送收敛（2026-10-22）
+
+固定基线 `0f63d97e9ab951957490108de83b17b81580578d`，先补行为覆盖的快照为 `89b20a0fe6efc5345765096e435fd491d1600413`，最终实现为 `4cf80c707ed4cf605d0ce4a0ccb98ca27484c474`。普通字节回复复用既有 `try_prepare_shm_response` 和 `PreparedShmResponse`，删除第二套 buddy 分配、复制、元数据与写失败释放链。prepared 发送分支抽为一个具体私有函数；未增加框架、状态机、后台任务或兼容入口。
+
+用户接受低层 Rust 返回类型改为 `Result<Option<PreparedShmResponse>, String>`、普通回复采用既有 `free_at` 的 GC 空闲记账时点和统一诊断文案。max_payload 先于错池检查，分配失败仅在写前回退，写失败直接返回；原池身份、快照、预算、写锁及取消边界、buddy 交接与 dedicated 释放语义保留。ABI 5、IPC 12、SHM 3 与业务 wire 未改。
+
+基线实际覆盖普通/预制、buddy/dedicated 写失败、非整幂长度与旁存分配、完整分块字节以及真实写锁前取消。候选将两个失败测试合并为四种组合，保留所有实质断言。基线已证实写锁前取消保留未发布分配直到 pool 收尾，候选保留该行为；其修复需要单独所有权方案，不扩入本批。
+
+实际生产新增 49、删除 153，净减 104 行；测试新增 131、删除 72，净增 59 行；合计净减 45 行。没有吞吐或延迟提升声明。macOS 已通过基线 reply 8、response 5、候选 server 178、response 5 与完整 relay 416 项；固定候选的独立只读审查无阻断，最后只删除未使用的测试 import。三端、跨语言、端点验收及最终 GitHub Actions 结果继续绑定发布候选收据；本节不将未结束的门禁记为通过。
+
+### C03 · chunk 重组与路由许可单一所有权（2026-10-22，完成）
+
+原只读评估固定于 `862f6fa93a0b49f0a35a4492414e2d790c731140`，当时未修改生产代码和测试，也未构建。原链为：首块取得 route pending permit → registry 分配并登记 assembly → 写 route/method 副本 → 第二张表登记 route/permit → feed → 分别取两张表 → finish → execute。GC、断连和发布回滚必须分别收尾，GC 另扫描 pending 表与 registry 对账。
+
+原设计有实际职责：`c8298c3f` 引入的 permit 使未拼完请求也占用 route 的 `max_pending`，可被关闭/排空策略观察；`f5c9aa33` 增加的代际 ID、发布回滚和准入围栏，保护取消、panic 和同 key 接替。当前 `c2-wire` 管理 backing，`c2-server` 管理路由，两张表来自分层后的所有权分离。本次要合并存储和移交，不撤掉这些职责。
+
+最小替换范围：
+
+- `c2-wire/src/chunk/registry.rs` 的既有 registry 条目携带类型参数 `C`；server 使用现有 `ChunkRouteAdmission` 的 route/method/permit，client 使用 `()`。一次插入发布 assembly 与上下文；插入拒绝把上下文交还调用方。wire 层不解释路由，不依赖 server，也不增加 hook、策略 trait、第二套管理器或后台任务。
+- 复用现有移除及代际检查，取回 `(ChunkAssembler, C)` 后由调用方调用已有 `ChunkAssembler::finish()`。这使 finish 失败时调用方仍持有 permit，能保持跨错误回复 await 的寿命。按代际取回用于发布回滚；guard 保留，删除其双表协调与多余状态。
+- `c2-server/src/server.rs` 删除 `chunk_route_pending`、专属锁、store/take/stale sweep、双发布失败处理及 route/method 对账。`c2-wire/src/assembler.rs` 删除 route/method 的可选副本，退役 `set_route_info`、`FinishedChunk` 旧表示；IPC reply 调用点直接取得 backing。
+- 继续使用 `chunk_admission_gate` 的 Pending/Admitted/Refused/Aborted、原子 commit 与代际 ID；保留首块/后续块排序、跨 await 准入校验、GC 时机、预算、soft limit、trim 原容量计费及 backing 释放权。R15 admission 进度与 R07 失败释放问题不混入。
+
+释放顺序是实施约束：普通 abort、GC、断连仍按 backing→permit；发布 guard 回滚仍按 permit→backing；insert 拒绝和 finish 失败仍持有 permit 直到错误回复完成或任务取消。上下文析构放在 shard/pool 锁外。`try_*` 清理失败须保留整个条目与 charge；成功移出的条目沿用已有锁外释放方式，不能直接在 `retain` 内析构上下文。
+
+| 范围 | 原方案的替换与预计物理行净量（含注释） |
+| --- | --- |
+| 生产 | 双表辅助、发布/对账、回滚和 wire 元数据约 164 行可替换；回补上下文移交、错误返还、锁外析构和调用点约 50–90 行。保守预计净减 70–110 行。 |
+| 测试 | server 的 `chunked_reassembly_via_registry`（50 行）与 `chunked_gc_sweep_releases_stale_route_pending_capacity`（60 行）合入已有 registry 字节/trim 测试和真实 timeout→容量恢复→再次调用测试。原断言职责保留；按代际回滚、持有 permit 等待错误回复、finish 错误和锁外析构补在现有用例。新增/迁移约 90–140 行，预计净减 20 至净增 30 行。 |
+| 合计 | 生产与测试预计净减 40–130 行；主要收益是消除一张所有权表、一把锁、一轮 GC 对账及两份路由元数据。若实际完整覆盖使净收益不成立，重新评估范围，不削减断言凑减量。 |
+
+需要明确接受的影响：低层公开 Rust `ChunkRegistry` 类型和插入/取回接口、`ChunkAssembler` 元数据字段及 `FinishedChunk` 导出改变，所有消费者同步迁移，不留旧入口；高层 Rust/Python SDK 签名、C/FFI ABI 5、IPC 12、SHM 3 和业务 wire 不变。GC 会在该条目移除收尾时归还其 permit，取消原来等待另一次 stale sweep 的滞后；半状态对账的补救错误分支随表示退役。外部帧/路由/容量校验顺序与对应错误保持。这里有清理可见时点变化，不能称为完全无行为变化。
+
+主要回归风险为提前释放 permit、在锁内析构造成锁序问题、旧 guard 误删新代际，以及 reply 侧持有 backing 的计费/池寿命缩短。泛型有两个正式实例，可能增加编译代码量；不承诺吞吐提升。GC 对账与同 key 接替的风险目前仅静态分析，未动态复现，不作为已确认生产故障报告。
+
+确认后的顺序：先在原实现补齐错误回复阻塞和既有释放顺序的行为证据，再迁移单一所有权并收敛重复测试；覆盖取消/panic/断连/timeout、同 key 新代际、buddy/inline/file backing、池锁竞争及 retained reply。完成完整 relay、真实跨语言、macOS/Linux/Windows（Windows 优先开发机）、端点零残留和独立审查；低层 Rust API 变更须对确切候选完成 GitHub Actions 适用跨平台门禁。验证后及时清理产物。
+
+原方案经 hey-my-buddy 0.50.0 独立只读复核，保留释放顺序、GC 时序和测试成本约束。用户随后接受低层 Rust API 与 GC permit 归还时点变化，批准实施。
+
+实施基线为 `ef7098b16d4ae205fcfd674a8d4669478a6da921`，最终实现及测试候选为 `9839951ece928585a3dc2cf08c6c3716ce15f9ec`。实际生产新增 179、删除 381，净减 202 行；测试新增 346、删除 299，净增 47 行；非文档合计净减 155 行。移除一张表、一把锁、GC 对账和重复路由元数据；没有新增管理器、后台任务或兼容入口。Python 手工 assembler 元数据留在既有 PyO3 owner 内，与 consumed 状态一起移动，高层接口保持。
+
+先在基线补齐真实写锁阻塞下的 permit 寿命、池锁竞争下的普通 abort 与发布回滚释放顺序，并用提前归还 permit、反转回滚顺序两个变异证明断言有效。Python 元数据的 finish、失败 finish、abort 三条覆盖也先通过基线。候选复用并扩展真实 timeout/容量恢复、代际、预算和锁外析构测试，退役两个重复用例及一条要求旧补救分支存在的源码词串测试。
+
+macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 416，Rust SDK 19；Linux aarch64 运行时与完整 relay 1225 项通过（4 项既有 ignored）；Windows 开发机完整 Core 1668 项通过，其中缺少 MSVC 环境导致的 C 头文件测试在补齐环境后单独通过。macOS 与 Windows 的 assembler 19、真实跨语言 25 及严格 18 行矩阵均通过；Windows Python 按仓库标准使用 FastDB source 模式，Rust 消费者使用官方 SDK。未将缺少官方 Linux arm64 SDK 的本地容器记作跨语言通过。
+
+[GitHub Actions 39734314720](https://github.com/Dsssyc/c-two/actions/runs/39734314720) 对确切候选完成 9/9 门禁：Linux、macOS、Windows 2022/2025 及 Python 3.14t；FastDB 来源为 `abba785ef2a7d3fbee1bbc608393a3e6c7b042c4`。五个 source 任务均通过各自适用门禁与 Rust/Python 18 行、TypeScript 12 行矩阵。此前候选发现的 PyO3 消费者迁移遗漏及旧源码词串测试已修正后更换候选，未通过重跑相同候选或放宽断言验收。
+
+三轮固定候选及差量的 buddy 独立审查无阻断，Host 已验收并回收审查工作树。Unix 隔离 socket/lease 为零，Windows 本批进程及 C2 命名管道为零；历史目录身份与内容未变。本机约 3.4 GiB、Windows 约 4.2 GiB 构建及临时产物已清理，Windows Rust 工具链保留。本地 HEAD、分支和标签未动，仅向 fork 验证分支推送 CI 候选；两份控制会话重构继续暂缓。
+
+## R02 唯一写所有权（2026-10-21，完成）
+
+基线 `a523967b`，实现候选 `2d1b1d1095f3ab6e4d229fb354262bfc25dd113e`。生产代码净增 204 行，测试净增 526 行；属于正确性修复。18 个漏洞反例先在基线被接纳，候选的 21 条编译探针及真实双客户端错池回归通过；本机完整 Core/relay 1716、Rust SDK 19、native 8，Python ordinary/portable/TypeScript 1231/25/14，以及 18/18 Rust/Python、12/12 TypeScript direct/relay 矩阵通过。
+
+[Actions 39523167030](https://github.com/world-in-progress/c-two/actions/runs/39523167030) 对确切候选的 Linux、macOS、Windows 2022/2025、Python 3.14t 门禁全部通过。新版 buddy 多轮独立审查发现均已关闭，最终固定候选复核通过；本批 socket/lease 零残留，历史目录未动，可重建产物已清理。同环境分配微基准增加约 9.6–15.5 ns（4.7%–6.7%），只读 guard/重组中位数变化低于 1%；未声明 RPC 性能提升。完整来源、接口边界、布局开销、审查及实际增量见 [R02 验收记录](../reports/2026-10-21-r02-unique-write-ownership-acceptance.md)。
+
+## R03 shutdown 发送阶段（2026-10-19，完成）
+
+基线为 0.7.6 的 `fe43f20257947c466d8908d7e47d5a36ead35f99`，实现候选为 `f340d4ec4054a6319f4a0a9128e2b8004b193866`。直接 IPC admin shutdown 仅重试发送前失败；开始控制写后丢失确认，沿用现有未确认结果并停止重发。私有 exchange 区分 NotSent 与 DispatchUncertain，一个单调的 write_started 标记覆盖写失败、读失败和外层超时。ping、首次端点不存在的处理与权限错误顺序、原总预算、ACK 仅证明 initiate、公开 API/ABI、wire、身份校验与生命周期策略保持。
+
+先在原生产实现补齐反例：9 项中 7 项通过，ACK EOF 与外层超时两项均失败于替换监听器收到 shutdown 重放；原生 close 完成后才执行行为断言。修复后相同测试模块 9/9 通过。正常 ACK 与发送前拒绝恢复复用原 responder，两个真实实例替换反例共用一个测试函数；ping 丢回复后重试保持，未新增测试框架。
+
+相对 `fe43f202`，生产代码净增 14 行、测试净增 100 行、文档净增 22 行（含 AGENTS.md 清理规则），合计净增 136 行。按物理行统计，Rust test_seam、测试模块及 cfg(test) 连接拒绝注入计入测试。R03 是独立正确性修复，这些增量不计作瘦身收益。
+
+本机完整 Core 1715 passed（含 relay 416）、Rust SDK 19；Python ordinary 1231、portable 25、TypeScript 14，收据为 18/18 Rust/Python 和 12/12 TypeScript direct/relay 行；Node 61 passed。本机 Python 5 项及 Node 1 项 Windows 专属用例由线上 Windows 覆盖。Core 的 4 个 ignored 是父测试调用的子进程夹具，另 1 个要求特权跨用户环境；未新增 skip/ignored。
+
+[GitHub Actions 39131157512](https://github.com/world-in-progress/c-two/actions/runs/39131157512) 在 attempt 1 对确切候选 `f340d4ec` 完成 9/9 作业。五份源验证收据逐一绑定该 SHA 与 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，118 个适用步骤全部 passed：Linux/macOS 各 25、Windows 2022/2025 各 26、Python 3.14t 为 16。四个 full 作业均实际通过 R03 的 EOF、外层超时、发送前重试和 ping 回归；relay 在 Unix 为 416、Windows 为 411，差异仅为原有 5 个 cfg(unix) 用例。五个平台的跨语言矩阵均为 18/18 和 12/12，两个 Windows 普通用户消费者通过，进程与 reader 收尾收据通过。
+
+新版 hey-my-buddy 0.45.3 的固定候选独立只读审查无阻断发现；Host 补做基线补丁重建及候选测试模块一致性核对。实际 socket/lease 零残留，历史 IPC 目录元数据未变；本机验证副本仅替换隔离命名空间，线上验证原始默认路径源码。原始命令、红绿日志、收据、审查、端点验收与 CI 文本证据保留于 `~/.codex/diagnostics/c2-r03-20261018-912ege8c/`。
+
+用户要求清理后，已删除 79 个 Cargo 构建目录及散落的 native、dist、打包产物，保留源码、Git、日志与收据。收尾仅复核现有证据并修改文档，没有重跑已通过的测试、重建产物或触发新 CI；下载附件仅在内存核对归档哈希，落盘仅保留 JSON、JUnit 与文本日志。AGENTS.md 已加入测试或工作结束后及时清理无用产物的要求；后续文档提交不是新的实现候选。
 
 ## R01 精确分配释放身份（2026-10-16，完成）
 
@@ -286,7 +370,7 @@ R13 在同一 macOS arm64、CPython 3.13.3、相同依赖与 release 参数下�
 
 ### 暂缓项与原因
 
-以下均保持未实施或仅部分完成状态。R01–R07 等为独立正确性审查项，尚未验收为已修复；后续恢复工作时须按当时源码复核，不因本轮 CI 通过而自动关闭。
+以下仅记录 2026-10-14 收束时的状态，不是当前待办表。当时 R01–R07 尚未验收为已修复；后来 R01、R03 已完成，R08、R23、R24、R30、R31 等亦有续批。当前状态以本文顶部及对应验收记录为准，未完成项仍须按当时源码独立复核，不因其他批次 CI 通过而自动关闭。
 
 | 条目 | 剩余范围与暂缓理由 |
 | --- | --- |

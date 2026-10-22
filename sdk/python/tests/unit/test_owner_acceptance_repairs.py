@@ -147,7 +147,7 @@ def test_transport_swap_failure_preserves_native_owner_for_retry(monkeypatch, fa
         assert not old.owner_control_attached
         resource = EchoResource()
         cc.register(Echo, resource, name='acceptance-owner')
-        keepalive.shutdown()
+        keepalive.close()
         deadline = time.monotonic() + 5
         while cc.native_terminal_outcome() is None:
             assert time.monotonic() < deadline
@@ -162,7 +162,7 @@ def test_transport_swap_failure_preserves_native_owner_for_retry(monkeypatch, fa
         AdoptionBoundary.fail_adoption = False
         if isinstance(registry._runtime_session, AdoptionBoundary):
             registry._runtime_session = registry._runtime_session.native_session
-        keepalive.shutdown()
+        keepalive.close()
         assert cc.shutdown(timeout=5)['completed']
         settings.shm_threshold = previous_threshold
 
@@ -184,7 +184,7 @@ def test_owned_child_wait_reaps_and_caches_exit_status():
         with pytest.raises(RuntimeError, match='closed'):
             child.poll()
     finally:
-        keepalive.shutdown()
+        keepalive.close()
 
 
 def test_owned_child_timeout_kill_and_wait_release_the_gil():
@@ -209,7 +209,7 @@ def test_owned_child_timeout_kill_and_wait_release_the_gil():
         child.kill()  # Already reaped is harmless.
         child.close()
     finally:
-        keepalive.shutdown()
+        keepalive.close()
 
 
 @pytest.mark.parametrize('release', ['close', 'drop'])
@@ -238,7 +238,7 @@ def test_owned_child_released_handle_is_reaped_without_blocking(tmp_path, releas
             with pytest.raises(ChildProcessError):
                 os.waitpid(pid, os.WNOHANG)
     finally:
-        keepalive.shutdown()
+        keepalive.close()
 
 
 def test_failed_native_lifecycle_handoff_keeps_both_capabilities_usable():
@@ -258,13 +258,13 @@ def test_failed_native_lifecycle_handoff_keeps_both_capabilities_usable():
         second.ensure_host_started()
         with pytest.raises(Exception, match='after Runtime use'):
             first.transfer_unstarted_lifecycle_to(RuntimeSession())
-        first_keepalive.shutdown()
-        second_keepalive.shutdown()
+        first_keepalive.close()
+        second_keepalive.close()
         assert first.shutdown(route_names=[], timeout_seconds=5)['completed']
         assert second.shutdown(route_names=[], timeout_seconds=5)['completed']
     finally:
-        first_keepalive.shutdown()
-        second_keepalive.shutdown()
+        first_keepalive.close()
+        second_keepalive.close()
         first.shutdown(route_names=[], timeout_seconds=5)
         second.shutdown(route_names=[], timeout_seconds=5)
 

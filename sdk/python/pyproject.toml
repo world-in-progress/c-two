@@ -1,6 +1,6 @@
 [project]
 name = "c-two"
-version = "0.7.6"
+version = "0.8.0"
 description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
 readme = "README.md"
 license-files = ["LICENSE", "licenses/fastdb/LICENSE", "licenses/fastdb/THIRD_PARTY_NOTICES.txt"]
@@ -23,7 +23,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-fastdb = ["fastdb4py==0.2.2"]
+fastdb = ["fastdb4py==0.2.3"]
 
 [build-system]
 requires = ["maturin>=1.7,<2.0"]

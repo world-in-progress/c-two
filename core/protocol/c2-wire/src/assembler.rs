@@ -31,10 +31,6 @@ pub struct ChunkAssembler {
     written_end: usize,
     backing: ReassemblyBacking,
     received_flags: Vec<bool>,
-    /// Route name extracted from the first chunk (server-side).
-    pub route_name: Option<String>,
-    /// Method index extracted from the first chunk (server-side).
-    pub method_idx: Option<u16>,
 }
 
 /// Checked immutable geometry. Only the canonical checks can create this token.
@@ -121,8 +117,6 @@ impl ChunkAssembler {
             written_end: 0,
             backing,
             received_flags: vec![false; total_chunks],
-            route_name: None,
-            method_idx: None,
         })
     }
 
@@ -392,7 +386,7 @@ mod tests {
         assert_eq!(after.buddy_expanded_allocs, before.buddy_expanded_allocs);
         assert_eq!(after.dedicated_allocs, 0);
         assert_eq!(after.file_spill_allocs, 0);
-        guard.release_handle(handle);
+        guard.release_handle(handle).unwrap();
         assert_eq!(guard.stats().alloc_count, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }

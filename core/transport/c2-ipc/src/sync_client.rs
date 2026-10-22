@@ -10,7 +10,7 @@ use c2_mem::MemPool;
 
 use crate::client::{
     ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RequestBlock,
-    RequestTransportKind, RouteBinding, ServerPoolState, choose_request_transport,
+    RequestTransportKind, RouteBinding, choose_request_transport,
 };
 use crate::response::{ResponseData, ResponseLease};
 
@@ -88,6 +88,7 @@ pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
         | IpcError::Shm(_)
         | IpcError::Pool(_) => TransportPhase::PreDispatch,
         IpcError::Io(_)
+        | IpcError::Connect(_)
         | IpcError::Decode(_)
         | IpcError::Chunk(_)
         | IpcError::CrmError(_)
@@ -148,6 +149,15 @@ pub(crate) fn ensure_runtime_with_deadline(
     initialize_runtime(&GLOBAL_RUNTIME, &RUNTIME_INIT, deadline).map(|_| ())
 }
 
+/// Core's dedicated owner-control streams use the existing client I/O executor.
+#[doc(hidden)]
+pub fn shared_io_handle(
+    deadline: c2_config::ConnectDeadline,
+) -> Result<tokio::runtime::Handle, IpcError> {
+    initialize_runtime(&GLOBAL_RUNTIME, &RUNTIME_INIT, deadline)
+        .map(|runtime| runtime.handle().clone())
+}
+
 /// Return the shared tokio runtime, creating it on first call.
 ///
 /// The runtime uses 2 worker threads — sufficient for client I/O.
@@ -183,10 +193,11 @@ const _: () = {
 };
 
 impl SyncClient {
-    /// Connect to a server with optional pool for SHM transfers.
+    /// Connect, taking ownership of an optional pool for SHM transfers.
+    /// No mutable pool alias may survive while a fill callback borrows its storage.
     pub fn connect(
         address: &str,
-        pool: Option<Arc<Mutex<MemPool>>>,
+        pool: Option<MemPool>,
         config: ClientIpcConfig,
     ) -> Result<Self, IpcError> {
         Self::connect_with_endpoint(
@@ -199,7 +210,7 @@ impl SyncClient {
     /// Connect using the caller's already-derived, immutable platform endpoint.
     pub fn connect_with_endpoint(
         endpoint: c2_config::LocalEndpoint,
-        pool: Option<Arc<Mutex<MemPool>>>,
+        pool: Option<MemPool>,
         config: ClientIpcConfig,
     ) -> Result<Self, IpcError> {
         let rt = get_or_create_runtime();
@@ -214,7 +225,7 @@ impl SyncClient {
     /// Share construction with pure policy tests without performing connection I/O.
     fn client_for_endpoint(
         endpoint: c2_config::LocalEndpoint,
-        pool: Option<Arc<Mutex<MemPool>>>,
+        pool: Option<MemPool>,
         config: ClientIpcConfig,
     ) -> IpcClient {
         match pool {
@@ -371,13 +382,13 @@ impl SyncClient {
             .select_request_pool()
             .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
         let mut pool = pool_arc.lock();
-        let alloc = pool
-            .alloc(data.len())
+        let handle = pool
+            .alloc_shm_handle(data.len())
             .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
-        let ptr = match pool.data_ptr(&alloc) {
+        let ptr = match pool.data_ptr(&handle.shm_allocation().expect("SHM allocation")) {
             Ok(ptr) => ptr,
             Err(e) => {
-                let _ = pool.free(&alloc);
+                let _ = pool.release_handle(handle);
                 return Err(IpcError::Pool(format!("data_ptr failed: {e}")));
             }
         };
@@ -385,7 +396,7 @@ impl SyncClient {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
         drop(pool);
-        Ok(RequestBlock::new(pool_arc, alloc))
+        Ok(RequestBlock::new(pool_arc, handle))
     }
 
     /// Allocate from the client SHM pool and let the caller fill the block.
@@ -408,20 +419,20 @@ impl SyncClient {
             .inner
             .select_request_pool()
             .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
-        let (alloc, ptr) = {
+        let (handle, ptr) = {
             let mut pool = pool_arc.lock();
-            let alloc = pool
-                .alloc(data_size)
+            let handle = pool
+                .alloc_shm_handle(data_size)
                 .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
-            match pool.data_ptr(&alloc) {
-                Ok(ptr) => (alloc, ptr),
+            match pool.data_ptr(&handle.shm_allocation().expect("SHM allocation")) {
+                Ok(ptr) => (handle, ptr),
                 Err(e) => {
-                    let _ = pool.free(&alloc);
+                    let _ = pool.release_handle(handle);
                     return Err(IpcError::Pool(format!("data_ptr failed: {e}")));
                 }
             }
         };
-        let block = RequestBlock::new(pool_arc, alloc);
+        let block = RequestBlock::new(pool_arc, handle);
         let destination = unsafe { std::slice::from_raw_parts_mut(ptr, data_size) };
         if let Err(err) = fill(destination) {
             let _ = block.release();
@@ -438,14 +449,15 @@ impl SyncClient {
         let _ = block.release();
     }
 
-    /// Synchronous CRM call with pre-allocated SHM data through an immutable route binding.
+    /// Publish the block's original requested length through its allocating
+    /// connection and an immutable route binding.
     pub fn call_bound_prealloc(
         &self,
         binding: &RouteBinding,
         method_name: &str,
         block: &RequestBlock,
-        data_size: usize,
     ) -> Result<ResponseData, IpcError> {
+        let data_size = block.len();
         let (method_idx, identity) = match (|| {
             let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
             let data_size_u64 = u64::try_from(data_size).unwrap_or(u64::MAX);
@@ -463,15 +475,8 @@ impl SyncClient {
                 return Err(err);
             }
         };
-        self.rt.block_on(
-            self.inner
-                .call_with_prealloc(&identity, method_idx, block, data_size),
-        )
-    }
-
-    /// Get a reference to the server SHM pool (for FFI layer).
-    pub fn server_pool_arc(&self) -> Arc<Mutex<Option<ServerPoolState>>> {
-        self.inner.server_pool.clone()
+        self.rt
+            .block_on(self.inner.call_with_prealloc(&identity, method_idx, block))
     }
 
     /// The transport-owned request pool this client currently holds, if any.
@@ -495,7 +500,7 @@ impl SyncClient {
     /// Reassembled handles carry their own pool and budget charge inside the
     /// [`c2_wire::chunk::ReassemblyBacking`] carrier.
     pub fn lease_response(&self, response: ResponseData) -> ResponseLease {
-        ResponseLease::new(response, self.server_pool_arc())
+        ResponseLease::new(response)
     }
 
     /// Synchronous close.
@@ -511,7 +516,7 @@ impl SyncClient {
     /// slots detached within `timeout`. Live RequestBlocks, held carriers and
     /// dedicated-retire jobs retain their exact pools and budget charges.
     /// IPC-owned cleanup-lock contention returns `false` with the cleanup
-    /// owners reachable for a later close; injected pools remain external.
+    /// owners reachable for a later close; injected pools remain attached.
     /// Busy connection cleanup stays owned for retry. This is not a hard
     /// real-time bound on OS scheduling or mapping destruction.
     pub fn close_shared(&self, timeout: std::time::Duration) -> bool {
@@ -525,6 +530,11 @@ impl SyncClient {
     /// Whether the client is connected.
     pub fn is_connected(&self) -> bool {
         self.inner.is_connected()
+    }
+
+    /// Observe the existing physical connection without connecting/reconnecting.
+    pub fn connection_observation(&self) -> Option<c2_local::ConnectionObservation> {
+        self.inner.connection_observation()
     }
 
     /// Get the route table for a named route.
@@ -805,7 +815,7 @@ pub(crate) mod tests {
             },
             ..ClientIpcConfig::default()
         };
-        let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default())));
+        let pool = MemPool::new(c2_mem::PoolConfig::default());
         let client = SyncClient {
             inner: IpcClient::with_pool("ipc://sync_selector", pool, config),
             rt: get_or_create_runtime().handle().clone(),
@@ -899,16 +909,15 @@ pub(crate) mod tests {
     fn sync_client_factory_with_external_pool_preserves_snapshot_and_policy_gate() {
         let endpoint = factory_test_endpoint();
         let config = factory_test_config();
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+        let pool = MemPool::new_with_prefix_and_budget(
             config.base.primary_pool_config(&config.pool_tuning()),
             "sync-factory-injected".into(),
             c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits()),
-        )));
-        let client =
-            SyncClient::client_for_endpoint(endpoint.clone(), Some(pool.clone()), config.clone());
+        );
+        let client = SyncClient::client_for_endpoint(endpoint.clone(), Some(pool), config.clone());
         assert_eq!(client.config(), &config);
         assert_eq!(client.local_endpoint().unwrap(), &endpoint);
-        assert!(Arc::ptr_eq(&client.request_pool().unwrap(), &pool));
+        let pool = client.request_pool().unwrap();
         assert!(!pool.lock().config().buddy_enabled);
 
         // Both injected-pool rejections occur before OS connection or allocation.
@@ -922,19 +931,16 @@ pub(crate) mod tests {
             config.validate().unwrap();
             let mut pool_config = config.base.primary_pool_config(&config.pool_tuning());
             pool_config.buddy_enabled = buddy_enabled;
-            let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+            let pool = MemPool::new_with_prefix_and_budget(
                 pool_config,
                 "sync-factory-rejected".into(),
                 c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits()),
-            )));
-            let mut client = SyncClient::client_for_endpoint(
-                endpoint.clone(),
-                Some(pool.clone()),
-                config.clone(),
             );
+            let mut client =
+                SyncClient::client_for_endpoint(endpoint.clone(), Some(pool), config.clone());
             assert_eq!(client.config(), &config);
             assert_eq!(client.local_endpoint().unwrap(), &endpoint);
-            assert!(Arc::ptr_eq(&client.request_pool().unwrap(), &pool));
+            let pool = client.request_pool().unwrap();
             let error = get_or_create_runtime()
                 .block_on(client.connect())
                 .unwrap_err();
@@ -950,8 +956,9 @@ pub(crate) mod tests {
             shm_threshold: 1,
             ..ClientIpcConfig::default()
         };
-        let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default())));
-        let inner = IpcClient::with_pool("ipc://sync_payload_limit", pool.clone(), config);
+        let pool = MemPool::new(c2_mem::PoolConfig::default());
+        let inner = IpcClient::with_pool("ipc://sync_payload_limit", pool, config);
+        let pool = inner.request_pool().unwrap();
         inner.route_directory.write().insert_table(
             "grid".to_string(),
             MethodTable::from_entries(
@@ -997,7 +1004,7 @@ pub(crate) mod tests {
             .bind_cached_route(&expected)
             .expect("cached test route should bind");
         let err = client
-            .call_bound_prealloc(&binding, "ping", &alloc, 5)
+            .call_bound_prealloc(&binding, "ping", &alloc)
             .unwrap_err();
 
         assert!(err.to_string().contains("max_payload_size"));
@@ -1218,19 +1225,20 @@ pub(crate) mod tests {
     /// pool instead of stranding the charge until the client is dropped.
     #[test]
     fn pool_alloc_and_fill_panic_releases_the_allocation() {
-        let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig {
+        let pool = MemPool::new(c2_mem::PoolConfig {
             segment_size: 65_536,
             max_segments: 1,
             ..c2_mem::PoolConfig::default()
-        })));
+        });
         let inner = IpcClient::with_pool(
             "ipc://fill_panic_release",
-            Arc::clone(&pool),
+            pool,
             ClientIpcConfig {
                 shm_threshold: 1,
                 ..ClientIpcConfig::default()
             },
         );
+        let pool = inner.request_pool().unwrap();
         let client = SyncClient {
             inner,
             rt: get_or_create_runtime().handle().clone(),

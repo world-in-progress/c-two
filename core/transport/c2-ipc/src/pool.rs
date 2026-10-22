@@ -172,7 +172,7 @@ fn cleanup_deadline(deadline: ConnectDeadline) -> Instant {
 fn is_transient_connect_error(error: &IpcError) -> bool {
     matches!(
         error,
-        IpcError::Io(io_error)
+        IpcError::Io(io_error) | IpcError::Connect(io_error)
             if matches!(
                 io_error.kind(),
                 ErrorKind::UnexpectedEof
@@ -1698,7 +1698,7 @@ mod tests {
             _route_name: &str,
             _method_idx: u16,
             _request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(b"ok".to_vec()))
         }

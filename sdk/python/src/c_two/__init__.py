@@ -1,7 +1,11 @@
 from importlib.metadata import version
 __version__ = version('c-two')
 
-from ._native import NativeOwnerReceiver, OwnerControlKeepalive, OwnedChild
+from ._native import (
+    NativeOwnerBootstrap, OwnerControl, OwnedChild,
+    OwnerRecoveryTicket, PreparedOwnerTakeover, OwnerStatus, OwnerControlError,
+    ConnectionClosed, ConnectionObservation, ConnectionEvent, ConnectionEvents, ConnectionEventsLagged,
+)
 from . import error
 from .config import (
     BaseIPCOverrides,
@@ -35,7 +39,7 @@ from .transport.endpoint import (
     reap_endpoint,
     sweep_endpoints,
 )
-from .transport.client.proxy import with_call_options
+from .transport.client.proxy import connection_observation, with_call_options
 from .transport.input_lifetime import InputLifetime
 from .transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 from .transport.registry import (
@@ -58,20 +62,25 @@ from .transport.registry import (
     hold_stats,
     memory_stats,
     owner_control_pair,
+    prepare_owner_takeover,
     adopt_owner_stdin,
     spawn_owned_child,
     native_lifecycle_snapshot,
+    connection_events,
     native_terminal_outcome,
 )
 
 __all__ = [
+    'ConnectionClosed', 'ConnectionObservation', 'ConnectionEvent', 'ConnectionEvents',
+    'ConnectionEventsLagged', 'connection_observation', 'connection_events',
     '__version__',
     'error',
     'BaseIPCOverrides',
     'ClientIPCOverrides',
     'LifecycleConfig',
-    'NativeOwnerReceiver',
-    'OwnerControlKeepalive',
+    'NativeOwnerBootstrap',
+    'OwnerControl',
+    'OwnerRecoveryTicket', 'PreparedOwnerTakeover', 'OwnerStatus', 'OwnerControlError',
     'OwnedChild',
     'ServerIPCOverrides',
     'ContractArtifact',
@@ -126,6 +135,7 @@ __all__ = [
     'hold_stats',
     'memory_stats',
     'owner_control_pair',
+    'prepare_owner_takeover',
     'adopt_owner_stdin',
     'spawn_owned_child',
     'native_lifecycle_snapshot',

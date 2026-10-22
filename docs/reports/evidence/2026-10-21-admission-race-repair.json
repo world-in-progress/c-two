@@ -1,0 +1,131 @@
+{
+  "schema": "c-two.admission-race-local-evidence.v1",
+  "date": "2026-10-21",
+  "baseline": "0acf784f6742487cd619a7d419379f693434a337",
+  "scope": "B admission only",
+  "branch_and_tags_unchanged": true,
+  "committed_pushed_released": false,
+  "platforms_executed": [
+    "macOS arm64"
+  ],
+  "python": "3.13",
+  "source_files": {
+    "core/runtime/c2-core/src/session.rs": "2c968b8f9822c51aa0a74805fd7093333b2484e48fe89d089ea3b0556a21e479",
+    "core/transport/c2-server/src/server.rs": "fe69ca3ba3d062d6a9d8bbf9ab3bcd74c1d0cd53163bc4527345c3ac2e6a0cae",
+    "core/runtime/c2-core/tests/owner_bound_lifecycle.rs": "821889620cb80f58f328630880352039a5effe9d0bbdc3dffe6477fcb45516d0"
+  },
+  "isolated_export": {
+    "source_files_audited": 847,
+    "exceptions": [
+      "core/foundation/c2-config/src/local.rs",
+      "core/transport/c2-local/src/unix_managed/directories.rs",
+      "sdk/python/tests/unit/test_endpoint_context.py",
+      "sdk/python/tests/unit/test_ipc_address_validation.py",
+      "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs"
+    ],
+    "primary_default_namespace_changed": false,
+    "historical_directories_accessed": false
+  },
+  "baseline_tests": {
+    "expected_failures": 6,
+    "positive_controls": 3,
+    "production_unchanged": true
+  },
+  "review_regression": {
+    "test": "unrelated_unregister_preserves_pending_registration_rollback",
+    "before_fix": "assertion failed: rollback.local_removed",
+    "after_fix": "passed"
+  },
+  "checks": {
+    "rust_server_passed": 165,
+    "rust_core_passed": 206,
+    "rust_core_existing_ignored_fixture_entries": 4,
+    "rust_http_relay_passed": 416,
+    "python_isolated_passed": 195,
+    "python_export_git_metadata_skip": 1,
+    "python_git_metadata_original_checkout_passed": 1,
+    "public_signature_declarations_equal": 134,
+    "git_diff_check": true
+  },
+  "endpoint_audit": {
+    "default_socket_root": {
+      "sockets": [],
+      "leases": [],
+      "root_entries": []
+    },
+    "coordination_root": {
+      "sockets": [],
+      "leases": [],
+      "root_entries": [
+        ".gate.marker",
+        ".gate"
+      ]
+    },
+    "task_tmp": {
+      "sockets": [],
+      "leases": [],
+      "root_entries": [
+        "c_two_spill",
+        "c2-relay-start-1d40d9aa3869faf2160188e8.lock",
+        "pytest-of-soku"
+      ]
+    },
+    "task_ipc": {
+      "sockets": [],
+      "leases": [],
+      "root_entries": []
+    }
+  },
+  "delta": {
+    "production": {
+      "added": 122,
+      "removed": 50,
+      "net": 72
+    },
+    "test": {
+      "added": 649,
+      "removed": 26,
+      "net": 623
+    }
+  },
+  "review": {
+    "skill_version": "0.50.0",
+    "run_id": "3166d054-f006-40ad-8021-40f0e8bc1780",
+    "snapshot": "33552002676a23f82894ad347e70ffd6380fc234",
+    "artifact_id": "87b16c0c-d09b-412d-a9ba-def10eb8d07d",
+    "verdict": "accepted; no remaining static blockers"
+  },
+  "build_artifact": {
+    "wheel_name": "c_two-0.7.6-cp313-cp313-macosx_11_0_arm64.whl",
+    "sha256": "da8b2f15569de06f978f40702add71c3c154c7066d7476e32c2600ae04fd7742",
+    "source_native_files": [
+      "c_two/_native.cpython-313-darwin.so",
+      "c_two.dylibs/libfastdb-669e6a9b.dylib"
+    ]
+  },
+  "cleanup": {
+    "all_listed_outputs_removed": true,
+    "allocated_kib_removed": 2348548,
+    "retained": [
+      "source",
+      "logs",
+      "scripts",
+      "hashes",
+      "review receipts",
+      "namespace gate/marker"
+    ]
+  },
+  "log_sha256": {
+    "baseline-server-open.log": "09e664dcbeaa5383fd8b94090a51c895ebb8da98b17fb144a2fbd4108b48e680",
+    "baseline-server-token.log": "e0f23b58933222634b0b59a39094d923599e4743be555e4649d97203788f4edc",
+    "baseline-core-replacement.log": "768aa00634ec8a84c58f85193ed29f4687cbb9f1cfff87fcd2328a2dd95815bb",
+    "baseline-core-failure.log": "7664b14c81ee673a00a71c84e84256ef1b2f64cc6de285813161ff04d3123bf2",
+    "baseline-owner-relay.log": "d95db39a67529852dd7c27a51dabe119158cad5d860c02a0359cee9fdd55d1d4",
+    "review-before-fix-scope-retirement.log": "3c2120f53333ef567d20311805957ef08804ccbadf6218b13e123df94834a0b8",
+    "candidate-2-rust-full.log": "78ebda7a610d6962cc73bc05661331d9768ffdc111b41ee536b79de4c9797997",
+    "candidate-3-rust-full.log": "3b6a6fe641a66f92c5babc95e6a10659dd2a79bff86cb5b0b9d0c437c1bcd9b1",
+    "candidate-4-core-final.log": "bce3e2c6b2cc02d89e97dd7812c76b90c43a12519ba16586b7909a805879de70",
+    "python-full-relay.log": "3c109e806056d7a9cfe761f3c06ef2aa24167c24310f801d6143b487fee9f6f4",
+    "python-git-metadata.log": "99a24796443a1d07f66a424f8116a06a2079063af758e7d3c87801c191ad2ecd"
+  }
+}

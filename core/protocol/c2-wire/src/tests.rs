@@ -3,6 +3,445 @@
 //! Tests verify round-trip encoding/decoding and canonical cross-language
 //! wire compatibility fixtures.
 
+mod owner_control_tests {
+    use crate::owner_control::*;
+
+    // Handwritten bytes, never produced by the codec under test. The address
+    // occupies four UTF-8 bytes; the distinct byte ranges expose field swaps.
+    const IDENTITY: &[u8] = b"\x04\x00a\xe7\x95\x8c\x01\x00s\x01\x00i\
+        \x01\x02\x03\x04\x05\x06\x07\x08\
+        \x10\x11\x12\x13\x14\x15\x16\x17\
+        \x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\
+        \x20\x21\x22\x23\x24\x25\x26\x27\
+        \x28\x29\x2a\x2b\x2c\x2d\x2e\x2f";
+    const SECRET: &[u8] = b"\x30\x31\x32\x33\x34\x35\x36\x37\
+        \x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\
+        \x40\x41\x42\x43\x44\x45\x46\x47\
+        \x48\x49\x4a\x4b\x4c\x4d\x4e\x4f";
+    const SUCCESSOR: &[u8] = b"\x50\x51\x52\x53\x54\x55\x56\x57\
+        \x58\x59\x5a\x5b\x5c\x5d\x5e\x5f\
+        \x60\x61\x62\x63\x64\x65\x66\x67\
+        \x68\x69\x6a\x6b\x6c\x6d\x6e\x6f";
+
+    fn ticket() -> OwnerTicketWire {
+        OwnerTicketWire {
+            address: "a界".into(),
+            server_id: "s".into(),
+            server_instance_id: "i".into(),
+            epoch: 0x0807_0605_0403_0201,
+            context_binding: std::array::from_fn(|i| 0x10 + i as u8),
+            secret: std::array::from_fn(|i| 0x30 + i as u8),
+        }
+    }
+
+    fn status(phase: OwnerPhaseWire) -> OwnerStatusWire {
+        let ticket = ticket();
+        OwnerStatusWire {
+            address: ticket.address,
+            server_id: ticket.server_id,
+            server_instance_id: ticket.server_instance_id,
+            epoch: ticket.epoch,
+            context_binding: ticket.context_binding,
+            phase,
+        }
+    }
+
+    fn request_cases() -> Vec<(OwnerRequest, Vec<u8>)> {
+        vec![
+            (OwnerRequest::Hello, vec![0x16, 1, 1]),
+            (OwnerRequest::GetRecoveryTicket, vec![0x16, 1, 2]),
+            (OwnerRequest::RevokeRecovery, vec![0x16, 1, 3]),
+            (
+                OwnerRequest::Takeover {
+                    ticket: ticket(),
+                    successor_secret: std::array::from_fn(|i| 0x50 + i as u8),
+                },
+                [b"\x16\x01\x04".as_slice(), IDENTITY, SECRET, SUCCESSOR].concat(),
+            ),
+            (OwnerRequest::RequestShutdown, vec![0x16, 1, 5]),
+        ]
+    }
+
+    fn response_cases() -> Vec<(OwnerResponse, Vec<u8>)> {
+        vec![
+            (
+                OwnerResponse::Status(status(OwnerPhaseWire::OwnerMissing)),
+                [b"\x16\x01\x01".as_slice(), IDENTITY, b"\x02"].concat(),
+            ),
+            (
+                OwnerResponse::RecoveryTicket(ticket()),
+                [b"\x16\x01\x02".as_slice(), IDENTITY, SECRET].concat(),
+            ),
+            (OwnerResponse::Revoked, vec![0x16, 1, 3]),
+            (
+                OwnerResponse::TakenOver(status(OwnerPhaseWire::Armed)),
+                [b"\x16\x01\x04".as_slice(), IDENTITY, b"\x01"].concat(),
+            ),
+            (OwnerResponse::ShutdownInitiated, vec![0x16, 1, 5]),
+            (
+                OwnerResponse::Rejected(OwnerRejection::InvalidGrant),
+                vec![0x16, 1, 255, 5],
+            ),
+        ]
+    }
+
+    #[test]
+    fn all_request_operations_match_handwritten_goldens() {
+        for (request, golden) in request_cases() {
+            assert_eq!(encode_owner_request(&request).unwrap(), golden);
+            assert_eq!(decode_owner_request(&golden).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn all_response_operations_match_handwritten_goldens() {
+        for (response, golden) in response_cases() {
+            assert_eq!(encode_owner_response(&response).unwrap(), golden);
+            assert_eq!(decode_owner_response(&golden).unwrap(), response);
+        }
+    }
+
+    #[test]
+    fn phase_and_rejection_discriminants_match_handwritten_goldens() {
+        for (byte, phase) in [
+            (1, OwnerPhaseWire::Armed),
+            (2, OwnerPhaseWire::OwnerMissing),
+            (3, OwnerPhaseWire::Draining),
+            (4, OwnerPhaseWire::Finished),
+            (5, OwnerPhaseWire::WatcherIoError),
+        ] {
+            for op in [1, 4] {
+                let golden = [&[0x16, 1, op], IDENTITY, &[byte]].concat();
+                let response = if op == 1 {
+                    OwnerResponse::Status(status(phase))
+                } else {
+                    OwnerResponse::TakenOver(status(phase))
+                };
+                assert_eq!(encode_owner_response(&response).unwrap(), golden);
+                assert_eq!(decode_owner_response(&golden).unwrap(), response);
+            }
+        }
+        for (byte, reason) in [
+            (1, OwnerRejection::Malformed),
+            (2, OwnerRejection::UnsupportedVersion),
+            (3, OwnerRejection::IdentityMismatch),
+            (4, OwnerRejection::OwnerPresent),
+            (5, OwnerRejection::InvalidGrant),
+            (6, OwnerRejection::GraceExpired),
+            (7, OwnerRejection::ShuttingDown),
+            (8, OwnerRejection::Unavailable),
+        ] {
+            let golden = [0x16, 1, 255, byte];
+            let response = OwnerResponse::Rejected(reason);
+            assert_eq!(encode_owner_response(&response).unwrap(), golden);
+            assert_eq!(decode_owner_response(&golden).unwrap(), response);
+        }
+    }
+
+    #[test]
+    fn every_truncated_or_extended_golden_is_rejected() {
+        for (_, mut golden) in request_cases() {
+            for len in 0..golden.len() {
+                assert!(decode_owner_request(&golden[..len]).is_err(), "{len}");
+            }
+            golden.push(0);
+            assert_eq!(
+                decode_owner_request(&golden),
+                Err(OwnerWireError::Malformed)
+            );
+        }
+        for (_, mut golden) in response_cases() {
+            for len in 0..golden.len() {
+                assert!(decode_owner_response(&golden[..len]).is_err(), "{len}");
+            }
+            golden.push(0);
+            assert_eq!(
+                decode_owner_response(&golden),
+                Err(OwnerWireError::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_tags_versions_operations_and_enums_are_rejected() {
+        for byte in 0..=255 {
+            if byte != 0x16 {
+                assert_eq!(
+                    decode_owner_request(&[byte, 1, 1]),
+                    Err(OwnerWireError::Malformed)
+                );
+                assert_eq!(
+                    decode_owner_response(&[byte, 1, 3]),
+                    Err(OwnerWireError::Malformed)
+                );
+            }
+            if byte != 1 {
+                assert_eq!(
+                    decode_owner_request(&[0x16, byte, 1]),
+                    Err(OwnerWireError::UnsupportedVersion)
+                );
+                assert_eq!(
+                    decode_owner_response(&[0x16, byte, 3]),
+                    Err(OwnerWireError::UnsupportedVersion)
+                );
+            }
+            if !(1..=5).contains(&byte) {
+                assert_eq!(
+                    decode_owner_request(&[0x16, 1, byte]),
+                    Err(OwnerWireError::Malformed)
+                );
+                if byte != 255 {
+                    assert_eq!(
+                        decode_owner_response(&[0x16, 1, byte]),
+                        Err(OwnerWireError::Malformed)
+                    );
+                }
+                for op in [1, 4] {
+                    let payload = [&[0x16, 1, op], IDENTITY, &[byte]].concat();
+                    assert_eq!(
+                        decode_owner_response(&payload),
+                        Err(OwnerWireError::Malformed)
+                    );
+                }
+            }
+            if !(1..=8).contains(&byte) {
+                assert_eq!(
+                    decode_owner_response(&[0x16, 1, 255, byte]),
+                    Err(OwnerWireError::Malformed)
+                );
+            }
+        }
+        // Correct tag but no version is a format error, not a version error.
+        assert_eq!(
+            decode_owner_request(&[0x16]),
+            Err(OwnerWireError::Malformed)
+        );
+        assert_eq!(
+            decode_owner_response(&[0x16]),
+            Err(OwnerWireError::Malformed)
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_and_string_lengths_are_rejected_in_each_field() {
+        for (op, body, is_request) in [
+            (4, [IDENTITY, SECRET, SUCCESSOR].concat(), true),
+            (2, [IDENTITY, SECRET].concat(), false),
+            (1, [IDENTITY, b"\x01"].concat(), false),
+            (4, [IDENTITY, b"\x02"].concat(), false),
+        ] {
+            let golden = [&[0x16, 1, op], body.as_slice()].concat();
+            for (length_offset, text_offset) in [(3, 5), (9, 11), (12, 14)] {
+                let mut invalid_utf8 = golden.clone();
+                invalid_utf8[text_offset] = 0xff;
+                let mut overlong = golden.clone();
+                overlong[length_offset..length_offset + 2].copy_from_slice(&[0xff, 0xff]);
+                for payload in [invalid_utf8, overlong] {
+                    if is_request {
+                        assert_eq!(
+                            decode_owner_request(&payload),
+                            Err(OwnerWireError::Malformed)
+                        );
+                    } else {
+                        assert_eq!(
+                            decode_owner_response(&payload),
+                            Err(OwnerWireError::Malformed)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_payload_limit_is_enforced_for_both_decoders() {
+        assert_eq!(MAX_OWNER_PAYLOAD_SIZE, 4096);
+        for op in [1, 2, 3, 4, 5, 255] {
+            let mut oversized = vec![0; 4097];
+            oversized[..3].copy_from_slice(&[0x16, 1, op]);
+            assert_eq!(
+                decode_owner_request(&oversized),
+                Err(OwnerWireError::PayloadTooLarge)
+            );
+            assert_eq!(
+                decode_owner_response(&oversized),
+                Err(OwnerWireError::PayloadTooLarge)
+            );
+        }
+    }
+
+    #[test]
+    fn encoding_limits_include_header_and_all_fixed_fields() {
+        // Empty text fields leave 81 bytes for a ticket response, 113 for a
+        // takeover request, and 50 for a status response (including headers).
+        for (op, fixed_size) in [(2, 81), (4, 113), (1, 50)] {
+            let address_len = 4096 - fixed_size;
+            let mut ticket = OwnerTicketWire {
+                address: "a".repeat(address_len),
+                server_id: String::new(),
+                server_instance_id: String::new(),
+                epoch: 0,
+                context_binding: [0; 32],
+                secret: [0; 32],
+            };
+            let mut golden = vec![0x16, 1, op];
+            golden.extend_from_slice(&(address_len as u16).to_le_bytes());
+            golden.extend_from_slice(&vec![b'a'; address_len]);
+            golden.extend_from_slice(&[0; 4 + 8 + 32]);
+            if op == 1 {
+                golden.push(1);
+            } else {
+                golden.extend_from_slice(&[0; 32]);
+                if op == 4 {
+                    golden.extend_from_slice(&[0; 32]);
+                }
+            }
+            assert_eq!(golden.len(), 4096);
+            if op == 4 {
+                let request = OwnerRequest::Takeover {
+                    ticket: ticket.clone(),
+                    successor_secret: [0; 32],
+                };
+                assert_eq!(encode_owner_request(&request).unwrap(), golden);
+                assert_eq!(decode_owner_request(&golden).unwrap(), request);
+                ticket.address.push('a');
+                assert_eq!(
+                    encode_owner_request(&OwnerRequest::Takeover {
+                        ticket,
+                        successor_secret: [0; 32]
+                    }),
+                    Err(OwnerWireError::PayloadTooLarge)
+                );
+            } else if op == 2 {
+                let response = OwnerResponse::RecoveryTicket(ticket.clone());
+                assert_eq!(encode_owner_response(&response).unwrap(), golden);
+                assert_eq!(decode_owner_response(&golden).unwrap(), response);
+                ticket.address.push('a');
+                assert_eq!(
+                    encode_owner_response(&OwnerResponse::RecoveryTicket(ticket)),
+                    Err(OwnerWireError::PayloadTooLarge)
+                );
+            } else {
+                let mut status = OwnerStatusWire {
+                    address: ticket.address,
+                    server_id: ticket.server_id,
+                    server_instance_id: ticket.server_instance_id,
+                    epoch: 0,
+                    context_binding: [0; 32],
+                    phase: OwnerPhaseWire::Armed,
+                };
+                let response = OwnerResponse::Status(status.clone());
+                assert_eq!(encode_owner_response(&response).unwrap(), golden);
+                assert_eq!(decode_owner_response(&golden).unwrap(), response);
+                status.address.push('a');
+                assert_eq!(
+                    encode_owner_response(&OwnerResponse::Status(status.clone())),
+                    Err(OwnerWireError::PayloadTooLarge)
+                );
+                assert_eq!(
+                    encode_owner_response(&OwnerResponse::TakenOver(status)),
+                    Err(OwnerWireError::PayloadTooLarge)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn excessive_text_lengths_are_rejected_without_payload_diagnostics() {
+        for len in [4096, u16::MAX as usize, u16::MAX as usize + 1] {
+            for field in 0..3 {
+                let mut ticket = ticket();
+                let text = "s".repeat(len);
+                match field {
+                    0 => ticket.address = text,
+                    1 => ticket.server_id = text,
+                    _ => ticket.server_instance_id = text,
+                }
+                let error = encode_owner_response(&OwnerResponse::RecoveryTicket(ticket.clone()))
+                    .unwrap_err();
+                assert_eq!(error, OwnerWireError::PayloadTooLarge);
+                assert_eq!(
+                    format!("{error}"),
+                    "owner control payload exceeds size limit"
+                );
+                assert_eq!(format!("{error:?}"), "PayloadTooLarge");
+                assert_eq!(
+                    encode_owner_request(&OwnerRequest::Takeover {
+                        ticket,
+                        successor_secret: [0; 32]
+                    }),
+                    Err(error)
+                );
+            }
+        }
+        assert_eq!(
+            OwnerWireError::Malformed.to_string(),
+            "malformed owner control payload"
+        );
+        assert_eq!(
+            OwnerWireError::UnsupportedVersion.to_string(),
+            "unsupported owner control version"
+        );
+    }
+
+    #[test]
+    fn codec_leaves_business_identity_validation_to_core() {
+        let ticket = OwnerTicketWire {
+            address: "not an IPC address\0界".into(),
+            server_id: String::new(),
+            server_instance_id: " / \\ ".into(),
+            epoch: u64::MAX,
+            context_binding: [0xff; 32],
+            secret: [0; 32],
+        };
+        let response = OwnerResponse::RecoveryTicket(ticket.clone());
+        assert_eq!(
+            decode_owner_response(&encode_owner_response(&response).unwrap()).unwrap(),
+            response
+        );
+        let request = OwnerRequest::Takeover {
+            ticket,
+            successor_secret: [0; 32],
+        };
+        assert_eq!(
+            decode_owner_request(&encode_owner_request(&request).unwrap()).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn debug_redacts_ticket_and_successor_secrets_in_nested_values() {
+        let first = ticket();
+        let mut second = first.clone();
+        second.secret = [0xa7; 32];
+        for pretty in [false, true] {
+            let debug = |value: &dyn std::fmt::Debug| {
+                if pretty {
+                    format!("{value:#?}")
+                } else {
+                    format!("{value:?}")
+                }
+            };
+            assert_eq!(debug(&first), debug(&second));
+            assert!(debug(&first).contains("[REDACTED]"));
+            assert_eq!(
+                debug(&OwnerResponse::RecoveryTicket(first.clone())),
+                debug(&OwnerResponse::RecoveryTicket(second.clone()))
+            );
+            let before = OwnerRequest::Takeover {
+                ticket: first.clone(),
+                successor_secret: [0xb9; 32],
+            };
+            let after = OwnerRequest::Takeover {
+                ticket: second.clone(),
+                successor_secret: [0xc8; 32],
+            };
+            assert_eq!(debug(&before), debug(&after));
+            assert_eq!(debug(&before).matches("[REDACTED]").count(), 2);
+        }
+    }
+}
+
 mod frame_tests {
     use crate::flags::*;
     use crate::frame::*;

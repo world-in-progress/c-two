@@ -291,6 +291,9 @@ class CRMProxy:
         method_idx = self._scheduler.method_idx(method_name)
         try:
             guard = self._scheduler.execution_guard(method_idx)
+            # Final admission can fail after acquire while Python waits to run.
+            # Normalize that native error before entering resource code.
+            guard.__enter__()
         except RuntimeError as exc:
             error_bytes = getattr(exc, 'error_bytes', None)
             if error_bytes is not None:
@@ -313,8 +316,21 @@ class CRMProxy:
                 )
                 raise ResourceClosed(message, details=details) from exc
             raise
-        with guard:
+        try:
             return method(*args)
+        finally:
+            guard.__exit__(None, None, None)
+
+    def connection_observation(self):
+        """Read the current physical IPC connection without acquiring another."""
+        with self._close_lock:
+            if self._closed:
+                from ...error import ResourceClosed
+                raise ResourceClosed('CRM proxy is closed')
+            if self._mode != 'ipc':
+                from ...error import UnsupportedCallMode
+                raise UnsupportedCallMode('connection observation requires a physical IPC connection')
+            return _native_call(self._client.connection_observation)
 
     def terminate(self) -> None:
         """Release the proxy and invoke cleanup callback if set."""
@@ -359,6 +375,14 @@ class _PreparedClient:
 
     def close(self):
         self._prepared.close()
+
+
+def connection_observation(proxy):
+    """Observe connection facts; logical proxy close need not close a shared IPC stream."""
+    client = getattr(proxy, 'client', None)
+    if not isinstance(client, CRMProxy):
+        raise TypeError('cc.connection_observation() requires a connected CRM instance')
+    return client.connection_observation()
 
 
 def with_call_options(proxy, *, timeout=...):

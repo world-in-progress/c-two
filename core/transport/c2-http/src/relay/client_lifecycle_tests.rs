@@ -27,14 +27,11 @@ impl CrmCallback for InlineReply {
         _: &str,
         _: u16,
         input: RequestData,
-        _: Arc<parking_lot::RwLock<MemPool>>,
+        _: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         assert!(matches!(
             &input,
-            RequestData::Shm {
-                is_dedicated: true,
-                ..
-            }
+            RequestData::Shm(shm) if shm.is_dedicated()
         ));
         let mut owner = RequestLease::new(input);
         assert_eq!(
@@ -202,8 +199,10 @@ async fn public_stop_cleanup_case(acquire_failure: bool) {
         tokio::time::timeout(STEP, probe.entered.notified())
             .await
             .unwrap();
-        let holder =
-            PoolHolder::start(client.request_pool_for_test().expect("actual request pool")).await;
+        let holder = PoolHolder::start(
+            unsafe { client.request_pool_for_test() }.expect("actual request pool"),
+        )
+        .await;
         release.send(()).unwrap();
         let response = tokio::time::timeout(STEP, call).await.unwrap().unwrap();
         assert_eq!(response.as_ref(), &[9; 32]);
@@ -242,7 +241,7 @@ async fn public_stop_cleanup_case(acquire_failure: bool) {
         let _stopped = tokio::time::timeout(STEP, stopping).await.unwrap().unwrap();
         assert_eq!(client.pending_len_for_test(), 0);
         assert_eq!(state.clients.outstanding(), 0);
-        assert!(client.request_pool_for_test().is_none());
+        assert!(unsafe { client.request_pool_for_test() }.is_none());
     })
     .catch_unwind()
     .await;
@@ -516,11 +515,10 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap();
         let old_entry = state.local_route("grid").unwrap();
-        let (lease, _) =
-            tokio::time::timeout(STEP, state.acquire_upstream_for_route(&old_entry))
-                .await
-                .unwrap()
-                .unwrap_or_else(|_| panic!("initial real acquisition"));
+        let (lease, _) = tokio::time::timeout(STEP, state.acquire_upstream_for_route(&old_entry))
+            .await
+            .unwrap()
+            .unwrap_or_else(|_| panic!("initial real acquisition"));
         let old_client = lease.client();
         drop(lease);
         assert!(old_client.is_connected());
@@ -575,12 +573,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            reply
-                .into_bytes_with_pool(replacement.server_pool_arc())
-                .unwrap(),
-            b"echo"
-        );
+        assert_eq!(reply.into_bytes().unwrap(), b"echo");
         // Re-observing the precise closing owner cannot target its replacement.
         state.clients.close(&old_client);
         assert!(old_client.close_shared_bounded(STEP).await);
@@ -595,12 +588,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            reply
-                .into_bytes_with_pool(replacement.server_pool_arc())
-                .unwrap(),
-            b"echo"
-        );
+        assert_eq!(reply.into_bytes().unwrap(), b"echo");
         drop(same_lease);
         drop(replacement_lease);
         assert!(state.local_route("grid").is_some());

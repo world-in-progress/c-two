@@ -46,11 +46,16 @@ pub fn cancel(raw: usize) {
     }
 }
 
+pub fn cancel_stream(stream: &Stream) {
+    cancel(raw_handle(stream));
+}
+
 pub fn poll_flush(stream: &mut Stream, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
     Pin::new(stream).poll_flush(cx)
 }
 
 pub type Listener = crate::unix_managed::ManagedListener;
+pub(crate) use crate::unix_managed::ContextBinding;
 
 pub(crate) fn inspect_endpoint(endpoint: &LocalEndpoint) -> EndpointInspection {
     crate::unix_managed::inspect_managed(endpoint)

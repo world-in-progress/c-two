@@ -407,7 +407,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
                        "import subprocess,sys; [subprocess.run([sys.argv[1],*args],check=True) for args in "
                        "[ ['--version'], ['--help'], ['relay','--help'], ['registry','--help'] ]]", str(retained_cli)], ("cli-artifact",)),
         cargo("rust-sdk-test", "sdk/rust/Cargo.toml", "--all-features"),
-        ("fastdb-wheel-build", ["uv", "run", "--isolated", "--no-project", "--python", python, "--with", "pip", "python", "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(output / "wheels/fastdb"), "fastdb4py==0.2.2"], ()),
+        ("fastdb-wheel-build", ["uv", "run", "--isolated", "--no-project", "--python", python, "--with", "pip", "python", "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(output / "wheels/fastdb"), "fastdb4py==0.2.3"], ()),
         ("python-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/c-two"), "--no-create-gitignore", "sdk/python"], ()),
         ("wheel-consumer", [python, str(ROOT / "tools/ci/windows_wheel_smoke.py"),
                                     "--fastdb-wheel", str(output / "wheels/fastdb"),

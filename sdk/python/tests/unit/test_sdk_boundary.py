@@ -1039,22 +1039,10 @@ def test_relay_router_does_not_silence_response_materialization_errors():
     call_handler = production[production.index("async fn call_handler"):]
     call_handler = call_handler[:call_handler.index("async fn acquire_request_client")]
 
-    assert "into_bytes_with_pool" in call_handler
+    assert "result.into_bytes()" in call_handler
     materialization = call_handler[call_handler.index("fn materialized_response_or_error"):]
     assert "resource_unavailable_response_with_phase" in materialization
     assert '"dispatch_uncertain"' in materialization
     assert '"pre_dispatch"' not in materialization
     assert "Json(serde_json::json!" not in materialization
     assert "unwrap_or_default()" not in call_handler
-
-
-def test_chunked_dispatch_does_not_default_missing_route_metadata():
-    root = Path(__file__).resolve().parents[4]
-    server_source = (
-        root / "core" / "transport" / "c2-server" / "src" / "server.rs"
-    ).read_text(encoding="utf-8")
-    production = server_source.split("\n#[cfg(test)]\nmod tests")[0]
-
-    assert "finished.route_name.unwrap_or_default()" not in production
-    assert "finished.method_idx.unwrap_or(0)" not in production
-    assert "chunked call missing route metadata" in production

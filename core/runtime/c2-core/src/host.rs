@@ -14,7 +14,7 @@ use c2_error::{C2Error, ErrorCode};
 use c2_server::{
     AccessLevel, ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
     RouteBuildSpec, RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerLimits,
-    SchedulerSnapshot, Server, ServerIdentity, ServerRuntimeBuilder,
+    SchedulerSnapshot, Server, ServerFailure, ServerIdentity, ServerRuntimeBuilder,
 };
 
 use crate::{Error, LifecycleError, RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome};
@@ -104,6 +104,7 @@ impl From<SchedulerSnapshot> for RouteConcurrencySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteConcurrencyError {
     Closed,
+    Unavailable,
     Capacity { field: &'static str, limit: usize },
 }
 
@@ -111,6 +112,7 @@ impl fmt::Display for RouteConcurrencyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => formatter.write_str("route closed"),
+            Self::Unavailable => formatter.write_str("host admission unavailable"),
             Self::Capacity { field, limit } => {
                 write!(
                     formatter,
@@ -127,6 +129,7 @@ impl From<SchedulerAcquireError> for RouteConcurrencyError {
     fn from(error: SchedulerAcquireError) -> Self {
         match error {
             SchedulerAcquireError::Closed => Self::Closed,
+            SchedulerAcquireError::Unavailable => Self::Unavailable,
             SchedulerAcquireError::Capacity { field, limit } => Self::Capacity { field, limit },
         }
     }
@@ -158,7 +161,7 @@ impl RouteConcurrency {
     ) -> Result<RouteConcurrencyGuard, RouteConcurrencyError> {
         self.inner
             .blocking_acquire(method_index)
-            .map(|inner| RouteConcurrencyGuard { _inner: inner })
+            .map(|inner| RouteConcurrencyGuard { inner })
             .map_err(RouteConcurrencyError::from)
     }
 
@@ -168,7 +171,15 @@ impl RouteConcurrency {
 }
 
 pub struct RouteConcurrencyGuard {
-    _inner: SchedulerGuard,
+    inner: SchedulerGuard,
+}
+
+impl RouteConcurrencyGuard {
+    /// Final native admission after all SDK-side waiting, immediately before
+    /// entering the resource callback. Already committed work may drain.
+    pub fn commit(&mut self) -> Result<(), RouteConcurrencyError> {
+        self.inner.commit().map_err(RouteConcurrencyError::from)
+    }
 }
 
 impl fmt::Debug for RouteConcurrencyGuard {
@@ -632,9 +643,9 @@ impl HostInner {
     fn unregister(&self, route_name: &str) -> Result<UnregisterOutcome, Error> {
         self.refresh_shutdown_outcome();
         if self.runtime.shutdown_pending(&self.server) {
-            return Err(LifecycleError::Server(
+            return Err(LifecycleError::Server(ServerFailure::new(
                 "native shutdown is still draining; route hooks are not yet safe".into(),
-            )
+            ))
             .into());
         }
         if let Some(shutdown) = self.shutdown_outcome.lock().as_ref()
@@ -718,7 +729,7 @@ impl Host {
             .inner
             .server
             .build_route(route_spec, callback)
-            .map_err(|error| LifecycleError::Server(error.to_string()))?;
+            .map_err(LifecycleError::from)?;
         let route_concurrency = RouteConcurrency {
             inner: route.route_handle(),
         };
@@ -847,24 +858,57 @@ impl Runtime {
             None if relay_anchor_address.is_some() => self.relay_use_proxy()?,
             None => false,
         };
-        let server = Arc::new(
-            Server::new_with_identity_and_endpoint(
-                self.freeze_local_endpoint_context()?
-                    .endpoint(&identity.ipc_address)
-                    .map_err(|error| LifecycleError::Configuration(error.to_string()))?,
+        let endpoint = self
+            .freeze_local_endpoint_context()?
+            .endpoint(&identity.ipc_address)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        let server_identity = ServerIdentity {
+            server_id: identity.server_id,
+            server_instance_id: identity.server_instance_id,
+        };
+        let (server, owner_admission) = if options.lifecycle.is_owner_bound() {
+            let (server, admission) = Server::new_owner_bound_with_identity_and_endpoint(
+                endpoint,
                 config.clone(),
-                ServerIdentity {
-                    server_id: identity.server_id,
-                    server_instance_id: identity.server_instance_id,
-                },
+                server_identity.clone(),
             )
-            .map_err(|error| LifecycleError::Server(error.to_string()))?,
-        );
+            .map_err(LifecycleError::from)?;
+            (server, Some(admission))
+        } else {
+            (
+                Server::new_with_identity_and_endpoint(
+                    endpoint,
+                    config.clone(),
+                    server_identity.clone(),
+                )
+                .map_err(LifecycleError::from)?,
+                None,
+            )
+        };
+        let lifecycle = crate::owner_bound::HostLifecycleCell::new(&options.lifecycle);
+        let owner_supervisor = owner_admission.map(|admission| {
+            Arc::new(crate::owner_bound::OwnerSupervisor::new(
+                lifecycle.clone(),
+                admission,
+                server_identity,
+                identity.ipc_address,
+                options
+                    .lifecycle
+                    .owner_missing_grace()
+                    .expect("owner-bound policy"),
+            ))
+        });
+        let server = server.with_connection_event_source(self.connection_event_source());
+        let server = Arc::new(match &owner_supervisor {
+            Some(owner) => server.with_owner_control_handler(owner.clone()),
+            None => server,
+        });
+        if let Some(owner) = &owner_supervisor {
+            owner.attach_server(&server);
+        }
         let server_runtime = ServerRuntimeBuilder::build(&config)
-            .map_err(|error| LifecycleError::Server(error.to_string()))?;
-        server
-            .begin_start_attempt()
-            .map_err(|error| LifecycleError::Server(error.to_string()))?;
+            .map_err(|error| LifecycleError::Server(ServerFailure::new(error.to_string())))?;
+        server.begin_start_attempt().map_err(LifecycleError::from)?;
 
         // Consume the native owner control capability before this host can
         // publish readiness. Naming the OwnerBound policy alone fails here,
@@ -876,7 +920,6 @@ impl Runtime {
                 Some(self.consume_owner_control()?)
             }
         };
-        let lifecycle = crate::owner_bound::HostLifecycleCell::new(&options.lifecycle);
         let inner = Arc::new(HostInner {
             runtime: self.clone(),
             server: Arc::clone(&server),
@@ -895,8 +938,6 @@ impl Runtime {
         // alive, and the thread always ends within bounded shutdown waits.
         let weak_inner = Arc::downgrade(&inner);
         let run_server = Arc::clone(&server);
-        let watch = lifecycle;
-        let owner_grace = options.lifecycle.owner_missing_grace();
         let owner_startup_timeout = options.startup_timeout;
         let thread = std::thread::Builder::new()
             .name(format!("c2-host-{}", server.server_id()))
@@ -918,10 +959,10 @@ impl Runtime {
                     // Arm the owner watcher before the accept loop runs, so
                     // readiness can only be published behind a live watcher
                     // and an already-gone capability is refused pre-ready.
-                    match crate::owner_bound::arm_owner_watch_with_fence(crate::owner_bound::arm_owner_watch(&mut receiver), &run_server, owner_startup_timeout).await {
-                        crate::owner_bound::OwnerArmOutcome::Alive => {}
+                    let session = match crate::owner_bound::arm_owner_watch_with_fence(crate::owner_bound::arm_owner_watch(&mut receiver), &run_server, owner_startup_timeout).await {
+                        crate::owner_bound::OwnerArmOutcome::Alive(session) => session,
                         crate::owner_bound::OwnerArmOutcome::Closed => {
-                            receiver.shutdown();
+                            receiver.close();
                             let _ = run_server.reject_start_attempt(
                                 "owner control capability was already closed before the host became ready"
                                     .to_string(),
@@ -929,28 +970,25 @@ impl Runtime {
                             return ThreadOutcome::PreReadyRefused;
                         }
                         crate::owner_bound::OwnerArmOutcome::IoError(message) => {
-                            receiver.shutdown();
+                            receiver.close();
                             let _ = run_server.reject_start_attempt(format!(
                                 "owner control watcher failed before the host became ready: {message}"
                             ));
                             return ThreadOutcome::PreReadyRefused;
                         }
-                    }
+                    };
                     let run = run_server.run();
+                    let supervision = owner_supervisor.expect("owner-bound supervisor").supervise(session);
                     tokio::pin!(run);
+                    tokio::pin!(supervision);
                     tokio::select! {
-                        result = &mut run => ThreadOutcome::ServerFinished(result),
-                        _ = run_server.wait_for_shutdown_requested() => {
-                            receiver.shutdown();
-                            ThreadOutcome::ServerFinished(run.await)
+                        result = &mut run => {
+                            supervision.await;
+                            ThreadOutcome::ServerFinished(result)
                         },
-                        _ = crate::owner_bound::supervise_owner(
-                            &mut receiver, &run_server, &watch,
-                            owner_grace.expect("OwnerBound policy carries a grace window"),
-                        ) => {
+                        _ = &mut supervision => {
                             // Owner supervision only initiates drain. Never drop the run future
                             // after a caller timeout; it owns the route journal and callbacks.
-                            receiver.shutdown();
                             ThreadOutcome::ServerFinished(run.await)
                         }
                     }
@@ -969,7 +1007,7 @@ impl Runtime {
 
                 }
             })
-            .map_err(|error| LifecycleError::Server(error.to_string()))?;
+            .map_err(|error| LifecycleError::Server(ServerFailure::new(error.to_string())))?;
         *inner.thread.lock() = Some(thread);
         let wait_runtime = Runtime::server_runtime()?;
         if let Err(error) =
@@ -981,7 +1019,7 @@ impl Runtime {
                     let _ = thread.join();
                 }
             }
-            return Err(LifecycleError::Server(error.to_string()).into());
+            return Err(LifecycleError::from(error).into());
         }
 
         Ok(Host { inner })
@@ -1032,7 +1070,7 @@ impl CrmCallback for CoreCallback {
         _route_name: &str,
         method_idx: u16,
         request: RequestData,
-        _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+        _response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         let mut lease = RequestLease::new(request);
         let bytes = match lease.copy_bytes() {
@@ -1089,7 +1127,7 @@ mod lifecycle_tests {
             ..Default::default()
         })
         .unwrap();
-        let (_owner, receiver) = c2_local::owner_control_pair().unwrap();
+        let (_owner, receiver) = crate::owner_control_pair().unwrap();
         runtime.attach_owner_control(receiver).unwrap();
         let host = runtime
             .host(

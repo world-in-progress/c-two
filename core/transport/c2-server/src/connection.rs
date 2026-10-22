@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use c2_config::MAX_IPC_POOL_SEGMENTS;
+use c2_local::{ConnectionEndReason, ConnectionObservation, ConnectionPublisher};
 use c2_mem::config::PoolConfig;
 use c2_mem::{FreeResult, MemPool};
 
@@ -51,7 +52,8 @@ impl PeerShmState {
                 return Err("dedicated generation must be zero".into());
             }
             let name = MemPool::dedicated_segment_name(&self.prefix, seg_idx);
-            pool.open_dedicated_at(seg_idx, &name, data_size)
+            // SAFETY: the private peer cache and canonical name come from one handshake.
+            unsafe { pool.open_dedicated_at(seg_idx, &name, data_size) }
         } else {
             // Open with exactly the frame's data span: the mapped region must
             // hold the advertised payload, and the allocator header supplies
@@ -83,6 +85,7 @@ impl Drop for FlightGuard<'_> {
 /// Per-client connection state.
 pub struct Connection {
     conn_id: u64,
+    ordinary_protocol: AtomicBool,
     handshake_done: AtomicBool,
     chunked_capable: AtomicBool,
 
@@ -98,9 +101,8 @@ pub struct Connection {
     /// Notified whenever `inflight` drops to zero.
     idle_notify: Notify,
 
-    /// Set when the read loop has closed and queued not-started work should stop.
-    cancelled: AtomicBool,
-    cancel_notify: Notify,
+    /// Terminal transport authority; queued work cancellation derives from it.
+    publisher: ConnectionPublisher,
 }
 
 impl Connection {
@@ -109,21 +111,55 @@ impl Connection {
     /// All fields start at their default/empty state; `last_activity` is set
     /// to the current instant.
     pub fn new(conn_id: u64) -> Self {
+        let connection = Self::with_publisher(conn_id, ConnectionPublisher::new());
+        connection.select_ordinary_protocol();
+        connection
+    }
+
+    pub(crate) fn observed(publisher: ConnectionPublisher) -> Self {
+        Self::with_publisher(publisher.observation().connection_id(), publisher)
+    }
+
+    fn with_publisher(conn_id: u64, publisher: ConnectionPublisher) -> Self {
         Self {
             conn_id,
+            ordinary_protocol: AtomicBool::new(false),
             handshake_done: AtomicBool::new(false),
             chunked_capable: AtomicBool::new(false),
             peer_shm: Mutex::new(PeerShmState::new()),
             last_activity: Mutex::new(Instant::now()),
             inflight: AtomicI32::new(0),
             idle_notify: Notify::new(),
-            cancelled: AtomicBool::new(false),
-            cancel_notify: Notify::new(),
+            publisher,
         }
     }
 
     pub fn conn_id(&self) -> u64 {
         self.conn_id
+    }
+
+    pub(crate) fn ordinary_protocol(&self) -> bool {
+        self.ordinary_protocol.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn select_ordinary_protocol(&self) {
+        self.ordinary_protocol.store(true, Ordering::Release);
+    }
+
+    pub fn connection_observation(&self) -> ConnectionObservation {
+        self.publisher.observation()
+    }
+
+    pub(crate) fn end(&self, reason: ConnectionEndReason, operation: &'static str) {
+        self.publisher.close(reason, operation, None);
+    }
+
+    pub(crate) fn end_read(&self, operation: &'static str, error: &std::io::Error) {
+        self.publisher.close_read_error(operation, error);
+    }
+
+    pub(crate) fn end_io(&self, operation: &'static str, error: &std::io::Error) {
+        self.publisher.close_io(operation, error);
     }
 
     pub fn handshake_done(&self) -> bool {
@@ -146,7 +182,8 @@ impl Connection {
 
     /// Get a shared reference to the peer's MemPool (for ShmBuffer construction).
     /// Returns None if handshake hasn't completed yet.
-    pub fn peer_pool_arc(&self) -> Option<Arc<RwLock<MemPool>>> {
+    #[cfg(test)]
+    pub(crate) fn peer_pool_arc(&self) -> Option<Arc<RwLock<MemPool>>> {
         let state = self.peer_shm.lock();
         state.pool.clone()
     }
@@ -204,7 +241,7 @@ impl Connection {
 
     /// Ensure the peer's SHM segment is mapped and return the pool Arc.
     /// Combines `ensure_peer_segment` + `peer_pool_arc` under one lock.
-    pub fn ensure_and_get_peer_pool(
+    pub(crate) fn ensure_and_get_peer_pool(
         &self,
         seg_idx: u16,
         generation: u32,
@@ -223,7 +260,12 @@ impl Connection {
     ///
     /// Lazy-opens the segment if it hasn't been seen before — the name is
     /// derived by MemPool from its prefix, index, and generation.
-    pub fn read_peer_data(
+    ///
+    /// Crate-private: only the server's frame-receive paths may pass peer
+    /// coordinates through this raw seam; every admission funnels into a
+    /// [`crate::PeerShmRequest`] carrier that owns the read/release
+    /// authority for its block.
+    pub(crate) fn read_peer_data(
         &self,
         seg_idx: u16,
         generation: u32,
@@ -236,14 +278,21 @@ impl Connection {
         state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated)?;
         let pool_arc = state.pool.as_ref().ok_or("peer pool not initialised")?;
         let pool = pool_arc.read();
-        pool.copy_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
+        // SAFETY: the coordinates come from a frame decoded on this exact
+        // connection; the peer completed and published the write
+        // (write-then-publish protocol) and no other local access to the
+        // block exists.
+        unsafe { pool.copy_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated) }
     }
 
     /// Free a buddy block in the peer's SHM pool.
     ///
     /// Lazy-opens the segment if not yet mapped.
     /// Returns `FreeResult` so callers can trigger deferred GC on idle segments.
-    pub fn free_peer_block(
+    ///
+    /// Crate-private: same frame-admission boundary as
+    /// [`Connection::read_peer_data`].
+    pub(crate) fn free_peer_block(
         &self,
         seg_idx: u16,
         generation: u32,
@@ -268,14 +317,19 @@ impl Connection {
             match pool
                 .validate_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
                 .and_then(|_| {
-                    pool.free_at(
-                        seg_idx as u32,
-                        generation,
-                        offset,
-                        data_size,
-                        is_dedicated,
-                        allocation_id,
-                    )
+                    // SAFETY: the coordinates come from a frame received on
+                    // this connection and the server is the sole releaser
+                    // for the peer's block (read-then-release protocol).
+                    unsafe {
+                        pool.free_at(
+                            seg_idx as u32,
+                            generation,
+                            offset,
+                            data_size,
+                            is_dedicated,
+                            allocation_id,
+                        )
+                    }
                 }) {
                 Ok(result) => return result,
                 Err(e) => {
@@ -324,28 +378,15 @@ impl Connection {
     }
 
     pub(crate) fn cancel_queued_work(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.cancel_notify.notify_waiters();
+        self.end(ConnectionEndReason::LocalClose, "connection_cancel");
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.publisher.is_closed()
     }
 
     pub(crate) async fn wait_cancelled(&self) {
-        if self.is_cancelled() {
-            return;
-        }
-        loop {
-            let notified = self.cancel_notify.notified();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-            if self.is_cancelled() {
-                return;
-            }
-        }
+        self.connection_observation().wait_closed(None).await;
     }
 
     /// Current number of in-flight requests.

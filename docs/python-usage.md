@@ -1,6 +1,6 @@
 # Python SDK usage
 
-C-Two 0.7.4 uses CRM contracts to expose stateful resources over same-process calls, local IPC and HTTP relay. Python uses FastDB 0.2.1 and the matching C3 0.3.3. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
+C-Two 0.8.0 uses CRM contracts to expose stateful resources over same-process calls, local IPC and HTTP relay. Portable Python payloads use the optional FastDB 0.2.3 extra and the matching C3 0.4.0. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 

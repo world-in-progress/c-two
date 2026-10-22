@@ -39,12 +39,12 @@ cc.serve()
             assert time.monotonic() < deadline, 'child never became ready'
             time.sleep(.01)
         assert ready.read_text().startswith('ipc://')
-        keepalive.shutdown()
+        keepalive.close()
         assert child.wait(timeout=10) == 0
         assert finished.read_text() == 'one hook'
         assert child.poll() == 0
     finally:
-        keepalive.shutdown()
+        keepalive.close()
         if child.poll() is None:
             child.kill()
         child.wait(timeout=10)

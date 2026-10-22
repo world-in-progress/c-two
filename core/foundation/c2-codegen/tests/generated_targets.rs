@@ -209,7 +209,7 @@ publish = false
 
 [dependencies]
 c-two = {{ version = "0.1.0", path = {c_two:?} }}
-fastdb = "=0.2.1"
+fastdb = "=0.2.3"
 "#,
         c_two = repository.join("sdk/rust"),
     );

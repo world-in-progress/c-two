@@ -302,7 +302,7 @@ class TestOwnerBoundNativeSurface:
             )
             cc.register(Echo, EchoResource(), name='observed-echo')
             print('NATIVE_ARMED', cc.native_lifecycle_snapshot()['phase'], flush=True)
-            keepalive.shutdown()
+            keepalive.close()
             deadline = time.monotonic() + 30
             while cc.native_terminal_outcome() is None:
                 assert time.monotonic() < deadline
@@ -407,7 +407,7 @@ def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: b
         future = executor.submit(proxy.blocked, source)
         assert entered.wait(5), 'real IPC callback did not enter'
         if owner_bound:
-            keepalive.shutdown()
+            keepalive.close()
         started = time.monotonic()
         outcome = cc.shutdown(timeout=0.1)
         assert time.monotonic() - started < 0.8, outcome
@@ -460,5 +460,5 @@ def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: b
             serve_thread.join(timeout=5)
             assert not serve_thread.is_alive()
         if keepalive is not None:
-            keepalive.shutdown()
+            keepalive.close()
         cc.shutdown()

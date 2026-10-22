@@ -22,6 +22,7 @@ pub mod flags;
 pub mod frame;
 pub mod handshake;
 pub mod msg_type;
+pub mod owner_control;
 pub mod registration_control;
 pub mod route_catalog_control;
 pub mod shutdown_control;

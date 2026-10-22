@@ -66,7 +66,7 @@ from .server.scheduler import ConcurrencyConfig
 from .server.native import NativeServerBridge as Server
 
 if TYPE_CHECKING:
-    from c_two._native import NativeOwnerReceiver, OwnedChild
+    from c_two._native import NativeOwnerBootstrap, OwnedChild
     from c_two.mem import MemoryStats
 
 CRM = TypeVar('CRM')
@@ -337,7 +337,7 @@ class _ProcessRegistry:
         server_id: str | None = None,
         ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
         lifecycle: LifecycleConfig | None = None,
-        owner_control: NativeOwnerReceiver | None = None,
+        owner_control: NativeOwnerBootstrap | None = None,
     ) -> None:
         """Configure IPC server and its native lifecycle. Call before register().
 
@@ -354,7 +354,7 @@ class _ProcessRegistry:
             control capability must also be attached through *owner_control*.
         owner_control:
             The controller-held opaque
-            :class:`c_two.NativeOwnerReceiver`. It is consumed exactly once and
+            :class:`c_two.NativeOwnerBootstrap`. It is consumed exactly once and
             is deliberately kept outside the IPC override mapping and every
             other cloneable configuration path.
         """
@@ -975,7 +975,7 @@ def set_server(
     server_id: str | None = None,
     ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
     lifecycle: LifecycleConfig | None = None,
-    owner_control: NativeOwnerReceiver | None = None,
+    owner_control: NativeOwnerBootstrap | None = None,
 ) -> None:
     """Configure IPC server and its native lifecycle. Call before register().
 
@@ -990,7 +990,7 @@ def set_server(
 
 
 def owner_control_pair():
-    """Create the private native owner control pair ``(keepalive, receiver)``.
+    """Create ``(OwnerControl, NativeOwnerBootstrap)`` for explicit inheritance.
 
     The controller keeps the keepalive private and hands the opaque receiver to
     exactly one target child through :func:`c_two.spawn_owned_child`. Neither value ever exposes an OS
@@ -1001,6 +1001,15 @@ def owner_control_pair():
     return _owner_control_pair()
 
 
+def prepare_owner_takeover(ticket):
+    """Prepare one takeover in this runtime's existing endpoint context.
+
+    Save ``successor_ticket`` before committing when recovery after a lost
+    acknowledgement is required. ``inspect`` observes state, not a receipt.
+    """
+    return _ProcessRegistry.get()._runtime_session.prepare_owner_takeover(ticket)
+
+
 def adopt_owner_stdin():
     """Adopt the owner control receiver inherited as this process's stdin.
 
@@ -1008,9 +1017,9 @@ def adopt_owner_stdin():
     was started with the receiver endpoint as its stdio. Ordinary business
     stdin is never adopted automatically.
     """
-    from c_two._native import NativeOwnerReceiver
+    from c_two._native import NativeOwnerBootstrap
 
-    return NativeOwnerReceiver.adopt_owner_stdin()
+    return NativeOwnerBootstrap.adopt_owner_stdin()
 
 
 def spawn_owned_child(receiver, program, args=None, cwd=None) -> OwnedChild:
@@ -1120,6 +1129,13 @@ def shutdown(*, timeout: float = 30.0) -> dict:
     See :meth:`_ProcessRegistry.shutdown`.
     """
     return _ProcessRegistry.get().shutdown(timeout=timeout)
+
+
+def connection_events():
+    """Subscribe to accepted IPC connections without starting or configuring a server."""
+    registry = _ProcessRegistry.get()
+    with registry._lock:
+        return registry._runtime_session.connection_events()
 
 
 def native_lifecycle_snapshot() -> dict | None:

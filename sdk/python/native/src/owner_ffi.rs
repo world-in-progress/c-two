@@ -1,22 +1,4 @@
-//! PyO3 projection of the canonical private owner control capability.
-//!
-//! The capability itself is a one-way native pair owned by `c2-core`
-//! (`c2_local::owner_control_pair`). Python sees only two opaque values:
-//!
-//! * [`PyNativeOwnerReceiver`] wraps one [`OwnerControlReceiver`]. It can be
-//!   consumed exactly once by a `RuntimeSession`, explicitly adopted from a
-//!   trusted launcher's child stdio, or used to spawn the one intended child
-//!   whose stdin is the receiver endpoint. It is never cloneable, never
-//!   picklable, and never renders a descriptor, handle, endpoint name, or
-//!   token in `repr`.
-//! * [`PyOwnerControlKeepalive`] wraps one [`OwnerControlKeepalive`]. The
-//!   controller holds it private; closing it is the only thing that ends an
-//!   owner-bound host.
-//!
-//! Neither value exposes an OS handle, path, or secret. Nothing here logs the
-//! capability, writes it to argv or the environment, or reads ordinary
-//! process stdin; [`PyNativeOwnerReceiver::adopt_owner_stdin`] is the single
-//! explicit adoption seam reserved for a trusted launcher's child.
+//! Thin Python projection of Core owner capabilities and native child handles.
 
 use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, LazyLock};
@@ -28,51 +10,206 @@ use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 
 use c2_core::{
-    OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair as native_owner_control_pair,
+    OwnerBootstrap, OwnerControl, OwnerControlErrorKind, OwnerPhase, OwnerRecoveryTicket,
+    OwnerStatus, PreparedOwnerTakeover, owner_control_pair as native_owner_control_pair,
 };
+use pyo3::types::PyBytes;
 
-/// Controller-side endpoint of the private owner control pair.
-///
-/// Not cloneable and not constructible from Python. It is created together
-/// with its receiver by [`owner_control_pair`] and stays private to the
-/// controller process.
-#[pyclass(name = "OwnerControlKeepalive", module = "c_two._native", frozen)]
-pub struct PyOwnerControlKeepalive {
-    inner: parking_lot::Mutex<Option<OwnerControlKeepalive>>,
+pyo3::create_exception!(_native, OwnerControlError, PyRuntimeError);
+
+fn error_kind(kind: OwnerControlErrorKind) -> &'static str {
+    match kind {
+        OwnerControlErrorKind::Malformed => "malformed",
+        OwnerControlErrorKind::UnsupportedVersion => "unsupported_version",
+        OwnerControlErrorKind::IdentityMismatch => "identity_mismatch",
+        OwnerControlErrorKind::OwnerPresent => "owner_present",
+        OwnerControlErrorKind::InvalidGrant => "invalid_grant",
+        OwnerControlErrorKind::GraceExpired => "grace_expired",
+        OwnerControlErrorKind::ShuttingDown => "shutting_down",
+        OwnerControlErrorKind::Unavailable => "unavailable",
+        OwnerControlErrorKind::NotSent => "not_sent",
+        OwnerControlErrorKind::Indeterminate => "indeterminate",
+    }
+}
+
+pub(crate) fn owner_error(py: Python<'_>, error: c2_core::OwnerControlError) -> PyErr {
+    let exception = OwnerControlError::new_err(error.to_string());
+    if let Err(error) = exception
+        .value(py)
+        .setattr("kind", error_kind(error.kind()))
+    {
+        return error;
+    }
+    if let Err(error) = exception
+        .value(py)
+        .setattr("cause_kind", error.cause_kind().map(error_kind))
+    {
+        return error;
+    }
+    exception
+}
+
+fn control_timeout(timeout: Option<f64>) -> PyResult<Option<Duration>> {
+    timeout
+        .map(|seconds| {
+            Duration::try_from_secs_f64(seconds).map_err(|_| {
+                PyValueError::new_err(
+                    "timeout must be finite, non-negative, and representable as a Duration",
+                )
+            })
+        })
+        .transpose()
+}
+
+#[pyclass(name = "OwnerControl", module = "c_two._native", frozen)]
+pub(crate) struct PyOwnerControl {
+    inner: OwnerControl,
 }
 
 #[pymethods]
-impl PyOwnerControlKeepalive {
-    /// Close the owner endpoint. The matching receiver observes EOF.
-    ///
-    /// Repeated calls are harmless; the capability is one-way and this first
-    /// version never reconnects or takes over an existing owner.
-    fn shutdown(&self) {
-        if let Some(mut keepalive) = self.inner.lock().take() {
-            keepalive.shutdown();
-        }
+impl PyOwnerControl {
+    #[pyo3(signature = (timeout=None))]
+    fn recovery_ticket(
+        &self,
+        py: Python<'_>,
+        timeout: Option<f64>,
+    ) -> PyResult<PyOwnerRecoveryTicket> {
+        let timeout = control_timeout(timeout)?;
+        py.detach(|| self.inner.recovery_ticket(timeout))
+            .map(|inner| PyOwnerRecoveryTicket { inner })
+            .map_err(|error| owner_error(py, error))
     }
 
-    fn close(&self) {
-        self.shutdown();
+    #[pyo3(signature = (timeout=None))]
+    fn revoke_recovery(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<()> {
+        let timeout = control_timeout(timeout)?;
+        py.detach(|| self.inner.revoke_recovery(timeout))
+            .map_err(|error| owner_error(py, error))
     }
 
-    /// Whether this endpoint still owns a live capability.
-    #[getter]
-    fn is_alive(&self) -> bool {
-        self.inner.lock().is_some()
+    #[pyo3(signature = (timeout=None))]
+    fn request_shutdown(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<()> {
+        let timeout = control_timeout(timeout)?;
+        py.detach(|| self.inner.request_shutdown(timeout))
+            .map_err(|error| owner_error(py, error))
+    }
+
+    fn close(&self, py: Python<'_>) {
+        py.detach(|| self.inner.close());
     }
 
     fn __repr__(&self) -> &'static str {
-        "<c_two._native.OwnerControlKeepalive (opaque owner capability)>"
+        "<c_two.OwnerControl (opaque owner capability)>"
     }
 }
 
-impl Drop for PyOwnerControlKeepalive {
-    fn drop(&mut self) {
-        if let Some(mut keepalive) = self.inner.lock().take() {
-            keepalive.shutdown();
+#[pyclass(
+    name = "OwnerRecoveryTicket",
+    module = "c_two._native",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub(crate) struct PyOwnerRecoveryTicket {
+    pub(crate) inner: OwnerRecoveryTicket,
+}
+
+#[pymethods]
+impl PyOwnerRecoveryTicket {
+    /// Explicit export for storage by the controlling application.
+    fn export<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.export())
+    }
+
+    #[staticmethod]
+    fn from_bytes(py: Python<'_>, data: &[u8]) -> PyResult<Self> {
+        OwnerRecoveryTicket::import(data)
+            .map(|inner| Self { inner })
+            .map_err(|error| owner_error(py, error))
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "<c_two.OwnerRecoveryTicket (redacted)>"
+    }
+}
+
+#[pyclass(name = "OwnerStatus", module = "c_two._native", frozen)]
+pub(crate) struct PyOwnerStatus {
+    inner: OwnerStatus,
+}
+
+#[pymethods]
+impl PyOwnerStatus {
+    #[getter]
+    fn address(&self) -> &str {
+        &self.inner.address
+    }
+    #[getter]
+    fn server_id(&self) -> &str {
+        &self.inner.server_id
+    }
+    #[getter]
+    fn server_instance_id(&self) -> &str {
+        &self.inner.server_instance_id
+    }
+    #[getter]
+    fn epoch(&self) -> u64 {
+        self.inner.epoch
+    }
+    #[getter]
+    fn context_binding<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.context_binding)
+    }
+    #[getter]
+    fn phase(&self) -> &'static str {
+        match self.inner.phase {
+            OwnerPhase::Armed => "armed",
+            OwnerPhase::OwnerMissing => "owner_missing",
+            OwnerPhase::Draining => "draining",
+            OwnerPhase::Finished => "finished",
+            OwnerPhase::WatcherIoError => "watcher_io_error",
         }
+    }
+}
+
+#[pyclass(name = "PreparedOwnerTakeover", module = "c_two._native", frozen)]
+pub(crate) struct PyPreparedOwnerTakeover {
+    pub(crate) inner: PreparedOwnerTakeover,
+}
+
+#[pymethods]
+impl PyPreparedOwnerTakeover {
+    #[getter]
+    fn successor_ticket(&self) -> PyOwnerRecoveryTicket {
+        PyOwnerRecoveryTicket {
+            inner: self.inner.successor_ticket().clone(),
+        }
+    }
+    #[getter]
+    fn recovery_ticket(&self) -> PyOwnerRecoveryTicket {
+        PyOwnerRecoveryTicket {
+            inner: self.inner.recovery_ticket().clone(),
+        }
+    }
+
+    #[pyo3(signature = (timeout=None))]
+    fn inspect(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<PyOwnerStatus> {
+        let timeout = control_timeout(timeout)?;
+        py.detach(|| self.inner.inspect(timeout))
+            .map(|inner| PyOwnerStatus { inner })
+            .map_err(|error| owner_error(py, error))
+    }
+
+    #[pyo3(signature = (timeout=None))]
+    fn commit(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<PyOwnerControl> {
+        let timeout = control_timeout(timeout)?;
+        py.detach(|| self.inner.commit(timeout))
+            .map(|inner| PyOwnerControl { inner })
+            .map_err(|error| owner_error(py, error))
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "<c_two.PreparedOwnerTakeover (redacted)>"
     }
 }
 
@@ -82,13 +219,13 @@ impl Drop for PyOwnerControlKeepalive {
 /// intended child with this endpoint as that child's stdin, and the child
 /// adopts it with [`adopt_owner_stdin`](Self::adopt_owner_stdin). Ordinary
 /// business stdin is deliberately not adopted.
-#[pyclass(name = "NativeOwnerReceiver", module = "c_two._native", frozen)]
-pub struct PyNativeOwnerReceiver {
-    inner: parking_lot::Mutex<Option<OwnerControlReceiver>>,
+#[pyclass(name = "NativeOwnerBootstrap", module = "c_two._native", frozen)]
+pub struct PyNativeOwnerBootstrap {
+    inner: parking_lot::Mutex<Option<OwnerBootstrap>>,
 }
 
-impl PyNativeOwnerReceiver {
-    fn new(receiver: OwnerControlReceiver) -> Self {
+impl PyNativeOwnerBootstrap {
+    fn new(receiver: OwnerBootstrap) -> Self {
         Self {
             inner: parking_lot::Mutex::new(Some(receiver)),
         }
@@ -98,18 +235,16 @@ impl PyNativeOwnerReceiver {
     ///
     /// A second take on the same object fails instead of silently producing a
     /// second capability, so one receiver can never arm two owner-bound hosts.
-    pub(crate) fn take_for_attach(&self) -> PyResult<OwnerControlReceiver> {
-        self.inner.lock().take().ok_or_else(|| {
-            PyRuntimeError::new_err(
-                "owner control receiver was already consumed; the capability is one-way and \
-                 cannot be reattached, reconnected, or taken over",
-            )
-        })
+    pub(crate) fn take_for_attach(&self) -> PyResult<OwnerBootstrap> {
+        self.inner
+            .lock()
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("owner bootstrap was already consumed"))
     }
 }
 
 #[pymethods]
-impl PyNativeOwnerReceiver {
+impl PyNativeOwnerBootstrap {
     /// Explicitly adopt an owner control receiver from the inherited stdin of
     /// a trusted launcher's child process.
     ///
@@ -125,9 +260,9 @@ impl PyNativeOwnerReceiver {
     /// the handle; that provenance is the trusted launcher's responsibility.
     /// Ordinary business connections must never be adopted this way.
     #[staticmethod]
-    fn adopt_owner_stdin(py: Python<'_>) -> PyResult<PyNativeOwnerReceiver> {
+    fn adopt_owner_stdin(py: Python<'_>) -> PyResult<PyNativeOwnerBootstrap> {
         let receiver = py.detach(adopt_process_stdin)?;
-        Ok(PyNativeOwnerReceiver::new(receiver))
+        Ok(PyNativeOwnerBootstrap::new(receiver))
     }
 
     /// Whether this value still owns an unconsumed native receiver.
@@ -138,17 +273,17 @@ impl PyNativeOwnerReceiver {
 
     fn __repr__(&self) -> &'static str {
         // Never render a descriptor, handle, endpoint path, or token.
-        "<c_two._native.NativeOwnerReceiver (opaque owner capability)>"
+        "<c_two._native.NativeOwnerBootstrap (opaque owner capability)>"
     }
 }
 
-fn adopt_process_stdin() -> PyResult<OwnerControlReceiver> {
+fn adopt_process_stdin() -> PyResult<OwnerBootstrap> {
     #[cfg(unix)]
     {
         // SAFETY: fd 0 is the descriptor this process was explicitly started
         // with. The call duplicates it, so the inherited descriptor keeps its
         // original owner and is never closed here.
-        unsafe { OwnerControlReceiver::from_inherited_fd(0) }
+        unsafe { OwnerBootstrap::from_inherited_fd(0) }
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
     #[cfg(windows)]
@@ -158,7 +293,7 @@ fn adopt_process_stdin() -> PyResult<OwnerControlReceiver> {
         // SAFETY: the standard-input handle is the inherited handle this
         // process was explicitly started with. The call duplicates it, so the
         // inherited handle keeps its original owner.
-        unsafe { OwnerControlReceiver::from_inherited_handle(stdin.as_handle().as_raw_handle()) }
+        unsafe { OwnerBootstrap::from_inherited_handle(stdin.as_handle().as_raw_handle()) }
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
     #[cfg(not(any(unix, windows)))]
@@ -176,14 +311,12 @@ fn adopt_process_stdin() -> PyResult<OwnerControlReceiver> {
 /// hands the receiver to exactly one target child. The returned values expose
 /// no descriptor, handle, name, or secret.
 #[pyfunction]
-fn owner_control_pair() -> PyResult<(PyOwnerControlKeepalive, PyNativeOwnerReceiver)> {
+fn owner_control_pair() -> PyResult<(PyOwnerControl, PyNativeOwnerBootstrap)> {
     let (keepalive, receiver) = native_owner_control_pair()
         .map_err(|error| PyValueError::new_err(format!("owner control pair failed: {error}")))?;
     Ok((
-        PyOwnerControlKeepalive {
-            inner: parking_lot::Mutex::new(Some(keepalive)),
-        },
-        PyNativeOwnerReceiver::new(receiver),
+        PyOwnerControl { inner: keepalive },
+        PyNativeOwnerBootstrap::new(receiver),
     ))
 }
 
@@ -373,7 +506,7 @@ impl PyOwnedChild {
 #[pyo3(signature = (receiver, program, args=None, cwd=None))]
 fn spawn_owned_child(
     py: Python<'_>,
-    receiver: &PyNativeOwnerReceiver,
+    receiver: &PyNativeOwnerBootstrap,
     program: &str,
     args: Option<Vec<String>>,
     cwd: Option<String>,
@@ -430,8 +563,15 @@ fn owner_control_supported() -> bool {
 }
 
 pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyOwnerControlKeepalive>()?;
-    module.add_class::<PyNativeOwnerReceiver>()?;
+    module.add_class::<PyOwnerControl>()?;
+    module.add_class::<PyOwnerRecoveryTicket>()?;
+    module.add_class::<PyPreparedOwnerTakeover>()?;
+    module.add_class::<PyOwnerStatus>()?;
+    module.add(
+        "OwnerControlError",
+        module.py().get_type::<OwnerControlError>(),
+    )?;
+    module.add_class::<PyNativeOwnerBootstrap>()?;
     module.add_class::<PyOwnedChild>()?;
     module.add_function(wrap_pyfunction!(owner_control_pair, module)?)?;
     module.add_function(wrap_pyfunction!(spawn_owned_child, module)?)?;

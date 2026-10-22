@@ -12,7 +12,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use c2_config::{CallExecutionLimits, ClientIpcConfig, LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, RouteBinding};
-use c2_mem::MemPool;
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
     RouteBuildSpec, SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
@@ -107,7 +106,7 @@ struct Probe {
     release: [parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>; 2],
     input_kind: AtomicUsize,
     response_kind: AtomicUsize,
-    response_pool: parking_lot::Mutex<Option<Arc<parking_lot::RwLock<MemPool>>>>,
+    response_pool: parking_lot::Mutex<Option<Arc<c2_server::ResponsePool>>>,
 }
 
 impl CrmCallback for Probe {
@@ -116,17 +115,12 @@ impl CrmCallback for Probe {
         _: &str,
         method: u16,
         input: RequestData,
-        response_pool: Arc<parking_lot::RwLock<MemPool>>,
+        response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         let kind = match &input {
             RequestData::Inline(_) => 1,
-            RequestData::Shm {
-                is_dedicated: false,
-                ..
-            } => 2,
-            RequestData::Shm {
-                is_dedicated: true, ..
-            } => 3,
+            RequestData::Shm(shm) if !shm.is_dedicated() => 2,
+            RequestData::Shm(_) => 3,
             RequestData::Handle(_) => 4,
         };
         let mut owner = RequestLease::new(input);
@@ -163,13 +157,11 @@ impl CrmCallback for Probe {
             )
             .map_err(CrmError::InternalError)?
             .expect("selected SHM response carrier must actually allocate");
-            if let ResponseMeta::ShmAlloc { is_dedicated, .. } = &prepared {
-                self.response_kind
-                    .store(if *is_dedicated { 3 } else { 2 }, Ordering::SeqCst);
-            } else {
-                panic!("response helper did not produce SHM carrier");
-            }
-            Ok(prepared)
+            self.response_kind.store(
+                if prepared.is_dedicated() { 3 } else { 2 },
+                Ordering::SeqCst,
+            );
+            Ok(ResponseMeta::ShmAlloc(prepared))
         } else {
             // The server cannot allocate SHM; production framing selects
             // chunked delivery, whose relay receive owner must use file spill.
@@ -1138,10 +1130,10 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
         let other_result = bounded(&mut other).await;
         other_joined = true;
         let other_reply = other_result.unwrap().unwrap();
-        assert_eq!(other_reply.into_bytes_with_pool(fixture.client.server_pool_arc()).unwrap(), vec![0; 32], "already-in-flight other RID must succeed on same IPC client");
+        assert_eq!(other_reply.into_bytes().unwrap(), vec![0; 32], "already-in-flight other RID must succeed on same IPC client");
         assert!(fixture.client.is_connected());
         let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; INPUT_LEN])).await.unwrap();
-        assert_eq!(ping.into_bytes_with_pool(fixture.client.server_pool_arc()).unwrap(), vec![2; 32], "same client ping must succeed without reconnect");
+        assert_eq!(ping.into_bytes().unwrap(), vec![2; 32], "same client ping must succeed without reconnect");
         let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled client acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "liveness cannot be masked by reconnecting");
         drop(lease);
@@ -1154,7 +1146,7 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
             let pool = fixture.probe.response_pool.lock().as_ref().unwrap().clone();
             eventually(|| pool.read().stats().alloc_count == 0).await;
             if carrier == Carrier::Dedicated {
-                eventually(|| { pool.write().gc_dedicated(); fixture.server.memory_budget_snapshot().budget.shm.used_bytes == 0 }).await;
+                eventually(|| { unsafe { pool.write() }.gc_dedicated(); fixture.server.memory_budget_snapshot().budget.shm.used_bytes == 0 }).await;
             }
         }
         let memory = fixture.state.upstream_memory_snapshot();
@@ -1292,11 +1284,7 @@ async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal()
         ))
         .await
         .unwrap();
-        assert_eq!(
-            ping.into_bytes_with_pool(fixture.client.server_pool_arc())
-                .unwrap(),
-            vec![2; 32]
-        );
+        assert_eq!(ping.into_bytes().unwrap(), vec![2; 32]);
         eprintln!(
             "[relay-forwarding] known and unknown HTTP source faults: retention={:?}",
             fixture.state.forwarding.snapshot()
@@ -1447,7 +1435,7 @@ async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() 
         fixture.release(0);
         let other_result = bounded(&mut other).await;
         other_joined = true;
-        assert_eq!(other_result.unwrap().unwrap().into_bytes_with_pool(fixture.client.server_pool_arc()).unwrap(), vec![0; 32], "already-dispatched RID must finish before the target writer resumes");
+        assert_eq!(other_result.unwrap().unwrap().into_bytes().unwrap(), vec![0; 32], "already-dispatched RID must finish before the target writer resumes");
         assert!(fixture.client.is_connected());
         assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (1, LEN as u64));
         write_release.take().unwrap().send(()).unwrap();
@@ -1458,7 +1446,7 @@ async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() 
         eventually(|| fixture.client.pending_len_for_test() == 0).await;
         assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
         let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; LEN])).await.unwrap();
-        assert_eq!(ping.into_bytes_with_pool(fixture.client.server_pool_arc()).unwrap(), vec![2; 32]);
+        assert_eq!(ping.into_bytes().unwrap(), vec![2; 32]);
         let current = fixture.state.local_route("grid").expect("HTTP disconnect must not withdraw route");
         assert_eq!(current.route_uid, fixture.entry.route_uid);
         assert_eq!(current.route_revision, fixture.entry.route_revision);
@@ -1556,11 +1544,7 @@ async fn h1_admitted_unknown_upload_growth_after_close_is_pre_dispatch_capacity_
         ))
         .await
         .unwrap();
-        assert_eq!(
-            ping.into_bytes_with_pool(fixture.client.server_pool_arc())
-                .unwrap(),
-            vec![2; 32]
-        );
+        assert_eq!(ping.into_bytes().unwrap(), vec![2; 32]);
     })
     .catch_unwind()
     .await;

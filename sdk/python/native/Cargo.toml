@@ -30,7 +30,7 @@ serde_json = "1"
 # from the official FastDB repository checkout instead of requiring a
 # system-installed libfastdb. The safe fastdb crate itself still comes from
 # crates.io; this patch reroutes only the raw fastdb-sys bindings to the
-# immutable v0.2.1 source at this rev, whose checkout layout lets its build
+# immutable v0.2.3 source at this rev, whose checkout layout lets its build
 # script drive source-mode CMake builds.
 [patch.crates-io]
-fastdb-sys = { git = "https://github.com/world-in-progress/fastdb", rev = "4f99f86a662b0e950a0dd29800c25a1c9fca4def" }
+fastdb-sys = { git = "https://github.com/world-in-progress/fastdb", rev = "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4" }

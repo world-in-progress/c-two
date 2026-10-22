@@ -227,7 +227,7 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
         assert "--all-targets" in commands["core-check"]
         assert "--all-features" in commands["rust-sdk-test"]
         assert "--all-features" in commands["fastdb-rust-test"]
-        assert "fastdb4py==0.2.2" in commands["fastdb-wheel-build"]
+        assert "fastdb4py==0.2.3" in commands["fastdb-wheel-build"]
         assert "../fastdb" not in commands["fastdb-wheel-build"]
         assert "--lib" not in commands["core-test"]
         assert all(not deps for name, _, deps in gates if name in runner.INDEPENDENT_SETUP_GATES)

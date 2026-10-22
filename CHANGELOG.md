@@ -4,7 +4,60 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.0] — companion c3 0.4.0
+
+### Changed
+
+- Ordinary SHM replies reuse `PreparedShmResponse` preparation and sending.
+  The low-level Rust preparation API returns `Result<Option<PreparedShmResponse>, String>`;
+  ordinary release uses the existing `free_at` bookkeeping and shared error
+  messages. Sending failures never trigger fallback or replay.
+- Allocation owners are move-only and pool-bound; low-level raw memory access
+  requires explicit unsafe contracts. Consumers must migrate and recompile;
+  there are no compatibility constructors.
+
+- Breaking low-level Rust chunk API: `ChunkRegistry<C>` owns each assembly and
+  its required context together. `take` / `take_id` replace `finish` / `abort_id`;
+  `set_route_info`, `FinishedChunk` and Rust assembler route fields are removed
+  without aliases. GC returns route permits with their assembly instead of a
+  later reconciliation sweep. Python metadata access, admission and release
+  ordering, IPC 12, SHM 3 and C/FFI ABI 5 retain their contracts.
+- Breaking Rust error API: `ServerLifecycleState::Failed` and `LifecycleError::Server` now carry `ServerFailure`; `ServerError::Bind` / `Failed` and `IpcError::Connect` identify local endpoint failures. Core and the Rust SDK expose `LocalIoCause` through the existing error chain. There are no compatibility variants; IPC 12, SHM 3 and C/FFI ABI 5 are unchanged.
+- Dependencies now pin FastDB 0.2.3 across Python, Rust,
+  TypeScript validation and the verified Core SDK. SDK preparation also
+  recognizes the official Windows ARM64 bundle. Portable payload semantics
+  and FastDB ABI-117 are unchanged.
+- Breaking low-level owner API: `owner_control_pair()` now returns `OwnerControl` and Rust `OwnerBootstrap` / Python `NativeOwnerBootstrap`, replacing the single-direction API without compatibility aliases. Explicit recovery tickets and one-use prepared takeover replace the old ownership relationship; `close()` starts grace, while `request_shutdown()` requests drain. Ordinary OwnerBound admin shutdown receives a negative ACK; Persistent and trusted in-process shutdown retain their behavior.
+- OwnerMissing grace now preserves published Ready routes and their UID/revision while calls report `ResourceUnavailable`. Takeover must commit before the original monotonic deadline, consumes the old grant and advances the owner epoch; failed attempts cannot extend grace. Lost confirmation requires explicit recovery with saved tickets, without automatic replay or old/new-key fallback. Owner control uses independent version 1; IPC 12, SHM 3, C/FFI ABI 5 and business frames are unchanged.
+
+### Added
+
+- Rust and Python expose read-only physical IPC connection observations and
+  bounded server connection events on Unix sockets and Windows Named Pipes.
+  Idle peers are observed by the existing receive loop; waiting requires no
+  business call. Terminal reasons describe transport facts, not process death
+  or completion of resource and payload cleanup.
+
+### Fixed
+
+- Local bind/connect failures retain their original OS kind and code through readiness waiters and Python `CoreError.io_kind`, `raw_os_error` and `io_operation`. Contextual messages, outer policy refusals, error ordering and retry budgets remain unchanged. Deadline, handshake and other non-local-I/O failures do not acquire an OS cause.
+- A relay registration response arriving after owner loss or shutdown cannot
+  reopen route admission with an obsolete registration token.
+
+- Direct IPC admin shutdown retries only before control writing begins; loss
+  of confirmation after submission does not replay the request. ACK still
+  proves initiation only.
+- Non-Hello owner setup refusal obeys the original setup deadline.
+- Development dependencies use patched Pillow 13.0.0 and certifi 2026.10.19.
+  Banner generation has a separate Python 3.11+ group; SDK and ordinary test
+  environments retain Python 3.10 support.
+
+See [0.8.0 migration and release scope](docs/releases/0.8.0.md).
+
+## [0.7.6] — companion c3 0.3.5
+
+- Fixed concurrent outgoing IPC shutdown reports that could label completed
+  client cleanup as unconfirmed. See [the release notes](docs/releases/0.7.6.md).
 
 ## [0.7.5] — local preparation, companion c3 0.3.4
 

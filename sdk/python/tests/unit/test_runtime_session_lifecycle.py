@@ -9,6 +9,8 @@ controller/service process behaviour lives in
 from __future__ import annotations
 
 import time
+import pickle
+import sys
 
 import pytest
 
@@ -128,9 +130,11 @@ class TestOwnerControlCapability:
         text = f'{receiver!r} {keepalive!r}'
         for forbidden in ('fd', 'handle', 'pipe', 'tmp', 'token', '/'):
             assert forbidden not in text
-        assert keepalive.is_alive is True
-        keepalive.shutdown()
-        assert keepalive.is_alive is False
+        assert isinstance(keepalive, cc.OwnerControl)
+        keepalive.close()
+        with pytest.raises(cc.OwnerControlError) as closed:
+            keepalive.recovery_ticket(timeout=0)
+        assert closed.value.kind == 'not_sent'
 
     def test_capability_is_consumed_exactly_once(self) -> None:
         from c_two._native import RuntimeSession
@@ -152,7 +156,7 @@ class TestOwnerControlCapability:
             with pytest.raises(Exception, match='before the Core host starts'):
                 session.attach_owner_control(receiver)
         finally:
-            keepalive.shutdown()
+            keepalive.close()
             session.shutdown(route_names=[], timeout_seconds=5.0)
 
     def test_owner_eof_reaches_a_real_terminal_outcome(self) -> None:
@@ -165,7 +169,7 @@ class TestOwnerControlCapability:
             session.attach_owner_control(receiver)
             session.ensure_host_started()
             assert session.native_terminal_outcome() is None
-            keepalive.shutdown()
+            keepalive.close()
             deadline = time.monotonic() + 10.0
             while session.native_terminal_outcome() is None:
                 assert time.monotonic() < deadline, 'owner EOF never became terminal'
@@ -195,7 +199,7 @@ class TestSetServerKeywords:
                     owner_control=receiver,
                 )
         finally:
-            keepalive.shutdown()
+            keepalive.close()
         # The rejected call attached nothing.
         from c_two.transport.registry import _ProcessRegistry
 
@@ -232,7 +236,7 @@ class TestSetServerKeywords:
             assert server.native_lifecycle_snapshot()['phase'] == 'armed'
             assert server.native_terminal_outcome() is None
 
-            keepalive.shutdown()
+            keepalive.close()
             deadline = time.monotonic() + 10.0
             while server.native_terminal_outcome() is None:
                 assert time.monotonic() < deadline, 'owner EOF never became terminal'
@@ -240,7 +244,7 @@ class TestSetServerKeywords:
             assert server.is_started() is False
             assert server.native_lifecycle_snapshot()['phase'] == 'finished'
         finally:
-            keepalive.shutdown()
+            keepalive.close()
             cc.shutdown()
 
     def test_ordinary_business_clients_never_end_an_owner_bound_server(self) -> None:
@@ -278,7 +282,7 @@ class TestSetServerKeywords:
         finally:
             if proxy is not None:
                 cc.close(proxy)
-            keepalive.shutdown()
+            keepalive.close()
             cc.shutdown()
 
 
@@ -304,8 +308,8 @@ def test_duplicate_and_configuration_errors_preserve_valid_receiver():
             session.attach_owner_control(second)
         assert second.is_available
     finally:
-        first_keepalive.shutdown()
-        second_keepalive.shutdown()
+        first_keepalive.close()
+        second_keepalive.close()
         session.shutdown(route_names=[], timeout_seconds=5)
         cc.shutdown()
 
@@ -316,7 +320,7 @@ def test_preclosed_owner_cannot_publish_readiness():
     session = RuntimeSession()
     session.set_lifecycle_policy('owner_bound', 0)
     session.attach_owner_control(receiver)
-    keepalive.shutdown()
+    keepalive.close()
     with pytest.raises(Exception):
         session.ensure_host_started()
     assert not session.host_started
@@ -330,7 +334,7 @@ def test_failed_start_late_attach_preserves_valid_receiver():
     session = RuntimeSession()
     session.set_lifecycle_policy('owner_bound', 0)
     session.attach_owner_control(receiver)
-    keepalive.shutdown()
+    keepalive.close()
     with pytest.raises(Exception):
         session.ensure_host_started()
     other_keepalive, other_receiver = cc.owner_control_pair()
@@ -339,7 +343,7 @@ def test_failed_start_late_attach_preserves_valid_receiver():
             session.attach_owner_control(other_receiver)
         assert other_receiver.is_available
     finally:
-        other_keepalive.shutdown()
+        other_keepalive.close()
         session.shutdown(route_names=[], timeout_seconds=5)
 
 
@@ -363,4 +367,89 @@ def test_failed_spawn_consumes_the_transferred_receiver():
         with pytest.raises(RuntimeError, match='already consumed'):
             cc.spawn_owned_child(receiver, '/nonexistent-c2-owner-test-program')
     finally:
-        keepalive.shutdown()
+        keepalive.close()
+
+
+def test_takeover_tickets_and_real_thread_guard_survive_pause_resume(monkeypatch):
+    from c_two.error import ResourceUnavailable
+
+    @cc.crm(namespace='test.owner.takeover', version='1.0.0')
+    class Echo:
+        def echo(self, value: int) -> int: ...
+
+    class Resource:
+        calls = 0
+
+        def echo(self, value):
+            self.calls += 1
+            return value
+
+    owner, bootstrap = cc.owner_control_pair()
+    successor = None
+    proxy = None
+    address = None
+    old_guard = None
+    try:
+        cc.set_server(lifecycle=LifecycleConfig.owner_bound(10), owner_control=bootstrap)
+        resource = Resource()
+        cc.register(Echo, resource, name='takeover-echo')
+        address = cc.server_address()
+        proxy = cc.connect(Echo, name='takeover-echo')
+        scheduler = proxy.client._scheduler
+        assert not scheduler.is_unconstrained
+        first = owner.recovery_ticket(timeout=3)
+        assert owner.recovery_ticket(timeout=3).export() == first.export()
+        for opaque in (owner, bootstrap, first):
+            with pytest.raises(TypeError):
+                pickle.dumps(opaque)
+        assert 'redacted' in repr(first)
+        owner.revoke_recovery(timeout=3)
+        owner.revoke_recovery(timeout=3)
+        current = owner.recovery_ticket(timeout=3)
+        assert current.export() != first.export()
+        prepared = cc.prepare_owner_takeover(cc.OwnerRecoveryTicket.from_bytes(current.export()))
+        assert prepared.inspect(timeout=3).phase == 'armed'
+        saved = prepared.successor_ticket.export()
+        # Hold the actual native guard before EOF; it must not cross the whole
+        # pause/resume interval, even though a new permit will be accepted.
+        old_guard = scheduler.execution_guard(scheduler.method_idx('echo'))
+        owner.close()
+        deadline = time.monotonic() + 3
+        while cc.native_lifecycle_snapshot()['phase'] != 'owner_missing':
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+        with pytest.raises(cc.OwnerControlError) as revoked:
+            cc.prepare_owner_takeover(first).commit(timeout=3)
+        assert revoked.value.kind == 'invalid_grant'
+        successor = prepared.commit(timeout=3)
+        assert successor.recovery_ticket(timeout=3).export() == saved
+        with monkeypatch.context() as patch:
+            patch.setattr(scheduler, 'execution_guard', lambda _: old_guard)
+            with pytest.raises(ResourceUnavailable):
+                proxy.echo(11)
+        assert resource.calls == 0
+        assert scheduler.snapshot().pending == 0
+        assert proxy.echo(23) == 23
+        assert resource.calls == 1
+        with pytest.raises(cc.OwnerControlError) as replay:
+            prepared.commit(timeout=3)
+        assert replay.value.kind == 'not_sent'
+        successor.request_shutdown(timeout=3)
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        if old_guard is not None:
+            old_guard.__exit__(None, None, None)
+        cc.shutdown(timeout=5)
+        owner.close()
+        if successor is not None:
+            successor.close()
+        if address is not None:
+            inspected = cc.inspect_endpoint(address)
+            if sys.platform == 'win32':
+                from c_two.transport.client.util import ping
+                assert inspected['status'] == 'not-applicable'
+                assert inspected['reason'] == 'kernel-managed'
+                assert not ping(address, timeout=1), 'stopped owner still has an IPC listener'
+            else:
+                assert inspected['status'] == 'absent'

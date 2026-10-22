@@ -130,8 +130,12 @@ fn lease_path_at(root: &Path, endpoint: &LocalEndpoint) -> PathBuf {
 
 fn lease_path(endpoint: &LocalEndpoint) -> PathBuf {
     let names = managed_names(endpoint).unwrap();
-    let directories = NamespaceDirectories::open(endpoint.context().unix_root().unwrap(), false).unwrap();
-    directories.records.path().join(OsStr::from_bytes(names.lock.as_bytes()))
+    let directories =
+        NamespaceDirectories::open(endpoint.context().unix_root().unwrap(), false).unwrap();
+    directories
+        .records
+        .path()
+        .join(OsStr::from_bytes(names.lock.as_bytes()))
 }
 
 fn identity_of(path: &Path) -> SocketIdentity {
@@ -2661,6 +2665,21 @@ fn socket_is_0600_before_listen_under_permissive_umask() {
 
 #[tokio::test]
 async fn directory_policy_and_diagnostics_are_shared_by_all_entry_points() {
+    // Sweep admission is process-wide. Keep this permission-order diagnostic
+    // independent of maintenance sweeps running in other test threads.
+    if std::env::var_os("C2_DIRECTORY_POLICY_CHILD").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unix_managed::tests::directory_policy_and_diagnostics_are_shared_by_all_entry_points",
+                "--nocapture",
+            ])
+            .env("C2_DIRECTORY_POLICY_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
     let namespace = TestNamespace::new();
     let root = namespace.path();
     let endpoint = managed_endpoint_at(root, "policy");
@@ -2735,6 +2754,7 @@ fn final_directory_symlink_and_replacement_are_refused_with_context() {
     let moved = root.with_file_name("moved");
     let directory = EndpointDirectory::open(root, false).unwrap();
     std::fs::rename(root, &moved).unwrap();
+    let missing_path = directory.validate().unwrap_err();
     std::os::unix::fs::symlink(&moved, root).unwrap();
     let error = EndpointDirectory::open(root, false).err().unwrap();
     let message = error.to_string();
@@ -2759,6 +2779,11 @@ fn final_directory_symlink_and_replacement_are_refused_with_context() {
     );
     assert!(moved.is_dir());
     assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+    // The policy still rejects the missing identity; diagnostics retain the OS cause.
+    assert_eq!(missing_path.kind(), io::ErrorKind::PermissionDenied);
+    let cause = crate::EndpointIoError::from(&missing_path);
+    assert_eq!(cause.kind, io::ErrorKind::NotFound);
+    assert_eq!(cause.raw_os_error, Some(libc::ENOENT));
 }
 
 #[test]
@@ -2882,7 +2907,8 @@ async fn before_listen_checkpoint_rejects_an_already_listening_socket() {
     let namespace = open_root_bounded(root, true).unwrap();
     let names = managed_names(&endpoint).unwrap();
     let lease = namespace
-        .directories.records
+        .directories
+        .records
         .open_file(
             &names.lock,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
@@ -2892,7 +2918,13 @@ async fn before_listen_checkpoint_rejects_an_already_listening_socket() {
         .unwrap();
     try_lock_lease(&lease).unwrap();
     let socket = bind_in_verified_directory(&namespace, &names).unwrap();
-    let guard = BoundSocketGuard::capture(&namespace.directories.records, &namespace.directories.records, &names, &lease).unwrap();
+    let guard = BoundSocketGuard::capture(
+        &namespace.directories.records,
+        &namespace.directories.records,
+        &names,
+        &lease,
+    )
+    .unwrap();
     set_socket_permissions(&namespace.directories.records, &names, &guard).unwrap();
     socket.listen(128).unwrap();
     fault::inject(Failure::BeforeListen);
@@ -3137,5 +3169,206 @@ async fn native_listener_in_directory_with_spaces_and_unicode() {
     let (client, accepted) = tokio::join!(connecting, listener.accept());
     drop(client.unwrap());
     drop(accepted.unwrap());
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+}
+
+#[tokio::test]
+async fn binding_alias_digest_ignores_paths_and_directory_churn() {
+    let root = TestNamespace::new();
+    let endpoint = managed_endpoint_at(root.path(), "binding-alias");
+    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+    let binding = listener.context_binding().unwrap();
+    let alias_parent = root._parent.path().join("alias");
+    std::os::unix::fs::symlink(root._parent.path(), &alias_parent).unwrap();
+    let alias = context_for_namespace(&alias_parent.join("ipc"))
+        .endpoint(endpoint.address())
+        .unwrap();
+    let alias_binding = crate::EndpointContextBinding::capture(&alias).unwrap();
+    assert_eq!(binding.digest(), alias_binding.digest());
+    assert_ne!(
+        endpoint.context().namespace_id(),
+        alias.context().namespace_id()
+    );
+    let other = crate::LocalListener::bind_with_context_binding(&managed_endpoint_at(
+        root.path(),
+        "binding-churn",
+    ))
+    .unwrap();
+    assert_eq!(other.context_binding().unwrap().digest(), binding.digest());
+    assert!(matches!(other.close(), EndpointReapResult::Reaped));
+    binding.validate().unwrap();
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    // An independent binding pins identity only, never a listener lease or a held gate lock.
+    binding.validate().unwrap();
+    alias_binding.validate().unwrap();
+    let rebound = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+    assert_eq!(
+        rebound.context_binding().unwrap().digest(),
+        binding.digest()
+    );
+    assert!(matches!(rebound.close(), EndpointReapResult::Reaped));
+    let gate_flags = unsafe { libc::fcntl(binding.0.gate_pin.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(gate_flags & libc::O_ACCMODE, libc::O_RDONLY);
+}
+
+#[test]
+fn binding_capture_never_initializes_an_absent_namespace() {
+    let root = TestNamespace::new();
+    let endpoint = managed_endpoint_at(root.path(), "binding-absent");
+    assert_eq!(
+        crate::EndpointContextBinding::capture(&endpoint)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn binding_missing_marker_is_refused_without_repair() {
+    let root = TestNamespace::new();
+    let endpoint = managed_endpoint_at(root.path(), "binding-marker");
+    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+    let binding = listener.context_binding().unwrap();
+    let marker = root.path().join(MARKER_NAME);
+    let original = fs::read(&marker).unwrap();
+    fs::remove_file(&marker).unwrap();
+    assert!(binding.validate().is_err());
+    assert!(listener.context_binding().unwrap().validate().is_err());
+    assert!(crate::EndpointContextBinding::capture(&endpoint).is_err());
+    assert!(
+        !marker.exists(),
+        "validation/capture must never recreate a marker"
+    );
+    let mut restored = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&marker)
+        .unwrap();
+    restored.write_all(&original).unwrap();
+    binding.validate().unwrap();
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+}
+
+#[tokio::test]
+async fn binding_keeps_the_original_bind_directory_instead_of_adopting_a_replacement() {
+    let root = TestNamespace::new();
+    let endpoint = managed_endpoint_at(root.path(), "binding-replaced");
+    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+    let credential = listener.credential();
+    let binding = listener.context_binding().unwrap();
+    let original_root = root._parent.path().join("original");
+    fs::rename(root.path(), &original_root).unwrap();
+    fs::create_dir(root.path()).unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let replacement = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+    assert_ne!(
+        binding.digest(),
+        replacement.context_binding().unwrap().digest()
+    );
+    assert!(binding.validate().is_err());
+    // This method must return the old bind pin, never recapture the currently valid pathname.
+    assert!(listener.context_binding().unwrap().validate().is_err());
+    assert!(matches!(replacement.close(), EndpointReapResult::Reaped));
+    drop(listener);
+    fs::remove_dir_all(root.path()).unwrap();
+    fs::rename(&original_root, root.path()).unwrap();
+    binding.validate().unwrap();
+    assert!(matches!(
+        crate::reap_endpoint(&endpoint, &credential),
+        EndpointReapResult::Reaped
+    ));
+}
+
+#[tokio::test]
+async fn binding_rejects_gate_inode_or_nonce_changes_with_strict_marker_checks() {
+    let root = TestNamespace::new();
+    let endpoint = managed_endpoint_at(root.path(), "binding-gate");
+    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+    let binding = listener.context_binding().unwrap();
+    let gate = root.path().join(GATE_NAME);
+    let original_gate = root.path().join("original-gate");
+    fs::rename(&gate, &original_gate).unwrap();
+    let original = fs::read(&original_gate).unwrap();
+    let mut replacement = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&gate)
+        .unwrap();
+    replacement.write_all(&original).unwrap();
+    assert!(binding.validate().is_err());
+    assert!(crate::EndpointContextBinding::capture(&endpoint).is_err());
+    fs::remove_file(&gate).unwrap();
+    fs::rename(&original_gate, &gate).unwrap();
+    binding.validate().unwrap();
+    let mut changed = original.clone();
+    changed[9] ^= 0xff;
+    let file = OpenOptions::new().write(true).open(&gate).unwrap();
+    file.write_all_at(&changed, 0).unwrap();
+    assert!(binding.validate().is_err());
+    assert!(crate::EndpointContextBinding::capture(&endpoint).is_err());
+    assert_eq!(
+        fs::read(root.path().join(MARKER_NAME)).unwrap()[25..41],
+        original[9..25]
+    );
+    file.write_all_at(&original, 0).unwrap();
+    binding.validate().unwrap();
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+}
+
+#[tokio::test]
+async fn binding_readers_share_the_gate_and_preserve_writer_exclusion() {
+    let root = TestNamespace::new();
+    let endpoint = managed_endpoint_at(root.path(), "binding-busy");
+    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
+    let binding = listener.context_binding().unwrap();
+    let gate = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.path().join(GATE_NAME))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let started = Instant::now();
+    for result in [
+        crate::EndpointContextBinding::capture(&endpoint).map(|_| ()),
+        binding.validate(),
+    ] {
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("busy"));
+    }
+    // Projecting the identity already captured under bind's gate must not
+    // reacquire it and make successful startup fail on unrelated socket churn.
+    assert_eq!(
+        listener.context_binding().unwrap().digest(),
+        binding.digest()
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_UN) }, 0);
+    assert_eq!(
+        unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
+    // Concurrent identity readers succeed under the same gate, but the
+    // existing namespace mutation path still requires exclusive ownership.
+    assert_eq!(
+        crate::EndpointContextBinding::capture(&endpoint)
+            .unwrap()
+            .digest(),
+        binding.digest()
+    );
+    binding.validate().unwrap();
+    listener.context_binding().unwrap();
+    assert!(matches!(
+        ManagedNamespace::open_root(root.path(), false, false),
+        Err(NamespaceError::Busy)
+    ));
+    assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_UN) }, 0);
     assert!(matches!(listener.close(), EndpointReapResult::Reaped));
 }

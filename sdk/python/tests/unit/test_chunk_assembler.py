@@ -193,6 +193,31 @@ class TestChunkAssembler:
 class TestAssemblerEdgeCases:
     """Edge cases for the Rust-backed ChunkAssembler."""
 
+    @pytest.mark.parametrize('ending', ['finish', 'incomplete', 'abort'])
+    def test_route_metadata_is_consumed_with_assembly(self, pool, ending):
+        asm = RustChunkAssembler(pool, 1, 512)
+        try:
+            assert asm.route_name is None
+            assert asm.method_idx is None
+            asm.route_name = 'grid'
+            asm.method_idx = 0
+            assert (asm.route_name, asm.method_idx) == ('grid', 0)
+            if ending == 'finish':
+                asm.feed_chunk(0, b'payload')
+                asm.finish().release()
+            elif ending == 'incomplete':
+                with pytest.raises(RuntimeError, match='incomplete'):
+                    asm.finish()
+            else:
+                asm.abort()
+            assert asm.route_name is None
+            assert asm.method_idx is None
+            for name, value in [('route_name', 'next'), ('method_idx', 1)]:
+                with pytest.raises(RuntimeError, match='consumed'):
+                    setattr(asm, name, value)
+        finally:
+            asm.abort()
+
     def test_zero_length_chunk(self, pool):
         """Zero-length chunk data in assembler."""
         asm = RustChunkAssembler(pool, 1, 1024)

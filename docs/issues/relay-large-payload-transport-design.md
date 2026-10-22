@@ -566,9 +566,9 @@ Acceptance evidence:
 - Relay benchmark does not silently skip large payloads unless the selected
   transport label is unavailable.
 - If response streaming is implemented, tests prove SHM and handle responses are
-  streamed to HTTP without `into_bytes_with_pool()` materialization.
+  streamed to HTTP without `ResponseData::into_bytes()` materialization.
 
-Current residual boundary: the relay still calls `into_bytes_with_pool()` before
+Current residual boundary: the relay still calls `ResponseData::into_bytes()` before
 building the HTTP response, so no benchmark result from this phase should be
 described as bidirectional streaming.
 

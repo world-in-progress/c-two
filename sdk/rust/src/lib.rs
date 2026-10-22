@@ -15,17 +15,19 @@ pub use c2_contract::{
 pub use c2_core::{
     CallExecutionLimits, CallExecutionLimitsOverrides, CallExecutionObservation,
     CallExecutionObserver, CallExecutionSnapshot, CallOptions, CallTimeout, Client, ConfigSources,
-    Connect, ConnectOptions, DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome,
-    ENDPOINT_CREDENTIAL_MAX_BYTES, ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential,
-    EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
-    EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, EnvFilePolicy,
-    EnvMap, Host, HostOptions, LifecycleError, LocalEndpoint, LocalEndpointContext,
-    LocalEndpointNamespace, LocalEndpointOptions, MemoryCellStats, MemoryScopeStats, ObservedPath,
+    Connect, ConnectOptions, ConnectionClosed, ConnectionEndReason, ConnectionEvent,
+    ConnectionEvents, ConnectionEventsError, ConnectionObservation, DirectIpcShutdownOutcome,
+    DirectIpcShutdownRouteOutcome, ENDPOINT_CREDENTIAL_MAX_BYTES,
+    ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential, EndpointCredentialError,
+    EndpointCredentialErrorKind, EndpointInspection, EndpointIoError, EndpointReapResult,
+    EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, EnvFilePolicy, EnvMap, Host,
+    HostOptions, LifecycleError, LocalEndpoint, LocalEndpointContext, LocalEndpointNamespace,
+    LocalEndpointOptions, LocalIoCause, MemoryCellStats, MemoryScopeStats, ObservedPath,
     ObservedRoute, PathCounters, Registration, RouteConcurrency, RouteConcurrencyError,
     RouteConcurrencyGuard, RouteConcurrencySnapshot, Runtime, RuntimeIdentity, RuntimeMemoryStats,
-    RuntimeOptions, ServiceConcurrencyMode, ServiceDefinition, SweepBatch, SweepBudget,
-    direct_ipc_endpoint, direct_ipc_endpoint_with_context, inspect_endpoint, ping_direct_ipc,
-    ping_direct_ipc_with_context, reap_endpoint, shutdown_direct_ipc,
+    RuntimeOptions, ServerFailure, ServiceConcurrencyMode, ServiceDefinition, SweepBatch,
+    SweepBudget, direct_ipc_endpoint, direct_ipc_endpoint_with_context, inspect_endpoint,
+    ping_direct_ipc, ping_direct_ipc_with_context, reap_endpoint, shutdown_direct_ipc,
     shutdown_direct_ipc_with_context,
 };
 pub use error::Error;
@@ -54,6 +56,7 @@ pub mod generated {
 
 /// Native lifecycle and private owner capability, projected from Core.
 pub use c2_core::{
-    HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot, OwnerControlKeepalive,
-    OwnerControlReceiver, ServerLifecyclePolicy, owner_control_pair,
+    HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot, OwnerBootstrap, OwnerControl,
+    OwnerControlError, OwnerControlErrorKind, OwnerPhase, OwnerRecoveryTicket, OwnerStatus,
+    PreparedOwnerTakeover, ServerLifecyclePolicy, owner_control_pair,
 };

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let program = args.next().ok_or("usage: owned_child PROGRAM [ARG ...]")?;
-    let (mut keepalive, mut receiver) = owner_control_pair()?;
+    let (keepalive, mut receiver) = owner_control_pair()?;
     let mut child = Command::new(program)
         .args(args)
         .stdin(receiver.take_stdio()?)
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("C2_OWNER_RELEASE_MODE").as_deref() == Ok("drop") {
         drop(keepalive);
     } else {
-        keepalive.shutdown();
+        keepalive.close();
         drop(keepalive);
     }
     println!("CONTROLLER_RELEASED");

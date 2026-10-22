@@ -18,17 +18,61 @@ Endpoint leases need cleanup and use those same native retirement paths; failed 
 
 On Unix bind initialization failure, rollback removes only a lease created by that attempt whose original directory, gate and file identities still match. If the attempt bound a socket, that socket must first have been safely withdrawn. Pre-existing leases, replacements and unverifiable objects remain. This rollback uses creation proof still held by the current call; it does not expand historical invalid-record reap/sweep authority or guarantee cleanup after a process crashes during initialization.
 
-Runtime freezes the endpoint context before its first local bind/connect attempt, including failure. Changing the frozen root reports a configuration error; later environment changes do not affect existing listeners, clients, credentials or sweeps. Queries perform no filesystem I/O. Different directories form distinct native contexts, while connections still validate server identity, instance identity and route contracts. Root configuration does not move SHM, file spill or configuration files. See the [configuration guide](configuration.en.md).
+Runtime freezes the endpoint context before its first local bind/connect attempt or owner takeover preparation, including failure. Changing the frozen root reports a configuration error; later environment changes do not affect existing listeners, clients, credentials or sweeps. Pure context queries perform no filesystem I/O. Different directories form distinct native contexts, while connections still validate server identity, instance identity and route contracts. Root configuration does not move SHM, file spill or configuration files. See the [configuration guide](configuration.en.md).
 
 Unix credentials uniformly use existing schema 3, recording final root, namespace id, incarnation and socket identity. Encoding, decoding and CLI reading share a 32 KiB bound. Windows credentials use kernel-managed schema 1. Maintenance uses the recorded context; a mismatched explicit root is rejected before target access. Native configuration derives the full socket path; the document contains no caller-selected socket path. A credential describes an object and does not itself grant deletion authority.
 
+## Bind and connect failures
+
+In the unreleased source, Python `CoreError` exposes `io_operation` (`bind` or `connect`), `io_kind` (`permission_denied`, `not_found`, `connection_refused`, `address_in_use` or `other`) and `raw_os_error` (the native errno/Win32 code, or `None` when no native code exists). These describe the actual local operation. Configuration, handshake, contract and deadline failures have no local cause; all three fields are `None`. The existing Windows PIPE_BUSY wait retains its original connection budget; expiry is not an OS error. A C-Two listener lease conflict can report `address_in_use` with no Win32 code.
+
+Rust Core and SDK errors expose `local_io_cause() -> Option<LocalIoCause>`; its `operation()` and `error()` project the operation and existing `EndpointIoError`. The shared readiness watch carries `ServerFailure { message, bind_error }`, replacing the string payload of `ServerLifecycleState::Failed` and `LifecycleError::Server`. Exhaustive low-level matches must include `IpcError::Connect` and `ServerError::Bind` / `Failed`. Recompile Rust callers; no old payload or compatibility entry point remains. ABI and protocol versions do not change.
+
+Context preserves the original OS kind/code while outer directory-policy rejection stays unchanged. Readable messages, error ordering, retry classification and deadlines keep their existing meaning. These fields neither prove process death nor authorize restart, fallback or cleanup; controllers still use the existing listener ownership and identity-checked maintenance APIs. Endpoint maintenance retains its existing ErrorKind text format.
+
 ## Persistent and OwnerBound resources
 
-The default `Persistent` lifecycle keeps resources available after ordinary client disconnects and relay eviction. `OwnerBound` binds server lifetime to one private inherited controller capability, prepared before readiness. Create the relationship with `cc.owner_control_pair()`, transfer the receiver only to the target child with `cc.spawn_owned_child(receiver, program, args)`, and retain the keepalive in the controller. The child calls `cc.adopt_owner_stdin()` and selects `cc.LifecycleConfig.owner_bound(owner_missing_grace_seconds=3.0)` through `cc.set_server(..., owner_control=...)` before registration. The receiver cannot be reconnected or taken over. Losing that capability starts native draining after the configured bounded grace period; the grace period has no recovery entry point.
+The owner API and grace semantics below describe the unreleased development source; platform acceptance requires evidence for the exact candidate. The default `Persistent` lifecycle keeps resources available after ordinary client disconnects and relay eviction. Use `OwnerBound` only for a dedicated child whose entire Runtime belongs to one controller. `control, receiver = cc.owner_control_pair()` returns `OwnerControl` and a one-use `NativeOwnerBootstrap`; Rust returns `OwnerControl` and `OwnerBootstrap`. Retain control and transfer only the bootstrap to the intended child with `cc.spawn_owned_child(receiver, program, args)`; `receiver` remains the parameter name. The child explicitly calls `bootstrap = cc.adopt_owner_stdin()` and selects `cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(owner_missing_grace_seconds=3.0), owner_control=bootstrap)` before registration.
 
-`OwnedChild.poll()`, `wait(timeout=...)` and `kill()` observe or control the process. `close()` releases the observer; the native shared reaper continues OS process reclamation. There is no always-running system monitor required to manage every endpoint.
+Core arms the private duplex relationship before readiness. Unix uses a nonblocking CLOEXEC socketpair; Windows uses a local current-logon SID duplex byte-mode Named Pipe, registering the bootstrap with its reactor/IOCP only after transfer to the child. A trusted launcher supplies the inherited capability; ordinary business stdin or arbitrary handles cannot be promoted to owner authority. Late bootstrap attachment cannot bypass ticket recovery. Restarting a terminal OwnerBound host requires a fresh Runtime and bootstrap; an old ticket cannot authorize a new server instance. Ticket requests made before readiness wait within their original request budget until the endpoint is ready to issue a bound capability.
 
-`cc.shutdown(timeout=...)` reports native structured completion. A direct IPC admin shutdown ACK proves initiation, without proving that callbacks have drained or shutdown hooks can run. With `completed=False`, the session, bridge, routes and hooks remain available for observing the same transaction again. Listener closure, active work and retained payload leases are separate facts. Endpoint cleanup does not release held or borrowed payloads; their own lease release invalidates FastDB checked views.
+`control.close()`, destruction of control or controller exit ends the relationship. Native observation of its termination enters `OwnerMissing`, pauses host admission and starts the configured grace period. The current valid owner's `control.request_shutdown(timeout=...)` instead requests native drain immediately; success acknowledges shutdown initiation without waiting for business work or process exit. Ordinary direct IPC admin shutdown receives a negative ACK on OwnerBound hosts, including pre-handshake and duplicate initiate requests, and cannot bypass owner revocation. Persistent admin behavior and trusted in-process `Runtime.shutdown()` / `cc.shutdown()` retain their existing semantics.
+
+During `OwnerMissing`, published routes remain `Ready` with the same route UID/revision and server instance; catalog and relay registration remain present. `connect()` may succeed while calls report existing `ResourceUnavailable`, including Python thread-local calls through the same native gate. Already admitted work and held/borrowed leases retain their lifetime rules. Old pending requests cannot gain admission by sleeping through pause and resume. Takeover restores only the host gate: it neither re-registers routes nor reopens explicitly closed/unregistered routes. Late relay final responses still require their original registration token's identity and admission generation checks. A sent business frame retains its original transport phase/retry rules; `ResourceUnavailable` alone neither proves pre-dispatch failure nor authorizes business replay.
+
+Takeover requires `OwnerMissing` and monotonic `now < original grace deadline`. At or after the deadline it is refused and native draining begins even if the timer has not run yet. Wrong tickets, partial requests, competing attempts and inspect cannot extend that deadline. Successful commit atomically consumes the old grant, installs the successor grant, advances the owner epoch and transfers supervision. At most one contender using a ticket wins; old tickets and old-epoch commands, EOF and timers lose authority over the new owner. `WatcherIoError`, `Draining` and `Finished` cannot recover through takeover.
+
+Only the current session/epoch can issue a ticket with `control.recovery_ticket(timeout=...)` or idempotently revoke the current grant with `control.revoke_recovery(timeout=...)`. Repeated issuance returns the same current grant; issuance after revocation creates a new secret. `OwnerRecoveryTicket` has a redacted repr and no implicit pickle support. Explicit `ticket.export()` includes its secret; import with Rust `OwnerRecoveryTicket::import(&bytes)` or Python `cc.OwnerRecoveryTicket.from_bytes(data)`. The application must protect and durably save these bytes outside the controller. C-Two creates no secret file or background recovery worker.
+
+Configure the recovering controller's endpoint through the existing configuration API before `cc.prepare_owner_takeover(ticket)`; Rust uses `Runtime::prepare_owner_takeover(ticket)`. Preparation freezes that Runtime's existing endpoint configuration and captures native directory identity, including on failure; it neither starts a host nor adopts a directory from the ticket. Tickets bind the logical address, server instance, owner epoch and native endpoint context identity. Aliases of the same directory are checked by native identity rather than path spelling. Wrong roots/instances and directory replacement are rejected, with identity revalidated during inspect/commit and no automatic default-root selection. Recovery tickets and endpoint credentials are not instructions to adopt historical or replacement directories.
+
+Prepare, optionally call `prepared.inspect(timeout=...)`, save `prepared.successor_ticket.export()`, then call `prepared.commit(timeout=...)` once. Inspect observes current identity/epoch/phase; it is neither authorization nor a receipt proving this transaction succeeded. Commit revalidates authority and returns the new `OwnerControl` on success. Python exposes `successor_ticket` and `recovery_ticket` as properties; Rust uses methods of those names. The successor becomes valid only when the server atomically installs it, and both tickets remain exportable from the prepared object after every outcome. In the short example below, `save_ticket(name, data)` and `load_ticket(name)` are application-provided durable storage functions; the keys illustrate one recovery attempt. Keep the original ticket and successor separately, and finish saving before commit so they remain readable after controller exit. Use separate records for later attempts without overwriting saved tickets that might still be valid.
+
+```python
+# Original controller: the child is Ready; control came from cc.owner_control_pair().
+save_ticket("current", control.recovery_ticket(timeout=1.0).export())
+```
+
+```python
+import c_two as cc
+
+# Recovering controller: the original host's endpoint context is configured.
+ticket = cc.OwnerRecoveryTicket.from_bytes(load_ticket("current"))
+prepared = cc.prepare_owner_takeover(ticket)
+status = prepared.inspect(timeout=1.0)  # Observation only, never proof of takeover.
+save_ticket("successor", prepared.successor_ticket.export())
+control = prepared.commit(timeout=1.0)  # One commit per object; retain control.
+```
+
+Control failures raise `cc.OwnerControlError`. Python `error.kind` / `error.cause_kind` correspond to Rust `kind()` / `cause_kind()`. `NotSent` (`not_sent`) means the mutating request did not begin sending. `Indeterminate` (`indeterminate`) means sending began without a valid confirmation or explicit rejection; the candidate session closes, and neither success nor non-execution can be inferred. Complete refusals retain definite kinds such as `owner_present`, `invalid_grant`, `grace_expired`, `identity_mismatch` and `shutting_down`. The example propagates errors. Each prepared object permits only one commit regardless of outcome; retrying after NotSent also requires new preparation. The application must retain both tickets and their epoch information. After an uncertain result, inspect may observe the current epoch/phase, and the application can explicitly choose a saved original or successor ticket for a new prepared attempt. The original remains valid only if unconsumed; after consumption only the authorized successor is valid, and a competing winner or revocation can invalidate the application's tickets. Never automatically try old/new keys in sequence or treat an epoch change as proof that this transaction won.
+
+Each control operation has one native absolute budget and each session has one in-flight request. A waiter timing out before acquiring the serial slot cannot close another operation's session; expiry after acquiring the slot but before the first write also preserves a healthy session. Losing confirmation after writing begins terminates that dedicated session so a late reply cannot satisfy a later request. Candidate setup is bounded by the earlier of the native 5-second limit and the original grace deadline; partial frames and retries never reset it, and no configuration option is added. Owner control uses independent version 1 messages, bounded to 4 KiB within the existing frame envelope. IPC handshake 12, SHM 3, C/FFI ABI 5 and business frames/call/reply encodings remain unchanged. Rust exhaustive matches must add `MsgType::OwnerControl`, `SchedulerAcquireError::Unavailable` and `RouteConcurrencyError::Unavailable` branches. Superseded single-direction owner types, formats and aliases are removed without compatibility paths or downgrade to ordinary admin, HTTP or relay.
+
+`OwnedChild.poll()`, `wait(timeout=...)` and `kill()` observe or control the process. `OwnedChild.close()` releases the observer; the native shared reaper continues OS process reclamation. Its lifecycle effect differs from `OwnerControl.close()`. There is no always-running system monitor required to manage every endpoint.
+
+`cc.shutdown(timeout=...)` reports native structured completion. An accepted owner shutdown or Persistent admin shutdown ACK proves initiation, without proving that callbacks have drained or shutdown hooks can run. With `completed=False`, the session, bridge, routes and hooks remain available for observing the same transaction again. Listener closure, active work and retained payload leases are separate facts. Endpoint cleanup does not release held or borrowed payloads; their own lease release invalidates FastDB checked views.
+
+Persistent direct IPC admin shutdown retries transient connection failures only before attempting to write the control request. After writing starts, a write failure, lost ACK or timeout returns the existing unconfirmed result without reconnecting and resending; an unconfirmed result does not prove that the server did not execute the request. A replacement instance at the same address therefore cannot receive a replay from this call. Ping retains its probe retries; initial endpoint absence handling and the original total budget are unchanged.
 
 ## Exact cleanup and bounded sweeps
 
@@ -51,6 +95,69 @@ Relay freezes its local upstream context at startup. Upstream resources share th
 
 Authoritative route acquisition queries current server state and binds the route UID/revision and server instance. Idle eviction removes the data connection while retaining registration and owner state. An old proxy cannot acquire a replacement resource with the same name. Generated TypeScript persistent IPC clients use the same control lookup and identity rules.
 
+## Observing physical IPC connections
+
+Python `cc.connection_observation(proxy)` and Rust ordinary/generated clients'
+`client.connection_observation()` return a read-only view of the current physical
+IPC connection without connecting or reconnecting. Thread-local and HTTP clients
+report `UnsupportedCallMode`. Logical proxies can share a `connection_id`;
+closing one proxy need not close that connection. Reconnect creates a new ID and
+observation while the old observation retains its original terminal record.
+
+```python
+peer = cc.connect(Grid, name='grid', address=address)  # an ipc:// address
+observation = cc.connection_observation(peer)
+closed = observation.wait_closed(timeout=5.0)
+if closed is not None:
+    print(closed.connection_id, closed.reason, closed.operation, closed.os_error)
+cc.close(peer)
+```
+
+`snapshot()` immediately returns the terminal record or `None`.
+`wait_closed(timeout=None)` returns that record, or `None` on timeout, and releases
+the Python GIL while waiting. A zero timeout can read an existing terminal
+record. Rust uses async `wait_closed(Option<Duration>)`. Cancellation or timeout
+only ends that wait; late waiters receive the same record. Observations retain
+metadata, without keeping streams, runtimes, resources or payload leases alive.
+
+Subscribe with `cc.connection_events()` or Rust `Runtime::connection_events()`
+before starting the listener to receive all subsequently accepted connections.
+Subscription alone starts no host, creates no identity and freezes no config.
+Existing subscriptions survive legal configuration changes before startup.
+Python `events.recv(timeout=None)` returns a `ConnectionEvent`: `kind='opened'`
+carries an observation in `value`; `kind='closed'` carries a terminal record.
+Both expose `connection_id`. These are actual connections, including handshake,
+probe and relay connections; the ID identifies no process, user or CRM.
+
+```python
+events = cc.connection_events()
+cc.register(Grid, resource, name='grid')
+for event in events:
+    if event.kind == 'closed':
+        print(event.connection_id, event.value.reason)
+```
+
+There is no historical replay: a late subscriber may see only an existing
+connection's Closed event. The queue is allocated on first subscription with
+an internal capacity of 1024. Overflow raises
+Python `ConnectionEventsLagged` with a `missed` count, or Rust
+`ConnectionEventsError::Lagged`, and ends that subscription. Previously obtained
+per-connection observations remain usable. Python `recv()` returns `None` on
+timeout and raises `StopIteration` when the source or subscription ends; Rust
+returns `Ok(None)` at the end. Each subscription has one consumer and does not
+extend the runtime's lifetime.
+
+Reasons are `local_close`, `peer_close_message`, `peer_eof`, `connection_reset`,
+`heartbeat_timeout`, `protocol_error` and `io_error`. Only an actual DISCONNECT
+message yields `peer_close_message`. EOF, reset and heartbeat timeout do not
+prove process death. The first terminal fact is retained and the two ends can
+observe different reasons. Existing Linux/macOS UDS and Windows Named Pipe
+receive events and heartbeat drive notifications even with no pending call.
+Notification precedes work drain and memory release: use the original native
+shutdown/close outcomes for cleanup completion, OS wait for process exit and
+captured credentials for exact reap. Observations neither release Held results
+nor turn an ordinary disconnect into OwnerBound owner loss.
+
 Replaced objects, unknown endpoints, corrupt records and incomplete initialization report `unverified`. Age, PID and connection failure cannot authorize removal. Processes in one communication group use the same build and final-directory configuration. The new path directly replaces the old layout; existing processes, old credentials and historical directories are not migrated or swept automatically. Windows maintenance reports kernel ownership or `not-applicable`. Recovery from a crash at every possible point in initial registration is outside the guarantee. Validation reports identify the environments actually exercised.
 
-See the [owned-child Rust example](../sdk/rust/examples/owned_child.rs) and [0.7.4 guide](releases/0.7.4.md). Earlier [canonical endpoint validation](reports/canonical-local-endpoint-validation.md) and [endpoint validation](reports/local-endpoint-final-validation.md) retain their historical sources and scopes.
+See the [owned-child Rust example](../sdk/rust/examples/owned_child.rs) and historical [0.7.4 guide](releases/0.7.4.md). Earlier [canonical endpoint validation](reports/canonical-local-endpoint-validation.md) and [endpoint validation](reports/local-endpoint-final-validation.md) retain their historical sources and scopes.

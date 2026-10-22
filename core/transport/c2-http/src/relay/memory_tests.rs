@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use c2_config::{ClientIpcConfig, RelayConfig};
 use c2_ipc::{IpcClient, IpcError, ResponseData, RouteBinding};
-use c2_mem::{BudgetSnapshot, DedicatedSegment, MemPool};
+use c2_mem::{BudgetSnapshot, DedicatedSegment};
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
     RouteBuildSpec, SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
@@ -129,16 +129,14 @@ impl CrmCallback for Probe {
         _route: &str,
         method: u16,
         request: RequestData,
-        _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+        _response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         let kind = match &request {
-            RequestData::Shm {
-                is_dedicated: true, ..
-            } => {
+            RequestData::Shm(shm) if shm.is_dedicated() => {
                 self.shm_calls.fetch_add(1, Ordering::SeqCst);
                 "dedicated"
             }
-            RequestData::Shm { .. } => "buddy",
+            RequestData::Shm(_) => "buddy",
             RequestData::Handle(_) => {
                 self.handle_calls.fetch_add(1, Ordering::SeqCst);
                 "handle"
@@ -273,11 +271,10 @@ impl Upstream {
     }
 
     async fn acquire(&self, state: &RelayState) -> (UpstreamLease, Arc<IpcClient>, RouteBinding) {
-        let (lease, binding) =
-            match bounded(state.acquire_upstream_for_route(&self.entry)).await {
-                Ok(value) => value,
-                Err(_) => panic!("real attested upstream acquisition failed"),
-            };
+        let (lease, binding) = match bounded(state.acquire_upstream_for_route(&self.entry)).await {
+            Ok(value) => value,
+            Err(_) => panic!("real attested upstream acquisition failed"),
+        };
         assert_eq!(binding.route_uid(), self.entry.route_uid);
         assert_eq!(binding.route_revision(), self.entry.route_revision);
         let client = lease.client();

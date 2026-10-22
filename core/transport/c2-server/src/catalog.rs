@@ -419,7 +419,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use c2_mem::MemPool;
     use c2_wire::route_catalog_control::{
         RouteContractWire, RouteListResponse, RouteLookupRequest, RouteLookupResponse,
         RouteSelector, RouteStateReasonWire, RouteStateWire, RouteWatchEvent,
@@ -440,7 +439,7 @@ mod tests {
             _route_name: &str,
             _method_idx: u16,
             _request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            _response_pool: Arc<crate::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(b"ok".to_vec()))
         }

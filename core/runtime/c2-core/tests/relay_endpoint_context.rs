@@ -278,6 +278,176 @@ fn explicit_http_with_invalid_process_root_stays_usable() {
 }
 
 #[test]
+fn owner_takeover_preserves_relay_routes_through_idle_eviction_and_restart() {
+    use c2_core::{
+        ConnectionEndReason, ConnectionEvent, ConnectionEventWait, HostLifecyclePhase,
+        owner_control_pair, recv_connection_event,
+    };
+    use c2_http::client::RelayControlClient;
+    use c2_http::relay::{RelayConfig, RelayServer};
+    use std::time::Instant;
+
+    let server_id = format!("relay-takeover-{}", uuid::Uuid::new_v4().simple());
+    let service = Runtime::new(RuntimeOptions {
+        server_id: Some(server_id.clone()),
+        use_process_relay_anchor: false,
+        ..Default::default()
+    })
+    .unwrap();
+    #[cfg(unix)]
+    let root = tempfile::Builder::new()
+        .prefix("c2-owner-relay-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    #[cfg(unix)]
+    service
+        .set_local_endpoint_with_sources(
+            LocalEndpointOptions {
+                unix_root: Some(root.path().into()),
+            },
+            ConfigSources::empty(),
+        )
+        .unwrap();
+    let context = service.local_endpoint_context().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let url = format!("http://{address}");
+    let config = RelayConfig {
+        bind: address.to_string(),
+        advertise_url: url.clone(),
+        idle_timeout_secs: 1,
+        heartbeat_interval: Duration::ZERO,
+        anti_entropy_interval: Duration::ZERO,
+        ..Default::default()
+    };
+    let mut relay = RelayServer::start_with_context(config.clone(), context.clone()).unwrap();
+    let (owner, bootstrap) = owner_control_pair().unwrap();
+    service.attach_owner_control(bootstrap).unwrap();
+    let host = service
+        .host(
+            HostOptions::default()
+                .with_relay_anchor_address(&url)
+                .with_relay_use_proxy(false)
+                .with_owner_bound(Duration::from_secs(30)),
+        )
+        .unwrap();
+    let endpoint = host.local_endpoint().clone();
+    let registration = host.register(definition(b'R')).unwrap();
+    let outcome = registration.outcome();
+    let ticket = owner.recovery_ticket(Some(WAIT)).unwrap();
+    let caller = runtime(None);
+    let mut connections = service.connection_events();
+    let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let client = caller
+            .connect(
+                expected(),
+                Connect::ExplicitRelay {
+                    relay_url: url.clone(),
+                },
+            )
+            .unwrap()
+            .with_call_options(CallOptions::with_timeout(CallTimeout::After(WAIT)));
+        assert_eq!(client.call_owned("echo", b"before").unwrap(), b"Rbefore");
+        owner.close();
+        let deadline = Instant::now() + WAIT;
+        while host.lifecycle_snapshot().phase != HostLifecyclePhase::OwnerMissing {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A control watcher may connect before or after the data client. Wait
+        // for a newly observed connection's real close, not for the first Opened
+        // (which could be that persistent watcher). Old attestation closes have
+        // no matching Opened in this subscription and cannot satisfy the check.
+        let idle_deadline = Instant::now() + Duration::from_secs(8);
+        let mut opened = std::collections::HashSet::new();
+        loop {
+            match recv_connection_event(
+                &mut connections,
+                Some(idle_deadline.saturating_duration_since(Instant::now())),
+            )
+            .unwrap()
+            {
+                Some(ConnectionEventWait::Event(ConnectionEvent::Opened(observation))) => {
+                    opened.insert(observation.connection_id());
+                }
+                Some(ConnectionEventWait::Event(ConnectionEvent::Closed(closed))) => {
+                    // A failed watcher handshake may also close. Only a paired
+                    // explicit DISCONNECT proves the healthy idle client was retired.
+                    if opened.remove(&closed.connection_id())
+                        && closed.reason() == ConnectionEndReason::PeerCloseMessage
+                        && closed.operation() == "disconnect"
+                    {
+                        break;
+                    }
+                }
+                other => panic!("idle relay data connection was not evicted: {other:?}"),
+            }
+        }
+        let assert_paused = || {
+            let error = client.call_owned("echo", b"paused").unwrap_err();
+            assert!(
+                matches!(error, Error::Semantic(ref e) if e.code == ErrorCode::ResourceUnavailable),
+                "{error:?}"
+            );
+            let control = RelayControlClient::new(&url, false).unwrap();
+            let io = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let routes = io
+                .block_on(control.resolve_matching_async(&expected()))
+                .unwrap();
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0].route_uid, outcome.route_uid);
+            assert_eq!(routes[0].route_revision, outcome.route_revision);
+        };
+        assert_paused();
+        relay.stop().unwrap();
+        relay = RelayServer::start_with_context(config, context).unwrap();
+        // Restart with the existing explicit upstream registration. Its real
+        // route watch/FULL_SYNC must discover the same Ready route while paused.
+        relay
+            .register_upstream("route", &server_id, endpoint.address())
+            .unwrap();
+        assert_paused();
+        let prepared = service.prepare_owner_takeover(ticket).unwrap();
+        let replacement = prepared.commit(Some(WAIT)).unwrap();
+        assert_eq!(host.lifecycle_snapshot().phase, HostLifecyclePhase::Armed);
+        assert_eq!(client.call_owned("echo", b"after").unwrap(), b"Rafter");
+        replacement.request_shutdown(Some(WAIT)).unwrap();
+    }));
+    caller.shutdown_without_host(WAIT);
+    let shutdown = host.shutdown();
+    let remaining = relay.list_routes().unwrap();
+    relay.stop().unwrap();
+    drop(registration);
+    drop(host);
+    drop(service);
+    assert!(shutdown.runtime_barrier_error.is_none(), "{shutdown:?}");
+    assert!(shutdown.relay_errors.is_empty(), "{shutdown:?}");
+    assert!(
+        remaining.is_empty(),
+        "terminal shutdown must withdraw the route"
+    );
+    assert!(matches!(
+        c2_local::inspect_endpoint(&endpoint),
+        c2_local::EndpointInspection::Absent | c2_local::EndpointInspection::KernelManaged
+    ));
+    #[cfg(unix)]
+    assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".lease")
+    }));
+    if let Err(panic) = observed {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
 #[ignore = "isolated process fixture, invoked by parent"]
 fn http_only_child() {
     let fixture = HttpFixture::new(None, || {});

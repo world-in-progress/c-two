@@ -23,8 +23,10 @@ dev = [
     "httpx>=0.28.1",
     "numpy>=2.2.4",
     "pandas>=2.2.0",
-    "pillow>=12.3.0",
     "pyarrow>=23.0.1",
+]
+banner = [
+    "pillow>=13.0.0",
 ]
 examples = [
     "numpy>=2.2.4",
@@ -51,6 +53,9 @@ cache-keys = [
 
 [tool.uv.sources]
 c-two = { workspace = true }
+
+[tool.uv.dependency-groups]
+banner = { requires-python = ">=3.11" }
 
 [tool.uv.workspace]
 members = ["sdk/python"]

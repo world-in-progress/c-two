@@ -1,0 +1,644 @@
+{
+  "schema": "c-two.connection-observation-validation.v1",
+  "status": "implemented-cross-platform-ci-validated",
+  "source_commit": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+  "fastdb_source": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+  "fastdb_version": "0.2.3",
+  "protocols": {
+    "ipc": 12,
+    "shm": 3,
+    "c_ffi_abi": 5
+  },
+  "ci": {
+    "run_id": 39569384042,
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042",
+    "head_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "name": "changes",
+        "conclusion": "success",
+        "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042/job/119119460326"
+      },
+      {
+        "name": "workflow policy",
+        "conclusion": "success",
+        "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042/job/119119524735"
+      },
+      {
+        "name": "source (windows-2025, py3.12)",
+        "conclusion": "success",
+        "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042/job/119120176374"
+      },
+      {
+        "name": "source (macos-15, py3.12)",
+        "conclusion": "success",
+        "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042/job/119120176407"
+      },
+      {
+        "name": "source (ubuntu-24.04, py3.14t)",
+        "conclusion": "success",
+        "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042/job/119120176503"
+      },
+      {
+        "name": "source (ubuntu-24.04, py3.12)",
+        "conclusion": "success",
+        "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042/job/119120176521"
+      },
+      {
+        "name": "source (windows-2022, py3.12)",
+        "conclusion": "success",
+        "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042/job/119120176547"
+      },
+      {
+        "name": "test (py3.12)",
+        "conclusion": "success",
+        "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042/job/119127615731"
+      },
+      {
+        "name": "test (py3.14t)",
+        "conclusion": "success",
+        "url": "https://github.com/Dsssyc/c-two/actions/runs/39569384042/job/119127615736"
+      }
+    ],
+    "source_receipts": [
+      {
+        "label": "linux312",
+        "gates_passed": 25,
+        "sources": {
+          "c-two": {
+            "expected_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "actual_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "verified": true
+          },
+          "fastdb": {
+            "expected_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "actual_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "verified": true
+          }
+        },
+        "python": {
+          "ordinary": {
+            "tests": 1244,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 5
+          },
+          "portable": {
+            "tests": 25,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          },
+          "typescript": {
+            "tests": 14,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          }
+        },
+        "python_process_cleanup_confirmed": true,
+        "run_evidence_sha256": "0861915b0a4708e8b62945b2676e1e015ea41d1032f82eb6aa77a7ac61f10707",
+        "installed_wheel": {
+          "status": "passed",
+          "identity": {
+            "administrator": null
+          },
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "sha256": "01eda67ff530bbc2085406184667419b564a75f3eaeff591e49d8ccf626986b0"
+        },
+        "memory_matrix": {
+          "rows_total": 9,
+          "rows_selected": 9,
+          "rows_not_selected": 0,
+          "passed": 9,
+          "failed": 0,
+          "elapsed_ns": 2784762240,
+          "wall_seconds": 2.785
+        }
+      },
+      {
+        "label": "linux314t",
+        "gates_passed": 16,
+        "sources": {
+          "c-two": {
+            "expected_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "actual_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "verified": true
+          },
+          "fastdb": {
+            "expected_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "actual_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "verified": true
+          }
+        },
+        "python": {
+          "ordinary": {
+            "tests": 1244,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 5
+          }
+        },
+        "python_process_cleanup_confirmed": true,
+        "run_evidence_sha256": "1c248d5f472d733e49fad746e51d09657f9f48c1e108f4dec89822fd7373864d"
+      },
+      {
+        "label": "macos",
+        "gates_passed": 25,
+        "sources": {
+          "c-two": {
+            "expected_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "actual_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "verified": true
+          },
+          "fastdb": {
+            "expected_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "actual_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "verified": true
+          }
+        },
+        "python": {
+          "ordinary": {
+            "tests": 1244,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 5
+          },
+          "portable": {
+            "tests": 25,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          },
+          "typescript": {
+            "tests": 14,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          }
+        },
+        "python_process_cleanup_confirmed": true,
+        "run_evidence_sha256": "a2788d6914d7ce2acb90fb760adbd9f72e1e422b9cc601845a8e181c84f66442",
+        "installed_wheel": {
+          "status": "passed",
+          "identity": {
+            "administrator": null
+          },
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "sha256": "d38aae5443f9feb888d57b647e0c3da0661b9589baf701ee82a7b11dfd85aae4"
+        },
+        "memory_matrix": {
+          "rows_total": 9,
+          "rows_selected": 9,
+          "rows_not_selected": 0,
+          "passed": 9,
+          "failed": 0,
+          "elapsed_ns": 5501155417,
+          "wall_seconds": 5.501
+        }
+      },
+      {
+        "label": "windows2022",
+        "gates_passed": 26,
+        "sources": {
+          "c-two": {
+            "expected_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "actual_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "verified": true
+          },
+          "fastdb": {
+            "expected_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "actual_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "verified": true
+          }
+        },
+        "python": {
+          "ordinary": {
+            "tests": 1244,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 42
+          },
+          "portable": {
+            "tests": 25,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          },
+          "typescript": {
+            "tests": 14,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          }
+        },
+        "python_process_cleanup_confirmed": true,
+        "run_evidence_sha256": "0ad5bcb351eb44784a31e6cfd7a88b5fe669b5cfbd147acf8ff31c01134eab78",
+        "installed_wheel": {
+          "status": "passed",
+          "identity": {
+            "administrator": true
+          },
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "sha256": "80bc340e68c69fb62a0304f5e78e28d3c71b5b89602466d85c38aa811875f00b"
+        },
+        "standard_user": {
+          "status": "passed",
+          "identity": {
+            "administrator": false
+          },
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "sha256": "de4992a5742937fb105f180453f85a9da8ff82e414cbaf509116b6f8db4ef869"
+        },
+        "memory_matrix": {
+          "rows_total": 9,
+          "rows_selected": 9,
+          "rows_not_selected": 0,
+          "passed": 9,
+          "failed": 0,
+          "elapsed_ns": 5861597000,
+          "wall_seconds": 5.864
+        }
+      },
+      {
+        "label": "windows2025",
+        "gates_passed": 26,
+        "sources": {
+          "c-two": {
+            "expected_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "actual_sha": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+            "verified": true
+          },
+          "fastdb": {
+            "expected_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "actual_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+            "verified": true
+          }
+        },
+        "python": {
+          "ordinary": {
+            "tests": 1244,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 42
+          },
+          "portable": {
+            "tests": 25,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          },
+          "typescript": {
+            "tests": 14,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          }
+        },
+        "python_process_cleanup_confirmed": true,
+        "run_evidence_sha256": "47721f5ece694f1786eb6bed0fac9e44836f476cc34796a73db889721e928bf0",
+        "installed_wheel": {
+          "status": "passed",
+          "identity": {
+            "administrator": true
+          },
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "sha256": "32a29fb858e4984fa6763ca7d7450416edf91e53309883d5ddf4b5a98b1ae014"
+        },
+        "standard_user": {
+          "status": "passed",
+          "identity": {
+            "administrator": false
+          },
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "sha256": "b075b1b7b646aa085080da79b428c9b087aae9446a744a2d9e8f0f666ceb8eae"
+        },
+        "memory_matrix": {
+          "rows_total": 9,
+          "rows_selected": 9,
+          "rows_not_selected": 0,
+          "passed": 9,
+          "failed": 0,
+          "elapsed_ns": 7371162800,
+          "wall_seconds": 7.369
+        }
+      }
+    ]
+  },
+  "local": {
+    "macos_native_core_relay": {
+      "passed": 1153,
+      "ignored_fixture_entries": 5,
+      "dependency_stage": "pre FastDB 0.2.3; unchanged transport source"
+    },
+    "linux_native_core_relay": {
+      "passed": 1137,
+      "ignored_fixture_entries": 5,
+      "dependency_stage": "pre FastDB 0.2.3; unchanged transport source"
+    },
+    "fastdb023": {
+      "python_related": {
+        "passed": 348,
+        "skipped": 1,
+        "skip_reason": "Git-artifact policy requires repository metadata absent from isolated source export; verified separately in repository"
+      },
+      "portable_cross_language": {
+        "passed": 25,
+        "direct_relay_matrix_rows": 18
+      },
+      "rust_sdk": 19,
+      "codegen_lib": 2,
+      "generated_rust": 4,
+      "dependency_policy": {
+        "passed": 460,
+        "skipped": 1,
+        "skip_reason": "Windows npm adapter test on macOS"
+      },
+      "official_coresdk_archives_verified": 4
+    },
+    "ci_repairs": {
+      "core_wait_metadata": 4,
+      "core_real_observation": 2,
+      "sdk_boundary": 43,
+      "connection_crm_owner_ordered": 13,
+      "large_timeout_observation": "actual public wait and recv completed without panic; locked Tokio handles Instant overflow"
+    }
+  },
+  "independent_reviews": [
+    {
+      "topic": "connection initial",
+      "run_id": "8b201401-b90b-4f71-8d1e-f95308348a98",
+      "outcome": "two P2 findings corrected and reproduced before correction"
+    },
+    {
+      "topic": "connection final",
+      "run_id": "4c466140-81c1-44fa-bc7a-df1914254899",
+      "input_commit": "7e0f1cac481bb9a7b85daaed11a4e7a7d9c1827b",
+      "outcome": "no blocking findings; accepted"
+    },
+    {
+      "topic": "FastDB integration",
+      "run_id": "eb5b1e0a-598c-425e-ad84-b48c010a4d04",
+      "input_commit": "9e8285c185c428daf0a1feef8d5e264cadc6c0ca",
+      "outcome": "runtime/build integration clear; two active development docs corrected by Host in candidate"
+    },
+    {
+      "topic": "CI fixes",
+      "run_id": "e4a7a46d-68a4-41e7-802f-18e8e2244245",
+      "input_commit": "6340dadcc49785d076ed2613e25e58f9a70ee035",
+      "outcome": "no blocking findings; accepted; identical implementation tree to CI commit"
+    }
+  ],
+  "logs": {
+    "integrated-native-core-relay-mac.log": {
+      "sha256": "08a08dc34a6a3df7db9d3c3eaae31e44b2ae426e10e370f71d09aafc24c73b96",
+      "bytes": 108724
+    },
+    "integrated-native-core-relay-linux.log": {
+      "sha256": "f1b59019b94814f4db1e2be4cc929753bdcf03732156dc8d6def9c624c49aeea",
+      "bytes": 109853
+    },
+    "python-fastdb023.log": {
+      "sha256": "0012394bef6153ee32786f6be39faf108c987a3f3e99a32fbda9d66f39d50986",
+      "bytes": 432
+    },
+    "python-portable-fastdb023.log": {
+      "sha256": "f48255c341559206d96203dbf1e775d89098dcc88a7b73cded08d28e211a1407",
+      "bytes": 100
+    },
+    "fastdb023-policy.log": {
+      "sha256": "6494ff1dc9e4fdc8a60d8fc525bbed99b9a571a2b32ede3f812c3a9dc6633f29",
+      "bytes": 1066
+    },
+    "fastdb023-rust-sdk.log": {
+      "sha256": "778a075b4267de8ffcc987e878613de414e2ef2b0dc9485aca1ad4f3aac83968",
+      "bytes": 2756
+    },
+    "fastdb023-codegen-lib.log": {
+      "sha256": "e5f285b2f47e7fe26935705c1a18f16b8468a6449a0251cdc94feaf57f91c157",
+      "bytes": 590
+    },
+    "fastdb023-generated-rust.log": {
+      "sha256": "c48a68be41df57f92cd343fd7346cfaef5b160ee3a196110563c0c86611ed3ae",
+      "bytes": 810
+    },
+    "sender-boundary-counterexample.log": {
+      "sha256": "78a1b87f2ce8d1d91e297fdfbfb013e640826798eacd27e1b61d3bc43d96aa02",
+      "bytes": 1808
+    },
+    "python-config-observation-counterexample.log": {
+      "sha256": "f463f0fb4dc2fcc1c2679839f65bf987c8ce5b84229eedb8a5568559d83e87fe",
+      "bytes": 1952
+    },
+    "baseline-read-done-controlled.log": {
+      "sha256": "bd3b5394b35c2f654e1cf99bb38626828afb7a355ccca8aa2d729fd967eeffa6",
+      "bytes": 1079
+    },
+    "baseline-directory-contention.log": {
+      "sha256": "cceb5bc397c9f72e0a990d0a607c4997352aad2030a4bedd1a1bdd7da59174ab",
+      "bytes": 1524
+    },
+    "baseline-directory-isolated.log": {
+      "sha256": "a72b11345948ed79ca23b027b5b297621e865fc69191f1de309ff642825d8cd0",
+      "bytes": 1095
+    },
+    "fixture-leak-before.log": {
+      "sha256": "130766f052154ade202c3f0e9ec0aefd2f17fc61760937fdeac3e61ce1692cfc",
+      "bytes": 15963
+    },
+    "fixture-leak-after.log": {
+      "sha256": "1ea9ea909bb52f1124e93165bbb2ed58f9acbc178cd68c2b7be4b4b72e0a87e8",
+      "bytes": 99
+    },
+    "ci-fixed-connection-python.log": {
+      "sha256": "b5b558ca9b355ec9af7fe8ec6b3fc70b1864b0051a70ff091a18340fa05cfdfb",
+      "bytes": 99
+    },
+    "ci-fix-sdk-boundary.log": {
+      "sha256": "1666e6d7dcbee597f995f8e5ab9a2bb1fd854aeb996d21f7dd198b55e6687e36",
+      "bytes": 99
+    },
+    "ci-fixed-core-wait-unit.log": {
+      "sha256": "e0a25f17929a1a8421ad025eea9a9213746287e755a77f0842b11ed106cf5fe8",
+      "bytes": 6153
+    },
+    "ci-fixed-core-observation.log": {
+      "sha256": "52609b1f94907b1fa98945946a9a7aa070db78eb7b23ed149c8cdf27c050a76f",
+      "bytes": 628
+    },
+    "large-observation-timeout.log": {
+      "sha256": "7c58371c396fcc342c415906b1686aaacaf4c51ea95bc5bb8a8950cba452112a",
+      "bytes": 141
+    },
+    "windows-connection-observation-real.log": {
+      "sha256": "d3cf607a4051037078fba104e84af718c77cf8ec0c292c9e5c3ca5b69075d2f3",
+      "bytes": 4679
+    },
+    "windows-code-integrity-query.log": {
+      "sha256": "b11b4a5f0f4bd4ba5943b34ebe61efa421f83b8b6b27571e7005df661e6a64bb",
+      "bytes": 1162
+    },
+    "windows-cleanup.log": {
+      "sha256": "17e525e42450a3c6a9df8b17d7dc28730eafc9bdd4ff23ae1380d2eb024e8783",
+      "bytes": 241
+    }
+  },
+  "candidate_code_delta": {
+    "build": {
+      "added": 82,
+      "removed": 74,
+      "net": 8
+    },
+    "docs": {
+      "added": 145,
+      "removed": 15,
+      "net": 130
+    },
+    "production": {
+      "added": 955,
+      "removed": 83,
+      "net": 872
+    },
+    "tests": {
+      "added": 1571,
+      "removed": 148,
+      "net": 1423
+    }
+  },
+  "fastdb_only_delta": {
+    "build": {
+      "added": 82,
+      "removed": 74,
+      "net": 8
+    },
+    "docs": {
+      "added": 39,
+      "removed": 14,
+      "net": 25
+    },
+    "tests": {
+      "added": 53,
+      "removed": 33,
+      "net": 20
+    }
+  },
+  "endpoint_cleanup": {
+    "macos": {
+      "sockets": 0,
+      "leases": 0,
+      "gate_marker_retained": true,
+      "final_namespaces_checked": 4
+    },
+    "linux": {
+      "sockets": 0,
+      "leases": 0,
+      "task_container_removed": true
+    },
+    "historical_directories_touched": false,
+    "windows_developer_machine": {
+      "candidate_runtime_started": false,
+      "task_processes_remaining": 0,
+      "task_directory_removed": true,
+      "published_076_diagnostic_pipes_absent": true
+    }
+  },
+  "local_build_products_removed_logical_bytes": 5121419211,
+  "prior_ci": {
+    "head_sha": "d501d25f8a95377fc0a60f37895ad1714d9f1f0b",
+    "run_id": 39561814405,
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/39561814405",
+    "conclusion": "failure",
+    "causes": [
+      "new PyO3 Tokio builder violated SDK/Core ownership boundary",
+      "new fixture preserved explicit endpoint context and polluted later tests"
+    ],
+    "repairs": [
+      "move two concrete blocking observation operations into existing Core runtime seam",
+      "use existing _ProcessRegistry.reset in fixture setup/teardown"
+    ],
+    "same_wheel_fixture_reproduction": {
+      "before": {
+        "passed": 1,
+        "failed": 3
+      },
+      "after": {
+        "passed": 13,
+        "failed": 0
+      }
+    }
+  },
+  "source_tree_matches_working_tree": true,
+  "windows_developer_machine": {
+    "status": "blocked-before-runtime-load",
+    "platform": "Windows 11 10.0.26200 x64",
+    "python": "3.12.13",
+    "candidate_inputs_verified": true,
+    "c_two_wheel_sha256": "a657536535b107eeb6c7d7fbc1e4796ac608521db438de28aff94087add5b8c2",
+    "native_sha256": "6eae358d7003b4898c7a1a877f0e38ff35cbfa787b618213ab340dcae55580a3",
+    "code_integrity_event_ids": [
+      3077,
+      3033
+    ],
+    "reason": "candidate native module did not meet the machine code-integrity signing policy",
+    "connection_tests_executed": false,
+    "installed_wheel_smoke_executed": false,
+    "test_runner_setup_repair": "Incomplete pytest 9.1.1 metadata-only installation replaced with CI pytest 9.0.3; no test assertion changes",
+    "cleanup": {
+      "task_directory_removed": true,
+      "remaining_task_processes": [],
+      "removed_logical_bytes": 91673228,
+      "system_policy_changed": false,
+      "candidate_runtime_started": false
+    }
+  },
+  "working_tree_constraints": {
+    "candidate": "7bd749122f6bbd5824ed34e1884509b606783ddb",
+    "changed_candidate_files": [],
+    "head": "0acf784f6742487cd619a7d419379f693434a337",
+    "branch": "socu/r02-unique-write",
+    "local_branches_and_tags_unchanged": true
+  }
+}

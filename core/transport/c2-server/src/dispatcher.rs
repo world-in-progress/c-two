@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use c2_mem::MemPool;
+use c2_mem::{MemHandle, MemPool};
 use c2_wire::chunk::ReassemblyBacking;
 use c2_wire::handshake::MAX_METHODS;
 
@@ -40,15 +40,10 @@ impl std::error::Error for CrmError {}
 /// falling back to owned inline bytes.
 #[derive(Debug)]
 pub enum ResponseMeta {
-    /// CRM wrote result into response SHM (via pool.alloc + pool.write).
-    ShmAlloc {
-        seg_idx: u16,
-        generation: u32,
-        offset: u32,
-        data_size: u32,
-        is_dedicated: bool,
-        allocation_id: u64,
-    },
+    /// A backing prepared in the server response pool by the allocation and
+    /// fill helper ([`crate::response::try_prepare_shm_response`]). Carries
+    /// the unique write owner; the send path consumes it exactly once.
+    ShmAlloc(PreparedShmResponse),
     /// Owned response bytes awaiting native transport selection.
     ///
     /// `send_response_meta()` may still choose buddy SHM or chunked transport
@@ -58,14 +53,109 @@ pub enum ResponseMeta {
     Empty,
 }
 
-/// Input data for a CRM method call.
+/// A response SHM backing that exists, has been filled, and is owned by the
+/// server's response pool.
 ///
-/// Pure Rust types with no language-binding dependency. Binding-specific
-/// callback implementations convert these into SDK-visible objects.
-pub enum RequestData {
-    /// SHM coordinates from peer (buddy or dedicated).
-    /// ShmBuffer.release() frees via pool.free_at().
-    Shm {
+/// The only producer is the real allocation/fill helper; a `ShmAlloc`
+/// response cannot be hand-assembled from wire coordinates. The send path
+/// consumes the owner exactly once: it either releases it back to the
+/// response pool (error paths, or a dedicated backing whose lifecycle stays
+/// server-side) or, for a buddy backing, transfers the cross-process release
+/// responsibility to the receiving client by dropping the owner value
+/// without freeing.
+#[derive(Debug)]
+pub struct PreparedShmResponse {
+    handle: MemHandle,
+    /// Payload length for the reply frame; never exceeds the handle's
+    /// allocated logical length.
+    data_size: u32,
+}
+
+impl PreparedShmResponse {
+    pub(crate) fn new(handle: MemHandle, data_size: u32) -> Self {
+        Self { handle, data_size }
+    }
+
+    /// The payload length the reply frame will advertise.
+    pub fn data_size(&self) -> u32 {
+        self.data_size
+    }
+
+    /// Read-only coordinate projection of the prepared backing, for building
+    /// the reply frame. Permission-free descriptor: it grants no access and
+    /// cannot rebuild the owner.
+    pub fn shm_allocation(&self) -> Option<c2_mem::PoolAllocation> {
+        self.handle.shm_allocation()
+    }
+
+    /// Whether the backing is a dedicated (non-buddy) segment.
+    pub fn is_dedicated(&self) -> bool {
+        self.handle.is_dedicated()
+    }
+
+    /// Consume the carrier and release its backing through the exact owner
+    /// pool that allocated it.
+    pub(crate) fn release_through(self, pool: &mut MemPool) -> Result<c2_mem::FreeResult, String> {
+        pool.validate_handle(&self.handle)?;
+        let a = self
+            .handle
+            .shm_allocation()
+            .expect("prepared SHM allocation");
+        // SAFETY: consuming this carrier ends its private write authority; the
+        // original prepared-response path releases by advertised payload length.
+        unsafe {
+            pool.free_at(
+                a.seg_idx,
+                a.generation,
+                a.offset,
+                self.data_size,
+                a.is_dedicated,
+                a.allocation_id,
+            )
+        }
+    }
+
+    pub(crate) fn validate_pool(&self, pool: &MemPool) -> Result<(), String> {
+        pool.validate_handle(&self.handle)
+    }
+
+    /// Consume the carrier, handing back the unique owner. The send path
+    /// uses this only at the transfer boundary.
+    pub(crate) fn into_handle(self) -> MemHandle {
+        self.handle
+    }
+}
+
+/// Move-only receive carrier for one admitted peer SHM request block.
+///
+/// Minted only at this crate's frame-admission path: the coordinates come
+/// from a decoded request frame and the pool from the connection that
+/// received it. There is no public constructor from bare coordinates, so a
+/// [`RequestLease`] over this carrier is the only safe read/release surface.
+pub struct PeerShmRequest {
+    pool: Arc<parking_lot::RwLock<MemPool>>,
+    seg_idx: u16,
+    generation: u32,
+    offset: u32,
+    data_size: u32,
+    is_dedicated: bool,
+    allocation_id: u64,
+}
+
+impl std::fmt::Debug for PeerShmRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PeerShmRequest(seg={}, gen={}, off={}, size={}, ded={})",
+            self.seg_idx, self.generation, self.offset, self.data_size, self.is_dedicated
+        )
+    }
+}
+
+impl PeerShmRequest {
+    /// Admit one received SHM request block. Crate-private: only the decode
+    /// path that actually received the frame may call this.
+    pub(crate) fn admit(
         pool: Arc<parking_lot::RwLock<MemPool>>,
         seg_idx: u16,
         generation: u32,
@@ -73,7 +163,97 @@ pub enum RequestData {
         data_size: u32,
         is_dedicated: bool,
         allocation_id: u64,
-    },
+    ) -> Self {
+        Self {
+            pool,
+            seg_idx,
+            generation,
+            offset,
+            data_size,
+            is_dedicated,
+            allocation_id,
+        }
+    }
+
+    /// Whether the backing is a dedicated (non-buddy) segment.
+    pub fn is_dedicated(&self) -> bool {
+        self.is_dedicated
+    }
+
+    /// The peer's segment index (diagnostics and transport probes).
+    pub fn seg_idx(&self) -> u16 {
+        self.seg_idx
+    }
+
+    /// Read-only transport facts for in-crate probes.
+    #[cfg(test)]
+    pub(crate) fn coordinates(&self) -> (u32, u32, u32, u64) {
+        (
+            self.generation,
+            self.offset,
+            self.data_size,
+            self.allocation_id,
+        )
+    }
+
+    /// Copy the request bytes out of the peer's published block.
+    fn copy_bytes(&self) -> Result<Vec<u8>, String> {
+        let pool = self.pool.read();
+        // SAFETY: these coordinates were admitted from a frame received on
+        // this exact connection pool; the writing peer completed and
+        // published the block (write-then-publish protocol) and the carrier
+        // is the only local authority for it, so no conflicting access or
+        // release can race this copy.
+        unsafe {
+            pool.copy_data_at(
+                u32::from(self.seg_idx),
+                self.generation,
+                self.offset,
+                self.data_size,
+                self.is_dedicated,
+            )
+        }
+        .map_err(|error| format!("request SHM copy failed: {error}"))
+    }
+
+    /// Validate then release the peer's block exactly once.
+    fn release(&self) -> Result<(), String> {
+        let mut pool = self.pool.write();
+        pool.validate_data_at(
+            u32::from(self.seg_idx),
+            self.generation,
+            self.offset,
+            self.data_size,
+            self.is_dedicated,
+        )
+        .map_err(|error| format!("request SHM release validation failed: {error}"))?;
+        // SAFETY: this carrier is the sole release authority for the
+        // admitted block (read-then-release protocol) and the complete span
+        // was just validated against the live backing.
+        unsafe {
+            pool.free_at(
+                u32::from(self.seg_idx),
+                self.generation,
+                self.offset,
+                self.data_size,
+                self.is_dedicated,
+                self.allocation_id,
+            )
+        }
+        .map_err(|error| format!("request SHM release failed: {error}"))?;
+        Ok(())
+    }
+}
+
+/// Input data for a CRM method call.
+///
+/// Pure Rust types with no language-binding dependency. Binding-specific
+/// callback implementations convert these into SDK-visible objects.
+pub enum RequestData {
+    /// SHM block received from the peer. The carrier binds the coordinates
+    /// to the exact connection pool that received the frame and is the only
+    /// local read/release authority for the block.
+    Shm(PeerShmRequest),
     /// Inline bytes from a local IPC frame.
     Inline(Vec<u8>),
     /// Reassembled chunked transfer. The carrier owns the reassembly pool,
@@ -86,24 +266,7 @@ impl RequestData {
     fn copy_bytes(&self) -> Result<Vec<u8>, String> {
         match self {
             Self::Inline(data) => Ok(data.clone()),
-            Self::Shm {
-                pool,
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                is_dedicated,
-                ..
-            } => pool
-                .read()
-                .copy_data_at(
-                    u32::from(*seg_idx),
-                    *generation,
-                    *offset,
-                    *data_size,
-                    *is_dedicated,
-                )
-                .map_err(|error| format!("request SHM copy failed: {error}")),
+            Self::Shm(carrier) => carrier.copy_bytes(),
             Self::Handle(backing) => backing
                 .copy_bytes()
                 .map_err(|error| format!("request handle copy failed: {error}")),
@@ -113,35 +276,7 @@ impl RequestData {
     fn release(self) -> Result<(), String> {
         match self {
             Self::Inline(_) => Ok(()),
-            Self::Shm {
-                pool,
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                is_dedicated,
-                allocation_id,
-            } => {
-                let mut pool = pool.write();
-                pool.validate_data_at(
-                    u32::from(seg_idx),
-                    generation,
-                    offset,
-                    data_size,
-                    is_dedicated,
-                )
-                .map_err(|error| format!("request SHM release validation failed: {error}"))?;
-                pool.free_at(
-                    u32::from(seg_idx),
-                    generation,
-                    offset,
-                    data_size,
-                    is_dedicated,
-                    allocation_id,
-                )
-                .map_err(|error| format!("request SHM release failed: {error}"))?;
-                Ok(())
-            }
+            Self::Shm(carrier) => carrier.release(),
             Self::Handle(mut backing) => backing
                 .release()
                 .map_err(|error| format!("request handle release failed: {error}")),
@@ -225,17 +360,7 @@ pub fn cleanup_request(request: RequestData) {
 impl std::fmt::Debug for RequestData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RequestData::Shm {
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                is_dedicated,
-                ..
-            } => write!(
-                f,
-                "RequestData::Shm(seg={seg_idx}, gen={generation}, off={offset}, size={data_size}, ded={is_dedicated})"
-            ),
+            RequestData::Shm(carrier) => write!(f, "RequestData::Shm({carrier:?})"),
             RequestData::Inline(v) => write!(f, "RequestData::Inline({} bytes)", v.len()),
             RequestData::Handle(_) => write!(f, "RequestData::Handle"),
         }
@@ -255,7 +380,7 @@ pub trait CrmCallback: Send + Sync + 'static {
         route_name: &str,
         method_idx: u16,
         request: RequestData,
-        response_pool: Arc<parking_lot::RwLock<MemPool>>,
+        response_pool: Arc<crate::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError>;
 }
 
@@ -527,7 +652,7 @@ mod tests {
             _route: &str,
             _method_idx: u16,
             _request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            _response_pool: Arc<crate::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(b"echo".to_vec()))
         }
@@ -590,21 +715,19 @@ mod tests {
     fn request_lease_copy_retains_backing_until_idempotent_release() {
         let payload = b"borrowed request".repeat(128);
         let mut pool = request_test_pool();
-        let allocation = pool.alloc(payload.len()).unwrap();
-        let pointer = pool.data_ptr(&allocation).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer, payload.len());
-        }
+        let mut handle = pool.alloc_handle(payload.len()).unwrap();
+        pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
+        let coordinates = handle.shm_allocation().unwrap();
         let pool = Arc::new(parking_lot::RwLock::new(pool));
-        let mut lease = RequestLease::new(RequestData::Shm {
-            pool: Arc::clone(&pool),
-            seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
-            generation: allocation.generation,
-            offset: allocation.offset,
-            data_size: u32::try_from(payload.len()).unwrap(),
-            is_dedicated: allocation.is_dedicated,
-            allocation_id: allocation.allocation_id,
-        });
+        let mut lease = RequestLease::new(RequestData::Shm(PeerShmRequest::admit(
+            Arc::clone(&pool),
+            u16::try_from(coordinates.seg_idx).unwrap(),
+            coordinates.generation,
+            coordinates.offset,
+            u32::try_from(payload.len()).unwrap(),
+            coordinates.is_dedicated,
+            coordinates.allocation_id,
+        )));
 
         assert_eq!(lease.copy_bytes().unwrap(), payload);
         assert_eq!(pool.read().stats().alloc_count, 1);
@@ -617,21 +740,19 @@ mod tests {
     fn request_data_shm_materializes_and_releases_buddy_and_dedicated_allocations() {
         for payload in [b"buddy".repeat(32), b"dedicated".repeat(5000)] {
             let mut pool = request_test_pool();
-            let allocation = pool.alloc(payload.len()).unwrap();
-            let ptr = pool.data_ptr(&allocation).unwrap();
-            unsafe {
-                std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, payload.len());
-            }
+            let mut handle = pool.alloc_handle(payload.len()).unwrap();
+            pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
+            let coordinates = handle.shm_allocation().unwrap();
             let pool = Arc::new(parking_lot::RwLock::new(pool));
-            let request = RequestData::Shm {
-                pool: Arc::clone(&pool),
-                seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
-                generation: allocation.generation,
-                offset: allocation.offset,
-                data_size: u32::try_from(payload.len()).unwrap(),
-                is_dedicated: allocation.is_dedicated,
-                allocation_id: allocation.allocation_id,
-            };
+            let request = RequestData::Shm(PeerShmRequest::admit(
+                Arc::clone(&pool),
+                u16::try_from(coordinates.seg_idx).unwrap(),
+                coordinates.generation,
+                coordinates.offset,
+                u32::try_from(payload.len()).unwrap(),
+                coordinates.is_dedicated,
+                coordinates.allocation_id,
+            ));
 
             assert_eq!(
                 RequestLease::new(request).into_owned_bytes().unwrap(),
@@ -644,22 +765,25 @@ mod tests {
     #[test]
     fn request_data_shm_rejects_invalid_span_without_freeing_unproven_coordinates() {
         let mut pool = request_test_pool();
-        let allocation = pool.alloc(4096).unwrap();
+        let live = pool.alloc_handle(4096).unwrap();
         let capacity = pool
-            .segment(allocation.seg_idx as usize)
+            .segment(live.shm_allocation().unwrap().seg_idx as usize)
             .unwrap()
             .allocator()
             .data_size();
+        let coordinates = live.shm_allocation().unwrap();
         let pool = Arc::new(parking_lot::RwLock::new(pool));
-        let request = RequestData::Shm {
-            pool: Arc::clone(&pool),
-            seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
-            generation: allocation.generation,
-            offset: u32::try_from(capacity - 1).unwrap(),
-            data_size: 2,
-            is_dedicated: false,
-            allocation_id: allocation.allocation_id,
-        };
+        // In-crate admission of a deliberately invalid span: an outside
+        // caller cannot construct this carrier at all.
+        let request = RequestData::Shm(PeerShmRequest::admit(
+            Arc::clone(&pool),
+            u16::try_from(coordinates.seg_idx).unwrap(),
+            coordinates.generation,
+            u32::try_from(capacity - 1).unwrap(),
+            2,
+            false,
+            coordinates.allocation_id,
+        ));
 
         assert!(
             RequestLease::new(request)
@@ -668,7 +792,8 @@ mod tests {
                 .contains("outside buddy segment")
         );
         assert_eq!(pool.read().stats().alloc_count, 1);
-        pool.write().free(&allocation).unwrap();
+        pool.write().release_handle(live).unwrap();
+        assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     #[test]
@@ -731,7 +856,7 @@ mod tests {
         assert_eq!(route.method_names.len(), 2);
 
         // invoke the callback through the route
-        let pool = Arc::new(parking_lot::RwLock::new(
+        let pool = Arc::new(crate::ResponsePool::new(
             MemPool::new(PoolConfig::default()),
         ));
         let result = route
@@ -840,13 +965,13 @@ mod tests {
                 _route: &str,
                 _method_idx: u16,
                 _request: RequestData,
-                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+                _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 Err(CrmError::InternalError("method not found".into()))
             }
         }
 
-        let pool = Arc::new(parking_lot::RwLock::new(
+        let pool = Arc::new(crate::ResponsePool::new(
             MemPool::new(PoolConfig::default()),
         ));
         let cb: Arc<dyn CrmCallback> = Arc::new(FailCallback);

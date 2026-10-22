@@ -59,8 +59,8 @@ SOURCE_SHA = "a" * 40
 OTHER_SHA = "b" * 40
 C_TWO_VERSION = "0.6.0"
 C3_VERSION = "0.2.0"
-FASTDB_VERSION = "0.2.1"
-FASTDB_CORE_VERSION = "0.2.1"
+FASTDB_VERSION = "0.2.3"
+FASTDB_CORE_VERSION = "0.2.3"
 FASTDB_SOURCE_REV = promote.SOURCE_VALIDATION_FASTDB_SHA
 CLI_TARGETS = promote.CLI_TARGETS
 WINDOWS_TARGET = promote.WINDOWS_TARGET
@@ -688,7 +688,7 @@ def _build_source_members(label: str) -> tuple[dict[str, bytes], str]:
     c3_name = "c3.exe" if target_platform == "windows" else "c3"
     platform_tag = {"linux": "linux_x86_64", "macos": "macosx_11_0_arm64",
                     "windows": "win_amd64"}[target_platform]
-    fastdb_name = f"fastdb4py-0.2.1-cp312-cp312-{platform_tag}.whl"
+    fastdb_name = f"fastdb4py-{FASTDB_VERSION}-cp312-cp312-{platform_tag}.whl"
     ctwo_name = f"c_two-0.6.0-cp312-cp312-{platform_tag}.whl"
     members: dict[str, bytes] = {
         f"wheels/fastdb/{fastdb_name}": b"source fastdb wheel",
@@ -1610,7 +1610,7 @@ def test_happy_path_github_release_plan(tmp_path: Path, environment) -> None:
     assert all(path.startswith("/repos/") for path in api.paths)
 
 
-@pytest.mark.parametrize("core_version, accepted", [("0.2.1", True), ("0.2.2", False)])
+@pytest.mark.parametrize("core_version, accepted", [("0.2.3", True), ("0.2.1", False)])
 def test_python_fastdb_version_is_independent_of_native_core(
     tmp_path: Path, environment, monkeypatch, core_version, accepted,
 ) -> None:
@@ -1622,7 +1622,7 @@ def test_python_fastdb_version_is_independent_of_native_core(
     if accepted:
         assert json.loads(plan_path.read_text())["versions"]["fastdb_version"] == "0.2.2"
         body = body_path.read_text()
-        assert "Native FastDB Core: `0.2.1`" in body
+        assert "Native FastDB Core: `0.2.3`" in body
         assert "Optional Python FastDB: `fastdb4py==0.2.2`" in body
 
 

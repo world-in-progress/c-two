@@ -207,7 +207,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "c2-cli"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -274,9 +274,12 @@ dependencies = [
  "c2-local",
  "c2-mem",
  "c2-server",
+ "c2-wire",
  "futures-util",
+ "getrandom 0.4.2",
  "parking_lot",
  "serde_json",
+ "subtle",
  "tokio",
  "uuid",
 ]
@@ -380,6 +383,7 @@ dependencies = [
  "c2-local",
  "c2-mem",
  "c2-wire",
+ "futures-executor",
  "parking_lot",
  "tokio",
  "tracing",
@@ -578,17 +582,17 @@ dependencies = [
 
 [[package]]
 name = "fastdb"
-version = "0.2.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d8611385e839abe45afda547d2669995510e71eca4446f88daa6bf5a7129e06"
+checksum = "0b2c52789cc5ba8990cf685ec74893a2f4d31e79cd622e97267fa5e5f0effc04"
 dependencies = [
  "fastdb-sys",
 ]
 
 [[package]]
 name = "fastdb-sys"
-version = "0.2.1"
-source = "git+https://github.com/world-in-progress/fastdb?rev=4f99f86a662b0e950a0dd29800c25a1c9fca4def#4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+version = "0.2.3"
+source = "git+https://github.com/world-in-progress/fastdb?rev=abba785ef2a7d3fbee1bbc608393a3e6c7b042c4#abba785ef2a7d3fbee1bbc608393a3e6c7b042c4"
 
 [[package]]
 name = "fastrand"
