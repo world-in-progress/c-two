@@ -14,7 +14,7 @@ use c2_error::{C2Error, ErrorCode};
 use c2_server::{
     AccessLevel, ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
     RouteBuildSpec, RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerLimits,
-    SchedulerSnapshot, Server, ServerIdentity, ServerRuntimeBuilder,
+    SchedulerSnapshot, Server, ServerFailure, ServerIdentity, ServerRuntimeBuilder,
 };
 
 use crate::{Error, LifecycleError, RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome};
@@ -643,9 +643,9 @@ impl HostInner {
     fn unregister(&self, route_name: &str) -> Result<UnregisterOutcome, Error> {
         self.refresh_shutdown_outcome();
         if self.runtime.shutdown_pending(&self.server) {
-            return Err(LifecycleError::Server(
+            return Err(LifecycleError::Server(ServerFailure::new(
                 "native shutdown is still draining; route hooks are not yet safe".into(),
-            )
+            ))
             .into());
         }
         if let Some(shutdown) = self.shutdown_outcome.lock().as_ref()
@@ -729,7 +729,7 @@ impl Host {
             .inner
             .server
             .build_route(route_spec, callback)
-            .map_err(|error| LifecycleError::Server(error.to_string()))?;
+            .map_err(LifecycleError::from)?;
         let route_concurrency = RouteConcurrency {
             inner: route.route_handle(),
         };
@@ -872,7 +872,7 @@ impl Runtime {
                 config.clone(),
                 server_identity.clone(),
             )
-            .map_err(|error| LifecycleError::Server(error.to_string()))?;
+            .map_err(LifecycleError::from)?;
             (server, Some(admission))
         } else {
             (
@@ -881,7 +881,7 @@ impl Runtime {
                     config.clone(),
                     server_identity.clone(),
                 )
-                .map_err(|error| LifecycleError::Server(error.to_string()))?,
+                .map_err(LifecycleError::from)?,
                 None,
             )
         };
@@ -907,10 +907,10 @@ impl Runtime {
             owner.attach_server(&server);
         }
         let server_runtime = ServerRuntimeBuilder::build(&config)
-            .map_err(|error| LifecycleError::Server(error.to_string()))?;
+            .map_err(|error| LifecycleError::Server(ServerFailure::new(error.to_string())))?;
         server
             .begin_start_attempt()
-            .map_err(|error| LifecycleError::Server(error.to_string()))?;
+            .map_err(LifecycleError::from)?;
 
         // Consume the native owner control capability before this host can
         // publish readiness. Naming the OwnerBound policy alone fails here,
@@ -1009,7 +1009,7 @@ impl Runtime {
 
                 }
             })
-            .map_err(|error| LifecycleError::Server(error.to_string()))?;
+            .map_err(|error| LifecycleError::Server(ServerFailure::new(error.to_string())))?;
         *inner.thread.lock() = Some(thread);
         let wait_runtime = Runtime::server_runtime()?;
         if let Err(error) =
@@ -1021,7 +1021,7 @@ impl Runtime {
                     let _ = thread.join();
                 }
             }
-            return Err(LifecycleError::Server(error.to_string()).into());
+            return Err(LifecycleError::from(error).into());
         }
 
         Ok(Host { inner })

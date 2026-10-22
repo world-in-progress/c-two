@@ -22,7 +22,7 @@ fn now_millis() -> u64 {
 }
 
 fn is_retryable_connect_error(error: &c2_ipc::IpcError) -> bool {
-    let c2_ipc::IpcError::Io(error) = error else {
+    let (c2_ipc::IpcError::Io(error) | c2_ipc::IpcError::Connect(error)) = error else {
         return false;
     };
     matches!(

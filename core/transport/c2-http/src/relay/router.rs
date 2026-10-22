@@ -2099,7 +2099,7 @@ fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Respo
 
 fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
     match error {
-        c2_ipc::IpcError::Io(_) => "io",
+        c2_ipc::IpcError::Io(_) | c2_ipc::IpcError::Connect(_) => "io",
         c2_ipc::IpcError::Config(_) => "config",
         c2_ipc::IpcError::Decode(_) => "decode",
         c2_ipc::IpcError::Handshake(_) => "handshake",

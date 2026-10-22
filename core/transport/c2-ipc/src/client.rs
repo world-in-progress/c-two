@@ -1614,6 +1614,8 @@ pub enum IpcError {
     LocalCallRejected(C2Error),
     /// I/O error on the local connection.
     Io(std::io::Error),
+    /// The native local connection attempt failed before any handshake I/O.
+    Connect(std::io::Error),
     /// Invalid client configuration or IPC address.
     Config(String),
     /// Wire protocol decoding error.
@@ -1678,7 +1680,7 @@ impl std::fmt::Display for IpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LocalCallRejected(error) => write!(f, "IPC local call rejected: {error}"),
-            Self::Io(e) => write!(f, "IPC I/O error: {e}"),
+            Self::Io(e) | Self::Connect(e) => write!(f, "IPC I/O error: {e}"),
             Self::Config(msg) => write!(f, "IPC config error: {msg}"),
             Self::Decode(e) => write!(f, "IPC decode error: {e}"),
             Self::Handshake(msg) => write!(f, "IPC handshake failed: {msg}"),
@@ -1744,7 +1746,14 @@ impl std::fmt::Display for IpcError {
     }
 }
 
-impl std::error::Error for IpcError {}
+impl std::error::Error for IpcError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) | Self::Connect(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for IpcError {
     fn from(e: std::io::Error) -> Self {
@@ -3032,7 +3041,9 @@ impl IpcClient {
         }
 
         let stream = with_connect_deadline(deadline, "os_connect", async {
-            Ok(LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT).await?)
+            LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT)
+                .await
+                .map_err(IpcError::Connect)
         })
         .await?;
         let publisher = ConnectionPublisher::new();

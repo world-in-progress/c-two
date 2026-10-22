@@ -58,6 +58,7 @@ fn zero_budget_is_canonical_before_any_transport_or_configuration() {
                 ConnectOptions::new().with_timeout(Duration::ZERO),
             )
             .unwrap_err();
+        assert_eq!(error.local_io_cause(), None);
         let Error::Semantic(error) = error else {
             panic!("expected canonical connect deadline")
         };

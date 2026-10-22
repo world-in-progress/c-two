@@ -1187,7 +1187,7 @@ impl Runtime {
             if e.to_string().contains("already registered") {
                 LifecycleError::DuplicateRoute(route_name.clone())
             } else {
-                LifecycleError::Server(e.to_string())
+                LifecycleError::from(e)
             }
         })?;
         let mut reservation = Some(reservation);
@@ -2134,14 +2134,14 @@ impl Runtime {
     pub(crate) fn server_runtime() -> Result<tokio::runtime::Runtime, LifecycleError> {
         #[cfg(test)]
         if FORCE_SERVER_RUNTIME_FAILURE.with(|flag| flag.get()) {
-            return Err(LifecycleError::Server(
+            return Err(LifecycleError::Server(crate::ServerFailure::new(
                 "failed to create runtime: injected test failure".to_string(),
-            ));
+            )));
         }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| LifecycleError::Server(format!("failed to create runtime: {e}")))?;
+            .map_err(|e| LifecycleError::Server(crate::ServerFailure::new(format!("failed to create runtime: {e}"))))?;
         Ok(rt)
     }
 

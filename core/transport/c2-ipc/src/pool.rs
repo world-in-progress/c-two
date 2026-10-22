@@ -172,7 +172,7 @@ fn cleanup_deadline(deadline: ConnectDeadline) -> Instant {
 fn is_transient_connect_error(error: &IpcError) -> bool {
     matches!(
         error,
-        IpcError::Io(io_error)
+        IpcError::Io(io_error) | IpcError::Connect(io_error)
             if matches!(
                 io_error.kind(),
                 ErrorKind::UnexpectedEof

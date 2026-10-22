@@ -7,6 +7,8 @@ use c2_error::{C2Error, C2ErrorEnvelope, ErrorCode};
 use c2_http::client::HttpError;
 use c2_ipc::IpcError;
 use c2_ipc::client::ChunkError;
+use c2_local::EndpointIoError;
+use c2_server::{ServerError, ServerFailure};
 
 use crate::RegisterFailureOutcome;
 
@@ -35,7 +37,7 @@ pub enum LifecycleError {
     },
     ResponseCopy(String),
     Configuration(String),
-    Server(String),
+    Server(ServerFailure),
     Relay(String),
 }
 
@@ -96,7 +98,51 @@ impl fmt::Display for LifecycleError {
     }
 }
 
-impl StdError for LifecycleError {}
+impl StdError for LifecycleError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Server(failure) => Some(failure),
+            _ => None,
+        }
+    }
+}
+
+impl From<ServerError> for LifecycleError {
+    fn from(error: ServerError) -> Self {
+        Self::Server((&error).into())
+    }
+}
+
+/// Facts from the actual local endpoint operation, not a retry or cleanup permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalIoCause {
+    Bind(EndpointIoError),
+    Connect(EndpointIoError),
+}
+
+impl LocalIoCause {
+    pub fn operation(self) -> &'static str {
+        match self {
+            Self::Bind(_) => "bind",
+            Self::Connect(_) => "connect",
+        }
+    }
+
+    pub fn error(self) -> EndpointIoError {
+        match self {
+            Self::Bind(error) | Self::Connect(error) => error,
+        }
+    }
+}
+
+impl LifecycleError {
+    pub fn local_io_cause(&self) -> Option<LocalIoCause> {
+        match self {
+            Self::Server(failure) => failure.bind_error.map(LocalIoCause::Bind),
+            _ => None,
+        }
+    }
+}
 
 /// Whether a transport failure is known to have happened before dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -143,6 +189,13 @@ impl TransportError {
         self.kind
     }
 
+    pub fn local_io_cause(&self) -> Option<LocalIoCause> {
+        match self.source.downcast_ref::<IpcError>()? {
+            IpcError::Connect(error) => Some(LocalIoCause::Connect(error.into())),
+            _ => None,
+        }
+    }
+
     /// Canonical semantic information for a local transport admission failure.
     /// Replay safety still comes from `phase`, even when a semantic code exists.
     pub fn semantic_error(&self) -> Option<&C2Error> {
@@ -179,6 +232,16 @@ pub enum Error {
     Admission(ContractError),
     Transport(TransportError),
     Lifecycle(LifecycleError),
+}
+
+impl Error {
+    pub fn local_io_cause(&self) -> Option<LocalIoCause> {
+        match self {
+            Self::Transport(error) => error.local_io_cause(),
+            Self::Lifecycle(error) => error.local_io_cause(),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Error {

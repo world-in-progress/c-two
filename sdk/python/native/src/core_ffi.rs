@@ -10,7 +10,7 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 
 use c2_core::{
     CallOptions, CallTimeout, Client, EncodedService, HeldResponse, LifecycleError, ObservedPath,
-    ObservedRoute, PreparedCall,
+    ObservedRoute, PreparedCall, ServerFailure,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::BufferLeaseGuard;
@@ -43,7 +43,7 @@ impl PyCoreClient {
     // Keep this view lock out of preparation, config, materialization and I/O.
     fn client(&self) -> PyResult<Client> {
         self.inner.lock().clone().ok_or_else(|| {
-            lifecycle_error_to_py(LifecycleError::Server("Core client is closed".into()))
+            lifecycle_error_to_py(LifecycleError::Server(ServerFailure::new("Core client is closed".into())))
         })
     }
 }

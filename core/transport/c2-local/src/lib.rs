@@ -182,10 +182,45 @@ pub struct EndpointIoError {
 
 impl From<&io::Error> for EndpointIoError {
     fn from(error: &io::Error) -> Self {
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<ContextIoError>())
+            .map_or(error, |context| &context.source);
         Self {
             kind: error.kind(),
-            raw_os_error: error.raw_os_error(),
+            raw_os_error: source.raw_os_error(),
         }
+    }
+}
+
+impl EndpointIoError {
+    /// Stable local-I/O category; the original ErrorKind remains available.
+    pub fn category(&self) -> &'static str {
+        match self.kind {
+            io::ErrorKind::PermissionDenied => "permission_denied",
+            io::ErrorKind::NotFound => "not_found",
+            io::ErrorKind::ConnectionRefused => "connection_refused",
+            io::ErrorKind::AddrInUse => "address_in_use",
+            _ => "other",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ContextIoError {
+    message: String,
+    source: io::Error,
+}
+
+impl std::fmt::Display for ContextIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ContextIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 

@@ -88,6 +88,7 @@ pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
         | IpcError::Shm(_)
         | IpcError::Pool(_) => TransportPhase::PreDispatch,
         IpcError::Io(_)
+        | IpcError::Connect(_)
         | IpcError::Decode(_)
         | IpcError::Chunk(_)
         | IpcError::CrmError(_)

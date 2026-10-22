@@ -911,10 +911,11 @@ fn relay_aware_protocol_violation_is_terminal_without_fallback_resolution() {
     ))
     .expect("runtime");
 
-    let Error::Semantic(error) = runtime
+    let error = runtime
         .connect(expected, Connect::RelayAware)
-        .expect_err("protocol violation must be terminal")
-    else {
+        .expect_err("protocol violation must be terminal");
+    assert_eq!(error.local_io_cause(), None);
+    let Error::Semantic(error) = error else {
         panic!("protocol violation must be semantic");
     };
     assert_eq!(error.code, ErrorCode::ProtocolViolation);

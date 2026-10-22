@@ -135,7 +135,7 @@ fn close_client(client: crate::relay::client_lifecycle::ManagedClient) {
 fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
     matches!(
         error,
-        c2_ipc::IpcError::Io(err)
+        c2_ipc::IpcError::Io(err) | c2_ipc::IpcError::Connect(err)
             if matches!(
                 err.kind(),
                 std::io::ErrorKind::ConnectionRefused

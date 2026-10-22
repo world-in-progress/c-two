@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
 use c2_core::{
-    Error, LifecycleError, RegisterFailureOutcome, RelayCleanupError, RouteCloseOutcome,
+    Error, LifecycleError, LocalIoCause, RegisterFailureOutcome, RelayCleanupError, RouteCloseOutcome,
     TransportKind, TransportPhase,
 };
 
@@ -24,6 +24,7 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                 set_attr(value, "code", code);
                 set_attr(value, "name", name);
                 set_attr(value, "message", message);
+                set_io_cause(value, None);
                 let detail_dict = PyDict::new(py);
                 for (key, item) in details {
                     if key == "transport_phase" {
@@ -42,8 +43,8 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
             });
             exception
         }
-        Error::Contract(error) => local_error("contract", error.to_string(), |_| {}),
-        Error::Admission(error) => local_error("admission", error.to_string(), |_| {}),
+        Error::Contract(error) => local_error("contract", error.to_string(), None, |_| {}),
+        Error::Admission(error) => local_error("admission", error.to_string(), None, |_| {}),
         Error::Transport(error) => {
             let kind = match error.kind() {
                 TransportKind::Ipc => "ipc",
@@ -54,7 +55,7 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                 TransportPhase::DispatchUncertain => "dispatch_uncertain",
             };
             let fallback_eligible = error.is_fallback_eligible();
-            local_error("transport", error.to_string(), |value| {
+            local_error("transport", error.to_string(), error.local_io_cause(), |value| {
                 set_attr(value, "transport_kind", kind);
                 set_attr(value, "transport_phase", phase);
                 set_attr(value, "fallback_eligible", fallback_eligible);
@@ -80,7 +81,7 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
 
 pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
     let message = error.to_string();
-    local_error("lifecycle", message, |value| match &error {
+    local_error("lifecycle", message, error.local_io_cause(), |value| match &error {
         LifecycleError::InvalidServerId(_) => {
             set_attr(value, "lifecycle_kind", "invalid_server_id");
         }
@@ -159,7 +160,12 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
     })
 }
 
-fn local_error<F>(category: &'static str, message: String, configure: F) -> PyErr
+fn local_error<F>(
+    category: &'static str,
+    message: String,
+    cause: Option<LocalIoCause>,
+    configure: F,
+) -> PyErr
 where
     F: FnOnce(&Bound<'_, PyAny>),
 {
@@ -168,9 +174,16 @@ where
         let value = exception.value(py);
         set_attr(value, "category", category);
         set_attr(value, "message", message);
+        set_io_cause(value, cause);
         configure(value);
     });
     exception
+}
+
+fn set_io_cause(value: &Bound<'_, PyAny>, cause: Option<LocalIoCause>) {
+    set_attr(value, "io_operation", cause.map(LocalIoCause::operation));
+    set_attr(value, "io_kind", cause.map(|cause| cause.error().category()));
+    set_attr(value, "raw_os_error", cause.and_then(|cause| cause.error().raw_os_error));
 }
 
 fn register_failure_to_dict<'py>(

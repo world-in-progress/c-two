@@ -119,12 +119,15 @@ impl EndpointDirectory {
                 {
                     return Err(io::Error::new(
                         error.kind(),
-                        format!(
-                            "endpoint directory {} owner {} mode {:04o}: cannot open final directory without following symlinks: {error}",
-                            path.display(),
-                            metadata.uid(),
-                            metadata.mode() & 0o7777
-                        ),
+                        crate::ContextIoError {
+                            message: format!(
+                                "endpoint directory {} owner {} mode {:04o}: cannot open final directory without following symlinks: {error}",
+                                path.display(),
+                                metadata.uid(),
+                                metadata.mode() & 0o7777
+                            ),
+                            source: error,
+                        },
                     ));
                 }
             }
@@ -159,7 +162,7 @@ impl EndpointDirectory {
         verify_directory_stat(&self.path, &stat)?;
         #[cfg(target_os = "macos")]
         directory_acl::verify(self.fd()).map_err(|error| {
-            directory_policy_error(&self.path, &stat, &format!("extended ACL: {error}"))
+            directory_policy_io_error(&self.path, &stat, "extended ACL", error)
         })?;
         // Check effective credentials and ACLs against the pinned directory,
         // rather than testing a pathname that a rename could redirect.
@@ -172,20 +175,19 @@ impl EndpointDirectory {
             )
         } != 0
         {
-            return Err(directory_policy_error(
+            return Err(directory_policy_io_error(
                 &self.path,
                 &stat,
-                &format!(
-                    "effective user lacks read/write/traverse access: {}",
-                    io::Error::last_os_error()
-                ),
+                "effective user lacks read/write/traverse access",
+                io::Error::last_os_error(),
             ));
         }
         let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
-            directory_policy_error(
+            directory_policy_io_error(
                 &self.path,
                 &stat,
-                &format!("cannot verify directory path identity: {error}"),
+                "cannot verify directory path identity",
+                error,
             )
         })?;
         if !metadata.file_type().is_dir()
@@ -316,6 +318,22 @@ fn directory_policy_error(path: &Path, stat: &libc::stat, condition: &str) -> io
             stat.st_uid,
             stat.st_mode as libc::mode_t & 0o7777
         ),
+    )
+}
+
+fn directory_policy_io_error(
+    path: &Path,
+    stat: &libc::stat,
+    condition: &str,
+    source: io::Error,
+) -> io::Error {
+    let message = directory_policy_error(path, stat, &format!("{condition}: {source}"));
+    io::Error::new(
+        message.kind(),
+        crate::ContextIoError {
+            message: message.to_string(),
+            source,
+        },
     )
 }
 

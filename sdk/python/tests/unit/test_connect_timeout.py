@@ -89,6 +89,7 @@ def test_native_local_zero_validation_runs_no_python_callback():
         _native.ConnectAttempt(timeout_seconds=0)
     assert failure.value.details['operation'] == 'connect'
     assert failure.value.details['stage'] == 'connect_start'
+    assert (failure.value.io_kind, failure.value.raw_os_error, failure.value.io_operation) == (None, None, None)
 
 
 @pytest.mark.parametrize('timeout', [None, 0.125])

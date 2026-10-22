@@ -129,6 +129,8 @@ fn close_reason_to_route_state_reason(closed_reason: &str) -> RouteStateReasonWi
 #[derive(Debug)]
 pub enum ServerError {
     Io(std::io::Error),
+    Bind(std::io::Error),
+    Failed(ServerFailure),
     Config(String),
     Protocol(String),
 }
@@ -136,14 +138,61 @@ pub enum ServerError {
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::Io(e) | Self::Bind(e) => write!(f, "IO error: {e}"),
+            Self::Failed(failure) => write!(f, "config error: {failure}"),
             Self::Config(msg) => write!(f, "config error: {msg}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for ServerError {}
+impl std::error::Error for ServerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) | Self::Bind(error) => Some(error),
+            Self::Failed(failure) => Some(failure),
+            _ => None,
+        }
+    }
+}
+
+/// One clonable failure shared by lifecycle waiters; no independent error slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerFailure {
+    pub message: String,
+    pub bind_error: Option<c2_local::EndpointIoError>,
+}
+
+impl ServerFailure {
+    pub fn new(message: String) -> Self {
+        Self {
+            message,
+            bind_error: None,
+        }
+    }
+}
+
+impl From<&ServerError> for ServerFailure {
+    fn from(error: &ServerError) -> Self {
+        let bind_error = match error {
+            ServerError::Bind(source) => Some(source.into()),
+            ServerError::Failed(failure) => failure.bind_error,
+            _ => None,
+        };
+        Self {
+            message: error.to_string(),
+            bind_error,
+        }
+    }
+}
+
+impl std::fmt::Display for ServerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ServerFailure {}
 
 impl From<std::io::Error> for ServerError {
     fn from(e: std::io::Error) -> Self {
@@ -163,7 +212,7 @@ pub enum ServerLifecycleState {
     Ready,
     Stopping,
     Stopped,
-    Failed(String),
+    Failed(ServerFailure),
 }
 
 impl ServerLifecycleState {
@@ -1180,10 +1229,9 @@ impl Server {
                 let state = rx.borrow().clone();
                 match state {
                     ServerLifecycleState::Ready => return Ok(()),
-                    ServerLifecycleState::Failed(message) => {
-                        return Err(ServerError::Config(format!(
-                            "server failed to start: {message}",
-                        )));
+                    ServerLifecycleState::Failed(mut failure) => {
+                        failure.message = format!("server failed to start: {}", failure.message);
+                        return Err(ServerError::Failed(failure));
                     }
                     ServerLifecycleState::Stopped => {
                         return Err(ServerError::Config(
@@ -1309,8 +1357,8 @@ impl Server {
     // Terminal observation is a lifecycle fence even for Failed. Shutdown
     // completion must also report that failure instead of claiming success.
     fn completed_shutdown_outcomes(&self) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
-        if let ServerLifecycleState::Failed(message) = self.lifecycle_state() {
-            return Err(ServerError::Config(message));
+        if let ServerLifecycleState::Failed(failure) = self.lifecycle_state() {
+            return Err(ServerError::Failed(failure));
         }
         Ok(self.take_shutdown_route_outcomes())
     }
@@ -1324,7 +1372,7 @@ impl Server {
         self.wait_until_terminal().await?;
         let runtime_error = match self.lifecycle_state() {
             ServerLifecycleState::Initialized | ServerLifecycleState::Stopped => None,
-            ServerLifecycleState::Failed(message) => Some(message),
+            ServerLifecycleState::Failed(failure) => Some(failure.message),
             state => {
                 return Err(ServerError::Config(format!(
                     "server restarted during shutdown completion observation: {state:?}"
@@ -1426,12 +1474,12 @@ impl Server {
         } else {
             LocalListener::bind(&self.endpoint)
         }
-        .map_err(ServerError::Io);
+        .map_err(ServerError::Bind);
 
         let mut listener = match startup {
             Ok(listener) => listener,
             Err(err) => {
-                self.set_lifecycle_state(ServerLifecycleState::Failed(err.to_string()));
+                self.set_lifecycle_state(ServerLifecycleState::Failed((&err).into()));
                 return Err(err);
             }
         };
@@ -1441,7 +1489,9 @@ impl Server {
                 .context_binding()
                 .and_then(|binding| owner.bound(binding));
             if let Err(error) = bound {
-                self.set_lifecycle_state(ServerLifecycleState::Failed(error.to_string()));
+                self.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new(
+                    error.to_string(),
+                )));
                 return Err(ServerError::Io(error));
             }
         }
@@ -1558,7 +1608,7 @@ impl Server {
         // either terminal state is published. Failed remains restartable.
         match &result {
             Ok(()) => self.set_lifecycle_state(ServerLifecycleState::Stopped),
-            Err(error) => self.set_lifecycle_state(ServerLifecycleState::Failed(error.to_string())),
+            Err(error) => self.set_lifecycle_state(ServerLifecycleState::Failed(error.into())),
         }
         result
     }
@@ -1660,7 +1710,9 @@ impl Server {
             ServerLifecycleState::Starting | ServerLifecycleState::Stopping
                 if !self.run_entered.load(Ordering::Acquire) =>
             {
-                self.set_lifecycle_state(ServerLifecycleState::Failed(message));
+                self.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new(
+                    message,
+                )));
                 Ok(())
             }
             state => Err(ServerError::Config(format!(
@@ -5099,7 +5151,7 @@ mod tests {
         match second_result {
             Ok(Err(err)) => {
                 assert!(
-                    matches!(err, ServerError::Io(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
+                    matches!(err, ServerError::Bind(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
                     "unexpected error: {err}",
                 );
             }
@@ -5140,7 +5192,7 @@ mod tests {
             .expect("second server hung instead of rejecting the active socket")
             .expect_err("second bind must fail");
         assert!(
-            matches!(err, ServerError::Io(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
+            matches!(err, ServerError::Bind(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
             "unexpected error: {err}",
         );
         second.request_shutdown_signal();
@@ -5208,12 +5260,14 @@ mod tests {
 
         let second = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
         second.begin_start_attempt().unwrap();
-        let failed = second
-            .run()
-            .await
-            .expect_err("active socket should reject the first attempt");
+        let (ready_a, ready_b, failed) = tokio::join!(
+            second.wait_until_ready(Duration::from_secs(2)),
+            second.wait_until_ready(Duration::from_secs(2)),
+            second.run(),
+        );
+        let failed = failed.expect_err("active socket should reject the first attempt");
         assert!(
-            matches!(failed, ServerError::Io(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
+            matches!(failed, ServerError::Bind(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
             "unexpected error: {failed}",
         );
         assert!(matches!(
@@ -5237,6 +5291,16 @@ mod tests {
 
         second.request_shutdown_signal();
         second_runner.await.unwrap().unwrap();
+        let (ServerError::Failed(a), ServerError::Failed(b)) =
+            (ready_a.unwrap_err(), ready_b.unwrap_err())
+        else {
+            panic!("readiness waiters must retain the same bind failure");
+        };
+        assert_eq!(a, b);
+        let cause = a.bind_error.expect("actual bind cause");
+        assert_eq!(cause.kind, std::io::ErrorKind::AddrInUse);
+        assert_eq!(cause.raw_os_error, None, "listener lease owns the rejection");
+        assert_eq!(second.lifecycle_state(), ServerLifecycleState::Stopped);
     }
 
     #[tokio::test]
@@ -5283,11 +5347,11 @@ mod tests {
         server.finalize_runtime_stopped();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
 
-        server.set_lifecycle_state(ServerLifecycleState::Failed("bind failed".to_string()));
+        server.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new("bind failed".to_string())));
         server.finalize_runtime_stopped();
         assert_eq!(
             server.lifecycle_state(),
-            ServerLifecycleState::Failed("bind failed".to_string()),
+            ServerLifecycleState::Failed(ServerFailure::new("bind failed".to_string())),
         );
     }
 
