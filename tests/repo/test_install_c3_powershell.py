@@ -6,6 +6,8 @@ import hashlib
 import http.server
 import os
 import shutil
+import socket
+import socketserver
 import subprocess
 import sys
 import sysconfig
@@ -90,6 +92,11 @@ class _ReleaseMirror:
         self.requested: list[str] = []
         mirror = self
 
+        class _Server(http.server.ThreadingHTTPServer):
+            def server_bind(self) -> None:
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address
+
         class _Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 mirror.requested.append(self.path)
@@ -107,7 +114,7 @@ class _ReleaseMirror:
             def log_message(self, format: str, *args: object) -> None:
                 return
 
-        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._server = _Server(("127.0.0.1", 0), _Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -133,6 +140,17 @@ def test_installer_has_no_powershell_syntax_errors():
 
     assert result.returncode == 0
     assert "parse-ok" in result.stdout
+
+
+def test_release_mirror_does_not_require_dns(monkeypatch):
+    def unavailable(*args):
+        raise AssertionError("loopback mirror must not query DNS")
+    monkeypatch.setattr(socket, "getfqdn", unavailable)
+    mirror = _ReleaseMirror({})
+    try:
+        assert mirror.base_url.startswith("http://127.0.0.1:")
+    finally:
+        mirror.close()
 
 
 def test_installer_help_uses_valid_keywords_and_documents_options():
