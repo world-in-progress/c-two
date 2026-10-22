@@ -42,8 +42,8 @@ function Get-DetectedTarget {
 public static extern bool IsWow64Process2(System.IntPtr process, out ushort processMachine, out ushort nativeMachine);
 '@
         }
-        [ushort]$processMachine = 0
-        [ushort]$nativeMachine = 0
+        [System.UInt16]$processMachine = 0
+        [System.UInt16]$nativeMachine = 0
         if (-not [C3Installer.NativeSystem]::IsWow64Process2([IntPtr](-1), [ref]$processMachine, [ref]$nativeMachine)) {
             Fail "cannot determine native CPU architecture: Win32 error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
         }
