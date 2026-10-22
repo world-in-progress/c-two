@@ -443,17 +443,17 @@ impl OwnerSupervisor {
         if Instant::now() >= deadline {
             return;
         }
-        if !matches!(first.request, OwnerRequest::Hello) {
-            let _ = session
-                .reply(
-                    first.request_id,
-                    &OwnerResponse::Rejected(OwnerRejection::Malformed),
-                )
-                .await;
-            return;
-        }
         let server = self.server();
         let setup = async {
+            if !matches!(first.request, OwnerRequest::Hello) {
+                let _ = session
+                    .reply(
+                        first.request_id,
+                        &OwnerResponse::Rejected(OwnerRejection::Malformed),
+                    )
+                    .await;
+                return None;
+            }
             let status = {
                 let mut state = self.lifecycle.state.lock();
                 self.expire(&mut state, Instant::now());
@@ -625,6 +625,80 @@ async fn stopping(server: &Server) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn non_hello_rejection_obeys_setup_deadline_under_backpressure() {
+        use tokio::io::AsyncWriteExt;
+
+        let identity = ServerIdentity {
+            server_id: "owner-setup-deadline".into(),
+            server_instance_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let address = "ipc://owner-setup-deadline";
+        // Derivation and construction do not bind a listener or touch its directory.
+        let endpoint = c2_config::LocalEndpointContext::default_for_platform()
+            .unwrap()
+            .endpoint(address)
+            .unwrap();
+        let (server, admission) = Server::new_owner_bound_with_identity_and_endpoint(
+            endpoint,
+            Default::default(),
+            identity.clone(),
+        )
+        .unwrap();
+        server.begin_start_attempt().unwrap();
+        let server = Arc::new(server);
+        let grace = Duration::from_secs(2);
+        let lifecycle = HostLifecycleCell::new(&ServerLifecyclePolicy::OwnerBound {
+            owner_missing_grace: grace,
+        });
+        let owner = Arc::new(OwnerSupervisor::new(
+            lifecycle.clone(),
+            admission,
+            identity,
+            address.into(),
+            grace,
+        ));
+        owner.attach_server(&server);
+
+        let (mut controller, mut bootstrap) = c2_local::owner_endpoint_pair().unwrap();
+        let (peer, stream) = tokio::join!(controller.activate(), bootstrap.activate());
+        let peer = peer.unwrap();
+        let mut stream = stream.unwrap();
+        // Inject native backpressure. A real first owner frame has no preceding output.
+        let mut filled = 0;
+        while let Ok(result) =
+            tokio::time::timeout(Duration::from_millis(20), stream.write(&[0; 65536])).await
+        {
+            let written = result.unwrap();
+            filled += written;
+            assert!(written > 0 && filled < 16 * 1024 * 1024);
+        }
+        let abort = stream.abort_handle();
+        let first = OwnerMessage {
+            request_id: 1,
+            request: OwnerRequest::GetRecoveryTicket,
+        };
+        let completed = tokio::time::timeout(
+            Duration::from_millis(250),
+            owner.candidate(
+                OwnerSession::new(stream),
+                first,
+                Instant::now() + Duration::from_millis(50),
+            ),
+        )
+        .await;
+        peer.abort_handle().abort();
+        assert!(
+            abort.is_aborted(),
+            "candidate must release its native session"
+        );
+        assert!(completed.is_ok(), "rejection escaped the setup deadline");
+        let state = lifecycle.state.lock();
+        assert_eq!(state.phase, HostLifecyclePhase::Armed);
+        assert_eq!(state.epoch, 1);
+        assert!(state.grant.is_none() && state.deadline.is_none());
+    }
 
     #[test]
     fn watcher_error_diagnosis_survives_completion() {

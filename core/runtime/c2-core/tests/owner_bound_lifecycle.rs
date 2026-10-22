@@ -593,11 +593,13 @@ fn owner_protocol_owner_role_rejects_business_header_old_version_and_unknown_ope
             |p| *p == HostLifecyclePhase::OwnerMissing,
             Duration::from_secs(2),
         );
-        for invalid in 0..3 {
+        for invalid in 0..4 {
             io.block_on(async {
                 let mut stream = LocalStream::connect(&endpoint, Duration::from_millis(500)).await.unwrap();
-                send_owner_frame(&mut stream, 1, &OwnerRequest::Hello).await;
-                assert!(matches!(read_owner_reply(&mut stream, 1).await, OwnerResponse::Status(status) if status.phase == OwnerPhase::OwnerMissing));
+                if invalid != 3 {
+                    send_owner_frame(&mut stream, 1, &OwnerRequest::Hello).await;
+                    assert!(matches!(read_owner_reply(&mut stream, 1).await, OwnerResponse::Status(status) if status.phase == OwnerPhase::OwnerMissing));
+                }
                 let (frame, rejection) = match invalid {
                     0 => {
                         // A business-call header alone must fail the fixed
@@ -613,7 +615,8 @@ fn owner_protocol_owner_role_rejects_business_header_old_version_and_unknown_ope
                         // remainder of this otherwise permitted 4KiB body.
                         (frame, OwnerRejection::UnsupportedVersion)
                     }
-                    _ => (encode_frame(8, FLAG_CTRL, &[MsgType::OwnerControl.as_byte(), OWNER_CONTROL_VERSION, 255]), OwnerRejection::Malformed),
+                    2 => (encode_frame(8, FLAG_CTRL, &[MsgType::OwnerControl.as_byte(), OWNER_CONTROL_VERSION, 255]), OwnerRejection::Malformed),
+                    _ => (encode_frame(8, FLAG_CTRL, &encode_owner_request(&OwnerRequest::GetRecoveryTicket).unwrap()), OwnerRejection::Malformed),
                 };
                 AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
                 let response = read_owner_reply(&mut stream, 8).await;
