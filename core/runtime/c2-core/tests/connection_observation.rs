@@ -54,6 +54,7 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
             unix_root: Some(directory.path().to_path_buf()),
         })
         .unwrap();
+    let mut events = runtime.connection_events();
     let host = runtime
         .host(HostOptions::default().without_relay())
         .unwrap();
@@ -79,7 +80,40 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
     )
     .unwrap();
     let registration = host.register(definition).unwrap();
-    let mut events = runtime.connection_events();
+    // Host readiness may retry its ping. Drain every admitted probe with
+    // its exact terminal record before creating the client under test.
+    let mut probes = std::collections::HashMap::new();
+    loop {
+        let timeout = if probes.is_empty() {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(2)
+        };
+        match recv_connection_event(&mut events, Some(timeout)).expect("readiness probe events") {
+            Some(ConnectionEventWait::Event(ConnectionEvent::Opened(probe))) => {
+                assert!(probes.insert(probe.connection_id(), probe).is_none());
+            }
+            Some(ConnectionEventWait::Event(ConnectionEvent::Closed(closed))) => {
+                let probe = probes.remove(&closed.connection_id()).expect("known readiness probe");
+                assert_eq!(probe.snapshot(), Some(closed));
+            }
+            None => {
+                assert!(probes.is_empty(), "readiness probe close deadline");
+                break;
+            }
+            other => panic!("unexpected readiness probe event: {other:?}"),
+        }
+    }
+    let mut next = || match recv_connection_event(&mut events, Some(Duration::from_secs(2)))
+        .expect("connection event wait")
+    {
+        Some(ConnectionEventWait::Event(event)) => Some(event),
+        Some(ConnectionEventWait::Ended) => None,
+        Some(ConnectionEventWait::Lagged(missed)) => {
+            panic!("connection events lagged by {missed}")
+        }
+        None => panic!("connection event deadline"),
+    };
     let client_runtime = Runtime::new(RuntimeOptions {
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
@@ -104,16 +138,6 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
     );
     drop(client);
     assert!(observation.snapshot().is_none());
-    let mut next = || match recv_connection_event(&mut events, Some(Duration::from_secs(2)))
-        .expect("connection event wait")
-    {
-        Some(ConnectionEventWait::Event(event)) => Some(event),
-        Some(ConnectionEventWait::Ended) => None,
-        Some(ConnectionEventWait::Lagged(missed)) => {
-            panic!("connection events lagged by {missed}")
-        }
-        None => panic!("connection event deadline"),
-    };
     let ConnectionEvent::Opened(incoming) = next().unwrap() else {
         panic!("expected Opened");
     };
