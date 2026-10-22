@@ -926,7 +926,7 @@ def verify_candidate_receipts(
                 name, digest = built["name"], built["sha256"]
             else:
                 name, digest = decision["filename"], decision["sha256"]
-            _require(proof_wheels.pop(name, None) == digest,
+            _require(name in proof_wheels and proof_wheels.pop(name) == digest,
                      f"FastDB proof wheel {name} is not a distinct retained wheel bound by {receipt_name}")
             try:
                 distribution, version, _, tags = parse_wheel_filename(name)
