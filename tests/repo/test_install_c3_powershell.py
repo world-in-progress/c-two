@@ -203,9 +203,11 @@ def test_installer_rejects_unsupported_target_overrides():
     assert "unsupported operating system" in bad_os.stderr
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows emulated PowerShell")
-def test_emulated_powershell_selects_native_os_target():
-    powershell = Path(os.environ["SystemRoot"]) / "SysWOW64/WindowsPowerShell/v1.0/powershell.exe"
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell host architectures")
+@pytest.mark.parametrize("shell", ["pwsh", "System32", "SysWOW64"])
+def test_powershell_selects_native_os_target(shell):
+    powershell = (pwsh if shell == "pwsh" else
+                  Path(os.environ["SystemRoot"]) / shell / "WindowsPowerShell/v1.0/powershell.exe")
     result = subprocess.run(
         [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(_installer()), "-PrintTarget"],
         env={key: value for key, value in os.environ.items() if not key.startswith("C3_")},

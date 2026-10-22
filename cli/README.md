@@ -297,7 +297,9 @@ $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```
 
-PowerShell 5.1 is supported. The default per-user directory is
+PowerShell 5.1 is supported. Automatic architecture detection uses Windows
+`IsWow64Process2` (Windows 10 / Windows Server version 1709 or later), including
+from emulated shells. The default per-user directory is
 `$env:LOCALAPPDATA\Programs\c3`; `-BinDir` selects another directory.
 The installer verifies SHA-256 and copies the binary to `c3.exe`, without
 requiring an administrator or persistently registering PATH. The example adds

@@ -40,6 +40,7 @@ c3.exe --version
 ```
 
 The installer supports PowerShell 5.1 and needs no administrator privileges.
+Automatic architecture detection uses `IsWow64Process2` (Windows 10 / Windows Server version 1709 or later), so an emulated PowerShell still selects the native executable.
 It copies the verified executable to `c3.exe` in
 `$env:LOCALAPPDATA\Programs\c3`, or a directory selected by `-BinDir`.
 It does not persistently register PATH; the example updates this session only.

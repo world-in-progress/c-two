@@ -32,8 +32,26 @@ if (-not $BinDir) { $BinDir = if ($env:C3_INSTALL_DIR) { $env:C3_INSTALL_DIR } e
 
 function Get-DetectedTarget {
     $os = if ($env:C3_INSTALLER_OS) { $env:C3_INSTALLER_OS.ToLowerInvariant() } else { "windows" }
-    $arch = if ($env:C3_INSTALLER_ARCH) { $env:C3_INSTALLER_ARCH.ToLowerInvariant() } else {
+    $arch = if ($env:C3_INSTALLER_ARCH) { $env:C3_INSTALLER_ARCH.ToLowerInvariant() } elseif ($isUnixHost) {
         [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    } else {
+        # Older .NET reports the emulated CPU even through OSArchitecture.
+        if (-not ("C3Installer.NativeSystem" -as [type])) {
+            Add-Type -Namespace C3Installer -Name NativeSystem -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool IsWow64Process2(System.IntPtr process, out ushort processMachine, out ushort nativeMachine);
+'@
+        }
+        [ushort]$processMachine = 0
+        [ushort]$nativeMachine = 0
+        if (-not [C3Installer.NativeSystem]::IsWow64Process2([IntPtr](-1), [ref]$processMachine, [ref]$nativeMachine)) {
+            Fail "cannot determine native CPU architecture: Win32 error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+        switch ($nativeMachine) {
+            0x8664 { "x86_64" }
+            0xAA64 { "aarch64" }
+            default { Fail "unsupported CPU architecture: $nativeMachine" }
+        }
     }
     switch ($arch) {
         "x64" { $arch = "x86_64" }
