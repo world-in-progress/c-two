@@ -516,7 +516,7 @@ def python_abi_pair(python: str) -> tuple[str, str]:
 
 
 def wheel_platform_matches_target(platform: str, target: str) -> bool:
-    """Mirror of the candidate contract's platform-to-target matching rule."""
+    """Match a wheel platform's compatibility to a candidate target."""
     if target == "x86_64-pc-windows-msvc":
         return platform == "win_amd64"
     if target == "aarch64-pc-windows-msvc":
@@ -535,7 +535,10 @@ def wheel_platform_matches_target(platform: str, target: str) -> bool:
         platform.startswith(("linux_", "manylinux")) if system == "linux"
         else platform.startswith("macosx_")
     )
-    return prefix_ok and platform.endswith("_" + architecture)
+    return prefix_ok and (
+        platform.endswith("_" + architecture)
+        or (system == "macos" and platform.endswith("_universal2"))
+    )
 
 
 def verify_manifest_binding(
@@ -630,23 +633,6 @@ def verify_manifest_binding(
     _require(len(retained_sdists) == 1,
              f"expected exactly one retained FastDB sdist, found "
              f"{[entry['name'] for entry in retained_sdists]}")
-    proof_targets: list[str] = []
-    for entry in fastdb_proof:
-        if not entry["name"].endswith(".whl"):
-            continue
-        try:
-            distribution, version, _, tags = parse_wheel_filename(entry["name"])
-        except InvalidWheelFilename as error:
-            raise PromotionError(f"invalid FastDB proof wheel {entry['name']}: {error}") from error
-        _require(distribution == "fastdb4py" and str(version) == meta["fastdb_version"],
-                 f"FastDB proof wheel {entry['name']} distribution/version mismatch")
-        targets = {target for target in CLI_TARGETS
-                   if any((tag.interpreter, tag.abi) == ("cp312", "cp312")
-                          and wheel_platform_matches_target(tag.platform, target) for tag in tags)}
-        _require(len(targets) == 1, f"FastDB proof wheel {entry['name']} is not one cp312 target row")
-        proof_targets.extend(targets)
-    _require(sorted(proof_targets) == sorted(CLI_TARGETS),
-             "FastDB proof wheels must cover every CLI target exactly once on cp312")
 
     counts = manifest.get("counts")
     _require(isinstance(counts, dict), "rc-manifest counts are missing")
@@ -910,6 +896,10 @@ def verify_candidate_receipts(
         "retained FastDB sdist does not match the verified published listing",
     )
     built_identities: set[tuple[str, str]] = set()
+    proof_wheels = {entry["name"]: entry["sha256"] for entry in manifest["fastdb_proof"]
+                    if entry["name"].endswith(".whl")}
+    _require(len(proof_wheels) == len(CLI_TARGETS),
+             "FastDB proof wheels must cover every CLI target exactly once on cp312")
 
     def load(name: str) -> dict[str, Any]:
         payload = _load_json_file(extraction / name)
@@ -933,6 +923,21 @@ def verify_candidate_receipts(
             if decision["mode"] == "sdist":
                 built = decision["built_wheel"]
                 built_identities.add((built["name"], built["sha256"]))
+                name, digest = built["name"], built["sha256"]
+            else:
+                name, digest = decision["filename"], decision["sha256"]
+            _require(proof_wheels.pop(name, None) == digest,
+                     f"FastDB proof wheel {name} is not a distinct retained wheel bound by {receipt_name}")
+            try:
+                distribution, version, _, tags = parse_wheel_filename(name)
+            except InvalidWheelFilename as error:
+                raise PromotionError(f"invalid FastDB proof wheel {name}: {error}") from error
+            target = receipt_name.removeprefix("fastdb-").removesuffix(".json")
+            _require(distribution == "fastdb4py" and str(version) == manifest["meta"]["fastdb_version"],
+                     f"FastDB proof wheel {name} distribution/version mismatch")
+            _require(any((tag.interpreter, tag.abi) == ("cp312", "cp312")
+                         and wheel_platform_matches_target(tag.platform, target) for tag in tags),
+                     f"FastDB proof wheel {name} does not support the cp312 target {target}")
 
     # 35 executed ABI rows: installed-wheel-smoke receipts bound to their row.
     rows: dict[tuple[str, str], str] = {}
