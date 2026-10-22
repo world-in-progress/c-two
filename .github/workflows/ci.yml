@@ -135,9 +135,12 @@ jobs:
         shell: bash
         run: |
           python - <<'PYTHON'
-          import hashlib, os, subprocess
+          import hashlib, os, subprocess, sys, sysconfig
           compiler = "cl" if os.name == "nt" else "cc"
           identity = subprocess.check_output(["rustc", "-vV"])
+          identity += repr((sys.version, sys.executable, tuple(
+              sysconfig.get_config_var(name) for name in ("LIBDIR", "LDLIBRARY", "LIBRARY", "SOABI")
+          ))).encode()
           identity += subprocess.run([compiler, "--version"] if compiler != "cl" else [compiler],
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout
           inputs = {key: value for key, value in os.environ.items()

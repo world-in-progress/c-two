@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 try:
@@ -32,6 +33,40 @@ def test_cli_release_requires_an_explicit_candidate_and_defaults_to_preview():
     assert inputs["candidate_run_id"]["required"] == "true"
     assert inputs["dry_run"]["default"] == "true"
     assert "workflow_run" not in _workflow_text()
+
+
+@pytest.mark.parametrize("changed", ["version", "executable", "LIBDIR", "LDLIBRARY", "LIBRARY", "SOABI"])
+def test_cargo_cache_identity_tracks_the_actual_python(changed, tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    import sysconfig
+    from types import SimpleNamespace
+
+    workflow = yaml.load((_repo_root() / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["source"]["steps"]
+    script = next(step["run"] for step in steps if step.get("id") == "cargo_identity")
+    script = script.split("<<'PYTHON'\n", 1)[1].rsplit("\nPYTHON", 1)[0]
+    cache = next(step["with"] for step in steps if step.get("id") == "cargo_cache")
+    assert "steps.cargo_identity.outputs.key" in cache["key"]
+    assert all("steps.cargo_identity.outputs.key" in key for key in cache["restore-keys"].splitlines())
+    output = tmp_path / "identity"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: b"fixed rustc")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout=b"fixed cc"))
+    configuration = {name: "original" for name in ("LIBDIR", "LDLIBRARY", "LIBRARY", "SOABI")}
+    monkeypatch.setattr(sysconfig, "get_config_var", configuration.get)
+
+    def fingerprint():
+        exec(script, {})
+        return output.read_text().splitlines()[-1]
+
+    original = fingerprint()
+    assert fingerprint() == original
+    if changed in ("version", "executable"):
+        monkeypatch.setattr(sys, changed, getattr(sys, changed) + "-changed")
+    else:
+        configuration[changed] = "changed"
+    assert fingerprint() != original
 
 
 def test_cli_release_accepts_explicit_manual_candidate_inputs():
