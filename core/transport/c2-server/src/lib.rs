@@ -32,8 +32,8 @@ pub use scheduler::{
 pub use server::{
     DIRECT_IPC_SHUTDOWN_REASON, OWNER_BOUND_SHUTDOWN_REASON, OWNER_MISSING_ADMISSION_REASON,
     OWNER_WATCHER_ERROR_ADMISSION_REASON, OWNER_WATCHER_ERROR_SHUTDOWN_REASON, Server, ServerError,
-    ServerFailure, ServerIdentity, ServerLifecycleState, ServerMemorySnapshot, ServerRouteCloseOutcome,
-    ServerShutdownCompletion,
+    ServerFailure, ServerIdentity, ServerLifecycleState, ServerMemorySnapshot,
+    ServerRouteCloseOutcome, ServerShutdownCompletion,
 };
 
 pub use response::ResponsePool;

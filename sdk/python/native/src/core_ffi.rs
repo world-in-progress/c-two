@@ -43,7 +43,9 @@ impl PyCoreClient {
     // Keep this view lock out of preparation, config, materialization and I/O.
     fn client(&self) -> PyResult<Client> {
         self.inner.lock().clone().ok_or_else(|| {
-            lifecycle_error_to_py(LifecycleError::Server(ServerFailure::new("Core client is closed".into())))
+            lifecycle_error_to_py(LifecycleError::Server(ServerFailure::new(
+                "Core client is closed".into(),
+            )))
         })
     }
 }

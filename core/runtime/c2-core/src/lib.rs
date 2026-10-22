@@ -34,10 +34,11 @@ pub use control::{
     shutdown_direct_ipc, shutdown_direct_ipc_with_context,
 };
 pub use error::{
-    AdapterFailure, AdapterFailurePhase, Error, ExternalCause, LifecycleError, LocalIoCause, TransportError,
-    TransportKind, TransportPhase, external_cause_details, normalize_adapter_failure,
-    normalize_http_error, normalize_http_semantic_body, normalize_ipc_error,
-    normalize_ipc_semantic_bytes, semantic_error_from_http_body, semantic_error_from_ipc_bytes,
+    AdapterFailure, AdapterFailurePhase, Error, ExternalCause, LifecycleError, LocalIoCause,
+    TransportError, TransportKind, TransportPhase, external_cause_details,
+    normalize_adapter_failure, normalize_http_error, normalize_http_semantic_body,
+    normalize_ipc_error, normalize_ipc_semantic_bytes, semantic_error_from_http_body,
+    semantic_error_from_ipc_bytes,
 };
 pub use host::{
     EncodedService, Host, HostOptions, MethodDefinition, Registration, RouteConcurrency,

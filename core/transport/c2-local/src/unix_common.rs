@@ -161,9 +161,8 @@ impl EndpointDirectory {
         let stat = fstat(self.fd())?;
         verify_directory_stat(&self.path, &stat)?;
         #[cfg(target_os = "macos")]
-        directory_acl::verify(self.fd()).map_err(|error| {
-            directory_policy_io_error(&self.path, &stat, "extended ACL", error)
-        })?;
+        directory_acl::verify(self.fd())
+            .map_err(|error| directory_policy_io_error(&self.path, &stat, "extended ACL", error))?;
         // Check effective credentials and ACLs against the pinned directory,
         // rather than testing a pathname that a rename could redirect.
         if unsafe {

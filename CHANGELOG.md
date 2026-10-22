@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- Breaking Rust error API: `ServerLifecycleState::Failed` and `LifecycleError::Server` now carry `ServerFailure`; `ServerError::Bind` / `Failed` and `IpcError::Connect` identify local endpoint failures. Core and the Rust SDK expose `LocalIoCause` through the existing error chain. There are no compatibility variants; IPC 12, SHM 3 and C/FFI ABI 5 are unchanged.
 - Development dependencies now pin FastDB 0.2.3 across Python, Rust,
   TypeScript validation and the verified Core SDK. SDK preparation also
   recognizes the official Windows ARM64 bundle. Portable payload semantics
@@ -25,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- Local bind/connect failures retain their original OS kind and code through readiness waiters and Python `CoreError.io_kind`, `raw_os_error` and `io_operation`. Contextual messages, outer policy refusals, error ordering and retry budgets remain unchanged. Deadline, handshake and other non-local-I/O failures do not acquire an OS cause.
 - A relay registration response arriving after owner loss or shutdown cannot
   reopen route admission with an obsolete registration token.
 

@@ -1710,9 +1710,7 @@ impl Server {
             ServerLifecycleState::Starting | ServerLifecycleState::Stopping
                 if !self.run_entered.load(Ordering::Acquire) =>
             {
-                self.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new(
-                    message,
-                )));
+                self.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new(message)));
                 Ok(())
             }
             state => Err(ServerError::Config(format!(
@@ -5299,7 +5297,10 @@ mod tests {
         assert_eq!(a, b);
         let cause = a.bind_error.expect("actual bind cause");
         assert_eq!(cause.kind, std::io::ErrorKind::AddrInUse);
-        assert_eq!(cause.raw_os_error, None, "listener lease owns the rejection");
+        assert_eq!(
+            cause.raw_os_error, None,
+            "listener lease owns the rejection"
+        );
         assert_eq!(second.lifecycle_state(), ServerLifecycleState::Stopped);
     }
 
@@ -5347,7 +5348,9 @@ mod tests {
         server.finalize_runtime_stopped();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
 
-        server.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new("bind failed".to_string())));
+        server.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new(
+            "bind failed".to_string(),
+        )));
         server.finalize_runtime_stopped();
         assert_eq!(
             server.lifecycle_state(),

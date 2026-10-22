@@ -908,9 +908,7 @@ impl Runtime {
         }
         let server_runtime = ServerRuntimeBuilder::build(&config)
             .map_err(|error| LifecycleError::Server(ServerFailure::new(error.to_string())))?;
-        server
-            .begin_start_attempt()
-            .map_err(LifecycleError::from)?;
+        server.begin_start_attempt().map_err(LifecycleError::from)?;
 
         // Consume the native owner control capability before this host can
         // publish readiness. Naming the OwnerBound policy alone fails here,

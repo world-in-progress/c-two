@@ -3,8 +3,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
 use c2_core::{
-    Error, LifecycleError, LocalIoCause, RegisterFailureOutcome, RelayCleanupError, RouteCloseOutcome,
-    TransportKind, TransportPhase,
+    Error, LifecycleError, LocalIoCause, RegisterFailureOutcome, RelayCleanupError,
+    RouteCloseOutcome, TransportKind, TransportPhase,
 };
 
 pyo3::create_exception!(c_two._native, CoreError, PyRuntimeError);
@@ -55,25 +55,30 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                 TransportPhase::DispatchUncertain => "dispatch_uncertain",
             };
             let fallback_eligible = error.is_fallback_eligible();
-            local_error("transport", error.to_string(), error.local_io_cause(), |value| {
-                set_attr(value, "transport_kind", kind);
-                set_attr(value, "transport_phase", phase);
-                set_attr(value, "fallback_eligible", fallback_eligible);
-                if let Some(semantic) = error.semantic_error() {
-                    set_attr(value, "code", u16::from(semantic.code));
-                    set_attr(value, "name", semantic.code.name());
-                    let details = PyDict::new(value.py());
-                    for (key, item) in &semantic.details {
-                        let _ = details.set_item(key, item);
+            local_error(
+                "transport",
+                error.to_string(),
+                error.local_io_cause(),
+                |value| {
+                    set_attr(value, "transport_kind", kind);
+                    set_attr(value, "transport_phase", phase);
+                    set_attr(value, "fallback_eligible", fallback_eligible);
+                    if let Some(semantic) = error.semantic_error() {
+                        set_attr(value, "code", u16::from(semantic.code));
+                        set_attr(value, "name", semantic.code.name());
+                        let details = PyDict::new(value.py());
+                        for (key, item) in &semantic.details {
+                            let _ = details.set_item(key, item);
+                        }
+                        set_attr(value, "details", details);
+                        set_attr(
+                            value,
+                            "error_bytes",
+                            PyBytes::new(value.py(), &semantic.to_wire_bytes()),
+                        );
                     }
-                    set_attr(value, "details", details);
-                    set_attr(
-                        value,
-                        "error_bytes",
-                        PyBytes::new(value.py(), &semantic.to_wire_bytes()),
-                    );
-                }
-            })
+                },
+            )
         }
         Error::Lifecycle(error) => lifecycle_error_to_py(error),
     }
@@ -81,83 +86,88 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
 
 pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
     let message = error.to_string();
-    local_error("lifecycle", message, error.local_io_cause(), |value| match &error {
-        LifecycleError::InvalidServerId(_) => {
-            set_attr(value, "lifecycle_kind", "invalid_server_id");
-        }
-        LifecycleError::ConfigFrozen => {
-            set_attr(value, "lifecycle_kind", "config_frozen");
-        }
-        LifecycleError::ClientConfigFrozen => {
-            set_attr(value, "lifecycle_kind", "client_config_frozen");
-        }
-        LifecycleError::DuplicateRoute(route) => {
-            set_attr(value, "lifecycle_kind", "duplicate_route");
-            set_attr(value, "route_name", route);
-            set_attr(value, "status_code", 409_u16);
-        }
-        LifecycleError::MissingRoute(route) => {
-            set_attr(value, "lifecycle_kind", "missing_route");
-            set_attr(value, "route_name", route);
-        }
-        LifecycleError::RelayDuplicateRoute(route) => {
-            set_attr(value, "lifecycle_kind", "relay_duplicate_route");
-            set_attr(value, "route_name", route);
-            set_attr(value, "status_code", 409_u16);
-            set_attr(value, "relay_duplicate", true);
-        }
-        LifecycleError::MissingRelayAddress => {
-            set_attr(value, "lifecycle_kind", "missing_relay_address");
-        }
-        LifecycleError::RelayHttp {
-            status_code,
-            message,
-        } => {
-            set_attr(value, "lifecycle_kind", "relay_http");
-            set_attr(value, "status_code", *status_code);
-            set_attr(value, "body", message);
-        }
-        LifecycleError::RegisterFailure(failure) => {
-            set_attr(value, "lifecycle_kind", "register_failure");
-            set_attr(value, "failure_source", &failure.failure_source);
-            set_attr(value, "route_name", &failure.route_name);
-            if let Ok(details) = register_failure_to_dict(value.py(), failure) {
-                set_attr(value, "registration_failure", details.clone());
-                match details.get_item("rollback") {
-                    Ok(Some(rollback)) => set_attr(value, "rollback", rollback),
-                    _ => set_attr(value, "rollback", value.py().None()),
+    local_error(
+        "lifecycle",
+        message,
+        error.local_io_cause(),
+        |value| match &error {
+            LifecycleError::InvalidServerId(_) => {
+                set_attr(value, "lifecycle_kind", "invalid_server_id");
+            }
+            LifecycleError::ConfigFrozen => {
+                set_attr(value, "lifecycle_kind", "config_frozen");
+            }
+            LifecycleError::ClientConfigFrozen => {
+                set_attr(value, "lifecycle_kind", "client_config_frozen");
+            }
+            LifecycleError::DuplicateRoute(route) => {
+                set_attr(value, "lifecycle_kind", "duplicate_route");
+                set_attr(value, "route_name", route);
+                set_attr(value, "status_code", 409_u16);
+            }
+            LifecycleError::MissingRoute(route) => {
+                set_attr(value, "lifecycle_kind", "missing_route");
+                set_attr(value, "route_name", route);
+            }
+            LifecycleError::RelayDuplicateRoute(route) => {
+                set_attr(value, "lifecycle_kind", "relay_duplicate_route");
+                set_attr(value, "route_name", route);
+                set_attr(value, "status_code", 409_u16);
+                set_attr(value, "relay_duplicate", true);
+            }
+            LifecycleError::MissingRelayAddress => {
+                set_attr(value, "lifecycle_kind", "missing_relay_address");
+            }
+            LifecycleError::RelayHttp {
+                status_code,
+                message,
+            } => {
+                set_attr(value, "lifecycle_kind", "relay_http");
+                set_attr(value, "status_code", *status_code);
+                set_attr(value, "body", message);
+            }
+            LifecycleError::RegisterFailure(failure) => {
+                set_attr(value, "lifecycle_kind", "register_failure");
+                set_attr(value, "failure_source", &failure.failure_source);
+                set_attr(value, "route_name", &failure.route_name);
+                if let Ok(details) = register_failure_to_dict(value.py(), failure) {
+                    set_attr(value, "registration_failure", details.clone());
+                    match details.get_item("rollback") {
+                        Ok(Some(rollback)) => set_attr(value, "rollback", rollback),
+                        _ => set_attr(value, "rollback", value.py().None()),
+                    }
+                    match details.get_item("relay_cleanup_error") {
+                        Ok(Some(error)) => set_attr(value, "relay_cleanup_error", error),
+                        _ => set_attr(value, "relay_cleanup_error", value.py().None()),
+                    }
                 }
-                match details.get_item("relay_cleanup_error") {
-                    Ok(Some(error)) => set_attr(value, "relay_cleanup_error", error),
-                    _ => set_attr(value, "relay_cleanup_error", value.py().None()),
+                if let Some(status_code) = failure.status_code {
+                    set_attr(value, "status_code", status_code);
+                    if status_code == 409 {
+                        set_attr(value, "relay_duplicate", true);
+                    }
                 }
             }
-            if let Some(status_code) = failure.status_code {
-                set_attr(value, "status_code", status_code);
-                if status_code == 409 {
-                    set_attr(value, "relay_duplicate", true);
-                }
+            LifecycleError::HeldResponseCopy { .. } => {
+                set_attr(value, "lifecycle_kind", "held_response_copy");
             }
-        }
-        LifecycleError::HeldResponseCopy { .. } => {
-            set_attr(value, "lifecycle_kind", "held_response_copy");
-        }
-        LifecycleError::HeldResponseRelease { .. } => {
-            set_attr(value, "lifecycle_kind", "held_response_release");
-        }
-        LifecycleError::ResponseCopy(_) => {
-            set_attr(value, "lifecycle_kind", "response_copy");
-        }
-        LifecycleError::Configuration(_) => {
-            set_attr(value, "lifecycle_kind", "configuration");
-        }
-        LifecycleError::Server(_) => {
-            set_attr(value, "lifecycle_kind", "server");
-        }
-        LifecycleError::Relay(_) => {
-            set_attr(value, "lifecycle_kind", "relay");
-        }
-    })
+            LifecycleError::HeldResponseRelease { .. } => {
+                set_attr(value, "lifecycle_kind", "held_response_release");
+            }
+            LifecycleError::ResponseCopy(_) => {
+                set_attr(value, "lifecycle_kind", "response_copy");
+            }
+            LifecycleError::Configuration(_) => {
+                set_attr(value, "lifecycle_kind", "configuration");
+            }
+            LifecycleError::Server(_) => {
+                set_attr(value, "lifecycle_kind", "server");
+            }
+            LifecycleError::Relay(_) => {
+                set_attr(value, "lifecycle_kind", "relay");
+            }
+        },
+    )
 }
 
 fn local_error<F>(
@@ -182,8 +192,16 @@ where
 
 fn set_io_cause(value: &Bound<'_, PyAny>, cause: Option<LocalIoCause>) {
     set_attr(value, "io_operation", cause.map(LocalIoCause::operation));
-    set_attr(value, "io_kind", cause.map(|cause| cause.error().category()));
-    set_attr(value, "raw_os_error", cause.and_then(|cause| cause.error().raw_os_error));
+    set_attr(
+        value,
+        "io_kind",
+        cause.map(|cause| cause.error().category()),
+    );
+    set_attr(
+        value,
+        "raw_os_error",
+        cause.and_then(|cause| cause.error().raw_os_error),
+    );
 }
 
 fn register_failure_to_dict<'py>(

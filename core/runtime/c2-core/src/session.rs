@@ -2141,7 +2141,11 @@ impl Runtime {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| LifecycleError::Server(crate::ServerFailure::new(format!("failed to create runtime: {e}"))))?;
+            .map_err(|e| {
+                LifecycleError::Server(crate::ServerFailure::new(format!(
+                    "failed to create runtime: {e}"
+                )))
+            })?;
         Ok(rt)
     }
 
