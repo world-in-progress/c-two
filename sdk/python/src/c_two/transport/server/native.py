@@ -486,8 +486,8 @@ class NativeServerBridge:
         """Build the Python callable passed into native route registration.
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
-        held.  Signature: ``(route_name, method_idx, shm_buffer)``.
-        It reads the request via ``memoryview(shm_buffer)``, resolves the
+        held.  Signature: ``(route_name, method_idx, request_buf)``.
+        It reads the owned request snapshot via ``memoryview(request_buf)``, resolves the
         method, calls the resource, and returns serialized result data (or
         *None* for empty responses). Rust native code owns the response
         allocation choice for inline, SHM, or chunked transport.
@@ -530,7 +530,7 @@ class NativeServerBridge:
                         pass
 
             if buffer_mode == 'view':
-                # Pass memoryview; _release_fn frees SHM after deserialize
+                # Pass memoryview; _release_fn releases the input buffer after deserialize.
                 try:
                     result = method(
                         mv,

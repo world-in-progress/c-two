@@ -180,7 +180,7 @@ impl Connection {
 
     // -- peer SHM accessors -------------------------------------------------
 
-    /// Get a shared reference to the peer's MemPool (for ShmBuffer construction).
+    /// Get a shared reference to the peer's MemPool.
     /// Returns None if handshake hasn't completed yet.
     #[cfg(test)]
     pub(crate) fn peer_pool_arc(&self) -> Option<Arc<RwLock<MemPool>>> {
@@ -227,7 +227,7 @@ impl Connection {
     }
 
     /// Ensure the peer's SHM segment at `seg_idx` is mapped (lazy-open).
-    /// Does NOT read data — just ensures the segment is available for ShmBuffer access.
+    /// Does NOT read data — just ensures the segment is available for peer access.
     pub fn ensure_peer_segment(
         &self,
         seg_idx: u16,

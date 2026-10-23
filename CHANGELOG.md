@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- Removed the unused low-level Python `c_two._native.ShmBuffer` export and its native module without compatibility aliases. The existing Core request snapshot, response receive path and transport lease ordering are unchanged; R06 active buffer state, C/FFI ABI 5, IPC 12, SHM 3 and the Rust API are unchanged.
 - Low-level TypeScript IPC connections require an idempotent `close()` that terminates pending reads and writes; custom Node sockets require `pause()` and `resume()`. There are no optional-close compatibility paths.
 - Generated chunked calls receive replies during upload, close and join failed exchanges, and retain the first confirmed failure and exact SHM release. The next call reconnects under the existing identity checks; successful calls reuse their connection and failed calls are never replayed. The official Node connector pauses idle input. IPC 12, SHM 3 and C/FFI ABI 5 are unchanged.
 

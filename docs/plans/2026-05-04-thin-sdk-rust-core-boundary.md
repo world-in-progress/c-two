@@ -60,6 +60,14 @@ below records the generic runtime mechanisms that were identified here and have
 now moved to Rust ownership, while keeping Python domain logic, CRM decorators,
 and transferable serialization semantics in the SDK.
 
+### Current encoded request and response boundary
+
+The current remote request path is `RequestData -> RequestLease.copy_bytes() -> EncodedService.invoke(Vec<u8>) -> PyCoreRequestBuffer -> Python memoryview`. Core retains the original transport lease until `invoke` returns or unwinds. The owned snapshot remains intentional; PyO3 moves that same `Vec` into its buffer projection without a second copy. Response receive follows `ResponseLease.copy_bytes() -> HeldResponse -> PyCoreResponse`; Core owns transport lease release ordering, while `c2-mem` remains the allocation-release authority. Same-process thread-local calls continue to pass Python objects directly.
+
+`6e6519a8` removed all `PyShmBuffer` construction from `server_ffi.rs`; `e21e79c4` retained the snapshot while removing the second request copy. Retirement removes only the unused `sdk/python/native/src/shm_buffer.rs`, its module registration and the low-level `c_two._native.ShmBuffer` export, without compatibility aliases. It does not change these data paths, R06 active buffer state, C/FFI ABI 5, IPC 12, SHM 3 or the Rust API.
+
+The ledger's verified coverage below records the implementation stage named in each section. Earlier `ShmBuffer` and direct Python-buffer-to-response-SHM observations remain historical evidence; they do not establish zero-copy behavior for the current copy-backed Core adapters.
+
 ## Keep In Python SDKs
 
 These are language-specific and should not be forced into the Rust core:
@@ -219,12 +227,7 @@ snapshot to the SDK. Python keeps `ConcurrencyConfig` as the typed facade and
 keeps `Scheduler.execution_guard()` only as a thin adapter for thread-local
 direct calls.
 
-Verified coverage from that implementation includes remote IPC `exclusive`,
-`parallel`, and `read_parallel` behavior; large SHM-backed hold input arriving
-as `memoryview` over `ShmBuffer`; explicit direct `ipc://` bypassing a bad
-relay environment; and thread-local calls continuing to pass Python objects
-directly. Route-level `max_pending` and `max_workers` are now enforced by the
-same Rust handle for remote IPC and same-process thread-local calls.
+Historical verified coverage from that scheduler implementation includes remote IPC `exclusive`, `parallel`, and `read_parallel` behavior; large SHM-backed hold input arriving as `memoryview` over `ShmBuffer`; explicit direct `ipc://` bypassing a bad relay environment; and thread-local calls continuing to pass Python objects directly. Route-level `max_pending` and `max_workers` are now enforced by the same Rust handle for remote IPC and same-process thread-local calls.
 
 **Why this is core behavior**
 
@@ -232,38 +235,9 @@ Read/write/exclusive/parallel dispatch semantics are not Python-specific. Every
 language SDK needs identical behavior once calls cross IPC. If this remains in
 Python, future SDKs must reimplement scheduler semantics and risk diverging.
 
-**Zero-copy constraint from design review**
+**Current snapshot and lease constraint**
 
-Do not reintroduce an extra Python/Rust bytes copy while moving scheduler
-configuration into Rust.
-
-Safe migration boundary:
-
-```text
-Python ConcurrencyConfig
-  -> pass mode / max_pending / worker-limit intent as typed config
-RustServer.register_route(...)
-  -> construct Rust Scheduler(mode, access_map, limits)
-Rust Scheduler
-  -> acquire locks/permits and call callback.invoke(...)
-callback.invoke(...)
-  -> keep RequestData::Shm / RequestData::Handle / RequestData::Inline
-PyO3
-  -> keep PyShmBuffer and memoryview(request_buf)
-```
-
-Unsafe migration boundary:
-
-```text
-Rust scheduler
-  -> materialize SHM/handle payload as Python bytes before dispatch
-  -> call Python with bytes instead of ShmBuffer/memoryview
-```
-
-That unsafe boundary would add the copy that was previously rejected. The P1
-work is only to move scheduler *configuration and concurrency enforcement* into
-Rust; it must not change the `RequestData -> PyShmBuffer -> memoryview` data
-path.
+The original scheduler downshift preserved the then-current `RequestData -> PyShmBuffer -> memoryview` path and rejected an extra Python `bytes` materialization. That describes the scheduler implementation stage, before the Core encoded-service boundary replaced it. Current scheduler changes must preserve the owned snapshot and transport lease ordering described above: `RequestLease.copy_bytes()` creates the snapshot, `EncodedService.invoke(Vec<u8>)` receives it, and PyO3 moves it into `PyCoreRequestBuffer` for Python `memoryview` access without a second copy.
 
 **Thread-local caveat**
 
@@ -294,8 +268,7 @@ concurrency state must remain Rust-owned.
 - Remote IPC `ConcurrencyMode::Parallel` permits concurrent writes.
 - Remote IPC `ConcurrencyMode::ReadParallel` permits concurrent reads and
   serializes writes.
-- Large SHM-backed requests still arrive in Python as `ShmBuffer`/
-  `memoryview`, not `bytes`.
+- Remote requests expose the Core-owned snapshot through `PyCoreRequestBuffer` / Python `memoryview`, with no second PyO3 copy and the original transport lease retained through invocation.
 - Thread-local calls still skip serialization and still pass Python objects.
 - Mixed thread-local/direct-IPC calls share `max_workers` and `max_pending`
   capacity limits through the same native route handle.
@@ -489,14 +462,9 @@ mode are retention policies. Python keeps `cc.hold()`, `HeldResult`,
 state, byte totals, ages, storage/direction aggregation, and stale snapshots
 come from native accounting.
 
-Client-side `cc.hold()` is the primary retained lease path. Resource-side
-`@cc.transfer(..., buffer="hold")` input retention uses the same native tracker
-as a diagnostic path. Inline retained buffers are counted because they can back
-zero-copy `memoryview` outputs through native-owned `Vec<u8>`; they are reported
-separately from SHM-backed retained buffers so memory pressure diagnostics stay
-accurate.
+Client-side `cc.hold()` is the primary retained lease path. At the issue5 implementation stage, resource-side `@cc.transfer(..., buffer="hold")` input retention used the same native tracker as a diagnostic path; that decorator form is now retired. Inline retained buffers are counted because they can back zero-copy `memoryview` outputs through native-owned `Vec<u8>`; they are reported separately from SHM-backed retained buffers so memory pressure diagnostics stay accurate.
 
-**Verified coverage**
+**Historical verified coverage (issue5 implementation stage)**
 
 - Inline client-response `cc.hold()` counts as a retained lease and releases on
   `HeldResult.release()` / context manager / GC fallback.
@@ -519,15 +487,7 @@ accurate.
 
 **Non-blocking future hardening notes**
 
-The current implementation covers the issue5 ownership boundary. Further work
-should be treated as hardening rather than a second architecture: keep `c2-mem`
-as the source of truth, keep `ResponseBuffer.release()` / `ShmBuffer.release()`
-as memory-release authority, and improve only the SDK/native seam. A future
-hardening plan can focus on (1) locking down successful-hold tracking semantics
-for both `from_buffer()` and deserialize-only outputs, (2) making native retained
-tracking calls idempotent and non-leaking under exceptional paths, and (3)
-extracting cross-SDK conformance tests that Go, Rust, Fortran, and Python can
-share without forcing payload copies or SHM promotion for inline results.
+The issue5 ledger records the earlier `ResponseBuffer.release()` / `ShmBuffer.release()` seam. Current work must keep `c2-mem` as the allocation-release authority and Core `RequestLease` / `ResponseLease` / `HeldResponse` as the transport lifetime boundary; Python buffer projections must not acquire independent transport release authority. Further work should improve only the SDK/native seam. A future hardening plan can focus on (1) locking down successful-hold tracking semantics for both `from_buffer()` and deserialize-only outputs, (2) making native retained tracking calls idempotent and non-leaking under exceptional paths, and (3) extracting cross-SDK conformance tests that Go, Rust, Fortran, and Python can share without forcing payload copies or SHM promotion for inline results.
 
 ### P2. Server route slot lifecycle and readiness
 
@@ -592,21 +552,11 @@ compares `len(res_part)` against `shm_threshold`, writes response SHM, returns
 SHM coordinate tuples, or converts `memoryview` outputs with `bytes(...)` for
 transport.
 
-Rust `c2-server::response::try_prepare_shm_response()` owns threshold-based
-large response SHM preparation and post-allocation cleanup. Payloads that are
-valid for the configured response path but too large for buddy SHM wire
-metadata fall back to owned bytes so the Rust server can choose chunked
-transport rather than reporting a CRM failure. PyO3
-`parse_response_meta()` accepts `bytes` and generic `PyBuffer<u8>` exporters,
-attempts direct Python-buffer-to-response-SHM writes for large outputs, and
-only materializes owned inline bytes for small outputs or SHM allocation
-fallback. It rejects outputs above `ServerIpcConfig.max_payload_size` before
-allocating fallback buffers. Existing `send_response_meta()` remains the final
-inline / buddy SHM / chunked transport selector for owned bytes, with core-side
-`max_payload_size` enforcement plus checked inline frame length, buddy
-data-size, and chunk-count limits.
+Rust `c2-server::response::try_prepare_shm_response()` owns threshold-based large response SHM preparation and post-allocation cleanup. Current `EncodedService` returns owned response bytes through Core; `c2-server` enforces payload limits and selects inline / buddy SHM / chunked transport, including checked frame length, buddy metadata and chunk-count limits. Payloads valid for the configured response path but too large for buddy wire metadata use chunked fallback.
 
-**Verified coverage**
+At the response-allocation downshift stage, PyO3 `parse_response_meta()` accepted `bytes` and generic `PyBuffer<u8>` exporters, attempted direct Python-buffer-to-response-SHM writes for large outputs, and materialized owned bytes for small outputs or SHM allocation fallback. Its pre-allocation payload-limit checks and the coverage below describe that earlier implementation; they are not a requirement to restore PyO3-owned response allocation or evidence of current direct SHM construction.
+
+**Historical verified coverage (response-allocation downshift stage)**
 
 - Rust helper tests cover below-threshold no-allocation behavior, large
   direct SHM writes, allocation-failure fallback, and cleanup after copy
@@ -760,7 +710,7 @@ Every implementation spawned from this reference should preserve:
 - Remote relay HTTP calls use the resolved route's `relay_url` directly rather
   than adding an anchor-relay forwarding hop.
 - Thread-local same-process calls do not serialize Python objects.
-- SHM-backed remote IPC requests arrive as `ShmBuffer`/`memoryview`.
+- Remote IPC preserves the Core-owned request snapshot, moves the same `Vec` into `PyCoreRequestBuffer` for Python `memoryview` access, and retains the original transport lease through invocation.
 - Large result replies keep using Rust transport selection and avoid avoidable
   copies.
 - Chunked request/response lifecycle cleanup remains Rust-owned: no client or

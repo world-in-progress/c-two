@@ -7,6 +7,7 @@ import time
 import pytest
 
 import c_two as cc
+from c_two import _native
 from c_two.transport.registry import _ProcessRegistry
 
 
@@ -141,17 +142,28 @@ class TestBuddyReply:
         assert not errors, f"Concurrent test errors: {errors}"
         assert completed == [3, 3, 3], f"Incomplete concurrent calls: {completed}"
 
-    def test_response_buffer_memoryview(self):
+    @pytest.mark.parametrize('size', [3, 1024 * 1024])
+    def test_response_buffer_memoryview(self, size):
         """ResponseBuffer supports zero-copy memoryview access."""
         import pickle
         proxy = self._setup_ipc()
         rust_client = proxy.client._client
-        data = os.urandom(1024 * 1024)  # 1 MB — above SHM threshold
+        data = os.urandom(size)
         response = rust_client.call('echo', pickle.dumps(data))
+        tracker = _native.BufferLeaseTracker()
+        response.track_retained(tracker, 'echo', 'echo')
+        assert tracker.stats()['total_held_bytes'] == len(response)
         mv = memoryview(response)
         result = pickle.loads(bytes(mv))
         assert result == data
-        del mv
+        with pytest.raises(BufferError, match='currently exported'):
+            response.release()
+        assert not response.is_released
+        assert tracker.stats()['by_storage']['inline']['active_holds'] == 1
+        mv.release()
+        response.release()
+        assert tracker.stats()['by_storage']['inline']['active_holds'] == 0
+        assert tracker.stats()['total_held_bytes'] == 0
         response.release()
         cc.close(proxy)
 
