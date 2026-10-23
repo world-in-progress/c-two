@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from c_two._native import LocalEndpointContext
+from c_two._native import EndpointCredential, LocalEndpointContext
 
 __all__ = [
     'LocalEndpointContext',
@@ -77,62 +77,6 @@ def local_endpoint_context(*, root: str | None = None) -> LocalEndpointContext:
     return _selected_context(root, None)
 
 
-class EndpointCredential:
-    """Opaque native endpoint credential.
-
-    The value is produced only by the native layer: ``inspect_endpoint``
-    returns the encoded document, and ``EndpointCredential.from_json`` parses
-    a document with the one Rust credential codec. There is no Python
-    constructor that assembles fields, because a credential is a native
-    identity record and not a Python-owned data structure.
-
-    ``to_json()`` is a description, not a secret and not an authorization
-    token. It records a logical address, protocol, and platform; it is never
-    evidence that the endpoint exists or is alive.
-    """
-
-    __slots__ = ('_native',)
-
-    def __init__(self, native: Any) -> None:
-        # Wraps an already-parsed native credential. Callers use `from_json`
-        # or receive one from `inspect_endpoint`.
-        self._native = native
-
-    @classmethod
-    def from_json(cls, document: str) -> 'EndpointCredential':
-        """Parse a strict JSON credential document with the Rust codec."""
-        if not isinstance(document, str):
-            raise TypeError('credential document must be a str')
-        return cls(_native().PyEndpointCredential.from_json(document))
-
-    def to_json(self) -> str:
-        """Encode this credential as strict JSON."""
-        return self._native.to_json()
-
-    @property
-    def address(self) -> str:
-        """The logical IPC address this credential describes (metadata)."""
-        return self._native.address
-
-    @property
-    def context(self) -> LocalEndpointContext:
-        """The endpoint context captured by the sole native credential codec."""
-        return self._native.context
-
-    @property
-    def protocol(self) -> str:
-        """The endpoint protocol this credential records (metadata)."""
-        return self._native.protocol
-
-    @property
-    def platform(self) -> str:
-        """The OS namespace this credential lives in (metadata)."""
-        return self._native.platform
-
-    def __repr__(self) -> str:
-        return f'EndpointCredential(address={self.address!r}, protocol={self.protocol!r})'
-
-
 def inspect_endpoint(
     address: str,
     *,
@@ -161,11 +105,9 @@ def inspect_endpoint(
     """
     if not isinstance(address, str):
         raise TypeError('address must be a str')
-    result = dict(
+    return dict(
         _native().inspect_endpoint_endpoint(address, context=_selected_context(root, context))
     )
-    _wrap_credential(result)
-    return result
 
 
 def reap_endpoint(
@@ -204,7 +146,7 @@ def reap_endpoint(
     _selection(root, context)
     return dict(
         _native().reap_endpoint_credential(  # noqa: SLF001
-            address, credential._native, root=root, context=context,
+            address, credential, root=root, context=context,
         )
     )
 
@@ -337,14 +279,3 @@ def sweep_endpoints(
             context=_selected_context(root, context),
         )
     )
-
-
-def _wrap_credential(result: dict[str, Any]) -> None:
-    """Replace a ``'present'`` credential document with a native credential.
-
-    The document itself is not retained: it is only a transport form. The
-    native credential object is the authority for a later ``reap_endpoint``.
-    """
-    document = result.get('credential')
-    if isinstance(document, str):
-        result['credential'] = EndpointCredential.from_json(document)

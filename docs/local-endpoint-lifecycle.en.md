@@ -121,6 +121,8 @@ Persistent direct IPC admin shutdown retries transient connection failures only 
 
 After readiness, call `cc.inspect_endpoint(address)` and save the `EndpointCredential` from a `present` result. `present` describes the observed object without proving process liveness. `WouldBlock` indicates coordinator contention and cannot establish death. After normal exit, or after `kill()` plus an OS `wait()` confirms exit, call `cc.reap_endpoint(address, credential)`. An old credential cannot remove a new incarnation.
 
+`cc.EndpointCredential` is the immutable native value returned directly by inspection and accepted by reap. Share its reference within a process; for storage or transfer, explicitly use `credential.to_json()` and `cc.EndpointCredential.from_json(document=...)`. Both retain the sole Rust codec's strict validation and 32 KiB bound; inspection does not guarantee successful JSON export. Manual construction, subclassing, mutation and shallow copying are unsupported. The Python wrapper, its `_native` slot and the old `_native.PyEndpointCredential` export are removed; see the [unreleased migration notes](releases/unreleased.md).
+
 ```python
 observed = cc.inspect_endpoint(address)
 credential = observed['credential']

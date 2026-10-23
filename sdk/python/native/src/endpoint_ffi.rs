@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyDict, PyInt};
+use pyo3::types::{PyAny, PyBool, PyDict, PyInt, PyString};
 
 use c2_config::{
     ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointNamespace,
@@ -257,11 +257,14 @@ fn nonempty_io_kind(error: &std::io::Error) -> Option<String> {
     Some(io_error_kind_name(error.kind()))
 }
 
-/// Entry point, written and read only through the one Rust credential codec.
-/// `parse` and `to_json` are the only value constructors, so every other
-/// operation on `PyEndpointCredential` is provably operating on a credential
-/// the Rust gate accepted.
-#[pyclass(module = "c_two._native", frozen)]
+/// Opaque native endpoint credential, produced by inspection or from_json().
+/// Metadata describes an observed object without proving liveness or granting
+/// deletion authority; reap always checks the current native identity.
+#[pyclass(
+    name = "EndpointCredential",
+    module = "c_two.transport.endpoint",
+    frozen
+)]
 pub(crate) struct PyEndpointCredential {
     inner: EndpointCredential,
 }
@@ -277,13 +280,13 @@ impl PyEndpointCredential {
     /// Parses a strict JSON credential document.
     ///
     /// Decoding is a pure parse: the sole c2-local codec derives the endpoint
-    /// in its recorded context (schema 2 retains the historical default root),
+    /// in its recorded context,
     /// rejects unknown fields and unsupported schema versions, and enforces
     /// the documented size limit. A successful
     /// decode proves nothing about liveness; only `reap_endpoint` decides.
     #[staticmethod]
-    fn from_json(json: &str) -> PyResult<Self> {
-        EndpointCredential::from_json(json)
+    fn from_json(document: &str) -> PyResult<Self> {
+        EndpointCredential::from_json(document)
             .map(Self::new)
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
@@ -322,14 +325,14 @@ impl PyEndpointCredential {
         if cfg!(windows) { "windows" } else { "unix" }
     }
 
-    fn __repr__(&self) -> String {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         // Never echo the encoded document: it is not a secret, but a repr that
         // copies identity fields invites callers to treat it as a capability.
-        format!(
-            "PyEndpointCredential(address={:?}, protocol={:?})",
-            self.inner.endpoint().address(),
-            self.inner.endpoint().protocol(),
-        )
+        Ok(format!(
+            "EndpointCredential(address={}, protocol={})",
+            PyString::new(py, self.address()).repr()?.to_str()?,
+            PyString::new(py, self.protocol()).repr()?.to_str()?,
+        ))
     }
 }
 
@@ -351,11 +354,11 @@ fn inspect_endpoint_endpoint<'py>(
     match inspection {
         EndpointInspection::Absent => result_dict(py, "absent"),
         EndpointInspection::Present(credential) => {
-            let json = credential
-                .to_json()
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
             let dict = result_dict(py, "present")?;
-            dict.set_item("credential", Some(json))?;
+            dict.set_item(
+                "credential",
+                Py::new(py, PyEndpointCredential::new(credential))?,
+            )?;
             Ok(dict)
         }
         // The platform owns endpoint lifetime inside a kernel namespace. This

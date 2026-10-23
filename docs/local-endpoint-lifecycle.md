@@ -64,6 +64,8 @@ Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时�
 
 运行器在服务就绪后调用 cc.inspect_endpoint(address)，保存 present 结果中的 EndpointCredential。present 只表示对象被观察，不证明进程存活。WouldBlock 是协调争用，不能视为死亡。子进程正常退出或 kill()+wait() 确认退出后，再用 cc.reap_endpoint(address, credential) 精确收尾；旧凭据不能删除新 incarnation。
 
+`cc.EndpointCredential` 是不可变原生对象；inspect 直接交付该对象，reap 接收同一对象。需要保存或跨进程传递时显式使用 `credential.to_json()` 与 `cc.EndpointCredential.from_json(document=...)`，两者继续执行唯一 Rust codec 的严格校验和 32 KiB 限制；inspect 本身不保证 JSON 导出成功。凭据不能手工构造、继承、修改或浅复制，同进程可共享其引用。Python 包装壳、`_native` 槽和旧 `_native.PyEndpointCredential` 导出已退出，见[未发布变更](releases/unreleased.md)。
+
 需要续扫时使用 cc.sweep_endpoints(addresses=[本次运行的逻辑地址], max_entries=64, max_ms=10) 的 context manager 和 next_batch()；只在原生报告 round_complete 时记为本轮完成，中断或命名空间变化单独处理。c3 endpoint inspect/reap/sweep 调用同一原生机制，sweep 可重复传 --address，需要非默认 root 时传 --ipc-root（或环境变量 C2_IPC_ROOT）。运行器不拼 OS 路径，不直接 unlink。
 
 Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己的本地上游域上下文，一个 relay 本地域对应一个 root，上游资源与它使用一致配置；不同 root 可运行不同 relay。客户端在发现请求中携带 Core 派生的本地 namespace 标识（不含原始路径，不是授权凭据）。`/_resolve` 响应的 `x-c2-local-namespace` 头是整批路由的唯一 namespace 来源，JSON 路由不再附加该字段。Rust/Core 客户端只在 anchor 为本机、响应头与本地上下文匹配且握手身份、契约与代际检查均通过时接受 IPC。缺头或不匹配时使用 HTTP，不推定默认 root，也不从旧 JSON 字段恢复 namespace；重复或非法响应头仍拒绝。HTTP 路由不会因 namespace 不匹配被撤销，HTTP-only 调用不要求本地端点能力。Windows 标识由 backend 与当前 logon scope 构成，实际权限仍由 OS DACL、握手身份与完整路由契约检查。

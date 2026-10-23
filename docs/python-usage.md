@@ -127,7 +127,7 @@ The main user surface, shown throughout the guides. The top-level `cc` namespace
 - Registry: `cc.register`, `cc.connect`, `cc.close`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.set_transport_policy`, `cc.set_local_endpoint`
 - Contracts: `cc.export_contract_descriptor`, `cc.export_contract_release_ref`, `cc.compile_contract_artifacts`, `cc.infer_crm_from_resource`
 - Lifecycle and ownership: `cc.LifecycleConfig`, `cc.owner_control_pair`, `cc.spawn_owned_child`, `cc.adopt_owner_stdin`, `cc.OwnerControl`, `cc.OwnerRecoveryTicket`, `cc.prepare_owner_takeover`, `cc.PreparedOwnerTakeover`, `cc.OwnerStatus`, `cc.OwnerControlError`
-- Endpoint maintenance: `cc.inspect_endpoint`, `cc.reap_endpoint`, `cc.sweep_endpoints`
+- Endpoint maintenance: `cc.inspect_endpoint`, `cc.reap_endpoint`, `cc.sweep_endpoints`, `cc.EndpointCredential` (immutable native value; explicit JSON import/export)
 - Connection observations: `cc.connection_observation`, `cc.connection_events`, `cc.ConnectionObservation`, `cc.ConnectionClosed`, `cc.ConnectionEvent`, `cc.ConnectionEvents`, `cc.ConnectionEventsLagged`
 - Errors: `cc.error.CoreError` (structured local/Core errors), `cc.error.CCError` (semantic errors), with common `cc.error.CCBaseError`
 - Monitoring: `cc.hold_stats`, `cc.memory_stats`, `cc.call_execution_snapshot`, `cc.native_lifecycle_snapshot`, `cc.native_terminal_outcome` (read-only)
