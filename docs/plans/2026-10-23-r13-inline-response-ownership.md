@@ -1,10 +1,10 @@
 # R13：IPC inline 响应直接移交已有字节所有权
 
-状态：用户已确认最小实施边界及小幅增量；基线反例已复现，局部实现正在验收。固定输入为 `3e575acbb4c30414f06caaeb7e6e8c84e503ff3c`。本项针对每次 IPC inline 响应的重复分配和复制，属于运行时成本优化；生产与测试净增，不能记为代码净减。R35 已暂缓，公开心跳 API 删除不混入；R06/R07、两份控制会话重构及其他响应载体的所有权策略也不扩展。
+状态：2026-10-24 已完成实施与验收，实现为 `1ac341506acbafcd28382deae291359abbf03aa9`，固定基线为 `3e575acbb4c30414f06caaeb7e6e8c84e503ff3c`；实际增量、性能及完整门禁见[验收记录](../reports/2026-10-24-r13-inline-response-ownership-acceptance.md)。本项针对每次 IPC inline 响应的重复分配和复制，属于运行时成本优化；生产与测试净增，不能记为代码净减。R35 已暂缓，公开心跳 API 删除不混入；R06/R07、两份控制会话重构及其他响应载体的所有权策略也不扩展。
 
 ## 实际调用链与历史理由
 
-普通 Python 远程调用也通过 `PyNativePreparedCall::finish` 调用 Core `EncodedCall::call_held`，并非只有 `cc.hold` 才经过这条路径。IPC 接收端已将成功 inline payload 放入独占 `ResponseData::Inline(Vec<u8>)`；私有 `call_ipc` 随后通过 `SyncClient::lease_response` 将它包进 `ResponseLease`。Core `HeldResponse::from_response_lease` 再调用 `lease.copy_bytes()`，inline 分支执行 `Vec::clone()`，并把原 Vec 保留在 lease 中。一个非空 payload 此时有两个副本，直到 transport lease 释放。
+基线中的普通 Python 远程调用也通过 `PyNativePreparedCall::finish` 调用 Core `EncodedCall::call_held`，并非只有 `cc.hold` 才经过这条路径。IPC 接收端已将成功 inline payload 放入独占 `ResponseData::Inline(Vec<u8>)`；私有 `call_ipc` 随后通过 `SyncClient::lease_response` 将它包进 `ResponseLease`。Core `HeldResponse::from_response_lease` 再调用 `lease.copy_bytes()`，inline 分支执行 `Vec::clone()`，并把原 Vec 保留在 lease 中。一个非空 payload 此时有两个副本，直到 transport lease 释放。
 
 可直接复用的能力已经存在：`ResponseData` 能携带完整传输所有权；Rust owned 调用使用 `ResponseLease::into_owned_bytes` 移动 inline Vec；HTTP held 调用使用 `HeldResponse::from_owned_bytes`。后者保留相同的失效、释放状态和 bytes 观察方式，Core 随后照常附加连接保活，不需要新的响应类型、通用 owner 框架或公开接口。
 
@@ -44,4 +44,4 @@ inline 已经是接收任务交出的唯一 Rust Vec，直接移动不借用网�
 
 Host 已核对上述 Core/PyO3/IPC 调用链、原始提交、两种既有构造器、接收端 inline Vec 来源、retention 投影及 native 迟到结果处置。hey-my-buddy 独立只读分析 run `ada7448b-61bb-422f-87c3-c3537bf82963`、最终 artifact `2db9e0dc-5eb5-4bbd-8b66-ca7b9aba2dd7` 得到同一候选，确认服务端没有可以直接删除的重复物化事务；交付补丁为空。这是方案筛选证据，实施候选仍需独立审查。
 
-基线新增内容、空响应及幂等释放覆盖通过，现有 lifetime ordering 5 项通过；把非空 Vec 地址连续性改为必需断言后，旧生产路径稳定失败于 `inline bytes must move`。候选沿用同一断言并通过。候选同时通过 Core client modes、call deadlines、call execution observer 和 lifetime ordering 共 39 项；完整平台、relay、跨语言、性能与清理结果尚待验收，不以这组局部通过代替。
+基线新增内容、空响应及幂等释放覆盖通过，现有 lifetime ordering 5 项通过；把非空 Vec 地址连续性改为必需断言后，旧生产路径稳定失败于 `inline bytes must move`。候选沿用同一断言并通过。随后完成针对性回归、完整 relay、Rust/Python/Node 跨语言、三系统、同环境性能、端点零残留及独立实现审查；GitHub Actions 的同一候选 10/10 通过。生产实际净增 7 行、测试净增 30 行；没有测得稳定的端到端提速，具体样本、首轮失败及验证修正保留在验收记录中。
