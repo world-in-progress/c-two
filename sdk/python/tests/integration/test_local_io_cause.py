@@ -290,7 +290,7 @@ def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
         assert 0.15 <= report['elapsed'] < 2, report
 
 
-def _assert_real_listener_conflict_has_no_raw_system_code() -> None:
+def test_real_listener_conflict_has_no_raw_system_code() -> None:
     with tempfile.TemporaryDirectory(prefix='c2-', dir=None if IS_WINDOWS else '/tmp') as root:
         address = f'ipc://io-{uuid.uuid4().hex}'
         policy = '' if IS_WINDOWS else f'cc.set_local_endpoint(root={root!r})\n'
@@ -324,13 +324,3 @@ def _assert_real_listener_conflict_has_no_raw_system_code() -> None:
         _assert_io(json.loads(owner['stdout']), 'bind', 'address_in_use', None)
         assert all(not entry.is_socket() and not entry.name.endswith('.lease')
                    for entry in Path(root).rglob('*'))
-
-
-@UNIX_ONLY
-def test_unix_real_listener_conflict_has_no_raw_system_code() -> None:
-    _assert_real_listener_conflict_has_no_raw_system_code()
-
-
-@pytest.mark.skipif(not IS_WINDOWS, reason='Windows named-pipe platform contract')
-def test_windows_real_listener_conflict_has_no_raw_system_code() -> None:
-    _assert_real_listener_conflict_has_no_raw_system_code()
