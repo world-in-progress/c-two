@@ -6,7 +6,13 @@ TypeScript facade and Node-API loader for the Rust `c2-mem-ffi` memory pool. The
 
 The source build supports Linux and macOS shared libraries and Windows `c2_mem_ffi.dll`. The loader uses `dlopen` on Unix and Unicode `LoadLibraryExW` on Windows. Windows addon builds use the pinned development dependency `node-gyp` with Python and Visual Studio C++ build tools. A native run on each target is required to establish runtime support; the package contains the artifacts built for the current platform and architecture.
 
+The addon targets Node-API 10. Use Node 22.14 or newer in the Node 22 line, or Node 24 or newer; earlier Node 22 releases expose Node-API 9. Build tools and consumers must both use a supported runtime.
+
 `createNodeIpcConnect()` accepts logical `ipc://server-id` addresses. Rust resolves each address to a Unix socket or a Windows Named Pipe in the current logon scope. `resolveLocalIpcEndpoint(address)` exposes the same native resolver for diagnostics. Neither helper treats a pipe endpoint as a filesystem path.
+
+Connections provide `write`, `readExactly` and a required, idempotent `close` that terminates pending reads and writes. Custom connectors must implement that contract; injected sockets must implement the native `pause` and `resume` operations. The connector factory's own `close` releases its endpoint snapshot and leaves existing connections usable.
+
+The Node connection pauses input while no read needs more bytes. Low-level consumers exchanging large writes in both directions must also advance their reads. Generated clients receive replies while uploading a chunked request and close failed chunked exchanges before another call can reuse the stream. The next call reconnects with the same server and route identity requirements; failed calls are never replayed. Successful calls retain their connection. Idle prefetch is bounded by read demand; this does not impose a total memory limit on valid in-flight payloads or user-retained results.
 
 Use `createBundledC2MemFfiNodeRuntime()` for generated clients. It exposes `connect`, `resolveEndpoint` and a response pool factory accepted by generated `createC2MemFfiNativeResponseShmReader(...)`. Native loading is deferred until an IPC operation, so creating a transport configuration for HTTP does not open local shared memory. Initialize request and response IPC adapters only for local transport paths.
 

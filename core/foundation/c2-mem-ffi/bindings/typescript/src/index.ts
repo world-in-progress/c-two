@@ -205,7 +205,7 @@ export interface C2MemFfiNodeRuntime {
 export interface C2NodeIpcConnection {
   write(data: Uint8Array): MaybePromise<void>;
   readExactly(byteLength: number): MaybePromise<Uint8Array>;
-  close?(): MaybePromise<void>;
+  close(): MaybePromise<void>;
 }
 
 export type C2NodeIpcConnect = (address: string) => MaybePromise<C2NodeIpcConnection>;
@@ -220,6 +220,8 @@ export type C2NodeIpcConnector = C2NodeIpcConnect & {
 
 export interface C2NodeIpcSocket {
   readonly destroyed: boolean;
+  pause(): C2NodeIpcSocket;
+  resume(): C2NodeIpcSocket;
   write(buffer: Uint8Array, callback?: (error?: Error | null) => void): boolean;
   end(): C2NodeIpcSocket;
   destroy(error?: Error): C2NodeIpcSocket;
@@ -901,12 +903,14 @@ class NodeIpcConnection implements C2NodeIpcConnection {
   private closed = false;
 
   constructor(private readonly socket: C2NodeIpcSocket) {
+    socket.pause();
     socket.on("data", (chunk: Uint8Array): void => {
       if (chunk.byteLength === 0) {
         return;
       }
       this.chunks.push(chunk);
       this.bufferedBytes += chunk.byteLength;
+      socket.pause();
       this.wake();
     });
     socket.on("error", (error: Error): void => {
@@ -972,6 +976,7 @@ class NodeIpcConnection implements C2NodeIpcConnection {
       }
       await new Promise<void>((resolve) => {
         this.waiters.push(resolve);
+        this.socket.resume();
       });
     }
     return this.take(requested);

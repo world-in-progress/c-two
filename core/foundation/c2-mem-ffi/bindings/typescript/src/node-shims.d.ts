@@ -10,6 +10,8 @@ declare module "node:module" {
 declare module "node:net" {
   export interface Socket {
     readonly destroyed: boolean;
+    pause(): this;
+    resume(): this;
     write(buffer: Uint8Array, callback?: () => void): boolean;
     end(): this;
     destroy(error?: Error): this;

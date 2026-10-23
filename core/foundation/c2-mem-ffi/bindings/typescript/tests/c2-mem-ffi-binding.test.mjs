@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
-import { dirname } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createServer } from 'node:net';
-import { mkdirSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -60,6 +59,9 @@ class ContextTestSocket extends EventEmitter {
     callback?.();
     return true;
   }
+
+  pause() { return this; }
+  resume() { return this; }
 
   end() {
     this.emit('end');
@@ -412,80 +414,74 @@ test('injected resolvers remain supported and invalid addresses do not consume s
   assert.equal(fixture.contexts[0].closeCount, 1);
 });
 
-test('createNodeIpcConnect adapts the native local endpoint to C2IpcConnection', async (t) => {
-  const address = `ipc://node-${process.pid}-${Date.now()}`;
-  const socketPath = resolveLocalIpcEndpoint(address);
-  if (process.platform !== 'win32') mkdirSync(dirname(socketPath), { recursive: true });
-  try {
-    if (process.platform !== 'win32') unlinkSync(socketPath);
-  } catch {
-  }
-  const received = [];
-  const server = createServer((socket) => {
-    socket.on('data', (chunk) => {
-      received.push(...chunk);
+for (const ending of ['EOF', 'explicit close']) {
+  test(`native Node IPC pauses idle input and preserves read progress through ${ending}`, { timeout: 10000 }, async (t) => {
+    const root = process.platform === 'win32' ? undefined : mkdtempSync('/tmp/c2-node-');
+    const connect = createNodeIpcConnect({ ipcRoot: root });
+    const address = `ipc://node-${process.pid}-${Date.now()}`;
+    const socketPath = connect.resolveEndpoint(address);
+    let peer, connection;
+    const received = [];
+    let receivedBytes = 0;
+    const server = createServer((socket) => {
+      peer = socket;
+      socket.on('data', (chunk) => {
+        receivedBytes += chunk.length;
+        received.push(...chunk.subarray(0, Math.max(0, 2 - received.length)));
+      });
     });
-    socket.write(new Uint8Array([1, 2]));
-    setTimeout(() => socket.write(new Uint8Array([3, 4])), 5);
-  });
-  t.after(async () => {
-    await closeServer(server);
-    try {
-      if (process.platform !== 'win32') unlinkSync(socketPath);
-    } catch {
-    }
-  });
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(socketPath, resolve);
-  });
-
-  const connect = createNodeIpcConnect();
-  const connection = await connect(address);
-  try {
-    const first = await connection.readExactly(3);
-    assert.deepEqual(Array.from(first), [1, 2, 3]);
+    t.after(async () => {
+      connection?.close();
+      connect.close();
+      peer?.destroy();
+      await closeServer(server);
+      if (root !== undefined) {
+        assert.equal(existsSync(socketPath), false, 'closed server must unlink its socket');
+        assert.equal(readdirSync(root).some((name) => name.endsWith('.lease')), false);
+        rmSync(root, { recursive: true });
+      }
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    connection = await connect(address);
+    await waitFor(() => peer !== undefined, 'accepted peer');
     await connection.write(new Uint8Array([9, 8]));
     await waitFor(() => received.length >= 2, 'server data');
     assert.deepEqual(received.slice(0, 2), [9, 8]);
-    const second = await connection.readExactly(1);
-    assert.deepEqual(Array.from(second), [4]);
-  } finally {
-    await connection.close?.();
-  }
-});
-
-test('createNodeIpcConnect rejects reads after explicit close even with buffered bytes', async (t) => {
-  const address = `ipc://node-close-${process.pid}-${Date.now()}`;
-  const socketPath = resolveLocalIpcEndpoint(address);
-  if (process.platform !== 'win32') mkdirSync(dirname(socketPath), { recursive: true });
-  try {
-    if (process.platform !== 'win32') unlinkSync(socketPath);
-  } catch {
-  }
-  const server = createServer((socket) => {
-    socket.write(new Uint8Array([1, 2, 3]));
+    const payload = new Uint8Array(8 * 1024 * 1024).fill(0x5a);
+    const sent = new Promise((resolve) => peer.write(payload, resolve));
+    assert.equal(connection.socket.isPaused(), true, 'idle input must apply native backpressure');
+    assert.equal(connection.bufferedBytes, 0, 'idle input must remain in Node, not an unbounded private queue');
+    const [large, writeError] = await Promise.all([connection.readExactly(payload.length), sent, connection.write(payload)]);
+    assert.ifError(writeError);
+    await waitFor(() => receivedBytes === payload.length + 2, 'simultaneous large write');
+    assert.equal(large.length, payload.length);
+    assert.ok(large.every((value) => value === 0x5a), 'reads larger than the native high-water mark must progress');
+    assert.equal(connection.bufferedBytes, 0);
+    peer.write(new Uint8Array([8, 9]));
+    assert.equal(connection.socket.isPaused(), true, 'finishing a read must pause native input again');
+    assert.equal(connection.bufferedBytes, 0, 'finishing a read must restore idle backpressure');
+    assert.deepEqual(Array.from(await connection.readExactly(2)), [8, 9]);
+    peer.write(new Uint8Array([1, 2]));
+    const first = connection.readExactly(3);
+    peer.write(new Uint8Array([3, 4]));
+    assert.deepEqual(Array.from(await first), [1, 2, 3]);
+    assert.deepEqual(Array.from(await connection.readExactly(1)), [4]);
+    const concurrent = [connection.readExactly(1), connection.readExactly(2)];
+    peer.write(new Uint8Array([5, 6, 7]));
+    assert.deepEqual((await Promise.all(concurrent)).map((bytes) => Array.from(bytes)), [[5], [6, 7]]);
+    peer.write(new Uint8Array([1, 2, 3]));
+    assert.deepEqual(Array.from(await connection.readExactly(1)), [1]);
+    const incomplete = connection.readExactly(3);
+    if (ending === 'EOF') peer.end();
+    else connection.close();
+    await assert.rejects(incomplete, /ended|closed/);
+    if (ending === 'EOF') assert.deepEqual(Array.from(await connection.readExactly(2)), [2, 3]);
+    await assert.rejects(connection.readExactly(1), /ended|closed/);
   });
-  t.after(async () => {
-    await closeServer(server);
-    try {
-      if (process.platform !== 'win32') unlinkSync(socketPath);
-    } catch {
-    }
-  });
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(socketPath, resolve);
-  });
-
-  const connection = await createNodeIpcConnect()(address);
-  assert.deepEqual(Array.from(await connection.readExactly(1)), [1]);
-  await connection.close?.();
-  await assert.rejects(
-    () => connection.readExactly(1),
-    /closed/,
-  );
-});
+}
 
 test('createNodeIpcConnect rejects sockets that close before connect', async () => {
   const fakeSocket = {

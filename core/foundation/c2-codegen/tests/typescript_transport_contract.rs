@@ -72,7 +72,10 @@ impl CompiledTransportProject {
 const connect: C2IpcConnect = async () => ({
   write() {},
   readExactly(length) { return new Uint8Array(length); },
+  close() {},
 });
+// @ts-expect-error A connection must be able to terminate pending reads/writes.
+const missingClose: C2IpcConnect = () => ({ write() {}, readExactly(n: number) { return new Uint8Array(n); } });
 createIpcEncodedTransport("ipc://typed-custom", { connect });
 // @ts-expect-error Node factories belong to @c-two/c2-mem-ffi.
 import { createNodeIpcConnect } from "./c_two_contract.js";
@@ -590,24 +593,27 @@ function server() {
     routes: new Map([['manager', record('manager')]]), instance: 'instance',
     connections: [], lookups: [], lists: [], calls: [], callFlags: [], failCall: false,
     failRead: false, responseData: Buffer.alloc(0), chunkedReply: false, shmReply: false,
-    nextControl: undefined, corrupt: undefined,
+    nextControl: undefined, corrupt: undefined, writesAfterClose: 0,
   };
   s.connect = async () => {
     let buffered = Buffer.alloc(0);
     let businessReply = false;
+    let wakeRead, finishWrite;
+    const feed = (bytes) => { buffered = Buffer.concat([buffered, bytes]); wakeRead?.(); };
     const c = {
       closed: 0,
       async write(data) {
+        if (this.closed) { s.writesAfterClose += 1; throw new Error('write after close'); }
         const b = Buffer.from(data);
         assert.equal(b.readUInt32LE(0), b.length - 4);
         const id = b.readBigUInt64LE(4), flags = b.readUInt32LE(12);
         const payload = b.subarray(16);
         const reply = (tag, value) => {
           const bytes = Buffer.concat([Buffer.from([tag]), Buffer.from(JSON.stringify(value))]);
-          buffered = Buffer.concat([buffered, frame(id, 2 | 16, bytes)]);
+          feed(frame(id, 2 | 16, bytes));
         };
         if (flags === 4) {
-          buffered = Buffer.concat([buffered, frame(0n, 2 | 4, handshake([...s.routes.values()], s.instance))]);
+          feed(frame(0n, 2 | 4, handshake([...s.routes.values()], s.instance)));
         } else if (flags === 16) {
           const request = JSON.parse(payload.subarray(1).toString());
           if (payload[0] === 0x0e) {
@@ -624,7 +630,7 @@ function server() {
           assert.equal(request.observed_route_uid === null, request.observed_route_revision === null);
           s.lookups.push(request);
           if (s.corrupt) {
-            buffered = Buffer.concat([buffered, s.corrupt(id)]);
+            feed(s.corrupt(id));
             s.corrupt = undefined;
             return;
           }
@@ -641,24 +647,29 @@ function server() {
           s.callFlags.push(flags);
           s.calls.push(payload);
           if (s.failCall) { s.failCall = false; throw new Error('uncertain write'); }
+          if (s.onCall) return await s.onCall({id, flags, feed, block: () => new Promise((resolve, reject) => { finishWrite = s.completeWriteOnClose ? resolve : () => reject(new Error('write interrupted by close')); })});
           if ((flags & 512) !== 0 && (flags & 1024) === 0) return;
           businessReply = true;
           const body = Buffer.concat([Buffer.from([0]), s.responseData]);
           if (s.chunkedReply) {
             for (let index = 0; index < 2; index += 1) {
               const data = s.responseData.subarray(index * 2, (index + 1) * 2);
-              buffered = Buffer.concat([buffered, frame(id, 2 | 256 | 512 | (index === 1 ? 1024 : 0), Buffer.concat([u64(s.responseData.length), u32(2), u32(index), data]))]);
+              feed(frame(id, 2 | 256 | 512 | (index === 1 ? 1024 : 0), Buffer.concat([u64(s.responseData.length), u32(2), u32(index), data])));
             }
           } else if (s.shmReply) {
             const buddy = Buffer.concat([u16(0), u32(1), u32(0), u32(s.responseData.length), Buffer.from([0]), u64(s.responseAllocationId ?? 1n)]);
-            buffered = Buffer.concat([buffered, frame(id, 2 | 256 | 64, Buffer.concat([buddy, Buffer.from([0])]))]);
+            feed(frame(id, 2 | 256 | 64, Buffer.concat([buddy, Buffer.from([0])])));
           } else {
-            buffered = Buffer.concat([buffered, frame(id, 2 | 256, body)]);
+            feed(frame(id, 2 | 256, body));
           }
         }
       },
       async readExactly(n) {
-        assert.ok(buffered.length >= n, 'control/call frame stream must stay serialized');
+        while (buffered.length < n) {
+          if (s.readFailure) { const error = s.readFailure; s.readFailure = undefined; throw error; }
+          if (this.closed) throw new Error('connection closed');
+          await new Promise((resolve) => { wakeRead = resolve; });
+        }
         const b = buffered.subarray(0, n); buffered = buffered.subarray(n);
         if (businessReply) {
           businessReply = false;
@@ -666,7 +677,12 @@ function server() {
         }
         return b;
       },
-      async close() { this.closed += 1; },
+      async close() {
+        if (this.closed) return;
+        this.closed = 1;
+        finishWrite?.();
+        wakeRead?.();
+      },
     };
     s.connections.push(c);
     return c;
@@ -873,6 +889,98 @@ test('failed initial acquisition leaves server binding unset until successful ac
   assert.equal(s.calls.length, 1);
   await t.close();
 });
+
+const refusalPayload = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 702, name: 'ResourceUnavailable', message: 'reassembly budget exhausted', details: {}}));
+const refusal = (id) => frame(id, 2 | 256, Buffer.concat([Buffer.from([1]), u32(refusalPayload.length), refusalPayload]));
+const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+for (const failure of ['refusal', 'refusal-with-successful-write', 'wrong-id', 'bad-flags', 'read-loss']) {
+  test(`chunked ${failure} ends the currently blocked write and joins before the next call`, async () => {
+    const s = server(), t = transport(s, {requestChunkSize: 2});
+    s.completeWriteOnClose = failure === 'refusal-with-successful-write';
+    s.onCall = ({id, feed, block}) => {
+      const pending = block();
+      if (failure === 'read-loss') {
+        s.readFailure = new Error('independent read failure');
+        feed(Buffer.alloc(0));
+      } else {
+        feed(failure.startsWith('refusal') ? refusal(id) : failure === 'wrong-id'
+          ? refusal(id + 1n) : frame(id, 0, Buffer.from([0])));
+      }
+      return pending;
+    };
+    const result = t.call('manager', CONTRACT, 'ping', new Uint8Array(8)).catch((error) => error);
+    try {
+      await nextTurn();
+      assert.equal(s.connections[0].closed, 1, 'terminal receive must interrupt this write');
+      const error = await result;
+      if (failure.startsWith('refusal')) {
+        assert.equal(error.name, 'C2CrmMethodError');
+        assert.deepEqual(Buffer.from(error.payload), refusalPayload);
+      } else {
+        assert.match(error.message, failure === 'wrong-id' ? /did not match/ : failure === 'bad-flags' ? /v2 reply/ : /independent read failure/);
+      }
+      assert.equal(s.calls.length, 1, 'unsent chunks must not be sent or replayed');
+      assert.equal(s.writesAfterClose, 0, 'a successful write callback must not resume a closed exchange');
+      s.onCall = undefined;
+      await call(t); await call(t);
+      assert.equal(s.connections.length, 2, 'only the failed connection is replaced');
+      assert.equal(s.lookups.at(-1).observed_route_uid, 'manager-uid');
+      assert.equal(s.lookups.at(-1).observed_route_revision, 1);
+    } finally {
+      await t.close();
+      await result;
+    }
+  });
+}
+
+test('a refusal after the last chunk discards duplicate replies before the next call', async () => {
+  const s = server(), t = transport(s, {requestChunkSize: 2});
+  s.onCall = ({id, flags, feed}) => {
+    if (flags & 1024) feed(Buffer.concat([refusal(id), refusal(id)]));
+  };
+  try {
+    await assert.rejects(t.call('manager', CONTRACT, 'ping', new Uint8Array(8)), (error) => {
+      assert.equal(error.name, 'C2CrmMethodError');
+      assert.deepEqual(Buffer.from(error.payload), refusalPayload);
+      return true;
+    });
+    assert.equal(s.connections[0].closed, 1);
+    assert.equal(s.calls.length, 4);
+    s.onCall = undefined;
+    await call(t); await call(t);
+    assert.equal(s.connections.length, 2);
+  } finally { await t.close(); }
+});
+
+for (const [generation, allocationId, dedicated] of [[1, 7n, false], [0, 0n, true], [1, 0n, false]]) {
+  test(`a received SHM reply is released exactly when authorized after a write failure (${generation}/${allocationId})`, async () => {
+    const s = server(), releases = [];
+    let allocated = 0;
+    const t = transport(s, {
+      requestChunkSize: 2,
+      responsePayloadAllocator() { allocated += 1; throw new Error('must not allocate after failed send'); },
+      responseShmReader: {
+        read() { throw new Error('must not copy an undelivered reply'); },
+        release(block) { releases.push(block); },
+      },
+    });
+    s.onCall = ({id, flags, feed}) => {
+      if (!(flags & 1024)) return;
+      const buddy = Buffer.concat([u16(0), u32(generation), u32(0), u32(3), Buffer.from([Number(dedicated)]), u64(allocationId)]);
+      feed(frame(id, 2 | 256 | 64, Buffer.concat([buddy, Buffer.from([0])])));
+      return new Promise((_, reject) => setImmediate(() => reject(new Error('write acknowledgement lost'))));
+    };
+    try {
+      await assert.rejects(t.call('manager', CONTRACT, 'ping', new Uint8Array(8)),
+        !dedicated && allocationId === 0n ? /allocationId/ : /write acknowledgement lost/);
+      assert.equal(allocated, 0);
+      assert.deepEqual(releases.map(({prefix, generation, allocationId, dedicated}) => ({prefix, generation, allocationId, dedicated})),
+        !dedicated && allocationId === 0n ? [] : [{prefix: '/serverpool', generation, allocationId, dedicated}]);
+      assert.equal(s.connections[0].closed, 1);
+    } finally { await t.close(); }
+  });
+}
 
 test('provider allocator, SHM release and chunk framing remain on the same shared stream', async () => {
   const s = server();
