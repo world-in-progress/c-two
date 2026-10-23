@@ -10,10 +10,7 @@
 use std::time::Duration;
 
 use crate::{LifecycleError, Runtime};
-use c2_local::{
-    ConnectionClosed, ConnectionEvent, ConnectionEvents, ConnectionEventsError,
-    ConnectionObservation,
-};
+use c2_local::{ConnectionEvent, ConnectionEvents, ConnectionEventsError};
 
 /// Outcome of one connection-event receive that did not time out.
 #[derive(Clone, Debug)]
@@ -24,24 +21,15 @@ pub enum ConnectionEventWait {
     Ended,
     /// This subscription lagged and is permanently terminated.
     Lagged(u64),
-}
-
-/// Block the calling thread until one connection's terminal record is
-/// available or `timeout` elapses. Timing out cancels only this waiter; a
-/// late waiter still observes the same terminal record.
-pub fn wait_connection_closed(
-    observation: &ConnectionObservation,
-    timeout: Option<Duration>,
-) -> Result<Option<ConnectionClosed>, LifecycleError> {
-    let runtime = Runtime::server_runtime()?;
-    Ok(runtime.block_on(observation.wait_closed(timeout)))
+    /// Another receiver already owns this subscription.
+    ConcurrentReceive,
 }
 
 /// Block the calling thread until the next connection event is available or
 /// `timeout` elapses. `Ok(None)` reports only the timeout: no event is
 /// consumed and the subscription stays usable for the next receive.
 pub fn recv_connection_event(
-    events: &mut ConnectionEvents,
+    events: &ConnectionEvents,
     timeout: Option<Duration>,
 ) -> Result<Option<ConnectionEventWait>, LifecycleError> {
     let runtime = Runtime::server_runtime()?;
@@ -55,65 +43,37 @@ pub fn recv_connection_event(
         Ok(Some(event)) => ConnectionEventWait::Event(event),
         Ok(None) => ConnectionEventWait::Ended,
         Err(ConnectionEventsError::Lagged(missed)) => ConnectionEventWait::Lagged(missed),
+        Err(ConnectionEventsError::ConcurrentReceive) => ConnectionEventWait::ConcurrentReceive,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_local::{ConnectionEndReason, ConnectionEventSource, ConnectionPublisher};
-
-    #[test]
-    fn blocking_wait_serves_the_one_terminal_record_to_late_waiters() {
-        let publisher = ConnectionPublisher::new();
-        let observation = publisher.observation();
-        assert_eq!(
-            wait_connection_closed(&observation, Some(Duration::from_millis(10))).unwrap(),
-            None,
-            "an open connection times out without changing the observation"
-        );
-        let closed = std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| wait_connection_closed(&observation, None).unwrap());
-            std::thread::sleep(Duration::from_millis(20));
-            assert!(
-                !waiter.is_finished(),
-                "the waiter must block until the close"
-            );
-            assert!(publisher.close(ConnectionEndReason::PeerCloseMessage, "disconnect", None));
-            waiter.join().unwrap()
-        })
-        .expect("terminal record once published");
-        assert_eq!(closed.connection_id(), observation.connection_id());
-        assert_eq!(closed.reason(), ConnectionEndReason::PeerCloseMessage);
-        assert_eq!(
-            wait_connection_closed(&observation, Some(Duration::ZERO)).unwrap(),
-            Some(closed),
-            "a late waiter observes the same terminal record"
-        );
-    }
+    use c2_local::{ConnectionEndReason, ConnectionEventSource};
 
     #[test]
     fn timed_out_receive_consumes_nothing_and_metadata_keeps_no_feed_alive() {
         let source = ConnectionEventSource::new();
-        let mut events = source.subscribe();
+        let events = source.subscribe();
         assert!(matches!(
-            recv_connection_event(&mut events, Some(Duration::from_millis(10))).unwrap(),
+            recv_connection_event(&events, Some(Duration::from_millis(10))).unwrap(),
             None
         ));
-        let publisher = source.open_connection();
+        let publisher = source.open_connection(c2_local::ConnectionSide::Server);
         publisher.close(
             ConnectionEndReason::HeartbeatTimeout,
             "heartbeat_timeout",
             None,
         );
-        let observation = match recv_connection_event(&mut events, Some(Duration::from_secs(2)))
+        let observation = match recv_connection_event(&events, Some(Duration::from_secs(2)))
             .unwrap()
             .expect("queued events survive an earlier timed-out receive")
         {
             ConnectionEventWait::Event(ConnectionEvent::Opened(observation)) => observation,
             other => panic!("expected Opened, got {other:?}"),
         };
-        match recv_connection_event(&mut events, Some(Duration::ZERO))
+        match recv_connection_event(&events, Some(Duration::ZERO))
             .unwrap()
             .expect("the close event is still queued")
         {
@@ -124,20 +84,21 @@ mod tests {
             other => panic!("expected Closed, got {other:?}"),
         }
         assert!(matches!(
-            recv_connection_event(&mut events, Some(Duration::ZERO)).unwrap(),
+            recv_connection_event(&events, Some(Duration::ZERO)).unwrap(),
             None
         ));
+        let terminal = publisher.observation().snapshot();
         drop(source);
         drop(publisher);
         assert!(matches!(
-            recv_connection_event(&mut events, Some(Duration::from_secs(2)))
+            recv_connection_event(&events, Some(Duration::from_secs(2)))
                 .unwrap()
                 .expect("the feed ends once its owners are gone"),
             ConnectionEventWait::Ended
         ));
         assert_eq!(
-            wait_connection_closed(&observation, Some(Duration::ZERO)).unwrap(),
             observation.snapshot(),
+            terminal,
             "an obtained observation stays usable after its feed ended"
         );
     }
@@ -145,15 +106,15 @@ mod tests {
     #[test]
     fn lagged_receive_reports_missed_events_and_keeps_observations_usable() {
         let source = ConnectionEventSource::new();
-        let mut events = source.subscribe();
-        let publisher = source.open_connection();
-        // The server-side feed keeps a fixed capacity of 1024 events, so
+        let events = source.subscribe();
+        let publisher = source.open_connection(c2_local::ConnectionSide::Server);
+        // The feed keeps a fixed capacity of 1024 events, so
         // publishing 1026 while this subscription consumes none must report
         // both lost events instead of blocking or silently skipping.
         for _ in 0..1025 {
-            source.open_connection();
+            source.open_connection(c2_local::ConnectionSide::Server);
         }
-        match recv_connection_event(&mut events, Some(Duration::from_secs(2)))
+        match recv_connection_event(&events, Some(Duration::from_secs(2)))
             .unwrap()
             .expect("lag is reported instead of waiting for new events")
         {
@@ -161,32 +122,32 @@ mod tests {
             other => panic!("expected Lagged, got {other:?}"),
         }
         assert!(matches!(
-            recv_connection_event(&mut events, Some(Duration::from_secs(2)))
+            recv_connection_event(&events, Some(Duration::from_secs(2)))
                 .unwrap()
                 .expect("a lagged subscription is ended"),
             ConnectionEventWait::Ended
         ));
         publisher.close(ConnectionEndReason::LocalClose, "close", None);
         let observation = publisher.observation();
-        assert_eq!(
-            wait_connection_closed(&observation, Some(Duration::ZERO)).unwrap(),
-            observation.snapshot(),
-            "existing observations stay usable after their feed lagged"
-        );
+        let closed = observation
+            .snapshot()
+            .expect("terminal record survives feed lag");
+        assert_eq!(closed.connection_id(), observation.connection_id());
+        assert_eq!(closed.reason(), ConnectionEndReason::LocalClose);
     }
 
     #[test]
     fn blocking_receive_waits_for_events_published_on_another_thread() {
         let source = ConnectionEventSource::new();
-        let mut events = source.subscribe();
+        let events = source.subscribe();
         let received = std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| recv_connection_event(&mut events, None).unwrap());
+            let waiter = scope.spawn(|| recv_connection_event(&events, None).unwrap());
             std::thread::sleep(Duration::from_millis(20));
             assert!(
                 !waiter.is_finished(),
                 "the receive must block while no event exists"
             );
-            source.open_connection();
+            source.open_connection(c2_local::ConnectionSide::Server);
             waiter.join().unwrap()
         });
         match received.expect("an event published while blocking") {

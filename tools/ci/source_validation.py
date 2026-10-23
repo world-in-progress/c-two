@@ -429,7 +429,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
                                              "-Receipt", str(output / "installed-wheel-standard-user-full-receipt.v1.json")],
          ("wheel-consumer",)),
         ("python-build", ["uv", "sync", "--locked", "--python", python], ()),
-        ("python-native-test", ["cargo", "test", "--locked", "--manifest-path", "sdk/python/native/Cargo.toml"], ("python-build",)),
+        ("python-native-test", [str(venv_python), "tools/dev/test_native.py"], ("python-build",)),
         ("source-harness-tests", ["uv", "run", "--no-sync", "pytest",
                                    "tests/repo/test_source_validation.py", "tests/repo/test_windows_wheel_smoke.py",
                                    "tests/repo/test_ipc_memory_benchmark.py", "tests/repo/test_install_c3_powershell.py",

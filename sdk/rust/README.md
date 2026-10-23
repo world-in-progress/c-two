@@ -13,8 +13,8 @@ This source-only package has no crates.io release. It reuses
 `c2-contract` for release identity and `c2-core` for route, transport, retry,
 host, and lifetime behavior. It does not expose a second runtime state machine.
 
-This guide uses the shared runtime behavior of Python 0.8.1 / c3 0.4.0;
-this SDK retains its independent 0.1.0 version. See [release notes](../../docs/releases/0.8.1.md) for configuration and upgrade details.
+This guide uses the shared runtime behavior of Python 0.8.2 / c3 0.4.1;
+this SDK retains its independent 0.1.0 version. See [release notes](../../docs/releases/0.8.2.md) for configuration and upgrade details.
 Rust `c2-core` owns default `Persistent`, explicit `OwnerBound`, shutdown drain
 transactions and local endpoint maintenance. SDKs use the one OS endpoint
 derived by `LocalEndpoint::from_address`; there is no backend selector.
@@ -39,7 +39,7 @@ see [connection configuration](../../docs/configuration.en.md#connection-deadlin
 | Entry point | Contract |
 | --- | --- |
 | `Client::connection_observation()` / generated client method | Returns the current physical IPC observation. `snapshot()` reads its terminal record; async `wait_closed(Option<Duration>)` waits without retaining the connection. Thread-local and HTTP clients reject this operation. |
-| `Runtime::connection_events()` | Subscribes to future accepted IPC connections without starting a host. Async `recv()` returns `Ok(None)` when the source ends; lag returns `ConnectionEventsError::Lagged` and ends that subscription. |
+| `Runtime::connection_events()` | Subscribes to future outgoing and accepted IPC connections without starting a host. Values expose `ConnectionSide`; async `recv(&self)` returns `Ok(None)` at end. `close()` wakes this subscriber only; lag or concurrent consumers return `ConnectionEventsError`. |
 | `owner_control_pair()` | Returns `OwnerControl` and the one-use `OwnerBootstrap` for a trusted launcher. `recovery_ticket(timeout)` issues the current recovery grant; `revoke_recovery(timeout)` revokes it. |
 | `Runtime::prepare_owner_takeover(ticket)` | Freezes the configured endpoint context. Save `successor_ticket().export()` before one `commit(timeout)`; a successful commit returns the new `OwnerControl`. `inspect(timeout)` observes state without proving commit success. |
 | `Error::local_io_cause()` | Returns `Option<LocalIoCause>` for actual bind/connect failures. Its operation and `EndpointIoError` retain the OS cause; non-I/O errors have none. |

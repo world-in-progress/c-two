@@ -1,4 +1,8 @@
+import copy
+import pickle
+
 import pytest
+from c_two import _native
 import c_two.error as error
 from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
@@ -11,6 +15,20 @@ from c_two.error import (
     RouteCatalogCompacted, RouteWatchUnavailable, ProtocolViolation, FallbackDenied,
     CallDeadlineExceeded, UnsupportedCallMode, CallCapacityExceeded,
 )
+
+
+def test_core_error_copy_and_pickle_preserve_structured_fields():
+    with pytest.raises(error.CoreError) as failure:
+        _native.ConnectAttempt(timeout_seconds=0)
+    original = failure.value
+    assert original.name == 'CallDeadlineExceeded'
+    assert original.details['operation'] == 'connect'
+    for restored in (copy.copy(original), pickle.loads(pickle.dumps(original))):
+        assert type(restored) is error.CoreError
+        assert restored is not original
+        assert restored.args == original.args
+        assert str(restored) == str(original)
+        assert restored.__dict__ == original.__dict__
 
 
 class TestERRORCode:

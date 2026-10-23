@@ -66,7 +66,7 @@ export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayl
 export interface C2IpcConnection {
   write(data: C2ByteArray): void | Promise<void>;
   readExactly(byteLength: number): C2ByteArray | Promise<C2ByteArray>;
-  close?(): void | Promise<void>;
+  close(): void | Promise<void>;
 }
 
 export type C2IpcConnect = (address: string) => C2IpcConnection | Promise<C2IpcConnection>;
@@ -345,6 +345,10 @@ interface C2IpcBuddyPayload {
   readonly dedicated: boolean;
 }
 
+type C2IpcCallResponse =
+  | { readonly kind: "inline"; readonly payload: Uint8Array }
+  | { readonly kind: "shm"; readonly block: C2IpcResponseShmBlock };
+
 type C2IpcReplyControl =
   | { readonly kind: "success"; readonly payload: Uint8Array }
   | { readonly kind: "error"; readonly payload: Uint8Array }
@@ -431,7 +435,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   const discardConnection = async (open: C2IpcOpenConnection): Promise<void> => {
     connectionPromise = undefined;
     try {
-      await open.connection.close?.();
+      await open.connection.close();
     } catch {
       // Preserve the primary stream failure, including uncertain writes.
     }
@@ -562,120 +566,156 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         const methodInfo = findIpcMethod(route, method);
         const requestId = allocateRequestId();
         let requestShmBlock: C2IpcRequestShmBlock | undefined;
-        try {
-          requestShmBlock = await writeIpcCallRequestFrames(open.connection, requestId, open.handshake, route, methodInfo.index, requestPayload, requestShmWriter, requestShmThreshold, requestChunkSize);
-          requests += 1;
-        } catch (error) {
-          await discardConnection(open);
-          if (error instanceof C2IpcTransportError) {
-            throw error;
-          }
-          throw new C2IpcTransportError(`C-Two IPC call write failed: ${String(error)}`);
-        }
         let responseError: unknown;
         let responseValue: Payload | undefined;
         let requestShmServerConsumed = false;
-        try {
-        let responseFrame: C2IpcFrame;
-        try {
-          responseFrame = await readIpcFrame(open.connection);
-        } catch (error) {
-          await discardConnection(open);
-          throw new C2IpcTransportError(`C-Two IPC call response read failed: ${String(error)}`);
-        }
-        if (responseFrame.requestId !== requestId) {
-          await discardConnection(open);
-          throw new C2IpcTransportError(`C-Two IPC response request id ${responseFrame.requestId} did not match request id ${requestId}.`);
-        }
-        if ((responseFrame.flags & C2_IPC_FLAG_RESPONSE) === 0 || (responseFrame.flags & C2_IPC_FLAG_REPLY_V2) === 0) {
-          await discardConnection(open);
-          throw new C2IpcTransportError("C-Two IPC response is not a v2 reply frame.");
-        }
-        requestShmServerConsumed = true;
-        if ((responseFrame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
-          if ((responseFrame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
-            throw new C2IpcTransportError("C-Two IPC chunked SHM responses are not supported by this generated transport yet.");
+        const useShm = requestShmWriter !== undefined && requestPayload.byteLength > requestShmThreshold && requestPayload.byteLength <= 0xffffffff;
+        const chunked = !useShm && requestPayload.byteLength > requestChunkSize;
+        const receive = async (): Promise<C2IpcCallResponse> => {
+          let frame: C2IpcFrame;
+          try {
+            try {
+              frame = await readIpcFrame(open.connection);
+            } catch (error) {
+              throw new C2IpcTransportError(`C-Two IPC call response read failed: ${String(error)}`);
+            }
+            if (frame.requestId !== requestId) {
+              throw new C2IpcTransportError(`C-Two IPC response request id ${frame.requestId} did not match request id ${requestId}.`);
+            }
+            if ((frame.flags & C2_IPC_FLAG_RESPONSE) === 0 || (frame.flags & C2_IPC_FLAG_REPLY_V2) === 0) {
+              throw new C2IpcTransportError("C-Two IPC response is not a v2 reply frame.");
+            }
+          } catch (error) {
+            if (!chunked) await discardConnection(open);
+            throw error;
           }
-          const buddy = decodeIpcBuddyPayload(responseFrame.payload);
-          const reply = decodeIpcReplyControl(responseFrame.payload.subarray(C2_IPC_BUDDY_PAYLOAD_BYTES));
-          if (reply.kind === "success") {
+          requestShmServerConsumed = true;
+          let buddy: C2IpcBuddyPayload | undefined;
+          if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
+            if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
+              throw new C2IpcTransportError("C-Two IPC chunked SHM responses are not supported by this generated transport yet.");
+            }
+            buddy = decodeIpcBuddyPayload(frame.payload);
+          } else if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
+            try {
+              return { kind: "inline", payload: await readIpcChunkedSuccessPayload(open.connection, frame, requestId) };
+            } catch (error) {
+              if (!chunked) await discardConnection(open);
+              if (error instanceof C2IpcTransportError) throw error;
+              throw new C2IpcTransportError(`C-Two IPC chunked response read failed: ${String(error)}`);
+            }
+          }
+          const reply = decodeIpcReplyControl(frame.payload.subarray(buddy === undefined ? 0 : C2_IPC_BUDDY_PAYLOAD_BYTES));
+          if (reply.kind === "error") throw new C2CrmMethodError(reply.payload);
+          if (reply.kind === "route-not-found") throw new C2IpcRouteNotFoundError(reply.routeName);
+          if (buddy !== undefined) {
             if (reply.payload.byteLength !== 0) {
               throw new C2IpcTransportError("C-Two IPC SHM success reply control contains unexpected inline payload bytes.");
             }
-            responseValue = await readIpcShmSuccessPayload(open.handshake, buddy, responsePayloadAllocator, responseShmReader);
-            responses += 1;
-            return observeTransportResponse(responseValue, observe, {
-              path: observationPath,
-              routeName,
-              routeUid: route.routeUid,
-              routeRevision: route.routeRevision,
-              ipcAddress: address,
-              serverId: open.handshake.serverIdentity.serverId,
-              serverInstanceId: open.handshake.serverIdentity.serverInstanceId,
-              requests,
-              responses,
-            });
+            if (responseShmReader === undefined) {
+              throw new C2IpcTransportError("C-Two IPC responseShmReader is required for SHM replies.");
+            }
+            return { kind: "shm", block: buildIpcResponseShmBlock(open.handshake, buddy) };
           }
-          if (reply.kind === "error") {
-            throw new C2CrmMethodError(reply.payload);
-          }
-          throw new C2IpcRouteNotFoundError(reply.routeName);
-        }
-        if ((responseFrame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
-          let chunkedPayload: Uint8Array;
+          return { kind: "inline", payload: reply.payload };
+        };
+        const observeResponse = (value: Payload): Payload => {
+          responses += 1;
+          return observeTransportResponse(value, observe, {
+            path: observationPath,
+            routeName,
+            routeUid: route.routeUid,
+            routeRevision: route.routeRevision,
+            ipcAddress: address,
+            serverId: open.handshake.serverIdentity.serverId,
+            serverInstanceId: open.handshake.serverIdentity.serverInstanceId,
+            requests,
+            responses,
+          });
+        };
+        try {
+          let callControl: Uint8Array;
+          const totalChunks = chunked ? Math.ceil(requestPayload.byteLength / requestChunkSize) : 0;
           try {
-            chunkedPayload = await readIpcChunkedSuccessPayload(open.connection, responseFrame, requestId);
+            callControl = encodeIpcCallControl(route, methodInfo.index);
+            if (chunked) {
+              if ((open.handshake.capabilityFlags & C2_IPC_CAP_CHUNKED) === 0) {
+                throw new C2IpcTransportError("C-Two IPC server does not support chunked request calls.");
+              }
+              if (totalChunks <= 0 || totalChunks > 0xffff) {
+                throw new C2IpcTransportError(`C-Two IPC request chunk count ${totalChunks} is outside the u16 chunk header range.`);
+              }
+            }
           } catch (error) {
             await discardConnection(open);
-            if (error instanceof C2IpcTransportError) {
+            if (error instanceof C2IpcTransportError) throw error;
+            throw new C2IpcTransportError(`C-Two IPC call write failed: ${String(error)}`);
+          }
+          const writing = (async (): Promise<void> => {
+            try {
+              if (useShm) {
+                requestShmBlock = await writeIpcBuddyCallRequestFrame(open.connection, requestId, callControl, requestPayload, requestShmWriter!);
+              } else if (chunked) {
+                for (let index = 0; index < totalChunks; index += 1) {
+                  // close/discard clears this before closing the stream;
+                  // callChain prevents a replacement until this exchange ends.
+                  if (connectionPromise === undefined) {
+                    throw new C2IpcTransportError("C-Two IPC connection is closed.");
+                  }
+                  const start = index * requestChunkSize;
+                  const chunk = requestPayload.subarray(start, Math.min(start + requestChunkSize, requestPayload.byteLength));
+                  let flags = C2_IPC_FLAG_CALL_V2 | C2_IPC_FLAG_CHUNKED;
+                  if (index === totalChunks - 1) flags |= C2_IPC_FLAG_CHUNK_LAST;
+                  const body = index === 0
+                    ? concatUint8Arrays([encodeIpcRequestChunkHeader(index, totalChunks), callControl, chunk])
+                    : concatUint8Arrays([encodeIpcRequestChunkHeader(index, totalChunks), chunk]);
+                  await open.connection.write(encodeIpcFrame(requestId, flags, body));
+                }
+              } else {
+                await open.connection.write(encodeIpcFrame(requestId, C2_IPC_FLAG_CALL_V2, concatUint8Arrays([callControl, requestPayload])));
+              }
+              requests += 1;
+            } catch (error) {
+              if (error instanceof C2IpcTransportError) throw error;
+              throw new C2IpcTransportError(`C-Two IPC call write failed: ${String(error)}`);
+            }
+          })();
+          let reply: C2IpcCallResponse;
+          if (chunked) {
+            const receiving = receive();
+            try {
+              [, reply] = await Promise.all([writing, receiving]);
+            } catch (error) {
+              // Preserve the first failure before close wakes the other side.
+              await discardConnection(open);
+              const [, received] = await Promise.allSettled([writing, receiving]);
+              if (received.status === "fulfilled" && received.value.kind === "shm") {
+                await releaseIpcShmResponseBlockAfterRead(responseShmReader!, received.value.block, error);
+              }
               throw error;
             }
-            throw new C2IpcTransportError(`C-Two IPC chunked response read failed: ${String(error)}`);
+          } else {
+            try {
+              await writing;
+            } catch (error) {
+              await discardConnection(open);
+              throw error;
+            }
+            reply = await receive();
           }
-          try {
-            responseValue = copyResponsePayloadToAllocator(chunkedPayload, responsePayloadAllocator);
-            responses += 1;
-            return observeTransportResponse(responseValue, observe, {
-              path: observationPath,
-              routeName,
-              routeUid: route.routeUid,
-              routeRevision: route.routeRevision,
-              ipcAddress: address,
-              serverId: open.handshake.serverIdentity.serverId,
-              serverInstanceId: open.handshake.serverIdentity.serverInstanceId,
-              requests,
-              responses,
-            });
-          } catch (error) {
-            throw new C2IpcTransportError(`C-Two IPC responsePayloadAllocator failed: ${String(error)}`);
+          if (reply.kind === "shm") {
+            responseValue = await readIpcShmSuccessPayload(reply.block, responsePayloadAllocator, responseShmReader!);
+            return observeResponse(responseValue);
           }
-        }
-        const reply = decodeIpcReplyControl(responseFrame.payload);
-        if (reply.kind === "success") {
           try {
             responseValue = copyResponsePayloadToAllocator(reply.payload, responsePayloadAllocator);
-            responses += 1;
-            return observeTransportResponse(responseValue, observe, {
-              path: observationPath,
-              routeName,
-              routeUid: route.routeUid,
-              routeRevision: route.routeRevision,
-              ipcAddress: address,
-              serverId: open.handshake.serverIdentity.serverId,
-              serverInstanceId: open.handshake.serverIdentity.serverInstanceId,
-              requests,
-              responses,
-            });
+            return observeResponse(responseValue);
           } catch (error) {
             throw new C2IpcTransportError(`C-Two IPC responsePayloadAllocator failed: ${String(error)}`);
           }
-        }
-        if (reply.kind === "error") {
-          throw new C2CrmMethodError(reply.payload);
-        }
-        throw new C2IpcRouteNotFoundError(reply.routeName);
         } catch (error) {
           responseError = error;
+          if (chunked) await discardConnection(open);
         } finally {
           if (requestShmServerConsumed && requestShmBlock !== undefined && requestShmWriter !== undefined) {
             await releaseIpcRequestShmBlockAfterCall(requestShmWriter, requestShmBlock, responseError);
@@ -696,7 +736,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         return;
       }
       const open = await current.catch(() => undefined);
-      if (open?.connection.close !== undefined) {
+      if (open !== undefined) {
         try {
           await open.connection.close();
         } catch (error) {
@@ -1566,8 +1606,8 @@ function requireIpcConnection(value: unknown): C2IpcConnection {
   if (typeof candidate.readExactly !== "function") {
     throw new C2IpcTransportError("C-Two IPC connection readExactly must be a function.");
   }
-  if (candidate.close !== undefined && typeof candidate.close !== "function") {
-    throw new C2IpcTransportError("C-Two IPC connection close must be a function when provided.");
+  if (typeof candidate.close !== "function") {
+    throw new C2IpcTransportError("C-Two IPC connection close must be a function.");
   }
   return candidate as C2IpcConnection;
 }
@@ -1597,11 +1637,9 @@ async function connectAndHandshakeIpc(address: string, connect: C2IpcConnect, re
     }
     return { connection, handshake };
   } catch (error) {
-    if (connection.close !== undefined) {
-      try {
-        await connection.close();
-      } catch {
-      }
+    try {
+      await connection.close();
+    } catch {
     }
     if (error instanceof C2IpcTransportError) {
       throw error;
@@ -1697,32 +1735,6 @@ function encodeIpcCallControl(route: C2IpcRouteInfo, methodIndex: number): Uint8
   ]);
 }
 
-async function writeIpcCallRequestFrames(
-  connection: C2IpcConnection,
-  requestId: bigint,
-  handshake: C2IpcHandshake,
-  route: C2IpcRouteInfo,
-  methodIndex: number,
-  requestPayload: Uint8Array,
-  requestShmWriter: C2IpcRequestShmWriter | undefined,
-  requestShmThreshold: number,
-  requestChunkSize: number,
-): Promise<C2IpcRequestShmBlock | undefined> {
-  const callControl = encodeIpcCallControl(route, methodIndex);
-  if (requestShmWriter !== undefined && requestPayload.byteLength > requestShmThreshold && requestPayload.byteLength <= 0xffffffff) {
-    return await writeIpcBuddyCallRequestFrame(connection, requestId, callControl, requestPayload, requestShmWriter);
-  }
-  if (requestPayload.byteLength <= requestChunkSize) {
-    await connection.write(encodeIpcFrame(requestId, C2_IPC_FLAG_CALL_V2, concatUint8Arrays([callControl, requestPayload])));
-    return undefined;
-  }
-  if ((handshake.capabilityFlags & C2_IPC_CAP_CHUNKED) === 0) {
-    throw new C2IpcTransportError("C-Two IPC server does not support chunked request calls.");
-  }
-  await writeIpcChunkedCallRequestFrames(connection, requestId, callControl, requestPayload, requestChunkSize);
-  return undefined;
-}
-
 async function writeIpcBuddyCallRequestFrame(
   connection: C2IpcConnection,
   requestId: bigint,
@@ -1752,7 +1764,7 @@ async function writeIpcBuddyCallRequestFrame(
       await tryReleaseIpcRequestShmBlock(requestShmWriter, block);
     }
     if (frameWriteAttempted) {
-      await closeIpcConnectionAfterChunkedRequestWriteFailure(connection);
+      await closeIpcConnectionAfterWriteFailure(connection);
     }
     if (error instanceof C2IpcTransportError) {
       throw error;
@@ -1865,46 +1877,7 @@ function encodeIpcBuddyPayload(block: C2IpcRequestShmBlock): Uint8Array {
   ]);
 }
 
-async function writeIpcChunkedCallRequestFrames(
-  connection: C2IpcConnection,
-  requestId: bigint,
-  callControl: Uint8Array,
-  requestPayload: Uint8Array,
-  requestChunkSize: number,
-): Promise<void> {
-  const totalChunks = Math.ceil(requestPayload.byteLength / requestChunkSize);
-  if (totalChunks <= 0 || totalChunks > 0xffff) {
-    throw new C2IpcTransportError(`C-Two IPC request chunk count ${totalChunks} is outside the u16 chunk header range.`);
-  }
-  let sentOrAttempted = false;
-  try {
-    for (let index = 0; index < totalChunks; index += 1) {
-      const start = index * requestChunkSize;
-      const end = Math.min(start + requestChunkSize, requestPayload.byteLength);
-      const chunk = requestPayload.subarray(start, end);
-      const isLast = index === totalChunks - 1;
-      let flags = C2_IPC_FLAG_CALL_V2 | C2_IPC_FLAG_CHUNKED;
-      if (isLast) {
-        flags |= C2_IPC_FLAG_CHUNK_LAST;
-      }
-      const payload = index === 0
-        ? concatUint8Arrays([encodeIpcRequestChunkHeader(index, totalChunks), callControl, chunk])
-        : concatUint8Arrays([encodeIpcRequestChunkHeader(index, totalChunks), chunk]);
-      sentOrAttempted = true;
-      await connection.write(encodeIpcFrame(requestId, flags, payload));
-    }
-  } catch (error) {
-    if (sentOrAttempted) {
-      await closeIpcConnectionAfterChunkedRequestWriteFailure(connection);
-    }
-    throw error;
-  }
-}
-
-async function closeIpcConnectionAfterChunkedRequestWriteFailure(connection: C2IpcConnection): Promise<void> {
-  if (connection.close === undefined) {
-    return;
-  }
+async function closeIpcConnectionAfterWriteFailure(connection: C2IpcConnection): Promise<void> {
   try {
     await connection.close();
   } catch {
@@ -2396,15 +2369,10 @@ function buildIpcResponseShmBlock(handshake: C2IpcHandshake, buddy: C2IpcBuddyPa
 }
 
 async function readIpcShmSuccessPayload<Payload extends C2ResponsePayload>(
-  handshake: C2IpcHandshake,
-  buddy: C2IpcBuddyPayload,
+  block: C2IpcResponseShmBlock,
   allocator: C2ResponsePayloadAllocator<Payload> | undefined,
-  reader: C2IpcResponseShmReader | undefined,
+  reader: C2IpcResponseShmReader,
 ): Promise<Payload> {
-  if (reader === undefined) {
-    throw new C2IpcTransportError("C-Two IPC responseShmReader is required for SHM replies.");
-  }
-  const block = buildIpcResponseShmBlock(handshake, buddy);
   if (allocator !== undefined) {
     let allocated: C2AllocatedResponsePayload<Payload>;
     try {

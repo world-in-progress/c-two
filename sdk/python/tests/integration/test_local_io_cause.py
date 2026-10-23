@@ -32,7 +32,12 @@ class Resource:
     def echo(self, value): return value
 
 def diagnostic(error):
-    return {key: getattr(error, key, None) for key in (
+    assert type(error) is cc.error.CoreError
+    assert isinstance(error, cc.error.CCBaseError) and isinstance(error, RuntimeError)
+    assert set(cc.error.CoreError.__annotations__).issubset(vars(error))
+    assert not hasattr(_native, 'CoreError')
+    assert not hasattr(cc, 'CoreError')
+    return {key: getattr(error, key) for key in (
         'category', 'lifecycle_kind', 'transport_kind', 'transport_phase',
         'fallback_eligible', 'io_kind', 'raw_os_error', 'io_operation', 'name', 'details', 'message',
         'startup_stage', 'timeout_seconds',
@@ -94,7 +99,7 @@ def test_unix_local_io_cause(case, operation, kind, raw) -> None:
                         cc.register(Echo, Resource(), name='io')
                     else:
                         client = cc.connect(Echo, name='io', address=address, timeout=2)
-                except _native.CoreError as exc:
+                except cc.error.CoreError as exc:
                     error = diagnostic(exc)
                 finally:
                     if root.is_dir():
@@ -119,6 +124,66 @@ def test_unix_local_io_cause(case, operation, kind, raw) -> None:
             if root.is_dir():
                 root.chmod(0o700)
     _assert_io(json.loads(result.stdout), operation, kind, raw)
+
+
+def test_response_admission_preserves_outer_transport_and_inner_semantic_messages() -> None:
+    with tempfile.TemporaryDirectory(prefix='c2-', dir=None if IS_WINDOWS else '/tmp') as root:
+        _run_isolated(COMMON + textwrap.dedent(f'''
+            from pathlib import Path
+            root = Path({root!r})
+            if not {IS_WINDOWS!r}:
+                cc.set_local_endpoint(root=str(root))
+            cc.set_server(ipc_overrides={{
+                'pool_enabled': False, 'shm_backing_budget_bytes': 0, 'chunk_size': 65536,
+            }})
+            cc.set_client(ipc_overrides={{
+                'pool_enabled': False, 'shm_backing_budget_bytes': 0, 'chunk_size': 65536,
+                'file_backing_budget_bytes': 1024 * 1024, 'live_reassembly_budget_bytes': 0,
+            }})
+            cc.set_transport_policy(shm_threshold=4096)
+            class CountedResource(Resource):
+                calls = 0
+                def echo(self, value):
+                    self.calls += 1
+                    return value
+            resource = CountedResource()
+            proxy = None
+            try:
+                cc.register(Echo, resource, name='admission')
+                proxy = cc.connect(Echo, name='admission', address=cc.server_address())
+                try:
+                    proxy.echo('x' * (256 * 1024))
+                except cc.error.ResourceUnavailable as semantic:
+                    native = semantic.__cause__
+                    report = diagnostic(native)
+                    assert report['category'] == 'transport'
+                    assert native.transport_kind == 'ipc'
+                    assert native.transport_phase == 'dispatch_uncertain'
+                    assert native.fallback_eligible is False
+                    assert native.message == str(native) and native.message != semantic.message
+                    inner = cc.error.CCError.deserialize(native.error_bytes)
+                    assert inner.message == semantic.message
+                    assert inner.code == native.code == semantic.code
+                    assert inner.details == native.details == semantic.details
+                    assert cc.error.CCError.serialize(inner) == native.error_bytes
+                    assert all(getattr(native, field) is None for field in (
+                        'io_operation', 'io_kind', 'raw_os_error', 'lifecycle_kind',
+                    ))
+                else:
+                    raise AssertionError('response admission unexpectedly succeeded')
+                assert resource.calls == 1
+                assert proxy.echo('after') == 'after'
+                assert resource.calls == 2
+                assert cc.hold_stats()['active_leases'] == 0
+                cells = cc.memory_stats()['runtime_outgoing']['cells']
+                assert all(cells[cell]['used_bytes'] == 0 for cell in ('reassembly', 'file', 'shm'))
+            finally:
+                if proxy is not None:
+                    cc.close(proxy)
+                assert cc.shutdown(timeout=3)['completed']
+            assert all(not entry.is_socket() and not entry.name.endswith('.lease')
+                       for entry in root.rglob('*'))
+        '''))
 
 
 WIN32 = '''
@@ -186,7 +251,7 @@ def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
             try:
                 client = cc.connect(Echo, name='io', address=address,
                                     timeout={timeout!r})
-            except _native.CoreError as exc:
+            except cc.error.CoreError as exc:
                 error = diagnostic(exc)
             except cc.error.CallDeadlineExceeded as exc:
                 error, details = diagnostic(exc.__cause__), exc.details
@@ -225,34 +290,37 @@ def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
         assert 0.15 <= report['elapsed'] < 2, report
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason='Windows named-pipe platform contract')
-def test_windows_real_listener_conflict_has_no_raw_system_code() -> None:
-    address = f'ipc://io-{uuid.uuid4().hex}'
-    contender = COMMON + textwrap.dedent(f'''
-        error = None
-        try:
-            cc.set_server(server_id={address.removeprefix('ipc://')!r})
-            cc.register(Echo, Resource(), name='io')
-        except _native.CoreError as exc:
-            error = diagnostic(exc)
-        finally:
-            stopped = cc.shutdown(timeout=3)
-        print(json.dumps({{'error': error, 'completed': stopped['completed']}}))
-    ''')
-    result = _run_isolated(COMMON + textwrap.dedent(f'''
-        import subprocess
-        import sys
-        try:
-            cc.set_server(server_id={address.removeprefix('ipc://')!r})
-            cc.register(Echo, Resource(), name='io')
-            # Inherit the environment sanitized by _run_isolated/_isolated_env.
-            child = subprocess.run([sys.executable, '-c', {contender!r}],
-                                   capture_output=True, text=True, timeout=8)
-        finally:
-            stopped = cc.shutdown(timeout=3)
-        print(json.dumps({{'returncode': child.returncode, 'stdout': child.stdout,
-                          'stderr': child.stderr, 'completed': stopped['completed']}}))
-    '''))
-    owner = json.loads(result.stdout)  # Both participants have exited before diagnostics.
-    assert owner['completed'] and owner['returncode'] == 0, owner
-    _assert_io(json.loads(owner['stdout']), 'bind', 'address_in_use', None)
+def test_real_listener_conflict_has_no_raw_system_code() -> None:
+    with tempfile.TemporaryDirectory(prefix='c2-', dir=None if IS_WINDOWS else '/tmp') as root:
+        address = f'ipc://io-{uuid.uuid4().hex}'
+        policy = '' if IS_WINDOWS else f'cc.set_local_endpoint(root={root!r})\n'
+        contender = COMMON + policy + textwrap.dedent(f'''
+            error = None
+            try:
+                cc.set_server(server_id={address.removeprefix('ipc://')!r})
+                cc.register(Echo, Resource(), name='io')
+            except cc.error.CoreError as exc:
+                error = diagnostic(exc)
+            finally:
+                stopped = cc.shutdown(timeout=3)
+            print(json.dumps({{'error': error, 'completed': stopped['completed']}}))
+        ''')
+        result = _run_isolated(COMMON + policy + textwrap.dedent(f'''
+            import subprocess
+            import sys
+            try:
+                cc.set_server(server_id={address.removeprefix('ipc://')!r})
+                cc.register(Echo, Resource(), name='io')
+                # Inherit the environment sanitized by _run_isolated/_isolated_env.
+                child = subprocess.run([sys.executable, '-c', {contender!r}],
+                                       capture_output=True, text=True, timeout=8)
+            finally:
+                stopped = cc.shutdown(timeout=3)
+            print(json.dumps({{'returncode': child.returncode, 'stdout': child.stdout,
+                              'stderr': child.stderr, 'completed': stopped['completed']}}))
+        '''))
+        owner = json.loads(result.stdout)  # Both participants have exited before diagnostics.
+        assert owner['completed'] and owner['returncode'] == 0, owner
+        _assert_io(json.loads(owner['stdout']), 'bind', 'address_in_use', None)
+        assert all(not entry.is_socket() and not entry.name.endswith('.lease')
+                   for entry in Path(root).rglob('*'))

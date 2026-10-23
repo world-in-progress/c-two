@@ -146,12 +146,15 @@ def persistent_node_project() -> Iterator[tuple[Path, str]]:
 
 
 class PersistentNode:
-    def __init__(self, project: tuple[Path, str], address: str) -> None:
+    def __init__(
+        self, project: tuple[Path, str], address: str, *, ipc_root: str | None = None,
+    ) -> None:
         root, node = project
         self.root = root
         config = root / "persistent.json"
         config.write_text(json.dumps({
             "address": address,
+            "ipcRoot": ipc_root,
             "managerModule": str(root / "dist/manager/typescript/c_two_contract.js"),
             "builderModule": str(root / "dist/builder/typescript/c_two_contract.js"),
         }), encoding="utf-8")
@@ -219,6 +222,83 @@ def _reject(result: dict[str, Any], text: str | None = None) -> None:
     assert not result["ok"], result
     if text:
         assert text in result["error"]["message"], result
+
+
+def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
+    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
+) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="c2-r16-", dir=tempfile.gettempdir() if os.name == "nt" else "/tmp",
+    ) as directory:
+        ipc_root = directory if os.name != "nt" else None
+        server = local_server(unique_ipc_address, ipc_overrides={
+            "pool_enabled": False,
+            "reassembly_segment_size": 65536,
+            "reassembly_max_segments": 1,
+            "max_reassembly_bytes": 65536,
+            "max_total_chunks": 2,
+        })
+        manager = CountingResource()
+        node: PersistentNode | None = None
+        try:
+            if ipc_root is not None:
+                server._runtime_session.set_local_endpoint(root=ipc_root)
+            server.register_crm(Manager, manager, name="manager")
+            server.start()
+            native_identity = dict(server._runtime_session.ensure_server())
+            node = PersistentNode(persistent_node_project, unique_ipc_address, ipc_root=ipc_root)
+            first = _ok(node.request("call"))
+            assert first["connects"] == 1 and manager.calls == 1
+            bound = first["observations"][-1]
+            assert bound["serverId"] == native_identity["server_id"]
+            assert bound["serverInstanceId"] == native_identity["server_instance_id"]
+
+            rejected = node.request("large")
+            _reject(rejected)
+            assert rejected["error"]["name"] == "C2CrmMethodError", rejected
+            # Either native limit may win the first-reply race. Neither a
+            # client-side preflight refusal nor close-induced I/O is acceptable.
+            wire_error = rejected["error"]["payload"]
+            assert wire_error.startswith("C2E1"), rejected
+            native_error = json.loads(wire_error[4:])
+            assert native_error["version"] == 1 and native_error["details"] == {}
+            assert (native_error["code"], native_error["name"], native_error["message"]) in (
+                (713, "ProtocolViolation",
+                 "chunked call reassembly admission failed: total_chunks 16384 exceeds limit 2"),
+                (702, "ResourceUnavailable",
+                 "server chunk processing capacity exceeded: max_total_chunks=2"),
+            ), rejected
+            assert manager.calls == 1 and rejected["chunkRequests"] == 1
+            stopped_at = rejected["chunkWrites"]
+            assert 0 < stopped_at < 64 * 1024 * 1024 // 4096, rejected
+            assert rejected["activeWrites"] == 0 and rejected["writesAfterClose"] == 0
+            assert rejected["connects"] == 1 and rejected["closes"] == 1
+            assert rejected["observations"] == first["observations"]
+
+            for calls in (2, 3):
+                resumed = _ok(node.request("call"))
+                assert resumed["connects"] == 2 and resumed["closes"] == 1
+                assert manager.calls == calls and resumed["chunkRequests"] == 1
+                assert resumed["chunkWrites"] == stopped_at
+                assert resumed["businessWrites"] == rejected["businessWrites"] + calls - 1
+                assert resumed["activeWrites"] == 0 and resumed["writesAfterClose"] == 0
+                for key in ("serverId", "serverInstanceId", "routeName", "routeUid", "routeRevision"):
+                    assert resumed["observations"][-1][key] == bound[key], resumed
+        finally:
+            try:
+                if node is not None:
+                    node.stop()
+            finally:
+                assert server.shutdown()["completed"]
+                inspection = cc.inspect_endpoint(
+                    unique_ipc_address, context=server._runtime_session.local_endpoint_context(),
+                )
+                assert inspection["status"] in ("absent", "not-applicable"), inspection
+                residue = [
+                    str(entry) for entry in Path(directory).rglob("*")
+                    if entry.is_socket() or entry.name.endswith(".lease")
+                ]
+                assert not residue, f"private endpoint socket/lease residue: {residue}"
 
 
 def test_generated_node_persistent_dynamic_acquire_and_identity_fences(

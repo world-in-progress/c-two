@@ -28,7 +28,7 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
 
-**C-Two 0.8.1** supports Python 3.10+. Ordinary Python calls have no Python runtime dependencies; FastDB payloads use the optional `c-two[fastdb]` extra (`fastdb4py==0.2.3`). This patch exposes the server startup budget through `cc.set_server(startup_timeout=...)` and distinguishes startup expiry and local I/O failures from configuration errors. See the [release notes](docs/releases/0.8.1.md).
+**C-Two 0.8.2** supports Python 3.10+. Ordinary Python calls have no Python runtime dependencies; FastDB payloads use the optional `c-two[fastdb]` extra (`fastdb4py==0.2.3`). This release adds one client/server connection event feed, exposes structured `cc.error.CoreError`, and repairs relay observer recovery after capacity exhaustion. See the [release notes](docs/releases/0.8.2.md).
 
 ## Features
 
@@ -38,7 +38,7 @@ A **CRM contract** declares the callable methods and their namespace/version. A 
 - **Contract-scoped routing:** clients match the route name, CRM identity and contract hashes. Relay discovery selects a verified local IPC path or an HTTP target; `c3` runs the relay and supports relay meshes.
 - **Native memory transport:** IPC uses lazy buddy pools, dedicated shared memory, checked chunk transfer and file spill. Budgets and idle reclamation control memory and file usage for large payloads. See [memory policy](docs/memory-policy.en.md).
 - **Explicit payload lifetimes:** `cc.hold()` retains response leases, while registration can select borrowed input lifetimes. Release invalidates FastDB owners and checked views before releasing transport storage. See [Python payload usage](docs/python-usage.md).
-- **Connection observations:** client and server APIs report physical IPC connection termination without an in-flight call. Reasons describe transport facts, not proof of process death.
+- **Connection observations:** `cc.connection_events()` aggregates outgoing and accepted physical IPC connections; one cancellable consumer replaces per-connection blocking waits. Reasons describe transport facts, not proof of process death.
 - **Resource lifecycle management:** Resources use `Persistent` or controller-owned `OwnerBound` lifecycles; native shutdown drains work, and scoped endpoint maintenance cleans up confirmed exits. See [lifecycle integration](docs/local-endpoint-lifecycle.en.md).
 - **Shared Rust core:** Python and Rust use the same routing, transport, memory, error and lifecycle mechanisms. The native c3 CLI handles relay, contract tools and endpoint maintenance on Linux, macOS and Windows x64 and ARM64.
 
@@ -53,12 +53,12 @@ uv pip install 'c-two[fastdb]'
 The same command works in Windows PowerShell. For c3 on Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.sh | sh -s -- --version 0.4.0
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1/c3-installer.sh | sh -s -- --version 0.4.1
 ```
 
-On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
+On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
-C3 0.4.0 works with C-Two 0.8.x. IPC 12, SHM 3 and C/FFI ABI 5 remain unchanged; owner control has its own version 1. When upgrading from 0.7.x, follow the [0.8.0 migration notes](docs/releases/0.8.0.md), upgrade cooperating owner controllers and hosts together, and recompile Rust consumers.
+C3 0.4.1 works with C-Two 0.8.x. IPC 12, SHM 3 and C/FFI ABI 5 remain unchanged; owner control has its own version 1. When upgrading from 0.7.x, follow the [0.8.0 migration notes](docs/releases/0.8.0.md), upgrade cooperating owner controllers and hosts together, and recompile Rust consumers.
 
 For source builds and tests, see the [development guide](docs/development.md).
 

@@ -30,6 +30,7 @@ use crate::relay::upstream_control::{self, UpstreamControlTask, UpstreamOwnerKey
 struct UpstreamControls {
     closed: bool,
     tasks: HashMap<UpstreamOwnerKey, UpstreamControlTask>,
+    upstream_watch_unavailable: HashMap<UpstreamOwnerKey, String>,
 }
 
 #[cfg(test)]
@@ -48,7 +49,6 @@ pub struct RelayState {
     controls_stop_seam: parking_lot::Mutex<Option<TestPause>>,
     #[cfg(test)]
     acquire_recheck_seam: parking_lot::Mutex<Option<TestPause>>,
-    upstream_watch_unavailable: RwLock<HashMap<UpstreamOwnerKey, String>>,
     config: Arc<RelayConfig>,
     endpoint_context: LocalEndpointContext,
     default_endpoint_namespace: bool,
@@ -205,7 +205,6 @@ impl RelayState {
             controls_stop_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
             acquire_recheck_seam: parking_lot::Mutex::new(None),
-            upstream_watch_unavailable: RwLock::new(HashMap::new()),
             disseminator,
             config,
             endpoint_context,
@@ -750,18 +749,49 @@ impl RelayState {
         *self.acquire_recheck_seam.lock() = Some((entered, resume));
     }
 
+    pub(crate) fn set_upstream_watch_status(
+        &self,
+        key: &UpstreamOwnerKey,
+        token: &Arc<()>,
+        reason: Option<String>,
+    ) {
+        let mut controls = self.upstream_controls.write();
+        if controls
+            .tasks
+            .get(key)
+            .is_some_and(|task| task.token_matches(token))
+        {
+            match reason {
+                Some(reason) => {
+                    controls
+                        .upstream_watch_unavailable
+                        .insert(key.clone(), reason);
+                }
+                None => {
+                    controls.upstream_watch_unavailable.remove(key);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn mark_upstream_control_watch_unavailable(
         &self,
         key: &UpstreamOwnerKey,
         reason: impl Into<String>,
     ) {
-        self.upstream_watch_unavailable
+        self.upstream_controls
             .write()
+            .upstream_watch_unavailable
             .insert(key.clone(), reason.into());
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_upstream_control_watch_unavailable(&self, key: &UpstreamOwnerKey) {
-        self.upstream_watch_unavailable.write().remove(key);
+        self.upstream_controls
+            .write()
+            .upstream_watch_unavailable
+            .remove(key);
     }
 
     pub(crate) fn upstream_control_watch_unavailable_for_route(
@@ -769,7 +799,11 @@ impl RelayState {
         route: &RouteEntry,
     ) -> Option<String> {
         let key = upstream_control::owner_key_for_route(route)?;
-        self.upstream_watch_unavailable.read().get(&key).cloned()
+        self.upstream_controls
+            .read()
+            .upstream_watch_unavailable
+            .get(&key)
+            .cloned()
     }
 
     pub(crate) fn local_routes_for_owner(&self, key: &UpstreamOwnerKey) -> Vec<RouteEntry> {
@@ -793,8 +827,7 @@ impl RelayState {
             .is_some_and(|task| task.token_matches(token))
         {
             controls.tasks.remove(key);
-            drop(controls);
-            self.clear_upstream_control_watch_unavailable(key);
+            controls.upstream_watch_unavailable.remove(key);
         }
     }
 
@@ -802,13 +835,18 @@ impl RelayState {
         let Some(key) = upstream_control::owner_key_for_route(entry) else {
             return;
         };
-        if !self.local_routes_for_owner(&key).is_empty() {
-            return;
-        }
-        if let Some(task) = self.upstream_controls.write().tasks.remove(&key) {
+        let task = {
+            let routes = self.route_table.read();
+            if routes.has_local_route_for_endpoint(&key) {
+                return;
+            }
+            let mut controls = self.upstream_controls.write();
+            controls.upstream_watch_unavailable.remove(&key);
+            controls.tasks.remove(&key)
+        };
+        if let Some(task) = task {
             task.abort();
         }
-        self.clear_upstream_control_watch_unavailable(&key);
     }
 
     /// Called by route authority while it holds the route-table write lock and
@@ -2137,13 +2175,17 @@ mod tests {
         assert!(state.conn_pool.list_connections().is_empty());
     }
 
-    #[test]
-    fn upstream_watch_unavailable_marks_owner_without_withdrawing_route() {
-        let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
-        let entry = register_local(&state, "grid", "server-grid", "ipc://grid", client);
-        let key = upstream_control::owner_key_for_route(&entry).expect("local route owner key");
-
+    #[tokio::test]
+    async fn upstream_watch_status_preserves_owner_and_fences_task_generations() {
+        let state = Arc::new(RelayState::new(test_config(), null_disseminator()));
+        let entry = register_local(
+            &state,
+            "grid",
+            "server-grid",
+            "ipc://grid",
+            Arc::new(IpcClient::new("ipc://grid")),
+        );
+        let key = upstream_control::owner_key_for_route(&entry).unwrap();
         state.mark_upstream_control_watch_unavailable(&key, "watch stream closed");
 
         let reason = state
@@ -2161,6 +2203,78 @@ mod tests {
                 .is_none()
         );
         assert!(state.local_route("grid").is_some());
+
+        let old_token = Arc::new(());
+        let token = Arc::new(());
+        // Only the task/token bookkeeping is under test here; real control
+        // connections and owner drain are covered by the capacity regressions.
+        state.upstream_controls.write().tasks.insert(
+            key.clone(),
+            UpstreamControlTask::new(old_token.clone(), tokio::spawn(async {})),
+        );
+        state.set_upstream_watch_status(&key, &old_token, Some("old reason".into()));
+        let old_task = state.upstream_controls.write().tasks.insert(
+            key.clone(),
+            UpstreamControlTask::new(token.clone(), tokio::spawn(async {})),
+        );
+        old_task.unwrap().abort_and_wait().await;
+        state.set_upstream_watch_status(&key, &token, Some("new reason".into()));
+
+        state.set_upstream_watch_status(&key, &old_token, Some("late old error".into()));
+        state.set_upstream_watch_status(&key, &old_token, None);
+        state.clear_upstream_control_if_matches(&key, &old_token);
+        assert_eq!(state.controls_snapshot_for_test(), (false, 1));
+        assert_eq!(
+            state
+                .upstream_control_watch_unavailable_for_route(&entry)
+                .as_deref(),
+            Some("new reason")
+        );
+        state.set_upstream_watch_status(&key, &token, None);
+        assert!(
+            state
+                .upstream_control_watch_unavailable_for_route(&entry)
+                .is_none()
+        );
+        state.set_upstream_watch_status(&key, &token, Some("new error".into()));
+        state.clear_upstream_control_if_matches(&key, &token);
+        assert_eq!(state.controls_snapshot_for_test(), (false, 0));
+        state.set_upstream_watch_status(&key, &old_token, Some("after removal".into()));
+        assert!(
+            state
+                .upstream_control_watch_unavailable_for_route(&entry)
+                .is_none()
+        );
+        let token = Arc::new(());
+        state.upstream_controls.write().tasks.insert(
+            key.clone(),
+            UpstreamControlTask::new(token.clone(), tokio::spawn(async {})),
+        );
+        state.set_upstream_watch_status(&key, &token, Some("retained reason".into()));
+        state.stop_upstream_control_if_owner_idle_for_route(&entry);
+        assert_eq!(state.controls_snapshot_for_test(), (false, 1));
+        state.stop_upstream_controls().await;
+        assert_eq!(state.controls_snapshot_for_test(), (true, 0));
+        state.start_upstream_control(&entry);
+        state.set_upstream_watch_status(&key, &token, None);
+        state.set_upstream_watch_status(&key, &token, Some("after stop".into()));
+        state.clear_upstream_control_if_matches(&key, &token);
+        assert_eq!(
+            state
+                .upstream_control_watch_unavailable_for_route(&entry)
+                .as_deref(),
+            Some("retained reason")
+        );
+        assert!(matches!(
+            state.unregister_upstream("grid", "server-grid"),
+            UnregisterResult::Removed { .. }
+        ));
+        assert!(
+            state
+                .upstream_control_watch_unavailable_for_route(&entry)
+                .is_none()
+        );
+        assert_eq!(state.controls_snapshot_for_test(), (true, 0));
     }
 
     #[test]

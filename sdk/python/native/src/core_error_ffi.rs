@@ -1,4 +1,3 @@
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
@@ -7,7 +6,7 @@ use c2_core::{
     RouteCloseOutcome, TransportKind, TransportPhase,
 };
 
-pyo3::create_exception!(c_two._native, CoreError, PyRuntimeError);
+pyo3::import_exception!(c_two.error, CoreError);
 
 pub(crate) fn core_error_to_py(error: Error) -> PyErr {
     match error {
@@ -17,13 +16,11 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
             let name = error.code.name();
             let details = error.details.clone();
             let error_bytes = error.to_wire_bytes();
-            let exception = CoreError::new_err(message.clone());
+            let exception = CoreError::new_err(("semantic", message));
             Python::attach(|py| {
                 let value = exception.value(py);
-                set_attr(value, "category", "semantic");
                 set_attr(value, "code", code);
                 set_attr(value, "name", name);
-                set_attr(value, "message", message);
                 set_io_cause(value, None);
                 let detail_dict = PyDict::new(py);
                 for (key, item) in details {
@@ -184,11 +181,9 @@ fn local_error<F>(
 where
     F: FnOnce(&Bound<'_, PyAny>),
 {
-    let exception = CoreError::new_err(message.clone());
+    let exception = CoreError::new_err((category, message));
     Python::attach(|py| {
         let value = exception.value(py);
-        set_attr(value, "category", category);
-        set_attr(value, "message", message);
         set_io_cause(value, cause);
         configure(value);
     });
@@ -261,9 +256,4 @@ where
     V: IntoPyObject<'py>,
 {
     let _ = value.setattr(name, item);
-}
-
-pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("CoreError", module.py().get_type::<CoreError>())?;
-    Ok(())
 }

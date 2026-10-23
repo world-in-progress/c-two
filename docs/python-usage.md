@@ -1,6 +1,6 @@
 # Python SDK usage
 
-C-Two 0.8.1 uses CRM contracts to expose stateful resources over same-process calls, local IPC and HTTP relay. Portable Python payloads use the optional FastDB 0.2.3 extra and the matching C3 0.4.0. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
+C-Two 0.8.2 uses CRM contracts to expose stateful resources over same-process calls, local IPC and HTTP relay. Portable Python payloads use the optional FastDB 0.2.3 extra and the matching C3 0.4.1. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 
@@ -129,10 +129,11 @@ The main user surface, shown throughout the guides. The top-level `cc` namespace
 - Lifecycle and ownership: `cc.LifecycleConfig`, `cc.owner_control_pair`, `cc.spawn_owned_child`, `cc.adopt_owner_stdin`, `cc.OwnerControl`, `cc.OwnerRecoveryTicket`, `cc.prepare_owner_takeover`, `cc.PreparedOwnerTakeover`, `cc.OwnerStatus`, `cc.OwnerControlError`
 - Endpoint maintenance: `cc.inspect_endpoint`, `cc.reap_endpoint`, `cc.sweep_endpoints`
 - Connection observations: `cc.connection_observation`, `cc.connection_events`, `cc.ConnectionObservation`, `cc.ConnectionClosed`, `cc.ConnectionEvent`, `cc.ConnectionEvents`, `cc.ConnectionEventsLagged`
+- Errors: `cc.error.CoreError` (structured local/Core errors), `cc.error.CCError` (semantic errors), with common `cc.error.CCBaseError`
 - Monitoring: `cc.hold_stats`, `cc.memory_stats`, `cc.call_execution_snapshot`, `cc.native_lifecycle_snapshot`, `cc.native_terminal_outcome` (read-only)
 
 Use `cc.set_server(startup_timeout=...)` before registration to choose a native startup wait. Startup expiry has `CoreError.lifecycle_kind == 'startup_timeout'`, `startup_stage` and `timeout_seconds`; see [startup configuration and errors](configuration.en.md#server-startup-deadlines).
 
 Process-level IPC policy, call admission limits and relay settings are documented in the [configuration guide](configuration.en.md).
 
-The [lifecycle API guide](local-endpoint-lifecycle.en.md) specifies observation return values, timeout/end/lag behavior, owner ticket issuance and revocation, the single-commit takeover sequence and error outcomes. Its [bind/connect section](local-endpoint-lifecycle.en.md#bind-and-connect-failures) documents the structured OS fields on native `CoreError`. These observations do not prove process exit or authorize replay or cleanup.
+The [lifecycle API guide](local-endpoint-lifecycle.en.md) specifies observation return values, timeout/end/lag behavior, owner ticket issuance and revocation, the single-commit takeover sequence and error outcomes. Its [bind/connect section](local-endpoint-lifecycle.en.md#bind-and-connect-failures) documents the structured OS fields on public `cc.error.CoreError`. These observations do not prove process exit or authorize replay or cleanup.

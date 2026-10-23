@@ -190,6 +190,7 @@ fn connect_with_transient_retry(
     budget: &c2_mem::MemoryBudget,
     deadline: ConnectDeadline,
     mut fresh: FreshClientGuard,
+    event_source: Option<&c2_local::ConnectionEventSource>,
 ) -> Result<(Arc<SyncClient>, FreshClientGuard), IpcError> {
     crate::sync_client::ensure_runtime_with_deadline(deadline)?;
     let pool_config = pool_config_from_client_config(cfg);
@@ -219,6 +220,7 @@ fn connect_with_transient_retry(
             cfg.clone(),
             budget.clone(),
             deadline,
+            event_source,
         );
         let client = Arc::new(client);
         fresh.attach(client.clone());
@@ -616,6 +618,7 @@ pub struct ClientPool {
     // One immutable namespace per cache. Address keys are scoped by this owner;
     // draining changes only the epoch, never the endpoint or memory domain.
     endpoint_context: Result<LocalEndpointContext, String>,
+    connection_event_source: Option<c2_local::ConnectionEventSource>,
     state: Mutex<CacheState>,
     grace_period: Duration,
     default_config: Mutex<Option<ClientIpcConfig>>,
@@ -830,12 +833,19 @@ impl ClientPool {
         Self::from_endpoint_context(grace_period, Ok(context))
     }
 
+    /// Publish every physical connection incarnation through the owner's feed.
+    pub fn with_connection_event_source(mut self, source: c2_local::ConnectionEventSource) -> Self {
+        self.connection_event_source = Some(source);
+        self
+    }
+
     fn from_endpoint_context(
         grace_period: Duration,
         context: Result<LocalEndpointContext, String>,
     ) -> Self {
         Self {
             endpoint_context: context,
+            connection_event_source: None,
             state: Mutex::new(CacheState {
                 entries: HashMap::new(),
                 epoch: 0,
@@ -1142,6 +1152,7 @@ impl ClientPool {
             &budget,
             deadline,
             fresh.expect("fresh acquisition reserves cleanup ownership"),
+            self.connection_event_source.as_ref(),
         )?;
 
         let mut state = match connect_lock(&self.state, deadline, "pool_publish_wait") {
@@ -2014,6 +2025,7 @@ mod tests {
             cfg.clone(),
             budget.clone(),
             connect_budget(0),
+            None,
         );
         assert!(matches!(result, Err(IpcError::LocalCallRejected(_))));
         let client = Arc::new(client);

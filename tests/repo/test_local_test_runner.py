@@ -181,6 +181,6 @@ def test_native_prepare_has_dependency_stage(tmp_path):
     runner = local()
     options = runner.parser().parse_args(['prepare', '--suite', 'native', '--output', str(tmp_path / 'logs')])
     steps = runner.preparation_steps(options, tmp_path / 'inputs')
-    assert [s.name for s in steps] == ['native-dependencies']
+    assert [s.name for s in steps] == ['native-dependencies', 'python-sync']
     assert steps[0].link_mode == 'source'
     assert steps[0].command == ['cargo', 'fetch', '--locked', '--manifest-path', 'sdk/python/native/Cargo.toml']

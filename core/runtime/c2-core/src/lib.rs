@@ -53,7 +53,7 @@ pub use identity::{
 // writing their own paths, parsers, or management loops.
 pub use c2_local::{
     ConnectionClosed, ConnectionEndReason, ConnectionEvent, ConnectionEvents,
-    ConnectionEventsError, ConnectionObservation, ENDPOINT_CREDENTIAL_MAX_BYTES,
+    ConnectionEventsError, ConnectionObservation, ConnectionSide, ENDPOINT_CREDENTIAL_MAX_BYTES,
     ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential, EndpointCredentialError,
     EndpointCredentialErrorKind, EndpointInspection, EndpointIoError, EndpointReapResult,
     EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, LocalEndpoint, SweepBatch,
@@ -62,9 +62,7 @@ pub use c2_local::{
 pub use call_execution::{CallExecutionObservation, CallExecutionObserver};
 // Blocking waits for the connection-observation surface stay with Core's
 // single runtime authority; SDKs project parameters and results only.
-pub use connection_observation::{
-    ConnectionEventWait, recv_connection_event, wait_connection_closed,
-};
+pub use connection_observation::{ConnectionEventWait, recv_connection_event};
 pub use memory::{
     MemoryCellStats, MemoryScopeStats, RetiredMemoryObservation, RetiredScopeReport,
     RetirementHandoff, RuntimeMemoryStats, scope,

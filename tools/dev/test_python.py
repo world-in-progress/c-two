@@ -47,7 +47,6 @@ WINDOWS_ENDPOINT_TESTS = frozenset((
     ),
     *(f"tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[{case}]"
       for case in ("missing-2", "denied-2", "busy-0.2", "busy-None", "busy-10")),
-    "tests/integration/test_local_io_cause.py::test_windows_real_listener_conflict_has_no_raw_system_code",
 ))
 # Frozen platform cases, including exact parameter IDs. A matching reason on
 # any other test remains a failure; unavailable prerequisites are never allowed.

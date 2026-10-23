@@ -111,7 +111,10 @@ impl Connection {
     /// All fields start at their default/empty state; `last_activity` is set
     /// to the current instant.
     pub fn new(conn_id: u64) -> Self {
-        let connection = Self::with_publisher(conn_id, ConnectionPublisher::new());
+        let connection = Self::with_publisher(
+            conn_id,
+            ConnectionPublisher::new(c2_local::ConnectionSide::Server),
+        );
         connection.select_ordinary_protocol();
         connection
     }
@@ -180,7 +183,7 @@ impl Connection {
 
     // -- peer SHM accessors -------------------------------------------------
 
-    /// Get a shared reference to the peer's MemPool (for ShmBuffer construction).
+    /// Get a shared reference to the peer's MemPool.
     /// Returns None if handshake hasn't completed yet.
     #[cfg(test)]
     pub(crate) fn peer_pool_arc(&self) -> Option<Arc<RwLock<MemPool>>> {
@@ -227,7 +230,7 @@ impl Connection {
     }
 
     /// Ensure the peer's SHM segment at `seg_idx` is mapped (lazy-open).
-    /// Does NOT read data — just ensures the segment is available for ShmBuffer access.
+    /// Does NOT read data — just ensures the segment is available for peer access.
     pub fn ensure_peer_segment(
         &self,
         seg_idx: u16,
@@ -425,6 +428,10 @@ mod tests {
     #[test]
     fn new_connection_defaults() {
         let conn = Connection::new(42);
+        assert_eq!(
+            conn.connection_observation().side(),
+            c2_local::ConnectionSide::Server
+        );
         assert_eq!(conn.conn_id(), 42);
         assert!(!conn.handshake_done());
         assert!(!conn.chunked_capable());

@@ -755,6 +755,13 @@ def dispatch(route, method, request):
                 let view = module.getattr("view").unwrap();
                 let owner = view.getattr("obj").unwrap();
                 let owner = owner.cast::<PyCoreRequestBuffer>().unwrap().borrow();
+                let tracker = PyBufferLeaseTracker::from_arc(std::sync::Arc::new(
+                    c2_mem::BufferLeaseTracker::new(false),
+                ));
+                owner
+                    .track_retained(&tracker, "request-owner", "dispatch", "resource_input")
+                    .unwrap();
+                assert_eq!(tracker.inner.stats().total_held_bytes, 32);
                 assert_eq!(owner.bytes.as_ptr(), address);
                 assert_eq!(
                     view.call_method0("tobytes")
@@ -769,7 +776,11 @@ def dispatch(route, method, request):
                         .unwrap_err()
                         .is_instance_of::<PyBufferError>(py)
                 );
+                assert_eq!(tracker.inner.stats().active_holds, 1);
                 view.call_method0("release").unwrap();
+                owner.release().unwrap();
+                assert_eq!(tracker.inner.stats().active_holds, 0);
+                assert_eq!(tracker.inner.stats().total_held_bytes, 0);
                 owner.release().unwrap();
                 assert!(owner.__len__().is_err());
             }

@@ -326,7 +326,7 @@ def _build_transfer_wrapper(
                 return HeldResult(result)
             return result
 
-        except error.CCBaseError:
+        except error.CCError:
             raise
         except Exception as exc:
             details = _cause_details(exc)

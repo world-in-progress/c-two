@@ -6,6 +6,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from typing import Literal, get_type_hints
 
 import pytest
 
@@ -35,6 +36,48 @@ def test_public_connect_timeout_is_optional_keyword():
     assert timeout.default is None
 
 
+@pytest.mark.parametrize('category', ['semantic', 'contract', 'admission', 'transport', 'lifecycle'])
+def test_public_core_error_has_complete_independent_fields(category):
+    error = cc.error.CoreError(category, 'native diagnostic')
+    assert isinstance(error, cc.error.CCBaseError)
+    assert isinstance(error, RuntimeError)
+    assert not isinstance(error, cc.error.CCError)
+    assert type(error).__module__ == 'c_two.error'
+    assert str(error) == error.message == 'native diagnostic'
+    assert error.args == ('native diagnostic',)
+    assert error.category == category
+    optional = {
+        'code', 'name', 'error_bytes', 'transport_kind', 'transport_phase',
+        'fallback_eligible', 'route_withdrawal', 'io_operation', 'io_kind',
+        'raw_os_error', 'lifecycle_kind', 'startup_stage', 'timeout_seconds',
+        'route_name', 'status_code', 'body', 'relay_duplicate', 'failure_source',
+        'registration_failure', 'rollback', 'relay_cleanup_error',
+    }
+    assert all(getattr(error, field) is None for field in optional)
+    assert optional | {'category', 'message', 'details'} == set(cc.error.CoreError.__annotations__)
+    other = cc.error.CoreError(category, 'another diagnostic')
+    error.details['caller'] = 'one'
+    assert other.details == {}
+    assert not hasattr(_native, 'CoreError')
+    assert not hasattr(cc, 'CoreError')
+
+
+def test_public_core_error_annotations_expose_native_literal_values():
+    hints = get_type_hints(cc.error.CoreError)
+    assert hints['category'] == Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle']
+    assert hints['transport_kind'] == Literal['ipc', 'http'] | None
+    assert hints['transport_phase'] == str | None
+    assert hints['io_operation'] == Literal['bind', 'connect'] | None
+    assert hints['io_kind'] == Literal[
+        'permission_denied', 'not_found', 'connection_refused', 'address_in_use', 'other',
+    ] | None
+    assert hints['startup_stage'] == Literal['readiness', 'responsiveness', 'owner_control'] | None
+    assert hints['code'] == int | None
+    assert hints['details'] == dict[str, str]
+    assert hints['error_bytes'] == bytes | None
+    assert hints['fallback_eligible'] == hints['route_withdrawal'] == bool | None
+
+
 @pytest.mark.parametrize('timeout', [-1, -0.01, float('nan'), float('inf'), float('-inf'), 1e300])
 @pytest.mark.parametrize('mode', ['ipc', 'explicit_relay', 'relay'])
 def test_native_connect_rejects_invalid_options_before_transport(timeout, mode):
@@ -59,6 +102,8 @@ def test_public_zero_timeout_has_connect_semantics_without_transport(address):
         assert failure.value.transport_phase == 'pre_dispatch'
         assert failure.value.details['operation'] == 'connect'
         assert failure.value.details['stage']
+        assert isinstance(failure.value.__cause__, cc.error.CoreError)
+        assert failure.value.__cause__.error_bytes == cc.error.CCError.serialize(failure.value)
     finally:
         _ProcessRegistry.reset()
 
@@ -85,11 +130,14 @@ def test_local_connect_keeps_direct_objects_and_does_not_invoke_resource(timeout
 
 
 def test_native_local_zero_validation_runs_no_python_callback():
-    with pytest.raises(_native.CoreError) as failure:
+    with pytest.raises(RuntimeError) as failure:
         _native.ConnectAttempt(timeout_seconds=0)
     assert failure.value.details['operation'] == 'connect'
     assert failure.value.details['stage'] == 'connect_start'
     assert (failure.value.io_kind, failure.value.raw_os_error, failure.value.io_operation) == (None, None, None)
+    assert failure.value.category == 'semantic'
+    assert failure.value.name == 'CallDeadlineExceeded'
+    assert isinstance(failure.value, cc.error.CoreError)
 
 
 @pytest.mark.parametrize('timeout', [None, 0.125])
@@ -144,7 +192,7 @@ def test_registry_projects_budget_with_full_expected_contract(timeout, address, 
 
 
 def test_native_deadline_error_round_trip_preserves_connect_details():
-    with pytest.raises(_native.CoreError) as failure:
+    with pytest.raises(cc.error.CoreError) as failure:
         _native.ConnectAttempt(timeout_seconds=0)
     native = failure.value
     projected = cc.error.CCError.deserialize(native.error_bytes)
@@ -273,7 +321,7 @@ def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
 
         def connect_via_relay(self, *args, connect_attempt=None):
             observed.append(connect_attempt)
-            raise _native.CoreError('projection reached')
+            raise cc.error.CoreError('lifecycle', 'projection reached')
 
     registry._runtime_session = CapturedSession()
     with pytest.raises(cc.error.RegistryUnavailable, match='projection reached'):
@@ -346,7 +394,7 @@ def test_expiry_after_python_lock_acquisition_releases_only_new_acquisition():
             lock.release()
 
     attempt = _native.ConnectAttempt(timeout_seconds=0.05)
-    with pytest.raises(_native.CoreError) as failure:
+    with pytest.raises(cc.error.CoreError) as failure:
         attempt.acquire_lock(DelayedAcquire(), 'registry_snapshot_wait')
     assert failure.value.details['stage'] == 'registry_snapshot_wait'
     assert released == [True]

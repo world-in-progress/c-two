@@ -222,8 +222,11 @@ impl EndpointTestRoot {
         use std::os::unix::fs::DirBuilderExt;
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/rn{:x}{:x}",
+        let parent = std::env::var_os("C2_IPC_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let path = parent.join(format!(
+            "rn{:x}{:x}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

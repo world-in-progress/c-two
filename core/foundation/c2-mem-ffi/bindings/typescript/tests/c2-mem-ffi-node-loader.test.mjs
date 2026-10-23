@@ -242,6 +242,8 @@ test('Runtime shares its first-attempt native snapshot with queries and reconnec
     let fail = false;
     class Socket extends EventEmitter {
       destroyed = false;
+      pause() { return this; }
+      resume() { return this; }
       write(bytes, callback) { writes.push(bytes); callback?.(); return true; }
       end() { this.emit('end'); return this; }
       destroy() { if (!this.destroyed) { this.destroyed = true; this.emit('close'); } return this; }
@@ -393,6 +395,7 @@ test('typed shared snapshot frees after its last factory or accessor owner, incl
       const open = () => {
         const socket = new EventEmitter();
         socket.destroyed = false;
+        socket.pause = socket.resume = () => socket;
         socket.end = () => socket;
         socket.destroy = () => { socket.destroyed = true; socket.emit('close'); return socket; };
         queueMicrotask(() => socket.emit('connect'));

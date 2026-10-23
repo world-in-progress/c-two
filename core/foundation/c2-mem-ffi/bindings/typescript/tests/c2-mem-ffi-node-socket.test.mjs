@@ -7,9 +7,10 @@ import { createNodeIpcConnect } from '../dist/index.js';
 async function connectionWith(write) {
   const socket = new EventEmitter();
   socket.destroyed = false;
+  socket.pause = socket.resume = () => socket;
   socket.write = (bytes, callback) => write(socket, bytes, callback);
   socket.end = () => socket;
-  socket.destroy = () => { socket.destroyed = true; return socket; };
+  socket.destroy = () => { socket.destroyed = true; socket.emit('close'); return socket; };
   const connector = createNodeIpcConnect({
     resolveEndpoint: () => process.platform === 'win32' ? '\\\\.\\pipe\\c2-test-socket' : '/tmp/c2-test-socket',
     createConnection: () => {

@@ -84,9 +84,9 @@ def required_tools(suite: str, *, prepare: bool) -> list[str]:
         required.add('cargo')
     if any(s in selected for s in ('core', 'python', 'typescript', 'node')):
         required.update(('node', 'npm'))
-    if prepare and any(s in selected for s in ('python', 'typescript')):
+    if prepare and any(s in selected for s in ('python', 'typescript', 'native')):
         required.update(('cmake', 'ninja'))
-    if any(s in selected for s in ('python', 'repo')) or (prepare and 'typescript' in selected):
+    if any(s in selected for s in ('python', 'repo')) or (prepare and any(s in selected for s in ('typescript', 'native'))):
         required.add('uv')
     return sorted(required)
 
@@ -157,7 +157,7 @@ def suite_steps(options, root: Path) -> list[Step]:
         'core': ['cargo', 'test', '--locked', '--manifest-path', 'core/Cargo.toml', '--workspace'],
         'cli': ['cargo', 'test', '--locked', '--manifest-path', 'cli/Cargo.toml'],
         'rust-sdk': ['cargo', 'test', '--locked', '--manifest-path', 'sdk/rust/Cargo.toml', '--all-features'],
-        'native': ['cargo', 'test', '--locked', '--manifest-path', 'sdk/python/native/Cargo.toml'],
+        'native': [python, 'tools/dev/test_native.py'],
         'repo': [os.path.abspath(options.repo_python or python), '-m', 'pytest', '--confcutdir=tests/repo', 'tests/repo', '-q', '-rs', '--timeout=60',
                  f'--basetemp={output / "repo/tmp"}', f'--junitxml={output / "repo/junit.xml"}'],
         'python': [python, 'tools/dev/test_python.py', '--python', python, '--c3', str(c3.resolve()),
@@ -491,7 +491,7 @@ def preparation_steps(options, staging: Path) -> list[Step]:
                                'source' if suite == 'native' else 'system'))
     if any(s in selected for s in ('cli', 'python', 'typescript')):
         result.append(Step('c3-build', ['cargo', 'build', '--locked', '--manifest-path', 'cli/Cargo.toml', '--bins'], 'source'))
-    if any(s in selected for s in ('python', 'typescript')):
+    if any(s in selected for s in ('python', 'typescript', 'native')):
         result.append(Step('python-sync', ['uv', 'sync', '--locked', '--python', options.python], 'source'))
     if 'repo' in selected:
         repo_venv = staging / 'repo-venv'

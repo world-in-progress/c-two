@@ -58,24 +58,3 @@ def test_native_buffer_lease_tracker_rejects_invalid_labels():
             pass
         else:
             raise AssertionError(f"expected ValueError for {kwargs}")
-
-
-def test_response_buffer_inline_retained_lease_counts_until_release():
-    tracker = _native.BufferLeaseTracker()
-    # RustClient is not needed for this unit test because MemPool.read() returns bytes,
-    # so this test uses the tracker object directly through a retained lease.
-    lease = tracker.track_retained(
-        route_name="grid",
-        method_name="subdivide_grids",
-        direction="client_response",
-        storage="inline",
-        bytes=3,
-    )
-    assert tracker.stats()["by_storage"]["inline"]["active_holds"] == 1
-    lease.release()
-    assert tracker.stats()["by_storage"]["inline"]["active_holds"] == 0
-
-
-def test_native_buffer_classes_expose_track_retained_methods():
-    assert hasattr(_native.ResponseBuffer, "track_retained")
-    assert hasattr(_native.ShmBuffer, "track_retained")

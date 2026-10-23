@@ -197,8 +197,8 @@ mod tests {
     async fn heartbeat_timeout_returns() {
         use tokio::io::AsyncReadExt;
         let source = c2_local::ConnectionEventSource::new();
-        let mut events = source.subscribe();
-        let publisher = source.open_connection();
+        let events = source.subscribe();
+        let publisher = source.open_connection(c2_local::ConnectionSide::Server);
         let conn = Arc::new(Connection::observed(publisher.clone()));
         conn.select_ordinary_protocol();
         let observation = conn.connection_observation();

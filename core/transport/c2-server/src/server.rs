@@ -1958,7 +1958,9 @@ fn handle_connection(
     server: Arc<Server>,
     stream: LocalStream,
 ) -> impl std::future::Future<Output = ()> + Send {
-    let publisher = server.connection_event_source.open_connection();
+    let publisher = server
+        .connection_event_source
+        .open_connection(c2_local::ConnectionSide::Server);
     let stream = stream.with_connection_publisher(publisher.clone());
     let conn = Arc::new(Connection::observed(publisher));
     let conn_id = conn.conn_id();
@@ -7353,7 +7355,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let mut events = server.connection_events();
+            let events = server.connection_events();
             let route_a_started = Arc::new(AtomicUsize::new(0));
             let route_b_started = Arc::new(AtomicUsize::new(0));
             let release_route_a =
@@ -7883,7 +7885,7 @@ mod tests {
     #[tokio::test]
     async fn unpolled_connection_events_do_not_retain_host_or_connection() {
         let source = ConnectionEventSource::new();
-        let mut events = source.subscribe();
+        let events = source.subscribe();
         let server = Arc::new(
             Server::new(
                 &unique_readiness_address("observation_unpolled"),
@@ -7936,7 +7938,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut events = server.connection_events();
+        let events = server.connection_events();
         let (peer, stream) = LocalStream::pair().await.unwrap();
         let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
         let observation = match events.recv().await.unwrap().unwrap() {
@@ -7975,7 +7977,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let mut events = server.connection_events();
+            let events = server.connection_events();
             let (mut peer, stream) = LocalStream::pair().await.unwrap();
             let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
             let observation = match events.recv().await.unwrap().unwrap() {
