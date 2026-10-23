@@ -1,0 +1,271 @@
+{
+  "version": "0.8.2",
+  "cli_version": "0.4.1",
+  "baseline_sha": "7ff2bf512f0d8d151d32c5e90929ba66deda47ba",
+  "candidate_sha": "c94aa83c1c7bd7cfb6dce4504ff34e4fe1ced990",
+  "implementation_sha": "fc8ad41d0761ed1cfe578d892d6a78be856ff971",
+  "source_sha": "2aa60fe0d259aa3364b4d49fc74797672decab66",
+  "pull_request": "https://github.com/world-in-progress/c-two/pull/195",
+  "protocols": {
+    "IPC": 12,
+    "SHM": 3,
+    "C_FFI_ABI": 5,
+    "owner_control": 1,
+    "business_frames": "unchanged",
+    "CRM_hashes": "unchanged"
+  },
+  "delta": {
+    "docs": [
+      236,
+      94
+    ],
+    "metadata": [
+      13,
+      4
+    ],
+    "production": [
+      322,
+      117
+    ],
+    "tests": [
+      889,
+      202
+    ]
+  },
+  "delta_method": "git diff --unified=0 physical added/deleted lines; cfg(test) spans and tools counted as tests; docs and manifests/locks separate",
+  "R18_delta": {
+    "metadata": [
+      1,
+      0
+    ],
+    "production": [
+      70,
+      21
+    ],
+    "tests": [
+      368,
+      23
+    ]
+  },
+  "reviews": {
+    "tool": "hey-my-buddy 0.51.1",
+    "implementation": "83ebdb7c-5ac3-4362-a050-5fd1c375a9cd",
+    "test_entrypoint": "dddbfeb0-0cfc-4b74-b1f5-821cff960d5b",
+    "outcome": "accepted; no unresolved blockers; read-only review distinct from test execution"
+  },
+  "source_validation": [
+    {
+      "run_id": 39938148830,
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/39938148830",
+      "source_sha": "c94aa83c1c7bd7cfb6dce4504ff34e4fe1ced990",
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "changes",
+          "conclusion": "success"
+        },
+        {
+          "name": "workflow policy",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (windows-2025, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (windows-2022, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (ubuntu-24.04, py3.14t)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (windows-11-arm, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (ubuntu-24.04, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (macos-15, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "test (py3.14t)",
+          "conclusion": "success"
+        },
+        {
+          "name": "test (py3.12)",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "run_id": 39942349170,
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/39942349170",
+      "source_sha": "2aa60fe0d259aa3364b4d49fc74797672decab66",
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "changes",
+          "conclusion": "success"
+        },
+        {
+          "name": "workflow policy",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (ubuntu-24.04, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (windows-11-arm, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (windows-2022, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (macos-15, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (windows-2025, py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "source (ubuntu-24.04, py3.14t)",
+          "conclusion": "success"
+        },
+        {
+          "name": "test (py3.12)",
+          "conclusion": "success"
+        },
+        {
+          "name": "test (py3.14t)",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "artifact_source_note": "Source 2aa60fe0 produced the release; later acceptance and changelog documentation commits did not produce these artifacts.",
+  "release_candidate": {
+    "run_id": 39948762550,
+    "url": "https://github.com/world-in-progress/c-two/actions/runs/39948762550",
+    "passed_jobs": 38,
+    "designed_skip": "linux (aarch64-unknown-linux-gnu) / sdist",
+    "counts": {
+      "wheels": 35,
+      "sdist": 1,
+      "cli": 6,
+      "installers": 2,
+      "fastdb_proof": 9,
+      "receipts": 56
+    },
+    "manifest_sha256": "f4fd1c94aa51b8a8b369c0a06765e70e5422e308daec2fbf900763902ede9720",
+    "manifest_url": "https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1/rc-manifest.json"
+  },
+  "promotion": {
+    "python_dry_run": 39951202646,
+    "cli_dry_run": 39951205132,
+    "python_publish": 39951565265,
+    "cli_publish": 39951570298,
+    "all_conclusions": "success",
+    "pypi_environment": "approved under explicit user release authorization; exact plan verified",
+    "rebuilt_during_promotion": false
+  },
+  "publication": {
+    "pypi_version": "0.8.2",
+    "wheel_count": 35,
+    "windows_arm64_wheels": [
+      "c_two-0.8.2-cp311-cp311-win_arm64.whl",
+      "c_two-0.8.2-cp312-cp312-win_arm64.whl",
+      "c_two-0.8.2-cp313-cp313-win_arm64.whl",
+      "c_two-0.8.2-cp314-cp314-win_arm64.whl",
+      "c_two-0.8.2-cp314-cp314t-win_arm64.whl"
+    ],
+    "cli_tag": "c3-v0.4.1",
+    "cli_url": "https://github.com/world-in-progress/c-two/releases/tag/c3-v0.4.1",
+    "all_names_sizes_sha256_match": true,
+    "yanked_files": 0,
+    "pypi_file_count": 36,
+    "cli_asset_count": 17,
+    "tag_source_sha": "2aa60fe0d259aa3364b4d49fc74797672decab66"
+  },
+  "macos": {
+    "targeted_python_passed": 231,
+    "windows_only_skips": 6,
+    "native_rust_passed": 8,
+    "shared_test_and_runner_passed": 83,
+    "runner_windows_only_skip": 1,
+    "private_socket_lease_remaining": 0,
+    "published_smoke": {
+      "version": "0.8.2",
+      "installed_package": true,
+      "optional_imports_absent": true,
+      "public_error": {
+        "category": "transport",
+        "io_kind": "not_found",
+        "raw_os_error": 2
+      },
+      "physical_events": [
+        "opened",
+        "opened",
+        "opened",
+        "peer_eof",
+        "peer_eof",
+        "local_close"
+      ],
+      "remaining_socket_or_lease": []
+    }
+  },
+  "windows_dev": {
+    "audit": {
+      "source": "dac43117dbeaee3a12b1da308d406b9a4fdeaad7",
+      "result": "PASS",
+      "owned_processes": 0,
+      "lease_files": 0,
+      "endpoint_backend": "Windows Named Pipe and kernel listener lease",
+      "endpoint_evidence": "Native close and per-fixture teardown assertions passed",
+      "platform": "Microsoft Windows NT 10.0.26200.0",
+      "arch": "AMD64"
+    },
+    "checks": {
+      "targeted_python": 221,
+      "platform_skips": 16,
+      "rust_relay": 412,
+      "native": 8,
+      "persistent_node": 2,
+      "observations": "local/core/server/reconnect/handshake passed",
+      "python_relay": 54,
+      "portable": 39,
+      "node_tests": 59,
+      "node_unix_skips": 3
+    },
+    "retained_evidence_files": 45,
+    "retained_manifest_sha256": "ba8418e62df8a1aa37f624e825dbc5994d8468147e1e4cef7761c30247d98d70",
+    "retained_manifest_name": "windows-evidence-manifest.json"
+  },
+  "diagnostic_runs": {
+    "cli_lock_mismatch_cancelled": 39930307694,
+    "strict_platform_skip_failed": 39931323867,
+    "correction_sha": "c94aa83c1c7bd7cfb6dce4504ff34e4fe1ced990",
+    "correction": "One unchanged listener-conflict body executes on every platform; retired skip permission removed; assertions retained."
+  },
+  "cleanup": {
+    "windows_removed_bytes": 3879279689,
+    "windows_task_processes_remaining": 0,
+    "local_final_removed_bytes": 45066538,
+    "urgent_rust_target_directories": 9,
+    "urgent_rust_disk_bytes": 2006691840,
+    "free_GiB_after_urgent_cleanup": 9.7,
+    "buddy_checkouts": "reclaimed",
+    "other_task_worktree": "slimming-batches retained after application ownership refusal",
+    "preserved_other_task_branch": "socu/076-ci-release-gates",
+    "historical_ipc": "not cleaned or migrated",
+    "source_dependencies": "retained; task-built native extension removed"
+  }
+}

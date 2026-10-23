@@ -1,6 +1,6 @@
 # R16：Node 收发与空闲背压验收
 
-基线为 `764d39b03971119bc73301eb1d4d58465dce7649`，实现候选为 `02be11ea9ed0f8254838c39f42003c75891d86d7`。[Source Validation](https://github.com/Dsssyc/c-two/actions/runs/39892443324) 的全部 10 个作业通过，包括 Linux、macOS、Windows 2022、Windows 2025、Windows ARM64 和 Python 3.14t。运行 attempt 为 1；候选未通过重复重跑取得验收。ARM64 的 26 个验证步骤及安装后的普通/标准用户验收通过，FastDB、C-Two 原生库和 c3 的 PE machine 均为 `0xAA64`。最终提交相对候选仅补充文档和验收记录，生产与测试字节一致。本批未发版。
+基线为 `764d39b03971119bc73301eb1d4d58465dce7649`，实现候选为 `02be11ea9ed0f8254838c39f42003c75891d86d7`。[Source Validation](https://github.com/Dsssyc/c-two/actions/runs/39892443324) 的全部 10 个作业通过，包括 Linux、macOS、Windows 2022、Windows 2025、Windows ARM64 和 Python 3.14t。运行 attempt 为 1；候选未通过重复重跑取得验收。ARM64 的 26 个验证步骤及安装后的普通/标准用户验收通过，FastDB、C-Two 原生库和 c3 的 PE machine 均为 `0xAA64`。最终提交相对候选仅补充文档和验收记录，生产与测试字节一致。该次独立验收时未发版；随后已随 0.8.2 交付，见[发布记录](2026-10-23-082-client-observation-release-acceptance.md)。
 
 实现复用原帧解析、关闭、chunk 拼接和 SHM 释放。chunked 请求在上传期间接收回复；失败先保存主错误，关闭连接，等待收发双方结束，归还已校验但未交付的 SHM 回复。逐片早停使用已有 connectionPromise 与 callChain，不增加停止状态机。成功连接继续复用；失败调用不重放，下一次调用重新建连并保留 server instance、route UID/revision 校验。Node 仅在 readExactly 需要更多数据时 resume，每次收片后 pause，保留大读取、并发读与 EOF 尾部行为。
 
