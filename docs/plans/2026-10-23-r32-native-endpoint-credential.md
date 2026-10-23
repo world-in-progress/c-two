@@ -1,10 +1,10 @@
 # R32：端点凭据单一原生投影方案
 
-状态：用户已确认完整边界，实施后正在验证。固定分析输入为 `548710a8617a33755d5ad73f62b3271452429874`，即 0.8.2 发布后同步了验收记录的主分支。本次只收敛 R32 的 Python 端点凭据投影；结构化错误转换、R17 的 inspect/reap I/O 分类及两份控制会话重构继续独立保留。
+状态：已实施并验收，实现提交 `6065660318fd74161ca873eb99e6a74b5e384a1f`。实际生产净减 66 行、测试净增 14 行，合计净减 52 行；完整回归、Windows 开发机、GitHub Actions 10/10（含 Windows ARM64）、端点零残留及独立审查见[验收记录](../reports/2026-10-23-r32-native-endpoint-credential-acceptance.md)。固定分析输入为 `548710a8617a33755d5ad73f62b3271452429874`，即 0.8.2 发布后同步了验收记录的主分支。本次只收敛 R32 的 Python 端点凭据投影；结构化错误转换、R17 的 inspect/reap I/O 分类及两份控制会话重构继续独立保留。
 
 ## 调用链和原设计
 
-当前 `cc.inspect_endpoint` 经 `transport/endpoint.py` 进入 `endpoint_ffi.rs::inspect_endpoint_endpoint`，由 Core 重导出的 `c2-local::inspect_endpoint` 返回 `EndpointInspection::Present(EndpointCredential)`。PyO3 随后将此凭据编码成 JSON；Python 的 `_wrap_credential` 再调用 `EndpointCredential.from_json`，经 PyO3 返回同一个 Rust codec 重新解析、派生 context 和 endpoint，最后套入持有 `_native` 的 Python 对象。后续 `cc.reap_endpoint` 又取出 `_native` 交给 Rust。
+基线的 `cc.inspect_endpoint` 经 `transport/endpoint.py` 进入 `endpoint_ffi.rs::inspect_endpoint_endpoint`，由 Core 重导出的 `c2-local::inspect_endpoint` 返回 `EndpointInspection::Present(EndpointCredential)`。PyO3 随后将此凭据编码成 JSON；Python 的 `_wrap_credential` 再调用 `EndpointCredential.from_json`，经 PyO3 返回同一个 Rust codec 重新解析、派生 context 和 endpoint，最后套入持有 `_native` 的 Python 对象。后续 `cc.reap_endpoint` 又取出 `_native` 交给 Rust。
 
 `def93646` 在 2026-10-06 引入 Python 维护面。原报告明确要求 Rust 独占字段校验、路径派生和回收权，Python 提供门面；JSON 则服务于持久记录与跨进程传递。未发现同进程、同次 inspect 的 JSON 往返是独立安全边界的设计承诺。`5ed04149`、`b0031040` 后续把捕获的 context 和最终目录身份带入凭据，并没有让 Python wrapper 获得额外 authority。当前原生 `PyEndpointCredential` 已经提供全部 metadata、`from_json`、`to_json` 和 repr；Python 类只再转发一次。`LocalEndpointContext`、连接观察和所有者控制类型已经采用原生类直接公开的方式，本项复用这一现有模式。
 
@@ -19,7 +19,7 @@
 | 现有 Python 端点测试 | wrapper 断言改为原生类型、不可手工构造/替换/继承断言；补 `document=` 和 repr 边界；两处 native reap 调用去掉 `_native` 解包。合并到现有用例，不另建夹具或框架。 | 净增约 10–20 行 |
 | 生产与测试合计 | 去掉一个 Python 对象层及一次 JSON encode/decode、endpoint 重建链。 | 预计净减约 35–55 行 |
 
-这是基于当前替换范围的估算，不是已完成的减量；实施后按实际 numstat 分开报告生产、测试、文档。可确定的运行成本收益是每次 Unix `present` 少一次编码、一次解码和一个 wrapper 分配，不承诺尚未测量的延迟或吞吐提升。Windows 的 inspect 本来返回 kernel-managed 状态，本项不会给 Windows 凭空制造凭据。
+上表保留确认时的估算，实际 numstat 已在验收记录中分开统计生产、测试和文档。可确定的运行成本收益是每次 Unix `present` 少一次编码、一次解码和一个 wrapper 分配；没有测量延迟或吞吐提升。Windows 的 inspect 本来返回 kernel-managed 状态，本项不会给 Windows 凭空制造凭据。
 
 ## API、协议与语义
 
@@ -31,15 +31,15 @@
 
 Rust 公开 API、C/FFI ABI 5、IPC 12、SHM 3、owner control 1、业务帧、CRM 哈希及凭据 JSON 格式不变。配置冻结、身份校验、回收/关闭和生命周期策略不变；不更改 socket/协调记录位置，不接纳历史对象，不扩大 sweep 范围。公开 re-export 继续指向唯一类型，不保留旧 wrapper 作为兼容层。
 
-## 回归风险与确认后的验收
+## 回归风险与验收边界
 
 主要风险是 Python 类替换造成的公开调用形状变化，或迁移测试时误删跨 context、旧 incarnation 和异常退出覆盖。将正常 metadata/JSON round-trip、`document=`、引号/非 ASCII repr、跨 context 拒绝和正常关闭覆盖先在基线确认；类型、构造、复制退役断言在候选执行。保留现有未知字段/版本/平台、尺寸边界、地址失配、目录替换、异常退出及重新绑定后的精确回收断言。
 
 优先修改 `tests/unit/test_endpoint_maintenance.py`、`tests/unit/test_endpoint_context.py` 和 `tests/integration/test_endpoint_context.py` 中已有用例。Unix 的真实 Present 对象直接传入 reap，导出的 JSON 再导入后同样传入 reap，覆盖两种真正的入口；Windows 执行 Named Pipe kernel-managed、Windows credential JSON、错平台和错地址分支，不能用 Unix skip 代替。真实 connection observation 的子进程清理也要通过原公开路径。
 
-完成端点定向回归、完整 relay、真实跨语言、三系统及独立实现审查。Windows 优先开发机；由于 Python API 删除，确切候选还需完成 GitHub Actions 现行跨平台门禁，包括 Windows ARM64 与 3.14t。针对本批隔离端点验收 socket/lease 零残留，随后清理不再使用的构建产物。已经通过且不受本批影响的历史候选不重跑。
+端点定向回归、完整 relay、真实跨语言、三系统及独立实现审查均已完成。Windows 先在开发机验证；由于 Python API 删除，确切候选同时通过 GitHub Actions 现行跨平台门禁，包括 Windows ARM64 与 3.14t。本批隔离端点 socket/lease 零残留验收及构建产物清理均已完成，详细范围见验收记录。已经通过且不受本批影响的历史候选没有重跑。
 
-同步更新当前 Python 使用/端点生命周期中英文说明及发布迁移条目，说明唯一类型和显式 JSON 交接；历史验收报告保持原事实。清单仍将 R32 标为部分完成，直到本子项实际验收。
+当前 Python 使用/端点生命周期中英文说明及未发布迁移条目已同步，说明唯一类型和显式 JSON 交接；历史验收报告保持原事实。本凭据子项已完成，R32 整项仍标为部分完成，剩余内部错误转换另行评估。
 
 ## 本轮分析证据
 

@@ -52,7 +52,7 @@ R13 已交付子项生产净减 104 行、测试净增 59 行，合计净减 45 
 | R22 剩余 | benchmark selector、旧 sweep 和测量标签仅为工具整理。已完成的 SDK 登记/撤回与强制 HTTP 实跑保持。 |
 | R25 剩余 | 三个旧 call_prepared 入口已退役；FastDB 正式路径、Python-only pickle、Core bytes、服务端 sink、Rust 预分配及当前 client/scheduler 适配边界保留。新的协议收窄需独立决定。R23 bridge、R24 旧 buffer 参数链已完成。 |
 | R26 | relay journal 明确保留；旧快照及删除原因有独有信息，未来 watch/list history 尚未退役，也没有支持删除的成本测量。 |
-| R29、R32、R33 剩余 | codegen 同次缓存/typed projection、结构化错误与凭据内部序列化、Python 错误常量及孤立 wrap_error。0.8.2 的公开 CoreError 是现有错误链投影，不代表 R32 内部序列化收敛已经完成。R32 凭据子项的[单一原生投影方案](2026-10-23-r32-native-endpoint-credential.md)已确认，实施后正在验收；预计生产与测试合计净减 35–55 行。生成 release 复用、call-control 写入去重和 Rust 错误码单一声明已完成；其余转换子项净收益仍不足，Transport 内外层错误、外部 JSON/wire 与错误顺序保留。 |
+| R29、R32、R33 剩余 | codegen 同次缓存/typed projection、结构化错误内部序列化、Python 错误常量及孤立 wrap_error。0.8.2 的公开 CoreError 是现有错误链投影，不代表 R32 内部错误转换收敛已经完成。R32 凭据子项已按[单一原生投影方案](2026-10-23-r32-native-endpoint-credential.md)验收：实现 `60656603`，生产净减 66、测试净增 14，合计净减 52 行；完整回归、三系统、GitHub Actions 10/10、端点零残留及独立审查见[验收记录](../reports/2026-10-23-r32-native-endpoint-credential-acceptance.md)。生成 release 复用、call-control 写入去重和 Rust 错误码单一声明已完成；其余转换子项净收益仍不足，Transport 内外层错误、外部 JSON/wire 与错误顺序保留。 |
 | R34、R35 | peer SHM 私有副本已退出；RouteAck 是尚未退役的公开预留协议，禁用 heartbeat 的任务优化净收益未证实。C05 ABI 4 完整端点能力子项已完成，不借机删除预分配能力。 |
 | R36、R38、R39、C06 剩余 | 已完成的死状态、不可达尾部和 readiness 后等待不再重开；真实等待、维护 EOF/错误退出、操作错误映射和外部 chunk 配置接纳仍有职责。私有 proof 或专属结果类型须先证明整体收益。 |
 | T01–T07 剩余 | 源码词串门禁、假 owner、阻塞读取、重连/GC 负例及默认值证明，随对应正确性事项替换；不为测试行数牺牲行为覆盖。已迁移的真实生命周期、协议边界和手写 golden 不回退。 |
