@@ -1,5 +1,9 @@
 # Unreleased
 
+## Inline response ownership
+
+Core now moves an IPC inline response's existing byte vector into the held response owner. Ordinary Python IPC calls and Rust held calls avoid one payload allocation and copy; Rust owned calls retain their existing move path. SHM and chunked responses keep their original transport leases, pool identity, budget accounting and release order. Python snapshots and FastDB receive adapters retain their existing behavior. Public APIs, ABI and protocols are unchanged.
+
 ## Python endpoint credentials
 
 `cc.EndpointCredential` now exposes the existing frozen native type directly. `cc.inspect_endpoint` passes the observed Rust credential to Python without encoding JSON, parsing it again or allocating a Python wrapper. `cc.reap_endpoint(address, credential)` accepts that same value. Metadata properties, `from_json(document=...)`, `to_json()` and the public repr are preserved.
