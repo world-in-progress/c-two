@@ -6,11 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.8.2] — companion c3 0.4.1
+
+### Added
+
+- One bounded physical IPC event feed for managed outgoing and accepted connections, with `side`, shared observation IDs and cross-thread subscription close. Python waits through `ConnectionEvents.recv()`; the GIL is released.
+- Public typed `c_two.error.CoreError`, sharing `CCBaseError` with semantic errors and retaining `RuntimeError` ancestry. Every structured field is present and documented.
+
+### Fixed
+
+- Relay upstream observers recover after temporary owner-capacity exhaustion through the existing retry loop. Status updates/removal use the original task generation under one lock, preserving independent unavailable-record lifetime and capacity/release semantics.
+
 ### Changed
 
+- Removed Python `ConnectionObservation.wait_closed()`, its Core blocking bridge and `_native.CoreError`, without aliases. Low-level Rust observation constructors require `ConnectionSide`; the async native close primitive remains. IPC 12, SHM 3 and C/FFI ABI 5 are unchanged. See [0.8.2 migration notes](docs/releases/0.8.2.md).
 - Removed the unused low-level Python `c_two._native.ShmBuffer` export and its native module without compatibility aliases. The existing Core request snapshot, response receive path and transport lease ordering are unchanged; R06 active buffer state, C/FFI ABI 5, IPC 12, SHM 3 and the Rust API are unchanged.
 - Low-level TypeScript IPC connections require an idempotent `close()` that terminates pending reads and writes; custom Node sockets require `pause()` and `resume()`. There are no optional-close compatibility paths.
 - Generated chunked calls receive replies during upload, close and join failed exchanges, and retain the first confirmed failure and exact SHM release. The next call reconnects under the existing identity checks; successful calls reuse their connection and failed calls are never replayed. The official Node connector pauses idle input. IPC 12, SHM 3 and C/FFI ABI 5 are unchanged.
+
+## [0.8.1]
+
+### Fixed
+
+- Python `cc.set_server(startup_timeout=...)` configures the existing Core startup budget; explicit Rust HostOptions win, then Runtime configuration, then the finite five-second default. No Python timer is added.
+- Startup expiry exposes `lifecycle_kind='startup_timeout'`, stage and configured seconds; local bind failures retain their OS cause and no longer appear as configuration errors. See [0.8.1 migration notes](docs/releases/0.8.1.md).
 
 ## [0.8.0] — companion c3 0.4.0
 

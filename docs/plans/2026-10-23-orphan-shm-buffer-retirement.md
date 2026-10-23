@@ -1,6 +1,6 @@
 # 旧 Python ShmBuffer 投影退役方案
 
-状态：已按用户确认边界完成，[验收记录](../reports/2026-10-23-shm-buffer-retirement.md)。分析输入为 `723a9130d9a26d9903d56226b6170f4143a19a29`，实现候选为 `fa62f7a3f5227626a49066d1ae51dacb88a2741a`。本项是在复核剩余 R06 时发现的独立残留，不等同于修复或关闭 R06。
+状态：已按用户确认边界完成，[验收记录](../reports/2026-10-23-shm-buffer-retirement.md)，并随 0.8.2 发布，见[发布记录](../reports/2026-10-23-082-client-observation-release-acceptance.md)。分析输入为 `723a9130d9a26d9903d56226b6170f4143a19a29`，实现候选为 `fa62f7a3f5227626a49066d1ae51dacb88a2741a`。本项是在复核剩余 R06 时发现的独立残留，不等同于修复或关闭 R06。
 
 ## 选择与历史依据
 

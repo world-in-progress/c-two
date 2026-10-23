@@ -1,6 +1,6 @@
 # 旧 Python ShmBuffer 投影退役验收
 
-状态：本机回归、GitHub Actions 全部门禁、端点验收与独立审查完成。基线为 `723a9130d9a26d9903d56226b6170f4143a19a29`，固定实现候选为 `fa62f7a3f5227626a49066d1ae51dacb88a2741a`。[Source Validation](https://github.com/Dsssyc/c-two/actions/runs/39905696790) 全部 10 个作业通过，运行 attempt 为 1，未靠重跑取得通过。最终提交相对该候选仅更新方案、清单和验收文档，生产与测试字节一致。本批不发版。
+状态：本机回归、GitHub Actions 全部门禁、端点验收与独立审查完成。基线为 `723a9130d9a26d9903d56226b6170f4143a19a29`，固定实现候选为 `fa62f7a3f5227626a49066d1ae51dacb88a2741a`。[Source Validation](https://github.com/Dsssyc/c-two/actions/runs/39905696790) 全部 10 个作业通过，运行 attempt 为 1，未靠重跑取得通过。最终提交相对该候选仅更新方案、清单和验收文档，生产与测试字节一致。该次独立验收未单独发版；随后已随 0.8.2 交付，见[发布记录](2026-10-23-082-client-observation-release-acceptance.md)。
 
 ## 实现与边界
 
