@@ -1,8 +1,8 @@
 use c2_contract::{ContractRelease, MethodAccess};
 use c2_core::{
-    Connect, ConnectionEndReason, ConnectionEvent, ConnectionEventWait, EncodedService,
-    HostOptions, MethodDefinition, Runtime, RuntimeOptions, ServiceDefinition,
-    recv_connection_event, wait_connection_closed,
+    Connect, ConnectionEndReason, ConnectionEvent, ConnectionEventWait, ConnectionSide,
+    EncodedService, HostOptions, MethodDefinition, Runtime, RuntimeOptions, ServiceDefinition,
+    recv_connection_event,
 };
 use c2_error::C2Error;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ impl EncodedService for Echo {
 #[tokio::test]
 async fn subscription_has_no_identity_configuration_or_runtime_ownership() {
     let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
-    let mut events = runtime.connection_events();
+    let events = runtime.connection_events();
     assert!(runtime.server_id().is_none());
     assert!(!runtime.local_endpoint_frozen());
     assert!(!runtime.client_config_frozen());
@@ -54,7 +54,7 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
             unix_root: Some(directory.path().to_path_buf()),
         })
         .unwrap();
-    let mut events = runtime.connection_events();
+    let events = runtime.connection_events();
     let host = runtime
         .host(HostOptions::default().without_relay())
         .unwrap();
@@ -89,12 +89,14 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
         } else {
             Duration::from_secs(2)
         };
-        match recv_connection_event(&mut events, Some(timeout)).expect("readiness probe events") {
+        match recv_connection_event(&events, Some(timeout)).expect("readiness probe events") {
             Some(ConnectionEventWait::Event(ConnectionEvent::Opened(probe))) => {
                 assert!(probes.insert(probe.connection_id(), probe).is_none());
             }
             Some(ConnectionEventWait::Event(ConnectionEvent::Closed(closed))) => {
-                let probe = probes.remove(&closed.connection_id()).expect("known readiness probe");
+                let probe = probes
+                    .remove(&closed.connection_id())
+                    .expect("known readiness probe");
                 assert_eq!(probe.snapshot(), Some(closed));
             }
             None => {
@@ -104,7 +106,7 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
             other => panic!("unexpected readiness probe event: {other:?}"),
         }
     }
-    let mut next = || match recv_connection_event(&mut events, Some(Duration::from_secs(2)))
+    let next = || match recv_connection_event(&events, Some(Duration::from_secs(2)))
         .expect("connection event wait")
     {
         Some(ConnectionEventWait::Event(event)) => Some(event),
@@ -112,6 +114,7 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
         Some(ConnectionEventWait::Lagged(missed)) => {
             panic!("connection events lagged by {missed}")
         }
+        Some(ConnectionEventWait::ConcurrentReceive) => panic!("only one receiver"),
         None => panic!("connection event deadline"),
     };
     let client_runtime = Runtime::new(RuntimeOptions {
@@ -122,6 +125,7 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
     client_runtime
         .inherit_local_endpoint_selection(&runtime)
         .unwrap();
+    let outgoing = client_runtime.connection_events();
     let client = client_runtime
         .connect(
             release.expected_route(&name).unwrap(),
@@ -131,6 +135,13 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
         )
         .unwrap();
     let observation = client.connection_observation().unwrap();
+    let Some(ConnectionEventWait::Event(ConnectionEvent::Opened(opened))) =
+        recv_connection_event(&outgoing, Some(Duration::from_secs(2))).unwrap()
+    else {
+        panic!("outgoing physical connection opened");
+    };
+    assert_eq!(opened.side(), ConnectionSide::Client);
+    assert_eq!(opened.connection_id(), observation.connection_id());
     let view = client.with_call_options(Default::default());
     assert_eq!(
         view.connection_observation().unwrap().connection_id(),
@@ -141,16 +152,21 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
     let ConnectionEvent::Opened(incoming) = next().unwrap() else {
         panic!("expected Opened");
     };
+    assert_eq!(incoming.side(), ConnectionSide::Server);
     assert!(
-        wait_connection_closed(&observation, Some(Duration::ZERO))
+        recv_connection_event(&outgoing, Some(Duration::ZERO))
             .unwrap()
             .is_none()
     );
     let outcome = host.shutdown();
     assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
-    let closed = wait_connection_closed(&observation, Some(Duration::from_secs(2)))
-        .unwrap()
-        .expect("idle receiver observed server close");
+    let Some(ConnectionEventWait::Event(ConnectionEvent::Closed(closed))) =
+        recv_connection_event(&outgoing, Some(Duration::from_secs(2))).unwrap()
+    else {
+        panic!("idle receiver observed server close");
+    };
+    assert_eq!(closed.connection_id(), observation.connection_id());
+    assert_eq!(closed.side(), ConnectionSide::Client);
     assert!(
         matches!(
             closed.reason(),
@@ -158,8 +174,8 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
         ),
         "{closed:?}"
     );
-    let incoming_closed = wait_connection_closed(&incoming, Some(Duration::ZERO))
-        .unwrap()
+    let incoming_closed = incoming
+        .snapshot()
         .expect("server side observed its own shutdown close");
     assert_eq!(incoming_closed.reason(), ConnectionEndReason::LocalClose);
     let ConnectionEvent::Closed(event) = next().unwrap() else {
@@ -176,10 +192,10 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
         "observers must not retain the Runtime or feed sender"
     );
     assert_eq!(observation.snapshot(), Some(closed));
-    assert_eq!(
-        wait_connection_closed(&observation, Some(Duration::ZERO)).unwrap(),
-        Some(closed)
-    );
+    assert!(matches!(
+        recv_connection_event(&outgoing, Some(Duration::from_secs(2))).unwrap(),
+        Some(ConnectionEventWait::Ended)
+    ));
     assert!(matches!(
         c2_local::inspect_endpoint(&endpoint),
         c2_local::EndpointInspection::Absent | c2_local::EndpointInspection::KernelManaged

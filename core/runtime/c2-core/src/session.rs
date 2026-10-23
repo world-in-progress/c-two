@@ -276,7 +276,7 @@ impl Drop for RuntimeState {
 }
 
 impl Runtime {
-    /// Subscribe to future accepted IPC connections without starting a host or
+    /// Subscribe to future outgoing and accepted IPC connections without starting a host or
     /// resolving configuration. The receiver retains metadata alone.
     pub fn connection_events(&self) -> c2_local::ConnectionEvents {
         self.connection_event_source().subscribe()
@@ -805,13 +805,17 @@ impl Runtime {
                 let mut state = connect_state_lock(&self.state, deadline, "runtime_config_wait")
                     .map_err(connect_error_to_ipc)?;
                 if let Some(config) = state.frozen_client_config.clone() {
+                    let events = state.connection_event_source.clone();
                     let pool = state
                         .client_pool
                         .get_or_insert_with(|| {
-                            Arc::new(c2_ipc::ClientPool::with_endpoint_context(
-                                Duration::from_secs(60),
-                                context.clone(),
-                            ))
+                            Arc::new(
+                                c2_ipc::ClientPool::with_endpoint_context(
+                                    Duration::from_secs(60),
+                                    context.clone(),
+                                )
+                                .with_connection_event_source(events),
+                            )
                         })
                         .clone();
                     break (config, pool);
@@ -833,13 +837,17 @@ impl Runtime {
             }
             let config = resolved.map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
             state.frozen_client_config = Some(config.clone());
+            let events = state.connection_event_source.clone();
             let pool = state
                 .client_pool
                 .get_or_insert_with(|| {
-                    Arc::new(c2_ipc::ClientPool::with_endpoint_context(
-                        Duration::from_secs(60),
-                        context.clone(),
-                    ))
+                    Arc::new(
+                        c2_ipc::ClientPool::with_endpoint_context(
+                            Duration::from_secs(60),
+                            context.clone(),
+                        )
+                        .with_connection_event_source(events),
+                    )
                 })
                 .clone();
             break (config, pool);

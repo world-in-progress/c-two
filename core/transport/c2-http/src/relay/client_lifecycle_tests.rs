@@ -96,6 +96,12 @@ async fn public_stop_cleanup_case(acquire_failure: bool) {
             .as_nanos()
     );
     let address = format!("ipc://{id}");
+    #[cfg(unix)]
+    let root = super::test_support::EndpointTestRoot::new();
+    #[cfg(unix)]
+    let context = root.context();
+    #[cfg(windows)]
+    let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
     let mut ipc = ClientIpcConfig::default();
     ipc.base.pool_enabled = false;
     ipc.base.pool_prewarm_segments = 0;
@@ -106,8 +112,8 @@ async fn public_stop_cleanup_case(acquire_failure: bool) {
     server_config.base = ipc.base.clone();
     server_config.max_execution_workers = 2;
     let server = Arc::new(
-        Server::new_with_identity(
-            &address,
+        Server::new_with_identity_and_endpoint(
+            context.endpoint(&address).unwrap(),
             server_config,
             ServerIdentity {
                 server_id: id.clone(),
@@ -160,7 +166,7 @@ async fn public_stop_cleanup_case(acquire_failure: bool) {
         let address = address.clone();
         let id = id.clone();
         let running = tokio::task::spawn_blocking(move || {
-            let relay = RelayServer::start(config).unwrap();
+            let relay = RelayServer::start_with_context(config, context).unwrap();
             relay.register_upstream("grid", &id, &address).unwrap();
             relay
         })
@@ -292,9 +298,15 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
             .as_nanos()
     );
     let address = format!("ipc://{id}");
+    #[cfg(unix)]
+    let root = super::test_support::EndpointTestRoot::new();
+    #[cfg(unix)]
+    let context = root.context();
+    #[cfg(windows)]
+    let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
     let server = Arc::new(
-        Server::new_with_identity(
-            &address,
+        Server::new_with_identity_and_endpoint(
+            context.endpoint(&address).unwrap(),
             ServerIpcConfig::default(),
             ServerIdentity {
                 server_id: id.clone(),
@@ -325,9 +337,11 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
             idle_timeout_secs: 0,
             ..RelayConfig::default()
         };
-        let running = tokio::task::spawn_blocking(move || RelayServer::start(config).unwrap())
-            .await
-            .unwrap();
+        let running = tokio::task::spawn_blocking(move || {
+            RelayServer::start_with_context(config, context).unwrap()
+        })
+        .await
+        .unwrap();
         let state = running.state_for_test();
         cleanup_state = Some(state.clone());
         relay = Some(running);
@@ -346,6 +360,7 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
             "server_instance_id": server.server_instance_id(),
             "max_payload_size": server.config().max_payload_size,
         });
+        let namespace = state.endpoint_context().namespace_id().to_owned();
         registration_task = Some(tokio::spawn(async move {
             let response = reqwest::Client::builder()
                 .no_proxy()
@@ -353,6 +368,7 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
                 .build()
                 .unwrap()
                 .post(format!("http://{socket}/_register"))
+                .header(crate::client::LOCAL_ENDPOINT_NAMESPACE_HEADER, namespace)
                 .json(&registration)
                 .send()
                 .await
@@ -468,9 +484,15 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .as_nanos()
     );
     let address = format!("ipc://{id}");
+    #[cfg(unix)]
+    let root = super::test_support::EndpointTestRoot::new();
+    #[cfg(unix)]
+    let context = root.context();
+    #[cfg(windows)]
+    let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
     let server = Arc::new(
-        Server::new_with_identity(
-            &address,
+        Server::new_with_identity_and_endpoint(
+            context.endpoint(&address).unwrap(),
             ServerIpcConfig::default(),
             ServerIdentity {
                 server_id: id.clone(),
@@ -500,7 +522,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
         };
         let register_address = address.clone();
         let running = tokio::task::spawn_blocking(move || {
-            let relay = RelayServer::start(config).unwrap();
+            let relay = RelayServer::start_with_context(config, context).unwrap();
             relay
                 .register_upstream("grid", &id, &register_address)
                 .unwrap();

@@ -11,7 +11,6 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
-from c_two import _native
 from c_two.transport.registry import _ProcessRegistry
 from tests.fixtures.http_server import LoopbackHTTPServer
 
@@ -72,7 +71,7 @@ def stalled_relay():
             body = json.dumps({
                 'version': 1, 'code': 701, 'name': 'ResourceNotFound',
                 'message': 'route not found: connect-timeout',
-                'details': {'transport_phase': 'pre_dispatch', 'route_name': 'connect-timeout'},
+                'details': {'transport_phase': 'application_detail', 'route_name': 'connect-timeout'},
             }).encode()
             self.send_response(404)
             self.send_header('Content-Type', 'application/json')
@@ -118,7 +117,7 @@ def test_stalled_relay_connect_budget_and_recovery(mode, stalled_relay):
 
     try:
         started = time.monotonic()
-        expected_error = cc.error.CallDeadlineExceeded if mode == 'explicit' else _native.CoreError
+        expected_error = cc.error.CallDeadlineExceeded if mode == 'explicit' else cc.error.CoreError
         with pytest.raises(expected_error) as failure:
             connect(0.1)
         elapsed = time.monotonic() - started
@@ -127,20 +126,28 @@ def test_stalled_relay_connect_budget_and_recovery(mode, stalled_relay):
         assert failure.value.details['operation'] == 'connect'
         assert failure.value.details['transport_phase'] == 'pre_dispatch'
         assert failure.value.details['stage']
+        native = failure.value.__cause__ if mode == 'explicit' else failure.value
+        assert type(native) is cc.error.CoreError
+        assert isinstance(native, cc.error.CCBaseError) and isinstance(native, RuntimeError)
+        assert set(cc.error.CoreError.__annotations__).issubset(vars(native))
+        assert (native.io_operation, native.io_kind, native.raw_os_error) == (None, None, None)
         assert paths and all(path.startswith(('/_resolve', '/_probe')) for path in paths)
         # Let the late control response finish. A new caller must reach the
         # server promptly and observe its authoritative 404, not a stuck waiter.
         release.set()
         previous_requests = len(paths)
         started = time.monotonic()
-        recovered_error = cc.error.ResourceNotFound if mode == 'explicit' else _native.CoreError
+        recovered_error = cc.error.ResourceNotFound if mode == 'explicit' else cc.error.CoreError
         with pytest.raises(recovered_error) as recovered:
             connect(1)
         assert time.monotonic() - started < 1
         projected = recovered.value if mode == 'explicit' else cc.error.CCError.deserialize(recovered.value.error_bytes)
+        native = recovered.value.__cause__ if mode == 'explicit' else recovered.value
+        assert type(native) is cc.error.CoreError
         assert isinstance(projected, cc.error.ResourceNotFound)
         assert projected.message == 'route not found: connect-timeout'
         assert projected.details['route_name'] == 'connect-timeout'
+        assert native.transport_phase == projected.details['transport_phase'] == 'application_detail'
         assert len(paths) > previous_requests
     finally:
         release.set()

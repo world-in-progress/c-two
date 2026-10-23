@@ -183,6 +183,7 @@ dependencies = [
  "c2-contract",
  "c2-error",
  "c2-ipc",
+ "c2-local",
  "c2-mem",
  "c2-server",
  "c2-wire",
@@ -215,6 +216,7 @@ dependencies = [
  "c2-wire",
  "futures-util",
  "parking_lot",
+ "tempfile",
  "tokio",
 ]
 
@@ -232,6 +234,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "uuid",
  "windows-sys 0.61.2",
 ]

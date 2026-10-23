@@ -111,7 +111,10 @@ impl Connection {
     /// All fields start at their default/empty state; `last_activity` is set
     /// to the current instant.
     pub fn new(conn_id: u64) -> Self {
-        let connection = Self::with_publisher(conn_id, ConnectionPublisher::new());
+        let connection = Self::with_publisher(
+            conn_id,
+            ConnectionPublisher::new(c2_local::ConnectionSide::Server),
+        );
         connection.select_ordinary_protocol();
         connection
     }
@@ -425,6 +428,10 @@ mod tests {
     #[test]
     fn new_connection_defaults() {
         let conn = Connection::new(42);
+        assert_eq!(
+            conn.connection_observation().side(),
+            c2_local::ConnectionSide::Server
+        );
         assert_eq!(conn.conn_id(), 42);
         assert!(!conn.handshake_done());
         assert!(!conn.chunked_capable());

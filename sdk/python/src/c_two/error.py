@@ -1,6 +1,7 @@
 from __future__ import annotations
 from collections.abc import Mapping
 from enum import IntEnum, unique
+from typing import Literal
 
 from c_two import _native
 
@@ -53,6 +54,86 @@ ERROR_Code = unique(IntEnum("ERROR_Code", _load_error_code_members()))
 
 class CCBaseError(Exception):
     """Base class for all C-Two-related errors."""
+
+
+class CoreError(CCBaseError, RuntimeError):
+    """Structured failure populated by the native Core runtime.
+
+    ``message`` retains the outer Core diagnostic. When present,
+    ``error_bytes`` contains the canonical semantic error, whose message can
+    differ from that diagnostic. Fields without a native value remain None.
+    """
+
+    category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle']
+    message: str
+    code: int | None
+    name: str | None
+    details: dict[str, str]
+    error_bytes: bytes | None
+    transport_kind: Literal['ipc', 'http'] | None
+    # Semantic errors preserve the peer's arbitrary diagnostic detail.
+    transport_phase: str | None
+    fallback_eligible: bool | None
+    route_withdrawal: bool | None
+    io_operation: Literal['bind', 'connect'] | None
+    io_kind: Literal[
+        'permission_denied', 'not_found', 'connection_refused', 'address_in_use', 'other',
+    ] | None
+    raw_os_error: int | None
+    lifecycle_kind: Literal[
+        'invalid_server_id', 'config_frozen', 'client_config_frozen',
+        'duplicate_route', 'missing_route', 'relay_duplicate_route',
+        'missing_relay_address', 'relay_http', 'register_failure',
+        'held_response_copy', 'held_response_release', 'response_copy',
+        'configuration', 'server', 'startup_timeout', 'relay',
+    ] | None
+    startup_stage: Literal['readiness', 'responsiveness', 'owner_control'] | None
+    timeout_seconds: float | None
+    route_name: str | None
+    status_code: int | None
+    body: str | None
+    relay_duplicate: bool | None
+    failure_source: Literal[
+        'relay_projection', 'relay_prepare', 'commit', 'relay_register', 'route_open',
+    ] | None
+    registration_failure: dict[str, object] | None
+    rollback: dict[str, object] | None
+    relay_cleanup_error: dict[str, object] | None
+
+    def __init__(
+        self,
+        category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle'],
+        message: str,
+    ):
+        super().__init__(message)
+        self.category = category
+        self.message = message
+        self.code = None
+        self.name = None
+        self.details = {}
+        self.error_bytes = None
+        self.transport_kind = None
+        self.transport_phase = None
+        self.fallback_eligible = None
+        self.route_withdrawal = None
+        self.io_operation = None
+        self.io_kind = None
+        self.raw_os_error = None
+        self.lifecycle_kind = None
+        self.startup_stage = None
+        self.timeout_seconds = None
+        self.route_name = None
+        self.status_code = None
+        self.body = None
+        self.relay_duplicate = None
+        self.failure_source = None
+        self.registration_failure = None
+        self.rollback = None
+        self.relay_cleanup_error = None
+
+    def __reduce__(self):
+        return type(self), (self.category, self.message), self.__dict__
+
 
 class CCError(CCBaseError):
     """

@@ -2,14 +2,14 @@
 
 C-Two exposes stateful Python resources through typed CRM contracts over same-process calls, local IPC, or an external HTTP relay. This package projects the shared Rust runtime into Python.
 
-Python C-Two **0.8.1** pairs with c3 **0.4.0**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.8.1.md).
+Python C-Two **0.8.2** pairs with c3 **0.4.1**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.8.2.md).
 
 Install the matching published versions:
 
 ```bash
-uv pip install 'c-two==0.8.1'
+uv pip install 'c-two==0.8.2'
 # Only for FastDB Payload contracts:
-uv pip install 'c-two[fastdb]==0.8.1'
+uv pip install 'c-two[fastdb]==0.8.2'
 ```
 
 The base package has no Python runtime dependencies. Ordinary CRM definition,
@@ -26,7 +26,7 @@ Local IPC uses Unix domain sockets or current-logon-SID Windows Named Pipes. Uni
 
 IPC uses lazy buddy pools, idle decay and finite backing/reassembly budgets; `pool_enabled=False` skips buddy. `cc.memory_stats()` observes native accounting; held responses and borrowed inputs retain independent leases. The standalone relay has its own upstream policy. See the [memory guide](https://github.com/world-in-progress/c-two/blob/main/docs/memory-policy.en.md).
 
-Physical IPC connection observations work without a pending call. OwnerBound hosts support explicit, single-use recovery tickets during the original grace period. Bind/connect failures preserve `io_kind`, `raw_os_error` and `io_operation` on native `CoreError`. These features share the Rust implementation on macOS, Linux and Windows x64 and ARM64; see the lifecycle guide for API examples.
+Use `cc.connection_events()` for one cancellable, bounded stream of incoming and outgoing physical IPC events, tagged by `side`. `ConnectionObservation.snapshot()` retains late inspection; its old blocking `wait_closed()` is removed. Physical observations work without a pending call. OwnerBound hosts support explicit, single-use recovery tickets during the original grace period. Bind/connect failures preserve `io_kind`, `raw_os_error` and `io_operation` on public `cc.error.CoreError`. These features share the Rust implementation on macOS, Linux and Windows x64 and ARM64; see the lifecycle guide for API examples.
 
 ## Development
 

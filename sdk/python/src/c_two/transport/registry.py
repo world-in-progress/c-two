@@ -1144,7 +1144,7 @@ def shutdown(*, timeout: float = 30.0) -> dict:
 
 
 def connection_events():
-    """Subscribe to accepted IPC connections without starting or configuring a server."""
+    """Subscribe to outgoing and accepted IPC connections without starting or configuring a server."""
     registry = _ProcessRegistry.get()
     with registry._lock:
         return registry._runtime_session.connection_events()

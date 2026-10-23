@@ -105,6 +105,10 @@ impl ClientLifecycle {
         })
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.lock().closed
+    }
+
     fn publish(&self, slot: usize, client: Arc<IpcClient>, closing: bool) {
         let mut inner = self.inner.lock();
         let closed = inner.closed;

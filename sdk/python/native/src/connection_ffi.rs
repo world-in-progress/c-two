@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use c2_core::{
     ConnectionClosed, ConnectionEvent, ConnectionEventWait, ConnectionEvents,
-    ConnectionObservation, recv_connection_event, wait_connection_closed,
+    ConnectionObservation, recv_connection_event,
 };
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
@@ -89,20 +89,6 @@ impl PyConnectionObservation {
             .map(|inner| PyConnectionClosed { inner })
     }
 
-    #[pyo3(signature = (timeout=None))]
-    fn wait_closed(
-        &self,
-        py: Python<'_>,
-        timeout: Option<f64>,
-    ) -> PyResult<Option<PyConnectionClosed>> {
-        let timeout = wait_timeout(timeout)?;
-        py.detach(|| {
-            wait_connection_closed(&self.inner, timeout)
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
-                .map(|closed| closed.map(|inner| PyConnectionClosed { inner }))
-        })
-    }
-
     fn __repr__(&self) -> String {
         format!(
             "ConnectionObservation(id={}, closed={})",
@@ -124,6 +110,14 @@ pub(crate) struct PyConnectionEvent {
 
 #[pymethods]
 impl PyConnectionEvent {
+    #[getter]
+    fn side(&self) -> &'static str {
+        match &self.inner {
+            ConnectionEvent::Opened(observation) => observation.side().as_str(),
+            ConnectionEvent::Closed(record) => record.side().as_str(),
+        }
+    }
+
     #[getter]
     fn kind(&self) -> &'static str {
         match &self.inner {
@@ -159,12 +153,12 @@ impl PyConnectionEvent {
     }
 }
 
-/// A subscription has one consumer, just like Rust's mutable Receiver. PyO3's
-/// mutable borrow rejects simultaneous consumers instead of queueing a second
-/// waiter behind an unbounded wait. Waiting releases the GIL and retains no host.
+/// Core rejects simultaneous consumers. A shared Python borrow permits close
+/// from another thread while recv releases the GIL; neither retains a host.
 #[pyclass(
     name = "ConnectionEvents",
     module = "c_two._native",
+    frozen,
     skip_from_py_object
 )]
 pub(crate) struct PyConnectionEvents {
@@ -173,15 +167,15 @@ pub(crate) struct PyConnectionEvents {
 
 #[pymethods]
 impl PyConnectionEvents {
+    fn close(&self) {
+        self.inner.close();
+    }
+
     #[pyo3(signature = (timeout=None))]
-    fn recv(
-        &mut self,
-        py: Python<'_>,
-        timeout: Option<f64>,
-    ) -> PyResult<Option<PyConnectionEvent>> {
+    fn recv(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Option<PyConnectionEvent>> {
         let timeout = wait_timeout(timeout)?;
         let received = py
-            .detach(|| recv_connection_event(&mut self.inner, timeout))
+            .detach(|| recv_connection_event(&self.inner, timeout))
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         match received {
             None => Ok(None),
@@ -189,6 +183,9 @@ impl PyConnectionEvents {
             Some(ConnectionEventWait::Ended) => {
                 Err(PyStopIteration::new_err("connection event source ended"))
             }
+            Some(ConnectionEventWait::ConcurrentReceive) => Err(PyRuntimeError::new_err(
+                "connection events already has a receiver",
+            )),
             Some(ConnectionEventWait::Lagged(missed)) => {
                 let error = ConnectionEventsLagged::new_err(format!(
                     "connection event subscription lost {missed} events and ended"
@@ -201,7 +198,7 @@ impl PyConnectionEvents {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyConnectionEvent>> {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyConnectionEvent>> {
         self.recv(py, None)
     }
 }

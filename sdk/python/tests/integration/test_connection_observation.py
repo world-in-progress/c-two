@@ -1,8 +1,8 @@
 """Physical IPC facts with idle real processes on UDS and Windows Named Pipes."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
@@ -104,27 +104,81 @@ finally:
                 assert cc.inspect_endpoint(ready['address'], context=context)['status'] in {'absent', 'not-applicable'}
 
 
-def test_server_kill_notifies_idle_client_and_wait_releases_gil():
-    with peer_process('server') as (server, ready):
-        client = cc.connect(ObservationPeer, name='peer', address=ready['address'])
-        observation = cc.connection_observation(client)
-        assert observation.snapshot() is None
-        assert observation.wait_closed(0.0) is None
+def test_one_client_subscription_observes_multiple_idle_connections():
+    events = cc.connection_events()
+    with ExitStack() as stack:
+        peers = [stack.enter_context(peer_process('server')) for _ in range(3)]
+        clients = [cc.connect(ObservationPeer, name='peer', address=ready['address'])
+                   for _, ready in peers]
+        observations = [cc.connection_observation(client) for client in clients]
+        ids = {observation.connection_id for observation in observations}
+        assert len(ids) == 3
+        opened = [events.recv(5.0) for _ in range(3)]
+        assert {event.connection_id for event in opened} == ids
+        assert all(event.side == 'client' and event.kind == 'opened' for event in opened)
+        assert all(observation.snapshot() is None for observation in observations)
+        assert not hasattr(observations[0], 'wait_closed')
+        shared = cc.connect(ObservationPeer, name='peer', address=peers[0][1]['address'])
+        assert cc.connection_observation(shared).connection_id == observations[0].connection_id
+        cc.close(shared)
+        cc.close(clients[1])
+        assert observations[1].snapshot() is None
+        assert events.recv(0.0) is None
+        for index, terminate in enumerate(('kill', 'close')):
+            server = peers[index][0]
+            if terminate == 'kill':
+                server.kill()
+            else:
+                server.stdin.close()
+            server.wait(timeout=5.0)
+            event = events.recv(5.0)
+            assert event.side == 'client' and event.kind == 'closed'
+            assert event.connection_id == observations[index].connection_id
+            assert event.value.reason in {'peer_eof', 'connection_reset'}
+            assert event.value == observations[index].snapshot()
+        cc.shutdown()
+        event = events.recv(5.0)
+        assert event.side == 'client' and event.kind == 'closed'
+        assert event.connection_id == observations[2].connection_id
+        assert event.value.reason == 'local_close'
+        assert event.value == observations[2].snapshot()
+        events.close()
+        with pytest.raises(StopIteration):
+            events.recv(0.0)
+
+
+def test_subscription_wait_releases_gil_and_close_wakes_only_that_subscription():
+    with peer_process('server') as (_, ready):
+        events = cc.connection_events()
+        other = cc.connection_events()
         entered = threading.Event()
         def wait():
             entered.set()
-            return observation.wait_closed(5.0)
+            return events.recv()
         with ThreadPoolExecutor(max_workers=1) as executor:
             waiting = executor.submit(wait)
-            assert entered.wait(2.0)
-            server.kill()
-            server.wait(timeout=5.0)
-            closed = waiting.result(timeout=6.0)
-        assert closed is not None
-        assert closed.reason in {'peer_eof', 'connection_reset'}
-        assert closed.connection_id == observation.connection_id
-        assert observation.snapshot() == closed
-        assert observation.wait_closed(0.0) == closed
+            try:
+                assert entered.wait(2.0)
+                with pytest.raises(FutureTimeout):
+                    waiting.result(timeout=0.05)
+                with pytest.raises(RuntimeError, match='already has a receiver'):
+                    events.recv(0.0)
+                events.close()
+                with pytest.raises(StopIteration):
+                    waiting.result(timeout=2.0)
+            finally:
+                events.close()
+                if not waiting.done():
+                    cc.shutdown()
+        events.close()
+        client = cc.connect(ObservationPeer, name='peer', address=ready['address'])
+        opened = other.recv(5.0)
+        assert opened.side == 'client' and opened.kind == 'opened'
+        assert client.echo(b'after observer close') == b'after observer close'
+        assert cc.connection_observation(client).snapshot() is None
+        with pytest.raises(StopIteration):
+            events.recv(0.0)
+        other.close()
         cc.close(client)
 
 
@@ -166,13 +220,13 @@ def test_idle_client_end_notifies_server(terminate, reconfigure):
         else:
             client.stdin.close()
         client.wait(timeout=5.0)
-        closed = observation.wait_closed(5.0)
+        event = events.recv(5.0)
+        assert event.side == 'server' and event.kind == 'closed'
+        closed = event.value
         assert closed is not None
         assert closed.reason in ({'peer_eof', 'connection_reset'} if terminate == 'kill' else {'peer_close_message'})
-        event = events.recv(5.0)
-        assert event.kind == 'closed'
         assert event.connection_id == opened.connection_id
-        assert event.value == closed
+        assert observation.snapshot() == closed
         assert events.recv(0.0) is None
 
 
@@ -231,6 +285,10 @@ def test_lagged_subscription_ends_but_existing_observation_remains_usable():
         assert observation.snapshot() is None
         client.kill()
         client.wait(timeout=5.0)
-        closed = observation.wait_closed(5.0)
+        closed_event = progress.recv(5.0)
+        assert closed_event.kind == 'closed'
+        assert closed_event.connection_id == observation.connection_id
+        closed = observation.snapshot()
+        assert closed_event.value == closed
         assert closed is not None
         assert closed.reason in {'peer_eof', 'connection_reset'}

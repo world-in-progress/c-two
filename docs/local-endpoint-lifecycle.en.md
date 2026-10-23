@@ -26,11 +26,52 @@ Unix credentials uniformly use existing schema 3, recording final root, namespac
 
 Since 0.8.1, startup deadline expiry has `CoreError.lifecycle_kind='startup_timeout'`, `startup_stage` and `timeout_seconds`. Local bind failure messages no longer carry the incorrect `config error` prefix; their existing OS fields are preserved. Configure the wait with `cc.set_server(startup_timeout=...)` before registration. See [startup deadlines](configuration.en.md#server-startup-deadlines) for the finite default, freezing and cleanup boundary.
 
-In C-Two 0.8.0, Python `CoreError` exposes `io_operation` (`bind` or `connect`), `io_kind` (`permission_denied`, `not_found`, `connection_refused`, `address_in_use` or `other`) and `raw_os_error` (the native errno/Win32 code, or `None` when no native code exists). These describe the actual local operation. Configuration, handshake, contract and deadline failures have no local cause; all three fields are `None`. The existing Windows PIPE_BUSY wait retains its original connection budget; expiry is not an OS error. A C-Two listener lease conflict can report `address_in_use` with no Win32 code.
+Public `c_two.error.CoreError` exposes `io_operation` (`bind` or `connect`), `io_kind` (`permission_denied`, `not_found`, `connection_refused`, `address_in_use` or `other`) and `raw_os_error` (the native errno/Win32 code, or `None` when no native code exists). These describe the actual local operation. Configuration, handshake, contract and deadline failures have no local cause; all three fields are `None`. The existing Windows PIPE_BUSY wait retains its original connection budget; expiry is not an OS error. A C-Two listener lease conflict can report `address_in_use` with no Win32 code.
 
 Rust Core and SDK errors expose `local_io_cause() -> Option<LocalIoCause>`; its `operation()` and `error()` project the operation and existing `EndpointIoError`. The shared readiness watch carries `ServerFailure { message, bind_error, startup_timeout }`, replacing the string payload of `ServerLifecycleState::Failed` and `LifecycleError::Server`. Exhaustive low-level matches must include `IpcError::Connect` and `ServerError::Bind` / `Failed` / `StartupTimeout`; Core exposes the latter through `LifecycleError::StartupTimeout`. Recompile Rust callers; no old payload or compatibility entry point remains. ABI and protocol versions do not change.
 
 Context preserves the original OS kind/code while outer directory-policy rejection stays unchanged. Readable messages, error ordering, retry classification and deadlines keep their existing meaning. These fields neither prove process death nor authorize restart, fallback or cleanup; controllers still use the existing listener ownership and identity-checked maintenance APIs. Endpoint maintenance retains its existing ErrorKind text format.
+
+## Public structured Python errors
+
+Catch `c_two.error.CoreError` directly. It is a `CCBaseError` and a `RuntimeError`; `CCError` remains the separate canonical semantic-error family. Catch `CCBaseError` to handle both families, or `CCError` when only semantic errors should bypass a call-stage wrapper. `_native.CoreError` is removed. There is no top-level alias or replacement error wrapper.
+
+```python
+from c_two.error import CoreError
+
+try:
+    resource = cc.connect(Grid, name="grid", address="ipc://worker")
+except CoreError as exc:
+    if exc.io_operation == "connect" and exc.io_kind == "permission_denied":
+        raise PermissionError(exc.message) from exc
+    raise
+```
+
+Every instance has the annotated fields below. Optional fields default to `None`, `details` to a fresh dictionary. `str(exc)` and `args[0]` retain the original outer diagnostic. Python copying and pickle preserve the structured fields; they do not define a portable error protocol.
+
+| Field | Type and values |
+| --- | --- |
+| `category` | `semantic`, `contract`, `admission`, `transport`, `lifecycle` |
+| `message` | `str`, outer Core diagnostic |
+| `code`, `name` | `int` / `str` or `None`; a matched pair from the canonical `c2-error` registry (the codes in `error.ERROR_Code`, with Rust variant names) |
+| `details` | `dict[str, str]`, canonical semantic context; keys depend on the error |
+| `error_bytes` | `bytes` or `None`, canonical semantic error bytes; its inner message can differ from `message` |
+| `transport_kind` | `ipc`, `http` or `None` |
+| `transport_phase` | `str` or `None`; Core transport failures use `pre_dispatch` (before business dispatch) or `dispatch_uncertain` (peer execution is unknown). Semantic errors preserve an arbitrary peer-provided detail; it is not a trusted transport classification |
+| `fallback_eligible`, `route_withdrawal` | `bool` or `None`, existing Core classifications; not independent permission to replay a request |
+| `io_operation` | `bind`, `connect` or `None` |
+| `io_kind` | `permission_denied`, `not_found`, `connection_refused`, `address_in_use`, `other` or `None` |
+| `raw_os_error` | `int` or `None`; original errno/Win32 code, absent for refusals without a native code and for non-I/O failures |
+| `lifecycle_kind` | `invalid_server_id`, `config_frozen`, `client_config_frozen`, `duplicate_route`, `missing_route`, `relay_duplicate_route`, `missing_relay_address`, `relay_http`, `register_failure`, `held_response_copy`, `held_response_release`, `response_copy`, `configuration`, `server`, `startup_timeout`, `relay` or `None` |
+| `startup_stage` | `readiness`, `responsiveness`, `owner_control` or `None` |
+| `timeout_seconds` | `float` or `None`, configured startup budget in seconds |
+| `route_name`, `body` | `str` or `None`, affected route or HTTP response diagnostic |
+| `status_code` | `int` or `None`, HTTP status (including 409 for duplicate registration) |
+| `relay_duplicate` | `bool` or `None`, relay duplicate-registration classification |
+| `failure_source` | `relay_projection`, `relay_prepare`, `commit`, `relay_register`, `route_open` or `None` |
+| `registration_failure`, `rollback`, `relay_cleanup_error` | `dict[str, object]` or `None`, existing registration transaction outcomes |
+
+`registration_failure` contains `route_name`, `failure_source`, `error_message`, nullable `status_code`, `rollback` and `relay_cleanup_error`. `rollback` contains `route_name`, `local_removed`, `active_drained`, `closed_reason` and `close_error`; `relay_cleanup_error` contains `route_name`, nullable `status_code` and `message`. These outcomes report the original transaction; observing them does not repeat cleanup. Ordinary imports do not load FastDB or NumPy.
 
 ## Persistent and OwnerBound resources
 
@@ -99,55 +140,26 @@ Authoritative route acquisition queries current server state and binds the route
 
 ## Observing physical IPC connections
 
-Python `cc.connection_observation(proxy)` and Rust ordinary/generated clients'
-`client.connection_observation()` return a read-only view of the current physical
-IPC connection without connecting or reconnecting. Thread-local and HTTP clients
-report `UnsupportedCallMode`. Logical proxies can share a `connection_id`;
-closing one proxy need not close that connection. Reconnect creates a new ID and
-observation while the old observation retains its original terminal record.
+Subscribe with `cc.connection_events()` or Rust `Runtime::connection_events()` before making outgoing connections or starting a listener. The same bounded feed reports this Runtime's managed outgoing IPC connections and accepted connections, with `event.side` equal to `client` or `server`. Subscription starts no host, creates no identity and freezes no configuration; subscriptions survive legal pre-use configuration changes.
+
+Python `events.recv(timeout=None)` returns a `ConnectionEvent`: `kind='opened'` carries a `ConnectionObservation` in `value`, and `kind='closed'` carries a `ConnectionClosed`. Both expose `connection_id` and `side`. The outgoing ID matches `cc.connection_observation(proxy).connection_id`. Open means that the OS connection was established or accepted, not that handshake, contract validation or a business call succeeded. Each physical reconnect has a new ID. Several logical proxies may share one connection; closing a proxy is not a physical close and emits no event by itself.
 
 ```python
-peer = cc.connect(Grid, name='grid', address=address)  # an ipc:// address
-observation = cc.connection_observation(peer)
-closed = observation.wait_closed(timeout=5.0)
-if closed is not None:
-    print(closed.connection_id, closed.reason, closed.operation, closed.os_error)
-cc.close(peer)
+events = cc.connection_events()  # subscribe before connecting
+try:
+    peers = [cc.connect(Grid, name='grid', address=address) for address in addresses]
+    for event in events:
+        if event.side == 'client' and event.kind == 'closed':
+            print(event.connection_id, event.value.reason, event.value.operation)
+finally:
+    events.close()
 ```
 
-`snapshot()` immediately returns the terminal record or `None`.
-`wait_closed(timeout=None)` returns that record, or `None` on timeout, and releases
-the Python GIL while waiting. A zero timeout can read an existing terminal
-record. Rust uses async `wait_closed(Option<Duration>)`. Cancellation or timeout
-only ends that wait; late waiters receive the same record. Observations retain
-metadata, without keeping streams, runtimes, resources or payload leases alive.
+`recv()` releases the GIL, returns `None` on timeout and raises `StopIteration` when the source or subscription ends. `events.close()` can be called from another thread to interrupt a blocked receive; it is idempotent, discards that subscription's queued metadata and does not close a transport or another subscription. A receive racing close may already have received an event; later receives are ended. Each subscription permits one receiver at a time; concurrent receivers raise `RuntimeError`. Applications use one consumer for many connections, without one blocking thread per connection. HTTP-only and same-process calls produce no outgoing IPC events; independent raw admin/owner controls are not inserted into the Runtime's client cache.
 
-Subscribe with `cc.connection_events()` or Rust `Runtime::connection_events()`
-before starting the listener to receive all subsequently accepted connections.
-Subscription alone starts no host, creates no identity and freezes no config.
-Existing subscriptions survive legal configuration changes before startup.
-Python `events.recv(timeout=None)` returns a `ConnectionEvent`: `kind='opened'`
-carries an observation in `value`; `kind='closed'` carries a terminal record.
-Both expose `connection_id`. These are actual connections, including handshake,
-probe and relay connections; the ID identifies no process, user or CRM.
+There is no historical replay: a late subscriber can observe a later close without a synthetic open. The queue is allocated on first subscription and retains at most 1024 events. Overflow raises `ConnectionEventsLagged` with a `missed` count and permanently ends that subscription. Rust uses async `recv(&self)`, returning `Ok(None)` at end, `ConnectionEventsError::Lagged` on overflow and `ConcurrentReceive` for a second receiver. Subscriptions and event values retain metadata only, not Runtime, transport, resource or payload leases.
 
-```python
-events = cc.connection_events()
-cc.register(Grid, resource, name='grid')
-for event in events:
-    if event.kind == 'closed':
-        print(event.connection_id, event.value.reason)
-```
-
-There is no historical replay: a late subscriber may see only an existing
-connection's Closed event. The queue is allocated on first subscription with
-an internal capacity of 1024. Overflow raises
-Python `ConnectionEventsLagged` with a `missed` count, or Rust
-`ConnectionEventsError::Lagged`, and ends that subscription. Previously obtained
-per-connection observations remain usable. Python `recv()` returns `None` on
-timeout and raises `StopIteration` when the source or subscription ends; Rust
-returns `Ok(None)` at the end. Each subscription has one consumer and does not
-extend the runtime's lifetime.
+`cc.connection_observation(proxy)` remains a read-only view of the current physical IPC incarnation; `snapshot()` immediately returns its terminal record or `None`. Thread-local and HTTP proxies reject this query with `UnsupportedCallMode`. Python `ConnectionObservation.wait_closed()` and the Core blocking `wait_connection_closed()` bridge are removed: use the event feed for waiting and the snapshot for late inspection. Rust's existing async `ConnectionObservation::wait_closed(Option<Duration>)` remains the cancellable single-connection primitive used by native close barriers. Its cancellation affects only that waiter, and its terminal record is the same one published in the feed.
 
 Reasons are `local_close`, `peer_close_message`, `peer_eof`, `connection_reset`,
 `heartbeat_timeout`, `protocol_error` and `io_error`. Only an actual DISCONNECT

@@ -202,7 +202,7 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
         elif {attempt!r} == 'connect':
             try:
                 cc.connect(Echo, name='same-route', address={address!r})
-            except _native.CoreError as exc:
+            except cc.error.CoreError as exc:
                 assert exc.category == 'transport', exc
                 assert exc.transport_kind == 'ipc', exc
                 assert exc.transport_phase == 'pre_dispatch', exc
@@ -223,7 +223,7 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
         session.set_local_endpoint(context=captured)
         try:
             cc.set_local_endpoint(root={changed!r})
-        except _native.CoreError as exc:
+        except cc.error.CoreError as exc:
             assert exc.lifecycle_kind == 'config_frozen', exc
         else:
             raise AssertionError('failed local attempt left root mutable')
@@ -263,7 +263,7 @@ def test_used_selection_survives_repeated_shutdown_then_refreezes(source: str) -
         assert _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
         try:
             cc.set_local_endpoint(root={changed!r})
-        except _native.CoreError as error:
+        except cc.error.CoreError as error:
             assert error.lifecycle_kind == 'config_frozen', error
         else:
             raise AssertionError('inherited local selection did not freeze')

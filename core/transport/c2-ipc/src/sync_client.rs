@@ -268,9 +268,13 @@ impl SyncClient {
         config: ClientIpcConfig,
         budget: c2_mem::MemoryBudget,
         deadline: c2_config::ConnectDeadline,
+        event_source: Option<&c2_local::ConnectionEventSource>,
     ) -> (Self, Result<(), IpcError>) {
         let rt = get_or_create_runtime();
         let mut client = IpcClient::with_transport_pool(endpoint, pool, config, budget);
+        if let Some(source) = event_source {
+            client = client.with_connection_event_source(source.clone());
+        }
         let result = rt.block_on(client.connect_with_deadline(deadline));
         (
             Self {

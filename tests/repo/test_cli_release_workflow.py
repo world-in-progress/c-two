@@ -187,11 +187,11 @@ def test_ci_runs_cli_rust_tests():
         commands = {name: command for name, command, _ in gates(
             "python", Path("."), "full", target_platform=platform)}
         for name, manifest in (("cli-test", "cli/Cargo.toml"),
-                               ("core-test", "core/Cargo.toml"),
-                               ("python-native-test", "sdk/python/native/Cargo.toml")):
+                               ("core-test", "core/Cargo.toml")):
             assert commands[name][:2] == ["cargo", "test"]
             assert commands[name][commands[name].index("--manifest-path") + 1] == manifest
             assert "--exclude" not in commands[name]
+        assert commands['python-native-test'][1:] == ['tools/dev/test_native.py']
 
 
 def test_ci_validates_source_on_pr_merge_group_and_main_push():

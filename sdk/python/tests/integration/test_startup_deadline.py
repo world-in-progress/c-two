@@ -23,7 +23,7 @@ error = None
 try:
     cc.set_server(startup_timeout=0)
     cc.register(Echo, Resource(), name='startup')
-except _native.CoreError as exc:
+except cc.error.CoreError as exc:
     error = diagnostic(exc)
 finally:
     stopped = cc.shutdown(timeout=3)
@@ -74,7 +74,7 @@ try:
     assert current is not old and current.startup_timeout == 0
     try:
         cc.register(Echo, Resource(), name='startup')
-    except _native.CoreError as error:
+    except cc.error.CoreError as error:
         assert error.lifecycle_kind == 'startup_timeout'
     else:
         raise AssertionError('zero startup budget unexpectedly registered a route')
@@ -83,7 +83,7 @@ try:
     assert current.ensure_server_bridge().names == []
     try:
         current.set_server_options(startup_timeout=30)
-    except _native.CoreError as error:
+    except cc.error.CoreError as error:
         assert error.lifecycle_kind == 'config_frozen'
     else:
         raise AssertionError('failed startup unfroze server configuration')

@@ -2455,6 +2455,7 @@ pub struct IpcClient {
     /// tasks finish. Reconnect must wait for that same transaction to finish.
     close_incomplete: AtomicBool,
     connection: RwLock<Option<ConnectionPublisher>>,
+    connection_event_source: Option<c2_local::ConnectionEventSource>,
     /// DISCONNECT write/ACK transaction, separate from transport termination:
     /// local_close is published before the courtesy ACK can arrive. A retry
     /// must retain this transaction's original abnormal-close diagnosis.
@@ -2631,6 +2632,7 @@ impl IpcClient {
             close_gate: tokio::sync::Mutex::new(()),
             close_incomplete: AtomicBool::new(false),
             connection: RwLock::new(None),
+            connection_event_source: None,
             disconnect: Arc::new(AtomicU8::new(DISCONNECT_NOT_CONNECTED)),
             pool: StdMutex::new(pool),
             pool_transport_owned,
@@ -2779,6 +2781,15 @@ impl IpcClient {
     pub fn with_config(address: &str, config: ClientIpcConfig) -> Self {
         let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
         Self::with_shared_budget(address, config, budget)
+    }
+
+    /// Publish future physical connections to the owning Runtime's event feed.
+    pub(crate) fn with_connection_event_source(
+        mut self,
+        source: c2_local::ConnectionEventSource,
+    ) -> Self {
+        self.connection_event_source = Some(source);
+        self
     }
 
     /// Create a new IPC client whose request and reassembly pools both charge
@@ -3055,7 +3066,10 @@ impl IpcClient {
                 })
         })
         .await?;
-        let publisher = ConnectionPublisher::new();
+        let publisher = self.connection_event_source.as_ref().map_or_else(
+            || ConnectionPublisher::new(c2_local::ConnectionSide::Client),
+            |source| source.open_connection(c2_local::ConnectionSide::Client),
+        );
         let stream = stream.with_connection_publisher(publisher.clone());
         *self.connection.get_mut() = Some(publisher.clone());
         let connection = ReceiveConnectionState {
@@ -5103,7 +5117,7 @@ impl IpcClient {
                 .as_ref()
                 .is_none_or(ConnectionPublisher::is_closed)
             {
-                *connection = Some(ConnectionPublisher::new());
+                *connection = Some(ConnectionPublisher::new(c2_local::ConnectionSide::Client));
             }
         } else if let Some(publisher) = connection.as_ref() {
             publisher.close(ConnectionEndReason::LocalClose, "force_connected", None);
@@ -8527,6 +8541,14 @@ mod pending_disconnect_tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed),
         );
+        #[cfg(unix)]
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(root.path())
+            .unwrap()
+            .endpoint(&address)
+            .unwrap();
+        #[cfg(windows)]
         let endpoint = LocalEndpoint::from_address(&address).unwrap();
         let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
         let peer = tokio::spawn(async move {
@@ -8574,7 +8596,10 @@ mod pending_disconnect_tests {
             crate::tests::close_listener(listener).await;
         });
 
-        let mut client = IpcClient::new(&address);
+        let source = c2_local::ConnectionEventSource::new();
+        let events = source.subscribe();
+        let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default())
+            .with_connection_event_source(source);
         client.connect().await.expect("first real handshake");
         let old = client.connection_observation().unwrap();
         let old_abort = client.abort.lock().as_ref().unwrap().clone();
@@ -8644,6 +8669,24 @@ mod pending_disconnect_tests {
             old.snapshot().unwrap().connection_id(),
             new.snapshot().unwrap().connection_id()
         );
+        for observation in [&old, &new] {
+            let Some(c2_local::ConnectionEvent::Opened(opened)) = events.recv().await.unwrap()
+            else {
+                panic!("one open per incarnation");
+            };
+            assert_eq!(opened.connection_id(), observation.connection_id());
+            assert_eq!(opened.side(), c2_local::ConnectionSide::Client);
+            let Some(c2_local::ConnectionEvent::Closed(closed)) = events.recv().await.unwrap()
+            else {
+                panic!("one close per incarnation");
+            };
+            assert_eq!(observation.snapshot(), Some(closed));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, events.recv())
+                .await
+                .is_err()
+        );
         tokio::time::timeout(std::time::Duration::from_secs(2), peer)
             .await
             .unwrap()
@@ -8667,7 +8710,7 @@ mod pending_disconnect_tests {
         let (resume_tx, resume_rx) = oneshot::channel();
         let (attempted_tx, attempted_rx) = oneshot::channel();
         let loop_pending = Arc::clone(&pending);
-        let publisher = ConnectionPublisher::new();
+        let publisher = ConnectionPublisher::new(c2_local::ConnectionSide::Client);
         let observation = publisher.observation();
         let connection = ReceiveConnectionState {
             publisher,
@@ -8719,7 +8762,7 @@ mod pending_disconnect_tests {
         *client.abort.lock() = Some(stream.abort_handle());
         let (reader, writer) = stream.into_split();
         *client.writer.lock().await = Some(writer);
-        let publisher = ConnectionPublisher::new();
+        let publisher = ConnectionPublisher::new(c2_local::ConnectionSide::Client);
         let observation = publisher.observation();
         *client.connection.write() = Some(publisher.clone());
         let connection = ReceiveConnectionState {
@@ -8765,7 +8808,7 @@ mod pending_disconnect_tests {
         *client.abort.lock() = Some(stream.abort_handle());
         let (reader, writer) = stream.into_split();
         *client.writer.lock().await = Some(writer);
-        let publisher = ConnectionPublisher::new();
+        let publisher = ConnectionPublisher::new(c2_local::ConnectionSide::Client);
         let observation = publisher.observation();
         *client.connection.write() = Some(publisher.clone());
         client
@@ -8831,7 +8874,7 @@ mod pending_disconnect_tests {
         let (stream, _peer) = LocalStream::pair().await.unwrap();
         let (reader, writer) = stream.into_split();
         *client.writer.lock().await = Some(writer);
-        let publisher = ConnectionPublisher::new();
+        let publisher = ConnectionPublisher::new(c2_local::ConnectionSide::Client);
         let observation = publisher.observation();
         let connection = ReceiveConnectionState {
             publisher,
@@ -8863,6 +8906,74 @@ mod pending_disconnect_tests {
 mod connect_deadline_tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn failed_and_expired_handshakes_publish_one_open_and_close() {
+        for stall in [false, true] {
+            let address = format!("ipc://observation_handshake_{}_{stall}", std::process::id());
+            #[cfg(unix)]
+            let root = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            let endpoint = c2_config::LocalEndpointContext::with_unix_root(root.path())
+                .unwrap()
+                .endpoint(&address)
+                .unwrap();
+            #[cfg(windows)]
+            let endpoint = LocalEndpoint::from_address(&address).unwrap();
+            let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
+            let (release, resume) = oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let mut length = [0; 4];
+                stream.read_exact(&mut length).await.unwrap();
+                let mut body = vec![0; u32::from_le_bytes(length) as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                if stall {
+                    let _ = resume.await;
+                }
+                drop(stream);
+                crate::tests::close_listener(listener).await;
+            });
+            let source = c2_local::ConnectionEventSource::new();
+            let events = source.subscribe();
+            let mut client = IpcClient::with_endpoint(endpoint.clone(), ClientIpcConfig::default())
+                .with_connection_event_source(source);
+            let deadline = ConnectDeadline::start(
+                c2_config::ConnectOptions::new().with_timeout(Duration::from_secs(1)),
+            )
+            .unwrap();
+            let result = client.connect_with_deadline(deadline).await;
+            let _ = release.send(());
+            peer.await.unwrap();
+            assert!(matches!(
+                c2_local::inspect_endpoint(&endpoint),
+                c2_local::EndpointInspection::Absent | c2_local::EndpointInspection::KernelManaged
+            ));
+            let error = result.unwrap_err();
+            if stall {
+                let IpcError::LocalCallRejected(error) = error else {
+                    panic!("expected handshake deadline")
+                };
+                assert_eq!(error.details["stage"], "handshake");
+            }
+            let (opened, closed) = tokio::time::timeout(Duration::from_secs(2), async {
+                (events.recv().await.unwrap(), events.recv().await.unwrap())
+            })
+            .await
+            .unwrap();
+            let Some(c2_local::ConnectionEvent::Opened(opened)) = opened else {
+                panic!("failed handshake still opened a physical connection")
+            };
+            let Some(c2_local::ConnectionEvent::Closed(closed)) = closed else {
+                panic!("failed handshake must close its physical connection")
+            };
+            assert_eq!(opened.side(), c2_local::ConnectionSide::Client);
+            assert_eq!(opened.connection_id(), closed.connection_id());
+            assert_eq!(opened.snapshot(), Some(closed));
+            drop(client);
+            assert!(events.recv().await.unwrap().is_none());
+        }
+    }
 
     #[test]
     fn zero_connect_deadline_never_polls_transport_without_runtime() {
@@ -8941,7 +9052,7 @@ mod connect_deadline_tests {
     #[tokio::test]
     async fn partial_control_write_deadline_aborts_actual_local_stream() {
         let (stream, mut peer) = c2_local::LocalStream::pair().await.unwrap();
-        let publisher = ConnectionPublisher::new();
+        let publisher = ConnectionPublisher::new(c2_local::ConnectionSide::Client);
         let observation = publisher.observation();
         let stream = stream.with_connection_publisher(publisher);
         let abort = stream.abort_handle();

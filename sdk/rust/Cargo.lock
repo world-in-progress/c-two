@@ -219,6 +219,7 @@ dependencies = [
  "sha2",
  "socket2",
  "tokio",
+ "tokio-util",
  "uuid",
  "windows-sys 0.61.2",
 ]

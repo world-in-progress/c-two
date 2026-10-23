@@ -74,38 +74,55 @@ Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己�
 
 从 0.8.1 起，启动期限通过 `CoreError.lifecycle_kind='startup_timeout'`、`startup_stage` 和 `timeout_seconds` 识别；本地 bind 失败的消息不再加错误的 `config error` 前缀，原 OS 字段保持。注册前可用 `cc.set_server(startup_timeout=...)` 设置等待预算；有限默认值、冻结与收尾边界见[启动期限说明](configuration.md#服务启动期限)。
 
-C-Two 0.8.0 中的 Python `CoreError` 提供 `io_operation`（`bind` 或 `connect`）、`io_kind`（`permission_denied`、`not_found`、`connection_refused`、`address_in_use`、`other`）及 `raw_os_error`（原始 errno/Win32 码，无系统码时为 `None`）。这些字段描述实际本地操作；配置、握手、合同及期限失败没有本地原因，三个字段均为 `None`。Windows PIPE_BUSY 等待沿用原连接预算，期限耗尽不冒充 OS 错误；C-Two listener lease 冲突可以是 `address_in_use` 且没有 Win32 码。
+公开的 `c_two.error.CoreError` 提供 `io_operation`（`bind` 或 `connect`）、`io_kind`（`permission_denied`、`not_found`、`connection_refused`、`address_in_use`、`other`）及 `raw_os_error`（原始 errno/Win32 码，无系统码时为 `None`）。这些字段描述实际本地操作；配置、握手、合同及期限失败没有本地原因，三个字段均为 `None`。Windows PIPE_BUSY 等待沿用原连接预算，期限耗尽不冒充 OS 错误；C-Two listener lease 冲突可以是 `address_in_use` 且没有 Win32 码。
 
 Rust Core 与 SDK 错误通过 `local_io_cause() -> Option<LocalIoCause>` 暴露原因，`operation()` 和 `error()` 分别提供操作及已有 `EndpointIoError`。原 readiness watch 传递 `ServerFailure { message, bind_error, startup_timeout }`，替换 `ServerLifecycleState::Failed` 与 `LifecycleError::Server` 的字符串负载。低层穷尽匹配需要包含 `IpcError::Connect`、`ServerError::Bind` / `Failed` / `StartupTimeout`；Core 通过 `LifecycleError::StartupTimeout` 暴露启动期限。Rust 调用者需要重新编译，没有旧负载或兼容入口。ABI 与协议版本不变。
 
 目录上下文保留原始 OS kind/code，外层目录策略仍按原规则拒绝。可读消息、错误顺序、重试分类和期限含义保持原样。原因字段不能证明进程死亡，也不授予启动、回退或清理权限；控制者仍须遵循已有监听所有权与严格身份回收机制。端点维护 API 沿用现有 ErrorKind 文本格式。
 
+## 公开的 Python 结构化错误
+
+直接捕获 `c_two.error.CoreError`。它继承 `CCBaseError` 和 `RuntimeError`；`CCError` 继续表示 canonical 语义错误。处理两类错误时捕获 `CCBaseError`；只允许语义错误穿过调用阶段包装时捕获 `CCError`。旧 `_native.CoreError` 导出已删除，不提供顶层别名或包装异常。
+
+```python
+from c_two.error import CoreError
+
+try:
+    resource = cc.connect(Grid, name="grid", address="ipc://worker")
+except CoreError as exc:
+    if exc.io_operation == "connect" and exc.io_kind == "permission_denied":
+        raise PermissionError(exc.message) from exc
+    raise
+```
+
+所有实例都具备类中声明的字段；可选值缺省为 `None`，`details` 为独立字典。`str(exc)` 与 `args[0]` 保留外层原始诊断；Python 复制和 pickle 往返保留字段，不改变 portable 错误协议。全部字段及取值范围见[字段表](local-endpoint-lifecycle.en.md#public-structured-python-errors)。
+
+`category` 为 `semantic / contract / admission / transport / lifecycle`；`transport_kind` 为 `ipc / http / None`；`transport_phase` 为 `str / None`：Core 传输错误产生 `pre_dispatch / dispatch_uncertain`，分别表示业务发送前、不能确定对端是否执行；语义错误原样保留对端任意诊断字符串，不代表可信传输分类。`io_kind` 为 `permission_denied / not_found / connection_refused / address_in_use / other / None`；`raw_os_error` 仅保留真实 errno/Win32 码，无原始系统码的策略拒绝及非 I/O 失败为 `None`。这些字段不自行授权重试或清理。
+
+`lifecycle_kind`、启动阶段/秒数、HTTP 状态、登记失败来源及 rollback/relay cleanup 结果继续来自原 Core 错误链；结构化字段并不重新执行事务。普通导入仍不加载 FastDB 或 NumPy。
+
 ## 观察 IPC 连接结束
 
-`cc.connection_observation(proxy)` 返回当前物理 IPC 连接的只读观察对象；Rust 的普通及生成客户端使用 `client.connection_observation()`。查询不建立连接或重连，thread-local 和 HTTP 客户端返回 `UnsupportedCallMode`。多个逻辑代理可以共享同一 `connection_id`；关闭一个代理不等于物理连接结束。重连产生新的 ID 和观察对象，旧对象保留旧连接的终态。
+在连接客户端或启动监听之前调用 `cc.connection_events()`，订阅本 Runtime 的受管理 outgoing IPC 连接以及服务端接受的连接；Rust 对应 `Runtime::connection_events()`。同一事件流通过 `event.side` 的 `client` / `server` 区分双方。订阅不启动主机、创建身份或冻结配置，预使用阶段的合法配置变更保留既有订阅。
+
+Python `events.recv(timeout=None)` 返回 `ConnectionEvent`：`kind='opened'` 的 `value` 是 `ConnectionObservation`，`kind='closed'` 的 `value` 是 `ConnectionClosed`。两者都有 `connection_id` 和 `side`；客户端 ID 与 `cc.connection_observation(proxy).connection_id` 一致。opened 只证明 OS 物理连接建立或接受，不证明握手、合同或业务就绪。多代理可共享同一连接，逻辑代理 close 不单独产生物理关闭；重连分配新 ID。
 
 ```python
-peer = cc.connect(Grid, name='grid', address=address)  # address 是 ipc:// 地址
-observation = cc.connection_observation(peer)
-closed = observation.wait_closed(timeout=5.0)
-if closed is not None:
-    print(closed.connection_id, closed.reason, closed.operation, closed.os_error)
-cc.close(peer)
+events = cc.connection_events()  # 在连接之前订阅
+try:
+    peers = [cc.connect(Grid, name='grid', address=address) for address in addresses]
+    for event in events:
+        if event.side == 'client' and event.kind == 'closed':
+            print(event.connection_id, event.value.reason, event.value.operation)
+finally:
+    events.close()
 ```
 
-`snapshot()` 立即返回终态或 `None`；`wait_closed(timeout=None)` 等待终态，超时返回 `None`，Python 等待期间释放 GIL。零超时可以读取已发生的终态。Rust 使用异步 `wait_closed(Option<Duration>)`。取消或超时仅结束本次等待；晚到的等待者得到同一条终态。观察对象只持元数据，不保活 stream、Runtime、资源或 payload lease。
+`recv()` 等待时释放 GIL，超时返回 `None`，来源或订阅结束时抛 `StopIteration`。其他线程可以调用幂等的 `events.close()` 唤醒阻塞接收；它丢弃该订阅排队的元数据，不关闭物理连接或其他订阅。与 close 并发的接收可能已取得一条事件，之后的接收均结束。一个订阅同一时刻只允许一个消费者，并发接收抛 `RuntimeError`。一个消费者可观察多个连接，无须为每条连接各阻塞一个线程。HTTP-only、同进程调用不产生 outgoing IPC 事件，独立的原始 admin/owner 控制连接不被插入 Runtime 客户端缓存。
 
-服务端在启动监听前调用 `cc.connection_events()` 或 Rust `Runtime::connection_events()`，订阅本 Runtime 此后接受的连接；订阅本身不启动主机、创建身份或冻结配置，启动前的合法配置变更保留既有订阅。Python 的 `events.recv(timeout=None)` 返回 `ConnectionEvent`：`kind='opened'` 时 `value` 为单连接观察，`kind='closed'` 时为终态记录。两者都有 `connection_id`。订阅包括握手、探针和 relay 的实际连接，ID 不表示进程、用户或 CRM 身份。
+事件不回放历史，晚订阅可能只收到旧连接此后的关闭。队列首次订阅时分配，固定容量 1024；溢出抛 `ConnectionEventsLagged`，`missed` 表示遗漏数，并永久结束该订阅。Rust 的异步 `recv(&self)` 在结束时返回 `Ok(None)`，溢出为 `ConnectionEventsError::Lagged`，并发接收为 `ConcurrentReceive`。事件和订阅仅保留元数据，不保活 Runtime、transport、resource 或 payload lease。
 
-```python
-events = cc.connection_events()
-cc.register(Grid, resource, name='grid')
-for event in events:
-    if event.kind == 'closed':
-        print(event.connection_id, event.value.reason)
-```
-
-订阅只覆盖创建后的事件，晚订阅可能只收到既有连接的 Closed。队列在首次订阅时分配，内部容量固定为 1024；落后超出容量时 Python 抛出 `ConnectionEventsLagged`（`missed` 为遗漏数量），Rust 返回 `ConnectionEventsError::Lagged`，随后该订阅结束。既有单连接观察仍可使用。Python `recv()` 超时返回 `None`，来源结束或已终止的订阅抛出 `StopIteration`；Rust `recv()` 结束时返回 `Ok(None)`。每个订阅只有一个消费者，订阅不延长 Runtime 生命。
+`cc.connection_observation(proxy)` 保留当前物理连接的只读元数据；`snapshot()` 立即返回终态或 `None`，thread-local 和 HTTP 代理拒绝该查询。Python 的 `ConnectionObservation.wait_closed()` 和专用 Core 同步桥 `wait_connection_closed()` 已退役，等待统一走事件流，迟到查询使用 snapshot。底层 Rust 异步 `ConnectionObservation::wait_closed(Option<Duration>)` 仍用于原生关闭屏障和可取消的单连接 future，与汇总流读取同一终态权威。
 
 原因仅为 `local_close`、`peer_close_message`、`peer_eof`、`connection_reset`、`heartbeat_timeout`、`protocol_error`、`io_error`。只有收到 DISCONNECT 才报告 `peer_close_message`；EOF/reset 不证明对端进程死亡，心跳超时也不证明死亡。两端的原因可以不同，首个终态保持不变。通知复用 Linux/macOS UDS 和 Windows Named Pipe 的接收事件及现有心跳，不依赖在途调用；通知先于工作排空和内存释放。仍须通过原生 shutdown/close 完成结果确认收尾，通过 OS wait 确认进程退出，再按凭据精确 reap。通知不会释放 Held，也不会把普通断连变成 OwnerBound 所有者丢失。
 

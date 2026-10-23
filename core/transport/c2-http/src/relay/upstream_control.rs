@@ -60,9 +60,10 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
         let endpoint = match state.endpoint_context().endpoint(key.address()) {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                state.mark_upstream_control_watch_unavailable(
+                state.set_upstream_watch_status(
                     &key,
-                    format!("control watch endpoint invalid: {error}"),
+                    &token,
+                    Some(format!("control watch endpoint invalid: {error}")),
                 );
                 tokio::time::sleep(CONTROL_RETRY_DELAY).await;
                 continue;
@@ -73,9 +74,18 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
             .manage(|| IpcClient::with_endpoint(endpoint, c2_config::ClientIpcConfig::default()))
         {
             Ok(client) => client,
-            Err(_) => {
-                state.clear_upstream_control_if_matches(&key, &token);
-                return;
+            Err(error) => {
+                if state.clients.is_closed() {
+                    state.clear_upstream_control_if_matches(&key, &token);
+                    return;
+                }
+                state.set_upstream_watch_status(
+                    &key,
+                    &token,
+                    Some(format!("control watch client unavailable: {error}")),
+                );
+                tokio::time::sleep(CONTROL_RETRY_DELAY).await;
+                continue;
             }
         };
         match client.connect().await {
@@ -87,9 +97,10 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
                     key.server_instance_id(),
                     key.address()
                 );
-                state.mark_upstream_control_watch_unavailable(
+                state.set_upstream_watch_status(
                     &key,
-                    format!("control watch connect failed: {err}"),
+                    &token,
+                    Some(format!("control watch connect failed: {err}")),
                 );
                 tokio::time::sleep(CONTROL_RETRY_DELAY).await;
                 continue;
@@ -112,7 +123,7 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
             state.clear_upstream_control_if_matches(&key, &token);
             return;
         }
-        state.clear_upstream_control_watch_unavailable(&key);
+        state.set_upstream_watch_status(&key, &token, None);
 
         loop {
             if state.local_routes_for_owner(&key).is_empty() {
@@ -134,7 +145,11 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
                     key.server_instance_id(),
                     key.address()
                 );
-                state.mark_upstream_control_watch_unavailable(&key, "control watch disconnected");
+                state.set_upstream_watch_status(
+                    &key,
+                    &token,
+                    Some("control watch disconnected".into()),
+                );
                 break;
             }
             tokio::time::sleep(CONTROL_OBSERVE_INTERVAL).await;
@@ -250,12 +265,19 @@ mod tests {
                 .as_nanos()
         );
         let address = format!("ipc://{id}");
+        #[cfg(unix)]
+        let root = crate::relay::test_support::EndpointTestRoot::new();
+        #[cfg(unix)]
+        let context = root.context();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let endpoint = context.endpoint(&address).unwrap();
         let mut config = c2_server::ServerIpcConfig::default();
         config.base.pool_enabled = false;
         config.base.pool_prewarm_segments = 0;
         let server = Arc::new(
-            c2_server::Server::new_with_identity(
-                &address,
+            c2_server::Server::new_with_identity_and_endpoint(
+                endpoint.clone(),
                 config,
                 c2_server::ServerIdentity {
                     server_id: id.clone(),
@@ -277,7 +299,7 @@ mod tests {
         let mut ipc_config = c2_config::ClientIpcConfig::default();
         ipc_config.base.pool_enabled = false;
         ipc_config.base.pool_prewarm_segments = 0;
-        let mut client = IpcClient::with_config(&address, ipc_config);
+        let mut client = IpcClient::with_endpoint(endpoint, ipc_config);
 
         // Cleanup runs after every assertion failure or bounded step timeout.
         let result = std::panic::AssertUnwindSafe(tokio::time::timeout(STEP, async {
@@ -402,5 +424,234 @@ mod tests {
             "a missing transport connection is not proof that the route disappeared"
         );
         assert!(client.close_shared_bounded(STEP).await);
+    }
+
+    #[tokio::test]
+    async fn watch_capacity_recovers_or_shutdown_drains() {
+        for shutdown_after_full in [false, true] {
+            let state = crate::relay::test_support::test_state_for_client();
+            let id = format!(
+                "watch_capacity_{}_{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let address = format!("ipc://{id}");
+            let endpoint = state.endpoint_context().endpoint(&address).unwrap();
+            let mut config = c2_server::ServerIpcConfig::default();
+            config.base.pool_enabled = false;
+            config.base.pool_prewarm_segments = 0;
+            let server = Arc::new(
+                c2_server::Server::new_with_identity_and_endpoint(
+                    endpoint.clone(),
+                    config,
+                    c2_server::ServerIdentity {
+                        server_id: id.clone(),
+                        server_instance_id: format!("{id}-instance"),
+                    },
+                )
+                .unwrap(),
+            );
+            crate::relay::test_support::register_echo_route(&server, ROUTE_NAME).await;
+            let (uid, revision) = server.registered_route_identity(ROUTE_NAME).unwrap();
+            let entry = route_entry(&id, &address, uid, revision);
+            let registered = test_commit_registration!(
+                &state,
+                entry.name.clone(),
+                id.clone(),
+                format!("{id}-instance"),
+                address,
+                entry.crm_ns.clone(),
+                entry.crm_name.clone(),
+                entry.crm_ver.clone(),
+                entry.abi_hash.clone(),
+                entry.signature_hash.clone(),
+                entry.max_payload_size,
+                entry.route_uid.clone(),
+                entry.route_revision,
+                None
+            );
+            assert!(matches!(
+                registered,
+                crate::relay::state::RegisterCommitResult::Registered { .. }
+            ));
+            let running = server.clone();
+            let mut server_task = tokio::spawn(async move { running.run().await });
+            let mut reserved = Vec::new();
+            let domain = state.clients.clone();
+            let mut observer = tokio::spawn(async move { domain.run().await });
+            let mut shutdown = None;
+            let result = std::panic::AssertUnwindSafe(async {
+                server.wait_until_ready(STEP).await.unwrap();
+                // Real unpublished ManagedClients occupy the same bounded owner
+                // slots as connected and closing clients. No fake admission seam.
+                for _ in 0..1024 {
+                    reserved.push(
+                        state
+                            .clients
+                            .manage(|| {
+                                IpcClient::with_endpoint(
+                                    endpoint.clone(),
+                                    c2_config::ClientIpcConfig::default(),
+                                )
+                            })
+                            .unwrap(),
+                    );
+                }
+                assert_eq!(state.clients.outstanding(), 1024);
+                assert!(state.clients.manage(|| panic!("capacity is full")).is_err());
+                state.start_upstream_control(&entry);
+                tokio::time::timeout(STEP, async {
+                    while state.controls_snapshot_for_test().1 != 0
+                        && state
+                            .upstream_control_watch_unavailable_for_route(&entry)
+                            .is_none()
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("watcher did not observe full capacity");
+                let unavailable = state.upstream_control_watch_unavailable_for_route(&entry);
+                let controls = state.controls_snapshot_for_test();
+                assert!(
+                    unavailable.is_some(),
+                    "full capacity retains watch-unavailable reason"
+                );
+                assert_eq!(controls, (false, 1));
+                assert!(!state.clients.is_closed());
+                assert!(state.local_route(ROUTE_NAME).is_some());
+                assert_eq!(state.with_route_table(|rt| rt.list_tombstones().len()), 0);
+
+                if shutdown_after_full {
+                    let domain = state.clients.clone();
+                    shutdown = Some(tokio::spawn(async move { domain.shutdown().await }));
+                    tokio::time::timeout(CONTROL_RETRY_DELAY * 3, async {
+                        while state.controls_snapshot_for_test().1 != 0 {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("closed lifecycle did not terminate the capacity retry");
+                    assert!(state.clients.is_closed());
+                    assert!(
+                        state
+                            .upstream_control_watch_unavailable_for_route(&entry)
+                            .is_none()
+                    );
+                    assert!(state.local_route(ROUTE_NAME).is_some());
+                    assert_eq!(state.clients.outstanding(), 1024);
+                    assert!(
+                        !shutdown.as_ref().unwrap().is_finished(),
+                        "shutdown must wait for unpublished owners"
+                    );
+                } else {
+                    drop(reserved.pop());
+                    let recovered = tokio::time::timeout(CONTROL_RETRY_DELAY * 3, async {
+                        while state.controls_snapshot_for_test() != (false, 1)
+                            || state.clients.outstanding() != 1024
+                            || state
+                                .upstream_control_watch_unavailable_for_route(&entry)
+                                .is_some()
+                        {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await;
+                    assert!(
+                        recovered.is_ok(),
+                        "capacity recovery must reconnect the original upstream watcher"
+                    );
+
+                    // Unavailability still requires a live data-plane check. A valid
+                    // contract/token must remain callable while the reason is set.
+                    drop(reserved.pop());
+                    tokio::time::timeout(STEP, async {
+                        while state.clients.outstanding() == 1024 {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let key = owner_key_for_route(&entry).unwrap();
+                    state.mark_upstream_control_watch_unavailable(&key, "controlled watch absence");
+                    let (lease, binding) =
+                        tokio::time::timeout(STEP, state.acquire_upstream_for_route(&entry))
+                            .await
+                            .unwrap()
+                            .unwrap_or_else(|_| {
+                                panic!("live acquire must succeed while watch is unavailable")
+                            });
+                    assert_eq!(binding.route_uid(), entry.route_uid);
+                    assert_eq!(binding.route_revision(), entry.route_revision);
+                    let reply = tokio::time::timeout(
+                        STEP,
+                        lease.client().call_bound(&binding, "ping", &[]),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(reply.into_bytes().unwrap(), b"echo");
+                    assert!(
+                        state
+                            .upstream_control_watch_unavailable_for_route(&entry)
+                            .is_some()
+                    );
+                    drop(lease);
+                    assert!(server.unregister_route(ROUTE_NAME).await);
+                    tokio::time::timeout(STEP, async {
+                        while state.local_route(ROUTE_NAME).is_some()
+                            || state.controls_snapshot_for_test().1 != 0
+                        {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("recovered watcher did not observe real upstream withdrawal");
+                    assert!(
+                        state
+                            .upstream_control_watch_unavailable_for_route(&entry)
+                            .is_none()
+                    );
+                    assert_eq!(state.with_route_table(|rt| rt.list_tombstones().len()), 1);
+                }
+            })
+            .catch_unwind()
+            .await;
+
+            // Run cleanup on the baseline assertion failure as well as success.
+            drop(reserved);
+            let controls = tokio::time::timeout(STEP, state.stop_upstream_controls()).await;
+            let clients = tokio::time::timeout(STEP * 5, state.clients.shutdown()).await;
+            if let Some(shutdown) = shutdown {
+                tokio::time::timeout(STEP, shutdown).await.unwrap().unwrap();
+            }
+            let observed = tokio::time::timeout(STEP, &mut observer).await;
+            let stopped = server.shutdown_and_wait(STEP).await;
+            let joined = tokio::time::timeout(STEP, &mut server_task).await;
+            if observed.is_err() {
+                observer.abort();
+                let _ = observer.await;
+            }
+            if joined.is_err() {
+                server_task.abort();
+                let _ = server_task.await;
+            }
+            assert!(controls.is_ok());
+            assert!(clients.is_ok());
+            assert!(matches!(observed, Ok(Ok(()))));
+            assert_eq!(state.clients.outstanding(), 0);
+            assert!(stopped.is_ok());
+            assert!(matches!(joined, Ok(Ok(Ok(())))));
+            assert!(matches!(
+                c2_local::inspect_endpoint(&endpoint),
+                c2_local::EndpointInspection::Absent | c2_local::EndpointInspection::KernelManaged
+            ));
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
     }
 }

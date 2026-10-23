@@ -69,7 +69,7 @@ Typed overrides 为 `BaseIPCOverrides`、`ServerIPCOverrides`、`ClientIPCOverri
 
 Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；启动前通过 `set_transport_policy` 替换 RuntimeSession 时会保留该设置。完整 `cc.shutdown()` 后产生的新 session 可以重新配置。Rust 的优先级为显式 `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > 5 秒。就绪和后续直连 IPC ping 共用等待预算，所有者启动围栏也使用该配置时长。配置、合同验证发生在等待之前；超时后的原生收尾仍使用独立的 shutdown 预算，因此这不是 `cc.register()` 的总墙钟时限。
 
-启动到期产生原生 `CoreError`：`category='lifecycle'`、`lifecycle_kind='startup_timeout'`，并携带 `startup_stage`（`readiness`、`responsiveness` 或 `owner_control`）及 `timeout_seconds`。三个本地 I/O 字段 `io_operation`、`io_kind`、`raw_os_error` 均为 `None`。真实 bind 失败保持原结构化系统原因，消息不再添加错误的 `config error` 前缀。这些诊断不提供重试、接管或清理端点的权限。
+启动到期产生公开的 `c_two.error.CoreError`：`category='lifecycle'`、`lifecycle_kind='startup_timeout'`，并携带 `startup_stage`（`readiness`、`responsiveness` 或 `owner_control`）及 `timeout_seconds`。三个本地 I/O 字段 `io_operation`、`io_kind`、`raw_os_error` 均为 `None`。真实 bind 失败保持原结构化系统原因，消息不再添加错误的 `config error` 前缀。这些诊断不提供重试、接管或清理端点的权限。完整类型及取值范围见[公开错误字段表](local-endpoint-lifecycle.en.md#public-structured-python-errors)。
 
 ## IPC 内存、分块与心跳
 

@@ -21,6 +21,7 @@ mod observation;
 pub use observation::{
     ConnectionClosed, ConnectionEndReason, ConnectionEvent, ConnectionEventSource,
     ConnectionEvents, ConnectionEventsError, ConnectionObservation, ConnectionPublisher,
+    ConnectionSide,
 };
 
 mod credential;
@@ -731,7 +732,7 @@ mod write_observation_tests {
     #[tokio::test]
     async fn native_write_error_is_published_before_abort_without_a_reader_task() {
         let (stream, peer) = LocalStream::pair().await.unwrap();
-        let publisher = ConnectionPublisher::new();
+        let publisher = ConnectionPublisher::new(ConnectionSide::Client);
         let observation = publisher.observation();
         let stream = stream.with_connection_publisher(publisher);
         let abort = stream.abort_handle();
@@ -763,8 +764,8 @@ mod write_observation_tests {
         use tokio::io::AsyncReadExt;
 
         let source = ConnectionEventSource::new();
-        let mut events = source.subscribe();
-        let publisher = source.open_connection();
+        let events = source.subscribe();
+        let publisher = source.open_connection(ConnectionSide::Server);
         let observation = publisher.observation();
         let (stream, mut peer) = LocalStream::pair().await.unwrap();
         let stream = stream.with_connection_publisher(publisher);

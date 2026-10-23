@@ -46,7 +46,6 @@ use pyo3::prelude::*;
 #[pymodule(name = "_native", gil_used = false)]
 fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     error_ffi::register_module(m)?;
-    core_error_ffi::register_module(m)?;
     core_ffi::register_module(m)?;
     connection_ffi::register_module(m)?;
     control_ffi::register_module(m)?;
