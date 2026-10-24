@@ -986,7 +986,7 @@ mod tests {
         wire.server_id = format!("owner-kind-{}", uuid::Uuid::new_v4().simple());
         wire.address = format!("ipc://{}", wire.server_id);
         let endpoint = context.endpoint(&wire.address).unwrap();
-        let mut listener =
+        let listener =
             runtime().block_on(async { c2_local::LocalListener::bind(&endpoint).unwrap() });
         wire.context_binding = EndpointContextBinding::capture(&endpoint).unwrap().digest();
 
