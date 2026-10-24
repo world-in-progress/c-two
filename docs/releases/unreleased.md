@@ -1,5 +1,11 @@
 # Unreleased
 
+## Python manual assembly API retirement
+
+Remove `c_two.mem.ChunkAssembler`, `c_two.mem.MemHandle` and their `_native` exports. These were the manual Python entry points used by the retired Python transport loops. They have no compatibility aliases or replacement Python manual-assembly API. Code that directly constructed an assembler and accessed its finished handle must move to normal RPC automatic chunking or the retained Rust assembler API.
+
+The Rust `ChunkRegistry`, `ChunkAssembler`, `ReassemblyBacking` and `MemHandle` remain unchanged. Current IPC chunking, memory-pool APIs, snapshots, budget accounting and release order are preserved; C/FFI ABI 5, IPC 12, SHM 3 and owner control 1 are unchanged.
+
 ## Inline response ownership
 
 Core now moves an IPC inline response's existing byte vector into the held response owner. Ordinary Python IPC calls and Rust held calls avoid one payload allocation and copy; Rust owned calls retain their existing move path. SHM and chunked responses keep their original transport leases, pool identity, budget accounting and release order. Python snapshots and FastDB receive adapters retain their existing behavior. Public APIs, ABI and protocols are unchanged.

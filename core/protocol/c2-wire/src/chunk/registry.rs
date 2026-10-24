@@ -618,7 +618,9 @@ mod tests {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
         reg.insert(1, 200, 3, 1024, ()).unwrap();
+        assert!(!reg.feed(1, 200, 0, &[7; 200]).unwrap());
         assert_eq!(reg.active_count(), 1);
+        assert_eq!(reg.total_bytes(), 3 * 1024);
         assert_eq!(reassembly_used(&budget), 3 * 1024);
         reg.abort(1, 200);
         // Idempotent: a missing entry aborts nothing.
@@ -1142,6 +1144,48 @@ mod tests {
         }
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
+    }
+
+    #[test]
+    fn interleaved_requests_keep_content_and_charges_independent() {
+        let (pool, budget) = budgeted_pool(2048);
+        let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
+        for request_id in [100, 200] {
+            reg.insert(42, request_id, 2, 512, ()).unwrap();
+        }
+        assert_eq!(reg.active_count(), 2);
+        assert_eq!(reg.total_bytes(), 2048);
+        assert_eq!(reassembly_used(&budget), 2048);
+        assert!(!reg.feed(42, 100, 0, &[1; 512]).unwrap());
+        assert!(!reg.feed(42, 200, 0, &[2; 512]).unwrap());
+        assert!(reg.feed(42, 100, 1, &[3; 100]).unwrap());
+
+        let (first, ()) = reg.take(42, 100).unwrap();
+        let mut first = first.finish().unwrap();
+        assert!(!reg.contains(42, 100));
+        assert!(reg.contains(42, 200));
+        assert_eq!(reg.active_count(), 1);
+        assert_eq!(reg.total_bytes(), 1024);
+        assert_eq!(reassembly_used(&budget), 2048);
+        let expected_first = [vec![1; 512], vec![3; 100]].concat();
+        assert_eq!(first.len(), 612);
+        assert_eq!(first.copy_bytes().unwrap(), expected_first);
+        first.release().unwrap();
+        assert_eq!(reassembly_used(&budget), 1024);
+        assert_eq!(pool.read().stats().alloc_count, 1);
+
+        assert!(reg.feed(42, 200, 1, &[4; 200]).unwrap());
+        let (second, ()) = reg.take(42, 200).unwrap();
+        let mut second = second.finish().unwrap();
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+        assert_eq!(reassembly_used(&budget), 1024);
+        let expected_second = [vec![2; 512], vec![4; 200]].concat();
+        assert_eq!(second.len(), 712);
+        assert_eq!(second.copy_bytes().unwrap(), expected_second);
+        second.release().unwrap();
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     // ── File-backing retention (spill_threshold = 0 forces file spill) ──

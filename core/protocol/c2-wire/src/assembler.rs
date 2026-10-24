@@ -338,13 +338,63 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_tiny_many_short_and_reverse_chunks() {
+        let pool = test_pool_arc();
+        for (total_chunks, chunk_size, last_size, reverse) in [
+            (1, 1024, 0, false),
+            (5, 1, 1, false),
+            (100, 64, 30, false),
+            (3, 4096, 1, false),
+            (5, 256, 100, true),
+        ] {
+            let chunks: Vec<Vec<u8>> = (0..total_chunks)
+                .map(|idx| {
+                    let len = if idx + 1 == total_chunks {
+                        last_size
+                    } else {
+                        chunk_size
+                    };
+                    vec![idx as u8; len]
+                })
+                .collect();
+            let mut asm =
+                ChunkAssembler::new(pool.clone(), total_chunks, chunk_size, 512, 8 * (1 << 30))
+                    .unwrap();
+            for step in 0..total_chunks {
+                let idx = if reverse {
+                    total_chunks - 1 - step
+                } else {
+                    step
+                };
+                assert_eq!(
+                    asm.feed_chunk(idx, &chunks[idx]).unwrap(),
+                    step + 1 == total_chunks
+                );
+                assert_eq!(asm.received(), step + 1);
+            }
+            let mut backing = asm.finish().unwrap();
+            assert_eq!(backing.len(), (total_chunks - 1) * chunk_size + last_size);
+            assert_eq!(backing.copy_bytes().unwrap(), chunks.concat());
+            assert_eq!(backing.capacity_bytes(), (total_chunks * chunk_size) as u64);
+            backing.release().unwrap();
+        }
+    }
+
+    #[test]
     fn test_duplicate_chunk_rejected() {
         let pool = test_pool_arc();
         let mut asm = ChunkAssembler::new(pool.clone(), 2, 8, 512, 8 * (1 << 30)).unwrap();
-        asm.feed_chunk(0, b"data").unwrap();
+        assert!(!asm.feed_chunk(0, b"data0000").unwrap());
+        assert_eq!(asm.received(), 1);
         let err = asm.feed_chunk(0, b"dup").unwrap_err();
         assert!(err.contains("duplicate"));
-        asm.abort();
+        assert_eq!(asm.received(), 1);
+        assert!(!asm.is_complete());
+        assert!(asm.feed_chunk(1, b"tail").unwrap());
+        assert_eq!(asm.received(), 2);
+        let mut backing = asm.finish().unwrap();
+        assert_eq!(backing.copy_bytes().unwrap(), b"data0000tail");
+        backing.release().unwrap();
     }
 
     #[test]
@@ -363,9 +413,13 @@ mod tests {
             format!("/cc3abort{:08x}", std::process::id()),
             budget.clone(),
         )));
-        let asm = ChunkAssembler::new(pool.clone(), 4, 4096, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 4, 4096, 512, 8 * (1 << 30)).unwrap();
         assert!(asm.backing.is_buddy());
         assert_eq!(pool.read().stats().alloc_count, 1);
+        assert!(!asm.feed_chunk(0, &[7; 200]).unwrap());
+        assert_eq!(asm.received(), 1);
+        assert_eq!(asm.written_end(), 200);
+        assert_eq!(asm.capacity_bytes(), 4 * 4096);
         assert_eq!(
             budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
             4 * 4096

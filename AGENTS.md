@@ -246,6 +246,7 @@ Paths: `core/`, `sdk/python/native/`
 
 Memory subsystem:
 
+- Python no longer exports the manual `c_two.mem.ChunkAssembler` / `MemHandle` wrappers or their `_native` names. Keep automatic IPC chunking in the existing Rust `ChunkRegistry` / `ChunkAssembler` / `ReassemblyBacking` chain; the Rust types and memory-pool APIs remain supported. Do not restore Python consumed/released wrappers or compatibility aliases for the retired manual entry points.
 - Allocation tiers: buddy SHM, dedicated SHM, file spill.
 - `MemHandle` abstracts buddy, dedicated, and file-spill handles.
 - `MemHandle` is a private, move-only allocation owner. Its SHM authority is

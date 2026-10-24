@@ -32,7 +32,7 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 | R14 · handle 只读校验复用 | 私有只读指针 helper 预计使生产减 40–55 行；补齐无效空 handle、allocation 长度、过期世代与错误顺序后，整体预计只减 0–35 行。原始指针借用边界也增加审查负担。 | 与有证据的所有权修复自然合并时再评估；不单独引入 CheckedSpan、缓存或锁证明框架。 |
 | C07 · Python direction/结果形状 | 服务端假 CRM 实例与双向 wrapper 的重新设计需要明确 callable 协议，并处理公开 direction、直接调用、自定义带 binding 方法及测试迁移。整体净收益未证明。普通未包装继承方法不满足 descriptor binding 接纳，不能误称已有正式可运行能力。 | 先决定公开 Python 调用约定；不混入已完成的 HTTP namespace 子项，也不重新把任意自定义编码器作为正式 portable 能力。 |
 | R21 · Resource 模板链 | 生成器仍输出装饰并继承 CRM 的旧模型，AST fallback 读取未保存的 ast_node。整链可毛删约 613 行，但会撤销公开模板生成能力；现有 c2-codegen 不提供等价 Resource skeleton。 | 单独决定修复工具或退役功能；不能把工具层删除记为生产运行时收益。 |
-| R35 · 禁用心跳空任务 | 用户明确暂缓。省掉禁用态空任务仅是局部资源优化，不依赖公开函数/枚举退役；此前 25–45 行估算混入了 API 删除和测试迁移，不能视为独立优化收益。 | 先证明禁用场景的实际收益；公开 API 退役有独立理由时另行决定，不为凑净减量捆绑。 |
+| R35 · 禁用心跳空任务 | 2026-10-24 用户确认继续暂缓。连接事件负责报告已知断连，心跳仍负责发现未关闭但失去响应的连接；启用/禁用配置均有职责。候选只省掉禁用态永久 pending 任务，未证明实际成本收益；此前 25–45 行估算混入公开函数/枚举删除和测试迁移，不能视为该优化的独立净收益。 | 先测量禁用场景的任务和资源成本；仅复用现有可选任务所有权。公开 API 退役必须有独立设计理由，不与局部优化捆绑，也不为凑净减量开批。 |
 
 该轮筛选已做调用链、引入历史和独立原生只读复核，只形成暂缓结论，没有形成这些项目的候选实现或性能收益证据。
 
@@ -53,8 +53,9 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 | R18 | 已按正确性修复验收并随 c3 0.4.1 发布：容量拒绝复用原 retry，永久关闭才退出；status 与任务共锁、按原 token 更新，保留不可用记录的独立寿命、1024 owner 上限、代际及释放顺序。生产 +49、测试 +345，不计作瘦身收益。见[验收记录](../reports/2026-10-23-082-client-observation-release-acceptance.md)。 |
 | R19、R20 | CLI 畸形成功响应和示例加载失败后的覆盖行为，属于错误/数据保护修复，不作为纯瘦身执行。 |
 | R22 剩余 | benchmark selector、旧 sweep 和测量标签仅为工具整理。已完成的 SDK 登记/撤回与强制 HTTP 实跑保持。 |
-| R25 剩余 | 三个旧 call_prepared 入口已退役；FastDB 正式路径、Python-only pickle、Core bytes、服务端 sink、Rust 预分配及当前 client/scheduler 适配边界保留。新的协议收窄需独立决定。R23 bridge、R24 旧 buffer 参数链已完成。 |
+| R25 剩余 | 三个旧 call_prepared 入口已退役；FastDB 正式路径、Python-only pickle、Core bytes、服务端 sink、Rust 预分配及当前 client/scheduler 适配边界保留。2026-10-24 在 `ed6c761a` 复核后继续暂缓：native 调度状态已集中，剩余 prepare_call 探测与 Closed 回退承担既有适配职责；收窄协议最多局部减约 13 行，六个 call-only fixture 及错误接纳覆盖预计使测试增 30–80 行，整体净增且须改变公开 Python 行为。R23 bridge、R24 旧 buffer 参数链已完成。 |
 | R26 | relay journal 明确保留；旧快照及删除原因有独有信息，未来 watch/list history 尚未退役，也没有支持删除的成本测量。 |
+| R33 · 旧 Python 手工分片投影 | 在 `ed6c761a` 发现 `c_two.mem.ChunkAssembler → MemHandle` 的原 Python 收发消费者已退出，仓内只余专属测试；现行 IPC 由 Rust registry/assembler/backing 管理。[下一批方案](2026-10-24-r33-python-manual-assembly-retirement.md)单列公开手工能力退役，生产约减 271 行、测试补齐底层缺口后约减 190–226 行，整体预计减约 460–500 行。用户已明确批准退役这两个 Python 手工导出，现已实施并在验收；实际生产减 271 行、测试减 215 行，合计减 486 行，基线覆盖已通过，完整门禁尚待完成。Rust 算法及公开 API、MemPool 公开能力、预算/释放、C/FFI ABI 和协议保持，R06/R07 不混入。 |
 | R29、R32、R33 剩余 | codegen 同次缓存/typed projection、结构化错误内部序列化、Python 错误常量及孤立 wrap_error。0.8.2 的公开 CoreError 是现有错误链投影，不代表 R32 内部错误转换收敛已经完成。R32 凭据子项已按[单一原生投影方案](2026-10-23-r32-native-endpoint-credential.md)验收：实现 `60656603`，生产净减 66、测试净增 14，合计净减 52 行；完整回归、三系统、GitHub Actions 10/10、端点零残留及独立审查见[验收记录](../reports/2026-10-23-r32-native-endpoint-credential-acceptance.md)。剩余错误投影在 `3e575acb` 上复核后继续暂缓：完整迁移包含调度错误和服务端反向转换，涉及至少 6 个生产、9 个测试文件，预计生产减 10–30、测试增 30–60 行；保留 error_bytes 就无法退出编码，替换该公开字段也只惠及错误路径，尚无性能证据。生成 release 复用、call-control 写入去重和 Rust 错误码单一声明已完成；Transport 内外层错误、外部 JSON/wire 与错误顺序保留，不混入无关 API 删除。 |
 | R34、R35 | peer SHM 私有副本已退出；RouteAck 是尚未退役的公开预留协议。R35 的[原分析](2026-10-23-r35-heartbeat-task-ownership.md)已按用户要求暂缓：禁用态空任务优化与公开 API 退役分开，不再把原捆绑估算列为下一批收益；未实施或测量。C05 ABI 4 完整端点能力子项已完成，不借机删除预分配能力。 |
 | R36、R38、R39、C06 剩余 | 已完成的死状态、不可达尾部和 readiness 后等待不再重开；真实等待、维护 EOF/错误退出、操作错误映射和外部 chunk 配置接纳仍有职责。私有 proof 或专属结果类型须先证明整体收益。 |
