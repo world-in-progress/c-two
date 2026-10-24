@@ -1,6 +1,6 @@
 # R33 续批：退役旧 Python 手工分片投影链
 
-状态：2026-10-24 用户已批准仅退役两个 Python 手工包装及导出，不留兼容；基线覆盖已通过，包装及导出已退出，正在验收确切候选。固定输入为 `ed6c761abcb2fcca7ccfac4b5cd89cd87762a58d`。本项归入剩余 R33 孤儿投影清理；R35 继续暂缓。这里明确提议退役一项公开 Python 手工能力，不能将其描述成完全没有 API 影响的内部删除。独立复核确认它仍有脱离 RPC 的独立使用价值，不支持仅凭仓内无调用或减行数删除；用户已经明确接受这部分公开 Python 支持面收窄，Rust 分片链及现行 IPC 行为保留。
+状态：2026-10-24 已完成用户批准的两个 Python 手工包装及导出退役，不留兼容。实现提交 `921b48ee7e54f5b88cafff5e4e19a31d47d5d545` 已通过基线覆盖、完整 relay、跨语言、三系统及 GitHub Actions 10/10、本批端点零残留和独立审查，见[验收记录](../reports/2026-10-24-r33-python-manual-assembly-retirement-acceptance.md)。固定输入为 `ed6c761abcb2fcca7ccfac4b5cd89cd87762a58d`。本项归入 R33 的已完成子项；R35 继续暂缓。这里退役了一项公开 Python 手工能力，不能描述成完全没有 API 影响的内部删除。用户明确接受这部分支持面收窄，Rust 分片链及现行 IPC 行为保留。
 
 ## 调用链与原设计理由
 
@@ -49,7 +49,7 @@ PyMemPool 的分配、读写、精确释放及模块导入测试继续保留。�
 
 先补并运行基线覆盖，再同步删除生产投影和专属测试；针对性运行 c2-wire assembler/registry/backing、Python mem pool/模块边界/held 与预算用例。然后完成完整 relay、真实 Rust/Python/Node 跨语言、持久连接和大消息分片。Windows 优先开发机 Named Pipe；确切实现提交必须通过 GitHub Actions Linux、macOS、Windows x64/ARM64 及适用 3.14t，接受独立实现审查后再提交。只验收本批创建的 socket/lease/Named Pipe 零残留，及时清理构建产物，历史目录不动。
 
-实施进度：原 Python 手工链 19 项全部通过；补齐后的原 Rust 生产实现通过 c2-wire 164 项。导出退役断言在旧原生扩展上按预期失败，删除包装并重建后通过。当前生产净减 271 行，测试净减 215 行，合计净减 486 行；完整平台、relay、跨语言、端点与独立审查仍须完成，不能用局部通过替代。
+验收结果：原 Python 手工链 19 项全部通过；补齐后的原 Rust 生产实现通过 c2-wire 164 项。导出退役断言在旧原生扩展上按预期失败，删除包装并重建后通过。生产净减 271 行，测试净减 215 行，合计净减 486 行。Windows 开发机完成完整 relay 和 Rust/Python/Node 实跑，确切实现的 GitHub Actions 首轮 10/10 成功，包含 Linux、macOS、Windows x64/ARM64 与 3.14t；独立审查无 P0–P3 发现，本批端点零残留，构建产物和两个委派工作区已清理。详细计数、证据和文档增量见验收记录。
 
 ## 独立复核与 Host 取舍
 
