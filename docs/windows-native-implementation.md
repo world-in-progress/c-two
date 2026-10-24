@@ -30,8 +30,7 @@ rows, ordinary/non-administrator wheel consumption and account/process/temp
 cleanup. Those wheels still identify as 0.6.0; this is source-development
 acceptance, not 0.7 formal package evidence.
 
-Windows uses one current-logon SID Named Pipe backend with an independent
-non-inheritable listener kernel lease. Rust owns endpoint derivation,
+The current source uses one TokenUser-scoped Named Pipe backend with a non-inheritable Global listener lease. Connections verify the actual pipe owner and server process before sending; the server must be at least Medium integrity. Cross-session payloads use negotiated owned/inline/chunked paths instead of Local mappings. See the [0.9.0 migration](releases/0.9.0.md) and [design boundary](plans/2026-10-24-windows-user-scope-ipc.md). Rust owns endpoint derivation,
 Persistent/OwnerBound lifecycle, drain and maintenance; credential protocol
 values are format metadata. See [usage](windows-native-usage.md),
 [lifecycle](local-endpoint-lifecycle.md) and [0.7 release notes](releases/0.7.0.md).

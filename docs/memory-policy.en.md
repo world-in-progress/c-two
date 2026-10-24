@@ -4,6 +4,8 @@ English · [简体中文](memory-policy.md)
 
 Rust owns IPC budget accounting, lazy allocation and tiered fallback. SDKs expose typed overrides and read-only statistics. See the [configuration guide](configuration.en.md) for the full option reference.
 
+On Windows, native pipe session facts and IPC 13 directional capabilities govern shared references. Different sessions use the existing owned/inline/chunked path, including copies of explicitly prepared SHM payloads with release through their original owner. The configured buddy-pool switch does not decide this reachability; reassembly may still use its own local memory pool.
+
 ## Finite budget cells
 
 Both server and client IPC overrides accept these independent byte budgets:

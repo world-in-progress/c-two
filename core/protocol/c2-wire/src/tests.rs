@@ -1173,8 +1173,8 @@ mod handshake_tests {
     }
 
     #[test]
-    fn allocation_identity_bumps_handshake_version() {
-        assert_eq!(HANDSHAKE_VERSION, 12);
+    fn shm_direction_negotiation_bumps_handshake_version() {
+        assert_eq!(HANDSHAKE_VERSION, 13);
 
         let client = encode_client_handshake(&[], CAP_CALL_V2, "")
             .expect("current client handshake encodes");
@@ -1186,7 +1186,9 @@ mod handshake_tests {
             &test_identity(),
         )
         .expect("current server handshake encodes");
-        for version in [9_u8, 10, 11] {
+        // Version 12 is the pre-negotiation handshake: it must be rejected in
+        // both directions with no compatibility fallback.
+        for version in [9_u8, 10, 11, 12] {
             for mut encoded in [client.clone(), server.clone()] {
                 encoded[0] = version;
                 assert!(matches!(
@@ -1196,6 +1198,68 @@ mod handshake_tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn shm_direction_capabilities_are_distinct_offer_bits() {
+        assert_eq!(CAP_SHM_REQUEST, 1 << 3);
+        assert_eq!(CAP_SHM_RESPONSE, 1 << 4);
+        // The new bits must not collide with the preserved capabilities.
+        assert_eq!(
+            CAP_SHM_REQUEST & (CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED),
+            0
+        );
+        assert_eq!(
+            CAP_SHM_RESPONSE & (CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED),
+            0
+        );
+        assert_ne!(CAP_SHM_REQUEST, CAP_SHM_RESPONSE);
+    }
+
+    #[test]
+    fn shm_direction_capabilities_survive_handshake_roundtrip() {
+        let cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED | CAP_SHM_REQUEST | CAP_SHM_RESPONSE;
+
+        let client = encode_client_handshake(&[], cap, "").unwrap();
+        let decoded_client = decode_handshake(&client).unwrap();
+        assert_eq!(decoded_client.capability_flags, cap);
+        assert_eq!(
+            decoded_client.capability_flags & CAP_SHM_REQUEST,
+            CAP_SHM_REQUEST
+        );
+        assert_eq!(
+            decoded_client.capability_flags & CAP_SHM_RESPONSE,
+            CAP_SHM_RESPONSE
+        );
+
+        let server = encode_server_handshake(
+            &[],
+            cap,
+            &[route_hash("grid")],
+            "test-prefix",
+            &test_identity(),
+        )
+        .unwrap();
+        let decoded_server = decode_handshake(&server).unwrap();
+        assert_eq!(decoded_server.capability_flags, cap);
+
+        // Direction bits are independent: an ACK may keep one and drop the
+        // other, which is how a one-direction-capable peer negotiates.
+        let one_direction = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED | CAP_SHM_RESPONSE;
+        let server = encode_server_handshake(
+            &[],
+            one_direction,
+            &[route_hash("grid")],
+            "test-prefix",
+            &test_identity(),
+        )
+        .unwrap();
+        let decoded_server = decode_handshake(&server).unwrap();
+        assert_eq!(decoded_server.capability_flags & CAP_SHM_REQUEST, 0);
+        assert_eq!(
+            decoded_server.capability_flags & CAP_SHM_RESPONSE,
+            CAP_SHM_RESPONSE
+        );
     }
 
     #[test]
@@ -1669,8 +1733,8 @@ mod handshake_tests {
 
     #[test]
     fn empty_handshake() {
-        // Version 12, prefix_len=0, 0 segments, cap_flags=0
-        let buf = [12, 0, 0, 0, 0, 0];
+        // Version 13, prefix_len=0, 0 segments, cap_flags=0
+        let buf = [13, 0, 0, 0, 0, 0];
         let decoded = decode_handshake(&buf).unwrap();
         assert_eq!(decoded.prefix, "");
         assert!(decoded.segments.is_empty());
@@ -1791,8 +1855,8 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_client_handshake_fixture_decodes() {
-        // v12: [0c][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
-        let bytes = hex_to_bytes("0c0001000000001004736567300300");
+        // v13: [0d][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
+        let bytes = hex_to_bytes("0d0001000000001004736567300300");
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
@@ -1805,10 +1869,10 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_server_handshake_fixture_decodes() {
-        // v12: client handshake prefix, server identity, then route table
+        // v13: client handshake prefix, server identity, then route table
         // with per-route full CRM tag and contract hashes.
         let bytes = hex_to_bytes(
-            "0c00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "0d00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -1893,8 +1957,8 @@ mod cross_lang_tests {
     fn rust_encode_matches_canonical_client_handshake_fixture() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
-        // v12: [0c][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
-        let expected = hex_to_bytes("0c0001000000001004736567300300");
+        // v13: [0d][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
+        let expected = hex_to_bytes("0d0001000000001004736567300300");
         assert_eq!(encoded, expected);
     }
 
@@ -1934,10 +1998,10 @@ mod cross_lang_tests {
             &identity,
         )
         .unwrap();
-        // v12: [0c][00 prefix_len] then segments/caps, identity, and route table
+        // v13: [0d][00 prefix_len] then segments/caps, identity, and route table
         // with per-route full CRM tag and contract hash metadata.
         let expected = hex_to_bytes(
-            "0c00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "0d00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

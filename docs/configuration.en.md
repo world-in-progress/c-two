@@ -134,7 +134,7 @@ After an HTTP caller disconnects, an already-dispatched forward retains its inpu
 | Platform | Endpoint | Location configuration |
 | --- | --- | --- |
 | Unix | UDS in the final owner-controlled directory | `cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, c3 `--ipc-root`; default `/tmp/c2-<uidhex>` |
-| Windows | Named Pipe scoped to the current logon SID | Automatic; Unix root overrides are rejected |
+| Windows | Named Pipe scoped to the current TokenUser SID | Automatic; Unix root overrides are rejected |
 
 On Unix, the socket is `<root>/<32-character id>`. Applications provision custom directories. Mode `0755` is accepted when the current user owns the directory and has read, write and traversal access, with no group or other write permission. C-Two creates its default directory with mode `0700` and sets and verifies each socket as `0600` before listening. Spaces and Unicode are preserved. Bind, connect and liveness probes address the short name through an open directory descriptor, so filesystem directory-opening limits govern the configured path. C-Two manages its endpoint, lease and coordinator files, preserves unrelated files and directories, and does not change existing permissions or recursively create parents.
 

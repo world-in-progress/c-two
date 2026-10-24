@@ -4,9 +4,9 @@
 
 本文说明原生端点所有权、运行器接入与回收规则。目录配置见 [配置指南](configuration.md#本地端点位置与平台差异)。
 
-本地端点由 Rust `c2-config` 统一派生，SDK、relay 和 c3 使用同一上下文。Unix 默认路径为 `/tmp/c2-<uidhex>/<32 字符标识>`，协调记录包含 nonce gate/marker 与可退休的监听租约；原 gate inode 保持固定直到监听租约释放。Windows 使用当前登录 SID 的 Named Pipe 和不可继承的内核监听租约。调用方传逻辑 `ipc://` 地址，系统自动选择后端；凭据中的 `managed-v2` / `named-pipe` 是格式元数据。
+本地端点由 Rust `c2-config` 统一派生，SDK、relay 和 c3 使用同一上下文。Unix 默认路径为 `/tmp/c2-<uidhex>/<32 字符标识>`，协调记录包含 nonce gate/marker 与可退休的监听租约；原 gate inode 保持固定直到监听租约释放。Windows 使用当前用户 TokenUser SID 的 Named Pipe 和不可继承的内核监听租约。调用方传逻辑 `ipc://` 地址，系统自动选择后端；凭据中的 `managed-v2` / `named-pipe` 是格式元数据。
 
-Unix 的最终端点目录由显式代码 `cc.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外用户目录、版本目录或 `.sock` 后缀。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 或准备 owner 接管时冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯上下文查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前登录 SID 的 Named Pipe，明确拒绝 Unix root 配置。
+Unix 的最终端点目录由显式代码 `cc.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外用户目录、版本目录或 `.sock` 后缀。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 或准备 owner 接管时冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯上下文查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前用户 TokenUser SID 的 Named Pipe，明确拒绝 Unix root 配置。
 
 macOS 还会检查目录句柄上的扩展 ACL：只读、遍历和 deny 条目可用；授予新增、删除、修改属性或权限等能力的 allow 条目会被拒绝，包括继承条目。启动失败会显式释放监听租约锁，重复文件描述符不会继续占有该锁。
 
@@ -22,7 +22,7 @@ Unix 凭据统一使用既有 schema 3，记录最终 root、namespace id、inca
 
 以下 owner 接口和 grace 语义适用于 C-Two 0.8.0，升级范围见[发布与迁移说明](releases/0.8.0.md)。默认生命周期为 `Persistent`，常驻服务直到显式关闭；普通业务连接断开、idle 驱逐、relay 重连不结束服务。只为一个控制器独占管理整个 Runtime 的专用子进程选择 `OwnerBound`。`control, receiver = cc.owner_control_pair()` 返回 `OwnerControl` 和一次性 `NativeOwnerBootstrap`；Rust 对应 `OwnerControl` 和 `OwnerBootstrap`。控制器保存 control，用 `cc.spawn_owned_child(receiver, program, args)` 只向目标子进程转移 bootstrap；`receiver` 是保留的参数名。子进程显式调用 `bootstrap = cc.adopt_owner_stdin()`，并在 `register()` 前设置 `cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(owner_missing_grace_seconds=3.0), owner_control=bootstrap)`。
 
-初始关系使用私有双向通道，由 Core 在 readiness 前 arm；Unix 为非阻塞 CLOEXEC socketpair，Windows 为当前登录 SID 的本地双向 byte-mode Named Pipe，bootstrap 转交子进程后才注册 reactor/IOCP。继承来源由可信 launcher 保证，不能将普通业务 stdin 或任意句柄升级为 owner 能力。启动后不能通过再次 attach bootstrap 绕过票据；终态后重新启动 OwnerBound 主机需要新的 Runtime 和 bootstrap，旧票据不能为新 server instance 续权。readiness 前的票据请求只能在原请求预算内等到端点就绪后发行。
+初始关系使用私有双向通道，由 Core 在 readiness 前 arm；Unix 为非阻塞 CLOEXEC socketpair，Windows 为当前用户 TokenUser SID 的本地双向 byte-mode Named Pipe，bootstrap 转交子进程后才注册 reactor/IOCP。继承来源由可信 launcher 保证，不能将普通业务 stdin 或任意句柄升级为 owner 能力。启动后不能通过再次 attach bootstrap 绕过票据；终态后重新启动 OwnerBound 主机需要新的 Runtime 和 bootstrap，旧票据不能为新 server instance 续权。readiness 前的票据请求只能在原请求预算内等到端点就绪后发行。
 
 `control.close()`、销毁 control 或控制器退出结束所有者关系；原生观察到终态后进入 `OwnerMissing`，暂停主机准入并开始配置的 grace。`control.request_shutdown(timeout=...)` 则由当前有效 owner 直接请求原生排空，成功只证明 shutdown initiate；它不等待业务或进程退出。普通直连 IPC admin shutdown 对 OwnerBound 返回负 ACK，包括握手前和重复 initiate，不能用作接管或绕过 owner 撤销。Persistent 的 admin 行为和可信进程内 `Runtime.shutdown()` / `cc.shutdown()` 保持原语义。
 
@@ -54,7 +54,7 @@ control = prepared.commit(timeout=1.0)  # 每个准备对象只提交一次；�
 
 这些控制方法失败时抛出 `cc.OwnerControlError`；Python 的 `error.kind` / `error.cause_kind` 对应 Rust 的 `kind()` / `cause_kind()`。`NotSent`（`not_sent`）说明变更请求尚未开始发送；`Indeterminate`（`indeterminate`）说明发送已开始但没有有效确认或明确拒绝，候选会话会关闭，不能推断成功或未执行。完整的拒绝仍给出确定分类，例如 `owner_present`、`invalid_grant`、`grace_expired`、`identity_mismatch`、`shutting_down`。上例直接传播错误，每个准备对象无论结果都只允许调用一次 commit，NotSent 后重试也须重新 prepare；应用必须保留两份票据及对应的 epoch 信息。在不确定结果后，可用 inspect 观察当前 epoch/phase，再由应用显式选择已保存的原票据或 successor 创建新的准备对象；原 grant 未消费才仍有效，若已消费则只有已授权的 successor 有效，竞争者获胜或撤销也可能令自己的票据失效。不得自动依次尝试 old/new key，也不得从 epoch 变化认定自己的事务获胜。
 
-每次控制调用使用一个原生绝对预算，每个 session 只有一个在途请求；等待串行槽超时只结束该 waiter，不能关闭其他调用的 owner session；取得槽后、首次写入前超时也保留健康会话。开始写入后丢失确认会终止该专用会话，迟到应答不能交给下一请求。候选 setup 上限为原生 5 秒与剩余原 grace deadline 的较早者，拆包或重试不重置它；不新增配置项。owner 控制独立使用 version 1、最多 4 KiB 的消息，复用既有帧封装；IPC 握手 12、SHM 3、C/FFI ABI 5 和业务帧、调用/回复编码保持不变。Rust 穷举匹配须增加 `MsgType::OwnerControl`、`SchedulerAcquireError::Unavailable` 和 `RouteConcurrencyError::Unavailable` 分支。旧单向 owner 类型、格式和别名已移除，无兼容入口；不向普通 admin、HTTP 或 relay 降级。
+每次控制调用使用一个原生绝对预算，每个 session 只有一个在途请求；等待串行槽超时只结束该 waiter，不能关闭其他调用的 owner session；取得槽后、首次写入前超时也保留健康会话。开始写入后丢失确认会终止该专用会话，迟到应答不能交给下一请求。候选 setup 上限为原生 5 秒与剩余原 grace deadline 的较早者，拆包或重试不重置它；不新增配置项。owner 控制独立使用 version 1、最多 4 KiB 的消息，复用既有帧封装；当前 IPC 握手为 13、SHM 为 3、C/FFI ABI 为 6；owner 控制仍使用版本 1，业务帧、调用/回复布局保持。Rust 穷举匹配须增加 `MsgType::OwnerControl`、`SchedulerAcquireError::Unavailable` 和 `RouteConcurrencyError::Unavailable` 分支。旧单向 owner 类型、格式和别名已移除，无兼容入口；不向普通 admin、HTTP 或 relay 降级。
 
 `OwnedChild.poll()` / `wait(timeout=...)` / `kill()` 观察或管理进程，`OwnedChild.close()` 只释放观察者，原生共享 reaper 继续负责 OS 回收。它与 `OwnerControl.close()` 的生命周期作用不同。
 
@@ -68,9 +68,11 @@ Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时�
 
 需要续扫时使用 cc.sweep_endpoints(addresses=[本次运行的逻辑地址], max_entries=64, max_ms=10) 的 context manager 和 next_batch()；只在原生报告 round_complete 时记为本轮完成，中断或命名空间变化单独处理。c3 endpoint inspect/reap/sweep 调用同一原生机制，sweep 可重复传 --address，需要非默认 root 时传 --ipc-root（或环境变量 C2_IPC_ROOT）。运行器不拼 OS 路径，不直接 unlink。
 
-Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己的本地上游域上下文，一个 relay 本地域对应一个 root，上游资源与它使用一致配置；不同 root 可运行不同 relay。客户端在发现请求中携带 Core 派生的本地 namespace 标识（不含原始路径，不是授权凭据）。`/_resolve` 响应的 `x-c2-local-namespace` 头是整批路由的唯一 namespace 来源，JSON 路由不再附加该字段。Rust/Core 客户端只在 anchor 为本机、响应头与本地上下文匹配且握手身份、契约与代际检查均通过时接受 IPC。缺头或不匹配时使用 HTTP，不推定默认 root，也不从旧 JSON 字段恢复 namespace；重复或非法响应头仍拒绝。HTTP 路由不会因 namespace 不匹配被撤销，HTTP-only 调用不要求本地端点能力。Windows 标识由 backend 与当前 logon scope 构成，实际权限仍由 OS DACL、握手身份与完整路由契约检查。
+Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己的本地上游域上下文，一个 relay 本地域对应一个 root，上游资源与它使用一致配置；不同 root 可运行不同 relay。客户端在发现请求中携带 Core 派生的本地 namespace 标识（不含原始路径，不是授权凭据）。`/_resolve` 响应的 `x-c2-local-namespace` 头是整批路由的唯一 namespace 来源，JSON 路由不再附加该字段。Rust/Core 客户端只在 anchor 为本机、响应头与本地上下文匹配且握手身份、契约与代际检查均通过时接受 IPC。缺头或不匹配时使用 HTTP，不推定默认 root，也不从旧 JSON 字段恢复 namespace；重复或非法响应头仍拒绝。HTTP 路由不会因 namespace 不匹配被撤销，HTTP-only 调用不要求本地端点能力。Windows 标识由 backend 与当前用户作用域 构成，实际权限仍由 OS DACL、握手身份与完整路由契约检查。
 
 原生路由获取查询服务端当前权威状态，随后固定 route UID/revision 和 server instance。数据连接 idle 驱逐保留资源登记与 owner；旧代理不能借同名替换取得新资源。生成的 TypeScript 持久直连客户端也使用该控制查询和身份固定规则。
+
+Windows 在发送数据或控制字节前，核对实际管道对象的所有者和固定的服务进程：TokenUser 必须匹配，服务端完整性至少为 Medium。监听启动只向同一用户授予进程身份查询、退出观察和令牌查询权限，支持 Medium/High 跨登录互通，不授予进程控制或令牌复制。监听唯一性由按用户限权的 Global 互斥体维护；Local 映射只在原生会话事实及握手方向允许时使用，跨会话复用 owned/inline/chunked，包括预分配请求和准备好的响应。[0.9.0 迁移说明](releases/0.9.0.md)列出了停旧服务后统一升级及旧票据绑定失配的边界。
 
 ## 绑定与连接失败
 

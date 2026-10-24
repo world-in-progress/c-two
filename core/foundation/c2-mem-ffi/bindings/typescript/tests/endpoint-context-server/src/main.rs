@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use c2_config::{ConfigResolver, ConfigSources, LocalEndpointOptions};
-use c2_local::{EndpointReapResult, LocalListener};
+use c2_local::{EndpointReapResult, LocalListener, LocalStream};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
@@ -54,7 +54,7 @@ async fn run() -> Result<(), Failure> {
     }
     let context = ConfigResolver::resolve_local_endpoint(
         LocalEndpointOptions {
-            unix_root: Some(PathBuf::from(&arguments[1])),
+            unix_root: (arguments[1] != "-").then(|| PathBuf::from(&arguments[1])),
         },
         ConfigSources::empty(),
     )
@@ -77,7 +77,7 @@ async fn run() -> Result<(), Failure> {
         emit(metadata("probe"));
         return Ok(());
     }
-    if arguments[0] != "serve" || arguments.len() != 5 {
+    if !matches!(arguments[0].as_str(), "serve" | "buffering") || arguments.len() != 5 {
         return Err(Failure {
             phase: "arguments",
             message: "unknown fixture mode or missing serve arguments".into(),
@@ -99,6 +99,7 @@ async fn run() -> Result<(), Failure> {
     emit(metadata("ready"));
 
     let mut tasks = tokio::task::JoinSet::new();
+    let buffering = arguments[0] == "buffering";
     for _ in 0..connections {
         let mut stream = tokio::time::timeout(Duration::from_secs(15), listener.accept())
             .await
@@ -110,6 +111,9 @@ async fn run() -> Result<(), Failure> {
             .map_err(|error| Failure::io("accept", error))?;
         tasks.spawn(async move {
             tokio::time::timeout(Duration::from_secs(15), async {
+                if buffering {
+                    return buffering_exchange(stream, marker == 0).await;
+                }
                 loop {
                     let mut size = [0_u8; 4];
                     match stream.read_exact(&mut size).await {
@@ -147,13 +151,52 @@ async fn run() -> Result<(), Failure> {
             .map_err(|error| Failure::io("serve", error))?;
     }
     let cleanup = listener.close();
-    if !matches!(cleanup, EndpointReapResult::Reaped) {
+    let expected = if cfg!(windows) {
+        matches!(cleanup, EndpointReapResult::NotApplicable)
+    } else {
+        matches!(cleanup, EndpointReapResult::Reaped)
+    };
+    if !expected {
         return Err(Failure {
             phase: "close",
             message: format!("native listener cleanup returned {cleanup:?}"),
             raw_os_error: None,
         });
     }
-    emit(json!({ "kind": "closed", "connections": connections, "cleanup": "Reaped" }));
+    emit(
+        json!({ "kind": "closed", "connections": connections, "cleanup": format!("{cleanup:?}") }),
+    );
+    Ok(())
+}
+
+async fn buffering_exchange(stream: LocalStream, eof: bool) -> io::Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut control = tokio::io::stdin();
+    let mut first = [0; 2];
+    reader.read_exact(&mut first).await?;
+    assert_eq!(first, [9, 8]);
+
+    control.read_u8().await?;
+    let payload = vec![0x5a; 8 * 1024 * 1024];
+    let mut received = vec![0; payload.len()];
+    tokio::try_join!(reader.read_exact(&mut received), writer.write_all(&payload))?;
+    assert_eq!(
+        received, payload,
+        "simultaneous large write must reach the server intact"
+    );
+
+    for bytes in [&[8, 9][..], &[1, 2], &[3, 4], &[5, 6, 7], &[1, 2, 3]] {
+        control.read_u8().await?;
+        writer.write_all(bytes).await?;
+    }
+    if eof {
+        control.read_u8().await?;
+    } else {
+        assert_eq!(
+            reader.read(&mut [0]).await?,
+            0,
+            "explicit close must reach the server"
+        );
+    }
     Ok(())
 }

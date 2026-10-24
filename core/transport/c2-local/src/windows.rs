@@ -2,36 +2,76 @@ use super::{
     EndpointCredential, EndpointInspection, EndpointReapResult, LocalEndpoint,
     LocalEndpointContext, SweepBatch, SweepBudget,
 };
-use c2_local_security::LocalSecurityAttributes;
+use c2_local_security::{
+    LocalSecurityAttributes, current_session_id, grant_server_identity_query_access,
+    verify_current_user_pipe_owner, verify_server_process_identity,
+};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle,
+};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::windows::named_pipe::{
-    ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
+use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions};
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_PIPE_BUSY, GetLastError, HANDLE};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT,
+};
 use windows_sys::Win32::System::IO::CancelIoEx;
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Pipes::{
+    GetNamedPipeClientSessionId, GetNamedPipeServerProcessId, GetNamedPipeServerSessionId,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    WaitForSingleObject,
+};
 
 pub enum Stream {
-    Client(NamedPipeClient),
+    // Keep the verified process object pinned as long as this connection lives.
+    Client {
+        pipe: NamedPipeClient,
+        _server_process: OwnedHandle,
+    },
+    // A private owner pair is a trusted launcher capability, including after
+    // transfer to a child. It does not require its creator to stay alive.
+    OwnerClient(NamedPipeClient),
     Server(NamedPipeServer),
     OwnerServer(NamedPipeServer),
 }
 
-pub async fn connect(endpoint: &LocalEndpoint) -> io::Result<Stream> {
+/// An owned, verified overlapped pipe that has never been associated with IOCP,
+/// plus the pinned server process. Same TokenUser does not imply equal trust or
+/// prevent denial of service by another process running as that user.
+pub struct WindowsPipeConnection {
+    pipe: OwnedHandle,
+    server_process: OwnedHandle,
+}
+
+impl WindowsPipeConnection {
+    /// Transfer both owners exactly once: pipe first, server process second.
+    /// The adopter must keep the process handle until it closes the pipe, and
+    /// must register the pipe with at most one event loop/IOCP.
+    pub fn into_parts(self) -> (OwnedHandle, OwnedHandle) {
+        (self.pipe, self.server_process)
+    }
+}
+
+pub(super) async fn connect_raw(endpoint: &LocalEndpoint) -> io::Result<WindowsPipeConnection> {
     loop {
-        match ClientOptions::new().open(endpoint.os_name()) {
-            Ok(client) => return Ok(Stream::Client(client)),
+        match open_verified_pipe(endpoint.os_name()) {
+            Ok(connection) => return Ok(connection),
             Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
-                // The common connect deadline bounds pipe-instance contention.
+                // The caller's one total deadline bounds pipe-instance contention.
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             Err(error) => return Err(error),
@@ -39,11 +79,125 @@ pub async fn connect(endpoint: &LocalEndpoint) -> io::Result<Stream> {
     }
 }
 
+fn open_verified_pipe(name: &OsStr) -> io::Result<WindowsPipeConnection> {
+    let name: Vec<_> = name.encode_wide().chain(Some(0)).collect();
+    // Identification SQOS must be present at open, before trusting the server:
+    // a malicious pipe must never receive a token it can impersonate for access.
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned a new, non-inheritable, unregistered handle.
+    let pipe = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let server_process = verify_server_process(pipe.as_handle())?;
+    Ok(WindowsPipeConnection {
+        pipe,
+        server_process,
+    })
+}
+
+fn server_process_id(pipe: BorrowedHandle<'_>) -> io::Result<u32> {
+    let mut pid = 0;
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pid)
+}
+
+fn identity_refusal(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+fn verify_server_process(pipe: BorrowedHandle<'_>) -> io::Result<OwnedHandle> {
+    // Check the object before the process: a same-user instance must not join
+    // a foreign-owned pipe object whose DACL happens to permit this user.
+    verify_current_user_pipe_owner(pipe)?;
+    let pid = server_process_id(pipe)?;
+    // QUERY_LIMITED_INFORMATION permits OpenProcessToken; SYNCHRONIZE permits
+    // a nonblocking liveness check and the handle pins this exact process object.
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: OpenProcess returned one owned, non-inheritable handle.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    verify_server_process_identity(process.as_handle())?;
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
+        WAIT_TIMEOUT => {}
+        WAIT_OBJECT_0 => return Err(identity_refusal("named pipe server process has exited")),
+        WAIT_FAILED => return Err(io::Error::last_os_error()),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected process wait result",
+            ));
+        }
+    }
+    if server_process_id(pipe)? != pid {
+        return Err(identity_refusal(
+            "named pipe server process changed during verification",
+        ));
+    }
+    Ok(process)
+}
+
+pub async fn connect(endpoint: &LocalEndpoint) -> io::Result<Stream> {
+    let (pipe, process) = connect_raw(endpoint).await?.into_parts();
+    // SAFETY: identity was checked on this owned overlapped pipe before its
+    // first IOCP registration. Tokio takes ownership, including on failure.
+    let client = unsafe { NamedPipeClient::from_raw_handle(pipe.into_raw_handle()) }?;
+    Ok(Stream::Client {
+        pipe: client,
+        _server_process: process,
+    })
+}
+
 pub fn raw_handle(stream: &Stream) -> usize {
     match stream {
-        Stream::Client(client) => client.as_raw_handle() as usize,
+        Stream::Client { pipe: client, .. } | Stream::OwnerClient(client) => {
+            client.as_raw_handle() as usize
+        }
         Stream::Server(server) | Stream::OwnerServer(server) => server.as_raw_handle() as usize,
     }
+}
+
+pub fn shared_memory_available(stream: &Stream) -> io::Result<bool> {
+    let mut peer_session = 0;
+    let raw = raw_handle(stream) as HANDLE;
+    // Use the connected instance, not endpoint names or cached process IDs.
+    // Query errors must reach the caller instead of silently disabling SHM.
+    let result = unsafe {
+        match stream {
+            Stream::Client { .. } | Stream::OwnerClient(..) => {
+                GetNamedPipeServerSessionId(raw, &mut peer_session)
+            }
+            Stream::Server(..) | Stream::OwnerServer(..) => {
+                GetNamedPipeClientSessionId(raw, &mut peer_session)
+            }
+        }
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(peer_session == current_session_id()?)
 }
 
 pub fn cancel(raw: usize) {
@@ -70,7 +224,9 @@ impl AsyncRead for Stream {
         bytes: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Client(client) => Pin::new(client).poll_read(cx, bytes),
+            Self::Client { pipe: client, .. } | Self::OwnerClient(client) => {
+                Pin::new(client).poll_read(cx, bytes)
+            }
             Self::Server(server) | Self::OwnerServer(server) => {
                 Pin::new(server).poll_read(cx, bytes)
             }
@@ -85,7 +241,9 @@ impl AsyncWrite for Stream {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
-            Self::Client(client) => Pin::new(client).poll_write(cx, bytes),
+            Self::Client { pipe: client, .. } | Self::OwnerClient(client) => {
+                Pin::new(client).poll_write(cx, bytes)
+            }
             Self::Server(server) | Self::OwnerServer(server) => {
                 Pin::new(server).poll_write(cx, bytes)
             }
@@ -107,37 +265,37 @@ pub fn poll_flush(stream: &mut Stream, cx: &mut Context<'_>) -> Poll<io::Result<
     Pin::new(stream).poll_write(cx, &[]).map_ok(|_| ())
 }
 
-/// Native identity of the current Windows logon scope at listener creation.
+/// Native identity of the current Windows TokenUser scope at listener creation.
 #[derive(Clone)]
 pub(crate) struct ContextBinding {
-    logon_scope_id: String,
+    user_scope_id: String,
 }
 
 impl ContextBinding {
     pub(crate) fn capture(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        let logon_scope_id = endpoint
+        let user_scope_id = endpoint
             .context()
-            .windows_logon_scope_id()
+            .windows_user_scope_id()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a Windows endpoint"))?
             .to_owned();
-        let binding = Self { logon_scope_id };
+        let binding = Self { user_scope_id };
         Ok(binding)
     }
 
     pub(crate) fn digest(&self) -> [u8; 32] {
         let mut hash = Sha256::new();
-        hash.update(b"c2.owner.windows-logon-scope.v1\0");
-        hash.update((self.logon_scope_id.len() as u64).to_le_bytes());
-        hash.update(self.logon_scope_id.as_bytes());
+        hash.update(b"c2.owner.windows-user-scope.v1\0");
+        hash.update((self.user_scope_id.len() as u64).to_le_bytes());
+        hash.update(self.user_scope_id.as_bytes());
         hash.finalize().into()
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
         let current = LocalEndpointContext::default_for_platform()?;
-        if current.windows_logon_scope_id() != Some(self.logon_scope_id.as_str()) {
+        if current.windows_user_scope_id() != Some(self.user_scope_id.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "Windows endpoint logon scope changed",
+                "Windows endpoint user scope changed",
             ));
         }
         Ok(())
@@ -169,6 +327,7 @@ impl Listener {
             .transpose()?;
         let mut security = LocalSecurityAttributes::new()?;
         let ownership = claim_listener(endpoint, &mut security)?;
+        grant_server_identity_query_access()?;
         let pending = create_instance(endpoint, &mut security)?;
         Ok(Self {
             pending,
@@ -268,7 +427,7 @@ fn listener_lease_name(endpoint_name: &OsStr) -> String {
     for unit in endpoint_name.encode_wide() {
         digest.update(unit.to_le_bytes());
     }
-    let mut name = String::from(r"Local\c_two_listener-");
+    let mut name = String::from(r"Global\c_two_listener-");
     for byte in digest.finalize() {
         write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
     }
@@ -316,10 +475,14 @@ fn create_instance(
         .first_pipe_instance(false);
     // SAFETY: the ACL owner lives across the synchronous CreateNamedPipe call;
     // the returned handle is explicitly non-inheritable.
-    unsafe {
+    let server = unsafe {
         options
             .create_with_security_attributes_raw(endpoint.os_name(), security.as_mut_ptr().cast())
-    }
+    }?;
+    // CreateNamedPipe may join an already existing pipe object and ignores
+    // our descriptor then. Never accept a foreign owner's permissive DACL.
+    verify_current_user_pipe_owner(server.as_handle())?;
+    Ok(server)
 }
 
 #[cfg(test)]
@@ -340,9 +503,89 @@ mod tests {
         ] {
             assert_eq!(
                 listener_lease_name(OsStr::new(name)),
-                format!(r"Local\c_two_listener-{digest}")
+                format!(r"Global\c_two_listener-{digest}")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn global_listener_lease_is_a_real_user_owned_kernel_object() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows_sys::Win32::Security::{
+            EqualSid, GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION,
+        };
+        use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+        use windows_sys::Win32::System::Threading::OpenMutexW;
+
+        let endpoint = endpoint(&format!("global-lease-{}", uuid::Uuid::new_v4().simple()));
+        let listener = Listener::bind(&endpoint).unwrap();
+        let name = listener_lease_name(endpoint.os_name());
+        let wide: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
+        let raw = unsafe { OpenMutexW(READ_CONTROL, 0, wide.as_ptr()) };
+        assert!(!raw.is_null(), "{}", io::Error::last_os_error());
+        // SAFETY: OpenMutexW returned a fresh handle to the live Global lease.
+        let lease = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut owner = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    lease.as_raw_handle(),
+                    SE_KERNEL_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        let mut expected_security = LocalSecurityAttributes::new().unwrap();
+        let mut expected_owner = std::ptr::null_mut();
+        let mut defaulted = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorOwner(
+                    (*expected_security.as_mut_ptr()).lpSecurityDescriptor,
+                    &mut expected_owner,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        let same_owner = unsafe { EqualSid(owner, expected_owner) };
+        unsafe { LocalFree(descriptor) };
+        assert_ne!(same_owner, 0);
+        assert_eq!(
+            Listener::bind(&endpoint).err().unwrap().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        drop(lease);
+        drop(listener);
+        // Session 0 may resolve Local and Global to the same namespace. Check
+        // release through the exact Global name used to open the live lease.
+        let released = unsafe { OpenMutexW(READ_CONTROL, 0, wide.as_ptr()) };
+        if !released.is_null() {
+            // Close even on assertion failure; only this test's unique name is touched.
+            drop(unsafe { OwnedHandle::from_raw_handle(released) });
+            panic!("Global listener lease must be released after its last handle closes");
+        }
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32)
+        );
+    }
+
+    #[tokio::test]
+    async fn unconnected_pipe_session_query_preserves_the_real_os_error() {
+        let endpoint = endpoint(&format!("session-error-{}", uuid::Uuid::new_v4().simple()));
+        let mut security = LocalSecurityAttributes::new().unwrap();
+        let server = create_instance(&endpoint, &mut security).unwrap();
+        let error = shared_memory_available(&Stream::Server(server)).unwrap_err();
+        assert!(error.raw_os_error().is_some(), "{error}");
     }
 
     fn endpoint(name: &str) -> LocalEndpoint {

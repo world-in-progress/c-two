@@ -273,6 +273,9 @@ mod client_tests {
             ..ClientIpcConfig::default()
         };
 
+        // `shm_available` means pool present AND a negotiated CAP_SHM_REQUEST
+        // direction; without negotiation the selector never picks SHM even
+        // for bodies the pool could carry.
         assert_eq!(
             choose_request_transport(&cfg, false, 50),
             RequestTransportKind::Inline
@@ -683,6 +686,14 @@ mod lazy_policy_roundtrip_tests {
     use c2_server::{
         AccessLevel, ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease,
         ResponseMeta, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
+    };
+    use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
+    use c2_wire::control::{ReplyControl, try_encode_reply_control};
+    use c2_wire::flags;
+    use c2_wire::frame;
+    use c2_wire::handshake::{
+        CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE,
+        ServerIdentity, decode_handshake, encode_server_handshake,
     };
     use parking_lot::Mutex;
     use tokio::time::timeout;
@@ -3882,20 +3893,23 @@ mod lazy_policy_roundtrip_tests {
                 .expect("handshake len");
             let mut body = vec![0u8; u32::from_le_bytes(len_buf) as usize];
             stream.read_exact(&mut body).await.expect("handshake body");
+            let client_handshake =
+                c2_wire::handshake::decode_handshake(&body[12..]).expect("client handshake");
             let identity = c2_wire::handshake::ServerIdentity {
                 server_id: "raw-peer-server".into(),
                 server_instance_id: "raw-peer-instance".into(),
             };
-            let handshake = c2_wire::handshake::encode_server_handshake(
-                &[],
-                c2_wire::handshake::CAP_CALL_V2
-                    | c2_wire::handshake::CAP_METHOD_IDX
-                    | c2_wire::handshake::CAP_CHUNKED,
-                &routes,
-                "",
-                &identity,
-            )
-            .expect("server handshake");
+            // Same-process peer: ACK the full intersection, including both
+            // SHM directions the client offered, so these fixtures keep
+            // exercising the negotiated SHM transports.
+            let caps = c2_wire::handshake::CAP_CALL_V2
+                | c2_wire::handshake::CAP_METHOD_IDX
+                | c2_wire::handshake::CAP_CHUNKED
+                | (client_handshake.capability_flags
+                    & (c2_wire::handshake::CAP_SHM_REQUEST | c2_wire::handshake::CAP_SHM_RESPONSE));
+            let handshake =
+                c2_wire::handshake::encode_server_handshake(&[], caps, &routes, "", &identity)
+                    .expect("server handshake");
             let frame = c2_wire::frame::encode_frame(
                 0,
                 c2_wire::flags::FLAG_HANDSHAKE | c2_wire::flags::FLAG_RESPONSE,
@@ -4700,8 +4714,8 @@ mod lazy_policy_roundtrip_tests {
         use c2_wire::flags;
         use c2_wire::frame;
         use c2_wire::handshake::{
-            CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, ServerIdentity, decode_handshake,
-            encode_server_handshake,
+            CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE,
+            ServerIdentity, decode_handshake, encode_server_handshake,
         };
         use c2_wire::route_catalog_control::{
             RouteContractWire, RouteLookupResponse, RouteMethodWire, RouteRecordWire,
@@ -4731,14 +4745,13 @@ mod lazy_policy_roundtrip_tests {
                 server_id: "terminal-peer".into(),
                 server_instance_id: format!("terminal-peer-{epoch}"),
             };
-            let handshake = encode_server_handshake(
-                &[],
-                CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
-                &[],
-                "",
-                &identity,
-            )
-            .unwrap();
+            // Same-process peer: ACK the offered SHM directions so this
+            // fixture keeps driving the real prealloc publication path.
+            let caps = CAP_CALL_V2
+                | CAP_METHOD_IDX
+                | CAP_CHUNKED
+                | (client_handshake.capability_flags & (CAP_SHM_REQUEST | CAP_SHM_RESPONSE));
+            let handshake = encode_server_handshake(&[], caps, &[], "", &identity).unwrap();
             peer.write_all(&frame::encode_frame(
                 0,
                 flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE,
@@ -5957,6 +5970,389 @@ mod lazy_policy_roundtrip_tests {
         client.close_shared().await;
         stop_server(&server).await;
     }
+
+    // ── Handshake v13 per-direction SHM negotiation ────────────────────────
+
+    /// A peer that completes the v13 handshake and then answers call frames
+    /// with a plain inline success reply. `ack_shm_request`/`ack_shm_response`
+    /// control the ACK's SHM bits independently of what the client offered,
+    /// so a non-intersecting ACK is representable. The returned mpsc channel
+    /// reports every frame header the peer observes.
+    async fn capped_ack_peer(
+        label: &str,
+        ack_shm_request: bool,
+        ack_shm_response: bool,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::mpsc::Receiver<c2_wire::frame::FrameHeader>,
+    ) {
+        let address = unique_address(label);
+        let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+        let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (header_tx, header_rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            let mut peer = listener.accept().await.unwrap();
+            drop(listener);
+            let (header, payload) = read_raw_frame(&mut peer).await.expect("handshake frame");
+            assert!(header.is_handshake());
+            decode_handshake(&payload).expect("client handshake");
+            let mut caps = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
+            if ack_shm_request {
+                caps |= CAP_SHM_REQUEST;
+            }
+            if ack_shm_response {
+                caps |= CAP_SHM_RESPONSE;
+            }
+            let identity = ServerIdentity {
+                server_id: "negotiation-peer".into(),
+                server_instance_id: "negotiation-peer-instance".into(),
+            };
+            let ack = encode_server_handshake(&[], caps, &[], "", &identity).unwrap();
+            peer.write_all(&frame::encode_frame(
+                header.request_id,
+                flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE,
+                &ack,
+            ))
+            .await
+            .unwrap();
+            // Answer every call frame with an inline success reply and report
+            // each observed frame header to the test.
+            while let Ok((header, _payload)) = read_raw_frame(&mut peer).await {
+                let _ = header_tx.send(header).await;
+                if !header.is_call_v2() {
+                    continue;
+                }
+                let reply = try_encode_reply_control(&ReplyControl::Success).unwrap();
+                peer.write_all(&frame::encode_frame(
+                    header.request_id,
+                    flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
+                    &reply,
+                ))
+                .await
+                .unwrap();
+            }
+            let _ = done_tx.send(());
+        });
+        (address, done_rx, header_rx)
+    }
+
+    async fn read_raw_frame(
+        peer: &mut c2_local::LocalStream,
+    ) -> Result<(c2_wire::frame::FrameHeader, Vec<u8>), std::io::Error> {
+        use tokio::io::AsyncReadExt as _;
+        let mut length = [0; 4];
+        peer.read_exact(&mut length).await?;
+        let mut bytes = vec![0u8; 4 + u32::from_le_bytes(length) as usize];
+        bytes[..4].copy_from_slice(&length);
+        peer.read_exact(&mut bytes[4..]).await?;
+        let (header, payload) = frame::decode_frame(&bytes).unwrap();
+        Ok((header, payload.to_vec()))
+    }
+
+    /// Control: against a same-session peer the handshake negotiates both
+    /// directions and a large body really travels through client SHM.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_session_handshake_negotiates_both_shm_directions() {
+        let (callback, seen_kinds) = echo_callback();
+        let base = small_base(64 * 1024, 2);
+        let server = start_echo_server(
+            "negotiation_control",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        assert!(
+            client.shm_request_available(),
+            "same-session peer must ACK the offered request direction"
+        );
+        let binding = client
+            .acquire_route(&expected_contract("negotiation_control"))
+            .await
+            .unwrap();
+        let payload = vec![5u8; 8192];
+        let response = client.call_bound(&binding, "echo", &payload).await.unwrap();
+        assert!(
+            matches!(response, ResponseData::Shm(_)),
+            "negotiated response uses SHM"
+        );
+        assert_eq!(response_bytes(&client, response), payload);
+        {
+            let kinds = seen_kinds.lock();
+            assert!(
+                kinds
+                    .iter()
+                    .any(|kind| matches!(*kind, "shm_buddy" | "shm_dedicated")),
+                "the negotiated request direction must carry the large body via SHM: {kinds:?}"
+            );
+        }
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Boundary negative: a peer whose ACK drops the SHM bits disables the
+    /// request direction locally — a body above the SHM threshold must be
+    /// written as a non-buddy (owned inline/chunked) frame, never as
+    /// coordinates the peer never agreed to map.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ack_without_shm_bits_never_writes_buddy_request_frames() {
+        let (address, _done, mut header_rx) =
+            capped_ack_peer("negotiation_drop", false, false).await;
+        let base = small_base(64 * 1024, 2);
+        let mut client = IpcClient::with_config(&address, client_config(base, 1024));
+        client.connect().await.unwrap();
+        assert!(!client.shm_request_available());
+        assert!(
+            client.has_request_pool(),
+            "the pool stays; only the direction is off"
+        );
+
+        // A body the pool would normally carry through SHM.
+        let payload = vec![9u8; 8192];
+        let response = client.call_inline(&raw_peer_identity(), 0, &payload).await;
+        assert!(
+            response.is_ok(),
+            "owned transports must still serve the call"
+        );
+        let observed = header_rx
+            .recv()
+            .await
+            .expect("peer must observe the call frame");
+        assert!(observed.is_call_v2());
+        assert!(
+            !observed.is_buddy(),
+            "an un-negotiated direction must never publish SHM coordinates"
+        );
+        client.close_shared().await;
+    }
+
+    /// Boundary negative: a buddy reply frame on a connection whose ACK
+    /// dropped `CAP_SHM_RESPONSE` must be rejected before any lease is
+    /// minted or any server segment lazy-opened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unnegotiated_buddy_reply_rejected_before_lease_or_lazy_open() {
+        let address = unique_address("negotiation_bad_reply");
+        let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+        let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
+        let peer_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut peer = listener.accept().await.unwrap();
+            drop(listener);
+            let (header, payload) = read_raw_frame(&mut peer).await.unwrap();
+            let client_handshake = decode_handshake(&payload).unwrap();
+            // ACK the request direction only: the client may use SHM
+            // requests, but the response direction is off.
+            let caps = CAP_CALL_V2
+                | CAP_CHUNKED
+                | CAP_METHOD_IDX
+                | (client_handshake.capability_flags & CAP_SHM_REQUEST);
+            let identity = ServerIdentity {
+                server_id: "bad-reply-peer".into(),
+                server_instance_id: "bad-reply-peer-instance".into(),
+            };
+            let ack = encode_server_handshake(&[], caps, &[], "", &identity).unwrap();
+            peer.write_all(&frame::encode_frame(
+                header.request_id,
+                flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE,
+                &ack,
+            ))
+            .await
+            .unwrap();
+            // Read the client's inline call, then answer with a fabricated
+            // buddy reply carrying arbitrary coordinates.
+            let (call_header, _payload) = read_raw_frame(&mut peer).await.unwrap();
+            assert!(call_header.is_call_v2() && !call_header.is_buddy());
+            let bp = encode_buddy_payload(&BuddyPayload {
+                seg_idx: 0,
+                generation: 1,
+                offset: 0,
+                data_size: 16,
+                is_dedicated: false,
+                allocation_id: 99,
+            });
+            let mut reply = bp.to_vec();
+            reply.extend_from_slice(&try_encode_reply_control(&ReplyControl::Success).unwrap());
+            peer.write_all(&frame::encode_frame(
+                call_header.request_id,
+                flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_BUDDY,
+                &reply,
+            ))
+            .await
+            .unwrap();
+            // Hold the stream until the client has settled the reply.
+            let mut byte = [0u8; 1];
+            let _ = timeout(Duration::from_secs(5), peer.read(&mut byte)).await;
+        });
+
+        let base = small_base(64 * 1024, 2);
+        let mut client = IpcClient::with_config(&address, client_config(base, 1024));
+        client.connect().await.unwrap();
+        let server_pool_probe = Arc::clone(client.server_pool_arc());
+        let result = client.call_inline(&raw_peer_identity(), 0, b"probe").await;
+        match result {
+            Err(IpcError::Protocol(message)) => assert!(
+                message.contains("CAP_SHM_RESPONSE"),
+                "unexpected protocol error: {message}"
+            ),
+            other => panic!("un-negotiated buddy reply must be rejected: {other:?}"),
+        }
+        let mapped_segments = server_pool_probe
+            .lock()
+            .as_ref()
+            .map(|state| state.segment_count())
+            .unwrap_or(0);
+        assert_eq!(
+            mapped_segments, 0,
+            "no server segment may be lazy-opened for an un-negotiated buddy reply"
+        );
+        client.close_shared().await;
+        peer_task.await.unwrap();
+    }
+
+    /// Current-pool preallocated block on an un-negotiated connection: the
+    /// direction gate copy-consumes the armed snapshot at its requested
+    /// length, frees it through the exact owning pool, and sends the owned
+    /// bytes through the inline/chunked policy — the peer never receives
+    /// coordinates it did not ACK.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unnegotiated_direction_copy_consumes_current_pool_prealloc_block() {
+        let (address, _done, mut header_rx) =
+            capped_ack_peer("prealloc_direction_copy", false, false).await;
+        let base = small_base(64 * 1024, 2);
+        let mut client = IpcClient::with_config(&address, client_config(base, 1024));
+        client.connect().await.unwrap();
+        assert!(!client.shm_request_available());
+        assert!(
+            client.has_request_pool(),
+            "the pool stays; only the direction is off"
+        );
+
+        let payload = vec![7u8; 8192];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .unwrap()
+            .expect("current pool allocates a request block");
+        block.write_at(0, &payload).unwrap();
+        let owner_pool = client.request_pool().expect("current request pool");
+
+        let identity = raw_peer_identity();
+        let response = client
+            .call_with_prealloc(&identity, 0, &block)
+            .await
+            .expect("copy-consumed block must still deliver its bytes");
+        assert!(matches!(response, ResponseData::Inline(_)));
+        let observed = header_rx
+            .recv()
+            .await
+            .expect("peer must observe the call frame");
+        assert!(observed.is_call_v2());
+        assert!(
+            !observed.is_buddy(),
+            "an un-negotiated direction must never publish SHM coordinates"
+        );
+        assert_eq!(
+            owner_pool.lock().stats().alloc_count,
+            0,
+            "copy-consumption must free through the exact owning pool once"
+        );
+        // The armed state machine is spent: a second publication attempt is a
+        // clean rejection, not a second frame or release.
+        let err = client.call_with_prealloc(&identity, 0, &block).await;
+        assert!(
+            matches!(err, Err(IpcError::Pool(ref message)) if message.contains("released")),
+            "a consumed block must never carry a second frame: {err:?}"
+        );
+
+        drop(block);
+        client.close_shared().await;
+    }
+
+    /// A block from a retired pool incarnation (after a confirmed close plus
+    /// reconnect) keeps the original writer-seam pool-identity rejection: it
+    /// is released through its original owner and never published, exactly
+    /// like a foreign pool's block. Copy-consumption exists only for the
+    /// current pool's blocks on un-negotiated connections.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_incarnation_prealloc_block_keeps_original_rejection() {
+        let (callback, seen_kinds) = echo_callback();
+        let base = small_base(64 * 1024, 2);
+        let server = start_echo_server(
+            "prealloc_retired_reject",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let binding = client
+            .acquire_route(&expected_contract("prealloc_retired_reject"))
+            .await
+            .unwrap();
+        let (method_idx, identity, _max_payload) = binding
+            .call_target_for("echo")
+            .expect("route target resolves");
+
+        let payload = vec![5u8; 4096];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .unwrap()
+            .expect("live session allocates a request block");
+        block.write_at(0, &payload).unwrap();
+        let retired_pool = client.request_pool().expect("live request pool");
+
+        // Retire the session: a confirmed close detaches the transport-owned
+        // pool, and reconnect installs a fresh incarnation.
+        assert!(
+            client.close_shared_bounded(Duration::from_secs(5)).await,
+            "close barrier must confirm before reconnect"
+        );
+        client.connect().await.unwrap();
+        let fresh_pool = client.request_pool().expect("reconnected request pool");
+        assert!(
+            !Arc::ptr_eq(&retired_pool, &fresh_pool),
+            "reconnect must install a fresh pool incarnation"
+        );
+
+        // The retired-incarnation block is rejected at the original
+        // writer-seam identity check, in its original error shape, and the
+        // failure releases the armed block through its original owner.
+        let err = client
+            .call_with_prealloc(&identity, method_idx, &block)
+            .await;
+        assert!(
+            matches!(err, Err(IpcError::Pool(ref message)) if message.contains("request pool")),
+            "a retired-incarnation block must keep the original rejection: {err:?}"
+        );
+        assert_eq!(
+            seen_kinds.lock().len(),
+            0,
+            "a rejected block must never reach the resource"
+        );
+        assert_eq!(
+            retired_pool.lock().stats().alloc_count,
+            0,
+            "rejection must release only the original owner's block"
+        );
+        // The fresh session keeps serving normal calls through SHM.
+        let response = client.call_bound(&binding, "echo", &payload).await.unwrap();
+        assert_eq!(response_bytes(&client, response), payload);
+        {
+            let kinds = seen_kinds.lock();
+            assert!(
+                kinds
+                    .iter()
+                    .any(|kind| matches!(*kind, "shm_buddy" | "shm_dedicated")),
+                "the fresh session must still use negotiated SHM: {kinds:?}"
+            );
+        }
+
+        drop(block);
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
 }
 
 /// Chunked-response admission against the client's canonical reassembly
@@ -6628,7 +7024,7 @@ mod endpoint_context_tests {
                 LocalEndpointNamespace::WindowsNamedPipe
             );
             assert!(context.unix_root().is_none());
-            assert!(context.windows_logon_scope_id().is_some());
+            assert!(context.windows_user_scope_id().is_some());
         }
         #[cfg(unix)]
         assert_eq!(

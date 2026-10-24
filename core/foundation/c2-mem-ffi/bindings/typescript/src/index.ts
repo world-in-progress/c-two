@@ -8,10 +8,11 @@ export const C2_MEM_FFI_STATUS_INVALID_ARGUMENT = 2;
 export const C2_MEM_FFI_STATUS_POOL_ERROR = 3;
 export const C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4;
 export const C2_MEM_FFI_STATUS_IO_ERROR = 5;
+export const C2_MEM_FFI_STATUS_PERMISSION_DENIED = 6;
 
 export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 255;
 export const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
-export const C2_MEM_FFI_ABI_VERSION = 5;
+export const C2_MEM_FFI_ABI_VERSION = 6;
 
 export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_OK
@@ -19,7 +20,8 @@ export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_INVALID_ARGUMENT
   | typeof C2_MEM_FFI_STATUS_POOL_ERROR
   | typeof C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER
-  | typeof C2_MEM_FFI_STATUS_IO_ERROR;
+  | typeof C2_MEM_FFI_STATUS_IO_ERROR
+  | typeof C2_MEM_FFI_STATUS_PERMISSION_DENIED;
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -131,10 +133,22 @@ export interface C2MemFfiNativeUnixSocket {
   close(): void;
 }
 
+/**
+ * Native addon owner of one verified Windows pipe. `takeFd()` transfers the
+ * Node-CRT descriptor to `new Socket({ fd })`; the pinned server process
+ * handle stays with this owner until the socket-backed connection closes or
+ * the owner is closed or collected.
+ */
+export interface C2MemFfiNativeWindowsSocket {
+  takeFd(): number;
+  close(): void;
+}
+
 export interface C2MemFfiNativeLocalEndpointContext {
   endpointName(address: string): C2MemFfiCallResult<string>;
   namespaceId(): C2MemFfiCallResult<string>;
   connectUnix?(address: string): Promise<C2MemFfiCallResult<C2MemFfiNativeUnixSocket>>;
+  connectWindows?(address: string): Promise<C2MemFfiCallResult<C2MemFfiNativeWindowsSocket>>;
   close(): void;
 }
 
@@ -145,6 +159,15 @@ export interface C2MemFfiLocalEndpointSymbols {
    */
   c2_mem_ffi_local_endpoint(address: string): C2MemFfiCallResult<string>;
   c2_mem_ffi_local_endpoint_context_capture(unixRoot: string | null): C2MemFfiCallResult<C2MemFfiNativeLocalEndpointContext>;
+  /**
+   * Module-level verified Windows connect. The addon re-validates the native
+   * context type tag of the receiver argument, so forged context objects with
+   * arbitrary connect functions cannot supply an unverified socket.
+   */
+  c2_mem_ffi_endpoint_context_connect_windows?(
+    context: C2MemFfiNativeLocalEndpointContext,
+    address: string,
+  ): Promise<C2MemFfiCallResult<C2MemFfiNativeWindowsSocket>>;
 }
 
 export interface C2MemFfiNodeNativeExtraSymbols<Handle = unknown> extends C2MemFfiLocalEndpointSymbols {
@@ -318,7 +341,7 @@ export function captureLocalIpcEndpointContext(
   return captureLocalIpcEndpointContextFromSymbols(symbols, options);
 }
 
-/** Capture through a loaded ABI 5 library. */
+/** Capture through a loaded ABI 6 library. */
 export function captureLocalIpcEndpointContextFromSymbols(
   symbols: C2MemFfiLocalEndpointSymbols,
   options: C2MemFfiLocalEndpointCaptureOptions = {},
@@ -474,6 +497,13 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
     throw new C2NodeIpcConnectionError("C-Two Node IPC connect options must be an object.");
   }
   requireEndpointOptions(options);
+  if (process.platform === "win32"
+    && (options.createConnection !== undefined || options.resolveEndpoint !== undefined || options.nativeSymbols !== undefined)) {
+    // The official Windows connector only opens sockets through the verified
+    // native entry. This refusal happens at construction, before any factory
+    // call or wire byte; Unix keeps its existing injection surface.
+    throw new C2NodeIpcConnectionError("C-Two Windows Node IPC requires the trusted native connector; createConnection, resolveEndpoint, and nativeSymbols are not accepted on Windows.");
+  }
   if (options.resolveEndpoint !== undefined && (options.ipcRoot !== undefined || options.endpointContext !== undefined || options.nativeSymbols !== undefined)) {
     throw new C2NodeIpcConnectionError("C-Two custom resolveEndpoint cannot be combined with ipcRoot, endpointContext, or nativeSymbols.");
   }
@@ -489,6 +519,7 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
   }
   options = { ...options };
   let snapshot: LocalEndpointContextLease | undefined;
+  let verifiedWindowsConnect: C2MemFfiLocalEndpointSymbols["c2_mem_ffi_endpoint_context_connect_windows"] | undefined;
   let attempted = false;
   let captureFailed = false;
   let captureError: unknown;
@@ -515,6 +546,18 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
           } finally {
             context.close();
           }
+        }
+        if (process.platform === "win32") {
+          // Every Windows socket goes through the addon's module-level verified
+          // connect, which re-validates the native context type tag of the
+          // snapshot receiver before any pipe handle is produced.
+          const symbols = loadBundledC2MemFfiNodeNativeSymbols(options).symbols;
+          requireEndpointSymbols(symbols);
+          const connect = symbols.c2_mem_ffi_endpoint_context_connect_windows;
+          if (typeof connect !== "function") {
+            throw new C2NodeIpcConnectionError("C-Two native endpoint symbols lack the verified Windows connect entry.");
+          }
+          verifiedWindowsConnect = connect;
         }
       } catch (error) {
         captureFailed = true;
@@ -548,6 +591,42 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
     let socket: C2NodeIpcSocket | undefined;
     try {
       freeze();
+      if (process.platform === "win32") {
+        requireLogicalIpcAddress(address);
+        if (snapshot === undefined) {
+          throw new C2NodeIpcConnectionError("C-Two Windows Node IPC connector lacks a frozen native endpoint snapshot.");
+        }
+        const verifiedConnect = verifiedWindowsConnect;
+        if (verifiedConnect === undefined) {
+          throw new C2NodeIpcConnectionError("C-Two Windows Node IPC connector lacks the verified native connect entry.");
+        }
+        const active = leaseEndpointContext(snapshot.owner.state);
+        let owner: C2MemFfiNativeWindowsSocket | undefined;
+        try {
+          const native = nativeEndpointContext(active);
+          const result = await verifiedConnect(native, address);
+          owner = result?.value;
+          if (result?.status !== C2_MEM_FFI_STATUS_OK || owner === undefined
+            || typeof owner.takeFd !== "function" || typeof owner.close !== "function") {
+            throw new C2NodeIpcConnectionError(`C-Two Node IPC connect failed (${c2MemFfiStatusName(result?.status)}).`);
+          }
+          requireOpen();
+          const fd = owner.takeFd();
+          try {
+            socket = new Socket({ fd, readable: true, writable: true });
+          } catch (error) {
+            closeSync(fd);
+            throw error;
+          }
+          const pinnedOwner = owner;
+          socket.once("close", () => pinnedOwner.close());
+          owner = undefined;
+          return new NodeIpcConnection(socket);
+        } finally {
+          owner?.close();
+          closeEndpointContextLease(active);
+        }
+      }
       const normalizedPath = requireNodeIpcSocketPath(resolveEndpoint(address));
       if (process.platform !== "win32" && options.createConnection === undefined && options.resolveEndpoint === undefined) {
         if (snapshot === undefined || typeof nativeEndpointContext(snapshot).connectUnix !== "function") {
@@ -627,6 +706,7 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
       closed = true;
       if (snapshot !== undefined) closeEndpointContextLease(snapshot);
       snapshot = undefined;
+      verifiedWindowsConnect = undefined;
       captureError = undefined;
       options = {};
     },
@@ -901,7 +981,6 @@ class NodeIpcConnection implements C2NodeIpcConnection {
   private readonly waiters: Array<() => void> = [];
   private terminalError: C2NodeIpcConnectionError | undefined;
   private closed = false;
-
   constructor(private readonly socket: C2NodeIpcSocket) {
     socket.pause();
     socket.on("data", (chunk: Uint8Array): void => {
@@ -1329,6 +1408,8 @@ function c2MemFfiStatusName(status: unknown): string {
       return "INSUFFICIENT_BUFFER";
     case C2_MEM_FFI_STATUS_IO_ERROR:
       return "IO_ERROR";
+    case C2_MEM_FFI_STATUS_PERMISSION_DENIED:
+      return "PERMISSION_DENIED";
     default:
       return `UNKNOWN(${String(status)})`;
   }

@@ -21,7 +21,11 @@ async function connectionWith(write) {
   return { connection: await connector('ipc://socket-test'), connector, socket };
 }
 
-test('write callback failure is reported without an error event', async () => {
+const socketOptions = {
+  skip: process.platform === 'win32' && 'Unix-only injected sockets; the official Windows connector requires the trusted native entry',
+};
+
+test('write callback failure is reported without an error event', socketOptions, async () => {
   const { connection, connector, socket } = await connectionWith((_socket, _bytes, callback) => {
     queueMicrotask(() => callback(new Error('callback-only failure')));
     return false;
@@ -35,7 +39,7 @@ test('write callback failure is reported without an error event', async () => {
   }
 });
 
-test('successful write callback accepts null error', async () => {
+test('successful write callback accepts null error', socketOptions, async () => {
   const { connection, connector } = await connectionWith((_socket, _bytes, callback) => {
     queueMicrotask(() => callback(null));
     return true;
@@ -48,7 +52,7 @@ test('successful write callback accepts null error', async () => {
   }
 });
 
-test('socket close before write callback rejects the pending write', async () => {
+test('socket close before write callback rejects the pending write', socketOptions, async () => {
   const { connection, connector } = await connectionWith((socket) => {
     queueMicrotask(() => socket.emit('close'));
     return false;
@@ -61,7 +65,7 @@ test('socket close before write callback rejects the pending write', async () =>
   }
 });
 
-test('remote EOF rejects an incomplete read and preserves already buffered bytes', async () => {
+test('remote EOF rejects an incomplete read and preserves already buffered bytes', socketOptions, async () => {
   for (const event of ['end', 'close']) {
     const { connection, connector, socket } = await connectionWith(() => true);
     try {

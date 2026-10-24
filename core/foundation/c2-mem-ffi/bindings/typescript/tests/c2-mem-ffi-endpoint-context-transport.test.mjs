@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -20,10 +20,13 @@ const hostCommand = 'mkdir -p /tmp/c2n && C2_ENDPOINT_CONTEXT_TEST_ROOT=/tmp/c2n
 
 // This gate exchanges actual bytes over c2-local streams. It does not exercise
 // portable RPC, FastDB payloads, SHM or a release matrix.
+let serverExecutable;
 function buildServer() {
-  const target = resolve(packageRoot, 'target', 'endpoint-context-server');
+  if (serverExecutable !== undefined) return serverExecutable;
+  const target = process.env.CARGO_TARGET_DIR ?? resolve(packageRoot, 'target', 'endpoint-context-server');
   let result;
   try {
+    copyFileSync(resolve(packageRoot, '../../../../Cargo.lock'), resolve(fixtureRoot, 'Cargo.lock'));
     result = spawnSync(resolveCargo(), [
       'build', '--offline', '--manifest-path', resolve(fixtureRoot, 'Cargo.toml'),
       '--target-dir', target,
@@ -33,7 +36,8 @@ function buildServer() {
     rmSync(resolve(fixtureRoot, 'Cargo.lock'), { force: true });
   }
   assert.equal(result.status, 0, `fixture build failed: ${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
-  return resolve(target, 'debug', 'c2-node-endpoint-context-server');
+  serverExecutable = resolve(target, 'debug', `c2-node-endpoint-context-server${process.platform === 'win32' ? '.exe' : ''}`);
+  return serverExecutable;
 }
 
 class FixtureFailure extends Error {
@@ -55,9 +59,9 @@ function probe(server, root, address) {
   return message;
 }
 
-function startServer(server, root, address, marker, connections) {
-  const child = spawn(server, ['serve', root, address, String(marker), String(connections)], {
-    cwd: packageRoot, stdio: ['ignore', 'pipe', 'pipe'],
+function startServer(server, root, address, marker, connections, mode = 'serve') {
+  const child = spawn(server, [mode, root, address, String(marker), String(connections)], {
+    cwd: packageRoot, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const messages = [];
   let stderr = '';
@@ -139,6 +143,47 @@ async function exchange(connection, marker) {
   const responseHeader = await connection.readExactly(4);
   assert.equal(new DataView(responseHeader.buffer, responseHeader.byteOffset, 4).getUint32(0, true), payload.length + 1);
   assert.deepEqual(await connection.readExactly(payload.length + 1), new Uint8Array([marker, ...payload]));
+}
+
+async function runWindowsScenario(server) {
+  const address = `ipc://node-user-context-${process.pid}-${randomBytes(6).toString('hex')}`;
+  const fixture = startServer(server, '-', address, 0x7c, 5);
+  const connect = createNodeIpcConnect({});
+  let raw;
+  try {
+    await fixture.ready;
+    const connection = await connect(address);
+    await exchange(connection, 0x7c);
+    await connection.close(); await connection.close();
+
+    const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
+    raw = symbols.c2_mem_ffi_local_endpoint_context_capture(null).value;
+    const owned = await raw.connectWindows(address);
+    assert.equal(owned.status, 0);
+    owned.value.close(); owned.value.close();
+    assert.throws(() => owned.value.takeFd(), /closed or transferred/);
+    const taken = await raw.connectWindows(address);
+    assert.equal(taken.status, 0);
+    const fd = taken.value.takeFd();
+    assert.ok(fd >= 3);
+    closeSync(fd);
+    taken.value.close(); taken.value.close();
+    assert.throws(() => taken.value.takeFd(), /closed or transferred/);
+    assert.throws(() => symbols.c2_mem_ffi_endpoint_context_connect_windows({}, address), /context receiver/);
+
+    const closing = raw.connectWindows(address);
+    raw.close(); raw.close();
+    assert.equal((await closing).status, 5);
+    const disposed = createNodeIpcConnect({});
+    const pending = disposed(address);
+    disposed.close();
+    await assert.rejects(pending, /connector is closed/);
+    const result = await fixture.closed;
+    assert.equal(result.code, 0, `${JSON.stringify(result.messages)} ${result.stderr}`);
+    assert.equal(result.messages.at(-1).cleanup, 'NotApplicable');
+  } finally {
+    raw?.close(); connect.close(); await stopServer(fixture);
+  }
 }
 
 async function runScenario(server, container) {
@@ -298,10 +343,13 @@ if (process.argv[2] === '--endpoint-context-child') {
     process.exitCode = 1;
   }
 } else {
-  test('Runtime roots freeze on first successful or failed IO and shared contexts support live connections', {
+  test('Native endpoint contexts retain verified streams and close pending connections', {
     timeout: 120_000,
-    skip: process.platform === 'win32' ? 'Unix custom-root transport gate; Windows root rejection is covered separately.' : false,
   }, async (t) => {
+    if (process.platform === 'win32') {
+      await runWindowsScenario(buildServer());
+      return;
+    }
     const explicitContainer = process.env.C2_ENDPOINT_CONTEXT_TEST_ROOT;
     const server = buildServer();
     const container = explicitContainer ?? resolve(packageRoot, 'target', 'node-transport-tests');
@@ -324,4 +372,59 @@ if (process.argv[2] === '--endpoint-context-child') {
     assert.equal(result.kind, 'passed');
     t.diagnostic(result.evidence);
   });
+  for (const ending of ['EOF', 'explicit close']) {
+    test(`native Node IPC pauses idle input and preserves read progress through ${ending}`, { timeout: 10000 }, async () => {
+      const root = process.platform === 'win32' ? undefined : mkdtempSync('/tmp/c2-node-');
+      const connect = createNodeIpcConnect({ ipcRoot: root });
+      const address = `ipc://node-buffer-${process.pid}-${randomBytes(6).toString('hex')}`;
+      const socketPath = connect.resolveEndpoint(address);
+      const fixture = startServer(buildServer(), root ?? '-', address, ending === 'EOF' ? 0 : 1, 1, 'buffering');
+      let connection;
+      const sendNext = () => fixture.child.stdin.write('x');
+      try {
+        await fixture.ready;
+        connection = await connect(address);
+        await connection.write(new Uint8Array([9, 8]));
+        const payload = new Uint8Array(8 * 1024 * 1024).fill(0x5a);
+        sendNext();
+        assert.equal(connection.socket.isPaused(), true, 'idle input must apply native backpressure');
+        assert.equal(connection.bufferedBytes, 0, 'idle input must remain in Node, not an unbounded private queue');
+        const [large] = await Promise.all([connection.readExactly(payload.length), connection.write(payload)]);
+        assert.equal(large.length, payload.length);
+        assert.ok(large.every((value) => value === 0x5a), 'reads larger than the native high-water mark must progress');
+        assert.equal(connection.bufferedBytes, 0);
+        sendNext();
+        assert.equal(connection.socket.isPaused(), true, 'finishing a read must pause native input again');
+        assert.equal(connection.bufferedBytes, 0, 'finishing a read must restore idle backpressure');
+        assert.deepEqual(Array.from(await connection.readExactly(2)), [8, 9]);
+        sendNext();
+        const first = connection.readExactly(3);
+        sendNext();
+        assert.deepEqual(Array.from(await first), [1, 2, 3]);
+        assert.deepEqual(Array.from(await connection.readExactly(1)), [4]);
+        const concurrent = [connection.readExactly(1), connection.readExactly(2)];
+        sendNext();
+        assert.deepEqual((await Promise.all(concurrent)).map((bytes) => Array.from(bytes)), [[5], [6, 7]]);
+        sendNext();
+        assert.deepEqual(Array.from(await connection.readExactly(1)), [1]);
+        const incomplete = connection.readExactly(3);
+        if (ending === 'EOF') sendNext();
+        else connection.close();
+        await assert.rejects(incomplete, /ended|closed/);
+        if (ending === 'EOF') assert.deepEqual(Array.from(await connection.readExactly(2)), [2, 3]);
+        await assert.rejects(connection.readExactly(1), /ended|closed/);
+        const result = await fixture.closed;
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(result.messages.at(-1).cleanup, process.platform === 'win32' ? 'NotApplicable' : 'Reaped');
+      } finally {
+        connection?.close(); connect.close(); await stopServer(fixture);
+        if (root !== undefined) {
+          assert.equal(existsSync(socketPath), false, 'closed server must unlink its socket');
+          assert.equal(readdirSync(root).some((name) => name.endsWith('.lease')), false);
+          rmSync(root, { recursive: true });
+        }
+      }
+    });
+  }
+
 }

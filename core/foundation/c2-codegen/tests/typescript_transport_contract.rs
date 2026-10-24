@@ -579,8 +579,8 @@ const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
 const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
 const text = (s) => Buffer.concat([Buffer.from([Buffer.byteLength(s)]), Buffer.from(s)]);
 const frame = (id, flags, payload) => Buffer.concat([u32(12 + payload.length), u64(id), u32(flags), payload]);
-const handshake = (routes, instance) => Buffer.concat([
-  Buffer.from([12]), text('/serverpool'), u16(0), u16(7), text('server'), text(instance), u16(routes.length),
+const handshake = (routes, instance, caps = 7) => Buffer.concat([
+  Buffer.from([13]), text('/serverpool'), u16(0), u16(caps), text('server'), text(instance), u16(routes.length),
   ...routes.map((r) => Buffer.concat([
     text(r.route_name), text(r.route_uid), u64(r.route_revision),
     text(r.contract.crm_ns), text(r.contract.crm_name), text(r.contract.crm_ver),
@@ -593,8 +593,14 @@ function server() {
     routes: new Map([['manager', record('manager')]]), instance: 'instance',
     connections: [], lookups: [], lists: [], calls: [], callFlags: [], failCall: false,
     failRead: false, responseData: Buffer.alloc(0), chunkedReply: false, shmReply: false,
+    ackShmRequest: false, ackShmResponse: false, clientHandshakes: [], clientCaps: 0,
     nextControl: undefined, corrupt: undefined, writesAfterClose: 0,
   };
+  // The ACK models the native session intersection: a direction is
+  // acknowledged only when this server enables it and the client offered it.
+  s.serverCaps = () => 7
+    | (s.ackShmRequest && (s.clientCaps & 8) !== 0 ? 8 : 0)
+    | (s.ackShmResponse && (s.clientCaps & 16) !== 0 ? 16 : 0);
   s.connect = async () => {
     let buffered = Buffer.alloc(0);
     let businessReply = false;
@@ -613,7 +619,9 @@ function server() {
           feed(frame(id, 2 | 16, bytes));
         };
         if (flags === 4) {
-          feed(frame(0n, 2 | 4, handshake([...s.routes.values()], s.instance)));
+          s.clientHandshakes.push(Buffer.from(payload));
+          s.clientCaps = payload.subarray(payload.length - 2).readUInt16LE(0);
+          feed(frame(0n, 2 | 4, handshake([...s.routes.values()], s.instance, s.serverCaps())));
         } else if (flags === 16) {
           const request = JSON.parse(payload.subarray(1).toString());
           if (payload[0] === 0x0e) {
@@ -956,6 +964,7 @@ test('a refusal after the last chunk discards duplicate replies before the next 
 for (const [generation, allocationId, dedicated] of [[1, 7n, false], [0, 0n, true], [1, 0n, false]]) {
   test(`a received SHM reply is released exactly when authorized after a write failure (${generation}/${allocationId})`, async () => {
     const s = server(), releases = [];
+    s.ackShmResponse = true;
     let allocated = 0;
     const t = transport(s, {
       requestChunkSize: 2,
@@ -982,9 +991,112 @@ for (const [generation, allocationId, dedicated] of [[1, 7n, false], [0, 0n, tru
   });
 }
 
+test('IPC13 client handshake offers each shared-memory direction separately', async () => {
+  const writerShape = {
+    prefix: '/requestpool', segments: [{name: '/requestpool_b0000', size: 1048576}],
+    async write() { throw new Error('must not write without the request ACK'); },
+    async release() {},
+  };
+  const readerShape = { read() {}, release() {} };
+
+  const s = server(), t = transport(s);
+  await call(t);
+  assert.equal(s.clientHandshakes.length, 1);
+  assert.equal(s.clientHandshakes[0][0], 13);
+  assert.equal(s.clientHandshakes[0].subarray(-2).readUInt16LE(0), 7);
+  assert.equal(s.clientHandshakes[0][1], 0, 'no pool advertisement without a writer');
+  await t.close();
+
+  const readerOnly = server();
+  const rt = transport(readerOnly, { responseShmReader: readerShape });
+  await call(rt);
+  assert.equal(readerOnly.clientHandshakes[0][0], 13);
+  assert.equal(readerOnly.clientHandshakes[0].subarray(-2).readUInt16LE(0), 7 | 16);
+  assert.equal(readerOnly.clientHandshakes[0][1], 0);
+  await rt.close();
+
+  const writerOnly = server();
+  const wt = transport(writerOnly, { requestShmThreshold: 0, requestShmWriter: writerShape });
+  await call(wt);
+  const offer = writerOnly.clientHandshakes[0];
+  assert.equal(offer.subarray(-2).readUInt16LE(0), 7 | 8);
+  assert.equal(offer.subarray(2, 2 + '/requestpool'.length).toString(), '/requestpool');
+  await wt.close();
+
+  const both = server();
+  const bt = transport(both, { requestShmThreshold: 0, requestShmWriter: writerShape, responseShmReader: readerShape });
+  await call(bt);
+  assert.equal(both.clientHandshakes[0].subarray(-2).readUInt16LE(0), 7 | 8 | 16);
+  await bt.close();
+});
+
+test('unacknowledged request shared memory stays on the owned inline path', async () => {
+  const s = server();
+  const events = [];
+  const writer = {
+    prefix: '/requestpool', segments: [{name: '/requestpool_b0000', size: 1048576}],
+    async write(payload) {
+      events.push(['write', payload.byteLength]);
+      return {segmentIndex: 0, generation: 1, offset: 0, byteLength: payload.byteLength, allocationId: 1n, dedicated: false};
+    },
+    async markConsumed() { events.push(['consumed']); },
+    async release() { events.push(['request-release']); },
+  };
+  const refused = transport(s, { requestShmThreshold: 0, requestShmWriter: writer });
+  await refused.call('manager', CONTRACT, 'ping', new Uint8Array(5));
+  assert.deepEqual(events, [], 'an unacknowledged direction never touches the writer');
+  assert.equal((s.callFlags.at(-1) & 64) === 0, true, 'requests stay on owned inline frames');
+  await refused.close();
+
+  s.ackShmRequest = true;
+  const accepted = transport(s, { requestShmThreshold: 0, requestShmWriter: writer });
+  await accepted.call('manager', CONTRACT, 'ping', new Uint8Array(5));
+  assert.deepEqual(events, [['write', 5], ['consumed']]);
+  assert.equal((s.callFlags.at(-1) & 64) !== 0, true, 'the ACK enables request shared memory');
+  await accepted.close();
+});
+
+test('SHM replies without the response ACK are rejected before any reader work', async () => {
+  const s = server();
+  const readerEvents = [];
+  let allocated = 0;
+  const allocator = (size) => {
+    allocated += 1;
+    const view = new Uint8Array(size);
+    return {payload: {byteLength: size, view}, view};
+  };
+  const t = transport(s, {
+    responsePayloadAllocator: allocator,
+    responseShmReader: {
+      read() { readerEvents.push('read'); },
+      release() { readerEvents.push('release'); },
+    },
+  });
+  s.shmReply = true;
+  s.responseData = Buffer.from([42]);
+  await assert.rejects(() => call(t), /without the acknowledged SHM response capability/);
+  assert.deepEqual(readerEvents, [], 'no mapper, read, or release may run');
+  assert.equal(allocated, 0, 'no response allocation may run');
+  assert.equal(s.connections[0].closed, 1, 'the protocol violation discards the connection');
+
+  s.ackShmResponse = true;
+  const control = transport(s, {
+    responsePayloadAllocator: allocator,
+    responseShmReader: {
+      read(block, destination) { readerEvents.push('read'); destination.set(Buffer.from([42])); },
+      release() { readerEvents.push('release'); },
+    },
+  });
+  assert.deepEqual(Array.from((await call(control)).view), [42]);
+  assert.deepEqual(readerEvents, ['read', 'release']);
+  await control.close();
+});
+
 test('provider allocator, SHM release and chunk framing remain on the same shared stream', async () => {
   const s = server();
   s.responseData = Buffer.from([42, 43, 44]);
+  s.ackShmRequest = true;
+  s.ackShmResponse = true;
   const allocations = [], shmEvents = [];
   const t = transport(s, {
     requestChunkSize: 2,

@@ -366,8 +366,11 @@ impl SyncClient {
 
     /// Whether the client has a SHM pool and data exceeds the threshold.
     pub fn should_use_shm(&self, data_len: usize) -> bool {
-        choose_request_transport(&self.inner.config, self.inner.has_request_pool(), data_len)
-            == RequestTransportKind::Buddy
+        choose_request_transport(
+            &self.inner.config,
+            self.inner.shm_request_available(),
+            data_len,
+        ) == RequestTransportKind::Buddy
     }
 
     /// Allocate from the client SHM pool and write data in a single lock scope.
@@ -826,9 +829,17 @@ pub(crate) mod tests {
         };
 
         assert!(!client.should_use_shm(50));
+        // A live pool alone never selects SHM: the direction must also be
+        // negotiated by this client's connection handshake.
+        assert!(!client.should_use_shm(200));
+        client.inner.set_shm_request_negotiated_for_test(true);
         assert!(client.should_use_shm(200));
         assert_eq!(
-            choose_request_transport(&client.inner.config, client.inner.has_request_pool(), 200),
+            choose_request_transport(
+                &client.inner.config,
+                client.inner.shm_request_available(),
+                200
+            ),
             RequestTransportKind::Buddy
         );
     }
@@ -903,8 +914,13 @@ pub(crate) mod tests {
             let threshold = config.shm_threshold as usize;
             assert!(!client.should_use_shm(threshold - 1));
             assert!(!client.should_use_shm(threshold));
-            // Disabling buddy retains a request pool for dedicated SHM;
-            // the same threshold still governs selection of that pool.
+            // Disabling buddy retains a request pool for dedicated SHM, but
+            // the projection still requires the negotiated direction: an
+            // unconnected client never claims SHM transport.
+            assert!(!client.should_use_shm(threshold + 1));
+            client.inner.set_shm_request_negotiated_for_test(true);
+            // With the direction negotiated, the same threshold governs
+            // selection of that pool for both buddy policies.
             assert!(client.should_use_shm(threshold + 1));
         }
     }

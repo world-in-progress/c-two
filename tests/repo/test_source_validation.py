@@ -232,11 +232,16 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
         assert "--lib" not in commands["core-test"]
         assert all(not deps for name, _, deps in gates if name in runner.INDEPENDENT_SETUP_GATES)
     assert inventories["linux"] == inventories["macos"]
-    assert inventories["windows"] - inventories["linux"] == {"windows-standard-user-consumer"}
+    assert inventories["windows"] - inventories["linux"] == {
+        "windows-standard-user-consumer", "windows-pipe-identity-test",
+    }
     assert inventories["linux"] <= inventories["windows"]
-    local = runner.gates(sys.executable, Path("evidence"), runner.LOCAL_PLATFORM_SCOPE)
+    local = runner.gates(sys.executable, Path("evidence"), runner.LOCAL_PLATFORM_SCOPE, target_platform="linux")
     assert [name for name, _, _ in local] == ["local-platform-tests"]
     assert "c2-core" in local[0][1] and "c2-http/relay" in local[0][1] and "--lib" not in local[0][1]
+    windows_local = runner.gates(sys.executable, Path("evidence"), runner.LOCAL_PLATFORM_SCOPE, target_platform="windows")
+    assert [name for name, _, _ in windows_local] == ["local-platform-tests", "windows-pipe-identity-test"]
+    assert windows_local[1][1][-3:] == ["--", "--ignored", "--exact"]
     python = {name for name, _, _ in runner.gates(sys.executable, Path("evidence"), runner.PYTHON_SCOPE)}
     assert {"python-suite", "python-native-test", "python-build", "cli-artifact", "python310-install"} <= python
     assert "core-test" not in python and "python-wheel-build" not in python

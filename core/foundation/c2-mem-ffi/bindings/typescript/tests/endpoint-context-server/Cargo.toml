@@ -11,4 +11,4 @@ publish = false
 c2-config = { version = "0.1.0", path = "../../../../../c2-config" }
 c2-local = { version = "0.1.0", path = "../../../../../../transport/c2-local" }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros", "io-util", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "time"] }

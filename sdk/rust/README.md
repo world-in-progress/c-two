@@ -13,8 +13,8 @@ This source-only package has no crates.io release. It reuses
 `c2-contract` for release identity and `c2-core` for route, transport, retry,
 host, and lifetime behavior. It does not expose a second runtime state machine.
 
-This guide uses the shared runtime behavior of Python 0.8.2 / c3 0.4.1;
-this SDK retains its independent 0.1.0 version. See [release notes](../../docs/releases/0.8.2.md) for configuration and upgrade details.
+This guide uses the shared runtime behavior of Python 0.9.0 / c3 0.5.0;
+this SDK retains its independent 0.1.0 version. See [release notes](../../docs/releases/0.9.0.md) for configuration and upgrade details.
 Rust `c2-core` owns default `Persistent`, explicit `OwnerBound`, shutdown drain
 transactions and local endpoint maintenance. SDKs use the one OS endpoint
 derived by `LocalEndpoint::from_address`; there is no backend selector.
@@ -44,7 +44,7 @@ see [connection configuration](../../docs/configuration.en.md#connection-deadlin
 | `Runtime::prepare_owner_takeover(ticket)` | Freezes the configured endpoint context. Save `successor_ticket().export()` before one `commit(timeout)`; a successful commit returns the new `OwnerControl`. `inspect(timeout)` observes state without proving commit success. |
 | `Error::local_io_cause()` | Returns `Option<LocalIoCause>` for actual bind/connect failures. Its operation and `EndpointIoError` retain the OS cause; non-I/O errors have none. |
 
-Timeouts above use `Option<Duration>`. The [lifecycle guide](../../docs/local-endpoint-lifecycle.en.md) specifies ticket protection, original grace deadlines, `NotSent`/`Indeterminate` outcomes and observation ordering. The [0.8.0 Rust migration notes](../../docs/releases/0.8.0.md#rust-migration-and-transport-behavior) cover removed low-level APIs, move-only allocation owners, `ChunkRegistry<C>`, SHM response preparation and structured lifecycle failures. IPC 12, SHM 3 and C/FFI ABI 5 remain unchanged from 0.7.6.
+Timeouts above use `Option<Duration>`. The [lifecycle guide](../../docs/local-endpoint-lifecycle.en.md) specifies ticket protection, original grace deadlines, `NotSent`/`Indeterminate` outcomes and observation ordering. The [0.8.0 Rust migration notes](../../docs/releases/0.8.0.md#rust-migration-and-transport-behavior) cover removed low-level APIs, move-only allocation owners, `ChunkRegistry<C>`, SHM response preparation and structured lifecycle failures. IPC handshake 13 and C/FFI ABI 6 are clean version cuts; SHM 3 remains. Recompile and upgrade peers together as described in the [0.9.0 migration notes](../../docs/releases/0.9.0.md).
 
 ## Portable payloads
 

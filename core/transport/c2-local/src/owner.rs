@@ -102,7 +102,8 @@ impl OwnerBootstrap {
     /// Duplicate a dedicated inherited Windows owner pipe without owning the original handle.
     ///
     /// Requires the duplex, byte-mode, overlapped server end. The non-inheritable duplicate
-    /// remains unregistered until activation. OS checks do not authenticate its provenance/ACL.
+    /// remains unregistered until activation. Its pipe object owner must match TokenUser;
+    /// OS checks do not authenticate the launcher or require it to remain alive.
     ///
     /// # Safety
     ///

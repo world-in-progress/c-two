@@ -224,15 +224,14 @@ impl Endpoint {
             .ok_or_else(|| self.unavailable())?
             .try_clone()?;
         let pending = self.pending.take().expect("pending socket");
-        let watcher = match tokio::net::UnixStream::from_std(
-            std::os::unix::net::UnixStream::from(pending),
-        ) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                disconnect(cleanup.as_raw_fd());
-                return Err(error);
-            }
-        };
+        let watcher =
+            match tokio::net::UnixStream::from_std(std::os::unix::net::UnixStream::from(pending)) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    disconnect(cleanup.as_raw_fd());
+                    return Err(error);
+                }
+            };
         drop(cleanup);
         if let Err(error) = probe_live(watcher.as_raw_fd()) {
             disconnect(watcher.as_raw_fd());

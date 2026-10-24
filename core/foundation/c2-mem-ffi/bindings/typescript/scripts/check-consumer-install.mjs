@@ -110,7 +110,7 @@ import {
 
 const { requestSymbols, responseSymbols, symbols } = loadBundledC2MemFfiNodeNativeSymbols();
 
-assert.equal(C2_MEM_FFI_ABI_VERSION, 5);
+assert.equal(C2_MEM_FFI_ABI_VERSION, 6);
 assert.equal(symbols.c2_mem_ffi_abi_version(), C2_MEM_FFI_ABI_VERSION);
 assert.equal(typeof createNodeIpcConnect, 'function');
 
@@ -233,7 +233,7 @@ import {
   loadBundledC2MemFfiNodeNativeSymbols,
 } from '@c-two/c2-mem-ffi';
 
-const abiVersion: 5 = C2_MEM_FFI_ABI_VERSION;
+const abiVersion: 6 = C2_MEM_FFI_ABI_VERSION;
 const symbols: C2MemFfiNodeNativeSymbols = loadBundledC2MemFfiNodeNativeSymbols();
 const connect = createNodeIpcConnect();
 const poolConfig: C2MemFfiPoolConfig = {

@@ -13,7 +13,7 @@ use std::sync::Mutex;
 const MAX_SHM_PREFIX_LEN: usize = 255;
 const OWNER_INCARNATION_SUFFIX_LEN: usize = 41;
 const MAX_IPC_SHM_SEGMENTS: u16 = 16;
-const C2_MEM_FFI_ABI_VERSION: u32 = 5;
+const C2_MEM_FFI_ABI_VERSION: u32 = 6;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,7 @@ pub enum C2MemFfiStatus {
     PoolError = 3,
     InsufficientBuffer = 4,
     IoError = 5,
+    PermissionDenied = 6,
 }
 
 #[repr(C)]
@@ -521,6 +522,8 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_namespace_id_copy(
 /// Transfers one connected Unix socket to a foreign event loop. Invoke this
 /// bounded operation on a worker, and keep the captured context alive until it
 /// returns. Windows consumers use their native Named Pipe connection API.
+/// Identity verification refusals arrive as `PermissionDenied`; other IO
+/// failures as `IoError`.
 ///
 /// # Safety
 /// `context` and the NUL-terminated `address` must remain live throughout the
@@ -564,7 +567,7 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_unix(
                 unsafe {
                     *out_os_error = error.raw_os_error().unwrap_or(0);
                 }
-                C2MemFfiStatus::IoError
+                connect_failure_status(&error)
             })?;
             unsafe {
                 *out_fd = stream.into_raw_fd();
@@ -572,6 +575,85 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_unix(
             Ok(())
         }
         #[cfg(not(unix))]
+        {
+            let _ = endpoint;
+            Err(C2MemFfiStatus::InvalidArgument)
+        }
+    })
+}
+
+/// Endpoint identity verification happens before the first byte in c2-local;
+/// such refusals stay distinguishable from other IO failures. A missing raw
+/// OS code stays 0 and is never fabricated.
+fn connect_failure_status(error: &std::io::Error) -> C2MemFfiStatus {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        C2MemFfiStatus::PermissionDenied
+    } else {
+        C2MemFfiStatus::IoError
+    }
+}
+
+/// Transfer one verified Windows Named Pipe connection, plus its pinned server
+/// process, to a foreign runtime. Both handles are overlapped-capable,
+/// IOCP-unregistered, and owned by the caller exactly once. The connect runs
+/// on the same current-thread runtime and `DEFAULT_CONNECT_TIMEOUT` budget as
+/// the Unix bridge. Windows only; other platforms return `InvalidArgument`.
+///
+/// # Safety
+/// `context` and the NUL-terminated `address` must remain live throughout the
+/// call. All output pointers must be writable and non-overlapping. On success
+/// `out_pipe` and `out_process` hold raw HANDLE values the caller must close
+/// or adopt exactly once. On failure both are 0; `out_os_error` is zero or the
+/// native OS error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_windows(
+    context: *const C2MemFfiLocalEndpointContext,
+    address: *const c_char,
+    out_pipe: *mut usize,
+    out_process: *mut usize,
+    out_os_error: *mut i32,
+) -> C2MemFfiStatus {
+    guard_status(|| {
+        if out_pipe.is_null() || out_process.is_null() || out_os_error.is_null() {
+            return Err(C2MemFfiStatus::NullPointer);
+        }
+        unsafe {
+            *out_pipe = 0;
+            *out_process = 0;
+            *out_os_error = 0;
+        }
+        if context.is_null() {
+            return Err(C2MemFfiStatus::NullPointer);
+        }
+        let address = parse_utf8_c_string(address)?;
+        let endpoint = unsafe { (*context).inner.endpoint(&address) }
+            .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::IntoRawHandle;
+            let connect = || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(c2_local::connect_windows_pipe(
+                        &endpoint,
+                        c2_local::DEFAULT_CONNECT_TIMEOUT,
+                    ))
+            };
+            let connection = connect().map_err(|error| {
+                unsafe {
+                    *out_os_error = error.raw_os_error().unwrap_or(0);
+                }
+                connect_failure_status(&error)
+            })?;
+            let (pipe, process) = connection.into_parts();
+            unsafe {
+                *out_pipe = pipe.into_raw_handle() as usize;
+                *out_process = process.into_raw_handle() as usize;
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
         {
             let _ = endpoint;
             Err(C2MemFfiStatus::InvalidArgument)
@@ -2048,7 +2130,100 @@ mod tests {
 
     #[test]
     fn public_abi_version_is_exported() {
-        assert_eq!(c2_mem_ffi_abi_version(), 5);
+        assert_eq!(c2_mem_ffi_abi_version(), 6);
+    }
+
+    #[test]
+    fn windows_connect_rejects_invalid_arguments_without_transferring_handles() {
+        let mut pipe = 77_usize;
+        let mut process = 88_usize;
+        let mut os_error = 99;
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_local_endpoint_context_connect_windows(
+                    ptr::null(),
+                    ptr::null(),
+                    &mut pipe,
+                    &mut process,
+                    &mut os_error,
+                )
+            },
+            C2MemFfiStatus::NullPointer
+        );
+        assert_eq!((pipe, process, os_error), (0, 0, 0));
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_local_endpoint_context_connect_windows(
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    &mut process,
+                    &mut os_error,
+                )
+            },
+            C2MemFfiStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_local_endpoint_context_connect_windows(
+                    ptr::null(),
+                    ptr::null(),
+                    &mut pipe,
+                    ptr::null_mut(),
+                    &mut os_error,
+                )
+            },
+            C2MemFfiStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_local_endpoint_context_connect_windows(
+                    ptr::null(),
+                    ptr::null(),
+                    &mut pipe,
+                    &mut process,
+                    ptr::null_mut(),
+                )
+            },
+            C2MemFfiStatus::NullPointer
+        );
+        assert_eq!((pipe, process, os_error), (0, 0, 0));
+        let context = C2MemFfiLocalEndpointContext {
+            inner: LocalEndpointContext::default_for_platform().unwrap(),
+        };
+        let address = std::ffi::CString::new("http://invalid").unwrap();
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_local_endpoint_context_connect_windows(
+                    &context,
+                    address.as_ptr(),
+                    &mut pipe,
+                    &mut process,
+                    &mut os_error,
+                )
+            },
+            C2MemFfiStatus::InvalidArgument
+        );
+        assert_eq!((pipe, process, os_error), (0, 0, 0));
+        #[cfg(not(windows))]
+        {
+            // Outside Windows the mandatory entry keeps the platform refusal
+            // contract: no handles are produced and no error code is invented.
+            let address = std::ffi::CString::new("ipc://valid").unwrap();
+            assert_eq!(
+                unsafe {
+                    c2_mem_ffi_local_endpoint_context_connect_windows(
+                        &context,
+                        address.as_ptr(),
+                        &mut pipe,
+                        &mut process,
+                        &mut os_error,
+                    )
+                },
+                C2MemFfiStatus::InvalidArgument
+            );
+            assert_eq!((pipe, process, os_error), (0, 0, 0));
+        }
     }
 
     #[test]
@@ -2125,9 +2300,10 @@ mod tests {
 _Static_assert(C2_MEM_FFI_STATUS_OK == 0, "status ok value");
 _Static_assert(C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER == 4, "status buffer value");
 _Static_assert(C2_MEM_FFI_STATUS_IO_ERROR == 5, "status IO value");
+_Static_assert(C2_MEM_FFI_STATUS_PERMISSION_DENIED == 6, "status permission value");
 _Static_assert(C2_MEM_FFI_MAX_SHM_PREFIX_LEN == 255u, "prefix length limit");
 _Static_assert(C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS == 16u, "segment count limit");
-_Static_assert(C2_MEM_FFI_ABI_VERSION == 5u, "abi version");
+_Static_assert(C2_MEM_FFI_ABI_VERSION == 6u, "abi version");
 _Static_assert(sizeof(C2MemFfiRequestBlock) == 24, "request block size");
 _Static_assert(offsetof(C2MemFfiRequestBlock, segment_index) == 0, "request segment_index offset");
 _Static_assert(offsetof(C2MemFfiRequestBlock, is_dedicated) == 2, "request dedicated offset");
@@ -2147,6 +2323,10 @@ static void use_endpoint_api(void) {
     C2MemFfiLocalEndpointContext *context = NULL;
     size_t length = 0;
     char name[256];
+    int32_t fd = 0;
+    int32_t os_error = 0;
+    uintptr_t pipe = 0;
+    uintptr_t process = 0;
     (void)c2_mem_ffi_local_endpoint_len("ipc://header-check", &length);
     (void)c2_mem_ffi_local_endpoint_copy("ipc://header-check", name, sizeof(name), &length);
     (void)c2_mem_ffi_local_endpoint_context_capture(NULL, &context);
@@ -2154,6 +2334,8 @@ static void use_endpoint_api(void) {
     (void)c2_mem_ffi_local_endpoint_context_name_copy(context, "ipc://header-check", name, sizeof(name), &length);
     (void)c2_mem_ffi_local_endpoint_context_namespace_id_len(context, &length);
     (void)c2_mem_ffi_local_endpoint_context_namespace_id_copy(context, name, sizeof(name), &length);
+    (void)c2_mem_ffi_local_endpoint_context_connect_unix(context, "ipc://header-check", &fd, &os_error);
+    (void)c2_mem_ffi_local_endpoint_context_connect_windows(context, "ipc://header-check", &pipe, &process, &os_error);
     c2_mem_ffi_local_endpoint_context_free(context);
 }
 
