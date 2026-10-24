@@ -731,6 +731,8 @@ pub struct PreparedOwnerTakeover {
     endpoint: LocalEndpoint,
     binding: EndpointContextBinding,
     attempted: AtomicBool,
+    #[cfg(test)]
+    connect_failure_for_test: Option<fn() -> io::Error>,
 }
 
 impl fmt::Debug for PreparedOwnerTakeover {
@@ -768,6 +770,8 @@ impl PreparedOwnerTakeover {
             endpoint,
             binding,
             attempted: AtomicBool::new(false),
+            #[cfg(test)]
+            connect_failure_for_test: None,
         })
     }
 
@@ -810,9 +814,15 @@ impl PreparedOwnerTakeover {
             .map_or(c2_local::DEFAULT_CONNECT_TIMEOUT, |remaining| {
                 remaining.min(c2_local::DEFAULT_CONNECT_TIMEOUT)
             });
-        let stream = LocalStream::connect(&self.endpoint, connect_timeout)
-            .await
-            .map_err(connect_error)?;
+        let connect = LocalStream::connect(&self.endpoint, connect_timeout);
+        #[cfg(test)]
+        let connect = async {
+            match self.connect_failure_for_test {
+                Some(fail) => Err(fail()),
+                None => connect.await,
+            }
+        };
+        let stream = connect.await.map_err(connect_error)?;
         // This guard aborts on every error or cancellation, including one that
         // arrives before the first control frame is sent.
         let mut io = OwnerIo {
@@ -963,30 +973,70 @@ mod tests {
 
     #[test]
     fn local_connect_identity_refusal_survives_inspect_and_not_sent() {
-        let error = connect_error(c2_local::peer_identity_mismatch("peer identity differs"));
-        assert_eq!(error.kind(), OwnerControlErrorKind::IdentityMismatch);
-        assert_eq!(error.cause_kind(), None);
-        let commit = error.submission(false);
-        assert_eq!(commit.kind(), OwnerControlErrorKind::NotSent);
-        assert_eq!(
-            commit.cause_kind(),
-            Some(OwnerControlErrorKind::IdentityMismatch)
-        );
+        #[cfg(unix)]
+        let root = tempfile::Builder::new()
+            .prefix("c2-owner-kind-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let context = LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        let mut wire = ticket_wire();
+        wire.server_id = format!("owner-kind-{}", uuid::Uuid::new_v4().simple());
+        wire.address = format!("ipc://{}", wire.server_id);
+        let endpoint = context.endpoint(&wire.address).unwrap();
+        let mut listener =
+            runtime().block_on(async { c2_local::LocalListener::bind(&endpoint).unwrap() });
+        wire.context_binding = EndpointContextBinding::capture(&endpoint).unwrap().digest();
 
-        // Neither an OS refusal nor matching text proves an identity mismatch.
-        for io_error in [
-            io::Error::from(io::ErrorKind::PermissionDenied),
-            io::Error::new(io::ErrorKind::PermissionDenied, "peer identity differs"),
-            io::Error::from(io::ErrorKind::NotFound),
-            io::Error::from(io::ErrorKind::TimedOut),
+        // Inject only the OS connect result. Both public methods still execute
+        // candidate(), its real error projection, and the submission boundary.
+        for (fail, expected) in [
+            (
+                (|| c2_local::peer_identity_mismatch("peer identity differs")) as fn() -> io::Error,
+                OwnerControlErrorKind::IdentityMismatch,
+            ),
+            (
+                || io::Error::new(io::ErrorKind::PermissionDenied, "peer identity differs"),
+                OwnerControlErrorKind::Unavailable,
+            ),
+            (
+                || io::Error::from(io::ErrorKind::NotFound),
+                OwnerControlErrorKind::Unavailable,
+            ),
+            (
+                || io::Error::from(io::ErrorKind::TimedOut),
+                OwnerControlErrorKind::Unavailable,
+            ),
         ] {
-            let error = connect_error(io_error);
-            assert_eq!(error.kind(), OwnerControlErrorKind::Unavailable);
-            assert_eq!(
-                error.submission(false).cause_kind(),
-                Some(OwnerControlErrorKind::Unavailable)
-            );
+            let mut prepared = PreparedOwnerTakeover::prepare(
+                OwnerRecoveryTicket::from_wire(wire.clone()).unwrap(),
+                &context,
+            )
+            .unwrap();
+            prepared.connect_failure_for_test = Some(fail);
+            let error = prepared.inspect(Some(Duration::from_secs(2))).unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert_eq!(error.cause_kind(), None);
+            let commit = prepared.commit(Some(Duration::from_secs(2))).unwrap_err();
+            assert_eq!(commit.kind(), OwnerControlErrorKind::NotSent);
+            assert_eq!(commit.cause_kind(), Some(expected));
+            assert_eq!(prepared.commit(None).unwrap_err().cause_kind(), None);
         }
+        assert!(matches!(
+            listener.close(),
+            c2_local::EndpointReapResult::Reaped | c2_local::EndpointReapResult::NotApplicable
+        ));
+        #[cfg(unix)]
+        assert!(
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .all(|entry| matches!(
+                    entry.unwrap().file_name().to_str(),
+                    Some(".gate" | ".gate.marker")
+                ))
+        );
     }
 
     #[test]
