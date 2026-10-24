@@ -150,6 +150,14 @@ fn unavailable<T>(_: T) -> OwnerControlError {
     OwnerControlError::new(OwnerControlErrorKind::Unavailable)
 }
 
+fn connect_error(error: io::Error) -> OwnerControlError {
+    OwnerControlError::new(if c2_local::is_peer_identity_mismatch(&error) {
+        OwnerControlErrorKind::IdentityMismatch
+    } else {
+        OwnerControlErrorKind::Unavailable
+    })
+}
+
 fn malformed() -> OwnerControlError {
     OwnerControlError::new(OwnerControlErrorKind::Malformed)
 }
@@ -804,7 +812,7 @@ impl PreparedOwnerTakeover {
             });
         let stream = LocalStream::connect(&self.endpoint, connect_timeout)
             .await
-            .map_err(unavailable)?;
+            .map_err(connect_error)?;
         // This guard aborts on every error or cancellation, including one that
         // arrives before the first control frame is sent.
         let mut io = OwnerIo {
@@ -951,6 +959,34 @@ mod tests {
 
     fn runtime() -> Handle {
         c2_ipc::shared_io_handle(ConnectDeadline::default()).unwrap()
+    }
+
+    #[test]
+    fn local_connect_identity_refusal_survives_inspect_and_not_sent() {
+        let error = connect_error(c2_local::peer_identity_mismatch("peer identity differs"));
+        assert_eq!(error.kind(), OwnerControlErrorKind::IdentityMismatch);
+        assert_eq!(error.cause_kind(), None);
+        let commit = error.submission(false);
+        assert_eq!(commit.kind(), OwnerControlErrorKind::NotSent);
+        assert_eq!(
+            commit.cause_kind(),
+            Some(OwnerControlErrorKind::IdentityMismatch)
+        );
+
+        // Neither an OS refusal nor matching text proves an identity mismatch.
+        for io_error in [
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            io::Error::new(io::ErrorKind::PermissionDenied, "peer identity differs"),
+            io::Error::from(io::ErrorKind::NotFound),
+            io::Error::from(io::ErrorKind::TimedOut),
+        ] {
+            let error = connect_error(io_error);
+            assert_eq!(error.kind(), OwnerControlErrorKind::Unavailable);
+            assert_eq!(
+                error.submission(false).cause_kind(),
+                Some(OwnerControlErrorKind::Unavailable)
+            );
+        }
     }
 
     #[test]

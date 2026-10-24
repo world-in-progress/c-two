@@ -54,6 +54,8 @@ control = prepared.commit(timeout=1.0)  # 每个准备对象只提交一次；�
 
 这些控制方法失败时抛出 `cc.OwnerControlError`；Python 的 `error.kind` / `error.cause_kind` 对应 Rust 的 `kind()` / `cause_kind()`。`NotSent`（`not_sent`）说明变更请求尚未开始发送；`Indeterminate`（`indeterminate`）说明发送已开始但没有有效确认或明确拒绝，候选会话会关闭，不能推断成功或未执行。完整的拒绝仍给出确定分类，例如 `owner_present`、`invalid_grant`、`grace_expired`、`identity_mismatch`、`shutting_down`。上例直接传播错误，每个准备对象无论结果都只允许调用一次 commit，NotSent 后重试也须重新 prepare；应用必须保留两份票据及对应的 epoch 信息。在不确定结果后，可用 inspect 观察当前 epoch/phase，再由应用显式选择已保存的原票据或 successor 创建新的准备对象；原 grant 未消费才仍有效，若已消费则只有已授权的 successor 有效，竞争者获胜或撤销也可能令自己的票据失效。不得自动依次尝试 old/new key，也不得从 epoch 变化认定自己的事务获胜。
 
+原生对端身份拒绝在 inspect 时保留 `kind="identity_mismatch"`；commit 尚未发送请求时保留 `kind="not_sent"` 和 `cause_kind="identity_mismatch"`。普通 OS 访问失败不推断为身份不符。
+
 每次控制调用使用一个原生绝对预算，每个 session 只有一个在途请求；等待串行槽超时只结束该 waiter，不能关闭其他调用的 owner session；取得槽后、首次写入前超时也保留健康会话。开始写入后丢失确认会终止该专用会话，迟到应答不能交给下一请求。候选 setup 上限为原生 5 秒与剩余原 grace deadline 的较早者，拆包或重试不重置它；不新增配置项。owner 控制独立使用 version 1、最多 4 KiB 的消息，复用既有帧封装；当前 IPC 握手为 13、SHM 为 3、C/FFI ABI 为 6；owner 控制仍使用版本 1，业务帧、调用/回复布局保持。Rust 穷举匹配须增加 `MsgType::OwnerControl`、`SchedulerAcquireError::Unavailable` 和 `RouteConcurrencyError::Unavailable` 分支。旧单向 owner 类型、格式和别名已移除，无兼容入口；不向普通 admin、HTTP 或 relay 降级。
 
 `OwnedChild.poll()` / `wait(timeout=...)` / `kill()` 观察或管理进程，`OwnedChild.close()` 只释放观察者，原生共享 reaper 继续负责 OS 回收。它与 `OwnerControl.close()` 的生命周期作用不同。

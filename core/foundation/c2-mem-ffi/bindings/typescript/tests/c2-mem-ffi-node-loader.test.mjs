@@ -30,7 +30,7 @@ function localTestDirectory(prefix) {
   return mkdtempSync(resolve(fileURLToPath(parent), prefix));
 }
 
-function compileContextFixture(directory, omittedSymbol) {
+function compileContextFixture(directory, omittedSymbol, connectStatus = 1) {
   const source = readFileSync(new URL('../native/node_c2_mem_ffi_loader.c', import.meta.url), 'utf8');
   const required = [...source.matchAll(/LOAD_REQUIRED\(\w+, "([^"]+)"\)/g)].map((match) => match[1]);
   const body = required.filter((name) => ![
@@ -44,12 +44,12 @@ function compileContextFixture(directory, omittedSymbol) {
     if (name === 'c2_mem_ffi_local_endpoint_context_connect_unix') return `
       #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
         _ctx: *const Context, _address: *const u8, fd: *mut i32, os: *mut i32) -> u32 {
-        unsafe { *fd = -1; *os = 0; } 1
+        unsafe { *fd = -1; *os = 0; } ${connectStatus}
       }`;
     if (name === 'c2_mem_ffi_local_endpoint_context_connect_windows') return `
       #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
         _ctx: *const Context, _address: *const u8, pipe: *mut usize, process: *mut usize, os: *mut i32) -> u32 {
-        unsafe { *pipe = 0; *process = 0; *os = 0; } 1
+        unsafe { *pipe = 0; *process = 0; *os = 0; } ${connectStatus}
       }`;
     return `#[unsafe(no_mangle)] pub extern "C" fn ${name}() { std::process::abort(); }`;
   }).join('\n');
@@ -352,6 +352,46 @@ test('native addon rejects ABI 6 without the complete context symbol group', () 
   try {
     const library = compileContextFixture(directory, 'c2_mem_ffi_local_endpoint_context_connect_unix');
     assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /Failed to load.*c2_mem_ffi_local_endpoint_context_connect_unix/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('native connect preserves identity refusal separately from OS access failure', () => {
+  const directory = localTestDirectory('connect-error-kind-');
+  try {
+    const cases = [[5, 'IO_ERROR'], [6, 'PERMISSION_DENIED'], [7, 'IDENTITY_MISMATCH']];
+    const libraries = cases.map(([status, name]) => {
+      const child = resolve(directory, name);
+      mkdirSync(child);
+      return [compileContextFixture(child, undefined, status), status, name];
+    });
+    const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
+    // Only exercise result projection through the real addon; these native
+    // fixtures return errors without opening any socket or pipe.
+    const script = `
+      import assert from 'node:assert/strict';
+      import { loadC2MemFfiNodeNativeSymbols, captureLocalIpcEndpointContextFromSymbols,
+        createNodeIpcConnect, C2NodeIpcConnectionError } from ${JSON.stringify(moduleUrl)};
+      for (const [library, status, name] of JSON.parse(process.argv[1])) {
+        const { symbols } = loadC2MemFfiNodeNativeSymbols(library);
+        const raw = symbols.c2_mem_ffi_local_endpoint_context_capture(null).value;
+        try {
+          assert.deepEqual(await symbols.c2_mem_ffi_endpoint_context_connect_windows(raw, 'ipc://classification'), {status});
+        } finally { raw.close(); }
+        const context = captureLocalIpcEndpointContextFromSymbols(symbols);
+        const connect = createNodeIpcConnect({endpointContext: context});
+        try {
+          await assert.rejects(connect('ipc://classification'), error => {
+            assert.ok(error instanceof C2NodeIpcConnectionError);
+            assert.ok(error.message.includes(name), error.message);
+            return true;
+          });
+        } finally { connect.close(); context.close(); }
+      }
+    `;
+    const output = spawnSync(process.execPath, ['--input-type=module', '-e', script, JSON.stringify(libraries)], { encoding: 'utf8' });
+    assert.equal(output.status, 0, `${output.signal ?? ''} ${output.stdout}${output.stderr}`);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -16,6 +16,7 @@ use futures_util::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub use c2_config::{LocalEndpoint, LocalEndpointContext};
+pub use c2_local_security::{is_peer_identity_mismatch, peer_identity_mismatch};
 
 mod observation;
 pub use observation::{

@@ -20,6 +20,7 @@ typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4,
     C2_MEM_FFI_STATUS_IO_ERROR = 5,
     C2_MEM_FFI_STATUS_PERMISSION_DENIED = 6,
+    C2_MEM_FFI_STATUS_IDENTITY_MISMATCH = 7,
 } C2MemFfiStatus;
 
 /* Backing descriptor: buddy generation/allocation_id > 0; dedicated generation, offset and allocation_id are 0. */

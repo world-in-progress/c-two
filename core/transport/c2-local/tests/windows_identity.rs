@@ -265,6 +265,7 @@ async fn foreign_object_owner_rejects_connect_listener_join_and_bootstrap_adopti
         let mismatch = verify_current_user_pipe_owner(server.as_handle()).unwrap_err();
         assert_eq!(mismatch.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(mismatch.raw_os_error(), None);
+        assert!(c2_local::is_peer_identity_mismatch(&mismatch));
         let error = match mode {
             "raw" => connect_windows_pipe(&endpoint, Duration::from_secs(2))
                 .await
@@ -289,6 +290,10 @@ async fn foreign_object_owner_rejects_connect_listener_join_and_bootstrap_adopti
             error.raw_os_error(),
             None,
             "{mode}: policy refusal has no OS cause"
+        );
+        assert!(
+            c2_local::is_peer_identity_mismatch(&error),
+            "{mode}: {error}"
         );
         let mut flags = 0;
         assert_ne!(

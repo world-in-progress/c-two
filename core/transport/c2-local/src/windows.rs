@@ -115,10 +115,6 @@ fn server_process_id(pipe: BorrowedHandle<'_>) -> io::Result<u32> {
     Ok(pid)
 }
 
-fn identity_refusal(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, message)
-}
-
 fn verify_server_process(pipe: BorrowedHandle<'_>) -> io::Result<OwnedHandle> {
     // Check the object before the process: a same-user instance must not join
     // a foreign-owned pipe object whose DACL happens to permit this user.
@@ -142,7 +138,12 @@ fn verify_server_process(pipe: BorrowedHandle<'_>) -> io::Result<OwnedHandle> {
     verify_server_process_identity(process.as_handle())?;
     match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
         WAIT_TIMEOUT => {}
-        WAIT_OBJECT_0 => return Err(identity_refusal("named pipe server process has exited")),
+        WAIT_OBJECT_0 => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "named pipe server process has exited",
+            ));
+        }
         WAIT_FAILED => return Err(io::Error::last_os_error()),
         _ => {
             return Err(io::Error::new(
@@ -152,7 +153,7 @@ fn verify_server_process(pipe: BorrowedHandle<'_>) -> io::Result<OwnedHandle> {
         }
     }
     if server_process_id(pipe)? != pid {
-        return Err(identity_refusal(
+        return Err(c2_local_security::peer_identity_mismatch(
             "named pipe server process changed during verification",
         ));
     }

@@ -207,8 +207,7 @@ fn token_user_sid(token: BorrowedHandle<'_>) -> io::Result<String> {
 pub fn verify_server_process_identity(process: BorrowedHandle<'_>) -> io::Result<()> {
     let token = process_token(process)?;
     if token_user_sid(token.as_handle())? != current_user_sid()? {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+        return Err(crate::peer_identity_mismatch(
             "named pipe server TokenUser does not match the current user",
         ));
     }
@@ -236,8 +235,7 @@ pub fn verify_server_process_identity(process: BorrowedHandle<'_>) -> io::Result
         *GetSidSubAuthority(label.Label.Sid, 0)
     };
     if level < SECURITY_MANDATORY_MEDIUM_RID as u32 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+        return Err(crate::peer_identity_mismatch(
             "named pipe server integrity is below Medium",
         ));
     }
@@ -291,18 +289,14 @@ pub fn verify_current_user_pipe_owner(pipe: BorrowedHandle<'_>) -> io::Result<()
         return Err(io::Error::from_raw_os_error(error as i32));
     }
     let actual = if owner.is_null() {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "named pipe has no owner SID",
-        ))
+        Err(crate::peer_identity_mismatch("named pipe has no owner SID"))
     } else {
         // SAFETY: owner is in the live descriptor allocated by GetSecurityInfo.
         unsafe { sid_to_string(owner) }
     };
     unsafe { LocalFree(descriptor) };
     if actual? != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+        return Err(crate::peer_identity_mismatch(
             "named pipe owner does not match the current TokenUser",
         ));
     }
@@ -473,6 +467,7 @@ mod tests {
         assert_ne!(changed, 0, "{cause}");
         let error = verify_server_process_identity(current_process()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(crate::is_peer_identity_mismatch(&error));
         assert_eq!(error.raw_os_error(), None);
         assert_eq!(
             error.to_string(),

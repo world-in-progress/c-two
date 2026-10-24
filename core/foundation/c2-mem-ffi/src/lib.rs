@@ -25,6 +25,7 @@ pub enum C2MemFfiStatus {
     InsufficientBuffer = 4,
     IoError = 5,
     PermissionDenied = 6,
+    IdentityMismatch = 7,
 }
 
 #[repr(C)]
@@ -522,8 +523,8 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_namespace_id_copy(
 /// Transfers one connected Unix socket to a foreign event loop. Invoke this
 /// bounded operation on a worker, and keep the captured context alive until it
 /// returns. Windows consumers use their native Named Pipe connection API.
-/// Identity verification refusals arrive as `PermissionDenied`; other IO
-/// failures as `IoError`.
+/// Typed peer identity refusals arrive as `IdentityMismatch`, other permission
+/// failures as `PermissionDenied`, and other IO failures as `IoError`.
 ///
 /// # Safety
 /// `context` and the NUL-terminated `address` must remain live throughout the
@@ -585,8 +586,11 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_unix(
 /// Endpoint identity verification happens before the first byte in c2-local;
 /// such refusals stay distinguishable from other IO failures. A missing raw
 /// OS code stays 0 and is never fabricated.
+#[cfg(any(unix, windows))]
 fn connect_failure_status(error: &std::io::Error) -> C2MemFfiStatus {
-    if error.kind() == std::io::ErrorKind::PermissionDenied {
+    if c2_local::is_peer_identity_mismatch(error) {
+        C2MemFfiStatus::IdentityMismatch
+    } else if error.kind() == std::io::ErrorKind::PermissionDenied {
         C2MemFfiStatus::PermissionDenied
     } else {
         C2MemFfiStatus::IoError
@@ -1190,6 +1194,29 @@ mod tests {
 
     static TEST_ID: AtomicU32 = AtomicU32::new(0);
     static ENDPOINT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn connect_status_distinguishes_identity_from_os_access_failure() {
+        let mismatch = c2_local::peer_identity_mismatch("peer identity differs");
+        assert_eq!(mismatch.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(mismatch.raw_os_error(), None);
+        assert_eq!(mismatch.to_string(), "peer identity differs");
+        assert_eq!(
+            connect_failure_status(&mismatch),
+            C2MemFfiStatus::IdentityMismatch
+        );
+        let denied = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "peer identity differs",
+        );
+        assert_eq!(
+            connect_failure_status(&denied),
+            C2MemFfiStatus::PermissionDenied
+        );
+        let absent = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(connect_failure_status(&absent), C2MemFfiStatus::IoError);
+    }
 
     struct SavedEndpointEnv {
         root: Option<std::ffi::OsString>,
@@ -2301,6 +2328,7 @@ _Static_assert(C2_MEM_FFI_STATUS_OK == 0, "status ok value");
 _Static_assert(C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER == 4, "status buffer value");
 _Static_assert(C2_MEM_FFI_STATUS_IO_ERROR == 5, "status IO value");
 _Static_assert(C2_MEM_FFI_STATUS_PERMISSION_DENIED == 6, "status permission value");
+_Static_assert(C2_MEM_FFI_STATUS_IDENTITY_MISMATCH == 7, "status identity value");
 _Static_assert(C2_MEM_FFI_MAX_SHM_PREFIX_LEN == 255u, "prefix length limit");
 _Static_assert(C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS == 16u, "segment count limit");
 _Static_assert(C2_MEM_FFI_ABI_VERSION == 6u, "abi version");

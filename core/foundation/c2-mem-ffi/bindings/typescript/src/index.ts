@@ -9,6 +9,7 @@ export const C2_MEM_FFI_STATUS_POOL_ERROR = 3;
 export const C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4;
 export const C2_MEM_FFI_STATUS_IO_ERROR = 5;
 export const C2_MEM_FFI_STATUS_PERMISSION_DENIED = 6;
+export const C2_MEM_FFI_STATUS_IDENTITY_MISMATCH = 7;
 
 export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 255;
 export const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
@@ -21,7 +22,8 @@ export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_POOL_ERROR
   | typeof C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER
   | typeof C2_MEM_FFI_STATUS_IO_ERROR
-  | typeof C2_MEM_FFI_STATUS_PERMISSION_DENIED;
+  | typeof C2_MEM_FFI_STATUS_PERMISSION_DENIED
+  | typeof C2_MEM_FFI_STATUS_IDENTITY_MISMATCH;
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -1410,6 +1412,8 @@ function c2MemFfiStatusName(status: unknown): string {
       return "IO_ERROR";
     case C2_MEM_FFI_STATUS_PERMISSION_DENIED:
       return "PERMISSION_DENIED";
+    case C2_MEM_FFI_STATUS_IDENTITY_MISMATCH:
+      return "IDENTITY_MISMATCH";
     default:
       return `UNKNOWN(${String(status)})`;
   }
