@@ -44,8 +44,9 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 | R03 | shutdown 发送阶段修复已验收：发送前失败可重试，开始控制写后丢确认不再重放；首次端点不存在的处理、ping、原总预算和 ACK 仅 initiate 的语义保持。 |
 | R02 | 唯一写所有权已按完整边界验收：真实分配 owner、接收/发布载体与原 pool 绑定，raw 访问明确 unsafe，封闭可替换 pool 及只读 guard 还原写锁入口。低层 Rust API 无兼容迁移，SHM 3 / IPC 12 / C ABI 5 保持；不替代 R06/R07。 |
 | R04 | 已完成：token 绑定 server instance、UID/revision 与准入代次，关门使旧 token 失效，接管恢复不能复活；同名替换及 owner_missing 后迟到 relay final 的反例有独立覆盖。见[准入修复验收](../reports/2026-10-21-admission-race-repair.md)及[三系统复核](../reports/2026-10-22-release-foundation-review.md)。 |
-| R05–R07、R17 | SHM 布局接纳、导出/释放同步、失败释放的 owner/charge、端点 inspect/reap I/O 分类，按各自反例修复。R01 已承接 SHM 3 布局安全接纳所需的边界；R05 须据新布局重新复核，不能直接套用旧反例或视为整项完成。 |
-| R09、R10 | relay 配置快照可能改变读取/错误观察时点；注册快照局部去重约 20 行，独立 borrowed 校验、动态 Resource 方法查找及错误顺序有真实职责。继续暂缓。R08 原环境拒绝语义的解析收敛和 R30 已批准子项已经完成。 |
+| R05、R07、R17 | SHM 布局接纳、失败释放的 owner/charge、端点 inspect/reap I/O 分类，按各自反例修复。R01 已承接 SHM 3 布局安全接纳所需的边界；R05 须据新布局重新复核，不能直接套用旧反例或视为整项完成。 |
+| R06 | 用户已批准[最小同步修复方案](2026-10-24-r06-python-buffer-lifecycle-synchronization.md)，复用现有 inner/lease 锁修复响应/请求导出、释放及 retained tracking 的接纳竞态，不新增状态框架或删公开能力。固定基线 `ea8345fa` 的四个受控反例按预期失败，修复后 native payload 8 项通过；完整回归、性能、三系统及 CI、零残留和独立审查正在验收。R06 按正确性修复单列，暂不计完成；回调重入风险仍独立待评估。 |
+| R09、R10 | 2026-10-24 复核 R09：四次 EnvCatalog 加载仍存在，复用现有窄 resolver 的最小方案生产约持平至增 5 行、测试增 25–50 行，尚无性能实测；提前读取 override 还会改变 state lock/deadline 与前三项解析的观察顺序。继续暂缓。R10 注册快照局部去重约 20 行，独立 borrowed 校验、动态 Resource 方法查找及错误顺序有真实职责。R08 原环境拒绝语义的解析收敛和 R30 已批准子项已经完成。 |
 | R12、R28 剩余 | 已完成可证明的同值重验删除、登记事实与 validated relay 表示收敛；跨 await 的 authority、owner/locality、代际、peer 活性和错误接纳继续保留。新增删除需另证局部不变量。 |
 | R13 剩余 | 请求所有权移动、IPC 拼帧、SHM prepare/send 合并及 [inline 响应所有权移交](../reports/2026-10-24-r13-inline-response-ownership-acceptance.md)均已验收。inline 子项复用已有 owned 构造器，省去 Core held 路径的一次 Vec 克隆及重复副本；API/ABI/协议不变，生产与测试实际净增 37 行，作为运行时成本优化单列，不记作代码净减。服务端 Python 初始快照仍有数据寿命职责；写锁前取消保留未发布分配直到 pool 收尾已在基线复现，须独立评估。不将这些子项计作 R13 整项完成。 |
 | R14 其他、R15、C03、C04 | C03 的 chunk assembly/pending permit 单一所有权子项已完成，代际与准入围栏保留。bitmap 锁证明、GC admission 进度及轮询改通知仍暂缓。不为精简删除跨进程锁、回收进度、预算与唤醒保护。 |
@@ -58,7 +59,7 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 | R33 · 旧 Python 手工分片投影 | 已按[批准方案](2026-10-24-r33-python-manual-assembly-retirement.md)退役 `c_two.mem.ChunkAssembler`、`c_two.mem.MemHandle` 及对应 `_native` 导出，不留兼容。实现 `921b48ee` 生产净减 271 行、测试净减 215 行，合计净减 486 行。基线覆盖、完整 relay、真实 Rust/Python/Node、Windows 开发机、GitHub Actions 首轮 10/10（含 Windows ARM64 与 3.14t）、本批端点零残留及独立审查见[验收记录](../reports/2026-10-24-r33-python-manual-assembly-retirement-acceptance.md)。Rust registry/assembler/backing、Rust 公开 API、MemPool 公开能力、预算/释放、C/FFI ABI 和协议保持；R06/R07 未混入。本子项尚未发版，R33 仍为部分完成，原 39 项分类数量不变。 |
 | R29、R32、R33 剩余 | codegen 同次缓存/typed projection、结构化错误内部序列化、Python 错误常量及孤立 wrap_error。0.8.2 的公开 CoreError 是现有错误链投影，不代表 R32 内部错误转换收敛已经完成。R32 凭据子项已按[单一原生投影方案](2026-10-23-r32-native-endpoint-credential.md)验收：实现 `60656603`，生产净减 66、测试净增 14，合计净减 52 行；完整回归、三系统、GitHub Actions 10/10、端点零残留及独立审查见[验收记录](../reports/2026-10-23-r32-native-endpoint-credential-acceptance.md)。剩余错误投影在 `3e575acb` 上复核后继续暂缓：完整迁移包含调度错误和服务端反向转换，涉及至少 6 个生产、9 个测试文件，预计生产减 10–30、测试增 30–60 行；保留 error_bytes 就无法退出编码，替换该公开字段也只惠及错误路径，尚无性能证据。生成 release 复用、call-control 写入去重和 Rust 错误码单一声明已完成；Transport 内外层错误、外部 JSON/wire 与错误顺序保留，不混入无关 API 删除。 |
 | R34、R35 | peer SHM 私有副本已退出；RouteAck 是尚未退役的公开预留协议。R35 的[原分析](2026-10-23-r35-heartbeat-task-ownership.md)已按用户要求暂缓：禁用态空任务优化与公开 API 退役分开，不再把原捆绑估算列为下一批收益；未实施或测量。C05 ABI 4 完整端点能力子项已完成，不借机删除预分配能力。 |
-| R36、R38、R39、C06 剩余 | 已完成的死状态、不可达尾部和 readiness 后等待不再重开；真实等待、维护 EOF/错误退出、操作错误映射和外部 chunk 配置接纳仍有职责。私有 proof 或专属结果类型须先证明整体收益。 |
+| R36、R38、R39、C06 剩余 | 已完成的死状态、不可达尾部和 readiness 后等待不再重开；真实等待、维护 EOF/错误退出、操作错误映射和外部 chunk 配置接纳仍有职责。2026-10-24 复核 R39：操作专属成功结果已完成，reap 必需 proof 约减 6 行、HTTP body 复用约减 7–10 行，不单独开批；专属错误表示约持平至增 5 行，当前映射保留。 |
 | T01–T07 剩余 | 源码词串门禁、假 owner、阻塞读取、重连/GC 负例及默认值证明，随对应正确性事项替换；不为测试行数牺牲行为覆盖。已迁移的真实生命周期、协议边界和手写 golden 不回退。 |
 | 两份控制会话重构 | 继续暂缓。连接通知、所有者接管及非 Hello setup 期限修复的交付不等于批准会话层重构；后续仍先证明能整体消除重复收发与复杂状态，核实身份、准入、期限、错误顺序和释放语义，再确认方案。 |
 | 已完成且无新剩余子项 | R11 登记事实、R27 FIFO 后的死计数、R30 已批准配置子项、R31 owner/冻结事实配对、R37 旧发布脚本等，维持各批验收状态。 |

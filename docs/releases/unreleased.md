@@ -1,5 +1,9 @@
 # Unreleased
 
+## Python buffer lifecycle synchronization
+
+Serialize Python buffer export admission with release through the existing native locks. A view that wins the race now prevents response invalidation or request release with the existing `BufferError`; a release that wins prevents new exports. Request retained tracking can no longer install a statistical lease after release. Snapshot storage, error types, release ordering, idempotency and all public APIs, ABIs and protocols remain unchanged.
+
 ## Python manual assembly API retirement
 
 Remove `c_two.mem.ChunkAssembler`, `c_two.mem.MemHandle` and their `_native` exports. These were the manual Python entry points used by the retired Python transport loops. They have no compatibility aliases or replacement Python manual-assembly API. Code that directly constructed an assembler and accessed its finished handle must move to normal RPC automatic chunking or the retained Rust assembler API.
