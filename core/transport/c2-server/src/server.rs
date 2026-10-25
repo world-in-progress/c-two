@@ -18,7 +18,7 @@ use c2_local::{
     ConnectionEndReason, ConnectionEventSource, ConnectionEvents, DEFAULT_CONNECT_TIMEOUT,
     EndpointReapResult, LocalEndpoint, LocalListener, LocalReadHalf, LocalStream, LocalWriteHalf,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
 
