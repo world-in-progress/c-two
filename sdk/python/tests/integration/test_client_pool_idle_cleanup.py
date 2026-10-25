@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import time
 from contextlib import contextmanager
 
 import pytest
+import c_two as cc
 
 from tests.fixtures.process_control import readline_with_timeout
 
@@ -21,15 +23,18 @@ from tests.fixtures.process_control import readline_with_timeout
 FIXTURES = Path(__file__).resolve().parents[1] / 'fixtures'
 
 
-def _unix_socket_count(pid: int) -> int:
+def _unix_socket_count(pid: int, endpoint_name: str | None = None) -> int:
     if sys.platform == 'linux':
         # Inodes are used only to classify this snapshot's FDs as AF_UNIX.
         # No identity comparison across snapshots: kernels can reuse IDs.
         process = Path('/proc') / str(pid)
-        unix_inodes = {
-            line.split()[6]
-            for line in (process / 'net/unix').read_text().splitlines()[1:]
-        }
+        unix_inodes = set()
+        for line in (process / 'net/unix').read_text().splitlines()[1:]:
+            fields = line.split()
+            if endpoint_name is None or (
+                len(fields) == 8 and Path(fields[7]).name == endpoint_name
+            ):
+                unix_inodes.add(fields[6])
         count = 0
         for fd in (process / 'fd').iterdir():
             try:
@@ -40,26 +45,34 @@ def _unix_socket_count(pid: int) -> int:
                 count += 1
         return count
     result = subprocess.run(
-        ['lsof', '-nP', '-a', '-p', str(pid), '-U', '-Ff'],
+        ['lsof', '-nP', '-a', '-p', str(pid), '-U', '-Ffn'],
         capture_output=True, text=True, timeout=5,
     )
     assert result.returncode == 0, f'lsof failed: {result.stderr}'
+    if endpoint_name is not None:
+        return sum(
+            line.startswith('n') and Path(line[1:]).name == endpoint_name
+            for line in result.stdout.splitlines()
+        )
     return sum(line.startswith('f') for line in result.stdout.splitlines())
 
 
-def _wait_count(pid: int, expected: int) -> None:
+def _wait_count(pid: int, expected: int, endpoint_name: str | None = None) -> None:
     deadline = time.monotonic() + 8
     observations = []
     while time.monotonic() < deadline:
-        actual = _unix_socket_count(pid)
+        actual = _unix_socket_count(pid, endpoint_name)
         observations.append(actual)
         if actual == expected:
             # Observe again after dispatch/EOF handling settles.
             time.sleep(0.2)
-            if _unix_socket_count(pid) == expected:
+            if _unix_socket_count(pid, endpoint_name) == expected:
                 return
         time.sleep(0.05)
-    pytest.fail(f'pid {pid}: expected {expected} Unix socket FDs, saw {observations}')
+    pytest.fail(
+        f'pid {pid}, endpoint {endpoint_name}: expected {expected} Unix socket FDs, '
+        f'saw {observations}'
+    )
 
 
 @contextmanager
@@ -102,6 +115,22 @@ def test_client_pool_idle_cleanup(tmp_path):
     # Only child environments change; each test owns a private namespace,
     # so xdist needs no process-global environment lock.
     with tempfile.TemporaryDirectory(prefix='c2-idle-', dir='/tmp') as ipc_root:
+        # A peer EOF must remain counted until the accepted FD itself closes.
+        endpoint = Path(ipc_root) / 'fd-probe'
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(endpoint))
+            listener.listen()
+            assert _unix_socket_count(os.getpid(), endpoint.name) == 1
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(str(endpoint))
+                accepted, _ = listener.accept()
+                with accepted:
+                    assert _unix_socket_count(os.getpid(), endpoint.name) == 2
+                    client.close()
+                    assert accepted.recv(1) == b''
+                    assert _unix_socket_count(os.getpid(), endpoint.name) == 2
+            assert _unix_socket_count(os.getpid(), endpoint.name) == 1
+        endpoint.unlink()
         env = {**os.environ, 'C2_ENV_FILE': '', 'C2_RELAY_ANCHOR_ADDRESS': '',
                'C2_IPC_ROOT': ipc_root}
         server_log = tmp_path / 'server.stderr'
@@ -110,6 +139,13 @@ def test_client_pool_idle_cleanup(tmp_path):
             hello = _message(server, server_log)
             assert hello['pid'] == server.pid
             assert hello['address'].startswith('ipc://')
+            endpoint_name = Path(cc.local_endpoint_context(root=ipc_root).endpoint_name(
+                hello['address'],
+            )).name
+            # READY follows PONG, before the server necessarily drops that
+            # probe's accepted FD. Wait for only the listener before sampling
+            # the full-process baseline; later leak assertions remain unfiltered.
+            _wait_count(server.pid, 1, endpoint_name)
             baseline = _unix_socket_count(server.pid)
             with _process('idle_pool_client.py', env, client_log, hello['address']) as client:
                 assert _message(client, client_log)['pid'] == client.pid
@@ -129,3 +165,5 @@ def test_client_pool_idle_cleanup(tmp_path):
             _wait_count(server.pid, baseline)
             server.stdin.close()
             assert server.wait(timeout=10) == 0, server_log.read_text()
+        assert not list(Path(ipc_root).glob('*.lease'))
+        assert not any(path.is_socket() for path in Path(ipc_root).iterdir())
