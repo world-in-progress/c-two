@@ -1,6 +1,6 @@
 # Windows user-scoped IPC and authenticated local connections
 
-Status: implementation and qualification in progress. This document records the approved target, not a completed security or release claim. The work includes the separately approved R06 buffer synchronization repair; its already collected baseline and local results remain separate evidence.
+Status: implementation, targeted repair, real Windows evidence review, and developer-host cleanup are complete. Canonical release qualification and publication remain pending. The separately approved R06 repair retains its own baseline and performance evidence. See the [acceptance record](../reports/2026-10-25-090-windows-release-acceptance.md) for exact source commits, reused validation and remaining release gates.
 
 ## Scope and boundary
 

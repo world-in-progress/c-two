@@ -69,4 +69,3 @@ test('Unix platforms keep the injected connector surface', () => {
   assert.equal(typeof runtime.connect, 'function');
   runtime.close();
 });
-
