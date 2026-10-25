@@ -593,8 +593,8 @@ fn managed_absent_reap_needs_an_independent_namespace() {
 
 #[tokio::test]
 async fn managed_registered_exit_without_destructors_is_reapable() {
-    let _shared = shared_namespace_guard();
-    let endpoint = managed_endpoint("exit-owner");
+    let namespace = TestNamespace::new();
+    let endpoint = managed_endpoint_at(namespace.path(), "exit-owner");
     let output = run_managed_process(&endpoint, "exit-owner");
     assert!(output.status.success(), "{output:?}");
     assert!(socket_path(&endpoint).exists());
