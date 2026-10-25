@@ -1,0 +1,230 @@
+{
+  "version": "0.9.0",
+  "cli_version": "0.5.0",
+  "baseline_sha": "548710a8617a33755d5ad73f62b3271452429874",
+  "candidate_sha": "0e63094ab2ef9add7e9d4dd0e6c4873d09a7e175",
+  "implementation_sha": "b9efb2d9706a7563ddaacfe2db2dc2d953c8b86e",
+  "source_sha": "3f223d658117511073ae549565ad2c49af163a87",
+  "pull_request": "https://github.com/world-in-progress/c-two/pull/197",
+  "protocols": {
+    "ipc": 13,
+    "shm": 3,
+    "c_ffi_abi": 6,
+    "owner_control": 1,
+    "endpoint_credential_json": 1
+  },
+  "delta": {
+    "production": {
+      "added": 1684,
+      "deleted": 554,
+      "net": 1130
+    },
+    "tests": {
+      "added": 2584,
+      "deleted": 602,
+      "net": 1982
+    },
+    "docs": {
+      "added": 631,
+      "deleted": 69,
+      "net": 562
+    },
+    "manifest": {
+      "added": 9,
+      "deleted": 9,
+      "net": 0
+    }
+  },
+  "delta_method": "Git changed-line counts; Rust cfg(test) fields, statements and modules count as tests. Source comments count with production. Post-publication documentation is excluded.",
+  "windows_delta": {
+    "production": {
+      "added": 1634,
+      "deleted": 179,
+      "net": 1455
+    },
+    "tests": {
+      "added": 2148,
+      "deleted": 229,
+      "net": 1919
+    },
+    "docs": {
+      "added": 158,
+      "deleted": 77,
+      "net": 81
+    },
+    "manifest": {
+      "added": 9,
+      "deleted": 9,
+      "net": 0
+    }
+  },
+  "r06_delta": {
+    "production": {
+      "added": 8,
+      "deleted": 4,
+      "net": 4
+    },
+    "tests": {
+      "added": 267,
+      "deleted": 31,
+      "net": 236
+    },
+    "docs": {
+      "added": 64,
+      "deleted": 3,
+      "net": 61
+    },
+    "manifest": {
+      "added": 0,
+      "deleted": 0,
+      "net": 0
+    }
+  },
+  "source_validation": {
+    "engineering_full": {
+      "run_id": 40088986489,
+      "repository": "Dsssyc/c-two",
+      "source": "6b2b176217dc9177f4fbe05dddc838c8d54deb30"
+    },
+    "identity_delta": {
+      "run_id": 40112888982,
+      "repository": "Dsssyc/c-two",
+      "tested_source": "b9efb2d9706a7563ddaacfe2db2dc2d953c8b86e",
+      "workflow_wrapper": "93a07c3f9b198416814af82790cfb73a8b6b3346"
+    },
+    "pull_request": {
+      "run_id": 40157625282,
+      "final_attempt": 2,
+      "successful_jobs": 10
+    },
+    "canonical": {
+      "run_id": 40161591075,
+      "attempt": 1,
+      "successful_jobs": 10,
+      "source": "3f223d658117511073ae549565ad2c49af163a87",
+      "full_lanes": {
+        "macos-15": {
+          "artifact": "source-macos-15-py3.12-full-3f223d658117511073ae549565ad2c49af163a87",
+          "gates_passed": 25,
+          "platform": "macos",
+          "run_id": 40161591075,
+          "run_url": "https://github.com/world-in-progress/c-two/actions/runs/40161591075",
+          "source_c3_sha256": "c55293c57a98acaf61e603cc3e8347f5805e40164f5c1d2bf6801ce185d048c5"
+        },
+        "ubuntu-24.04": {
+          "artifact": "source-ubuntu-24.04-py3.12-full-3f223d658117511073ae549565ad2c49af163a87",
+          "gates_passed": 25,
+          "platform": "linux",
+          "run_id": 40161591075,
+          "run_url": "https://github.com/world-in-progress/c-two/actions/runs/40161591075",
+          "source_c3_sha256": "dd483dabfa314ab565fac1bbfb88639ae45fb9276b06aa91003e4f9a2427d0f0"
+        },
+        "windows-11-arm": {
+          "artifact": "source-windows-11-arm-py3.12-full-3f223d658117511073ae549565ad2c49af163a87",
+          "gates_passed": 27,
+          "platform": "windows",
+          "run_id": 40161591075,
+          "run_url": "https://github.com/world-in-progress/c-two/actions/runs/40161591075",
+          "source_c3_sha256": "d24dde59701d22848a61c146d957cb835f43563bd8282f0421a04f7c923d5696"
+        },
+        "windows-2022": {
+          "artifact": "source-windows-2022-py3.12-full-3f223d658117511073ae549565ad2c49af163a87",
+          "gates_passed": 27,
+          "platform": "windows",
+          "run_id": 40161591075,
+          "run_url": "https://github.com/world-in-progress/c-two/actions/runs/40161591075",
+          "source_c3_sha256": "2fdba56a50f44c908922d9a3528ae190a13514be8e86d1bbdb5a9276a999c897"
+        },
+        "windows-2025": {
+          "artifact": "source-windows-2025-py3.12-full-3f223d658117511073ae549565ad2c49af163a87",
+          "gates_passed": 27,
+          "platform": "windows",
+          "run_id": 40161591075,
+          "run_url": "https://github.com/world-in-progress/c-two/actions/runs/40161591075",
+          "source_c3_sha256": "e7a8ae106643ca48ddad4ef127f67148ef1aa9e0a9ce1b476bd6da92581db1eb"
+        }
+      },
+      "free_threaded_job": "source (ubuntu-24.04, py3.14t)"
+    }
+  },
+  "macos_diagnostic": {
+    "initial_failed_run": 40157625282,
+    "test": "server::tests::shutdown_join_retires_socket_after_namespace_gate_contention",
+    "failure": "two-second close-probe timeout",
+    "root_cause": "unconfirmed",
+    "shutdown_functions_and_test_identical_to": "548710a8617a33755d5ad73f62b3271452429874",
+    "isolated_diagnostic_run": 40160295344,
+    "diagnostic_source": "5e025036cdb24ae97d2326b7e53ce39b4ed8cd3d",
+    "diagnostic_rounds": 10,
+    "server_tests_per_round": 185,
+    "diagnostic_failures": 0,
+    "changed_production_or_assertions": false,
+    "disposition": "One failed-job rerun passed; independent canonical main qualification passed on its first attempt. Original failure remains recorded, not described as repaired."
+  },
+  "release_candidate": {
+    "run_id": 40164835157,
+    "source": "3f223d658117511073ae549565ad2c49af163a87",
+    "successful_jobs": 38,
+    "expected_skipped_jobs": [
+      "linux (aarch64-unknown-linux-gnu) / sdist"
+    ],
+    "manifest_sha256": "08ba971cabcfdde421629f41f4b79d6f689afebbbbe213eb43de374bcf6b657c"
+  },
+  "promotion": {
+    "dry_run": {
+      "python": 40165944800,
+      "cli": 40165942688
+    },
+    "publication": {
+      "python": 40166223230,
+      "cli": 40166221456
+    },
+    "result": "success",
+    "pypi_environment": "approved under the user release authorization"
+  },
+  "publication": {
+    "pypi_url": "https://pypi.org/project/c-two/0.9.0/",
+    "cli_url": "https://github.com/world-in-progress/c-two/releases/tag/c3-v0.5.0",
+    "manifest_url": "https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/rc-manifest.json",
+    "manifest_sha256": "08ba971cabcfdde421629f41f4b79d6f689afebbbbe213eb43de374bcf6b657c",
+    "python_files": 36,
+    "wheels": 35,
+    "sdists": 1,
+    "cli_assets": 17,
+    "every_file_name_size_sha256_matched_plan": true,
+    "yanked_files": 0,
+    "windows_arm64_wheels": [
+      "c_two-0.9.0-cp311-cp311-win_arm64.whl",
+      "c_two-0.9.0-cp312-cp312-win_arm64.whl",
+      "c_two-0.9.0-cp313-cp313-win_arm64.whl",
+      "c_two-0.9.0-cp314-cp314-win_arm64.whl",
+      "c_two-0.9.0-cp314-cp314t-win_arm64.whl"
+    ],
+    "tag_source": "3f223d658117511073ae549565ad2c49af163a87"
+  },
+  "reviews": {
+    "r06": "a136cefd-fb94-4b4e-aee8-efd38c293f49",
+    "windows_final_delta": "e2e8be5b-be4d-4274-ad2c-aa372f983bc7",
+    "submitted_windows_evidence": "9c476201-d7c2-47e9-9bf1-3db768cb0db2",
+    "build_provenance": "5a25e296-2adc-4f5f-8672-8e57e01fe04a",
+    "identity_error_patch": "2a3a3e74-9699-43e9-ae03-1bcfde7c998d",
+    "release_gate": "e21b76d5-e02e-470a-8e47-df4ae847d280",
+    "identity_test_review_resolution": "Host replaced helper-only test with real public inspect/commit paths and proved the old actual connection mapping fails."
+  },
+  "cleanup": {
+    "windows_boot_utc": "2026-10-24T17:04:10.4182720Z",
+    "temporary_profiles_removed": 5,
+    "remaining_profile_directories": 0,
+    "remaining_test_accounts": 0,
+    "remaining_test_scheduled_tasks": 0,
+    "remaining_task_compiled_files": 0,
+    "known_removed_file_bytes_minimum": 6303635896,
+    "rust_toolchain_preserved": true,
+    "macos_diagnostic_cargo_cleanup": "688 files, 219.6 MiB; no active users",
+    "historical_ipc_touched": false,
+    "user_evidence_files": 168,
+    "user_evidence_manifest_sha256": "c9eb262fc57d0dc55c06bfc8343d31cd4bce3c18d06bdd813f1c4ea35c030513",
+    "retained_other_task_worktree": "~/.codex/worktrees/slimming-batches/c-two",
+    "retention_reason": "Codex archive tool refuses because another task owns this checkout."
+  }
+}

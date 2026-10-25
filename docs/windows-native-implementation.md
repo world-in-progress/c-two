@@ -2,6 +2,12 @@
 
 Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
 
+## C-Two 0.9.0 release (2026-10-25)
+
+The current release uses TokenUser scope across logons, verifies connected pipe ownership and a server of at least Medium integrity before sending, and uses existing owned/inline/chunked transfer across sessions that cannot share Local mappings. IPC 13 and C/FFI ABI 6 require coordinated upgrades; SHM 3 and owner control 1 retain their formats. The [release notes](releases/0.9.0.md) describe the API changes and the [acceptance record](reports/2026-10-25-090-windows-release-acceptance.md) binds the actual Windows developer-host, second-account, cross-session, hosted ARM64 and publication evidence.
+
+The stages and chronological evidence below retain the claims and open items of their original revisions. They do not define a second supported logon-scoped mode.
+
 ## C-Two 0.8.0 source (2026-10-22)
 
 The active dependency pins now select FastDB 0.2.3, source
@@ -64,7 +70,7 @@ The wire transport carries a `u32` buddy backing generation with every SHM coord
 
 Peer caches identify a concrete slot/generation and reject older generations. They may replace a cached backing only when its allocator is unlocked, unpoisoned and has zero allocations. Releasing the last valid block also releases an idle peer cache mapping, while an outstanding held/borrowed lease keeps its allocation live. This provides the retirement boundary through the existing allocation ownership rather than an unbounded wait for a new ACK. Connection loss does not revoke a still-live local held owner. A stale generation never reinitializes or frees a newer backing.
 
-Shared allocator header version 3 stores the full process identifier in a 64-bit lock word with a separate panic-poison flag and records each live buddy allocation's level and instance id. IPC handshake 12 carries that id through request and response release; C/FFI ABI 5 exposes it in block descriptors. An old id cannot release a new allocation at the same offset. A dead holder leaves the backing locked: observers refuse access without writing that PID-only word, avoiding a race with PID reuse. A panicking holder poisons its own backing. No process steals the lock and resumes potentially partial allocator mutations. Retirement tries to acquire the same lock once before checking the allocation count; busy or poisoned counters cannot authorize it. See [allocator crash safety](reports/windows-allocator-crash-safety.md) for the retained lock policy and its original version-2 evidence.
+Shared allocator header version 3 stores the full process identifier in a 64-bit lock word with a separate panic-poison flag and records each live buddy allocation's level and instance id. IPC 12 and C/FFI ABI 5 introduced that id in request/response release and block descriptors; the current IPC 13 / ABI 6 retain the same allocation-id contract. An old id cannot release a new allocation at the same offset. A dead holder leaves the backing locked: observers refuse access without writing that PID-only word, avoiding a race with PID reuse. A panicking holder poisons its own backing. No process steals the lock and resumes potentially partial allocator mutations. Retirement tries to acquire the same lock once before checking the allocation count; busy or poisoned counters cannot authorize it. See [allocator crash safety](reports/windows-allocator-crash-safety.md) for the retained lock policy and its original version-2 evidence.
 
 This contract must be proven by a test retaining an old peer mapping while the producer reclaims and regrows the same slot, plus tests holding an active block across attempted retirement. If these invariants cannot be maintained through every receive/release path, the implementation must add an explicit retirement protocol before claiming this stage complete.
 

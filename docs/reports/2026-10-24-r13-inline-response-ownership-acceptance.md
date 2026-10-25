@@ -1,6 +1,6 @@
 # R13 inline 响应所有权移交验收
 
-基线为 `3e575acbb4c30414f06caaeb7e6e8c84e503ff3c`，实现提交为 `1ac341506acbafcd28382deae291359abbf03aa9`，对应[批准方案](../plans/2026-10-23-r13-inline-response-ownership.md)。本项只移动 Core 已拥有的 IPC inline Vec；SHM 和分块仍走原 ResponseLease。公开 API、C/FFI ABI 5、IPC 12、SHM 3、owner control 1、业务帧及 CRM 哈希均不变。R35 保持暂缓，本轮不发版。
+基线为 `3e575acbb4c30414f06caaeb7e6e8c84e503ff3c`，实现提交为 `1ac341506acbafcd28382deae291359abbf03aa9`，对应[批准方案](../plans/2026-10-23-r13-inline-response-ownership.md)。本项只移动 Core 已拥有的 IPC inline Vec；SHM 和分块仍走原 ResponseLease。公开 API、C/FFI ABI 5、IPC 12、SHM 3、owner control 1、业务帧及 CRM 哈希均不变。R35 保持暂缓，该独立批次未发版，现已随 [0.9.0](2026-10-25-090-windows-release-acceptance.md) 发布；本记录中的协议编号对应当时的独立实现基线。
 
 ## 实际增量与收益
 
