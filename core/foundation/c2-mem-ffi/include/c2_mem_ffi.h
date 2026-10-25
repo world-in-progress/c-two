@@ -10,7 +10,7 @@ extern "C" {
 
 #define C2_MEM_FFI_MAX_SHM_PREFIX_LEN 255u
 #define C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS 16u
-#define C2_MEM_FFI_ABI_VERSION 5u
+#define C2_MEM_FFI_ABI_VERSION 6u
 
 typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_OK = 0,
@@ -19,6 +19,8 @@ typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_POOL_ERROR = 3,
     C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4,
     C2_MEM_FFI_STATUS_IO_ERROR = 5,
+    C2_MEM_FFI_STATUS_PERMISSION_DENIED = 6,
+    C2_MEM_FFI_STATUS_IDENTITY_MISMATCH = 7,
 } C2MemFfiStatus;
 
 /* Backing descriptor: buddy generation/allocation_id > 0; dedicated generation, offset and allocation_id are 0. */
@@ -61,14 +63,14 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_copy(
     const char *address, char *dst, size_t dst_len, size_t *out_written);
 
 /*
- * ABI 5 requires the complete context API, including connect_unix.
+ * ABI 6 requires the complete context API, including both connect entries.
  *
  * Capture c2-config's complete immutable endpoint context exactly once.
  * NULL unix_root inherits process env/.env/platform default; a non-NULL UTF-8
  * root is the explicit code override and does not read process env/.env.
  * Unix roots are validated without
  * creating or checking directories; the caller prepares a root before bind.
- * Windows uses the current logon SID and rejects every non-NULL root override.
+ * Windows uses the current TokenUser SID and rejects every non-NULL root override.
  * This context does not change SHM names or pool layouts.
  *
  * On failure a valid out_context is set to NULL. The successful pointer is
@@ -114,11 +116,29 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_context_namespace_id_copy(
  * storage must not overlap. On success out_fd is an owned nonblocking,
  * close-on-exec descriptor to adopt or close exactly once. On failure it is
  * -1 and out_os_error is zero or native errno. Windows returns INVALID_ARGUMENT;
- * its Node connector uses the native Named Pipe API.
+ * its Node connector uses the native Named Pipe API. Endpoint identity
+ * verification refusals return PERMISSION_DENIED; other IO failures IO_ERROR.
  */
 C2MemFfiStatus c2_mem_ffi_local_endpoint_context_connect_unix(
     const C2MemFfiLocalEndpointContext *context, const char *address,
     int32_t *out_fd, int32_t *out_os_error);
+
+/*
+ * Connect through c2-local's verified TokenUser-scoped Named Pipe addressing
+ * and transfer the pipe plus its pinned server process. Windows only; other
+ * platforms return INVALID_ARGUMENT. Call on a worker: completion is bounded
+ * by the same native default deadline as the Unix bridge. The returned pipe
+ * handle is overlapped-capable and not registered with any IOCP or foreign
+ * event loop; adopt it before any registration. context/address must remain
+ * live throughout the call; output storage must not overlap. On success
+ * out_pipe and out_process hold raw HANDLE values to close or adopt exactly
+ * once each. On failure both are 0 and out_os_error is zero or the native OS
+ * error. Server identity verification happens before the first byte and
+ * fails with PERMISSION_DENIED; other IO failures return IO_ERROR.
+ */
+C2MemFfiStatus c2_mem_ffi_local_endpoint_context_connect_windows(
+    const C2MemFfiLocalEndpointContext *context, const char *address,
+    uintptr_t *out_pipe, uintptr_t *out_process, int32_t *out_os_error);
 
 /* Creates a native buddy/dedicated request pool. max_segments must be 1..16. */
 C2MemFfiStatus c2_mem_ffi_request_pool_new(

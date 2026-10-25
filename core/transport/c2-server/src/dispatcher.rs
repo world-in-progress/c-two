@@ -119,6 +119,19 @@ impl PreparedShmResponse {
         pool.validate_handle(&self.handle)
     }
 
+    /// Copy the prepared backing's logical bytes (its advertised payload
+    /// length) out of the response pool after validating the handle.
+    ///
+    /// Used when the receiving connection never negotiated the SHM response
+    /// direction: the bytes are materialized and the original owner releases
+    /// the backing, so no coordinates are published to a peer that cannot
+    /// map them.
+    pub(crate) fn copy_logical_bytes(&self, pool: &MemPool) -> Result<Vec<u8>, String> {
+        pool.validate_handle(&self.handle)?;
+        let bytes = pool.handle_slice(&self.handle);
+        Ok(bytes[..self.data_size as usize].to_vec())
+    }
+
     /// Consume the carrier, handing back the unique owner. The send path
     /// uses this only at the transfer boundary.
     pub(crate) fn into_handle(self) -> MemHandle {

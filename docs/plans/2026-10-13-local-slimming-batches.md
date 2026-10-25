@@ -1,6 +1,6 @@
 # C-Two 局部精简批次记录与收束
 
-## 纯瘦身收束与当前剩余清单（2026-10-23 同步）
+## 纯瘦身收束与当前剩余清单（2026-10-24 同步）
 
 用户确认收束纯瘦身，停止按减行数继续挑批次。当时最后一个纯瘦身实现提交为 `6afec0f3`（R25 三个 Python prepared-call 入口退役），验收记录提交为 `3382b3ba`。收束时的筛选基于 `3382b3ba`，当时没有新的生产代码或测试修改；下表中的行数是静态方案估算，不是已实现的净减量。后续 R01、R02、R03、R16、R18 正确性修复单列记录，不计作纯瘦身收益。既有验证仍只绑定各批实现提交。
 
@@ -15,7 +15,9 @@
 | 尚未单独验收，待复核或实施 | 11 | R05–R07、R09、R10、R15、R17、R19–R21、R35 |
 | 明确保留 | 1 | R26 |
 
-R13 已交付子项生产净减 104 行、测试净增 59 行，合计净减 45 行；C03 已验收的生产与测试合计净减 155 行不重复累计。Windows ARM64 支持、安全依赖修复、发布校验修复及文档属于各自交付范围；原增减和发行门禁见 [0.8.0 验收记录](../reports/2026-10-23-r13-080-release-acceptance.md)。R16 本批生产净减 25 行、测试净增 219 行，合计净增 194 行；完整门禁、性能与清理见 [R16 验收记录](../reports/2026-10-23-r16-node-exchange-acceptance.md)。其他暂缓项未随本批扩展。
+R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净增 59 行，合计净减 45 行；C03 已验收的生产与测试合计净减 155 行不重复累计。Windows ARM64 支持、安全依赖修复、发布校验修复及文档属于各自交付范围；原增减和发行门禁见 [0.8.0 验收记录](../reports/2026-10-23-r13-080-release-acceptance.md)。R16 本批生产净减 25 行、测试净增 219 行，合计净增 194 行；完整门禁、性能与清理见 [R16 验收记录](../reports/2026-10-23-r16-node-exchange-acceptance.md)。其他暂缓项未随本批扩展。
+
+2026-10-24：R13 inline 响应所有权移交已验收，实现 `1ac34150` 生产净增 7 行、测试净增 30 行，合计净增 37 行。每个非空 inline 响应少一次 payload 分配和复制，构造微基准改善；真实 IPC 没有测得稳定提速。完整 relay、跨语言、三系统、GitHub Actions 10/10（含 Windows ARM64 与 3.14t）、本批端点零残留及独立审查见[验收记录](../reports/2026-10-24-r13-inline-response-ownership-acceptance.md)，首轮验证失败与后续处理也在其中保留。本项尚未发版，R13 仍为部分完成，R35 继续暂缓。
 
 2026-10-23：按单独确认的[方案](2026-10-23-orphan-shm-buffer-retirement.md)退役无构造调用者的旧 Python `ShmBuffer` 投影，接受低层 Python 导出删除。候选 `fa62f7a3` 生产净减 338 行、测试净增 2 行，合计净减 336 行；完整 relay、真实跨语言、三系统、GitHub Actions 10/10（含 Windows ARM64 与 3.14t）、端点零残留及独立审查完成，见[验收记录](../reports/2026-10-23-shm-buffer-retirement.md)。本批已随 0.8.2 发布，活跃 buffer 生产实现与基线相同。R06 导出/释放同步和 R07 失败释放仍独立待办，原 39 项状态数量不变；两份控制会话重构继续暂缓。
 
@@ -30,6 +32,7 @@ R13 已交付子项生产净减 104 行、测试净增 59 行，合计净减 45 
 | R14 · handle 只读校验复用 | 私有只读指针 helper 预计使生产减 40–55 行；补齐无效空 handle、allocation 长度、过期世代与错误顺序后，整体预计只减 0–35 行。原始指针借用边界也增加审查负担。 | 与有证据的所有权修复自然合并时再评估；不单独引入 CheckedSpan、缓存或锁证明框架。 |
 | C07 · Python direction/结果形状 | 服务端假 CRM 实例与双向 wrapper 的重新设计需要明确 callable 协议，并处理公开 direction、直接调用、自定义带 binding 方法及测试迁移。整体净收益未证明。普通未包装继承方法不满足 descriptor binding 接纳，不能误称已有正式可运行能力。 | 先决定公开 Python 调用约定；不混入已完成的 HTTP namespace 子项，也不重新把任意自定义编码器作为正式 portable 能力。 |
 | R21 · Resource 模板链 | 生成器仍输出装饰并继承 CRM 的旧模型，AST fallback 读取未保存的 ast_node。整链可毛删约 613 行，但会撤销公开模板生成能力；现有 c2-codegen 不提供等价 Resource skeleton。 | 单独决定修复工具或退役功能；不能把工具层删除记为生产运行时收益。 |
+| R35 · 禁用心跳空任务 | 2026-10-24 用户确认继续暂缓。连接事件负责报告已知断连，心跳仍负责发现未关闭但失去响应的连接；启用/禁用配置均有职责。候选只省掉禁用态永久 pending 任务，未证明实际成本收益；此前 25–45 行估算混入公开函数/枚举删除和测试迁移，不能视为该优化的独立净收益。 | 先测量禁用场景的任务和资源成本；仅复用现有可选任务所有权。公开 API 退役必须有独立设计理由，不与局部优化捆绑，也不为凑净减量开批。 |
 
 该轮筛选已做调用链、引入历史和独立原生只读复核，只形成暂缓结论，没有形成这些项目的候选实现或性能收益证据。
 
@@ -41,20 +44,22 @@ R13 已交付子项生产净减 104 行、测试净增 59 行，合计净减 45 
 | R03 | shutdown 发送阶段修复已验收：发送前失败可重试，开始控制写后丢确认不再重放；首次端点不存在的处理、ping、原总预算和 ACK 仅 initiate 的语义保持。 |
 | R02 | 唯一写所有权已按完整边界验收：真实分配 owner、接收/发布载体与原 pool 绑定，raw 访问明确 unsafe，封闭可替换 pool 及只读 guard 还原写锁入口。低层 Rust API 无兼容迁移，SHM 3 / IPC 12 / C ABI 5 保持；不替代 R06/R07。 |
 | R04 | 已完成：token 绑定 server instance、UID/revision 与准入代次，关门使旧 token 失效，接管恢复不能复活；同名替换及 owner_missing 后迟到 relay final 的反例有独立覆盖。见[准入修复验收](../reports/2026-10-21-admission-race-repair.md)及[三系统复核](../reports/2026-10-22-release-foundation-review.md)。 |
-| R05–R07、R17 | SHM 布局接纳、导出/释放同步、失败释放的 owner/charge、端点 inspect/reap I/O 分类，按各自反例修复。R01 已承接 SHM 3 布局安全接纳所需的边界；R05 须据新布局重新复核，不能直接套用旧反例或视为整项完成。 |
-| R09、R10 | relay 配置快照可能改变读取/错误观察时点；注册快照局部去重约 20 行，独立 borrowed 校验、动态 Resource 方法查找及错误顺序有真实职责。继续暂缓。R08 原环境拒绝语义的解析收敛和 R30 已批准子项已经完成。 |
+| R05、R07、R17 | SHM 布局接纳、失败释放的 owner/charge、端点 inspect/reap I/O 分类，按各自反例修复。R01 已承接 SHM 3 布局安全接纳所需的边界；R05 须据新布局重新复核，不能直接套用旧反例或视为整项完成。 |
+| R06 | 用户已批准[最小同步修复方案](2026-10-24-r06-python-buffer-lifecycle-synchronization.md)，复用现有 inner/lease 锁修复响应/请求导出、释放及 retained tracking 的接纳竞态，不新增状态框架或删公开能力。固定基线 `ea8345fa` 的四个受控反例按预期失败，修复后 native payload 8 项通过；完整回归、性能、三系统工程 CI、零残留和独立审查完成，Windows 五个临时 profile 与构建产物已清理，正在进行 0.9.0 canonical 发行验收，见[记录](../reports/2026-10-25-090-windows-release-acceptance.md)。R06 按正确性修复单列，暂不计完成；回调重入风险仍独立待评估。 |
+| R09、R10 | 2026-10-24 复核 R09：四次 EnvCatalog 加载仍存在，复用现有窄 resolver 的最小方案生产约持平至增 5 行、测试增 25–50 行，尚无性能实测；提前读取 override 还会改变 state lock/deadline 与前三项解析的观察顺序。继续暂缓。R10 注册快照局部去重约 20 行，独立 borrowed 校验、动态 Resource 方法查找及错误顺序有真实职责。R08 原环境拒绝语义的解析收敛和 R30 已批准子项已经完成。 |
 | R12、R28 剩余 | 已完成可证明的同值重验删除、登记事实与 validated relay 表示收敛；跨 await 的 authority、owner/locality、代际、peer 活性和错误接纳继续保留。新增删除需另证局部不变量。 |
-| R13 剩余 | 请求所有权移动、IPC 拼帧及 SHM prepare/send 合并均已验收。响应快照与初始转换仍有数据寿命职责；写锁前取消保留未发布分配直到 pool 收尾已在基线复现，本批保持该行为，须作为独立所有权/生命周期问题评估。不得把本子项交付计作 R13 整项完成。 |
+| R13 剩余 | 请求所有权移动、IPC 拼帧、SHM prepare/send 合并及 [inline 响应所有权移交](../reports/2026-10-24-r13-inline-response-ownership-acceptance.md)均已验收。inline 子项复用已有 owned 构造器，省去 Core held 路径的一次 Vec 克隆及重复副本；API/ABI/协议不变，生产与测试实际净增 37 行，作为运行时成本优化单列，不记作代码净减。服务端 Python 初始快照仍有数据寿命职责；写锁前取消保留未发布分配直到 pool 收尾已在基线复现，须独立评估。不将这些子项计作 R13 整项完成。 |
 | R14 其他、R15、C03、C04 | C03 的 chunk assembly/pending permit 单一所有权子项已完成，代际与准入围栏保留。bitmap 锁证明、GC admission 进度及轮询改通知仍暂缓。不为精简删除跨进程锁、回收进度、预算与唤醒保护。 |
 | R16 | 已按[修订方案](2026-10-23-r16-node-backpressure.md)验收：分片上传同步推进接收，失败关闭并汇合，成功保持连接复用，空闲读取使用原生背压；低层 TS close/pause/resume 契约已同步，不留兼容。生产净减 25、测试净增 219，属于正确性修复。完整 Node→Core 投影迁移需另立方案，不作为本批交付内容。 |
 | R18 | 已按正确性修复验收并随 c3 0.4.1 发布：容量拒绝复用原 retry，永久关闭才退出；status 与任务共锁、按原 token 更新，保留不可用记录的独立寿命、1024 owner 上限、代际及释放顺序。生产 +49、测试 +345，不计作瘦身收益。见[验收记录](../reports/2026-10-23-082-client-observation-release-acceptance.md)。 |
 | R19、R20 | CLI 畸形成功响应和示例加载失败后的覆盖行为，属于错误/数据保护修复，不作为纯瘦身执行。 |
 | R22 剩余 | benchmark selector、旧 sweep 和测量标签仅为工具整理。已完成的 SDK 登记/撤回与强制 HTTP 实跑保持。 |
-| R25 剩余 | 三个旧 call_prepared 入口已退役；FastDB 正式路径、Python-only pickle、Core bytes、服务端 sink、Rust 预分配及当前 client/scheduler 适配边界保留。新的协议收窄需独立决定。R23 bridge、R24 旧 buffer 参数链已完成。 |
+| R25 剩余 | 三个旧 call_prepared 入口已退役；FastDB 正式路径、Python-only pickle、Core bytes、服务端 sink、Rust 预分配及当前 client/scheduler 适配边界保留。2026-10-24 在 `ed6c761a` 复核后继续暂缓：native 调度状态已集中，剩余 prepare_call 探测与 Closed 回退承担既有适配职责；收窄协议最多局部减约 13 行，六个 call-only fixture 及错误接纳覆盖预计使测试增 30–80 行，整体净增且须改变公开 Python 行为。R23 bridge、R24 旧 buffer 参数链已完成。 |
 | R26 | relay journal 明确保留；旧快照及删除原因有独有信息，未来 watch/list history 尚未退役，也没有支持删除的成本测量。 |
-| R29、R32、R33 剩余 | codegen 同次缓存/typed projection、结构化错误与凭据内部序列化、Python 错误常量及孤立 wrap_error。0.8.2 的公开 CoreError 是现有错误链投影，不代表 R32 内部序列化收敛已经完成。生成 release 复用、call-control 写入去重和 Rust 错误码单一声明已完成；余项净收益不足，Transport 内外层错误、外部 JSON/wire 与错误顺序仍要保留。 |
-| R34、R35 | peer SHM 私有副本已退出；RouteAck 是尚未退役的公开预留协议，禁用 heartbeat 的任务优化净收益未证实。C05 ABI 4 完整端点能力子项已完成，不借机删除预分配能力。 |
-| R36、R38、R39、C06 剩余 | 已完成的死状态、不可达尾部和 readiness 后等待不再重开；真实等待、维护 EOF/错误退出、操作错误映射和外部 chunk 配置接纳仍有职责。私有 proof 或专属结果类型须先证明整体收益。 |
+| R33 · 旧 Python 手工分片投影 | 已按[批准方案](2026-10-24-r33-python-manual-assembly-retirement.md)退役 `c_two.mem.ChunkAssembler`、`c_two.mem.MemHandle` 及对应 `_native` 导出，不留兼容。实现 `921b48ee` 生产净减 271 行、测试净减 215 行，合计净减 486 行。基线覆盖、完整 relay、真实 Rust/Python/Node、Windows 开发机、GitHub Actions 首轮 10/10（含 Windows ARM64 与 3.14t）、本批端点零残留及独立审查见[验收记录](../reports/2026-10-24-r33-python-manual-assembly-retirement-acceptance.md)。Rust registry/assembler/backing、Rust 公开 API、MemPool 公开能力、预算/释放、C/FFI ABI 和协议保持；R06/R07 未混入。本子项尚未发版，R33 仍为部分完成，原 39 项分类数量不变。 |
+| R29、R32、R33 剩余 | codegen 同次缓存/typed projection、结构化错误内部序列化、Python 错误常量及孤立 wrap_error。0.8.2 的公开 CoreError 是现有错误链投影，不代表 R32 内部错误转换收敛已经完成。R32 凭据子项已按[单一原生投影方案](2026-10-23-r32-native-endpoint-credential.md)验收：实现 `60656603`，生产净减 66、测试净增 14，合计净减 52 行；完整回归、三系统、GitHub Actions 10/10、端点零残留及独立审查见[验收记录](../reports/2026-10-23-r32-native-endpoint-credential-acceptance.md)。剩余错误投影在 `3e575acb` 上复核后继续暂缓：完整迁移包含调度错误和服务端反向转换，涉及至少 6 个生产、9 个测试文件，预计生产减 10–30、测试增 30–60 行；保留 error_bytes 就无法退出编码，替换该公开字段也只惠及错误路径，尚无性能证据。生成 release 复用、call-control 写入去重和 Rust 错误码单一声明已完成；Transport 内外层错误、外部 JSON/wire 与错误顺序保留，不混入无关 API 删除。 |
+| R34、R35 | peer SHM 私有副本已退出；RouteAck 是尚未退役的公开预留协议。R35 的[原分析](2026-10-23-r35-heartbeat-task-ownership.md)已按用户要求暂缓：禁用态空任务优化与公开 API 退役分开，不再把原捆绑估算列为下一批收益；未实施或测量。C05 ABI 4 完整端点能力子项已完成，不借机删除预分配能力。 |
+| R36、R38、R39、C06 剩余 | 已完成的死状态、不可达尾部和 readiness 后等待不再重开；真实等待、维护 EOF/错误退出、操作错误映射和外部 chunk 配置接纳仍有职责。2026-10-24 复核 R39：操作专属成功结果已完成，reap 必需 proof 约减 6 行、HTTP body 复用约减 7–10 行，不单独开批；专属错误表示约持平至增 5 行，当前映射保留。 |
 | T01–T07 剩余 | 源码词串门禁、假 owner、阻塞读取、重连/GC 负例及默认值证明，随对应正确性事项替换；不为测试行数牺牲行为覆盖。已迁移的真实生命周期、协议边界和手写 golden 不回退。 |
 | 两份控制会话重构 | 继续暂缓。连接通知、所有者接管及非 Hello setup 期限修复的交付不等于批准会话层重构；后续仍先证明能整体消除重复收发与复杂状态，核实身份、准入、期限、错误顺序和释放语义，再确认方案。 |
 | 已完成且无新剩余子项 | R11 登记事实、R27 FIFO 后的死计数、R30 已批准配置子项、R31 owner/冻结事实配对、R37 旧发布脚本等，维持各批验收状态。 |

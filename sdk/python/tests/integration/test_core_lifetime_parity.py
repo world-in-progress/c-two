@@ -18,7 +18,8 @@ def _clean_registry():
     _ProcessRegistry.reset()
 
 
-def test_held_response_delegates_invalidation_before_release_to_core():
+@pytest.mark.parametrize("fail_invalidation", [False, True], ids=["success", "failure"])
+def test_held_response_delegates_invalidation_before_release_to_core(fail_invalidation):
     cc.register(Hello, HelloImpl(), name="core-held")
     proxy = cc.connect(Hello, name="core-held", address=cc.server_address())
     try:
@@ -29,36 +30,32 @@ def test_held_response_delegates_invalidation_before_release_to_core():
         assert hasattr(response, "invalidate_then_release")
         assert pickle.loads(bytes(response)) == "Hello, Lifetime!"
         events: list[str] = []
-        response.invalidate_then_release(
-            lambda value: events.append(f"invalidate:{value}"),
-            "owner",
-        )
-        assert events == ["invalidate:owner"]
+        failure = RuntimeError("invalidate failed")
+
+        def invalidator(value):
+            events.append(f"invalidate:{value}")
+            if fail_invalidation:
+                raise failure
+
+        def release_response():
+            events.append("core")
+            response.invalidate_then_release(invalidator, "owner")
+
+        held = HeldResult("owner", release_cb=release_response)
+        if fail_invalidation:
+            with pytest.raises(RuntimeError, match="invalidate failed") as caught:
+                held.release()
+            assert caught.value is failure
+        else:
+            held.release()
+        assert events == ["core", "invalidate:owner"]
         assert response.is_released
+        with pytest.raises(RuntimeError, match="value no longer accessible"):
+            _ = held.value
+        held.release()
+        response.invalidate_then_release(invalidator, "owner")
+        response.release()
+        assert response.is_released
+        assert events == ["core", "invalidate:owner"]
     finally:
         cc.close(proxy)
-
-
-def test_invalidation_failure_still_runs_core_release_once():
-    events: list[str] = []
-
-    class CoreOrderedResponse:
-        def invalidate_then_release(self, invalidator, value):
-            events.append("core")
-            invalidator(value)
-
-    def invalidator(_value):
-        events.append("invalidate")
-        raise RuntimeError("invalidate failed")
-
-    response = CoreOrderedResponse()
-    held = HeldResult(
-        "value",
-        release_cb=lambda: response.invalidate_then_release(
-            invalidator,
-            "value",
-        ),
-    )
-    with pytest.raises(RuntimeError, match="invalidate failed"):
-        held.release()
-    assert events == ["core", "invalidate"]

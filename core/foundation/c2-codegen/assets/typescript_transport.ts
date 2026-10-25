@@ -418,7 +418,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
 
   const openConnection = (): Promise<C2IpcOpenConnection> => {
     if (connectionPromise === undefined) {
-      connectionPromise = connectAndHandshakeIpc(address, connect, requestShmWriter).catch((error) => {
+      connectionPromise = connectAndHandshakeIpc(address, connect, requestShmWriter, responseShmReader).catch((error) => {
         connectionPromise = undefined;
         throw error;
       });
@@ -569,7 +569,13 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         let responseError: unknown;
         let responseValue: Payload | undefined;
         let requestShmServerConsumed = false;
-        const useShm = requestShmWriter !== undefined && requestPayload.byteLength > requestShmThreshold && requestPayload.byteLength <= 0xffffffff;
+        // The server's handshake ACK gates every outgoing shared-memory
+        // request. Without CAP_SHM_REQUEST the call automatically stays on the
+        // existing owned inline/chunked paths, never touching the writer.
+        const useShm = requestShmWriter !== undefined
+          && (open.handshake.capabilityFlags & C2_IPC_CAP_SHM_REQUEST) !== 0
+          && requestPayload.byteLength > requestShmThreshold
+          && requestPayload.byteLength <= 0xffffffff;
         const chunked = !useShm && requestPayload.byteLength > requestChunkSize;
         const receive = async (): Promise<C2IpcCallResponse> => {
           let frame: C2IpcFrame;
@@ -592,6 +598,13 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           requestShmServerConsumed = true;
           let buddy: C2IpcBuddyPayload | undefined;
           if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
+            if ((open.handshake.capabilityFlags & C2_IPC_CAP_SHM_RESPONSE) === 0) {
+              // Reject before any block mapping, reading, or release cleanup:
+              // an SHM reply the server never acknowledged is a protocol
+              // violation, and the connection state is no longer trustworthy.
+              await discardConnection(open);
+              throw new C2IpcTransportError("C-Two IPC server sent an SHM reply without the acknowledged SHM response capability.");
+            }
             if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
               throw new C2IpcTransportError("C-Two IPC chunked SHM responses are not supported by this generated transport yet.");
             }
@@ -1044,7 +1057,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
   };
 }
 
-const C2_IPC_HANDSHAKE_VERSION = 12;
+const C2_IPC_HANDSHAKE_VERSION = 13;
 const C2_IPC_FRAME_BODY_HEADER_BYTES = 12;
 const C2_IPC_FRAME_HEADER_BYTES = 16;
 const C2_IPC_BUDDY_PAYLOAD_BYTES = 23;
@@ -1060,6 +1073,14 @@ const C2_MEM_FFI_DEFAULT_MIN_BLOCK_SIZE = 4096;
 const C2_IPC_CAP_CALL_V2 = 1 << 0;
 const C2_IPC_CAP_METHOD_IDX = 1 << 1;
 const C2_IPC_CAP_CHUNKED = 1 << 2;
+// IPC 13 splits shared memory by client-relative direction. A client offers
+// CAP_SHM_REQUEST when it owns a request writer and CAP_SHM_RESPONSE when it
+// owns a response reader; the server ACK carries the intersection with its
+// real native session. Pool enablement is never a capability, and no session
+// switch exists: an unacknowledged direction silently stays on the existing
+// owned inline/chunked paths, including across SHM session boundaries.
+const C2_IPC_CAP_SHM_REQUEST = 1 << 3;
+const C2_IPC_CAP_SHM_RESPONSE = 1 << 4;
 const C2_IPC_FLAG_RESPONSE = 1 << 1;
 const C2_IPC_FLAG_HANDSHAKE = 1 << 2;
 const C2_IPC_FLAG_CTRL = 1 << 4;
@@ -1068,7 +1089,7 @@ const C2_IPC_FLAG_CALL_V2 = 1 << 7;
 const C2_IPC_FLAG_REPLY_V2 = 1 << 8;
 const C2_IPC_FLAG_CHUNKED = 1 << 9;
 const C2_IPC_FLAG_CHUNK_LAST = 1 << 10;
-// Canonical c2-wire MsgType discriminants for the v12 handshake.
+// Canonical c2-wire MsgType discriminants for the v13 handshake.
 const C2_IPC_ROUTE_LIST = 0x0e;
 const C2_IPC_ROUTE_LIST_ACK = 0x0f;
 const C2_IPC_ROUTE_LOOKUP = 0x10;
@@ -1612,7 +1633,12 @@ function requireIpcConnection(value: unknown): C2IpcConnection {
   return candidate as C2IpcConnection;
 }
 
-async function connectAndHandshakeIpc(address: string, connect: C2IpcConnect, requestShmWriter: C2IpcRequestShmWriter | undefined): Promise<C2IpcOpenConnection> {
+async function connectAndHandshakeIpc(
+  address: string,
+  connect: C2IpcConnect,
+  requestShmWriter: C2IpcRequestShmWriter | undefined,
+  responseShmReader: C2IpcResponseShmReader | undefined,
+): Promise<C2IpcOpenConnection> {
   let connection: C2IpcConnection;
   try {
     connection = requireIpcConnection(await connect(address));
@@ -1623,7 +1649,7 @@ async function connectAndHandshakeIpc(address: string, connect: C2IpcConnect, re
     throw new C2IpcTransportError(`C-Two IPC connect failed: ${String(error)}`);
   }
   try {
-    await connection.write(encodeIpcFrame(0n, C2_IPC_FLAG_HANDSHAKE, encodeClientIpcHandshake(requestShmWriter)));
+    await connection.write(encodeIpcFrame(0n, C2_IPC_FLAG_HANDSHAKE, encodeClientIpcHandshake(requestShmWriter, responseShmReader)));
     const frame = await readIpcFrame(connection);
     if ((frame.flags & C2_IPC_FLAG_HANDSHAKE) === 0) {
       throw new C2IpcTransportError("C-Two IPC server response is not a handshake frame.");
@@ -1674,9 +1700,18 @@ function validateIpcRegionId(region: string): void {
   }
 }
 
-function encodeClientIpcHandshake(requestShmWriter: C2IpcRequestShmWriter | undefined): Uint8Array {
+function encodeClientIpcHandshake(
+  requestShmWriter: C2IpcRequestShmWriter | undefined,
+  responseShmReader: C2IpcResponseShmReader | undefined,
+): Uint8Array {
+  // The request-pool advertisement is present exactly when the client offers
+  // the request direction; the response direction is offered through its own
+  // capability bit because the server owns that pool's advertisement.
   const prefix = requestShmWriter?.prefix ?? "";
   const segments = requestShmWriter?.segments ?? [];
+  let capabilityFlags = C2_IPC_CAP_CALL_V2 | C2_IPC_CAP_METHOD_IDX | C2_IPC_CAP_CHUNKED;
+  if (requestShmWriter !== undefined) capabilityFlags |= C2_IPC_CAP_SHM_REQUEST;
+  if (responseShmReader !== undefined) capabilityFlags |= C2_IPC_CAP_SHM_RESPONSE;
   return concatUint8Arrays([
     new Uint8Array([C2_IPC_HANDSHAKE_VERSION]),
     encodeIpcHandshakeText(prefix, "client SHM prefix"),
@@ -1685,7 +1720,7 @@ function encodeClientIpcHandshake(requestShmWriter: C2IpcRequestShmWriter | unde
       writeU32LE(segment.size),
       encodeIpcHandshakeText(segment.name, `client SHM segment ${index} name`),
     ])),
-    writeU16LE(C2_IPC_CAP_CALL_V2 | C2_IPC_CAP_METHOD_IDX | C2_IPC_CAP_CHUNKED),
+    writeU16LE(capabilityFlags),
   ]);
 }
 
@@ -2051,6 +2086,9 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     }
     shmSegments.push({ name, size });
   }
+  // Server ACK flags: CALL_V2/METHOD_IDX are mandatory; CAP_SHM_REQUEST and
+  // CAP_SHM_RESPONSE carry the native session's intersection with this
+  // client's directional offer and gate both shared-memory directions.
   const capabilityFlags = readU16("capability flags");
   const serverId = readText("server_id");
   const serverInstanceId = readText("server_instance_id");

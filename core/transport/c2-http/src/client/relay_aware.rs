@@ -1768,7 +1768,7 @@ mod tests {
         let _ = live_handle.await;
     }
 
-    // Windows uses the real current-logon namespace; Unix also exercises a custom root.
+    // Windows uses the real current-user namespace; Unix also exercises a custom root.
     #[tokio::test]
     async fn namespace_header_alone_selects_ipc_and_missing_or_mismatched_keeps_http() {
         for context in [

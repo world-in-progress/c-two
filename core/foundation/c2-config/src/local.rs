@@ -62,7 +62,7 @@ enum LocalEndpointPlatform {
         uid: u32,
     },
     WindowsNamedPipe {
-        logon_scope_id: String,
+        user_scope_id: String,
     },
 }
 
@@ -87,8 +87,8 @@ impl LocalEndpointPlatform {
                 "Unix filesystem endpoints cannot be derived on the Windows named-pipe backend",
             )),
             #[cfg(windows)]
-            Self::WindowsNamedPipe { logon_scope_id, .. } => {
-                Ok(format!(r"\\.\pipe\c_two-{logon_scope_id}-{identity}").into())
+            Self::WindowsNamedPipe { user_scope_id, .. } => {
+                Ok(format!(r"\\.\pipe\c_two-{user_scope_id}-{identity}").into())
             }
             #[cfg(unix)]
             Self::WindowsNamedPipe { .. } => Err(io::Error::new(
@@ -101,14 +101,14 @@ impl LocalEndpointPlatform {
 
 impl LocalEndpointContext {
     /// Context for the platform default: `/tmp/c2-<uidhex>` on
-    /// Unix, the current logon scope on Windows. Pure derivation; it never
+    /// Unix, the current TokenUser scope on Windows. Pure derivation; it never
     /// reads `C2_IPC_ROOT` or any other environment variable.
     pub fn default_for_platform() -> io::Result<Self> {
         #[cfg(windows)]
         {
-            let logon_scope_id = c2_local_security::current_scope_id()?;
+            let user_scope_id = c2_local_security::current_scope_id()?;
             return Ok(Self::new(LocalEndpointPlatform::WindowsNamedPipe {
-                logon_scope_id,
+                user_scope_id,
             }));
         }
 
@@ -170,17 +170,17 @@ impl LocalEndpointContext {
         }
     }
 
-    /// Windows logon scope when this is a `WindowsNamedPipe` context.
-    pub fn windows_logon_scope_id(&self) -> Option<&str> {
+    /// Windows TokenUser scope when this is a `WindowsNamedPipe` context.
+    pub fn windows_user_scope_id(&self) -> Option<&str> {
         match &self.platform {
             LocalEndpointPlatform::UnixManaged { .. } => None,
-            LocalEndpointPlatform::WindowsNamedPipe { logon_scope_id, .. } => Some(logon_scope_id),
+            LocalEndpointPlatform::WindowsNamedPipe { user_scope_id, .. } => Some(user_scope_id),
         }
     }
 
     /// Stable cross-process namespace identifier: a domain-separated SHA-256
     /// over the backend kind and platform scope (normalized
-    /// Unix root plus effective uid, or Windows logon scope), with
+    /// Unix root plus effective uid, or Windows TokenUser scope), with
     /// length-prefixed component boundaries. It contains no raw path bytes,
     /// never depends on the process pid, and is a routing/comparison key
     /// only — it grants no permission by itself.
@@ -274,9 +274,9 @@ fn compute_namespace_id(platform: &LocalEndpointPlatform) -> String {
             feed(&mut hasher, root.as_bytes());
             feed(&mut hasher, &uid.to_le_bytes());
         }
-        LocalEndpointPlatform::WindowsNamedPipe { logon_scope_id } => {
+        LocalEndpointPlatform::WindowsNamedPipe { user_scope_id } => {
             feed(&mut hasher, b"windows-named-pipe");
-            feed(&mut hasher, logon_scope_id.as_bytes());
+            feed(&mut hasher, user_scope_id.as_bytes());
         }
     }
     let mut id = String::with_capacity(64);
@@ -299,7 +299,7 @@ pub struct LocalEndpoint {
 
 impl LocalEndpoint {
     /// Pure platform-default derivation from `/tmp/c2-<uidhex>` (Unix) or the current
-    /// logon scope (Windows). It does not read the process environment;
+    /// TokenUser scope (Windows). It does not read the process environment;
     /// environment-resolved roots go through `ConfigResolver` and a frozen
     /// `LocalEndpointContext`.
     pub fn from_address(address: &str) -> io::Result<Self> {
@@ -737,7 +737,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_default_context_keeps_logon_pipe_identity() {
+    fn windows_default_context_uses_token_user_pipe_identity() {
         let context = LocalEndpointContext::default_for_platform().unwrap();
         assert_eq!(
             context.platform_kind(),
@@ -748,11 +748,11 @@ mod tests {
 
         let scope = c2_local_security::current_scope_id().unwrap();
         assert_eq!(
-            context.windows_logon_scope_id().as_deref(),
+            context.windows_user_scope_id().as_deref(),
             Some(scope.as_str())
         );
 
-        // The public identity is backed by the real logon scope; a fake root
+        // The public identity is backed by the real TokenUser scope; a fake root
         // or uid has no representation on this backend.
         let endpoint = context.endpoint("ipc://Server-A").unwrap();
         let expected = format!(r"\\.\pipe\c_two-{scope}-1118fcf083aa343ac0caf420a35a3025");

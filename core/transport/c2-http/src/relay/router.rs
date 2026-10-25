@@ -2716,7 +2716,7 @@ mod tests {
         build_router(state).oneshot(request).await.unwrap()
     }
 
-    // This runs on Windows too: the default namespace is the current logon SID,
+    // This runs on Windows too: the default namespace is the current user SID,
     // not a made-up Unix root or an environment-selected pipe backend.
     #[tokio::test]
     async fn default_relay_namespace_keeps_legacy_loopback_resolution() {

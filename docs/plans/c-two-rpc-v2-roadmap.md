@@ -212,8 +212,8 @@ v0.3.0 发布前对传输层和 Relay 进行的系统性代码审查与加固。
 - ✅ `c2-mem/handle.rs` — `MemHandle` 枚举 (Buddy/Dedicated/FileSpill)
 - ✅ `c2-mem/pool.rs` — `alloc_handle()`, `handle_slice()`, `release_handle()` 三层决策
 - ✅ `c2-wire/assembler.rs` — Rust `ChunkAssembler`（512 chunk / 8GB 上限）
-- ✅ `c2-ffi/mem_ffi.rs` — PyMemHandle (buffer protocol) + PyChunkAssembler
-- ✅ Server/Client 集成 — Python 侧完全使用 Rust ChunkAssembler
+- ✅ 分片载体 — Rust `ReassemblyBacking` 保留 backing 与预算；旧 Python `PyMemHandle` / `PyChunkAssembler` 手工入口已退役
+- ✅ Server/Client 集成 — Rust 收发循环通过 `ChunkRegistry` 使用 `ChunkAssembler`，Python RPC 自动使用该链
 - ✅ 清理 — 删除 `chunk.py`、`__memoryview_aware__`、`FLAG_DISK_SPILL`
 
 **设计文档**: `docs/superpowers/specs/2026-03-31-disk-spill-memhandle-design.md`
@@ -438,14 +438,14 @@ Python 侧对应关系：
 
 | Rust 层 | Python 模块 | 主要类型 |
 |---------|------------|---------|
-| `c2-mem` → `sdk/python/native/src/mem_ffi.rs` | `c_two.mem` | `MemPool`, `PoolConfig`, `PoolAlloc`, `PoolStats`, `MemHandle`, `ChunkAssembler` |
+| `c2-mem` → `sdk/python/native/src/mem_ffi.rs` | `c_two.mem` | `MemPool`, `PoolConfig`, `PoolAlloc`, `PoolStats` |
 | `c2-http::client` → `sdk/python/native/src/http_ffi.rs` | `c_two._native` | `RustHttpClient`, `RustHttpClientPool` |
 | `c2-ipc` → `sdk/python/native/src/client_ffi.rs` | `c_two._native` | `RustClient`, `RustClientPool` |
 | `c2-server` → `sdk/python/native/src/server_ffi.rs` | `c_two._native` | `RustServer` |
 | `c2-mem::alloc` | (内部使用) | `BuddyAllocator`, `ShmSpinlock` |
 | `c2-mem::segment` | (内部使用) | `ShmRegion` |
 | `c2-mem::spill` | (内部使用) | `available_physical_memory`, `should_spill`, `create_file_spill` |
-| `c2-wire::assembler` | (通过 `sdk/python/native` 暴露) | `ChunkAssembler` |
+| `c2-wire::assembler` | (由 Rust IPC 内部使用，保留 Rust API) | `ChunkAssembler` |
 
 Relay server 不通过 Python 模块暴露。源码 checkout 中的测试、examples 与 SDK 开发如果依赖 relay，需要先通过 `python tools/dev/c3_tool.py --build --link` 构建并链接 `c3`，再由测试 fixture、shell 或编排系统启动 `c3 relay`。
 

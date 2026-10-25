@@ -2,14 +2,14 @@
 
 C-Two exposes stateful Python resources through typed CRM contracts over same-process calls, local IPC, or an external HTTP relay. This package projects the shared Rust runtime into Python.
 
-Python C-Two **0.8.2** pairs with c3 **0.4.1**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.8.2.md).
+Python C-Two **0.9.0** pairs with c3 **0.5.0**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.9.0.md).
 
 Install the matching published versions:
 
 ```bash
-uv pip install 'c-two==0.8.2'
+uv pip install 'c-two==0.9.0'
 # Only for FastDB Payload contracts:
-uv pip install 'c-two[fastdb]==0.8.2'
+uv pip install 'c-two[fastdb]==0.9.0'
 ```
 
 The base package has no Python runtime dependencies. Ordinary CRM definition,
@@ -18,7 +18,7 @@ The `fastdb` extra pins `fastdb4py==0.2.3`; using FastDB payloads without it
 reports the extra to install. The exact pin selects the validated 0.x binding
 instead of allowing an untested later native interface.
 
-Local IPC uses Unix domain sockets or current-logon-SID Windows Named Pipes. Unix roots select the final endpoint directory, with short names and directory-relative connections. Rust owns `Persistent`/`OwnerBound` policies, structured shutdown and scoped maintenance. Install matching builds across communicating clients, resource servers and c3. See the [lifecycle guide](https://github.com/world-in-progress/c-two/blob/main/docs/local-endpoint-lifecycle.en.md).
+Local IPC uses Unix domain sockets or TokenUser-scoped Windows Named Pipes. Unix roots select the final endpoint directory, with short names and directory-relative connections. Rust owns `Persistent`/`OwnerBound` policies, structured shutdown and scoped maintenance. Install matching builds across communicating clients, resource servers and c3. See the [lifecycle guide](https://github.com/world-in-progress/c-two/blob/main/docs/local-endpoint-lifecycle.en.md).
 
 `cc.connect(..., timeout=...)` bounds connection acquisition across pool waiting, handshake and route discovery. `cc.with_call_options(proxy, timeout=...)` sets business-call waiting separately. Custom Unix endpoint directories can use `0755` when the current user owns them and other identities cannot modify them; Windows uses its SID-scoped pipe namespace. See [connection deadlines](https://github.com/world-in-progress/c-two/blob/main/docs/configuration.en.md#connection-deadlines) and [endpoint configuration](https://github.com/world-in-progress/c-two/blob/main/docs/configuration.en.md#local-endpoint-directories).
 

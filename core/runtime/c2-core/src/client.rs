@@ -266,9 +266,9 @@ impl EncodedCall {
                 move |input, scope| async move {
                     match &inner.transport {
                         ClientInner::Ipc(connection) => {
-                            let lease = call_ipc(connection, &method, input, scope).await?;
-                            lease
-                                .into_owned_bytes()
+                            let response = call_ipc(connection, &method, input, scope).await?;
+                            response
+                                .into_bytes()
                                 .map_err(|error| LifecycleError::ResponseCopy(error).into())
                         }
                         ClientInner::Http(client, _) => {
@@ -292,7 +292,7 @@ impl EncodedCall {
                 self.materialize,
                 move |input, scope| async move {
                     let response = match &inner.transport {
-                        ClientInner::Ipc(connection) => HeldResponse::from_response_lease(
+                        ClientInner::Ipc(connection) => HeldResponse::from_ipc_response(
                             call_ipc(connection, &method, input, scope).await?,
                         )?,
                         ClientInner::Http(client, _) => HeldResponse::from_owned_bytes(
@@ -311,11 +311,11 @@ async fn call_ipc(
     method: &str,
     input: Arc<RetainedCallInput>,
     scope: CallScope,
-) -> Result<c2_ipc::ResponseLease, Error> {
+) -> Result<c2_ipc::ResponseData, Error> {
     let preparation = scope.clone();
     let control = IpcCallControl::new(move || scope.try_begin_dispatch().map_err(guard_error))
         .with_before_prepare(move || preparation.check_pre_dispatch().map_err(guard_error));
-    let response = connection
+    connection
         .client
         .call_bound_controlled_async_phased(
             &connection.binding,
@@ -324,8 +324,7 @@ async fn call_ipc(
             &control,
         )
         .await
-        .map_err(normalize_ipc_call_error)?;
-    Ok(connection.client.lease_response(response))
+        .map_err(normalize_ipc_call_error)
 }
 
 async fn call_http(
@@ -387,6 +386,14 @@ pub struct HeldResponse {
 }
 
 impl HeldResponse {
+    // Receive carriers already bind their pool; inline bytes need no transport lease.
+    fn from_ipc_response(response: c2_ipc::ResponseData) -> Result<Self, LifecycleError> {
+        match response {
+            c2_ipc::ResponseData::Inline(bytes) => Ok(Self::from_owned_bytes(bytes)),
+            response => Self::from_response_lease(c2_ipc::ResponseLease::new(response)),
+        }
+    }
+
     pub fn from_owned_bytes(bytes: Vec<u8>) -> Self {
         Self {
             response: crate::lifetime::HeldResponse::from_owned_bytes(bytes),
@@ -834,4 +841,34 @@ fn relay_default(seconds: f64) -> Result<Option<Duration>, LifecycleError> {
     Duration::try_from_secs_f64(seconds)
         .map(Some)
         .map_err(|_| LifecycleError::Configuration("HTTP call timeout is not representable".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn held_inline_response_preserves_bytes_and_release_lifetime() {
+        for bytes in [Vec::new(), b"inline response".to_vec()] {
+            let source_ptr = bytes.as_ptr();
+            let expected = bytes.clone();
+            let mut held =
+                HeldResponse::from_ipc_response(c2_ipc::ResponseData::Inline(bytes)).unwrap();
+            assert_eq!(held.bytes(), expected);
+            if !expected.is_empty() {
+                assert_eq!(held.bytes().as_ptr(), source_ptr, "inline bytes must move");
+            }
+            assert!(!held.is_released());
+            let mut invalidations = 0;
+            held.invalidate_then_release(|| {
+                invalidations += 1;
+                Ok(())
+            })
+            .unwrap();
+            held.invalidate_then_release(|| panic!("invalidation must run once"))
+                .unwrap();
+            assert_eq!(invalidations, 1);
+            assert!(held.is_released());
+        }
+    }
 }

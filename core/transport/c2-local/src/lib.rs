@@ -16,6 +16,7 @@ use futures_util::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub use c2_config::{LocalEndpoint, LocalEndpointContext};
+pub use c2_local_security::{is_peer_identity_mismatch, peer_identity_mismatch};
 
 mod observation;
 pub use observation::{
@@ -36,7 +37,7 @@ pub use owner::{OwnerBootstrap, OwnerControllerEndpoint, owner_endpoint_pair};
 /// An opaque, read-only pin of the native identity of an endpoint context.
 ///
 /// Unix pins both directory roles and the verified coordinator inode/nonce. Windows binds the
-/// current logon scope. The digest contains no path; the logical address, server instance and
+/// current TokenUser scope. The digest contains no path; the logical address, server instance and
 /// owner epoch must be bound separately by the control protocol. This pin holds no listener
 /// lease or namespace lock and grants no cleanup or owner-control authority.
 #[derive(Clone)]
@@ -350,6 +351,23 @@ mod platform;
 #[path = "windows.rs"]
 mod platform;
 
+#[cfg(windows)]
+pub use platform::WindowsPipeConnection;
+
+/// Connect and verify Windows object/process identity before any application
+/// bytes or IOCP registration. Pipe-busy retries share this one total timeout.
+/// The returned owners are suitable for a foreign event loop; same SID does
+/// not imply equal trust or prevent denial of service.
+#[cfg(windows)]
+pub async fn connect_windows_pipe(
+    endpoint: &LocalEndpoint,
+    timeout: Duration,
+) -> io::Result<WindowsPipeConnection> {
+    tokio::time::timeout(timeout, platform::connect_raw(endpoint))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local connection deadline expired"))?
+}
+
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -445,6 +463,24 @@ impl LocalStream {
     pub async fn connect(endpoint: &LocalEndpoint, timeout: Duration) -> io::Result<Self> {
         let stream = connect_native(endpoint, timeout).await?;
         Ok(Self::from_inner(stream))
+    }
+
+    /// Whether this connected stream can use session-local shared memory.
+    /// Call after connect/accept and before splitting. Windows compares the
+    /// peer session from this pipe handle with this process's TokenSessionId;
+    /// query failures remain errors. Unix connected streams return true.
+    pub fn shared_memory_available(&self) -> io::Result<bool> {
+        let stream = self
+            .abort
+            .0
+            .stream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.abort.is_aborted() {
+            return Err(aborted());
+        }
+        let stream = stream.as_ref().ok_or_else(aborted)?;
+        platform::shared_memory_available(stream)
     }
 
     pub fn abort_handle(&self) -> AbortHandle {

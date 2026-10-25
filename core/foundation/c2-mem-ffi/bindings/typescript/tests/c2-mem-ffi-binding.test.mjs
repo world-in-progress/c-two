@@ -1,7 +1,5 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createServer } from 'node:net';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -20,36 +18,6 @@ import {
 
 function abiVersion() {
   return C2_MEM_FFI_ABI_VERSION;
-}
-
-async function closeServer(server) {
-  await new Promise((resolve, reject) => {
-    server.close((error) => {
-      if (error === undefined) {
-        resolve();
-      } else {
-        reject(error);
-      }
-    });
-  });
-}
-
-function waitFor(condition, label) {
-  const deadline = Date.now() + 1000;
-  return new Promise((resolve, reject) => {
-    const tick = () => {
-      if (condition()) {
-        resolve();
-        return;
-      }
-      if (Date.now() > deadline) {
-        reject(new Error(`timed out waiting for ${label}`));
-        return;
-      }
-      setTimeout(tick, 5);
-    };
-    tick();
-  });
 }
 
 class ContextTestSocket extends EventEmitter {
@@ -142,7 +110,7 @@ test('endpoint context facade keeps the native snapshot and closes unused owners
   assert.throws(() => context.namespaceId(), /context is closed/);
 });
 
-test('Node connector captures one explicit-root snapshot and frees it on factory close', async () => {
+test('Node connector captures one explicit-root snapshot and frees it on factory close', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   const fixture = endpointSymbolsFixture();
   const paths = [];
   const connect = createNodeIpcConnect({
@@ -176,7 +144,7 @@ test('Node connector captures one explicit-root snapshot and frees it on factory
   await assert.rejects(() => connect('ipc://closed'), /connector is closed/);
 });
 
-test('Node connector queries do not freeze but first attempt fixes later addresses and reconnects', async () => {
+test('Node connector queries do not freeze but first attempt fixes later addresses and reconnects', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   const fixture = endpointSymbolsFixture();
   const paths = [];
   const connect = createNodeIpcConnect({
@@ -201,7 +169,7 @@ test('Node connector queries do not freeze but first attempt fixes later address
   assert.equal(fixture.contexts[0].closeCount, 1);
 });
 
-test('typed context is reusable across factories and closes only after its last reference', async () => {
+test('typed context is reusable across factories and closes only after its last reference', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   const fixture = endpointSymbolsFixture();
   const context = captureLocalIpcEndpointContextFromSymbols(fixture.symbols);
   fixture.configureRoot('configured-later');
@@ -231,7 +199,7 @@ test('typed context is reusable across factories and closes only after its last 
   closedHandle.close();
 });
 
-test('socket end, error and close do not release the connector snapshot', async () => {
+test('socket end, error and close do not release the connector snapshot', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   for (const event of ['end', 'error', 'close']) {
     const fixture = endpointSymbolsFixture();
     const socket = connectedContextSocket();
@@ -246,7 +214,7 @@ test('socket end, error and close do not release the connector snapshot', async 
   }
 });
 
-test('query, socket-open and asynchronous failures retain the fixed factory snapshot until disposal', async () => {
+test('query, socket-open and asynchronous failures retain the fixed factory snapshot until disposal', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   for (const failure of ['query', 'invalid-output', 'open', 'error', 'close', 'listener']) {
     const fixture = endpointSymbolsFixture();
     const capture = fixture.symbols.c2_mem_ffi_local_endpoint_context_capture;
@@ -279,7 +247,7 @@ test('query, socket-open and asynchronous failures retain the fixed factory snap
   }
 });
 
-test('failed first open fixes the root for successful retries and a new factory can use another root', async () => {
+test('failed first open fixes the root for successful retries and a new factory can use another root', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   const fixture = endpointSymbolsFixture();
   const paths = [];
   const connect = createNodeIpcConnect({
@@ -303,7 +271,7 @@ test('failed first open fixes the root for successful retries and a new factory 
   assert.deepEqual(fixture.contexts.map((context) => context.closeCount), [1, 1]);
 });
 
-test('pure explicit-root queries use temporary contexts and close before first IO remains lazy', async () => {
+test('pure explicit-root queries use temporary contexts and close before first IO remains lazy', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   const fixture = endpointSymbolsFixture();
   const connect = createNodeIpcConnect({ nativeSymbols: fixture.symbols, ipcRoot: 'explicit-root' });
   assert.equal(connect.resolveEndpoint('ipc://query'), 'explicit-root:ipc://query');
@@ -317,7 +285,7 @@ test('pure explicit-root queries use temporary contexts and close before first I
   assert.equal(fixture.captureRoots.length, 2);
 });
 
-test('native capture failure is remembered after first attempt and partial owners close once', async () => {
+test('native capture failure is remembered after first attempt and partial owners close once', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   const fixture = endpointSymbolsFixture();
   let captures = 0, closes = 0;
   fixture.symbols.c2_mem_ffi_local_endpoint_context_capture = () => {
@@ -333,7 +301,7 @@ test('native capture failure is remembered after first attempt and partial owner
   assert.equal(captures, 1); assert.equal(closes, 1);
 });
 
-test('Node connector rejects missing context symbols before resolving or opening a socket', async () => {
+test('Node connector rejects missing context symbols before resolving or opening a socket', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   const fixture = endpointSymbolsFixture();
   delete fixture.symbols.c2_mem_ffi_local_endpoint_context_capture;
   let socketOpens = 0;
@@ -352,7 +320,7 @@ test('Node connector rejects missing context symbols before resolving or opening
   assert.deepEqual(fixture.atomicAddresses, []);
 });
 
-test('Node connector validates conflicts and native capture output before opening a socket', async () => {
+test('Node connector validates conflicts and native capture output before opening a socket', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   const fixture = endpointSymbolsFixture();
   const context = captureLocalIpcEndpointContextFromSymbols(fixture.symbols);
   for (const options of [
@@ -387,11 +355,11 @@ test('Node connector validates conflicts and native capture output before openin
   assert.equal(closeCount, 2);
   await assert.rejects(
     () => createNodeIpcConnect({ nativeSymbols: { ...fixture.symbols, c2_mem_ffi_abi_version: () => 2 } })('ipc://wrong-abi'),
-    /ABI version 2.*expected version 5/,
+    /ABI version 2.*expected version 6/,
   );
 });
 
-test('injected resolvers remain supported and invalid addresses do not consume shared contexts', async () => {
+test('injected resolvers remain supported and invalid addresses do not consume shared contexts', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   let path;
   const injected = createNodeIpcConnect({
     resolveEndpoint: () => 'injected-endpoint',
@@ -414,76 +382,7 @@ test('injected resolvers remain supported and invalid addresses do not consume s
   assert.equal(fixture.contexts[0].closeCount, 1);
 });
 
-for (const ending of ['EOF', 'explicit close']) {
-  test(`native Node IPC pauses idle input and preserves read progress through ${ending}`, { timeout: 10000 }, async (t) => {
-    const root = process.platform === 'win32' ? undefined : mkdtempSync('/tmp/c2-node-');
-    const connect = createNodeIpcConnect({ ipcRoot: root });
-    const address = `ipc://node-${process.pid}-${Date.now()}`;
-    const socketPath = connect.resolveEndpoint(address);
-    let peer, connection;
-    const received = [];
-    let receivedBytes = 0;
-    const server = createServer((socket) => {
-      peer = socket;
-      socket.on('data', (chunk) => {
-        receivedBytes += chunk.length;
-        received.push(...chunk.subarray(0, Math.max(0, 2 - received.length)));
-      });
-    });
-    t.after(async () => {
-      connection?.close();
-      connect.close();
-      peer?.destroy();
-      await closeServer(server);
-      if (root !== undefined) {
-        assert.equal(existsSync(socketPath), false, 'closed server must unlink its socket');
-        assert.equal(readdirSync(root).some((name) => name.endsWith('.lease')), false);
-        rmSync(root, { recursive: true });
-      }
-    });
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socketPath, resolve);
-    });
-    connection = await connect(address);
-    await waitFor(() => peer !== undefined, 'accepted peer');
-    await connection.write(new Uint8Array([9, 8]));
-    await waitFor(() => received.length >= 2, 'server data');
-    assert.deepEqual(received.slice(0, 2), [9, 8]);
-    const payload = new Uint8Array(8 * 1024 * 1024).fill(0x5a);
-    const sent = new Promise((resolve) => peer.write(payload, resolve));
-    assert.equal(connection.socket.isPaused(), true, 'idle input must apply native backpressure');
-    assert.equal(connection.bufferedBytes, 0, 'idle input must remain in Node, not an unbounded private queue');
-    const [large, writeError] = await Promise.all([connection.readExactly(payload.length), sent, connection.write(payload)]);
-    assert.ifError(writeError);
-    await waitFor(() => receivedBytes === payload.length + 2, 'simultaneous large write');
-    assert.equal(large.length, payload.length);
-    assert.ok(large.every((value) => value === 0x5a), 'reads larger than the native high-water mark must progress');
-    assert.equal(connection.bufferedBytes, 0);
-    peer.write(new Uint8Array([8, 9]));
-    assert.equal(connection.socket.isPaused(), true, 'finishing a read must pause native input again');
-    assert.equal(connection.bufferedBytes, 0, 'finishing a read must restore idle backpressure');
-    assert.deepEqual(Array.from(await connection.readExactly(2)), [8, 9]);
-    peer.write(new Uint8Array([1, 2]));
-    const first = connection.readExactly(3);
-    peer.write(new Uint8Array([3, 4]));
-    assert.deepEqual(Array.from(await first), [1, 2, 3]);
-    assert.deepEqual(Array.from(await connection.readExactly(1)), [4]);
-    const concurrent = [connection.readExactly(1), connection.readExactly(2)];
-    peer.write(new Uint8Array([5, 6, 7]));
-    assert.deepEqual((await Promise.all(concurrent)).map((bytes) => Array.from(bytes)), [[5], [6, 7]]);
-    peer.write(new Uint8Array([1, 2, 3]));
-    assert.deepEqual(Array.from(await connection.readExactly(1)), [1]);
-    const incomplete = connection.readExactly(3);
-    if (ending === 'EOF') peer.end();
-    else connection.close();
-    await assert.rejects(incomplete, /ended|closed/);
-    if (ending === 'EOF') assert.deepEqual(Array.from(await connection.readExactly(2)), [2, 3]);
-    await assert.rejects(connection.readExactly(1), /ended|closed/);
-  });
-}
-
-test('createNodeIpcConnect rejects sockets that close before connect', async () => {
+test('createNodeIpcConnect rejects sockets that close before connect', { skip: process.platform === 'win32' && 'Unix-only injection surface; the official Windows connector requires the trusted native entry' }, async () => {
   const fakeSocket = {
     destroyed: false,
     write() {
@@ -517,7 +416,7 @@ test('createNodeIpcConnect rejects sockets that close before connect', async () 
 });
 
 test('c2-mem-ffi symbol adapters validate ABI version before creating pools', async () => {
-  assert.equal(C2_MEM_FFI_ABI_VERSION, 5);
+  assert.equal(C2_MEM_FFI_ABI_VERSION, 6);
   let createCount = 0;
   const symbols = {
     c2_mem_ffi_abi_version() {
@@ -558,7 +457,7 @@ test('c2-mem-ffi symbol adapters validate ABI version before creating pools', as
       maxSegments: 1,
       minBlockSize: 512,
     }),
-    /ABI version 4.*expected version 5/,
+    /ABI version 5.*expected version 6/,
   );
   assert.equal(createCount, 0);
 });

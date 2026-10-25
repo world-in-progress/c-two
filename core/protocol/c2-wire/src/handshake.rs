@@ -3,7 +3,7 @@
 //! ## Client → Server
 //!
 //! ```text
-//! [1B version=12]
+//! [1B version=13]
 //! [1B prefix_len][prefix UTF-8]
 //! [2B seg_count LE]
 //! [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -37,7 +37,12 @@ use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
 /// Handshake version number.
-pub const HANDSHAKE_VERSION: u8 = 12;
+///
+/// Version 13 adds per-direction shared-memory capability negotiation
+/// ([`CAP_SHM_REQUEST`] / [`CAP_SHM_RESPONSE`]). It is not compatible with
+/// version 12: a 0.x clean cut, so both directions reject the old number
+/// instead of falling back.
+pub const HANDSHAKE_VERSION: u8 = 13;
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
@@ -49,6 +54,27 @@ pub const CAP_METHOD_IDX: u16 = 1 << 1;
 
 /// Supports chunked transfer for large payloads.
 pub const CAP_CHUNKED: u16 = 1 << 2;
+
+/// Client may carry request bodies in its own SHM blocks (client-relative
+/// direction: client writes, server reads and cross-process frees).
+///
+/// The client offers the bit only when its native local stream can actually
+/// reach shared memory with the peer (same TokenSessionId on Windows); the
+/// server ACKs it only when the client offered it and the server's own
+/// native reachability for this connection agrees. Without the ACK bit the
+/// client never writes buddy request frames, and the server rejects any
+/// inbound buddy request frame before touching a mapping.
+pub const CAP_SHM_REQUEST: u16 = 1 << 3;
+
+/// Server may carry response bodies in its own SHM blocks (client-relative
+/// direction: server writes, client reads and releases).
+///
+/// Offered by the client only when its native local stream can reach shared
+/// memory with the peer, and ACKed only through the same intersection. When
+/// the bit is absent the server never publishes response coordinates, and
+/// the client rejects any inbound buddy reply frame before admitting a
+/// lease or lazy-opening a mapping.
+pub const CAP_SHM_RESPONSE: u16 = 1 << 4;
 
 // ── Safety limits ────────────────────────────────────────────────────────
 

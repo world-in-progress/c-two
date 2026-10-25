@@ -232,3 +232,15 @@ async fn listener_restarts_after_cancelling_a_pending_accept() {
     assert_eq!(&bytes, b"new listener");
     close_listener(next);
 }
+
+#[tokio::test]
+async fn connected_pair_allows_same_session_shm_and_abort_is_an_error() {
+    let (client, server) = LocalStream::pair().await.unwrap();
+    assert!(client.shared_memory_available().unwrap());
+    assert!(server.shared_memory_available().unwrap());
+    client.abort_handle().abort();
+    assert_eq!(
+        client.shared_memory_available().unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+}

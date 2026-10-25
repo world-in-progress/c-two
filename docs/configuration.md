@@ -143,7 +143,7 @@ HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接
 | 平台 | 端点 | 位置配置 |
 | --- | --- | --- |
 | Unix | 配置目录内的 UDS | 代码 `cc.set_local_endpoint(root=...)`、环境 `C2_IPC_ROOT`、c3 `--ipc-root`，默认 `/tmp/c2-<uidhex>` |
-| Windows | 当前登录会话 SID 下的 Named Pipe | 自动选择；Unix root 配置不适用 |
+| Windows | 当前用户 TokenUser SID 下的 Named Pipe | 自动选择；Unix root 配置不适用 |
 
 Unix root 是最终端点目录，实际 socket 位于 `<root>/<32 字符标识>`。自定义目录由应用预建，允许 `0755`：当前用户持有目录，具备读、写、遍历权限，组和其他用户没有写权限。默认目录由 C-Two 创建为 `0700`。Socket 在开始监听前设置并核实为 `0600`。路径允许中文和空格，绑定、连接与探测通过目录句柄定位短名称，目录长度受文件系统限制。C-Two 只管理自身端点、租约及协调文件，不修改已有目录权限、不递归创建父目录、不删除应用目录或无关文件。共享本地域的资源进程、客户端和 relay 使用相同 root；root 不改变 SHM 或 file-spill 的位置。配置在首次本地 I/O 尝试时冻结，包括失败的尝试。
 

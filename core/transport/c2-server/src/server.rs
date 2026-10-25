@@ -46,8 +46,8 @@ use c2_wire::flags::{
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_ROUTES, MethodEntry, RouteInfo, decode_handshake,
-    encode_server_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, MAX_ROUTES,
+    MethodEntry, RouteInfo, decode_handshake, encode_server_handshake,
 };
 use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES};
 use c2_wire::registration_control::{
@@ -1986,6 +1986,30 @@ fn handle_connection(
             return;
         }
 
+        // Native shared-memory reachability for this exact accepted stream
+        // (same TokenSessionId as the pipe peer on Windows; always reachable
+        // on Unix). Captured before the halves split so the handshake ACK can
+        // intersect the client's SHM offers with actual reachability. The
+        // query is part of connection establishment: an indeterminate answer
+        // terminates the connection with its original OS cause through the
+        // existing IO-error observation chain — the same terminal path a
+        // ServerError::Io from the handshake feeds — before any handshake
+        // byte is read. An unknown reachability must never become a live
+        // connection negotiating without SHM.
+        let native_shm_reachable = match stream.shared_memory_available() {
+            Ok(reachable) => reachable,
+            Err(error) => {
+                warn!(
+                    conn_id,
+                    %error,
+                    "native shared-memory reachability indeterminate; terminating connection"
+                );
+                conn.end_io("shm_reachability", &error);
+                return;
+            }
+        };
+        conn.set_native_shm_reachable(native_shm_reachable);
+
         let abort = stream.abort_handle();
         let (mut reader, write_half) = stream.into_split();
         let writer = Arc::new(Mutex::new(write_half));
@@ -2210,6 +2234,36 @@ fn handle_connection(
             } else if header.is_ctrl() {
                 handle_ctrl(&server, payload, request_id, &writer).await;
             } else if header.is_call_v2() {
+                // Un-negotiated buddy coordinates must be refused before any
+                // admission, lazy-open, or late-discard cleanup could touch a
+                // mapping this connection was never promised. The rejection
+                // deliberately does not decode the buddy payload or run the
+                // buddy cleanup: cleanup itself would lazy-open the very
+                // mapping the direction gate exists to protect.
+                if c2_wire::flags::is_buddy(flags) && !conn.shm_request_capable() {
+                    warn!(
+                        conn_id,
+                        request_id, "buddy request frame without negotiated SHM request direction"
+                    );
+                    if c2_wire::flags::is_chunked(flags) {
+                        // The frame may belong to a request whose earlier
+                        // inline chunks were admitted; tear that admission
+                        // down terminal-first exactly like a capacity refusal
+                        // (no mappings involved), then correlate the caller.
+                        server.abort_chunk_request(conn.conn_id(), request_id);
+                    }
+                    write_reply(
+                        &writer,
+                        request_id,
+                        &ReplyControl::Error(error_wire(
+                            ErrorCode::ProtocolViolation,
+                            "buddy SHM request frames were not negotiated for this connection"
+                                .to_string(),
+                        )),
+                    )
+                    .await;
+                    continue;
+                }
                 if c2_wire::flags::is_chunked(flags) {
                     let chunk_processing_permit = match server.try_acquire_chunk_processing_permit()
                     {
@@ -2428,6 +2482,18 @@ async fn handle_handshake(
         conn.set_chunked_capable(true);
     }
 
+    // SHM direction negotiation: the ACK is the intersection of the client's
+    // offer with this connection's actual native shared-memory reachability.
+    // A client that did not offer a direction, or a stream that cannot
+    // natively reach shared memory with its peer, keeps that direction off —
+    // the peer then never receives coordinates it could not map, and the
+    // frame-admission gates below reject any that still arrive.
+    let native_shm = conn.native_shm_reachable();
+    let negotiated_shm_request = native_shm && client_hs.capability_flags & CAP_SHM_REQUEST != 0;
+    let negotiated_shm_response = native_shm && client_hs.capability_flags & CAP_SHM_RESPONSE != 0;
+    conn.set_shm_request_capable(negotiated_shm_request);
+    conn.set_shm_response_capable(negotiated_shm_response);
+
     // Collect response pool segment info for handshake.
     let (server_segments, server_prefix) = {
         let pool = server.response_pool.read();
@@ -2454,7 +2520,13 @@ async fn handle_handshake(
         .map(route_info_from_record)
         .collect();
 
-    let cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
+    let mut cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
+    if negotiated_shm_request {
+        cap |= CAP_SHM_REQUEST;
+    }
+    if negotiated_shm_response {
+        cap |= CAP_SHM_RESPONSE;
+    }
     let hs_bytes = encode_server_handshake(
         &server_segments,
         cap,
@@ -3019,6 +3091,7 @@ async fn reserve_route_execution(
 
 async fn send_route_execution_result(
     server: &Server,
+    conn: &Connection,
     writer: &Arc<Mutex<LocalWriteHalf>>,
     request_id: u64,
     result: Result<ResponseMeta, RouteExecutionError>,
@@ -3033,6 +3106,7 @@ async fn send_route_execution_result(
                 server.config.shm_threshold,
                 server.config.chunk_size as usize,
                 server.config.max_payload_size,
+                conn.shm_response_capable(),
             )
             .await
             {
@@ -3262,7 +3336,7 @@ async fn dispatch_admitted_call(call: AdmittedCall<'_>) {
     )
     .await;
 
-    send_route_execution_result(server, writer, request_id, result).await;
+    send_route_execution_result(server, conn, writer, request_id, result).await;
 }
 
 #[cfg(test)]
@@ -3474,7 +3548,7 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
     )
     .await;
 
-    send_route_execution_result(server, writer, request_id, result).await;
+    send_route_execution_result(server, conn, writer, request_id, result).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -4004,7 +4078,7 @@ async fn dispatch_chunked_call(
         )
         .await;
 
-        send_route_execution_result(server, writer, request_id, result).await;
+        send_route_execution_result(server, conn, writer, request_id, result).await;
     }
 }
 
@@ -4278,6 +4352,10 @@ async fn write_chunked_reply(
 }
 
 /// Dispatch a `ResponseMeta` to the appropriate reply path.
+///
+/// `shm_response_allowed` is this connection's negotiated server→client SHM
+/// response direction: while false, no reply on this connection ever carries
+/// response coordinates — owned bytes go out inline or chunked instead.
 async fn send_response_meta(
     response_pool: &crate::ResponsePool,
     writer: &Arc<Mutex<LocalWriteHalf>>,
@@ -4286,6 +4364,7 @@ async fn send_response_meta(
     shm_threshold: u64,
     chunk_size: usize,
     max_payload_size: u64,
+    shm_response_allowed: bool,
 ) -> Result<(), ResponseSendError> {
     match meta {
         ResponseMeta::Inline(data) => {
@@ -4297,6 +4376,7 @@ async fn send_response_meta(
                 &data,
                 shm_threshold,
                 chunk_size,
+                shm_response_allowed,
             )
             .await?;
         }
@@ -4312,6 +4392,48 @@ async fn send_response_meta(
                     "response payload size {data_size} exceeds max_payload_size {max_payload_size}"
                 )));
             }
+            // Preserve the original owner validation ahead of the direction
+            // gate: a foreign backing is rejected on identity before any
+            // transport decision, exactly as on the negotiated path.
+            prepared
+                .validate_pool(&response_pool.read())
+                .map_err(|error| {
+                    ResponseSendError::UserVisible(format!(
+                        "prepared SHM response owner mismatch: {error}"
+                    ))
+                })?;
+            if !shm_response_allowed {
+                // The peer never agreed to map response coordinates. Copy the
+                // logical bytes out, release the backing through its original
+                // owner, and send the owned bytes through the existing owned
+                // path — the peer is never handed an invisible mapping.
+                let bytes = {
+                    let pool = response_pool.read();
+                    prepared.copy_logical_bytes(&pool).map_err(|error| {
+                        ResponseSendError::UserVisible(format!(
+                            "prepared SHM response copy failed: {error}"
+                        ))
+                    })?
+                };
+                {
+                    let mut pool = response_pool.inner.write();
+                    prepared.release_through(&mut pool).map_err(|error| {
+                        ResponseSendError::UserVisible(format!(
+                            "prepared SHM response release failed: {error}"
+                        ))
+                    })?;
+                }
+                return smart_reply_with_data(
+                    response_pool,
+                    writer,
+                    request_id,
+                    &bytes,
+                    shm_threshold,
+                    chunk_size,
+                    false,
+                )
+                .await;
+            }
             send_prepared_shm_response(response_pool, writer, request_id, prepared).await?;
         }
     }
@@ -4326,18 +4448,21 @@ async fn smart_reply_with_data(
     data: &[u8],
     shm_threshold: u64,
     chunk_size: usize,
+    shm_response_allowed: bool,
 ) -> Result<(), ResponseSendError> {
     if data.len() as u64 > shm_threshold {
-        match try_prepare_shm_response(response_pool, shm_threshold, data.len(), |dst| {
-            dst.copy_from_slice(data);
-            Ok(())
-        }) {
-            Ok(Some(prepared)) => {
-                return send_prepared_shm_response(response_pool, writer, request_id, prepared)
-                    .await;
+        if shm_response_allowed {
+            match try_prepare_shm_response(response_pool, shm_threshold, data.len(), |dst| {
+                dst.copy_from_slice(data);
+                Ok(())
+            }) {
+                Ok(Some(prepared)) => {
+                    return send_prepared_shm_response(response_pool, writer, request_id, prepared)
+                        .await;
+                }
+                // Preserve pre-write fallback. Once prepared, a write error returns above.
+                Ok(None) | Err(_) => {}
             }
-            // Preserve pre-write fallback. Once prepared, a write error returns above.
-            Ok(None) | Err(_) => {}
         }
 
         // SHM failed or is not representable. Use chunked for large data and
@@ -9040,6 +9165,397 @@ mod tests {
         handler.await.expect("connection handler completes");
     }
 
+    // ── Handshake v13 SHM direction negotiation ─────────────────────────────
+
+    /// The ACK's SHM bits are the intersection of the client's offer with the
+    /// connection's actual native shared-memory reachability, in either
+    /// direction independently. A connection whose stream was never observed
+    /// (native reachability false) never negotiates SHM.
+    #[tokio::test]
+    async fn handshake_ack_intersects_offer_with_native_reachability() {
+        use c2_wire::handshake::{CAP_SHM_REQUEST, CAP_SHM_RESPONSE, decode_handshake};
+
+        let base_caps = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
+        for (native, offer, expect_request, expect_response) in [
+            (false, CAP_SHM_REQUEST | CAP_SHM_RESPONSE, false, false),
+            (true, CAP_SHM_REQUEST | CAP_SHM_RESPONSE, true, true),
+            (true, CAP_SHM_REQUEST, true, false),
+            (true, CAP_SHM_RESPONSE, false, true),
+            (true, 0, false, false),
+        ] {
+            let server = ordering_test_server("ipc://shm_ack_intersection", 8);
+            let (mut client, stream) = LocalStream::pair().await.expect("local pair");
+            let (_reader, write_half) = stream.into_split();
+            let writer = Arc::new(Mutex::new(write_half));
+            let conn = Arc::new(Connection::new(41));
+            conn.set_native_shm_reachable(native);
+
+            let handshake = c2_wire::handshake::encode_client_handshake(
+                &[],
+                base_caps | offer,
+                "shm-ack-prefix",
+            )
+            .unwrap();
+            handle_handshake(&server, &conn, &handshake, 0, &writer)
+                .await
+                .unwrap();
+            let (_rid, flags, payload) = read_reply_frame(&mut client).await;
+            assert_eq!(flags, FLAG_HANDSHAKE | FLAG_RESPONSE);
+            let decoded = decode_handshake(&payload).unwrap();
+            assert_eq!(
+                decoded.capability_flags & CAP_SHM_REQUEST != 0,
+                expect_request,
+                "request direction (native={native}, offer={offer})"
+            );
+            assert_eq!(
+                decoded.capability_flags & CAP_SHM_RESPONSE != 0,
+                expect_response,
+                "response direction (native={native}, offer={offer})"
+            );
+            assert_eq!(conn.shm_request_capable(), expect_request);
+            assert_eq!(conn.shm_response_capable(), expect_response);
+            // The preserved capabilities are untouched by the intersection.
+            assert_eq!(decoded.capability_flags & base_caps, base_caps);
+            assert!(conn.chunked_capable());
+            drop((client, writer, server));
+        }
+    }
+
+    /// Version 12 is the pre-negotiation handshake: the server rejects it and
+    /// closes the connection, with no compatibility fallback.
+    #[tokio::test]
+    async fn handshake_version_twelve_is_rejected_without_fallback() {
+        let server = ordering_test_server("ipc://shm_v12_reject", 8);
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        let mut handshake = c2_wire::handshake::encode_client_handshake(
+            &[],
+            CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+            "",
+        )
+        .unwrap();
+        assert_eq!(handshake[0], 13, "current codec encodes version 13");
+        handshake[0] = 12;
+        client
+            .write_all(&encode_frame(0, FLAG_HANDSHAKE, &handshake))
+            .await
+            .expect("write v12 handshake");
+
+        // The server must terminate the connection instead of replying or
+        // downgrading: the peer observes EOF.
+        use tokio::io::AsyncReadExt as _;
+        let mut probe = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut probe))
+            .await
+            .expect("read must settle")
+            .expect("read");
+        assert_eq!(read, 0, "server must close the v12 connection");
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    #[tokio::test]
+    async fn indeterminate_reachability_terminates_connection_before_handshake() {
+        let server = ordering_test_server("ipc://shm_reachability_error", 8);
+        let events = server.connection_events();
+        let (mut client, stream) = LocalStream::pair().await.expect("local pair");
+        stream.abort_handle().abort();
+        assert!(stream.shared_memory_available().is_err());
+        let handler = handle_connection(Arc::clone(&server), stream);
+        let observation = match events.recv().await.unwrap().unwrap() {
+            c2_local::ConnectionEvent::Opened(observation) => observation,
+            _ => panic!("expected Opened"),
+        };
+        handler.await;
+        let closed = observation
+            .snapshot()
+            .expect("query failure closes connection");
+        assert_eq!(closed.reason(), ConnectionEndReason::IoError);
+        assert_eq!(closed.operation(), "shm_reachability");
+        assert_eq!(server.active_connection_count(), 0);
+        assert!(matches!(events.recv().await.unwrap(),
+            Some(c2_local::ConnectionEvent::Closed(record)) if record == closed));
+        use tokio::io::AsyncReadExt as _;
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Shared fixture for the un-negotiated buddy frame rejections: a real
+    /// connection handler over a local pair with one echo route, a v13
+    /// handshake that offers no SHM directions, and the observed ACK.
+    async fn unnegotiated_shm_connection(
+        server: &Arc<Server>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (LocalStream, tokio::task::JoinHandle<()>) {
+        let mut route = make_host_route(server, "grid");
+        route.callback = Arc::new(EchoRequestBytes { calls });
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        let handshake = c2_wire::handshake::encode_client_handshake(
+            &[],
+            CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+            "unnegotiated-prefix",
+        )
+        .unwrap();
+        client
+            .write_all(&encode_frame(0, FLAG_HANDSHAKE, &handshake))
+            .await
+            .expect("write handshake");
+        let (_rid, _flags, payload) = read_reply_frame(&mut client).await;
+        let ack = c2_wire::handshake::decode_handshake(&payload).unwrap();
+        assert_eq!(ack.capability_flags & CAP_SHM_REQUEST, 0);
+        assert_eq!(ack.capability_flags & CAP_SHM_RESPONSE, 0);
+        (client, handler)
+    }
+
+    fn fabricated_buddy_call_frame(request_id: u64) -> Vec<u8> {
+        use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
+        use c2_wire::control::encode_call_control;
+
+        let mut payload = encode_buddy_payload(&BuddyPayload {
+            seg_idx: 0,
+            generation: 7,
+            offset: 4096,
+            data_size: 4096,
+            is_dedicated: false,
+            allocation_id: 4242,
+        })
+        .to_vec();
+        payload.extend_from_slice(&encode_call_control(&call_identity("grid"), 0).unwrap());
+        payload.extend_from_slice(b"never-mapped");
+        encode_frame(
+            request_id,
+            c2_wire::flags::FLAG_CALL_V2 | c2_wire::flags::FLAG_BUDDY,
+            &payload,
+        )
+    }
+
+    /// An inbound buddy request frame on a connection that never negotiated
+    /// the SHM request direction is refused with a correlated protocol error
+    /// before any admission, lazy-open, or cleanup could touch a mapping, and
+    /// the connection itself stays healthy.
+    #[tokio::test]
+    async fn unnegotiated_buddy_request_is_refused_before_any_mapping() {
+        let server = ordering_test_server("ipc://shm_buddy_refuse", 8);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut client, handler) = unnegotiated_shm_connection(&server, Arc::clone(&calls)).await;
+
+        client
+            .write_all(&fabricated_buddy_call_frame(31))
+            .await
+            .expect("write un-negotiated buddy frame");
+        let (rid, flags, payload) = read_reply_frame(&mut client).await;
+        assert_eq!(rid, 31);
+        assert!(flags & FLAG_RESPONSE != 0);
+        assert!(
+            flags & c2_wire::flags::FLAG_BUDDY == 0,
+            "no coordinates back"
+        );
+        let (control, _) = c2_wire::control::decode_reply_control(&payload, 0).unwrap();
+        match control {
+            ReplyControl::Error(bytes) => {
+                let error = C2Error::from_wire_bytes(&bytes)
+                    .unwrap()
+                    .expect("error payload");
+                assert_eq!(error.code, ErrorCode::ProtocolViolation);
+                assert!(error.message.contains("not negotiated"));
+            }
+            other => panic!("expected a protocol violation, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "resource must not run");
+
+        // The connection is not poisoned: a plain inline call still succeeds.
+        client
+            .write_all(&inline_call_frame(32, "grid", b"still-alive"))
+            .await
+            .expect("write inline call");
+        let (rid, flags, payload) = read_reply_frame(&mut client).await;
+        assert_eq!(rid, 32);
+        assert!(flags & FLAG_RESPONSE != 0);
+        let (control, consumed) = c2_wire::control::decode_reply_control(&payload, 0).unwrap();
+        match control {
+            ReplyControl::Success => {}
+            other => panic!("expected successful reply, got {other:?}"),
+        }
+        assert_eq!(&payload[consumed..], b"still-alive");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    /// A BUDDY|CHUNKED frame on an un-negotiated connection is refused the
+    /// same way — before chunk admission or processing permits — and a
+    /// subsequent fully inline chunked request still completes.
+    #[tokio::test]
+    async fn unnegotiated_buddy_chunk_frame_is_refused_with_correlated_error() {
+        let server = ordering_test_server("ipc://shm_buddy_chunk_refuse", 8);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut client, handler) = unnegotiated_shm_connection(&server, Arc::clone(&calls)).await;
+
+        // Fabricate a buddy-backed first chunk: buddy payload + chunk header +
+        // call control + data, flagged CALL_V2|CHUNKED|BUDDY|CHUNK_LAST.
+        use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
+        let mut payload = encode_buddy_payload(&BuddyPayload {
+            seg_idx: 1,
+            generation: 3,
+            offset: 0,
+            data_size: 128,
+            is_dedicated: true,
+            allocation_id: 0,
+        })
+        .to_vec();
+        payload.extend_from_slice(&c2_wire::chunk::encode_chunk_header(0, 1));
+        payload.extend_from_slice(
+            &c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap(),
+        );
+        payload.extend_from_slice(b"chunk-body");
+        client
+            .write_all(&encode_frame(
+                44,
+                c2_wire::flags::FLAG_CALL_V2
+                    | FLAG_CHUNKED
+                    | c2_wire::flags::FLAG_BUDDY
+                    | c2_wire::flags::FLAG_CHUNK_LAST,
+                &payload,
+            ))
+            .await
+            .expect("write un-negotiated buddy chunk frame");
+
+        let (rid, flags, reply_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(rid, 44);
+        assert!(flags & c2_wire::flags::FLAG_BUDDY == 0);
+        let (control, _) = c2_wire::control::decode_reply_control(&reply_payload, 0).unwrap();
+        match control {
+            ReplyControl::Error(bytes) => {
+                let error = C2Error::from_wire_bytes(&bytes)
+                    .unwrap()
+                    .expect("error payload");
+                assert_eq!(error.code, ErrorCode::ProtocolViolation);
+            }
+            other => panic!("expected a protocol violation, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // No chunk admission was published for the refused request id.
+        assert_eq!(server.chunk_admission_gate.len(), 0);
+        assert_eq!(server.chunk_registry.active_count(), 0);
+
+        // A fully inline chunked request still completes on this connection.
+        let data = b"inline-chunked-payload";
+        client
+            .write_all(&chunked_call_frame(45, 0, 1, data, "grid"))
+            .await
+            .expect("write inline chunked call");
+        let (rid, _flags, payload) = read_reply_frame(&mut client).await;
+        assert_eq!(rid, 45);
+        let (control, consumed) = c2_wire::control::decode_reply_control(&payload, 0).unwrap();
+        match control {
+            ReplyControl::Success => {}
+            other => panic!("expected successful reply, got {other:?}"),
+        }
+        assert_eq!(&payload[consumed..], data);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    fn inline_call_frame(request_id: u64, identity: &str, data: &[u8]) -> Vec<u8> {
+        use c2_wire::control::encode_call_control;
+        let mut payload = encode_call_control(&call_identity(identity), 0).unwrap();
+        payload.extend_from_slice(data);
+        encode_frame(request_id, c2_wire::flags::FLAG_CALL_V2, &payload)
+    }
+
+    /// Both normal and prepared responses use the same owned path when the
+    /// peer cannot map SHM: small replies stay inline, large replies are
+    /// ordered chunks, and a prepared allocation is freed by its original pool.
+    #[tokio::test]
+    async fn responses_without_shm_negotiation_keep_owned_framing_and_release() {
+        for prepared in [false, true] {
+            for size in [512usize, 8193] {
+                let pool = small_response_pool("shm_direction_off");
+                let payload: Vec<u8> = (0..size).map(|i| (i % 253) as u8).collect();
+                let meta = if prepared {
+                    ResponseMeta::ShmAlloc(
+                        try_prepare_shm_response(&pool, 0, payload.len(), |dst| {
+                            dst.copy_from_slice(&payload);
+                            Ok(())
+                        })
+                        .unwrap()
+                        .unwrap(),
+                    )
+                } else {
+                    ResponseMeta::Inline(payload.clone())
+                };
+                let segments_before = pool.read().segment_count();
+                let (mut peer, stream) = LocalStream::pair().await.unwrap();
+                let (reader, half) = stream.into_split();
+                let writer = Arc::new(Mutex::new(half));
+                let receive = async {
+                    let mut assembled = Vec::new();
+                    let chunks = if size > 1024 { size.div_ceil(4096) } else { 1 };
+                    for index in 0..chunks {
+                        let (rid, flags, body) = read_reply_frame(&mut peer).await;
+                        assert_eq!(rid, 7);
+                        assert_eq!(flags & FLAG_BUDDY, 0, "no SHM coordinates");
+                        assert_ne!(flags & FLAG_RESPONSE, 0);
+                        let consumed = if chunks > 1 {
+                            let last = if index + 1 == chunks {
+                                FLAG_CHUNK_LAST
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                flags & (FLAG_CHUNKED | FLAG_CHUNK_LAST),
+                                FLAG_CHUNKED | last
+                            );
+                            c2_wire::chunk::decode_reply_chunk_meta(&body, 0).unwrap().3
+                        } else {
+                            assert_eq!(flags & FLAG_CHUNKED, 0);
+                            let (control, consumed) =
+                                c2_wire::control::decode_reply_control(&body, 0).unwrap();
+                            assert!(matches!(control, ReplyControl::Success));
+                            consumed
+                        };
+                        assembled.extend_from_slice(&body[consumed..]);
+                    }
+                    assembled
+                };
+                let (sent, assembled) = tokio::join!(
+                    send_response_meta(&pool, &writer, 7, meta, 1024, 4096, 128 * 1024, false),
+                    receive
+                );
+                sent.unwrap();
+                assert_eq!(assembled, payload);
+                drop((reader, writer));
+                assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+                assert_eq!(pool.read().stats().alloc_count, 0);
+                assert_eq!(
+                    pool.read().segment_count(),
+                    segments_before,
+                    "owned path must not allocate SHM"
+                );
+            }
+        }
+    }
+
     /// Route admission refusal while later chunks are parked on the ordering
     /// gate must wake them, complete the caller with the structured canonical
     /// error, and leave no ordering entry, assembly, or permit behind.
@@ -9986,7 +10502,7 @@ mod tests {
                 } else {
                     ResponseMeta::Inline(b"x".repeat(len))
                 };
-                let err = send_response_meta(&pool, &writer, 7, meta, 1024, 4096, 128 * 1024)
+                let err = send_response_meta(&pool, &writer, 7, meta, 1024, 4096, 128 * 1024, true)
                     .await
                     .unwrap_err();
                 assert!(matches!(&err, ResponseSendError::Transport(_)));
@@ -10027,7 +10543,7 @@ mod tests {
             }
         };
         let (sent, ()) = tokio::join!(
-            smart_reply_with_data(&pool, &writer, 7, &payload, 1024, 4096),
+            smart_reply_with_data(&pool, &writer, 7, &payload, 1024, 4096, true),
             receive
         );
         sent.unwrap();
@@ -10062,7 +10578,7 @@ mod tests {
             assert_eq!(pool.read().stats().alloc_count, u32::from(prepared));
             let guard = writer.lock().await;
             let mut send = Box::pin(send_response_meta(
-                &pool, &writer, 7, meta, 1024, 4096, 16384,
+                &pool, &writer, 7, meta, 1024, 4096, 16384, true,
             ));
             assert!(owner_admission_poll_once(send.as_mut()).await.is_pending());
             assert_eq!(pool.read().stats().alloc_count, 1);
@@ -10098,6 +10614,7 @@ mod tests {
             1024,
             4096,
             16 * 1024,
+            true,
         )
         .await
         .unwrap_err();
@@ -10122,6 +10639,7 @@ mod tests {
             1024,
             4096,
             1024,
+            true,
         )
         .await
         .unwrap_err();
@@ -10152,6 +10670,7 @@ mod tests {
             1024,
             4096,
             4096,
+            true,
         )
         .await
         .unwrap_err();

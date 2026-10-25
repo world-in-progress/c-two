@@ -36,6 +36,10 @@ pub async fn connect(endpoint: &LocalEndpoint) -> io::Result<Stream> {
     Ok(stream)
 }
 
+pub fn shared_memory_available(_stream: &Stream) -> io::Result<bool> {
+    Ok(true)
+}
+
 pub fn raw_handle(stream: &Stream) -> usize {
     stream.as_raw_fd() as usize
 }

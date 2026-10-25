@@ -365,6 +365,16 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
     def cargo(name: str, manifest: str, *arguments: str) -> Gate:
         return name, ["cargo", "test", "--locked", "--manifest-path", manifest, *arguments], ()
 
+    # This actual foreign-owner fixture needs an elevated Windows token. Keep
+    # ordinary-user cargo tests usable, but run it explicitly on hosted native
+    # Windows lanes instead of leaving its ignored marker as a coverage gap.
+    windows_identity = [cargo(
+        "windows-pipe-identity-test", "core/Cargo.toml", "-p", "c2-local",
+        "--test", "windows_identity",
+        "foreign_object_owner_rejects_connect_listener_join_and_bootstrap_adoption",
+        "--", "--ignored", "--exact",
+    )] if target_platform == "windows" else []
+
     if scope == LOCAL_PLATFORM_SCOPE:
         # Include native integration tests (notably owner-control) and Core
         # call-state tests at each implementation stage, without SDK matrices.
@@ -372,7 +382,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
                       "--features", "c2-http/relay",
                       "-p", "c2-config", "-p", "c2-error", "-p", "c2-local-security", "-p", "c2-local",
                       "-p", "c2-mem", "-p", "c2-mem-ffi", "-p", "c2-wire",
-                      "-p", "c2-ipc", "-p", "c2-server", "-p", "c2-http", "-p", "c2-core")]
+                      "-p", "c2-ipc", "-p", "c2-server", "-p", "c2-http", "-p", "c2-core"), *windows_identity]
     if scope not in {FULL_SCOPE, PYTHON_SCOPE}:
         raise ValueError(f"Unknown native gate scope: {scope}")
     fastdb_typescript = "../fastdb/ts/fastdb4ts"
@@ -458,6 +468,8 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
     ]
     if target_platform != "windows":
         selected = [gate for gate in selected if gate[0] != "windows-standard-user-consumer"]
+    if scope == FULL_SCOPE:
+        selected.extend(windows_identity)
     if scope == PYTHON_SCOPE:
         omitted = {"fastdb-rust-test", "core-check", "core-test", "rust-sdk-test",
                    "fastdb-wheel-build", "python-wheel-build", "wheel-consumer",

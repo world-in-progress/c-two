@@ -1,9 +1,11 @@
 use std::io;
 use std::mem::size_of;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle,
+};
 use std::process::Stdio;
 
-use c2_local_security::LocalSecurityAttributes;
+use c2_local_security::{LocalSecurityAttributes, verify_current_user_pipe_owner};
 use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_ACCESS_INFORMATION, FILE_MODE_INFORMATION, FILE_PIPE_CONNECTED_STATE,
@@ -21,7 +23,7 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_READ_DATA,
     FILE_TYPE_DISK, FILE_TYPE_PIPE, FILE_WRITE_DATA, GetFileType, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX,
+    PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Pipes::{
@@ -77,7 +79,7 @@ pub(super) fn pair() -> io::Result<(Controller, Bootstrap)> {
         .collect();
 
     let mut security = LocalSecurityAttributes::new()?;
-    // This current-logon-SID, local-only, one-instance pipe is created as an
+    // This TokenUser-owned, local-only, one-instance pipe is created as an
     // unregistered overlapped handle so it can be transferred as child stdio.
     let raw_server = unsafe {
         CreateNamedPipeW(
@@ -97,6 +99,7 @@ pub(super) fn pair() -> io::Result<(Controller, Bootstrap)> {
     // SAFETY: CreateNamedPipeW returned one owned handle.
     let server = unsafe { OwnedHandle::from_raw_handle(raw_server) };
     ensure_noninheritable(server.as_raw_handle())?;
+    verify_current_user_pipe_owner(server.as_handle())?;
 
     let raw_client = unsafe {
         CreateFileW(
@@ -105,7 +108,7 @@ pub(super) fn pair() -> io::Result<(Controller, Bootstrap)> {
             0,
             std::ptr::null(),
             OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
             std::ptr::null_mut(),
         )
     };
@@ -115,6 +118,7 @@ pub(super) fn pair() -> io::Result<(Controller, Bootstrap)> {
     // SAFETY: CreateFileW returned one owned handle.
     let client = unsafe { OwnedHandle::from_raw_handle(raw_client) };
     ensure_noninheritable(client.as_raw_handle())?;
+    verify_current_user_pipe_owner(client.as_handle())?;
     Ok((
         Controller {
             pending: Some(client),
@@ -248,7 +252,13 @@ fn verify_bootstrap(handle: RawHandle) -> io::Result<()> {
             "owner bootstrap pipe must permit both reading and writing",
         ));
     }
-    Ok(())
+    // The bootstrap is already a trusted launcher capability. Check its
+    // object owner, but do not require its creator/controller to remain alive:
+    // early owner death must still reach the existing owner-missing supervisor.
+    // SAFETY: the caller keeps this valid borrowed pipe handle open.
+    verify_current_user_pipe_owner(unsafe {
+        std::os::windows::io::BorrowedHandle::borrow_raw(handle)
+    })
 }
 
 fn invalid_bootstrap(message: &'static str) -> io::Error {
@@ -338,7 +348,7 @@ impl Controller {
         };
         self.activated = true;
         Ok(crate::LocalStream::from_inner(
-            crate::platform::Stream::Client(client),
+            crate::platform::Stream::OwnerClient(client),
         ))
     }
 

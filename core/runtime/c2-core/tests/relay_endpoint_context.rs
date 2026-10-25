@@ -493,7 +493,7 @@ fn windows_default_projection_remains_named_pipe_and_rejects_unix_root() {
         context.platform_kind(),
         c2_core::LocalEndpointNamespace::WindowsNamedPipe
     );
-    assert!(context.windows_logon_scope_id().is_some());
+    assert!(context.windows_user_scope_id().is_some());
     assert!(
         runtime
             .local_endpoint("ipc://same-owner")

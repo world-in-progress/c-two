@@ -1,12 +1,17 @@
 #include <node_api.h>
 
 #ifdef _WIN32
+/* Types only: every uv_* function this addon uses is resolved at runtime from
+ * the process module (node.exe's bundled libuv) so descriptor tables always
+ * belong to the Node CRT. No uv symbol is linked directly. */
+#include <uv.h>
 #include <windows.h>
 #else
 #include <dlfcn.h>
 #include <unistd.h>
 #endif
 #include <stdbool.h>
+#include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +110,7 @@ typedef C2MemFfiStatus (*endpoint_context_name_copy_fn)(const C2MemFfiLocalEndpo
 typedef C2MemFfiStatus (*endpoint_context_namespace_id_len_fn)(const C2MemFfiLocalEndpointContext *, size_t *);
 typedef C2MemFfiStatus (*endpoint_context_namespace_id_copy_fn)(const C2MemFfiLocalEndpointContext *, char *, size_t, size_t *);
 typedef C2MemFfiStatus (*endpoint_context_connect_unix_fn)(const C2MemFfiLocalEndpointContext *, const char *, int32_t *, int32_t *);
+typedef C2MemFfiStatus (*endpoint_context_connect_windows_fn)(const C2MemFfiLocalEndpointContext *, const char *, uintptr_t *, uintptr_t *, int32_t *);
 
 typedef struct C2MemFfiNodeSymbols {
     void *library;
@@ -116,6 +122,7 @@ typedef struct C2MemFfiNodeSymbols {
     endpoint_context_namespace_id_len_fn endpoint_context_namespace_id_len;
     endpoint_context_namespace_id_copy_fn endpoint_context_namespace_id_copy;
     endpoint_context_connect_unix_fn endpoint_context_connect_unix;
+    endpoint_context_connect_windows_fn endpoint_context_connect_windows;
     request_pool_new_fn request_pool_new;
     request_pool_destroy_fn request_pool_destroy;
     request_pool_prefix_len_fn request_pool_prefix_len;
@@ -153,9 +160,11 @@ typedef struct C2MemFfiNodeEndpointContext {
     bool finalized;
 } C2MemFfiNodeEndpointContext;
 
-/* Only wrapped objects created by this addon can carry a context owner. */
+/* Only wrapped objects created by this addon can carry a context owner.
+ * ABI 6 rotated this tag from the ABI 5 constant: a stale ABI 5 addon's
+ * endpoint contexts must fail the tag check instead of being unwrapped. */
 static const napi_type_tag endpoint_context_tag = {
-    UINT64_C(0x0f29c11fb943496e), UINT64_C(0xa3535c87f53e14bf)
+    UINT64_C(0x5a71e0c3f28b94d6), UINT64_C(0xd6340f81b9e57c2a)
 };
 
 static napi_value throw_error(napi_env env, const char *message) {
@@ -970,11 +979,67 @@ static const napi_type_tag socket_fd_tag = {
     UINT64_C(0xb82cd6be1d234b99), UINT64_C(0x9b4e465211132206)
 };
 
+#ifdef _WIN32
+/* Descriptors handed to Node must live in the Node CRT's descriptor table.
+ * node.exe exports its bundled libuv's wrappers (uv_open_osfhandle and
+ * friends), so this addon resolves them from the process module instead of
+ * calling _open_osfhandle from another DLL's CRT or treating a HANDLE as an
+ * fd. Verified against official Node v22.23.4 win-x64 exports and the vendored
+ * libuv sources (win/handle.c, win/fs.c, win/pipe.c). */
+typedef int (*c2_uv_open_osfhandle_fn)(uv_os_fd_t);
+typedef int (*c2_uv_fs_close_fn)(uv_loop_t *, uv_fs_t *, uv_file, uv_fs_cb);
+typedef void (*c2_uv_fs_req_cleanup_fn)(uv_fs_t *);
+
+static c2_uv_open_osfhandle_fn c2_uv_open_osfhandle;
+static c2_uv_fs_close_fn c2_uv_fs_close;
+static c2_uv_fs_req_cleanup_fn c2_uv_fs_req_cleanup;
+static INIT_ONCE process_libuv_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK initialize_process_libuv(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once; (void)parameter; (void)context;
+    HMODULE process_module = GetModuleHandleW(NULL);
+    if (process_module == NULL) {
+        return TRUE;
+    }
+    c2_uv_open_osfhandle = (c2_uv_open_osfhandle_fn)(void *)GetProcAddress(process_module, "uv_open_osfhandle");
+    c2_uv_fs_close = (c2_uv_fs_close_fn)(void *)GetProcAddress(process_module, "uv_fs_close");
+    c2_uv_fs_req_cleanup = (c2_uv_fs_req_cleanup_fn)(void *)GetProcAddress(process_module, "uv_fs_req_cleanup");
+    if (c2_uv_open_osfhandle == NULL || c2_uv_fs_close == NULL ||
+        c2_uv_fs_req_cleanup == NULL) {
+        c2_uv_open_osfhandle = NULL;
+        c2_uv_fs_close = NULL;
+        c2_uv_fs_req_cleanup = NULL;
+    }
+    return TRUE;
+}
+
+static bool resolve_process_libuv(void) {
+    /* Worker environments share this addon. Publish the complete immutable
+     * function group once before any worker can mint a Node-owned descriptor. */
+    InitOnceExecuteOnce(&process_libuv_once, initialize_process_libuv, NULL, NULL);
+    return c2_uv_open_osfhandle != NULL;
+}
+
+/* Release through the Node CRT that minted the descriptor. The supported
+ * Node process initializes stdio slots 0-2 and libuv preserves them. */
+static void close_windows_pipe_fd(int32_t fd) {
+    if (fd < 0) {
+        return;
+    }
+    assert(fd >= 3);
+    assert(c2_uv_fs_close != NULL && c2_uv_fs_req_cleanup != NULL);
+    uv_fs_t request;
+    memset(&request, 0, sizeof(request));
+    c2_uv_fs_close(NULL, &request, fd, NULL);
+    c2_uv_fs_req_cleanup(&request);
+}
+#endif
+
 static void close_socket_fd(int32_t fd) {
 #ifndef _WIN32
     if (fd >= 0) close(fd);
 #else
-    (void)fd; /* Unix descriptor transfer is never available on Windows. */
+    close_windows_pipe_fd(fd);
 #endif
 }
 
@@ -1112,6 +1177,269 @@ static napi_value endpoint_context_connect(napi_env env, napi_callback_info info
     return promise;
 }
 
+/* A Windows pipe owner keeps the pinned server process handle until the
+ * descriptor is taken by Node's Socket and the resulting connection closes,
+ * including GC of an ignored result. */
+typedef struct NativeWindowsSocket {
+    int32_t fd;        /* -1 once transferred to Node or closed */
+    uintptr_t process; /* server process pin; 0 once released */
+} NativeWindowsSocket;
+static const napi_type_tag windows_socket_tag = {
+    UINT64_C(0x2f6b97d84c0a51e3), UINT64_C(0x6a1c40fe93b7d208)
+};
+
+static void windows_socket_release(NativeWindowsSocket *owner) {
+    close_socket_fd(owner->fd);
+    owner->fd = -1;
+#ifdef _WIN32
+    if (owner->process != 0) {
+        CloseHandle((HANDLE)owner->process);
+    }
+#endif
+    owner->process = 0;
+}
+
+static void windows_socket_finalize(napi_env env, void *data, void *hint) {
+    (void)env;
+    (void)hint;
+    NativeWindowsSocket *owner = (NativeWindowsSocket *)data;
+    if (owner == NULL) {
+        return;
+    }
+    windows_socket_release(owner);
+    free(owner);
+}
+
+static NativeWindowsSocket *windows_socket_receiver(napi_env env, napi_callback_info info) {
+    napi_value receiver;
+    bool tagged = false;
+    void *raw = NULL;
+    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, &receiver, NULL)) ||
+        !check_napi(napi_check_object_type_tag(env, receiver, &windows_socket_tag, &tagged)) ||
+        !tagged || !check_napi(napi_unwrap(env, receiver, &raw)) || raw == NULL) {
+        throw_type_error(env, "Expected a native connected Windows pipe owner.");
+        return NULL;
+    }
+    return (NativeWindowsSocket *)raw;
+}
+
+static napi_value windows_socket_take(napi_env env, napi_callback_info info) {
+    NativeWindowsSocket *owner = windows_socket_receiver(env, info);
+    if (owner == NULL) return NULL;
+    if (owner->fd < 0) return throw_type_error(env, "Native Windows pipe was already closed or transferred.");
+    napi_value value;
+    if (!check_napi(napi_create_int32(env, owner->fd, &value))) return NULL;
+    owner->fd = -1;
+    return value;
+}
+
+static napi_value windows_socket_close(napi_env env, napi_callback_info info) {
+    NativeWindowsSocket *owner = windows_socket_receiver(env, info);
+    if (owner == NULL) return NULL;
+    windows_socket_release(owner);
+    napi_value value;
+    if (!check_napi(napi_get_undefined(env, &value))) return NULL;
+    return value;
+}
+
+static napi_value windows_socket_object(napi_env env, int32_t fd, uintptr_t process, NativeWindowsSocket **out_owner) {
+    NativeWindowsSocket *owner = (NativeWindowsSocket *)malloc(sizeof(*owner));
+    if (owner == NULL) {
+        close_socket_fd(fd);
+#ifdef _WIN32
+        if (process != 0) CloseHandle((HANDLE)process);
+#endif
+        return throw_error(env, "Out of memory.");
+    }
+    owner->fd = fd;
+    owner->process = process;
+    napi_value object;
+    napi_property_descriptor methods[] = {
+        { "takeFd", NULL, windows_socket_take, NULL, NULL, NULL, napi_default, NULL },
+        { "close", NULL, windows_socket_close, NULL, NULL, NULL, napi_default, NULL },
+    };
+    if (!check_napi(napi_create_object(env, &object)) ||
+        !check_napi(napi_define_properties(env, object, 2, methods)) ||
+        !check_napi(napi_type_tag_object(env, object, &windows_socket_tag)) ||
+        !check_napi(napi_wrap(env, object, owner, windows_socket_finalize, NULL, NULL))) {
+        windows_socket_finalize(env, owner, NULL);
+        return NULL;
+    }
+    *out_owner = owner;
+    return object;
+}
+
+typedef struct WindowsConnectWork {
+    C2MemFfiNodeEndpointContext *context;
+    char *address;
+    napi_ref receiver;
+    napi_async_work work;
+    napi_deferred deferred;
+    C2MemFfiStatus status;
+    int32_t os_error;
+    uintptr_t pipe;
+    uintptr_t process;
+} WindowsConnectWork;
+
+static void windows_connect_execute(napi_env env, void *data) {
+    (void)env;
+    WindowsConnectWork *work = (WindowsConnectWork *)data;
+    work->status = work->context->symbols->endpoint_context_connect_windows(
+        work->context->ptr, work->address, &work->pipe, &work->process, &work->os_error);
+}
+
+static void windows_connect_discard_handles(WindowsConnectWork *work) {
+#ifdef _WIN32
+    if (work->pipe != 0) {
+        CloseHandle((HANDLE)work->pipe);
+    }
+    if (work->process != 0) {
+        CloseHandle((HANDLE)work->process);
+    }
+#endif
+    work->pipe = 0;
+    work->process = 0;
+}
+
+static void windows_connect_dispose(napi_env env, WindowsConnectWork *work) {
+    windows_connect_discard_handles(work);
+    work->context->active_connects -= 1;
+    endpoint_context_release_closed(work->context);
+    if (work->receiver != NULL) napi_delete_reference(env, work->receiver);
+    if (work->work != NULL) napi_delete_async_work(env, work->work);
+    free(work->address);
+    free(work);
+}
+
+#ifdef _WIN32
+static void windows_connect_reject_with_message(napi_env env, WindowsConnectWork *work, const char *message) {
+    napi_value text, error;
+    if (check_napi(napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &text)) &&
+        check_napi(napi_create_error(env, NULL, text, &error))) {
+        napi_reject_deferred(env, work->deferred, error);
+    } else {
+        throw_error(env, message);
+    }
+}
+#endif
+
+static void windows_connect_complete(napi_env env, napi_status status, void *data) {
+    WindowsConnectWork *work = (WindowsConnectWork *)data;
+    if (status != napi_ok || work->context->closed) {
+        work->status = C2_MEM_FFI_STATUS_IO_ERROR;
+        windows_connect_discard_handles(work);
+    }
+    NativeWindowsSocket *owner = NULL;
+    napi_value value = NULL;
+    if (work->status == C2_MEM_FFI_STATUS_OK) {
+        int32_t fd = -1;
+#ifdef _WIN32
+        /* Convert on the JS thread before anything can register the handle
+         * with an event loop: the descriptor is minted in the Node CRT and
+         * handed straight to net.Socket's fd adoption path. */
+        if (!resolve_process_libuv()) {
+            windows_connect_discard_handles(work);
+            windows_connect_reject_with_message(env, work,
+                "This Node process does not export the libuv descriptor transfer API (uv_open_osfhandle).");
+            windows_connect_dispose(env, work);
+            return;
+        }
+        fd = (int32_t)c2_uv_open_osfhandle((HANDLE)work->pipe);
+        if (fd < 0) {
+            /* The Node CRT did not adopt the handle, so the work entry is
+             * still the single owner of both raw handles and releases them. */
+            char message[160];
+            snprintf(message, sizeof(message),
+                "Node libuv descriptor transfer failed for the native Windows pipe (returned %d).", fd);
+            windows_connect_discard_handles(work);
+            windows_connect_reject_with_message(env, work, message);
+            windows_connect_dispose(env, work);
+            return;
+        }
+        /* Ownership handoff: only after a successful conversion does the CRT
+         * descriptor own the pipe handle; the work entry keeps the process
+         * pin until the socket owner below takes it over. */
+        work->pipe = 0;
+        /* Node PlatformInit occupies stdio slots; Windows libuv never closes
+         * them. A native embedder that bypasses that initialization is outside
+         * this Node connector's ownership contract (Node v22.23.4 node.cc). */
+        assert(fd >= 3);
+#else
+        /* The native entry never succeeds outside Windows. */
+        windows_connect_discard_handles(work);
+        work->status = C2_MEM_FFI_STATUS_IO_ERROR;
+#endif
+        if (work->status == C2_MEM_FFI_STATUS_OK) {
+            uintptr_t process = work->process;
+            work->process = 0; /* The socket owner now pins the server process. */
+            value = windows_socket_object(env, fd, process, &owner);
+            if (value == NULL) {
+                /* windows_socket_object released the descriptor and process pin. */
+                windows_connect_dispose(env, work);
+                return;
+            }
+        }
+    }
+    napi_value result = make_status_result(env, work->status, value);
+    if (result == NULL || !check_napi(napi_resolve_deferred(env, work->deferred, result))) {
+        if (owner != NULL) windows_socket_release(owner);
+    }
+    windows_connect_dispose(env, work);
+}
+
+static napi_value queue_windows_connect(napi_env env, C2MemFfiNodeEndpointContext *context, napi_value receiver, char *address) {
+    WindowsConnectWork *work = (WindowsConnectWork *)calloc(1, sizeof(*work));
+    if (work == NULL) {
+        free(address);
+        return throw_error(env, "Out of memory.");
+    }
+    work->context = context;
+    work->address = address;
+    context->active_connects += 1;
+    napi_value promise, name;
+    if (!check_napi(napi_create_promise(env, &work->deferred, &promise)) ||
+        !check_napi(napi_create_string_utf8(env, "c2-local-connect-windows", NAPI_AUTO_LENGTH, &name)) ||
+        !check_napi(napi_create_reference(env, receiver, 1, &work->receiver)) ||
+        !check_napi(napi_create_async_work(env, NULL, name, windows_connect_execute,
+            windows_connect_complete, work, &work->work)) ||
+        !check_napi(napi_queue_async_work(env, work->work))) {
+        windows_connect_dispose(env, work);
+        return throw_error(env, "Failed to queue a native Windows connection.");
+    }
+    return promise;
+}
+
+static napi_value endpoint_context_connect_windows_method(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1], receiver;
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc != 1) {
+        return throw_type_error(env, "connectWindows expects an ipc:// address.");
+    }
+    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
+    if (context == NULL) return NULL;
+    char *address = read_string_arg(env, args[0], "IPC address must be a string.");
+    if (address == NULL) return NULL;
+    return queue_windows_connect(env, context, receiver, address);
+}
+
+/* Module-level verified Windows connect: the receiver argument must be a real
+ * addon-tagged endpoint context. Forged endpoint objects carrying arbitrary
+ * connectUnix/connectWindows functions cannot pass the native type-tag check
+ * performed here, so unverified sockets cannot enter official Windows flows. */
+static napi_value endpoint_context_connect_windows_verified(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2];
+    C2MemFfiNodeSymbols *symbols = NULL;
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols)) || argc != 2) {
+        return throw_type_error(env, "verified Windows connect expects a context object and an ipc:// address.");
+    }
+    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, args[0], true);
+    if (context == NULL) return NULL;
+    char *address = read_string_arg(env, args[1], "IPC address must be a string.");
+    if (address == NULL) return NULL;
+    return queue_windows_connect(env, context, args[0], address);
+}
+
 static napi_value endpoint_context_capture(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
@@ -1148,6 +1476,7 @@ static napi_value endpoint_context_capture(napi_env env, napi_callback_info info
         { "endpointName", NULL, endpoint_context_name, NULL, NULL, NULL, napi_default, NULL },
         { "namespaceId", NULL, endpoint_context_namespace_id, NULL, NULL, NULL, napi_default, NULL },
         { "connectUnix", NULL, endpoint_context_connect, NULL, NULL, NULL, napi_default, NULL },
+        { "connectWindows", NULL, endpoint_context_connect_windows_method, NULL, NULL, NULL, napi_default, NULL },
         { "close", NULL, endpoint_context_close, NULL, NULL, NULL, napi_default, NULL },
     };
     if (!check_napi(napi_create_object(env, &object)) ||
@@ -1212,6 +1541,7 @@ static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
     LOAD_REQUIRED(endpoint_context_namespace_id_len, "c2_mem_ffi_local_endpoint_context_namespace_id_len");
     LOAD_REQUIRED(endpoint_context_namespace_id_copy, "c2_mem_ffi_local_endpoint_context_namespace_id_copy");
     LOAD_REQUIRED(endpoint_context_connect_unix, "c2_mem_ffi_local_endpoint_context_connect_unix");
+    LOAD_REQUIRED(endpoint_context_connect_windows, "c2_mem_ffi_local_endpoint_context_connect_windows");
     LOAD_REQUIRED(request_pool_new, "c2_mem_ffi_request_pool_new");
     LOAD_REQUIRED(request_pool_destroy, "c2_mem_ffi_request_pool_destroy");
     LOAD_REQUIRED(request_pool_prefix_len, "c2_mem_ffi_request_pool_prefix_len");
@@ -1280,6 +1610,7 @@ static napi_value load(napi_env env, napi_callback_info info) {
         !set_function(env, object, "c2_mem_ffi_abi_version", abi_version_callback, symbols) ||
         !set_function(env, object, "c2_mem_ffi_local_endpoint", local_endpoint, symbols) ||
         !set_function(env, object, "c2_mem_ffi_local_endpoint_context_capture", endpoint_context_capture, symbols) ||
+        !set_function(env, object, "c2_mem_ffi_endpoint_context_connect_windows", endpoint_context_connect_windows_verified, symbols) ||
         !set_function(env, object, "c2_mem_ffi_request_pool_destroy", request_pool_destroy, symbols) ||
         !set_function(env, object, "c2_mem_ffi_request_pool_prefix", request_pool_prefix, symbols) ||
         !set_function(env, object, "c2_mem_ffi_request_pool_segment_count", request_pool_segment_count, symbols) ||

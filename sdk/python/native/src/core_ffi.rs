@@ -264,6 +264,8 @@ pub(crate) struct PyCoreResponse {
     lease: Mutex<Option<BufferLeaseGuard>>,
     data_len: usize,
     exports: AtomicU32,
+    #[cfg(test)]
+    before_release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl PyCoreResponse {
@@ -274,6 +276,8 @@ impl PyCoreResponse {
             lease: Mutex::new(None),
             data_len,
             exports: AtomicU32::new(0),
+            #[cfg(test)]
+            before_release: Mutex::new(None),
         }
     }
 
@@ -315,8 +319,12 @@ impl PyCoreResponse {
     }
 
     fn release(&self) -> PyResult<()> {
-        self.ensure_not_exported()?;
+        #[cfg(test)]
+        if let Some(pause) = self.before_release.lock().take() {
+            Python::attach(|py| py.detach(pause));
+        }
         let mut inner = self.inner.lock();
+        self.ensure_not_exported()?;
         let Some(held) = inner.as_mut() else {
             return Ok(());
         };
@@ -332,8 +340,12 @@ impl PyCoreResponse {
         invalidator: Py<PyAny>,
         value: Py<PyAny>,
     ) -> PyResult<()> {
-        self.ensure_not_exported()?;
+        #[cfg(test)]
+        if let Some(pause) = self.before_release.lock().take() {
+            Python::attach(|py| py.detach(pause));
+        }
         let mut inner = self.inner.lock();
+        self.ensure_not_exported()?;
         let Some(held) = inner.as_mut() else {
             return Ok(());
         };
@@ -434,7 +446,12 @@ struct PyCoreRequestBuffer {
     bytes: Vec<u8>,
     released: AtomicBool,
     exports: AtomicU32,
+    // Serializes export, release and retained-lease admission.
     lease: Mutex<Option<BufferLeaseGuard>>,
+    #[cfg(test)]
+    before_release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_track_retained: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl PyCoreRequestBuffer {
@@ -444,6 +461,10 @@ impl PyCoreRequestBuffer {
             released: AtomicBool::new(false),
             exports: AtomicU32::new(0),
             lease: Mutex::new(None),
+            #[cfg(test)]
+            before_release: Mutex::new(None),
+            #[cfg(test)]
+            before_track_retained: Mutex::new(None),
         }
     }
 }
@@ -459,13 +480,18 @@ impl PyCoreRequestBuffer {
     }
 
     fn release(&self) -> PyResult<()> {
+        #[cfg(test)]
+        if let Some(pause) = self.before_release.lock().take() {
+            Python::attach(|py| py.detach(pause));
+        }
+        let mut lease = self.lease.lock();
         if self.exports.load(Ordering::Acquire) > 0 {
             return Err(PyBufferError::new_err(
                 "cannot release: buffer is currently exported as memoryview",
             ));
         }
         self.released.store(true, Ordering::Release);
-        self.lease.lock().take();
+        lease.take();
         Ok(())
     }
 
@@ -477,6 +503,11 @@ impl PyCoreRequestBuffer {
         method_name: &str,
         direction: &str,
     ) -> PyResult<()> {
+        #[cfg(test)]
+        if let Some(pause) = self.before_track_retained.lock().take() {
+            Python::attach(|py| py.detach(pause));
+        }
+        let mut lease_slot = self.lease.lock();
         if self.released.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -487,7 +518,7 @@ impl PyCoreRequestBuffer {
             "inline",
             self.bytes.len(),
         )?;
-        *self.lease.lock() = Some(lease);
+        *lease_slot = Some(lease);
         Ok(())
     }
 
@@ -497,6 +528,7 @@ impl PyCoreRequestBuffer {
         flags: std::os::raw::c_int,
     ) -> PyResult<()> {
         let this = slf.borrow();
+        let _lease = this.lease.lock();
         if this.released.load(Ordering::Acquire) {
             return Err(PyBufferError::new_err("buffer already released"));
         }
@@ -717,8 +749,10 @@ pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod payload_tests {
     use super::*;
-    use pyo3::types::PyModule;
+    use pyo3::types::{PyMemoryView, PyModule};
     use std::ffi::CString;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
 
     fn module<'py>(py: Python<'py>, source: &str) -> Bound<'py, PyModule> {
         PyModule::from_code(
@@ -728,6 +762,215 @@ mod payload_tests {
             c"payload_test",
         )
         .unwrap()
+    }
+
+    fn pause_once(
+        slot: &Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (reached, waiting) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        *slot.lock() = Some(Box::new(move || {
+            reached.send(()).unwrap();
+            paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+        (waiting, resume)
+    }
+
+    fn tracker() -> PyBufferLeaseTracker {
+        PyBufferLeaseTracker::from_arc(Arc::new(c2_mem::BufferLeaseTracker::new(false)))
+    }
+
+    fn assert_counts(tracker: &PyBufferLeaseTracker, holds: usize, bytes: usize) {
+        let stats = tracker.inner.stats();
+        assert_eq!((stats.active_leases, stats.active_holds), (holds, holds));
+        assert_eq!(
+            (stats.total_leased_bytes, stats.total_held_bytes),
+            (bytes, bytes)
+        );
+    }
+
+    fn assert_buffer_error(py: Python<'_>, result: PyResult<()>, message: &str) {
+        let error = result.unwrap_err();
+        assert!(error.is_instance_of::<PyBufferError>(py));
+        assert_eq!(error.value(py).str().unwrap().to_str().unwrap(), message);
+    }
+
+    fn response_release_race(invalidate: bool) {
+        Python::initialize();
+        Python::attach(|py| {
+            let response = Py::new(
+                py,
+                PyCoreResponse::new(HeldResponse::from_owned_bytes(vec![b'r'; 32])),
+            )
+            .unwrap();
+            let tracker = tracker();
+            response
+                .borrow(py)
+                .track_retained(&tracker, "response", "race", "client_response")
+                .unwrap();
+            let calls = PyList::empty(py);
+            let invalidator = calls.getattr("append").unwrap().unbind();
+            let worker_invalidator = invalidator.clone_ref(py);
+            let (reached, resume) = pause_once(&response.borrow(py).before_release);
+            let worker_response = response.clone_ref(py);
+            let worker = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    let owner = worker_response.borrow(py);
+                    if invalidate {
+                        owner.invalidate_then_release(py, worker_invalidator, py.None())
+                    } else {
+                        owner.release()
+                    }
+                })
+            });
+            py.detach(move || reached.recv_timeout(Duration::from_secs(10)))
+                .unwrap();
+            let exported = PyBuffer::<u8>::get(response.bind(py).as_any());
+            resume.send(()).unwrap();
+            let result = py.detach(|| worker.join()).unwrap();
+            let exported = exported.unwrap();
+            assert_buffer_error(
+                py,
+                result,
+                "cannot release: buffer is currently exported as memoryview",
+            );
+            let owner = response.borrow(py);
+            assert!(!owner.is_released());
+            assert!(owner.lease.lock().is_some());
+            assert_counts(&tracker, 1, 32);
+            assert_eq!(calls.len(), 0);
+            assert_eq!(exported.to_vec(py).unwrap(), vec![b'r'; 32]);
+            drop(exported);
+            if invalidate {
+                owner
+                    .invalidate_then_release(py, invalidator.clone_ref(py), py.None())
+                    .unwrap();
+            } else {
+                owner.release().unwrap();
+            }
+            assert!(owner.is_released());
+            assert!(owner.lease.lock().is_none());
+            owner
+                .invalidate_then_release(py, invalidator, py.None())
+                .unwrap();
+            owner.release().unwrap();
+            assert_eq!(calls.len(), usize::from(invalidate));
+            assert_counts(&tracker, 0, 0);
+            assert_buffer_error(
+                py,
+                PyMemoryView::from(response.bind(py).as_any()).map(|_| ()),
+                "buffer already released",
+            );
+        });
+    }
+
+    #[test]
+    fn response_release_rejects_export_before_inner_lock() {
+        response_release_race(false);
+    }
+
+    #[test]
+    fn response_invalidation_rejects_export_before_inner_lock() {
+        response_release_race(true);
+    }
+
+    #[test]
+    fn request_release_rejects_export_before_released_store() {
+        Python::initialize();
+        Python::attach(|py| {
+            let request = Py::new(py, PyCoreRequestBuffer::new(vec![b'q'; 32])).unwrap();
+            let tracker = tracker();
+            request
+                .borrow(py)
+                .track_retained(&tracker, "request", "race", "resource_input")
+                .unwrap();
+            let (reached, resume) = pause_once(&request.borrow(py).before_release);
+            let worker_request = request.clone_ref(py);
+            let worker = std::thread::spawn(move || {
+                Python::attach(|py| worker_request.borrow(py).release())
+            });
+            py.detach(move || reached.recv_timeout(Duration::from_secs(10)))
+                .unwrap();
+            let view = PyMemoryView::from(request.bind(py).as_any());
+            resume.send(()).unwrap();
+            let result = py.detach(|| worker.join()).unwrap();
+            let view = view.unwrap();
+            assert_buffer_error(
+                py,
+                result,
+                "cannot release: buffer is currently exported as memoryview",
+            );
+            let owner = request.borrow(py);
+            assert!(!owner.released.load(Ordering::Acquire));
+            assert!(owner.lease.lock().is_some());
+            assert_counts(&tracker, 1, 32);
+            let exported = PyBuffer::<u8>::get(view.as_any()).unwrap();
+            assert_eq!(exported.to_vec(py).unwrap(), vec![b'q'; 32]);
+            drop(exported);
+            view.call_method0("release").unwrap();
+            owner.release().unwrap();
+            assert!(owner.released.load(Ordering::Acquire));
+            assert!(owner.lease.lock().is_none());
+            owner.release().unwrap();
+            assert_counts(&tracker, 0, 0);
+            assert_buffer_error(
+                py,
+                PyBuffer::<u8>::get(request.bind(py).as_any()).map(|_| ()),
+                "buffer already released",
+            );
+        });
+    }
+
+    #[test]
+    fn request_tracking_after_release_does_not_revive_lease() {
+        Python::initialize();
+        Python::attach(|py| {
+            let request = Py::new(py, PyCoreRequestBuffer::new(vec![b'q'; 32])).unwrap();
+            let tracker = tracker();
+            request
+                .borrow(py)
+                .track_retained(&tracker, "request", "initial", "resource_input")
+                .unwrap();
+            assert_counts(&tracker, 1, 32);
+            let (reached, resume) = pause_once(&request.borrow(py).before_track_retained);
+            let worker_request = request.clone_ref(py);
+            let worker_tracker = tracker.clone();
+            let worker = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    worker_request.borrow(py).track_retained(
+                        &worker_tracker,
+                        "request",
+                        "late",
+                        "resource_input",
+                    )
+                })
+            });
+            py.detach(move || reached.recv_timeout(Duration::from_secs(10)))
+                .unwrap();
+            let released = request.borrow(py).release();
+            let after_release = tracker.inner.stats();
+            resume.send(()).unwrap();
+            py.detach(|| worker.join()).unwrap().unwrap();
+            released.unwrap();
+            assert_eq!(
+                (after_release.active_holds, after_release.total_held_bytes),
+                (0, 0)
+            );
+            let owner = request.borrow(py);
+            assert!(owner.released.load(Ordering::Acquire));
+            assert_counts(&tracker, 0, 0);
+            assert!(owner.lease.lock().is_none());
+            owner
+                .track_retained(&tracker, "request", "later", "resource_input")
+                .unwrap();
+            owner.release().unwrap();
+            assert_counts(&tracker, 0, 0);
+            assert_buffer_error(
+                py,
+                PyMemoryView::from(request.bind(py).as_any()).map(|_| ()),
+                "buffer already released",
+            );
+        });
     }
 
     #[test]

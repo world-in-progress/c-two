@@ -403,8 +403,8 @@ use c2_wire::control::{
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, Handshake, MethodEntry, RouteInfo, decode_handshake,
-    encode_client_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, Handshake,
+    MethodEntry, RouteInfo, decode_handshake, encode_client_handshake,
 };
 use c2_wire::msg_type::MsgType;
 use c2_wire::registration_control::{
@@ -1362,6 +1362,47 @@ impl RequestReleaseState {
         }
         Ok(true)
     }
+
+    /// Copy the armed block's snapshot at its requested length, then settle it
+    /// through the armed path of the same release transaction.
+    ///
+    /// The permit lock is held across both steps — the same lock
+    /// [`Self::try_dispatch`] and every release observer take — so a
+    /// concurrent dispatcher loses cleanly instead of publishing coordinates
+    /// that this path consumes. An armed block never carries a retire permit,
+    /// so the settle is the plain validate/free/`Released` tail shared with
+    /// [`Self::release_inner`].
+    fn copy_and_release_armed(&self) -> Result<Vec<u8>, IpcError> {
+        let _permit_slot = self.permit.lock();
+        match self.phase.load(Ordering::Acquire) {
+            Self::PHASE_ARMED => {}
+            Self::PHASE_RELEASED => {
+                return Err(IpcError::Pool(
+                    "request block was already released; its snapshot is gone".into(),
+                ));
+            }
+            _ => {
+                return Err(IpcError::Pool(
+                    "request block is already dispatched; it cannot be copy-consumed".into(),
+                ));
+            }
+        }
+        let bytes = {
+            let pool = self.pool.lock();
+            pool.copy_handle_data(&self.handle)
+                .map_err(|error| IpcError::Pool(format!("prealloc copy failed: {error}")))?
+        };
+        let mut pool = self.pool.lock();
+        pool.validate_handle(&self.handle)
+            .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))?;
+        // SAFETY: the private phase/permit transaction is the sole release
+        // authority, and the block is still armed so no peer free exists.
+        unsafe { pool.free(&self.alloc) }
+            .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))?;
+        drop(pool);
+        self.phase.store(Self::PHASE_RELEASED, Ordering::Release);
+        Ok(bytes)
+    }
 }
 
 impl Drop for RequestReleaseState {
@@ -2294,13 +2335,19 @@ pub(crate) enum RequestTransportKind {
     Chunked,
 }
 
+/// Select the transport for one request body.
+///
+/// `shm_available` means the SHM request direction is genuinely usable for
+/// this connection: a live request pool plus a negotiated `CAP_SHM_REQUEST`
+/// ACK. It is never derived from `pool_enabled` alone (that flag does not
+/// disable dedicated SHM requests).
 pub(crate) fn choose_request_transport(
     config: &ClientIpcConfig,
-    has_pool: bool,
+    shm_available: bool,
     data_len: usize,
 ) -> RequestTransportKind {
     let data_len = u64::try_from(data_len).unwrap_or(u64::MAX);
-    if has_pool && data_len > config.shm_threshold && data_len <= u64::from(u32::MAX) {
+    if shm_available && data_len > config.shm_threshold && data_len <= u64::from(u32::MAX) {
         RequestTransportKind::Buddy
     } else if data_len > config.chunk_size {
         RequestTransportKind::Chunked
@@ -2500,6 +2547,14 @@ pub struct IpcClient {
     pub(crate) chunk_registry: StdMutex<Option<Arc<ChunkRegistry<()>>>>,
     /// Unique connection identifier for the chunk registry.
     conn_id: u64,
+    /// Whether this connection negotiated the client→server SHM request
+    /// direction (client offered `CAP_SHM_REQUEST` with a real request pool
+    /// and native shared-memory reachability, and the server ACKed it).
+    ///
+    /// False until a handshake completes; request transport selection and
+    /// prealloc publication consult it so buddy frames are only ever written
+    /// when the peer agreed it can map and cross-process free them.
+    negotiated_shm_request: AtomicBool,
     /// At most one cancellable maintenance task per connection; `None` while
     /// disconnected and after `close_shared`. The task holds a [`Weak`]
     /// reference to this state as its liveness probe, so dropping the client
@@ -2639,6 +2694,7 @@ impl IpcClient {
             pool_injected,
             chunk_registry: StdMutex::new(chunk_registry),
             conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
+            negotiated_shm_request: AtomicBool::new(false),
             config,
             memory_budget,
             maintenance: Arc::new(StdMutex::new(None)),
@@ -2704,6 +2760,24 @@ impl IpcClient {
     /// Whether the client currently owns a request pool.
     pub(crate) fn has_request_pool(&self) -> bool {
         self.pool.lock().is_some()
+    }
+
+    /// Whether this connection may carry request bodies in client SHM blocks:
+    /// a live request pool and a negotiated `CAP_SHM_REQUEST` direction.
+    ///
+    /// This is the single authority for request-side SHM transport selection
+    /// and prealloc publication gating; `pool_enabled` alone is not consulted
+    /// because it does not disable dedicated SHM requests.
+    pub(crate) fn shm_request_available(&self) -> bool {
+        self.has_request_pool() && self.negotiated_shm_request.load(Ordering::Acquire)
+    }
+
+    /// Test-only override of the negotiated SHM request direction, for
+    /// projections that must observe both handshake outcomes without a live
+    /// peer. Production state is only ever written by the handshake.
+    #[cfg(test)]
+    pub(crate) fn set_shm_request_negotiated_for_test(&self, value: bool) {
+        self.negotiated_shm_request.store(value, Ordering::Release);
     }
 
     /// The complete resolved client configuration this connection was created
@@ -2947,6 +3021,9 @@ impl IpcClient {
 
     async fn connect_attempt(&mut self, deadline: ConnectDeadline) -> Result<(), IpcError> {
         connect_check(deadline, "ipc_connect")?;
+        // Each attempt negotiates from a clean state: the flags below are set
+        // only after this attempt's handshake completes.
+        self.negotiated_shm_request.store(false, Ordering::Release);
         // Reconnect only after the previous close barrier has accounted for
         // both background tasks. Replacing either handle here would detach
         // its task from the client's close and Drop ownership.
@@ -3076,6 +3153,20 @@ impl IpcClient {
             publisher,
             disconnect: Arc::clone(&self.disconnect),
         };
+        // Native shared-memory reachability for this exact stream (always
+        // reachable on Unix; on Windows the pipe peer must share this
+        // TokenSessionId for local SHM mappings to be mutually visible). The
+        // query is part of connection establishment: an indeterminate answer
+        // propagates its original OS cause through the existing IpcError::Connect
+        // chain and fails the attempt — it never silently downgrades to a
+        // non-SHM connection.
+        let stream_shm_available = match stream.shared_memory_available() {
+            Ok(available) => available,
+            Err(error) => {
+                connection.publisher.close_io("shm_reachability", &error);
+                return Err(IpcError::Connect(error));
+            }
+        };
         *connect_metadata_lock(&self.abort, "ipc_metadata_wait")? = Some(stream.abort_handle());
         let (reader, mut writer) = stream.into_split();
 
@@ -3097,7 +3188,13 @@ impl IpcClient {
         let hs = with_connect_deadline(deadline, "handshake", async {
             tokio::time::timeout(
                 DEFAULT_CONNECT_TIMEOUT,
-                self.do_handshake(&mut writer, reader, Arc::clone(&server_pool), connection),
+                self.do_handshake(
+                    &mut writer,
+                    reader,
+                    Arc::clone(&server_pool),
+                    connection,
+                    stream_shm_available,
+                ),
             )
             .await
             .map_err(|_| {
@@ -3181,6 +3278,7 @@ impl IpcClient {
         mut reader: LocalReadHalf,
         server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
         connection: ReceiveConnectionState,
+        stream_shm_available: bool,
     ) -> Result<Handshake, IpcError> {
         // Build segment list and prefix from pool (if available). The list may
         // legitimately be empty: lazy pools announce no backings and the server
@@ -3202,7 +3300,19 @@ impl IpcClient {
             } else {
                 (vec![], String::new())
             };
-        let cap_flags = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
+        // SHM directions are offered only when this exact stream can natively
+        // reach shared memory with the peer, and — for the request direction —
+        // only when a request pool exists to carry the blocks. The server's
+        // ACK intersects the offer with its own native reachability.
+        let offered_shm_request = stream_shm_available && self.has_request_pool();
+        let offered_shm_response = stream_shm_available;
+        let mut cap_flags = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
+        if offered_shm_request {
+            cap_flags |= CAP_SHM_REQUEST;
+        }
+        if offered_shm_response {
+            cap_flags |= CAP_SHM_RESPONSE;
+        }
 
         let payload = encode_client_handshake(&segments, cap_flags, &prefix)
             .map_err(|e| IpcError::Protocol(e.to_string()))?;
@@ -3286,6 +3396,16 @@ impl IpcClient {
             ));
         }
 
+        // Direction negotiation: a direction is active only when this side
+        // offered it and the server ACKed it. A server that ACKs an unoffered
+        // bit has no effect — the offer is part of the intersection.
+        let negotiated_shm_request =
+            offered_shm_request && hs.capability_flags & CAP_SHM_REQUEST != 0;
+        let negotiated_shm_response =
+            offered_shm_response && hs.capability_flags & CAP_SHM_RESPONSE != 0;
+        self.negotiated_shm_request
+            .store(negotiated_shm_request, Ordering::Release);
+
         // Spawn recv loop with the reader.
         let pending = self.pending.clone();
         let writer_clone = self.writer.clone();
@@ -3322,6 +3442,7 @@ impl IpcClient {
             writer_clone,
             chunk_registry,
             conn_id,
+            negotiated_shm_response,
             Some(connection),
             #[cfg(test)]
             partial_header_pending,
@@ -3616,7 +3737,7 @@ impl IpcClient {
 
         IpcCallControl::check_preparation(control)?;
 
-        match choose_request_transport(&self.config, self.has_request_pool(), data.len()) {
+        match choose_request_transport(&self.config, self.shm_request_available(), data.len()) {
             RequestTransportKind::Buddy => {
                 match self.call_buddy(&identity, method_idx, data, control).await {
                     Ok(result) => return Ok(result),
@@ -3640,13 +3761,29 @@ impl IpcClient {
             }
         }
 
+        self.call_owned_bytes(&identity, method_idx, data, control)
+            .await
+    }
+
+    /// Send fully owned request bytes through the non-SHM policy: chunked when
+    /// the body exceeds the chunk size, otherwise one inline frame. Used for
+    /// plain fallbacks and for copy-consumed preallocated blocks whose
+    /// coordinates must not be published.
+    async fn call_owned_bytes(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        data: &[u8],
+        control: Option<&IpcCallControl>,
+    ) -> Result<ResponseData, IpcError> {
         match choose_request_transport(&self.config, false, data.len()) {
             RequestTransportKind::Chunked => {
-                self.call_chunked(&identity, method_idx, data, control)
-                    .await
+                self.call_chunked(identity, method_idx, data, control).await
             }
+            // Buddy is unreachable with `shm_available=false`; the inline
+            // path is the only remaining owned transport.
             RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                self.call_inline_controlled(&identity, method_idx, data, control)
+                self.call_inline_controlled(identity, method_idx, data, control)
                     .await
             }
         }
@@ -3791,7 +3928,7 @@ impl IpcClient {
                 .map_err(classified_call_error);
         }
 
-        match choose_request_transport(&self.config, self.has_request_pool(), data_len) {
+        match choose_request_transport(&self.config, self.shm_request_available(), data_len) {
             RequestTransportKind::Buddy => {
                 if let Some(block) = self
                     .try_alloc_request_block(data_len)
@@ -4130,6 +4267,29 @@ impl IpcClient {
                 "buddy request payload size {data_size} exceeds wire limit {}",
                 u32::MAX
             )));
+        }
+        // Direction gate for the one block this path may publish: when the
+        // block still belongs to this client's current request pool but the
+        // SHM request direction was not negotiated, its coordinates can never
+        // be written. Copy the armed snapshot at its requested length, settle
+        // it through its original owner under the existing permit-lock state
+        // machine, and send the owned bytes through the inline/chunked
+        // policy. The peer never receives coordinates it cannot map, and no
+        // peer-free authority is granted for a pointer that was not sent.
+        // Blocks from any other pool — retired incarnations after a
+        // close/reconnect, or another client's pool — take no branch here:
+        // they keep flowing to the writer-seam pool identity check and its
+        // original rejection below, unchanged.
+        let pool_slot_is_owner = self
+            .pool
+            .lock()
+            .as_ref()
+            .is_some_and(|pool| Arc::ptr_eq(pool, &block.release.pool));
+        if !self.shm_request_available() && pool_slot_is_owner {
+            let data = block.release.copy_and_release_armed()?;
+            return self
+                .call_owned_bytes(identity, method_idx, &data, control)
+                .await;
         }
         let alloc = *block.allocation();
         // Build buddy payload from pre-allocated coordinates.
@@ -5617,6 +5777,7 @@ pub(crate) async fn recv_loop(
         writer,
         chunk_registry,
         conn_id,
+        false,
         None,
         #[cfg(test)]
         None,
@@ -5635,6 +5796,7 @@ async fn recv_loop_inner(
     writer: Arc<Mutex<Option<LocalWriteHalf>>>,
     chunk_registry: Arc<ChunkRegistry<()>>,
     conn_id: u64,
+    shm_response_allowed: bool,
     connection: Option<ReceiveConnectionState>,
     #[cfg(test)] mut partial_header_pending: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)] receiver_drop_gate: Option<ReceiverDropGuardForTest>,
@@ -5865,8 +6027,11 @@ async fn recv_loop_inner(
             continue; // Don't fall through to decode_response.
         }
 
-        // Decode non-chunked response.
-        let result = decode_response(&hdr, &recv_buf, &server_pool);
+        // Decode non-chunked response. An un-negotiated buddy reply is
+        // rejected inside the decoder before any lease is minted, any
+        // segment is lazy-opened, or any release cleanup could touch a
+        // mapping this connection was never promised.
+        let result = decode_response(&hdr, &recv_buf, &server_pool, shm_response_allowed);
 
         // Dispatch to pending caller.
         complete_unary_pending(&pending, rid, result).await;
@@ -5936,6 +6101,7 @@ fn decode_response(
     hdr: &FrameHeader,
     payload: &[u8],
     server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
+    shm_response_allowed: bool,
 ) -> Result<ResponseData, IpcError> {
     let is_v2 = hdr.is_reply_v2();
     let is_buddy = hdr.is_buddy();
@@ -5945,6 +6111,16 @@ fn decode_response(
     }
 
     if is_buddy {
+        if !shm_response_allowed {
+            // The server never negotiated the SHM response direction for this
+            // connection, so these coordinates were never valid here. Reject
+            // before decoding the buddy payload: no lease is created, no
+            // server segment is lazy-opened, and no release cleanup can be
+            // derived from bytes this connection was not promised.
+            return Err(IpcError::Protocol(
+                "server sent a buddy SHM reply without negotiated CAP_SHM_RESPONSE".into(),
+            ));
+        }
         if payload.len() < BUDDY_PAYLOAD_SIZE + 1 {
             return Err(IpcError::Decode(DecodeError::BufferTooShort {
                 need: BUDDY_PAYLOAD_SIZE + 1,
@@ -8140,6 +8316,7 @@ mod tests {
             ..ClientIpcConfig::default()
         };
         let client = IpcClient::with_config(&format!("ipc://{label}"), cfg);
+        client.set_shm_request_negotiated_for_test(true);
         let mut methods = HashMap::new();
         methods.insert("ping".to_string(), 0);
         client.route_directory.write().insert_table(
@@ -8432,7 +8609,13 @@ mod tests {
             };
             let handshake = c2_wire::handshake::encode_server_handshake(
                 &[],
-                CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+                CAP_CALL_V2
+                    | CAP_METHOD_IDX
+                    | CAP_CHUNKED
+                    | (decode_handshake(&body[12..])
+                        .expect("client handshake")
+                        .capability_flags
+                        & (CAP_SHM_REQUEST | CAP_SHM_RESPONSE)),
                 &[],
                 "",
                 &identity,
@@ -8776,6 +8959,7 @@ mod pending_disconnect_tests {
             Arc::clone(&client.writer),
             client.chunk_registry_arc().unwrap(),
             client.conn_id,
+            true,
             Some(connection),
             None,
             None,
@@ -8825,6 +9009,7 @@ mod pending_disconnect_tests {
             Arc::clone(&client.writer),
             client.chunk_registry_arc().unwrap(),
             client.conn_id,
+            true,
             Some(connection),
             None,
             None,
@@ -8887,6 +9072,7 @@ mod pending_disconnect_tests {
             Arc::clone(&client.writer),
             client.chunk_registry_arc().unwrap(),
             client.conn_id,
+            true,
             Some(connection),
             None,
             None,

@@ -1,23 +1,23 @@
 # Windows installation and development builds
 
-The native Windows backend uses byte-mode Named Pipes for `ipc://` control traffic and named file mappings for shared payload memory. It runs within one logon session under that session's SID. Ordinary SDK code continues to use logical `ipc://` addresses; do not construct pipe or mapping names in an SDK. HTTP relay still provides the network path.
+The native Windows backend uses byte-mode Named Pipes for `ipc://` control traffic and named file mappings for shared payload memory. It uses the process TokenUser SID across logons. Same-session peers may use SHM; different sessions use owned/inline/chunked transfers. Native connections require a matching user and a server integrity of at least Medium before sending. Ordinary SDK code continues to use logical `ipc://` addresses; do not construct pipe or mapping names in an SDK. HTTP relay still provides the network path.
 
-This guide covers Python C-Two **0.8.2**, c3 **0.4.1** and FastDB **0.2.3** on Windows x64 and ARM64. Install the matching Python and c3 versions together; see the [0.8.2 migration notes](releases/0.8.2.md) and [lifecycle guide](local-endpoint-lifecycle.en.md) for endpoint behavior.
+This guide covers Python C-Two **0.9.0**, c3 **0.5.0** and FastDB **0.2.3** on Windows x64 and ARM64. Install the matching Python and c3 versions together; see the [0.9.0 migration notes](releases/0.9.0.md) and [lifecycle guide](local-endpoint-lifecycle.en.md) for endpoint behavior.
 
-Unix root overrides (`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-root`) are rejected on Windows. Pipe names derive from the logical address and current logon SID.
+Unix root overrides (`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-root`) are rejected on Windows. Pipe names derive from the logical address and current TokenUser SID.
 
 ## Install Python and c3
 
 In an activated Python environment, explicitly select the documented version:
 
 ```powershell
-uv pip install 'c-two==0.8.2'
+uv pip install 'c-two==0.9.0'
 ```
 
-For the published [c3 0.4.1 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.4.1), download `c3-x86_64-pc-windows-msvc.exe` (x64) or `c3-aarch64-pc-windows-msvc.exe` (ARM64), its `.exe.sha256` checksum and optionally `c3-installer.ps1`. Verify the standalone executable before running it:
+For the published [c3 0.5.0 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.5.0), download `c3-x86_64-pc-windows-msvc.exe` (x64) or `c3-aarch64-pc-windows-msvc.exe` (ARM64), its `.exe.sha256` checksum and optionally `c3-installer.ps1`. Verify the standalone executable before running it:
 
 ```powershell
-$releaseBase = 'https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1'
+$releaseBase = 'https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0'
 $asset = 'c3-x86_64-pc-windows-msvc.exe'
 Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset" -OutFile ".\$asset"
 Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset.sha256" -OutFile ".\$asset.sha256"
@@ -34,7 +34,7 @@ Alternatively, use the checksum-verifying installer:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.4.1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.5.0
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```

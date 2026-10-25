@@ -28,7 +28,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-**C-Two 0.8.2** 支持 Python 3.10+。普通 Python 调用无 Python 运行时依赖；FastDB 载荷使用可选扩展 `c-two[fastdb]`（`fastdb4py==0.2.3`）。本版统一客户端与服务端连接事件流，公开结构化的 `cc.error.CoreError`，并修复 relay 观察器在容量耗尽后的恢复。见[更新说明](docs/releases/0.8.2.md)。
+**C-Two 0.9.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.3`）。Windows IPC 改为按用户作用域，在发送前核对服务端身份，并自动选择跨登录会话可用的数据通路。本版还修复 Python 缓冲导出与释放的竞争，退役旧手工包装。见[更新说明](docs/releases/0.9.0.md)。
 
 ## 特点
 
@@ -53,12 +53,12 @@ uv pip install 'c-two[fastdb]'
 Windows PowerShell 使用相同命令。Linux、macOS 的 c3 安装命令：
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1/c3-installer.sh | sh -s -- --version 0.4.1
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-installer.sh | sh -s -- --version 0.5.0
 ```
 
-Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.4.1/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
+Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
 
-C3 0.4.1 可配合 C-Two 0.8.x 使用。IPC 12、SHM 3 和 C/FFI ABI 5 保持，所有者控制使用独立的版本 1。从 0.7.x 升级时请遵循 [0.8.0 迁移说明](docs/releases/0.8.0.md)，将所有者控制器与宿主一起升级，并重新编译 Rust 消费者。
+C3 0.5.0 配合 C-Two 0.9.x 使用。IPC 握手 13 和 C/FFI ABI 6 要求通信各端一起升级；SHM 3 与所有者控制 1 的格式保持。Windows 先停止旧服务，再升级并重启。见 [0.9.0 迁移说明](docs/releases/0.9.0.md)。
 
 源码构建与测试见[开发指南](docs/development.md)。
 

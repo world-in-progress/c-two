@@ -1,4 +1,4 @@
-//! Session-local named mappings. The handle and view share one RAII owner.
+//! Session-local named mappings with TokenUser-scoped names and ACLs. The handle and view share one RAII owner.
 
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -26,7 +26,7 @@ impl Drop for MappedView {
 /// One named shared region. Allocator participants require a read/write view.
 ///
 /// The logical name remains portable. Its OS name is encoded inside the
-/// current logon scope; the DACL permits only that logon SID. Windows removes
+/// current TokenUser scope; the DACL permits only that user SID. Windows removes
 /// the mapping after the last handle and view close, including on process exit.
 pub struct ShmRegion {
     name: String,
@@ -151,7 +151,8 @@ fn mapping_name(name: &str) -> Result<Vec<u16>, String> {
     }
     let scope = current_scope_id().map_err(|error| error.to_string())?;
     // Hex encoding is injective and avoids backslashes/case folding without
-    // allowing callers to select the Global kernel namespace.
+    // allowing callers to select the Global kernel namespace. Cross-session
+    // pipes must negotiate SHM off before any Local mapping is advertised.
     let mut encoded = String::with_capacity(name.len() * 2);
     use std::fmt::Write;
     for byte in name.as_bytes() {
@@ -249,6 +250,20 @@ mod tests {
             std::process::id(),
             NEXT_NAME.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    #[test]
+    fn mapping_uses_token_user_scope_in_session_local_namespace() {
+        let logical = name();
+        let wide = mapping_name(&logical).unwrap();
+        let os_name = String::from_utf16(&wide[..wide.len() - 1]).unwrap();
+        let scope = c2_local_security::current_scope_id().unwrap();
+        assert!(os_name.starts_with(&format!(r"Local\c_two_mem_{scope}_")));
+        assert!(!os_name.starts_with(r"Global\"));
+        let owner = ShmRegion::create(&logical, 4096).unwrap();
+        let peer = ShmRegion::open(&logical, 4096).unwrap();
+        unsafe { *owner.base_ptr() = 0x39 };
+        assert_eq!(unsafe { *peer.base_ptr() }, 0x39);
     }
 
     #[test]

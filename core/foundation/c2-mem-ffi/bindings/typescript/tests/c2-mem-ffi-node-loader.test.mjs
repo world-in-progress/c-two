@@ -30,7 +30,7 @@ function localTestDirectory(prefix) {
   return mkdtempSync(resolve(fileURLToPath(parent), prefix));
 }
 
-function compileContextFixture(directory, omittedSymbol) {
+function compileContextFixture(directory, omittedSymbol, connectStatus = 1) {
   const source = readFileSync(new URL('../native/node_c2_mem_ffi_loader.c', import.meta.url), 'utf8');
   const required = [...source.matchAll(/LOAD_REQUIRED\(\w+, "([^"]+)"\)/g)].map((match) => match[1]);
   const body = required.filter((name) => ![
@@ -38,12 +38,25 @@ function compileContextFixture(directory, omittedSymbol) {
     'c2_mem_ffi_local_endpoint_context_free', 'c2_mem_ffi_local_endpoint_context_name_len',
     'c2_mem_ffi_local_endpoint_context_name_copy', 'c2_mem_ffi_local_endpoint_context_namespace_id_len',
     'c2_mem_ffi_local_endpoint_context_namespace_id_copy', omittedSymbol,
-  ].includes(name)).map((name) =>
-    `#[unsafe(no_mangle)] pub extern "C" fn ${name}() { std::process::abort(); }`).join('\n');
+  ].includes(name)).map((name) => {
+    // A real failed native attempt freezes the snapshot without creating a
+    // socket. The reference-count tests do not need an injected JS connector.
+    if (name === 'c2_mem_ffi_local_endpoint_context_connect_unix') return `
+      #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
+        _ctx: *const Context, _address: *const u8, fd: *mut i32, os: *mut i32) -> u32 {
+        unsafe { *fd = -1; *os = 0; } ${connectStatus}
+      }`;
+    if (name === 'c2_mem_ffi_local_endpoint_context_connect_windows') return `
+      #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
+        _ctx: *const Context, _address: *const u8, pipe: *mut usize, process: *mut usize, os: *mut i32) -> u32 {
+        unsafe { *pipe = 0; *process = 0; *os = 0; } ${connectStatus}
+      }`;
+    return `#[unsafe(no_mangle)] pub extern "C" fn ${name}() { std::process::abort(); }`;
+  }).join('\n');
   const fixture = resolve(directory, 'context.rs');
   writeFileSync(fixture, `
     const NAME: &str = "/tmp/c2-context-fixture.sock";
-    #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 5 }
+    #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 6 }
     ${body}
       use std::sync::atomic::{AtomicUsize, Ordering};
       static FREES: AtomicUsize = AtomicUsize::new(0);
@@ -334,11 +347,51 @@ test('Windows context keeps current-SID pipe defaults and rejects Unix roots nat
   }
 });
 
-test('native addon rejects ABI 5 without the complete context symbol group', () => {
-  const directory = localTestDirectory('incomplete-abi4-');
+test('native addon rejects ABI 6 without the complete context symbol group', () => {
+  const directory = localTestDirectory('incomplete-abi6-');
   try {
     const library = compileContextFixture(directory, 'c2_mem_ffi_local_endpoint_context_connect_unix');
     assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /Failed to load.*c2_mem_ffi_local_endpoint_context_connect_unix/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('native connect preserves identity refusal separately from OS access failure', () => {
+  const directory = localTestDirectory('connect-error-kind-');
+  try {
+    const cases = [[5, 'IO_ERROR'], [6, 'PERMISSION_DENIED'], [7, 'IDENTITY_MISMATCH']];
+    const libraries = cases.map(([status, name]) => {
+      const child = resolve(directory, name);
+      mkdirSync(child);
+      return [compileContextFixture(child, undefined, status), status, name];
+    });
+    const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
+    // Only exercise result projection through the real addon; these native
+    // fixtures return errors without opening any socket or pipe.
+    const script = `
+      import assert from 'node:assert/strict';
+      import { loadC2MemFfiNodeNativeSymbols, captureLocalIpcEndpointContextFromSymbols,
+        createNodeIpcConnect, C2NodeIpcConnectionError } from ${JSON.stringify(moduleUrl)};
+      for (const [library, status, name] of JSON.parse(process.argv[1])) {
+        const { symbols } = loadC2MemFfiNodeNativeSymbols(library);
+        const raw = symbols.c2_mem_ffi_local_endpoint_context_capture(null).value;
+        try {
+          assert.deepEqual(await symbols.c2_mem_ffi_endpoint_context_connect_windows(raw, 'ipc://classification'), {status});
+        } finally { raw.close(); }
+        const context = captureLocalIpcEndpointContextFromSymbols(symbols);
+        const connect = createNodeIpcConnect({endpointContext: context});
+        try {
+          await assert.rejects(connect('ipc://classification'), error => {
+            assert.ok(error instanceof C2NodeIpcConnectionError);
+            assert.ok(error.message.includes(name), error.message);
+            return true;
+          });
+        } finally { connect.close(); context.close(); }
+      }
+    `;
+    const output = spawnSync(process.execPath, ['--input-type=module', '-e', script, JSON.stringify(libraries)], { encoding: 'utf8' });
+    assert.equal(output.status, 0, `${output.signal ?? ''} ${output.stdout}${output.stderr}`);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -375,7 +428,7 @@ test('opaque native context frees exactly once on close or GC and detached metho
       counter.close();
     `;
     const output = spawnSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', script, library], { encoding: 'utf8' });
-    assert.equal(output.status, 0, output.stdout + output.stderr);
+    assert.equal(output.status, 0, `${output.signal ?? ''} ${output.stdout}${output.stderr}`);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -388,24 +441,14 @@ test('typed shared snapshot frees after its last factory or accessor owner, incl
     const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
     const script = `
       import assert from 'node:assert/strict';
-      import { EventEmitter } from 'node:events';
       import { loadC2MemFfiNodeNativeSymbols, captureLocalIpcEndpointContextFromSymbols, createNodeIpcConnect } from ${JSON.stringify(moduleUrl)};
       const { symbols } = loadC2MemFfiNodeNativeSymbols(process.argv[1]);
       const counter = symbols.c2_mem_ffi_local_endpoint_context_capture(null).value;
-      const open = () => {
-        const socket = new EventEmitter();
-        socket.destroyed = false;
-        socket.pause = socket.resume = () => socket;
-        socket.end = () => socket;
-        socket.destroy = () => { socket.destroyed = true; socket.emit('close'); return socket; };
-        queueMicrotask(() => socket.emit('connect'));
-        return socket;
-      };
       const context = captureLocalIpcEndpointContextFromSymbols(symbols);
-      const a = createNodeIpcConnect({endpointContext: context, createConnection: open});
-      const b = createNodeIpcConnect({endpointContext: context, createConnection: open});
-      const first = await a('ipc://first'), second = await b('ipc://second');
-      first.close(); second.close();
+      const a = createNodeIpcConnect({endpointContext: context});
+      const b = createNodeIpcConnect({endpointContext: context});
+      await assert.rejects(a('ipc://first'), /connect failed/);
+      await assert.rejects(b('ipc://second'), /connect failed/);
       context.close(); context.close(); a.close(); a.close();
       assert.equal(counter.namespaceId().value, '0');
       assert.equal(b.resolveEndpoint('ipc://third'), '/tmp/c2-context-fixture.sock');
@@ -414,26 +457,27 @@ test('typed shared snapshot frees after its last factory or accessor owner, incl
 
       let handle = captureLocalIpcEndpointContextFromSymbols(symbols);
       const weakHandle = new WeakRef(handle);
-      const retained = createNodeIpcConnect({endpointContext: handle, createConnection: open});
-      const retainedSocket = await retained('ipc://retained');
+      const retained = createNodeIpcConnect({endpointContext: handle});
+      await assert.rejects(retained('ipc://retained'), /connect failed/);
       handle = null;
       for (let attempt = 0; attempt < 10; attempt += 1) {
         await new Promise(r => setTimeout(r, 5)); global.gc();
       }
       assert.equal(weakHandle.deref(), undefined, 'factory retains the snapshot, not the disposable caller handle');
       assert.equal(counter.namespaceId().value, '1');
-      retained.close(); retainedSocket.close();
+      retained.close();
       assert.equal(counter.namespaceId().value, '2', 'last explicit factory close releases an abandoned caller reference');
 
-      let abandoned = createNodeIpcConnect({nativeSymbols: symbols, createConnection: open});
-      const connection = await abandoned('ipc://gc');
+      const finalContext = captureLocalIpcEndpointContextFromSymbols(symbols);
+      let abandoned = createNodeIpcConnect({endpointContext: finalContext});
+      await assert.rejects(abandoned('ipc://gc'), /connect failed/);
+      finalContext.close();
       let query = abandoned.resolveEndpoint;
       abandoned = null;
       for (let attempt = 0; attempt < 3; attempt += 1) { global.gc(); await new Promise(r => setTimeout(r, 5)); }
       assert.equal(counter.namespaceId().value, '2', 'detached query must retain a live snapshot');
       assert.equal(query('ipc://live'), '/tmp/c2-context-fixture.sock');
       query = null;
-      connection.close();
       for (let attempt = 0; attempt < 100 && counter.namespaceId().value !== '3'; attempt += 1) {
         global.gc(); await new Promise(r => setTimeout(r, 5));
       }
@@ -441,7 +485,7 @@ test('typed shared snapshot frees after its last factory or accessor owner, incl
       counter.close();
     `;
     const output = spawnSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', script, library], { encoding: 'utf8' });
-    assert.equal(output.status, 0, output.stdout + output.stderr);
+    assert.equal(output.status, 0, `${output.signal ?? ''} ${output.stdout}${output.stderr}`);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -783,17 +827,17 @@ test('native dedicated requests and responses complete repeatedly without exhaus
 });
 
 
-test('native addon rejects ABI 4 before loading endpoint or pool symbols', () => {
+test('native addon rejects ABI 5 before loading endpoint or pool symbols', () => {
   const directory = mkdtempSync(resolve(tmpdir(), 'c2-stale-abi-'));
   try {
     const fixture = resolve(directory, 'stale.rs');
-    writeFileSync(fixture, '#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 4 }');
+    writeFileSync(fixture, '#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 5 }');
     const library = resolve(directory, process.platform === 'win32' ? 'stale.dll' : process.platform === 'darwin' ? 'stale.dylib' : 'stale.so');
     const output = spawnSync(process.env.RUSTC ?? 'rustc',
       ['--edition=2024', '--crate-type=cdylib', fixture, '-o', library],
       { cwd: directory, encoding: 'utf8' });
     assert.equal(output.status, 0, `${output.error ?? ''} ${output.stdout} ${output.stderr}`);
-    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 4.*expected version 5/);
+    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 5.*expected version 6/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

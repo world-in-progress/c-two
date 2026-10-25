@@ -1,8 +1,8 @@
 """Unit coverage for the native local-endpoint maintenance projection.
 
 These tests exercise the real public native objects: the same
-``_native.PyEndpointSweep`` / ``_native.PyEndpointCredential`` symbols the
-Python facade wraps. Nothing is monkeypatched into a fake, because the
+``_native.PyEndpointSweep`` / ``cc.EndpointCredential`` objects the
+Python maintenance API uses. Nothing is monkeypatched into a fake, because the
 properties under test (the process maintenance lease, strict credential
 parsing, honest result statuses) are owned by Rust and would not be proven by
 a stub.
@@ -13,6 +13,7 @@ executable coverage instead of disappearing from the suite.
 """
 from __future__ import annotations
 
+import copy
 import gc
 import json
 import os
@@ -121,18 +122,28 @@ def _native_credential(address: str = 'ipc://unit-native-endpoint') -> cc.Endpoi
     return cc.EndpointCredential.from_json(_native_document(address))
 
 
-def test_credential_is_an_opaque_native_wrapper() -> None:
-    # The Python type carries no field table; it only wraps the native value.
+def test_credential_is_an_opaque_native_value() -> None:
     credential = _native_credential()
-    assert isinstance(credential._native, _native.PyEndpointCredential)
+    assert type(credential) is cc.EndpointCredential is _native.EndpointCredential
+    assert not hasattr(_native, 'PyEndpointCredential')
+    assert not hasattr(credential, '_native')
+    with pytest.raises(TypeError):
+        cc.EndpointCredential(credential)
+    with pytest.raises(TypeError):
+        type('CredentialSubclass', (cc.EndpointCredential,), {})
+    with pytest.raises(AttributeError):
+        credential._native = object()
+    with pytest.raises(TypeError):
+        copy.copy(credential)
     assert credential.address == 'ipc://unit-native-endpoint'
     assert credential.protocol == ('named-pipe' if IS_WINDOWS else 'managed-v2')
     assert credential.platform == ('windows' if IS_WINDOWS else 'unix')
 
 
-def test_credential_round_trips_through_the_one_rust_codec() -> None:
-    document = _native_document()
-    credential = cc.EndpointCredential.from_json(document)
+@pytest.mark.parametrize('address', ['ipc://unit-native-endpoint', 'ipc://quote"-雪', 'ipc://both\'"-\ue000'])
+def test_credential_round_trips_through_the_one_rust_codec(address) -> None:
+    document = _native_document(address)
+    credential = cc.EndpointCredential.from_json(document=document)
     # `to_json` is produced by the Rust encoder; re-parsing it must yield the
     # same metadata, proving the value never passes through a Python field
     # table on the way out.
@@ -140,6 +151,8 @@ def test_credential_round_trips_through_the_one_rust_codec() -> None:
     assert reparsed.address == credential.address
     assert reparsed.protocol == credential.protocol
     assert reparsed.to_json() == credential.to_json()
+    assert type(credential).__module__ == 'c_two.transport.endpoint'
+    assert repr(credential) == f'EndpointCredential(address={address!r}, protocol={credential.protocol!r})'
 
 
 def test_credential_from_json_rejects_a_non_string_document() -> None:
@@ -383,6 +396,7 @@ def _assert_new_incarnation_preserved() -> None:
         address = cc.server_address()
         first = cc.inspect_endpoint(address)
         assert first['status'] == 'present', first
+        assert type(first['credential']) is cc.EndpointCredential
         old = cc.EndpointCredential.from_json(first['credential'].to_json())
         cc.shutdown()
         cc.set_server(server_id=server_id)

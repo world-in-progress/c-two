@@ -88,6 +88,23 @@ pub struct Connection {
     ordinary_protocol: AtomicBool,
     handshake_done: AtomicBool,
     chunked_capable: AtomicBool,
+    /// Native shared-memory reachability observed on this connection's
+    /// accepted stream (same TokenSessionId as the peer on Windows; always
+    /// true on Unix). Captured before the handshake so the capability ACK is
+    /// the intersection of the client's offer with actual reachability.
+    /// Defaults to `false`: a connection whose stream was never observed
+    /// never negotiates SHM directions.
+    native_shm_reachable: AtomicBool,
+    /// Whether the handshake negotiated the client→server SHM request
+    /// direction (client offered `CAP_SHM_REQUEST` and the native
+    /// reachability above agreed). Inbound buddy request frames are rejected
+    /// before any admission, lazy-open, or late-discard cleanup while this
+    /// is false.
+    shm_request_capable: AtomicBool,
+    /// Whether the handshake negotiated the server→client SHM response
+    /// direction. While false, response transport selection never publishes
+    /// response coordinates on this connection.
+    shm_response_capable: AtomicBool,
 
     /// Client's SHM pool incarnation prefix and opened peer cache.
     peer_shm: Mutex<PeerShmState>,
@@ -129,6 +146,9 @@ impl Connection {
             ordinary_protocol: AtomicBool::new(false),
             handshake_done: AtomicBool::new(false),
             chunked_capable: AtomicBool::new(false),
+            native_shm_reachable: AtomicBool::new(false),
+            shm_request_capable: AtomicBool::new(false),
+            shm_response_capable: AtomicBool::new(false),
             peer_shm: Mutex::new(PeerShmState::new()),
             last_activity: Mutex::new(Instant::now()),
             inflight: AtomicI32::new(0),
@@ -179,6 +199,36 @@ impl Connection {
 
     pub fn set_chunked_capable(&self, v: bool) {
         self.chunked_capable.store(v, Ordering::Relaxed);
+    }
+
+    /// Native shared-memory reachability of this connection's accepted
+    /// stream; set once by the accept path before the handshake runs.
+    pub(crate) fn native_shm_reachable(&self) -> bool {
+        self.native_shm_reachable.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_native_shm_reachable(&self, v: bool) {
+        self.native_shm_reachable.store(v, Ordering::Release);
+    }
+
+    /// Whether the handshake negotiated the client→server SHM request
+    /// direction for this connection.
+    pub(crate) fn shm_request_capable(&self) -> bool {
+        self.shm_request_capable.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_shm_request_capable(&self, v: bool) {
+        self.shm_request_capable.store(v, Ordering::Release);
+    }
+
+    /// Whether the handshake negotiated the server→client SHM response
+    /// direction for this connection.
+    pub(crate) fn shm_response_capable(&self) -> bool {
+        self.shm_response_capable.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_shm_response_capable(&self, v: bool) {
+        self.shm_response_capable.store(v, Ordering::Release);
     }
 
     // -- peer SHM accessors -------------------------------------------------
@@ -435,6 +485,11 @@ mod tests {
         assert_eq!(conn.conn_id(), 42);
         assert!(!conn.handshake_done());
         assert!(!conn.chunked_capable());
+        // SHM directions fail closed until the accept path observes the
+        // stream and the handshake negotiates them.
+        assert!(!conn.native_shm_reachable());
+        assert!(!conn.shm_request_capable());
+        assert!(!conn.shm_response_capable());
         assert!(conn.peer_prefix().is_empty());
         assert!(conn.peer_pool_arc().is_none());
         assert_eq!(conn.inflight_count(), 0);

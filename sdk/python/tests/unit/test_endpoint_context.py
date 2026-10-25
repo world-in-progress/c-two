@@ -592,7 +592,7 @@ def test_credential_retains_recorded_directory_under_new_environment() -> None:
         for result in (
             cc.reap_endpoint(credential.address, credential, root={root!r}),
             cc.reap_endpoint(credential.address, credential, context=cc.local_endpoint_context()),
-            _native.reap_endpoint_credential(credential.address, credential._native, root={root!r}),
+            _native.reap_endpoint_credential(credential.address, credential, root={root!r}),
         ):
             assert result['status'] == 'stale-target', result
             assert result['reason'] == 'credential-context-mismatch', result

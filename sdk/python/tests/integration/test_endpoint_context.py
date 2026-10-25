@@ -299,7 +299,7 @@ def test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state(ab
             for result in (
                 cc.reap_endpoint({address!r}, credential, root={other!r}),
                 cc.reap_endpoint({address!r}, credential, context=cc.local_endpoint_context()),
-                _native.reap_endpoint_credential({address!r}, credential._native, root={other!r}),
+                _native.reap_endpoint_credential({address!r}, credential, root={other!r}),
             ):
                 assert result['status'] == 'stale-target', result
                 assert result['reason'] == 'credential-context-mismatch', result

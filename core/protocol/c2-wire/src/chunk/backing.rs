@@ -478,6 +478,7 @@ mod tests {
         assert!(backing.try_release().unwrap());
         assert!(backing.is_released());
         assert!(backing.copy_bytes().is_err());
+        assert!(backing.write_at(0, &[21]).unwrap_err().contains("released"));
         assert_eq!(budget.snapshot().file.used_bytes, 4096);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 4096);
         // Idempotent release needs no lock once the storage is gone.
@@ -598,6 +599,12 @@ mod tests {
         backing.release().unwrap();
         assert_eq!(pool.read().stats().alloc_count, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+        assert!(
+            backing
+                .write_at(0, &[0x33])
+                .unwrap_err()
+                .contains("released")
+        );
     }
 
     fn coordinates(handle: &MemHandle) -> (u16, u32, u32) {

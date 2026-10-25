@@ -1,6 +1,6 @@
 # C-Two CLI (C3)
 
-C3 **0.4.1** accompanies C-Two **0.8.2**, sharing its native ownership, connection observation and local OS error handling. See the [release notes](../docs/releases/0.8.2.md).
+C3 **0.5.0** accompanies C-Two **0.9.0**, sharing its native ownership, connection observation and local OS error handling. See the [release notes](../docs/releases/0.9.0.md).
 
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
@@ -109,7 +109,7 @@ Useful options:
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
-| `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-<uidhex>` (Unix) | Final private endpoint directory; custom directories are application-provisioned with mode `0700`. Not applicable on Windows, where upstream IPC uses current-logon-SID Named Pipes. |
+| `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-<uidhex>` (Unix) | Final private endpoint directory; custom directories are application-provisioned with mode `0700`. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
 | `--ipc-pool-enabled <true\|false>` | `C2_IPC_POOL_ENABLED` | Rust resolver | Enable buddy for data-plane upstream IPC; `false` still permits dedicated SHM. |
 | `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |
 | `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
@@ -193,7 +193,7 @@ operates strictly on that captured context, so a credential from one root
 never touches an object under another. Custom-root routes discovered through
 a relay answer over HTTP when the relay's local namespace does not match;
 the namespace hint is a routing-domain signal, not an authentication
-credential. On Windows these commands keep their current-logon-SID Named
+credential. On Windows these commands keep their TokenUser-scoped Named
 Pipe behavior and `--ipc-root` is rejected as not applicable.
 
 Inspect reports observation, not process liveness. Reap refuses stale or
@@ -258,7 +258,7 @@ uv run --python 3.11 --group banner tools/dev/generate_banner.py
 
 ## Release
 
-The coordinated [c3 0.4.1 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.4.1)
+The coordinated [c3 0.5.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.5.0)
 uses the following binary target convention. Installation and checksum
 verification are in the [Windows guide](../docs/windows-native-usage.md):
 
@@ -276,14 +276,14 @@ The matching release's `rc-manifest.json` identifies the artifact source.
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.4.1
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.5.0
 ```
 
 The installer detects Linux/macOS and x86_64/aarch64. It defaults to
 `/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.4.1 --bin-dir "$HOME/bin"
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.5.0 --bin-dir "$HOME/bin"
 ```
 
 ### Windows x64 / ARM64
@@ -292,7 +292,7 @@ Download the PowerShell installer and select the coordinated version explicitly:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.4.1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.5.0
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```

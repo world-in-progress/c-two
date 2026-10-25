@@ -10,6 +10,15 @@ import pytest
 from c_two.mem import MemPool, PoolConfig, cleanup_stale_shm
 
 
+def test_manual_assembly_exports_retired():
+    from c_two import _native, mem
+
+    for name in ("ChunkAssembler", "MemHandle"):
+        assert name not in mem.__all__
+        assert not hasattr(mem, name)
+        assert not hasattr(_native, name)
+
+
 # ------------------------------------------------------------------
 # PoolConfig validation
 # ------------------------------------------------------------------
