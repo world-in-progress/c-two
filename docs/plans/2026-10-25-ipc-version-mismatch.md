@@ -1,6 +1,6 @@
 # IPC 版本不符的固定握手前导与结构化诊断
 
-状态：用户已批准按此边界实施；先补基线反例，再迁移生产与测试，验收后提交并回到瘦身清单；本批不发版。源码输入 `79d544cc1efabaf34b3eac2af7075dc8a556cd43`，当前 C-Two 0.9.0、IPC 握手 13、SHM 3、C/FFI ABI 6。R15 的已完成实现保持，R35 与两份控制会话重构继续暂缓。
+状态：已完成实现、基线反例、定向与完整跨平台回归、延迟对照、端点零残留和独立审查；确切候选 `968f7d29153ff23fc967f767d97506823554de1d`，见[验收记录](../reports/2026-10-26-ipc14-version-diagnostics-acceptance.md)。本批不发版。基线输入 `79d544cc1efabaf34b3eac2af7075dc8a556cd43` 当时为 C-Two 0.9.0、IPC 握手 13、SHM 3、C/FFI ABI 6；本次仅握手切换为 14。R15 的已完成实现保持，R35 与两份控制会话重构继续暂缓。
 
 ## 已核对的原因与边界
 
@@ -73,7 +73,7 @@ Windows 端点约定同时固定 TokenUser 来源、SID 文本和 server_id 编�
 - 已发布 0.9.0 wheel 与新构建各当一次客户端/服务端；按相同用户、根目录及逻辑地址测试，保留发行物哈希。只断言旧新组合不执行业务并明确记录实际连接失败，不从 EOF、错误码或文本推断版本。
 - Windows 优先开发机，Linux/macOS/Windows x64/ARM64 对确切候选执行 GitHub Actions。记录平台、架构、Python、原始日志与源码/wheel 哈希；未实测的平台明列缺口。只处理本批私有端点并及时清理构建产物，历史目录不动。
 
-当前证据仅为源码、历史及官方平台文档核对，尚无本方案的运行验证、性能数字或跨平台通过结论。方案确认后才实施。
+以上保留批准时的设计与静态估算；实施后的真实增量、失败处理、性能和完整平台结果以验收记录为准。
 
 独立只读复核使用 hey-my-buddy：Windows 命名与分流 run `874a7ddf-d21e-4fd1-b638-c7e95932a5e2` / artifact `b904c0f1-1c88-4e1f-81c1-ba4962a89415`；方案审查 run `34ee5035-cdb9-4798-95cc-c95824006648` / artifact `0db5d0b7-2e0a-418b-80df-26a4d1f3ca46`。Host 已将 Node 实际 fallback catch、最终 ACK 后开放 heartbeat、固定长度读取、Windows 拒绝发送与等待预算四项要求纳入本方案，并明确未握手 RPC 的接纳围栏。审查没有执行测试，报告已接受，工作树已回收；原始记录保留于 `~/.codex/diagnostics/c2-ipc-version-design-21ir7k2f/`。
 

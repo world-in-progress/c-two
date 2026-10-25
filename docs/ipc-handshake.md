@@ -1,6 +1,6 @@
 # IPC RPC 握手与固定版本前导规范
 
-状态：本文描述当前源码（IPC 握手版本 14）的规范边界，作为以后协议演进的依据；已发布的 C-Two 0.9.0 仍使用无固定前导的握手 13，两者不兼容。实现背景与批准边界见 [方案](plans/2026-10-25-ipc-version-mismatch.md)；未发布的变更记录见 [unreleased](releases/unreleased.md)。
+状态：本文描述当前源码（IPC 握手版本 14）的规范边界，作为以后协议演进的依据；已发布的 C-Two 0.9.0 仍使用无固定前导的握手 13，两者不兼容。实现背景与批准边界见 [方案](plans/2026-10-25-ipc-version-mismatch.md)；未发布的变更记录见 [unreleased](releases/unreleased.md)。 本次实现的三系统门禁、旧版混用边界及延迟证据见[验收记录](reports/2026-10-26-ipc14-version-diagnostics-acceptance.md)。
 
 ## 适用范围
 

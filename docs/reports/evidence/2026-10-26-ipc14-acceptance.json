@@ -1,0 +1,575 @@
+{
+  "schema": "c-two.ipc14-acceptance.v1",
+  "status": "accepted",
+  "base": "79d544cc1efabaf34b3eac2af7075dc8a556cd43",
+  "implementation_candidate": "968f7d29153ff23fc967f767d97506823554de1d",
+  "fastdb_source": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+  "publication": false,
+  "package_version_unchanged": "0.9.0",
+  "protocols": {
+    "ipc": 14,
+    "shm": 3,
+    "ffi_abi": 6,
+    "owner_control": 1
+  },
+  "delta": {
+    "documentation": {
+      "added": 869,
+      "deleted": 22,
+      "net": 847
+    },
+    "production": {
+      "added": 510,
+      "deleted": 103,
+      "net": 407
+    },
+    "tests": {
+      "added": 1375,
+      "deleted": 119,
+      "net": 1256
+    }
+  },
+  "ci": {
+    "run": 40226200305,
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/40226200305",
+    "attempt": 1,
+    "jobs": {
+      "changes": "success",
+      "workflow policy": "success",
+      "source (ubuntu-24.04, py3.12)": "success",
+      "source (ubuntu-24.04, py3.14t)": "success",
+      "source (macos-15, py3.12)": "success",
+      "source (windows-11-arm, py3.12)": "success",
+      "source (windows-2025, py3.12)": "success",
+      "source (windows-2022, py3.12)": "success",
+      "test (py3.14t)": "success",
+      "test (py3.12)": "success"
+    },
+    "source_gate_count": 147,
+    "lanes": [
+      {
+        "lane": "macos",
+        "runner": "macos-15",
+        "architecture": "arm64",
+        "python": "Python 3.12.10",
+        "source_verified": true,
+        "source_gates": 25,
+        "run_evidence_sha256": "4d74ab3185c554474094645a0fd41fd414752f2f1920d33f379cd77f1f4ba62e",
+        "rust_unit_counts": {
+          "c2_http": {
+            "passed": 417,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_ipc": {
+            "passed": 226,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_server": {
+            "passed": 193,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_wire": {
+            "passed": 167,
+            "failed": 0,
+            "ignored": 0
+          }
+        },
+        "ordinary": {
+          "passed": 1257,
+          "platform_skips": 10
+        },
+        "cross_language_tests": 25,
+        "typescript_tests": 15,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup": {
+          "host_processes_stopped": true,
+          "node_processes_stopped": true,
+          "relay_processes_stopped": true,
+          "response_readers_closed": true
+        }
+      },
+      {
+        "lane": "ubuntu-314t",
+        "runner": "ubuntu-24.04",
+        "architecture": "x86_64",
+        "python": "Python 3.14.9",
+        "source_verified": true,
+        "source_gates": 16,
+        "run_evidence_sha256": "8567eaf296944d03197fa217b001f3c5e0ea21eb4d17f906be34ffcdc84c2063",
+        "rust_unit_counts": {},
+        "ordinary": {
+          "passed": 1257,
+          "platform_skips": 10
+        },
+        "cross_language_tests": 25,
+        "typescript_tests": 15,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup": {
+          "host_processes_stopped": true,
+          "node_processes_stopped": true,
+          "relay_processes_stopped": true,
+          "response_readers_closed": true
+        }
+      },
+      {
+        "lane": "ubuntu-full",
+        "runner": "ubuntu-24.04",
+        "architecture": "x86_64",
+        "python": "Python 3.12.15",
+        "source_verified": true,
+        "source_gates": 25,
+        "run_evidence_sha256": "ad37c71b70f5a312187957a9df5fd4f694ec6279b1edef69ba842b94589f7d62",
+        "rust_unit_counts": {
+          "c2_http": {
+            "passed": 417,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_ipc": {
+            "passed": 226,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_server": {
+            "passed": 193,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_wire": {
+            "passed": 167,
+            "failed": 0,
+            "ignored": 0
+          }
+        },
+        "ordinary": {
+          "passed": 1257,
+          "platform_skips": 10
+        },
+        "cross_language_tests": 25,
+        "typescript_tests": 15,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup": {
+          "host_processes_stopped": true,
+          "node_processes_stopped": true,
+          "relay_processes_stopped": true,
+          "response_readers_closed": true
+        }
+      },
+      {
+        "lane": "windows-arm",
+        "runner": "windows-11-arm",
+        "architecture": "ARM64",
+        "python": "Python 3.12.10",
+        "source_verified": true,
+        "source_gates": 27,
+        "run_evidence_sha256": "049536a09d8c7c7d3d0fdcfc2fb5efe9b7bb9370d1a02cb9c2f359ad48fc1825",
+        "rust_unit_counts": {
+          "c2_http": {
+            "passed": 412,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_ipc": {
+            "passed": 226,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_server": {
+            "passed": 191,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_wire": {
+            "passed": 167,
+            "failed": 0,
+            "ignored": 0
+          }
+        },
+        "ordinary": {
+          "passed": 1220,
+          "platform_skips": 47
+        },
+        "cross_language_tests": 25,
+        "typescript_tests": 15,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup": {
+          "host_processes_stopped": true,
+          "node_processes_stopped": true,
+          "relay_processes_stopped": true,
+          "response_readers_closed": true
+        }
+      },
+      {
+        "lane": "windows2022",
+        "runner": "windows-2022",
+        "architecture": "AMD64",
+        "python": "Python 3.12.10",
+        "source_verified": true,
+        "source_gates": 27,
+        "run_evidence_sha256": "46c1d894d54686f9bd8946a78a0a33b5be01502b248eb7296d93026276cb5d48",
+        "rust_unit_counts": {
+          "c2_http": {
+            "passed": 412,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_ipc": {
+            "passed": 226,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_server": {
+            "passed": 191,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_wire": {
+            "passed": 167,
+            "failed": 0,
+            "ignored": 0
+          }
+        },
+        "ordinary": {
+          "passed": 1220,
+          "platform_skips": 47
+        },
+        "cross_language_tests": 25,
+        "typescript_tests": 15,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup": {
+          "host_processes_stopped": true,
+          "node_processes_stopped": true,
+          "relay_processes_stopped": true,
+          "response_readers_closed": true
+        }
+      },
+      {
+        "lane": "windows2025",
+        "runner": "windows-2025",
+        "architecture": "AMD64",
+        "python": "Python 3.12.10",
+        "source_verified": true,
+        "source_gates": 27,
+        "run_evidence_sha256": "48bb4e8793c0df92ae65b29a10942066f93b5fb807642d936cadd73c1fc4e8a5",
+        "rust_unit_counts": {
+          "c2_http": {
+            "passed": 412,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_ipc": {
+            "passed": 226,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_server": {
+            "passed": 191,
+            "failed": 0,
+            "ignored": 0
+          },
+          "c2_wire": {
+            "passed": 167,
+            "failed": 0,
+            "ignored": 0
+          }
+        },
+        "ordinary": {
+          "passed": 1220,
+          "platform_skips": 47
+        },
+        "cross_language_tests": 25,
+        "typescript_tests": 15,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup": {
+          "host_processes_stopped": true,
+          "node_processes_stopped": true,
+          "relay_processes_stopped": true,
+          "response_readers_closed": true
+        }
+      }
+    ],
+    "artifacts": [
+      {
+        "id": 12612380228,
+        "name": "source-macos-15-py3.12-full-968f7d29153ff23fc967f767d97506823554de1d",
+        "digest": "sha256:96093d66e0abaf4efdb4daab832a139b4005bc36c2d8216a42bb5210e8b0ab60"
+      },
+      {
+        "id": 12612341201,
+        "name": "source-windows-11-arm-py3.12-full-968f7d29153ff23fc967f767d97506823554de1d",
+        "digest": "sha256:0d675224d2f6dd28dbc4357493fcce58f42bca19c4e70cc87e468af37f7e363c"
+      },
+      {
+        "id": 12611715483,
+        "name": "source-ubuntu-24.04-py3.14t-python-968f7d29153ff23fc967f767d97506823554de1d",
+        "digest": "sha256:332f56772fd887a129868922ec950fbe24d5fd00b7366e8d961f388b2ecdfebd"
+      },
+      {
+        "id": 12611596516,
+        "name": "source-windows-2022-py3.12-full-968f7d29153ff23fc967f767d97506823554de1d",
+        "digest": "sha256:9cce2964e17db66db41e82c160fe27d39e3f90bd24bcebd6b94eba50395fcc21"
+      },
+      {
+        "id": 12611509330,
+        "name": "source-windows-2025-py3.12-full-968f7d29153ff23fc967f767d97506823554de1d",
+        "digest": "sha256:c131581ce30838e9a3c9a1c3e0055c4cdc007e51c38d8bec31e28a1cafb98d3a"
+      },
+      {
+        "id": 12611438990,
+        "name": "source-ubuntu-24.04-py3.12-full-968f7d29153ff23fc967f767d97506823554de1d",
+        "digest": "sha256:2ca6f94d9dd9b136b3eb3f370cbbfb2d5531790d39b88d780ba75a23d3ad259d"
+      },
+      {
+        "id": 12610579501,
+        "name": "workflow-policy-968f7d29153ff23fc967f767d97506823554de1d",
+        "digest": "sha256:bc5f4b601f8e45c3bfc13264b40b98c6f61f2b0d97867a42321139ecfbfa238d"
+      }
+    ]
+  },
+  "prior_ci_attempts": [
+    {
+      "run": 40214994701,
+      "source": "05661b9f9b87164fb43a15b94790ffd9bf1cdb1a",
+      "disposition": "cancelled",
+      "reason": "Windows developer-host scripted-peer post-close flush race; correction before accepting CI"
+    },
+    {
+      "run": 40216780388,
+      "source": "19a14feba9e617a71739fc38141693772eb60aa3",
+      "disposition": "cancelled early",
+      "reason": "remove now-unused async flush trait import before source qualification"
+    },
+    {
+      "run": 40216920609,
+      "source": "fa4e1b8a25d30a3f9d60faaefbc303d1c46711b5",
+      "disposition": "completed failed",
+      "reason": "all6 lanes: old CoreError strict fields/category expectations; macOS core-test: shared namespace exit-owner inspection assertion; all complete gate evidence audited"
+    },
+    {
+      "run": 40221589718,
+      "source": "0893a3b0616cd26df7cdbab90c0a9c72afb97a90",
+      "disposition": "cancelled",
+      "reason": "before claiming final, correct baseline exit-owner fixture isolation after controlled baseline reproduction; source c2-local remains unchanged"
+    },
+    {
+      "run": 40222763805,
+      "source": "7524f1e7cae881fdfb8e56d38d98981d1d22f38e",
+      "disposition": "completed failed",
+      "reason": "Only Ubuntu3.12 full python-suite failed: unchanged idle pool test sampled transient readiness-probe FD into initial baseline; other five source lanes succeeded. Controlled baseline reproduction retained; fixture correction pending."
+    }
+  ],
+  "performance": {
+    "python": {
+      "baseline-env": {
+        "fresh_connect": {
+          "n": 21,
+          "p50_ms": 1.191208,
+          "p95_ms": 1.329292,
+          "min_ms": 1.081083,
+          "max_ms": 1.644791
+        },
+        "persistent_call": {
+          "n": 4200,
+          "p50_ms": 0.079417,
+          "p95_ms": 0.153583,
+          "min_ms": 0.051959,
+          "max_ms": 0.625917
+        },
+        "zero_residue": true
+      },
+      "candidate-env": {
+        "fresh_connect": {
+          "n": 21,
+          "p50_ms": 1.249042,
+          "p95_ms": 1.467375,
+          "min_ms": 1.084584,
+          "max_ms": 1.65225
+        },
+        "persistent_call": {
+          "n": 4200,
+          "p50_ms": 0.0760835,
+          "p95_ms": 0.178,
+          "min_ms": 0.052542,
+          "max_ms": 4.008
+        },
+        "zero_residue": true
+      }
+    },
+    "node": {
+      "baseline": {
+        "fresh": {
+          "n": 155,
+          "p50_ms": 0.4437499999999943,
+          "p95_ms": 1.2972919999999988
+        },
+        "persistent": {
+          "n": 2500,
+          "p50_ms": 0.113249500000002,
+          "p95_ms": 0.22695900000002212
+        },
+        "relay": {
+          "n": 500,
+          "p50_ms": 0.5766459999999967,
+          "p95_ms": 0.8969580000000121
+        }
+      },
+      "candidate": {
+        "fresh": {
+          "n": 155,
+          "p50_ms": 0.5485829999999936,
+          "p95_ms": 1.092250000000007
+        },
+        "persistent": {
+          "n": 2500,
+          "p50_ms": 0.11547900000000055,
+          "p95_ms": 0.21066700000000083
+        },
+        "relay": {
+          "n": 500,
+          "p50_ms": 0.6205834999999951,
+          "p95_ms": 1.0090419999999938
+        }
+      }
+    },
+    "version_rejection": {
+      "n": 31,
+      "p50_ms": 0.744458,
+      "p95_ms": 0.914125,
+      "all_endpoint_lease_remaining": 0,
+      "sdk_boundary": "cc.connect entry to caught CoreError; native failed-connection close included"
+    }
+  },
+  "performance_source": "0893a3b0616cd26df7cdbab90c0a9c72afb97a90; later candidates change tests only",
+  "reviews": [
+    {
+      "run": "143e6fcd-6b33-4e9e-b7f6-8a6190c4c1cd",
+      "scope": "Initial implementation: stale raw peers found and fixed",
+      "blocking_findings_remaining": 0,
+      "artifact": "120ef574-7129-4daf-b6bc-69947ed3069e",
+      "state": "accepted",
+      "checkout_cleanup": "applied"
+    },
+    {
+      "run": "6ea5b92f-b8a3-4936-ac72-2d12b77065ee",
+      "scope": "Raw peer migration recheck",
+      "blocking_findings_remaining": 0,
+      "artifact": "f1266755-1d15-45ec-9b79-1ed18fc1bb18",
+      "state": "accepted",
+      "checkout_cleanup": "applied"
+    },
+    {
+      "run": "69dc784f-4a56-419e-a30f-eb8ea105e86c",
+      "scope": "Windows flush and bounded peer-close",
+      "blocking_findings_remaining": 0,
+      "artifact": "21b45b59-17eb-49f3-988a-3c4091dec18b",
+      "state": "accepted",
+      "checkout_cleanup": "applied"
+    },
+    {
+      "run": "0efdaaab-f329-4596-bbca-39619bf2af95",
+      "scope": "Small max_frame boundary",
+      "blocking_findings_remaining": 0,
+      "artifact": "c5287efc-adad-4ed5-be4d-76841f24f21a",
+      "state": "accepted",
+      "checkout_cleanup": "applied"
+    },
+    {
+      "run": "2e4c089c-3de8-4b9e-901b-81e4591c93eb",
+      "scope": "Private namespace exit fixture",
+      "blocking_findings_remaining": 0,
+      "artifact": "f2ce20ca-789a-4ff5-a500-0155246bfa4e",
+      "state": "accepted",
+      "checkout_cleanup": "applied"
+    },
+    {
+      "run": "de61efd2-7191-4dc9-a971-9e895e265ee3",
+      "scope": "Idle baseline, final968f7d29; Windows skip finding resolved",
+      "blocking_findings_remaining": 0,
+      "artifact": "7ed6fec9-e4ac-4eb9-9d92-465566d4fde3",
+      "state": "accepted",
+      "checkout_cleanup": "applied"
+    }
+  ],
+  "idle_fixture": {
+    "controlled_baseline_source": "79d544cc1efabaf34b3eac2af7075dc8a556cd43",
+    "controlled_baseline": 5,
+    "old_expected": 6,
+    "actual_after_probe_exit_and_business_connect": 5,
+    "original_ci_fd_identity_unrecorded": true,
+    "baseline_checks_passed": 2,
+    "candidate_checks_passed": 2,
+    "final_folded_test_passed": 1,
+    "final_folded_seconds": 125.97,
+    "changed_skip_rules": false
+  },
+  "cleanup": {
+    "local_removed_logical_bytes": 6868225006,
+    "windows_removed_logical_bytes": 2892516412,
+    "remaining_task_build_locations": 0,
+    "isolated_endpoint_and_lease_residue": 0,
+    "historical_objects_cleaned": false,
+    "scope_note": "One local connect_timeout run used default context by mistake; seven tests passed and native exact cleanup completed. Full relay uses clean CI runners."
+  },
+  "private_evidence_root": "~/.codex/diagnostics/c2-ipc14-implementation-mxyfpx5g/",
+  "retained_evidence_sha256": {
+    "macos-python-performance-raw.json": "272d79663336cf244925c5431d6e04f57e757f62c3242ec15720f89c4c9b3e6e",
+    "macos-node-performance-raw.json": "9528c6ca3f9d64dc50f20fa17ee53a17ed8f855f5c8a7f9f30d70a37742940d1",
+    "macos-version-failure-latency-raw.json": "857a7588a2192a58a01da8aeffde75a56fd4093447dcbf66e333a729a2ffda5b",
+    "macos-published-mixed.json": "62d290c93f96e9f4b9c182256b99afe6c9a94e2c5f3849629eab8dfa5ce0bf91",
+    "published-090-wheels.json": "0bda3cc40e1a33add9e433c10e45e53c54141726edb74a961cfda2ad9abd014a",
+    "baseline-wheel.json": "e5fd237b6afcef286d364c1d5b019c76b32e16ee49ff88cdd861be9e939b8380",
+    "bounded-preamble-wheel.json": "8b02916183ceae6364b848069c961fb117f9858044c7672457469d9bc4205359",
+    "build-environment.json": "c9d696d2fa8ed1cc36868619322b6bd3033a5c1e80ba8be7a8b38e95cdd0e762",
+    "windows-evidence/final-evidence.json": "227475c643872f5b670638b21d44485197e31988ea70ced6143da407340d8977",
+    "windows-frame-boundary-receipt.json": "6bcdd70934374272c7c0b0a89341ed484f861da2b6f58deec1dd6ecd33e295c0",
+    "idle-baseline-controlled.json": "07461a19a385da1c9a47ac6444c575e369f20533f8551cfcef44cead811b6f9b",
+    "local-cleanup-final.json": "47a9d4aa6e933fcd70551772c1e6fdd6517b3134611a9f5ab13c4dd66b822930",
+    "windows-evidence/cleanup.json": "22a73667967a2e43bba9fdc7b70b713d209fc7b5c1f1c6e30ccbf2d8da2f8ae3"
+  },
+  "delivery_acceptance": {
+    "rust": {
+      "run": "95393394-fafc-46e1-b221-a1f273ada4d7",
+      "artifact": "4bc936b6-1501-4b6b-8440-27a53dbb9d33",
+      "source": "968f7d29153ff23fc967f767d97506823554de1d",
+      "host_adjusted": true,
+      "checkout_reclaimed": true
+    },
+    "typescript": {
+      "run": "3ec99a44-3b43-4e1a-93fb-69b47f098b37",
+      "artifact": "73eaf8e1-72c1-4546-9d55-cd4a48794c37",
+      "source": "968f7d29153ff23fc967f767d97506823554de1d",
+      "host_adjusted": true,
+      "checkout_reclaimed": true
+    },
+    "public-tests": {
+      "run": "97f37e0d-631a-49df-a844-f54dcaeabcaa",
+      "artifact": "7abccd9e-817e-47ca-b3c7-3074570fa251",
+      "source": "968f7d29153ff23fc967f767d97506823554de1d",
+      "host_adjusted": true,
+      "checkout_reclaimed": true
+    },
+    "docs": {
+      "run": "c7fb7661-c924-47a0-989c-a2c45b711de0",
+      "artifact": "c67a4f58-d83c-40ce-9697-cb9a0339a166",
+      "source": "968f7d29153ff23fc967f767d97506823554de1d",
+      "host_adjusted": true,
+      "checkout_reclaimed": true
+    },
+    "fixtures": {
+      "run": "de81a34a-9402-408b-9fb3-a74c791e70ba",
+      "artifact": "a9c340e6-a6e8-4007-9361-46b565cdac60",
+      "source": "968f7d29153ff23fc967f767d97506823554de1d",
+      "host_adjusted": false,
+      "checkout_reclaimed": true
+    }
+  }
+}
