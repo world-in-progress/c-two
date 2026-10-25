@@ -1,0 +1,214 @@
+{
+  "source": "2e9a40d25cbe4bf8c9b1bc34aa33120023b6723b",
+  "scope": "baseline-only advisory threshold comparison, not candidate speedup or end-to-end RPC",
+  "environment": {
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0.1\nBuildVersion:\t\t26A434\n",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)\nbinary: rustc\ncommit-hash: f8297e351a40c1439a467bbbb6879088047f50b3\ncommit-date: 2025-10-28\nhost: aarch64-apple-darwin\nrelease: 1.91.0\nLLVM version: 21.1.2\n",
+    "cpu": "Apple M1 Max"
+  },
+  "metadata": {
+    "arch": "aarch64",
+    "candidate_implemented": false,
+    "iterations": 2048,
+    "os": "macos",
+    "proposed_cache_bytes": 24,
+    "samples": 9,
+    "tracing_subscriber": false,
+    "type": "metadata"
+  },
+  "costs": [
+    {
+      "entries": 32,
+      "pressure_insert_abort_median_ns": 581.888671875,
+      "no_pressure_control_median_ns": 584.55419921875,
+      "delta_ns": -2.66552734375,
+      "full_scan_median_ns": 252.94970703125,
+      "pressure_samples_ns": [
+        807.29150390625,
+        795.87841796875,
+        681.57958984375,
+        593.8720703125,
+        581.888671875,
+        554.056640625,
+        516.357421875,
+        490.580078125,
+        465.14892578125
+      ],
+      "control_samples_ns": [
+        899.25146484375,
+        687.94775390625,
+        677.67333984375,
+        589.09130859375,
+        584.55419921875,
+        515.29931640625,
+        520.46728515625,
+        464.37548828125,
+        468.93310546875
+      ]
+    },
+    {
+      "entries": 512,
+      "pressure_insert_abort_median_ns": 2170.12548828125,
+      "no_pressure_control_median_ns": 401.44873046875,
+      "delta_ns": 1768.6767578125,
+      "full_scan_median_ns": 1725.76904296875,
+      "pressure_samples_ns": [
+        2732.89013671875,
+        2526.46923828125,
+        2251.1796875,
+        2173.76708984375,
+        2103.57666015625,
+        2170.12548828125,
+        2115.41748046875,
+        2117.77783203125,
+        2133.28076171875
+      ],
+      "control_samples_ns": [
+        578.61328125,
+        437.82568359375,
+        436.82861328125,
+        399.169921875,
+        406.20947265625,
+        398.193359375,
+        400.37060546875,
+        401.44873046875,
+        401.265625
+      ]
+    },
+    {
+      "entries": 1024,
+      "pressure_insert_abort_median_ns": 4464.02978515625,
+      "no_pressure_control_median_ns": 442.037109375,
+      "delta_ns": 4021.99267578125,
+      "full_scan_median_ns": 3978.9833984375,
+      "pressure_samples_ns": [
+        4406.83984375,
+        4408.1015625,
+        4552.388671875,
+        4447.93701171875,
+        4418.111328125,
+        4490.6005859375,
+        4530.517578125,
+        4548.84814453125,
+        4464.02978515625
+      ],
+      "control_samples_ns": [
+        436.03515625,
+        442.037109375,
+        443.07421875,
+        438.2529296875,
+        441.22314453125,
+        442.341796875,
+        440.51123046875,
+        442.525390625,
+        442.87109375
+      ]
+    }
+  ],
+  "progress": [
+    {
+      "active_after": 1,
+      "active_before": 2,
+      "budget_used_after": 64,
+      "budget_used_before": 128,
+      "case": "no_timer_count_pressure_expired_other_shards",
+      "error": null,
+      "insert_ok": true,
+      "registry_bytes_before": 128,
+      "rejections_delta": 0,
+      "type": "progress"
+    },
+    {
+      "active_after": 1,
+      "active_before": 2,
+      "budget_used_after": 64,
+      "budget_used_before": 128,
+      "case": "no_timer_exact_byte_threshold_expired",
+      "error": null,
+      "insert_ok": true,
+      "registry_bytes_before": 128,
+      "rejections_delta": 0,
+      "type": "progress"
+    },
+    {
+      "active_after": 2,
+      "active_before": 2,
+      "budget_used_after": 128,
+      "budget_used_before": 128,
+      "case": "no_timer_exact_byte_threshold_fresh",
+      "error": "memory budget cell 'reassembly' rejected a 64 byte reservation: 128 of 128 bytes already in use",
+      "insert_ok": false,
+      "registry_bytes_before": 128,
+      "rejections_delta": 1,
+      "type": "progress"
+    },
+    {
+      "active_after": 2,
+      "active_before": 2,
+      "budget_used_after": 128,
+      "budget_used_before": 128,
+      "case": "no_timer_smaller_shared_budget_expired",
+      "error": "memory budget cell 'reassembly' rejected a 64 byte reservation: 128 of 128 bytes already in use",
+      "insert_ok": false,
+      "registry_bytes_before": 128,
+      "rejections_delta": 1,
+      "type": "progress"
+    },
+    {
+      "budget_used": 64,
+      "case": "no_timer_smaller_shared_budget_expired",
+      "expired": 2,
+      "insert_ok": true,
+      "type": "explicit_progress"
+    },
+    {
+      "active_after": 1,
+      "active_before": 1,
+      "budget_used_after": 128,
+      "budget_used_before": 128,
+      "case": "no_timer_budget_includes_held_backing",
+      "error": "memory budget cell 'reassembly' rejected a 64 byte reservation: 128 of 128 bytes already in use",
+      "insert_ok": false,
+      "registry_bytes_before": 64,
+      "rejections_delta": 1,
+      "type": "progress"
+    },
+    {
+      "budget_used": 128,
+      "case": "no_timer_budget_includes_held_backing",
+      "expired": 1,
+      "insert_ok": true,
+      "type": "explicit_progress"
+    }
+  ],
+  "cleanup": {
+    "endpoints_created": 0,
+    "historical_namespace_touched": false,
+    "pools": 59,
+    "type": "cleanup",
+    "native_reopen_rejections": 77,
+    "reopen_error_kinds_recorded": false,
+    "cargo_removed_files": 490,
+    "cargo_removed_mib": 96.5,
+    "cargo_target_removed": true,
+    "review_worktree_reclaimed": true
+  },
+  "raw_sha256": "20826e6fa4c9f3d0a02ebea8edb7c3ad42d6c8dcc1386d2e15784ea589ec6b56",
+  "probe_source_sha256": "09c0e8453460b74b73b587265eba09963154dd9c23bc80099d8573261bc99b0d",
+  "review": {
+    "run_id": "aff52710-0be9-4e53-9472-620e643cf39b",
+    "artifact_id": "1321c8d8-1a03-41ee-b8ca-7f48fcfc58e2",
+    "scope": "independent static review of call paths, original design and proposed lower-bound cache; no execution by reviewer"
+  },
+  "validation_notes": [
+    "Initial temporary probe compilation used the wrong telemetry field name; corrected to BudgetCellSnapshot.rejected_allocations before execution. Production sources were unchanged.",
+    "No proposed cache was implemented or benchmarked. Threshold-disabled results are a diagnostic control, not a speedup claim.",
+    "All progress cases ran without a Tokio runtime or background GC timer. Explicit gc_sweep was invoked only in the recorded recovery controls.",
+    "Native reopen rejected all 77 task backing names after Drop; the probe did not retain the individual OS error kinds. The record does not claim a separate OS namespace inventory. No IPC endpoint was created."
+  ],
+  "source_verification": {
+    "tracked_core_files_compared": 237,
+    "differences": [],
+    "candidate_implemented": false
+  }
+}
