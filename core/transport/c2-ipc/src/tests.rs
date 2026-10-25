@@ -1,5 +1,19 @@
 //! c2-ipc unit tests.
 
+/// Common first exchange for manual peers that exercise ordinary IPC traffic.
+pub(crate) async fn accept_version_preamble(stream: &mut c2_local::LocalStream) {
+    use c2_wire::handshake::{VersionPreambleKind, encode_version_preamble};
+    use tokio::io::AsyncReadExt as _;
+
+    let mut hello = [0u8; 25];
+    stream.read_exact(&mut hello).await.expect("version Hello");
+    assert_eq!(hello, encode_version_preamble(VersionPreambleKind::Hello));
+    stream
+        .write_all(&encode_version_preamble(VersionPreambleKind::Accepted))
+        .await
+        .expect("version Accepted");
+}
+
 pub(crate) async fn close_listener(listener: c2_local::LocalListener) {
     let outcome = tokio::task::spawn_blocking(move || listener.close())
         .await
@@ -107,7 +121,7 @@ mod client_tests {
 
     #[test]
     fn handshake_client_message() {
-        // Client sends: [version][segments][cap_flags]
+        // Same-version client metadata: [prefix][segments][cap_flags]
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &encoded);
@@ -3859,6 +3873,124 @@ mod lazy_policy_roundtrip_tests {
 
     // ── Linearizable dispatch state and physical dedicated retirement ─────
 
+    #[tokio::test]
+    async fn handshake_version_mismatch_is_reported_by_real_client() {
+        use tokio::io::AsyncReadExt as _;
+
+        let local = u32::from(c2_wire::handshake::HANDSHAKE_VERSION);
+        for peer in [1, local + 1, u32::MAX] {
+            let address = unique_address("version_mismatch");
+            #[cfg(unix)]
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            #[cfg(unix)]
+            let endpoint = c2_config::LocalEndpointContext::with_unix_root(root.path())
+                .unwrap()
+                .endpoint(&address)
+                .unwrap();
+            #[cfg(windows)]
+            let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+            let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
+            let handler = tokio::spawn(async move {
+                let exchange = timeout(Duration::from_secs(5), async {
+                    let mut stream = listener.accept().await?;
+                    let mut hello = [0; 25];
+                    stream.read_exact(&mut hello).await?;
+                    let mut refusal = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\0\0\0\0";
+                    refusal[21..].copy_from_slice(&peer.to_le_bytes());
+                    stream.write_all(&refusal).await?;
+                    // Keep the pipe alive until local close, and detect metadata sent too early.
+                    let trailing = stream.read(&mut [0]).await;
+                    Ok::<_, std::io::Error>((hello, trailing))
+                })
+                .await;
+                crate::tests::close_listener(listener).await;
+                exchange
+            });
+            let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default());
+            let connected = timeout(Duration::from_secs(5), client.connect()).await;
+            client.close().await;
+            let (hello, trailing) = handler.await.expect("peer joined").unwrap().unwrap();
+            let error = connected.unwrap().expect_err("peer version differs");
+            assert!(
+                matches!(
+                    &error,
+                    IpcError::ProtocolVersionMismatch { local: actual_local, peer: actual_peer }
+                        if *actual_local == local && *actual_peer == peer
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("IPC protocol version mismatch: local={local}, peer={peer}"),
+            );
+            assert!(std::error::Error::source(&error).is_none());
+            let mut expected = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\0\0\0\0";
+            expected[21..].copy_from_slice(&local.to_le_bytes());
+            assert_eq!(hello, expected, "client sends only the fixed Hello first");
+            assert!(
+                matches!(trailing, Ok(0) | Err(_)),
+                "metadata requires acceptance: {trailing:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_version_responses_close_without_metadata_or_typed_mismatch() {
+        use tokio::io::AsyncReadExt as _;
+
+        let local = c2_wire::handshake::HANDSHAKE_VERSION;
+        for (kind, peer, header_only) in [
+            (2, local + 1, false), // Accepted with a different version.
+            (3, local, false),     // VersionMismatch with the same version.
+            (1, local, false),     // Hello is never a response.
+            (3, local + 1, true),  // Invalid length must fail before payload read.
+        ] {
+            let address = unique_address("invalid_version_reply");
+            #[cfg(unix)]
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            #[cfg(unix)]
+            let endpoint = c2_config::LocalEndpointContext::with_unix_root(root.path())
+                .unwrap()
+                .endpoint(&address)
+                .unwrap();
+            #[cfg(windows)]
+            let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+            let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
+            let handler = tokio::spawn(async move {
+                let exchange = timeout(Duration::from_secs(3), async {
+                    let mut stream = listener.accept().await?;
+                    let mut hello = [0u8; 25];
+                    stream.read_exact(&mut hello).await?;
+                    let mut response = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\0\0\0\0";
+                    response[20] = kind;
+                    response[21..].copy_from_slice(&peer.to_le_bytes());
+                    if header_only {
+                        response[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+                    }
+                    stream
+                        .write_all(&response[..if header_only { 16 } else { 25 }])
+                        .await?;
+                    Ok::<_, std::io::Error>(stream.read(&mut [0]).await)
+                })
+                .await;
+                crate::tests::close_listener(listener).await;
+                exchange
+            });
+            let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default());
+            let connected = timeout(Duration::from_secs(2), client.connect()).await;
+            client.close().await;
+            let trailing = handler.await.unwrap().unwrap().unwrap();
+            let error = connected
+                .expect("reject without waiting for more bytes")
+                .unwrap_err();
+            assert!(matches!(error, IpcError::Protocol(_)), "{error:?}");
+            assert!(
+                matches!(trailing, Ok(0) | Err(_)),
+                "metadata sent: {trailing:?}"
+            );
+        }
+    }
+
     /// Raw handshake-only peer: completes the client handshake and hands the
     /// accepted stream back to the test, so tests can observe exactly which
     /// bytes the client wrote after connecting.
@@ -3885,6 +4017,7 @@ mod lazy_policy_roundtrip_tests {
         tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept client");
             crate::tests::close_listener(listener).await;
+            crate::tests::accept_version_preamble(&mut stream).await;
             let mut len_buf = [0u8; 4];
             use tokio::io::AsyncReadExt as _;
             stream
@@ -4737,6 +4870,7 @@ mod lazy_policy_roundtrip_tests {
             epoch: u64,
         ) -> (c2_local::LocalStream, String) {
             let mut peer = listener.accept().await.unwrap();
+            crate::tests::accept_version_preamble(&mut peer).await;
             let bytes = read_frame(&mut peer).await;
             let (header, payload) = frame::decode_frame(&bytes).unwrap();
             assert!(header.is_handshake());
@@ -5971,9 +6105,9 @@ mod lazy_policy_roundtrip_tests {
         stop_server(&server).await;
     }
 
-    // ── Handshake v13 per-direction SHM negotiation ────────────────────────
+    // ── Per-direction SHM negotiation after version acceptance ─────────────
 
-    /// A peer that completes the v13 handshake and then answers call frames
+    /// A peer that completes the handshake and then answers call frames
     /// with a plain inline success reply. `ack_shm_request`/`ack_shm_response`
     /// control the ACK's SHM bits independently of what the client offered,
     /// so a non-intersecting ACK is representable. The returned mpsc channel
@@ -5994,6 +6128,7 @@ mod lazy_policy_roundtrip_tests {
         let (header_tx, header_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
             let mut peer = listener.accept().await.unwrap();
+            crate::tests::accept_version_preamble(&mut peer).await;
             drop(listener);
             let (header, payload) = read_raw_frame(&mut peer).await.expect("handshake frame");
             assert!(header.is_handshake());
@@ -6140,6 +6275,7 @@ mod lazy_policy_roundtrip_tests {
         let peer_task = tokio::spawn(async move {
             use tokio::io::AsyncReadExt as _;
             let mut peer = listener.accept().await.unwrap();
+            crate::tests::accept_version_preamble(&mut peer).await;
             drop(listener);
             let (header, payload) = read_raw_frame(&mut peer).await.unwrap();
             let client_handshake = decode_handshake(&payload).unwrap();

@@ -1,9 +1,8 @@
-//! Handshake codec — capability negotiation and method table exchange.
+//! Fixed version preamble, followed by capability and method-table metadata.
 //!
 //! ## Client → Server
 //!
 //! ```text
-//! [1B version=13]
 //! [1B prefix_len][prefix UTF-8]
 //! [2B seg_count LE]
 //! [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -36,13 +35,95 @@
 use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
-/// Handshake version number.
+/// RPC protocol version; version 14 requires the fixed preamble before metadata.
+pub const HANDSHAKE_VERSION: u32 = 14;
+
+/// Permanent preamble kinds. Future RPC versions retain these values and layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VersionPreambleKind {
+    Hello = 1,
+    Accepted = 2,
+    VersionMismatch = 3,
+}
+
+/// Encode the permanent 25-byte preamble with this implementation's version.
 ///
-/// Version 13 adds per-direction shared-memory capability negotiation
-/// ([`CAP_SHM_REQUEST`] / [`CAP_SHM_RESPONSE`]). It is not compatible with
-/// version 12: a 0.x clean cut, so both directions reject the old number
-/// instead of falling back.
-pub const HANDSHAKE_VERSION: u8 = 13;
+/// Its length (21), request id (0), flags (4/6), magic, kind and u32 version
+/// stay independent of future business-frame and metadata formats.
+pub fn encode_version_preamble(kind: VersionPreambleKind) -> [u8; 25] {
+    let mut bytes = [0; 25];
+    bytes[0] = 21;
+    bytes[12] = if kind == VersionPreambleKind::Hello {
+        4
+    } else {
+        6
+    };
+    bytes[16..20].copy_from_slice(b"C2IP");
+    bytes[20] = kind as u8;
+    bytes[21..].copy_from_slice(&HANDSHAKE_VERSION.to_le_bytes());
+    bytes
+}
+
+/// Validate the fixed envelope before reading its nine-byte payload.
+pub fn validate_version_preamble_header(
+    header: &[u8; 16],
+    response: bool,
+) -> Result<(), DecodeError> {
+    for (field, value, expected) in [
+        (
+            "version preamble length",
+            u64::from(u32::from_le_bytes(header[..4].try_into().unwrap())),
+            21,
+        ),
+        (
+            "version preamble request id",
+            u64::from_le_bytes(header[4..12].try_into().unwrap()),
+            0,
+        ),
+        (
+            "version preamble flags",
+            u64::from(u32::from_le_bytes(header[12..].try_into().unwrap())),
+            if response { 6 } else { 4 },
+        ),
+    ] {
+        if value != expected {
+            return Err(DecodeError::InvalidValue { field, value });
+        }
+    }
+    Ok(())
+}
+
+/// Decode a complete fixed payload. The caller validates the expected phase.
+pub fn decode_version_preamble_payload(
+    payload: &[u8; 9],
+) -> Result<(VersionPreambleKind, u32), DecodeError> {
+    if &payload[..4] != b"C2IP" {
+        return Err(DecodeError::InvalidText {
+            field: "version preamble magic",
+            reason: "expected C2IP".into(),
+        });
+    }
+    let kind = match payload[4] {
+        1 => VersionPreambleKind::Hello,
+        2 => VersionPreambleKind::Accepted,
+        3 => VersionPreambleKind::VersionMismatch,
+        value => {
+            return Err(DecodeError::InvalidValue {
+                field: "version preamble kind",
+                value: u64::from(value),
+            });
+        }
+    };
+    let version = u32::from_le_bytes(payload[5..].try_into().unwrap());
+    if version == 0 {
+        return Err(DecodeError::InvalidValue {
+            field: "protocol version",
+            value: 0,
+        });
+    }
+    Ok((kind, version))
+}
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
@@ -131,7 +212,7 @@ pub struct Handshake {
 
 // ── Encoding: Client → Server ────────────────────────────────────────────
 
-/// Encode client→server handshake.
+/// Encode client→server metadata, sent only after version acceptance.
 pub fn encode_client_handshake(
     segments: &[(String, u32)],
     capability_flags: u16,
@@ -146,7 +227,6 @@ pub fn encode_client_handshake(
         });
     }
     let mut buf = Vec::with_capacity(64);
-    buf.push(HANDSHAKE_VERSION);
     // Prefix
     let prefix_b = prefix.as_bytes();
     buf.push(prefix_b.len() as u8);
@@ -166,7 +246,7 @@ pub fn encode_client_handshake(
 
 // ── Encoding: Server → Client (ACK) ─────────────────────────────────────
 
-/// Encode server→client handshake ACK.
+/// Encode server→client metadata ACK after version acceptance.
 pub fn encode_server_handshake(
     segments: &[(String, u32)],
     capability_flags: u16,
@@ -297,7 +377,7 @@ fn validate_route_uid(value: &str) -> Result<(), String> {
 
 // ── Decoding (both directions) ───────────────────────────────────────────
 
-/// Decode handshake from either direction.
+/// Decode metadata from either direction after the fixed version exchange.
 ///
 /// Client payloads have no route section (detected by exhausting bytes
 /// after `capability_flags`).
@@ -306,15 +386,7 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
     if len < 3 {
         return Err(DecodeError::BufferTooShort { need: 3, have: len });
     }
-    let version = buf[0];
-    if version != HANDSHAKE_VERSION {
-        return Err(DecodeError::InvalidValue {
-            field: "handshake version",
-            value: version as u64,
-        });
-    }
-
-    let mut off = 1usize;
+    let mut off = 0usize;
 
     // Prefix
     check_remaining(buf, off, 1, "prefix length")?;

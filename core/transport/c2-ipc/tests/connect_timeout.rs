@@ -16,7 +16,7 @@ use c2_wire::flags;
 use c2_wire::frame::{FrameHeader, decode_frame_body, encode_frame};
 use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MethodEntry, RouteInfo, ServerIdentity,
-    encode_server_handshake,
+    VersionPreambleKind, encode_server_handshake, encode_version_preamble,
 };
 use c2_wire::route_catalog_control::{
     RouteContractWire, RouteLookupResponse, RouteMethodWire, RouteRecordWire, RouteStateWire,
@@ -117,6 +117,14 @@ async fn read_frame(stream: &mut LocalStream) -> (FrameHeader, Vec<u8>) {
 }
 
 async fn read_handshake(stream: &mut LocalStream) {
+    let mut hello = [0u8; 25];
+    stream.read_exact(&mut hello).await.expect("version Hello");
+    assert_eq!(hello, encode_version_preamble(VersionPreambleKind::Hello));
+    stream
+        .write_all(&encode_version_preamble(VersionPreambleKind::Accepted))
+        .await
+        .expect("version Accepted");
+    // Fixtures retain control over the metadata reply and their pause/EOF stage.
     let (header, _) = read_frame(stream).await;
     assert!(header.is_handshake());
 }

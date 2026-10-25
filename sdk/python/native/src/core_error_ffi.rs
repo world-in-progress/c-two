@@ -10,6 +10,18 @@ pyo3::import_exception!(c_two.error, CoreError);
 
 pub(crate) fn core_error_to_py(error: Error) -> PyErr {
     match error {
+        mismatch @ Error::ProtocolVersionMismatch { local, peer } => local_error(
+            "protocol_version_mismatch",
+            mismatch.to_string(),
+            None,
+            |value| {
+                set_attr(value, "local_protocol_version", local);
+                set_attr(value, "peer_protocol_version", peer);
+                set_attr(value, "transport_kind", "ipc");
+                set_attr(value, "transport_phase", "pre_dispatch");
+                set_attr(value, "fallback_eligible", false);
+            },
+        ),
         Error::Semantic(error) => {
             let message = error.message.clone();
             let code = u16::from(error.code);
@@ -78,6 +90,72 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
             )
         }
         Error::Lifecycle(error) => lifecycle_error_to_py(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_version_error_uses_public_class_and_typed_fields() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = core_error_to_py(Error::ProtocolVersionMismatch {
+                local: 14,
+                peer: 15,
+            });
+            let value = error.value(py);
+            let class = py
+                .import("c_two.error")
+                .unwrap()
+                .getattr("CoreError")
+                .unwrap();
+            assert!(value.is_instance(&class).unwrap());
+            for (name, expected) in [
+                ("category", "protocol_version_mismatch"),
+                ("transport_kind", "ipc"),
+                ("transport_phase", "pre_dispatch"),
+            ] {
+                assert_eq!(
+                    value.getattr(name).unwrap().extract::<String>().unwrap(),
+                    expected
+                );
+            }
+            for (name, expected) in [
+                ("local_protocol_version", 14_u32),
+                ("peer_protocol_version", 15),
+            ] {
+                assert_eq!(
+                    value.getattr(name).unwrap().extract::<u32>().unwrap(),
+                    expected
+                );
+                assert!(
+                    class
+                        .getattr("__annotations__")
+                        .unwrap()
+                        .contains(name)
+                        .unwrap()
+                );
+            }
+            assert!(
+                !value
+                    .getattr("fallback_eligible")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            for name in [
+                "code",
+                "name",
+                "error_bytes",
+                "io_operation",
+                "io_kind",
+                "raw_os_error",
+            ] {
+                assert!(value.getattr(name).unwrap().is_none(), "{name}");
+            }
+        });
     }
 }
 

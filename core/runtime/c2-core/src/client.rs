@@ -807,6 +807,9 @@ fn retain_local_ipc_cause(mut resolution: Error, direct: &Error) -> Error {
             };
             (kind, phase)
         }
+        Error::ProtocolVersionMismatch { .. } => {
+            ("protocol_version_mismatch".into(), "pre_dispatch")
+        }
         Error::Contract(_) => ("contract".into(), "pre_dispatch"),
         Error::Admission(_) => ("admission".into(), "pre_dispatch"),
         Error::Lifecycle(_) => ("lifecycle".into(), "pre_dispatch"),
@@ -821,17 +824,18 @@ fn retain_local_ipc_cause(mut resolution: Error, direct: &Error) -> Error {
 }
 
 fn local_candidate_failure_is_terminal(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::Semantic(error)
-            if matches!(
-                error.code,
-                c2_error::ErrorCode::CallDeadlineExceeded
-                    | c2_error::ErrorCode::ContractMismatch
-                    | c2_error::ErrorCode::IdentityMismatch
-                    | c2_error::ErrorCode::ProtocolViolation
-            )
-    )
+    matches!(error, Error::ProtocolVersionMismatch { .. })
+        || matches!(
+            error,
+            Error::Semantic(error)
+                if matches!(
+                    error.code,
+                    c2_error::ErrorCode::CallDeadlineExceeded
+                        | c2_error::ErrorCode::ContractMismatch
+                        | c2_error::ErrorCode::IdentityMismatch
+                        | c2_error::ErrorCode::ProtocolViolation
+                )
+        )
 }
 
 fn relay_default(seconds: f64) -> Result<Option<Duration>, LifecycleError> {
@@ -846,6 +850,36 @@ fn relay_default(seconds: f64) -> Result<Option<Duration>, LifecycleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_version_mismatch_is_terminal_with_both_versions() {
+        let error = normalize_ipc_error(
+            c2_ipc::IpcError::ProtocolVersionMismatch {
+                local: 14,
+                peer: 15,
+            },
+            TransportPhase::PreDispatch,
+        );
+        assert!(matches!(
+            error,
+            Error::ProtocolVersionMismatch {
+                local: 14,
+                peer: 15
+            }
+        ));
+        assert!(local_candidate_failure_is_terminal(&error));
+        assert!(error.local_io_cause().is_none());
+        assert_eq!(
+            error.to_string(),
+            "IPC protocol version mismatch: local=14, peer=15"
+        );
+        assert!(!is_stale_pooled_session_error(
+            &c2_ipc::IpcError::ProtocolVersionMismatch {
+                local: 14,
+                peer: 15
+            }
+        ));
+    }
 
     #[test]
     fn held_inline_response_preserves_bytes_and_release_lifetime() {

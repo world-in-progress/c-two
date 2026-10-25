@@ -403,8 +403,10 @@ use c2_wire::control::{
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, Handshake,
-    MethodEntry, RouteInfo, decode_handshake, encode_client_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, HANDSHAKE_VERSION,
+    Handshake, MethodEntry, RouteInfo, VersionPreambleKind, decode_handshake,
+    decode_version_preamble_payload, encode_client_handshake, encode_version_preamble,
+    validate_version_preamble_header,
 };
 use c2_wire::msg_type::MsgType;
 use c2_wire::registration_control::{
@@ -1665,6 +1667,8 @@ pub enum IpcError {
     Handshake(String),
     /// Peer violated IPC route/control protocol after the transport connected.
     Protocol(String),
+    /// The peer explicitly rejected this client's ordinary IPC protocol version.
+    ProtocolVersionMismatch { local: u32, peer: u32 },
     /// Connected server identity does not match the expected owner.
     IdentityMismatch {
         expected_server_id: String,
@@ -1726,6 +1730,12 @@ impl std::fmt::Display for IpcError {
             Self::Decode(e) => write!(f, "IPC decode error: {e}"),
             Self::Handshake(msg) => write!(f, "IPC handshake failed: {msg}"),
             Self::Protocol(msg) => write!(f, "IPC protocol violation: {msg}"),
+            Self::ProtocolVersionMismatch { local, peer } => {
+                write!(
+                    f,
+                    "IPC protocol version mismatch: local={local}, peer={peer}"
+                )
+            }
             Self::IdentityMismatch {
                 expected_server_id,
                 expected_server_instance_id,
@@ -3316,6 +3326,76 @@ impl IpcClient {
 
         let payload = encode_client_handshake(&segments, cap_flags, &prefix)
             .map_err(|e| IpcError::Protocol(e.to_string()))?;
+        // Preserve local metadata validation before sending any handshake bytes.
+        // Version selection precedes publication of variable metadata. The caller's one
+        // handshake guard covers both exchanges without restarting its budget.
+        writer
+            .write_all(&encode_version_preamble(VersionPreambleKind::Hello))
+            .await
+            .inspect_err(|error| {
+                connection.publisher.close_io("handshake_write", error);
+            })?;
+        let mut version_header = [0u8; 16];
+        reader
+            .read_exact(&mut version_header)
+            .await
+            .inspect_err(|error| {
+                connection
+                    .publisher
+                    .close_read_error("handshake_read", error);
+            })?;
+        validate_version_preamble_header(&version_header, true)
+            .inspect_err(|_| {
+                connection.publisher.close(
+                    ConnectionEndReason::ProtocolError,
+                    "handshake_preamble",
+                    None,
+                );
+            })
+            .map_err(|error| IpcError::Protocol(error.to_string()))?;
+        let mut version_payload = [0u8; 9];
+        reader
+            .read_exact(&mut version_payload)
+            .await
+            .inspect_err(|error| {
+                connection
+                    .publisher
+                    .close_read_error("handshake_read", error);
+            })?;
+        let (kind, peer) = decode_version_preamble_payload(&version_payload)
+            .inspect_err(|_| {
+                connection.publisher.close(
+                    ConnectionEndReason::ProtocolError,
+                    "handshake_preamble",
+                    None,
+                );
+            })
+            .map_err(|error| IpcError::Protocol(error.to_string()))?;
+        match (kind, peer == HANDSHAKE_VERSION) {
+            (VersionPreambleKind::Accepted, true) => {}
+            (VersionPreambleKind::VersionMismatch, false) => {
+                connection.publisher.close(
+                    ConnectionEndReason::ProtocolError,
+                    "handshake_version",
+                    None,
+                );
+                return Err(IpcError::ProtocolVersionMismatch {
+                    local: HANDSHAKE_VERSION,
+                    peer,
+                });
+            }
+            _ => {
+                connection.publisher.close(
+                    ConnectionEndReason::ProtocolError,
+                    "handshake_preamble",
+                    None,
+                );
+                return Err(IpcError::Protocol(
+                    "inconsistent server version preamble".into(),
+                ));
+            }
+        }
+
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &payload);
         writer.write_all(&frame_bytes).await.inspect_err(|error| {
             connection.publisher.close_io("handshake_write", error);
@@ -3345,12 +3425,15 @@ impl IpcClient {
                 );
             })?;
 
-        if !hdr.is_handshake() {
+        if total_len < 12
+            || hdr.request_id != 0
+            || hdr.flags != (flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE)
+        {
             connection
                 .publisher
                 .close(ConnectionEndReason::ProtocolError, "handshake_frame", None);
             return Err(IpcError::Protocol(
-                "Server response is not a handshake frame".into(),
+                "invalid server handshake metadata header".into(),
             ));
         }
 
@@ -7602,6 +7685,7 @@ mod tests {
             let mut streams = Vec::new();
             for _ in 0..2 {
                 let mut stream = listener.accept().await.expect("accept client");
+                crate::tests::accept_version_preamble(&mut stream).await;
                 let mut len_buf = [0_u8; 4];
                 stream
                     .read_exact(&mut len_buf)
@@ -8595,6 +8679,7 @@ mod tests {
         let mut listener = c2_local::LocalListener::bind(&endpoint).expect("test listener");
         let peer = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept client");
+            crate::tests::accept_version_preamble(&mut stream).await;
             crate::tests::close_listener(listener).await;
             let mut len_buf = [0u8; 4];
             stream
@@ -8751,6 +8836,7 @@ mod pending_disconnect_tests {
                 frame::encode_frame(0, flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE, &handshake);
             for _ in 0..2 {
                 let mut stream = listener.accept().await.unwrap();
+                crate::tests::accept_version_preamble(&mut stream).await;
                 let mut length = [0; 4];
                 stream.read_exact(&mut length).await.unwrap();
                 let mut body = vec![0; u32::from_le_bytes(length) as usize];

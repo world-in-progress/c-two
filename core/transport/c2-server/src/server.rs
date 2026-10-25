@@ -18,7 +18,7 @@ use c2_local::{
     ConnectionEndReason, ConnectionEventSource, ConnectionEvents, DEFAULT_CONNECT_TIMEOUT,
     EndpointReapResult, LocalEndpoint, LocalListener, LocalReadHalf, LocalStream, LocalWriteHalf,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -46,8 +46,10 @@ use c2_wire::flags::{
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, MAX_ROUTES,
-    MethodEntry, RouteInfo, decode_handshake, encode_server_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, HANDSHAKE_VERSION,
+    MAX_ROUTES, MethodEntry, RouteInfo, VersionPreambleKind, decode_handshake,
+    decode_version_preamble_payload, encode_server_handshake, encode_version_preamble,
+    validate_version_preamble_header,
 };
 use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES};
 use c2_wire::registration_control::{
@@ -1867,17 +1869,13 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
     let _ = receiver.wait_for(|requested| *requested).await;
 }
 
-async fn wait_for_control_peer_close(reader: &mut LocalReadHalf) {
+async fn wait_for_control_peer_close(reader: &mut LocalReadHalf, deadline: tokio::time::Instant) {
     // The control client consumes the complete acknowledgement and closes its
     // one-exchange connection. Retain the pipe until that EOF where possible.
     // A timeout or unexpected byte only ends the wait; neither proves that the
     // peer consumed the acknowledgement.
     let mut byte = [0_u8; 1];
-    let _ = tokio::time::timeout(
-        Duration::from_millis(CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS),
-        reader.read(&mut byte),
-    )
-    .await;
+    let _ = tokio::time::timeout_at(deadline, reader.read(&mut byte)).await;
 }
 
 async fn handle_post_shutdown_connection(
@@ -1927,7 +1925,11 @@ async fn handle_post_shutdown_connection(
         )
     {
         handle_shutdown_signal(&server, payload, header.request_id, &writer).await;
-        wait_for_control_peer_close(&mut reader).await;
+        wait_for_control_peer_close(
+            &mut reader,
+            tokio::time::Instant::now() + Duration::from_millis(CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS),
+        )
+        .await;
     }
 }
 
@@ -2057,26 +2059,70 @@ fn handle_connection(
                 break;
             }
 
-            // Read the type before allocating on every frame. A business
-            // connection cannot evade the owner limit by switching roles.
+            // Inspect the fixed header before reading any payload byte or
+            // allocating. Even a header-only invalid preamble must be rejected
+            // without waiting for an owner-control type byte.
             let mut prefix = [0u8; 13];
-            let prefix_len = (total_len as usize).min(prefix.len());
-            if prefix_len != 0 {
-                tokio::select! {
-                    result = reader.read_exact(&mut prefix[..prefix_len]) => {
-                        if let Err(error) = result {
-                            conn.end_read("read_frame_prefix", &error);
-                            break;
-                        }
+            let mut prefix_len = FRAME_FIXED_BODY_LEN as usize;
+            tokio::select! {
+                result = reader.read_exact(&mut prefix[..prefix_len]) => {
+                    if let Err(error) = result {
+                        conn.end_read("read_frame_prefix", &error);
+                        break;
                     }
+                }
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
+                    conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
+                    break;
+                }
+            }
+            let (header, _) = decode_frame_body(&prefix[..prefix_len], total_len)
+                .expect("validated fixed frame header");
+            if header.is_handshake() {
+                if conn.handshake_done() || conn.ordinary_protocol() {
+                    conn.end(ConnectionEndReason::ProtocolError, "duplicate_handshake");
+                    break;
+                }
+                let mut version_header = [0u8; 16];
+                version_header[..4].copy_from_slice(&len_buf);
+                version_header[4..].copy_from_slice(&prefix[..prefix_len]);
+                let result = tokio::select! {
+                    biased;
                     _ = wait_for_shutdown(&mut shutdown_rx) => {
                         conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
                         break;
                     }
+                    result = negotiate_handshake(&server, &conn, &version_header, &mut reader, &writer) => result,
+                };
+                if let Err(error) = result {
+                    warn!(conn_id, %error, "handshake failed");
+                    match &error {
+                        ServerError::Io(error) => conn.end_io("handshake", error),
+                        _ => conn.end(ConnectionEndReason::ProtocolError, "handshake"),
+                    }
+                    break;
                 }
-                let (header, payload) = decode_frame_body(&prefix[..prefix_len], total_len)
-                    .expect("validated fixed frame prefix");
-                if header.is_ctrl() && payload.first() == Some(&MsgType::OwnerControl.as_byte()) {
+                continue;
+            }
+            if header.is_ctrl() {
+                // OwnerControl has its own protocol. Only CTRL needs this
+                // separate byte before choosing that bounded setup path.
+                if total_len > FRAME_FIXED_BODY_LEN {
+                    tokio::select! {
+                        result = reader.read_exact(&mut prefix[prefix_len..prefix_len + 1]) => {
+                            if let Err(error) = result {
+                                conn.end_read("read_frame_prefix", &error);
+                                break;
+                            }
+                        }
+                        _ = wait_for_shutdown(&mut shutdown_rx) => {
+                            conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
+                            break;
+                        }
+                    }
+                    prefix_len += 1;
+                }
+                if prefix[12..prefix_len].first() == Some(&MsgType::OwnerControl.as_byte()) {
                     use crate::owner_control::{OwnerReadError, OwnerSession};
                     use c2_wire::owner_control::{
                         MAX_OWNER_PAYLOAD_SIZE, OwnerRejection, OwnerResponse, OwnerWireError,
@@ -2146,6 +2192,10 @@ fn handle_connection(
                     return;
                 }
             }
+            if !conn.handshake_done() && !header.is_signal() {
+                conn.end(ConnectionEndReason::ProtocolError, "frame_before_handshake");
+                break;
+            }
 
             // 2. Read the remaining body (request_id + flags + payload).
             let mut body = vec![0u8; total_len as usize];
@@ -2173,13 +2223,6 @@ fn handle_connection(
                 }
             };
 
-            if header.is_handshake()
-                || header.is_signal()
-                || header.is_ctrl()
-                || header.is_call_v2()
-            {
-                conn.select_ordinary_protocol();
-            }
             conn.touch();
             let flags = header.flags;
             let request_id = header.request_id;
@@ -2193,23 +2236,20 @@ fn handle_connection(
                     )
                 {
                     handle_shutdown_signal(&server, payload, request_id, &writer).await;
-                    wait_for_control_peer_close(&mut reader).await;
+                    wait_for_control_peer_close(
+                        &mut reader,
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS),
+                    )
+                    .await;
                 }
                 break;
             }
 
             // 4. Dispatch by frame type.
-            if header.is_handshake() {
-                if let Err(e) = handle_handshake(&server, &conn, payload, request_id, &writer).await
-                {
-                    warn!(conn_id, %e, "handshake failed");
-                    match &e {
-                        ServerError::Io(error) => conn.end_io("handshake", error),
-                        _ => conn.end(ConnectionEndReason::ProtocolError, "handshake"),
-                    }
-                    break;
-                }
-            } else if header.is_signal() {
+            if header.is_signal() {
+                // A standalone control exchange still commits the ordinary role.
+                conn.select_ordinary_protocol();
                 if matches!(
                     payload.first().and_then(|&b| MsgType::from_byte(b)),
                     Some(MsgType::ShutdownClient)
@@ -2218,7 +2258,12 @@ fn handle_connection(
                     // Malformed shutdown also ends this handler, preserving
                     // the existing negative ACK and frame policy.
                     conn.end(ConnectionEndReason::LocalClose, "shutdown_control_close");
-                    wait_for_control_peer_close(&mut reader).await;
+                    wait_for_control_peer_close(
+                        &mut reader,
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS),
+                    )
+                    .await;
                     break;
                 }
                 if matches!(
@@ -2464,6 +2509,78 @@ fn handle_connection(
 // Handshake
 // ---------------------------------------------------------------------------
 
+async fn negotiate_handshake(
+    server: &Server,
+    conn: &Connection,
+    header: &[u8; 16],
+    reader: &mut LocalReadHalf,
+    writer: &Arc<Mutex<LocalWriteHalf>>,
+) -> Result<(), ServerError> {
+    validate_version_preamble_header(header, false)
+        .map_err(|error| ServerError::Protocol(format!("version preamble header: {error}")))?;
+    let mut payload = [0u8; 9];
+    reader.read_exact(&mut payload).await?;
+    let (kind, peer) = decode_version_preamble_payload(&payload)
+        .map_err(|error| ServerError::Protocol(format!("version preamble payload: {error}")))?;
+    if kind != VersionPreambleKind::Hello {
+        return Err(ServerError::Protocol("expected version Hello".into()));
+    }
+    conn.touch();
+    if peer != HANDSHAKE_VERSION {
+        // One absolute budget covers writer acquisition, write, asynchronous
+        // flush and waiting for peer EOF. The caller retains shutdown and
+        // heartbeat cancellation; no synchronous pipe-consumption flush runs.
+        let deadline = tokio::time::Instant::now() + DEFAULT_CONNECT_TIMEOUT;
+        tokio::time::timeout_at(deadline, async {
+            let mut writer = writer.lock().await;
+            writer
+                .write_all(&encode_version_preamble(
+                    VersionPreambleKind::VersionMismatch,
+                ))
+                .await?;
+            writer.flush().await
+        })
+        .await
+        .map_err(|_| {
+            ServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "version rejection deadline expired",
+            ))
+        })??;
+        conn.end(ConnectionEndReason::ProtocolError, "handshake_version");
+        wait_for_control_peer_close(reader, deadline).await;
+        return Err(ServerError::Protocol(format!(
+            "IPC protocol version mismatch: local={HANDSHAKE_VERSION}, peer={peer}"
+        )));
+    }
+    writer
+        .lock()
+        .await
+        .write_all(&encode_version_preamble(VersionPreambleKind::Accepted))
+        .await?;
+
+    // This same stack owns both reads. Metadata cannot be interleaved with a
+    // second Hello, owner-control selection, or normal route dispatch.
+    let mut metadata_header = [0u8; 16];
+    reader.read_exact(&mut metadata_header).await?;
+    let (total_len, body) = frame::decode_total_len(&metadata_header)
+        .map_err(|error| ServerError::Protocol(format!("handshake metadata header: {error}")))?;
+    let (header, _) = decode_frame_body(body, total_len)
+        .map_err(|error| ServerError::Protocol(format!("handshake metadata header: {error}")))?;
+    if total_len < FRAME_FIXED_BODY_LEN
+        || u64::from(total_len) > server.config.max_frame_size
+        || header.request_id != 0
+        || header.flags != FLAG_HANDSHAKE
+    {
+        return Err(ServerError::Protocol(
+            "invalid handshake metadata header".into(),
+        ));
+    }
+    let mut metadata = vec![0u8; header.payload_len()];
+    reader.read_exact(&mut metadata).await?;
+    handle_handshake(server, conn, &metadata, 0, writer).await
+}
+
 async fn handle_handshake(
     server: &Server,
     conn: &Connection,
@@ -2476,7 +2593,6 @@ async fn handle_handshake(
 
     // Frames identify peer backings by pool incarnation, index and generation.
     conn.init_peer_shm(client_hs.prefix);
-    conn.set_handshake_done(true);
 
     if client_hs.capability_flags & CAP_CHUNKED != 0 {
         conn.set_chunked_capable(true);
@@ -2538,6 +2654,11 @@ async fn handle_handshake(
     let frame = encode_frame(request_id, FLAG_HANDSHAKE | FLAG_RESPONSE, &hs_bytes);
 
     writer.lock().await.write_all(&frame).await?;
+    // Heartbeat and business admission open only after the complete final ACK
+    // has been written; neither may interleave with version/metadata exchange.
+    conn.set_handshake_done(true);
+    conn.select_ordinary_protocol();
+    conn.touch();
     Ok(())
 }
 
@@ -5025,6 +5146,7 @@ mod tests {
         let mut client = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
             .await
             .unwrap();
+        negotiate_test_version(&mut client).await;
         let payload = c2_wire::handshake::encode_client_handshake(&[], CAP_CALL_V2, "").unwrap();
         let frame = encode_frame(0, FLAG_HANDSHAKE, &payload);
         for bytes in frame.chunks(3) {
@@ -7501,6 +7623,7 @@ mod tests {
             let mut peer = Some(peer);
             let abort = stream.abort_handle();
             let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+            handshake_test_client(peer.as_mut().unwrap()).await;
             let observation = match events.recv().await.unwrap().unwrap() {
                 c2_local::ConnectionEvent::Opened(observation) => observation,
                 _ => panic!("expected Opened"),
@@ -7640,6 +7763,7 @@ mod tests {
         let mut client = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
             .await
             .expect("connect client");
+        handshake_test_client(&mut client).await;
         client
             .write_all(&12u32.to_le_bytes())
             .await
@@ -9014,6 +9138,46 @@ mod tests {
         (header.request_id, header.flags, payload.to_vec())
     }
 
+    async fn negotiate_test_version(client: &mut LocalStream) {
+        client
+            .write_all(&encode_version_preamble(VersionPreambleKind::Hello))
+            .await
+            .expect("write version Hello");
+        let mut accepted = [0u8; 25];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut accepted))
+            .await
+            .expect("version acceptance within timeout")
+            .expect("read version Accepted");
+        assert_eq!(
+            accepted,
+            encode_version_preamble(VersionPreambleKind::Accepted)
+        );
+    }
+
+    /// Ordinary raw business fixtures use the same complete two-stage handshake.
+    async fn handshake_test_client(client: &mut LocalStream) {
+        negotiate_test_version(client).await;
+        let metadata = c2_wire::handshake::encode_client_handshake(
+            &[],
+            CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+            "",
+        )
+        .unwrap();
+        client
+            .write_all(&encode_frame(0, FLAG_HANDSHAKE, &metadata))
+            .await
+            .expect("write client metadata");
+        let (rid, flags, payload) = read_reply_frame(client).await;
+        assert_eq!(rid, 0);
+        assert_eq!(flags, FLAG_HANDSHAKE | FLAG_RESPONSE);
+        assert!(
+            decode_handshake(&payload)
+                .unwrap()
+                .server_identity
+                .is_some()
+        );
+    }
+
     /// Poll until `check` holds, with a bounded wait so a regression fails the
     /// test instead of hanging it.
     async fn wait_until(label: &str, mut check: impl FnMut() -> bool) {
@@ -9087,6 +9251,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // Hold the route gate the first chunk must pass through.
         let dispatcher_guard = server.dispatcher.write().await;
@@ -9165,7 +9330,7 @@ mod tests {
         handler.await.expect("connection handler completes");
     }
 
-    // ── Handshake v13 SHM direction negotiation ─────────────────────────────
+    // ── Same-version metadata SHM direction negotiation ─────────────────────
 
     /// The ACK's SHM bits are the intersection of the client's offer with the
     /// connection's actual native shared-memory reachability, in either
@@ -9221,41 +9386,304 @@ mod tests {
         }
     }
 
-    /// Version 12 is the pre-negotiation handshake: the server rejects it and
-    /// closes the connection, with no compatibility fallback.
+    async fn version_fence_connection() -> (Arc<Server>, LocalStream, LocalStream) {
+        use c2_local::EndpointReapResult::{AlreadyAbsent, NotApplicable, Reaped};
+
+        let address = unique_readiness_address("version_fence");
+        #[cfg(unix)]
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(unix)]
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(root.path())
+            .unwrap()
+            .endpoint(&address)
+            .unwrap();
+        #[cfg(windows)]
+        let endpoint = parse_local_endpoint(&address).unwrap();
+        let server = Server::new_with_endpoint(endpoint.clone(), Default::default()).unwrap();
+        let mut listener = LocalListener::bind(&endpoint).unwrap();
+        let pair = tokio::try_join!(
+            LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+            listener.accept()
+        );
+        let closed = tokio::task::spawn_blocking(move || listener.close())
+            .await
+            .unwrap();
+        assert!(matches!(closed, Reaped | AlreadyAbsent | NotApplicable));
+        let (client, stream) = pair.unwrap();
+        (Arc::new(server), client, stream)
+    }
+
+    #[tokio::test]
+    async fn handshake_version_mismatch_returns_fixed_preamble() {
+        let local = HANDSHAKE_VERSION;
+        for peer in [1, local + 1, u32::MAX] {
+            let (server, mut client, stream) = version_fence_connection().await;
+            let handler = tokio::spawn(handle_connection(server, stream));
+            let mut hello = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\0\0\0\0";
+            hello[21..].copy_from_slice(&peer.to_le_bytes());
+            let reply = tokio::time::timeout(Duration::from_secs(5), async {
+                client.write_all(&hello).await?;
+                let mut reply = [0; 25];
+                client.read_exact(&mut reply).await?;
+                Ok::<_, std::io::Error>(reply)
+            })
+            .await;
+            drop(client);
+            handler.await.expect("connection handler completes");
+            let mut expected = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\0\0\0\0";
+            expected[21..].copy_from_slice(&local.to_le_bytes());
+            assert_eq!(reply.unwrap().expect("version refusal"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_preamble_headers_are_rejected_without_reading_payload() {
+        for (length, rid, flags) in [
+            (20u32, 0u64, FLAG_HANDSHAKE),
+            (21, 1, FLAG_HANDSHAKE),
+            (21, 0, FLAG_HANDSHAKE | FLAG_RESPONSE),
+            (21, 0, FLAG_HANDSHAKE | FLAG_CTRL),
+            (21, 0, FLAG_RESPONSE),
+            (21, 0, 0),
+        ] {
+            let (server, mut client, stream) = version_fence_connection().await;
+            let handler = tokio::spawn(handle_connection(server, stream));
+            let mut header = [0u8; 16];
+            header[..4].copy_from_slice(&length.to_le_bytes());
+            header[4..12].copy_from_slice(&rid.to_le_bytes());
+            header[12..].copy_from_slice(&flags.to_le_bytes());
+            client.write_all(&header).await.unwrap();
+            let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut [0])).await;
+            drop(client);
+            handler.await.unwrap();
+            assert!(
+                matches!(read, Ok(Ok(0) | Err(_))),
+                "waited for payload: {read:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_and_established_connections_reject_handshake_or_owner_role_changes() {
+        let metadata = c2_wire::handshake::encode_client_handshake(&[], CAP_CALL_V2, "").unwrap();
+        let mut wrong_rid = encode_frame(1, FLAG_HANDSHAKE, &metadata);
+        wrong_rid.truncate(16);
+        let mut wrong_flags = encode_frame(0, FLAG_HANDSHAKE | FLAG_RESPONSE, &metadata);
+        wrong_flags.truncate(16);
+        let owner = encode_frame(1, FLAG_CTRL, &[MsgType::OwnerControl.as_byte()]);
+        let hello = encode_version_preamble(VersionPreambleKind::Hello).to_vec();
+        for (established, frame) in [
+            (false, wrong_rid),
+            (false, wrong_flags),
+            (false, owner.clone()),
+            (false, hello.clone()),
+            (true, owner),
+            (true, hello),
+        ] {
+            let (server, mut client, stream) = version_fence_connection().await;
+            let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+            if established {
+                handshake_test_client(&mut client).await;
+            } else {
+                negotiate_test_version(&mut client).await;
+                let conn_id = server.active_connection_ids()[0];
+                let conn = server.active_connection(conn_id).unwrap();
+                assert!(!conn.handshake_done() && !conn.ordinary_protocol());
+            }
+            client.write_all(&frame).await.unwrap();
+            let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut [0])).await;
+            drop(client);
+            handler.await.unwrap();
+            assert!(
+                matches!(read, Ok(Ok(0) | Err(_))),
+                "accepted role change: {read:?}"
+            );
+            assert_eq!(server.active_connection_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_ack_must_finish_before_handshake_and_heartbeat_admission() {
+        let server = ordering_test_server("ipc://metadata_ack_gate", 3);
+        let conn = Connection::observed(c2_local::ConnectionPublisher::new(
+            c2_local::ConnectionSide::Server,
+        ));
+        let (stream, mut client) = LocalStream::pair().await.unwrap();
+        let (_reader, writer) = stream.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+        let held = writer.lock().await;
+        let metadata = c2_wire::handshake::encode_client_handshake(&[], CAP_CALL_V2, "").unwrap();
+        let handshake = handle_handshake(&server, &conn, &metadata, 0, &writer);
+        tokio::pin!(handshake);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut handshake)
+                .await
+                .is_err()
+        );
+        assert!(!conn.handshake_done() && !conn.ordinary_protocol());
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), handshake)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(conn.handshake_done() && conn.ordinary_protocol());
+        let (rid, flags, payload) = read_reply_frame(&mut client).await;
+        assert_eq!((rid, flags), (0, FLAG_HANDSHAKE | FLAG_RESPONSE));
+        assert!(
+            decode_handshake(&payload)
+                .unwrap()
+                .server_identity
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn version_rejection_survives_delayed_read_and_shutdown_interrupts_peer_wait() {
+        let (server, mut client, stream) = version_fence_connection().await;
+        let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+        let mut hello = encode_version_preamble(VersionPreambleKind::Hello);
+        hello[21..].copy_from_slice(&(HANDSHAKE_VERSION + 1).to_le_bytes());
+        client.write_all(&hello).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !handler.is_finished(),
+            "50 ms control ACK window must not close version refusal"
+        );
+        let mut reply = [0u8; 25];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reply,
+            encode_version_preamble(VersionPreambleKind::VersionMismatch)
+        );
+        assert!(
+            !handler.is_finished(),
+            "reply consumption does not close the peer"
+        );
+        server.request_shutdown_signal();
+        tokio::time::timeout(Duration::from_secs(1), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.active_connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn version_rejection_peer_wait_expires_within_the_single_send_budget() {
+        let (server, mut client, stream) = version_fence_connection().await;
+        let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+        let started = tokio::time::Instant::now();
+        let mut hello = encode_version_preamble(VersionPreambleKind::Hello);
+        hello[21..].copy_from_slice(&(HANDSHAKE_VERSION + 1).to_le_bytes());
+        client.write_all(&hello).await.unwrap();
+        let mut reply = [0u8; 25];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(
+            reply,
+            encode_version_preamble(VersionPreambleKind::VersionMismatch)
+        );
+        tokio::time::timeout_at(
+            started + DEFAULT_CONNECT_TIMEOUT + Duration::from_secs(1),
+            handler,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(started.elapsed() >= DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(server.active_connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unhandshaken_call_and_route_control_are_rejected() {
+        let frames = [
+            inline_call_frame(1, "grid", b"unhandshaken"),
+            encode_frame(2, FLAG_CTRL, b"\x0e{\"selector\":{\"type\":\"all\"}}"),
+        ];
+        let mut observations = Vec::new();
+        for frame in frames {
+            let (server, mut client, stream) = version_fence_connection().await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut route = make_host_route(&server, "grid");
+            route.callback = Arc::new(EchoRequestBytes {
+                calls: Arc::clone(&calls),
+            });
+            server.register_route(route).await.unwrap();
+            let handler = tokio::spawn(handle_connection(server, stream));
+            let read = tokio::time::timeout(Duration::from_secs(5), async {
+                client.write_all(&frame).await?;
+                client.read(&mut [0]).await
+            })
+            .await;
+            drop(client);
+            handler.await.expect("connection handler completes");
+            observations.push((read, calls.load(Ordering::SeqCst)));
+        }
+        for (read, calls) in observations {
+            assert_eq!(calls, 0, "unhandshaken CALL must not invoke the callback");
+            // Rejecting before reading the body may close with an OS reset.
+            assert!(
+                matches!(read, Ok(Ok(0) | Err(_))),
+                "unhandshaken RPC must close without a reply: {read:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_connection_cannot_switch_to_owner_control() {
+        let (server, mut client, stream) = version_fence_connection().await;
+        let handler = tokio::spawn(handle_connection(server, stream));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            client
+                .write_all(&encode_frame(
+                    0,
+                    FLAG_SIGNAL,
+                    &c2_wire::msg_type::PING_BYTES,
+                ))
+                .await?;
+            let mut pong = [0; 17];
+            client.read_exact(&mut pong).await?;
+            let owner = c2_wire::owner_control::encode_owner_request(
+                &c2_wire::owner_control::OwnerRequest::Hello,
+            )
+            .unwrap();
+            client
+                .write_all(&encode_frame(1, FLAG_CTRL, &owner))
+                .await?;
+            Ok::<_, std::io::Error>((pong, client.read(&mut [0]).await))
+        })
+        .await;
+        drop(client);
+        handler.await.unwrap();
+        let (pong, closed) = outcome.unwrap().unwrap();
+        assert_eq!(
+            pong.as_slice(),
+            encode_frame(0, FLAG_RESPONSE | FLAG_SIGNAL, &PONG_BYTES)
+        );
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "ordinary role cannot become owner control: {closed:?}"
+        );
+    }
+
+    /// Retain rejection of the pre-negotiation, single-frame version 12 format.
     #[tokio::test]
     async fn handshake_version_twelve_is_rejected_without_fallback() {
-        let server = ordering_test_server("ipc://shm_v12_reject", 8);
-        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
-        let handler = {
-            let server = Arc::clone(&server);
-            tokio::spawn(async move { handle_connection(server, server_stream).await })
-        };
-
-        let mut handshake = c2_wire::handshake::encode_client_handshake(
-            &[],
-            CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
-            "",
-        )
-        .unwrap();
-        assert_eq!(handshake[0], 13, "current codec encodes version 13");
-        handshake[0] = 12;
-        client
-            .write_all(&encode_frame(0, FLAG_HANDSHAKE, &handshake))
-            .await
-            .expect("write v12 handshake");
-
-        // The server must terminate the connection instead of replying or
-        // downgrading: the peer observes EOF.
-        use tokio::io::AsyncReadExt as _;
-        let mut probe = [0u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut probe))
-            .await
-            .expect("read must settle")
-            .expect("read");
-        assert_eq!(read, 0, "server must close the v12 connection");
+        let (server, mut client, stream) = version_fence_connection().await;
+        let handler = tokio::spawn(handle_connection(server, stream));
+        let legacy = encode_frame(0, FLAG_HANDSHAKE, &[12, 0, 0, 0, 7, 0]);
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            client.write_all(&legacy).await?;
+            client.read(&mut [0]).await
+        })
+        .await;
         drop(client);
         handler.await.expect("connection handler completes");
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "server must close the v12 connection: {read:?}"
+        );
     }
 
     #[tokio::test]
@@ -9291,7 +9719,7 @@ mod tests {
     }
 
     /// Shared fixture for the un-negotiated buddy frame rejections: a real
-    /// connection handler over a local pair with one echo route, a v13
+    /// connection handler over a local pair with one echo route, a two-stage
     /// handshake that offers no SHM directions, and the observed ACK.
     async fn unnegotiated_shm_connection(
         server: &Arc<Server>,
@@ -9307,6 +9735,7 @@ mod tests {
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
 
+        negotiate_test_version(&mut client).await;
         let handshake = c2_wire::handshake::encode_client_handshake(
             &[],
             CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
@@ -9577,6 +10006,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // First chunk targets a route that is not in the catalog, so admission
         // is refused immediately; later chunks must not feed anything.
@@ -9633,6 +10063,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // Park the first chunk on the route gate and two later chunks on its
         // admission; every chunk-processing permit is then held.
@@ -9702,6 +10133,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // First chunk + middle chunk of a three-chunk request: the assembly
         // stays incomplete and keeps the route pending permit while it waits.
@@ -9843,6 +10275,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // Stall the first chunk's route admission and fill both chunk-processing
         // permits: the first chunk parks on the held dispatcher gate, one later
@@ -9936,6 +10369,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         let dispatcher_guard = server.dispatcher.write().await;
         client
@@ -10005,6 +10439,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         let dispatcher_guard = server.dispatcher.write().await;
         client
@@ -10066,6 +10501,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // The first chunk of a two-chunk request is admitted and its assembly
         // and stored route admission are published.
@@ -10404,6 +10840,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         let dispatcher_guard = server.dispatcher.write().await;
         let data: Vec<u8> = (0..96u8).map(|i| i.wrapping_mul(7)).collect();

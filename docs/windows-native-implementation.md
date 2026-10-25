@@ -2,6 +2,12 @@
 
 Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
 
+## Current source (unreleased)
+
+Current source moves the RPC IPC handshake to version 14 behind a permanent fixed 25-byte version preamble; it is unpublished and incompatible with the released 0.9.0 (handshake 13). The wire sequence, malformed/mismatch distinction, error surfaces and the one shared rejection budget — bounded `write_all`, adapter async flush and bounded peer-close wait, never a synchronous `FlushFileBuffers` that would park a Tokio worker until the client consumes — are specified in [the handshake spec](ipc-handshake.md). SHM 3, C/FFI ABI 6, owner control 1 and business frame layouts do not change.
+
+Windows endpoint naming is fixed and does not vary with the protocol or package version. The pipe name is `\\.\pipe\c_two-{scope}-{identity}`: `scope` is the lowercase full-length SHA-256 hex (64 characters) of the process TokenUser SID text (for example `S-1-5-...`) encoded as UTF-8, and `identity` is the first 16 bytes of the SHA-256 of the server_id's raw UTF-8 — the logical address with the `ipc://` prefix stripped, case preserved — as 32 lowercase hex characters. Listener uniqueness is a user-restricted non-inheritable mutex named `Global\c_two_listener-` followed by the lowercase SHA-256 hex of the pipe name encoded as UTF-16LE (each UTF-16 code unit fed as little-endian bytes). Neither name carries a package or IPC version; protocol upgrades must not change the TokenUser source, SID/server_id encoding and case, SHA-256 truncation, prefix or separators, and add no version-query bypass, broadcast, registry file or broker.
+
 ## C-Two 0.9.0 release (2026-10-25)
 
 The current release uses TokenUser scope across logons, verifies connected pipe ownership and a server of at least Medium integrity before sending, and uses existing owned/inline/chunked transfer across sessions that cannot share Local mappings. IPC 13 and C/FFI ABI 6 require coordinated upgrades; SHM 3 and owner control 1 retain their formats. The [release notes](releases/0.9.0.md) describe the API changes and the [acceptance record](reports/2026-10-25-090-windows-release-acceptance.md) binds the actual Windows developer-host, second-account, cross-session, hosted ARM64 and publication evidence.

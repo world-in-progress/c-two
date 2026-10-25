@@ -19,6 +19,7 @@ import pytest
 import c_two as cc
 from c_two.config.settings import settings
 from c_two.transport.registry import _ProcessRegistry
+from tests.fixtures.ipc_version_peer import ipc_version_peer_binary, running_version_peer
 from tests.fixtures.portable_interop import FASTDB_REPOSITORY, logical_result_sha256
 from tests.fixtures.portable_matrix import (
     CRM_CLASSES,
@@ -735,6 +736,40 @@ def test_generated_typescript_reader_opens_lazy_empty_handshake(
     assert receipt["bootstrapSegmentSize"] == 2 * 4096
     assert receipt["ownerSegmentSize"] >= 1024 * 1024
     assert receipt["byteLength"] == 1024
+
+
+def test_typescript_real_connector_version_mismatch(
+    typescript_artifacts: TypeScriptArtifacts, ipc_version_peer_binary: Path,
+) -> None:
+    script = typescript_artifacts.node_root / "ipc-version.mjs"
+    script.write_text(dedent("""\
+        import assert from 'node:assert/strict';
+        import { pathToFileURL } from 'node:url';
+        import { createBundledC2MemFfiNodeRuntime } from '@c-two/c2-mem-ffi';
+        const [modulePath, address, root] = process.argv.slice(2);
+        const contract = await import(pathToFileURL(modulePath).href);
+        const runtime = createBundledC2MemFfiNodeRuntime(root ? {ipcRoot: root} : {});
+        let connects = 0;
+        const transport = contract.createIpcEncodedTransport(address, {
+          connect: async (target) => { connects++; return runtime.connect(target); },
+        });
+        try {
+          await assert.rejects(transport.prepare('version', contract.CONTRACT), (error) => {
+            assert.ok(error instanceof contract.C2IpcTransportError);
+            assert.equal(error.category, 'protocol_version_mismatch');
+            assert.equal(error.localProtocolVersion, 14);
+            assert.equal(error.peerProtocolVersion, 15);
+            return true;
+          });
+          assert.equal(connects, 1);
+        } finally { await transport.close(); await runtime.close(); }
+        """), encoding="utf-8")
+    with running_version_peer(ipc_version_peer_binary, "mismatch15") as (address, context):
+        _run_checked(
+            [typescript_artifacts.node_binary, str(script),
+             str(typescript_artifacts.contract_modules["no-payload"]), address, context.root or ""],
+            cwd=typescript_artifacts.node_root, timeout=10,
+        )
 
 
 def test_typescript_real_calls_write_strict_development_receipt(

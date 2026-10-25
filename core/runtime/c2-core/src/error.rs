@@ -237,6 +237,11 @@ impl StdError for TransportError {
 /// The language-neutral local C-Two error facade.
 #[derive(Debug)]
 pub enum Error {
+    /// A complete fixed IPC preamble proved that the peer uses another version.
+    ProtocolVersionMismatch {
+        local: u32,
+        peer: u32,
+    },
     Semantic(C2Error),
     Contract(ContractError),
     Admission(ContractError),
@@ -257,6 +262,10 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProtocolVersionMismatch { local, peer } => write!(
+                formatter,
+                "IPC protocol version mismatch: local={local}, peer={peer}"
+            ),
             Self::Semantic(error) => error.fmt(formatter),
             Self::Contract(error) => write!(formatter, "contract error: {error}"),
             Self::Admission(error) => write!(formatter, "contract admission error: {error}"),
@@ -269,6 +278,7 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
+            Self::ProtocolVersionMismatch { .. } => None,
             Self::Semantic(error) => Some(error),
             Self::Contract(error) | Self::Admission(error) => Some(error),
             Self::Transport(error) => Some(error),
@@ -302,6 +312,9 @@ impl From<LifecycleError> for Error {
 /// Normalize an IPC error without flattening its transport source.
 pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
     match error {
+        IpcError::ProtocolVersionMismatch { local, peer } => {
+            Error::ProtocolVersionMismatch { local, peer }
+        }
         IpcError::LocalCallRejected(error) => Error::Semantic(error),
         IpcError::Chunk(ChunkError::Capacity(message)) => {
             let semantic = C2Error::new(ErrorCode::ResourceUnavailable, message.clone())

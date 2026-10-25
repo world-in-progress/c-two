@@ -56,7 +56,7 @@ control = prepared.commit(timeout=1.0)  # 每个准备对象只提交一次；�
 
 原生对端身份拒绝在 inspect 时保留 `kind="identity_mismatch"`；commit 尚未发送请求时保留 `kind="not_sent"` 和 `cause_kind="identity_mismatch"`。普通 OS 访问失败不推断为身份不符。
 
-每次控制调用使用一个原生绝对预算，每个 session 只有一个在途请求；等待串行槽超时只结束该 waiter，不能关闭其他调用的 owner session；取得槽后、首次写入前超时也保留健康会话。开始写入后丢失确认会终止该专用会话，迟到应答不能交给下一请求。候选 setup 上限为原生 5 秒与剩余原 grace deadline 的较早者，拆包或重试不重置它；不新增配置项。owner 控制独立使用 version 1、最多 4 KiB 的消息，复用既有帧封装；当前 IPC 握手为 13、SHM 为 3、C/FFI ABI 为 6；owner 控制仍使用版本 1，业务帧、调用/回复布局保持。Rust 穷举匹配须增加 `MsgType::OwnerControl`、`SchedulerAcquireError::Unavailable` 和 `RouteConcurrencyError::Unavailable` 分支。旧单向 owner 类型、格式和别名已移除，无兼容入口；不向普通 admin、HTTP 或 relay 降级。
+每次控制调用使用一个原生绝对预算，每个 session 只有一个在途请求；等待串行槽超时只结束该 waiter，不能关闭其他调用的 owner session；取得槽后、首次写入前超时也保留健康会话。开始写入后丢失确认会终止该专用会话，迟到应答不能交给下一请求。候选 setup 上限为原生 5 秒与剩余原 grace deadline 的较早者，拆包或重试不重置它；不新增配置项。owner 控制独立使用 version 1、最多 4 KiB 的消息，复用既有帧封装；当前 IPC 握手为 14，采用永久固定版本前导（见[握手规范](ipc-handshake.md)），SHM 为 3、C/FFI ABI 为 6；owner 控制仍使用版本 1，业务帧、调用/回复布局保持。Rust 穷举匹配须增加 `MsgType::OwnerControl`、`SchedulerAcquireError::Unavailable`、`RouteConcurrencyError::Unavailable` 以及类型化的 `IpcError::ProtocolVersionMismatch` / Core `Error::ProtocolVersionMismatch` 分支。旧单向 owner 类型、格式和别名已移除，无兼容入口；不向普通 admin、HTTP 或 relay 降级。
 
 `OwnedChild.poll()` / `wait(timeout=...)` / `kill()` 观察或管理进程，`OwnedChild.close()` 只释放观察者，原生共享 reaper 继续负责 OS 回收。它与 `OwnerControl.close()` 的生命周期作用不同。
 
@@ -73,6 +73,8 @@ Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时�
 Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己的本地上游域上下文，一个 relay 本地域对应一个 root，上游资源与它使用一致配置；不同 root 可运行不同 relay。客户端在发现请求中携带 Core 派生的本地 namespace 标识（不含原始路径，不是授权凭据）。`/_resolve` 响应的 `x-c2-local-namespace` 头是整批路由的唯一 namespace 来源，JSON 路由不再附加该字段。Rust/Core 客户端只在 anchor 为本机、响应头与本地上下文匹配且握手身份、契约与代际检查均通过时接受 IPC。缺头或不匹配时使用 HTTP，不推定默认 root，也不从旧 JSON 字段恢复 namespace；重复或非法响应头仍拒绝。HTTP 路由不会因 namespace 不匹配被撤销，HTTP-only 调用不要求本地端点能力。Windows 标识由 backend 与当前用户作用域 构成，实际权限仍由 OS DACL、握手身份与完整路由契约检查。
 
 原生路由获取查询服务端当前权威状态，随后固定 route UID/revision 和 server instance。数据连接 idle 驱逐保留资源登记与 owner；旧代理不能借同名替换取得新资源。生成的 TypeScript 持久直连客户端也使用该控制查询和身份固定规则。
+
+relay 选出的本地 IPC 候选上发生类型化握手版本不符是终态：客户端完成本地清理后原样抛出，不继续后续路由、不做 HTTP fallback、不自动重试。HTTP 侧，relay 自身连接上游的版本不符由 relay 投影为既有 `ProtocolViolation`（502）并附 `local_protocol_version` / `peer_protocol_version` details——那是 relay 与其上游的一对版本，不是调用方本端。详见[握手规范](ipc-handshake.md)。
 
 Windows 在发送数据或控制字节前，核对实际管道对象的所有者和固定的服务进程：TokenUser 必须匹配，服务端完整性至少为 Medium。监听启动只向同一用户授予进程身份查询、退出观察和令牌查询权限，支持 Medium/High 跨登录互通，不授予进程控制或令牌复制。监听唯一性由按用户限权的 Global 互斥体维护；Local 映射只在原生会话事实及握手方向允许时使用，跨会话复用 owned/inline/chunked，包括预分配请求和准备好的响应。[0.9.0 迁移说明](releases/0.9.0.md)列出了停旧服务后统一升级及旧票据绑定失配的边界。
 
@@ -103,7 +105,7 @@ except CoreError as exc:
 
 所有实例都具备类中声明的字段；可选值缺省为 `None`，`details` 为独立字典。`str(exc)` 与 `args[0]` 保留外层原始诊断；Python 复制和 pickle 往返保留字段，不改变 portable 错误协议。全部字段及取值范围见[字段表](local-endpoint-lifecycle.en.md#public-structured-python-errors)。
 
-`category` 为 `semantic / contract / admission / transport / lifecycle`；`transport_kind` 为 `ipc / http / None`；`transport_phase` 为 `str / None`：Core 传输错误产生 `pre_dispatch / dispatch_uncertain`，分别表示业务发送前、不能确定对端是否执行；语义错误原样保留对端任意诊断字符串，不代表可信传输分类。`io_kind` 为 `permission_denied / not_found / connection_refused / address_in_use / other / None`；`raw_os_error` 仅保留真实 errno/Win32 码，无原始系统码的策略拒绝及非 I/O 失败为 `None`。这些字段不自行授权重试或清理。
+`category` 为 `semantic / contract / admission / transport / lifecycle / protocol_version_mismatch`；`transport_kind` 为 `ipc / http / None`；`transport_phase` 为 `str / None`：Core 传输错误产生 `pre_dispatch / dispatch_uncertain`，分别表示业务发送前、不能确定对端是否执行；语义错误原样保留对端任意诊断字符串，不代表可信传输分类。`io_kind` 为 `permission_denied / not_found / connection_refused / address_in_use / other / None`；`raw_os_error` 仅保留真实 errno/Win32 码，无原始系统码的策略拒绝及非 I/O 失败为 `None`。这些字段不自行授权重试或清理。`local_protocol_version` / `peer_protocol_version` 仅在 `protocol_version_mismatch` 时为非零 u32（例如本端 14、对端 15），其他错误均为 `None`；该错误 `transport_kind='ipc'`、`transport_phase='pre_dispatch'`、`fallback_eligible=False`，`code`、`name`、`error_bytes` 与 OS cause 三字段为 `None`，且为终态事实，不做路由/HTTP fallback 或自动重试；畸形/截断前导保持既有 transport/protocol 分类，不伪造对端版本，详见[握手规范](ipc-handshake.md)。
 
 `lifecycle_kind`、启动阶段/秒数、HTTP 状态、登记失败来源及 rollback/relay cleanup 结果继续来自原 Core 错误链；结构化字段并不重新执行事务。普通导入仍不加载 FastDB 或 NumPy。
 

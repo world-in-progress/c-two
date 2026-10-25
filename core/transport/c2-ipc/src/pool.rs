@@ -2405,6 +2405,7 @@ mod tests {
                     for attempt in 0..2 {
                         let mut stream = listener.accept().await.unwrap();
 
+                        crate::tests::accept_version_preamble(&mut stream).await;
                         let mut len_buf = [0_u8; 4];
                         stream.read_exact(&mut len_buf).await.unwrap();
                         let body_len = u32::from_le_bytes(len_buf) as usize;
@@ -2574,6 +2575,7 @@ mod tests {
                                 _ = &mut stopped => break,
                                 accepted = listener.accept() => {
                                     let mut stream = accepted.unwrap();
+                                    crate::tests::accept_version_preamble(&mut stream).await;
                                     let (header, _) = read_peer_frame(&mut stream).await.unwrap().unwrap();
                                     assert_ne!(header.flags & c2_wire::flags::FLAG_HANDSHAKE, 0);
                                     stream.write_all(&grid_handshake_reply_frame()).await.unwrap();
@@ -3235,7 +3237,10 @@ mod tests {
                                 let mut stream = stream;
                                 let handshake = tokio::time::timeout(
                                     Duration::from_secs(5),
-                                    read_peer_frame(&mut stream),
+                                    async {
+                                        crate::tests::accept_version_preamble(&mut stream).await;
+                                        read_peer_frame(&mut stream).await
+                                    },
                                 )
                                 .await
                                 .map_err(|e| e.to_string())??
@@ -3538,13 +3543,14 @@ mod tests {
                 let mut listener = LocalListener::bind(&endpoint).unwrap();
                 listener_ready_tx.send(()).unwrap();
 
-                // Accept both connections and read each handshake request
-                // before answering either, so both clients finish connect()
-                // only after both are already dialing: the insert race is
-                // deterministic no matter which thread wins.
+                // Accept both version preambles and read each metadata request
+                // before replying to either metadata request, so both clients
+                // finish connect() only after both are already dialing: the
+                // insert race is deterministic no matter which thread wins.
                 let mut streams = Vec::new();
                 for _ in 0..2 {
                     let mut stream = listener.accept().await.unwrap();
+                    crate::tests::accept_version_preamble(&mut stream).await;
                     let mut len_buf = [0_u8; 4];
                     stream.read_exact(&mut len_buf).await.unwrap();
                     let body_len = u32::from_le_bytes(len_buf) as usize;
@@ -3743,6 +3749,7 @@ mod tests {
                 listener_ready_tx.send(()).unwrap();
                 let mut stream = listener.accept().await.unwrap();
 
+                crate::tests::accept_version_preamble(&mut stream).await;
                 let mut len_buf = [0_u8; 4];
                 stream.read_exact(&mut len_buf).await.unwrap();
                 let body_len = u32::from_le_bytes(len_buf) as usize;
@@ -3795,8 +3802,8 @@ mod tests {
     #[test]
     fn close_all_rejects_in_flight_connect_and_reopens_under_new_epoch() {
         // A stalled handshake peer holds one pool acquire deterministically
-        // mid-connect: the handshake request has been read but no reply was
-        // sent. Draining the cache during that stall must fence the connect
+        // mid-connect: version selection completed and the metadata request
+        // has been read, but its reply is held. Draining must fence the connect
         // out of the new epoch: when the handshake finally succeeds, the
         // fresh connection is closed explicitly and the acquire rejects. A
         // later acquire under the new epoch must succeed (restart/reacquire).
@@ -3817,6 +3824,7 @@ mod tests {
                 listener_ready_tx.send(()).unwrap();
                 let mut stream = listener.accept().await.unwrap();
 
+                crate::tests::accept_version_preamble(&mut stream).await;
                 let mut len_buf = [0_u8; 4];
                 stream.read_exact(&mut len_buf).await.unwrap();
                 let body_len = u32::from_le_bytes(len_buf) as usize;
@@ -4089,6 +4097,7 @@ mod tests {
                 let mut listener = LocalListener::bind(&endpoint).unwrap();
                 listener_ready_tx.send(()).unwrap();
                 let mut stream = listener.accept().await.unwrap();
+                crate::tests::accept_version_preamble(&mut stream).await;
                 let mut len_buf = [0_u8; 4];
                 stream.read_exact(&mut len_buf).await.unwrap();
                 let body_len = u32::from_le_bytes(len_buf) as usize;

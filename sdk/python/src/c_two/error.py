@@ -64,7 +64,7 @@ class CoreError(CCBaseError, RuntimeError):
     differ from that diagnostic. Fields without a native value remain None.
     """
 
-    category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle']
+    category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch']
     message: str
     code: int | None
     name: str | None
@@ -80,6 +80,9 @@ class CoreError(CCBaseError, RuntimeError):
         'permission_denied', 'not_found', 'connection_refused', 'address_in_use', 'other',
     ] | None
     raw_os_error: int | None
+    # Only protocol_version_mismatch supplies these nonzero u32 values.
+    local_protocol_version: int | None
+    peer_protocol_version: int | None
     lifecycle_kind: Literal[
         'invalid_server_id', 'config_frozen', 'client_config_frozen',
         'duplicate_route', 'missing_route', 'relay_duplicate_route',
@@ -102,7 +105,7 @@ class CoreError(CCBaseError, RuntimeError):
 
     def __init__(
         self,
-        category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle'],
+        category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch'],
         message: str,
     ):
         super().__init__(message)
@@ -119,6 +122,8 @@ class CoreError(CCBaseError, RuntimeError):
         self.io_operation = None
         self.io_kind = None
         self.raw_os_error = None
+        self.local_protocol_version = None
+        self.peer_protocol_version = None
         self.lifecycle_kind = None
         self.startup_stage = None
         self.timeout_seconds = None

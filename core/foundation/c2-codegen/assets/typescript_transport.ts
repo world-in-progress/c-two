@@ -379,10 +379,27 @@ export class C2CrmMethodError extends Error {
 }
 
 export class C2IpcTransportError extends Error {
-  constructor(message: string) {
+  readonly category: "protocol_version_mismatch" | null;
+  readonly localProtocolVersion: number | null;
+  readonly peerProtocolVersion: number | null;
+
+  constructor(message: string, protocolVersionMismatch?: {
+    readonly localProtocolVersion: number;
+    readonly peerProtocolVersion: number;
+  }) {
     super(`C-Two IPC transport error: ${message}`);
     this.name = "C2IpcTransportError";
     Object.setPrototypeOf(this, C2IpcTransportError.prototype);
+    if (protocolVersionMismatch !== undefined) {
+      const { localProtocolVersion, peerProtocolVersion } = protocolVersionMismatch;
+      this.category = "protocol_version_mismatch";
+      this.localProtocolVersion = localProtocolVersion;
+      this.peerProtocolVersion = peerProtocolVersion;
+    } else {
+      this.category = null;
+      this.localProtocolVersion = null;
+      this.peerProtocolVersion = null;
+    }
   }
 }
 
@@ -753,7 +770,9 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         try {
           await open.connection.close();
         } catch (error) {
-          throw new C2IpcTransportError(`C-Two IPC close failed: ${String(error)}`);
+          const closeError = new C2IpcTransportError(`C-Two IPC close failed: ${String(error)}`);
+          closeError.cause = error;
+          throw closeError;
         }
       }
     },
@@ -943,16 +962,21 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
           try {
             await localTransport.prepare(routeName, routeContract);
           } catch (error) {
-            lastError = error;
-            excludedLocalRouteTokens.add(localTokenKey);
-            invalidateRelayRouteCache(routeCache, cacheKey);
             try {
               await localTransport.close();
             } catch (closeError) {
-              throw new C2IpcTransportError(
-                `C-Two relay-aware local IPC preparation failed and cleanup also failed: ${String(closeError)}`,
+              const primaryError = error instanceof Error ? error : new C2IpcTransportError(
+                `C-Two relay-aware local IPC preparation failed: ${String(error)}`,
               );
+              primaryError.cause = closeError;
+              throw primaryError;
             }
+            if (error instanceof C2IpcTransportError && error.category === "protocol_version_mismatch") {
+              throw error;
+            }
+            lastError = error;
+            excludedLocalRouteTokens.add(localTokenKey);
+            invalidateRelayRouteCache(routeCache, cacheKey);
             const distinctRoutes = routes.filter(
               (route) => routeTokenKey(route) !== localTokenKey,
             );
@@ -1057,7 +1081,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
   };
 }
 
-const C2_IPC_HANDSHAKE_VERSION = 13;
+const C2_IPC_HANDSHAKE_VERSION = 14;
 const C2_IPC_FRAME_BODY_HEADER_BYTES = 12;
 const C2_IPC_FRAME_HEADER_BYTES = 16;
 const C2_IPC_BUDDY_PAYLOAD_BYTES = 23;
@@ -1089,7 +1113,7 @@ const C2_IPC_FLAG_CALL_V2 = 1 << 7;
 const C2_IPC_FLAG_REPLY_V2 = 1 << 8;
 const C2_IPC_FLAG_CHUNKED = 1 << 9;
 const C2_IPC_FLAG_CHUNK_LAST = 1 << 10;
-// Canonical c2-wire MsgType discriminants for the v13 handshake.
+// Canonical c2-wire route catalog MsgType discriminants.
 const C2_IPC_ROUTE_LIST = 0x0e;
 const C2_IPC_ROUTE_LIST_ACK = 0x0f;
 const C2_IPC_ROUTE_LOOKUP = 0x10;
@@ -1649,10 +1673,14 @@ async function connectAndHandshakeIpc(
     throw new C2IpcTransportError(`C-Two IPC connect failed: ${String(error)}`);
   }
   try {
-    await connection.write(encodeIpcFrame(0n, C2_IPC_FLAG_HANDSHAKE, encodeClientIpcHandshake(requestShmWriter, responseShmReader)));
+    // Preserve local metadata validation before any bytes reach the peer.
+    const metadata = encodeIpcFrame(0n, C2_IPC_FLAG_HANDSHAKE, encodeClientIpcHandshake(requestShmWriter, responseShmReader));
+    await connection.write(encodeClientIpcHello());
+    await acceptServerIpcVersion(connection);
+    await connection.write(metadata);
     const frame = await readIpcFrame(connection);
-    if ((frame.flags & C2_IPC_FLAG_HANDSHAKE) === 0) {
-      throw new C2IpcTransportError("C-Two IPC server response is not a handshake frame.");
+    if (frame.requestId !== 0n || frame.flags !== (C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_HANDSHAKE)) {
+      throw new C2IpcTransportError("C-Two IPC server metadata response has invalid request id or flags.");
     }
     const handshake = decodeServerIpcHandshake(frame.payload);
     if ((handshake.capabilityFlags & C2_IPC_CAP_CALL_V2) === 0) {
@@ -1663,15 +1691,64 @@ async function connectAndHandshakeIpc(
     }
     return { connection, handshake };
   } catch (error) {
+    const primaryError = error instanceof C2IpcTransportError ? error : new C2IpcTransportError(
+      `C-Two IPC handshake failed: ${String(error)}`,
+    );
     try {
       await connection.close();
-    } catch {
+    } catch (closeError) {
+      primaryError.cause = closeError;
     }
-    if (error instanceof C2IpcTransportError) {
-      throw error;
-    }
-    throw new C2IpcTransportError(`C-Two IPC handshake failed: ${String(error)}`);
+    throw primaryError;
   }
+}
+
+function encodeClientIpcHello(): Uint8Array {
+  // This permanent 25-byte envelope is independent of business frame codecs.
+  const record = new Uint8Array(25);
+  const view = new DataView(record.buffer);
+  view.setUint32(0, 21, true);
+  view.setBigUint64(4, 0n, true);
+  view.setUint32(12, 0x04, true);
+  record.set([0x43, 0x32, 0x49, 0x50, 1], 16); // C2IP, Hello
+  view.setUint32(21, C2_IPC_HANDSHAKE_VERSION, true);
+  return record;
+}
+
+async function acceptServerIpcVersion(connection: C2IpcConnection): Promise<void> {
+  // Never let an unnegotiated length select a read or payload allocation.
+  const header = requireUint8Array(await connection.readExactly(16), "C-Two IPC version preamble header");
+  if (header.byteLength !== 16) {
+    throw new C2IpcTransportError("C-Two IPC version preamble header is truncated.");
+  }
+  const envelope = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  if (envelope.getUint32(0, true) !== 21 || envelope.getBigUint64(4, true) !== 0n || envelope.getUint32(12, true) !== 0x06) {
+    throw new C2IpcTransportError("C-Two IPC version preamble has invalid length, request id or flags.");
+  }
+  const body = requireUint8Array(await connection.readExactly(9), "C-Two IPC version preamble body");
+  if (body.byteLength !== 9) {
+    throw new C2IpcTransportError("C-Two IPC version preamble body is truncated.");
+  }
+  if (body[0] !== 0x43 || body[1] !== 0x32 || body[2] !== 0x49 || body[3] !== 0x50 || (body[4] !== 2 && body[4] !== 3)) {
+    throw new C2IpcTransportError("C-Two IPC version preamble has invalid magic or response kind.");
+  }
+  const peerProtocolVersion = readU32LE(body, 5);
+  if (peerProtocolVersion === 0) {
+    throw new C2IpcTransportError("C-Two IPC version preamble version must be positive.");
+  }
+  if (body[4] === 2) {
+    if (peerProtocolVersion !== C2_IPC_HANDSHAKE_VERSION) {
+      throw new C2IpcTransportError("C-Two IPC Accepted preamble has a different protocol version.");
+    }
+    return;
+  }
+  if (peerProtocolVersion === C2_IPC_HANDSHAKE_VERSION) {
+    throw new C2IpcTransportError("C-Two IPC VersionMismatch preamble has the local protocol version.");
+  }
+  throw new C2IpcTransportError(
+    `C-Two IPC protocol version mismatch: local=${C2_IPC_HANDSHAKE_VERSION}, peer=${peerProtocolVersion}.`,
+    { localProtocolVersion: C2_IPC_HANDSHAKE_VERSION, peerProtocolVersion },
+  );
 }
 
 function validateIpcAddress(address: string): void {
@@ -1713,7 +1790,6 @@ function encodeClientIpcHandshake(
   if (requestShmWriter !== undefined) capabilityFlags |= C2_IPC_CAP_SHM_REQUEST;
   if (responseShmReader !== undefined) capabilityFlags |= C2_IPC_CAP_SHM_RESPONSE;
   return concatUint8Arrays([
-    new Uint8Array([C2_IPC_HANDSHAKE_VERSION]),
     encodeIpcHandshakeText(prefix, "client SHM prefix"),
     writeU16LE(segments.length),
     ...segments.map((segment, index) => concatUint8Arrays([
@@ -2071,10 +2147,6 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     return value;
   };
 
-  const version = readU8("version");
-  if (version !== C2_IPC_HANDSHAKE_VERSION) {
-    throw new C2IpcTransportError(`C-Two IPC handshake version ${version} is unsupported.`);
-  }
   const shmPrefix = readText("prefix");
   const segmentCount = readU16("segment count");
   const shmSegments: C2IpcShmSegment[] = [];

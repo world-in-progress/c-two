@@ -58,7 +58,7 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.
 
 On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
-C3 0.5.0 pairs with C-Two 0.9.x. IPC handshake 13 and C/FFI ABI 6 require a coordinated upgrade; SHM 3 and owner control 1 keep their formats. Stop old Windows services before upgrading and restarting. See the [0.9.0 migration notes](docs/releases/0.9.0.md).
+C3 0.5.0 pairs with C-Two 0.9.0. The published 0.9.0 speaks IPC handshake 13; C/FFI ABI 6 requires a coordinated upgrade, and SHM 3 and owner control 1 keep their formats. Stop old Windows services before upgrading and restarting. See the [0.9.0 migration notes](docs/releases/0.9.0.md). Current source (unpublished) moves the RPC IPC handshake to 14 with a permanent fixed version preamble and typed mismatch errors; it is incompatible with 0.9.0 peers — see the [handshake spec](docs/ipc-handshake.md) and [unreleased notes](docs/releases/unreleased.md).
 
 For source builds and tests, see the [development guide](docs/development.md).
 
@@ -107,6 +107,7 @@ For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_ancho
 | Rust SDK and API migration | [Rust SDK guide](sdk/rust/README.md) |
 | Relay and contract tools | [c3 CLI guide](cli/README.md) |
 | Connection, owner and endpoint APIs | [Lifecycle guide](docs/local-endpoint-lifecycle.en.md) |
+| IPC handshake protocol | [Handshake spec](docs/ipc-handshake.md) |
 | Windows | [Build and usage](docs/windows-native-usage.md) |
 | Environment variables | [.env.example](.env.example) |
 | Development | [Build and tests](docs/development.md), [CI and releases](docs/ci-cd.md), [contributing](CONTRIBUTING.md) |

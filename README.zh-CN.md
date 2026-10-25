@@ -58,7 +58,7 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.
 
 Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
 
-C3 0.5.0 配合 C-Two 0.9.x 使用。IPC 握手 13 和 C/FFI ABI 6 要求通信各端一起升级；SHM 3 与所有者控制 1 的格式保持。Windows 先停止旧服务，再升级并重启。见 [0.9.0 迁移说明](docs/releases/0.9.0.md)。
+C3 0.5.0 配合已发布的 C-Two 0.9.0 使用。该发行版的 IPC 握手 13 和 C/FFI ABI 6 要求通信各端一起升级；SHM 3 与所有者控制 1 的格式保持。Windows 先停止旧服务，再升级并重启。见 [0.9.0 迁移说明](docs/releases/0.9.0.md)。 当前未发布源码使用 IPC 14 固定版本前导；采用该前导的不同版本能返回结构化版本错误，与已发布 0.9.0 混用仍是连接或协议失败。构建源码时两端应一同升级，见[握手规范](docs/ipc-handshake.md)和[未发布变更](docs/releases/unreleased.md)。
 
 源码构建与测试见[开发指南](docs/development.md)。
 

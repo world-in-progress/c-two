@@ -76,6 +76,7 @@ pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
         | IpcError::Config(_)
         | IpcError::Handshake(_)
         | IpcError::Protocol(_)
+        | IpcError::ProtocolVersionMismatch { .. }
         | IpcError::IdentityMismatch { .. }
         | IpcError::ContractMismatch(_)
         | IpcError::RouteNotFound(_)
