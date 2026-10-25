@@ -2537,8 +2537,7 @@ async fn negotiate_handshake(
                 .write_all(&encode_version_preamble(
                     VersionPreambleKind::VersionMismatch,
                 ))
-                .await?;
-            writer.flush().await
+                .await // LocalWriteHalf::write_all already drains the async adapter.
         })
         .await
         .map_err(|_| {

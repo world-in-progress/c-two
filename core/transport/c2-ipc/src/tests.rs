@@ -3897,7 +3897,7 @@ mod lazy_policy_roundtrip_tests {
                     stream.read_exact(&mut hello).await?;
                     let mut refusal = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\0\0\0\0";
                     refusal[21..].copy_from_slice(&peer.to_le_bytes());
-                    stream.write_all(&refusal).await?;
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, &refusal).await?;
                     // Keep the pipe alive until local close, and detect metadata sent too early.
                     let trailing = stream.read(&mut [0]).await;
                     Ok::<_, std::io::Error>((hello, trailing))
@@ -3967,9 +3967,11 @@ mod lazy_policy_roundtrip_tests {
                     if header_only {
                         response[..4].copy_from_slice(&u32::MAX.to_le_bytes());
                     }
-                    stream
-                        .write_all(&response[..if header_only { 16 } else { 25 }])
-                        .await?;
+                    tokio::io::AsyncWriteExt::write_all(
+                        &mut stream,
+                        &response[..if header_only { 16 } else { 25 }],
+                    )
+                    .await?;
                     Ok::<_, std::io::Error>(stream.read(&mut [0]).await)
                 })
                 .await;

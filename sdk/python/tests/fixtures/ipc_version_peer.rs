@@ -5,7 +5,7 @@ use std::{
     path::Path,
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 const HELLO14: &[u8; 25] = b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\x0e\0\0\0";
 
@@ -44,8 +44,9 @@ async fn main() -> io::Result<()> {
         if &hello != HELLO14 {
             return Err(io::Error::other("not the golden Hello14"));
         }
-        stream.write_all(reply).await?;
-        stream.flush().await?;
+        // The SDK asserts complete receipt; this peer retains the stream until EOF.
+        // Avoid LocalStream's additional flush probe racing the client's close.
+        tokio::io::AsyncWriteExt::write_all(&mut stream, reply).await?;
         let mut extra = [0; 1];
         extra_bytes = match stream.read(&mut extra).await {
             Ok(n) => n,
