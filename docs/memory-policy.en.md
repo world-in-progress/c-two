@@ -4,7 +4,7 @@ English · [简体中文](memory-policy.md)
 
 Rust owns IPC budget accounting, lazy allocation and tiered fallback. SDKs expose typed overrides and read-only statistics. See the [configuration guide](configuration.en.md) for the full option reference.
 
-On Windows, native pipe session facts and IPC 13 directional capabilities govern shared references. Different sessions use the existing owned/inline/chunked path, including copies of explicitly prepared SHM payloads with release through their original owner. The configured buddy-pool switch does not decide this reachability; reassembly may still use its own local memory pool.
+On Windows, native pipe session facts and negotiated directional capabilities govern shared references. Different sessions use the existing owned/inline/chunked path, including copies of explicitly prepared SHM payloads with release through their original owner. The configured buddy-pool switch does not decide this reachability; reassembly may still use its own local memory pool.
 
 ## Finite budget cells
 
@@ -36,7 +36,7 @@ Client requests choose inline or checked chunk transfer when request-pool SHM is
 
 Server responses up to `shm_threshold` use inline frames. Larger responses try buddy reuse, buddy expansion and dedicated SHM before checked chunk fallback. Payloads that cannot fit buddy wire metadata also use the checked fallback.
 
-SHM header version 3 records each buddy allocation's level and non-wrapping id under the existing allocator lock. Release must match that live record before changing free bits or counters, rejecting parent, child and stale-id releases. Logical sizes still round up to the allocation level, and trimming preserves the original release capacity. Records add 8 bytes per minimum block: the default 256 MiB / 4 KiB backing and its creation budget grow by 512 KiB. IPC 12 and C/FFI ABI 5 introduced this allocation-id representation. The current release uses IPC 13 and C/FFI ABI 6 with SHM header 3, and rejects the retired handshake and ABI.
+SHM header version 3 records each buddy allocation's level and non-wrapping id under the existing allocator lock. Release must match that live record before changing free bits or counters, rejecting parent, child and stale-id releases. Logical sizes still round up to the allocation level, and trimming preserves the original release capacity. Records add 8 bytes per minimum block: the default 256 MiB / 4 KiB backing and its creation budget grow by 512 KiB. IPC 12 and C/FFI ABI 5 introduced this allocation-id representation. Published 0.9.0 uses IPC 13 and C/FFI ABI 6 with SHM header 3. Current unpublished source uses the [IPC 14 fixed preamble](ipc-handshake.md), retaining ABI 6 and SHM header 3; retired handshakes and ABIs are rejected.
 
 Receiver assembly reserves full capacity, `total_chunks × chunk_size`, before accepting the storage. Allocation tries buddy reuse, reuse after GC, buddy expansion, dedicated SHM and finally file mmap. Completion may trim logical length while the capacity charge remains until storage release. Resources receive the complete assembled input; chunk transfer does not provide incremental resource input.
 

@@ -23,8 +23,6 @@ def test_core_error_copy_and_pickle_preserve_structured_fields():
     original = failure.value
     assert original.name == 'CallDeadlineExceeded'
     assert original.details['operation'] == 'connect'
-    assert original.local_protocol_version is None
-    assert original.peer_protocol_version is None
     for restored in (copy.copy(original), pickle.loads(pickle.dumps(original))):
         assert type(restored) is error.CoreError
         assert restored is not original

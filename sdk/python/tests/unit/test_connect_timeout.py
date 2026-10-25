@@ -36,7 +36,7 @@ def test_public_connect_timeout_is_optional_keyword():
     assert timeout.default is None
 
 
-@pytest.mark.parametrize('category', ['semantic', 'contract', 'admission', 'transport', 'lifecycle'])
+@pytest.mark.parametrize('category', ['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch'])
 def test_public_core_error_has_complete_independent_fields(category):
     error = cc.error.CoreError(category, 'native diagnostic')
     assert isinstance(error, cc.error.CCBaseError)
@@ -52,6 +52,7 @@ def test_public_core_error_has_complete_independent_fields(category):
         'raw_os_error', 'lifecycle_kind', 'startup_stage', 'timeout_seconds',
         'route_name', 'status_code', 'body', 'relay_duplicate', 'failure_source',
         'registration_failure', 'rollback', 'relay_cleanup_error',
+        'local_protocol_version', 'peer_protocol_version',
     }
     assert all(getattr(error, field) is None for field in optional)
     assert optional | {'category', 'message', 'details'} == set(cc.error.CoreError.__annotations__)
@@ -64,7 +65,7 @@ def test_public_core_error_has_complete_independent_fields(category):
 
 def test_public_core_error_annotations_expose_native_literal_values():
     hints = get_type_hints(cc.error.CoreError)
-    assert hints['category'] == Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle']
+    assert hints['category'] == Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch']
     assert hints['transport_kind'] == Literal['ipc', 'http'] | None
     assert hints['transport_phase'] == str | None
     assert hints['io_operation'] == Literal['bind', 'connect'] | None
@@ -73,6 +74,7 @@ def test_public_core_error_annotations_expose_native_literal_values():
     ] | None
     assert hints['startup_stage'] == Literal['readiness', 'responsiveness', 'owner_control'] | None
     assert hints['code'] == int | None
+    assert hints['local_protocol_version'] == hints['peer_protocol_version'] == int | None
     assert hints['details'] == dict[str, str]
     assert hints['error_bytes'] == bytes | None
     assert hints['fallback_eligible'] == hints['route_withdrawal'] == bool | None

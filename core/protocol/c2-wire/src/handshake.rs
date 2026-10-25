@@ -38,6 +38,9 @@ use crate::frame::DecodeError;
 /// RPC protocol version; version 14 requires the fixed preamble before metadata.
 pub const HANDSHAKE_VERSION: u32 = 14;
 
+/// Fixed preamble body length, independent of configurable variable-frame limits.
+pub const VERSION_PREAMBLE_BODY_LEN: u32 = 21;
+
 /// Permanent preamble kinds. Future RPC versions retain these values and layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -53,7 +56,7 @@ pub enum VersionPreambleKind {
 /// stay independent of future business-frame and metadata formats.
 pub fn encode_version_preamble(kind: VersionPreambleKind) -> [u8; 25] {
     let mut bytes = [0; 25];
-    bytes[0] = 21;
+    bytes[..4].copy_from_slice(&VERSION_PREAMBLE_BODY_LEN.to_le_bytes());
     bytes[12] = if kind == VersionPreambleKind::Hello {
         4
     } else {
@@ -74,7 +77,7 @@ pub fn validate_version_preamble_header(
         (
             "version preamble length",
             u64::from(u32::from_le_bytes(header[..4].try_into().unwrap())),
-            21,
+            u64::from(VERSION_PREAMBLE_BODY_LEN),
         ),
         (
             "version preamble request id",

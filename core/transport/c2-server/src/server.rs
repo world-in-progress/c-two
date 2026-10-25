@@ -47,9 +47,9 @@ use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, HANDSHAKE_VERSION,
-    MAX_ROUTES, MethodEntry, RouteInfo, VersionPreambleKind, decode_handshake,
-    decode_version_preamble_payload, encode_server_handshake, encode_version_preamble,
-    validate_version_preamble_header,
+    MAX_ROUTES, MethodEntry, RouteInfo, VERSION_PREAMBLE_BODY_LEN, VersionPreambleKind,
+    decode_handshake, decode_version_preamble_payload, encode_server_handshake,
+    encode_version_preamble, validate_version_preamble_header,
 };
 use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES};
 use c2_wire::registration_control::{
@@ -2053,7 +2053,12 @@ fn handle_connection(
                 conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
                 break;
             }
-            if total_len < 12 || (total_len as u64) > max_frame {
+            let variable_frame_over_limit = u64::from(total_len) > max_frame;
+            // Only the fixed-size preamble can reach header inspection outside
+            // the variable-frame budget; its exact flags and bytes are checked below.
+            if total_len < 12
+                || (variable_frame_over_limit && total_len != VERSION_PREAMBLE_BODY_LEN)
+            {
                 warn!(conn_id, total_len, "invalid frame length");
                 conn.end(ConnectionEndReason::ProtocolError, "frame_length");
                 break;
@@ -2103,6 +2108,10 @@ fn handle_connection(
                     break;
                 }
                 continue;
+            }
+            if variable_frame_over_limit {
+                conn.end(ConnectionEndReason::ProtocolError, "frame_length");
+                break;
             }
             if header.is_ctrl() {
                 // OwnerControl has its own protocol. Only CTRL needs this
@@ -9415,8 +9424,17 @@ mod tests {
     #[tokio::test]
     async fn handshake_version_mismatch_returns_fixed_preamble() {
         let local = HANDSHAKE_VERSION;
-        for peer in [1, local + 1, u32::MAX] {
-            let (server, mut client, stream) = version_fence_connection().await;
+        for (max_frame, peer) in [
+            (u32::MAX, 1),
+            (u32::MAX, local + 1),
+            (u32::MAX, u32::MAX),
+            (17, local + 1),
+        ] {
+            let (mut server, mut client, stream) = version_fence_connection().await;
+            let config = &mut Arc::get_mut(&mut server).unwrap().config;
+            config.max_frame_size = u64::from(max_frame);
+            config.shm_threshold = config.shm_threshold.min(config.max_frame_size);
+            config.validate().unwrap();
             let handler = tokio::spawn(handle_connection(server, stream));
             let mut hello = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\0\0\0\0";
             hello[21..].copy_from_slice(&peer.to_le_bytes());
@@ -9437,15 +9455,20 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_preamble_headers_are_rejected_without_reading_payload() {
-        for (length, rid, flags) in [
-            (20u32, 0u64, FLAG_HANDSHAKE),
-            (21, 1, FLAG_HANDSHAKE),
-            (21, 0, FLAG_HANDSHAKE | FLAG_RESPONSE),
-            (21, 0, FLAG_HANDSHAKE | FLAG_CTRL),
-            (21, 0, FLAG_RESPONSE),
-            (21, 0, 0),
+        for (max_frame, length, rid, flags) in [
+            (u32::MAX, 20u32, 0u64, FLAG_HANDSHAKE),
+            (u32::MAX, 21, 1, FLAG_HANDSHAKE),
+            (u32::MAX, 21, 0, FLAG_HANDSHAKE | FLAG_RESPONSE),
+            (u32::MAX, 21, 0, FLAG_HANDSHAKE | FLAG_CTRL),
+            (u32::MAX, 21, 0, FLAG_RESPONSE),
+            (u32::MAX, 21, 0, 0),
+            (17, 21, 0, FLAG_SIGNAL), // Fixed length does not exempt ordinary frames.
         ] {
-            let (server, mut client, stream) = version_fence_connection().await;
+            let (mut server, mut client, stream) = version_fence_connection().await;
+            let config = &mut Arc::get_mut(&mut server).unwrap().config;
+            config.max_frame_size = u64::from(max_frame);
+            config.shm_threshold = config.shm_threshold.min(config.max_frame_size);
+            config.validate().unwrap();
             let handler = tokio::spawn(handle_connection(server, stream));
             let mut header = [0u8; 16];
             header[..4].copy_from_slice(&length.to_le_bytes());
