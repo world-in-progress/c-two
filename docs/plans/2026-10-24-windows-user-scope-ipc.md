@@ -1,6 +1,6 @@
 # Windows user-scoped IPC and authenticated local connections
 
-Status: implementation, targeted repair, real Windows evidence review, and developer-host cleanup are complete. Canonical release qualification and publication remain pending. The separately approved R06 repair retains its own baseline and performance evidence. See the [acceptance record](../reports/2026-10-25-090-windows-release-acceptance.md) for exact source commits, reused validation and remaining release gates.
+Status: C-Two 0.9.0 and c3 0.5.0 were published on 2026-10-25 after canonical release qualification. Implementation, targeted repair, real Windows evidence review, and developer-host cleanup are complete. The separately approved R06 repair retains its own baseline and performance evidence. See the [acceptance record](../reports/2026-10-25-090-windows-release-acceptance.md) for exact source commits, reused validation and remaining release gates.
 
 ## Scope and boundary
 

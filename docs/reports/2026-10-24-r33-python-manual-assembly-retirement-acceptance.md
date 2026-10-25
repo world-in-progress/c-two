@@ -1,6 +1,6 @@
 # R33 Python 手工分片包装退役验收
 
-用户批准退役 `c_two.mem.ChunkAssembler`、`c_two.mem.MemHandle` 及对应 `_native` 导出，不留兼容。实现提交为 `921b48ee7e54f5b88cafff5e4e19a31d47d5d545`，基线为 `ed6c761abcb2fcca7ccfac4b5cd89cd87762a58d`，对应[批准方案](../plans/2026-10-24-r33-python-manual-assembly-retirement.md)。Rust `ChunkRegistry → ChunkAssembler → ReassemblyBacking`、Rust MemHandle 及正式 IPC 行为保持。R35 继续暂缓，本轮不发版。
+用户批准退役 `c_two.mem.ChunkAssembler`、`c_two.mem.MemHandle` 及对应 `_native` 导出，不留兼容。实现提交为 `921b48ee7e54f5b88cafff5e4e19a31d47d5d545`，基线为 `ed6c761abcb2fcca7ccfac4b5cd89cd87762a58d`，对应[批准方案](../plans/2026-10-24-r33-python-manual-assembly-retirement.md)。Rust `ChunkRegistry → ChunkAssembler → ReassemblyBacking`、Rust MemHandle 及正式 IPC 行为保持。R35 继续暂缓，该独立批次未发版，现已随 [0.9.0](2026-10-25-090-windows-release-acceptance.md) 发布；本记录中的协议编号对应当时的独立实现基线。
 
 ## 替换与实际净量
 

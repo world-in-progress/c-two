@@ -1,6 +1,6 @@
 # 0.9.0 Windows 用户作用域与发布验收
 
-状态：工程验证和 Windows 开发机清理已完成，正式发布门禁正在准备；本记录不表示 0.9.0 已发布。最终生产候选为 `b9efb2d9706a7563ddaacfe2db2dc2d953c8b86e`，包含 R06 和 Windows 用户作用域修复。发行候选还收束了测试文件末尾的空行和验收文档，生产内容不再变更。C-Two 版本为 0.9.0，c3 为 0.5.0，FastDB 保持 0.2.3。
+[C-Two 0.9.0](https://pypi.org/project/c-two/0.9.0/) 与 [c3 0.5.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.5.0) 已发布。发行来源为 `3f223d658117511073ae549565ad2c49af163a87`，来自 [PR #197](https://github.com/world-in-progress/c-two/pull/197)，其内容树与候选 `0e63094ab2ef9add7e9d4dd0e6c4873d09a7e175` 相同。生产实现冻结在 `b9efb2d9706a7563ddaacfe2db2dc2d953c8b86e`；后续候选只追加文档并清理一行测试空行。FastDB 保持 0.2.3；本验收的后续纯文档提交不是发行产物来源。
 
 ## 行为与证据边界
 
@@ -38,6 +38,32 @@ Windows 重新启动时间为 `2026-10-24T17:04:10.4182720Z`，已与重启前�
 
 ## 发行门禁
 
-既有发布器要求 canonical `main` 上同一确切来源的完整 Source Validation，不接受 fork、祖先提交或跨运行拼接。用户已明确授权这一轮必要的完整发行门禁。main push 的合格运行直接复用，不额外 dispatch 同一轮；成功后只构建一次 Release Candidate，Python 与 CLI 的演练及正式晋升共用该 run 的已验证字节。
+既有发布器要求 canonical `main` 上同一确切来源的完整 Source Validation，不接受 fork、祖先提交或跨运行拼接。用户明确授权这一轮必要的完整发行门禁。上游 main push 的运行直接复用，没有追加同源 dispatch；只构建一次 Release Candidate，Python 与 CLI 的演练及正式晋升共用该 run 的已验证字节。
 
-待完成：canonical 来源与完整 Source Validation、Release Candidate 的 35 个 wheel/1 个 sdist/6 个 CLI、两次 promotion 演练与正式发布、远端文件哈希核对、本地/fork/upstream 同步和本轮验证分支清理。后续验收文档提交不得被误记为已构建产物的来源。
+| 阶段 | 实际结果 |
+| --- | --- |
+| [PR Source Validation](https://github.com/world-in-progress/c-two/actions/runs/40157625282) | 最终 10/10 job 成功；仅对失败的 macOS job 复核一次，其他 source 结果复用。 |
+| [上游 Source Validation](https://github.com/world-in-progress/c-two/actions/runs/40161591075) | 来源 `3f223d65`，首轮 10/10 job 成功。 |
+| [Release Candidate](https://github.com/world-in-progress/c-two/actions/runs/40164835157) | 38 job 成功，1 个既定的 Linux ARM64 重复 sdist 分支跳过。 |
+| [Python 预演](https://github.com/world-in-progress/c-two/actions/runs/40165944800) / [CLI 预演](https://github.com/world-in-progress/c-two/actions/runs/40165942688) | 两份清单均成功验证，不上传。 |
+| [Python 发布](https://github.com/world-in-progress/c-two/actions/runs/40166223230) / [CLI 发布](https://github.com/world-in-progress/c-two/actions/runs/40166221456) | 两条流程成功，直接晋升上述候选字节。 |
+
+PR 首轮 macOS 的既有 `shutdown_join_retires_socket_after_namespace_gate_contention` 测试在两秒关闭探测处超时，server 组其余 184 项及后续 Python/relay/跨语言检查通过。与 0.8.2 比较，该测试、Server run/drain/close 函数和 Unix listener 回收实现逐字节相同。隔离单项及诊断循环未重现；[macOS 15 独立诊断](https://github.com/Dsssyc/c-two/actions/runs/40160295344) 的原 server 组十轮、每轮 185 项均通过。这些结果不证明根因已修复。Host 没有修改生产代码、期限或断言；原失败的 macOS job 单独复核一次通过，随后 canonical main 首轮完整通过。原超时保持未定位记录，未以猜测补丁或略过测试处理。
+
+发行清单 SHA-256 为 `08ba971cabcfdde421629f41f4b79d6f689afebbbbe213eb43de374bcf6b657c`。PyPI 全部 35 个 wheel、1 个 sdist 和 GitHub 全部 17 个附件的名称、大小、SHA-256 均与预演清单一致；没有 yanked 文件。Windows ARM64 的 cp311、cp312、cp313、cp314、cp314t 五个 wheel 齐全。实际 `c3-v0.5.0` 标签指向发行来源 `3f223d65`。第一次 PyPI JSON 读取显示上传期间的 23 文件视图，刷新后得到完整 36 文件并逐一匹配摘要；没有重新上传。
+
+## 发行范围的实际增量
+
+下表绑定 0.8.2 主线 `548710a8` 至发行内容树，Rust cfg(test) 字段、语句和模块按测试分类，生产文件内的 API 注释计入生产。后续验收文档另计。
+
+| 范围 | 新增 | 删除 | 净量 |
+| --- | ---: | ---: | ---: |
+| 生产代码 | 1684 | 554 | +1130 |
+| 测试与测试入口 | 2584 | 602 | +1982 |
+| 文档 | 631 | 69 | +562 |
+| 版本与依赖清单 | 9 | 9 | 0 |
+| 合计 | 4908 | 1234 | +3674 |
+
+Windows 用户作用域与身份修复子项生产净增 1455 行、测试净增 1919 行、文档净增 81 行。R06 子项生产净增 4 行、测试净增 236 行、文档净增 61 行；它们是功能与正确性增量，其他已验收的 Python 退役和 inline 移交按各自记录统计。结构化来源、门禁与发布核对见 [evidence](evidence/2026-10-25-090-windows-release-acceptance.json)。
+
+本轮临时 profile、编译产物及已验收 Buddy checkout 均已清理。应用拒绝归档另一个任务拥有的旧 `slimming-batches` worktree，保留其源码和 `socu/076-ci-release-gates` 分支。本验收合入后同步本地、fork 与 upstream，并清理本轮已结束的验证分支；同步不改变已发布包的来源。
