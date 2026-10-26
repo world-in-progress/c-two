@@ -1070,7 +1070,11 @@ mod lazy_policy_roundtrip_tests {
             }));
         }
         #[cfg(windows)]
-        assert!(c2_local::LocalStream::connect(&endpoint).await.is_err());
+        assert!(
+            c2_local::LocalStream::connect(&endpoint, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
         assert!(request_failure.unwrap_err().contains("spin budget"));
         assert!(response_failure.unwrap_err().contains("spin budget"));
         assert_eq!(request_snapshot, payload);
