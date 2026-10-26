@@ -1,0 +1,126 @@
+{
+  "case": "R17a slot stat error classification evaluation",
+  "base": "dfa03d16099ea95e17809bfc4bc7eca1d31ddd98",
+  "status": "proposal only; awaiting user confirmation",
+  "runtime_source_changed": false,
+  "repository_tests_changed": false,
+  "built_rust": false,
+  "source_findings": {
+    "sweep_missing_lease": "unix_managed.rs:1798-1806 discards socket_stat error and returns AlreadyAbsent; public credential reap already propagates this error",
+    "inspect_late_lease": "unix_managed.rs:1905-1916 discards records.stat error and returns RecordMismatch",
+    "origin": "da5ca3bec; macOS split migration9ebef7e55 retained the original behavior",
+    "other_folds_deferred": [
+      "verify_lease_entry",
+      "read_lease_record",
+      "gate_still_named"
+    ]
+  },
+  "proposed_behavior": {
+    "reuse": "existing EndpointInspection::IoError / EndpointReapResult::IoError and projection/counters",
+    "inspect_priority": "capture late lease stat Result in its original syscall position; preserve known socket identity mismatch before unpacking; then retain lease and gate fences",
+    "public_signatures_abi_protocol": "unchanged; IPC14/SHM3/CABI6",
+    "visible_semantics": "target failures become io-error/OS kind+errno or sweep io_errors; inspect retryable true follows existing projection; CLI sweep EOF/exit policy unchanged"
+  },
+  "estimates": {
+    "production_net_lines": [
+      0,
+      15
+    ],
+    "tests_net_lines": [
+      100,
+      180
+    ],
+    "non_document_net_lines": [
+      100,
+      195
+    ],
+    "kind": "correctness increment, no slimming or performance gain claimed"
+  },
+  "macos_mechanism_probe": {
+    "platform": "macOS arm64",
+    "uid": 501,
+    "scope": "real descriptor-relative no-follow stat after a task-owned directory permission change; mechanism only",
+    "public_inspect_reap_end_to_end_reproduced": false,
+    "results": [
+      {
+        "entry": "socket",
+        "open_directory_fd_stayed_valid": true,
+        "real_stat_error": {
+          "errno": 13,
+          "kind": "permission_denied"
+        },
+        "entry_identity_unchanged_after_restore": true,
+        "missing_control_errno": 2
+      },
+      {
+        "entry": "lease",
+        "open_directory_fd_stayed_valid": true,
+        "real_stat_error": {
+          "errno": 13,
+          "kind": "permission_denied"
+        },
+        "entry_identity_unchanged_after_restore": true,
+        "missing_control_errno": 2
+      }
+    ],
+    "cleanup": {
+      "socket_zero": true,
+      "lease_zero": true,
+      "task_root_removed": true,
+      "historical_namespace_accessed": false
+    },
+    "limitations": "Does not force the whole native fenced control flow into either exact late-stat branch. Baseline regression must place a one-shot test seam at that stage or use an isolated permission-race rendezvous."
+  },
+  "priority_model": {
+    "scope": "proposal classification truth table only, not native runtime validation",
+    "combinations": 32,
+    "changed": [
+      {
+        "socket_same_file": true,
+        "socket_identity_matches": true,
+        "late_lease": "io-error",
+        "gate_current": false,
+        "old": "record-mismatch",
+        "proposed": "io-error"
+      },
+      {
+        "socket_same_file": true,
+        "socket_identity_matches": true,
+        "late_lease": "io-error",
+        "gate_current": true,
+        "old": "record-mismatch",
+        "proposed": "io-error"
+      }
+    ],
+    "syscall_order": "late socket stat then late lease stat Result captured, then predicates; same as current source",
+    "known_socket_mismatch_still_wins": true
+  },
+  "verification_limits": [
+    "No complete native target-branch reproduction yet",
+    "No Linux or Windows experiment in this evaluation",
+    "No existing source/relay/CI suites rerun",
+    "Baseline target seams and actual public projection regressions remain implementation gates"
+  ],
+  "independent_review": {
+    "run": "cb5f0be3-0163-4bd4-a14e-e778a864691e",
+    "artifact": "6fe2fd5b-6ecb-4c59-aac2-35c5671e2843",
+    "input": "dfa03d16099ea95e17809bfc4bc7eca1d31ddd98",
+    "buddy": {
+      "effort": "max",
+      "harness": "codex",
+      "model": "gpt-6.1-sol",
+      "provider": "openai"
+    },
+    "scope": "static source/history/test audit; no runtime claims",
+    "host_refinement": "preserve known socket mismatch priority rather than naive early return on late lease error"
+  },
+  "raw_evidence_at": "~/.codex/diagnostics/c2-r17-evaluation-yig7hv6m/",
+  "evidence_sha256": {
+    "stat-mechanism-probe.py": "092d685a2e759c32a5b3bc12bf24f2953b63c64f14410b9403593c3b12fc0666",
+    "stat-mechanism-result.json": "4876ca5c204e2617c4587b21dec48b7e6a153807a7f246f490be29b7674f67d7",
+    "priority-model.json": "b970050953e2745cca78445821012ff74b8836c699920f27cb726662892389f9",
+    "review-outcome.json": "1b6076ca0da1f585b4f94a123a9b87902f2c6d6f0e81ac5024e880a52c8a4436"
+  },
+  "historical_namespaces_touched": false,
+  "cleanup": "task-owned probe socket/lease zero, temporary root removed; no build target created"
+}

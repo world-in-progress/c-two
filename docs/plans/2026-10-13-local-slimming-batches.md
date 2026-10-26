@@ -19,11 +19,13 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 
 2026-10-24：R13 inline 响应所有权移交已验收，实现 `1ac34150` 生产净增 7 行、测试净增 30 行，合计净增 37 行。每个非空 inline 响应少一次 payload 分配和复制，构造微基准改善；真实 IPC 没有测得稳定提速。完整 relay、跨语言、三系统、GitHub Actions 10/10（含 Windows ARM64 与 3.14t）、本批端点零残留及独立审查见[验收记录](../reports/2026-10-24-r13-inline-response-ownership-acceptance.md)，首轮验证失败与后续处理也在其中保留。本项已随 0.9.0 发布，R13 仍为部分完成，R35 继续暂缓。
 
-2026-10-23：按单独确认的[方案](2026-10-23-orphan-shm-buffer-retirement.md)退役无构造调用者的旧 Python `ShmBuffer` 投影，接受低层 Python 导出删除。候选 `fa62f7a3` 生产净减 338 行、测试净增 2 行，合计净减 336 行；完整 relay、真实跨语言、三系统、GitHub Actions 10/10（含 Windows ARM64 与 3.14t）、端点零残留及独立审查完成，见[验收记录](../reports/2026-10-23-shm-buffer-retirement.md)。本批已随 0.8.2 发布，活跃 buffer 生产实现与基线相同。该批未扩展 R06/R07；R06 后来按独立方案随 0.9.0 发布，R07 与两份控制会话重构继续暂缓。
+2026-10-23：按单独确认的[方案](2026-10-23-orphan-shm-buffer-retirement.md)退役无构造调用者的旧 Python `ShmBuffer` 投影，接受低层 Python 导出删除。候选 `fa62f7a3` 生产净减 338 行、测试净增 2 行，合计净减 336 行；完整 relay、真实跨语言、三系统、GitHub Actions 10/10（含 Windows ARM64 与 3.14t）、端点零残留及独立审查完成，见[验收记录](../reports/2026-10-23-shm-buffer-retirement.md)。本批已随 0.8.2 发布，活跃 buffer 生产实现与基线相同。该批未扩展 R06/R07；R06 后来随 0.9.0 发布，R07a 则于 2026-10-26 单独验收。R07 剩余接管责任与两份控制会话重构继续单列。
 
-2026-10-26：IPC 版本诊断修缮已单独验收，候选 `968f7d29` 将普通 RPC 握手切换为 14，公开错误保留本端/对端版本；ABI 6、SHM 3、业务帧和独立控制协议保持。生产净增 407、测试净增 1256 行，不计作瘦身收益。完整 relay、Rust/Python/Node、三系统（含 Windows ARM64）、Actions 10/10、端点零残留与独立审查见[验收记录](../reports/2026-10-26-ipc14-version-diagnostics-acceptance.md)。未 bump 包版本或发版，构建产物已清理。C04 只读复核没有找到安全且整体净收益明确的替换，继续暂缓；下一优先项是 R07 的独立正确性分析，先复现与方案确认。R 条目 17 / 13 / 8 / 1 的统计不变。
+2026-10-26：IPC 版本诊断修缮已单独验收，候选 `968f7d29` 将普通 RPC 握手切换为 14，公开错误保留本端/对端版本；ABI 6、SHM 3、业务帧和独立控制协议保持。生产净增 407、测试净增 1256 行，不计作瘦身收益。完整 relay、Rust/Python/Node、三系统（含 Windows ARM64）、Actions 10/10、端点零残留与独立审查见[验收记录](../reports/2026-10-26-ipc14-version-diagnostics-acceptance.md)。未 bump 包版本或发版，构建产物已清理。C04 只读复核没有找到安全且整体净收益明确的替换，继续暂缓。该阶段统计为 17 / 13 / 8 / 1；随后 R07a 已验收，当前分类以顶部 17 / 14 / 7 / 1 为准。
 
-2026-10-26：R07a 已完成批准范围，实现/测试来源 `b059c02d`，非文档净增 561 行，不计瘦身收益；见[验收记录](../reports/2026-10-26-r07a-explicit-release-acceptance.md)。仅该子项核销，R07 为部分完成；C04、R35 与两份会话重构继续暂缓。本批未发版，构建产物与本批 CI 分支收尾清理。
+2026-10-26：R07a 已完成批准范围，实现/测试来源 `b059c02d`、验收记录提交 `dfa03d16`。生产 +134、测试 +427、文档及验收证据 +287 行；非文档净增 561 行，不计瘦身收益。完整 relay、跨语言、三系统及确切候选 Actions 10/10（含 Windows ARM64/3.14t）、端点零残留和独立审查通过，见[验收记录](../reports/2026-10-26-r07a-explicit-release-acceptance.md)。R07 为部分完成，Core/Held、consuming、最终 Drop 继续单列；C04、R35 与两份会话重构继续暂缓。构建产物、专用 CI 分支及三份 buddy 工作树已清理，未发版。
+
+2026-10-26 续评：下一建议为 R17a，等待方案确认后实施。此轮仅更新清单与方案、核查源码/历史，并验证 task-owned 目录上真实 stat 的 EACCES/ENOENT 区别；未修改运行时代码或正式测试，未构建 Rust、未重跑既有门禁。实验 socket/lease 为零且临时根已移除，历史目录未动；条目数量保持 17 / 14 / 7 / 1。
 
 ### 继续暂缓、不单独开批的项目
 
@@ -48,7 +50,7 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 | --- | --- |
 | 已完成性能优化：R15 | 按[批准方案](2026-10-25-r15-chunk-gc-evaluation.md)完成完整 GC 下界复用，实现 `e1e6cda3`，生产 +18、测试 +108，合计 +126 行。同环境 180 组样本：512/1024 新鲜条目单线程 insert＋abort 开销降 79%/89%，四线程单位操作成本降 52%/60%；512 压力、128 B 原生 RPC 的 P50 由 45.5 降至 42.0 µs。8 KiB 未见稳定改善，完整扫描本身约慢 30%，均如实保留。原压力条件、无 timer 进度、预算及释放保持；完整 relay、跨语言、三系统、Actions 首轮 10/10、端点零残留和独立审查见[验收记录](../reports/2026-10-25-r15-chunk-gc-acceptance.md)。不计为代码净减，未发版。 |
 | 已复核暂缓：C04 | [2026-10-26 复核](2026-10-26-c04-notification-reuse-review.md)确认：IPC pool 只有两处生产 5 ms 等待，第三处属于测试；锁外完成与通知之间仍存在等待窗口。Relay 的 10 ms 周期还负责裸 Arc 归还和未确认清理进度，50 ms 周期承担真实路由 attestation，现有 RouteWatch 不是持续推送。机械删等待仅省几行，完整替换需要新增协调/引用/订阅机制，未找到生产与测试整体净收益。不实施、不测量；两份会话重构继续暂缓。 |
-| 已验收 R07a；其后 R17 | [R07 评估](2026-10-26-r07-failed-release-ownership-evaluation.md)已在 macOS/Windows 11 原样基线复现 false success、transport lease 丢 owner 及重组预算滞留；直接 backing 的失败保留对照通过。建议先做四处低层 Rust 返回签名与两类显式 lease 的 R07a，复用原 owner/Option，不加队列或 worker。Core/Held、consuming 错误与最终 Drop 的接管责任仍属剩余范围，完整 R07 保持开放；R07a 已按用户确认验收，见[记录](../reports/2026-10-26-r07a-explicit-release-acceptance.md)。R17 随后单独评估，不按净减量排序。 |
+| 下一待确认：R17a | [2026-10-26 评估](2026-10-26-r17-slot-io-evaluation.md)确认 sweep 内部缺 lease 分支将 socket stat 错误计为已不存在，inspect 最后一次 lease stat 将错误归成记录不符。建议仅两处复用现有 IoError，并保留已确定 socket 身份不符的优先顺序；公开凭据 reap 的对应 stat 已正确传播。生产预计净增 0–15、测试净增 100–180 行，作为正确性修复，不计净减收益。已完成源码/历史和独立静态核查及 macOS 原生 stat 机制实验，尚未端到端命中两处窗口，也未实施生产修复。 |
 | 工具与生成阶段：R19–R22、R29 剩余 | CLI 响应解析、示例文件保护、Resource 模板和 benchmark 整理各自保留；生成器同次编译去重/typed projection 仍属于生成阶段。它们不记作常驻运行时状态或热路径精简，不挤占优先队列。 |
 | 小项随相关工作合并：R33、R39 剩余 | `wrap_error` 当前仍只有定义，残留错误序列化回退可在相关错误边界工作中删除；R39 的 proof/body 局部去重也保持“不为几行另开批”。不为合并小项引入新抽象或删除公开能力。 |
 | 明确保持的决定 | R35、R09/R10、C01/C02、R14 只读校验、R25 适配协议、R32 错误转换、C07 Python 结果形状及两份控制会话重构维持原暂缓边界；R26 relay journal 保留。T01–T07 随对应生产事项替换，保留真实行为覆盖。 |
@@ -67,7 +69,7 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 | R04 | 已完成：token 绑定 server instance、UID/revision 与准入代次，关门使旧 token 失效，接管恢复不能复活；同名替换及 owner_missing 后迟到 relay final 的反例有独立覆盖。见[准入修复验收](../reports/2026-10-21-admission-race-repair.md)及[三系统复核](../reports/2026-10-22-release-foundation-review.md)。 |
 | R05 | 原范围已由 R01 覆盖。`BuddySegment::open → ShmRegion::open → BuddyAllocator::attach` 先核实际映射长度，再用创建端共用的 `checked_layout` 核对逻辑大小、offset、min_block 和 levels，最后构造 bitmap/live-record 指针。当前 attach 与畸形几何测试和已验收提交 `141668dd` 相同；旧版本、截断映射、错误几何及页取整容量已有覆盖，见 [R01 验收](2026-10-16-r01-allocation-release-evaluation.md)。不因没有名为 ValidatedLayout 的新类型继续保留同一待办，也不扩大为不合作进程任意修改共享内存的保证。 |
 | R07 | [R07a](../reports/2026-10-26-r07a-explicit-release-acceptance.md) 已验收：低层 `release_handle` 返还失败 owner，SyncClient 准备错误只允许清理，显式 request/response lease 成功后才清空原 Option。生产 +134、测试 +427，属于正确性修复；完整 relay、跨语言、三系统、确切来源 Actions 10/10、端点零残留和独立审查通过。Core/Held、consuming 和最终 Drop 的接管责任继续单列，R07 不整体核销。 |
-| R17 | Unix inspect/reap 仍有 slot 级 stat 的 `.ok().flatten()` 折叠：缺 lease 的 reap 路径可把 I/O 错误当 AlreadyAbsent，inspect 尾部的 lease 重验可把它当 RecordMismatch。整目录权限拒绝及 bind/connect 系统原因的已有覆盖不能代替这些单点错误反例；保留第二次身份核对和原回收授权边界。 |
+| R17 | [R17a 方案待确认](2026-10-26-r17-slot-io-evaluation.md)：只修 Unix sweep 内部缺 lease 的末次 socket stat 与 inspect 末次 lease stat 的错误折叠。公共 `reap_endpoint → reap_locked` 的对应分支已传播错误，不混称缺陷；其 Busy/旧凭据顺序保留。其他 `verify_lease_entry`、`read_lease_record`、`gate_still_named` 的保守分类尚须单独审查，R17 不整体核销。原生类/JSON、删除授权与身份围栏保留。 |
 | R06 | 用户已批准[最小同步修复方案](2026-10-24-r06-python-buffer-lifecycle-synchronization.md)，复用现有 inner/lease 锁修复响应/请求导出、释放及 retained tracking 的接纳竞态，不新增状态框架或删公开能力。固定基线 `ea8345fa` 的四个受控反例按预期失败，修复后 native payload 8 项通过；完整回归、性能、三系统工程 CI、零残留和独立审查完成，Windows 五个临时 profile 与构建产物已清理，0.9.0 canonical 发行验收与发布均已完成，见[记录](../reports/2026-10-25-090-windows-release-acceptance.md)。R06 按正确性修复单列并计入完成；生产净增 4 行、测试净增 236 行。回调重入风险仍独立待评估。 |
 | R09、R10 | 2026-10-24 复核 R09：四次 EnvCatalog 加载仍存在，复用现有窄 resolver 的最小方案生产约持平至增 5 行、测试增 25–50 行，尚无性能实测；提前读取 override 还会改变 state lock/deadline 与前三项解析的观察顺序。继续暂缓。R10 注册快照局部去重约 20 行，独立 borrowed 校验、动态 Resource 方法查找及错误顺序有真实职责。R08 原环境拒绝语义的解析收敛和 R30 已批准子项已经完成。 |
 | R12、R28 剩余 | 已完成可证明的同值重验删除、登记事实与 validated relay 表示收敛；跨 await 的 authority、owner/locality、代际、peer 活性和错误接纳继续保留。新增删除需另证局部不变量。 |
