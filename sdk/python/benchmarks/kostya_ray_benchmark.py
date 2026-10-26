@@ -10,7 +10,7 @@ Mirrors `kostya_ctwo_benchmark.py`:
 Notes:
   * Ray on macOS caps object_store_memory at 2 GiB. Cap N accordingly.
   * Ray is unavailable on Python 3.14t today. For local smoke runs:
-        uv run --no-project --python 3.12 --with ray --with numpy \
+        uv run --locked --python 3.12 --only-group benchmark \
           python sdk/python/benchmarks/kostya_ray_benchmark.py --sizes 1000,10000 --iters 5
 """
 from __future__ import annotations
