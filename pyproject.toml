@@ -41,6 +41,7 @@ benchmark = [
 
 [tool.uv]
 package = false
+constraint-dependencies = ["filelock>=4.2.1"]
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "sdk/python/pyproject.toml" },
@@ -56,6 +57,7 @@ c-two = { workspace = true }
 
 [tool.uv.dependency-groups]
 banner = { requires-python = ">=3.11" }
+benchmark = { requires-python = ">=3.11" }
 
 [tool.uv.workspace]
 members = ["sdk/python"]
