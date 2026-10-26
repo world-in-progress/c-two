@@ -1300,7 +1300,7 @@ async fn managed_directory_rename_inside_the_gate_window_never_binds_into_the_re
             &ManagedNamespace::open_root(&moved, false, false).unwrap(),
             &endpoint_stem(&endpoint).unwrap(),
         ) {
-            Err(reason) => EndpointReapResult::Unverified(reason),
+            Err(error) => namespace_reap_error(error),
             other => panic!("partial slot must remain unverifiable: {other:?}"),
         };
         assert!(
@@ -3492,5 +3492,200 @@ async fn late_stat_inspection_keeps_io_cause_and_known_socket_mismatch_priority(
             assert_eq!(error.raw_os_error(), Some(libc::EIO));
             assert_eq!(error.kind(), io::Error::from_raw_os_error(libc::EIO).kind());
         }
+    }
+}
+
+#[tokio::test]
+async fn lease_verification_io_preserves_maintenance_and_close_ownership() {
+    use crate::unix_common::fault::{self, Failure};
+    let mut outcomes = Vec::new();
+    for failure in [Failure::VerifyLeaseFstat, Failure::VerifyLeaseStat] {
+        let namespace = TestNamespace::new();
+        let endpoint = managed_endpoint_at(namespace.path(), "lease-verify-io");
+        let listener = crate::LocalListener::bind(&endpoint).unwrap();
+        let credential = listener.credential();
+        let socket = socket_path(&endpoint);
+        let lease = lease_path(&endpoint);
+        let identity = identity_of(&socket);
+        let bytes = fs::read(&lease).unwrap();
+        fault::inject(failure);
+        let inspected = crate::inspect_endpoint(&endpoint);
+        assert!(!fault::take_if(failure));
+        fault::inject(failure);
+        let reaped = crate::reap_endpoint(&endpoint, &credential);
+        assert!(!fault::take_if(failure));
+        fault::inject(failure);
+        let closed = listener.close();
+        assert!(!fault::take_if(failure));
+        assert_eq!(identity_of(&socket), identity);
+        assert_eq!(fs::read(&lease).unwrap(), bytes);
+        // Explicit close must release its lease even when retirement fails.
+        let unlocked = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease)
+            .unwrap();
+        assert!(try_lock_lease(&unlocked).is_ok());
+        drop(unlocked);
+        assert!(matches!(
+            crate::reap_endpoint(&endpoint, &credential),
+            EndpointReapResult::Reaped
+        ));
+        assert!(!socket.exists() && !lease.exists());
+        eprintln!("{failure:?}: inspect={inspected:?}, reap={reaped:?}, close={closed:?}");
+        outcomes.push((inspected, reaped, closed));
+
+        // Drop discards the diagnostic but must release the same ownership.
+        let listener = crate::LocalListener::bind(&endpoint).unwrap();
+        let credential = listener.credential();
+        let bytes = fs::read(&lease).unwrap();
+        fault::inject(failure);
+        drop(listener);
+        assert!(!fault::take_if(failure));
+        assert!(socket.exists());
+        assert_eq!(fs::read(&lease).unwrap(), bytes);
+        let unlocked = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease)
+            .unwrap();
+        assert!(try_lock_lease(&unlocked).is_ok());
+        drop(unlocked);
+        assert!(matches!(
+            crate::reap_endpoint(&endpoint, &credential),
+            EndpointReapResult::Reaped
+        ));
+        assert!(!socket.exists() && !lease.exists());
+    }
+    for (inspected, reaped, closed) in outcomes {
+        assert!(
+            matches!(inspected, EndpointInspection::IoError(ref error)
+            if error.raw_os_error() == Some(libc::EIO)
+                && error.kind() == io::Error::from_raw_os_error(libc::EIO).kind()),
+            "{inspected:?}"
+        );
+        for outcome in [reaped, closed] {
+            assert!(
+                matches!(outcome, EndpointReapResult::IoError(ref error)
+                if error.raw_os_error() == Some(libc::EIO)
+                    && error.kind() == io::Error::from_raw_os_error(libc::EIO).kind()),
+                "{outcome:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn lease_read_io_is_counted_without_retiring_the_record() {
+    use crate::unix_common::fault::{self, Failure};
+    let mut outcomes = Vec::new();
+    for failure in [
+        Failure::ReadLeaseStat,
+        Failure::ReadLeaseOpen,
+        Failure::ReadLeaseRecord,
+        Failure::VerifyLeaseFstat,
+        Failure::VerifyLeaseStat,
+    ] {
+        let namespace = TestNamespace::new();
+        let endpoint = managed_endpoint_at(namespace.path(), "lease-read-io");
+        let listener = bind_managed_at(&endpoint, namespace.path()).unwrap();
+        let credential = listener.credential();
+        listener.abandon_for_test();
+        let socket = socket_path(&endpoint);
+        let lease = lease_path(&endpoint);
+        let identity = identity_of(&socket);
+        let bytes = fs::read(&lease).unwrap();
+        let mut sweep =
+            retry_sweep(|| scoped_sweep_at(namespace.path(), std::slice::from_ref(&endpoint)));
+        fault::inject(failure);
+        let batch = sweep.next_batch(SweepBudget {
+            max_entries: 64,
+            max_duration: Duration::from_secs(1),
+        });
+        assert!(!fault::take_if(failure));
+        drop(sweep);
+        assert!(batch.round_complete, "{batch:?}");
+        assert_eq!(identity_of(&socket), identity);
+        assert_eq!(fs::read(&lease).unwrap(), bytes);
+        assert!(matches!(
+            crate::reap_endpoint(&endpoint, &credential),
+            EndpointReapResult::Reaped
+        ));
+        assert!(!socket.exists() && !lease.exists());
+        eprintln!("{failure:?}: {batch:?}");
+        outcomes.push(batch);
+    }
+    for batch in outcomes {
+        assert_eq!(
+            (
+                batch.io_errors,
+                batch.unverified,
+                batch.already_absent,
+                batch.reaped
+            ),
+            (1, 0, 0, 0),
+            "{batch:?}"
+        );
+        assert_eq!(
+            batch.last_io_error,
+            Some(crate::EndpointIoError::from(&io::Error::from_raw_os_error(
+                libc::EIO
+            )))
+        );
+    }
+}
+
+#[tokio::test]
+async fn lease_verification_io_keeps_bind_rollback_and_policy_priority() {
+    use crate::unix_common::fault::{self, Failure};
+    let mut outcomes = Vec::new();
+    for failure in [Failure::VerifyLeaseFstat, Failure::VerifyLeaseStat] {
+        for preexisting in [false, true] {
+            let namespace = TestNamespace::new();
+            test_namespace_root(namespace.path()).unwrap();
+            let endpoint = managed_endpoint_at(namespace.path(), "bind-lease-io");
+            let lease = lease_path(&endpoint);
+            let identity = preexisting.then(|| {
+                fs::write(&lease, b"fixture-owned previous lease").unwrap();
+                fs::set_permissions(&lease, fs::Permissions::from_mode(0o600)).unwrap();
+                identity_of(&lease)
+            });
+            fault::inject(failure);
+            let error = crate::LocalListener::bind(&endpoint)
+                .err()
+                .expect("injected I/O must fail bind");
+            assert!(!fault::take_if(failure));
+            assert!(!socket_path(&endpoint).exists());
+            if let Some(identity) = identity {
+                assert_eq!(identity_of(&lease), identity);
+                assert_eq!(fs::read(&lease).unwrap(), b"fixture-owned previous lease");
+                fs::remove_file(&lease).unwrap(); // Only this test's unchanged preexisting fixture.
+            }
+            assert!(!lease.exists());
+            eprintln!("{failure:?}, preexisting={preexisting}: {error:?}");
+            outcomes.push(error);
+        }
+    }
+    // A known unsafe mode must still win before the later stat or lock.
+    let namespace = TestNamespace::new();
+    test_namespace_root(namespace.path()).unwrap();
+    let endpoint = managed_endpoint_at(namespace.path(), "bind-lease-policy");
+    let lease = lease_path(&endpoint);
+    fs::write(&lease, b"fixture-owned unsafe mode").unwrap();
+    fs::set_permissions(&lease, fs::Permissions::from_mode(0o644)).unwrap();
+    fault::inject(Failure::VerifyLeaseStat);
+    let policy = crate::LocalListener::bind(&endpoint).err().unwrap();
+    assert!(fault::take_if(Failure::VerifyLeaseStat));
+    assert_eq!(fs::read(&lease).unwrap(), b"fixture-owned unsafe mode");
+    fs::remove_file(&lease).unwrap();
+    assert!(!socket_path(&endpoint).exists() && !lease.exists());
+    assert_eq!(policy.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        policy.to_string(),
+        "managed lease is unverifiable: InvalidOwnership"
+    );
+    for error in outcomes {
+        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error:?}");
+        assert_eq!(error.kind(), io::Error::from_raw_os_error(libc::EIO).kind());
     }
 }

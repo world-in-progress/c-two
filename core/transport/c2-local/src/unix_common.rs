@@ -40,6 +40,11 @@ pub(crate) mod fault {
         /// The managed socket entry is replaced by a foreign object before the
         /// owner record is written.
         ManagedRecordWriteAfterReplacement,
+        VerifyLeaseFstat,
+        VerifyLeaseStat,
+        ReadLeaseStat,
+        ReadLeaseOpen,
+        ReadLeaseRecord,
         MissingLeaseSocketStat,
         InspectFinalLeaseStat,
         InspectSocketReplacementThenLeaseStat,

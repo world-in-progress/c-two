@@ -860,24 +860,46 @@ fn verify_lease_entry(
     directory: &EndpointDirectory,
     name: &CString,
     file: &File,
-) -> Result<libc::stat, EndpointUnverifiedReason> {
-    let opened = fstat(file.as_raw_fd()).map_err(|_| EndpointUnverifiedReason::InvalidOwnership)?;
+) -> Result<libc::stat, NamespaceError> {
+    let opened = fstat(file.as_raw_fd());
+    #[cfg(test)]
+    let opened =
+        if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::VerifyLeaseFstat)
+        {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            opened
+        };
+    let opened = opened?;
     if stat_is(&opened, libc::S_IFLNK) {
-        return Err(EndpointUnverifiedReason::Symlink);
+        return Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::Symlink,
+        ));
     }
     if !stat_is(&opened, libc::S_IFREG)
         || opened.st_uid != unsafe { libc::geteuid() }
         || opened.st_mode as libc::mode_t & 0o077 != 0
     {
-        return Err(EndpointUnverifiedReason::InvalidOwnership);
+        return Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::InvalidOwnership,
+        ));
     }
-    let current = directory
-        .stat(name)
-        .ok()
-        .flatten()
-        .ok_or(EndpointUnverifiedReason::InvalidOwnership)?;
+    let current = directory.stat(name);
+    #[cfg(test)]
+    let current = if crate::unix_common::fault::take_if(
+        crate::unix_common::fault::Failure::VerifyLeaseStat,
+    ) {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    } else {
+        current
+    };
+    let current = current?.ok_or(NamespaceError::Unverified(
+        EndpointUnverifiedReason::InvalidOwnership,
+    ))?;
     if !same_file(&opened, &current) {
-        return Err(EndpointUnverifiedReason::InvalidOwnership);
+        return Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::InvalidOwnership,
+        ));
     }
     Ok(opened)
 }
@@ -1082,7 +1104,7 @@ fn retire_owned(
     };
     let opened_lock = match verify_lease_entry(&namespace.directories.records, &names.lock, lease) {
         Ok(stat) => stat,
-        Err(reason) => return EndpointReapResult::Unverified(reason),
+        Err(error) => return namespace_reap_error(error),
     };
     match read_record(lease) {
         Ok(Some(record)) if record == *expected => {}
@@ -1415,14 +1437,15 @@ fn bind_at(
         created,
         socket_bound: false,
     };
-    if let Err(reason) =
-        verify_lease_entry(&namespace.directories.records, &names.lock, lease.file())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("managed lease is unverifiable: {reason:?}"),
-        ));
-    }
+    verify_lease_entry(&namespace.directories.records, &names.lock, lease.file()).map_err(
+        |error| match error {
+            NamespaceError::Unverified(reason) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("managed lease is unverifiable: {reason:?}"),
+            ),
+            error => namespace_bind_error(error),
+        },
+    )?;
     if let Err(result) = try_lock_lease(lease.file()) {
         return Err(match result {
             EndpointReapResult::Busy => endpoint_in_use(),
@@ -1568,36 +1591,51 @@ fn slot_name(stem: &OsStr, suffix: &str) -> io::Result<CString> {
 pub(crate) fn read_lease_record(
     namespace: &ManagedNamespace,
     stem: &OsStr,
-) -> Result<Option<OwnerRecord>, EndpointUnverifiedReason> {
+) -> Result<Option<OwnerRecord>, NamespaceError> {
     let mut lease = stem.as_bytes().to_vec();
     lease.extend_from_slice(LEASE_SUFFIX.as_bytes());
-    let name = CString::new(lease).map_err(|_| EndpointUnverifiedReason::InvalidRecord)?;
-    namespace
-        .directories
-        .verify_slot(&name)
-        .map_err(|error| match error {
-            NamespaceError::Unverified(reason) => reason,
-            _ => EndpointUnverifiedReason::InvalidOwnership,
-        })?;
-    let stat = match namespace.directories.records.stat(&name) {
-        Ok(Some(stat)) => stat,
-        Ok(None) => return Ok(None),
-        Err(_) => return Err(EndpointUnverifiedReason::InvalidOwnership),
+    let name = CString::new(lease)
+        .map_err(|_| NamespaceError::Unverified(EndpointUnverifiedReason::InvalidRecord))?;
+    namespace.directories.verify_slot(&name)?;
+    let stat = namespace.directories.records.stat(&name);
+    #[cfg(test)]
+    let stat =
+        if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::ReadLeaseStat) {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            stat
+        };
+    let Some(stat) = stat? else {
+        return Ok(None);
     };
     if let Some(reason) = lease_entry_unverified(&stat) {
-        return Err(reason);
+        return Err(NamespaceError::Unverified(reason));
     }
-    let file = match open_lease(&namespace.directories.records, &name) {
-        Ok(Some(file)) => file,
-        Ok(None) => return Ok(None),
-        Err(_) => return Err(EndpointUnverifiedReason::InvalidOwnership),
+    let file = open_lease(&namespace.directories.records, &name);
+    #[cfg(test)]
+    let file =
+        if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::ReadLeaseOpen) {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            file
+        };
+    let Some(file) = file? else {
+        return Ok(None);
     };
     let _ = verify_lease_entry(&namespace.directories.records, &name, &file)?;
-    match read_record(&file) {
-        Ok(Some(record)) => Ok(Some(record)),
-        Ok(None) => Err(EndpointUnverifiedReason::InvalidRecord),
-        Err(_) => Err(EndpointUnverifiedReason::InvalidOwnership),
-    }
+    let record = read_record(&file);
+    #[cfg(test)]
+    let record = if crate::unix_common::fault::take_if(
+        crate::unix_common::fault::Failure::ReadLeaseRecord,
+    ) {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    } else {
+        record
+    };
+    let record = record?.ok_or(NamespaceError::Unverified(
+        EndpointUnverifiedReason::InvalidRecord,
+    ))?;
+    Ok(Some(record))
 }
 
 /// Shared reap core. `expected` carries the credential proof for a public reap;
@@ -1648,7 +1686,7 @@ fn reap_locked(
     let opened_lock = match verify_lease_entry(&namespace.directories.records, &names.lock, &lease)
     {
         Ok(stat) => stat,
-        Err(reason) => return EndpointReapResult::Unverified(reason),
+        Err(error) => return namespace_reap_error(error),
     };
     if let Err(result) = try_lock_lease(&lease) {
         return result;
@@ -1815,7 +1853,7 @@ fn reap_slot_with_directory(
                 Err(error) => EndpointReapResult::IoError(error),
             };
         }
-        Err(reason) => return EndpointReapResult::Unverified(reason),
+        Err(error) => return namespace_reap_error(error),
     };
     let address = record.address.clone();
     let Ok(endpoint) = context.endpoint(&address) else {
@@ -1895,7 +1933,7 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
     let opened_lock = match verify_lease_entry(&namespace.directories.records, &names.lock, &lease)
     {
         Ok(stat) => stat,
-        Err(reason) => return EndpointInspection::Unverified(reason),
+        Err(error) => return namespace_inspection_error(error),
     };
     let record = match read_record(&lease) {
         Ok(Some(record)) => record,

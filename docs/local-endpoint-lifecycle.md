@@ -139,3 +139,5 @@ finally:
 Rust 示例见 [owned_child](../sdk/rust/examples/owned_child.rs)，历史版本行为见 [0.7.4 指南](releases/0.7.4.zh-CN.md)。[早期原生端点验收](reports/canonical-local-endpoint-validation.md)与[端点验收](reports/local-endpoint-final-validation.md)保留各自的历史源码和范围。
 
 端点维护的 slot stat 失败按现有 I/O 结果报告：sweep 在缺 lease 时无法读取 socket 状态，会计入 `io_errors` 并保留 `last_io_error`，不计作 `already_absent`。inspect 最后一次 lease stat 失败返回 `io-error`；已确认的 socket 身份不符仍优先拒绝，缺失/替换及 gate 围栏保留。Python 继续按原约定给出 kind/errno 与 `retryable=True`，该标记不启动自动重试。CLI sweep 的 `complete` 仍表示遍历到 EOF，需要另看错误计数。Windows 的 KernelManaged/NotApplicable 与现有凭据 JSON 不受影响。
+
+lease 核验及记录读取同样保留原生 I/O 原因，包括分离目录的 slot 检查、fstat/stat、open 和 read；维护结果不将这些故障归为 InvalidOwnership。已识别的文件类型、属主、权限、身份变化和坏记录仍按原顺序拒绝。bind 对这类策略拒绝仍给出 InvalidData 和原文案，对真实 I/O 失败透传原错误。显式 close 失败后仍释放 listener/lease 并保留记录供精确 reap；Drop 与初始化回滚维持原清理条件，均不新增重试。

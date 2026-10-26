@@ -336,6 +336,28 @@ async fn split_invalid_lease_and_failed_bind_preserve_foreign_records() {
     assert!(invalid_lease.exists());
 }
 
+#[tokio::test]
+async fn split_lease_read_preserves_native_slot_io_cause() {
+    let fixture = SplitFixture::new();
+    let endpoint = fixture.endpoint(&fixture.sockets, "slot-io");
+    let listener = crate::LocalListener::bind(&endpoint).unwrap();
+    let bytes = fs::read(fixture.lease(&endpoint)).unwrap();
+    let namespace = ManagedNamespace::open_root(&fixture.sockets, false, false).unwrap();
+    fs::set_permissions(&fixture.sockets, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = read_lease_record(&namespace, &endpoint_stem(&endpoint).unwrap())
+        .map_err(namespace_reap_error);
+    fs::set_permissions(&fixture.sockets, fs::Permissions::from_mode(0o700)).unwrap();
+    drop(namespace);
+    assert_eq!(fs::read(fixture.lease(&endpoint)).unwrap(), bytes);
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    fixture.assert_only_coordinator();
+    let Err(EndpointReapResult::IoError(error)) = result else {
+        panic!("split slot I/O cause was lost: {result:?}");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+}
+
 #[test]
 fn split_process_fixture() {
     let Ok(address) = std::env::var("C2_SPLIT_TEST_ADDRESS") else {
