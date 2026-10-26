@@ -1795,14 +1795,24 @@ fn reap_slot_with_directory(
         Ok(None) => {
             // A socket without any lease is an unregistered object, not proof
             // that the slot is already clean.
-            let socket = slot_name(stem, "").ok();
-            let present = socket
-                .and_then(|name| namespace.directories.socket_stat(&name).ok().flatten())
-                .is_some();
-            return if present {
-                EndpointReapResult::Unverified(EndpointUnverifiedReason::MissingOwnership)
-            } else {
-                EndpointReapResult::AlreadyAbsent
+            let socket = slot_name(stem, "").and_then(|name| {
+                let stat = namespace.directories.socket_stat(&name);
+                #[cfg(test)]
+                let stat = if crate::unix_common::fault::take_if(
+                    crate::unix_common::fault::Failure::MissingLeaseSocketStat,
+                ) {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    stat
+                };
+                stat
+            });
+            return match socket {
+                Ok(Some(_)) => {
+                    EndpointReapResult::Unverified(EndpointUnverifiedReason::MissingOwnership)
+                }
+                Ok(None) => EndpointReapResult::AlreadyAbsent,
+                Err(error) => EndpointReapResult::IoError(error),
             };
         }
         Err(reason) => return EndpointReapResult::Unverified(reason),
@@ -1897,20 +1907,44 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
     }
     // Re-verify both entries after reading so a concurrent replacement cannot
     // be reported as a present endpoint.
+    #[cfg(test)]
+    if crate::unix_common::fault::take_if(
+        crate::unix_common::fault::Failure::InspectSocketReplacementThenLeaseStat,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = namespace.directory().path().join(&names.socket_os);
+        fs::remove_file(&path).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::unix_common::fault::inject(
+            crate::unix_common::fault::Failure::InspectFinalLeaseStat,
+        );
+    }
     let current_socket = match namespace.directories.socket_stat(&names.socket) {
         Ok(Some(stat)) => stat,
         Ok(None) => return EndpointInspection::Absent,
         Err(error) => return EndpointInspection::IoError(error),
     };
-    let current_lock = namespace
-        .directories
-        .records
-        .stat(&names.lock)
-        .ok()
-        .flatten();
-    if !same_file(&socket_stat, &current_socket)
-        || identity_of(&current_socket) != record.identity
-        || current_lock.is_none_or(|current| !same_file(&opened_lock, &current))
+    let current_lock = namespace.directories.records.stat(&names.lock);
+    #[cfg(test)]
+    let current_lock = if crate::unix_common::fault::take_if(
+        crate::unix_common::fault::Failure::InspectFinalLeaseStat,
+    ) {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    } else {
+        current_lock
+    };
+    // A socket identity already known to be wrong takes precedence over a
+    // concurrent error while re-reading the lease entry.
+    if !same_file(&socket_stat, &current_socket) || identity_of(&current_socket) != record.identity
+    {
+        return EndpointInspection::Unverified(EndpointUnverifiedReason::RecordMismatch);
+    }
+    let current_lock = match current_lock {
+        Ok(stat) => stat,
+        Err(error) => return EndpointInspection::IoError(error),
+    };
+    if current_lock.is_none_or(|current| !same_file(&opened_lock, &current))
         || !namespace.gate_still_named()
     {
         return EndpointInspection::Unverified(EndpointUnverifiedReason::RecordMismatch);

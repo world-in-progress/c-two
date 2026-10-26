@@ -272,7 +272,7 @@ def test_windows_kernel_managed_credential_parses_without_unix_fields() -> None:
             )
 
 
-def test_inspect_reports_absent_for_an_unbound_endpoint() -> None:
+def test_inspect_preserves_platform_and_io_status_fields(tmp_path: Path) -> None:
     result = cc.inspect_endpoint(
         'ipc://unit-absent-endpoint'
     )
@@ -295,6 +295,22 @@ def test_inspect_reports_absent_for_an_unbound_endpoint() -> None:
         'raw_os_error',
         'retryable',
     }
+    assert result['io_kind'] is None and result['raw_os_error'] is None
+    if not IS_WINDOWS:
+        # Policy rejects other-writable roots even when the test runs as root.
+        previous_mode = tmp_path.stat().st_mode
+        try:
+            tmp_path.chmod(0o777)
+            denied = cc.inspect_endpoint('ipc://policy-denial', root=str(tmp_path))
+        finally:
+            tmp_path.chmod(previous_mode)
+        assert set(denied) == set(result)
+        assert denied['status'] == 'io-error'
+        assert denied['credential'] is None
+        assert denied['io_kind'] == 'PermissionDenied'
+        assert denied['raw_os_error'] is None  # Native policy refusal, not an OS errno.
+        assert denied['retryable'] is True
+        assert not list(tmp_path.iterdir()), 'inspection must not create ownership files'
 
 
 def test_inspect_rejects_an_invalid_address() -> None:

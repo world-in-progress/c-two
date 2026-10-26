@@ -3372,3 +3372,125 @@ async fn binding_readers_share_the_gate_and_preserve_writer_exclusion() {
     assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_UN) }, 0);
     assert!(matches!(listener.close(), EndpointReapResult::Reaped));
 }
+
+#[test]
+fn late_stat_failure_is_counted_without_retiring_an_unknown_socket() {
+    // The process-wide sweep lease cannot be held by a parallel fixture.
+    if std::env::var_os("C2_LATE_STAT_SWEEP_CHILD").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unix_managed::tests::late_stat_failure_is_counted_without_retiring_an_unknown_socket", "--nocapture"])
+            .env("C2_LATE_STAT_SWEEP_CHILD", "1").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+    use crate::unix_common::fault::{self, Failure};
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    test_namespace_root(root).unwrap();
+    let endpoint = managed_endpoint_at(root, "stat-error");
+    let path = socket_path_at(root, &endpoint);
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    let identity = identity_of(&path);
+    let mut sweep = scoped_sweep_at(root, std::slice::from_ref(&endpoint)).unwrap();
+    fault::inject(Failure::MissingLeaseSocketStat);
+    let batch = sweep.next_batch(SweepBudget {
+        max_entries: 64,
+        max_duration: Duration::from_secs(1),
+    });
+    let reached = !fault::take_if(Failure::MissingLeaseSocketStat);
+    drop(sweep);
+    let preserved = identity_of(&path) == identity && !lease_path_at(root, &endpoint).exists();
+    let control = reap_slot(endpoint.context(), &endpoint_stem(&endpoint).unwrap());
+    fs::remove_file(&path).unwrap(); // Only the unregistered object created above.
+    let absent = reap_slot(endpoint.context(), &endpoint_stem(&endpoint).unwrap());
+    assert!(!path.exists() && !lease_path_at(root, &endpoint).exists());
+    assert!(reached && preserved && batch.round_complete, "{batch:?}");
+    assert!(matches!(
+        control,
+        EndpointReapResult::Unverified(EndpointUnverifiedReason::MissingOwnership)
+    ));
+    assert!(matches!(absent, EndpointReapResult::AlreadyAbsent));
+    assert_eq!(
+        (
+            batch.io_errors,
+            batch.already_absent,
+            batch.reaped,
+            batch.unverified
+        ),
+        (1, 0, 0, 0),
+        "{batch:?}"
+    );
+    assert_eq!(
+        batch.last_io_error,
+        Some(crate::EndpointIoError::from(&io::Error::from_raw_os_error(
+            libc::EIO
+        )))
+    );
+}
+
+#[tokio::test]
+async fn late_stat_inspection_keeps_io_cause_and_known_socket_mismatch_priority() {
+    use crate::unix_common::fault::{self, Failure};
+    let mut outcomes = Vec::new();
+    for replacement in [true, false] {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        let endpoint = managed_endpoint_at(root, "inspect-stat-error");
+        let path = socket_path_at(root, &endpoint);
+        let lease_path = lease_path_at(root, &endpoint);
+        let listener = bind_managed_at(&endpoint, root).unwrap();
+        let credential = listener.credential();
+        let original = identity_of(&path);
+        let lease_bytes = fs::read(&lease_path).unwrap();
+        fault::inject(if replacement {
+            Failure::InspectSocketReplacementThenLeaseStat
+        } else {
+            Failure::InspectFinalLeaseStat
+        });
+        let outcome = crate::inspect_endpoint(&endpoint);
+        let reached = !fault::take_if(Failure::InspectFinalLeaseStat)
+            && !fault::take_if(Failure::InspectSocketReplacementThenLeaseStat);
+        let after = identity_of(&path);
+        let lease_preserved = fs::read(&lease_path).unwrap() == lease_bytes;
+        let closed = listener.close();
+        if replacement {
+            assert!(
+                matches!(closed, EndpointReapResult::StaleTarget),
+                "{closed:?}"
+            );
+            assert_eq!(
+                identity_of(&path),
+                after,
+                "close must preserve the replacement"
+            );
+            fs::remove_file(&path).unwrap(); // The replacement was created by this fixture's one-shot seam.
+            assert!(matches!(
+                crate::reap_endpoint(&endpoint, &credential),
+                EndpointReapResult::Reaped
+            ));
+        } else {
+            assert!(matches!(closed, EndpointReapResult::Reaped), "{closed:?}");
+        }
+        assert!(!path.exists() && !lease_path.exists());
+        assert!(reached && lease_preserved);
+        assert_eq!(original != after, replacement);
+        outcomes.push((replacement, outcome));
+    }
+    for (replacement, outcome) in outcomes {
+        if replacement {
+            assert!(
+                matches!(
+                    outcome,
+                    EndpointInspection::Unverified(EndpointUnverifiedReason::RecordMismatch)
+                ),
+                "{outcome:?}"
+            );
+        } else {
+            let EndpointInspection::IoError(error) = outcome else {
+                panic!("late stat error was lost: {outcome:?}");
+            };
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            assert_eq!(error.kind(), io::Error::from_raw_os_error(libc::EIO).kind());
+        }
+    }
+}

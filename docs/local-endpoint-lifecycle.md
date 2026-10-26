@@ -137,3 +137,5 @@ finally:
 对象替换、未知端点、损坏记录与部分初始化报告 unverified，不能凭年龄、PID 或连接失败删除。同一通信组使用相同构建及对应的最终目录配置；路径调整直接替换旧布局，旧凭据和旧进程端点不做自动迁移。升级不清扫旧目录中的历史数据。Windows 端点回收报告内核管理或 not-applicable。初始登记任意位置崩溃后的自动恢复不在保证范围内。平台验证范围见对应的验收记录。
 
 Rust 示例见 [owned_child](../sdk/rust/examples/owned_child.rs)，历史版本行为见 [0.7.4 指南](releases/0.7.4.zh-CN.md)。[早期原生端点验收](reports/canonical-local-endpoint-validation.md)与[端点验收](reports/local-endpoint-final-validation.md)保留各自的历史源码和范围。
+
+端点维护的 slot stat 失败按现有 I/O 结果报告：sweep 在缺 lease 时无法读取 socket 状态，会计入 `io_errors` 并保留 `last_io_error`，不计作 `already_absent`。inspect 最后一次 lease stat 失败返回 `io-error`；已确认的 socket 身份不符仍优先拒绝，缺失/替换及 gate 围栏保留。Python 继续按原约定给出 kind/errno 与 `retryable=True`，该标记不启动自动重试。CLI sweep 的 `complete` 仍表示遍历到 EOF，需要另看错误计数。Windows 的 KernelManaged/NotApplicable 与现有凭据 JSON 不受影响。

@@ -1,6 +1,6 @@
 # R17a：端点 slot stat 错误分类最小方案
 
-状态：仅评估，等待用户确认；未修改生产代码或正式测试。基线 `dfa03d16099ea95e17809bfc4bc7eca1d31ddd98`，包含已验收 R07a；IPC 14、SHM 3、C/FFI ABI 6。R07 的 Core/Held、consuming、最终 Drop，C04、R35 和两份控制会话重构继续单列。R17 仍未验收，本方案不将其整体核销。
+状态：用户已批准 R17a，生产最小替换与定向基线红绿已完成；独立静态审查无阻断，完整验收进行中，尚未提交或发版。基线 `dfa03d16099ea95e17809bfc4bc7eca1d31ddd98`，包含已验收 R07a；IPC 14、SHM 3、C/FFI ABI 6。R07 的 Core/Held、consuming、最终 Drop，C04、R35 和两份控制会话重构继续单列。R17 仍未验收，本方案不将其整体核销。
 
 ## 调用链、原设计与问题
 

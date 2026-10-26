@@ -277,6 +277,17 @@ async fn split_sweep_counts_lease_only_and_unknown_socket_in_one_budget() {
     assert!(unverified >= 1);
     assert!(!fixture.lease(&orphan).exists());
     assert_eq!(fs::read(fixture.socket(&unknown)).unwrap(), b"foreign");
+    fault::inject(Failure::MissingLeaseSocketStat);
+    let outcome = reap_slot(unknown.context(), &endpoint_stem(&unknown).unwrap());
+    let reached = !fault::take_if(Failure::MissingLeaseSocketStat);
+    assert_eq!(fs::read(fixture.socket(&unknown)).unwrap(), b"foreign");
+    fs::remove_file(fixture.socket(&unknown)).unwrap();
+    fixture.assert_only_coordinator();
+    assert!(reached);
+    let EndpointReapResult::IoError(error) = outcome else {
+        panic!("split socket stat error was lost: {outcome:?}");
+    };
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
 }
 
 #[tokio::test]

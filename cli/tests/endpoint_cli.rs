@@ -466,7 +466,7 @@ fn help_exposes_the_three_bounded_subcommands() {
 }
 
 #[test]
-fn inspect_reports_absent_without_inventing_an_endpoint() {
+fn inspect_preserves_platform_and_io_status_fields() {
     let address = unique_address("absent");
     let mut command = c3();
     command.args(["endpoint", "inspect", &address]);
@@ -481,6 +481,28 @@ fn inspect_reports_absent_without_inventing_an_endpoint() {
     assert
         .stdout(predicate::str::contains(r#""status":"not-applicable""#))
         .stdout(predicate::str::contains("kernel-managed"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let denied_root = short_root();
+        let root = denied_root.path();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let output = c3()
+            .args(["endpoint", "inspect", &address])
+            .arg("--ipc-root")
+            .arg(root)
+            .output();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = output.unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{report:?}");
+        assert_eq!(report["status"], "io-error");
+        assert_eq!(
+            report["reason"],
+            std::io::ErrorKind::PermissionDenied.to_string()
+        );
+        assert!(std::fs::read_dir(root).unwrap().next().is_none());
+    }
 }
 
 #[test]
