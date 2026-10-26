@@ -34,7 +34,7 @@ pub use lease::{
     BufferLeaseTracker, BufferStorage, DirectionLeaseStats, LeaseDirection, LeaseRetention,
     StorageLeaseStats,
 };
-pub use pool::{FreeResult, MemPool};
+pub use pool::{FreeResult, MemPool, ReleaseHandleError};
 pub use retention::{
     RetentionBudget, RetentionError, RetentionPermit, RetentionRejectReason, RetentionSnapshot,
 };

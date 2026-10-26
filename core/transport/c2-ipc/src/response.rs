@@ -179,9 +179,10 @@ impl ResponseLease {
     ///
     /// SHM coordinates are validated before any coordinate-derived free is
     /// attempted; reassembly backing release (storage first, then budget
-    /// refund) is owned by the carrier.
+    /// refund) is owned by the carrier. Failure retains the original carrier
+    /// for another explicit release attempt.
     pub fn release(&mut self) -> Result<(), String> {
-        let Some(response) = self.response.take() else {
+        let Some(response) = self.response.as_mut() else {
             return Ok(());
         };
         match response {
@@ -200,10 +201,12 @@ impl ResponseLease {
                     carrier.allocation_id,
                 )
             }
-            ResponseData::Handle(mut backing) => backing
+            ResponseData::Handle(backing) => backing
                 .release()
                 .map_err(|error| format!("response handle release failed: {error}")),
-        }
+        }?;
+        self.response.take();
+        Ok(())
     }
 
     /// Materialize owned bytes and release the backing allocation.

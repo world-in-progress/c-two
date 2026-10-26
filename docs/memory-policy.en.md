@@ -40,6 +40,10 @@ SHM header version 3 records each buddy allocation's level and non-wrapping id u
 
 Receiver assembly reserves full capacity, `total_chunks × chunk_size`, before accepting the storage. Allocation tries buddy reuse, reuse after GC, buddy expansion, dedicated SHM and finally file mmap. Completion may trim logical length while the capacity charge remains until storage release. Resources receive the complete assembled input; chunk transfer does not provide incremental resource input.
 
+Low-level explicit Rust release retains authority on failure. `MemPool::release_handle` returns `ReleaseHandleError` containing the original `handle` and `reason`; `RequestLease::release` and `ResponseLease::release` clear their carrier only after success. A caller may retry after contention ends; retry does not repair poison, stale identity or a wrong pool. Reassembly reservations are refunded only after storage release; cached mapping charges still follow the existing GC policy.
+
+`SyncClient::pool_alloc_and_write/fill` returns `RequestPreparationError`: `source_error()` exposes the preparation failure, `release_error()` the initial cleanup failure, `has_pending_release()` the pending ownership, and `release()` attempts cleanup without replaying the fill callback. The incomplete block cannot be recovered or published. `pool_free` returns the existing release result. Consuming calls, Core/SDK Held and final Drop remain separate ownership work; this change does not guarantee their failed-owner retention or add background retries.
+
 FastDB content remains opaque at this layer. C-Two transports bytes or SHM coordinates and delegates nested payload specifications to FastDB Core.
 
 ## Disabling buddy

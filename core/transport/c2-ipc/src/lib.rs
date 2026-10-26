@@ -37,4 +37,4 @@ pub use pool::{ClientCacheMemorySnapshot, ClientPool};
 pub use response::{ResponseData, ResponseLease, ServerShmResponse};
 #[doc(hidden)]
 pub use sync_client::shared_io_handle;
-pub use sync_client::{IpcCallError, SyncClient, TransportPhase};
+pub use sync_client::{IpcCallError, RequestPreparationError, SyncClient, TransportPhase};

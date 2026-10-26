@@ -286,11 +286,11 @@ impl RequestData {
         }
     }
 
-    fn release(self) -> Result<(), String> {
+    fn release(&mut self) -> Result<(), String> {
         match self {
             Self::Inline(_) => Ok(()),
             Self::Shm(carrier) => carrier.release(),
-            Self::Handle(mut backing) => backing
+            Self::Handle(backing) => backing
                 .release()
                 .map_err(|error| format!("request handle release failed: {error}")),
         }
@@ -321,11 +321,14 @@ impl RequestLease {
             .copy_bytes()
     }
 
+    /// Failure retains the original carrier; success ends its release authority.
     pub fn release(&mut self) -> Result<(), String> {
-        let Some(request) = self.request.take() else {
+        let Some(request) = self.request.as_mut() else {
             return Ok(());
         };
-        request.release()
+        request.release()?;
+        self.request.take();
+        Ok(())
     }
 
     pub fn into_owned_bytes(mut self) -> Result<Vec<u8>, String> {
@@ -692,26 +695,42 @@ mod tests {
         }
     }
 
-    fn request_test_pool() -> MemPool {
-        static NEXT_POOL: AtomicU64 = AtomicU64::new(0);
-        MemPool::new_with_prefix(
-            PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 1,
-                max_dedicated_segments: 2,
-                dedicated_crash_timeout_secs: 5.0,
-                buddy_idle_decay_secs: 1.0,
-                spill_threshold: 0.8,
-                spill_dir: std::env::temp_dir().join("c_two_request_data_test_spill"),
-                ..PoolConfig::default()
-            },
-            format!(
-                "/c2rq{:08x}{:04x}",
-                std::process::id(),
-                NEXT_POOL.fetch_add(1, Ordering::Relaxed),
-            ),
+    static REQUEST_POOL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn request_pool_config() -> PoolConfig {
+        PoolConfig {
+            segment_size: 64 * 1024,
+            min_block_size: 4096,
+            max_segments: 1,
+            max_dedicated_segments: 2,
+            dedicated_crash_timeout_secs: 5.0,
+            buddy_idle_decay_secs: 1.0,
+            spill_threshold: 0.8,
+            spill_dir: std::env::temp_dir().join("c_two_request_data_test_spill"),
+            ..PoolConfig::default()
+        }
+    }
+
+    fn request_pool_prefix() -> String {
+        format!(
+            "/c2rq{:08x}{:04x}",
+            std::process::id(),
+            REQUEST_POOL_SEQ.fetch_add(1, Ordering::Relaxed),
         )
+    }
+
+    fn request_test_pool() -> MemPool {
+        MemPool::new_with_prefix(request_pool_config(), request_pool_prefix())
+    }
+
+    fn request_pool_with_reassembly_budget(limit: u64) -> Arc<parking_lot::RwLock<MemPool>> {
+        Arc::new(parking_lot::RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                request_pool_config(),
+                request_pool_prefix(),
+                c2_mem::MemoryBudget::new(8 * 1024 * 1024, 16 * 1024 * 1024, limit),
+            ),
+        ))
     }
 
     #[test]
@@ -857,6 +876,46 @@ mod tests {
             #[cfg(windows)]
             assert!(!path.exists());
         }
+    }
+
+    #[test]
+    fn contended_reassembly_request_release_retains_backing_for_real_retry() {
+        use c2_mem::{BuddySegment, SegmentHeader, ShmSpinlock};
+        use c2_wire::chunk::ReassemblyBacking;
+        use std::mem::offset_of;
+
+        // Exact-fit reassembly budget: a first release failing on real SHM
+        // contention must keep the backing so the retry after unlock frees
+        // storage, refunds the charge, and re-admits the same capacity.
+        let capacity = 4096usize;
+        let pool = request_pool_with_reassembly_budget(capacity as u64);
+        let backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, capacity).unwrap();
+        let mut lease = RequestLease::new(RequestData::Handle(backing));
+
+        let name = pool.read().segment_name(0).unwrap().to_string();
+        let word = pool.read().segment(0).unwrap().base_ptr();
+        let lock = unsafe { ShmSpinlock::new(word.add(offset_of!(SegmentHeader, spinlock))) };
+        lock.try_lock().unwrap();
+
+        let first = lease.release();
+        lock.unlock();
+        let second = lease.release();
+        let live_after = pool.read().stats().alloc_count;
+        let snapshot = pool.read().budget().unwrap().snapshot();
+        let charge_after = snapshot.reassembly.used_bytes;
+        let readmitted = ReassemblyBacking::admit(Arc::clone(&pool), 1, capacity)
+            .map(|mut again| again.release().is_ok())
+            .unwrap_or(false);
+        pool.write().destroy();
+        let reopened = BuddySegment::open(&name, 64 * 1024);
+
+        let first_error = first.expect_err("contended request release must fail");
+        assert!(first_error.contains("spin budget"), "got: {first_error}");
+        assert!(second.is_ok(), "retry must succeed: {second:?}");
+        assert_eq!(live_after, 0, "retry must free the allocation");
+        assert_eq!(charge_after, 0, "retry must refund the charge");
+        assert!(readmitted, "same-capacity admission must succeed again");
+        assert!(reopened.is_err(), "SHM gone after destroy");
     }
 
     #[test]

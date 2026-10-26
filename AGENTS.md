@@ -268,6 +268,12 @@ Memory subsystem:
   `try_prepare_shm_response`, while raw mutable pool access requires `unsafe`.
   Read access returns a mapped guard: an ordinary read guard can reveal its
   original writable lock through `RwLockReadGuard::rwlock`.
+- Explicit failed release retains its original owner: `release_handle` returns
+  `ReleaseHandleError` with the moved handle; request/response leases clear
+  their carrier only on success. `RequestPreparationError` privately holds a
+  failed request block for cleanup only, preserving both initial errors.
+  Do not extract/publish that block, replay its fill, or silently discard a
+  `pool_free` error. Core/Held, consuming paths and final Drop remain R07 work.
 - `c2-mem` owns SDK-visible buffer lease accounting. Lease tracking records metadata and retention state only; it must not read payload bytes, allocate a second buffer, or replace `MemPool::free_at()` / `release_handle()` as the memory release authority.
 - Python buffer export admission and lifecycle transitions share the existing owner boundary: `PyCoreResponse` checks exports under `inner`; `PyCoreRequestBuffer` serializes export, release and retained tracking under `lease`. An active export must reject release before invalidation or lease removal, and tracking after release cannot revive a lease. Keep view-release counter decrements atomic and preserve Core snapshot and release authority.
 - Each owner pool appends a fresh PID/UUID incarnation to its logical label. `MemPool` alone derives bounded OS backing names; SDKs must not concatenate prefix/index suffixes.

@@ -30,6 +30,24 @@ pub enum FreeResult {
     DedicatedFreed { seg_idx: u16 },
 }
 
+/// A rejected release, retaining the exact allocation owner for the caller.
+///
+/// The handle is unchanged. Returning it does not repair a poisoned backing
+/// or make a stale identity valid; the caller still owns the pool lifetime.
+#[derive(Debug)]
+pub struct ReleaseHandleError {
+    pub handle: MemHandle,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ReleaseHandleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for ReleaseHandleError {}
+
 /// Backing-creation failure at a policy-enforced seam.
 ///
 /// Budget rejections and OS-memory pressure denials are separable from other
@@ -1140,33 +1158,36 @@ impl MemPool {
 
     /// Release resources held by a [`MemHandle`].
     ///
-    /// Returns `FreeResult` so callers can trigger deferred GC.
+    /// Returns `FreeResult` so callers can trigger deferred GC. A failed
+    /// release returns the original handle instead of consuming its authority.
     /// For `FileSpill`, always returns `Normal` (OS handles cleanup via Drop).
-    pub fn release_handle(&mut self, handle: MemHandle) -> Result<FreeResult, String> {
-        self.validate_handle_owner(&handle)?;
-        Ok(match handle.backing {
-            HandleBacking::Shm { allocation: a, .. } if !a.is_dedicated => {
-                // SAFETY: consuming the owner ends all safe payload borrows. Preserve the existing failure policy.
-                unsafe {
-                    self.free_at(
-                        a.seg_idx,
-                        a.generation,
-                        a.offset,
-                        a.actual_size,
-                        false,
-                        a.allocation_id,
-                    )
+    pub fn release_handle(&mut self, handle: MemHandle) -> Result<FreeResult, ReleaseHandleError> {
+        let result = self
+            .validate_handle_owner(&handle)
+            .and_then(|()| match &handle.backing {
+                HandleBacking::Shm { allocation: a, .. } if !a.is_dedicated => {
+                    // SAFETY: the moved owner ends all external payload borrows.
+                    // A rejected free leaves this owner intact for the caller.
+                    unsafe {
+                        self.free_at(
+                            a.seg_idx,
+                            a.generation,
+                            a.offset,
+                            a.actual_size,
+                            false,
+                            a.allocation_id,
+                        )
+                    }
                 }
-                .unwrap_or(FreeResult::Normal)
-            }
-            HandleBacking::Shm { allocation: a, .. } => {
-                self.free_dedicated(a.seg_idx);
-                FreeResult::DedicatedFreed {
-                    seg_idx: a.seg_idx as u16,
+                HandleBacking::Shm { allocation: a, .. } => {
+                    self.free_dedicated(a.seg_idx);
+                    Ok(FreeResult::DedicatedFreed {
+                        seg_idx: a.seg_idx as u16,
+                    })
                 }
-            }
-            HandleBacking::FileSpill { .. } => FreeResult::Normal,
-        })
+                HandleBacking::FileSpill { .. } => Ok(FreeResult::Normal),
+            });
+        result.map_err(|reason| ReleaseHandleError { handle, reason })
     }
 
     // --- Internal methods ---
@@ -2932,12 +2953,16 @@ mod handle_tests {
                 }))
                 .is_err()
             );
-            assert!(other.release_handle(handle).is_err());
+            let error = other.release_handle(handle).unwrap_err();
+            assert!(error.reason.contains("owner incarnation"));
+            let returned = error.handle.shm_allocation().unwrap();
+            assert_eq!(returned.allocation_id, allocation.allocation_id);
+            assert_eq!(returned.generation, allocation.generation);
+            assert_eq!(owner.handle_slice(&error.handle)[0], 0x11);
             assert_eq!(other.handle_slice(&survivor)[0], 0x22);
             assert_eq!(owner.stats().alloc_count, 1);
-            // The rejected release consumed the owner value but not its storage.
-            // SAFETY: no handle or payload borrow survives; this test owns the original allocation.
-            unsafe { owner.free(&allocation) }.unwrap();
+            owner.release_handle(error.handle).unwrap();
+            assert_eq!(owner.stats().alloc_count, 0);
             other.release_handle(survivor).unwrap();
         }
     }
@@ -2951,10 +2976,89 @@ mod handle_tests {
             let mut fresh = pool.alloc_shm_handle(size).unwrap();
             pool.handle_slice_mut(&mut fresh)[0] = 0x5A;
             assert!(pool.validate_handle(&old).is_err());
-            pool.release_handle(old).unwrap();
+            let result = pool.release_handle(old);
+            if size == 4096 {
+                assert!(result.unwrap_err().reason.contains("generation"));
+            } else {
+                result.unwrap(); // Dedicated missing-slot no-op is unchanged.
+            }
             assert_eq!(pool.handle_slice(&fresh)[0], 0x5A);
             pool.release_handle(fresh).unwrap();
         }
+    }
+
+    #[test]
+    fn release_handle_reports_real_contention_failure() {
+        // A real SHM allocator failure must not be flattened into success:
+        // the consumed handle is the only release authority for a live allocation.
+        use crate::{SegmentHeader, ShmSpinlock};
+        use std::mem::offset_of;
+
+        let mut pool = MemPool::new(test_config());
+        let handle = pool.alloc_shm_handle(4096).unwrap();
+        let allocation = handle.shm_allocation().unwrap();
+        let word = pool
+            .segment(allocation.seg_idx as usize)
+            .unwrap()
+            .base_ptr();
+        let lock = unsafe { ShmSpinlock::new(word.add(offset_of!(SegmentHeader, spinlock))) };
+        lock.try_lock().unwrap();
+        let contended = pool.release_handle(handle);
+        let contended_live = pool.stats().alloc_count;
+        lock.unlock();
+        let error = contended.unwrap_err();
+        let returned = error.handle.shm_allocation().unwrap();
+        let cause = error.reason;
+        pool.release_handle(error.handle).unwrap();
+        let live_after_retry = pool.stats().alloc_count;
+        let contended_name = pool
+            .segment_name(allocation.seg_idx as usize)
+            .unwrap()
+            .to_string();
+        pool.destroy();
+        let contended_reopened = BuddySegment::open(&contended_name, test_config().segment_size);
+        assert!(cause.contains("spin budget"), "{cause}");
+        assert_eq!(returned.allocation_id, allocation.allocation_id);
+        assert_eq!(returned.generation, allocation.generation);
+        assert_eq!(returned.actual_size, allocation.actual_size);
+        assert_eq!(contended_live, 1, "release kept the allocation live");
+        assert_eq!(live_after_retry, 0);
+        assert!(contended_reopened.is_err(), "SHM gone after destroy");
+    }
+
+    #[test]
+    fn release_handle_reports_real_poison_failure() {
+        use crate::{SegmentHeader, ShmSpinlock};
+        use std::mem::offset_of;
+
+        let mut pool = MemPool::new(test_config());
+        let handle = pool.alloc_shm_handle(4096).unwrap();
+        let allocation = handle.shm_allocation().unwrap();
+        let seg_idx = allocation.seg_idx as usize;
+        let poisoned_name = pool.segment_name(seg_idx).unwrap().to_string();
+        let word = pool.segment(seg_idx).unwrap().base_ptr();
+        let lock = unsafe { ShmSpinlock::new(word.add(offset_of!(SegmentHeader, spinlock))) };
+        lock.try_lock().unwrap();
+        lock.poison_panicked(std::process::id());
+        let poisoned = pool.release_handle(handle);
+        let poisoned_live = pool.stats().alloc_count;
+        let error = poisoned.unwrap_err();
+        let returned = error.handle.shm_allocation().unwrap();
+        let rejected_again = pool.release_handle(error.handle).unwrap_err();
+        // Poison is terminal: never unlock or reset the word; destroying
+        // this test's own unpublished mapping is the only cleanup.
+        pool.destroy();
+        let poisoned_reopened = BuddySegment::open(&poisoned_name, test_config().segment_size);
+        assert!(
+            rejected_again.reason.contains("poison"),
+            "{}",
+            rejected_again.reason
+        );
+        assert_eq!(returned.allocation_id, allocation.allocation_id);
+        assert_eq!(returned.generation, allocation.generation);
+        assert_eq!(returned.actual_size, allocation.actual_size);
+        assert_eq!(poisoned_live, 1, "release kept the allocation live");
+        assert!(poisoned_reopened.is_err(), "SHM gone after destroy");
     }
 
     #[test]

@@ -44,6 +44,10 @@ SHM 头部版本 3 在同一分配器锁下维护每次 buddy 分配的层级与
 
 接收端组装是完整预留：按 `total_chunks × chunk_size` 一次性预留全部容量，存储层级为 buddy 复用 → GC 后复用 → buddy 扩展 → dedicated SHM → 文件 mmap 最终回退。组装完成时逻辑长度可以裁剪，但容量计费保持到存储真正释放。注意这是"接收全量、组装完成后一次交给资源"，不是流式或增量资源输入。
 
+低层 Rust 的显式释放失败会保留原释放权：`MemPool::release_handle` 返回的 `ReleaseHandleError` 包含原 `handle` 与 `reason`；`RequestLease::release` / `ResponseLease::release` 只有成功后才清空 carrier。竞争解除后可由调用者再次释放，poison、过期身份或错误 pool 不因重试恢复有效。重组 reservation 仍在存储释放成功后归还；空闲映射的 SHM charge 继续遵循原 GC 策略。
+
+`SyncClient::pool_alloc_and_write/fill` 返回 `RequestPreparationError`：`source_error()` 查询准备错误，`release_error()` 查询首次清理错误，`has_pending_release()` 表示是否仍持有待清理块，`release()` 只尝试清理且不重放填充回调。失败块不能取出或发布，`pool_free` 也返回原释放结果。消费式调用、Core/SDK Held 和最终 Drop 的失败接管仍是独立范围；本变化不保证它们能保留失败 owner，也不新增后台重试。
+
 FastDB 载荷内容对该层不透明：C-Two 只搬运字节或共享内存指针，嵌套规格作为不透明 JSON 委托 FastDB Core，这是保持中立的边界。
 
 ## 4. `pool_enabled=False` 只关闭 buddy 层

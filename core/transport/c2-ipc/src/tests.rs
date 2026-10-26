@@ -608,6 +608,50 @@ mod response_lease_tests {
         assert!(error.contains("response handle release failed"), "{error}");
     }
 
+    #[test]
+    fn contended_reassembly_release_retains_backing_for_real_retry() {
+        use c2_mem::{BuddySegment, MemoryBudget, SegmentHeader, ShmSpinlock};
+        use c2_wire::chunk::ReassemblyBacking;
+        use std::mem::offset_of;
+
+        // Exact-fit reassembly budget: a first release failing on real SHM
+        // contention must keep the backing so the retry after unlock frees
+        // storage, refunds the charge, and re-admits the same capacity.
+        let capacity = 4096usize;
+        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
+            pool_config(),
+            unique_prefix('k'),
+            MemoryBudget::new(8 * 1024 * 1024, 16 * 1024 * 1024, capacity as u64),
+        )));
+        let backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, capacity).unwrap();
+        let mut lease = ResponseLease::new(ResponseData::Handle(backing));
+
+        let name = pool.read().segment_name(0).unwrap().to_string();
+        let word = pool.read().segment(0).unwrap().base_ptr();
+        let lock = unsafe { ShmSpinlock::new(word.add(offset_of!(SegmentHeader, spinlock))) };
+        lock.try_lock().unwrap();
+
+        let first = lease.release();
+        lock.unlock();
+        let second = lease.release();
+        let live_after = pool.read().stats().alloc_count;
+        let snapshot = pool.read().budget().unwrap().snapshot();
+        let charge_after = snapshot.reassembly.used_bytes;
+        let readmitted = ReassemblyBacking::admit(Arc::clone(&pool), 1, capacity)
+            .map(|mut again| again.release().is_ok())
+            .unwrap_or(false);
+        pool.write().destroy();
+        let reopened = BuddySegment::open(&name, SEGMENT_SIZE);
+
+        let first_error = first.expect_err("contended response release must fail");
+        assert!(first_error.contains("spin budget"), "got: {first_error}");
+        assert!(second.is_ok(), "retry must succeed: {second:?}");
+        assert_eq!(live_after, 0, "retry must free the allocation");
+        assert_eq!(charge_after, 0, "retry must refund the charge");
+        assert!(readmitted, "same-capacity admission must succeed again");
+        assert!(reopened.is_err(), "SHM gone after destroy");
+    }
+
     fn assert_shm_response(payload: Vec<u8>, expected_dedicated: bool, label: char) {
         let prefix = unique_prefix(label);
         let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());
@@ -923,6 +967,117 @@ mod lazy_policy_roundtrip_tests {
 
     fn response_bytes(_client: &IpcClient, response: ResponseData) -> Vec<u8> {
         response.into_bytes().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_shm_leases_keep_failed_release_authority() {
+        struct RetainedRequest(Arc<Mutex<Option<RequestLease>>>);
+        impl CrmCallback for RetainedRequest {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                request: RequestData,
+                _: Arc<c2_server::ResponsePool>,
+            ) -> Result<ResponseMeta, CrmError> {
+                assert_eq!(request_kind(&request), "shm_buddy");
+                let request = RequestLease::new(request);
+                let bytes = request.copy_bytes().map_err(CrmError::InternalError)?;
+                *self.0.lock() = Some(request);
+                Ok(ResponseMeta::Inline(bytes))
+            }
+        }
+
+        #[cfg(unix)]
+        let root = tempfile::Builder::new()
+            .prefix("r7")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let label = "release_retry";
+        let endpoint = context.endpoint(&unique_address(label)).unwrap();
+        let base = small_base(64 * 1024, 2);
+        let retained = Arc::new(Mutex::new(None));
+        let server = Arc::new(
+            Server::new_with_endpoint(endpoint.clone(), server_config(base.clone(), 1024)).unwrap(),
+        );
+        let built = server
+            .build_route(
+                route_spec(label),
+                Arc::new(RetainedRequest(retained.clone())),
+            )
+            .unwrap();
+        let reservation = server.reserve_route(built).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+        let serving = tokio::spawn({
+            let server = server.clone();
+            async move { server.run().await }
+        });
+        server
+            .wait_until_ready(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut client = IpcClient::with_endpoint(endpoint.clone(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let payload = vec![0xA7; 8192];
+        let response = echo_roundtrip(&client, label, &payload).await;
+        assert!(matches!(&response, ResponseData::Shm(carrier) if !carrier.is_dedicated()));
+        let mut response = ResponseLease::new(response);
+        let mut request = retained.lock().take().unwrap();
+        let request_snapshot = request.copy_bytes().unwrap();
+        let response_snapshot = response.copy_bytes().unwrap();
+        let request_pool = client.request_pool().unwrap();
+        let response_pool = server.response_pool_arc();
+        let request_base = request_pool.lock().segment(0).unwrap().base_ptr();
+        let response_base = response_pool.read().segment(0).unwrap().base_ptr();
+        // SAFETY: these are this round trip's live mappings; the pools and
+        // carriers outlive both bounded lock attempts. No lock word is reset.
+        let request_lock = unsafe {
+            c2_mem::ShmSpinlock::new(
+                request_base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
+            )
+        };
+        let response_lock = unsafe {
+            c2_mem::ShmSpinlock::new(
+                response_base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
+            )
+        };
+        let request_failure = request_lock.with_lock(|| request.release()).unwrap();
+        let response_failure = response_lock.with_lock(|| response.release()).unwrap();
+        let request_retained = request.copy_bytes().unwrap();
+        let response_retained = response.copy_bytes().unwrap();
+        request.release().unwrap();
+        response.release().unwrap();
+        request.release().unwrap();
+        response.release().unwrap();
+        let request_live = request_pool.lock().stats().alloc_count;
+        let response_live = response_pool.read().stats().alloc_count;
+        client.close().await;
+        stop_server(&server).await;
+        serving.await.unwrap().unwrap();
+        #[cfg(unix)]
+        {
+            assert!(!std::path::Path::new(endpoint.os_name()).exists());
+            assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".lease")
+            }));
+        }
+        #[cfg(windows)]
+        assert!(c2_local::LocalStream::connect(&endpoint).await.is_err());
+        assert!(request_failure.unwrap_err().contains("spin budget"));
+        assert!(response_failure.unwrap_err().contains("spin budget"));
+        assert_eq!(request_snapshot, payload);
+        assert_eq!(response_snapshot, payload);
+        assert_eq!(request_retained, payload);
+        assert_eq!(response_retained, payload);
+        assert_eq!((request_live, response_live), (0, 0));
     }
 
     // Fake callback state is a transport seam, not a Core deadline model.
