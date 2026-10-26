@@ -1052,13 +1052,13 @@ async fn managed_budgeted_sweep_advances_past_busy_and_corrupt_slots() {
 
 /// Public sweep dispatch: `EndpointSweep::for_scope` enumerates the real
 /// managed-v2 namespace, converges registered leftovers, and never touches the
-/// unselected slots.
+/// unselected slots. A private context keeps unrelated tests from taking its gate.
 #[tokio::test]
 async fn managed_public_sweep_targets_the_selected_namespace_only() {
-    let _shared = shared_namespace_guard();
-    let live = managed_endpoint("public-sweep-live");
+    let namespace = TestNamespace::new();
+    let live = managed_endpoint_at(namespace.path(), "public-sweep-live");
     let live_listener = crate::LocalListener::bind(&live).unwrap();
-    let dead = managed_endpoint("public-sweep-dead");
+    let dead = managed_endpoint_at(namespace.path(), "public-sweep-dead");
     let output = run_managed_process(&dead, "exit-owner");
     assert!(output.status.success(), "{output:?}");
     assert!(socket_path(&dead).exists());
