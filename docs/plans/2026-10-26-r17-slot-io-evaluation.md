@@ -1,8 +1,8 @@
 # R17a：端点 slot stat 错误分类最小方案
 
-状态：用户已批准 R17a，生产最小替换与定向基线红绿已完成；独立静态审查无阻断，完整验收进行中，尚未提交或发版。基线 `dfa03d16099ea95e17809bfc4bc7eca1d31ddd98`，包含已验收 R07a；IPC 14、SHM 3、C/FFI ABI 6。R07 的 Core/Held、consuming、最终 Drop，C04、R35 和两份控制会话重构继续单列。R17 仍未验收，本方案不将其整体核销。
+状态：R17a 已按批准边界完成；生产 +5、测试 +203 行，属于正确性修复。实施基线 `074d620b`，最终实现/测试来源 `f64afd9e`；真实三端、完整 relay/跨语言、确切来源 Actions 10/10、端点零残留及独立审查见[验收记录](../reports/2026-10-26-r17a-slot-io-acceptance.md)。本批未发版，构建产物已清理。原评估基线 `dfa03d16`；IPC 14、SHM 3、C/FFI ABI 6 不变。R17 仅部分完成，其他保守身份分类、R07 剩余所有权、C04、R35 和两份控制会话重构继续单列。
 
-## 调用链、原设计与问题
+## 实施前调用链、原设计与问题
 
 `EndpointDirectory::stat` 使用 dirfd 相对的 `fstatat(AT_SYMLINK_NOFOLLOW)`；只把 ENOENT 转成 `Ok(None)`，其余错误保持 Err。两个上层分支再次用 `.ok().flatten()` 丢掉了这个区分：
 
@@ -41,7 +41,7 @@ Rust/Python sweep 的错误计数及最后 I/O 原因会恢复；CLI sweep 只�
 | 原有 fault 枚举、managed/split fixtures 与公开投影测试 | 预计净增 100–180 行 | 定向命中原生分支并核 kind/errno、计数与未删除对象，不建立测试框架 |
 | 生产与测试合计 | 预计净增 100–195 行 | 作为正确性修复，不能记作净减量；实际值在实现后重算 |
 
-## 当前证据及确认后的验收
+## 方案确认前的证据与验收要求
 
 本机 macOS arm64 的 task-owned 双目录机制实验已验证：目录 FD 保持打开时，去掉目录遍历权限仍使 socket 和 lease 的无跟随 stat 返回 EACCES/13；恢复权限后 inode 不变，ENOENT/2 控制也成立。本批 socket/lease 已删除，临时根已移除，未访问历史命名空间。它没有端到端命中完整原生 gate/record 检查后的两个目标窗口，也没有执行 Linux/Windows 实验；不能写作公共 API 已复现。
 
