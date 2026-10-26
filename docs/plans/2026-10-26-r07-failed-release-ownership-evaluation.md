@@ -1,6 +1,6 @@
 # R07 失败释放的所有权与预算评估
 
-状态：用户已批准下述 R07a 及四处低层 Rust 签名变化；候选实现与基线反例已落地，完整验收进行中，尚未提交或发版。基线 `7a1dd40fd12bb2d5d35dd4fffb55bdf653ab7be0`，IPC 14、SHM 3、C/FFI ABI 6。C04、R35 与两份控制会话重构继续暂缓。R07a 只覆盖仍有明确接收者的显式释放；完整 R07 保持开放。
+状态：R07a 已按用户批准边界完成并提交；实现/测试来源 `b059c02d`，完整验收见[记录](../reports/2026-10-26-r07a-explicit-release-acceptance.md)。生产净增 134、测试净增 427 行；确切来源 Actions 10/10、真实三端、完整 relay/跨语言、端点零残留及独立审查完成，构建产物已清理，未发版。基线 `7a1dd40fd12bb2d5d35dd4fffb55bdf653ab7be0`，IPC 14、SHM 3、C/FFI ABI 6。C04、R35 与两份控制会话重构继续暂缓。R07a 只覆盖仍有明确接收者的显式释放；完整 R07 保持开放。
 
 ## 已复现的原因
 
@@ -60,3 +60,7 @@ Core Held 可另用现有 released 表示逻辑失效、lease Option 表示物�
 确认后按以下范围验收：先把真实竞争/poison、错误 pool、返还同一 allocation_id/generation 与两类 lease 的再释放反例纳入现有测试；补 helper 的主/释放双错误、fill 仅一次、错误块不能发布；保留 trim 到 0/1 的原容量、dedicated 退休、file、快照、copy/release 双错误与 dispatch/取消覆盖。dead-holder 必须继续拒绝且不改锁字。随后运行定向、完整 relay、Rust/Python 18 行和 Node 12 行矩阵、真实三系统及确切候选 Actions（含 Windows ARM64/3.14t），本批 socket/lease 零残留，独立审查后提交；Windows 优先开发机，完成即清理构建产物。
 
 独立只读核查使用 hey-my-buddy run `5cc2f3dc-23b6-4250-b055-8c7d724dc5b7`、空补丁 artifact `20b2b746-b6f8-43e4-9c9b-72559d88f1a2`。Host 复核源码/历史并执行上述实验；worker 没有运行实验，不把 Host 结果当作其独立运行证据。报告已接受，工作树已回收；只读环境拒绝过一条需 heredoc 临时文件的计数辅助命令，没有绕过，不影响 Host 的复现及本方案交付。
+
+## R07a 实施后边界
+
+首批四处低层返回签名及两类显式 lease 已验收；上述静态估算由[实际行数与开销](../reports/2026-10-26-r07a-explicit-release-acceptance.md)取代。Core/Held、consuming、构造回滚与最终 Drop 的失败接管责任继续开放；R07 不整体核销。失败保留提供调用者再次清理的条件，poison/dead-holder、过期身份及最终析构不因此获得恢复保证。

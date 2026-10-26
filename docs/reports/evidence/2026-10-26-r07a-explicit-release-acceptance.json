@@ -1,0 +1,221 @@
+{
+  "case": "R07a explicit failed release ownership",
+  "base": "0e7db94e2b63d71196e2c1f64ce69efd5db732b9",
+  "source": "b059c02dd78729e38e9c375612580af72c30374f",
+  "scope": "four low-level Rust signatures and explicit request/response leases only; complete R07 remains open",
+  "versions": {
+    "ipc": 14,
+    "shm": 3,
+    "c_ffi_abi": 6,
+    "changed": false
+  },
+  "code_counts": {
+    "method": "Git diff; cfg(test) separated; comments and blank lines included",
+    "production": {
+      "added": 184,
+      "deleted": 50,
+      "net": 134
+    },
+    "tests": {
+      "added": 452,
+      "deleted": 25,
+      "net": 427
+    },
+    "non_document_net": 561,
+    "docs": {
+      "added": 294,
+      "deleted": 7,
+      "net": 287
+    },
+    "scope": "whole batch including acceptance docs and this evidence record"
+  },
+  "baseline": {
+    "macos_arm64": {
+      "contention": "expected failure",
+      "poison": "expected failure",
+      "request_reassembly_retry": "expected failure",
+      "response_reassembly_retry": "expected failure"
+    },
+    "windows_11_x64": "same four expected failures; native process exited and private SHM names gone"
+  },
+  "targeted": {
+    "macos_arm64_tests": 61,
+    "windows_11_x64_tests": 61,
+    "ownership_gate": "21 external consumer compile cases included in each single gate test",
+    "request_preparation_compile_fail": "private pending block cannot be extracted",
+    "real_shm_rpc": "request/response contention, retained snapshots, retry, idempotence, alloc_count zero, endpoint close"
+  },
+  "ci": {
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/40272071925",
+    "run_id": 40272071925,
+    "attempt": 1,
+    "head_sha": "b059c02dd78729e38e9c375612580af72c30374f",
+    "conclusion": "success",
+    "all_jobs_passed": true,
+    "jobs": {
+      "changes": 121407248673,
+      "workflow policy": 121407287823,
+      "source (macos-15, py3.12)": 121407621136,
+      "source (windows-2022, py3.12)": 121407621155,
+      "source (windows-2025, py3.12)": 121407621175,
+      "source (ubuntu-24.04, py3.14t)": 121407621188,
+      "source (windows-11-arm, py3.12)": 121407621189,
+      "source (ubuntu-24.04, py3.12)": 121407621254,
+      "test (py3.14t)": 121421796226,
+      "test (py3.12)": 121421796235
+    },
+    "applicable_source_gates": 147,
+    "fastdb_source": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+    "lanes": [
+      {
+        "runner": "macos-15",
+        "scope": "full",
+        "machine": "arm64",
+        "gates": 25,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "new_native_cases": 7,
+        "source_verified": true,
+        "artifact_id": 12629477722,
+        "github_archive_digest": "sha256:1cf0b4887125c9a71d08c53fba51d6ce2b15ebd1ab7ba0dafaee42c88c6c5a8e",
+        "run_evidence_sha256": "c5d894b8c853f3501324ad79fd4438ea44a416e1fffb8ab3fe828c2b2262d477",
+        "retained_artifact_hashes_verified": 173
+      },
+      {
+        "runner": "ubuntu-24.04",
+        "scope": "full",
+        "machine": "x86_64",
+        "gates": 25,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "new_native_cases": 7,
+        "source_verified": true,
+        "artifact_id": 12629596214,
+        "github_archive_digest": "sha256:c773ce8a842ec527f610ef5598248ea5f0989151ddf8a58eb64b1683040def8c",
+        "run_evidence_sha256": "46148e2149ce6a29dbfd8c11616b1363b116d76cf8701fc1f63a2c57ba5a59a6",
+        "retained_artifact_hashes_verified": 173
+      },
+      {
+        "runner": "ubuntu-24.04",
+        "scope": "python",
+        "machine": "x86_64",
+        "gates": 16,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "new_native_cases": 0,
+        "source_verified": true,
+        "artifact_id": 12629585522,
+        "github_archive_digest": "sha256:345284bc7b02dca375c6d388a1fb52872d9cbfc45eb25f88be2a95349320832d",
+        "run_evidence_sha256": "9e317df7ac56f05280e16c93a067d2317afa1d70f499c983412392f56bb9ddfc",
+        "retained_artifact_hashes_verified": 152
+      },
+      {
+        "runner": "windows-11-arm",
+        "scope": "full",
+        "machine": "ARM64",
+        "gates": 27,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "new_native_cases": 7,
+        "source_verified": true,
+        "artifact_id": 12629938786,
+        "github_archive_digest": "sha256:4b227eb5a69fa3a99fb4788e555620b439e97e1c052da53915802e9ef518ae1d",
+        "run_evidence_sha256": "9b54679be56f8e0fea89082d2701427e222dc884c84e7048e9a757cf2750954c",
+        "retained_artifact_hashes_verified": 179
+      },
+      {
+        "runner": "windows-2022",
+        "scope": "full",
+        "machine": "AMD64",
+        "gates": 27,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "new_native_cases": 7,
+        "source_verified": true,
+        "artifact_id": 12629593094,
+        "github_archive_digest": "sha256:be5d957a13d524ecce700f2032fc33ac69fcc68a16fbc885f4b78e8d227dd653",
+        "run_evidence_sha256": "70737614affd90c2cef1be282e241842d1635352d3549cea3fe1a5472d2419b5",
+        "retained_artifact_hashes_verified": 179
+      },
+      {
+        "runner": "windows-2025",
+        "scope": "full",
+        "machine": "AMD64",
+        "gates": 27,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "new_native_cases": 7,
+        "source_verified": true,
+        "artifact_id": 12629776597,
+        "github_archive_digest": "sha256:c8346f3bea9b080f60feaa7193176f91aa30990e9341ef88cd34f00fa954715e",
+        "run_evidence_sha256": "62b02d0f26f2c88a926786e404331ab03a9ecc8960576451ad3eec729a3e96f5",
+        "retained_artifact_hashes_verified": 179
+      }
+    ],
+    "artifact_verification": "Range-fetched text only; ZIP CRC and retained per-file SHA-256 verified against run evidence. GitHub archive digests recorded, not independently hashed as whole archives."
+  },
+  "independent_reviews": [
+    {
+      "run": "3218a4fc-53fa-4abd-8bfb-fbbee1bec7da",
+      "artifact": "20fb0ecc-d21a-44e7-aac3-f31e25fdbbb5",
+      "input": "5811200c9eb21103b3d7cb5100e3d1cea04f9623",
+      "scope": "six production files; no blocking findings; static only"
+    },
+    {
+      "run": "dd22dc78-e0bb-4f9d-b553-8d505b47fb23",
+      "artifact": "2a35ea4e-1120-43af-885a-4d14693c0895",
+      "input": "d18028062fbe52f0392cb32615d8e01cdac4c081",
+      "scope": "tests and API docs; no blocking findings; static only"
+    }
+  ],
+  "review_delta": "Final six production bodies match reviewed input excluding comments; Host reviewed Windows teardown Duration argument correction and verified it natively. Both reviews accepted/reclaimed.",
+  "baseline_worker": {
+    "run": "bb842283-2428-4935-aff6-e1a4cefb3482",
+    "buddy": "GLM-5.3 / bigmodel-api-2 / high",
+    "artifact": "39787fd1-0468-472f-ab10-56bc1ac352f9",
+    "scope": "tests only, not built/run by Worker; Host split contention/poison and extended exact owner/real RPC cases; accepted adjusted target and reclaimed"
+  },
+  "resolved_validation_issues": [
+    "Host test initially used wrong existing Display prefix; corrected test to Pool error, production wording unchanged.",
+    "Windows mixed target reused old baseline binary; result discarded. Independent candidate target passed.",
+    "Windows-only teardown test missed required connect Duration; corrected. First CI 40271664346 cancelled after five source lanes entered shared validation; incomplete results not accepted. Final implementation candidate requalified completely."
+  ],
+  "cost": {
+    "platform": "macOS arm64",
+    "kind": "public Rust type layouts, not stable ABI or runtime allocation counts",
+    "old_release_result_bytes": 24,
+    "new_release_result_bytes": 104,
+    "release_error_bytes": 104,
+    "ipc_error_bytes": 96,
+    "request_preparation_error_bytes": 200,
+    "old_preparation_result_bytes": 96,
+    "new_preparation_result_bytes": 200,
+    "successful_path_new_payload_copy": false,
+    "successful_path_new_lock": false,
+    "not_measured": "RPC performance and codegen effects; no performance gain claimed",
+    "failure_cost": "error retains its original pool/allocation/reservation until explicit cleanup; existing Drop can make a further bounded allocator attempt"
+  },
+  "cleanup": {
+    "mac_target_bytes": 544680280,
+    "mac_transfer_archive_bytes": 2075476,
+    "windows_target_bytes": [
+      420459245,
+      289792670,
+      411582307
+    ],
+    "local_target_remaining": false,
+    "windows_target_remaining": false,
+    "windows_temp_remaining": false,
+    "socket_and_lease_zero": "task-owned real RPC assertions passed; Windows kernel endpoint refused connection after close",
+    "shm_cleanup": "private counterexample mappings destroyed and native reopen rejected",
+    "historical_directories_touched": false,
+    "source_and_text_evidence_retained_at": "~/.codex/diagnostics/c2-r07a-implementation-1_sjflpb/"
+  },
+  "remaining": [
+    "Core/Held owner and connection pin on failure",
+    "consuming and construction rollback ownership",
+    "final Drop reliable failed-owner recipient",
+    "C04, R35 and both control-session refactors remain deferred"
+  ],
+  "published": false
+}
