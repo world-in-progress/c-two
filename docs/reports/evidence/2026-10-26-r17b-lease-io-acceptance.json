@@ -1,0 +1,217 @@
+{
+  "schema": "c-two.r17b-lease-io-acceptance.v1",
+  "date": "2026-10-26",
+  "base": "41c90f04557deaa76a38035e77e1d25783dffcdd",
+  "source": "172350276e2f7f769c608a655e5fca74d5c2cf26",
+  "protocols": {
+    "ipc": 14,
+    "shm": 3,
+    "c_ffi_abi": 6,
+    "changed": false
+  },
+  "line_counts": {
+    "production": {
+      "added": 45,
+      "deleted": 45,
+      "net": 0
+    },
+    "tests": {
+      "added": 261,
+      "deleted": 1,
+      "net": 260
+    },
+    "docs": {
+      "added": 293,
+      "deleted": 3,
+      "net": 290
+    }
+  },
+  "baseline": {
+    "groups_failed_as_expected": 4,
+    "faults": [
+      "VerifyLeaseFstat",
+      "VerifyLeaseStat",
+      "ReadLeaseStat",
+      "ReadLeaseOpen",
+      "ReadLeaseRecord"
+    ],
+    "real_split_error": "EACCES/PermissionDenied after namespace gate acquisition",
+    "additional_drop_control": "old classification still failed at original assertion after successful Drop cleanup control"
+  },
+  "native": {
+    "mac_distinct_targeted_tests_passed": 23,
+    "modified_drop_test_rechecked": true,
+    "socket_lease_residues_in_new_fixtures": 0
+  },
+  "windows_developer": {
+    "original_receipt": "../c2-r17a-implementation-j4rx68ra/windows-verified.json",
+    "original_receipt_sha256": "b8dfac5d4a0f8bcf7350943ac11c5f27fa8851315f296dc67e19e9e026ac36c0",
+    "executed_this_batch": false,
+    "retained_checks": [
+      "10 credential tests",
+      "public native observation probe, no listener created"
+    ],
+    "verified_windows_source_sha256": {
+      "core/transport/c2-local/src/lib.rs": "001bc6c54a713819d19b4f1509f0d8801a0b15fdd6f324b1389ec7fa91bcf8f1",
+      "core/transport/c2-local/src/windows.rs": "ccde4bf145bf8b012bfec80a5cb4a38b9f65c40efe0d655ea6c39c331ff2893a"
+    },
+    "unchanged_since_source": "f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+    "protected_paths": [
+      "core/foundation/c2-config",
+      "core/foundation/c2-local-security",
+      "core/transport/c2-local/Cargo.toml",
+      "core/transport/c2-local/src/lib.rs",
+      "core/transport/c2-local/src/windows.rs",
+      "core/transport/c2-local/src/credential.rs",
+      "core/transport/c2-local/src/credential_tests.rs",
+      "core/Cargo.lock"
+    ],
+    "reason": "Only cfg(unix) source/tests changed. Existing developer checks reused after source verification; this exact candidate also passed new Windows x64/ARM64 CI."
+  },
+  "ci": {
+    "run_id": 40322814485,
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/40322814485",
+    "attempt": 1,
+    "jobs_passed": 10,
+    "gates_passed": 147,
+    "fastdb_source": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+    "lanes": [
+      {
+        "lane": "source-macos-15-py3.12-full",
+        "gates": 25,
+        "verified_text_files": 173,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-ubuntu-24.04-py3.12-full",
+        "gates": 25,
+        "verified_text_files": 173,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-ubuntu-24.04-py3.14t-python",
+        "gates": 16,
+        "verified_text_files": 152,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-windows-11-arm-py3.12-full",
+        "gates": 27,
+        "verified_text_files": 179,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-windows-2022-py3.12-full",
+        "gates": 27,
+        "verified_text_files": 179,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-windows-2025-py3.12-full",
+        "gates": 27,
+        "verified_text_files": 179,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      }
+    ]
+  },
+  "ci_artifacts": [
+    {
+      "id": 12651350413,
+      "name": "source-ubuntu-24.04-py3.12-full-172350276e2f7f769c608a655e5fca74d5c2cf26",
+      "github_digest": "sha256:50c5baf5bda635310a7247084ca3e1b641f2f470f760b2cfc96d2b2cb5b0e58d"
+    },
+    {
+      "id": 12651341262,
+      "name": "source-windows-2025-py3.12-full-172350276e2f7f769c608a655e5fca74d5c2cf26",
+      "github_digest": "sha256:9e49341816cec671dc7a66e64636fbe67abb5591b1e37bc3e1d2db3cb9ff2933"
+    },
+    {
+      "id": 12650950373,
+      "name": "source-ubuntu-24.04-py3.14t-python-172350276e2f7f769c608a655e5fca74d5c2cf26",
+      "github_digest": "sha256:7296b736dbc13c76dcc3416b8e59bf35533da4ef9fb16a11ff57a0fb605d3d13"
+    },
+    {
+      "id": 12649318784,
+      "name": "workflow-policy-172350276e2f7f769c608a655e5fca74d5c2cf26",
+      "github_digest": "sha256:bef1d69d0bd9102ec7a97d64f9845b5187e748322c01279b870c7ee14f7046a5"
+    },
+    {
+      "id": 12650898154,
+      "name": "source-macos-15-py3.12-full-172350276e2f7f769c608a655e5fca74d5c2cf26",
+      "github_digest": "sha256:6cb549e0ea498f41385295f1ecc9244d1c35680a4996fe07e59944abcb72f89d"
+    },
+    {
+      "id": 12652015938,
+      "name": "source-windows-2022-py3.12-full-172350276e2f7f769c608a655e5fca74d5c2cf26",
+      "github_digest": "sha256:36fc2d1764af145d7a78c6202a2990a7c3db874a260bb64b72eae343e51f06c6"
+    },
+    {
+      "id": 12654201547,
+      "name": "source-windows-11-arm-py3.12-full-172350276e2f7f769c608a655e5fca74d5c2cf26",
+      "github_digest": "sha256:7a427c1a0bc92c957d7aceb8607c90120bae02882a1fb53401cd2faf97a743dc"
+    }
+  ],
+  "hash_policy": "Range-downloaded text verified by ZIP CRC and run-evidence SHA-256. Recorded GitHub archive digests are not independently recomputed.",
+  "reviews": [
+    {
+      "run": "3df776e0-a78b-4d80-a7d3-a45d179ec9cb",
+      "artifact": "f6b067ad-7ed8-4792-aa16-6af798c31318",
+      "input": "41c90f04557deaa76a38035e77e1d25783dffcdd",
+      "scope": "call chain and original design"
+    },
+    {
+      "run": "24d3fd48-f730-4af7-8f14-1e57f8ceee2f",
+      "artifact": "d815b896-c0a6-4c16-bf1c-342e28738e36",
+      "input": "26d8504c6302a6b288b2bbdb9f024a642b836246",
+      "scope": "implementation and tests, optional Drop coverage identified"
+    },
+    {
+      "run": "e8e48ec3-bbce-41f8-8ab5-c26b3a574a69",
+      "artifact": "2ecf51af-6fd5-4af7-bac8-2d293fd50ac2",
+      "input": "fdc97d0272a9fcfb33d334712b20ab9c5cc8cd10",
+      "scope": "Drop coverage and close-error documentation, no new issues"
+    }
+  ],
+  "review_boundary": "Static only; no independent test execution. All accepted and workspaces reclaimed. Host retained original fresh-lease rollback instead of the initial auditor suggestion.",
+  "cleanup": {
+    "mac_removed_target_bytes": [
+      157934096,
+      157939296,
+      157940360
+    ],
+    "windows_new_builds": false,
+    "local_targets_remaining": false,
+    "historical_directory_maintenance": false,
+    "branch": {
+      "branch": "socu/r17b-lease-io-ci",
+      "expected_sha": "172350276e2f7f769c608a655e5fca74d5c2cf26",
+      "deleted_with_exact_lease": true,
+      "remote_absent": true
+    }
+  },
+  "evidence_root": "~/.codex/diagnostics/c2-r17b-implementation-bk8xm7ar/",
+  "evidence_hashes": {
+    "native-results.json": "2121e1b46cede83bd940fc868cec132e450a7359b3c81fdbb415ea5c48630f0b",
+    "adjacent-results.json": "3a746aea007da035e4e5498193f40b937d23ab0854737922cb011250b05c4585",
+    "windows-reuse.json": "46698a290ed7c68670c986d0eff290daae7f55d66e50365d2d94af2a97b25807",
+    "final-ci-audit.json": "cd37ce40a382f4a8d59c58928a66744fb392030117bbdee24ce8694ae8186843",
+    "audit-outcome.json": "e08a8f0f6210c342e80a26026eb3bfaf88d45ad33a7465222fb1640617385acd",
+    "review-outcome.json": "d6f5c3967cbd58060a3af0cdd4f0db3e625775f704037d71755a10635754613b",
+    "delta-review-outcome.json": "5f7f84b8fb7df2ec6d333531c7c9480200ffd717bba0f0027bc99508f014e9b2"
+  },
+  "release": false,
+  "r17_status": "partial; gate/current-directory and context classification remain separate",
+  "evidence_download": "One SSL EOF while fetching the final artifact; text download resumed, no CI rerun. Complete six-lane audit passed afterward."
+}
