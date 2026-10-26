@@ -7,10 +7,10 @@ Mirrors `thread_vs_ipc_benchmark.py`:
 
 Ray wraps a `@ray.remote` EchoActor to parallel C-Two's CRM + connect model.
 
-NOTE: Ray does not run on free-threaded CPython 3.14t. Run this script with
-stock Python 3.12:
+The locked benchmark group requires Python 3.11 or later for filelock security
+fixes. Ray is selected only below Python 3.14; use stock Python 3.12:
 
-    /tmp/ray_bench_env/bin/python sdk/python/benchmarks/ray_echo_benchmark.py
+    uv run --locked --python 3.12 --only-group benchmark python sdk/python/benchmarks/ray_echo_benchmark.py
 """
 from __future__ import annotations
 

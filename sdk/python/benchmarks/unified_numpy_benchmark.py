@@ -4,11 +4,11 @@ Both frameworks transport the same payload: 4 numpy arrays (row_id u32,
 x/y/z f64) + 1 string list.  Measures end-to-end latency including
 cross-process RPC + client-side aggregation.
 
-Requires: numpy, ray, c-two  (run from a Python 3.12/3.13 venv)
+Uses the locked benchmark group (Python >=3.11); run with Python 3.12 or 3.13.
 
 Usage:
-    python sdk/python/benchmarks/unified_numpy_benchmark.py
-    python sdk/python/benchmarks/unified_numpy_benchmark.py --sizes 1000 10000 100000 1000000
+    uv run --locked --python 3.12 --group benchmark python sdk/python/benchmarks/unified_numpy_benchmark.py
+    uv run --locked --python 3.12 --group benchmark python sdk/python/benchmarks/unified_numpy_benchmark.py --sizes 1000 10000 100000 1000000
 """
 from __future__ import annotations
 
