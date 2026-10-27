@@ -208,8 +208,8 @@ class TestOnShutdownLifecycle:
         crm = CounterImpl()
         cc.register(Counter, crm, name='ctr_rpc')
 
-        from c_two.transport.registry import _ProcessRegistry
-        reg = _ProcessRegistry._instance
+        from c_two.transport import registry as registry_module
+        reg = registry_module._default_runtime
         slot = reg._server._slots.get('ctr_rpc')
         assert slot is not None
         # cleanup should NOT be in the dispatch table

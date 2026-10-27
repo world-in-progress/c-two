@@ -62,15 +62,15 @@ def test_startup_budget_survives_session_replacement_and_failed_register() -> No
     with tempfile.TemporaryDirectory(prefix='c2-start-', dir=None if sys.platform == 'win32' else '/tmp') as root:
         _run_isolated(COMMON + f'''
 from pathlib import Path
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import Runtime, _get_default_runtime
 root = Path({root!r})
 if {sys.platform!r} != 'win32':
     cc.set_local_endpoint(root=str(root))
 try:
     cc.set_server(startup_timeout=0)
-    old = _ProcessRegistry.get()._runtime_session
+    old = _get_default_runtime()._runtime_session
     cc.set_transport_policy(shm_threshold=128)
-    current = _ProcessRegistry.get()._runtime_session
+    current = _get_default_runtime()._runtime_session
     assert current is not old and current.startup_timeout == 0
     try:
         cc.register(Echo, Resource(), name='startup')
@@ -95,7 +95,7 @@ if {sys.platform!r} != 'win32':
 try:
     cc.set_server(startup_timeout=30)
     cc.register(Echo, Resource(), name='startup')
-    running = _ProcessRegistry.get()._runtime_session
+    running = _get_default_runtime()._runtime_session
     try:
         running.set_server_options('bad/id', {{'unknown': True}}, float('nan'))
     except RuntimeError as error:

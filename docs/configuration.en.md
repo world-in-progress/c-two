@@ -20,11 +20,13 @@ python resource.py
 $env:C2_ENV_FILE = ''
 ```
 
-Set process policy before registering resources or connecting clients. Each native configuration domain freezes when first used: local endpoints on the first bind/connect attempt, including a failed attempt; call admission on the first remote business call. Queries do not freeze configuration. Later environment changes do not alter a frozen choice.
+Set Runtime policy before registering resources or connecting clients. Each native configuration domain freezes when first used: local endpoints on the first bind/connect attempt, including a failed attempt; call admission on the first remote business call. Queries do not freeze configuration. Later environment changes do not alter a frozen choice.
+
+Current unpublished Python source exposes `cc.Runtime()` for an independently configured instance. The module-level functions use the default Runtime; each explicit instance owns its code overrides and native session and does not copy the default Runtime's overrides. All instances still read the same process environment and `.env` through the native resolver. Configure a particular instance with `runtime.set_*()` before its freeze point instead of changing `os.environ` to target one Runtime. `None` retains each setter's existing clear/inherit meaning.
 
 ## SDK and transport configuration
 
-`cc.set_server(...)` sets server identity, IPC overrides and lifecycle policy. `cc.set_client(...)` sets client IPC overrides. `cc.set_transport_policy(...)` controls process transport policy.
+`cc.set_server(...)` sets server identity, IPC overrides and lifecycle policy. `cc.set_client(...)` sets client IPC overrides. `cc.set_transport_policy(...)` controls the default Runtime transport policy; `runtime.set_transport_policy(...)` configures that explicit instance.
 
 ```python
 import c_two as cc
@@ -60,7 +62,7 @@ An explicit `address='ipc://...'` uses local IPC independently of relay discover
 
 `cc.set_server(startup_timeout=seconds)` configures the Core startup wait before the first registration. The native `RuntimeSession` constructor and `set_server_options` accept the same keyword. Values must be finite, non-negative seconds representable by the native clock; zero expires immediately. Omitted/`None` selects the existing finite five-second default, not unlimited waiting. This default bounds unattended startup; it is not a performance guarantee for a busy runner. Applications should choose their deployment budget explicitly.
 
-Core owns and freezes server configuration on the first Host start attempt, including failure. The setting survives pre-use RuntimeSession replacement by `set_transport_policy`. A completed `cc.shutdown()` creates a fresh session that can be configured again. Rust resolution is explicit `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > five seconds. Readiness and its direct IPC ping share the wait budget; owner startup fencing uses the configured duration too. Configuration/contract validation precedes this wait, and cleanup after expiry retains its separate shutdown budget, so this is not a total wall-clock limit on `cc.register()`.
+Core owns and freezes server configuration on the first Host start attempt, including failure. `runtime.start()` is also a first Host attempt, even with no CRM. The setting survives pre-use RuntimeSession replacement by `set_transport_policy`. A completed `cc.shutdown()` or explicit `runtime.shutdown()` creates a fresh session that can be configured again. Rust resolution is explicit `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > five seconds. Readiness and its direct IPC ping share the wait budget; owner startup fencing uses the configured duration too. Configuration/contract validation precedes this wait, and cleanup after expiry retains its separate shutdown budget, so this is not a total wall-clock limit on `cc.register()` or `runtime.start()`.
 
 Startup expiry raises public `c_two.error.CoreError` with `category='lifecycle'`, `lifecycle_kind='startup_timeout'`, `startup_stage` (`readiness`, `responsiveness` or `owner_control`) and `timeout_seconds`. Its `io_operation`, `io_kind` and `raw_os_error` are `None`. Local bind failures retain their original structured OS cause and no longer carry the misleading `config error` message prefix. These diagnostics do not authorize retry, takeover or endpoint cleanup. See the [public error field table](local-endpoint-lifecycle.en.md#public-structured-python-errors) for types and value ranges.
 

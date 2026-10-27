@@ -76,14 +76,14 @@ def test_server_credential_does_not_wait_for_the_namespace_gate() -> None:
             from pathlib import Path
             import subprocess
             import sys
-            from c_two.transport.registry import _ProcessRegistry
+            from c_two.transport.registry import _get_default_runtime
 
             class Resource:
                 def value(self): return 'ready'
                 def done(self): pass
 
             assert cc.server_credential() is None
-            assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+            assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
             holder = None
             try:
                 cc.register(Echo, Resource(), name='own')
@@ -242,9 +242,9 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
         import os
         from pathlib import Path
         from c_two import _native
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         from c_two.transport.client import util
-        session = _ProcessRegistry.get()._runtime_session
+        session = _get_default_runtime()._runtime_session
         captured = cc.local_endpoint_context()
         assert captured.root == {missing!r}
         assert not session.local_endpoint_frozen
@@ -284,7 +284,7 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
         else:
             raise AssertionError('failed local attempt left root mutable')
         assert cc.shutdown()['completed']
-        replacement = _ProcessRegistry.get()._runtime_session
+        replacement = _get_default_runtime()._runtime_session
         assert replacement is not session
         assert not replacement.local_endpoint_frozen
         assert cc.local_endpoint_context() == captured
@@ -304,19 +304,19 @@ def test_used_selection_survives_repeated_shutdown_then_refreezes(source: str) -
         import c_two as cc
         from c_two import _native
         from c_two.transport.client import util
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         if {source!r} == 'code':
             cc.set_local_endpoint(root={missing!r})
         context = cc.local_endpoint_context()
         assert not util.ping('ipc://failed-inheritance', .01)
-        assert _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        assert _get_default_runtime()._runtime_session.local_endpoint_frozen
         os.environ['C2_IPC_ROOT'] = {changed!r}
         for _ in range(2):
             assert cc.shutdown()['completed']
-            assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+            assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
             assert cc.local_endpoint_context() == context
         assert not util.ping('ipc://failed-inheritance', .01)
-        assert _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        assert _get_default_runtime()._runtime_session.local_endpoint_frozen
         try:
             cc.set_local_endpoint(root={changed!r})
         except cc.error.CoreError as error:
@@ -442,7 +442,7 @@ def test_common_owner_bound_transfer_default_context_and_business_disconnect() -
         import subprocess
         import sys
         import time
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         keepalive, receiver = cc.owner_control_pair()
         class Resource:
             hooks = 0
@@ -452,10 +452,10 @@ def test_common_owner_bound_transfer_default_context_and_business_disconnect() -
         try:
             cc.set_server(server_id={address.removeprefix('ipc://')!r},
                 lifecycle=cc.LifecycleConfig.owner_bound(.05), owner_control=receiver)
-            original = _ProcessRegistry.get()._runtime_session
+            original = _get_default_runtime()._runtime_session
             context = cc.local_endpoint_context()
             cc.set_transport_policy(shm_threshold=8192)
-            replacement = _ProcessRegistry.get()._runtime_session
+            replacement = _get_default_runtime()._runtime_session
             assert replacement is not original
             assert replacement.owner_control_attached
             assert not original.owner_control_attached
@@ -487,7 +487,7 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
     _run_isolated('''
         import threading
         import c_two as cc
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         @cc.crm(namespace='test.endpoint.active', version='0.1.0')
         class Blocking:
             def wait(self) -> str: ...
@@ -506,7 +506,7 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
         results = []
         cc.register(Blocking, resource, name='blocking')
         proxy = cc.connect(Blocking, name='blocking')
-        session = _ProcessRegistry.get()._runtime_session
+        session = _get_default_runtime()._runtime_session
         context = cc.local_endpoint_context()
         worker = threading.Thread(target=lambda: results.append(proxy.wait()))
         worker.start()
@@ -514,8 +514,8 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
             assert resource.entered.wait(5)
             pending = cc.shutdown(timeout=0)
             assert not pending['completed'], pending
-            assert _ProcessRegistry.get()._runtime_session is session
-            assert _ProcessRegistry.get().names == ['blocking']
+            assert _get_default_runtime()._runtime_session is session
+            assert _get_default_runtime().names == ['blocking']
             assert cc.local_endpoint_context() == context
             assert resource.hooks == 0
         finally:
@@ -526,6 +526,6 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
         assert results == ['drained']
         assert resource.hooks == 1
         assert cc.local_endpoint_context() == context
-        assert _ProcessRegistry.get()._runtime_session is not session
+        assert _get_default_runtime()._runtime_session is not session
         cc.close(proxy)
     ''')

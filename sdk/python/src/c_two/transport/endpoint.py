@@ -61,9 +61,9 @@ def _selected_context(
         return context
     if root is not None:
         return _native().resolve_local_endpoint_context(root=root)
-    from .registry import _ProcessRegistry
+    from .registry import _get_default_runtime
 
-    return _ProcessRegistry.get()._runtime_session.local_endpoint_context()  # noqa: SLF001
+    return _get_default_runtime()._runtime_session.local_endpoint_context()  # noqa: SLF001
 
 
 def local_endpoint_context(*, root: str | None = None) -> LocalEndpointContext:

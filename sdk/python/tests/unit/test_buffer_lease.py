@@ -28,10 +28,10 @@ def test_runtime_session_lease_tracker_is_shared_by_stats():
 
 def test_public_hold_stats_uses_native_session_without_server():
     import c_two as cc
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport import registry as registry_module
 
     cc.shutdown()
-    _ProcessRegistry._instance = None  # noqa: SLF001
+    registry_module._default_runtime = None  # noqa: SLF001
     stats = cc.hold_stats()
     assert stats["active_holds"] == 0
     assert stats["total_held_bytes"] == 0

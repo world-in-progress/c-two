@@ -34,7 +34,12 @@ Current unpublished source adds `cc.server_credential() -> EndpointCredential | 
 reading the listener's lifecycle snapshot without inspection or a gate lock.
 It adds `CoreError.endpoint_unverified_reason` for unverifiable Unix binds,
 uses Unix credential schema 4 without `device`, and versions default endpoint
-directories with namespace disk format 3. These APIs and formats are not in
+directories with namespace disk format 3.
+It also exposes `cc.Runtime()` for independent Python bindings and native
+sessions. Configure and shut down an explicit instance through its methods;
+`cc.serve()` handles signals only for the module-level default runtime. See
+the [independent runtime example](https://github.com/world-in-progress/c-two/blob/main/examples/python/independent_runtime.py).
+These APIs and formats are not in
 the published 0.9.0 wheel. Upgrade SDKs, c3 and Node consumers together; see
 the [unreleased notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/unreleased.md)
 for snapshot semantics and custom-root migration.

@@ -24,11 +24,13 @@ python resource.py
 $env:C2_ENV_FILE = ''
 ```
 
-在注册资源、连接客户端之前设置进程策略。各原生配置域在首次使用时冻结：本地端点在第一次 bind/connect 尝试时冻结，调用准入在第一次远程业务调用时冻结。查询端点或调用统计不冻结配置。改变运行中进程的环境变量不改变已经冻结的选择。
+在注册资源、连接客户端之前设置 Runtime 策略。各原生配置域在首次使用时冻结：本地端点在第一次 bind/connect 尝试时冻结，调用准入在第一次远程业务调用时冻结。查询端点或调用统计不冻结配置。改变运行中进程的环境变量不改变已经冻结的选择。
+
+当前未发布 Python 源码提供 `cc.Runtime()` 来创建独立配置的实例。模块函数使用默认 Runtime；每个显式实例拥有自己的代码覆盖值和原生会话，不复制默认实例的覆盖值。所有实例仍通过原生 resolver 读取同一进程环境和 `.env`。需要配置某个实例时，在对应冻结点前调用 `runtime.set_*()`，不要通过修改 `os.environ` 定向配置另一个 Runtime。`None` 保持各 setter 原有的清除覆盖或继承语义。
 
 ## SDK 服务端、客户端与传输
 
-服务端通过 `cc.set_server(...)` 设置身份、IPC overrides 和生命周期；客户端通过 `cc.set_client(...)` 设置自己的 IPC overrides。进程传输策略通过 `cc.set_transport_policy(...)` 设置：
+服务端通过 `cc.set_server(...)` 设置身份、IPC overrides 和生命周期；客户端通过 `cc.set_client(...)` 设置自己的 IPC overrides。默认 Runtime 的传输策略通过 `cc.set_transport_policy(...)` 设置；显式实例使用自己的 `runtime.set_transport_policy(...)`：
 
 ```python
 import c_two as cc
@@ -67,7 +69,7 @@ Typed overrides 为 `BaseIPCOverrides`、`ServerIPCOverrides`、`ClientIPCOverri
 
 在首次注册前用 `cc.set_server(startup_timeout=秒数)` 设置 Core 的启动等待预算。原生 `RuntimeSession` 构造器和 `set_server_options` 接受同名参数。数值必须有限、非负且能由原生时钟表示；零表示立即到期。省略或 `None` 使用原有的 5 秒有限默认值，不表示无限等待。保留默认值是为了约束无人配置时的启动等待，不保证繁忙运行器能在 5 秒内就绪；应用应明确选择自己的部署预算。
 
-Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；启动前通过 `set_transport_policy` 替换 RuntimeSession 时会保留该设置。完整 `cc.shutdown()` 后产生的新 session 可以重新配置。Rust 的优先级为显式 `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > 5 秒。就绪和后续直连 IPC ping 共用等待预算，所有者启动围栏也使用该配置时长。配置、合同验证发生在等待之前；超时后的原生收尾仍使用独立的 shutdown 预算，因此这不是 `cc.register()` 的总墙钟时限。
+Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；空 Host 的 `runtime.start()` 同样是首次启动尝试。启动前通过 `set_transport_policy` 替换 RuntimeSession 时会保留该设置。完整 `cc.shutdown()` 或显式 `runtime.shutdown()` 后产生的新 session 可以重新配置。Rust 的优先级为显式 `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > 5 秒。就绪和后续直连 IPC ping 共用等待预算，所有者启动围栏也使用该配置时长。配置、合同验证发生在等待之前；超时后的原生收尾仍使用独立的 shutdown 预算，因此这不是 `cc.register()` 或 `runtime.start()` 的总墙钟时限。
 
 启动到期产生公开的 `c_two.error.CoreError`：`category='lifecycle'`、`lifecycle_kind='startup_timeout'`，并携带 `startup_stage`（`readiness`、`responsiveness` 或 `owner_control`）及 `timeout_seconds`。三个本地 I/O 字段 `io_operation`、`io_kind`、`raw_os_error` 均为 `None`。真实 bind 失败保持原结构化系统原因，消息不再添加错误的 `config error` 前缀。这些诊断不提供重试、接管或清理端点的权限。完整类型及取值范围见[公开错误字段表](local-endpoint-lifecycle.en.md#public-structured-python-errors)。
 

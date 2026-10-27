@@ -11,7 +11,7 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from tests.fixtures.http_server import LoopbackHTTPServer
 
 
@@ -30,7 +30,7 @@ class Resource:
 
 
 def test_ipc_timeout_zero_then_finite_and_default_connect_are_usable(unique_ipc_address):
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     resource = Resource()
     server = local_server(unique_ipc_address)
     server.register_crm(ConnectContract, resource, name='connect-timeout')
@@ -53,7 +53,7 @@ def test_ipc_timeout_zero_then_finite_and_default_connect_are_usable(unique_ipc_
         assert resource.calls == 3
     finally:
         server.shutdown()
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
 
 
 @pytest.fixture
@@ -102,9 +102,9 @@ def stalled_relay():
 
 @pytest.mark.parametrize('mode', ['explicit', 'discovery'])
 def test_stalled_relay_connect_budget_and_recovery(mode, stalled_relay):
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     url, entered, release, paths = stalled_relay
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     # Use the session projection for discovery to avoid changing global settings.
     from c_two.crm.contract import crm_contract
     args = ('connect-timeout', *crm_contract(ConnectContract).native_args())
@@ -151,4 +151,4 @@ def test_stalled_relay_connect_budget_and_recovery(mode, stalled_relay):
         assert len(paths) > previous_requests
     finally:
         release.set()
-        _ProcessRegistry.reset()
+        _reset_default_runtime()

@@ -16,7 +16,7 @@ from tests.fixtures import local_server
 import c_two as cc
 from c_two.config import settings
 from c_two.transport import ConcurrencyConfig, ConcurrencyMode
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from c_two.transport.server.native import CRMSlot, NativeServerBridge
 from c_two.transport.wire import MethodTable
 
@@ -603,39 +603,39 @@ class TestRegistryNameCollision:
     @pytest.fixture(autouse=True)
     def _clean_registry(self):
         """Reset the global registry before/after each test."""
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         settings.relay_anchor_address = None
         yield
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         settings.relay_anchor_address = None
 
     def test_duplicate_name_raises(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='hello')
         with pytest.raises(ValueError, match='already registered'):
             registry.register(Hello, HelloImpl(), name='hello')
 
     def test_duplicate_name_different_icrm_raises(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='shared')
         with pytest.raises(ValueError, match='already registered'):
             registry.register(Counter, CounterImpl(), name='shared')
 
     def test_same_icrm_different_names_ok(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='hello_1')
         registry.register(Hello, HelloImpl(), name='hello_2')
         assert set(registry.names) == {'hello_1', 'hello_2'}
 
     def test_reregister_after_unregister(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='temp')
         registry.unregister('temp')
         registry.register(Counter, CounterImpl(), name='temp')
         assert registry.names == ['temp']
 
     def test_unregister_uses_native_outcome_and_preserves_slot_on_failure(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='temp')
 
         class FailingServer:
@@ -660,7 +660,7 @@ class TestRegistryNameCollision:
 
     def test_registry_no_longer_exposes_legacy_relay_unregister(self):
         """Relay unregister cleanup is returned by native RuntimeSession."""
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='temp')
 
         assert not hasattr(registry, '_relay_unregister')
@@ -669,6 +669,6 @@ class TestRegistryNameCollision:
         registry.shutdown()
 
     def test_unregister_nonexistent_raises(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         with pytest.raises(KeyError):
             registry.unregister('nope')

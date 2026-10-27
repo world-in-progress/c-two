@@ -8,7 +8,7 @@ import pytest
 
 import c_two as cc
 from c_two import _native
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport import registry as registry_module
 
 
 @cc.crm(namespace='test.buddy_reply', version='0.1.0')
@@ -25,7 +25,7 @@ class Echo:
 def _cleanup():
     yield
     cc.shutdown()
-    _ProcessRegistry._instance = None
+    registry_module._default_runtime = None
 
 
 @pytest.mark.timeout(30)

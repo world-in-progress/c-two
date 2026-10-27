@@ -43,6 +43,7 @@ from .transport.client.proxy import connection_observation, with_call_options
 from .transport.input_lifetime import InputLifetime
 from .transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 from .transport.registry import (
+    Runtime,
     set_local_endpoint,
 
     set_call_execution_limits,
@@ -72,6 +73,7 @@ from .transport.registry import (
 )
 
 __all__ = [
+    'Runtime',
     'ConnectionClosed', 'ConnectionObservation', 'ConnectionEvent', 'ConnectionEvents',
     'ConnectionEventsLagged', 'connection_observation', 'connection_events',
     '__version__',

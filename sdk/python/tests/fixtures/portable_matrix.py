@@ -22,7 +22,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 import c_two as cc
 from tests.fixtures.process_control import portable_command, readline_with_timeout
 from c_two.config.settings import settings
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 from fastdb4py.payload import Payload, PayloadError, View
 
 from tests.fixtures.portable_interop import (
@@ -701,7 +701,7 @@ def configure_python_runtime(
     client: bool,
     relay_url: str | None,
 ) -> None:
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings.relay_anchor_address = None
     settings.shm_threshold = None
     cc.set_transport_policy(shm_threshold=1)

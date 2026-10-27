@@ -16,7 +16,7 @@ import time
 
 import c_two as cc
 from c_two.transport.client.util import ping
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 
 # ── Echo CRMs ─────────────────────────────────────────────────────────
 
@@ -80,7 +80,7 @@ def _wait_for_ipc(address: str, timeout: float = 5.0) -> None:
 def bench_ipc_bytes(payload_size: int, seg_size: int) -> float | None:
     global _counter
     _counter += 1
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
 
     ipc_overrides = {
         'pool_segment_size': seg_size,
@@ -125,7 +125,7 @@ def bench_ipc_bytes(payload_size: int, seg_size: int) -> float | None:
 def bench_ipc_dict(payload_size: int, seg_size: int) -> float | None:
     global _counter
     _counter += 1
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
 
     ipc_overrides = {
         'pool_segment_size': seg_size,

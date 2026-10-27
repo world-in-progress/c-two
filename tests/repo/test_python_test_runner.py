@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tools.dev import test_python as runner
 
+RUNTIME_BIND_DENIAL_TEST = 'tests/unit/test_runtime.py::test_public_start_preserves_native_bind_denial_and_cleanup'
+
 
 
 @pytest.mark.parametrize('groups', [
@@ -139,6 +141,12 @@ def test_only_declared_windows_setup_skip_is_not_applicable(
 
 
 @pytest.mark.parametrize('platform,nodeid,phase,reason,accepted', [
+    ('win32', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', True),
+    ('linux', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
+    ('darwin', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
+    ('win32', RUNTIME_BIND_DENIAL_TEST, 'call', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
+    ('win32', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix filesystem root capability', False),
+    ('win32', 'tests/unit/test_runtime.py::test_other_runtime_case', 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
     ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'setup', 'Skipped: Unix filesystem root capability', True),
     ('win32', 'tests/integration/test_endpoint_context.py::test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state[normal]', 'setup', 'Skipped: Unix filesystem root capability', True),
     ('win32', 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup', 'setup', 'Skipped: OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes', True),

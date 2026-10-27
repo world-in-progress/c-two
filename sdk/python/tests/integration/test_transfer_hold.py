@@ -2,7 +2,7 @@
 import pytest
 import c_two as cc
 from c_two.crm.transferable import HeldResult
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport import registry as registry_module
 
 from tests.fixtures.ihello import Hello
 from tests.fixtures.hello import HelloImpl
@@ -12,7 +12,7 @@ from tests.fixtures.hello import HelloImpl
 def _cleanup():
     yield
     cc.shutdown()
-    _ProcessRegistry._instance = None
+    registry_module._default_runtime = None
 
 
 class TestIPCHoldMode:

@@ -1,6 +1,6 @@
 # 公开现有独立 Runtime：接口与所有权方案
 
-状态：待用户确认，未实施。源码基线 `a80380db`；本轮只读审查和方案文档，不构建、不启动端点、不发版。本文替代未实施的窄 `probe_local_ipc` 草案。用户进一步要求直接公开已有能力，因此不附带一次性关闭状态、Runtime 上下文管理器、临时 namespace 自动删除或新的探测协议。
+状态：用户已批准；实现与验证进行中，尚未最终验收或发版。方案审查的源码基线为 `a80380db`；本文替代未实施的窄 `probe_local_ipc` 草案。用户进一步要求直接公开已有能力，因此不附带一次性关闭状态、Runtime 上下文管理器、临时 namespace 自动删除或新的探测协议。下文保留批准时的方案与基线证据，验收结论以完成后的独立记录为准。
 
 ## 目标与直接复用
 
@@ -79,7 +79,7 @@ Windows 不传 Unix root，使用本 Runtime 自动生成的唯一 server id 和
 
 源码中 wait_until_responsive 失败后直接 shutdown_and_wait 的结果被忽略，HostInner.Drop 随后进入既有 Core shutdown transaction；PyRuntimeSession 只保存成功 Host。两种交错需要在基线验证：首次启动失败后没有 Host；旧 Persistent Host 已终态、下一次启动失败后槽中仍保存旧 Host。后者的 shutdown 可能读到旧终态，不能只验证 hostless 分支，也不能把旧 Host 的完成当作新失败尝试的完成。
 
-本轮只有源码疑点，未运行交错，不宣称已经复现。批准实施后先用现有 startup gate / shutdown transaction 夹具确认这两条路径，要求本次相关清理是否完成及错误能被准确观察。如果基线通过，就保留证据而不加生产分支。如果证明存在错误完成报告，公开门面的验收暂停在该问题，另给具体最小修复及其语义影响，经用户确认后处理；本方案不预先授权遍历/合并所有事务或改生命周期。
+方案批准前只有源码疑点；批准后已用现有 startup gate / shutdown transaction 夹具确认两条基线反例，回执修复获单独批准，详见[修复方案](2026-10-27-failed-start-cleanup-observation.md)。原验收门槛为：要求本次相关清理是否完成及错误能被准确观察。如果基线通过，就保留证据而不加生产分支。如果证明存在错误完成报告，公开门面的验收暂停在该问题，另给具体最小修复及其语义影响，经用户确认后处理；本方案不预先授权遍历/合并所有事务或改生命周期。
 
 修复评估必须识别失败尝试对应的具体 Server/已有事务，保留 delivered 一次性交付与旧 route journal，同一 deadline 内观察原 Condvar/outcome，并区分终态与清理无错误。不能增加第二份 Host、Python pending/closed 状态或再发一轮 shutdown 来猜测完成。此项是不能虚报“可清目录”的门槛，不构成直接公开 Runtime 的新增管理机制；在证据未补齐前不接受异常路径零残留结论。
 
@@ -106,4 +106,4 @@ Windows 不传 Unix root，使用本 Runtime 自动生成的唯一 server id 和
 5. Windows 开发机优先跑真实 Named Pipe 启动/PONG、两实例隔离、重复绑定、关闭和再使用；Unix root 明确拒绝，不能跳过共同 Runtime 用例。CI 包含 Windows 2022/2025、Windows ARM64、Linux/macOS 和 Python 3.14t。
 6. 最终精确候选完成完整 relay、真实 Rust/Python/Node 跨语言及既有矩阵、独立审查与 GitHub Actions。Python/Rust错误、配置和连接生命周期保持同一 Core 权威。验证后清理本批产物，历史目录和下游仓库/状态不动；发版等待单独指令。
 
-本轮已完成两项独立初审及修订后的最终静态复核；最终结论为可提交用户确认此范围，无接口合同或证据表述阻塞。初审发现的 Bridge/Host 归属、relay 提交顺序和配置来源已写入上述必要适配；未复现的失败启动清理疑点保留为单列门槛。没有新增功能已实现、基线已复现或三端已通过的声明。
+方案阶段完成两项独立初审及修订后的静态复核；初审发现的 Bridge/Host 归属、relay 提交顺序和配置来源已写入上述必要适配。失败启动清理疑点后来由确定性 Core 反例证实，并作为[单列修复](2026-10-27-failed-start-cleanup-observation.md)获批；其生产修复与编译后验证仍需记录。本文不充当实现、三端验证或最终验收证明。

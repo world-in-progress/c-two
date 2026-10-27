@@ -14,7 +14,7 @@ import c_two.config.ipc as ipc_config
 from c_two.config.settings import settings
 from c_two.error import ResourceNotFound
 from c_two.transport import Server
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 
 
 @cc.crm(namespace='unit.config', version='0.1.0')
@@ -31,7 +31,7 @@ class UnitConfigCRM:
 @pytest.fixture(autouse=True)
 def _reset_registry_and_settings(monkeypatch):
     cc.shutdown()
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings.relay_anchor_address = None
     settings.shm_threshold = None
     settings.remote_payload_chunk_size = None
@@ -55,7 +55,7 @@ def _reset_registry_and_settings(monkeypatch):
     yield
     try:
         cc.shutdown()
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
     finally:
         settings.relay_anchor_address = None
         settings.shm_threshold = None
@@ -143,7 +143,7 @@ def test_remote_payload_chunk_size_resolves_from_env_and_policy(monkeypatch):
     assert settings.remote_payload_chunk_size == 2_097_152
 
     cc.set_transport_policy(remote_payload_chunk_size=1_048_576)
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
 
     assert settings.remote_payload_chunk_size == 1_048_576
     assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
@@ -152,7 +152,7 @@ def test_remote_payload_chunk_size_resolves_from_env_and_policy(monkeypatch):
 def test_transport_policy_updates_preserve_unspecified_overrides():
     cc.set_transport_policy(shm_threshold=8192)
     cc.set_transport_policy(remote_payload_chunk_size=1_048_576)
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
 
     assert settings.shm_threshold == 8192
     assert settings.remote_payload_chunk_size == 1_048_576
@@ -160,7 +160,7 @@ def test_transport_policy_updates_preserve_unspecified_overrides():
     assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
 
     cc.set_transport_policy(shm_threshold=None)
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
 
     assert registry._runtime_session.client_ipc_config['shm_threshold'] == 4096  # noqa: SLF001
     assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
@@ -357,7 +357,7 @@ def test_memory_budget_invalid_env_value_rejected_by_native(monkeypatch):
 
 def test_client_session_projects_memory_budget_overrides():
     cc.set_client(ipc_overrides={'shm_backing_budget_bytes': 2 * GIB})
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
 
     client_config = registry._runtime_session.client_ipc_config  # noqa: SLF001
     assert client_config['shm_backing_budget_bytes'] == 2 * GIB
@@ -376,7 +376,7 @@ def test_client_ipc_overrides_beat_env(monkeypatch):
     monkeypatch.setenv('C2_IPC_REASSEMBLY_SEGMENT_SIZE', str(32 * 1024 * 1024))
 
     cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
 
     assert registry._runtime_session.client_ipc_config['reassembly_segment_size'] == 16 * 1024 * 1024  # noqa: SLF001
 
@@ -553,7 +553,7 @@ def test_high_level_ipc_overrides_are_copied_when_set():
     cc.set_server(ipc_overrides=overrides)
     overrides['pool_segment_size'] = 4 * 1024 * 1024
 
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     assert registry._runtime_session.server_ipc_overrides == {
         'pool_segment_size': 2 * 1024 * 1024,
     }  # noqa: SLF001
@@ -568,7 +568,7 @@ def test_ipc_override_mapping_is_snapshotted_by_native():
     cc.set_server(ipc_overrides=overrides)  # type: ignore[arg-type]
     overrides['pool_segment_size'] = 4 * 1024 * 1024
 
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     assert registry._runtime_session.server_ipc_overrides == {
         'pool_segment_size': 2 * 1024 * 1024,
     }  # noqa: SLF001
@@ -678,7 +678,7 @@ class _FakeRuntimeSession:
 
 
 def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(monkeypatch):
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     calls = []
 
     class FakeRuntimeSession(_FakeRuntimeSession):
@@ -731,7 +731,7 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
 
 
 def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeypatch):
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     installed = _FakeRuntimeSession(
         max_outstanding_calls=7, retained_input_budget_bytes=8192,
     )
@@ -751,7 +751,7 @@ def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeyp
 
 
 def test_relay_resolved_connect_uses_native_session_not_python_relay_client():
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     settings.relay_anchor_address = 'http://registry-relay.test'
 
     with pytest.raises(Exception):
@@ -789,7 +789,7 @@ def test_relay_connected_http_mode_uses_single_core_client_call_path():
 
 
 def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatch):
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
 
     class FakeRuntimeSession(_FakeRuntimeSession):
         def connect_via_relay(

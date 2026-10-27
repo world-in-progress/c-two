@@ -93,6 +93,8 @@ Run with `python counter.py`. This example uses the same-process path; keep `C2_
 
 For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`; the [IPC example](examples/python/ipc_resource.py) shows this connection. Current unpublished source also lets the resource process capture `credential = cc.server_credential()` after registration and pass it to its controller for later exact cleanup, as described in the [lifecycle guide](docs/local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
 
+Current unpublished source also exposes `runtime = cc.Runtime()` for an application-owned Python runtime with its own configuration, routes and native session. Configure it through `runtime.set_*()`, then use `runtime.start()` for an empty Host readiness check or `runtime.register()` for resources. The module functions continue to use the default runtime; `cc.serve()` owns its process signal handling and has no instance equivalent. Call `runtime.shutdown()` and inspect its structured outcome when the application is done. See the [independent runtime example](examples/python/independent_runtime.py) and [Python API guide](docs/python-usage.md#independent-python-runtimes).
+
 For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_anchor('http://relay-host:8300')` on both sides, then connect by name. The relay is a separate process. Explicit IPC addresses bypass relay discovery.
 
 ## Examples and documentation
@@ -101,6 +103,7 @@ For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_ancho
 | --- | --- |
 | Local calls | [local.py](examples/python/local.py) |
 | Direct IPC | [resource](examples/python/ipc_resource.py), [client](examples/python/ipc_client.py) |
+| Independent Python Runtime | [owned endpoint preflight](examples/python/independent_runtime.py) |
 | Relay | [resource](examples/python/relay_resource.py), [client](examples/python/relay_client.py), [mesh](examples/python/relay_mesh/README.md) |
 | Configuration: code, environment and `.env` | [Configuration guide](docs/configuration.en.md) |
 | Python contracts, portable payloads and API index | [Python SDK guide](docs/python-usage.md) |

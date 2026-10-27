@@ -14,7 +14,7 @@ import threading
 import pytest
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from tests.fixtures.process_control import python_process_options, readline_with_timeout
 
 
@@ -30,7 +30,7 @@ class PeerResource:
 
 @pytest.fixture(autouse=True)
 def isolated_runtime(tmp_path, monkeypatch):
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     for name in ('_relay_anchor_address', '_shm_threshold', '_remote_payload_chunk_size'):
         monkeypatch.setattr(settings, name, None)
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', '')
@@ -45,7 +45,7 @@ def isolated_runtime(tmp_path, monkeypatch):
     context = cc.local_endpoint_context()
     yield
     address = cc.server_address()
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     if address:
         assert cc.inspect_endpoint(address, context=context)['status'] in {'absent', 'not-applicable'}
 
@@ -204,7 +204,7 @@ def test_idle_client_end_notifies_server(terminate, reconfigure):
     if reconfigure:
         cc.set_transport_policy(shm_threshold=8192, remote_payload_chunk_size=8192)
         assert events.recv(0.0) is None
-        runtime = _ProcessRegistry.get()._runtime_session
+        runtime = _get_default_runtime()._runtime_session
         assert runtime.client_ipc_config['shm_threshold'] == 8192
         assert not runtime.client_config_frozen
         assert runtime.server_address is None

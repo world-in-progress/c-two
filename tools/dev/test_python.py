@@ -84,6 +84,7 @@ UNIX_ENDPOINT_TESTS = frozenset(
     for case in ('missing-lease-missing-ownership', 'old-format-unsupported-namespace-format')
 )
 UNIX_SOCKET_COUNT_TEST = 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup'
+UNIX_RUNTIME_BIND_DENIAL_TEST = 'tests/unit/test_runtime.py::test_public_start_preserves_native_bind_denial_and_cleanup'
 POSIX_FROZEN_PEER_TESTS = frozenset(
     f'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[{hosted}-True]'
     for hosted in ('False', 'True')
@@ -234,6 +235,7 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
     allowed_skips = (
         {**dict.fromkeys(UNIX_ENDPOINT_TESTS, 'Skipped: Unix filesystem root capability'),
          UNIX_SOCKET_COUNT_TEST: 'Skipped: OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes',
+         UNIX_RUNTIME_BIND_DENIAL_TEST: 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names',
          **dict.fromkeys(POSIX_FROZEN_PEER_TESTS, 'Skipped: SIGSTOP/SIGCONT are POSIX process controls')}
         if sys.platform == 'win32' else
         dict.fromkeys(WINDOWS_ENDPOINT_TESTS, 'Skipped: Windows named-pipe platform contract')

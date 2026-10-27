@@ -39,7 +39,7 @@ def test_native_shutdown_accepts_zero_and_normal_timeout(timeout: float) -> None
 
 def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -> None:
     import c_two as cc
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport.registry import _get_default_runtime
 
     @cc.crm(namespace='test.shutdown-timeout-boundary', version='0.1.0')
     class Alive:
@@ -65,7 +65,7 @@ def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -
     proxy = None
     try:
         cc.register(Alive, resource, name='timeout-alive')
-        session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+        session = _get_default_runtime()._runtime_session  # noqa: SLF001
         identity = (session.server_id, session.server_address)
         credential = cc.server_credential()
         assert credential.address == identity[1]
@@ -502,14 +502,14 @@ def test_failed_native_registration_leaves_existing_route_usable(monkeypatch) ->
             cc.register(Phase3CRM, Phase3Impl('bad'), name='bad')
 
         assert cc.server_address() is not None
-        from c_two.transport.registry import _ProcessRegistry
-        registry = _ProcessRegistry.get()
+        from c_two.transport.registry import _get_default_runtime
+        registry = _get_default_runtime()
         assert registry.names == ['good']
         crm = registry.connect(Phase3CRM, name='good')
         try:
             assert crm.ping() == 'good'
         finally:
-            registry.close(crm)
+            cc.close(crm)
     finally:
         cc.shutdown()
 
@@ -517,7 +517,7 @@ def test_failed_native_registration_leaves_existing_route_usable(monkeypatch) ->
 def test_failed_native_registration_leaves_no_route_or_identity(monkeypatch) -> None:
     import c_two as cc
     from c_two.transport.server.native import NativeServerBridge
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport.registry import _get_default_runtime
 
     @cc.crm(namespace='cc.test.runtime_session_phase3_first', version='0.1.0')
     class Phase3FirstCRM:
@@ -537,10 +537,10 @@ def test_failed_native_registration_leaves_no_route_or_identity(monkeypatch) -> 
         with pytest.raises(RuntimeError, match='synthetic native register failure'):
             cc.register(Phase3FirstCRM, Phase3FirstImpl(), name='first')
 
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         assert registry.names == []
-        assert registry.get_server_address() is None
-        assert registry.get_server_id() is None
+        assert registry.server_address() is None
+        assert registry.server_id() is None
         with pytest.raises(LookupError, match='not registered locally'):
             registry.connect(Phase3FirstCRM, name='first')
     finally:
@@ -552,7 +552,7 @@ def test_direct_ipc_acquire_waits_for_dynamic_route_publication() -> None:
     import time
 
     import c_two as cc
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport.registry import Runtime
 
     @cc.crm(namespace='cc.test.runtime_session_dynamic_route', version='0.1.0')
     class DynamicRouteCRM:
@@ -563,14 +563,14 @@ def test_direct_ipc_acquire_waits_for_dynamic_route_publication() -> None:
         def ping(self) -> str:
             return 'pong'
 
-    registrar = _ProcessRegistry()
-    resolver = _ProcessRegistry()
+    registrar = Runtime()
+    resolver = Runtime()
     crm = None
 
     try:
         server = registrar._runtime_session.ensure_server_bridge()  # noqa: SLF001
         server.start()
-        address = registrar.get_server_address()
+        address = registrar.server_address()
         assert address is not None
 
         def delayed_register() -> None:
@@ -595,7 +595,7 @@ def test_direct_ipc_acquire_waits_for_dynamic_route_publication() -> None:
             assert not thread.is_alive()
     finally:
         if crm is not None:
-            resolver.close(crm)
+            cc.close(crm)
         resolver.shutdown()
         registrar.shutdown()
 
@@ -638,13 +638,13 @@ def test_set_client_preserves_pending_server_id_override() -> None:
 
 def test_set_server_preserves_pending_client_overrides() -> None:
     import c_two as cc
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport.registry import _get_default_runtime
 
     cc.shutdown()
     try:
         cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
         cc.set_server(server_id='unit-preserve-client')
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         assert registry._runtime_session.client_ipc_config['reassembly_segment_size'] == 16 * 1024 * 1024  # noqa: SLF001
     finally:
         cc.shutdown()
@@ -711,12 +711,12 @@ def test_set_client_after_register_preserves_server_identity() -> None:
 
 def test_runtime_session_client_config_respects_transport_policy() -> None:
     import c_two as cc
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport.registry import _get_default_runtime
 
     cc.shutdown()
     try:
         cc.set_transport_policy(shm_threshold=16384)
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         assert registry._runtime_session.client_ipc_config['shm_threshold'] == 16384  # noqa: SLF001
     finally:
         cc.shutdown()
@@ -836,9 +836,9 @@ def test_runtime_session_exposes_no_language_owned_http_pool(monkeypatch) -> Non
 
 def test_set_relay_anchor_blank_clears_native_override() -> None:
     from c_two.config.settings import settings
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport.registry import _get_default_runtime
 
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     previous = settings._relay_anchor_address  # noqa: SLF001
     try:
         registry.set_relay_anchor('http://relay.test/')
@@ -870,7 +870,7 @@ def test_registry_restores_native_error_bytes_before_wrapping() -> None:
 
 def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> None:
     from c_two._native import LocalEndpointContext, resolve_local_endpoint_context
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport.registry import Runtime
 
     class FakeRetiredObservation:
         """Retirement bundle double: an opaque handoff token."""
@@ -906,6 +906,9 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         def inherit_local_endpoint_selection(self, previous: FakeSession) -> None:
             self._context = previous._context
 
+        def set_relay_anchor_address(self, address: str | None) -> None:
+            self.relay_anchor_address_override = address
+
         def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
             assert timeout_seconds == 30.0
             return {**self._outcome, 'completed': not any(self._outcome.get(key) for key in (
@@ -919,8 +922,8 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         def adopt_retired_memory_observation(self, observation: object) -> None:
             self.adopted_observations.append(observation)
 
-    def hostless_registry(outcome: dict) -> _ProcessRegistry:
-        registry = _ProcessRegistry()
+    def hostless_registry(outcome: dict) -> Runtime:
+        registry = Runtime()
         registry._runtime_session = FakeSession(outcome)  # noqa: SLF001
         registry._server = None  # noqa: SLF001
         return registry

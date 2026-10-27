@@ -149,7 +149,7 @@ Unified configuration is resolved by the Rust `c2-config` resolver. Python store
 
 | File | Purpose |
 | --- | --- |
-| `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay_anchor()` and process transport policy |
+| `settings.py` | `C2Settings` facade for Runtime-owned code overrides such as relay anchor and transport policy |
 | `ipc.py` | Typed override schemas: `BaseIPCOverrides`, `ServerIPCOverrides`, `ClientIPCOverrides`; Rust owns defaults and validation |
 
 IPC override key validation belongs to Rust/native config parsing. Python `ipc.py` may expose typed override schemas and forward mappings, but it must not keep allowed-key or forbidden-key validation tables.
@@ -164,7 +164,7 @@ Do not reintroduce Python-side default validation for IPC or relay internals. SD
 
 Scheduler-related config follows the same boundary. Python may expose `ConcurrencyConfig` and SDK-level enums, but Rust now owns the resolved route concurrency handle, including mode, `max_pending`, `max_workers`, and close state. Python must pass the full typed config into Rust, then treat the native handle as the source of truth for both same-process direct calls and remote dispatch. Do not keep a second Python-owned scheduler state or hidden default policy alive after registration.
 
-Runtime config follows the same ownership rule. Rust `c2-core::Runtime` owns process server identity, canonical `ipc://` address derivation, server IPC override storage/projection, direct IPC client acquire/release, client IPC config projection/freeze, route registration transactions, unregister/shutdown transaction outcomes, relay projection, relay-backed name resolution, explicit HTTP relay contract validation, and low-level HTTP client pool projection. Python exposes that authority through its native `RuntimeSession` projection and may expose typed override facades, but must not keep separate `_server_ipc_overrides`, `_client_config`, `_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address, direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`, `_rollback_registration`, relay control-client caches, or independent route unregister/shutdown ordering authority in `registry.py`. Python still owns Python CRM local bindings and invokes `@on_shutdown` callbacks exactly once from native structured outcomes.
+Runtime config follows the same ownership rule. Rust `c2-core::Runtime` owns its instance server identity, canonical `ipc://` address derivation, server IPC override storage/projection, direct IPC client acquire/release, client IPC config projection/freeze, route registration transactions, unregister/shutdown transaction outcomes, relay projection, relay-backed name resolution, explicit HTTP relay contract validation, and low-level HTTP client pool projection. Python exposes that authority through its native `RuntimeSession` projection and may expose typed override facades, but must not keep separate `_server_ipc_overrides`, `_client_config`, `_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address, direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`, `_rollback_registration`, relay control-client caches, or independent route unregister/shutdown ordering authority in `registry.py`. Python still owns Python CRM local bindings and invokes `@on_shutdown` callbacks exactly once from native structured outcomes.
 
 ### Transport Layer
 
@@ -174,7 +174,7 @@ The Python transport layer is a thin orchestration shell around a Rust-native co
 
 | File | Purpose |
 | --- | --- |
-| `registry.py` | SOTA API: `cc.register()`, `cc.connect()`, `cc.close()`, `cc.shutdown()`, `cc.set_server()`, `cc.set_client()` |
+| `registry.py` | Public `cc.Runtime()` owns independent Python bindings over one native session; module-level registration, connection, shutdown and setters use the default Runtime. `cc.close(proxy)` follows the proxy's owner. |
 | `wire.py` | `MethodTable` for Python resource method dispatch |
 | `server/native.py` | `NativeServerBridge` exported as `Server` |
 | `server/scheduler.py` | `ConcurrencyConfig` facade plus thin native route-concurrency adapter for same-process direct calls |
@@ -183,6 +183,8 @@ The Python transport layer is a thin orchestration shell around a Rust-native co
 | `client/util.py` | Thin native-backed `ping()` and `shutdown()` probes for direct IPC |
 
 `registry.py` asks native `RuntimeSession.ensure_server_bridge()` for the server bridge, `RuntimeSession.acquire_ipc_client()` for direct IPC clients, `RuntimeSession.connect_explicit_relay_http()` for explicit HTTP relay clients, and `RuntimeSession.connect_via_relay()` for relay name resolution. It consumes native unregister/shutdown outcomes before mutating Python local bindings. Do not reintroduce `_relay_control_client`, `_relay_control_address`, `_relay_control_client_for()`, `_http_pool`, direct `RustHttpClientPool.instance()`, or direct construction of `RustRelayAwareHttpClient` in `registry.py`.
+
+An explicit Python `Runtime` owns its code overrides and native session; it does not inherit the default Runtime's code overrides. Process environment and `.env` remain common resolver inputs. Instance `start()` uses the existing native readiness/PONG path, including for an empty Host. `cc.serve()` alone manages process signals for the default Runtime; explicit instances are shut down by their callers. A completed shutdown replaces that instance's native session under the existing handoff rules; old event subscriptions stay with their old source. Custom endpoint directories remain application-owned. Do not add a Runtime context manager, `Runtime.serve()`, a global instance registry, or automatic directory deletion.
 
 Transport modes:
 
@@ -409,7 +411,7 @@ The C-Two transport design reduces the practical blast radius of those unsafe es
 
 ### SOTA API Pattern
 
-The registry exposes a flat top-level API on the `cc` namespace:
+The module-level registration, connection, configuration and shutdown API on `cc` delegates to the default Python Runtime. `cc.close(proxy)` follows that proxy's owner. Current source also exposes `cc.Runtime()` for application-owned instances with the same register/connect/configure/shutdown methods and an empty-Host `start()`:
 
 ```python
 import c_two as cc

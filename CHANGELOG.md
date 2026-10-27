@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 - IPC 14 version diagnostics, Unix namespace disk format 3 and credential schema 4, listener credential snapshots, and typed binding refusal causes are implemented in source. See the [unreleased migration and validation notes](docs/releases/unreleased.md) for API changes, coordinated upgrades and acceptance status. No new package version is published.
+- Python exposes `cc.Runtime()` for independently configured routes and native sessions. Module functions continue through the default Runtime; an explicit instance can start an empty Host and must be shut down by its caller. The implementation and failed-start cleanup receipt are under validation; see the [public Runtime plan](docs/plans/2026-10-27-public-independent-runtime.md).
 
 ## [0.9.0] — companion c3 0.5.0
 

@@ -18,7 +18,7 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 from tests.fixtures.ipc_version_peer import ipc_version_peer_binary, running_version_peer
 from tests.fixtures.portable_interop import FASTDB_REPOSITORY, logical_result_sha256
 from tests.fixtures.portable_matrix import (
@@ -505,11 +505,11 @@ def typescript_artifacts() -> Iterator[TypeScriptArtifacts]:
 def _clean_python_runtime() -> Iterator[None]:
     previous_relay = settings._relay_anchor_address  # noqa: SLF001
     previous_threshold = settings._shm_threshold  # noqa: SLF001
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings.relay_anchor_address = None
     settings.shm_threshold = None
     yield
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings._relay_anchor_address = previous_relay  # noqa: SLF001
     settings._shm_threshold = previous_threshold  # noqa: SLF001
 
@@ -568,7 +568,7 @@ def _run_python_host(
         resource.assert_lifetime()
         return receipt, resource.calls
     finally:
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         resource.close()
 
 

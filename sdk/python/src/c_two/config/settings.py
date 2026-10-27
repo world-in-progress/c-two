@@ -38,7 +38,7 @@ class C2Settings:
     def shm_threshold(self) -> int:
         if self._shm_threshold is not None:
             return self._shm_threshold
-        return _resolve_shm_threshold()
+        return _resolve_shm_threshold(self._shm_overrides())
 
     @shm_threshold.setter
     def shm_threshold(self, value: int | None) -> None:
@@ -80,10 +80,9 @@ def _clean_optional_str(value: str | None) -> str | None:
     return value or None
 
 
-def _resolve_shm_threshold() -> int:
+def _resolve_shm_threshold(shm_overrides: dict[str, int]) -> int:
     from c_two._native import resolve_shm_threshold
 
-    shm_overrides = settings._shm_overrides()  # noqa: SLF001
     return int(resolve_shm_threshold(shm_overrides))
 
 

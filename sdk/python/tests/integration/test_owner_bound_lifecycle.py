@@ -277,7 +277,7 @@ class TestOwnerBoundNativeSurface:
     """The facade's native observation stays honest about a stopped host."""
 
     def test_native_observation_matches_in_process_termination(self, tmp_path: Path) -> None:
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
 
         marker = tmp_path / 'observation_marker.txt'
         controller_script = textwrap.dedent(
@@ -325,7 +325,7 @@ class TestOwnerBoundNativeSurface:
         assert 'NATIVE_ARMED armed' in result.stdout
         assert 'NATIVE_TERMINAL finished True' in result.stdout
         # This test process's own registry never saw that controller's host.
-        assert _ProcessRegistry.get().native_lifecycle_snapshot() is None
+        assert _get_default_runtime().native_lifecycle_snapshot() is None
 
 @pytest.mark.parametrize('owner_bound', [False, True])
 def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: bool) -> None:
@@ -334,7 +334,7 @@ def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: b
     from concurrent.futures import ThreadPoolExecutor
     from fastdb4py.payload import Payload, PayloadError
     from tests.integration.test_portable_payload_runtime import SPEC, build_payload, read_value
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport.registry import Runtime, _get_default_runtime
 
     entered = threading.Event()
     finish = threading.Event()
@@ -380,13 +380,13 @@ def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: b
     held = None
     proxy = None
     executor = ThreadPoolExecutor(max_workers=1)
-    client_registry = _ProcessRegistry()
+    client_registry = Runtime()
     serve_done = threading.Event()
     serve_thread = None
     try:
         cc.register(PayloadService, resource, name='blocked-payload',
                     input_lifetime={'blocked': cc.InputLifetime.BORROWED})
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         if owner_bound:
             def run_serve():
                 cc.serve()

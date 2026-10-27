@@ -8,16 +8,16 @@ import c_two as cc
 from c_two.config.settings import settings
 from c_two.crm.contract import crm_contract
 from c_two.error import ContractMismatch
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
     previous_relay = settings.relay_anchor_address
     settings.relay_anchor_address = None
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     yield
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings.relay_anchor_address = previous_relay
 
 
@@ -161,7 +161,7 @@ def test_runtime_session_rejects_direct_ipc_expected_contract_missing_or_malform
     cc.register(contract, CountingResource(), name="grid")
     address = cc.server_address()
     assert address is not None
-    session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+    session = _get_default_runtime()._runtime_session  # noqa: SLF001
     expected = crm_contract(contract)
 
     invalid_hashes = [
@@ -191,7 +191,7 @@ def test_direct_ipc_route_contract_projection_includes_abi_and_signature_hashes(
     address = cc.server_address()
     assert address is not None
 
-    session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+    session = _get_default_runtime()._runtime_session  # noqa: SLF001
     bound_client = session.acquire_ipc_client(
         address,
         "grid",

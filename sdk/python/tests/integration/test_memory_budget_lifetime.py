@@ -14,7 +14,7 @@ import pytest
 import c_two as cc
 from c_two.error import ClientCallResource
 from c_two.transport.client.util import ping
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime
 from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec, Payload, PayloadError
 
 
@@ -316,7 +316,7 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         assert address is not None
         _wait_ready(address)
         proxy = cc.connect(ObservedLargeOutput, name=route, address=address)
-        old_session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+        old_session = _get_default_runtime()._runtime_session  # noqa: SLF001
         initial = _outgoing_cells(cc.memory_stats())
         assert all(initial[kind]['used_bytes'] == 0 for kind in ('shm', 'file', 'reassembly'))
         assert cc.hold_stats()['active_holds'] == 0
@@ -368,12 +368,12 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         call_thread = threading.Thread(target=call_held, daemon=True)
         call_thread.start()
         assert entered.wait(timeout=5)
-        bridge = _ProcessRegistry.get()._server  # noqa: SLF001
+        bridge = _get_default_runtime()._server  # noqa: SLF001
         pending = cc.shutdown(timeout=0.05)
         assert pending['completed'] is False, pending
-        assert _ProcessRegistry.get()._runtime_session is old_session  # noqa: SLF001
-        assert _ProcessRegistry.get()._server is bridge  # noqa: SLF001
-        assert route in _ProcessRegistry.get().names
+        assert _get_default_runtime()._runtime_session is old_session  # noqa: SLF001
+        assert _get_default_runtime()._server is bridge  # noqa: SLF001
+        assert route in _get_default_runtime().names
         assert hooks == []
         assert not proceed.is_set()
         proceed.set()
@@ -384,7 +384,7 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         completed = cc.shutdown(timeout=10)
         assert completed['completed'] is True, completed
         assert hooks == ['stopped']
-        assert _ProcessRegistry.get()._runtime_session is not old_session  # noqa: SLF001
+        assert _get_default_runtime()._runtime_session is not old_session  # noqa: SLF001
         with checked.acquire() as access:
             assert access.bytes() == BLOB
         after_shutdown = observer.memory_stats()
@@ -611,7 +611,7 @@ def test_failed_public_shutdown_retry_keeps_its_own_held_budget(monkeypatch) -> 
         assert live['file']['used_bytes'] - baseline['file']['used_bytes'] == capacity
         assert cc.hold_stats()['active_holds'] >= 1
 
-        old_session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+        old_session = _get_default_runtime()._runtime_session  # noqa: SLF001
 
         def refuse_replacement(_self, *_args, **_kwargs):
             raise RuntimeError('injected RuntimeSession construction failure')
@@ -623,7 +623,7 @@ def test_failed_public_shutdown_retry_keeps_its_own_held_budget(monkeypatch) -> 
             with pytest.raises(RuntimeError, match='injected RuntimeSession'):
                 cc.shutdown()
 
-        assert _ProcessRegistry.get()._runtime_session is old_session  # noqa: SLF001
+        assert _get_default_runtime()._runtime_session is old_session  # noqa: SLF001
         failed = _outgoing_cells(cc.memory_stats())
         assert failed['reassembly']['used_bytes'] - baseline['reassembly']['used_bytes'] == capacity
         assert failed['file']['used_bytes'] - baseline['file']['used_bytes'] == capacity

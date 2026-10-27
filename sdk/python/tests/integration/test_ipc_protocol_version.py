@@ -6,7 +6,7 @@ import pytest
 import c_two as cc
 from c_two.config.settings import settings
 from c_two.error import CoreError, ProtocolViolation
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 from tests.fixtures.ipc_version_peer import ipc_version_peer_binary, running_version_peer
 
 pytestmark = pytest.mark.timeout(300)
@@ -20,12 +20,12 @@ class VersionContract:
 @pytest.fixture(autouse=True)
 def _clean_runtime():
     previous = settings._relay_anchor_address
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings.relay_anchor_address = None
     try:
         yield
     finally:
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         settings._relay_anchor_address = previous
 
 

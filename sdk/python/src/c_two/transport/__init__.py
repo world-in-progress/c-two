@@ -8,6 +8,7 @@ Provides the complete transport stack for C-Two:
 from __future__ import annotations
 
 __all__ = [
+    'Runtime',
     'CRMProxy',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
@@ -21,6 +22,7 @@ __all__ = [
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    'Runtime': ('.registry', 'Runtime'),
     'with_call_options': ('.client.proxy', 'with_call_options'),
     'set_call_execution_limits': ('.registry', 'set_call_execution_limits'),
     'call_execution_snapshot': ('.registry', 'call_execution_snapshot'),

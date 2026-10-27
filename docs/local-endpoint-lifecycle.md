@@ -8,6 +8,8 @@
 
 Unix 的最终端点目录由显式代码 `cc.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-v3-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外子目录或 `.sock` 后缀；默认 root 的 `v3` 与 namespace 磁盘格式版本相同，自定义 root 不追加版本名。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 或准备 owner 接管时冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯上下文查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前用户 TokenUser SID 的 Named Pipe，明确拒绝 Unix root 配置。
 
+当前未发布 Python 源码可用 `runtime = cc.Runtime()` 分别拥有端点上下文、路由和原生会话。在 `runtime.start()` 或 `runtime.register()` 前调用 `runtime.set_local_endpoint(root=...)`；维护该实例的自定义 Unix root 时，将 `runtime.local_endpoint_context()` 传给现有 inspect/reap/sweep helper。显式 Runtime 不删除调用方创建的目录。Windows 使用原有用户范围的管道命名空间并拒绝 Unix root。[应用自有目录预检示例](../examples/python/independent_runtime.py)仅在确认关闭完成且排空无错误后删除新建的私有 Unix 目录。
+
 macOS 还会检查目录句柄上的扩展 ACL：只读、遍历和 deny 条目可用；授予新增、删除、修改属性或权限等能力的 allow 条目会被拒绝，包括继承条目。启动失败会显式释放监听租约锁，重复文件描述符不会继续占有该锁。
 
 macOS 默认命名空间的 socket 路径位于 `/tmp/c2-v3-<uidhex>`；只有 `.gate`、`.gate.marker` 和 `<标识>.lease` 存放到 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`。这是系统提供的非临时用户目录，查询发生在原生 I/O 阶段。现存默认目录的路径别名按目录身份共用同一协调器；显式别名缺失时仍由应用预建。Linux 与非默认自定义 root 的记录仍与 socket 同目录。
@@ -63,6 +65,8 @@ control = prepared.commit(timeout=1.0)  # 每个准备对象只提交一次；�
 `OwnedChild.poll()` / `wait(timeout=...)` / `kill()` 观察或管理进程，`OwnedChild.close()` 只释放观察者，原生共享 reaper 继续负责 OS 回收。它与 `OwnerControl.close()` 的生命周期作用不同。
 
 `cc.shutdown(timeout=...)` 返回原生结构化完成结果；有效 owner shutdown 或 Persistent admin shutdown 的 ACK 仅证明已接受发起排空，不能用作 callback 排空完成或运行 hook 的依据。`completed=false` 时保留原 Session、bridge、路由及关闭 hook，稍后观察同一事务。监听器关闭、工作排空和 payload lease 是独立事实；端点回收不释放 held/borrowed，FastDB 检查视图由各自 lease 释放时失效。
+
+显式 Python `runtime.shutdown(timeout=...)` 遵循相同完成规则。完成后，这个 Python 对象取得新原生 session；应保存返回的 outcome，作为旧 session 的关闭结果。`runtime.connection_events()` 绑定当前 session，换代后需要重新订阅。启动错误与随后关闭的结果须分别保存，失败启动后的未完成或错误清理不能被原启动异常掩盖。已批准的[失败启动回执修复](plans/2026-10-27-failed-start-cleanup-observation.md)仍在实施与验证；确定性 Core 反例并非已编译 PyO3 竞争的证明。
 
 Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时重试暂时连接失败。开始写入后，写入失败、ACK 丢失或超时均返回现有未确认结果，不再重连重发；未确认不证明服务端没有执行。这样同地址重新绑定的新实例不会收到本次调用的重发。ping 继续保留探测重试，首次观察到端点不存在的处理与原总预算保持。
 

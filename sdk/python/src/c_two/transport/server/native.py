@@ -27,7 +27,6 @@ from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...crm.payload_plan import PayloadPlanKind
 from ...error import ResourceAlreadyRegistered
-from c_two.config.ipc import _resolve_server_ipc_config
 from ..input_lifetime import (
     InputLifetime,
     InputLifetimeLike,
@@ -146,7 +145,7 @@ class NativeServerBridge:
         lease_tracker: object | None = None,
     ) -> None:
         # Keep config failures at bridge construction, before CRM binding work.
-        _resolve_server_ipc_config(runtime_session.server_ipc_overrides)
+        runtime_session._preflight_server_config()
 
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()

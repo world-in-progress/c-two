@@ -14,9 +14,9 @@ use c2_contract::{
     PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
 };
 use c2_core::{
-    CallExecutionObserver, Connect, Host, HostClientHeldLeases, HostLifecyclePhase,
-    HostLifecycleSnapshot, HostOptions, MethodDefinition, RegisterOutcome, Registration,
-    RetiredMemoryObservation, Runtime, RuntimeOptions, ServerLifecyclePolicy,
+    CallExecutionObserver, Connect, FailedStartShutdownReceipt, Host, HostClientHeldLeases,
+    HostLifecyclePhase, HostLifecycleSnapshot, HostOptions, MethodDefinition, RegisterOutcome,
+    Registration, RetiredMemoryObservation, Runtime, RuntimeOptions, ServerLifecyclePolicy,
     ServiceConcurrencyMode, ServiceDefinition, ShutdownOutcome, UnregisterOutcome,
 };
 use c2_mem::{BufferLeaseStats, BufferLeaseTracker};
@@ -150,7 +150,7 @@ mod connect_attempt_tests {
 pub struct PyRuntimeSession {
     inner: Arc<Runtime>,
     lease_tracker: Arc<BufferLeaseTracker>,
-    host: Mutex<Option<Host>>,
+    host: Mutex<HostRecord>,
     registrations: Mutex<HashMap<String, Registration>>,
     server_bridge: Mutex<Option<Py<PyAny>>>,
     /// Retired read-only observations adopted from previous sessions.
@@ -166,6 +166,12 @@ pub struct PyRuntimeSession {
     /// Opaque Core observers retain only publication and counter metadata,
     /// never retired runtimes, transports, services or payload ownership.
     retired_call_execution: Mutex<Vec<CallExecutionObserver>>,
+}
+
+#[derive(Default)]
+struct HostRecord {
+    host: Option<Host>,
+    failed_start_receipt: Option<FailedStartShutdownReceipt>,
 }
 
 /// Read-only observation bundle passed from a shutting-down session to its
@@ -197,7 +203,7 @@ impl PyRuntimeSession {
     /// second `ensure_host` reuses the live host and never re-consumes.
     fn ensure_host(&self) -> PyResult<Host> {
         let mut host_guard = self.host.lock();
-        if let Some(host) = host_guard.as_ref() {
+        if let Some(host) = host_guard.host.as_ref() {
             if host.shutdown_outcome().is_none() {
                 if !host.is_running() || self.inner.has_pending_teardown() {
                     return Err(PyRuntimeError::new_err(
@@ -222,12 +228,21 @@ impl PyRuntimeSession {
             // Persistent restart publishes a fresh Host only after its native
             // start succeeds. Keep the old terminal journal on every error.
         }
-        let host = self
+        let mut failed_receipt = None;
+        let started = self
             .inner
-            .host(HostOptions::default())
-            .map_err(core_error_to_py)?;
-        *host_guard = Some(host.clone());
-        Ok(host)
+            .host_with_failed_start_receipt(HostOptions::default(), |receipt| {
+                failed_receipt = Some(receipt)
+            });
+        if let Ok(host) = &started {
+            host_guard.host = Some(host.clone());
+            host_guard.failed_start_receipt = None;
+        } else if let Some(receipt) = failed_receipt {
+            host_guard.failed_start_receipt = Some(receipt);
+        }
+        // Error projection attaches to Python; release the Host lock before the GIL.
+        drop(host_guard);
+        started.map_err(core_error_to_py)
     }
 
     /// Capture this session's retirement bundle plus every adopted earlier
@@ -247,7 +262,7 @@ impl PyRuntimeSession {
         if let Some(observer) = self.inner.outgoing_memory_observer() {
             pending.push_scope(c2_core::scope::RUNTIME_OUTGOING, observer);
         }
-        if let Some(host) = self.host.lock().as_ref() {
+        if let Some(host) = self.host.lock().host.as_ref() {
             pending.push_scope(c2_core::scope::SERVER, host.server_memory_observer());
         }
         pending.push_tracker(Arc::clone(&self.lease_tracker));
@@ -374,7 +389,7 @@ impl PyRuntimeSession {
         Ok(Self {
             inner: Arc::new(inner),
             lease_tracker: Arc::new(BufferLeaseTracker::default()),
-            host: Mutex::new(None),
+            host: Mutex::new(HostRecord::default()),
             registrations: Mutex::new(HashMap::new()),
             server_bridge: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
@@ -568,7 +583,7 @@ impl PyRuntimeSession {
     /// The three budget cells are independent accounting scopes, not process
     /// RSS; their sum must never be read as physical memory usage.
     fn memory_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let stats = match self.host.lock().as_ref() {
+        let stats = match self.host.lock().host.as_ref() {
             Some(host) => host.memory_stats(),
             None => self.inner.memory_stats(),
         };
@@ -705,6 +720,7 @@ impl PyRuntimeSession {
     fn server_credential(&self) -> Option<PyEndpointCredential> {
         self.host
             .lock()
+            .host
             .as_ref()
             .and_then(Host::endpoint_credential)
             .map(PyEndpointCredential::new)
@@ -733,7 +749,7 @@ impl PyRuntimeSession {
         startup_timeout: Option<f64>,
     ) -> PyResult<()> {
         // Preserve frozen-before-parsing precedence; Core also fences the commit.
-        if self.host.lock().is_some() {
+        if self.host.lock().host.is_some() {
             return Err(PyRuntimeError::new_err(
                 "server options are frozen after the Core host starts",
             ));
@@ -767,7 +783,7 @@ impl PyRuntimeSession {
                     .map_err(core_error_to_py)?,
                 None => self.host.lock(),
             };
-            if host.is_some() {
+            if host.host.is_some() {
                 let requested = relay_anchor_address
                     .as_deref()
                     .map(str::trim)
@@ -874,8 +890,15 @@ impl PyRuntimeSession {
         Ok(server)
     }
 
-    fn ensure_host_started(&self) -> PyResult<()> {
-        self.ensure_host().map(|_| ())
+    fn _preflight_server_config(&self) -> PyResult<()> {
+        self.inner
+            .server_ipc_config()
+            .map(|_| ())
+            .map_err(runtime_configuration_error_to_py)
+    }
+
+    fn ensure_host_started(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.ensure_host().map(|_| ()))
     }
 
     /// True while the Core host is actually running.
@@ -888,6 +911,7 @@ impl PyRuntimeSession {
     fn host_started(&self) -> bool {
         self.host
             .lock()
+            .host
             .as_ref()
             .is_some_and(c2_core::Host::is_running)
     }
@@ -902,7 +926,7 @@ impl PyRuntimeSession {
         &self,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let host = self.host.lock().clone();
+        let host = self.host.lock().host.clone();
         host.map(|host| lifecycle_snapshot_to_dict(py, &host.lifecycle_snapshot()))
             .transpose()
     }
@@ -913,7 +937,20 @@ impl PyRuntimeSession {
         &self,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let host = self.host.lock().clone();
+        let (host, receipt) = {
+            let record = self.host.lock();
+            (record.host.clone(), record.failed_start_receipt.clone())
+        };
+        if let Some(receipt) = receipt {
+            return match receipt.terminal_outcome() {
+                Some(outcome) => {
+                    let dict = shutdown_outcome_to_dict(py, outcome)?;
+                    dict.set_item("completed", true)?;
+                    Ok(Some(dict))
+                }
+                None => Ok(None),
+            };
+        }
         let Some(host) = host else {
             return Ok(None);
         };
@@ -951,7 +988,7 @@ impl PyRuntimeSession {
 
     fn attach_owner_control(&self, receiver: &PyNativeOwnerBootstrap) -> PyResult<()> {
         let host_guard = self.host.lock();
-        if host_guard.is_some() || self.inner.owner_control_consumed() {
+        if host_guard.host.is_some() || self.inner.owner_control_consumed() {
             return Err(PyRuntimeError::new_err(
                 "owner control capability must be attached before the Core host starts",
             ));
@@ -1020,7 +1057,7 @@ impl PyRuntimeSession {
             )));
         }
         if let Some(relay_anchor_address) = relay_anchor_address {
-            if self.host.lock().is_some() {
+            if self.host.lock().host.is_some() {
                 return Err(PyRuntimeError::new_err(
                     "explicit registration relay anchor must be configured before the Core host starts",
                 ));
@@ -1087,7 +1124,30 @@ impl PyRuntimeSession {
         // Validate before taking the Host or changing any session state.
         let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
         let _ = relay_anchor_address;
-        let host = self.host.lock().clone();
+        let (receipt_result, host) = py.detach(|| {
+            let record = self.host.lock();
+            if let Some(receipt) = record.failed_start_receipt.as_ref() {
+                // Keep this Host ownership lock through observation and local
+                // cleanup, but release it before reacquiring the Python GIL.
+                // A later ensure_host cannot publish a Host that we then clear.
+                let (outcome, completed) = receipt.observe_with_timeout(timeout);
+                let retired_bridge = if completed {
+                    self.registrations.lock().clear();
+                    self.server_bridge.lock().take()
+                } else {
+                    None
+                };
+                (Some((outcome, completed, retired_bridge)), None)
+            } else {
+                (None, record.host.clone())
+            }
+        });
+        if let Some((outcome, completed, retired_bridge)) = receipt_result {
+            drop(retired_bridge);
+            let dict = shutdown_outcome_to_dict(py, outcome)?;
+            dict.set_item("completed", completed)?;
+            return Ok(dict);
+        }
         if let Some(route_names) = route_names.filter(|_| {
             host.as_ref()
                 .is_none_or(|host| host.shutdown_outcome().is_none())
@@ -1141,6 +1201,7 @@ impl PyRuntimeSession {
         if self
             .host
             .lock()
+            .host
             .as_ref()
             .is_some_and(|host| host.shutdown_outcome().is_none())
         {

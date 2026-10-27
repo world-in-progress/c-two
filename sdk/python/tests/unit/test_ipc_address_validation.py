@@ -46,7 +46,7 @@ def test_client_util_accepts_plain_ipc_region():
 
 def test_client_util_uses_native_endpoint_name(monkeypatch):
     import c_two._native as native
-    from c_two.transport.registry import _ProcessRegistry
+    from c_two.transport.registry import _get_default_runtime
 
     calls = []
     captured = native.resolve_local_endpoint_context()
@@ -59,7 +59,7 @@ def test_client_util_uses_native_endpoint_name(monkeypatch):
     def unexpected_process_resolution(*_args, **_kwargs):
         pytest.fail('util must use the current Runtime context')
 
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     with monkeypatch.context() as patch:
         patch.setattr(registry, '_runtime_session', SessionSpy())
         patch.setattr(native, 'ipc_endpoint_name', unexpected_process_resolution)

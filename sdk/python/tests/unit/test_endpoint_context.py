@@ -55,12 +55,12 @@ def test_shutdown_preserves_unused_endpoint_policy_without_resolving_it() -> Non
     _run_isolated('''
         import c_two as cc
         from c_two.transport.client import util
-        from c_two.transport.registry import _ProcessRegistry
-        before = _ProcessRegistry.get()._runtime_session
+        from c_two.transport.registry import _get_default_runtime
+        before = _get_default_runtime()._runtime_session
         assert not before.local_endpoint_frozen
         outcome = cc.shutdown()
         assert outcome['completed'], outcome
-        after = _ProcessRegistry.get()._runtime_session
+        after = _get_default_runtime()._runtime_session
         assert after is not before
         assert not after.local_endpoint_frozen
         try:
@@ -81,15 +81,15 @@ def test_unused_code_root_survives_session_replacement_and_env_change(replace: s
         import os
         from pathlib import Path
         import c_two as cc
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         cc.set_local_endpoint(root={root!r})
-        before = _ProcessRegistry.get()._runtime_session
+        before = _get_default_runtime()._runtime_session
         assert not before.local_endpoint_frozen
         if {replace!r} == 'shutdown':
             assert cc.shutdown()['completed']
         else:
             cc.set_transport_policy(shm_threshold=8192)
-        after = _ProcessRegistry.get()._runtime_session
+        after = _get_default_runtime()._runtime_session
         assert after is not before
         assert not after.local_endpoint_frozen
         os.environ['C2_IPC_ROOT'] = {other!r}
@@ -108,14 +108,14 @@ def test_unused_environment_policy_is_still_lazy_after_shutdown() -> None:
     _run_isolated(f'''
         import os
         import c_two as cc
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         assert cc.shutdown()['completed']
         os.environ['C2_IPC_ROOT'] = {root!r}
         assert cc.local_endpoint_context().root == {root!r}
         assert cc.shutdown()['completed']
         os.environ['C2_IPC_ROOT'] = {other!r}
         assert cc.local_endpoint_context().root == {other!r}
-        assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
     ''', C2_IPC_ROOT='relative')
 
 
@@ -125,10 +125,10 @@ def test_unresolved_policy_survives_transport_policy_replacement() -> None:
     _run_isolated('''
         import c_two as cc
         from c_two.transport.client import util
-        from c_two.transport.registry import _ProcessRegistry
-        before = _ProcessRegistry.get()._runtime_session
+        from c_two.transport.registry import _get_default_runtime
+        before = _get_default_runtime()._runtime_session
         cc.set_transport_policy(shm_threshold=8192)
-        after = _ProcessRegistry.get()._runtime_session
+        after = _get_default_runtime()._runtime_session
         assert after is not before
         assert not after.local_endpoint_frozen
         for _ in range(2):
@@ -139,7 +139,7 @@ def test_unresolved_policy_survives_transport_policy_replacement() -> None:
                 assert 'root' in str(error).lower(), error
             else:
                 raise AssertionError('replacement dropped native policy')
-            assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+            assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
     ''', C2_IPC_ROOT='relative')
 
 
@@ -157,7 +157,7 @@ def test_admin_probes_surface_invalid_root_configuration(
     _run_isolated(f'''
         import uuid
         from c_two.transport.client import util
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         operation = getattr(util, {probe!r})
         try:
             operation('ipc://invalid-config-' + uuid.uuid4().hex, 0.01)
@@ -165,7 +165,7 @@ def test_admin_probes_surface_invalid_root_configuration(
             assert 'root' in str(error).lower(), error
         else:
             raise AssertionError('configuration error reported as an offline endpoint')
-        assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
         # Even a malformed target must not hide invalid process configuration.
         try:
             operation('tcp://not-ipc', 0.01)
@@ -207,7 +207,7 @@ def test_admin_probes_accept_long_directory_in_all_contexts(
         import c_two as cc
         from c_two import _native
         from c_two.transport.client import util
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         kwargs = {{}}
         if {selection!r} == 'context':
             kwargs['context'] = cc.local_endpoint_context(root={root!r})
@@ -219,7 +219,7 @@ def test_admin_probes_accept_long_directory_in_all_contexts(
             assert result is False, result
         else:
             assert result == {{'acknowledged': True, 'shutdown_started': False, 'server_stopped': True, 'route_outcomes': []}}, result
-        session = _ProcessRegistry.get()._runtime_session
+        session = _get_default_runtime()._runtime_session
         assert session.local_endpoint_frozen == ({selection!r} != 'context')
         assert not session.client_config_frozen
     ''', **updates)
@@ -232,7 +232,7 @@ def test_admin_invalid_targets_remain_negative_in_native_and_public_contexts(pro
         import c_two as cc
         from c_two import _native
         from c_two.transport.client import util
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         session = _native.RuntimeSession(use_process_relay_anchor=False)
         context = session.local_endpoint_context()
         expected = False if {probe!r} == 'ping' else {{
@@ -264,7 +264,7 @@ def test_admin_invalid_targets_remain_negative_in_native_and_public_contexts(pro
                         raise AssertionError('invalid target hid an invalid timeout')
         assert session.local_endpoint_frozen
         assert not session.client_config_frozen
-        assert _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        assert _get_default_runtime()._runtime_session.local_endpoint_frozen
     ''')
 
 
@@ -277,9 +277,9 @@ def test_admin_runtime_configuration_precedence_and_freeze(probe: str) -> None:
         import uuid
         import c_two as cc
         from c_two.transport.client import util
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         cc.set_local_endpoint(root={root!r})
-        session = _ProcessRegistry.get()._runtime_session
+        session = _get_default_runtime()._runtime_session
         assert not session.local_endpoint_frozen
         address = 'ipc://admin-freeze-' + uuid.uuid4().hex
         expected = False if {probe!r} == 'ping' else {{
@@ -387,17 +387,17 @@ def test_public_code_override_wins_env_and_dotenv_and_survives_session_replaceme
     _run_isolated(f'''
         import os
         import c_two as cc
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         assert cc.local_endpoint_context().root == {env!r}
         cc.set_local_endpoint(root={code!r})
         captured = cc.local_endpoint_context()
         assert captured.root == {code!r}
-        old = _ProcessRegistry.get()._runtime_session
+        old = _get_default_runtime()._runtime_session
         assert not old.local_endpoint_frozen
         os.environ['C2_IPC_ROOT'] = {file!r}
         assert cc.local_endpoint_context() == captured
         assert cc.shutdown()['completed']
-        new = _ProcessRegistry.get()._runtime_session
+        new = _get_default_runtime()._runtime_session
         assert new is not old
         assert not new.local_endpoint_frozen
         assert cc.local_endpoint_context() == captured
@@ -485,10 +485,10 @@ def test_admin_name_defaults_to_runtime_code_context_without_freezing() -> None:
         import c_two as cc
         from c_two import _native
         from c_two.transport.client import util
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         cc.set_local_endpoint(root={root!r})
         context = cc.local_endpoint_context()
-        session = _ProcessRegistry.get()._runtime_session
+        session = _get_default_runtime()._runtime_session
         address = 'ipc://admin-name-context'
         os.environ['C2_IPC_ROOT'] = {other!r}
         assert util._endpoint_name_from_address(address) == context.endpoint_name(address)
@@ -547,9 +547,9 @@ def test_public_replacement_preserves_root_and_native_retirement_observations() 
     root = _unused_root()
     _run_isolated(f'''
         import c_two as cc
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         cc.set_local_endpoint(root={root!r})
-        old = _ProcessRegistry.get()._runtime_session
+        old = _get_default_runtime()._runtime_session
         tracker = old.lease_tracker()
         lease = tracker.track_retained(route_name='endpoint-retirement', method_name='echo',
             direction='client_response', storage='inline', bytes=64)

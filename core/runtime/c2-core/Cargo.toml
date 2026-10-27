@@ -30,6 +30,4 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 axum = "0.8"
 c2-http = { version = "0.1.0", path = "../../transport/c2-http", features = ["relay"] }
-
-[target.'cfg(unix)'.dev-dependencies]
 tempfile = "3"

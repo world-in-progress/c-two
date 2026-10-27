@@ -17,7 +17,7 @@ from c_two.error import (
     ResourceRemoved,
     RouteStale,
 )
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 from fastdb4py.payload import Payload
 from tests.fixtures.portable_interop import (
     GRAPH_SPEC,
@@ -72,11 +72,11 @@ def matrix_artifacts() -> Iterator[MatrixArtifacts]:
 def _clean_python_runtime() -> Iterator[None]:
     previous_relay = settings._relay_anchor_address  # noqa: SLF001
     previous_threshold = settings._shm_threshold  # noqa: SLF001
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings.relay_anchor_address = None
     settings.shm_threshold = None
     yield
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings._relay_anchor_address = previous_relay  # noqa: SLF001
     settings._shm_threshold = previous_threshold  # noqa: SLF001
 
@@ -163,7 +163,7 @@ def _run_python_host_row(
             assert resolved["route_revision"] == result[1]
         return result
     finally:
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         resource.close()
 
 
@@ -242,7 +242,7 @@ def _run_rust_host_row(
                 )
             finally:
                 cc.close(proxy)
-                _ProcessRegistry.reset()
+                _reset_default_runtime()
     finally:
         host_calls = host.stop()
     assert host_calls == 1
@@ -408,7 +408,7 @@ def test_route_disappearance_preserves_release_reference(
             assert retained_route[1] > 0
         finally:
             cc.close(proxy)
-            _ProcessRegistry.reset()
+            _reset_default_runtime()
             resource.close()
 
 
@@ -471,7 +471,7 @@ def test_contract_fingerprint_mismatch_is_transport_scoped(
                 )
             assert resource.calls == 0
         finally:
-            _ProcessRegistry.reset()
+            _reset_default_runtime()
             resource.close()
 
 
@@ -517,5 +517,5 @@ def test_held_response_invalidates_before_relay_lease_release(
                 if value is not None:
                     value.close()
             cc.close(proxy)
-            _ProcessRegistry.reset()
+            _reset_default_runtime()
             resource.close()

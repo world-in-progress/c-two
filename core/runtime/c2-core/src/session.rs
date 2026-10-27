@@ -177,6 +177,85 @@ struct ShutdownTransaction {
     delivered: AtomicBool,
 }
 
+impl ShutdownTransaction {
+    fn observe_until(&self, deadline: Instant) -> Option<ShutdownOutcome> {
+        let mut outcome = self.outcome.lock();
+        while outcome.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            self.completed.wait_for(&mut outcome, remaining);
+        }
+        outcome.clone()
+    }
+}
+
+/// Read-only observation of the native cleanup transaction for one failed
+/// Host start. It retains the transaction, whose Server reference is weak.
+#[derive(Clone)]
+pub struct FailedStartShutdownReceipt {
+    transaction: Arc<ShutdownTransaction>,
+}
+
+impl fmt::Debug for FailedStartShutdownReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedStartShutdownReceipt")
+            .finish_non_exhaustive()
+    }
+}
+
+impl FailedStartShutdownReceipt {
+    /// Wait within this caller's budget without consuming the transaction's
+    /// one-time route handoff. Completion is separate from cleanup success.
+    pub fn observe_with_timeout(&self, timeout: Duration) -> (ShutdownOutcome, bool) {
+        match self.transaction.observe_until(Instant::now() + timeout) {
+            Some(outcome) => (outcome, true),
+            None => (
+                ShutdownOutcome {
+                    server_was_started: self
+                        .transaction
+                        .server
+                        .upgrade()
+                        .is_some_and(|server| server.is_running()),
+                    runtime_barrier_error: Some(
+                        "native shutdown transaction is still draining after the caller deadline"
+                            .into(),
+                    ),
+                    ..Default::default()
+                },
+                false,
+            ),
+        }
+    }
+
+    /// Return the original terminal outcome, including cleanup errors.
+    pub fn terminal_outcome(&self) -> Option<ShutdownOutcome> {
+        self.transaction.outcome.lock().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_transaction_for_test(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.transaction, &other.transaction)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivered_for_test(&self) -> bool {
+        self.transaction.delivered.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_terminal_error_for_test(&self, message: &str) {
+        self.transaction
+            .outcome
+            .lock()
+            .as_mut()
+            .expect("test transaction is terminal")
+            .runtime_barrier_error = Some(message.to_string());
+    }
+}
+
 struct RuntimeState {
     connection_event_source: c2_local::ConnectionEventSource,
     server_id_override: Option<String>,
@@ -874,7 +953,8 @@ impl Runtime {
         connect_stage_check(deadline, "pool_discard")
     }
 
-    pub(crate) fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
+    /// Resolve this Runtime's server IPC configuration without starting a Host.
+    pub fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
         let runtime_overrides = c2_config::RuntimeConfigOverrides {
             server_ipc: self.server_ipc_overrides().unwrap_or_default(),
             shm_threshold: self.shm_threshold_override(),
@@ -1591,6 +1671,71 @@ impl Runtime {
                 scopes,
             );
         }
+        let receipt = self.begin_server_shutdown_transaction(
+            server,
+            route_names,
+            relay_anchor_address,
+            relay_use_proxy,
+            relay_cleanup_config_error,
+            shutdown_timeout,
+            scopes,
+        );
+        let Some(result) = receipt.transaction.observe_until(deadline) else {
+            return ShutdownOutcome {
+                server_was_started: server.is_running(),
+                runtime_barrier_error: Some(
+                    "native shutdown transaction is still draining after the caller deadline"
+                        .into(),
+                ),
+                ..Default::default()
+            };
+        };
+        if receipt.transaction.delivered.swap(true, Ordering::AcqRel) {
+            return ShutdownOutcome {
+                ipc_clients_drained: true,
+                ..Default::default()
+            };
+        }
+        result
+    }
+
+    /// Start the existing transaction for this concrete Server without using
+    /// another caller wait budget. The failed Host's normal Drop remains the
+    /// one bounded Core shutdown waiter.
+    pub(crate) fn begin_failed_start_shutdown(
+        &self,
+        server: &Arc<c2_server::Server>,
+        route_names: Vec<String>,
+        relay_anchor_address: Option<&str>,
+        relay_use_proxy: bool,
+        shutdown_timeout: Duration,
+    ) -> FailedStartShutdownReceipt {
+        {
+            let state = self.state.lock();
+            state.call_execution_observer.close();
+        }
+        let scopes = self.capture_registration_scopes(server, &route_names);
+        self.begin_server_shutdown_transaction(
+            server,
+            route_names,
+            relay_anchor_address,
+            relay_use_proxy,
+            None,
+            shutdown_timeout,
+            scopes,
+        )
+    }
+
+    fn begin_server_shutdown_transaction(
+        &self,
+        server: &Arc<c2_server::Server>,
+        route_names: Vec<String>,
+        relay_anchor_address: Option<&str>,
+        relay_use_proxy: bool,
+        relay_cleanup_config_error: Option<String>,
+        shutdown_timeout: Duration,
+        scopes: HashMap<String, RelayRegistrationScope>,
+    ) -> FailedStartShutdownReceipt {
         let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
         let transaction = {
             let mut state = self.state.lock();
@@ -1642,28 +1787,7 @@ impl Runtime {
                 transaction
             }
         };
-        let mut result = transaction.outcome.lock();
-        while result.is_none() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return ShutdownOutcome {
-                    server_was_started: server.is_running(),
-                    runtime_barrier_error: Some(
-                        "native shutdown transaction is still draining after the caller deadline"
-                            .into(),
-                    ),
-                    ..Default::default()
-                };
-            }
-            transaction.completed.wait_for(&mut result, remaining);
-        }
-        if transaction.delivered.swap(true, Ordering::AcqRel) {
-            return ShutdownOutcome {
-                ipc_clients_drained: true,
-                ..Default::default()
-            };
-        }
-        result.as_ref().unwrap().clone()
+        FailedStartShutdownReceipt { transaction }
     }
 
     fn shutdown_transaction(

@@ -1,6 +1,6 @@
 # Python SDK usage
 
-This guide describes the current Python source APIs. The latest published pair is C-Two 0.9.0 / c3 0.5.0; `cc.server_credential()`, Unix schema 4 and the additional binding reason are unpublished changes described in the [migration notes](releases/unreleased.md). CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.3 extra. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
+This guide describes the current Python source APIs. The latest published pair is C-Two 0.9.0 / c3 0.5.0; `cc.Runtime()`, `cc.server_credential()`, Unix schema 4 and the additional binding reason are unpublished changes described in the [migration notes](releases/unreleased.md). CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.3 extra. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 
@@ -86,7 +86,7 @@ Unix processes sharing an IPC domain use the same configured root (`cc.set_local
 
 ## Low-level server bridge
 
-`c_two.transport.Server` is a bridge bound to one native `RuntimeSession`. Applications normally use `cc.register()` and `cc.shutdown()`. Low-level hosts can obtain a bridge from their explicitly configured session:
+`c_two.transport.Server` is a bridge bound to one native `RuntimeSession`. Applications normally use the module-level `cc.register()` / `cc.shutdown()` or an explicit `cc.Runtime()` instance. Low-level hosts can obtain a bridge from their explicitly configured session:
 
 ```python
 from c_two._native import RuntimeSession
@@ -124,7 +124,8 @@ The main user surface, shown throughout the guides. The top-level `cc` namespace
 
 - Authoring: `@cc.crm`, `@cc.read`, `@cc.write`, `@cc.on_shutdown`, `@cc.transfer`, `cc.hold`, `cc.InputLifetime`
 - Calls: `cc.with_call_options` (per-call deadline views, see [remote connections and deadlines](#remote-connections-and-deadlines))
-- Registry: `cc.register`, `cc.connect`, `cc.close`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.server_credential`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.set_transport_policy`, `cc.set_local_endpoint`
+- Runtime: `cc.Runtime`, whose instance methods include `set_local_endpoint`, `set_server`, `set_client`, `set_transport_policy`, `set_relay_anchor`, `set_call_execution_limits`, `register`, `connect`, `unregister`, `start`, `server_id`, `server_address`, `server_credential`, `local_endpoint_context`, `shutdown`, `connection_events`, `native_lifecycle_snapshot`, `native_terminal_outcome`, `memory_stats`, `hold_stats`, `call_execution_snapshot` and `prepare_owner_takeover`
+- Default Runtime: `cc.register`, `cc.connect`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.server_credential`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.set_transport_policy`, `cc.set_local_endpoint`; `cc.close(proxy)` follows the proxy's own connection
 - Contracts: `cc.export_contract_descriptor`, `cc.export_contract_release_ref`, `cc.compile_contract_artifacts`, `cc.infer_crm_from_resource`
 - Lifecycle and ownership: `cc.LifecycleConfig`, `cc.owner_control_pair`, `cc.spawn_owned_child`, `cc.adopt_owner_stdin`, `cc.OwnerControl`, `cc.OwnerRecoveryTicket`, `cc.prepare_owner_takeover`, `cc.PreparedOwnerTakeover`, `cc.OwnerStatus`, `cc.OwnerControlError`
 - Endpoint maintenance: `cc.inspect_endpoint`, `cc.reap_endpoint`, `cc.sweep_endpoints`, `cc.EndpointCredential` (immutable native value; explicit JSON import/export)
@@ -136,6 +137,14 @@ Use `cc.set_server(startup_timeout=...)` before registration to choose a native 
 
 After a listener reaches Ready, `cc.server_credential() -> cc.EndpointCredential | None` returns its native credential from the existing lifecycle watch without inspection or filesystem I/O. It returns `None` before start and after terminal shutdown; a snapshot is not proof of liveness or cleanup authority. See the [lifecycle guide](local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
 
-Process-level IPC policy, call admission limits and relay settings are documented in the [configuration guide](configuration.en.md).
+Runtime-scoped IPC policy, call admission limits and relay settings are documented in the [configuration guide](configuration.en.md).
 
 The [lifecycle API guide](local-endpoint-lifecycle.en.md) specifies observation return values, timeout/end/lag behavior, owner ticket issuance and revocation, the single-commit takeover sequence and error outcomes. Its [bind/connect section](local-endpoint-lifecycle.en.md#bind-and-connect-failures) documents the structured OS fields on public `cc.error.CoreError`. These observations do not prove process exit or authorize replay or cleanup.
+
+### Independent Python runtimes
+
+`cc.Runtime()` creates an independent Python binding owner and native session. Its `set_*`, `register`, `connect`, `unregister` and `shutdown` methods have the module-level signatures. Module functions use a separate default Runtime. Each explicit instance starts with empty code overrides; process environment and `.env` remain shared configuration sources, resolved by Core at the usual freeze points. Use instance setters when different runtimes need different settings. Independence means separate route, connection, observation and configuration ownership within one process.
+
+`runtime.start()` starts a Host with no registered CRM and waits for native readiness and the existing IPC PING/PONG. A later `runtime.register()` uses that Host. Without an explicit address, `runtime.connect()` searches only that instance's local routes; use `address=other.server_address()` and the same Unix endpoint context for a cross-instance IPC call. `cc.close(proxy)`, its context manager, `cc.hold()` and `cc.with_call_options()` follow the proxy's original owner. Explicit instances have no `serve()` method or automatic signal/atexit cleanup; `cc.serve()` handles the module-level default Runtime.
+
+Call `runtime.shutdown(timeout=...)` and inspect `completed`, top-level errors and per-route drain/close results. A pending result stays on the same native session for another observation. Once shutdown completes, the Python Runtime object receives a fresh session; configured endpoint selection, transport policy, call limits and relay override retain their existing handoff behavior, while server identity, IPC overrides, startup timeout and one-use owner capability reset. An existing `connection_events()` subscription observes its original session only; subscribe again for the new session. The return value is the closing session's result, and held payloads retain their own lifetime. An application owns any custom endpoint directory it creates; the Runtime does not remove that directory. The [preflight example](../examples/python/independent_runtime.py) checks the shutdown outcome before deleting its newly created private directory.
