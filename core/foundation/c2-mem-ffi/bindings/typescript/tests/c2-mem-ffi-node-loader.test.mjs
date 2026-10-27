@@ -116,7 +116,7 @@ test('logical addresses resolve to one deterministic native OS endpoint', () => 
   if (process.platform === 'win32') {
     assert.ok(endpoint.startsWith('\\\\.\\pipe\\c_two-'));
   } else {
-    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/[0-9a-f]{32}$/);
+    assert.match(endpoint, /^\/tmp\/c2-v3-[0-9a-f]+\/[0-9a-f]{32}$/);
   }
   assert.equal(endpoint, resolveLocalIpcEndpoint(address));
   const runtime = createBundledC2MemFfiNodeRuntime();
@@ -731,7 +731,7 @@ test('native endpoint resolution preserves logical identity and rejects path inp
   if (process.platform === 'win32') {
     assert.match(endpoint, /^\\\\\.\\pipe\\c_two-/);
   } else {
-    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/[0-9a-f]{32}$/);
+    assert.match(endpoint, /^\/tmp\/c2-v3-[0-9a-f]+\/[0-9a-f]{32}$/);
   }
   for (const invalid of ['/tmp/node.sock', 'ipc://../bad', 'ipc://bad\0name']) {
     assert.throws(() => resolveLocalIpcEndpoint(invalid));
