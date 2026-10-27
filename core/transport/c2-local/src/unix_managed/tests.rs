@@ -2697,9 +2697,9 @@ async fn native_full_backlog_probe_is_bounded_and_preserves_the_listener() {
     let address = SockAddr::unix(&path).unwrap();
     listener.bind(&address).unwrap();
     listener.listen(1).unwrap();
-    let identity = identity_of(&path);
+    let identity = fs::symlink_metadata(&path).unwrap();
     let mut clients = Vec::new();
-    let mut saturated = false;
+    let mut saturation_error = None;
     for _ in 0..128 {
         let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
         client.set_nonblocking(true).unwrap();
@@ -2710,35 +2710,58 @@ async fn native_full_backlog_probe_is_bounded_and_preserves_the_listener() {
                     || error.kind() == io::ErrorKind::ConnectionRefused,
                 "{error}"
             );
-            saturated = true;
+            saturation_error = Some(error.kind());
             break;
         }
         clients.push(client);
     }
-    assert!(saturated, "fixture must fill listen backlog");
+    let saturation_error = saturation_error.expect("fixture must fill listen backlog");
     let handle = tokio::runtime::Handle::current();
     let root = root.to_owned();
     let tested_endpoint = endpoint.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let probe = std::thread::spawn(move || {
         let _entered = handle.enter();
-        tx.send(
-            bind_managed_at(&tested_endpoint, &root)
-                .err()
-                .map(|e| e.kind()),
-        )
-        .unwrap();
+        tx.send(bind_managed_at(&tested_endpoint, &root).err())
+            .unwrap();
     });
     let outcome = rx.recv_timeout(Duration::from_secs(1));
+    let current = fs::symlink_metadata(&path).unwrap();
     assert_eq!(
-        identity_of(&path),
-        identity,
+        (
+            current.dev(),
+            current.ino(),
+            current.ctime(),
+            current.ctime_nsec()
+        ),
+        (
+            identity.dev(),
+            identity.ino(),
+            identity.ctime(),
+            identity.ctime_nsec()
+        ),
         "duplicate probe changed active socket"
     );
     drop(listener);
     drop(clients);
     probe.join().unwrap();
-    assert_eq!(outcome.unwrap(), Some(io::ErrorKind::AddrInUse));
+    assert!(!lease_path_at(namespace.path(), &endpoint).exists());
+    fs::remove_file(&path).unwrap(); // The unchanged raw socket created by this fixture.
+    let error = outcome
+        .unwrap()
+        .expect("an unknown full-backlog socket cannot be adopted");
+    // The clients keep the queue full. A kernel refusal is not proof that the
+    // listener died; without its lease, the bind must preserve this unknown slot.
+    // A pending/would-block probe still denies replacement as address-in-use.
+    if saturation_error == io::ErrorKind::ConnectionRefused {
+        assert_unverified_bind(&error, EndpointUnverifiedReason::MissingOwnership);
+    } else {
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(
+            crate::EndpointBindCause::from(&error).unverified_reason,
+            None
+        );
+    }
 }
 
 #[tokio::test]

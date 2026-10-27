@@ -52,7 +52,7 @@ def test_public_core_error_has_complete_independent_fields(category):
         'raw_os_error', 'lifecycle_kind', 'startup_stage', 'timeout_seconds',
         'route_name', 'status_code', 'body', 'relay_duplicate', 'failure_source',
         'registration_failure', 'rollback', 'relay_cleanup_error',
-        'local_protocol_version', 'peer_protocol_version',
+        'local_protocol_version', 'peer_protocol_version', 'endpoint_unverified_reason',
     }
     assert all(getattr(error, field) is None for field in optional)
     assert optional | {'category', 'message', 'details'} == set(cc.error.CoreError.__annotations__)
@@ -71,6 +71,12 @@ def test_public_core_error_annotations_expose_native_literal_values():
     assert hints['io_operation'] == Literal['bind', 'connect'] | None
     assert hints['io_kind'] == Literal[
         'permission_denied', 'not_found', 'connection_refused', 'address_in_use', 'other',
+    ] | None
+    assert hints['endpoint_unverified_reason'] == Literal[
+        'unsafe-directory', 'symlink', 'unexpected-object', 'foreign-owner',
+        'missing-ownership', 'invalid-ownership', 'invalid-record', 'record-mismatch',
+        'coordinator-missing', 'coordinator-replaced', 'initialization-incomplete',
+        'unsupported-namespace-format',
     ] | None
     assert hints['startup_stage'] == Literal['readiness', 'responsiveness', 'owner_control'] | None
     assert hints['code'] == int | None
