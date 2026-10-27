@@ -69,6 +69,7 @@ UNIX_ENDPOINT_TESTS = frozenset(
         ('unit', 'test_credential_retains_recorded_directory_under_new_environment', ('',)),
         ('unit', 'test_public_python_rpc_and_maintenance_use_a_long_final_directory', ('',)),
         ('integration', 'test_same_logical_address_registers_connects_and_stays_isolated', ('',)),
+        ('integration', 'test_server_credential_does_not_wait_for_the_namespace_gate', ('',)),
         ('integration', 'test_first_failed_local_attempt_freezes_context_without_creating_missing_container', tuple(f'[{attempt}]' for attempt in ('bind', 'connect', 'ping', 'shutdown'))),
         ('integration', 'test_used_selection_survives_repeated_shutdown_then_refreezes', ('[environment]', '[code]')),
         ('integration', 'test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state', ('[normal]', '[abnormal]')),
@@ -78,6 +79,9 @@ UNIX_ENDPOINT_TESTS = frozenset(
 ) | frozenset(
     f'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[{case}]'
     for case in ('unwritable', 'not_directory', 'missing', 'refused', 'inaccessible')
+) | frozenset(
+    f'tests/integration/test_local_io_cause.py::test_bind_unverified_reason_survives_the_startup_watch[{case}]'
+    for case in ('missing-lease-missing-ownership', 'old-format-unsupported-namespace-format')
 )
 UNIX_SOCKET_COUNT_TEST = 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup'
 POSIX_FROZEN_PEER_TESTS = frozenset(
