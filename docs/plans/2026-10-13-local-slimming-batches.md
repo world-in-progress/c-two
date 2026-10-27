@@ -35,6 +35,8 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 
 2026-10-27：[R17c](2026-10-27-r17c-final-lease-stat-evaluation.md) 已验收，实现 `1e74b4c9`；[同源 Actions](https://github.com/Dsssyc/c-two/actions/runs/40462218729) 10/10 jobs、六线合计 147/147 适用 gate 通过，见[记录](../reports/2026-10-27-r17c-final-lease-stat-acceptance.md)。生产净 +6、测试净 +255，作为正确性修复不计瘦身收益。随后按 `8ef1ce21` 批准的[持久身份与自身凭据合并方案](2026-10-27-unix-namespace-identity-and-own-credential.md)完成候选 `9f9d4de3`：Unix format 3/schema 4、单一绑定 cause 和现有 watch 凭据投影，独立实机/跨语言/完整 relay/六线 Actions/零残留与审查见[验收记录](../reports/2026-10-27-unix-namespace-identity-acceptance.md)。这项补强不新增已核销 R 编号，gate/context 与目录 pin 的完整分类继续单列；分类数量仍为 17 / 15 / 6 / 1。
 
+后续需求：[独立本地 IPC 探测方案与公开草案](2026-10-27-independent-local-ipc-probe.md)已完成调用链及独立静态审查，等待用户确认，尚未实施。建议只新增窄的探测入口与结构化结果，复用原生 bind/connect/close；本次不公开 RuntimeSession，不计作纯瘦身或新增 R 条目核销。
+
 ### 继续暂缓、不单独开批的项目
 
 下表的理由与行数估算绑定各自原评估基线，未按 0.9.0 重新测算；重启时须重新核实调用链、原设计理由和生产代码与测试的整体净收益，再确认方案。
