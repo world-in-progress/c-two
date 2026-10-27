@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+- IPC 14 version diagnostics, Unix namespace disk format 3 and credential schema 4, listener credential snapshots, and typed binding refusal causes are implemented in source. See the [unreleased migration and validation notes](docs/releases/unreleased.md) for API changes, coordinated upgrades and acceptance status. No new package version is published.
+
+## [0.9.0] — companion c3 0.5.0
+
+Published 2026-10-25. See the [release notes](docs/releases/0.9.0.md) for Windows user-scoped IPC, native server identity checks, cross-session transfer, IPC 13 and C/FFI ABI 6, plus the full wheel inventory and migration requirements.
+
 ## [0.8.2] — companion c3 0.4.1
 
 ### Added

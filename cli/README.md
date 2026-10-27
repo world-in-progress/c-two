@@ -109,7 +109,7 @@ Useful options:
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
-| `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-<uidhex>` (Unix) | Final private endpoint directory; custom directories are application-provisioned with mode `0700`. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
+| `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-v3-<uidhex>` (Unix, current source) | Final owner-controlled endpoint directory; custom directories are application-provisioned, and `0755` is accepted when other identities cannot modify them. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
 | `--ipc-pool-enabled <true\|false>` | `C2_IPC_POOL_ENABLED` | Rust resolver | Enable buddy for data-plane upstream IPC; `false` still permits dedicated SHM. |
 | `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |
 | `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
@@ -188,13 +188,20 @@ c3 endpoint sweep --address ipc://this-run-server --max-entries 64 --max-ms 10 -
 
 Inspect, reap and sweep accept `--ipc-root` (or `C2_IPC_ROOT`) to address
 endpoints in a custom final Unix directory. The application provisions it
-with current-user ownership and mode `0700`; the CLI captures the endpoint context with the inspection and reap
+with current-user ownership, read/write/traverse access and no write access for other identities; `0755` is accepted, while default directories are created `0700`. The CLI captures the endpoint context with the inspection and reap
 operates strictly on that captured context, so a credential from one root
 never touches an object under another. Custom-root routes discovered through
 a relay answer over HTTP when the relay's local namespace does not match;
 the namespace hint is a routing-domain signal, not an authentication
 credential. On Windows these commands keep their TokenUser-scoped Named
 Pipe behavior and `--ipc-root` is rejected as not applicable.
+
+Current unpublished source uses Unix namespace disk format 3 and credential
+schema 4 without `device`. Default directory names include the disk format
+version; custom roots gain no suffix. Old default directories remain untouched,
+and old Unix credential schemas are rejected. Upgrade local SDKs, c3 and Node
+consumers together; follow the [unreleased migration notes](../docs/releases/unreleased.md)
+before rebuilding a custom root that reports `unsupported-namespace-format`.
 
 Inspect reports observation, not process liveness. Reap refuses stale or
 unverified objects. Keep sweep addresses scoped to the current run; report

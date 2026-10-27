@@ -91,7 +91,7 @@ finally:
 
 Run with `python counter.py`. This example uses the same-process path; keep `C2_RELAY_ANCHOR_ADDRESS` unset for local registration.
 
-For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`. A resource process can capture its listener credential with `credential = cc.server_credential()` after registration and pass it to its controller for later exact cleanup. The [IPC example](examples/python/ipc_resource.py) shows both sides.
+For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`; the [IPC example](examples/python/ipc_resource.py) shows this connection. Current unpublished source also lets the resource process capture `credential = cc.server_credential()` after registration and pass it to its controller for later exact cleanup, as described in the [lifecycle guide](docs/local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
 
 For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_anchor('http://relay-host:8300')` on both sides, then connect by name. The relay is a separate process. Explicit IPC addresses bypass relay discovery.
 

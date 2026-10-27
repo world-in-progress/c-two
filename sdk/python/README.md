@@ -30,6 +30,15 @@ Use `cc.connection_events()` for one cancellable, bounded stream of incoming and
 
 ## Development
 
+Current unpublished source adds `cc.server_credential() -> EndpointCredential | None`,
+reading the listener's lifecycle snapshot without inspection or a gate lock.
+It adds `CoreError.endpoint_unverified_reason` for unverifiable Unix binds,
+uses Unix credential schema 4 without `device`, and versions default endpoint
+directories with namespace disk format 3. These APIs and formats are not in
+the published 0.9.0 wheel. Upgrade SDKs, c3 and Node consumers together; see
+the [unreleased notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/unreleased.md)
+for snapshot semantics and custom-root migration.
+
 Use canonical main for source development and run commands from the repository root. Python patch-release provenance is recorded with its release notes; the c3 release's `rc-manifest.json` identifies that CLI release's source, which can differ from a later Python patch:
 
 ```bash

@@ -1,8 +1,8 @@
 # Unix 持久身份与服务自身端点凭据合并方案
 
-状态：用户已批准，以 `8ef1ce21` 为实施基线，正在实施。核查基线为 `f4ab1c7bf9e629a3d2e22df236d0ed7285c12670`；R17c 的独立候选为 `1e74b4c9463071ae6162619fc20eca4f55634b75`，不属于本方案待批内容。本文合并持久命名空间身份修复和 Python 自身凭据查询，两项进入同一后续发行版本；具体发行版本号和发版时机由用户决定。本轮不发版。
+状态：已按批准基线 `8ef1ce21` 实施并验收，最终实现/测试来源为 `9f9d4de3`，见[验收记录](../reports/2026-10-27-unix-namespace-identity-acceptance.md)。核查基线为 `f4ab1c7bf9e629a3d2e22df236d0ed7285c12670`；R17c 的独立候选为 `1e74b4c9463071ae6162619fc20eca4f55634b75`，不属于本方案待批内容。本文合并持久命名空间身份修复和 Python 自身凭据查询，两项进入同一后续发行版本；具体发行版本号和发版时机由用户决定。本轮不发版。
 
-用户已接受不同磁盘格式不得显式共用物理 root 的边界。本版按最新反馈保留固定魔数、删除 record 重复协议字节、只用现有生命周期 watch 投影凭据，并将无法核验的原因限定在绑定 cause；按批准范围实施。此前只读审查中关于字段、错误顺序和最后一次现场 stat 的核查继续适用，弱存活标记方案已撤销。本文没有新的动态验证或实现完成声明。
+用户已接受不同磁盘格式不得显式共用物理 root 的边界。本版按最新反馈保留固定魔数、删除 record 重复协议字节、只用现有生命周期 watch 投影凭据，并将无法核验的原因限定在绑定 cause；按批准范围实施。此前只读审查中关于字段、错误顺序和最后一次现场 stat 的核查继续适用，弱存活标记方案已撤销。下文保留批准时的设计与估算；实际验证、差异和清理以验收记录为准。
 
 本版已再次完成独立只读复核，未发现阻塞设计问题；绑定拒绝分支须保留具名 source，不能在到达 Server 的生命周期快照之前将 reason 字符串化丢失。
 
@@ -74,7 +74,7 @@ owner `context_digest` 的输入和 `c2.owner.unix-context.v1` domain 保持原�
 
 原因只放在绑定专用的 cause 上。`EndpointIoError { kind, raw_os_error }`、其转换和 Rust SDK 导出保持原形状，sweep 的 `last_io_error` 不增加永远为 None 的字段。新增一个 `EndpointBindCause` 作为绑定原因的唯一载体，由 Server 的失败快照和 Core 的 Bind 分支共用；不另设错误缓存或平行原因字段。
 
-公开 Rust 目标形状如下。`EndpointBindCause` 定义在 `c2-local`，Core 与 Rust SDK 按现有方式导出；`ServerFailure.bind_error` 随载荷变更一并改名为 `ServerFailure.bind_cause`，同一绑定原因只用一种名称；`LocalIoCause::error()` 仍返回 `EndpointIoError`，从 Bind 取 `cause.error`，从 Connect 直接取原值。
+公开 Rust 目标形状如下。`EndpointBindCause` 定义在 `c2-local`，Core 与 Rust SDK 按现有方式导出；`ServerFailure` 统一使用字段 `bind_cause`，同一绑定原因只用一种名称；`LocalIoCause::error()` 仍返回 `EndpointIoError`，从 Bind 取 `cause.error`，从 Connect 直接取原值。
 
 ```rust
 pub struct EndpointIoError {

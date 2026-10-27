@@ -1,5 +1,7 @@
 # 本地 IPC 端点生命周期与残留回收方案
 
+历史方案：下文的“当前”均指各段记录的日期，不是现行接口规范。默认目录、Windows 用户作用域和凭据格式已继续演进；现行规则见[生命周期指南](../local-endpoint-lifecycle.md)及[未发布迁移说明](../releases/unreleased.md)。
+
 方案日期：2026-10-06。2026-10-07 收口：尚未发布的新版本使用唯一原生端点。Unix 自动采用托管 v2.2 命名空间和可退休端点租约，Windows 自动采用当前登录 SID 的 Named Pipe 与内核监听租约。旧 Unix 映射、永久每地址锁机制及公开协议选择开关从当前实现移除；SDK、relay 和 CLI 只接受逻辑地址，并共享 Rust 地址派生权威。凭据格式元数据不再表示可选的运行模式。
 
 默认 Persistent 和专用子进程 OwnerBound 各自承担常驻与受控服务用途。2026-10-21 的当前开发源码以双向 owner session 和显式恢复票据替换初始单向关系，接管合同见 [C 方案](../plans/2026-10-21-connection-observation-owner-takeover.md#c统一-owner-session限定新增控制面)。已安装 hey-my-buddy 的调用方接入、正式发布和 Windows 11 桌面验证分别需要实际证据；本次文档迁移不表示这些步骤或三平台 CI 已完成。代码清理没有授权删除旧目录数据。

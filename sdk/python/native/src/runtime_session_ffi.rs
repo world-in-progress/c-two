@@ -405,7 +405,7 @@ impl PyRuntimeSession {
             };
             let sources = c2_config::ConfigSources::empty();
             // A captured choice must still describe this platform scope.
-            // Refuse a UID/logon-scope change rather than silently rebasing it.
+            // Refuse a user-scope change rather than silently rebasing it.
             let resolved =
                 c2_config::ConfigResolver::resolve_local_endpoint(options.clone(), sources.clone())
                     .map_err(|error| PyValueError::new_err(error.to_string()))?;
