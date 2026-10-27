@@ -42,6 +42,8 @@ pub(crate) mod fault {
         ManagedRecordWriteAfterReplacement,
         VerifyLeaseFstat,
         VerifyLeaseStat,
+        FinalLeaseStat,
+        SocketPermissionsThenFinalLeaseStat,
         ReadLeaseStat,
         ReadLeaseOpen,
         ReadLeaseRecord,
@@ -614,6 +616,10 @@ fn lock_entry_matches(
     name: &CString,
     opened: &libc::stat,
 ) -> io::Result<bool> {
+    #[cfg(test)]
+    if fault::take_if(fault::Failure::FinalLeaseStat) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
     Ok(directory
         .stat(name)?
         .is_some_and(|current| stat_is(&current, libc::S_IFREG) && same_file(opened, &current)))
@@ -647,9 +653,15 @@ pub(crate) fn unlink_verified(
 ) -> EndpointReapResult {
     if !directory.path_still_names_open_directory()
         || !ownership_directory.path_still_names_open_directory()
-        || !lock_entry_matches(ownership_directory, &names.lock, opened_lock).unwrap_or(false)
     {
         return EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership);
+    }
+    match lock_entry_matches(ownership_directory, &names.lock, opened_lock) {
+        Ok(true) => {}
+        Ok(false) => {
+            return EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership);
+        }
+        Err(error) => return EndpointReapResult::IoError(error),
     }
     let current = match directory.stat(&names.socket) {
         Ok(Some(stat)) => stat,
@@ -885,6 +897,14 @@ pub(crate) fn set_socket_permissions(
     names: &EndpointNames,
     guard: &BoundSocketGuard<'_>,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    if fault::take_if(fault::Failure::SocketPermissionsThenFinalLeaseStat) {
+        fault::inject(fault::Failure::FinalLeaseStat);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected socket permission failure before rollback stat",
+        ));
+    }
     #[cfg(test)]
     if fault::take_if(fault::Failure::SocketPermissionsWithDuplicate) {
         fault::retain_duplicate(guard.ownership);

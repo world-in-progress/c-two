@@ -3689,3 +3689,244 @@ async fn lease_verification_io_keeps_bind_rollback_and_policy_priority() {
         assert_eq!(error.kind(), io::Error::from_raw_os_error(libc::EIO).kind());
     }
 }
+
+#[tokio::test]
+async fn final_lease_stat_io_preserves_stale_bind_reap_and_sweep() {
+    use crate::unix_common::fault::{self, Failure};
+    let mut stale_error = None;
+    let mut reap_result = None;
+    let mut sweep_batch = None;
+    for operation in ["stale-bind", "reap", "sweep"] {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        eprintln!("R17C_TEST_ROOT {}", root.display());
+        let endpoint = managed_endpoint_at(root, operation);
+        let listener = bind_managed_at(&endpoint, root).unwrap();
+        let credential = listener.credential();
+        listener.abandon_for_test();
+        let socket = socket_path_at(root, &endpoint);
+        let lease = lease_path_at(root, &endpoint);
+        let identity = identity_of(&socket);
+        let lease_bytes = fs::read(&lease).unwrap();
+        let mut sweep = (operation == "sweep")
+            .then(|| retry_sweep(|| scoped_sweep_at(root, std::slice::from_ref(&endpoint))));
+        fault::inject(Failure::FinalLeaseStat);
+        match operation {
+            "stale-bind" => stale_error = bind_managed_at(&endpoint, root).err(),
+            "reap" => reap_result = Some(reap_managed_at(&endpoint, &credential, root)),
+            "sweep" => {
+                sweep_batch = Some(sweep.as_mut().unwrap().next_batch(SweepBudget::default()))
+            }
+            _ => unreachable!(),
+        }
+        assert!(!fault::take_if(Failure::FinalLeaseStat));
+        drop(sweep);
+        assert_eq!(identity_of(&socket), identity);
+        assert_eq!(fs::read(&lease).unwrap(), lease_bytes);
+        assert!(matches!(
+            reap_managed_at(&endpoint, &credential, root),
+            EndpointReapResult::Reaped
+        ));
+        assert!(!socket.exists() && !lease.exists());
+    }
+    let stale_error = stale_error.unwrap();
+    let reap_result = reap_result.unwrap();
+    let sweep_batch = sweep_batch.unwrap();
+    eprintln!(
+        "final stat outcomes: stale={stale_error:?}, reap={reap_result:?}, sweep={sweep_batch:?}"
+    );
+    assert_eq!(
+        stale_error.raw_os_error(),
+        Some(libc::EIO),
+        "{stale_error:?}"
+    );
+    assert_eq!(
+        stale_error.kind(),
+        io::Error::from_raw_os_error(libc::EIO).kind()
+    );
+    assert!(
+        matches!(reap_result, EndpointReapResult::IoError(ref error)
+        if error.raw_os_error() == Some(libc::EIO)),
+        "{reap_result:?}"
+    );
+    assert_eq!(
+        (sweep_batch.io_errors, sweep_batch.unverified),
+        (1, 0),
+        "{sweep_batch:?}"
+    );
+    assert_eq!(
+        sweep_batch.last_io_error,
+        Some(crate::EndpointIoError::from(&io::Error::from_raw_os_error(
+            libc::EIO
+        )))
+    );
+}
+
+#[tokio::test]
+async fn final_lease_stat_io_releases_close_and_drop_leases() {
+    use crate::unix_common::fault::{self, Failure};
+    let mut explicit_close = None;
+    for close in [true, false] {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        eprintln!("R17C_TEST_ROOT {}", root.display());
+        let endpoint = managed_endpoint_at(root, "final-stat-close");
+        let listener = bind_managed_at(&endpoint, root).unwrap();
+        let credential = listener.credential();
+        let socket = socket_path_at(root, &endpoint);
+        let lease = lease_path_at(root, &endpoint);
+        let identity = identity_of(&socket);
+        let bytes = fs::read(&lease).unwrap();
+        fault::inject(Failure::FinalLeaseStat);
+        if close {
+            explicit_close = Some(listener.close());
+        } else {
+            drop(listener);
+        }
+        assert!(!fault::take_if(Failure::FinalLeaseStat));
+        assert_eq!(identity_of(&socket), identity);
+        assert_eq!(fs::read(&lease).unwrap(), bytes);
+        let unlocked = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease)
+            .unwrap();
+        assert!(try_lock_lease(&unlocked).is_ok());
+        drop(unlocked);
+        assert!(matches!(
+            reap_managed_at(&endpoint, &credential, root),
+            EndpointReapResult::Reaped
+        ));
+        assert!(!socket.exists() && !lease.exists());
+    }
+    let outcome = explicit_close.unwrap();
+    assert!(
+        matches!(outcome, EndpointReapResult::IoError(ref error)
+        if error.raw_os_error() == Some(libc::EIO)),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn final_lease_stat_short_circuits_directory_and_keeps_ownership_denials() {
+    use crate::unix_common::fault::{self, Failure};
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    eprintln!("R17C_TEST_ROOT {}", root.display());
+    let endpoint = managed_endpoint_at(root, "final-stat-order");
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    let credential = listener.credential();
+    listener.abandon_for_test();
+    let socket = socket_path_at(root, &endpoint);
+    let lease = lease_path_at(root, &endpoint);
+    let names = managed_names(&endpoint).unwrap();
+    let directories = NamespaceDirectories::open(root, false).unwrap();
+    let opened = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lease)
+        .unwrap();
+    let opened_stat = fstat(opened.as_raw_fd()).unwrap();
+    let moved_root = namespace._parent.path().join("moved-ipc");
+    fs::rename(root, &moved_root).unwrap();
+    fs::create_dir(root).unwrap();
+    fault::inject(Failure::FinalLeaseStat);
+    let refused = crate::unix_common::unlink_verified(
+        directories.socket_directory().unwrap(),
+        &directories.records,
+        &names,
+        &opened_stat,
+        credential.identity(),
+    );
+    assert!(fault::take_if(Failure::FinalLeaseStat));
+    fs::remove_dir(root).unwrap();
+    fs::rename(&moved_root, root).unwrap();
+    let other = TestNamespace::new();
+    let foreign_records = EndpointDirectory::open(other.path(), false).unwrap();
+    let moved_other = other._parent.path().join("moved-ipc");
+    fs::rename(other.path(), &moved_other).unwrap();
+    fs::create_dir(other.path()).unwrap();
+    fault::inject(Failure::FinalLeaseStat);
+    let refused_records = crate::unix_common::unlink_verified(
+        directories.socket_directory().unwrap(),
+        &foreign_records,
+        &names,
+        &opened_stat,
+        credential.identity(),
+    );
+    assert!(fault::take_if(Failure::FinalLeaseStat));
+    fs::remove_dir(other.path()).unwrap();
+    fs::rename(&moved_other, other.path()).unwrap();
+    let moved_lease = namespace._parent.path().join("moved-lease");
+    fs::rename(&lease, &moved_lease).unwrap();
+    let missing = crate::unix_common::unlink_verified(
+        directories.socket_directory().unwrap(),
+        &directories.records,
+        &names,
+        &opened_stat,
+        credential.identity(),
+    );
+    fs::write(&lease, b"foreign lease").unwrap();
+    let replaced = crate::unix_common::unlink_verified(
+        directories.socket_directory().unwrap(),
+        &directories.records,
+        &names,
+        &opened_stat,
+        credential.identity(),
+    );
+    fs::remove_file(&lease).unwrap();
+    std::os::unix::fs::symlink(&moved_lease, &lease).unwrap();
+    let wrong_type = crate::unix_common::unlink_verified(
+        directories.socket_directory().unwrap(),
+        &directories.records,
+        &names,
+        &opened_stat,
+        credential.identity(),
+    );
+    fs::remove_file(&lease).unwrap();
+    fs::rename(&moved_lease, &lease).unwrap();
+    drop(opened);
+    assert!(matches!(
+        reap_managed_at(&endpoint, &credential, root),
+        EndpointReapResult::Reaped
+    ));
+    assert!(!socket.exists() && !lease.exists() && !moved_lease.exists());
+    for outcome in [refused, refused_records, missing, replaced, wrong_type] {
+        assert!(
+            matches!(
+                outcome,
+                EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership)
+            ),
+            "{outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn final_lease_stat_rollback_keeps_initialization_error() {
+    use crate::unix_common::fault::{self, Failure};
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    eprintln!("R17C_TEST_ROOT {}", root.display());
+    let endpoint = managed_endpoint_at(root, "final-stat-rollback");
+    fault::inject(Failure::SocketPermissionsThenFinalLeaseStat);
+    let error = bind_managed_at(&endpoint, root).err().unwrap();
+    assert!(!fault::take_if(Failure::FinalLeaseStat));
+    let socket = socket_path_at(root, &endpoint);
+    let lease = lease_path_at(root, &endpoint);
+    assert!(socket.exists() && lease.exists());
+    let unlocked = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lease)
+        .unwrap();
+    assert!(try_lock_lease(&unlocked).is_ok());
+    drop(unlocked);
+    fs::remove_file(&socket).unwrap();
+    fs::remove_file(&lease).unwrap();
+    assert!(!socket.exists() && !lease.exists());
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error
+        .to_string()
+        .contains("injected socket permission failure before rollback stat"));
+}
