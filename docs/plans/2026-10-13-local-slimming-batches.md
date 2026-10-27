@@ -35,7 +35,7 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 
 2026-10-27：[R17c](2026-10-27-r17c-final-lease-stat-evaluation.md) 已验收，实现 `1e74b4c9`；[同源 Actions](https://github.com/Dsssyc/c-two/actions/runs/40462218729) 10/10 jobs、六线合计 147/147 适用 gate 通过，见[记录](../reports/2026-10-27-r17c-final-lease-stat-acceptance.md)。生产净 +6、测试净 +255，作为正确性修复不计瘦身收益。随后按 `8ef1ce21` 批准的[持久身份与自身凭据合并方案](2026-10-27-unix-namespace-identity-and-own-credential.md)完成候选 `9f9d4de3`：Unix format 3/schema 4、单一绑定 cause 和现有 watch 凭据投影，独立实机/跨语言/完整 relay/六线 Actions/零残留与审查见[验收记录](../reports/2026-10-27-unix-namespace-identity-acceptance.md)。这项补强不新增已核销 R 编号，gate/context 与目录 pin 的完整分类继续单列；分类数量仍为 17 / 15 / 6 / 1。
 
-后续需求：[独立本地 IPC 探测方案与公开草案](2026-10-27-independent-local-ipc-probe.md)已完成调用链及独立静态审查，等待用户确认，尚未实施。建议只新增窄的探测入口与结构化结果，复用原生 bind/connect/close；本次不公开 RuntimeSession，不计作纯瘦身或新增 R 条目核销。
+后续需求：用户要求直接公开现有能力，窄探测草案已撤回，改为[公开精简独立 Runtime 方案](2026-10-27-public-independent-runtime.md)。显式与默认实例复用现有注册/连接/关闭代码，只拆必要的全局配置及进程适配；临时目录由应用管理，不增加 probe、closed 状态或清理框架。方案已完成独立静态审查，待用户确认，尚未实施；失败启动清理结果的源码疑点先单列基线验证，若复现再确认最小修复。不计作纯瘦身或新增 R 条目核销，R35、C04 和两份会话重构继续暂缓。
 
 ### 继续暂缓、不单独开批的项目
 
