@@ -66,7 +66,7 @@ control = prepared.commit(timeout=1.0)  # 每个准备对象只提交一次；�
 
 `cc.shutdown(timeout=...)` 返回原生结构化完成结果；有效 owner shutdown 或 Persistent admin shutdown 的 ACK 仅证明已接受发起排空，不能用作 callback 排空完成或运行 hook 的依据。`completed=false` 时保留原 Session、bridge、路由及关闭 hook，稍后观察同一事务。监听器关闭、工作排空和 payload lease 是独立事实；端点回收不释放 held/borrowed，FastDB 检查视图由各自 lease 释放时失效。
 
-显式 Python `runtime.shutdown(timeout=...)` 遵循相同完成规则。完成后，这个 Python 对象取得新原生 session；应保存返回的 outcome，作为旧 session 的关闭结果。`runtime.connection_events()` 绑定当前 session，换代后需要重新订阅。启动错误与随后关闭的结果须分别保存，失败启动后的未完成或错误清理不能被原启动异常掩盖。已批准的[失败启动回执修复](plans/2026-10-27-failed-start-cleanup-observation.md)仍在实施与验证；确定性 Core 反例并非已编译 PyO3 竞争的证明。
+显式 Python `runtime.shutdown(timeout=...)` 遵循相同完成规则。完成后，这个 Python 对象取得新原生 session；应保存返回的 outcome，作为旧 session 的关闭结果。`runtime.connection_events()` 绑定当前 session，换代后需要重新订阅。启动错误与随后关闭的结果须分别保存，失败启动后的未完成或错误清理不能被原启动异常掩盖。失败启动后，NativeSession 观察本次具体 Server 的原有关闭事务，保留终态错误。见[验收记录](reports/2026-10-28-public-runtime-acceptance.md)：pending 的确定性交错在 Core 验证，真实 Native/Bridge 另行验证终态错误保真。
 
 Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时重试暂时连接失败。开始写入后，写入失败、ACK 丢失或超时均返回现有未确认结果，不再重连重发；未确认不证明服务端没有执行。这样同地址重新绑定的新实例不会收到本次调用的重发。ping 继续保留探测重试，首次观察到端点不存在的处理与原总预算保持。
 

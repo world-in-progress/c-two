@@ -1,6 +1,6 @@
 # 公开现有独立 Runtime：接口与所有权方案
 
-状态：用户已批准；实现与验证进行中，尚未最终验收或发版。方案审查的源码基线为 `a80380db`；本文替代未实施的窄 `probe_local_ipc` 草案。用户进一步要求直接公开已有能力，因此不附带一次性关闭状态、Runtime 上下文管理器、临时 namespace 自动删除或新的探测协议。下文保留批准时的方案与基线证据，验收结论以完成后的独立记录为准。
+状态：已按批准范围实施并完成验收，构建来源 `e0b5af2d`，见[最终记录](../reports/2026-10-28-public-runtime-acceptance.md)；未发版。方案审查的源码基线为 `a80380db`；本文替代未实施的窄 `probe_local_ipc` 草案。用户进一步要求直接公开已有能力，因此不附带一次性关闭状态、Runtime 上下文管理器、临时 namespace 自动删除或新的探测协议。下文保留批准时的方案与基线证据，验收结论以完成后的独立记录为准。
 
 ## 目标与直接复用
 
@@ -67,9 +67,9 @@ proxy、在途调用和 Held 对象保有原有实际 owner。shutdown 处理本
 
 Unix 临时目录由应用通过标准库创建并拥有，例如 `tempfile.mkdtemp(dir=application_owned_parent)`；传给 set_local_endpoint 的是这个完整目录。Runtime 借用目录，只按原 close/reap 规则处理自己的 socket/lease，不删除 gate/marker、父目录或无关内容。确认 completed、runtime_barrier_error/route_close_error/ipc_client_close_error 为空，并逐路由确认 active_drained 且 close_error 为空后，应用对自己独占新建的临时目录执行标准库清理；目录并非共享 root，禁止把这种例程用于默认目录或已有应用 namespace。
 
-预检步骤是：创建私有目录 → 创建 Runtime 并配置 root/startup_timeout → start 等待现有 Host 就绪与 PONG → 读取自身 credential（如需诊断）→ shutdown 并检查原 outcome → 清理应用创建的目录。等待释放 GIL；不用 socket 完整路径绑定、文件出现轮询、私有导入或新的 probe 函数。成功路径与正常绑定拒绝路径都纳入本次目录零残留验收；以下失败启动清理门槛未通过时不能宣称这部分已验收。
+预检步骤是：创建私有目录 → 创建 Runtime 并配置 root/startup_timeout → start 等待现有 Host 就绪与 PONG → 读取自身 credential（如需诊断）→ shutdown 并检查原 outcome → 清理应用创建的目录。等待释放 GIL；不用 socket 完整路径绑定、文件出现轮询、私有导入或新的 probe 函数。成功路径、正常绑定拒绝及单列失败启动清理门槛均已完成验收，结果见最终验收记录。
 
-出现启动/关闭异常或未确认的清理时，应用保留原错误、shutdown outcome 与临时路径；不能在 finally 中无条件 rmtree，也不能将一个外层 TemporaryDirectory context 的退出视为原生进程已经排空。文件删除失败由标准 OSError 保留 errno/path。完整例程将展示两类错误同时保留和“确认关闭才删目录”的判断，不作为新的 SDK 管理框架。Held/backing 生命周期保持，IPC root 不管理 SHM/file-spill 的目录。
+启动异常必须保留并在收尾后抛出；只有确认终态且全部清理检查通过，才可删除本次独占的新临时目录。关闭异常或清理未确认时，应用保留原错误、shutdown outcome 与临时路径；不能在 finally 中无条件 rmtree，也不能将一个外层 TemporaryDirectory context 的退出视为原生进程已经排空。文件删除失败由标准 OSError 保留 errno/path。完整例程展示两类错误同时保留和“确认关闭才删目录”的判断，不作为新的 SDK 管理框架。Held/backing 生命周期保持，IPC root 不管理 SHM/file-spill 的目录。
 
 Windows 不传 Unix root，使用本 Runtime 自动生成的唯一 server id 和 TokenUser 范围 Named Pipe；没有需要删除的 namespace 文件夹。start、PONG、shutdown 与身份核对沿正式后端。这里的隔离是同用户范围内不同逻辑端点，不能声称创建了独立 TokenUser namespace；关闭遵守已有句柄/IOCP 语义。
 
@@ -106,4 +106,4 @@ Windows 不传 Unix root，使用本 Runtime 自动生成的唯一 server id 和
 5. Windows 开发机优先跑真实 Named Pipe 启动/PONG、两实例隔离、重复绑定、关闭和再使用；Unix root 明确拒绝，不能跳过共同 Runtime 用例。CI 包含 Windows 2022/2025、Windows ARM64、Linux/macOS 和 Python 3.14t。
 6. 最终精确候选完成完整 relay、真实 Rust/Python/Node 跨语言及既有矩阵、独立审查与 GitHub Actions。Python/Rust错误、配置和连接生命周期保持同一 Core 权威。验证后清理本批产物，历史目录和下游仓库/状态不动；发版等待单独指令。
 
-方案阶段完成两项独立初审及修订后的静态复核；初审发现的 Bridge/Host 归属、relay 提交顺序和配置来源已写入上述必要适配。失败启动清理疑点后来由确定性 Core 反例证实，并作为[单列修复](2026-10-27-failed-start-cleanup-observation.md)获批；其生产修复与编译后验证仍需记录。本文不充当实现、三端验证或最终验收证明。
+方案阶段完成两项独立初审及修订后的静态复核；初审发现的 Bridge/Host 归属、relay 提交顺序和配置来源已写入上述必要适配。失败启动清理疑点后来由确定性 Core 反例证实，并作为[单列修复](2026-10-27-failed-start-cleanup-observation.md)获批；修复及编译后 Native、三端和最终 CI 验收已在上述最终记录中完成。本文保留批准时的设计依据。

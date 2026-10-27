@@ -1,0 +1,182 @@
+{
+  "schema": "c-two.public-runtime-acceptance.v1",
+  "baseline": "e4ddcc85e88b2b8a5ab4c911c8734de6ebac5740",
+  "implementation": "e0b5af2d8aabd225dc286d75e5d1ef5c6b492855",
+  "ci": {
+    "run_id": 40532138553,
+    "attempt": 1,
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/40532138553",
+    "status": "success",
+    "jobs_passed": 10,
+    "applicable_gates_passed": 147,
+    "lanes": [
+      {
+        "lane": "linux",
+        "runner": "ubuntu-24.04",
+        "gates": 25,
+        "status": "passed",
+        "portable_rows": 18,
+        "node_rows": 12,
+        "artifact_id": 12748161108,
+        "provider_archive_sha256": "c1137b0e46698ecc99d0d7115f5c31e520b83b7740e97d50f88a88241a38c828",
+        "source_receipt_sha256": "fa1b7681f76c1548a7e27be08a864a2a094d054bf9b62438c8321e07ead65631",
+        "cleanup_confirmed": true
+      },
+      {
+        "lane": "macos",
+        "runner": "macos-15",
+        "gates": 25,
+        "status": "passed",
+        "portable_rows": 18,
+        "node_rows": 12,
+        "artifact_id": 12747412003,
+        "provider_archive_sha256": "6793e4d3295c76c576ef3b9c83cbf73d324dd7e92e16a8b6861c27a5a59501fd",
+        "source_receipt_sha256": "7be658f6fc60b5aa32a21990141cbfd3c1b66fed8c92bee9715c1a8d64e6de2e",
+        "cleanup_confirmed": true
+      },
+      {
+        "lane": "win2022",
+        "runner": "windows-2022",
+        "gates": 27,
+        "status": "passed",
+        "portable_rows": 18,
+        "node_rows": 12,
+        "artifact_id": 12747348656,
+        "provider_archive_sha256": "9d7ca2ccedaec3cb0a1e136be34d0822ad41a7f7d9c7dca92c80a23fb299f1c2",
+        "source_receipt_sha256": "c184c894012887b9229e59fea6c3b7e8085e08bc002fdde720998b6a1d7006b2",
+        "cleanup_confirmed": true
+      },
+      {
+        "lane": "win2025",
+        "runner": "windows-2025",
+        "gates": 27,
+        "status": "passed",
+        "portable_rows": 18,
+        "node_rows": 12,
+        "artifact_id": 12748301330,
+        "provider_archive_sha256": "4d6258c5be56aacf4cf9c1475de2df088c2c5dd6fea8b1e153efbc8f336707c0",
+        "source_receipt_sha256": "c52d3da06a769f799bbfd70804eaa7bb61720e548b3957f1d614f6ba5386834a",
+        "cleanup_confirmed": true
+      },
+      {
+        "lane": "winarm64",
+        "runner": "windows-11-arm",
+        "gates": 27,
+        "status": "passed",
+        "portable_rows": 18,
+        "node_rows": 12,
+        "artifact_id": 12751331496,
+        "provider_archive_sha256": "56b5e2dc7a6c6c705c82f4e75bb45b916182a25af4dc445ba839adad5410bacd",
+        "source_receipt_sha256": "8b3095a6d692312f89ac7238eeb71229c0a833627e903db2ef1ea63ee6b99469",
+        "cleanup_confirmed": true
+      },
+      {
+        "lane": "py314t",
+        "runner": "ubuntu-24.04",
+        "gates": 16,
+        "status": "passed",
+        "portable_rows": 18,
+        "node_rows": 12,
+        "artifact_id": 12746863095,
+        "provider_archive_sha256": "b76fed809fb515b8b750ec4bb73f3fbc41f52001f9cb948a0d22b35cd1952776",
+        "source_receipt_sha256": "9a128901764540e3f6b214d7049440327c2868e11f17fc13bac2dba2bfd0e861",
+        "cleanup_confirmed": true
+      }
+    ]
+  },
+  "first_candidate": {
+    "implementation": "dc8a869da424ab848b719717a76a960dd32398c7",
+    "run_id": 40526344938,
+    "windows_failures": [
+      "unconditional TempDir test type had Unix-only dev dependency",
+      "one Unix-only setup skip was missing from the exact platform applicability map"
+    ],
+    "production_unchanged_by_correction": true
+  },
+  "fail_first": {
+    "settings_and_preflight": 4,
+    "core_pending_cleanup": 2,
+    "native_terminal_error": 2
+  },
+  "local_validation": {
+    "core_receipts": {
+      "passed": 5
+    },
+    "python_expanded_initial": {
+      "passed": 271,
+      "failed": 3,
+      "skipped": 2
+    },
+    "python_corrections": {
+      "passed": 3
+    },
+    "connect_and_examples": {
+      "passed": 71
+    },
+    "sdk_boundaries": {
+      "passed": 49
+    },
+    "macos_sandbox_bind_denial": {
+      "passed": 1
+    },
+    "test_runner_applicability": {
+      "passed": 101,
+      "skipped": 1
+    }
+  },
+  "windows_dev": {
+    "runtime_source": "dc8a869da424ab848b719717a76a960dd32398c7",
+    "runtime_passed": 127,
+    "unix_only_skipped": 1,
+    "final_core_source": "e0b5af2d8aabd225dc286d75e5d1ef5c6b492855",
+    "core_receipt_passed": 5,
+    "pipe_absent_os_error": 2,
+    "isolated_budgets_verified": true,
+    "task_directories_removed": true
+  },
+  "cleanup": {
+    "baseline_native_target_removed": true,
+    "candidate_native_target_removed": true,
+    "baseline_environment_removed": true,
+    "baseline_source_copy_removed": true,
+    "candidate_environment_removed": true,
+    "task_uv_cache_removed": true,
+    "generated_native_extension_removed": true,
+    "owned_endpoint_test_directories_removed": true,
+    "candidate_archive_removed": true,
+    "python_cache_directories_removed": 16,
+    "ci_branch_removed": true,
+    "temporary_index_removed": true
+  },
+  "local_socket_lease_residues": 0,
+  "private_endpoint_roots_checked": 13,
+  "implementation_line_delta": {
+    "production": {
+      "added": 449,
+      "removed": 194,
+      "net": 255
+    },
+    "tests": {
+      "added": 986,
+      "removed": 307,
+      "net": 679
+    },
+    "docs": {
+      "added": 113,
+      "removed": 19,
+      "net": 94
+    },
+    "examples": {
+      "added": 76,
+      "removed": 0,
+      "net": 76
+    }
+  },
+  "final_documentation_line_delta": {
+    "added": 353,
+    "removed": 24,
+    "net": 329
+  },
+  "deferred": "same-instance concurrent register/shutdown publication and hook ownership; reproduced in baseline and candidate",
+  "release": false
+}
