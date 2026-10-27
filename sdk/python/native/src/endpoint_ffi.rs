@@ -35,8 +35,8 @@ use c2_config::{
     LocalEndpointOptions,
 };
 use c2_core::{
-    EndpointCredential, EndpointInspection, EndpointReapResult, EndpointSweep,
-    EndpointUnverifiedReason, SweepBatch, SweepBudget, inspect_endpoint, reap_endpoint,
+    EndpointCredential, EndpointInspection, EndpointReapResult, EndpointSweep, SweepBatch,
+    SweepBudget, inspect_endpoint, reap_endpoint,
 };
 
 /// Immutable Core context. Python cannot assemble its platform identity or
@@ -163,22 +163,6 @@ impl Drop for SweepLease {
     }
 }
 
-fn unverified_reason_name(reason: EndpointUnverifiedReason) -> &'static str {
-    match reason {
-        EndpointUnverifiedReason::UnsafeDirectory => "unsafe-directory",
-        EndpointUnverifiedReason::Symlink => "symlink",
-        EndpointUnverifiedReason::UnexpectedObject => "unexpected-object",
-        EndpointUnverifiedReason::ForeignOwner => "foreign-owner",
-        EndpointUnverifiedReason::MissingOwnership => "missing-ownership",
-        EndpointUnverifiedReason::InvalidOwnership => "invalid-ownership",
-        EndpointUnverifiedReason::InvalidRecord => "invalid-record",
-        EndpointUnverifiedReason::RecordMismatch => "record-mismatch",
-        EndpointUnverifiedReason::CoordinatorMissing => "coordinator-missing",
-        EndpointUnverifiedReason::CoordinatorReplaced => "coordinator-replaced",
-        EndpointUnverifiedReason::InitializationIncomplete => "initialization-incomplete",
-    }
-}
-
 fn io_error_kind_name(kind: std::io::ErrorKind) -> String {
     // `Debug` is the stable spelling of an `ErrorKind`; `kind().to_string()`
     // omits the raw OS code, which is reported separately.
@@ -229,12 +213,9 @@ fn reap_dict<'py>(py: Python<'py>, result: &EndpointReapResult) -> PyResult<Boun
             None,
             Some("identity-mismatch".to_string()),
         )?,
-        EndpointReapResult::Unverified(reason) => set_result_fields(
-            &dict,
-            "unverified",
-            None,
-            Some(unverified_reason_name(*reason).to_string()),
-        )?,
+        EndpointReapResult::Unverified(reason) => {
+            set_result_fields(&dict, "unverified", None, Some(reason.as_str().to_string()))?
+        }
         // There is no filesystem entry to collect on this platform. This is
         // not an error and not proof that a matching live endpoint exists.
         EndpointReapResult::NotApplicable => set_result_fields(
@@ -370,7 +351,7 @@ fn inspect_endpoint_endpoint<'py>(
         }
         EndpointInspection::Unverified(reason) => {
             let dict = result_dict(py, "unverified")?;
-            dict.set_item("reason", Some(unverified_reason_name(reason).to_string()))?;
+            dict.set_item("reason", Some(reason.as_str().to_string()))?;
             Ok(dict)
         }
         EndpointInspection::IoError(error) => {

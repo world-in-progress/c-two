@@ -80,6 +80,12 @@ class CoreError(CCBaseError, RuntimeError):
         'permission_denied', 'not_found', 'connection_refused', 'address_in_use', 'other',
     ] | None
     raw_os_error: int | None
+    endpoint_unverified_reason: Literal[
+        'unsafe-directory', 'symlink', 'unexpected-object', 'foreign-owner',
+        'missing-ownership', 'invalid-ownership', 'invalid-record',
+        'record-mismatch', 'coordinator-missing', 'coordinator-replaced',
+        'initialization-incomplete', 'unsupported-namespace-format',
+    ] | None
     # Only protocol_version_mismatch supplies these nonzero u32 values.
     local_protocol_version: int | None
     peer_protocol_version: int | None
@@ -122,6 +128,7 @@ class CoreError(CCBaseError, RuntimeError):
         self.io_operation = None
         self.io_kind = None
         self.raw_os_error = None
+        self.endpoint_unverified_reason = None
         self.local_protocol_version = None
         self.peer_protocol_version = None
         self.lifecycle_kind = None

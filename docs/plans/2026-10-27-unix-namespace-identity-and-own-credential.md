@@ -1,8 +1,8 @@
 # Unix 持久身份与服务自身端点凭据合并方案
 
-状态：待用户确认，尚未实施。核查基线为 `f4ab1c7bf9e629a3d2e22df236d0ed7285c12670`；R17c 的独立候选为 `1e74b4c9463071ae6162619fc20eca4f55634b75`，不属于本方案待批内容。本文合并持久命名空间身份修复和 Python 自身凭据查询，两项进入同一后续发行版本；具体发行版本号和发版时机由用户决定。本轮不发版。
+状态：用户已批准，以 `8ef1ce21` 为实施基线，正在实施。核查基线为 `f4ab1c7bf9e629a3d2e22df236d0ed7285c12670`；R17c 的独立候选为 `1e74b4c9463071ae6162619fc20eca4f55634b75`，不属于本方案待批内容。本文合并持久命名空间身份修复和 Python 自身凭据查询，两项进入同一后续发行版本；具体发行版本号和发版时机由用户决定。本轮不发版。
 
-用户已接受不同磁盘格式不得显式共用物理 root 的边界。本版按最新反馈保留固定魔数、删除 record 重复协议字节、只用现有生命周期 watch 投影凭据，并将无法核验的原因限定在绑定 cause；等待用户确认后实施。此前只读审查中关于字段、错误顺序和最后一次现场 stat 的核查继续适用，弱存活标记方案已撤销。本文没有新的动态验证或实现完成声明。
+用户已接受不同磁盘格式不得显式共用物理 root 的边界。本版按最新反馈保留固定魔数、删除 record 重复协议字节、只用现有生命周期 watch 投影凭据，并将无法核验的原因限定在绑定 cause；按批准范围实施。此前只读审查中关于字段、错误顺序和最后一次现场 stat 的核查继续适用，弱存活标记方案已撤销。本文没有新的动态验证或实现完成声明。
 
 本版已再次完成独立只读复核，未发现阻塞设计问题；绑定拒绝分支须保留具名 source，不能在到达 Server 的生命周期快照之前将 reason 字符串化丢失。
 
@@ -74,7 +74,7 @@ owner `context_digest` 的输入和 `c2.owner.unix-context.v1` domain 保持原�
 
 原因只放在绑定专用的 cause 上。`EndpointIoError { kind, raw_os_error }`、其转换和 Rust SDK 导出保持原形状，sweep 的 `last_io_error` 不增加永远为 None 的字段。新增一个 `EndpointBindCause` 作为绑定原因的唯一载体，由 Server 的失败快照和 Core 的 Bind 分支共用；不另设错误缓存或平行原因字段。
 
-公开 Rust 目标形状如下。`EndpointBindCause` 定义在 `c2-local`，Core 与 Rust SDK 按现有方式导出；`ServerFailure.bind_error` 的字段名保留、载荷改为绑定 cause；`LocalIoCause::error()` 仍返回 `EndpointIoError`，从 Bind 取 `cause.error`，从 Connect 直接取原值。
+公开 Rust 目标形状如下。`EndpointBindCause` 定义在 `c2-local`，Core 与 Rust SDK 按现有方式导出；`ServerFailure.bind_error` 随载荷变更一并改名为 `ServerFailure.bind_cause`，同一绑定原因只用一种名称；`LocalIoCause::error()` 仍返回 `EndpointIoError`，从 Bind 取 `cause.error`，从 Connect 直接取原值。
 
 ```rust
 pub struct EndpointIoError {
@@ -90,7 +90,7 @@ pub struct EndpointBindCause {
 
 pub struct ServerFailure {
     pub message: String,
-    pub bind_error: Option<EndpointBindCause>,
+    pub bind_cause: Option<EndpointBindCause>,
     pub startup_timeout: Option<ServerStartupTimeout>,
 }
 
@@ -100,11 +100,11 @@ pub enum LocalIoCause {
 }
 ```
 
-原因沿现有链传递：原绑定 `io::Error` 的具名原因 → `EndpointBindCause::from(&error)` → `ServerFailure.bind_error` / 生命周期 watch → `LocalIoCause::Bind` → `CoreError.endpoint_unverified_reason`。普通 OS 绑定失败的 reason 为 None；Connect、sweep 等路径不携带该绑定 reason。Python 新字段在类上声明固定 Literal 取值，其他错误为 None；值与 inspect.reason 相同。Rust 原生错误为 InvalidData，Python `io_kind` 保留现有粗粒度词表（该类映射为 `other`），不再是 `address_in_use`；以新增 reason 字段程序化区分，不从消息解析。真实 errno 不造假，策略拒绝 raw_os_error 为 None。
+原因沿现有链传递：原绑定 `io::Error` 的具名原因 → `EndpointBindCause::from(&error)` → `ServerFailure.bind_cause` / 生命周期 watch → `LocalIoCause::Bind` → `CoreError.endpoint_unverified_reason`。普通 OS 绑定失败的 reason 为 None；Connect、sweep 等路径不携带该绑定 reason。Python 新字段在类上声明固定 Literal 取值，其他错误为 None；值与 inspect.reason 相同。Rust 原生错误为 InvalidData，Python `io_kind` 保留现有粗粒度词表（该类映射为 `other`），不再是 `address_in_use`；以新增 reason 字段程序化区分，不从消息解析。真实 errno 不造假，策略拒绝 raw_os_error 为 None。
 
 所有绑定无法核验分支统一把现有 `EndpointUnverifiedReason` 作为可 downcast 的具名 `io::Error` source 保存；绑定 cause 在 `ServerFailure` 的既有转换边界提取一次，Core 与 PyO3 只投影同一值。不先转成裸字符串，不通过消息重新推断原因。
 
-原因字符串由现有原生枚举提供一处映射，inspect、CLI 和 CoreError 共用；删除重复的 Python native/CLI 枚举到字符串表。公开 Rust 变化为新增 `EndpointUnverifiedReason` 枚举项、`EndpointBindCause` 类型，以及 `ServerFailure.bind_error` 和 `LocalIoCause::Bind` 的载荷变化；不保留旧载荷兼容入口。`EndpointIoError` 不变，没有 C ABI 或协议改动。更广的 gate/context I/O 折叠继续列为 R17 剩余工作，不借这次重构所有错误机制。
+原因字符串由现有原生枚举提供一处映射，inspect、CLI 和 CoreError 共用；删除重复的 Python native/CLI 枚举到字符串表。公开 Rust 变化为新增 `EndpointUnverifiedReason` 枚举项、`EndpointBindCause` 类型，以及 `ServerFailure.bind_cause` 和 `LocalIoCause::Bind` 的载荷变化；不保留旧载荷兼容入口。`EndpointIoError` 不变，没有 C ABI 或协议改动。更广的 gate/context I/O 折叠继续列为 R17 剩余工作，不借这次重构所有错误机制。
 
 ## 自身监听凭据接口
 
@@ -160,6 +160,6 @@ getter 返回的是查询时捕获的凭据，不保证下一时刻仍在监听�
 5. 不同磁盘格式不得通过显式自定义 root 共用同一物理目录。违反时，缺少本方租约、活监听及身份不符仍阻止删除对方 socket/lease，旧 lease 不会通过新协调目录被删除；计数和错误原因可能不准，这种配置不受支持。
 6. 所有 Unix schema 3 凭据一律拒绝，无 device 忽略兼容。应用须从升级后的 listener 重新取得 schema 4；旧凭据不能用于新目录实例。Windows schema 1 不变。
 7. `cc.server_credential()` 直接返回现有生命周期 watch 持有的监听凭据快照；它不证明 listener 仍存活、不授予权限，终态后为 None。服务进程无需 inspect 自己来获取它；第三方观察仍使用 inspect，忙时的 retryable 语义保持。Windows 返回 kernel-managed 凭据，精确文件回收为 not-applicable。
-8. 低层 Rust 新增 reason 枚举项、绑定专用 `EndpointBindCause` 与只读凭据 getter；`ServerFailure.bind_error` 和 `LocalIoCause::Bind` 改用该载荷，不保留旧载荷兼容。`EndpointIoError` 与 sweep OS 原因形状保持；无 C/FFI ABI、IPC、SHM、业务帧或 owner 控制消息变化。列明实际验证平台、实现来源与 CI 链接，未运行的实验照实标明。
+8. 低层 Rust 新增 reason 枚举项、绑定专用 `EndpointBindCause` 与只读凭据 getter；`ServerFailure.bind_cause` 和 `LocalIoCause::Bind` 改用该载荷，不保留旧载荷兼容。`EndpointIoError` 与 sweep OS 原因形状保持；无 C/FFI ABI、IPC、SHM、业务帧或 owner 控制消息变化。列明实际验证平台、实现来源与 CI 链接，未运行的实验照实标明。
 
 本方案不触碰 hey-my-buddy 仓库或其用户状态，不读取/清理历史 IPC 目录，不新增后台清扫。构建结束清理本批可再生成产物，保留源代码、日志和验收记录。R17c 独立完成原有门禁；C04、R35、两份会话重构和更广 R17 剩余项继续单列。

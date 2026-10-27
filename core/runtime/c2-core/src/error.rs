@@ -7,7 +7,7 @@ use c2_error::{C2Error, C2ErrorEnvelope, ErrorCode};
 use c2_http::client::HttpError;
 use c2_ipc::IpcError;
 use c2_ipc::client::ChunkError;
-use c2_local::EndpointIoError;
+use c2_local::{EndpointBindCause, EndpointIoError};
 use c2_server::{ServerError, ServerFailure, ServerStartupTimeout};
 
 use crate::RegisterFailureOutcome;
@@ -126,7 +126,7 @@ impl From<ServerError> for LifecycleError {
 /// Facts from the actual local endpoint operation, not a retry or cleanup permit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalIoCause {
-    Bind(EndpointIoError),
+    Bind(EndpointBindCause),
     Connect(EndpointIoError),
 }
 
@@ -140,7 +140,8 @@ impl LocalIoCause {
 
     pub fn error(self) -> EndpointIoError {
         match self {
-            Self::Bind(error) | Self::Connect(error) => error,
+            Self::Bind(cause) => cause.error,
+            Self::Connect(error) => error,
         }
     }
 }
@@ -148,7 +149,7 @@ impl LocalIoCause {
 impl LifecycleError {
     pub fn local_io_cause(&self) -> Option<LocalIoCause> {
         match self {
-            Self::Server(failure) => failure.bind_error.map(LocalIoCause::Bind),
+            Self::Server(failure) => failure.bind_cause.map(LocalIoCause::Bind),
             _ => None,
         }
     }

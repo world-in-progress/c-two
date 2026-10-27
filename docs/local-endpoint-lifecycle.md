@@ -4,21 +4,23 @@
 
 本文说明原生端点所有权、运行器接入与回收规则。目录配置见 [配置指南](configuration.md#本地端点位置与平台差异)。
 
-本地端点由 Rust `c2-config` 统一派生，SDK、relay 和 c3 使用同一上下文。Unix 默认路径为 `/tmp/c2-<uidhex>/<32 字符标识>`，协调记录包含 nonce gate/marker 与可退休的监听租约；原 gate inode 保持固定直到监听租约释放。Windows 使用当前用户 TokenUser SID 的 Named Pipe 和不可继承的内核监听租约。调用方传逻辑 `ipc://` 地址，系统自动选择后端；凭据中的 `managed-v2` / `named-pipe` 是格式元数据。
+本地端点由 Rust `c2-config` 统一派生，SDK、relay 和 c3 使用同一上下文。Unix 默认路径为 `/tmp/c2-v3-<uidhex>/<32 字符标识>`，协调记录包含 nonce gate/marker 与可退休的监听租约；原 gate inode 保持固定直到监听租约释放。Windows 使用当前用户 TokenUser SID 的 Named Pipe 和不可继承的内核监听租约。调用方传逻辑 `ipc://` 地址，系统自动选择后端；凭据中的 `managed-v2` / `named-pipe` 表示后端。
 
-Unix 的最终端点目录由显式代码 `cc.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外用户目录、版本目录或 `.sock` 后缀。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 或准备 owner 接管时冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯上下文查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前用户 TokenUser SID 的 Named Pipe，明确拒绝 Unix root 配置。
+Unix 的最终端点目录由显式代码 `cc.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-v3-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外子目录或 `.sock` 后缀；默认 root 的 `v3` 与 namespace 磁盘格式版本相同，自定义 root 不追加版本名。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 或准备 owner 接管时冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯上下文查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前用户 TokenUser SID 的 Named Pipe，明确拒绝 Unix root 配置。
 
 macOS 还会检查目录句柄上的扩展 ACL：只读、遍历和 deny 条目可用；授予新增、删除、修改属性或权限等能力的 allow 条目会被拒绝，包括继承条目。启动失败会显式释放监听租约锁，重复文件描述符不会继续占有该锁。
 
-macOS 默认命名空间的 socket 路径仍在 `/tmp/c2-<uidhex>`；只有 `.gate`、`.gate.marker` 和 `<标识>.lease` 存放到 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination`。这是系统提供的非临时用户目录，查询发生在原生 I/O 阶段。现存默认目录的路径别名按目录身份共用同一协调器，公开 namespace id 和凭据格式不变；显式别名缺失时仍由应用预建。Linux 与非默认自定义 root 的记录仍与 socket 同目录。
+macOS 默认命名空间的 socket 路径位于 `/tmp/c2-v3-<uidhex>`；只有 `.gate`、`.gate.marker` 和 `<标识>.lease` 存放到 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`。这是系统提供的非临时用户目录，查询发生在原生 I/O 阶段。现存默认目录的路径别名按目录身份共用同一协调器；显式别名缺失时仍由应用预建。Linux 与非默认自定义 root 的记录仍与 socket 同目录。
 
 双目录使用同一 gate 锁并分别验证目录与对象身份，监听器还持有原目录句柄直到租约释放。正常 close/Drop 回收自身 socket 和 lease；异常退出后复用精确 reap、有预算的 sweep 或后续 bind。重启或系统清理使 socket 目录消失后，完整且已解锁的 lease 仍可回收，维护接口不会为此重建 socket 目录；存活租约仍拒绝第二次绑定。目录替换、损坏记录继续拒绝删除。
 
-协调记录本身有清理场合：每个端点的 lease 随上述原生收尾撤回，失败回滚只撤回本次创建项；损坏历史 lease 保留待单独处理。gate/marker 是固定协调身份，在线不删除；没有新增后台清扫。切换旧版布局须先停止并禁止重启所有旧进程，将旧 socket 目录完整归档，再由新版初始化同名目录。该操作须单独安排；新版不在线迁移历史记录，也不与旧版共享该命名空间。
+Unix namespace 磁盘格式为 3，gate、marker 和 lease record 共用此版本；固定魔数 `c2mgatv2` / `c2mgrec2` 的末位仍表示 managed-v2 后端。gate 为 25 字节，marker 为 33 字节，lease record 固定头为 51 字节；持久身份不存储 device，record 也不再存储 `RECORD_PROTOCOL`。同一时刻的目录和文件核对仍使用 dev+ino，owner `context_digest` 及其 domain 保持原样。入口遇到可辨认的异版本 gate/marker 时报告 `unsupported-namespace-format`，不解释旧正文或采用旧记录。
+
+协调记录本身有清理场合：每个端点的 lease 随上述原生收尾撤回，失败回滚只撤回本次创建项；损坏历史 lease 保留待单独处理。gate/marker 是固定协调身份，在线不删除；没有新增后台清扫。默认目录随磁盘格式改为版本化目录，旧默认目录不会被新版读取、删除或同名重建；同机 Python、Rust、c3 和 Node 程序应一起升级。历史旧目录若需人工清理，须先确认所有旧进程已退出并禁止重启。不同磁盘格式显式共享同一个自定义物理 root 不受支持；该 root 遇到 `unsupported-namespace-format` 时，只能在所有使用者退出且不会重启、整个 root 已安全离线归档后，由新格式重新建立，不能在线迁移或采用旧记录。即使误配共根，身份核验仍阻止删除对方端点，但计数和拒绝原因可能不准确。
 
 Unix bind 初始化失败时，只撤回本次新建且仍由原目录、gate 和文件身份确认的 lease；若已经绑定 socket，须先确认该 socket 已安全撤回。既有 lease、替换项及无法确认身份的对象继续保留。这一回滚利用当前调用仍持有的创建证明，不扩大历史损坏记录的 reap/sweep 权限，也不保证进程在初始化中崩溃后的自动清理。
 
-Unix 凭据统一使用既有 schema 3，记录最终 root、namespace id、incarnation 与 socket 身份；编码、解码和 CLI 读取共用 32 KiB 上限。Windows 保持 kernel-managed schema 1。inspect/reap/sweep 使用凭据捕获的上下文，显式传入不一致的 root 在访问目标前被拒绝。凭据中的 socket 完整路径由原生配置派生，不作为输入字段；凭据自身不授予删除权限。
+Unix 凭据使用 schema 4，记录最终 root、namespace id、incarnation 及 socket 的 inode、ctime，不存储 device；schema 3 一律拒绝。编码、解码和 CLI 读取共用 32 KiB 上限。Windows 保持 kernel-managed schema 1，inspect 为 not-applicable，reap 为 NotApplicable。inspect/reap/sweep 使用凭据捕获的上下文，显式传入不一致的 root 在访问目标前被拒绝。凭据中的 socket 完整路径由原生配置派生，不作为输入字段；凭据自身不授予删除权限。
 
 以下 owner 接口和 grace 语义适用于 C-Two 0.8.0，升级范围见[发布与迁移说明](releases/0.8.0.md)。默认生命周期为 `Persistent`，常驻服务直到显式关闭；普通业务连接断开、idle 驱逐、relay 重连不结束服务。只为一个控制器独占管理整个 Runtime 的专用子进程选择 `OwnerBound`。`control, receiver = cc.owner_control_pair()` 返回 `OwnerControl` 和一次性 `NativeOwnerBootstrap`；Rust 对应 `OwnerControl` 和 `OwnerBootstrap`。控制器保存 control，用 `cc.spawn_owned_child(receiver, program, args)` 只向目标子进程转移 bootstrap；`receiver` 是保留的参数名。子进程显式调用 `bootstrap = cc.adopt_owner_stdin()`，并在 `register()` 前设置 `cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(owner_missing_grace_seconds=3.0), owner_control=bootstrap)`。
 
@@ -64,9 +66,16 @@ control = prepared.commit(timeout=1.0)  # 每个准备对象只提交一次；�
 
 Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时重试暂时连接失败。开始写入后，写入失败、ACK 丢失或超时均返回现有未确认结果，不再重连重发；未确认不证明服务端没有执行。这样同地址重新绑定的新实例不会收到本次调用的重发。ping 继续保留探测重试，首次观察到端点不存在的处理与原总预算保持。
 
-运行器在服务就绪后调用 cc.inspect_endpoint(address)，保存 present 结果中的 EndpointCredential。present 只表示对象被观察，不证明进程存活。WouldBlock 是协调争用，不能视为死亡。子进程正常退出或 kill()+wait() 确认退出后，再用 cc.reap_endpoint(address, credential) 精确收尾；旧凭据不能删除新 incarnation。
+服务进程可在监听 Ready 后直接调用 `cc.server_credential() -> EndpointCredential | None` 并把凭据交给控制器；此查询读取现有生命周期 watch 中由 listener 发布的值，不调用 inspect、不做文件 I/O、不取 namespace gate，也不等待 readiness。Ready 和仍持有 listener 的 Stopping 阶段有值；启动前、绑定失败及 Stopped/Failed 终态返回 None。run 取消到现有 finalize 发布终态之间允许返回旧快照。控制器也可在协调 gate 空闲时调用 `cc.inspect_endpoint(address)` 取得 present 凭据；present 和 getter 快照均不证明存活或授予删除、owner 权限，WouldBlock 表示协调争用。子进程正常退出或 kill()+wait() 确认退出后，再用 `cc.reap_endpoint(address, credential)` 精确收尾；旧凭据不能删除新 incarnation。Windows getter 返回 kernel-managed schema 1 凭据，但 reap 为 NotApplicable。
 
-`cc.EndpointCredential` 是不可变原生对象；inspect 直接交付该对象，reap 接收同一对象。需要保存或跨进程传递时显式使用 `credential.to_json()` 与 `cc.EndpointCredential.from_json(document=...)`，两者继续执行唯一 Rust codec 的严格校验和 32 KiB 限制；inspect 本身不保证 JSON 导出成功。凭据不能手工构造、继承、修改或浅复制，同进程可共享其引用。Python 包装壳、`_native` 槽和旧 `_native.PyEndpointCredential` 导出已退出，见[未发布变更](releases/unreleased.md)。
+`cc.EndpointCredential` 是不可变原生对象；server_credential 与 inspect 交付同一类型，reap 接收该对象。需要保存或跨进程传递时显式使用 `credential.to_json()` 与 `cc.EndpointCredential.from_json(document=...)`，两者继续执行唯一 Rust codec 的严格校验和 32 KiB 限制；inspect 本身不保证 JSON 导出成功。凭据不能手工构造、继承、修改或浅复制，同进程可共享其引用。Python 包装壳、`_native` 槽和旧 `_native.PyEndpointCredential` 导出已退出，见[未发布变更](releases/unreleased.md)。
+
+```python
+import c_two as cc
+
+cc.register(Grid, GridResource(), name="grid")
+credential = cc.server_credential()  # Listener 已就绪；可交给控制器保存。
+```
 
 需要续扫时使用 cc.sweep_endpoints(addresses=[本次运行的逻辑地址], max_entries=64, max_ms=10) 的 context manager 和 next_batch()；只在原生报告 round_complete 时记为本轮完成，中断或命名空间变化单独处理。c3 endpoint inspect/reap/sweep 调用同一原生机制，sweep 可重复传 --address，需要非默认 root 时传 --ipc-root（或环境变量 C2_IPC_ROOT）。运行器不拼 OS 路径，不直接 unlink。
 
@@ -82,9 +91,9 @@ Windows 在发送数据或控制字节前，核对实际管道对象的所有者
 
 从 0.8.1 起，启动期限通过 `CoreError.lifecycle_kind='startup_timeout'`、`startup_stage` 和 `timeout_seconds` 识别；本地 bind 失败的消息不再加错误的 `config error` 前缀，原 OS 字段保持。注册前可用 `cc.set_server(startup_timeout=...)` 设置等待预算；有限默认值、冻结与收尾边界见[启动期限说明](configuration.md#服务启动期限)。
 
-公开的 `c_two.error.CoreError` 提供 `io_operation`（`bind` 或 `connect`）、`io_kind`（`permission_denied`、`not_found`、`connection_refused`、`address_in_use`、`other`）及 `raw_os_error`（原始 errno/Win32 码，无系统码时为 `None`）。这些字段描述实际本地操作；配置、握手、合同及期限失败没有本地原因，三个字段均为 `None`。Windows PIPE_BUSY 等待沿用原连接预算，期限耗尽不冒充 OS 错误；C-Two listener lease 冲突可以是 `address_in_use` 且没有 Win32 码。
+公开的 `c_two.error.CoreError` 提供 `io_operation`（`bind` 或 `connect`）、`io_kind`（`permission_denied`、`not_found`、`connection_refused`、`address_in_use`、`other`）及 `raw_os_error`（原始 errno/Win32 码，无系统码时为 `None`）。绑定时无法核验端点身份会给出 `io_kind=other`、原生 `InvalidData` 和 `endpoint_unverified_reason`，其有限字符串集合与 inspect.reason 相同；这种策略拒绝没有伪造 errno。真实 OS 错误保留原 kind/errno。配置、握手、合同及期限失败没有本地原因。Windows PIPE_BUSY 等待沿用原连接预算；协调 gate 等待耗尽为 `WouldBlock`，仍存活的地址或 listener lease 冲突为 `AddrInUse`。
 
-Rust Core 与 SDK 错误通过 `local_io_cause() -> Option<LocalIoCause>` 暴露原因，`operation()` 和 `error()` 分别提供操作及已有 `EndpointIoError`。原 readiness watch 传递 `ServerFailure { message, bind_error, startup_timeout }`，替换 `ServerLifecycleState::Failed` 与 `LifecycleError::Server` 的字符串负载。低层穷尽匹配需要包含 `IpcError::Connect`、`ServerError::Bind` / `Failed` / `StartupTimeout`；Core 通过 `LifecycleError::StartupTimeout` 暴露启动期限。Rust 调用者需要重新编译，没有旧负载或兼容入口。ABI 与协议版本不变。
+Rust Core 与 SDK 错误通过 `local_io_cause() -> Option<LocalIoCause>` 暴露原因，`operation()` 和 `error()` 分别提供操作及不变的 `EndpointIoError`。绑定分支 `LocalIoCause::Bind(EndpointBindCause)` 包含 `error` 和可选的 `unverified_reason`；连接分支仍持有 `EndpointIoError`。readiness watch 传递 `ServerFailure { message, bind_cause, startup_timeout }`，其中 `bind_cause` 使用同一 `EndpointBindCause`。低层穷尽匹配需要包含 `IpcError::Connect`、`ServerError::Bind` / `Failed` / `StartupTimeout`；Core 通过 `LifecycleError::StartupTimeout` 暴露启动期限。Rust 调用者需要重新编译，没有旧负载或兼容入口。ABI 与协议版本不变。
 
 目录上下文保留原始 OS kind/code，外层目录策略仍按原规则拒绝。可读消息、错误顺序、重试分类和期限含义保持原样。原因字段不能证明进程死亡，也不授予启动、回退或清理权限；控制者仍须遵循已有监听所有权与严格身份回收机制。端点维护 API 沿用现有 ErrorKind 文本格式。
 
@@ -105,7 +114,7 @@ except CoreError as exc:
 
 所有实例都具备类中声明的字段；可选值缺省为 `None`，`details` 为独立字典。`str(exc)` 与 `args[0]` 保留外层原始诊断；Python 复制和 pickle 往返保留字段，不改变 portable 错误协议。全部字段及取值范围见[字段表](local-endpoint-lifecycle.en.md#public-structured-python-errors)。
 
-`category` 为 `semantic / contract / admission / transport / lifecycle / protocol_version_mismatch`；`transport_kind` 为 `ipc / http / None`；`transport_phase` 为 `str / None`：Core 传输错误产生 `pre_dispatch / dispatch_uncertain`，分别表示业务发送前、不能确定对端是否执行；语义错误原样保留对端任意诊断字符串，不代表可信传输分类。`io_kind` 为 `permission_denied / not_found / connection_refused / address_in_use / other / None`；`raw_os_error` 仅保留真实 errno/Win32 码，无原始系统码的策略拒绝及非 I/O 失败为 `None`。这些字段不自行授权重试或清理。`local_protocol_version` / `peer_protocol_version` 仅在 `protocol_version_mismatch` 时为非零 u32（例如本端 14、对端 15），其他错误均为 `None`；该错误 `transport_kind='ipc'`、`transport_phase='pre_dispatch'`、`fallback_eligible=False`，`code`、`name`、`error_bytes` 与 OS cause 三字段为 `None`，且为终态事实，不做路由/HTTP fallback 或自动重试；畸形/截断前导保持既有 transport/protocol 分类，不伪造对端版本，详见[握手规范](ipc-handshake.md)。
+`category` 为 `semantic / contract / admission / transport / lifecycle / protocol_version_mismatch`；`transport_kind` 为 `ipc / http / None`；`transport_phase` 为 `str / None`：Core 传输错误产生 `pre_dispatch / dispatch_uncertain`，分别表示业务发送前、不能确定对端是否执行；语义错误原样保留对端任意诊断字符串，不代表可信传输分类。`io_kind` 为 `permission_denied / not_found / connection_refused / address_in_use / other / None`；`endpoint_unverified_reason` 为 `unsafe-directory / symlink / unexpected-object / foreign-owner / missing-ownership / invalid-ownership / invalid-record / record-mismatch / coordinator-missing / coordinator-replaced / initialization-incomplete / unsupported-namespace-format / None`，仅绑定无法核验时设置，与 inspect.reason 共用原生字符串；`raw_os_error` 仅保留真实 errno/Win32 码，无原始系统码的策略拒绝及非 I/O 失败为 `None`。这些字段不自行授权重试或清理。`local_protocol_version` / `peer_protocol_version` 仅在 `protocol_version_mismatch` 时为非零 u32（例如本端 14、对端 15），其他错误均为 `None`；该错误 `transport_kind='ipc'`、`transport_phase='pre_dispatch'`、`fallback_eligible=False`，`code`、`name`、`error_bytes` 与 OS cause 三字段为 `None`，且为终态事实，不做路由/HTTP fallback 或自动重试；畸形/截断前导保持既有 transport/protocol 分类，不伪造对端版本，详见[握手规范](ipc-handshake.md)。
 
 `lifecycle_kind`、启动阶段/秒数、HTTP 状态、登记失败来源及 rollback/relay cleanup 结果继续来自原 Core 错误链；结构化字段并不重新执行事务。普通导入仍不加载 FastDB 或 NumPy。
 

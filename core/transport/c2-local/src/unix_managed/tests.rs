@@ -57,6 +57,333 @@ fn managed_endpoint_at(root: &Path, label: &str) -> LocalEndpoint {
         .unwrap()
 }
 
+fn assert_unverified_bind(error: &io::Error, reason: EndpointUnverifiedReason) {
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    let cause = crate::EndpointBindCause::from(error);
+    assert_eq!(cause.error.kind, io::ErrorKind::InvalidData);
+    assert_eq!(cause.error.raw_os_error, None);
+    assert_eq!(cause.unverified_reason, Some(reason));
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<EndpointUnverifiedReason>()),
+        Some(&reason),
+    );
+}
+
+#[test]
+fn bound_guard_keeps_live_device_identity_after_persistent_identity_drops_it() {
+    let fixture = TestNamespace::new();
+    let root = fixture.path();
+    let endpoint = managed_endpoint_at(root, "guard-device");
+    let namespace = open_root_bounded(root, true).unwrap();
+    let names = managed_names(&endpoint).unwrap();
+    let lease = namespace
+        .directories
+        .records
+        .open_file(
+            &names.lock,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+        .unwrap()
+        .unwrap();
+    let _socket = bind_in_verified_directory(&namespace, &names).unwrap();
+    let guard = BoundSocketGuard::capture(
+        namespace.directory(),
+        &namespace.directories.records,
+        &names,
+        &lease,
+    )
+    .unwrap();
+    let current = namespace.directory().stat(&names.socket).unwrap().unwrap();
+    let mut different_device = current;
+    different_device.st_dev += 1;
+    assert_eq!(
+        SocketIdentity::from_stat(&current),
+        SocketIdentity::from_stat(&different_device)
+    );
+    assert!(guard.matches(&current));
+    assert!(!guard.matches(&different_device));
+    drop(guard);
+    assert!(!socket_path(&endpoint).exists());
+    fs::write(socket_path(&endpoint), b"foreign").unwrap();
+    let error = BoundSocketGuard::capture(
+        namespace.directory(),
+        &namespace.directories.records,
+        &names,
+        &lease,
+    )
+    .err()
+    .unwrap();
+    assert_unverified_bind(&error, EndpointUnverifiedReason::UnexpectedObject);
+    fs::remove_file(socket_path(&endpoint)).unwrap();
+}
+
+#[test]
+fn bind_context_capture_keeps_named_reason_without_changing_read_only_context_kind() {
+    let fixture = TestNamespace::new();
+    let root = fixture.path();
+    test_namespace_root(root).unwrap();
+    let endpoint = managed_endpoint_at(root, "owner-context-reason");
+    let namespace = ManagedNamespace::open_root(root, false, false).unwrap();
+    let marker = root.join(MARKER_NAME);
+    let mut old = fs::read(&marker).unwrap();
+    old[8] = 2;
+    fs::write(&marker, &old).unwrap();
+    // This namespace was already admitted. A subsequent format replacement
+    // fails its identity recheck; only a fresh namespace entry classifies format.
+    let error = ContextBinding::from_namespace(root, &namespace)
+        .err()
+        .unwrap();
+    assert!(matches!(
+        error,
+        NamespaceError::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
+    ));
+    assert_unverified_bind(
+        &namespace_bind_error(error),
+        EndpointUnverifiedReason::CoordinatorReplaced,
+    );
+    drop(namespace);
+    let context_error = ContextBinding::capture(&endpoint).err().unwrap();
+    assert_eq!(context_error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        context_error
+            .to_string()
+            .contains("endpoint context is unverifiable: UnsupportedNamespaceFormat")
+    );
+}
+
+#[test]
+fn persistent_socket_identity_ignores_device_but_live_file_identity_checks_it() {
+    let mut before = unsafe { std::mem::zeroed::<libc::stat>() };
+    before.st_dev = 7;
+    before.st_ino = 11;
+    before.st_ctime = 13;
+    before.st_ctime_nsec = 17;
+    let mut after = before;
+    after.st_dev = 23;
+    assert_eq!(
+        SocketIdentity::from_stat(&before),
+        SocketIdentity::from_stat(&after)
+    );
+    assert!(!same_file(&before, &after));
+    after.st_dev = before.st_dev;
+    after.st_ino += 1;
+    assert_ne!(
+        SocketIdentity::from_stat(&before),
+        SocketIdentity::from_stat(&after)
+    );
+    after.st_ino = before.st_ino;
+    after.st_ctime += 1;
+    assert_ne!(
+        SocketIdentity::from_stat(&before),
+        SocketIdentity::from_stat(&after)
+    );
+    after.st_ctime = before.st_ctime;
+    after.st_ctime_nsec += 1;
+    assert_ne!(
+        SocketIdentity::from_stat(&before),
+        SocketIdentity::from_stat(&after)
+    );
+}
+
+#[test]
+fn persistent_marker_identity_ignores_device_but_keeps_inode() {
+    let mut before = unsafe { std::mem::zeroed::<libc::stat>() };
+    before.st_dev = 7;
+    before.st_ino = 11;
+    // Independent format-3 bytes, including the nonce checked by the I/O path.
+    let mut marker = b"c2mgatv2\x03".to_vec();
+    marker.extend_from_slice(&11_u64.to_le_bytes());
+    marker.extend_from_slice(&[19; 16]);
+    assert!(marker_matches_gate_inode(&marker, &before));
+    let mut after = before;
+    after.st_dev = 23;
+    assert!(marker_matches_gate_inode(&marker, &after));
+    assert!(!same_file(&before, &after));
+    after.st_ino += 1;
+    assert!(!marker_matches_gate_inode(&marker, &after));
+}
+
+#[tokio::test]
+async fn bind_rejects_unknown_socket_and_missing_lease_with_named_causes() {
+    let fixture = TestNamespace::new();
+    let root = fixture.path();
+    test_namespace_root(root).unwrap();
+    let target = root.join("unrelated");
+    fs::write(&target, b"unrelated").unwrap();
+    for (label, reason, make_entry) in [
+        ("symlink", EndpointUnverifiedReason::Symlink, true),
+        ("file", EndpointUnverifiedReason::UnexpectedObject, false),
+    ] {
+        let endpoint = managed_endpoint_at(root, label);
+        let socket = socket_path(&endpoint);
+        if make_entry {
+            std::os::unix::fs::symlink(&target, &socket).unwrap();
+        } else {
+            fs::write(&socket, b"unrelated").unwrap();
+        }
+        let error = bind_managed_at(&endpoint, root).err().unwrap();
+        assert_unverified_bind(&error, reason);
+        assert!(!lease_path_at(root, &endpoint).exists());
+        assert!(socket.exists() || socket.is_symlink());
+        fs::remove_file(socket).unwrap();
+    }
+    let endpoint = managed_endpoint_at(root, "missing-lease");
+    let socket = socket_path(&endpoint);
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    let error = bind_managed_at(&endpoint, root).err().unwrap();
+    assert_unverified_bind(&error, EndpointUnverifiedReason::MissingOwnership);
+    assert!(!lease_path_at(root, &endpoint).exists());
+    assert!(socket.exists());
+}
+
+#[tokio::test]
+async fn bind_rejects_invalid_and_mismatched_existing_records() {
+    let fixture = TestNamespace::new();
+    let root = fixture.path();
+    test_namespace_root(root).unwrap();
+    for (label, reason) in [
+        ("invalid-record", EndpointUnverifiedReason::InvalidRecord),
+        ("old-record", EndpointUnverifiedReason::InvalidRecord),
+        ("wrong-record", EndpointUnverifiedReason::RecordMismatch),
+    ] {
+        let endpoint = managed_endpoint_at(root, label);
+        let socket = socket_path(&endpoint);
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let lease = lease_path_at(root, &endpoint);
+        if label == "invalid-record" {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&lease)
+                .unwrap();
+        } else if label == "old-record" {
+            let identity = identity_of(&socket);
+            let address = endpoint.address().as_bytes();
+            let mut old = Vec::with_capacity(60 + address.len());
+            old.extend_from_slice(b"c2mgrec2");
+            old.extend_from_slice(&[2, 2]); // old format and protocol bytes
+            old.extend_from_slice(&(address.len() as u16).to_le_bytes());
+            old.extend_from_slice(&[0x42; 16]);
+            old.extend_from_slice(&fs::symlink_metadata(&socket).unwrap().dev().to_le_bytes());
+            old.extend_from_slice(&identity.inode.to_le_bytes());
+            old.extend_from_slice(&identity.changed_secs.to_le_bytes());
+            old.extend_from_slice(&identity.changed_nanos.to_le_bytes());
+            old.extend_from_slice(address);
+            assert_eq!(old.len(), 60 + address.len());
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&lease)
+                .unwrap();
+            file.write_all(&old).unwrap();
+            file.sync_all().unwrap();
+        } else {
+            write_lease(
+                &lease,
+                &OwnerRecord {
+                    address: "ipc://different-address".into(),
+                    incarnation: [0x42; 16],
+                    identity: identity_of(&socket),
+                },
+            );
+        }
+        let before = fs::read(&lease).unwrap();
+        let error = bind_managed_at(&endpoint, root).err().unwrap();
+        assert_unverified_bind(&error, reason);
+        assert_eq!(fs::read(&lease).unwrap(), before);
+        assert!(socket.exists());
+    }
+}
+
+#[test]
+fn namespace_entry_rejects_recognizable_other_formats_before_mutation() {
+    let fixture = TestNamespace::new();
+    let root = fixture.path();
+    test_namespace_root(root).unwrap();
+    let endpoint = managed_endpoint_at(root, "format-check");
+    let gate = root.join(GATE_NAME);
+    let marker = root.join(MARKER_NAME);
+    let gate_bytes = fs::read(&gate).unwrap();
+    let marker_bytes = fs::read(&marker).unwrap();
+    assert_eq!(gate_bytes.len(), 25);
+    assert_eq!(marker_bytes.len(), 33);
+    for version in [1, 2, 4, 255] {
+        for path in [&gate, &marker] {
+            let mut foreign = if path == &gate {
+                gate_bytes.clone()
+            } else {
+                marker_bytes.clone()
+            };
+            foreign[8] = version;
+            if path == &marker && version == 2 {
+                foreign.extend_from_slice(&[0; 8]);
+            }
+            fs::write(path, &foreign).unwrap();
+            assert!(matches!(
+                inspect_managed_at(&endpoint, root),
+                EndpointInspection::Unverified(
+                    EndpointUnverifiedReason::UnsupportedNamespaceFormat
+                )
+            ));
+            let error = bind_managed_at(&endpoint, root).err().unwrap();
+            assert_unverified_bind(&error, EndpointUnverifiedReason::UnsupportedNamespaceFormat);
+            assert_eq!(fs::read(path).unwrap(), foreign);
+            assert!(!socket_path(&endpoint).exists());
+            assert!(!lease_path_at(root, &endpoint).exists());
+            fs::write(
+                path,
+                if path == &gate {
+                    &gate_bytes
+                } else {
+                    &marker_bytes
+                },
+            )
+            .unwrap();
+        }
+    }
+    let mut wrong_magic = marker_bytes.clone();
+    wrong_magic[7] = b'3';
+    fs::write(&marker, &wrong_magic).unwrap();
+    let error = bind_managed_at(&endpoint, root).err().unwrap();
+    assert_unverified_bind(&error, EndpointUnverifiedReason::CoordinatorReplaced);
+    assert_eq!(fs::read(&marker).unwrap(), wrong_magic);
+    fs::write(&marker, &marker_bytes).unwrap();
+    let mut wrong_gate = gate_bytes.clone();
+    wrong_gate[7] = b'3';
+    fs::write(&gate, &wrong_gate).unwrap();
+    let error = bind_managed_at(&endpoint, root).err().unwrap();
+    assert_unverified_bind(&error, EndpointUnverifiedReason::CoordinatorReplaced);
+    fs::write(&gate, &gate_bytes[..8]).unwrap();
+    let error = bind_managed_at(&endpoint, root).err().unwrap();
+    assert_unverified_bind(&error, EndpointUnverifiedReason::CoordinatorReplaced);
+}
+
+#[test]
+fn custom_root_foreign_format_preserves_existing_slot() {
+    let fixture = TestNamespace::new();
+    let root = fixture.path();
+    test_namespace_root(root).unwrap();
+    let endpoint = managed_endpoint_at(root, "foreign-format-slot");
+    let socket = socket_path(&endpoint);
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    let original = identity_of(&socket);
+    let lease = lease_path_at(root, &endpoint);
+    fs::write(&lease, b"foreign-format-lease").unwrap();
+    let mut gate = fs::read(root.join(GATE_NAME)).unwrap();
+    gate[8] = 2;
+    fs::write(root.join(GATE_NAME), &gate).unwrap();
+    let error = bind_managed_at(&endpoint, root).err().unwrap();
+    assert_unverified_bind(&error, EndpointUnverifiedReason::UnsupportedNamespaceFormat);
+    assert_eq!(identity_of(&socket), original);
+    assert_eq!(fs::read(lease).unwrap(), b"foreign-format-lease");
+    assert_eq!(fs::read(root.join(GATE_NAME)).unwrap(), gate);
+}
+
 fn sweep_at(root: &Path) -> io::Result<ManagedSweep> {
     ManagedSweep::for_endpoint(&context_for_namespace(root).endpoint("ipc://sweep-fixture")?)
 }
@@ -79,7 +406,6 @@ fn context_mismatch_is_refused_before_any_namespace_access() {
     let credential = EndpointCredential::unix_managed(
         ea.clone(),
         SocketIdentity {
-            device: 1,
             inode: 2,
             changed_secs: 3,
             changed_nanos: 4,
@@ -141,7 +467,6 @@ fn lease_path(endpoint: &LocalEndpoint) -> PathBuf {
 fn identity_of(path: &Path) -> SocketIdentity {
     let metadata = std::fs::symlink_metadata(path).unwrap();
     SocketIdentity {
-        device: metadata.dev(),
         inode: metadata.ino(),
         changed_secs: metadata.ctime(),
         changed_nanos: metadata.ctime_nsec(),
@@ -546,7 +871,6 @@ fn managed_absent_reap_needs_an_independent_namespace() {
         address: endpoint.address().to_owned(),
         incarnation: [0x5a; 16],
         identity: SocketIdentity {
-            device: 1,
             inode: 2,
             changed_secs: 3,
             changed_nanos: 4,
@@ -689,9 +1013,9 @@ async fn managed_missing_or_replaced_gate_never_creates_a_second_lock() {
         inspect_managed_at(&endpoint, root),
         EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorMissing)
     ));
-    assert_eq!(
-        bind_managed_at(&endpoint, root).err().unwrap().kind(),
-        io::ErrorKind::AddrInUse
+    assert_unverified_bind(
+        &bind_managed_at(&endpoint, root).err().unwrap(),
+        EndpointUnverifiedReason::CoordinatorMissing,
     );
     assert!(
         !gate.exists(),
@@ -719,20 +1043,19 @@ async fn managed_missing_or_replaced_gate_never_creates_a_second_lock() {
 
     // Deterministically model inode ABA even on filesystems that do not reuse
     // the just-unlinked inode: keep the original marker's persistent identity,
-    // but make its device/inode describe the new, empty gate. A dev/ino-only
+    // but make its inode describe the new, empty gate. An inode-only
     // protocol incorrectly adopts this fresh OS object.
     let replacement_identity = identity_of(&gate);
     let mut aba_marker = marker_before.clone();
-    aba_marker[9..17].copy_from_slice(&replacement_identity.device.to_le_bytes());
-    aba_marker[17..25].copy_from_slice(&replacement_identity.inode.to_le_bytes());
+    aba_marker[9..17].copy_from_slice(&replacement_identity.inode.to_le_bytes());
     std::fs::write(root.join(MARKER_NAME), &aba_marker).unwrap();
     assert!(matches!(
         inspect_managed_at(&endpoint, root),
         EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
     ));
-    assert_eq!(
-        bind_managed_at(&endpoint, root).err().unwrap().kind(),
-        io::ErrorKind::AddrInUse
+    assert_unverified_bind(
+        &bind_managed_at(&endpoint, root).err().unwrap(),
+        EndpointUnverifiedReason::CoordinatorReplaced,
     );
     assert_eq!(std::fs::read(root.join(MARKER_NAME)).unwrap(), aba_marker);
     assert_eq!(
@@ -741,7 +1064,7 @@ async fn managed_missing_or_replaced_gate_never_creates_a_second_lock() {
         "replacement gate must never be initialized"
     );
 
-    // A well-formed new coordinator identity is also rejected when dev/ino
+    // A well-formed new coordinator identity is also rejected when inode
     // match the old marker: validity of the object does not prove continuity.
     let mut new_identity = Vec::new();
     new_identity.extend_from_slice(GATE_MAGIC);
@@ -752,9 +1075,9 @@ async fn managed_missing_or_replaced_gate_never_creates_a_second_lock() {
         inspect_managed_at(&endpoint, root),
         EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
     ));
-    assert_eq!(
-        bind_managed_at(&endpoint, root).err().unwrap().kind(),
-        io::ErrorKind::AddrInUse
+    assert_unverified_bind(
+        &bind_managed_at(&endpoint, root).err().unwrap(),
+        EndpointUnverifiedReason::CoordinatorReplaced,
     );
     assert_eq!(std::fs::read(&gate).unwrap(), new_identity);
     assert_eq!(std::fs::read(root.join(MARKER_NAME)).unwrap(), aba_marker);
@@ -789,9 +1112,9 @@ async fn managed_listener_pins_original_gate_until_lease_ownership_ends() {
         inspect_managed_at(&endpoint, root),
         EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
     ));
-    assert_eq!(
-        bind_managed_at(&endpoint, root).err().unwrap().kind(),
-        io::ErrorKind::AddrInUse
+    assert_unverified_bind(
+        &bind_managed_at(&endpoint, root).err().unwrap(),
+        EndpointUnverifiedReason::CoordinatorReplaced,
     );
     let lease = OpenOptions::new()
         .read(true)
@@ -867,7 +1190,6 @@ fn captured_sweep_directory_never_adopts_a_replacement_slot() {
         &OwnerRecord {
             address: endpoint.address().to_owned(),
             identity: SocketIdentity {
-                device: 1,
                 inode: 2,
                 changed_secs: 3,
                 changed_nanos: 4,
@@ -889,7 +1211,7 @@ fn captured_sweep_directory_never_adopts_a_replacement_slot() {
 }
 
 #[tokio::test]
-async fn managed_device_inode_only_marker_is_rejected_without_online_upgrade() {
+async fn managed_old_marker_is_rejected_without_online_upgrade() {
     let namespace = TestNamespace::new();
     let root = namespace.path();
     let endpoint = managed_endpoint_at(&root, "old-gate-marker");
@@ -906,11 +1228,11 @@ async fn managed_device_inode_only_marker_is_rejected_without_online_upgrade() {
     std::fs::write(&gate, []).unwrap();
     assert!(matches!(
         inspect_managed_at(&endpoint, root),
-        EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
+        EndpointInspection::Unverified(EndpointUnverifiedReason::UnsupportedNamespaceFormat)
     ));
-    assert_eq!(
-        bind_managed_at(&endpoint, root).err().unwrap().kind(),
-        io::ErrorKind::AddrInUse
+    assert_unverified_bind(
+        &bind_managed_at(&endpoint, root).err().unwrap(),
+        EndpointUnverifiedReason::UnsupportedNamespaceFormat,
     );
     assert_eq!(std::fs::read(marker).unwrap(), old_marker);
     assert_eq!(std::fs::metadata(gate).unwrap().len(), 0);
@@ -987,7 +1309,6 @@ async fn managed_budgeted_sweep_advances_past_busy_and_corrupt_slots() {
         address: orphan.address().to_owned(),
         incarnation: uuid::Uuid::new_v4().into_bytes(),
         identity: SocketIdentity {
-            device: 11,
             inode: 22,
             changed_secs: 33,
             changed_nanos: 44,
@@ -1505,7 +1826,6 @@ fn managed_record_decode_rejects_hash_only_and_oversized_payloads() {
     let endpoint = managed_endpoint("record-shape");
     let incarnation = uuid::Uuid::new_v4().into_bytes();
     let identity = SocketIdentity {
-        device: 1,
         inode: 2,
         changed_secs: 3,
         changed_nanos: 4,
@@ -1524,8 +1844,8 @@ fn managed_record_decode_rejects_hash_only_and_oversized_payloads() {
     let other = LocalEndpoint::from_address("ipc://record-shape-other").unwrap();
     assert!(!record_matches_endpoint(&record, &other));
 
-    // Undecodable shapes never become a record: truncated, oversized, and a
-    // corrupt protocol byte.
+    // Undecodable shapes never become a record: truncated, oversized, and an
+    // unsupported format version.
     assert_eq!(OwnerRecord::decode(&encoded[..encoded.len() - 1]), None);
     let mut oversized = encoded.clone();
     oversized.push(0);
@@ -1533,9 +1853,32 @@ fn managed_record_decode_rejects_hash_only_and_oversized_payloads() {
     let mut old_format = encoded.clone();
     old_format[8] = 1;
     assert_eq!(OwnerRecord::decode(&old_format), None);
-    let mut wrong_protocol = encoded.clone();
-    wrong_protocol[9] = 1;
-    assert_eq!(OwnerRecord::decode(&wrong_protocol), None);
+}
+
+#[test]
+fn managed_record_format_three_matches_independent_golden() {
+    let record = OwnerRecord {
+        address: "ipc://golden".into(),
+        incarnation: [0x11; 16],
+        identity: SocketIdentity {
+            inode: 0x0102_0304_0506_0708,
+            changed_secs: 42,
+            changed_nanos: 7,
+        },
+    };
+    let mut golden = Vec::new();
+    golden.extend_from_slice(b"c2mgrec2");
+    golden.push(3);
+    golden.extend_from_slice(&[12, 0]);
+    golden.extend_from_slice(&[0x11; 16]);
+    golden.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+    golden.extend_from_slice(&[42, 0, 0, 0, 0, 0, 0, 0]);
+    golden.extend_from_slice(&[7, 0, 0, 0, 0, 0, 0, 0]);
+    golden.extend_from_slice(b"ipc://golden");
+    assert_eq!(RECORD_FIXED_LEN, 51);
+    assert_eq!(golden.len(), 63);
+    assert_eq!(record.encode().unwrap(), golden);
+    assert_eq!(OwnerRecord::decode(&golden), Some(record));
 }
 
 /// P2 blocker: a coordinator held by another process must not block
@@ -1695,7 +2038,7 @@ fn managed_bind_does_not_change_cwd_in_an_independent_subprocess() {
 }
 
 /// A held coordinator must never make `bind_managed_at` wait unboundedly: server
-/// startup reaches it, so a foreign gate holder becomes a bounded `AddrInUse`
+/// startup reaches it, so a foreign gate holder becomes a bounded `WouldBlock`
 /// that the upper start layer can retry with its own timeout.
 #[tokio::test]
 async fn managed_bind_is_bounded_when_the_gate_is_held() {
@@ -1739,7 +2082,7 @@ async fn managed_bind_is_bounded_when_the_gate_is_held() {
         .err()
         .expect("a held gate must refuse a bind, not block it");
     let elapsed = started.elapsed();
-    assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{error}");
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
     assert!(
         elapsed < Duration::from_secs(5),
         "a held gate blocked bind for {elapsed:?}; startup must stay bounded"
@@ -1810,7 +2153,7 @@ async fn managed_record_failures_roll_back_conservatively() {
         let error = bind_managed_at(&endpoint, root)
             .err()
             .expect("a replaced socket entry must fail bind");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert_unverified_bind(&error, EndpointUnverifiedReason::UnexpectedObject);
         let replacement = socket_path_at(root, &endpoint);
         assert!(
             replacement.exists(),
@@ -2448,9 +2791,9 @@ async fn native_unknown_socket_and_unsafe_permissions_are_preserved() {
         !lease.exists(),
         "unknown socket reap must not create a lease"
     );
-    assert_eq!(
-        bind_managed_at(&endpoint, root).err().unwrap().kind(),
-        io::ErrorKind::AddrInUse
+    assert_unverified_bind(
+        &bind_managed_at(&endpoint, root).err().unwrap(),
+        EndpointUnverifiedReason::MissingOwnership,
     );
     assert_eq!(identity_of(&path), identity);
     assert!(!lease.exists(), "refused bind must withdraw its new lease");
@@ -2686,7 +3029,6 @@ async fn directory_policy_and_diagnostics_are_shared_by_all_entry_points() {
     let credential = EndpointCredential::unix_managed(
         endpoint.clone(),
         SocketIdentity {
-            device: 1,
             inode: 2,
             changed_secs: 3,
             changed_nanos: 4,
@@ -2868,7 +3210,6 @@ async fn missing_coordinator_in_0755_directory_is_never_recreated() {
     let credential = EndpointCredential::unix_managed(
         endpoint.clone(),
         SocketIdentity {
-            device: 1,
             inode: 2,
             changed_secs: 3,
             changed_nanos: 4,
@@ -3311,7 +3652,7 @@ async fn binding_rejects_gate_inode_or_nonce_changes_with_strict_marker_checks()
     assert!(binding.validate().is_err());
     assert!(crate::EndpointContextBinding::capture(&endpoint).is_err());
     assert_eq!(
-        fs::read(root.path().join(MARKER_NAME)).unwrap()[25..41],
+        fs::read(root.path().join(MARKER_NAME)).unwrap()[17..33],
         original[9..25]
     );
     file.write_all_at(&original, 0).unwrap();
@@ -3680,10 +4021,7 @@ async fn lease_verification_io_keeps_bind_rollback_and_policy_priority() {
     fs::remove_file(&lease).unwrap();
     assert!(!socket_path(&endpoint).exists() && !lease.exists());
     assert_eq!(policy.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(
-        policy.to_string(),
-        "managed lease is unverifiable: InvalidOwnership"
-    );
+    assert_unverified_bind(&policy, EndpointUnverifiedReason::InvalidOwnership);
     for error in outcomes {
         assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error:?}");
         assert_eq!(error.kind(), io::Error::from_raw_os_error(libc::EIO).kind());
@@ -3827,6 +4165,12 @@ async fn final_lease_stat_short_circuits_directory_and_keeps_ownership_denials()
         .open(&lease)
         .unwrap();
     let opened_stat = fstat(opened.as_raw_fd()).unwrap();
+    let socket_stat = directories
+        .socket_directory()
+        .unwrap()
+        .stat(&names.socket)
+        .unwrap()
+        .unwrap();
     let moved_root = namespace._parent.path().join("moved-ipc");
     fs::rename(root, &moved_root).unwrap();
     fs::create_dir(root).unwrap();
@@ -3836,7 +4180,7 @@ async fn final_lease_stat_short_circuits_directory_and_keeps_ownership_denials()
         &directories.records,
         &names,
         &opened_stat,
-        credential.identity(),
+        &socket_stat,
     );
     assert!(fault::take_if(Failure::FinalLeaseStat));
     fs::remove_dir(root).unwrap();
@@ -3852,7 +4196,7 @@ async fn final_lease_stat_short_circuits_directory_and_keeps_ownership_denials()
         &foreign_records,
         &names,
         &opened_stat,
-        credential.identity(),
+        &socket_stat,
     );
     assert!(fault::take_if(Failure::FinalLeaseStat));
     fs::remove_dir(other.path()).unwrap();
@@ -3864,7 +4208,7 @@ async fn final_lease_stat_short_circuits_directory_and_keeps_ownership_denials()
         &directories.records,
         &names,
         &opened_stat,
-        credential.identity(),
+        &socket_stat,
     );
     fs::write(&lease, b"foreign lease").unwrap();
     let replaced = crate::unix_common::unlink_verified(
@@ -3872,7 +4216,7 @@ async fn final_lease_stat_short_circuits_directory_and_keeps_ownership_denials()
         &directories.records,
         &names,
         &opened_stat,
-        credential.identity(),
+        &socket_stat,
     );
     fs::remove_file(&lease).unwrap();
     std::os::unix::fs::symlink(&moved_lease, &lease).unwrap();
@@ -3881,7 +4225,7 @@ async fn final_lease_stat_short_circuits_directory_and_keeps_ownership_denials()
         &directories.records,
         &names,
         &opened_stat,
-        credential.identity(),
+        &socket_stat,
     );
     fs::remove_file(&lease).unwrap();
     fs::rename(&moved_lease, &lease).unwrap();
@@ -3926,7 +4270,9 @@ async fn final_lease_stat_rollback_keeps_initialization_error() {
     fs::remove_file(&lease).unwrap();
     assert!(!socket.exists() && !lease.exists());
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-    assert!(error
-        .to_string()
-        .contains("injected socket permission failure before rollback stat"));
+    assert!(
+        error
+            .to_string()
+            .contains("injected socket permission failure before rollback stat")
+    );
 }

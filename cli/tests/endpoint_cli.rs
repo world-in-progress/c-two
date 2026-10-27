@@ -111,7 +111,7 @@ fn long_final_directory_supports_cli_credentials_and_exact_maintenance() {
     let host = host_at(&address, &root);
     let document = credential_at(&address, &root);
     assert_eq!(document["unixRoot"], root.to_str().unwrap());
-    assert_eq!(document["schemaVersion"], 3);
+    assert_eq!(document["schemaVersion"], 4);
     let file = root.join("credential.json");
     std::fs::write(&file, document.to_string()).unwrap();
     c3().args(["endpoint", "reap", &address, "--credential"])
@@ -274,7 +274,7 @@ fn reap_captured_context_ignores_env_and_rejects_explicit_other_root() {
     let address = unique_address("captured");
     let host = host_at(&address, root.path());
     let credential = credential_at(&address, root.path());
-    assert_eq!(credential["schemaVersion"], 3);
+    assert_eq!(credential["schemaVersion"], 4);
     let file = root.path().join("credential.json");
     std::fs::write(&file, credential.to_string()).unwrap();
     let missing_root = root.path().join("missing");
@@ -323,7 +323,7 @@ fn described_unix_credential(
     address: &str,
     context: &c2_config::LocalEndpointContext,
 ) -> serde_json::Value {
-    serde_json::json!({"schemaVersion":3,"address":address,"protocol":"managed-v2","platform":"unix","unixRoot":context.unix_root().unwrap(),"namespaceId":context.namespace_id(),"incarnation":"00112233445566778899aabbccddeeff","device":1,"inode":2,"changedSecs":3,"changedNanos":4})
+    serde_json::json!({"schemaVersion":4,"address":address,"protocol":"managed-v2","platform":"unix","unixRoot":context.unix_root().unwrap(),"namespaceId":context.namespace_id(),"incarnation":"00112233445566778899aabbccddeeff","inode":2,"changedSecs":3,"changedNanos":4})
 }
 
 #[cfg(unix)]
@@ -450,7 +450,7 @@ fn invalid_credential() -> (tempfile::TempDir, PathBuf) {
         value.to_string()
     };
     #[cfg(windows)]
-    let document = r#"{"schemaVersion":3,"address":"ipc://c3-cli-bad","protocol":"named-pipe","platform":"windows"}"#;
+    let document = r#"{"schemaVersion":4,"address":"ipc://c3-cli-bad","protocol":"named-pipe","platform":"windows"}"#;
     std::fs::write(&path, document).unwrap();
     (dir, path)
 }
@@ -750,7 +750,7 @@ fn reap_uses_the_native_credential_endpoint() {
             .code(1)
             .stdout(predicate::str::contains(r#""status":"not-applicable""#))
             .stdout(predicate::str::contains("no-filesystem-entry"));
-        let unsupported = serde_json::json!({"schemaVersion":3,"address":address,"protocol":"managed-v2","platform":"unix","incarnation":"00112233445566778899aabbccddeeff","device":1,"inode":2,"changedSecs":3,"changedNanos":4});
+        let unsupported = serde_json::json!({"schemaVersion":4,"address":address,"protocol":"managed-v2","platform":"unix","incarnation":"00112233445566778899aabbccddeeff","inode":2,"changedSecs":3,"changedNanos":4});
         std::fs::write(&path, unsupported.to_string()).unwrap();
         c3().args(["endpoint", "reap", &address])
             .arg("--credential")

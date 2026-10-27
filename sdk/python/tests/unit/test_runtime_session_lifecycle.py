@@ -94,9 +94,13 @@ class TestRuntimeSessionLifecycleProjection:
 
         session = RuntimeSession(server_id='unit-host-started')
         assert session.host_started is False
+        assert session.server_credential is None
         assert session.native_lifecycle_snapshot() is None
         session.ensure_host_started()
         assert session.host_started is True
+        credential = session.server_credential
+        assert type(credential) is cc.EndpointCredential  # No route was registered.
+        assert credential.address == session.server_address
         snapshot = session.native_lifecycle_snapshot()
         assert snapshot['phase'] == 'persistent'
         assert snapshot['terminal'] is False
@@ -106,6 +110,7 @@ class TestRuntimeSessionLifecycleProjection:
         session.shutdown(route_names=[], timeout_seconds=5.0)
         # A completed shutdown releases the session's host handle.
         assert session.host_started is False
+        assert session.server_credential is None
         assert session.native_lifecycle_snapshot()['terminal'] is True
         assert session.native_terminal_outcome() == session.shutdown(route_names=[], timeout_seconds=0)
 
@@ -119,6 +124,7 @@ class TestRuntimeSessionLifecycleProjection:
         assert session.owner_control_attached is False
         # The refused attempt left no host and no consumed capability behind.
         assert session.native_lifecycle_snapshot() is None
+        assert session.server_credential is None
         session.shutdown(route_names=[], timeout_seconds=1.0)
 
 

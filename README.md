@@ -58,7 +58,7 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.
 
 On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
-C3 0.5.0 pairs with C-Two 0.9.0. The published 0.9.0 speaks IPC handshake 13; C/FFI ABI 6 requires a coordinated upgrade, and SHM 3 and owner control 1 keep their formats. Stop old Windows services before upgrading and restarting. See the [0.9.0 migration notes](docs/releases/0.9.0.md). Current source (unpublished) moves the RPC IPC handshake to 14 with a permanent fixed version preamble and typed mismatch errors; it is incompatible with 0.9.0 peers — see the [handshake spec](docs/ipc-handshake.md) and [unreleased notes](docs/releases/unreleased.md).
+C3 0.5.0 pairs with C-Two 0.9.0. The published 0.9.0 speaks IPC handshake 13; C/FFI ABI 6 requires a coordinated upgrade, and SHM 3 and owner control 1 keep their formats. Stop old Windows services before upgrading and restarting. See the [0.9.0 migration notes](docs/releases/0.9.0.md). Current source (unpublished) uses IPC handshake 14, which cannot interoperate with published 0.9.0 IPC 13 peers. It also uses Unix namespace disk format 3 with versioned default directories and provides `cc.server_credential()` after listener readiness. Upgrade the Python and Rust SDKs, c3 and Node consumers on one host together; see the [handshake spec](docs/ipc-handshake.md), [endpoint lifecycle guide](docs/local-endpoint-lifecycle.en.md) and [unreleased notes](docs/releases/unreleased.md).
 
 For source builds and tests, see the [development guide](docs/development.md).
 
@@ -91,7 +91,7 @@ finally:
 
 Run with `python counter.py`. This example uses the same-process path; keep `C2_RELAY_ANCHOR_ADDRESS` unset for local registration.
 
-For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`. The [IPC example](examples/python/ipc_resource.py) shows both sides.
+For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`. A resource process can capture its listener credential with `credential = cc.server_credential()` after registration and pass it to its controller for later exact cleanup. The [IPC example](examples/python/ipc_resource.py) shows both sides.
 
 For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_anchor('http://relay-host:8300')` on both sides, then connect by name. The relay is a separate process. Explicit IPC addresses bypass relay discovery.
 

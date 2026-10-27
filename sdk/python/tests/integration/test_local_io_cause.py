@@ -40,7 +40,7 @@ def diagnostic(error):
     return {key: getattr(error, key) for key in (
         'category', 'lifecycle_kind', 'transport_kind', 'transport_phase',
         'fallback_eligible', 'io_kind', 'raw_os_error', 'io_operation', 'name', 'details', 'message',
-        'startup_stage', 'timeout_seconds',
+        'startup_stage', 'timeout_seconds', 'endpoint_unverified_reason',
     )}
 '''
 
@@ -58,6 +58,66 @@ def _assert_io(report: dict, operation: str, kind: str, raw: int | None) -> None
         kind, raw, operation,
     ), error
     assert 'config error' not in error['message'], error
+    assert error['endpoint_unverified_reason'] is None, error
+
+
+@UNIX_ONLY
+@pytest.mark.parametrize('case,reason', [
+    ('missing-lease', 'missing-ownership'),
+    ('old-format', 'unsupported-namespace-format'),
+])
+def test_bind_unverified_reason_survives_the_startup_watch(case, reason) -> None:
+    with tempfile.TemporaryDirectory(prefix='c2-reason-', dir='/tmp') as container:
+        result = _run_isolated(COMMON + textwrap.dedent(f'''
+            import socket
+            from pathlib import Path
+            root = Path({container!r})
+            cc.set_local_endpoint(root=str(root))
+            # Initialize this private coordinator, then leave no live listener.
+            prepare = _native.RuntimeSession(use_process_relay_anchor=False)
+            prepare.set_local_endpoint(root=str(root))
+            prepare.ensure_host_started()
+            assert prepare.shutdown(timeout_seconds=5)['completed']
+            address = 'ipc://unverified-bind'
+            endpoint = Path(cc.local_endpoint_context().endpoint_name(address))
+            raw_socket = None
+            error = None
+            if {case!r} == 'old-format':
+                gate = root / '.gate'
+                previous = gate.read_bytes()
+                invalid = previous[:8] + bytes([2]) + previous[9:]
+                gate.write_bytes(invalid)
+            else:
+                raw_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                raw_socket.bind(str(endpoint))
+                endpoint.chmod(0o600)
+            try:
+                cc.set_server(server_id=address.removeprefix('ipc://'))
+                try:
+                    cc.register(Echo, Resource(), name='refused')
+                except cc.error.CoreError as exc:
+                    error = diagnostic(exc)
+                observed = cc.inspect_endpoint(address)
+            finally:
+                stopped = cc.shutdown(timeout=5)
+                if raw_socket is not None:
+                    assert endpoint.is_socket()
+                    raw_socket.close()
+                    endpoint.unlink()  # This test's unregistered socket only.
+                else:
+                    assert gate.read_bytes() == invalid
+            assert all(not p.is_socket() and not p.name.endswith('.lease') for p in root.iterdir())
+            print(json.dumps({{'error': error, 'completed': stopped['completed'],
+                              'inspect_reason': observed['reason']}}))
+        '''))
+        report = json.loads(result.stdout)
+        assert report['completed'] and report['error'] is not None, report
+        error = report['error']
+        assert error['category'] == 'lifecycle' and error['lifecycle_kind'] == 'server', error
+        assert (error['io_operation'], error['io_kind'], error['raw_os_error']) == (
+            'bind', 'other', None,
+        ), error
+        assert error['endpoint_unverified_reason'] == report['inspect_reason'] == reason
 
 
 @UNIX_ONLY
@@ -168,6 +228,7 @@ def test_response_admission_preserves_outer_transport_and_inner_semantic_message
                     assert cc.error.CCError.serialize(inner) == native.error_bytes
                     assert all(getattr(native, field) is None for field in (
                         'io_operation', 'io_kind', 'raw_os_error', 'lifecycle_kind',
+                        'endpoint_unverified_reason',
                     ))
                 else:
                     raise AssertionError('response admission unexpectedly succeeded')

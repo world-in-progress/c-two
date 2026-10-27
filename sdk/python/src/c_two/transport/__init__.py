@@ -17,7 +17,7 @@ __all__ = [
     'set_transport_policy', 'set_server', 'set_client',
     'set_relay_anchor',
     'register', 'connect', 'close',
-    'unregister', 'server_address', 'server_id', 'shutdown', 'serve',
+    'unregister', 'server_address', 'server_id', 'server_credential', 'shutdown', 'serve',
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
@@ -40,6 +40,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'unregister':        ('.registry',            'unregister'),
     'server_address':    ('.registry',            'server_address'),
     'server_id':         ('.registry',            'server_id'),
+    'server_credential': ('.registry',            'server_credential'),
     'shutdown':          ('.registry',            'shutdown'),
     'serve':             ('.registry',            'serve'),
 }

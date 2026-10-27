@@ -272,6 +272,14 @@ fn set_io_cause(value: &Bound<'_, PyAny>, cause: Option<LocalIoCause>) {
     set_attr(value, "io_operation", cause.map(LocalIoCause::operation));
     set_attr(
         value,
+        "endpoint_unverified_reason",
+        cause.and_then(|cause| match cause {
+            LocalIoCause::Bind(bind) => bind.unverified_reason.map(|reason| reason.as_str()),
+            LocalIoCause::Connect(_) => None,
+        }),
+    );
+    set_attr(
+        value,
         "io_kind",
         cause.map(|cause| cause.error().category()),
     );

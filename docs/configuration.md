@@ -142,12 +142,12 @@ HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接
 
 | 平台 | 端点 | 位置配置 |
 | --- | --- | --- |
-| Unix | 配置目录内的 UDS | 代码 `cc.set_local_endpoint(root=...)`、环境 `C2_IPC_ROOT`、c3 `--ipc-root`，默认 `/tmp/c2-<uidhex>` |
+| Unix | 配置目录内的 UDS | 代码 `cc.set_local_endpoint(root=...)`、环境 `C2_IPC_ROOT`、c3 `--ipc-root`，默认 `/tmp/c2-v3-<uidhex>` |
 | Windows | 当前用户 TokenUser SID 下的 Named Pipe | 自动选择；Unix root 配置不适用 |
 
 Unix root 是最终端点目录，实际 socket 位于 `<root>/<32 字符标识>`。自定义目录由应用预建，允许 `0755`：当前用户持有目录，具备读、写、遍历权限，组和其他用户没有写权限。默认目录由 C-Two 创建为 `0700`。Socket 在开始监听前设置并核实为 `0600`。路径允许中文和空格，绑定、连接与探测通过目录句柄定位短名称，目录长度受文件系统限制。C-Two 只管理自身端点、租约及协调文件，不修改已有目录权限、不递归创建父目录、不删除应用目录或无关文件。共享本地域的资源进程、客户端和 relay 使用相同 root；root 不改变 SHM 或 file-spill 的位置。配置在首次本地 I/O 尝试时冻结，包括失败的尝试。
 
-macOS 默认命名空间只将 gate/marker/lease 协调记录放到 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination`，socket 路径不变；默认目录的别名共用同一协调器。非默认自定义 root 与 Linux 保持同目录布局。协调记录回收及旧版冷切换边界见[生命周期指南](local-endpoint-lifecycle.md)。
+macOS 默认命名空间只将 gate/marker/lease 协调记录放到 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`，socket 路径不变；默认目录的别名共用同一协调器。非默认自定义 root 与 Linux 保持同目录布局。默认目录中的 `v3` 取自 namespace 磁盘格式版本；自定义 root 不追加版本名。不同格式各用自己的默认目录，旧默认目录无需同名冷切换。显式共享同一自定义物理 root 不受支持；若出现 `unsupported-namespace-format`，须在全部旧进程退出并禁止重启、完整离线归档该 root 后重建。协调记录与精确回收规则见[生命周期指南](local-endpoint-lifecycle.md)。
 
 macOS 会额外拒绝允许修改目录内容、属性或权限的扩展 ACL 条目，包括继承条目；只读、遍历和 deny 条目可用。
 
@@ -155,7 +155,7 @@ macOS 会额外拒绝允许修改目录内容、属性或权限的扩展 ACL 条
 from pathlib import Path
 import c_two as cc
 
-ipc_dir = Path('/Users/me/Library/Application Support/my-app/ipc')
+ipc_dir = Path.home() / 'my-app' / 'ipc'
 ipc_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 cc.set_local_endpoint(root=str(ipc_dir))
 ```

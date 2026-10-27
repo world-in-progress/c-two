@@ -699,6 +699,12 @@ impl Drop for HostInner {
 }
 
 impl Host {
+    /// Read the credential published by this host's bound listener.
+    /// The snapshot does not prove the listener is still alive.
+    pub fn endpoint_credential(&self) -> Option<c2_local::EndpointCredential> {
+        self.inner.server.endpoint_credential()
+    }
+
     /// Exact native endpoint retained for bind, readiness, and credentials.
     pub fn local_endpoint(&self) -> &c2_config::LocalEndpoint {
         self.inner.server.local_endpoint()
@@ -1147,6 +1153,36 @@ fn protocol_violation(message: &str, cause: String, release_error: Option<String
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_host_projects_bound_listener_credential_until_shutdown() {
+        let directory = tempfile::Builder::new()
+            .prefix("c2-host-credential-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let runtime = Runtime::new(crate::RuntimeOptions {
+            server_id: Some(format!("credential-{}", uuid::Uuid::new_v4().simple())),
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap();
+        runtime
+            .set_local_endpoint(c2_config::LocalEndpointOptions {
+                unix_root: Some(directory.path().to_path_buf()),
+            })
+            .unwrap();
+        let host = runtime
+            .host(HostOptions::default().without_relay())
+            .unwrap();
+        let credential = host
+            .endpoint_credential()
+            .expect("bound listener credential");
+        assert_eq!(credential.endpoint(), host.local_endpoint());
+        assert!(host.is_running());
+        assert!(host.shutdown().runtime_barrier_error.is_none());
+        assert!(host.endpoint_credential().is_none());
+    }
 
     #[test]
     fn unrepresentable_startup_timeout_does_not_freeze_configuration() {

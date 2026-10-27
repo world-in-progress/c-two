@@ -120,7 +120,6 @@ impl EndpointCredential {
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UnixSocketIdentity {
-    pub(crate) device: u64,
     pub(crate) inode: u64,
     pub(crate) changed_secs: i64,
     pub(crate) changed_nanos: i64,
@@ -146,7 +145,38 @@ pub enum EndpointUnverifiedReason {
     /// A managed namespace contains endpoint objects but no verifiable first
     /// initialization identity. Nothing in it may be retired automatically.
     InitializationIncomplete,
+    /// A recognizable gate or marker belongs to a different namespace disk
+    /// format and must not be adopted or rewritten in place.
+    UnsupportedNamespaceFormat,
 }
+
+impl EndpointUnverifiedReason {
+    /// Canonical spelling shared by inspect, bind diagnostics, and CLI output.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsafeDirectory => "unsafe-directory",
+            Self::Symlink => "symlink",
+            Self::UnexpectedObject => "unexpected-object",
+            Self::ForeignOwner => "foreign-owner",
+            Self::MissingOwnership => "missing-ownership",
+            Self::InvalidOwnership => "invalid-ownership",
+            Self::InvalidRecord => "invalid-record",
+            Self::RecordMismatch => "record-mismatch",
+            Self::CoordinatorMissing => "coordinator-missing",
+            Self::CoordinatorReplaced => "coordinator-replaced",
+            Self::InitializationIncomplete => "initialization-incomplete",
+            Self::UnsupportedNamespaceFormat => "unsupported-namespace-format",
+        }
+    }
+}
+
+impl std::fmt::Display for EndpointUnverifiedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for EndpointUnverifiedReason {}
 
 /// A read-only observation of a local endpoint.
 #[derive(Debug)]
@@ -180,6 +210,33 @@ pub enum EndpointReapResult {
 pub struct EndpointIoError {
     pub kind: io::ErrorKind,
     pub raw_os_error: Option<i32>,
+}
+
+/// Native I/O details and an optional named refusal for a listener bind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EndpointBindCause {
+    pub error: EndpointIoError,
+    pub unverified_reason: Option<EndpointUnverifiedReason>,
+}
+
+impl From<&io::Error> for EndpointBindCause {
+    fn from(error: &io::Error) -> Self {
+        let mut source = error
+            .get_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static));
+        let mut unverified_reason = None;
+        while let Some(current) = source {
+            if let Some(reason) = current.downcast_ref::<EndpointUnverifiedReason>() {
+                unverified_reason = Some(*reason);
+                break;
+            }
+            source = current.source();
+        }
+        Self {
+            error: EndpointIoError::from(error),
+            unverified_reason,
+        }
+    }
 }
 
 impl From<&io::Error> for EndpointIoError {

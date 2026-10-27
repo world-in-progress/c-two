@@ -133,12 +133,12 @@ After an HTTP caller disconnects, an already-dispatched forward retains its inpu
 
 | Platform | Endpoint | Location configuration |
 | --- | --- | --- |
-| Unix | UDS in the final owner-controlled directory | `cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, c3 `--ipc-root`; default `/tmp/c2-<uidhex>` |
+| Unix | UDS in the final owner-controlled directory | `cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, c3 `--ipc-root`; default `/tmp/c2-v3-<uidhex>` |
 | Windows | Named Pipe scoped to the current TokenUser SID | Automatic; Unix root overrides are rejected |
 
 On Unix, the socket is `<root>/<32-character id>`. Applications provision custom directories. Mode `0755` is accepted when the current user owns the directory and has read, write and traversal access, with no group or other write permission. C-Two creates its default directory with mode `0700` and sets and verifies each socket as `0600` before listening. Spaces and Unicode are preserved. Bind, connect and liveness probes address the short name through an open directory descriptor, so filesystem directory-opening limits govern the configured path. C-Two manages its endpoint, lease and coordinator files, preserves unrelated files and directories, and does not change existing permissions or recursively create parents.
 
-For the macOS default namespace, only gate/marker/lease records move to `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination`; the socket path stays unchanged and aliases share one coordinator. Non-default custom roots and Linux retain colocated records. See the [lifecycle guide](local-endpoint-lifecycle.en.md) for record cleanup and the separate old-layout cold switch.
+For the macOS default namespace, only gate/marker/lease records move to `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`; the socket path stays unchanged and aliases share one coordinator. Non-default custom roots and Linux retain colocated records. The `v3` default-directory suffix is the namespace disk format version; custom roots gain no suffix. Different formats have separate default directories and need no same-path cold switch. Sharing one custom physical root across formats is unsupported; on `unsupported-namespace-format`, rebuild only after all old processes exit, cannot restart and the full root is safely archived offline. See the [lifecycle guide](local-endpoint-lifecycle.en.md) for record and exact-reap rules.
 
 macOS also rejects extended ACL allow entries that can change directory contents, attributes or permissions, including inherited entries; read, traversal and deny entries are accepted.
 
@@ -146,7 +146,7 @@ macOS also rejects extended ACL allow entries that can change directory contents
 from pathlib import Path
 import c_two as cc
 
-ipc_dir = Path('/Users/me/Library/Application Support/my-app/ipc')
+ipc_dir = Path.home() / 'my-app' / 'ipc'
 ipc_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 cc.set_local_endpoint(root=str(ipc_dir))
 ```

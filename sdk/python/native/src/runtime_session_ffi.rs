@@ -30,7 +30,7 @@ use crate::core_error_ffi::{
     route_close_outcome_to_dict,
 };
 use crate::core_ffi::{PyCoreClient, PyCoreService};
-use crate::endpoint_ffi::PyLocalEndpointContext;
+use crate::endpoint_ffi::{PyEndpointCredential, PyLocalEndpointContext};
 use crate::lease_ffi::{PyBufferLeaseTracker, lease_stats_dict};
 use crate::owner_ffi::{
     PyNativeOwnerBootstrap, PyOwnerRecoveryTicket, PyPreparedOwnerTakeover, owner_error,
@@ -698,6 +698,16 @@ impl PyRuntimeSession {
     #[getter]
     fn server_address(&self) -> Option<String> {
         self.inner.server_address()
+    }
+
+    /// Snapshot the existing host's bound listener without creating a host.
+    #[getter]
+    fn server_credential(&self) -> Option<PyEndpointCredential> {
+        self.host
+            .lock()
+            .as_ref()
+            .and_then(Host::endpoint_credential)
+            .map(PyEndpointCredential::new)
     }
 
     #[getter]

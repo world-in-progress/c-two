@@ -61,20 +61,26 @@ def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -
 
     cc.shutdown()
     resource = AliveResource()
+    assert cc.server_credential() is None
     proxy = None
     try:
         cc.register(Alive, resource, name='timeout-alive')
         session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
         identity = (session.server_id, session.server_address)
+        credential = cc.server_credential()
+        assert credential.address == identity[1]
+        assert credential.to_json() == session.server_credential.to_json()
         proxy = cc.connect(Alive, name='timeout-alive', address=cc.server_address())
         assert proxy.ping() == 'pong'
         for timeout in BAD_SHUTDOWN_TIMEOUTS:
             with pytest.raises(ValueError, match='timeout_seconds'):
                 session.shutdown(route_names=['timeout-alive'], timeout_seconds=timeout)
             assert (session.server_id, session.server_address) == identity
+            assert cc.server_credential().to_json() == credential.to_json()
             assert proxy.ping() == 'pong'
             assert resource.shutdown_calls == 0
         cc.shutdown()
+        assert cc.server_credential() is None
         assert resource.shutdown_calls == 1
         cc.shutdown()
         assert resource.shutdown_calls == 1
@@ -98,6 +104,7 @@ def test_native_runtime_session_explicit_identity_is_lazy() -> None:
     assert identity['ipc_address'] == 'ipc://unit-server'
     assert session.server_id == 'unit-server'
     assert session.server_address == 'ipc://unit-server'
+    assert session.server_credential is None  # Allocating an address did not bind.
 
 
 @pytest.mark.parametrize('side', ['server', 'client'])

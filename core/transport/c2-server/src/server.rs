@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use c2_local::{
     ConnectionEndReason, ConnectionEventSource, ConnectionEvents, DEFAULT_CONNECT_TIMEOUT,
-    EndpointReapResult, LocalEndpoint, LocalListener, LocalReadHalf, LocalStream, LocalWriteHalf,
+    EndpointCredential, EndpointReapResult, LocalEndpoint, LocalListener, LocalReadHalf,
+    LocalStream, LocalWriteHalf,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
@@ -202,7 +203,7 @@ impl std::error::Error for ServerStartupTimeout {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerFailure {
     pub message: String,
-    pub bind_error: Option<c2_local::EndpointIoError>,
+    pub bind_cause: Option<c2_local::EndpointBindCause>,
     pub startup_timeout: Option<ServerStartupTimeout>,
 }
 
@@ -210,7 +211,7 @@ impl ServerFailure {
     pub fn new(message: String) -> Self {
         Self {
             message,
-            bind_error: None,
+            bind_cause: None,
             startup_timeout: None,
         }
     }
@@ -221,13 +222,13 @@ impl From<&ServerError> for ServerFailure {
         if let ServerError::Failed(failure) = error {
             return failure.clone();
         }
-        let bind_error = match error {
+        let bind_cause = match error {
             ServerError::Bind(source) => Some(source.into()),
             _ => None,
         };
         Self {
             message: error.to_string(),
-            bind_error,
+            bind_cause,
             startup_timeout: match error {
                 ServerError::StartupTimeout(timeout) => Some(*timeout),
                 _ => None,
@@ -273,6 +274,13 @@ impl ServerLifecycleState {
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Starting | Self::Ready | Self::Stopping)
     }
+}
+
+/// The listener credential is published with readiness on the existing watch.
+#[derive(Debug, Clone)]
+struct LifecycleSnapshot {
+    state: ServerLifecycleState,
+    credential: Option<EndpointCredential>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,7 +336,7 @@ pub struct Server {
     /// revisioned watch history. It must not be held across awaits.
     route_catalog: parking_lot::RwLock<RouteCatalog>,
     shutdown_tx: watch::Sender<bool>,
-    lifecycle_tx: watch::Sender<ServerLifecycleState>,
+    lifecycle_tx: watch::Sender<LifecycleSnapshot>,
     connection_event_source: ConnectionEventSource,
     route_registration: Mutex<()>,
     /// Sharded chunk reassembly lifecycle manager.
@@ -607,7 +615,10 @@ impl Server {
                 .map_err(|e| ServerError::Config(format!("response pool prewarm: {e}")))?;
         }
         let chunk_admission_gate = ChunkAdmissionGate::new(config.max_total_chunks as usize);
-        let (lifecycle_tx, _lifecycle_rx) = watch::channel(ServerLifecycleState::Initialized);
+        let (lifecycle_tx, _lifecycle_rx) = watch::channel(LifecycleSnapshot {
+            state: ServerLifecycleState::Initialized,
+            credential: None,
+        });
         let pending_requests = Arc::new(Semaphore::new(config.max_pending_requests as usize));
         let chunk_processing_permits = Arc::new(Semaphore::new(config.max_total_chunks as usize));
         let route_catalog = RouteCatalog::new(identity.clone(), config.max_payload_size);
@@ -1172,11 +1183,33 @@ impl Server {
     }
 
     fn set_lifecycle_state(&self, state: ServerLifecycleState) {
-        self.lifecycle_tx.send_replace(state);
+        self.lifecycle_tx.send_modify(|snapshot| {
+            if matches!(
+                &state,
+                ServerLifecycleState::Starting
+                    | ServerLifecycleState::Stopped
+                    | ServerLifecycleState::Failed(_)
+            ) {
+                snapshot.credential = None;
+            }
+            snapshot.state = state;
+        });
+    }
+
+    fn publish_ready(&self, credential: EndpointCredential) {
+        self.lifecycle_tx.send_replace(LifecycleSnapshot {
+            state: ServerLifecycleState::Ready,
+            credential: Some(credential),
+        });
     }
 
     pub fn lifecycle_state(&self) -> ServerLifecycleState {
-        self.lifecycle_tx.borrow().clone()
+        self.lifecycle_tx.borrow().state.clone()
+    }
+
+    /// Credential captured from the bound listener; it does not prove liveness.
+    pub fn endpoint_credential(&self) -> Option<EndpointCredential> {
+        self.lifecycle_tx.borrow().credential.clone()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -1223,7 +1256,7 @@ impl Server {
         let mut rx = self.lifecycle_tx.subscribe();
         let wait = async {
             loop {
-                let state = rx.borrow().clone();
+                let state = rx.borrow().state.clone();
                 match state {
                     ServerLifecycleState::Ready => return Ok(()),
                     ServerLifecycleState::Failed(mut failure) => {
@@ -1284,7 +1317,7 @@ impl Server {
         let mut rx = self.lifecycle_tx.subscribe();
         let wait = async {
             loop {
-                let state = rx.borrow().clone();
+                let state = rx.borrow().state.clone();
                 match state {
                     ServerLifecycleState::Initialized
                     | ServerLifecycleState::Stopped
@@ -1319,7 +1352,7 @@ impl Server {
         let mut rx = self.lifecycle_tx.subscribe();
         loop {
             if matches!(
-                *rx.borrow(),
+                &rx.borrow().state,
                 ServerLifecycleState::Initialized
                     | ServerLifecycleState::Stopped
                     | ServerLifecycleState::Failed(_)
@@ -1497,7 +1530,7 @@ impl Server {
                 return Err(ServerError::Io(error));
             }
         }
-        self.set_lifecycle_state(ServerLifecycleState::Ready);
+        self.publish_ready(listener.credential());
         info!(endpoint = ?self.endpoint.os_name(), "server listening");
 
         // Spawn periodic GC sweep for expired chunk assemblies. The same
@@ -4899,6 +4932,20 @@ mod tests {
 
     #[tokio::test]
     async fn run_sets_ready_then_shutdown_sets_stopped() {
+        #[cfg(unix)]
+        let directory = tempfile::Builder::new()
+            .prefix("c2-ready-credential-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&unique_readiness_address("ready_state"))
+            .unwrap();
+        #[cfg(unix)]
+        let server =
+            Arc::new(Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap());
+        #[cfg(not(unix))]
         let server = Arc::new(
             Server::new(
                 &unique_readiness_address("ready_state"),
@@ -4906,6 +4953,7 @@ mod tests {
             )
             .unwrap(),
         );
+        assert!(server.endpoint_credential().is_none());
         let runner = {
             let server = Arc::clone(&server);
             tokio::spawn(async move { server.run().await })
@@ -4919,12 +4967,73 @@ mod tests {
         assert!(server.is_ready());
         assert!(server.is_running());
         assert!(endpoint_connects(server.local_endpoint()).await);
+        let credential = server
+            .endpoint_credential()
+            .expect("bound listener credential");
+        assert_eq!(credential.endpoint(), server.local_endpoint());
 
         server.request_shutdown_signal();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopping);
+        assert_eq!(server.endpoint_credential(), Some(credential.clone()));
         runner.await.unwrap().unwrap();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(server.endpoint_credential().is_none());
         assert!(!server.is_ready());
         assert!(!server.is_running());
+
+        server.begin_start_attempt().unwrap();
+        assert!(server.endpoint_credential().is_none());
+        let restarted = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let next = server.endpoint_credential().expect("restarted credential");
+        #[cfg(unix)]
+        assert_ne!(next, credential);
+        #[cfg(not(unix))]
+        assert_eq!(next, credential);
+        server.request_shutdown_signal();
+        restarted.await.unwrap().unwrap();
+        assert!(server.endpoint_credential().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_run_keeps_snapshot_until_runtime_finalization() {
+        let directory = tempfile::Builder::new()
+            .prefix("c2-cancel-credential-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&unique_readiness_address("cancel_credential"))
+            .unwrap();
+        let server =
+            Arc::new(Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap());
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let credential = server.endpoint_credential().expect("ready credential");
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Ready);
+        assert_eq!(server.endpoint_credential(), Some(credential.clone()));
+        server.finalize_runtime_stopped();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(server.endpoint_credential().is_none());
+        assert!(matches!(
+            c2_local::reap_endpoint(server.local_endpoint(), &credential),
+            EndpointReapResult::Reaped | EndpointReapResult::AlreadyAbsent
+        ));
     }
 
     /// A transient namespace operation must not turn a successful shutdown
@@ -5050,6 +5159,7 @@ mod tests {
             server.lifecycle_state(),
             ServerLifecycleState::Failed(_)
         ));
+        assert!(server.endpoint_credential().is_none());
         assert!(!server.is_running());
         assert!(socket.exists(), "unverified socket must be preserved");
         assert!(tokio::net::UnixStream::connect(socket).await.is_err());
@@ -5335,11 +5445,13 @@ mod tests {
             second.lifecycle_state(),
             ServerLifecycleState::Failed(_)
         ));
+        assert!(second.endpoint_credential().is_none());
 
         first.request_shutdown_signal();
         first_runner.await.unwrap().unwrap();
 
         second.begin_start_attempt().unwrap();
+        assert!(second.endpoint_credential().is_none());
         let second_runner = {
             let second = Arc::clone(&second);
             tokio::spawn(async move { second.run().await })
@@ -5349,6 +5461,7 @@ mod tests {
             .await
             .unwrap();
         assert!(endpoint_connects(second.local_endpoint()).await);
+        assert!(second.endpoint_credential().is_some());
 
         second.request_shutdown_signal();
         second_runner.await.unwrap().unwrap();
@@ -5360,10 +5473,10 @@ mod tests {
         assert_eq!(a, b);
         assert!(!a.message.contains("config error"));
         assert!(a.startup_timeout.is_none());
-        let cause = a.bind_error.expect("actual bind cause");
-        assert_eq!(cause.kind, std::io::ErrorKind::AddrInUse);
+        let cause = a.bind_cause.expect("actual bind cause");
+        assert_eq!(cause.error.kind, std::io::ErrorKind::AddrInUse);
         assert_eq!(
-            cause.raw_os_error, None,
+            cause.error.raw_os_error, None,
             "listener lease owns the rejection"
         );
         assert_eq!(second.lifecycle_state(), ServerLifecycleState::Stopped);
@@ -5412,6 +5525,7 @@ mod tests {
         server.set_lifecycle_state(ServerLifecycleState::Stopping);
         server.finalize_runtime_stopped();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(server.endpoint_credential().is_none());
 
         server.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new(
             "bind failed".to_string(),

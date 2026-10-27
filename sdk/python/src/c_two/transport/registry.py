@@ -68,6 +68,7 @@ from .server.native import NativeServerBridge as Server
 if TYPE_CHECKING:
     from c_two._native import NativeOwnerBootstrap, OwnedChild
     from c_two.mem import MemoryStats
+    from .endpoint import EndpointCredential
 
 CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
@@ -742,6 +743,10 @@ class _ProcessRegistry:
         """Server identity of the auto-created server, or ``None``."""
         return self._runtime_session.server_id
 
+    def get_server_credential(self) -> EndpointCredential | None:
+        """Credential captured from the bound listener, if one is present."""
+        return self._runtime_session.server_credential
+
     @property
     def names(self) -> list[str]:
         """List of currently registered routing names."""
@@ -1133,6 +1138,11 @@ def server_address() -> str | None:
 def server_id() -> str | None:
     """Server identity of the auto-created server, or ``None``."""
     return _ProcessRegistry.get().get_server_id()
+
+
+def server_credential() -> EndpointCredential | None:
+    """Return the bound listener's credential snapshot, if one is present."""
+    return _ProcessRegistry.get().get_server_credential()
 
 
 def shutdown(*, timeout: float = 30.0) -> dict:

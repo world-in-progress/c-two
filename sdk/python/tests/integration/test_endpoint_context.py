@@ -53,12 +53,12 @@ cc.set_server(server_id=address.removeprefix('ipc://'))
 resource = Resource(label)
 cc.register(Echo, resource, name='same-route')
 context = cc.local_endpoint_context()
-observed = cc.inspect_endpoint(address)
-assert observed['status'] == 'present', observed
+credential = cc.server_credential()
+assert credential is not None
 print(json.dumps({
     'address': cc.server_address(), 'root': context.root,
     'namespace_id': context.namespace_id,
-    'credential': observed['credential'].to_json(),
+    'credential': credential.to_json(),
 }), flush=True)
 assert sys.stdin.readline().strip() == 'stop'
 outcome = cc.shutdown(timeout=5)
@@ -66,6 +66,62 @@ assert outcome['completed'], outcome
 assert resource.hooks == 1
 print(json.dumps({'completed': True, 'hooks': resource.hooks}), flush=True)
 '''
+
+
+@UNIX_ONLY
+def test_server_credential_does_not_wait_for_the_namespace_gate() -> None:
+    with tempfile.TemporaryDirectory(prefix='c2-own-', dir='/tmp') as root:
+        _run_isolated(CONTRACT + textwrap.dedent('''
+            import json
+            from pathlib import Path
+            import subprocess
+            import sys
+            from c_two.transport.registry import _ProcessRegistry
+
+            class Resource:
+                def value(self): return 'ready'
+                def done(self): pass
+
+            assert cc.server_credential() is None
+            assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+            holder = None
+            try:
+                cc.register(Echo, Resource(), name='own')
+                address = cc.server_address()
+                credential = cc.server_credential()
+                observed = cc.inspect_endpoint(address)
+                assert observed['status'] == 'present', observed
+                assert credential.to_json() == observed['credential'].to_json()
+                document = json.loads(credential.to_json())
+                assert document['schemaVersion'] == 4 and 'device' not in document
+                gate = Path(credential.context.root) / '.gate'
+                holder = subprocess.Popen([
+                    sys.executable, '-c',
+                    "import fcntl,sys; f=open(sys.argv[1],'rb'); "
+                    "fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); "
+                    "assert sys.stdin.readline().strip() == 'release'", str(gate),
+                ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert holder.stdout.readline().strip() == 'locked'
+                held = cc.inspect_endpoint(address)
+                assert (held['status'], held['io_kind'], held['retryable']) == (
+                    'io-error', 'WouldBlock', True,
+                ), held
+                # The holder cannot release until the own-listener query returns.
+                assert cc.server_credential().to_json() == credential.to_json()
+                _, stderr = holder.communicate('release\\n', timeout=5)
+                assert holder.returncode == 0, stderr
+                assert cc.reap_endpoint(address, credential)['status'] == 'busy'
+                cc.unregister('own')
+                assert cc.server_credential().to_json() == credential.to_json()
+            finally:
+                if holder is not None and holder.poll() is None:
+                    holder.kill()
+                    holder.communicate(timeout=5)
+                stopped = cc.shutdown(timeout=5)
+            assert stopped['completed'], stopped
+            assert cc.server_credential() is None
+            assert cc.reap_endpoint(address, credential)['status'] == 'already-absent'
+        '''), C2_IPC_ROOT=root)
 
 
 @pytest.fixture

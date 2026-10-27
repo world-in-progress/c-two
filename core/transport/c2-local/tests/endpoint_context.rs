@@ -244,11 +244,11 @@ fn endpoint_context_child_fixture() {
         assert_eq!(captured.unix_root(), Some(Path::new(&root)));
         let endpoint = captured.endpoint(ADDRESS).unwrap();
         let json = format!(
-            r#"{{"schemaVersion":3,"address":"{ADDRESS}","protocol":"managed-v2","platform":"unix","unixRoot":"{root}","namespaceId":"{}","incarnation":"00112233445566778899aabbccddeeff","device":1,"inode":2,"changedSecs":3,"changedNanos":4}}"#,
+            r#"{{"schemaVersion":4,"address":"{ADDRESS}","protocol":"managed-v2","platform":"unix","unixRoot":"{root}","namespaceId":"{}","incarnation":"00112233445566778899aabbccddeeff","inode":2,"changedSecs":3,"changedNanos":4}}"#,
             captured.namespace_id()
         );
         let default = LocalEndpointContext::default_for_platform().unwrap();
-        let default_json = serde_json::json!({"schemaVersion":3,"address":"ipc://context-default","protocol":"managed-v2","platform":"unix","unixRoot":default.unix_root().unwrap(),"namespaceId":default.namespace_id(),"incarnation":"00112233445566778899aabbccddeeff","device":1,"inode":2,"changedSecs":3,"changedNanos":4}).to_string();
+        let default_json = serde_json::json!({"schemaVersion":4,"address":"ipc://context-default","protocol":"managed-v2","platform":"unix","unixRoot":default.unix_root().unwrap(),"namespaceId":default.namespace_id(),"incarnation":"00112233445566778899aabbccddeeff","inode":2,"changedSecs":3,"changedNanos":4}).to_string();
         let other = std::env::var(OTHER_ROOT).unwrap();
         // SAFETY: this isolated one-test child has no application workers,
         // reactors, or concurrent readers of the process environment.

@@ -341,7 +341,7 @@ def test_common_default_is_opaque_native_and_query_does_not_freeze() -> None:
             assert context.platform == 'unix'
             import os
             from pathlib import Path
-            assert context.root == f'/tmp/c2-{os.geteuid():x}'
+            assert context.root == f'/tmp/c2-v3-{os.geteuid():x}'
             assert Path(name).parent == Path(context.root)
             assert len(Path(name).name) == 32
         try:
@@ -581,10 +581,10 @@ def test_credential_retains_recorded_directory_under_new_environment() -> None:
         import c_two as cc
         from c_two import _native
         context = cc.local_endpoint_context(root={other!r})
-        document = {{'schemaVersion': 3, 'address': 'ipc://recorded-context',
+        document = {{'schemaVersion': 4, 'address': 'ipc://recorded-context',
             'protocol': 'managed-v2', 'platform': 'unix', 'unixRoot': context.root,
             'namespaceId': context.namespace_id, 'incarnation': '00112233445566778899aabbccddeeff',
-            'device': 1, 'inode': 2, 'changedSecs': 3, 'changedNanos': 4}}
+            'inode': 2, 'changedSecs': 3, 'changedNanos': 4}}
         credential = cc.EndpointCredential.from_json(json.dumps(document))
         assert cc.local_endpoint_context().root == {root!r}
         assert credential.context == context

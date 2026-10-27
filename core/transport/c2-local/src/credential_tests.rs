@@ -15,13 +15,18 @@ fn host_platform() -> &'static str {
     if cfg!(windows) { "windows" } else { "unix" }
 }
 #[cfg(unix)]
-fn managed() -> (LocalListener, EndpointCredential) {
-    let endpoint =
-        LocalEndpoint::from_address(&format!("ipc://codec-{}", uuid::Uuid::new_v4().simple()))
-            .unwrap();
+fn managed() -> (tempfile::TempDir, LocalListener, EndpointCredential) {
+    let root = tempfile::Builder::new()
+        .prefix("c2-codec-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let endpoint = LocalEndpointContext::with_unix_root(root.path())
+        .unwrap()
+        .endpoint(&format!("ipc://codec-{}", uuid::Uuid::new_v4().simple()))
+        .unwrap();
     let listener = LocalListener::bind(&endpoint).expect("bind native listener");
     let credential = listener.credential();
-    (listener, credential)
+    (root, listener, credential)
 }
 
 /// The kernel-managed credential a Windows listener hands out. The endpoint is
@@ -85,9 +90,10 @@ fn assert_rejected(json: &str, expected: &[EndpointCredentialErrorKind]) {
 #[cfg(unix)]
 #[tokio::test]
 async fn managed_credential_records_directory_without_socket_path() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     let json = credential.to_json().unwrap();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(value.get("device").is_none());
     assert_eq!(
         value["unixRoot"],
         credential
@@ -114,7 +120,7 @@ async fn managed_credential_records_directory_without_socket_path() {
 #[cfg(unix)]
 #[tokio::test]
 async fn rejects_unknown_fields_unknown_schema_and_oversize() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     let json = credential.to_json().unwrap();
     assert_rejected(
         &mutate(&json, |object| {
@@ -124,7 +130,7 @@ async fn rejects_unknown_fields_unknown_schema_and_oversize() {
     );
     assert_rejected(
         &mutate(&json, |object| {
-            object.insert("schemaVersion".into(), 4.into());
+            object.insert("schemaVersion".into(), 5.into());
         }),
         &[EndpointCredentialErrorKind::UnsupportedSchemaVersion],
     );
@@ -139,7 +145,7 @@ async fn rejects_unknown_fields_unknown_schema_and_oversize() {
 #[cfg(unix)]
 #[tokio::test]
 async fn rejects_missing_required_fields() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     let json = credential.to_json().unwrap();
     for field in ["address", "protocol", "platform", "incarnation", "inode"] {
         assert_rejected(
@@ -160,7 +166,7 @@ async fn rejects_missing_required_fields() {
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_requires_incarnation_and_rejects_superseded_schemas() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     let json = credential.to_json().unwrap();
     assert_rejected(
         &mutate(&json, |object| {
@@ -168,14 +174,14 @@ async fn unix_requires_incarnation_and_rejects_superseded_schemas() {
         }),
         &[EndpointCredentialErrorKind::IncarnationRequired],
     );
-    for schema_version in [1, 2] {
+    for schema_version in [1, 2, 3] {
         assert_rejected(
             &mutate(&json, |object| {
                 object.insert("schemaVersion".into(), schema_version.into());
                 object.insert("protocol".into(), "legacy-v1".into());
                 object.remove("incarnation");
             }),
-            &[if schema_version == 2 {
+            &[if schema_version == 2 || schema_version == 3 {
                 EndpointCredentialErrorKind::UnsupportedSchemaVersion
             } else {
                 EndpointCredentialErrorKind::InvalidValue
@@ -194,12 +200,11 @@ async fn unix_requires_incarnation_and_rejects_superseded_schemas() {
 #[cfg(unix)]
 #[tokio::test]
 async fn rejects_checked_integer_and_identity_violations() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     let json = credential.to_json().unwrap();
     for (field, value) in [
         // Beyond u64, wrongly typed, negative, and fractional integers must
         // all fail rather than coerce.
-        ("device", serde_json::json!("18446744073709551616")),
         ("inode", serde_json::json!("1")),
         ("changedSecs", serde_json::json!(-1.5)),
         ("changedNanos", serde_json::json!(0.5)),
@@ -229,7 +234,7 @@ async fn rejects_checked_integer_and_identity_violations() {
 #[cfg(unix)]
 #[tokio::test]
 async fn rejects_address_protocol_and_platform_mismatches() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     let json = credential.to_json().unwrap();
     // The OS path is never authority: path-like and non-local addresses fail
     // the config derivation instead of being accepted as a filesystem path.
@@ -274,7 +279,7 @@ async fn rejects_address_protocol_and_platform_mismatches() {
 #[cfg(unix)]
 #[tokio::test]
 async fn rejects_trailing_garbage_and_non_object_documents() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     let json = credential.to_json().unwrap();
     for document in ["[]", "null", "42", "{}"] {
         assert!(
@@ -292,15 +297,18 @@ async fn rejects_trailing_garbage_and_non_object_documents() {
 #[cfg(unix)]
 #[tokio::test]
 async fn decoding_does_not_create_filesystem_state() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     // Decode a syntactically valid credential for an unbound, unique target.
     // Other parallel listeners may change the shared namespace, so observe
     // only this target's native-derived backing names, never a global count.
-    let endpoint = LocalEndpoint::from_address(&format!(
-        "ipc://codec-unbound-{}",
-        uuid::Uuid::new_v4().simple()
-    ))
-    .unwrap();
+    let endpoint = credential
+        .endpoint()
+        .context()
+        .endpoint(&format!(
+            "ipc://codec-unbound-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
     let mut document: serde_json::Value =
         serde_json::from_str(&credential.to_json().unwrap()).unwrap();
     document["address"] = endpoint.address().into();
@@ -331,7 +339,7 @@ async fn decoding_does_not_create_filesystem_state() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_decoded_managed_credential_reaps_through_the_native_gate() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     let json = credential.to_json().unwrap();
     let decoded = decoded(&json).unwrap();
 
@@ -371,9 +379,9 @@ async fn a_decoded_managed_credential_reaps_through_the_native_gate() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_credential_for_another_endpoint_is_stale_not_authority() {
-    let (listener, credential) = managed();
+    let (_namespace, listener, credential) = managed();
     let decoded = decoded(&credential.to_json().unwrap()).unwrap();
-    let (other_listener, other) = managed();
+    let (_other_namespace, other_listener, other) = managed();
 
     // Reaping a different live endpoint with this credential must not remove
     // the other listener's socket.
@@ -468,7 +476,6 @@ fn described_credential(context: &LocalEndpointContext) -> EndpointCredential {
     EndpointCredential::unix_managed(
         context.endpoint("ipc://codec-context").unwrap(),
         UnixSocketIdentity {
-            device: 11,
             inode: 22,
             changed_secs: 33,
             changed_nanos: 44,
@@ -483,7 +490,7 @@ fn context_codec_default_and_custom_root_use_one_directory_form() {
     let default = described_credential(&LocalEndpointContext::default_for_platform().unwrap());
     let json = default.to_json().unwrap();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(value["schemaVersion"], 3);
+    assert_eq!(value["schemaVersion"], 4);
     assert_eq!(
         value["unixRoot"],
         default
@@ -510,7 +517,7 @@ fn context_codec_default_and_custom_root_use_one_directory_form() {
     let custom = described_credential(&context);
     let json = custom.to_json().unwrap();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(value["schemaVersion"], 3);
+    assert_eq!(value["schemaVersion"], 4);
     assert_eq!(value["unixRoot"], root);
     assert_eq!(value["namespaceId"], context.namespace_id());
     assert_eq!(value["protocol"], "managed-v2");
@@ -520,11 +527,17 @@ fn context_codec_default_and_custom_root_use_one_directory_form() {
 
 #[cfg(unix)]
 #[test]
-fn context_codec_v3_strictly_binds_root_and_namespace() {
+fn context_codec_v4_strictly_binds_root_and_namespace() {
     let context =
         LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-codec")).unwrap();
     let json = described_credential(&context).to_json().unwrap();
-    for field in ["unixRoot", "namespaceId", "device", "inode", "incarnation"] {
+    assert_rejected(
+        &mutate(&json, |object| {
+            object.insert("device".into(), 11.into());
+        }),
+        &[EndpointCredentialErrorKind::MalformedJson],
+    );
+    for field in ["unixRoot", "namespaceId", "inode", "incarnation"] {
         assert!(
             decoded(&mutate(&json, |object| {
                 object.remove(field);
@@ -579,7 +592,7 @@ fn context_codec_v3_strictly_binds_root_and_namespace() {
     );
     assert!(
         decoded(&mutate(&json, |object| {
-            object.insert("schemaVersion".into(), 4.into());
+            object.insert("schemaVersion".into(), 3.into());
         }))
         .is_err()
     );
@@ -592,6 +605,32 @@ fn context_codec_v3_strictly_binds_root_and_namespace() {
     // Serde must reject duplicate fields as well as unknown fields.
     let duplicate = json.replacen('{', "{\"unixRoot\":\"/tmp/c2-other\",", 1);
     assert_rejected(&duplicate, &[EndpointCredentialErrorKind::MalformedJson]);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_schema_four_matches_independent_json_golden() {
+    let context =
+        LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-codec-golden")).unwrap();
+    let credential = EndpointCredential::unix_managed(
+        context.endpoint("ipc://golden").unwrap(),
+        UnixSocketIdentity {
+            inode: 22,
+            changed_secs: 33,
+            changed_nanos: 44,
+        },
+        [0x11; 16],
+    );
+    let expected = format!(
+        r#"{{"schemaVersion":4,"address":"ipc://golden","protocol":"managed-v2","platform":"unix","incarnation":"11111111111111111111111111111111","inode":22,"changedSecs":33,"changedNanos":44,"unixRoot":"/tmp/c2-codec-golden","namespaceId":"{}"}}"#,
+        context.namespace_id()
+    );
+    assert_eq!(credential.to_json().unwrap(), expected);
+    assert_eq!(decoded(&expected).unwrap(), credential);
+    assert_eq!(
+        reject(&expected.replacen("\"schemaVersion\":4", "\"schemaVersion\":3", 1)),
+        EndpointCredentialErrorKind::UnsupportedSchemaVersion
+    );
 }
 
 #[cfg(unix)]
@@ -636,7 +675,6 @@ fn long_escaped_directory_and_address_obey_the_same_encode_decode_limit() {
     let credential = EndpointCredential::unix_managed(
         endpoint,
         UnixSocketIdentity {
-            device: 11,
             inode: 22,
             changed_secs: 33,
             changed_nanos: 44,
@@ -704,7 +742,7 @@ fn context_codec_system_alias_keeps_its_lexical_identity() {
     assert_ne!(alias, default);
     let credential = described_credential(&alias);
     let value: serde_json::Value = serde_json::from_str(&credential.to_json().unwrap()).unwrap();
-    assert_eq!(value["schemaVersion"], 3);
+    assert_eq!(value["schemaVersion"], 4);
     assert_eq!(value["unixRoot"], "/private/tmp");
     assert_eq!(decoded(&value.to_string()).unwrap(), credential);
     assert!(
@@ -722,7 +760,7 @@ fn context_codec_system_alias_keeps_its_lexical_identity() {
 fn context_codec_rejects_unix_fields_in_windows_documents() {
     // These cases run on both platforms. Unix rejects the platform; Windows
     // must reject the otherwise known fields even when their value is null.
-    for schema in [1, 3] {
+    for schema in [1, 4] {
         for fields in [
             r#""unixRoot":"/tmp/c2-codec""#,
             r#""namespaceId":"forged""#,
@@ -815,5 +853,5 @@ fn windows_rejects_managed_v2_documents() {
     assert_eq!(error.field(), Some("schemaVersion"));
     // A Unix identity field is not a Windows pipe property either.
     let with_identity = r#"{"schemaVersion":1,"address":"ipc://codec-managedunsupported","protocol":"named-pipe","platform":"windows","device":1,"inode":2}"#;
-    assert_rejected(with_identity, &[EndpointCredentialErrorKind::InvalidValue]);
+    assert_rejected(with_identity, &[EndpointCredentialErrorKind::MalformedJson]);
 }
