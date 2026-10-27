@@ -1,8 +1,8 @@
 # R17c：删除前末次 lease 核对的 I/O 原因保留
 
-状态：用户已批准，候选 `1e74b4c9463071ae6162619fc20eca4f55634b75` 已完成基线反例、macOS 定向回归与独立审查，完整跨平台门禁进行中，尚未验收完成。最初评估源码为 `d9e3ac9e0e0b40167fb4ec0022c76edae977e9b2`，隔离反例基线为 `f4ab1c7bf9e629a3d2e22df236d0ed7285c12670`。R17a、R17b 的既有验收继续有效；R17 不整体核销。
+状态：R17c 子项验收完成。实现候选 `1e74b4c9463071ae6162619fc20eca4f55634b75` 已通过固定基线反例、候选定向回归、独立审查及确切来源的完整跨平台门禁。最初评估源码为 `d9e3ac9e0e0b40167fb4ec0022c76edae977e9b2`，隔离反例基线为 `f4ab1c7bf9e629a3d2e22df236d0ed7285c12670`。R17a、R17b 的既有验收继续有效；R17 仍部分完成。
 
-当前进度：旧分类上 2 个反例按预期失败、2 个控制通过；候选 4 个新场景及 10 个相关既有测试通过。Host 复核日志、生产差异、格式与空白检查；独立只读审查未发现阻塞问题。14 个本轮记录的隔离端点目录已消失，专属 Cargo target 已清理。实际生产 +7/−1、净 +6；测试场景 +241、既有 cfg(test) 故障点 +14，测试合计 +255，非文档净增 261 行。测试量超过初估，原因是覆盖四条调用链、两次目录短路及异常收尾，未新增夹具框架。完整 relay、跨语言、Linux/macOS/Windows x64/ARM64 与 Python 3.14t 由同源 [Source Validation 40462218729](https://github.com/Dsssyc/c-two/actions/runs/40462218729) 执行；不能将已通过的定向子集写成全部门禁通过。本批未发版。
+验收与收尾：旧分类基线上的 2 个故障反例按预期失败、2 个控制通过；候选 4 个新增场景及 10 个相关既有测试通过。Host 复核日志、生产差异、格式与空白检查；独立只读审查未发现阻塞问题。14 个本轮记录的隔离端点目录已消失，专属 baseline/candidate Cargo target 均已清理。该证据只证明本轮创建的隔离资源已清理，不表示历史默认 IPC 目录为空。实际生产 +7/−1，净 +6；测试场景 +241、既有 cfg(test) 故障点 +14，测试合计 +255，非文档净增 261 行。测试量超过初估，源于覆盖四条调用链、两次目录短路及异常收尾，未新增夹具框架。完整 relay、跨语言、Linux/macOS/Windows x64/ARM64 与 Python 3.14t 由同源 [Source Validation 40462218729](https://github.com/Dsssyc/c-two/actions/runs/40462218729) 全部通过，详见[验收报告](../reports/2026-10-27-r17c-final-lease-stat-acceptance.md)及[机器证据](../reports/evidence/2026-10-27-r17c-final-lease-stat-acceptance.json)。本批未发版；专用 fork CI 分支已按确切候选 SHA 删除。
 
 ## 问题、原设计与选择理由
 
@@ -54,6 +54,6 @@ R17 的 gate/context 分类涉及 `gate_entry_is_current`、`gate_still_named`�
 
 ## 后续边界
 
-R17 剩余 gate/context、目录 pin、`NamespaceDirectories::same_as`、sweep 中的目录失效分类仍需单独设计。目录检查既含真实 I/O 又含策略拒绝，不能机械改成 `?`；owner 层也会再次归类错误。C04、R35、两份控制会话重构和 R07 剩余所有权继续保持原边界。
+R17c 只处理 `unlink_verified` 的末次 lease stat。R17 的 gate/context 分类（包括 `gate_entry_is_current`、`gate_still_named`）、目录 pin、`NamespaceDirectories::same_as`、sweep 中的目录失效分类和 owner context 映射继续单列，R17 整体仍为部分完成。目录检查同时表达真实 I/O 与策略拒绝，owner 层也会再次归类错误，需另行设计。C04、R35、两份控制会话重构和 R07 剩余所有权继续保持原边界。
 
 两轮原生只读复核分别核查了较大的 gate/context 范围，以及本方案的四条直接调用链；后一轮确认本子项可独立成立，并指出早期 `VerifyLeaseStat` 不能代替新故障点。均未执行测试。hey-my-buddy health 返回 `C_TWO_LIFECYCLE` / 命名空间无法验证，本轮没有维护其历史目录，改由原生子代理完成独立复核。
