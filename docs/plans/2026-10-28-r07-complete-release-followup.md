@@ -23,9 +23,9 @@ macOS 隔离副本运行四项反例，全部在预期安全断言处失败，�
 | Core Held 第一次释放被原 pool 身份校验拒绝，恢复原 pool 后再调用 | 第一次报错，第二次返回成功；原块仍在，512 字节重组预算仍计费。 |
 | Core invalidator panic 被调用者捕获后再次释放 | 用户回调执行两次，未满足只失效一次。 |
 
-Prepared 反例通过真实 `LocalStream::pair()`、原 `write_complete` 和原 `send_prepared_shm_response`；临时编译期夹具只改变 `LocalWriteHalf::poll_flush` 的结果，不修改 write、发送或释放逻辑。Windows 的实际 `poll_flush` 使用零字节写等待此前的 overlapped write 完成，因此“整帧写完”与“flush 完成”确实是两个边界；本次 macOS 故障注入证明代码缺陷，不冒充 Windows 自然故障实测。Held 反例受控替换并恢复原 pool，只验证上层失败保留；不把它当成真实使用中的争锁事故。
+Prepared 反例通过真实 `LocalStream::pair()`、原 `write_complete` 和原 `send_prepared_shm_response`；临时编译期夹具在 `LocalWriteHalf::poll_flush` 注入错误/等待，并在 pair 中显式传入本批独立 context；不修改 write、发送或释放逻辑。Windows 的实际 `poll_flush` 使用零字节写等待此前的 overlapped write 完成，因此“整帧写完”与“flush 完成”确实是两个边界；本次 macOS 故障注入证明代码缺陷，不冒充 Windows 自然故障实测。Held 反例受控替换并恢复原 pool，只验证上层失败保留；不把它当成真实使用中的争锁事故。
 
-Core 探针首次构建遗漏编译时包含的合同夹具，补入同一提交的原文件后执行；失败日志保留，未改断言或运行时逻辑。全部测试使用本批目录及独立 SHM 名，socket/lease 残留均为零。Linux、Windows、完整 relay、跨语言和修复后回归留待实施验收，不把这些红色反例算作修复通过。
+Core 探针首次构建遗漏编译时包含的合同夹具，补入同一提交的原文件后执行；失败日志保留，未改断言或运行时逻辑。初轮 Prepared 误把 `C2_IPC_ROOT` 当成 pair 的隔离设置，实际访问了默认命名空间；该次临时端点由原生 pair close 回收，没有手动清理历史文件。此轮记录不作为隔离验收。已修正为显式 `with_unix_root(...).endpoint(...)` 并重做四项反例，结果相同；最终任务根只余 `.gate/.gate.marker`，socket/lease 均为零，原 `write_complete` 与发送函数 SHA-256 未变。初轮日志及更正均随收据保留。Linux、Windows、完整 relay、跨语言和修复后回归留待实施验收，不把这些红色反例算作修复通过。
 
 ## 3. 单一 scope 计数
 

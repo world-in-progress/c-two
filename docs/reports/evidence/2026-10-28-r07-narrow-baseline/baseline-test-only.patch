@@ -1,3 +1,12 @@
+--- a/core/transport/c2-local/Cargo.toml
++++ b/core/transport/c2-local/Cargo.toml
+@@ -27,3 +27,6 @@
+ 
+ [target.'cfg(windows)'.dependencies]
+ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Wdk_Storage_FileSystem"] }
++
++[features]
++r07-baseline = []
 --- a/core/transport/c2-local/src/lib.rs
 +++ b/core/transport/c2-local/src/lib.rs
 @@ -564,6 +564,8 @@
@@ -9,7 +18,19 @@
              },
          )
      }
-@@ -698,10 +700,14 @@
+@@ -590,6 +592,11 @@
+             std::process::id(),
+             NEXT.fetch_add(1, Ordering::Relaxed)
+         );
++        #[cfg(all(feature = "r07-baseline", unix))]
++        let endpoint = LocalEndpointContext::with_unix_root(std::path::Path::new(
++            &std::env::var("C2_IPC_ROOT").expect("R07 baseline requires an explicit isolated root"),
++        ))?.endpoint(&address)?;
++        #[cfg(not(all(feature = "r07-baseline", unix)))]
+         let endpoint = LocalEndpoint::from_address(&address)?;
+         let mut listener = LocalListener::bind(&endpoint)?;
+         let connected = tokio::try_join!(
+@@ -698,10 +705,14 @@
  }
  
  pub struct LocalWriteHalf {
@@ -24,7 +45,7 @@
      pub fn abort_handle(&self) -> AbortHandle {
          self.abort.clone()
      }
-@@ -727,7 +733,14 @@
+@@ -727,7 +738,14 @@
          Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
      }
      fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -40,15 +61,6 @@
      }
      fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
          Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
---- a/core/transport/c2-local/Cargo.toml
-+++ b/core/transport/c2-local/Cargo.toml
-@@ -27,3 +27,6 @@
- 
- [target.'cfg(windows)'.dependencies]
- windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Wdk_Storage_FileSystem"] }
-+
-+[features]
-+r07-baseline = []
 --- a/core/transport/c2-server/src/server.rs
 +++ b/core/transport/c2-server/src/server.rs
 @@ -11412,4 +11412,68 @@
