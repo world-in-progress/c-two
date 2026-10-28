@@ -1,0 +1,91 @@
+{
+  "source_commit": "d8ae4e764e5599d843380c852a49d96bfb6ac816",
+  "production_baseline": "ba6179a937d26419cf1d0bf28e0d74ba5867c256",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+  "baseline_only": true,
+  "production_fix_applied": false,
+  "fault_seam": "temporary compile-time fixture in isolated c2-local; native poll_write, write_complete and send_prepared_shm_response bodies retained; only poll_flush reports injected BrokenPipe or Pending",
+  "native_transport": "macOS Unix socket, LocalStream::pair, task-owned C2_IPC_ROOT",
+  "prepared_tests": {
+    "exit_code": 101,
+    "expected_red": 2,
+    "complete_frame_received": true,
+    "live_allocations_after_error": 0,
+    "same_address_reused": true,
+    "original_allocation_id": 67,
+    "replacement_allocation_id": 131
+  },
+  "held_tests": {
+    "exit_code": 101,
+    "expected_red": 2,
+    "second_release_reported_ok": true,
+    "remaining_allocations": 1,
+    "remaining_reassembly_bytes": 512,
+    "callback_count_after_caught_panic": 2
+  },
+  "fixture_setup_failure": "first Core test build omitted tests/fixtures/contracts/portable-release.contract.json; added exact pinned fixture, no source logic or assertions changed",
+  "endpoint_residuals": {
+    "socket": 0,
+    "lease": 0,
+    "historical_directories_touched": false
+  },
+  "not_run": [
+    "Linux",
+    "Windows",
+    "full relay",
+    "cross-language",
+    "GitHub Actions",
+    "post-fix tests"
+  ],
+  "files": {
+    "held-fixture-missing.log": "41b496af86aeda74e78a590dec25b6ae94ce61d6fe2f90b97b649daaf84112a7",
+    "held-baseline.log": "c17b4e9068a769a072cb15b6ab7aa6d204bd2b12b70d58b4649f942a87a508bf",
+    "baseline.log": "b70b703b624e90e5a8ed5f002220ec06c8011bee8ec8bf17dfb90fcce640767c",
+    "baseline-test-only.patch": "c95ecd845f7cda3d0e870e753ac5d0b2994187f56e92d4ba24427397c6b69cac"
+  },
+  "commands": {
+    "command.json": [
+      "cargo",
+      "test",
+      "--manifest-path",
+      "<isolated>/source/core/Cargo.toml",
+      "-p",
+      "c2-server",
+      "--lib",
+      "--locked",
+      "--offline",
+      "--features",
+      "c2-local/r07-baseline",
+      "r07_baseline_full_frame_flush",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "held-command.json": [
+      "cargo",
+      "test",
+      "--manifest-path",
+      "<isolated>/source/core/Cargo.toml",
+      "-p",
+      "c2-core",
+      "--lib",
+      "--locked",
+      "--offline",
+      "r07_narrow_baseline",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ]
+  },
+  "unchanged_production_function_sha256": {
+    "c2-local::write_complete": "d6ffa10fff7fa865ce6eb54f1b6a07ad61ed186611d60530006975dc75b9870b",
+    "c2-server::send_prepared_shm_response": "5865240ac7858b87d448a9f09d2fba0b4aaec13a8771db36284d40fcf338cdbd"
+  },
+  "reproduce": [
+    "Export pinned core/ and tests/fixtures/contracts/portable-release.contract.json into an isolated directory.",
+    "Apply baseline-test-only.patch; use task-owned C2_IPC_ROOT, CARGO_TARGET_DIR, CARGO_INCREMENTAL=0 and debug=0 profiles.",
+    "Run the two recorded commands. Each must exit 101 with two assertion failures, not a build failure.",
+    "After confirming the process exited, remove task-owned source/target/endpoint trees. Keep this text evidence."
+  ]
+}

@@ -1,0 +1,182 @@
+--- a/core/transport/c2-local/src/lib.rs
++++ b/core/transport/c2-local/src/lib.rs
+@@ -564,6 +564,8 @@
+             LocalWriteHalf {
+                 inner: writer,
+                 abort,
++                #[cfg(feature = "r07-baseline")]
++                r07_flush_fault: 0,
+             },
+         )
+     }
+@@ -698,10 +700,14 @@
+ }
+ 
+ pub struct LocalWriteHalf {
++    #[cfg(feature = "r07-baseline")]
++    r07_flush_fault: u8,
+     inner: tokio::io::WriteHalf<LocalStream>,
+     abort: AbortHandle,
+ }
+ impl LocalWriteHalf {
++    #[cfg(feature = "r07-baseline")]
++    pub fn r07_set_flush_fault(&mut self, mode: u8) { self.r07_flush_fault = mode; }
+     pub fn abort_handle(&self) -> AbortHandle {
+         self.abort.clone()
+     }
+@@ -727,7 +733,14 @@
+         Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
+     }
+     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
++        let this = self.get_mut();
++        #[cfg(feature = "r07-baseline")]
++        match this.r07_flush_fault {
++            1 => return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "R07 baseline injected flush failure"))),
++            2 => return Poll::Pending,
++            _ => (),
++        }
++        Pin::new(&mut this.inner).poll_flush(cx)
+     }
+     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+--- a/core/transport/c2-local/Cargo.toml
++++ b/core/transport/c2-local/Cargo.toml
+@@ -27,3 +27,6 @@
+ 
+ [target.'cfg(windows)'.dependencies]
+ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Wdk_Storage_FileSystem"] }
++
++[features]
++r07-baseline = []
+--- a/core/transport/c2-server/src/server.rs
++++ b/core/transport/c2-server/src/server.rs
+@@ -11412,4 +11412,68 @@
+         assert_eq!(decoded.segments[0].1, 4096);
+         assert_eq!(decoded.capability_flags & CAP_CHUNKED, CAP_CHUNKED);
+     }
++
++    // R07 baseline only: real native stream and production send/write_complete.
++    // The dependency hook changes poll_flush only, after native write_all.
++    async fn r07_assert_published_frame_not_recycled(flush_fault: u8) {
++        let pool = small_response_pool("r07publish");
++        let prepared = try_prepare_shm_response(&pool, 1024, 8192, |dst| {
++            dst.fill(0xA5); Ok(())
++        }).unwrap().unwrap();
++        let original = prepared.shm_allocation().unwrap();
++        let (mut peer, stream) = LocalStream::pair().await.unwrap();
++        let (_reader, mut half) = stream.into_split();
++        half.r07_set_flush_fault(flush_fault);
++        let writer = Arc::new(Mutex::new(half));
++        let result;
++        let received;
++        if flush_fault == 1 {
++            (result, received) = tokio::join!(
++                send_prepared_shm_response(&pool, &writer, 73, prepared),
++                read_reply_frame(&mut peer),
++            );
++        } else {
++            let mut send = Box::pin(send_prepared_shm_response(&pool, &writer, 73, prepared));
++            received = tokio::select! {
++                biased;
++                result = &mut send => panic!("flush must remain pending: {result:?}"),
++                frame = read_reply_frame(&mut peer) => frame,
++            };
++            tokio::time::pause();
++            tokio::time::advance(Duration::from_secs(31)).await;
++            result = send.await;
++        }
++        let (request_id, flags, payload) = received;
++        assert_eq!(request_id, 73);
++        assert_eq!(flags, FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY);
++        let (wire, _) = decode_buddy_payload(&payload).unwrap();
++        assert_eq!(wire.allocation_id, original.allocation_id);
++        assert_eq!(wire.offset, original.offset);
++        let error = result.expect_err("flush failure/expiry must remain an error");
++        let live_after_error = pool.read().stats().alloc_count;
++        let mut next = pool.inner.write().alloc_shm_handle(8192).unwrap();
++        let replacement = next.shm_allocation().unwrap();
++        let reused = replacement.seg_idx == original.seg_idx
++            && replacement.offset == original.offset
++            && replacement.allocation_id != original.allocation_id;
++        pool.read().handle_slice_mut(&mut next).fill(0x5A);
++        eprintln!("R07_BASELINE flush_fault={flush_fault} complete_frame_received=true error={error} live_after_error={live_after_error} same_address_reused={reused} old_id={} new_id={}", original.allocation_id, replacement.allocation_id);
++        pool.inner.write().release_handle(next).unwrap();
++        drop((writer, peer));
++        // Correct contract: publication retains the original allocation for peer release.
++        // Current baseline fails here, after its isolated replacement is cleaned.
++        assert_eq!(live_after_error, 1, "published SHM was freed locally after flush failed");
++        assert!(!reused, "peer-visible coordinates now address a new allocation");
++    }
++
++    #[tokio::test]
++    async fn r07_baseline_full_frame_flush_failure_must_not_free_published_shm() {
++        r07_assert_published_frame_not_recycled(1).await;
++    }
++
++    #[tokio::test]
++    async fn r07_baseline_full_frame_flush_timeout_must_not_free_published_shm() {
++        r07_assert_published_frame_not_recycled(2).await;
++    }
++
+ }
+--- a/core/runtime/c2-core/src/lifetime.rs
++++ b/core/runtime/c2-core/src/lifetime.rs
+@@ -98,3 +98,57 @@
+         self.released = true;
+     }
+ }
++
++#[cfg(test)]
++mod r07_narrow_baseline {
++    use super::*;
++    use std::{cell::Cell, sync::Arc};
++    use c2_mem::{MemPool, PoolConfig};
++    use c2_wire::chunk::ReassemblyBacking;
++    use parking_lot::RwLock;
++
++    fn pool(label: &str) -> MemPool {
++        MemPool::new_with_prefix(PoolConfig {
++            segment_size: 64 * 1024, min_block_size: 4096,
++            max_segments: 1, max_dedicated_segments: 1,
++            ..PoolConfig::default()
++        }, format!("/c2r07n{}-{label}", std::process::id()))
++    }
++
++    #[test]
++    fn r07_baseline_failed_held_release_keeps_native_retry_obligation() {
++        let pool = Arc::new(RwLock::new(pool("original")));
++        let budget = pool.read().budget().unwrap().clone();
++        let backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, 512).unwrap();
++        let mut held = HeldResponse::from_response_lease(ResponseLease::new(
++            c2_ipc::ResponseData::Handle(backing),
++        )).unwrap();
++        let original = std::mem::replace(&mut *pool.write(), self::pool("foreign"));
++        let calls = Cell::new(0);
++        let first = held.invalidate_then_release(|| { calls.set(calls.get()+1); Ok(()) });
++        assert!(first.is_err());
++        *pool.write() = original;
++        let second = held.invalidate_then_release(|| { calls.set(calls.get()+1); Ok(()) });
++        let remaining = pool.read().stats().alloc_count;
++        let charge = budget.snapshot().reassembly.used_bytes;
++        eprintln!("R07_HELD_BASELINE first_error={} second_ok={} invalidations={} remaining={} reassembly_charge={}", first.unwrap_err(), second.is_ok(), calls.get(), remaining, charge);
++        drop(held);
++        pool.write().destroy(); // This task-owned pool only; no repair of the foreign authority.
++        assert!(second.is_ok());
++        assert_eq!(calls.get(), 1, "invalidation must not replay");
++        assert_eq!(remaining, 0, "second release reported success with its old allocation still live");
++        assert_eq!(charge, 0, "successful retry must refund its original reservation");
++    }
++
++    #[test]
++    fn r07_baseline_invalidation_panic_does_not_replay_user_callback() {
++        let mut held = HeldResponse::from_owned_bytes(vec![1]);
++        let calls = Cell::new(0);
++        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            held.invalidate_then_release(|| { calls.set(calls.get()+1); panic!("R07 injected invalidator panic"); })
++        })).is_err());
++        held.invalidate_then_release(|| { calls.set(calls.get()+1); Ok(()) }).unwrap();
++        eprintln!("R07_INVALIDATOR_BASELINE callback_count={}", calls.get());
++        assert_eq!(calls.get(), 1, "caught invalidator panic must not replay user code");
++    }
++}
