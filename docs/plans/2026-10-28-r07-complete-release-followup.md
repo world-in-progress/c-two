@@ -47,7 +47,9 @@ Rust Held 的 value 与 response 不再作为一个不可重试的 `owners.take(
 
 `ServerShmResponse` 和 `PeerShmRequest` 成为最低层释放义务载体；裸 ResponseData/RequestData 被丢弃也由此受保护。ReassemblyBacking 把原 handle 与 reservation 一起交接。RequestBlock 继续由原 Armed/Dispatched/Released 事务决定何时可以交接，不增加第二套请求 phase。
 
-生命周期锚只持原生 counted-entry pin 和 tracking guard，不接收用户回调。把现有 ClientLease 的 PoolReferences 归还权拆成可移动的 pin；它只持计数/时间戳状态，不持 SyncClient、ClientPool、Core ClientConnection 或 Runtime。Core Held 不再为同一目的保留整个 ClientConnection Arc，避免隔离记录反过来阻止 Runtime/缓存 teardown。正常持有期间计数仍阻止 idle eviction，显式 Runtime close 仍可关闭连接而保留真实 payload pool。
+生命周期锚只持原生 counted-entry pin 和 tracking guard，不接收用户回调。把现有 ClientLease 的 PoolReferences 归还权放入共享的 counted pin；克隆同一个 pin 只共享既有归还义务，不按 clone 次数增加引用计数。pin 只持计数/时间戳状态，不持 SyncClient、ClientPool、Core ClientConnection 或 Runtime。正常 Held 继续按原方式保留具体连接的生命周期；失败对象仍活着时保留原连接与 lease，只有最终移交清理时才把纯计数 pin 留给原生 work，避免 work/quarantine 反过来阻止 Runtime/缓存 teardown。显式 Runtime close 仍可关闭连接而保留真实 payload pool。
+
+原 `ClientLease::into_client` 的显式归还契约保持：取得显式 counted reference 后释放它自己的共享 pin，不能把整个共享 pin 标成 disabled，连带取消尚存 native work 的归还义务。节点的 pin 附件是现有共享原生对象的 Arc 克隆，最终 Drop 不为它分配 Box/执行闭包。
 
 锚随实际清理工作保留，完成后一次归还。pool 内清理记录不得反向强持 pool/Runtime/Client；执行器的 queued/in-flight 工作才强持实际 owner。隔离记录可持上述纯计数 pin 和 tracking guard，原 pool teardown 时在 backing/reservation 之后归还；它们没有反向运输引用。生命周期附件只在 Core/native 装配到真实 release work，不形成独立 anchor 工作或 SDK 自定义回调接口。
 
@@ -75,7 +77,7 @@ Rust Held 的 value 与 response 不再作为一个不可重试的 `owners.take(
 - 有界共享锁竞争：只重试同一原分配；每轮有界且公平，不能让一个 backing 阻塞全部退休工作，也不能重启业务请求或扩大原调用期限。
 - poison、dead-holder、incarnation/generation/allocation_id/span 拒绝：不重置、不偷锁、不自由重试。移回原 pool 的 quarantine，记录不含 pool/Runtime/Client 强引用；执行器撤掉自己的 pool 引用，原 pool 因而能够真实 teardown。其他真实 owner 仍活着时记录及计费保留；原 backing 结束后才归还本地 reservation、tracking 和纯计数 pin。peer 的生产者计费仍由生产者决定，不能从接收方 unmap 推出退款。
 
-原 worker 改为公平短步：锁外执行一条释放/GC 步骤，未完成则将同一节点放回队尾，复用现有 Condvar 的有界定时等待。一个 dedicated 的 read_done 等待或一个 contended pool 不能长期霸占 worker。接管步骤不再调用 ensure_workers_locked；单个 allocator unwind 在 worker 边界保住 work，按 typed poison 处置，不吞业务 panic、不重新发布请求。Contended 不以尝试次数或等待时长耗尽作为“已释放”，原调用期限仍只约束调用方。
+原 worker 改为公平短步：锁外执行一条释放/GC 步骤，未完成则将同一节点放回队尾，复用现有 Condvar 的有界定时等待。一个 dedicated 的 read_done 等待或一个 contended pool 不能长期霸占 worker。接管步骤不再调用 ensure_workers_locked；单个 allocator unwind 在 worker 边界保住同一节点，按 typed poison 处置，原 worker 继续处理下一项，不让单项 unwind 逃出线程再寄望 Drop 重建。worker 只有在所有活预留结束后才按原空闲规则退出。该捕获不吞业务 panic、不重新发布请求。Contended 不以尝试次数或等待时长耗尽作为“已释放”，原调用期限仍只约束调用方。
 
 这里无 timer 指关闭 Tokio maintenance/time driver 后仍有进度；复用已有原生 Condvar 定时重试。shared unlock 没有跨进程通知，不能额外承诺完全无轮询。原 dedicated 工作也只以实际 entry 退休为结束，不能 elapsed bound 到期就放弃最后原 pool 引用；read_done/crash-timeout 的政策决定仍完全由原 MemPool GC 作出。
 
@@ -126,14 +128,16 @@ Pending retirement 在原 Core 锁序内将 seed 和封存范围交给同一 hos
 | Python `hold`/HeldResult、Runtime/shutdown | 调用签名保持；重复 release 可继续原生清理但不重放 invalidator，失效后不能访问 value。失败启动在 host thread 未创建时不再顺带关闭旧 outgoing clients。 |
 | Rust Held/Core Held | 保留 release 和 consuming 的主签名；增加 `has_pending_release(&self) -> bool` 只读投影，供桥接及调用者区分逻辑失效和物理待清理；connection pin 归还按真实释放完成。 |
 | 低层 Rust allocator/pool | `BuddyAllocator::free`、`MemPool::free/free_at` 的错误改为 `ReleaseFailure`；它区分 `Allocator(SpinlockError)` 与 `InvalidAllocation(String)`。`ReleaseHandleError.reason` 同步改为该类型，仍携带原 MemHandle。Display 保留原上下文与错误顺序；不保留旧 String 返回入口。 |
-| 原生载体和退休代码 | 下沉已有 ResponsePool 固定 owner 能力，形成不可失败的 `MemPoolOwner::new(MemPool) -> MemPoolOwner`；ReassemblyBacking 准入参数改为该 owner，取代可替换 Arc 锁输入。IpcClient/SyncClient 的注入 MemPool 所有权入口保持，由其内部封装。raw received-admission 桥保留唯一释放义务的 unsafe 契约；worker/node 准备失败走原 allocation/connection 的错误返回，不消费既有 owner。退休器下沉及相关低层 Rust 输入迁移不留旧 owner 入口。 |
+| 原生载体和退休代码 | 下沉已有 ResponsePool 固定 owner 能力，形成不可失败的 `MemPoolOwner::new(MemPool, ReleaseCleanupContext) -> MemPoolOwner`；ReassemblyBacking 准入参数改为该 owner，取代可替换 Arc 锁输入。IpcClient/SyncClient 的注入 MemPool 所有权入口保持，由其内部封装。raw received-admission 桥保留唯一释放义务的 unsafe 契约；worker/node 准备失败走原 allocation/connection 的错误返回，不消费既有 owner。退休器下沉及相关低层 Rust 输入迁移不留旧 owner 入口。 |
 | c2-local 写入 | 新增 `LocalWriteHalf::write_all_with_progress(&mut self, bytes: &[u8], frame_written: &mut bool) -> io::Result<()>`；只是原写入实现的完成事实投影，普通 write_all/with_timeout 仍各有其现有用途，不作为旧 Prepared 兼容分支。 |
 | raw `MemPool::destroy` | 保持原手动 API 及旧句柄 generation 拒绝；正式 native carrier 使用固定 owner，其安全面不能 replace/destroy 活池。原池的 unsafe 访问契约与 compile-fail 覆盖同步迁移。 |
 | 内存观察 | `c2_mem::ReleaseCleanupStats { pending: u64, failed: u64 }` 为 Copy 快照；`BudgetSnapshot` 和 Core `MemoryScopeStats` 增加 `release_cleanup`，Python 原 memory stats 的各 scope 增加同名 `{pending, failed}` 对象。pending 计恢复性待处理，failed 计拒绝修改且仍持有的隔离义务；一次只归入一类。weak observer 只持计数，不能成为 cleanup owner；错误本身沿原 Result/原生日志报告，不建错误历史队列。 |
 | Host/failed-start receipt | Host 驱动与请求/观察责任变化；Host 未创建的错误不再交付声称已做 Core cleanup 的 receipt。Rust SDK 和 Native 仍暴露相同主入口，不新增第二套 close API。 |
 | 协议及 ABI | IPC 14、SHM 3、C/FFI ABI 6、业务帧、CRM hash、属主协议及端点/凭据格式均不变；不新增旧格式兼容。 |
 
-inline/owned Held 仍保持原 pin 生命周期，不借本项提前触发其 idle eviction；把整个 Core connection 改为纯计数 pin 后，Held 本身不再额外保留 Runtime 的配置/连接权威。失败释放后的 retained 统计跟随真实原生清理义务，可能在业务值已失效后仍非零；这是修正后的可观察失败语义，不代表还能读取 value。
+inline/owned Held 仍保持原 pin 生命周期，不借本项提前触发其 idle eviction；最终移交给后台的清理 work 不持整个 Core connection 的配置/连接权威。失败释放后的 retained 统计跟随真实原生清理义务，可能在业务值已失效后仍非零；这是修正后的可观察失败语义，不代表还能读取 value。
+
+统计归属在 owner 创建时固定：`MemoryBudget::release_cleanup_context()` 返回只含同一 scope 元数据的 `ReleaseCleanupContext`，不暴露 reserve/free；Runtime outgoing 和 Server 各自把它交给本 scope 的所有固定 owner。peer owner 同样取得接收方的清理统计上下文，但其 `MemPool::budget` 仍为 None，不增加接收方 SHM backing 计费。活 ticket/隔离记录保持该纯元数据状态可观察，既有 retired weak observer 不会因 payload cell 为零就漏掉 pending；不能为此让 observer 强持任何 pool/client/runtime。上下文绑定是 Rust 内部域归属，不是新用户配置项。
 
 ## 8. 改动量与维护成本
 
