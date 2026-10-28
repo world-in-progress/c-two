@@ -7,6 +7,11 @@ import re
 
 import pytest
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pytest already depends on tomli on Python 3.10.
+    import tomli as tomllib
+
 
 def _rust_function(source: str, name: str) -> str:
     """Limit guards to one function, ignoring comment/string brace contents."""
@@ -849,6 +854,19 @@ def test_python_native_server_bridge_does_not_expose_public_bool_unit_lifecycle_
     assert "_close_outcome_is_hook_safe" in bridge_source
 
 
+def _assert_no_native_transport_dependencies(cargo: str) -> None:
+    manifest = tomllib.loads(cargo)
+    tables = [manifest, *manifest.get("target", {}).values()]
+    dependencies = {
+        spec.get("package", name) if isinstance(spec, dict) else name
+        for table in tables
+        for kind in ("dependencies", "build-dependencies")
+        for name, spec in table.get(kind, {}).items()
+    }
+    forbidden = dependencies & {"c2-server", "c2-http", "c2-ipc"}
+    assert not forbidden, f"PyO3 production dependencies must go through Core: {sorted(forbidden)}"
+
+
 def test_python_native_does_not_build_transport_runtime_directly():
     root = Path(__file__).resolve().parents[4]
     native_root = root / "sdk" / "python" / "native" / "src"
@@ -861,9 +879,39 @@ def test_python_native_does_not_build_transport_runtime_directly():
 
     assert direct_builder_uses == []
     cargo = (native_root.parent / "Cargo.toml").read_text(encoding="utf-8")
-    assert "c2-server" not in cargo
-    assert "c2-http" not in cargo
-    assert "c2-ipc" not in cargo
+    _assert_no_native_transport_dependencies(cargo)
+
+
+def test_native_transport_dependencies_allow_dev_tables():
+    _assert_no_native_transport_dependencies('''
+        [package]
+        name = "boundary-test"
+        description = "c2-server, c2-http and c2-ipc are development fixtures"
+        [dependencies]
+        c2-core = "0.1.0" # c2-ipc is reached through Core in production
+        [dev-dependencies]
+        c2-ipc = "0.1.0"
+        c2-server = "0.1.0"
+        [target.'cfg(windows)'.dev-dependencies]
+        c2-http = "0.1.0"
+    ''')
+
+
+@pytest.mark.parametrize("crate", ("c2-server", "c2-http", "c2-ipc"))
+@pytest.mark.parametrize("table", (
+    "dependencies",
+    "build-dependencies",
+    "target.'cfg(windows)'.dependencies",
+    'target."cfg(unix)".build-dependencies',
+))
+@pytest.mark.parametrize("renamed", (False, True))
+def test_native_transport_dependencies_reject_production_tables(crate, table, renamed):
+    dependency = (
+        f'transport = {{ package = "{crate}", version = "0.1.0" }}'
+        if renamed else f'{crate} = "0.1.0"'
+    )
+    with pytest.raises(AssertionError, match=crate):
+        _assert_no_native_transport_dependencies(f"[{table}]\n{dependency}\n")
 
 
 def test_python_native_server_start_wait_uses_core_responsive_fence():

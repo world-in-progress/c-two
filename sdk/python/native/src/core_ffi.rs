@@ -1023,6 +1023,100 @@ def cleanup():
     }
 
     #[test]
+    fn failed_native_response_keeps_tracking_until_retry_or_abandonment() {
+        Python::initialize();
+        Python::attach(|py| {
+            for abandon in [false, true] {
+                let config = c2_mem::PoolConfig {
+                    segment_size: 65536,
+                    min_block_size: 4096,
+                    max_segments: 1,
+                    ..Default::default()
+                };
+                let pool = Arc::new(parking_lot::RwLock::new(c2_mem::MemPool::new(
+                    config.clone(),
+                )));
+                let budget = pool.read().budget().unwrap().clone();
+                let backing =
+                    c2_wire::chunk::ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
+                let held = HeldResponse::from_response_lease(c2_ipc::ResponseLease::new(
+                    c2_ipc::ResponseData::Handle(backing),
+                ))
+                .unwrap();
+                let response = Py::new(py, PyCoreResponse::new(held)).unwrap();
+                let tracker = tracker();
+                let owner = response.borrow(py);
+                owner
+                    .track_retained(&tracker, "retry", "release", "client_response")
+                    .unwrap();
+                let original = std::mem::replace(&mut *pool.write(), c2_mem::MemPool::new(config));
+                let globals = pyo3::types::PyDict::new(py);
+                py.run(
+                    c"def invalidator(value):
+ try:
+  raise KeyError('prior')
+ except KeyError:
+  raise ValueError('primary')",
+                    Some(&globals),
+                    None,
+                )
+                .unwrap();
+                let invalidator = globals.get_item("invalidator").unwrap().unwrap().unbind();
+                let error = owner
+                    .invalidate_then_release(py, invalidator, py.None())
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyValueError>(py));
+                let cleanup = error
+                    .context(py)
+                    .expect("cleanup error stays in exception chain");
+                assert!(
+                    cleanup
+                        .to_string()
+                        .contains("pool owner incarnation mismatch")
+                );
+                assert!(
+                    cleanup
+                        .context(py)
+                        .unwrap()
+                        .is_instance_of::<pyo3::exceptions::PyKeyError>(py)
+                );
+                assert!(owner.is_released());
+                assert!(owner.has_pending_release());
+                assert_counts(&tracker, 1, 512);
+                // A direct release retry must retain tracking on native failure too.
+                let retry_error = owner.release().unwrap_err();
+                assert!(
+                    retry_error
+                        .to_string()
+                        .contains("pool owner incarnation mismatch")
+                );
+                assert!(owner.has_pending_release());
+                assert_counts(&tracker, 1, 512);
+                assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+                assert_eq!(budget.snapshot().abandoned_releases, 0);
+                if abandon {
+                    owner._abandon_after_failed_release();
+                    assert_eq!(budget.snapshot().abandoned_releases, 1);
+                    assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+                } else {
+                    *pool.write() = original;
+                    owner.release().unwrap();
+                    assert_eq!(budget.snapshot().abandoned_releases, 0);
+                    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+                    assert!(!owner.has_pending_release());
+                    assert_counts(&tracker, 0, 0);
+                    pool.write().destroy();
+                    continue;
+                }
+                assert!(!owner.has_pending_release());
+                assert_counts(&tracker, 0, 0);
+                *pool.write() = original;
+                pool.write().destroy();
+            }
+        });
+    }
+
+    #[test]
     fn response_release_rejects_export_before_inner_lock() {
         response_release_race(false);
     }
