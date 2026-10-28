@@ -130,7 +130,7 @@ cp target/native-error-boundaries-python/debug/libc2_ffi.dylib \
   target/native-error-boundaries-python/python/c_two/_native.so
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 C2_RELAY_ANCHOR_ADDRESS= \
 DYLD_LIBRARY_PATH=/tmp/c2-memory-fastdb-sdk/lib \
-PYTHONPATH="$PWD/target/native-error-boundaries-python/python:/Users/soku/Desktop/codespace/WorldInProgress/c-two/.venv/lib/python3.13/site-packages" \
+PYTHONPATH="$PWD/target/native-error-boundaries-python/python:<c-two>/.venv/lib/python3.13/site-packages" \
 python3 -m pytest --confcutdir=sdk/python/tests/unit \
   sdk/python/tests/unit/test_runtime_session.py \
   -k 'native_shutdown_rejects_invalid_timeout or native_shutdown_accepts_zero_and_normal_timeout' \

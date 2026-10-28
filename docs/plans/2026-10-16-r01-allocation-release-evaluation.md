@@ -22,7 +22,7 @@
 
 四次池实验各有一个新建且唯一命名的 SHM 对象。子进程均通过 OS wait 确认退出，owner 原生 Drop 后四个名字再次打开均为 `ENOENT`。实验未创建 socket 或 endpoint lease，没有扫描、清理、重建历史目录。
 
-证据目录：`/Users/soku/.codex/diagnostics/c2-r01-evaluation-3382b3ba-6cx0jvuu/`，包含 `source-manifest.json`、三个 cargo 探针、`baseline.log`、`current.log`、`pool-probe.log`、环境和带日志 SHA-256 的 `receipt.json`。三个 `cargo run --offline` 均退出 0。两个输入的 `buddy.rs` 与 `spinlock.rs` SHA-256 完全相同；`bitmap.rs` 仅差此前删除的空区间初始化循环。结合两版实跑，可确认这个缺陷在瘦身前已经存在，不能归因于本轮瘦身。
+证据目录：`~/.codex/diagnostics/c2-r01-evaluation-3382b3ba-6cx0jvuu/`，包含 `source-manifest.json`、三个 cargo 探针、`baseline.log`、`current.log`、`pool-probe.log`、环境和带日志 SHA-256 的 `receipt.json`。三个 `cargo run --offline` 均退出 0。两个输入的 `buddy.rs` 与 `spinlock.rs` SHA-256 完全相同；`bitmap.rs` 仅差此前删除的空区间初始化循环。结合两版实跑，可确认这个缺陷在瘦身前已经存在，不能归因于本轮瘦身。
 
 ## 原设计与调用链
 
@@ -119,4 +119,4 @@ backing generation 解决段槽位被回收再创建后的旧引用；本次同�
 
 本次隔离默认根及各轮私有测试根最终 socket/lease 均为零；历史两个默认根在开始及结束均不存在，没有清理、重建或冷切换。812 个跟踪文件逐一核对，仅在隔离副本替换登记的默认目录及对应严格路径断言。Python 完整运行后仅增加上述 5 行 Rust `cfg(test)`，生产前缀逐字一致；最终 c2-mem 与线上候选覆盖该补强。
 
-证据目录 `/Users/soku/.codex/diagnostics/c2-r01-zvd34zy6/` 保留基线红绿、完整回归、严格收据、两组变异实验、源码/包/原生二进制哈希、独立审查、性能样本和 `local-acceptance.json`；构建物与本机证据没有加入 Git。
+证据目录 `~/.codex/diagnostics/c2-r01-zvd34zy6/` 保留基线红绿、完整回归、严格收据、两组变异实验、源码/包/原生二进制哈希、独立审查、性能样本和 `local-acceptance.json`；构建物与本机证据没有加入 Git。

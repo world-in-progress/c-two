@@ -55,7 +55,7 @@ no-file-creation acceptance.
 The first native compile attempt in the DSH `workspace-write` sandbox could not
 reach the crate: the FastDB dependency build script configures CMake inside its
 cargo git checkout and fails writing
-`/Users/soku/.cargo/git/checkouts/fastdb-def8b40a5adb8189/4f99f86/fastcarto/lib/clipper/Clipper2Lib/include/clipper2/clipper.version.h.tmp`
+`~/.cargo/git/checkouts/fastdb-def8b40a5adb8189/4f99f86/fastcarto/lib/clipper/Clipper2Lib/include/clipper2/clipper.version.h.tmp`
 with `Operation not permitted`; a direct `touch` probe in that checkout was
 denied the same way. That sandbox-denied attempt is superseded.
 
@@ -100,7 +100,7 @@ C++ source-mode build or for a source-mode native artifact.
 ## Integration notes
 
 The worktree Git index lives outside the allocated checkout
-(`/Users/soku/Desktop/codespace/WorldInProgress/c-two/.git/worktrees/checkout5`),
+(`<c-two>/.git/worktrees/checkout5`),
 so no `git add` was attempted for this repair; as instructed, the worktree was
 not touched through the index. This report stays untracked in the delivered
 worktree and the Host integrates it via the sealed patch.

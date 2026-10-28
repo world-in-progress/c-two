@@ -221,8 +221,8 @@
     "portable_rows": 18,
     "typescript_rows": 12,
     "provenance": {
-      "package": "/Users/soku/.codex/worktrees/c2-endpoint-lifecycle/c-two/sdk/python/src/c_two/__init__.py",
-      "native": "/Users/soku/.codex/worktrees/c2-endpoint-lifecycle/c-two/sdk/python/src/c_two/_native.cpython-313-darwin.so",
+      "package": "~/.codex/worktrees/c2-endpoint-lifecycle/c-two/sdk/python/src/c_two/__init__.py",
+      "native": "~/.codex/worktrees/c2-endpoint-lifecycle/c-two/sdk/python/src/c_two/_native.cpython-313-darwin.so",
       "build_target_reuse": "/tmp/c2-endpoint-targets/final-2cfd151949de",
       "source_sha": "980acec1bd32d960771e6a4a14a1ba4fc4d786cb",
       "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",

@@ -3841,7 +3841,7 @@ python tools/dev/c3_tool.py --build --link
 
 Expected: local `c3 relay` binary is rebuilt from current Rust code.
 
-Status as of 2026-05-11: passed; `/Users/soku/.cargo/bin/c3` was linked to the
+Status as of 2026-05-11: passed; `~/.cargo/bin/c3` was linked to the
 current `cli/target/debug/c3`.
 
 - [x] **Step 5: Run Python suite**

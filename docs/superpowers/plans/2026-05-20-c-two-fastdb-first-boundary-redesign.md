@@ -18,7 +18,7 @@
 - Prior implementation plan: `docs/plans/2026-05-18-fastdb-first-crm-abi-and-bridge.md`
 - Closure review packet: `docs/plans/2026-05-20-fastdb-first-closure-review-packet.md`
 - TypeScript IPC/runtime requirement notes: `docs/plans/2026-05-20-typescript-ipc-shm-runtime-adapter-requirements.md`
-- FastDB sibling plan material: `/Users/soku/Desktop/codespace/WorldInProgress/fastdb/docs/superpowers/plans/2026-05-18-c-two-call-db-codec.md`
+- FastDB sibling plan material: `<fastdb>/docs/superpowers/plans/2026-05-18-c-two-call-db-codec.md`
 
 ## Boundary Inventory From Current Worktree
 
@@ -97,7 +97,7 @@ Expected: the output includes the C-Two files listed in this plan's inventory se
 
 - [x] **Step 2: Refresh the FastDB inventory scan**
 
-Run from `/Users/soku/Desktop/codespace/WorldInProgress/fastdb`:
+Run from `<fastdb>`:
 
 ```bash
 rg -l "fastdb4py\\.c_two|fastdb4ts/src/c-two|codegen/c_two|c_two_provider|c_two_bridge|c_two_call|fdb codegen --c-two-ts|C-Two provider|C-Two codec|C-Two call-db|createFastdbC2|FastdbC2" README.md docs python/fastdb4py ts/fastdb4ts/src tests/python tests/ts --glob '!**/.venv/**' | sort
@@ -153,7 +153,7 @@ Expected before implementation: import failure for `c_two.fastdb`.
 
 - [x] **Step 2: Add the dependency**
 
-Modify `sdk/python/pyproject.toml` so `[project].dependencies` includes `fastdb4py`. If the published dependency version is available in the development index, use a lower bound matching the sibling package version currently observed in `/Users/soku/Desktop/codespace/WorldInProgress/fastdb/pyproject.toml`:
+Modify `sdk/python/pyproject.toml` so `[project].dependencies` includes `fastdb4py`. If the published dependency version is available in the development index, use a lower bound matching the sibling package version currently observed in `<fastdb>/pyproject.toml`:
 
 ```toml
 dependencies = [
@@ -211,7 +211,7 @@ C2_RELAY_ANCHOR_ADDRESS= uv run --locked pytest sdk/python/tests/unit/test_sdk_b
 git diff --check
 ```
 
-Observed evidence: focused ABI tests reported `4 passed in 0.19s`; compileall exited 0; import smoke printed `/Users/soku/Desktop/codespace/WorldInProgress/fastdb/python/fastdb4py/__init__.py` and `True <class 'fastdb4py.type.Array'> <class 'fastdb4py.type.Batch'> <function feature ...>`; lazy import smoke printed `after import c_two False False` and `after from import fastdb c_two.fastdb True`; adjacent SDK boundary run reported `38 passed in 0.49s`; `git diff --check` exited 0.
+Observed evidence: focused ABI tests reported `4 passed in 0.19s`; compileall exited 0; import smoke printed `<fastdb>/python/fastdb4py/__init__.py` and `True <class 'fastdb4py.type.Array'> <class 'fastdb4py.type.Batch'> <function feature ...>`; lazy import smoke printed `after import c_two False False` and `after from import fastdb c_two.fastdb True`; adjacent SDK boundary run reported `38 passed in 0.49s`; `git diff --check` exited 0.
 
 ### Task 1.2: Make official FastDB ABI planning not require provider installation
 
@@ -446,7 +446,7 @@ Stop exporting C-Two-specific symbols such as `createFastdbC2CodecRegistry`, `Fa
 
 - [x] **Step 3: Verify FastDB TypeScript runtime**
 
-Run from `/Users/soku/Desktop/codespace/WorldInProgress/fastdb`:
+Run from `<fastdb>`:
 
 ```bash
 npm --prefix ts/fastdb4ts run build
@@ -511,7 +511,7 @@ Update `python/fastdb4py/cli.py` so the FastDB CLI no longer presents C-Two code
 
 - [x] **Step 4: Verify FastDB Python suite**
 
-Run from `/Users/soku/Desktop/codespace/WorldInProgress/fastdb`:
+Run from `<fastdb>`:
 
 ```bash
 uv run pytest tests/python -q
@@ -538,7 +538,7 @@ If `docs/c-two-provider-architecture.md` remains, mark it historical or supersed
 
 - [x] **Step 3: Verify FastDB doc hygiene**
 
-Run from `/Users/soku/Desktop/codespace/WorldInProgress/fastdb`:
+Run from `<fastdb>`:
 
 ```bash
 rg -n "install_c_two_provider|fdb codegen --c-two-ts|fastdb4py\\.c_two|C-Two provider|provider-owned portable payload ABI" README.md docs python/fastdb4py ts/fastdb4ts/src
@@ -566,7 +566,7 @@ uv run --locked python -m compileall -q sdk/python/src/c_two/fastdb sdk/python/t
 git diff --check
 ```
 
-Observed evidence: C-Two's uv environment resolves `fastdb4py` to `/Users/soku/Desktop/codespace/WorldInProgress/fastdb/python/fastdb4py/__init__.py`, confirming the local editable sibling repository is the test input instead of the stale PyPI package. The RED FastDB import-boundary test first failed because `fastdb4py` exposed and eagerly loaded `fastdb4py.c_two_provider`, `fastdb4py.c_two_call`, `fastdb4py.c_two_bridge`, `fastdb4py.codegen.c_two_ts`, and `--c-two-ts`; after cleanup, focused boundary tests reported `5 passed`, full FastDB Python tests reported `318 passed`, FastDB compileall passed, the focused FastDB doc hygiene scan returned no matches, and FastDB `git diff --check` passed. The old FastDB C-Two modules and tests were deleted or moved into C-Two-owned surfaces, `fastdb4py.__init__` now exports only generic FastDB names, `fastdb4py.codegen` only exports generic TypeScript schema codegen, and `fdb codegen` no longer advertises C-Two codegen. C-Two smoke verification reported `6 passed` for `test_fastdb_abi.py`, `12 passed in 27.41s` for grid FastDB bridge smoke, and `114 passed in 314.26s` for the full FastDB codec provider smoke after removing obsolete provider-installation idempotence tests. C-Two compileall and `git diff --check` passed. The C-Two source/test scan no longer finds direct imports from `fastdb4py.c_two*`; remaining matches are C-Two docs/spec/plan text that belongs to Phase 5 cleanup, plus the intentional negative boundary assertion in `test_fastdb_abi.py`.
+Observed evidence: C-Two's uv environment resolves `fastdb4py` to `<fastdb>/python/fastdb4py/__init__.py`, confirming the local editable sibling repository is the test input instead of the stale PyPI package. The RED FastDB import-boundary test first failed because `fastdb4py` exposed and eagerly loaded `fastdb4py.c_two_provider`, `fastdb4py.c_two_call`, `fastdb4py.c_two_bridge`, `fastdb4py.codegen.c_two_ts`, and `--c-two-ts`; after cleanup, focused boundary tests reported `5 passed`, full FastDB Python tests reported `318 passed`, FastDB compileall passed, the focused FastDB doc hygiene scan returned no matches, and FastDB `git diff --check` passed. The old FastDB C-Two modules and tests were deleted or moved into C-Two-owned surfaces, `fastdb4py.__init__` now exports only generic FastDB names, `fastdb4py.codegen` only exports generic TypeScript schema codegen, and `fdb codegen` no longer advertises C-Two codegen. C-Two smoke verification reported `6 passed` for `test_fastdb_abi.py`, `12 passed in 27.41s` for grid FastDB bridge smoke, and `114 passed in 314.26s` for the full FastDB codec provider smoke after removing obsolete provider-installation idempotence tests. C-Two compileall and `git diff --check` passed. The C-Two source/test scan no longer finds direct imports from `fastdb4py.c_two*`; remaining matches are C-Two docs/spec/plan text that belongs to Phase 5 cleanup, plus the intentional negative boundary assertion in `test_fastdb_abi.py`.
 
 ### Checkpoint: Phase 4
 
@@ -722,8 +722,8 @@ Run:
 
 ```bash
 cargo test --manifest-path core/foundation/c2-mem-ffi/Cargo.toml
-NODE=/Users/soku/.nvm/versions/node/v22.17.0/bin/node npm test --prefix core/foundation/c2-mem-ffi/bindings/typescript
-NODE=/Users/soku/.nvm/versions/node/v22.17.0/bin/node npm run pack:check --prefix core/foundation/c2-mem-ffi/bindings/typescript
+NODE=~/.nvm/versions/node/v22.17.0/bin/node npm test --prefix core/foundation/c2-mem-ffi/bindings/typescript
+NODE=~/.nvm/versions/node/v22.17.0/bin/node npm run pack:check --prefix core/foundation/c2-mem-ffi/bindings/typescript
 ```
 
 Expected: all pass; `pack:check` is not run concurrently with tests.
@@ -732,7 +732,7 @@ Observed evidence on 2026-05-20: `cargo test --manifest-path core/foundation/c2-
 
 - [x] **Step 5: Run FastDB sibling suites**
 
-Run from `/Users/soku/Desktop/codespace/WorldInProgress/fastdb`:
+Run from `<fastdb>`:
 
 ```bash
 uv run pytest tests/python -q

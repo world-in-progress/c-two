@@ -696,13 +696,13 @@
     "checks": [
       {
         "paths": {
-          "c_two": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/__init__.py",
-          "c_two._native": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/_native.cpython-313-darwin.so",
-          "fastdb4py": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/__init__.py",
-          "fastdb_library": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/core/libfastdb.dylib",
-          "numpy": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/numpy/__init__.py"
+          "c_two": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/__init__.py",
+          "c_two._native": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/_native.cpython-313-darwin.so",
+          "fastdb4py": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/__init__.py",
+          "fastdb_library": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/core/libfastdb.dylib",
+          "numpy": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/numpy/__init__.py"
         },
-        "prefix": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv",
+        "prefix": "$TMPDIR/c-two wheel 安装 mqu35thv/venv",
         "pid": 24282,
         "installed_wheels": {
           "fastdb4py": {
@@ -733,13 +733,13 @@
       },
       {
         "paths": {
-          "c_two": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/__init__.py",
-          "c_two._native": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/_native.cpython-313-darwin.so",
-          "fastdb4py": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/__init__.py",
-          "fastdb_library": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/core/libfastdb.dylib",
-          "numpy": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/numpy/__init__.py"
+          "c_two": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/__init__.py",
+          "c_two._native": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/_native.cpython-313-darwin.so",
+          "fastdb4py": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/__init__.py",
+          "fastdb_library": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/core/libfastdb.dylib",
+          "numpy": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/numpy/__init__.py"
         },
-        "prefix": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv",
+        "prefix": "$TMPDIR/c-two wheel 安装 mqu35thv/venv",
         "pid": 24283,
         "installed_wheels": {
           "fastdb4py": {
@@ -819,13 +819,13 @@
     "cli_version": "c3 0.3.3",
     "host": {
       "paths": {
-        "c_two": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/__init__.py",
-        "c_two._native": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/_native.cpython-313-darwin.so",
-        "fastdb4py": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/__init__.py",
-        "fastdb_library": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/core/libfastdb.dylib",
-        "numpy": "/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/numpy/__init__.py"
+        "c_two": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/__init__.py",
+        "c_two._native": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/c_two/_native.cpython-313-darwin.so",
+        "fastdb4py": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/__init__.py",
+        "fastdb_library": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/fastdb4py/core/libfastdb.dylib",
+        "numpy": "$TMPDIR/c-two wheel 安装 mqu35thv/venv/lib/python3.13/site-packages/numpy/__init__.py"
       },
-      "prefix": "/private/var/folders/8s/_8wkkrz159qft4v82tbn7dzc0000gn/T/c-two wheel 安装 mqu35thv/venv",
+      "prefix": "$TMPDIR/c-two wheel 安装 mqu35thv/venv",
       "pid": 24171,
       "installed_wheels": {
         "fastdb4py": {
@@ -870,8 +870,8 @@
     "unrelated_mimosa_preserved": true,
     "native": {
       "version": "0.7.4",
-      "sdk": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/__init__.py",
-      "native": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/_native.cpython-313-darwin.so",
+      "sdk": "<c-two>/sdk/python/src/c_two/__init__.py",
+      "native": "<c-two>/sdk/python/src/c_two/_native.cpython-313-darwin.so",
       "connect_timeout": true,
       "sha256": "d9f4deea1f7c8010e5bbb1a7183b86673d868240286c99ed76a16795b0b1d918"
     },
@@ -879,7 +879,7 @@
   },
   "scoped_branch_worktree_cleanup": {
     "managed_worktree": "archived",
-    "root": "/Users/soku/.codex/worktrees/c2-0-7-4/c-two",
+    "root": "~/.codex/worktrees/c2-0-7-4/c-two",
     "branch": "socu/0.7.4",
     "local_branch_deleted": true,
     "origin_branch_deleted": true,
@@ -887,7 +887,7 @@
     "unrelated_locked_worktrees_untouched": true
   },
   "original_handover_files": {
-    "directory": "/Users/soku/Desktop/codespace/mememe/hey-my-buddy/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe",
+    "directory": "<hey-my-buddy>/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe",
     "files": {
       "HANDOVER.md": {
         "sha256": "cefdad63775aa4c5a3b9e6c19da3caade57f8c1dbcf9cfbd6ecaac721a5667a6",
@@ -1011,15 +1011,15 @@
         "allocated_bytes_before": 212664320
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/core/target",
+        "path": "<c-two>/core/target",
         "allocated_bytes_before": 4009385984
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/cli/target",
+        "path": "<c-two>/cli/target",
         "allocated_bytes_before": 945917952
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/rust/target",
+        "path": "<c-two>/sdk/rust/target",
         "allocated_bytes_before": 1315045376
       },
       {
@@ -1147,71 +1147,71 @@
         "allocated_bytes_before": 4325376
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/.pytest_cache",
+        "path": "<c-two>/.pytest_cache",
         "allocated_bytes_before": 40960
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/tools/local_rc/__pycache__",
+        "path": "<c-two>/tools/local_rc/__pycache__",
         "allocated_bytes_before": 163840
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/tools/ci/__pycache__",
+        "path": "<c-two>/tools/ci/__pycache__",
         "allocated_bytes_before": 53248
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/tests/repo/__pycache__",
+        "path": "<c-two>/tests/repo/__pycache__",
         "allocated_bytes_before": 602112
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/.pytest_cache",
+        "path": "<c-two>/sdk/python/.pytest_cache",
         "allocated_bytes_before": 16384
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/tests/__pycache__",
+        "path": "<c-two>/sdk/python/tests/__pycache__",
         "allocated_bytes_before": 28672
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/tests/unit/__pycache__",
+        "path": "<c-two>/sdk/python/tests/unit/__pycache__",
         "allocated_bytes_before": 1167360
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/tests/integration/__pycache__",
+        "path": "<c-two>/sdk/python/tests/integration/__pycache__",
         "allocated_bytes_before": 774144
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/tests/fixtures/__pycache__",
+        "path": "<c-two>/sdk/python/tests/fixtures/__pycache__",
         "allocated_bytes_before": 90112
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/__pycache__",
+        "path": "<c-two>/sdk/python/src/c_two/__pycache__",
         "allocated_bytes_before": 32768
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/transport/__pycache__",
+        "path": "<c-two>/sdk/python/src/c_two/transport/__pycache__",
         "allocated_bytes_before": 98304
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/transport/server/__pycache__",
+        "path": "<c-two>/sdk/python/src/c_two/transport/server/__pycache__",
         "allocated_bytes_before": 40960
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/transport/client/__pycache__",
+        "path": "<c-two>/sdk/python/src/c_two/transport/client/__pycache__",
         "allocated_bytes_before": 28672
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/config/__pycache__",
+        "path": "<c-two>/sdk/python/src/c_two/config/__pycache__",
         "allocated_bytes_before": 20480
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/crm/__pycache__",
+        "path": "<c-two>/sdk/python/src/c_two/crm/__pycache__",
         "allocated_bytes_before": 135168
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/sdk/python/src/c_two/mem/__pycache__",
+        "path": "<c-two>/sdk/python/src/c_two/mem/__pycache__",
         "allocated_bytes_before": 4096
       },
       {
-        "path": "/Users/soku/Desktop/codespace/WorldInProgress/c-two/.github/scripts/__pycache__",
+        "path": "<c-two>/.github/scripts/__pycache__",
         "allocated_bytes_before": 368640
       }
     ],

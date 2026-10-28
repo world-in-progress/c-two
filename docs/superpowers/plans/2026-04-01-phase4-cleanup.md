@@ -702,7 +702,7 @@ git commit -m "refactor(tests): delete/slim tests for removed Python transport c
 - [ ] **Step 1: Verify no dangling imports to deleted modules**
 
 ```bash
-cd /Users/soku/Desktop/codespace/WorldInProgress/c-two
+cd <c-two>
 grep -rn 'from.*server\.core import\|from.*server\.connection import\|from.*server\.handshake import\|from.*server\.dispatcher import\|from.*server\.heartbeat import' src/ tests/ --include='*.py' | grep -v __pycache__
 ```
 Expected: Zero results.

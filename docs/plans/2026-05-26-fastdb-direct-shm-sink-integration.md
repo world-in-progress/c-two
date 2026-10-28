@@ -125,7 +125,7 @@ C-Two must not implement this integration before FastDB provides a generic, tran
 - keep slot binding distinct from physical layer names;
 - reject or materialize object-graph direct builds until root-slot and dependency rules are fully specified.
 
-The sibling tracking document is `/Users/soku/Desktop/codespace/WorldInProgress/fastdb/docs/opt/batch-array-call-db-fast-path-design.md`.
+The sibling tracking document is `<fastdb>/docs/opt/batch-array-call-db-fast-path-design.md`.
 
 ## C-Two Implementation Phases
 

@@ -26,7 +26,7 @@ FASTDB_PAYLOAD_SYSTEM_LIB_DIR=/private/tmp/c2-memory-fastdb-sdk/lib
 DYLD_LIBRARY_PATH=/private/tmp/c2-memory-fastdb-sdk/lib
 ```
 
-Final native build exit was zero. Log: `/tmp/c2-python-owner-build-final.log`. `otool -L` confirms `@rpath/libfastdb.dylib`. Imported module: `/Users/soku/.codex/worktrees/c2-python-owner-final/c-two/sdk/python/src/c_two/_native.cpython-312-darwin.so`.
+Final native build exit was zero. Log: `/tmp/c2-python-owner-build-final.log`. `otool -L` confirms `@rpath/libfastdb.dylib`. Imported module: `~/.codex/worktrees/c2-python-owner-final/c-two/sdk/python/src/c_two/_native.cpython-312-darwin.so`.
 
 - Native SHA-256: `c75d05117b6b8cf2f39ec55eef3312d74148b5bc6ca7f449ec19cdf5e80ffbab`.
 - Rust owned_child SHA-256: `3a1ea339732e20a7363bfeac9a1ece7efd12bac5c813fb61e35ef98b4f0b0883`.

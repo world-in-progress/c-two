@@ -3,13 +3,13 @@
   "candidate_commit": "d679786994ef76df8d8bb76eecb865adafcffa3a",
   "fixed_fastdb_input": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
   "python": "3.12.10 (main, Apr  9 2025, 03:49:38) [Clang 20.1.0 ]",
-  "package": "/Users/soku/.codex/worktrees/c2-python-owner-repair/c-two/sdk/python/src/c_two/__init__.py",
-  "native": "/Users/soku/.codex/worktrees/c2-python-owner-repair/c-two/sdk/python/src/c_two/_native.cpython-312-darwin.so",
+  "package": "~/.codex/worktrees/c2-python-owner-repair/c-two/sdk/python/src/c_two/__init__.py",
+  "native": "~/.codex/worktrees/c2-python-owner-repair/c-two/sdk/python/src/c_two/_native.cpython-312-darwin.so",
   "target": "/tmp/c2-endpoint-targets/python-owner-repair",
   "venv": "/tmp/c2-endpoint-python-owner-repair-venv",
   "artifacts": [
     {
-      "path": "/Users/soku/.codex/worktrees/c2-python-owner-repair/c-two/sdk/python/src/c_two/_native.cpython-312-darwin.so",
+      "path": "~/.codex/worktrees/c2-python-owner-repair/c-two/sdk/python/src/c_two/_native.cpython-312-darwin.so",
       "sha256": "0fbce7df9a025a2b7316ac848001ee974ff06d5f76b3d97358a3b3b5d73bd474"
     },
     {

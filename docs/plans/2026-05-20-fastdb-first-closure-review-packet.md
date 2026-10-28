@@ -46,8 +46,8 @@ Item 91 remains real follow-up work, but it is no longer a blocker for this clos
 - `cargo test --manifest-path core/foundation/c2-mem-ffi/Cargo.toml` passed: 19 tests plus doc-test collection.
 - `cargo test --manifest-path core/Cargo.toml --workspace` passed across `c2-codegen`, `c2-config`, `c2-contract`, `c2-error`, `c2-http`, `c2-ipc`, `c2-mem`, `c2-mem-ffi`, `c2-runtime`, `c2-server`, and `c2-wire`.
 - `uv run python -m compileall -q sdk/python/src/c_two sdk/python/tests/integration/test_fastdb_codec_provider_smoke.py sdk/python/tests/integration/test_grid_fastdb_bridge_smoke.py sdk/python/tests/unit/test_contract_export.py sdk/python/tests/unit/test_contract_infer.py` passed.
-- `NODE=/Users/soku/.nvm/versions/node/v22.17.0/bin/node npm test` under `core/foundation/c2-mem-ffi/bindings/typescript` passed: 27 tests.
-- `NODE=/Users/soku/.nvm/versions/node/v22.17.0/bin/node npm run pack:check` under `core/foundation/c2-mem-ffi/bindings/typescript` passed sequentially.
+- `NODE=~/.nvm/versions/node/v22.17.0/bin/node npm test` under `core/foundation/c2-mem-ffi/bindings/typescript` passed: 27 tests.
+- `NODE=~/.nvm/versions/node/v22.17.0/bin/node npm run pack:check` under `core/foundation/c2-mem-ffi/bindings/typescript` passed sequentially.
 - `rg -n "fastdb4py|from fastdb|import fastdb" sdk/python/src core --glob '*.py' --glob '*.rs'` returned no production C-Two imports.
 - `git diff --check` passed.
 

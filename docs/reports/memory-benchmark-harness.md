@@ -66,9 +66,9 @@ Add `--require-memory-stats` when the integrated candidate exposes `cc.memory_st
 Python 3.10 syntax gate (execute-only, no bytecode written):
 
 ```bash
-/Users/soku/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -c \
+~/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -c \
   "import pathlib; p=pathlib.Path('tools/benchmarks/ipc_memory.py'); compile(p.read_text(), str(p), 'exec')"
-/Users/soku/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -B tools/benchmarks/ipc_memory.py --list-rows
+~/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -B tools/benchmarks/ipc_memory.py --list-rows
 ```
 
 Commands as executed (from the recovery checkout, `<checkout>` below):
@@ -108,7 +108,7 @@ Two additional negative checks were driven from a scratch copy / scratch scripts
 
 ## Executed evidence
 
-All commands above ran in the recovery checkout at input commit `57b3a21d072e1c37d55fbf4901eaa6aeca9c8e50`, using the uncommitted working-tree copy of `tools/benchmarks/ipc_memory.py` that this recovery delivers (the harness-repo HEAD recorded inside those artifacts is therefore still `57b3a21d...`), with `/tmp/c2-memory-venv/bin/python` (Python 3.13.3) as driver and worker interpreter. The imported module was `/Users/soku/.codex/worktrees/c2-memory-policy/c-two/sdk/python/src/c_two/__init__.py` (editable `c_two.pth`), native `_native.cpython-313-darwin.so` SHA-256 `a9482acffbb4912cc8bf11553731e58d7f15a67c5ef3fa38916c6ddf0bb3230f`, from repository HEAD `365cf9486c059058205b860aee59e782f0e01c96` with `tracked_dirty: true` (`docs/plans/2026-09-26-memory-policy.md`). Package metadata reported `c-two 0.6.0`, `fastdb4py 0.2.1`. The imported native is therefore **not** proven to be a build of this worktree's HEAD or of `947415b`; it is the accepted Host build plus the pressure/stats slice, and it is dirty.
+All commands above ran in the recovery checkout at input commit `57b3a21d072e1c37d55fbf4901eaa6aeca9c8e50`, using the uncommitted working-tree copy of `tools/benchmarks/ipc_memory.py` that this recovery delivers (the harness-repo HEAD recorded inside those artifacts is therefore still `57b3a21d...`), with `/tmp/c2-memory-venv/bin/python` (Python 3.13.3) as driver and worker interpreter. The imported module was `~/.codex/worktrees/c2-memory-policy/c-two/sdk/python/src/c_two/__init__.py` (editable `c_two.pth`), native `_native.cpython-313-darwin.so` SHA-256 `a9482acffbb4912cc8bf11553731e58d7f15a67c5ef3fa38916c6ddf0bb3230f`, from repository HEAD `365cf9486c059058205b860aee59e782f0e01c96` with `tracked_dirty: true` (`docs/plans/2026-09-26-memory-policy.md`). Package metadata reported `c-two 0.6.0`, `fastdb4py 0.2.1`. The imported native is therefore **not** proven to be a build of this worktree's HEAD or of `947415b`; it is the accepted Host build plus the pressure/stats slice, and it is dirty.
 
 | Case | Invocation (abbreviated) | Result |
 | --- | --- | --- |

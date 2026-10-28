@@ -250,7 +250,7 @@ Expected: compiles cleanly. The method uses the same types as `call_buddy()`.
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/soku/Desktop/codespace/WorldInProgress/c-two
+cd <c-two>
 git add src/c_two/_native/c2-ipc/src/client.rs
 git commit -m "feat(c2-ipc): add call_with_prealloc for pre-allocated buddy SHM
 
@@ -369,7 +369,7 @@ Expected: compiles cleanly.
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/soku/Desktop/codespace/WorldInProgress/c-two
+cd <c-two>
 git add src/c_two/_native/c2-ipc/src/sync_client.rs src/c_two/_native/c2-ipc/src/client.rs
 git commit -m "feat(c2-ipc): SyncClient pool_alloc_and_write + call_prealloc
 
@@ -488,7 +488,7 @@ Expected: compiles cleanly.
 - [ ] **Step 3: Rebuild Python extension and run tests**
 
 ```bash
-cd /Users/soku/Desktop/codespace/WorldInProgress/c-two
+cd <c-two>
 uv sync --reinstall-package c-two
 C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
@@ -607,7 +607,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - [ ] **Step 1: Run the full benchmark**
 
 ```bash
-cd /Users/soku/Desktop/codespace/WorldInProgress/c-two
+cd <c-two>
 C2_RELAY_ANCHOR_ADDRESS= uv run python benchmarks/three_mode_benchmark.py
 ```
 
