@@ -1,0 +1,105 @@
+Pre-fix default namespace contention (first 32-thread run)
+failures:
+
+---- tests::completed_reply_remains_readable_after_server_stream_is_dropped stdout ----
+
+thread 'tests::completed_reply_remains_readable_after_server_stream_is_dropped' (18633441) panicked at transport/c2-local/src/tests.rs:85:62:
+called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: "managed endpoint namespace gate is busy" }
+
+---- tests::owned_halves_exchange_bytes_and_abort_wakes_a_pending_read stdout ----
+
+thread 'tests::owned_halves_exchange_bytes_and_abort_wakes_a_pending_read' (18633452) panicked at transport/c2-local/src/tests.rs:19:54:
+called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: "managed endpoint namespace gate is busy" }
+
+---- tests::listener_restarts_after_server_closes_even_with_an_old_client_handle stdout ----
+
+thread 'tests::listener_restarts_after_server_closes_even_with_an_old_client_handle' (18633451) panicked at transport/c2-local/src/tests.rs:102:55:
+called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: "managed endpoint namespace gate is busy" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::listener_restarts_after_cancelling_a_pending_accept stdout ----
+
+thread 'tests::listener_restarts_after_cancelling_a_pending_accept' (18633448) panicked at transport/c2-local/src/tests.rs:212:52:
+called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: "managed endpoint namespace gate is busy" }
+
+---- tests::cancelling_a_partial_write_poisoned_the_connection stdout ----
+
+thread 'tests::cancelling_a_partial_write_poisoned_the_connection' (18633440) panicked at transport/c2-local/src/tests.rs:37:59:
+called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: "managed endpoint namespace gate is busy" }
+
+---- tests::another_process_cannot_displace_the_listener stdout ----
+
+thread 'tests::another_process_cannot_displace_the_listener' (18633438) panicked at transport/c2-local/src/tests.rs:168:52:
+called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: "managed endpoint namespace gate is busy" }
+
+---- tests::listener_restarts_after_owner_process_exits_without_destructors stdout ----
+
+thread 'tests::listener_restarts_after_owner_process_exits_without_destructors' (18633450) panicked at transport/c2-local/src/tests.rs:158:5:
+Output { status: ExitStatus(unix_wait_status(25856)), stdout: "\nrunning 1 test\ntest tests::listener_process_fixture ... FAILED\n\nfailures:\n\nfailures:\n    tests::listener_process_fixture\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 157 filtered out; finished in 0.21s\n\n", stderr: "\nthread 'tests::listener_process_fixture' (18633465) panicked at transport/c2-local/src/tests.rs:143:60:\ncalled `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: \"managed endpoint namespace gate is busy\" }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n" }
+
+
+failures:
+    tests::another_process_cannot_displace_the_listener
+    tests::cancelling_a_partial_write_poisoned_the_connection
+    tests::completed_reply_remains_readable_after_server_stream_is_dropped
+    tests::listener_restarts_after_cancelling_a_pending_accept
+    tests::listener_restarts_after_owner_process_exits_without_destructors
+    tests::listener_restarts_after_server_closes_even_with_an_old_client_handle
+    tests::owned_halves_exchange_bytes_and_abort_wakes_a_pending_read
+
+test result: FAILED. 150 passed; 7 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.42s
+
+
+
+Amplified real fork load
+failures:
+
+---- unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases stdout ----
+R17C_TEST_ROOT /tmp/c2m-OwUEzG/ipc
+R17C_TEST_ROOT /tmp/c2m-Jw4CEE/ipc
+
+thread 'unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases' (18938901) panicked at transport/c2-local/src/unix_managed/tests.rs:4185:9:
+close=false: Busy
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 156 filtered out; finished in 0.47s
+
+error: test failed, to rerun pass `-p c2-local --lib`
+
+
+Deterministic duplicate before fix
+failures:
+
+---- unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases stdout ----
+R17C_TEST_ROOT /tmp/c2m-mcraUI/ipc
+
+thread 'unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases' (18970218) panicked at transport/c2-local/src/unix_managed/tests.rs:4163:9:
+close=true: Busy
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 157 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p c2-local --lib`
+
+
+Additional first-initialization high-load observation
+failures:
+
+---- unix_managed::tests::managed_parallel_first_initialization_shares_one_gate_inode stdout ----
+
+thread 'unix_managed::tests::managed_parallel_first_initialization_shares_one_gate_inode' (19021000) panicked at transport/c2-local/src/unix_managed/tests.rs:1686:26:
+a fresh namespace must be adoptable by every opener: Custom { kind: WouldBlock, error: "managed endpoint namespace gate is busy" }
+
+
+failures:
+    unix_managed::tests::managed_parallel_first_initialization_shares_one_gate_inode
+
+test result: FAILED. 156 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.91s

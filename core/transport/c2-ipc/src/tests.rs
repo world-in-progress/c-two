@@ -6289,19 +6289,27 @@ mod lazy_policy_roundtrip_tests {
         ack_shm_request: bool,
         ack_shm_response: bool,
     ) -> (
-        String,
+        c2_local::LocalEndpoint,
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::mpsc::Receiver<c2_wire::frame::FrameHeader>,
     ) {
         let address = unique_address(label);
-        let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+        #[cfg(unix)]
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let endpoint = context.endpoint(&address).unwrap();
         let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let (header_tx, header_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
+            #[cfg(unix)]
+            let _root = root;
             let mut peer = listener.accept().await.unwrap();
             crate::tests::accept_version_preamble(&mut peer).await;
-            drop(listener);
+            crate::tests::close_listener(listener).await;
             let (header, payload) = read_raw_frame(&mut peer).await.expect("handshake frame");
             assert!(header.is_handshake());
             decode_handshake(&payload).expect("client handshake");
@@ -6342,7 +6350,7 @@ mod lazy_policy_roundtrip_tests {
             }
             let _ = done_tx.send(());
         });
-        (address, done_rx, header_rx)
+        (endpoint, done_rx, header_rx)
     }
 
     async fn read_raw_frame(
@@ -6406,10 +6414,10 @@ mod lazy_policy_roundtrip_tests {
     /// coordinates the peer never agreed to map.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ack_without_shm_bits_never_writes_buddy_request_frames() {
-        let (address, _done, mut header_rx) =
+        let (endpoint, done, mut header_rx) =
             capped_ack_peer("negotiation_drop", false, false).await;
         let base = small_base(64 * 1024, 2);
-        let mut client = IpcClient::with_config(&address, client_config(base, 1024));
+        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024));
         client.connect().await.unwrap();
         assert!(!client.shm_request_available());
         assert!(
@@ -6434,6 +6442,7 @@ mod lazy_policy_roundtrip_tests {
             "an un-negotiated direction must never publish SHM coordinates"
         );
         client.close_shared().await;
+        done.await.unwrap();
     }
 
     /// Boundary negative: a buddy reply frame on a connection whose ACK
@@ -6442,13 +6451,19 @@ mod lazy_policy_roundtrip_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unnegotiated_buddy_reply_rejected_before_lease_or_lazy_open() {
         let address = unique_address("negotiation_bad_reply");
-        let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+        #[cfg(unix)]
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let endpoint = context.endpoint(&address).unwrap();
         let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
         let peer_task = tokio::spawn(async move {
             use tokio::io::AsyncReadExt as _;
             let mut peer = listener.accept().await.unwrap();
             crate::tests::accept_version_preamble(&mut peer).await;
-            drop(listener);
+            crate::tests::close_listener(listener).await;
             let (header, payload) = read_raw_frame(&mut peer).await.unwrap();
             let client_handshake = decode_handshake(&payload).unwrap();
             // ACK the request direction only: the client may use SHM
@@ -6496,7 +6511,7 @@ mod lazy_policy_roundtrip_tests {
         });
 
         let base = small_base(64 * 1024, 2);
-        let mut client = IpcClient::with_config(&address, client_config(base, 1024));
+        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024));
         client.connect().await.unwrap();
         let server_pool_probe = Arc::clone(client.server_pool_arc());
         let result = client.call_inline(&raw_peer_identity(), 0, b"probe").await;
@@ -6527,10 +6542,10 @@ mod lazy_policy_roundtrip_tests {
     /// coordinates it did not ACK.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unnegotiated_direction_copy_consumes_current_pool_prealloc_block() {
-        let (address, _done, mut header_rx) =
+        let (endpoint, done, mut header_rx) =
             capped_ack_peer("prealloc_direction_copy", false, false).await;
         let base = small_base(64 * 1024, 2);
-        let mut client = IpcClient::with_config(&address, client_config(base, 1024));
+        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024));
         client.connect().await.unwrap();
         assert!(!client.shm_request_available());
         assert!(
@@ -6576,6 +6591,7 @@ mod lazy_policy_roundtrip_tests {
 
         drop(block);
         client.close_shared().await;
+        done.await.unwrap();
     }
 
     /// A block from a retired pool incarnation (after a confirmed close plus

@@ -753,7 +753,8 @@ async fn managed_public_namespace_lifecycle_converges_over_repeated_runs() {
 
 #[tokio::test]
 async fn managed_concurrent_same_address_bind_has_exactly_one_winner() {
-    let endpoint = managed_endpoint("race");
+    let namespace = TestNamespace::new();
+    let endpoint = managed_endpoint_at(namespace.path(), "race");
     let root = socket_path(&endpoint).parent().unwrap().to_owned();
     let start = std::sync::Arc::new(std::sync::Barrier::new(8));
     let runtime = tokio::runtime::Handle::current();
@@ -936,8 +937,8 @@ async fn managed_registered_exit_without_destructors_is_reapable() {
 
 #[tokio::test]
 async fn managed_live_listener_is_busy_and_disconnects_keep_service_available() {
-    let _shared = shared_namespace_guard();
-    let endpoint = managed_endpoint("busy");
+    let namespace = TestNamespace::new();
+    let endpoint = managed_endpoint_at(namespace.path(), "busy");
     let mut listener = crate::LocalListener::bind(&endpoint).unwrap();
     let credential = listener.credential();
     assert!(matches!(
@@ -2832,7 +2833,8 @@ async fn native_unknown_socket_and_unsafe_permissions_are_preserved() {
 
 #[tokio::test]
 async fn native_concurrent_stale_bind_keeps_the_winner_reachable() {
-    let endpoint = managed_endpoint("stale-race");
+    let namespace = TestNamespace::new();
+    let endpoint = managed_endpoint_at(namespace.path(), "stale-race");
     let output = run_managed_process(&endpoint, "exit-owner");
     assert!(output.status.success(), "{output:?}");
     assert!(socket_path(&endpoint).exists());
@@ -3890,7 +3892,7 @@ async fn lease_verification_io_preserves_maintenance_and_close_ownership() {
             .open(&lease)
             .unwrap();
         assert!(try_lock_lease(&unlocked).is_ok());
-        drop(unlocked);
+        drop(Lease(Some(unlocked)));
         assert!(matches!(
             crate::reap_endpoint(&endpoint, &credential),
             EndpointReapResult::Reaped
@@ -3914,7 +3916,7 @@ async fn lease_verification_io_preserves_maintenance_and_close_ownership() {
             .open(&lease)
             .unwrap();
         assert!(try_lock_lease(&unlocked).is_ok());
-        drop(unlocked);
+        drop(Lease(Some(unlocked)));
         assert!(matches!(
             crate::reap_endpoint(&endpoint, &credential),
             EndpointReapResult::Reaped
@@ -4153,12 +4155,18 @@ async fn final_lease_stat_io_releases_close_and_drop_leases() {
             .open(&lease)
             .unwrap();
         assert!(try_lock_lease(&unlocked).is_ok());
-        drop(unlocked);
-        assert!(matches!(
-            reap_managed_at(&endpoint, &credential, root),
-            EndpointReapResult::Reaped
-        ));
+        // A parallel fork can inherit the probe's open file description. Keep
+        // a real duplicate open to make that race deterministic: Lease must
+        // explicitly unlock before reap, even while this copy remains open.
+        let inherited_probe = unlocked.try_clone().unwrap();
+        drop(Lease(Some(unlocked)));
+        let reaped = reap_managed_at(&endpoint, &credential, root);
+        assert!(
+            matches!(reaped, EndpointReapResult::Reaped),
+            "close={close}: {reaped:?}"
+        );
         assert!(!socket.exists() && !lease.exists());
+        drop(inherited_probe);
     }
     let outcome = explicit_close.unwrap();
     assert!(
@@ -4288,7 +4296,7 @@ async fn final_lease_stat_rollback_keeps_initialization_error() {
         .open(&lease)
         .unwrap();
     assert!(try_lock_lease(&unlocked).is_ok());
-    drop(unlocked);
+    drop(Lease(Some(unlocked)));
     fs::remove_file(&socket).unwrap();
     fs::remove_file(&lease).unwrap();
     assert!(!socket.exists() && !lease.exists());
