@@ -1,0 +1,46 @@
+import c_two as cc
+import json, time, statistics, tempfile, pathlib, sys, os, shutil
+@cc.crm(namespace="test.retirement-benchmark",version="1.0.0")
+class Echo:
+ def echo(self,value:str)->str: ...
+class Resource:
+ def echo(self,value): return value
+root=pathlib.Path(tempfile.mkdtemp(prefix="bench-",dir=sys.argv[1]))
+def runtime():
+ r=cc.Runtime()
+ if os.name!="nt": r.set_local_endpoint(root=str(root))
+ return r
+def close(r):
+ o=r.shutdown(timeout=5)
+ assert o['completed'] and o['ipc_clients_drained'] and not o['runtime_barrier_error'] and not o['ipc_client_close_error'],o
+server,client=runtime(),runtime()
+try:
+ server.register(Echo,Resource(),name="echo")
+ address=server.server_address()
+ samples=[]; identity=None
+ for i in range(540):
+  start=time.perf_counter_ns()
+  proxy=client.connect(Echo,name="echo",address=address,timeout=5)
+  elapsed=time.perf_counter_ns()-start
+  current=cc.connection_observation(proxy).connection_id
+  assert identity is None or identity==current
+  identity=current
+  if i%100==0: assert proxy.echo("ok")=="ok"
+  cc.close(proxy)
+  if i>=40:samples.append(elapsed/1000)
+ close(client)
+ close(server)
+ empty=[]
+ for i in range(60):
+  r=cc.Runtime();start=time.perf_counter_ns();close(r);elapsed=time.perf_counter_ns()-start
+  if i>=10:empty.append(elapsed/1000)
+ hosted=[]
+ for i in range(25):
+  r=runtime();r.start();start=time.perf_counter_ns();close(r);elapsed=time.perf_counter_ns()-start
+  if i>=5:hosted.append(elapsed/1000)
+ assert set(x.name for x in root.iterdir())<={".gate",".gate.marker"}
+ print(json.dumps({"cached_connect_us":samples,"empty_shutdown_us":empty,"hosted_shutdown_us":hosted,"socket_lease_remaining":0}))
+finally:
+ close(client);close(server)
+ assert set(x.name for x in root.iterdir())<={".gate",".gate.marker"}
+ shutil.rmtree(root)

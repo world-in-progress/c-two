@@ -2,7 +2,7 @@
 
 ## 纯瘦身收束与当前剩余清单（2026-10-28 复核）
 
-当前已验收实现候选为 `e0b5af2d`；此前以 `d9e3ac9e` 合入主线安全依赖修复 `cc407052`。正式发行仍为 C-Two 0.9.0 / c3 0.5.0；未发布源码使用 IPC 14、Unix namespace 磁盘格式 3 与凭据 schema 4，不能与正式 wheel 的 IPC 13/旧目录格式混淆。R17c 和持久身份/自身凭据补强均已完成各自验收，本轮不发版。
+当前已验收实现/测试候选为 `f747a7c9`；此前以 `d9e3ac9e` 合入主线安全依赖修复 `cc407052`。正式发行仍为 C-Two 0.9.0 / c3 0.5.0；未发布源码使用 IPC 14、Unix namespace 磁盘格式 3 与凭据 schema 4，不能与正式 wheel 的 IPC 13/旧目录格式混淆。R17c 和持久身份/自身凭据补强均已完成各自验收，本轮不发版。
 
 用户确认收束纯瘦身，停止按减行数继续挑批次。当时最后一个纯瘦身实现提交为 `6afec0f3`（R25 三个 Python prepared-call 入口退役），验收记录提交为 `3382b3ba`。收束时的筛选基于 `3382b3ba`，当时没有新的生产代码或测试修改；下表中的行数是静态方案估算，不是已实现的净减量。后续 R01、R02、R03、R16、R18 正确性修复单列记录，不计作纯瘦身收益。既有验证仍只绑定各批实现提交。
 
@@ -35,7 +35,7 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 
 2026-10-27：[R17c](2026-10-27-r17c-final-lease-stat-evaluation.md) 已验收，实现 `1e74b4c9`；[同源 Actions](https://github.com/Dsssyc/c-two/actions/runs/40462218729) 10/10 jobs、六线合计 147/147 适用 gate 通过，见[记录](../reports/2026-10-27-r17c-final-lease-stat-acceptance.md)。生产净 +6、测试净 +255，作为正确性修复不计瘦身收益。随后按 `8ef1ce21` 批准的[持久身份与自身凭据合并方案](2026-10-27-unix-namespace-identity-and-own-credential.md)完成候选 `9f9d4de3`：Unix format 3/schema 4、单一绑定 cause 和现有 watch 凭据投影，独立实机/跨语言/完整 relay/六线 Actions/零残留与审查见[验收记录](../reports/2026-10-27-unix-namespace-identity-acceptance.md)。这项补强不新增已核销 R 编号，gate/context 与目录 pin 的完整分类继续单列；分类数量仍为 17 / 15 / 6 / 1。
 
-后续需求：用户要求直接公开现有能力，窄探测草案已撤回，改为[公开精简独立 Runtime 方案](2026-10-27-public-independent-runtime.md)。显式与默认实例复用现有注册/连接/关闭代码，只拆必要的全局配置及进程适配；临时目录由应用管理，不增加 probe、closed 状态或清理框架。方案 `e4ddcc85` 及单列失败启动回执修复已完成，来源 `e0b5af2d`，生产净 +255、测试净 +679、示例 +76。最终 Actions 10/10、147/147 适用门禁，完整 relay、跨语言、三端、零残留和独立审查见[验收记录](../reports/2026-10-28-public-runtime-acceptance.md)；未发版。另发现并发 register/shutdown 的旧会话换代窗口，基线与候选均复现，列入[单独后续记录](../reports/2026-10-27-runtime-concurrent-shutdown-followup.md)，本批不改其生命周期策略。后续四项迟到 connect 基线反例已完成（仍为预期红灯），[完整 Core 收尾方案](2026-10-28-runtime-retirement-core-plan.md)经 Opus 5.5 high 复审及 Host 条件落实，待用户确认实施，不计已修。预算到期/pending 的 owner、driver 和 receipt 已列明；最终 Drop 仍单列。不能把 review 产物验收当作生产修复通过。不计作纯瘦身或新增 R 条目核销，R35、C04 和两份会话重构继续暂缓。
+后续需求：用户要求直接公开现有能力，窄探测草案已撤回，改为[公开精简独立 Runtime 方案](2026-10-27-public-independent-runtime.md)。显式与默认实例复用现有注册/连接/关闭代码，只拆必要的全局配置及进程适配；临时目录由应用管理，不增加 probe、closed 状态或清理框架。方案 `e4ddcc85` 及单列失败启动回执修复已完成，来源 `e0b5af2d`，生产净 +255、测试净 +679、示例 +76。最终 Actions 10/10、147/147 适用门禁，完整 relay、跨语言、三端、零残留和独立审查见[验收记录](../reports/2026-10-28-public-runtime-acceptance.md)；未发版。另发现并发 register/shutdown 的旧会话换代窗口，基线与候选均复现，列入[单独后续记录](../reports/2026-10-27-runtime-concurrent-shutdown-followup.md)，本批不改其生命周期策略。后续四项迟到 connect 基线反例已完成，用户批准的[完整 Core 收尾方案](2026-10-28-runtime-retirement-core-plan.md)已实施为 `e66d2509`；最终测试候选 `f747a7c9` 已通过完整 Actions 10/10、147/147 适用门禁和三端验收，见[记录](../reports/2026-10-28-runtime-retirement-acceptance.md)。生产 +920、测试 +1838 行，作为正确性补强单列；预算到期/pending 的 owner、唯一 driver 和 receipt 已落实，最终 Drop 仍单列。本批完整 relay、跨语言、Windows 开发机/三系统 Actions、端点零残留、性能及独立审查均已完成，产物已清理，未发版。不计作纯瘦身或新增 R 条目核销，R35、C04 和两份会话重构继续暂缓。
 
 ### 继续暂缓、不单独开批的项目
 

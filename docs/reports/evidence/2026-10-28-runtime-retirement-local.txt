@@ -1,0 +1,129 @@
+=== core-review-unit.log ===
+   Compiling c2-core v0.1.0 (<repo>/core/runtime/c2-core)
+    Finished `test` profile [unoptimized] target(s) in 5.76s
+     Running unittests src/lib.rs (<validation>/target/debug/deps/c2_core-8b82a3f2dedbcb3e)
+
+running 6 tests
+test session::retirement_tests::contended_pool_seal_keeps_original_owner_and_does_not_spawn ... ok
+test session::retirement_tests::failed_start_receipt_keeps_terminal_error_after_map_pruning ... ok
+test session::retirement_tests::pending_upgrade_and_terminal_publication_are_serialized_on_same_transaction ... ok
+test session::retirement_tests::retirement_executor_and_spawn_failures_keep_owner_and_admission ... ok
+test session::retirement_tests::terminal_shutdown_error_with_live_server_requires_actual_native_completion ... ok
+test session::retirement_tests::zero_budget_contended_core_lock_does_not_publish_retirement ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 134 filtered out; finished in 0.15s
+
+
+=== core-review-integration.log ===
+   Compiling c2-core v0.1.0 (<repo>/core/runtime/c2-core)
+    Finished `test` profile [unoptimized] target(s) in 1.99s
+     Running tests/runtime_retirement.rs (<validation>/target/debug/deps/runtime_retirement-18ed21020b594897)
+
+running 8 tests
+test client_only_retirement_closes_retained_connection_before_peer_shutdown ... ok
+test client_scope_cannot_report_completion_for_an_undeclared_host ... ok
+test foreign_host_target_is_rejected_before_retirement ... ok
+test hosted_zero_budget_retirement_keeps_draining_and_rejects_new_work ... ok
+test ordinary_host_shutdown_preserves_runtime_restart_and_reacquire ... ok
+test retirement_keeps_deadline_and_contract_precedence_without_creating_ipc_pool ... ok
+test retirement_publishes_before_last_host_drop_and_releases_driver_owners ... ok
+test terminal_delivered_host_journal_survives_retirement_of_late_clients ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+
+=== pool-review-tests.log ===
+   Compiling c2-ipc v0.1.0 (<repo>/core/transport/c2-ipc)
+    Finished `test` profile [unoptimized] target(s) in 7.28s
+     Running unittests src/lib.rs (<validation>/target/debug/deps/c2_ipc-2a9bd5fdaf169065)
+
+running 20 tests
+test pool::tests::close_report::abnormal_close_between_shutdown_retries_is_reported_once ... ok
+test pool::tests::close_report::completed_historical_abnormal_close_is_not_replayed ... ok
+test pool::tests::close_report::direct_abnormal_close_is_bounded_and_not_replayed ... ok
+test pool::tests::close_report::final_wait_timeout_keeps_late_observed_abnormal_detail ... ok
+test pool::tests::close_report::late_seed_merge_does_not_replay_a_consumed_close_ticket ... ok
+test pool::tests::close_report::observed_detached_abnormal_close_is_reported ... ok
+test pool::tests::close_report::pre_wait_timeout_keeps_already_confirmed_abnormal_detail ... ok
+test pool::tests::close_report::prepare_seal_coordinator_lock_respects_zero_and_short_deadlines ... ok
+test pool::tests::close_report::prepare_seal_state_lock_respects_zero_and_short_deadlines ... ok
+test pool::tests::close_report::preparing_close_between_observation_and_drain_is_reported ... ok
+test pool::tests::close_report::same_address_drain_and_retry_have_distinct_close_tickets ... ok
+test pool::tests::close_report::seal_seed_rejects_another_pool_coordinator - should panic ... ok
+test pool::tests::close_report::seal_seed_retains_abnormal_completion_before_driver_merge_once ... ok
+test pool::tests::close_report::sealed_drain_detaches_entries_while_an_exact_owner_is_closing ... ok
+test pool::tests::close_report::sealed_pool_rejects_new_acquires_and_never_reopens ... ok
+test pool::tests::close_report::sealed_pool_rejects_transient_retry_after_first_owner_retires ... ok
+test pool::tests::close_report::sealed_preparing_drain_waits_on_the_original_record_notification ... ok
+test pool::tests::close_report::sealed_publication_retires_the_exact_in_flight_client ... ok
+test pool::tests::close_report::sealed_zero_budget_keeps_preparing_and_late_native_owner ... ok
+test pool::tests::close_report::uncommitted_seal_guard_leaves_admission_open ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 222 filtered out; finished in 3.34s
+
+
+=== core-failed-start-retirement.log ===
+    Finished `test` profile [unoptimized] target(s) in 0.13s
+     Running unittests src/lib.rs (<validation>/target/debug/deps/c2_core-8b82a3f2dedbcb3e)
+
+running 1 test
+test host::lifecycle_tests::failed_start_runtime_retirement_observes_original_pending_cleanup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 0.05s
+
+
+=== native-default-parallel.log ===
+   Compiling c2-core v0.1.0 (<repo>/core/runtime/c2-core)
+   Compiling c2-python-native v0.1.0 (<repo>/sdk/python/native)
+    Finished `test` profile [unoptimized] target(s) in 4.05s
+     Running unittests src/lib.rs (<validation>/target/debug/deps/c2_ffi-a44c8c3fcf7f7de4)
+
+running 17 tests
+test core_ffi::payload_tests::mutable_and_readonly_alias_snapshots_own_stable_bytes ... ok
+test core_ffi::payload_tests::response_invalidation_rejects_export_before_inner_lock ... ok
+test core_ffi::payload_tests::request_release_rejects_export_before_released_store ... ok
+test core_ffi::payload_tests::response_release_rejects_export_before_inner_lock ... ok
+test core_ffi::payload_tests::request_snapshot_moves_into_python_and_outlives_service_return ... ok
+test core_ffi::payload_tests::request_tracking_after_release_does_not_revive_lease ... ok
+test runtime_session_ffi::shutdown_timeout_tests::invalid_timeouts_are_rejected_without_panicking ... ok
+test runtime_session_ffi::shutdown_timeout_tests::zero_and_normal_timeouts_remain_valid ... ok
+test runtime_session_ffi::connect_attempt_tests::retired_hostless_session_keeps_explicit_name_validation ... ok
+test core_ffi::payload_tests::response_writer_transfers_its_only_vec_and_escaped_failure_stays_safe ... ok
+test core_ffi::payload_tests::bytes_subclass_is_snapshotted_and_finalized_on_caller ... ok
+test core_error_ffi::tests::protocol_version_error_uses_public_class_and_typed_fields ... ok
+test runtime_session_ffi::connect_attempt_tests::retirement_owner_lock_timeout_does_not_seal_or_hold_the_gil ... ok
+test runtime_session_ffi::connect_attempt_tests::retired_explicit_name_observation_keeps_all_lock_waits_in_original_deadline ... ok
+test runtime_session_ffi::connect_attempt_tests::relay_override_host_lock_expires_before_owner_releases_and_recovers ... ok
+test runtime_session_ffi::connect_attempt_tests::sdk_shutdown_projects_owner_timeout_after_releasing_binding_lock ... ok
+test config_ffi::connect_attempt_tests::python_lock_projection_expires_before_owner_releases_and_recovers ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+   Doc-tests c2_ffi
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+=== python-final-affected.log ===
+........................................................................ [ 36%]
+........................................................................ [ 72%]
+.......................................................                  [100%]
+199 passed in 8.74s
+
+=== python-held-retirement.log ===
+..                                                                       [100%]
+2 passed in 2.18s
+
+=== ci-repair-baseline-memory.log ===
+..                                                                       [100%]
+2 passed in 1.78s
+
+=== ci-repair-candidate-memory.log ===
+..                                                                       [100%]
+2 passed in 1.37s
+
+=== ci-repair-owner-tests-system-sdk.log ===
+..                                                                       [100%]
+2 passed in 6.65s
