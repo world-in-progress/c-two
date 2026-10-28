@@ -95,6 +95,7 @@ class CoreError(CCBaseError, RuntimeError):
         'missing_relay_address', 'relay_http', 'register_failure',
         'held_response_copy', 'held_response_release', 'response_copy',
         'configuration', 'server', 'startup_timeout', 'relay',
+        'runtime_retired', 'shutdown_wait_timeout',
     ] | None
     startup_stage: Literal['readiness', 'responsiveness', 'owner_control'] | None
     timeout_seconds: float | None

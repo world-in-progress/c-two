@@ -1,0 +1,602 @@
+LATE_CONNECT_BASELINE {"closed_after_old_shutdown": true, "closed_after_proxy_close": false, "connect_result": "Echo", "endpoint_remaining": [".gate", ".gate.marker"], "expire_at_finish": false, "hosted": false, "late_call": "still-alive", "old_session_reobserve_completed": true, "old_session_reobserve_drained": true, "shutdown_completed": true, "shutdown_ipc_clients_drained": true}
+FLATE_CONNECT_BASELINE {"closed_after_old_shutdown": false, "closed_after_proxy_close": false, "connect_result": "Echo", "endpoint_remaining": [".gate", ".gate.marker"], "expire_at_finish": false, "hosted": true, "late_call": "still-alive", "old_session_reobserve_completed": true, "old_session_reobserve_drained": true, "shutdown_completed": true, "shutdown_ipc_clients_drained": true}
+FLATE_CONNECT_BASELINE {"closed_after_old_shutdown": true, "closed_after_proxy_close": false, "connect_error": "ERROR_CALL_DEADLINE_EXCEEDED: connect deadline exceeded", "connect_result": "CallDeadlineExceeded", "endpoint_remaining": [".gate", ".gate.marker"], "expire_at_finish": true, "hosted": false, "old_session_reobserve_completed": true, "old_session_reobserve_drained": true, "shutdown_completed": true, "shutdown_ipc_clients_drained": true}
+FLATE_CONNECT_BASELINE {"closed_after_old_shutdown": false, "closed_after_proxy_close": false, "connect_error": "ERROR_CALL_DEADLINE_EXCEEDED: connect deadline exceeded", "connect_result": "CallDeadlineExceeded", "endpoint_remaining": [".gate", ".gate.marker"], "expire_at_finish": true, "hosted": true, "old_session_reobserve_completed": true, "old_session_reobserve_drained": true, "shutdown_completed": true, "shutdown_ipc_clients_drained": true}
+F
+=================================== FAILURES ===================================
+_ test_shutdown_cannot_publish_a_connection_from_its_retired_session[live-budget-hostless] _
+
+tmp_path = PosixPath('/private<task-temp>/pytest-final/test_shutdown_cannot_publish_a0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x1070d3e30>
+hosted = False, expire_at_finish = False
+
+    @pytest.mark.parametrize('hosted', [False, True], ids=['hostless', 'hosted'])
+    @pytest.mark.parametrize('expire_at_finish', [False, True], ids=['live-budget', 'expired-budget'])
+    def test_shutdown_cannot_publish_a_connection_from_its_retired_session(
+        tmp_path, monkeypatch, hosted, expire_at_finish,
+    ):
+        for key in tuple(os.environ):
+            if key.startswith('C2_'):
+                monkeypatch.delenv(key)
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        server, client = cc.Runtime(), cc.Runtime()
+        if os.name != 'nt':
+            for runtime in (server, client):
+                runtime.set_local_endpoint(root=str(tmp_path))
+        old_session = client._runtime_session  # Keep ownership explicit through cleanup.
+        events = client.connection_events()
+        captured, resume = Event(), Event()
+        reached_finish, resume_finish = Event(), Event()
+        attempts, observations = Queue(), Queue()
+        result = Queue()
+        original_args = CRMContract.native_args
+        original_call = registry._connect_native_call
+        original_ipc = CRMProxy.ipc
+        observation = None
+        late_proxy = None
+        evidence = {'hosted': hosted, 'expire_at_finish': expire_at_finish}
+    
+        def native_args(contract):
+            if current_thread() is worker:
+                # Runtime._connect has captured its session, but has not entered
+                # NativeSession.acquire_ipc_client. No native result is faked.
+                captured.set()
+                assert resume.wait(5), 'test did not release the captured connect'
+            return original_args(contract)
+    
+        def ipc(*args, **kwargs):
+            proxy = original_ipc(*args, **kwargs)
+            if current_thread() is worker:
+                observations.put(proxy.connection_observation())
+            return proxy
+    
+        def native_call(operation, *args, **kwargs):
+            if expire_at_finish and current_thread() is worker and args == ('python_connect_finish',):
+                attempts.put(operation.__self__)
+                reached_finish.set()
+                assert resume_finish.wait(5), 'test did not release final publication'
+            return original_call(operation, *args, **kwargs)
+    
+        def connect():
+            try:
+                result.put(client.connect(
+                    Echo, name='echo', address=server.server_address(), timeout=3,
+                ))
+            except BaseException as error:
+                result.put(error)  # Keep the traceback and old owners alive too.
+            finally:
+                reached_finish.set()
+    
+        worker = Thread(target=connect, name='captured-runtime-connect')
+        try:
+            server.register(Echo, EchoResource(), name='echo')
+            if hosted:
+                client.start()
+            monkeypatch.setattr(CRMContract, 'native_args', native_args)
+            monkeypatch.setattr(CRMProxy, 'ipc', ipc)
+            monkeypatch.setattr(registry, '_connect_native_call', native_call)
+            worker.start()
+            assert captured.wait(5), 'connect did not reach the native boundary'
+            outcome = client.shutdown(timeout=2)
+            evidence['shutdown_completed'] = outcome['completed']
+            evidence['shutdown_ipc_clients_drained'] = outcome['ipc_clients_drained']
+            assert outcome['completed'] and outcome['ipc_clients_drained']
+            assert client._runtime_session is not old_session
+            resume.set()
+            if expire_at_finish:
+                assert reached_finish.wait(5)
+                if not attempts.empty():
+                    attempt = attempts.get_nowait()
+                    # Expire the original native budget on a real held lock;
+                    # no sleep, clock replacement, or fresh timeout is involved.
+                    blocked = Lock()
+                    blocked.acquire()
+                    try:
+                        with pytest.raises(cc.error.CoreError):
+                            attempt.acquire_lock(blocked, 'fixture_expire_original_budget')
+                    finally:
+                        blocked.release()
+                resume_finish.set()
+            worker.join(5)
+            assert not worker.is_alive()
+            returned = result.get_nowait()
+            evidence['connect_result'] = type(returned).__name__
+            if not isinstance(returned, BaseException):
+                late_proxy = returned
+                evidence['late_call'] = late_proxy.echo('still-alive')
+                cc.close(late_proxy)
+            else:
+                evidence['connect_error'] = str(returned)
+            if not observations.empty():
+                observation = observations.get_nowait()
+                event = events.recv(timeout=1)
+                while event is not None and event.side != 'client':
+                    event = events.recv(timeout=1)
+                assert event.kind == 'opened' and event.side == 'client'
+                assert event.connection_id == observation.connection_id
+                evidence['closed_after_proxy_close'] = observation.snapshot() is not None
+                repeated = old_session.shutdown(timeout_seconds=1)
+                evidence['old_session_reobserve_completed'] = repeated['completed']
+                evidence['old_session_reobserve_drained'] = repeated['ipc_clients_drained']
+                evidence['closed_after_old_shutdown'] = observation.snapshot() is not None
+        finally:
+            resume.set()
+            resume_finish.set()
+            if worker.ident is not None:
+                worker.join(5)
+                assert not worker.is_alive()
+            if late_proxy is not None:
+                cc.close(late_proxy)
+            # The real peer's close barrier also collects the baseline's late
+            # hosted connection; old Host.shutdown otherwise just replays its journal.
+            assert server.shutdown()['completed']
+            assert old_session.shutdown()['completed']
+            assert client.shutdown()['completed']
+            events.close()
+            if observation is not None:
+                assert observation.snapshot() is not None
+            remaining = sorted(path.name for path in tmp_path.iterdir())
+            assert set(remaining) <= {'.gate', '.gate.marker'}
+            evidence['endpoint_remaining'] = remaining
+            print('LATE_CONNECT_BASELINE ' + json.dumps(evidence, sort_keys=True))
+    
+>       assert isinstance(returned, (RuntimeError, cc.error.CallDeadlineExceeded)), (
+            'shutdown reported drained, but the captured old session published '
+            f'a new usable connection: {evidence}'
+        )
+E       AssertionError: shutdown reported drained, but the captured old session published a new usable connection: {'hosted': False, 'expire_at_finish': False, 'shutdown_completed': True, 'shutdown_ipc_clients_drained': True, 'connect_result': 'Echo', 'late_call': 'still-alive', 'closed_after_proxy_close': False, 'old_session_reobserve_completed': True, 'old_session_reobserve_drained': True, 'closed_after_old_shutdown': True, 'endpoint_remaining': ['.gate', '.gate.marker']}
+E       assert False
+E        +  where False = isinstance(<tests.unit.test_runtime_shutdown_publication.Echo object at 0x1070f4920>, (<class 'RuntimeError'>, <class 'c_two.error.CallDeadlineExceeded'>))
+
+sdk/python/tests/unit/test_runtime_shutdown_publication.py:157: AssertionError
+_ test_shutdown_cannot_publish_a_connection_from_its_retired_session[live-budget-hosted] _
+
+tmp_path = PosixPath('/private<task-temp>/pytest-final/test_shutdown_cannot_publish_a1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x1070f4bc0>
+hosted = True, expire_at_finish = False
+
+    @pytest.mark.parametrize('hosted', [False, True], ids=['hostless', 'hosted'])
+    @pytest.mark.parametrize('expire_at_finish', [False, True], ids=['live-budget', 'expired-budget'])
+    def test_shutdown_cannot_publish_a_connection_from_its_retired_session(
+        tmp_path, monkeypatch, hosted, expire_at_finish,
+    ):
+        for key in tuple(os.environ):
+            if key.startswith('C2_'):
+                monkeypatch.delenv(key)
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        server, client = cc.Runtime(), cc.Runtime()
+        if os.name != 'nt':
+            for runtime in (server, client):
+                runtime.set_local_endpoint(root=str(tmp_path))
+        old_session = client._runtime_session  # Keep ownership explicit through cleanup.
+        events = client.connection_events()
+        captured, resume = Event(), Event()
+        reached_finish, resume_finish = Event(), Event()
+        attempts, observations = Queue(), Queue()
+        result = Queue()
+        original_args = CRMContract.native_args
+        original_call = registry._connect_native_call
+        original_ipc = CRMProxy.ipc
+        observation = None
+        late_proxy = None
+        evidence = {'hosted': hosted, 'expire_at_finish': expire_at_finish}
+    
+        def native_args(contract):
+            if current_thread() is worker:
+                # Runtime._connect has captured its session, but has not entered
+                # NativeSession.acquire_ipc_client. No native result is faked.
+                captured.set()
+                assert resume.wait(5), 'test did not release the captured connect'
+            return original_args(contract)
+    
+        def ipc(*args, **kwargs):
+            proxy = original_ipc(*args, **kwargs)
+            if current_thread() is worker:
+                observations.put(proxy.connection_observation())
+            return proxy
+    
+        def native_call(operation, *args, **kwargs):
+            if expire_at_finish and current_thread() is worker and args == ('python_connect_finish',):
+                attempts.put(operation.__self__)
+                reached_finish.set()
+                assert resume_finish.wait(5), 'test did not release final publication'
+            return original_call(operation, *args, **kwargs)
+    
+        def connect():
+            try:
+                result.put(client.connect(
+                    Echo, name='echo', address=server.server_address(), timeout=3,
+                ))
+            except BaseException as error:
+                result.put(error)  # Keep the traceback and old owners alive too.
+            finally:
+                reached_finish.set()
+    
+        worker = Thread(target=connect, name='captured-runtime-connect')
+        try:
+            server.register(Echo, EchoResource(), name='echo')
+            if hosted:
+                client.start()
+            monkeypatch.setattr(CRMContract, 'native_args', native_args)
+            monkeypatch.setattr(CRMProxy, 'ipc', ipc)
+            monkeypatch.setattr(registry, '_connect_native_call', native_call)
+            worker.start()
+            assert captured.wait(5), 'connect did not reach the native boundary'
+            outcome = client.shutdown(timeout=2)
+            evidence['shutdown_completed'] = outcome['completed']
+            evidence['shutdown_ipc_clients_drained'] = outcome['ipc_clients_drained']
+            assert outcome['completed'] and outcome['ipc_clients_drained']
+            assert client._runtime_session is not old_session
+            resume.set()
+            if expire_at_finish:
+                assert reached_finish.wait(5)
+                if not attempts.empty():
+                    attempt = attempts.get_nowait()
+                    # Expire the original native budget on a real held lock;
+                    # no sleep, clock replacement, or fresh timeout is involved.
+                    blocked = Lock()
+                    blocked.acquire()
+                    try:
+                        with pytest.raises(cc.error.CoreError):
+                            attempt.acquire_lock(blocked, 'fixture_expire_original_budget')
+                    finally:
+                        blocked.release()
+                resume_finish.set()
+            worker.join(5)
+            assert not worker.is_alive()
+            returned = result.get_nowait()
+            evidence['connect_result'] = type(returned).__name__
+            if not isinstance(returned, BaseException):
+                late_proxy = returned
+                evidence['late_call'] = late_proxy.echo('still-alive')
+                cc.close(late_proxy)
+            else:
+                evidence['connect_error'] = str(returned)
+            if not observations.empty():
+                observation = observations.get_nowait()
+                event = events.recv(timeout=1)
+                while event is not None and event.side != 'client':
+                    event = events.recv(timeout=1)
+                assert event.kind == 'opened' and event.side == 'client'
+                assert event.connection_id == observation.connection_id
+                evidence['closed_after_proxy_close'] = observation.snapshot() is not None
+                repeated = old_session.shutdown(timeout_seconds=1)
+                evidence['old_session_reobserve_completed'] = repeated['completed']
+                evidence['old_session_reobserve_drained'] = repeated['ipc_clients_drained']
+                evidence['closed_after_old_shutdown'] = observation.snapshot() is not None
+        finally:
+            resume.set()
+            resume_finish.set()
+            if worker.ident is not None:
+                worker.join(5)
+                assert not worker.is_alive()
+            if late_proxy is not None:
+                cc.close(late_proxy)
+            # The real peer's close barrier also collects the baseline's late
+            # hosted connection; old Host.shutdown otherwise just replays its journal.
+            assert server.shutdown()['completed']
+            assert old_session.shutdown()['completed']
+            assert client.shutdown()['completed']
+            events.close()
+            if observation is not None:
+                assert observation.snapshot() is not None
+            remaining = sorted(path.name for path in tmp_path.iterdir())
+            assert set(remaining) <= {'.gate', '.gate.marker'}
+            evidence['endpoint_remaining'] = remaining
+            print('LATE_CONNECT_BASELINE ' + json.dumps(evidence, sort_keys=True))
+    
+>       assert isinstance(returned, (RuntimeError, cc.error.CallDeadlineExceeded)), (
+            'shutdown reported drained, but the captured old session published '
+            f'a new usable connection: {evidence}'
+        )
+E       AssertionError: shutdown reported drained, but the captured old session published a new usable connection: {'hosted': True, 'expire_at_finish': False, 'shutdown_completed': True, 'shutdown_ipc_clients_drained': True, 'connect_result': 'Echo', 'late_call': 'still-alive', 'closed_after_proxy_close': False, 'old_session_reobserve_completed': True, 'old_session_reobserve_drained': True, 'closed_after_old_shutdown': False, 'endpoint_remaining': ['.gate', '.gate.marker']}
+E       assert False
+E        +  where False = isinstance(<tests.unit.test_runtime_shutdown_publication.Echo object at 0x1070f5880>, (<class 'RuntimeError'>, <class 'c_two.error.CallDeadlineExceeded'>))
+
+sdk/python/tests/unit/test_runtime_shutdown_publication.py:157: AssertionError
+_ test_shutdown_cannot_publish_a_connection_from_its_retired_session[expired-budget-hostless] _
+
+tmp_path = PosixPath('/private<task-temp>/pytest-final/test_shutdown_cannot_publish_a2')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x1070f6fc0>
+hosted = False, expire_at_finish = True
+
+    @pytest.mark.parametrize('hosted', [False, True], ids=['hostless', 'hosted'])
+    @pytest.mark.parametrize('expire_at_finish', [False, True], ids=['live-budget', 'expired-budget'])
+    def test_shutdown_cannot_publish_a_connection_from_its_retired_session(
+        tmp_path, monkeypatch, hosted, expire_at_finish,
+    ):
+        for key in tuple(os.environ):
+            if key.startswith('C2_'):
+                monkeypatch.delenv(key)
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        server, client = cc.Runtime(), cc.Runtime()
+        if os.name != 'nt':
+            for runtime in (server, client):
+                runtime.set_local_endpoint(root=str(tmp_path))
+        old_session = client._runtime_session  # Keep ownership explicit through cleanup.
+        events = client.connection_events()
+        captured, resume = Event(), Event()
+        reached_finish, resume_finish = Event(), Event()
+        attempts, observations = Queue(), Queue()
+        result = Queue()
+        original_args = CRMContract.native_args
+        original_call = registry._connect_native_call
+        original_ipc = CRMProxy.ipc
+        observation = None
+        late_proxy = None
+        evidence = {'hosted': hosted, 'expire_at_finish': expire_at_finish}
+    
+        def native_args(contract):
+            if current_thread() is worker:
+                # Runtime._connect has captured its session, but has not entered
+                # NativeSession.acquire_ipc_client. No native result is faked.
+                captured.set()
+                assert resume.wait(5), 'test did not release the captured connect'
+            return original_args(contract)
+    
+        def ipc(*args, **kwargs):
+            proxy = original_ipc(*args, **kwargs)
+            if current_thread() is worker:
+                observations.put(proxy.connection_observation())
+            return proxy
+    
+        def native_call(operation, *args, **kwargs):
+            if expire_at_finish and current_thread() is worker and args == ('python_connect_finish',):
+                attempts.put(operation.__self__)
+                reached_finish.set()
+                assert resume_finish.wait(5), 'test did not release final publication'
+            return original_call(operation, *args, **kwargs)
+    
+        def connect():
+            try:
+                result.put(client.connect(
+                    Echo, name='echo', address=server.server_address(), timeout=3,
+                ))
+            except BaseException as error:
+                result.put(error)  # Keep the traceback and old owners alive too.
+            finally:
+                reached_finish.set()
+    
+        worker = Thread(target=connect, name='captured-runtime-connect')
+        try:
+            server.register(Echo, EchoResource(), name='echo')
+            if hosted:
+                client.start()
+            monkeypatch.setattr(CRMContract, 'native_args', native_args)
+            monkeypatch.setattr(CRMProxy, 'ipc', ipc)
+            monkeypatch.setattr(registry, '_connect_native_call', native_call)
+            worker.start()
+            assert captured.wait(5), 'connect did not reach the native boundary'
+            outcome = client.shutdown(timeout=2)
+            evidence['shutdown_completed'] = outcome['completed']
+            evidence['shutdown_ipc_clients_drained'] = outcome['ipc_clients_drained']
+            assert outcome['completed'] and outcome['ipc_clients_drained']
+            assert client._runtime_session is not old_session
+            resume.set()
+            if expire_at_finish:
+                assert reached_finish.wait(5)
+                if not attempts.empty():
+                    attempt = attempts.get_nowait()
+                    # Expire the original native budget on a real held lock;
+                    # no sleep, clock replacement, or fresh timeout is involved.
+                    blocked = Lock()
+                    blocked.acquire()
+                    try:
+                        with pytest.raises(cc.error.CoreError):
+                            attempt.acquire_lock(blocked, 'fixture_expire_original_budget')
+                    finally:
+                        blocked.release()
+                resume_finish.set()
+            worker.join(5)
+            assert not worker.is_alive()
+            returned = result.get_nowait()
+            evidence['connect_result'] = type(returned).__name__
+            if not isinstance(returned, BaseException):
+                late_proxy = returned
+                evidence['late_call'] = late_proxy.echo('still-alive')
+                cc.close(late_proxy)
+            else:
+                evidence['connect_error'] = str(returned)
+            if not observations.empty():
+                observation = observations.get_nowait()
+                event = events.recv(timeout=1)
+                while event is not None and event.side != 'client':
+                    event = events.recv(timeout=1)
+                assert event.kind == 'opened' and event.side == 'client'
+                assert event.connection_id == observation.connection_id
+                evidence['closed_after_proxy_close'] = observation.snapshot() is not None
+                repeated = old_session.shutdown(timeout_seconds=1)
+                evidence['old_session_reobserve_completed'] = repeated['completed']
+                evidence['old_session_reobserve_drained'] = repeated['ipc_clients_drained']
+                evidence['closed_after_old_shutdown'] = observation.snapshot() is not None
+        finally:
+            resume.set()
+            resume_finish.set()
+            if worker.ident is not None:
+                worker.join(5)
+                assert not worker.is_alive()
+            if late_proxy is not None:
+                cc.close(late_proxy)
+            # The real peer's close barrier also collects the baseline's late
+            # hosted connection; old Host.shutdown otherwise just replays its journal.
+            assert server.shutdown()['completed']
+            assert old_session.shutdown()['completed']
+            assert client.shutdown()['completed']
+            events.close()
+            if observation is not None:
+                assert observation.snapshot() is not None
+            remaining = sorted(path.name for path in tmp_path.iterdir())
+            assert set(remaining) <= {'.gate', '.gate.marker'}
+            evidence['endpoint_remaining'] = remaining
+            print('LATE_CONNECT_BASELINE ' + json.dumps(evidence, sort_keys=True))
+    
+        assert isinstance(returned, (RuntimeError, cc.error.CallDeadlineExceeded)), (
+            'shutdown reported drained, but the captured old session published '
+            f'a new usable connection: {evidence}'
+        )
+>       assert evidence.get('closed_after_proxy_close', True), (
+            'connect failed within its original budget, but its physical connection '
+            f'escaped the completed shutdown: {evidence}'
+        )
+E       AssertionError: connect failed within its original budget, but its physical connection escaped the completed shutdown: {'hosted': False, 'expire_at_finish': True, 'shutdown_completed': True, 'shutdown_ipc_clients_drained': True, 'connect_result': 'CallDeadlineExceeded', 'connect_error': 'ERROR_CALL_DEADLINE_EXCEEDED: connect deadline exceeded', 'closed_after_proxy_close': False, 'old_session_reobserve_completed': True, 'old_session_reobserve_drained': True, 'closed_after_old_shutdown': True, 'endpoint_remaining': ['.gate', '.gate.marker']}
+E       assert False
+E        +  where False = <built-in method get of dict object at 0x107176f00>('closed_after_proxy_close', True)
+E        +    where <built-in method get of dict object at 0x107176f00> = {'closed_after_old_shutdown': True, 'closed_after_proxy_close': False, 'connect_error': 'ERROR_CALL_DEADLINE_EXCEEDED: connect deadline exceeded', 'connect_result': 'CallDeadlineExceeded', ...}.get
+
+sdk/python/tests/unit/test_runtime_shutdown_publication.py:161: AssertionError
+_ test_shutdown_cannot_publish_a_connection_from_its_retired_session[expired-budget-hosted] _
+
+tmp_path = PosixPath('/private<task-temp>/pytest-final/test_shutdown_cannot_publish_a3')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x1070f7560>
+hosted = True, expire_at_finish = True
+
+    @pytest.mark.parametrize('hosted', [False, True], ids=['hostless', 'hosted'])
+    @pytest.mark.parametrize('expire_at_finish', [False, True], ids=['live-budget', 'expired-budget'])
+    def test_shutdown_cannot_publish_a_connection_from_its_retired_session(
+        tmp_path, monkeypatch, hosted, expire_at_finish,
+    ):
+        for key in tuple(os.environ):
+            if key.startswith('C2_'):
+                monkeypatch.delenv(key)
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        server, client = cc.Runtime(), cc.Runtime()
+        if os.name != 'nt':
+            for runtime in (server, client):
+                runtime.set_local_endpoint(root=str(tmp_path))
+        old_session = client._runtime_session  # Keep ownership explicit through cleanup.
+        events = client.connection_events()
+        captured, resume = Event(), Event()
+        reached_finish, resume_finish = Event(), Event()
+        attempts, observations = Queue(), Queue()
+        result = Queue()
+        original_args = CRMContract.native_args
+        original_call = registry._connect_native_call
+        original_ipc = CRMProxy.ipc
+        observation = None
+        late_proxy = None
+        evidence = {'hosted': hosted, 'expire_at_finish': expire_at_finish}
+    
+        def native_args(contract):
+            if current_thread() is worker:
+                # Runtime._connect has captured its session, but has not entered
+                # NativeSession.acquire_ipc_client. No native result is faked.
+                captured.set()
+                assert resume.wait(5), 'test did not release the captured connect'
+            return original_args(contract)
+    
+        def ipc(*args, **kwargs):
+            proxy = original_ipc(*args, **kwargs)
+            if current_thread() is worker:
+                observations.put(proxy.connection_observation())
+            return proxy
+    
+        def native_call(operation, *args, **kwargs):
+            if expire_at_finish and current_thread() is worker and args == ('python_connect_finish',):
+                attempts.put(operation.__self__)
+                reached_finish.set()
+                assert resume_finish.wait(5), 'test did not release final publication'
+            return original_call(operation, *args, **kwargs)
+    
+        def connect():
+            try:
+                result.put(client.connect(
+                    Echo, name='echo', address=server.server_address(), timeout=3,
+                ))
+            except BaseException as error:
+                result.put(error)  # Keep the traceback and old owners alive too.
+            finally:
+                reached_finish.set()
+    
+        worker = Thread(target=connect, name='captured-runtime-connect')
+        try:
+            server.register(Echo, EchoResource(), name='echo')
+            if hosted:
+                client.start()
+            monkeypatch.setattr(CRMContract, 'native_args', native_args)
+            monkeypatch.setattr(CRMProxy, 'ipc', ipc)
+            monkeypatch.setattr(registry, '_connect_native_call', native_call)
+            worker.start()
+            assert captured.wait(5), 'connect did not reach the native boundary'
+            outcome = client.shutdown(timeout=2)
+            evidence['shutdown_completed'] = outcome['completed']
+            evidence['shutdown_ipc_clients_drained'] = outcome['ipc_clients_drained']
+            assert outcome['completed'] and outcome['ipc_clients_drained']
+            assert client._runtime_session is not old_session
+            resume.set()
+            if expire_at_finish:
+                assert reached_finish.wait(5)
+                if not attempts.empty():
+                    attempt = attempts.get_nowait()
+                    # Expire the original native budget on a real held lock;
+                    # no sleep, clock replacement, or fresh timeout is involved.
+                    blocked = Lock()
+                    blocked.acquire()
+                    try:
+                        with pytest.raises(cc.error.CoreError):
+                            attempt.acquire_lock(blocked, 'fixture_expire_original_budget')
+                    finally:
+                        blocked.release()
+                resume_finish.set()
+            worker.join(5)
+            assert not worker.is_alive()
+            returned = result.get_nowait()
+            evidence['connect_result'] = type(returned).__name__
+            if not isinstance(returned, BaseException):
+                late_proxy = returned
+                evidence['late_call'] = late_proxy.echo('still-alive')
+                cc.close(late_proxy)
+            else:
+                evidence['connect_error'] = str(returned)
+            if not observations.empty():
+                observation = observations.get_nowait()
+                event = events.recv(timeout=1)
+                while event is not None and event.side != 'client':
+                    event = events.recv(timeout=1)
+                assert event.kind == 'opened' and event.side == 'client'
+                assert event.connection_id == observation.connection_id
+                evidence['closed_after_proxy_close'] = observation.snapshot() is not None
+                repeated = old_session.shutdown(timeout_seconds=1)
+                evidence['old_session_reobserve_completed'] = repeated['completed']
+                evidence['old_session_reobserve_drained'] = repeated['ipc_clients_drained']
+                evidence['closed_after_old_shutdown'] = observation.snapshot() is not None
+        finally:
+            resume.set()
+            resume_finish.set()
+            if worker.ident is not None:
+                worker.join(5)
+                assert not worker.is_alive()
+            if late_proxy is not None:
+                cc.close(late_proxy)
+            # The real peer's close barrier also collects the baseline's late
+            # hosted connection; old Host.shutdown otherwise just replays its journal.
+            assert server.shutdown()['completed']
+            assert old_session.shutdown()['completed']
+            assert client.shutdown()['completed']
+            events.close()
+            if observation is not None:
+                assert observation.snapshot() is not None
+            remaining = sorted(path.name for path in tmp_path.iterdir())
+            assert set(remaining) <= {'.gate', '.gate.marker'}
+            evidence['endpoint_remaining'] = remaining
+            print('LATE_CONNECT_BASELINE ' + json.dumps(evidence, sort_keys=True))
+    
+        assert isinstance(returned, (RuntimeError, cc.error.CallDeadlineExceeded)), (
+            'shutdown reported drained, but the captured old session published '
+            f'a new usable connection: {evidence}'
+        )
+>       assert evidence.get('closed_after_proxy_close', True), (
+            'connect failed within its original budget, but its physical connection '
+            f'escaped the completed shutdown: {evidence}'
+        )
+E       AssertionError: connect failed within its original budget, but its physical connection escaped the completed shutdown: {'hosted': True, 'expire_at_finish': True, 'shutdown_completed': True, 'shutdown_ipc_clients_drained': True, 'connect_result': 'CallDeadlineExceeded', 'connect_error': 'ERROR_CALL_DEADLINE_EXCEEDED: connect deadline exceeded', 'closed_after_proxy_close': False, 'old_session_reobserve_completed': True, 'old_session_reobserve_drained': True, 'closed_after_old_shutdown': False, 'endpoint_remaining': ['.gate', '.gate.marker']}
+E       assert False
+E        +  where False = <built-in method get of dict object at 0x1071601c0>('closed_after_proxy_close', True)
+E        +    where <built-in method get of dict object at 0x1071601c0> = {'closed_after_old_shutdown': False, 'closed_after_proxy_close': False, 'connect_error': 'ERROR_CALL_DEADLINE_EXCEEDED: connect deadline exceeded', 'connect_result': 'CallDeadlineExceeded', ...}.get
+
+sdk/python/tests/unit/test_runtime_shutdown_publication.py:161: AssertionError
+=========================== short test summary info ============================
+FAILED sdk/python/tests/unit/test_runtime_shutdown_publication.py::test_shutdown_cannot_publish_a_connection_from_its_retired_session[live-budget-hostless]
+FAILED sdk/python/tests/unit/test_runtime_shutdown_publication.py::test_shutdown_cannot_publish_a_connection_from_its_retired_session[live-budget-hosted]
+FAILED sdk/python/tests/unit/test_runtime_shutdown_publication.py::test_shutdown_cannot_publish_a_connection_from_its_retired_session[expired-budget-hostless]
+FAILED sdk/python/tests/unit/test_runtime_shutdown_publication.py::test_shutdown_cannot_publish_a_connection_from_its_retired_session[expired-budget-hosted]
+4 failed in 6.17s

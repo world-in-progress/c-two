@@ -64,9 +64,13 @@ control = prepared.commit(timeout=1.0)  # 每个准备对象只提交一次；�
 
 `OwnedChild.poll()` / `wait(timeout=...)` / `kill()` 观察或管理进程，`OwnedChild.close()` 只释放观察者，原生共享 reaper 继续负责 OS 回收。它与 `OwnerControl.close()` 的生命周期作用不同。
 
-`cc.shutdown(timeout=...)` 返回原生结构化完成结果；有效 owner shutdown 或 Persistent admin shutdown 的 ACK 仅证明已接受发起排空，不能用作 callback 排空完成或运行 hook 的依据。`completed=false` 时保留原 Session、bridge、路由及关闭 hook，稍后观察同一事务。监听器关闭、工作排空和 payload lease 是独立事实；端点回收不释放 held/borrowed，FastDB 检查视图由各自 lease 释放时失效。
+有效 owner shutdown 或 Persistent admin shutdown 的 ACK 仅证明已接受发起排空，不能用作 callback 排空完成或运行 hook 的依据。Python SDK 的显式 `Runtime.shutdown(timeout=...)` 和 `cc.shutdown(timeout=...)` 会启动所选 Core Runtime scope 的唯一永久退役事务：关闭新注册、start 和远程 connect 准入，并永久封闭该 SDK session 的 Core client pool。低层 Rust/Native Host 的 shutdown 仍只关闭具体 Host，原有重启语义不变。SDK 返回 `completed=false` 时，旧 session、bridge、路由和关闭 slots 均保留；即使后台事务随后完成，也必须由下一次 SDK shutdown 消费 receipt 并换代。零或短等待预算不会取消 driver。若预算在退役交接前耗尽，则抛出带 `lifecycle_kind='shutdown_wait_timeout'`、`details.stage` 和 `timeout_seconds` 的结构化错误，不报告 pending。Python 实例锁等待仍在期限之外；取得锁后，Native Host、Core 和 pool 等待共享一个绝对期限。监听器关闭、工作排空和 payload lease 是独立事实；端点回收不释放 held/borrowed，FastDB 检查视图由各自 lease 释放时失效。
 
-显式 Python `runtime.shutdown(timeout=...)` 遵循相同完成规则。完成后，这个 Python 对象取得新原生 session；应保存返回的 outcome，作为旧 session 的关闭结果。`runtime.connection_events()` 绑定当前 session，换代后需要重新订阅。启动错误与随后关闭的结果须分别保存，失败启动后的未完成或错误清理不能被原启动异常掩盖。失败启动后，NativeSession 观察本次具体 Server 的原有关闭事务，保留终态错误。见[验收记录](reports/2026-10-28-public-runtime-acceptance.md)：pending 的确定性交错在 Core 验证，真实 Native/Bridge 另行验证终态错误保真。
+Core 低层入口为 `begin_session_retirement(target, deadline) -> Result<RuntimeShutdownReceipt, LifecycleError>`。`RuntimeShutdownTarget` 借用一个 `Host`、具体的 `FailedStartShutdownReceipt`，或选择 `ClientsOnly`；receipt 通过 `retirement_receipt(deadline)` 观察同一退役范围。保留 failed-start receipt 对应具体清理事务的作用。`Host.shutdown_outcome_until(deadline)` 在调用期限内观察原 Host journal。
+
+SDK 将原始 connect deadline 用于最终发布检查；若期限先到，connect 返回 deadline 错误、仅释放本次逻辑 client 且不重试。正常成功连接仍复用已有池客户端。`runtime_retired` 是没有 I/O 因果字段的 lifecycle 错误。数值字符串不再是 shutdown timeout 的有效输入。Native 关闭失败的异常投影在 binding 锁外执行；session 换代后才在锁外调用关闭 hooks，若 replacement 构造失败则保留原 slots 和 journal。HTTP-only Runtime 不因退役创建 IPC 池；shutdown 也不承诺所有 HTTP keepalive socket 都已物理关闭。IPC 14、SHM 3、C/FFI ABI 6 不变；R07 final Drop 仍单列。
+
+失败启动的原始结果与随后 Runtime 退役结果须分别保存；失败启动后的未完成或错误清理不能被启动异常掩盖。NativeSession 观察本次具体 Server 的原有关闭事务，保留终态错误。见[验收记录](reports/2026-10-28-public-runtime-acceptance.md)：其中记录的是该项原始 acceptance 范围，不代表本文新增 Runtime retirement 范围的验收。
 
 Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时重试暂时连接失败。开始写入后，写入失败、ACK 丢失或超时均返回现有未确认结果，不再重连重发；未确认不证明服务端没有执行。这样同地址重新绑定的新实例不会收到本次调用的重发。ping 继续保留探测重试，首次观察到端点不存在的处理与原总预算保持。
 

@@ -180,7 +180,8 @@ pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
         | IpcError::WatchUnavailable(_)
         | IpcError::MethodNotFound { .. }
         | IpcError::Shm(_)
-        | IpcError::Pool(_) => TransportPhase::PreDispatch,
+        | IpcError::Pool(_)
+        | IpcError::PoolRetired => TransportPhase::PreDispatch,
         IpcError::Io(_)
         | IpcError::Connect(_)
         | IpcError::Decode(_)
@@ -874,6 +875,10 @@ pub(crate) mod tests {
 
     #[test]
     fn call_phase_is_transport_owned_and_dispatch_uncertainty_is_not_retry_safe() {
+        assert_eq!(
+            call_error_phase(&IpcError::PoolRetired),
+            TransportPhase::PreDispatch
+        );
         let before_dispatch = IpcCallError::new(
             TransportPhase::PreDispatch,
             IpcError::MethodNotFound {

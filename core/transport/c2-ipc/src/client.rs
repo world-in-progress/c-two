@@ -1719,6 +1719,8 @@ pub enum IpcError {
     Closed,
     /// Pool management error.
     Pool(String),
+    /// The owning client pool permanently closed connection admission.
+    PoolRetired,
 }
 
 impl std::fmt::Display for IpcError {
@@ -1793,6 +1795,7 @@ impl std::fmt::Display for IpcError {
             Self::CrmError(_) => write!(f, "CRM method error"),
             Self::Closed => write!(f, "IPC client closed"),
             Self::Pool(msg) => write!(f, "Pool error: {msg}"),
+            Self::PoolRetired => write!(f, "IPC client pool retired"),
         }
     }
 }

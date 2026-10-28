@@ -1,6 +1,6 @@
 # 并发注册与会话换代：独立待修项
 
-状态：已隔离复现，尚未拟定或批准修复。不计入公开 Runtime 或失败启动回执的修复范围。
+状态：原注册交错与四项迟到连接基线均已复现；[完整待修方案](../plans/2026-10-28-runtime-retirement-core-plan.md)已完成 Opus 5.5 high 复审及 Host 条件落实，待用户确认实施。不计入此前公开 Runtime 或失败启动回执的修复范围。
 
 在 `e4ddcc85` 的 `_ProcessRegistry` 和公开 Runtime 候选上，测试专用 Event 将已有 Bridge.shutdown 停在原生关闭与旧路由 hook 完成之后、Python registry 换代之前。另一线程在同一实例注册新路由并成功返回，再放开旧 shutdown。两版结果一致：
 

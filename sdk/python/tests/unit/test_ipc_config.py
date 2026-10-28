@@ -659,8 +659,13 @@ class _FakeRuntimeSession:
     def inherit_local_endpoint_selection(self, previous: _FakeRuntimeSession) -> None:
         self._context = previous._context
 
-    def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
-        assert route_names == []
+    def check_active(self, *, connect_attempt=None):
+        pass  # These are routing/configuration spies, not lifecycle doubles.
+
+    def begin_shutdown(self, *, timeout_seconds=5.0):
+        return self
+
+    def observe(self):
         return {'completed': True, 'relay_errors': [], 'route_outcomes': []}
 
     def retire_memory_observation(self) -> _FakeRetiredObservation:

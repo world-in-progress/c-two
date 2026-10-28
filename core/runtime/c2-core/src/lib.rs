@@ -72,7 +72,10 @@ pub use outcome::{
     RouteCloseOutcome, ShutdownOutcome, UnregisterOutcome,
 };
 pub use owner_bound::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot};
-pub use session::{FailedStartShutdownReceipt, Runtime, RuntimeIdentity, RuntimeOptions};
+pub use session::{
+    FailedStartShutdownReceipt, Runtime, RuntimeIdentity, RuntimeOptions, RuntimeShutdownReceipt,
+    RuntimeShutdownTarget,
+};
 
 // SDK facades use the canonical Core owner capability types.
 pub use c2_config::{

@@ -2132,6 +2132,7 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::LocalCallRejected(_) => "local-call-rejected",
         c2_ipc::IpcError::Closed => "closed",
         c2_ipc::IpcError::Pool(_) => "pool",
+        c2_ipc::IpcError::PoolRetired => "pool-retired",
     }
 }
 

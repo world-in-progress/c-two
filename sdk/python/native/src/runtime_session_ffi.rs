@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -16,8 +16,9 @@ use c2_contract::{
 use c2_core::{
     CallExecutionObserver, Connect, FailedStartShutdownReceipt, Host, HostClientHeldLeases,
     HostLifecyclePhase, HostLifecycleSnapshot, HostOptions, MethodDefinition, RegisterOutcome,
-    Registration, RetiredMemoryObservation, Runtime, RuntimeOptions, ServerLifecyclePolicy,
-    ServiceConcurrencyMode, ServiceDefinition, ShutdownOutcome, UnregisterOutcome,
+    Registration, RetiredMemoryObservation, Runtime, RuntimeOptions, RuntimeShutdownReceipt,
+    RuntimeShutdownTarget, ServerLifecyclePolicy, ServiceConcurrencyMode, ServiceDefinition,
+    ShutdownOutcome, UnregisterOutcome,
 };
 use c2_mem::{BufferLeaseStats, BufferLeaseTracker};
 
@@ -78,6 +79,191 @@ mod shutdown_timeout_tests {
 #[cfg(test)]
 mod connect_attempt_tests {
     use super::*;
+
+    #[test]
+    fn retired_hostless_session_keeps_explicit_name_validation() {
+        Python::initialize();
+        Python::attach(|py| {
+            let session = Py::new(
+                py,
+                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
+                    .unwrap(),
+            )
+            .unwrap();
+            PyRuntimeSession::begin_shutdown(session.clone_ref(py), py, 3.0)
+                .unwrap()
+                .observe(py)
+                .unwrap();
+            let error = session
+                .borrow(py)
+                .shutdown(py, Some(vec!["missing".into()]), None, 1.0)
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+        });
+    }
+
+    #[test]
+    fn retirement_owner_lock_timeout_does_not_seal_or_hold_the_gil() {
+        Python::initialize();
+        Python::attach(|py| {
+            let session = Py::new(
+                py,
+                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
+                    .unwrap(),
+            )
+            .unwrap();
+            let borrowed = session.borrow(py);
+            let owner = borrowed.host.lock();
+            let worker_session = session.clone_ref(py);
+            let (finished, observed) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    let wait = PyRuntimeSession::begin_shutdown(worker_session, py, 0.025).unwrap();
+                    let error = wait.observe(py).unwrap_err();
+                    let value = error.value(py);
+                    let kind: String = value.getattr("lifecycle_kind").unwrap().extract().unwrap();
+                    let stage: String = value
+                        .getattr("details")
+                        .unwrap()
+                        .get_item("stage")
+                        .unwrap()
+                        .extract()
+                        .unwrap();
+                    let timeout: f64 = value.getattr("timeout_seconds").unwrap().extract().unwrap();
+                    finished.send((kind, stage, timeout)).unwrap();
+                });
+            });
+            let result = py.detach(move || observed.recv_timeout(Duration::from_secs(3)));
+            drop(owner);
+            worker.join().unwrap();
+            assert_eq!(
+                result.unwrap(),
+                (
+                    "shutdown_wait_timeout".into(),
+                    "shutdown_owner_wait".into(),
+                    0.025,
+                )
+            );
+            assert!(
+                borrowed
+                    .inner
+                    .retirement_receipt(Instant::now())
+                    .unwrap()
+                    .is_none()
+            );
+            borrowed.inner.ensure_active().unwrap();
+        });
+    }
+
+    #[test]
+    fn sdk_shutdown_projects_owner_timeout_after_releasing_binding_lock() {
+        Python::initialize();
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            py.run(
+                pyo3::ffi::c_str!(
+                    r#"
+import c_two as cc
+runtime = cc.Runtime()
+original = cc.error.CoreError.__init__
+def observe_error(self, category, message):
+    assert not runtime._lock.locked(), 'error projection kept SDK binding lock'
+    assert runtime.names == []
+    original(self, category, message)
+cc.error.CoreError.__init__ = observe_error
+"#
+                ),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let runtime = globals.get_item("runtime").unwrap().unwrap().unbind();
+            // The embedded test crate and installed extension have separate
+            // PyType identities. Give the real SDK Runtime this test's native instance.
+            let session = Py::new(py, PyRuntimeSession::new(None, None, None, None, None, false, None, None, None).unwrap()).unwrap();
+            runtime.bind(py).setattr("_runtime_session", session.clone_ref(py)).unwrap();
+            let borrowed = session.borrow(py);
+            let owner = borrowed.host.lock();
+            let worker_runtime = runtime.clone_ref(py);
+            let (done, observed) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("timeout", 0.025).unwrap();
+                    let error = worker_runtime
+                        .bind(py)
+                        .call_method("shutdown", (), Some(&kwargs))
+                        .unwrap_err();
+                    done.send(
+                        error
+                            .value(py)
+                            .getattr("lifecycle_kind")
+                            .and_then(|value| value.extract::<String>()),
+                    )
+                    .unwrap();
+                });
+            });
+            let result = py.detach(move || observed.recv_timeout(Duration::from_secs(3)));
+            drop(owner);
+            py.detach(|| worker.join()).unwrap();
+            py.run(
+                pyo3::ffi::c_str!("cc.error.CoreError.__init__ = original"),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            assert_eq!(result.unwrap().unwrap(), "shutdown_wait_timeout");
+            assert!(
+                borrowed
+                    .inner
+                    .retirement_receipt(Instant::now())
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn retired_explicit_name_observation_keeps_owner_lock_in_original_deadline() {
+        Python::initialize();
+        Python::attach(|py| {
+            let session = Py::new(
+                py,
+                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
+                    .unwrap(),
+            )
+            .unwrap();
+            PyRuntimeSession::begin_shutdown(session.clone_ref(py), py, 3.0)
+                .unwrap()
+                .observe(py)
+                .unwrap();
+            let borrowed = session.borrow(py);
+            let owner = borrowed.host.lock();
+            let worker_session = session.clone_ref(py);
+            let (done, observed) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    let error = worker_session
+                        .borrow(py)
+                        .shutdown(py, Some(Vec::new()), None, 0.0)
+                        .unwrap_err();
+                    done.send(
+                        error
+                            .value(py)
+                            .getattr("lifecycle_kind")
+                            .unwrap()
+                            .extract::<String>()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                })
+            });
+            let result = py.detach(move || observed.recv_timeout(Duration::from_secs(3)));
+            drop(owner);
+            py.detach(|| worker.join()).unwrap();
+            assert_eq!(result.unwrap(), "shutdown_wait_timeout");
+        });
+    }
 
     #[test]
     fn relay_override_host_lock_expires_before_owner_releases_and_recovers() {
@@ -174,6 +360,41 @@ struct HostRecord {
     failed_start_receipt: Option<FailedStartShutdownReceipt>,
 }
 
+/// One caller's bounded observation of an already-started Core transaction.
+/// The receipt owns no competing cleanup work; Core continues after this wait drops.
+#[pyclass(name = "RuntimeShutdownWait", module = "c_two._native", frozen)]
+pub struct PyRuntimeShutdownWait {
+    session: Py<PyRuntimeSession>,
+    receipt: Result<RuntimeShutdownReceipt, c2_core::LifecycleError>,
+    deadline: Instant,
+    timeout_seconds: f64,
+}
+
+#[pymethods]
+impl PyRuntimeShutdownWait {
+    fn observe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        // Error construction can execute Python. The SDK observes outside its
+        // binding lock, after begin has either transferred work or kept its owner.
+        let receipt = self
+            .receipt
+            .as_ref()
+            .map_err(|error| shutdown_error_to_py(py, error.clone(), self.timeout_seconds))?;
+        let (outcome, completed) = py.detach(|| receipt.observe_until(self.deadline));
+        self.session
+            .borrow(py)
+            .project_shutdown_observation(py, outcome, completed)
+    }
+}
+
+fn shutdown_error_to_py(py: Python<'_>, error: c2_core::LifecycleError, seconds: f64) -> PyErr {
+    let timed_out = matches!(error, c2_core::LifecycleError::ShutdownWaitTimeout { .. });
+    let error = lifecycle_error_to_py(error);
+    if timed_out {
+        let _ = error.value(py).setattr("timeout_seconds", seconds);
+    }
+    error
+}
+
 /// Read-only observation bundle passed from a shutting-down session to its
 /// replacement.
 ///
@@ -194,6 +415,51 @@ pub struct PyRetiredMemoryObservation {
 }
 
 impl PyRuntimeSession {
+    fn check_shutdown_route_names(
+        &self,
+        route_names: Option<&[String]>,
+        deadline: Option<Instant>,
+    ) -> PyResult<()> {
+        if let Some(names) = route_names {
+            let registered = match deadline {
+                Some(deadline) => self.registrations.try_lock_until(deadline).ok_or_else(|| {
+                    lifecycle_error_to_py(c2_core::LifecycleError::ShutdownWaitTimeout {
+                        stage: "shutdown_registrations_wait",
+                    })
+                })?,
+                None => self.registrations.lock(),
+            };
+            for name in names {
+                if !registered.contains_key(name) {
+                    return Err(PyValueError::new_err(format!(
+                        "Name not registered: {name:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn project_shutdown_observation<'py>(
+        &self,
+        py: Python<'py>,
+        outcome: ShutdownOutcome,
+        completed: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if completed {
+            // Core has sealed publication before this path can run. Drop native
+            // registrations without the GIL, then release the Python bridge.
+            let bridge = py.detach(|| {
+                self.registrations.lock().clear();
+                self.server_bridge.lock().take()
+            });
+            drop(bridge);
+        }
+        let dict = shutdown_outcome_to_dict(py, outcome)?;
+        dict.set_item("completed", completed)?;
+        Ok(dict)
+    }
+
     /// Start this session's one Core host.
     ///
     /// The default [`HostOptions`] inherits the native lifecycle policy the
@@ -203,6 +469,10 @@ impl PyRuntimeSession {
     /// second `ensure_host` reuses the live host and never re-consumes.
     fn ensure_host(&self) -> PyResult<Host> {
         let mut host_guard = self.host.lock();
+        if let Err(error) = self.inner.ensure_active() {
+            drop(host_guard);
+            return Err(lifecycle_error_to_py(error));
+        }
         if let Some(host) = host_guard.host.as_ref() {
             if host.shutdown_outcome().is_none() {
                 if !host.is_running() || self.inner.has_pending_teardown() {
@@ -1113,6 +1383,61 @@ impl PyRuntimeSession {
         unregister_outcome_to_dict(py, outcome)
     }
 
+    /// Extract Python numeric input before the SDK takes its binding lock.
+    /// Range/deadline validation occurs once, at begin_shutdown.
+    #[staticmethod]
+    fn shutdown_timeout_seconds(seconds: f64) -> f64 {
+        seconds
+    }
+
+    #[pyo3(signature = (connect_attempt=None))]
+    fn check_active(
+        &self,
+        py: Python<'_>,
+        connect_attempt: Option<&PyConnectAttempt>,
+    ) -> PyResult<()> {
+        py.detach(|| match connect_attempt {
+            Some(attempt) => self.inner.ensure_active_with_attempt(&attempt.inner),
+            None => self.inner.ensure_active().map_err(c2_core::Error::from),
+        })
+        .map_err(core_error_to_py)
+    }
+
+    #[pyo3(signature = (timeout_seconds=5.0))]
+    fn begin_shutdown(
+        slf: Py<Self>,
+        py: Python<'_>,
+        timeout_seconds: f64,
+    ) -> PyResult<PyRuntimeShutdownWait> {
+        let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            PyValueError::new_err("timeout_seconds cannot be represented as a shutdown deadline")
+        })?;
+        let receipt = {
+            let borrowed = slf.borrow(py);
+            let session: &PyRuntimeSession = &borrowed;
+            py.detach(|| {
+                let record = session.host.try_lock_until(deadline).ok_or(
+                    c2_core::LifecycleError::ShutdownWaitTimeout {
+                        stage: "shutdown_owner_wait",
+                    },
+                )?;
+                let target = match (&record.failed_start_receipt, &record.host) {
+                    (Some(receipt), _) => RuntimeShutdownTarget::FailedStart(receipt),
+                    (None, Some(host)) => RuntimeShutdownTarget::Host(host),
+                    (None, None) => RuntimeShutdownTarget::ClientsOnly,
+                };
+                session.inner.begin_session_retirement(target, deadline)
+            })
+        };
+        Ok(PyRuntimeShutdownWait {
+            session: slf,
+            receipt,
+            deadline,
+            timeout_seconds,
+        })
+    }
+
     #[pyo3(signature = (route_names=None, relay_anchor_address=None, timeout_seconds=5.0))]
     fn shutdown<'py>(
         &self,
@@ -1124,6 +1449,41 @@ impl PyRuntimeSession {
         // Validate before taking the Host or changing any session state.
         let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
         let _ = relay_anchor_address;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            PyValueError::new_err("timeout_seconds cannot be represented as a shutdown deadline")
+        })?;
+        let receipt = py
+            .detach(|| self.inner.retirement_receipt(deadline))
+            .map_err(|error| shutdown_error_to_py(py, error, timeout_seconds))?;
+        if let Some(receipt) = receipt {
+            if route_names.is_some() {
+                let check_names = py
+                    .detach(|| {
+                        let record = self.host.try_lock_until(deadline).ok_or(
+                            c2_core::LifecycleError::ShutdownWaitTimeout {
+                                stage: "shutdown_owner_wait",
+                            },
+                        )?;
+                        if record.failed_start_receipt.is_some() {
+                            return Ok(false);
+                        }
+                        let host = record.host.clone();
+                        drop(record);
+                        Ok::<_, c2_core::LifecycleError>(match host {
+                            Some(host) => host.shutdown_outcome_until(deadline)?.is_none(),
+                            None => true,
+                        })
+                    })
+                    .map_err(|error| shutdown_error_to_py(py, error, timeout_seconds))?;
+                if check_names {
+                    py.detach(|| {
+                        self.check_shutdown_route_names(route_names.as_deref(), Some(deadline))
+                    })?;
+                }
+            }
+            let (outcome, completed) = py.detach(|| receipt.observe_until(deadline));
+            return self.project_shutdown_observation(py, outcome, completed);
+        }
         let (receipt_result, host) = py.detach(|| {
             let record = self.host.lock();
             if let Some(receipt) = record.failed_start_receipt.as_ref() {
@@ -1148,18 +1508,11 @@ impl PyRuntimeSession {
             dict.set_item("completed", completed)?;
             return Ok(dict);
         }
-        if let Some(route_names) = route_names.filter(|_| {
-            host.as_ref()
-                .is_none_or(|host| host.shutdown_outcome().is_none())
-        }) {
-            let registered = self.registrations.lock();
-            for route_name in route_names {
-                if !registered.contains_key(&route_name) {
-                    return Err(PyValueError::new_err(format!(
-                        "Name not registered: {route_name:?}",
-                    )));
-                }
-            }
+        if host
+            .as_ref()
+            .is_none_or(|host| host.shutdown_outcome().is_none())
+        {
+            self.check_shutdown_route_names(route_names.as_deref(), None)?;
         }
         let (outcome, completed) = py.detach(|| {
             // Completion and the projected result are one immutable native

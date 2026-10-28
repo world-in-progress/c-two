@@ -166,6 +166,15 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
         message,
         error.local_io_cause(),
         |value| match &error {
+            LifecycleError::RuntimeRetired => {
+                set_attr(value, "lifecycle_kind", "runtime_retired");
+            }
+            LifecycleError::ShutdownWaitTimeout { stage } => {
+                set_attr(value, "lifecycle_kind", "shutdown_wait_timeout");
+                let details = PyDict::new(value.py());
+                let _ = details.set_item("stage", stage);
+                set_attr(value, "details", details);
+            }
             LifecycleError::InvalidServerId(_) => {
                 set_attr(value, "lifecycle_kind", "invalid_server_id");
             }

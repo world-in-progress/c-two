@@ -52,6 +52,7 @@ from c_two.config.lifecycle import LifecycleConfig
 from c_two.config.settings import C2Settings, _clean_optional_str, settings
 from c_two.error import (
     CCError,
+    CoreError,
     ResourceNotFound,
     ResourceUnavailable,
     RegistryUnavailable,
@@ -236,6 +237,7 @@ class Runtime:
                     stacklevel=3,
                 )
                 return
+            self._runtime_session.check_active()
             previous_threshold = self._settings._shm_threshold  # noqa: SLF001
             previous_chunk_size = self._settings._remote_payload_chunk_size_override()  # noqa: SLF001
             try:
@@ -313,10 +315,7 @@ class Runtime:
         input ownership as part of this close.
         """
         try:
-            old_session.shutdown(
-                route_names=[],
-                relay_anchor_address=None,
-            )
+            old_session.begin_shutdown().observe()
         except Exception:
             log.warning(
                 'Error shutting down replaced RuntimeSession', exc_info=True,
@@ -416,6 +415,7 @@ class Runtime:
     def start(self) -> None:
         """Start this instance's Host and await its native readiness/PONG."""
         with self._lock:
+            self._runtime_session.check_active()
             self._sync_relay_override()
             self._ensure_server_bridge().start()
 
@@ -517,6 +517,7 @@ class Runtime:
             bridge=method_bridge_map,
         )
         with self._lock:
+            self._runtime_session.check_active()
             created_server = False
             try:
                 self._sync_relay_override()
@@ -618,6 +619,8 @@ class Runtime:
             )
             lease_tracker = runtime_session.lease_tracker()
 
+            remote = address is not None or local is None
+
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
             crm_instance, scheduler, actual_contract = local
@@ -702,6 +705,8 @@ class Runtime:
                         f'Name {name!r} is not registered locally '
                         f'and no address was provided',
                     ) from exc
+                if isinstance(exc, CoreError) and exc.lifecycle_kind == 'runtime_retired':
+                    raise
                 raise RegistryUnavailable(f"Relay unavailable: {exc}") from exc
             mode = getattr(client, 'mode', 'http')
             if mode == 'ipc':
@@ -725,6 +730,11 @@ class Runtime:
             crm = crm_class()
             crm.client = proxy
             _connect_native_call(attempt.check, 'python_connect_finish')
+            if remote:
+                with _connect_lock(self._lock, attempt, 'python_connect_finish'):
+                    _connect_native_call(runtime_session.check_active, connect_attempt=attempt)
+                    if self._runtime_session is not runtime_session:
+                        raise RuntimeError('Runtime session was replaced during connect')
             return crm
         except Exception:
             proxy.terminate()
@@ -772,14 +782,14 @@ class Runtime:
 
     def shutdown(self, *, timeout: float = 30.0) -> dict:
         """Consume native shutdown; retain the session until Core proves completion."""
+        from c_two._native import RuntimeSession
+
+        timeout = RuntimeSession.shutdown_timeout_seconds(timeout)
         with self._lock:
             server = self._server
             runtime_session = self._runtime_session
-        if server is not None:
-            outcome = server.shutdown(timeout=timeout)
-        else:
-            outcome = dict(runtime_session.shutdown(route_names=[],
-                relay_anchor_address=None, timeout_seconds=timeout))
+            observation = runtime_session.begin_shutdown(timeout_seconds=timeout)
+        outcome = dict(observation.observe())
         for key, description in (
                 ('ipc_client_close_error', 'IPC client cache'),
                 ('runtime_barrier_error', 'runtime barrier')):
@@ -787,12 +797,18 @@ class Runtime:
                 log.warning('Shutdown could not confirm %s cleanup: %s', description, outcome[key])
         if not outcome['completed']:
             return outcome
+        slots = []
         with self._lock:
             if self._runtime_session is runtime_session:
                 self._swap_runtime_session(preserve_server_identity=False)
+                if server is not None:
+                    slots = server._take_shutdown_slots(outcome)
                 if self._serve_stop is not None:
                     self._serve_stop.set()
                     self._serve_stop = None
+
+        for slot in slots:
+            server._invoke_shutdown(slot)
 
         for relay_error in outcome.get('relay_errors') or []:
             error = dict(relay_error)

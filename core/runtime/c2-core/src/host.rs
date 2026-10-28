@@ -718,6 +718,33 @@ impl Drop for HostInner {
 }
 
 impl Host {
+    pub(crate) fn belongs_to(&self, runtime: &Runtime) -> bool {
+        self.inner.runtime.same_instance(runtime)
+    }
+
+    pub(crate) fn retirement_server(&self) -> std::sync::Weak<Server> {
+        Arc::downgrade(&self.inner.server)
+    }
+
+    pub(crate) fn retirement_work(
+        &self,
+        deadline: Instant,
+    ) -> Result<crate::session::ShutdownWork, LifecycleError> {
+        let routes = self.inner.route_names.try_lock_until(deadline).ok_or(
+            LifecycleError::ShutdownWaitTimeout {
+                stage: "core_host_routes_wait",
+            },
+        )?;
+        let mut work = crate::session::ShutdownWork::new(
+            Some(self.inner.server.clone()),
+            self.inner.shutdown_timeout,
+        );
+        work.route_names = routes.iter().cloned().collect();
+        work.relay_anchor_address = self.inner.relay_anchor_address.clone();
+        work.relay_use_proxy = self.inner.relay_use_proxy;
+        Ok(work)
+    }
+
     /// Read the credential published by this host's bound listener.
     /// The snapshot does not prove the listener is still alive.
     pub fn endpoint_credential(&self) -> Option<c2_local::EndpointCredential> {
@@ -759,6 +786,7 @@ impl Host {
     }
 
     pub fn register(&self, definition: ServiceDefinition) -> Result<Registration, Error> {
+        self.inner.runtime.ensure_active()?;
         let route_name = definition.expected.route_name.clone();
         let route_spec = route_spec(&definition)?;
         let callback: Arc<dyn CrmCallback> = Arc::new(CoreCallback {
@@ -805,6 +833,27 @@ impl Host {
     pub fn shutdown_outcome(&self) -> Option<ShutdownOutcome> {
         self.inner.refresh_shutdown_outcome();
         self.inner.shutdown_outcome.lock().clone()
+    }
+
+    /// Observe the same journal within an existing caller deadline.
+    pub fn shutdown_outcome_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<ShutdownOutcome>, LifecycleError> {
+        let cached = self
+            .inner
+            .shutdown_outcome
+            .try_lock_until(deadline)
+            .ok_or(LifecycleError::ShutdownWaitTimeout {
+                stage: "core_host_outcome_wait",
+            })?
+            .clone();
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        self.inner
+            .runtime
+            .shutdown_observation_until(&self.inner.server, deadline)
     }
 
     /// Read-only lifecycle observation for this host.
@@ -1420,6 +1469,12 @@ mod lifecycle_tests {
         }
         #[cfg(not(unix))]
         {
+            runtime
+                .set_local_endpoint_with_sources(
+                    c2_config::LocalEndpointOptions::default(),
+                    c2_config::ConfigSources::empty(),
+                )
+                .unwrap();
             (runtime, None)
         }
     }
@@ -1507,6 +1562,31 @@ mod lifecycle_tests {
             );
             assert!(!root.exists());
         }
+    }
+
+    #[test]
+    fn failed_start_runtime_retirement_observes_original_pending_cleanup() {
+        let (runtime, directory) = receipt_test_runtime();
+        let attempt = failed_attempt(launch_failed_attempt(&runtime));
+        let failed_receipt = attempt.receipt.clone();
+        let receipt = runtime
+            .begin_session_retirement(
+                crate::RuntimeShutdownTarget::FailedStart(&failed_receipt),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(!receipt.observe_until(Instant::now()).1);
+        assert!(matches!(
+            runtime.ensure_active(),
+            Err(LifecycleError::RuntimeRetired)
+        ));
+        let (original, _) = finish_failed_attempt(attempt);
+        let (outcome, completed) = receipt.observe_until(Instant::now() + Duration::from_secs(5));
+        assert!(completed && outcome.ipc_clients_drained, "{outcome:?}");
+        assert_eq!(outcome, original);
+        assert_eq!(failed_receipt.terminal_outcome(), Some(outcome));
+        drop(runtime);
+        close_receipt_root(directory);
     }
 
     #[test]

@@ -1,0 +1,99 @@
+{
+  "schema": "c-two.runtime-late-connect-baseline.v1",
+  "source_commit": "9e8da3aacbfe64f704279a61a1c7f7198574d6c0",
+  "production_commit": "e0b5af2d8aabd225dc286d75e5d1ef5c6b492855",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "python": "CPython 3.12",
+  "native_sha256": "5bd917c857d36c1ccc0be79ea9c98666ad8cff096dbbbe7b0d9fa4f141892463",
+  "probe_path": "sdk/python/tests/unit/test_runtime_shutdown_publication.py",
+  "probe_sha256": "d2975988661b7d41f826798b920effb974c9f3486ef79fc72fc9055fa55c9b54",
+  "pytest_exit": 1,
+  "expected_failure_count": 4,
+  "rows": [
+    {
+      "closed_after_old_shutdown": true,
+      "closed_after_proxy_close": false,
+      "connect_result": "Echo",
+      "endpoint_remaining": [
+        ".gate",
+        ".gate.marker"
+      ],
+      "expire_at_finish": false,
+      "hosted": false,
+      "late_call": "still-alive",
+      "old_session_reobserve_completed": true,
+      "old_session_reobserve_drained": true,
+      "shutdown_completed": true,
+      "shutdown_ipc_clients_drained": true
+    },
+    {
+      "closed_after_old_shutdown": false,
+      "closed_after_proxy_close": false,
+      "connect_result": "Echo",
+      "endpoint_remaining": [
+        ".gate",
+        ".gate.marker"
+      ],
+      "expire_at_finish": false,
+      "hosted": true,
+      "late_call": "still-alive",
+      "old_session_reobserve_completed": true,
+      "old_session_reobserve_drained": true,
+      "shutdown_completed": true,
+      "shutdown_ipc_clients_drained": true
+    },
+    {
+      "closed_after_old_shutdown": true,
+      "closed_after_proxy_close": false,
+      "connect_error": "ERROR_CALL_DEADLINE_EXCEEDED: connect deadline exceeded",
+      "connect_result": "CallDeadlineExceeded",
+      "endpoint_remaining": [
+        ".gate",
+        ".gate.marker"
+      ],
+      "expire_at_finish": true,
+      "hosted": false,
+      "old_session_reobserve_completed": true,
+      "old_session_reobserve_drained": true,
+      "shutdown_completed": true,
+      "shutdown_ipc_clients_drained": true
+    },
+    {
+      "closed_after_old_shutdown": false,
+      "closed_after_proxy_close": false,
+      "connect_error": "ERROR_CALL_DEADLINE_EXCEEDED: connect deadline exceeded",
+      "connect_result": "CallDeadlineExceeded",
+      "endpoint_remaining": [
+        ".gate",
+        ".gate.marker"
+      ],
+      "expire_at_finish": true,
+      "hosted": true,
+      "old_session_reobserve_completed": true,
+      "old_session_reobserve_drained": true,
+      "shutdown_completed": true,
+      "shutdown_ipc_clients_drained": true
+    }
+  ],
+  "bounds": "Events order the snapshot/native-entry/final-publication boundaries. The held-lock wait uses the original native ConnectAttempt deadline. Old session, exceptions and observation remain alive through explicit cleanup.",
+  "prior_attempts": [
+    "Initial C++ build failed on missing standard headers; only task-local SDKROOT/CXXFLAGS were repaired.",
+    "First hosted run selected a startup server event; selection was corrected to the client side.",
+    "The expiration assertion was corrected to accept the existing CallDeadlineExceeded class, then verify physical cleanup separately."
+  ],
+  "endpoint_acceptance": "Four final roots contain gate and marker only; all task-owned runtimes explicitly shut down.",
+  "validation_scope": "macOS baseline only; no production fix, no cross-platform acceptance, no new CI run.",
+  "cleanup": {
+    "task": "runtime-late-connect-baseline",
+    "removed_artifacts_bytes": {
+      "target": 363917312,
+      "env": 70938624
+    },
+    "removed_total_bytes": 434855936,
+    "active_build_test_runtime": false,
+    "socket_or_lease_remaining": [],
+    "evidence_preserved": true,
+    "historical_namespaces_touched": false
+  },
+  "probe_archive": "docs/reports/evidence/2026-10-28-runtime-late-connect-baseline.py.txt"
+}

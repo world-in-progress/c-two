@@ -210,12 +210,14 @@ class TestServerNameCollision:
                 relay_anchor_address=None,
                 timeout_seconds=None,
             ):
+                assert route_names is None
+                closed = ['grid']  # The native journal owns the registered route list.
                 events.append(
-                    f'native_shutdown:{list(route_names or [])}:{relay_anchor_address}'
+                    f'native_shutdown:{route_names}:{relay_anchor_address}'
                 )
                 return {
                     'completed': True,
-                    'removed_routes': list(route_names or []),
+                    'removed_routes': list(closed),
                     'route_outcomes': [
                         {
                             'route_name': name,
@@ -224,7 +226,7 @@ class TestServerNameCollision:
                             'closed_reason': 'shutdown',
                             'close_error': None,
                         }
-                        for name in list(route_names or [])
+                        for name in closed
                     ],
                     'relay_errors': [],
                     'server_was_started': True,
@@ -274,7 +276,7 @@ class TestServerNameCollision:
         bridge.shutdown()
 
         assert events == [
-            "native_shutdown:['grid']:None",
+            'native_shutdown:None:None',
             'crm_shutdown',
         ]
         assert bridge.names == []
@@ -288,13 +290,15 @@ class TestServerNameCollision:
                 route_names=None,
                 relay_anchor_address=None,
                 timeout_seconds=None,
-            ):  # noqa: ANN001, ARG002
+            ):  # noqa: ANN001
+                assert route_names is None
+                closed = ['grid']  # The native journal owns the registered route list.
                 events.append(
-                    f'native_shutdown:{list(route_names or [])}:{relay_anchor_address}:{timeout_seconds}'
+                    f'native_shutdown:{route_names}:{relay_anchor_address}:{timeout_seconds}'
                 )
                 return {
                     'completed': True,
-                    'removed_routes': list(route_names or []),
+                    'removed_routes': list(closed),
                     'route_outcomes': [
                         {
                             'route_name': name,
@@ -303,7 +307,7 @@ class TestServerNameCollision:
                             'closed_reason': 'shutdown',
                             'close_error': None,
                         }
-                        for name in list(route_names or [])
+                        for name in closed
                     ],
                     'relay_errors': [],
                     'server_was_started': True,
@@ -350,7 +354,7 @@ class TestServerNameCollision:
         bridge.shutdown(timeout=1.25)
 
         assert events == [
-            "native_shutdown:['grid']:None:1.25",
+            'native_shutdown:None:None:1.25',
             'crm_shutdown',
         ]
 
@@ -365,7 +369,7 @@ class TestServerNameCollision:
                 relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                events.append(f'native_shutdown:{list(route_names or [])}')
+                events.append(f'native_shutdown:{route_names}')
                 return {
                     'completed': True,
                     'removed_routes': [],
@@ -417,7 +421,7 @@ class TestServerNameCollision:
         bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
         bridge.shutdown()
 
-        assert events == ["native_shutdown:['grid']"]
+        assert events == ['native_shutdown:None']
         assert bridge.names == ['grid']
 
     def test_shutdown_drains_native_runtime_even_when_lifecycle_stopped(self):
@@ -431,7 +435,7 @@ class TestServerNameCollision:
                 relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                events.append(f'native_shutdown:{list(route_names or [])}')
+                events.append(f'native_shutdown:{route_names}')
                 return {
                     'completed': True,
                     'removed_routes': [],
@@ -458,7 +462,7 @@ class TestServerNameCollision:
         bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
         bridge.shutdown()
 
-        assert events == ['native_shutdown:[]']
+        assert events == ['native_shutdown:None']
 
     def test_shutdown_keeps_slot_and_skips_hook_when_native_route_not_drained(self):
         events: list[str] = []
@@ -470,7 +474,7 @@ class TestServerNameCollision:
                 relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                events.append(f'native_shutdown:{list(route_names or [])}')
+                events.append(f'native_shutdown:{route_names}')
                 return {
                     'completed': False,
                     'removed_routes': ['grid'],
@@ -527,7 +531,7 @@ class TestServerNameCollision:
         bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
         bridge.shutdown()
 
-        assert events == ["native_shutdown:['grid']"]
+        assert events == ['native_shutdown:None']
         assert bridge.names == ['grid']
 
     def test_register_rolls_back_python_slot_when_rust_registration_fails(self, monkeypatch):
@@ -647,9 +651,10 @@ class TestRegistryNameCollision:
                 assert name == 'temp'
                 raise RuntimeError('native unregister failed')
 
-            def shutdown(self, *, timeout):
-                return dict(registry._runtime_session.shutdown(  # noqa: SLF001
-                    route_names=['temp'], timeout_seconds=timeout))
+            def _take_shutdown_slots(self, outcome):  # noqa: ANN001, ARG002
+                # Runtime.shutdown consumes the native journal here after a
+                # completed transaction; this double holds no Python slots.
+                return []
 
         registry._server = FailingServer()  # noqa: SLF001
 

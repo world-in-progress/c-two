@@ -888,6 +888,7 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         ) -> None:
             self._outcome = outcome if outcome is not None else {'relay_errors': []}
             self.adopted_observations: list[object] = []
+            self.begin_shutdown_timeouts: list[float] = []
             self._context = resolve_local_endpoint_context()
             self._limits = {
                 key: value for key, value in (
@@ -909,8 +910,14 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         def set_relay_anchor_address(self, address: str | None) -> None:
             self.relay_anchor_address_override = address
 
-        def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
-            assert timeout_seconds == 30.0
+        def check_active(self, connect_attempt=None) -> None:  # noqa: ARG002
+            return None
+
+        def begin_shutdown(self, timeout_seconds: float = 5.0):
+            self.begin_shutdown_timeouts.append(timeout_seconds)
+            return self
+
+        def observe(self):
             return {**self._outcome, 'completed': not any(self._outcome.get(key) for key in (
                 'ipc_client_close_error', 'runtime_barrier_error'))}
 
@@ -939,6 +946,10 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         ipc_session = pending_ipc._runtime_session
         assert not pending_ipc.shutdown()["completed"]
         assert pending_ipc._runtime_session is ipc_session
+        # Runtime.shutdown's default budget is forwarded to the native
+        # begin_shutdown transaction, and a pending outcome never begins a
+        # second one.
+        assert ipc_session.begin_shutdown_timeouts == [30.0]
         pending_runtime = hostless_registry({
             'relay_errors': [],
             'runtime_barrier_error': 'runtime barrier did not quiesce',
@@ -946,12 +957,14 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         runtime_session = pending_runtime._runtime_session
         assert not pending_runtime.shutdown()["completed"]
         assert pending_runtime._runtime_session is runtime_session
+        assert runtime_session.begin_shutdown_timeouts == [30.0]
         # Absent keys stay silent: apparent full cleanup is only reported
         # when the native outcome actually reports a failure.
         clean = hostless_registry({'relay_errors': []})
         clean_session = clean._runtime_session
         clean.shutdown()
         assert clean._runtime_session is not clean_session
+        assert clean_session.begin_shutdown_timeouts == [30.0]
         assert (
             clean._runtime_session.local_endpoint_context()
             is clean_session.local_endpoint_context()

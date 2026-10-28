@@ -15,6 +15,10 @@ use crate::RegisterFailureOutcome;
 /// Failures in process runtime setup, route lifecycle, and relay projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleError {
+    RuntimeRetired,
+    ShutdownWaitTimeout {
+        stage: &'static str,
+    },
     InvalidServerId(String),
     ClientConfigFrozen,
     ConfigFrozen,
@@ -45,6 +49,10 @@ pub enum LifecycleError {
 impl fmt::Display for LifecycleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RuntimeRetired => formatter.write_str("runtime is retired"),
+            Self::ShutdownWaitTimeout { stage } => {
+                write!(formatter, "shutdown wait deadline exceeded at {stage}")
+            }
             Self::InvalidServerId(message) => formatter.write_str(message),
             Self::ConfigFrozen => formatter.write_str("runtime configuration is frozen"),
             Self::ClientConfigFrozen => formatter.write_str("client IPC configuration is frozen"),
@@ -313,6 +321,7 @@ impl From<LifecycleError> for Error {
 /// Normalize an IPC error without flattening its transport source.
 pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
     match error {
+        IpcError::PoolRetired => LifecycleError::RuntimeRetired.into(),
         IpcError::ProtocolVersionMismatch { local, peer } => {
             Error::ProtocolVersionMismatch { local, peer }
         }
