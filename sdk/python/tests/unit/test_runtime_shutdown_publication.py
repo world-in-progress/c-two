@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from threading import Event, Lock, Thread, current_thread
+from threading import Barrier, Event, Lock, Thread, current_thread
 
 import pytest
 
@@ -108,7 +108,8 @@ def test_captured_session_cannot_acquire_after_public_shutdown(runtimes, monkeyp
 
 
 @pytest.mark.parametrize('hosted', [False, True], ids=['hostless', 'hosted'])
-def test_admitted_connection_closes_before_expired_publication_returns(runtimes, monkeypatch, hosted):
+@pytest.mark.parametrize('expired', [False, True], ids=['valid-budget', 'expired-budget'])
+def test_admitted_connection_closes_before_publication_returns(runtimes, monkeypatch, hosted, expired):
     server, client = runtimes
     _share_endpoint(server, client)
     server.register(Echo, EchoResource('echo:'), name='echo')
@@ -126,20 +127,33 @@ def test_admitted_connection_closes_before_expired_publication_returns(runtimes,
         assert outcome['completed'] and outcome['ipc_clients_drained']
         assert client._runtime_session is not old_session
         assert observation.snapshot() is not None  # Before peer shutdown/fixture cleanup.
-        blocked = Lock()
-        blocked.acquire()
-        try:
-            with pytest.raises(cc.error.CoreError):
-                attempts[0].acquire_lock(blocked, 'fixture_expire_original_budget')
-        finally:
-            blocked.release()
+        original_init = cc.error.CoreError.__init__
+
+        def observe_error(error, category, message):
+            if current_thread() is worker:
+                assert not client._lock.locked(), 'final refusal kept the binding lock'
+                client.names
+            original_init(error, category, message)
+
+        monkeypatch.setattr(cc.error.CoreError, '__init__', observe_error)
+        if expired:
+            blocked = Lock()
+            blocked.acquire()
+            try:
+                with pytest.raises(cc.error.CoreError):
+                    attempts[0].acquire_lock(blocked, 'fixture_expire_original_budget')
+            finally:
+                blocked.release()
         resume.set()
         worker.join(5)
         assert not worker.is_alive() and len(returned) == 1
         error = returned[0]
-        assert isinstance(error, cc.error.CallDeadlineExceeded), repr(error)
-        assert error.details['operation'] == 'connect'
-        assert error.details['stage'] == 'python_connect_finish'
+        if expired:
+            assert isinstance(error, cc.error.CallDeadlineExceeded), repr(error)
+            assert error.details['operation'] == 'connect'
+            assert error.details['stage'] == 'python_connect_finish'
+        else:
+            _assert_retired(error)
         assert observation.snapshot() is not None
 
 
@@ -251,3 +265,70 @@ def test_invalid_shutdown_input_does_not_retire_the_session(runtimes, timeout):
     assert runtime._runtime_session is session
     session.check_active()
     assert runtime.server_credential().to_json() == credential
+
+
+@pytest.mark.parametrize('operation', ['start', 'register', 'policy'])
+def test_retirement_entry_errors_allow_runtime_observation(runtimes, monkeypatch, operation):
+    runtime = runtimes[0]
+    session = runtime._runtime_session
+    assert session.begin_shutdown().observe()['completed']
+    original = cc.error.CoreError.__init__
+
+    def observe_error(error, category, message):
+        assert not runtime._lock.locked()
+        assert runtime.names == []
+        original(error, category, message)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cc.error.CoreError, '__init__', observe_error)
+        with pytest.raises(cc.error.CoreError) as caught:
+            if operation == 'start':
+                runtime.start()
+            elif operation == 'register':
+                runtime.register(Echo, EchoResource('late:'), name='late')
+            else:
+                runtime.set_transport_policy(shm_threshold=16384)
+        _assert_retired(caught.value)
+    assert runtime._runtime_session is session
+    assert runtime.shutdown()['completed']
+
+
+def test_two_completed_shutdown_observers_swap_and_invoke_hooks_once(runtimes, monkeypatch):
+    runtime = runtimes[0]
+    resource = EchoResource('old:')
+    runtime.register(Echo, resource, name='old')
+    session = runtime._runtime_session
+    observed = Barrier(2)
+    results, swaps = [], []
+    original_swap = runtime._swap_runtime_session
+
+    def outcome_dict(value):
+        # Both callers have observed the real native terminal receipt, before
+        # either can enter the existing SDK handoff lock.
+        if current_thread() in workers and 'completed' in value:
+            observed.wait(timeout=5)
+        return dict(value)
+
+    def swap(**kwargs):
+        swaps.append(None)
+        return original_swap(**kwargs)
+
+    def shutdown():
+        try:
+            results.append(runtime.shutdown())
+        except BaseException as error:
+            results.append(error)
+
+    workers = [Thread(target=shutdown) for _ in range(2)]
+    with monkeypatch.context() as patch:
+        patch.setattr(registry, 'dict', outcome_dict, raising=False)
+        patch.setattr(runtime, '_swap_runtime_session', swap)
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(5)
+        assert all(not worker.is_alive() for worker in workers)
+    assert len(results) == 2 and results[0] == results[1], results
+    assert results[0]['completed'] and results[0]['removed_routes'] == ['old']
+    assert len(swaps) == 1 and resource.stopped == 1
+    assert runtime._runtime_session is not session

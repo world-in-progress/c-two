@@ -384,6 +384,8 @@ def test_failed_session_replacement_preserves_previous_and_own_observations() ->
             # Let the swap reach the deliberately failing constructor.
             return {}
 
+        retired = False
+
         def check_active(self, connect_attempt=None) -> None:  # noqa: ARG002
             return None
 

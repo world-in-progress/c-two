@@ -910,6 +910,8 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         def set_relay_anchor_address(self, address: str | None) -> None:
             self.relay_anchor_address_override = address
 
+        retired = False
+
         def check_active(self, connect_attempt=None) -> None:  # noqa: ARG002
             return None
 

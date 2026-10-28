@@ -35,7 +35,7 @@ hosted = False, expire_at_finish = False
         observation = None
         late_proxy = None
         evidence = {'hosted': hosted, 'expire_at_finish': expire_at_finish}
-    
+
         def native_args(contract):
             if current_thread() is worker:
                 # Runtime._connect has captured its session, but has not entered
@@ -43,20 +43,20 @@ hosted = False, expire_at_finish = False
                 captured.set()
                 assert resume.wait(5), 'test did not release the captured connect'
             return original_args(contract)
-    
+
         def ipc(*args, **kwargs):
             proxy = original_ipc(*args, **kwargs)
             if current_thread() is worker:
                 observations.put(proxy.connection_observation())
             return proxy
-    
+
         def native_call(operation, *args, **kwargs):
             if expire_at_finish and current_thread() is worker and args == ('python_connect_finish',):
                 attempts.put(operation.__self__)
                 reached_finish.set()
                 assert resume_finish.wait(5), 'test did not release final publication'
             return original_call(operation, *args, **kwargs)
-    
+
         def connect():
             try:
                 result.put(client.connect(
@@ -66,7 +66,7 @@ hosted = False, expire_at_finish = False
                 result.put(error)  # Keep the traceback and old owners alive too.
             finally:
                 reached_finish.set()
-    
+
         worker = Thread(target=connect, name='captured-runtime-connect')
         try:
             server.register(Echo, EchoResource(), name='echo')
@@ -139,7 +139,7 @@ hosted = False, expire_at_finish = False
             assert set(remaining) <= {'.gate', '.gate.marker'}
             evidence['endpoint_remaining'] = remaining
             print('LATE_CONNECT_BASELINE ' + json.dumps(evidence, sort_keys=True))
-    
+
 >       assert isinstance(returned, (RuntimeError, cc.error.CallDeadlineExceeded)), (
             'shutdown reported drained, but the captured old session published '
             f'a new usable connection: {evidence}'
@@ -180,7 +180,7 @@ hosted = True, expire_at_finish = False
         observation = None
         late_proxy = None
         evidence = {'hosted': hosted, 'expire_at_finish': expire_at_finish}
-    
+
         def native_args(contract):
             if current_thread() is worker:
                 # Runtime._connect has captured its session, but has not entered
@@ -188,20 +188,20 @@ hosted = True, expire_at_finish = False
                 captured.set()
                 assert resume.wait(5), 'test did not release the captured connect'
             return original_args(contract)
-    
+
         def ipc(*args, **kwargs):
             proxy = original_ipc(*args, **kwargs)
             if current_thread() is worker:
                 observations.put(proxy.connection_observation())
             return proxy
-    
+
         def native_call(operation, *args, **kwargs):
             if expire_at_finish and current_thread() is worker and args == ('python_connect_finish',):
                 attempts.put(operation.__self__)
                 reached_finish.set()
                 assert resume_finish.wait(5), 'test did not release final publication'
             return original_call(operation, *args, **kwargs)
-    
+
         def connect():
             try:
                 result.put(client.connect(
@@ -211,7 +211,7 @@ hosted = True, expire_at_finish = False
                 result.put(error)  # Keep the traceback and old owners alive too.
             finally:
                 reached_finish.set()
-    
+
         worker = Thread(target=connect, name='captured-runtime-connect')
         try:
             server.register(Echo, EchoResource(), name='echo')
@@ -284,7 +284,7 @@ hosted = True, expire_at_finish = False
             assert set(remaining) <= {'.gate', '.gate.marker'}
             evidence['endpoint_remaining'] = remaining
             print('LATE_CONNECT_BASELINE ' + json.dumps(evidence, sort_keys=True))
-    
+
 >       assert isinstance(returned, (RuntimeError, cc.error.CallDeadlineExceeded)), (
             'shutdown reported drained, but the captured old session published '
             f'a new usable connection: {evidence}'
@@ -325,7 +325,7 @@ hosted = False, expire_at_finish = True
         observation = None
         late_proxy = None
         evidence = {'hosted': hosted, 'expire_at_finish': expire_at_finish}
-    
+
         def native_args(contract):
             if current_thread() is worker:
                 # Runtime._connect has captured its session, but has not entered
@@ -333,20 +333,20 @@ hosted = False, expire_at_finish = True
                 captured.set()
                 assert resume.wait(5), 'test did not release the captured connect'
             return original_args(contract)
-    
+
         def ipc(*args, **kwargs):
             proxy = original_ipc(*args, **kwargs)
             if current_thread() is worker:
                 observations.put(proxy.connection_observation())
             return proxy
-    
+
         def native_call(operation, *args, **kwargs):
             if expire_at_finish and current_thread() is worker and args == ('python_connect_finish',):
                 attempts.put(operation.__self__)
                 reached_finish.set()
                 assert resume_finish.wait(5), 'test did not release final publication'
             return original_call(operation, *args, **kwargs)
-    
+
         def connect():
             try:
                 result.put(client.connect(
@@ -356,7 +356,7 @@ hosted = False, expire_at_finish = True
                 result.put(error)  # Keep the traceback and old owners alive too.
             finally:
                 reached_finish.set()
-    
+
         worker = Thread(target=connect, name='captured-runtime-connect')
         try:
             server.register(Echo, EchoResource(), name='echo')
@@ -429,7 +429,7 @@ hosted = False, expire_at_finish = True
             assert set(remaining) <= {'.gate', '.gate.marker'}
             evidence['endpoint_remaining'] = remaining
             print('LATE_CONNECT_BASELINE ' + json.dumps(evidence, sort_keys=True))
-    
+
         assert isinstance(returned, (RuntimeError, cc.error.CallDeadlineExceeded)), (
             'shutdown reported drained, but the captured old session published '
             f'a new usable connection: {evidence}'
@@ -475,7 +475,7 @@ hosted = True, expire_at_finish = True
         observation = None
         late_proxy = None
         evidence = {'hosted': hosted, 'expire_at_finish': expire_at_finish}
-    
+
         def native_args(contract):
             if current_thread() is worker:
                 # Runtime._connect has captured its session, but has not entered
@@ -483,20 +483,20 @@ hosted = True, expire_at_finish = True
                 captured.set()
                 assert resume.wait(5), 'test did not release the captured connect'
             return original_args(contract)
-    
+
         def ipc(*args, **kwargs):
             proxy = original_ipc(*args, **kwargs)
             if current_thread() is worker:
                 observations.put(proxy.connection_observation())
             return proxy
-    
+
         def native_call(operation, *args, **kwargs):
             if expire_at_finish and current_thread() is worker and args == ('python_connect_finish',):
                 attempts.put(operation.__self__)
                 reached_finish.set()
                 assert resume_finish.wait(5), 'test did not release final publication'
             return original_call(operation, *args, **kwargs)
-    
+
         def connect():
             try:
                 result.put(client.connect(
@@ -506,7 +506,7 @@ hosted = True, expire_at_finish = True
                 result.put(error)  # Keep the traceback and old owners alive too.
             finally:
                 reached_finish.set()
-    
+
         worker = Thread(target=connect, name='captured-runtime-connect')
         try:
             server.register(Echo, EchoResource(), name='echo')
@@ -579,7 +579,7 @@ hosted = True, expire_at_finish = True
             assert set(remaining) <= {'.gate', '.gate.marker'}
             evidence['endpoint_remaining'] = remaining
             print('LATE_CONNECT_BASELINE ' + json.dumps(evidence, sort_keys=True))
-    
+
         assert isinstance(returned, (RuntimeError, cc.error.CallDeadlineExceeded)), (
             'shutdown reported drained, but the captured old session published '
             f'a new usable connection: {evidence}'

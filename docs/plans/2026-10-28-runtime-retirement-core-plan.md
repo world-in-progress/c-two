@@ -94,3 +94,5 @@ Native 仅投影 begin + observe。begin 返回本次观察的原生 deadline �
 实施接口落实：RuntimeShutdownTarget 借用调用方的 Host/failed-start receipt，事务成功交接时才持有克隆，避免失败参数路径消费最后一个 Host。重复调用只能观察已覆盖的目标，不能用 ClientsOnly 的 completed 冒充另一个未声明 Host 已停止。SDK 远程 connect 的起始拒绝直接复用 Core 入口，Python 只保留最终发布复核，不重复做起始 native 检查。
 
 实施审查修正：新 scope 保留目标原有 Weak 身份，即使 failed-start Server 已析构也能重复观察同一事务；封池先按同一 deadline 取得原 state/coordinator 锁，成功准备 driver 后才 commit。Native begin 保存原生 Result，SDK 在释放实例锁后的 observe 才构造 Python 异常；原生低层 shutdown 的退役分支同样使用原 deadline，显式名单校验保留。低层只会产生 LifecycleError 的新入口直接返回该类型；retirement_receipt(deadline) 及 Host.shutdown_outcome_until(deadline) 提供有界只读观察。已在 driver 入口封闭并完成的池不再重复 drain；pending 升级与历史 journal 的剩余池仍必须收尾。生产/测试增量已超过预估，最终按实际 diff 报告。
+
+SDK 新增退役 gate 的拒绝投影也移到 binding 锁外：私有 retired 观察即时读取既有 Core fence，不保存 Python 状态；锁内确认永久拒绝后，解锁再沿原 Core 错误链抛出。最终 remote connect 在原期限内锁住并捕获同 session 事实，解锁后先检查原 ConnectAttempt/Core，再报告身份变化；不可逆的退役状态保证这次成功可线性化于锁内观察点。Native 的错误初始化器重入测试在独立子进程执行，以免修改共享异常类干扰默认并行门禁。

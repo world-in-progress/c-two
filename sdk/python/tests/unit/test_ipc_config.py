@@ -659,6 +659,8 @@ class _FakeRuntimeSession:
     def inherit_local_endpoint_selection(self, previous: _FakeRuntimeSession) -> None:
         self._context = previous._context
 
+    retired = False
+
     def check_active(self, *, connect_attempt=None):
         pass  # These are routing/configuration spies, not lifecycle doubles.
 

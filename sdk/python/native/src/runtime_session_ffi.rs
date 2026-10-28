@@ -157,6 +157,21 @@ mod connect_attempt_tests {
 
     #[test]
     fn sdk_shutdown_projects_owner_timeout_after_releasing_binding_lock() {
+        // This probe replaces a public exception initializer. Run it alone in
+        // a child process so the normal parallel Native suite shares no mutation.
+        if std::env::var_os("C2_TEST_SDK_SHUTDOWN_REENTRY_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime_session_ffi::connect_attempt_tests::sdk_shutdown_projects_owner_timeout_after_releasing_binding_lock", "--nocapture"])
+                .env("C2_TEST_SDK_SHUTDOWN_REENTRY_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         Python::initialize();
         Python::attach(|py| {
             let globals = PyDict::new(py);
@@ -180,8 +195,16 @@ cc.error.CoreError.__init__ = observe_error
             let runtime = globals.get_item("runtime").unwrap().unwrap().unbind();
             // The embedded test crate and installed extension have separate
             // PyType identities. Give the real SDK Runtime this test's native instance.
-            let session = Py::new(py, PyRuntimeSession::new(None, None, None, None, None, false, None, None, None).unwrap()).unwrap();
-            runtime.bind(py).setattr("_runtime_session", session.clone_ref(py)).unwrap();
+            let session = Py::new(
+                py,
+                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
+                    .unwrap(),
+            )
+            .unwrap();
+            runtime
+                .bind(py)
+                .setattr("_runtime_session", session.clone_ref(py))
+                .unwrap();
             let borrowed = session.borrow(py);
             let owner = borrowed.host.lock();
             let worker_runtime = runtime.clone_ref(py);
@@ -224,7 +247,7 @@ cc.error.CoreError.__init__ = observe_error
     }
 
     #[test]
-    fn retired_explicit_name_observation_keeps_owner_lock_in_original_deadline() {
+    fn retired_explicit_name_observation_keeps_all_lock_waits_in_original_deadline() {
         Python::initialize();
         Python::attach(|py| {
             let session = Py::new(
@@ -238,30 +261,50 @@ cc.error.CoreError.__init__ = observe_error
                 .observe(py)
                 .unwrap();
             let borrowed = session.borrow(py);
-            let owner = borrowed.host.lock();
-            let worker_session = session.clone_ref(py);
-            let (done, observed) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
-                Python::attach(|py| {
-                    let error = worker_session
-                        .borrow(py)
-                        .shutdown(py, Some(Vec::new()), None, 0.0)
-                        .unwrap_err();
-                    done.send(
-                        error
-                            .value(py)
-                            .getattr("lifecycle_kind")
-                            .unwrap()
-                            .extract::<String>()
-                            .unwrap(),
-                    )
-                    .unwrap();
-                })
-            });
-            let result = py.detach(move || observed.recv_timeout(Duration::from_secs(3)));
-            drop(owner);
-            py.detach(|| worker.join()).unwrap();
-            assert_eq!(result.unwrap(), "shutdown_wait_timeout");
+            for stage in ["shutdown_owner_wait", "shutdown_registrations_wait"] {
+                let owner = (stage == "shutdown_owner_wait").then(|| borrowed.host.lock());
+                let registrations =
+                    (stage == "shutdown_registrations_wait").then(|| borrowed.registrations.lock());
+                let worker_session = session.clone_ref(py);
+                let (done, observed) = std::sync::mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    Python::attach(|py| {
+                        let error = worker_session
+                            .borrow(py)
+                            .shutdown(py, Some(Vec::new()), None, 0.0)
+                            .unwrap_err();
+                        let value = error.value(py);
+                        done.send((
+                            value
+                                .getattr("lifecycle_kind")
+                                .unwrap()
+                                .extract::<String>()
+                                .unwrap(),
+                            value
+                                .getattr("details")
+                                .unwrap()
+                                .get_item("stage")
+                                .unwrap()
+                                .extract::<String>()
+                                .unwrap(),
+                            value
+                                .getattr("timeout_seconds")
+                                .unwrap()
+                                .extract::<f64>()
+                                .unwrap(),
+                        ))
+                        .unwrap();
+                    })
+                });
+                let result = py.detach(move || observed.recv_timeout(Duration::from_secs(3)));
+                drop(registrations);
+                drop(owner);
+                py.detach(|| worker.join()).unwrap();
+                assert_eq!(
+                    result.unwrap(),
+                    ("shutdown_wait_timeout".into(), stage.into(), 0.0)
+                );
+            }
         });
     }
 
@@ -418,15 +461,23 @@ impl PyRuntimeSession {
     fn check_shutdown_route_names(
         &self,
         route_names: Option<&[String]>,
-        deadline: Option<Instant>,
+        wait: Option<(Instant, f64)>,
     ) -> PyResult<()> {
         if let Some(names) = route_names {
-            let registered = match deadline {
-                Some(deadline) => self.registrations.try_lock_until(deadline).ok_or_else(|| {
-                    lifecycle_error_to_py(c2_core::LifecycleError::ShutdownWaitTimeout {
-                        stage: "shutdown_registrations_wait",
-                    })
-                })?,
+            let registered = match wait {
+                Some((deadline, seconds)) => {
+                    self.registrations.try_lock_until(deadline).ok_or_else(|| {
+                        Python::attach(|py| {
+                            shutdown_error_to_py(
+                                py,
+                                c2_core::LifecycleError::ShutdownWaitTimeout {
+                                    stage: "shutdown_registrations_wait",
+                                },
+                                seconds,
+                            )
+                        })
+                    })?
+                }
                 None => self.registrations.lock(),
             };
             for name in names {
@@ -1403,6 +1454,13 @@ impl PyRuntimeSession {
         .map_err(core_error_to_py)
     }
 
+    /// Read the existing irreversible Core fence without constructing a Python
+    /// exception under an SDK binding lock. Refusal is projected after unlock.
+    #[getter]
+    fn retired(&self, py: Python<'_>) -> bool {
+        py.detach(|| self.inner.ensure_active().is_err())
+    }
+
     #[pyo3(signature = (timeout_seconds=5.0))]
     fn begin_shutdown(
         slf: Py<Self>,
@@ -1477,7 +1535,10 @@ impl PyRuntimeSession {
                     .map_err(|error| shutdown_error_to_py(py, error, timeout_seconds))?;
                 if check_names {
                     py.detach(|| {
-                        self.check_shutdown_route_names(route_names.as_deref(), Some(deadline))
+                        self.check_shutdown_route_names(
+                            route_names.as_deref(),
+                            Some((deadline, timeout_seconds)),
+                        )
                     })?;
                 }
             }

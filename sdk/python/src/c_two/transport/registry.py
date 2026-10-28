@@ -237,21 +237,26 @@ class Runtime:
                     stacklevel=3,
                 )
                 return
-            self._runtime_session.check_active()
-            previous_threshold = self._settings._shm_threshold  # noqa: SLF001
-            previous_chunk_size = self._settings._remote_payload_chunk_size_override()  # noqa: SLF001
-            try:
-                if shm_threshold is not _UNSET:
-                    self._settings.shm_threshold = shm_threshold  # type: ignore[assignment]
-                if remote_payload_chunk_size is not _UNSET:
-                    self._settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
-                old_session, _retired_observation = self._swap_runtime_session(
-                    preserve_server_identity=True,
-                )
-            except Exception:
-                self._settings.shm_threshold = previous_threshold
-                self._settings.remote_payload_chunk_size = previous_chunk_size
-                raise
+            runtime_session = self._runtime_session
+            retired = runtime_session.retired
+            if not retired:
+                previous_threshold = self._settings._shm_threshold  # noqa: SLF001
+                previous_chunk_size = self._settings._remote_payload_chunk_size_override()  # noqa: SLF001
+                try:
+                    if shm_threshold is not _UNSET:
+                        self._settings.shm_threshold = shm_threshold  # type: ignore[assignment]
+                    if remote_payload_chunk_size is not _UNSET:
+                        self._settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
+                    old_session, _retired_observation = self._swap_runtime_session(
+                        preserve_server_identity=True,
+                    )
+                except Exception:
+                    self._settings.shm_threshold = previous_threshold
+                    self._settings.remote_payload_chunk_size = previous_chunk_size
+                    raise
+
+        if retired:
+            return runtime_session.check_active()
 
         # Close the replaced session's client-only barrier outside the lock.
         # The retirement observation needs no fence: it observes through weak
@@ -412,10 +417,20 @@ class Runtime:
                 raise
         return self._server
 
+    @contextmanager
+    def _active_binding(self):
+        with self._lock:
+            session = self._runtime_session
+            if not session.retired:
+                yield
+                return
+        # Core retirement is irreversible. Project its original refusal only
+        # after unlocking, since an exception initializer may read this Runtime.
+        session.check_active()
+
     def start(self) -> None:
         """Start this instance's Host and await its native readiness/PONG."""
-        with self._lock:
-            self._runtime_session.check_active()
+        with self._active_binding():
             self._sync_relay_override()
             self._ensure_server_bridge().start()
 
@@ -516,8 +531,7 @@ class Runtime:
             input_lifetime_map,
             bridge=method_bridge_map,
         )
-        with self._lock:
-            self._runtime_session.check_active()
+        with self._active_binding():
             created_server = False
             try:
                 self._sync_relay_override()
@@ -732,9 +746,10 @@ class Runtime:
             _connect_native_call(attempt.check, 'python_connect_finish')
             if remote:
                 with _connect_lock(self._lock, attempt, 'python_connect_finish'):
-                    _connect_native_call(runtime_session.check_active, connect_attempt=attempt)
-                    if self._runtime_session is not runtime_session:
-                        raise RuntimeError('Runtime session was replaced during connect')
+                    same_session = self._runtime_session is runtime_session
+                _connect_native_call(runtime_session.check_active, connect_attempt=attempt)
+                if not same_session:
+                    raise RuntimeError('Runtime session was replaced during connect')
             return crm
         except Exception:
             proxy.terminate()
