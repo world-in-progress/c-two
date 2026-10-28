@@ -33,7 +33,7 @@ Core 探针首次构建遗漏编译时包含的合同夹具，补入同一提交
 
 计数的事件是“本进程放弃一个仍不能确认已完成的释放义务”，不是一次失败尝试。显式失败仍保留义务时不计；成功释放、正常移交给接收方时不计；最后出口失败或发送完成后结果不明、需要保守放弃时计一次。对端之后成功释放或 pool 真实 teardown，不回减历史计数。两端各有独立 scope，不跨进程汇总或推断重复泄漏。
 
-最低层实际载体负责最后一次计数：重组由 `ReassemblyBacking`，接收 SHM 由 `ServerShmResponse`/`PeerShmRequest`，prepared 由 `PreparedShmResponse`，预分配由最后一个 `RequestReleaseState`。上层 lease、Core、SDK 和异常清理不为同一块重复计数。载体若在消费错误路径主动放弃，必须清空自己的义务，嵌套 Drop 不再尝试或再计。日志复用现有 tracing/warn 约定，记录原失败及 backing 身份；不缓存错误、不新增 reporter。
+最低层实际载体负责最后一次计数：重组由 `ReassemblyBacking`，接收 SHM 由 `ServerShmResponse`/`PeerShmRequest`，prepared 由 `PreparedShmResponse`，预分配由最后一个 `RequestReleaseState`。上层 lease、Core、SDK 和异常清理不为同一块重复计数。载体若在消费错误路径主动放弃，必须清空自己的义务，嵌套 Drop 不再尝试或再计。日志复用现有 tracing/warn 约定，记录原失败及 backing 身份；不缓存错误、不新增 reporter。accounting lock 内只更新数字，free 和日志在其锁外；pool 锁内不析构 SDK value、具体连接或 tracking 附件。
 
 owner pool 直接使用既有 budget；peer pool 仍不承担生产者的 SHM backing 计费。接收载体在实际准入处捕获所属客户端或服务器的现有 `MemoryBudget` 克隆，供本端放弃计数；这是同一 accounting state 的引用，不是新的预算、资源 owner 或清理上下文。旧载体跨关闭、重连时仍记入原 scope，不从新连接当前槽位推断归属。
 
@@ -43,7 +43,7 @@ owner pool 直接使用既有 budget；peer pool 仍不承担生产者的 SHM ba
 
 ## 4. Core、Rust Held 和 Python HeldResult
 
-Core 的既有 `released` 表示逻辑失效已尝试，lease `Option` 表示原生释放尚未完成。调用 invalidator 前先置位，Err 或 unwind 后都不能重放。借用 lease 清理，成功才清空；失效失败不能抑制原生清理，首轮保留原错误顺序和双错误。后续调用只处理原 lease，不再次执行失效函数。`is_released()` 继续是值访问状态；新增 `has_pending_release(&self) -> bool` 区分尚未结束的原生义务，不引入新状态机。
+Core 的既有 `released` 表示逻辑失效已尝试，lease `Option` 表示原生释放尚未完成。调用 invalidator 前先置位，Err 或 unwind 后都不能重放。借用 lease 清理，成功才清空；失效返回 Err 后仍尝试原生清理，首轮保留原错误顺序和双错误；Rust unwind 仍传播，lease 留给同一持有者后续清理或其 Drop。后续调用只处理原 lease，不再次执行失效函数。`is_released()` 继续是值访问状态；新增 `has_pending_release(&self) -> bool` 区分尚未结束的原生义务，不引入新状态机。
 
 Core 具体 connection pin 在原生释放成功后归还，即使 invalidator 报错也不继续钉住；原生失败则原 Held 继续保有具体连接和 lease。最终 Drop 由原载体释放或保守放弃并计数，然后归还具体 pin，不建立计数 pin、后台锚或长期 connection 引用。
 
@@ -71,7 +71,7 @@ Prepared 在 fill 之前绑定并持有原 response pool 的原锁与 handle。�
 
 整帧写完即移交 buddy 的跨进程释放权。之后 flush 错误、期限或取消不再本地 free，保留发送错误并按本端结果不明计一次放弃；对端可能已经或随后正常释放，因此该计数不叫“确认泄漏”。不发 ACK 查询、不重试业务调用、不重发同一 allocation。dedicated 在正常成功发送时保留原生命周期；在整帧已写但结果不明时同样禁止执行会提前回收对端可见存储的本地 release，保守保留原 backing/计费，交由原 GC 政策及最终 pool teardown 处理，不引入新的超时回收规则。
 
-返回错误时不能用一次成功本地 free 覆盖发送错误；未发布 rollback 同时失败时保留初始错误和 cleanup 原因。最终 Drop/panic 没有 Result 出口，沿原日志报告 cleanup 失败并计数，不静默忽略。
+返回错误时不能用一次成功本地 free 覆盖发送错误；未发布 rollback 同时失败时保留初始错误和 cleanup 原因。正常写入已完成、随后 dedicated 本地 settle 失败也返回 cleanup 错误并计数，不以 `Ok` 吞掉；沿现有 Transport 分支记录，不再补发一帧 UserVisible 错误。最终 Drop/panic 没有 Result 出口，沿原日志报告 cleanup 失败并计数，不静默忽略。
 
 服务端 trailing-inline request 在分支前先接纳同一个 `PeerShmRequest`；有尾随参数时通过现有 RequestLease 拷贝、释放并拼接，删除直接 `read_peer_data/free_peer_block` 的吞错支路。copy/release 失败使用同一输入错误及日志顺序，最后出口由原 carrier 计数。保留成功 payload 字节及 idle buddy GC 的原触发条件。
 

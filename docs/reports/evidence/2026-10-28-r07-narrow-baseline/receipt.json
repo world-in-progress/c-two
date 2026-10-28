@@ -87,5 +87,12 @@
     "Apply baseline-test-only.patch; use task-owned C2_IPC_ROOT, CARGO_TARGET_DIR, CARGO_INCREMENTAL=0 and debug=0 profiles.",
     "Run the two recorded commands. Each must exit 101 with two assertion failures, not a build failure.",
     "After confirming the process exited, remove task-owned source/target/endpoint trees. Keep this text evidence."
-  ]
+  ],
+  "cleanup": {
+    "reclaimed_target_bytes": 458964090,
+    "source_removed": true,
+    "endpoints_removed": true,
+    "socket_lease_residuals": 0,
+    "historical_directories_touched": false
+  }
 }
