@@ -127,4 +127,4 @@ CoreCallback 的请求方向同样使用 `RequestLease::abandon(self)`：copy �
 - 平台：macOS 本机 UDS/POSIX SHM，隔离 Linux UDS/POSIX SHM，Windows 开发机优先验证 Named Pipe、真实 overlapped flush、named mapping 与 file spill；已通过且不受影响的旧验收不重跑。本轮 source candidate 的完整 relay、真实 Rust/Python 18 行及 Node 12 行跨语言、三系统及确切候选 GitHub Actions 按原门禁执行，含 Windows ARM64、Windows 2022/2025 与 Python 3.14t。
 - 收尾：本批正常场景 socket/lease、SHM、spill 零残留；受控不可释放的反例不靠 free/reset 伪造成功，以隔离进程真实退出/原 owner teardown 后无 OS backing 残留验收，计费在放弃前不下降。保留文本日志与候选/run URL，清掉测试用 target、临时环境及 checkout；历史目录不动，发版仍等单独指令。
 
-独立审查需核对以上完整边界及四项真实基线，重点是整帧事实与 future 取消的连接、统计只归属一个义务、没有用丢失 pin/tracking 掩盖失败。方案审查通过不代替修复后运行验收。
+独立审查及差量复核已执行，意见已落实；最后请求方向补充由 Host 按审查具体建议核对，详情见[审查与基线复核记录](../reports/2026-10-28-r07-narrow-plan-review.md)。当前方案等待用户确认实施，不把文档审查或红色反例当成修复后验收。
