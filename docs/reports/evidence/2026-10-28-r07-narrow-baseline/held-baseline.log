@@ -1,0 +1,33 @@
+   Compiling c2-core v0.1.0 (<isolated>/source/core/runtime/c2-core)
+    Finished `test` profile [unoptimized] target(s) in 3.27s
+     Running unittests src/lib.rs (<isolated>/target/debug/deps/c2_core-8b82a3f2dedbcb3e)
+
+running 2 tests
+test lifetime::r07_narrow_baseline::r07_baseline_failed_held_release_keeps_native_retry_obligation ... R07_HELD_BASELINE first_error=held response release failed; transport cleanup: response handle release failed: reassembly release validation failed: pool owner incarnation mismatch second_ok=true invalidations=1 remaining=1 reassembly_charge=512
+
+thread 'lifetime::r07_narrow_baseline::r07_baseline_failed_held_release_keeps_native_retry_obligation' (13195291) panicked at runtime/c2-core/src/lifetime.rs:139:9:
+assertion `left == right` failed: second release reported success with its old allocation still live
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback ... 
+thread 'lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback' (13195293) panicked at runtime/c2-core/src/lifetime.rs:148:73:
+R07 injected invalidator panic
+R07_INVALIDATOR_BASELINE callback_count=2
+
+thread 'lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback' (13195293) panicked at runtime/c2-core/src/lifetime.rs:152:9:
+assertion `left == right` failed: caught invalidator panic must not replay user code
+  left: 2
+ right: 1
+FAILED
+
+failures:
+
+failures:
+    lifetime::r07_narrow_baseline::r07_baseline_failed_held_release_keeps_native_retry_obligation
+    lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 140 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p c2-core --lib`
