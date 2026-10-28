@@ -90,13 +90,15 @@ Prepared 在 fill 之前绑定并持有原 response pool 的原锁与 handle。�
 | 面 | 变化 |
 | --- | --- |
 | Rust statistics | `BudgetSnapshot`、`MemoryScopeStats` 新增 `abandoned_releases: u64`；使用 struct literal 的低层调用者需要更新，不留旧形状兼容。既有 memory stats 观察入口不变。 |
-| Rust Core/Held | Core HeldResponse 新增 `has_pending_release()`，SDK Held 的 release 签名不变；显式失败保留、再次原生清理替代原先失败后空成功。 |
+| Rust Core/Held | Core HeldResponse 新增 `has_pending_release()` 与消费式 `abandon(self)`；ResponseLease 新增消费式 `abandon(self)`，SDK Held 的 release 签名不变；显式失败保留、再次原生清理替代原先失败后空成功。 |
 | Rust memory/local | `BudgetReservation::abandon(self)`、`ReassemblyBacking::abandon(self)` 和 MemoryBudget 的窄计数入口；LocalWriteHalf 增加共用 writer 的进度入口。无 typed allocator 错误改造，无裸 owner 全面重构。 |
 | Python | `MemoryScopeStats` TypedDict 及各 scope 返回值增加一个字段；正式 Held 的失败后释放可以再次尝试，用户回调不重放。公开 HeldResult 构造、hold/release、memory_stats 入口签名不变；native 私有投影同步状态。 |
 | ABI / 协议 | C/FFI ABI 6、IPC 14、SHM 3、业务帧、CRM hash、owner-control 与凭据格式全部不变，不加能力位、开关、旧格式兼容。 |
 | 生命周期 | Host、Runtime、listener、relay 关闭事务不改；pin/tracking 在成功原生释放或最终放弃时结束，不把逻辑失效等同物理释放。 |
 
-SHM carrier 的可更新 release/try_release、唯一放弃入口、RequestLease 保留 FreeResult 的内部辅助方法均留在所属 crate 内；只把跨 crate 的 ReassemblyBacking 消费式 abandon 列为新增 Rust 面。它不返还 handle 或 payload，也不构成失败块重新发布入口。
+跨 crate 的最小终结链明确新增三个消费式 Rust 入口：`c2_wire::chunk::ReassemblyBacking::abandon(self)`、`c2_ipc::ResponseLease::abandon(self)`、`c2_core::HeldResponse::abandon(self)`。后两者只消耗原 Option 并向下调用同一个 carrier 放弃，不 free、不重试、不调用 invalidator，也不返还 handle 或 payload。它们属于低层 Rust API；高层 Rust Held 与 Python HeldResult 不增加公开 abandon。SHM carrier 的可更新 release/try_release、RequestLease 保留 FreeResult 及其自身消费出口的内部辅助方法仍留在所属 crate 内。
+
+Core `from_response_lease` 的 copy 失败按 copy→一次 release→失败则 ResponseLease::abandon→返回原 copy/release 两因的顺序结束；不能 drop 一个仍 armed 的 lease 再触发一次释放。Rust FastDB 开启/消费失败的 SDK 清理，以及 PyO3 构造/解码消费错误的原生清理，在取得本次实际释放 Err 后转调 Core HeldResponse::abandon；最底层先计数并结束义务，再归还原具体 connection 和 tracking。原 PayloadError/Python 主异常保持，cleanup 原因沿已列错误链或原生日志报告。PyO3 仍复用 inner/export 边界：活跃导出拒绝没有进入原生 free，不能强行取走 inner；其导出者继续持原 holder，最后真正结束时才执行 native Drop。没有新封装 owner、第二套事务或后台执行器。
 
 ## 8. 替换范围、规模与成本
 
