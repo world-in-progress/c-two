@@ -113,7 +113,7 @@ assertion `left == right` failed: second release reported success with its old a
  right: 0
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 FAILED
-test lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback ... 
+test lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback ...
 thread 'lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback' (13763196) panicked at runtime/c2-core/src/lifetime.rs:148:73:
 R07 injected invalidator panic
 R07_INVALIDATOR_BASELINE callback_count=2

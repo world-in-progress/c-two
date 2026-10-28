@@ -46,7 +46,7 @@
   ],
   "files": {
     "held-fixture-missing.log": "41b496af86aeda74e78a590dec25b6ae94ce61d6fe2f90b97b649daaf84112a7",
-    "held-baseline.log": "01c451e86b502e9bf770ea2d27703100abde6cdf8ac699436c8e074326a56c48",
+    "held-baseline.log": "18099bdc0450ac3ebe44415f86340015b818fcc81185e3e3c7e95818d2d5ad82",
     "baseline.log": "9e204887cb034a3a6f605cdbbb66175b8def8f13416bf2f13f32392bdffc1ae1",
     "baseline-test-only.patch": "63d081f07e6a2e466d9292287da2a703f8d32544502d91e0342f048832506a71",
     "initial-default-namespace.log": "b70b703b624e90e5a8ed5f002220ec06c8011bee8ec8bf17dfb90fcce640767c"
@@ -114,5 +114,6 @@
     "superseded_for_isolation_acceptance": true,
     "correction": "temporary fixture now calls with_unix_root(...).endpoint(...) explicitly; all four baseline assertions reproduced again without a production fix"
   },
-  "fixture_patch_application": "git apply --unidiff-zero baseline-test-only.patch; zero context avoids whitespace-only context lines in this retained evidence file"
+  "fixture_patch_application": "git apply --unidiff-zero baseline-test-only.patch; zero context avoids whitespace-only context lines in this retained evidence file",
+  "log_normalization": "absolute isolated prefix replaced with <isolated>; trailing line whitespace stripped, substantive output unchanged"
 }

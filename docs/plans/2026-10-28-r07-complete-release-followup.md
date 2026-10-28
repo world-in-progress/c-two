@@ -49,15 +49,19 @@ Core 具体 connection pin 在原生释放成功后归还，即使 invalidator �
 
 Rust `Held<T>` 拆开不可恢复的 `owners.take()`：值访问由 Core 逻辑失效状态决定，失败后保留原 response，重复 release 只做 native 清理。保留正常退出及 invalidator panic 时的既有 value/response 析构顺序。回调 panic 仍按 Rust 原 unwind 规则传播，不重放或转后台执行。
 
-Python 正式 `hold()` 路径持有既有原生 response，不再把唯一清理责任藏在执行一次便清空的 closure 中；再次释放只调用该 response 的原生清理。手工 `HeldResult(release_cb=...)` 的任意用户回调仍只执行一次，不把它纳入原生重试。公开构造签名与普通 owned/pickle 路径保持。
+Python 正式 `hold()` 路径持有既有原生 response，不再把唯一清理责任藏在执行一次便清空的 closure 中；再次释放只调用该 response 的原生清理。手工 `HeldResult(release_cb=...)` 的任意用户回调仍只执行一次，不把它纳入原生重试。公开构造签名与普通 owned/pickle 路径保持。native 私有投影同时提供 `is_released` 与 `has_pending_release`，供正式 Held 分辨失效前拒绝、逻辑失效和仍待清理；不公开第二种清理机制。
 
-原生导出校验仍在 `inner` 锁内先于失效及 lease 移除。边界因活跃导出拒绝时，不标记为已经执行 invalidator；正式 Python Held 根据 native 状态保留这次尚未进入的失效步骤。一旦失效已尝试，value/buffer 不可复活，后续只清理。PyCoreResponse 的 tracking 随真实原生义务保留：成功释放后归还；最终放弃时先计数、结束真实载体，再归还 tracking，不能让 active hold 被误报为成功释放，也不在放弃后永远留下虚假 active hold。
+原生导出校验仍在 `inner` 锁内先于失效及 lease 移除。边界因活跃导出拒绝时，不标记为已经执行 invalidator；正式 Python Held 根据 native 状态保留这次尚未进入的失效步骤。一旦失效已尝试，value/buffer 不可复活，后续只清理。PyCoreResponse 的 tracking 随真实原生义务保留：成功释放后归还；最终放弃时先计数、结束真实载体，再归还 tracking，不能让 active hold 被误报为成功释放，也不在放弃后永远留下虚假 active hold。自身 view 已 release、但其他导出使 native 拒绝时，不能把旧 memoryview 再当可用 buffer。
+
+Python 双错误统一沿现有异常链保留主错误和本次 cleanup 原因，覆盖 Python 3.10；不再仅靠 `add_note` 成功与否来决定能否看到第二个错误，也不新增错误历史。原 invalidator 异常仍是主异常，不能覆盖原链条；FastDB 构造失败仍保留原 PayloadError，清理由原载体日志及计数报告。
 
 ## 5. 消费式出口和最终 Drop
 
 `ResponseData::into_bytes`、两类 lease 的 `into_owned_bytes`、Core Held 拷贝失败、Rust FastDB 开启失败以及 request preparation 错误退出共用已有释放事务。copy 失败仍尝试 cleanup，copy/release 双失败保留原主次；copy 成功但 release 失败仍返回错误，不能返回 `Ok(bytes)` 掩盖失败。消费式返回形状保持，不添加“失败块仍可发布”的逃逸入口。
 
 最低层接收载体以现有 move-only owner 和一个明确的未完成义务保存状态；成功后解除，失败后保持。原 release、try_release、Drop 共用同一清理动作，外层 lease 不再额外兜一轮造成重复归还/计数。重组沿用原 state Option。没有存活持有者的最后一步失败就放弃，不等待未来业务调用、GC、timer 或后台 worker 来恢复。
+
+无 waiter 的 `PendingResponse` 区分两种结果：本地 pool/permit 锁暂忙的 `Ok(false)` 保留原暂存/维护语义；实际释放 `Err` 必须退出该 pending 的恢复循环，不能继续每 5 ms 消耗共享锁的完整自旋预算。无人领取的 response 由原 carrier 明确放弃、计数并清空；request 只撤去 pending 的引用，存活 caller 仍持原释放事务，最后一个 `RequestReleaseState` 才进行最终结算。保留原信号、锁序及迟到回复的唯一责任，不加重试队列。
 
 `RequestReleaseState` 沿用 Armed/Dispatched/Released、原 permit 与 pending 责任。发送后的 buddy 仍归接收方，不能因本地超时再 free；existing dedicated `freed_at/read_done/crash-timeout` 及 256 许可、两 worker 机制原样保留。只在最后原释放义务确实被放弃时计数，caller token 结束但 pending 仍持有时不计。`RequestPreparationError` 的失败块只允许继续清理，最终丢弃由同一原生载体结算。
 
@@ -69,11 +73,15 @@ Prepared 在 fill 之前绑定并持有原 response pool 的原锁与 handle。�
 
 发送的局部 guard 同时持 Prepared 和 `frame_written`，传给公共写入函数的就是该 guard 的事实字段。这样 future 在 flush Pending 或错误传播途中被取消，析构仍能看到已经发布，不能等 await 返回后才更新 Prepared 状态。未完整成帧先沿原 AbortOnDrop 中断连接，再清理原分配；接收端仍先读取完整 payload 再准入 SHM。
 
-整帧写完即移交 buddy 的跨进程释放权。之后 flush 错误、期限或取消不再本地 free，保留发送错误并按本端结果不明计一次放弃；对端可能已经或随后正常释放，因此该计数不叫“确认泄漏”。不发 ACK 查询、不重试业务调用、不重发同一 allocation。dedicated 在正常成功发送时保留原生命周期；在整帧已写但结果不明时同样禁止执行会提前回收对端可见存储的本地 release，保守保留原 backing/计费，交由原 GC 政策及最终 pool teardown 处理，不引入新的超时回收规则。
+整帧写完即移交 buddy 的跨进程释放权。之后 flush 错误、期限或取消不再本地 free，保留发送错误并按本端结果不明计一次放弃；对端可能已经或随后正常释放，因此该计数不叫“确认泄漏”。不发 ACK 查询、不重试业务调用、不重发同一 allocation。dedicated 在正常成功发送时保留原生命周期；在整帧已写但结果不明时同样禁止执行会提前回收对端可见存储的本地 release，保守保留原 backing/计费，不引入新的超时回收规则。dedicated GC 只扫描已有 freed_at 的条目；本分支未 settle 时，即使以后收到 read_done，也可能一直保留到原 pool teardown。不能把“可由原 GC 处理”写成必然退休承诺。
 
 返回错误时不能用一次成功本地 free 覆盖发送错误；未发布 rollback 同时失败时保留初始错误和 cleanup 原因。正常写入已完成、随后 dedicated 本地 settle 失败也返回 cleanup 错误并计数，不以 `Ok` 吞掉；沿现有 Transport 分支记录，不再补发一帧 UserVisible 错误。最终 Drop/panic 没有 Result 出口，沿原日志报告 cleanup 失败并计数，不静默忽略。
 
-服务端 trailing-inline request 在分支前先接纳同一个 `PeerShmRequest`；有尾随参数时通过现有 RequestLease 拷贝、释放并拼接，删除直接 `read_peer_data/free_peer_block` 的吞错支路。copy/release 失败使用同一输入错误及日志顺序，最后出口由原 carrier 计数。保留成功 payload 字节及 idle buddy GC 的原触发条件。
+`smart_reply_with_data` 只把 helper 的 `Ok(None)` 视为原 inline/chunked fallback。helper `Err` 原样转入现有 ResponseSendError；分配后的 fill/回滚错误不能被 fallback 擦掉变成成功。
+
+服务端所有已解码、已通过 SHM 能力门的 Peer 请求共用同一个 `PeerShmRequest`：trailing-inline 的拷贝拼接、chunk 消费以及已拒绝/丢弃请求的清理一起收敛，删除 `free_peer_block` 把错误换成 `FreeResult::Normal` 的支路。复用握手保存的原 peer pool Arc，在首次可失败的映射/读取前建立唯一 carrier；能力门仍先于准入、映射或 cleanup，未协商 SHM 的伪造坐标不得取得释放权。
+
+公开 `RequestLease::release() -> Result<(), String>` 保持；内部成功释放保留原 `FreeResult`，交给既有 `schedule_peer_buddy_gc_if_idle`，不为共享 caller 改公开返回类型。trailing-inline 通过同一 lease 拷贝、释放后拼接，chunk 消费错误不得继续按成功输入处理；拒绝/丢弃分支保留最初拒绝的主次，最终 cleanup 失败按原 carrier 放弃计数。移除 raw 旁路时同时替换全部调用点，保留 payload 字节、身份校验和 idle GC 原触发条件。
 
 ## 7. API、ABI 和协议
 
@@ -91,12 +99,12 @@ Prepared 在 fill 之前绑定并持有原 response pool 的原锁与 handle。�
 | 生产范围 | 替换内容 | 预计净增 |
 | --- | --- | ---: |
 | c2-mem / wire accounting | 一个 scope 计数、reservation 保守放弃、重组末端计数与日志 | 35–65 |
-| c2-ipc / c2-server carriers | 原生义务保留、最低层 Drop/消费出口统一、Prepared 原锁复用、尾随参数旁路删除 | 130–205 |
-| c2-local / Prepared 发送 | 单次整帧事实、取消 guard、成功/失败的 publication 收尾 | 45–80 |
-| Core / 两 SDK / native 投影 | 失效仅一次、具体 pin/tracking 保留、Held 原生重试、stats 投影 | 90–150 |
-| 合计 | 约 16–20 个生产文件；同一函数的搬移不计精简收益 | 300–500 |
+| c2-ipc / c2-server carriers | 原生义务保留、最低层 Drop/消费出口统一、Prepared 原锁复用、尾随参数旁路删除 | 170–280 |
+| c2-local / Prepared 发送 | 单次整帧事实、取消 guard、成功/失败的 publication 收尾 | 65–100 |
+| Core / 两 SDK / native 投影 | 失效仅一次、具体 pin/tracking 保留、Held 原生重试、stats 投影 | 130–205 |
+| 合计 | 约 18–20 个生产文件；同一函数的搬移不计精简收益 | 400–650 |
 
-测试预计净增 550–900 行，以复用现有 pool、Held、memory stats 与真实跨语言夹具为主，合并吞错/错误成功的旧断言；不为每层再造模拟释放框架。文档及验收记录预计 140–220 行；历史基线的文本补丁、日志、receipt 单列为证据，不算生产实现或性能收益。此项属于正确性与可观察性修复，不声称净瘦身；实际超出区间须先重新核实原因，不能自动扩大范围。
+测试预计净增 650–1000 行，以复用现有 pool、Held、memory stats 与真实跨语言夹具为主，合并吞错/错误成功的旧断言；不为每层再造模拟释放框架。文档及验收记录预计 140–220 行；历史基线的文本补丁、日志、receipt 单列为证据，不算生产实现或性能收益。此项属于正确性与可观察性修复，不声称净瘦身；实际超出区间须先重新核实原因，不能自动扩大范围。
 
 成功路径成本限定为 Prepared 对原 pool 的 Arc 引用、必要接收载体对原 accounting state 的 Arc 引用、已有 Option/状态检查；计数及告警只在最后放弃分支更新。没有新 worker、队列、准入 ticket、额外配额或跨层错误类型体系。实施后对同环境小包、SHM、chunk、Held 成功释放做窄 benchmark，报告具体开销，不承诺性能收益。
 
@@ -104,9 +112,9 @@ Prepared 在 fill 之前绑定并持有原 response pool 的原锁与 handle。�
 
 先把本轮四项红色反例转成有效回归，再按 native carrier → Core/Held → Prepared/尾随参数的顺序修改；各段共用本方案的最终验收，不靠重复全套测试堆证据。
 
-- 释放与统计：原分配成功/失败/显式再试/最终放弃，copy 与 cleanup 双错误；同一块嵌套 Drop 只计一次；真实多 scope、关闭/重连后的旧 scope、退休观察、不改 byte cells；原生 raw owner 手动契约不变。
-- Held：invalidator Ok/Err/panic、先失效后释放、失败 lease/pin/tracking 保留、成功后各归还一次、最终放弃后不留下虚假 active hold；活跃 memoryview 拒绝与借用快照、Rust panic 析构顺序及任意 Python release_cb 不重放。
-- Prepared：fill Err/panic、校验/回滚双失败、writer 等待取消、部分写、完整写后 flush Err/期限/取消；对端完整帧的分配不能被本地复用；buddy/dedicated、正常 read_done/GC、未收到帧的不明结果计数；尾随参数 payload 与 idle GC 条件保持。
+- 释放与统计：原分配成功/失败/显式再试/最终放弃，copy 与 cleanup 双错误；同一块嵌套 Drop 只计一次，PendingResponse 的暂忙/真实错误分流及 no-waiter 收尾；真实多 scope、关闭/重连后的旧 scope、退休观察、不改 byte cells；原生 raw owner 手动契约不变。
+- Held：invalidator Ok/Err/panic、先失效后释放、失败 lease/pin/tracking 保留、成功后各归还一次、最终放弃后不留下虚假 active hold；活跃 memoryview 拒绝与借用快照、Rust panic 析构顺序及任意 Python release_cb 不重放，Python 3.10 与新解释器的主异常/cleanup 异常链齐全。
+- Prepared：fill Err/panic、校验/回滚双失败、writer 等待取消、部分写、完整写后 flush Err/期限/取消；对端完整帧的分配不能被本地复用；buddy/dedicated、正常 read_done/GC、未收到帧的不明结果计数；helper Err 不进入成功 fallback，trailing-inline/chunk/拒绝丢弃的全部 Peer 路径及 idle GC 条件保持。
 - 永久拒绝：原 1000 万次预算的代表性竞争、poison/dead-holder/PID 复用判断；锁字及 allocator 元数据不改、无后台恢复、预算饱和和无 timer 不隐藏退款。既有 read_done/crash-timeout GC 不额外改造。
 - 平台：macOS 本机 UDS/POSIX SHM，隔离 Linux UDS/POSIX SHM，Windows 开发机优先验证 Named Pipe、真实 overlapped flush、named mapping 与 file spill；已通过且不受影响的旧验收不重跑。本轮 source candidate 的完整 relay、真实 Rust/Python 18 行及 Node 12 行跨语言、三系统及确切候选 GitHub Actions 按原门禁执行，含 Windows ARM64、Windows 2022/2025 与 Python 3.14t。
 - 收尾：本批正常场景 socket/lease、SHM、spill 零残留；受控不可释放的反例不靠 free/reset 伪造成功，以隔离进程真实退出/原 owner teardown 后无 OS backing 残留验收，计费在放弃前不下降。保留文本日志与候选/run URL，清掉测试用 target、临时环境及 checkout；历史目录不动，发版仍等单独指令。
