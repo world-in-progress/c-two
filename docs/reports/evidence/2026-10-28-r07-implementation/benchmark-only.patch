@@ -1,0 +1,86 @@
+--- a/core/runtime/c2-core/src/lifetime.rs
++++ b/core/runtime/c2-core/src/lifetime.rs
+@@ -263,4 +263,50 @@
+         eprintln!("R07_INVALIDATOR callback_count={}", calls.get());
+         assert_eq!(calls.get(), 1, "caught panic must not replay user code");
+     }
++    #[cfg(unix)]
++    #[test]
++    #[ignore = "manual same-environment R07 microbenchmark"]
++    fn r07_success_path_benchmark() {
++        use std::{hint::black_box, time::Instant};
++        let pool = Arc::new(RwLock::new(self::pool()));
++        for mode in ["small", "chunk", "held"] {
++            let mut samples = Vec::new();
++            for _ in 0..7 {
++                let start = Instant::now();
++                for _ in 0..2000 {
++                    match mode {
++                        "small" => {
++                            black_box(
++                                c2_ipc::ResponseData::Inline(vec![7; 256])
++                                    .into_bytes()
++                                    .unwrap(),
++                            );
++                        }
++                        _ => {
++                            let mut backing =
++                                ReassemblyBacking::admit(pool.clone(), 4, 2048).unwrap();
++                            for i in 0..4 {
++                                backing.write_at(i * 2048, &[7; 2048]).unwrap();
++                            }
++                            let lease = ResponseLease::new(c2_ipc::ResponseData::Handle(backing));
++                            if mode == "held" {
++                                let mut held = HeldResponse::from_response_lease(lease).unwrap();
++                                held.invalidate_then_release(|| Ok(())).unwrap();
++                                black_box(held);
++                            } else {
++                                black_box(lease.into_owned_bytes().unwrap());
++                            }
++                        }
++                    }
++                }
++                samples.push(start.elapsed().as_nanos() / 2000);
++            }
++            samples.sort();
++            eprintln!(
++                "R07_BENCH mode={mode} median_ns={} samples_ns={samples:?} iterations=2000",
++                samples[3]
++            );
++        }
++        assert_eq!(pool.read().stats().alloc_count, 0);
++    }
+ }
+--- a/core/transport/c2-server/src/response.rs
++++ b/core/transport/c2-server/src/response.rs
+@@ -231,4 +231,29 @@
+         assert!(meta.is_none());
+         assert_eq!(pool.read().stats().alloc_count, 0);
+     }
+-}
++    #[test]
++    #[ignore = "manual same-environment R07 SHM preparation microbenchmark"]
++    fn r07_shm_success_benchmark() {
++        let pool = test_pool();
++        let mut samples = Vec::new();
++        for _ in 0..7 {
++            let start = std::time::Instant::now();
++            for _ in 0..2000 {
++                let mut prepared = super::try_prepare_shm_response(&pool, 1024, 8192, |dst| {
++                    dst.fill(7);
++                    Ok(())
++                })
++                .unwrap()
++                .unwrap();
++                prepared.release().unwrap();
++            }
++            samples.push(start.elapsed().as_nanos() / 2000);
++        }
++        samples.sort();
++        eprintln!(
++            "R07_BENCH mode=shm median_ns={} samples_ns={samples:?} iterations=2000",
++            samples[3]
++        );
++        assert_eq!(pool.read().stats().alloc_count, 0);
++    }
++}

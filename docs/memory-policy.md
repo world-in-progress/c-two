@@ -129,6 +129,8 @@ c3 relay --bind 127.0.0.1:8080 \
 
 `cc.memory_stats()` 返回只读、按方向标注的快照：`runtime_outgoing`（本 Runtime 出站客户端域，首次连接尝试时冻结；观察它不会触发冻结或连接）、`server`（本进程服务端方向，无主机时为 `None`）、`retired`（先前会话关闭时仍有持有者的域，`state="retired"`）、`holds`（与 `cc.hold_stats()` 同源的保留租约计数）与 `budget_cells_note`。每个域含 `role`、`state`、`limits`（三个已解析上限）与 `cells`（`shm`/`file`/`reassembly`），每格为 `limit_bytes`、`used_bytes`、`peak_bytes`、`rejected_allocations`、`rejected_bytes`，峰值跨释放保留高水位。
 
+每个域还在 `limits`、`cells` 同级返回 `abandoned_releases: int`；Rust `BudgetSnapshot` 和 `MemoryScopeStats` 对应字段为饱和 `u64`。它记录本进程最终放弃且尚不能确认完成的释放义务，每个义务由最低层载体计一次。显式失败仍由持有者负责时不计，成功移交给接收方也不计。整帧已发布但发送结果不明时会计数，对端随后仍可能正常释放。同一用户下行为异常的 SHM 对端还可能声称无效、重放或过期的分配坐标；本进程无法释放这些被声称的引用时也会计数，因此计数可能高于实际未释放分配数。该数既不是当前泄漏块数，零也不证明没有任何内存问题。计数不回减、不保留错误历史，不延长 retired 域寿命，也不承诺进程退出后可查。
+
 `cc.hold_stats()` 返回 `active_holds`、`total_held_bytes`、`oldest_hold_seconds` 与 `by_storage`；inline、SHM、handle、文件后备都是可保留租约，hold 不是 SHM 专属。
 
 读数纪律：三个单元是独立的计费口径，分别描述后备与组装/保留容量，不要把任何单元格求和当成物理内存占用，也不要把它们当成零拷贝证明——适配层仍可能有拷贝路径。retired 域的呈现方式属于实现中的行为，本文不对其细节作稳定性承诺。
@@ -136,6 +138,12 @@ c3 relay --bind 127.0.0.1:8080 \
 ## 9. held 生命周期与 FastDB 边界
 
 `cc.hold(proxy.method)(args)` 返回 `HeldResult`，提供 `.value`、`.unsafe_buffer` 与 `.release()`；安全层为显式 `release()`、`with` 上下文与 `__del__` 兜底。`release()` 的顺序固定：先执行 FastDB 检查视图失效回调，再释放传输租约。对便携方法，`held.value` 是 FastDB `Payload` 持有者，释放持有会使该持有者与其检查视图失效。需要在租约范围之外长期保存的数据，必须先通过 FastDB 官方 API 物化；`unsafe_buffer` 是显式不安全逃生口，无法机械失效用户自行导出的裸指针或 NumPy 别名。
+
+显式原生释放失败时，正式 `HeldResult` 保留原 lease、预算及具体连接，后续 `release()` 只重试原生清理。invalidator 在进入前就标记为已尝试，异常或 Rust unwind 后均不重放；逻辑失效开始后，值与 buffer 不可恢复。仍有活跃导出时，原生边界在失效之前拒绝释放；关闭额外导出后可以重试，但本次已 release 的 memoryview 不会重新成为可用 buffer。手工 `HeldResult(release_cb=...)` 的任意回调仍只执行一次。主异常与本次 cleanup 原因通过既有异常链保留，支持 Python 3.10。
+
+消费式出口和最终载体 Drop 失败后，无法把义务交回持有者，便返回或记录错误，保守放弃：不修改未经确认的分配、不退尚未释放的预算、只记一次放弃计数。重组保留原分配容量的计费，不按 trimmed 长度退款；最后一个真实 accounting owner 消失后，弱观察自然脱离。本机制不建后台接管、重试队列或恢复计时器。`Contended` 只说明原自旋预算耗尽，不证明持锁者存活或以后必然恢复；poison/dead-holder 使段持续拒绝分配与释放，不偷锁、不重置锁字。
+
+Prepared SHM 回复在整帧写完、flush 之前移交 buddy 的跨进程释放权；随后的 flush 错误、原期限到期或取消均不能本地 free，只记录结果不明和一次放弃。dedicated 成功发送仍用原生命周期；结果不明时不设置 `freed_at`，即便以后收到 `read_done`，也可能留到原 pool teardown。fill 错误、panic、等待 writer 取消和未完整成帧的失败通过原 pool 清理；失败原因不会被 inline/chunk fallback 抹成成功。
 
 关闭后的持有生命周期：`cc.shutdown()` 不强制释放仍被持有的数据，也不清零计账。其预算计费与保留租约转入 retired 域，继续出现在 `cc.memory_stats()['retired']`，只要旧代理、在途调用或 held 仍持有计数所有者，记录就继续可观察；计费归零与记录删除是两个时刻。最后一个真实所有者消失后，弱观察记录才移除，统计自身不会挽留池、连接、Runtime、回调或 payload。
 

@@ -76,6 +76,10 @@ same ordering at callback exit. This is not a zero-copy claim, and unsafe raw
 pointers extracted outside FastDB's checked owner/view model cannot be
 revoked.
 
+`Held::release()` retries a failed native cleanup using the original response; the invalidator runs once, including after a caught panic. `value()` becomes `None` when invalidation starts. Core `HeldResponse::is_released()` describes that access state, while `has_pending_release()` reports native obligations. A native failure keeps the exact connection pin until cleanup succeeds or the final owner abandons it.
+
+The low-level consuming `abandon(self)` entries on Core `HeldResponse`, `ResponseLease`, `RequestLease` and `ReassemblyBacking` end an unconfirmed obligation without another free, invalidation or refund. High-level `Held` keeps only `release()` and `Drop`. Final failures log/return their cause and increment the original scope's saturating `abandoned_releases` once. Both `BudgetSnapshot` and `MemoryScopeStats` expose this field; it counts historical abandonment rather than live leaked allocations. An abnormal same-user SHM peer can assert invalid, replayed or stale allocation coordinates; unreleaseable asserted references also count, so the value can exceed actual unreleased allocations. No background recovery is added. See [memory policy](../../docs/memory-policy.en.md#statistics-and-payload-lifetime).
+
 From the C-Two checkout:
 
 ```bash

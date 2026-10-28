@@ -587,7 +587,9 @@ impl SyncClient {
         })() {
             Ok(target) => target,
             Err(err) => {
-                let _ = block.release();
+                if let Err(cleanup) = block.release() {
+                    eprintln!("Warning: preallocated request cleanup failed: {cleanup}");
+                }
                 return Err(err);
             }
         };

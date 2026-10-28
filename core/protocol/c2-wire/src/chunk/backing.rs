@@ -282,6 +282,19 @@ impl ReassemblyBacking {
         self.release_storage()
     }
 
+    /// End this release obligation without freeing storage or refunding capacity.
+    pub fn abandon(mut self) {
+        self.abandon_state();
+    }
+
+    fn abandon_state(&mut self) {
+        if let Some(state) = self.state.take() {
+            tracing::warn!(handle = ?state.handle, "abandoning reassembly release");
+            drop(state.handle);
+            state.reservation.abandon();
+        }
+    }
+
     /// Try to release without waiting for the pool lock.
     ///
     /// `Ok(false)` leaves the entire carrier (storage, exact owner pool and
@@ -352,17 +365,9 @@ impl ReassemblyBacking {
 
 impl Drop for ReassemblyBacking {
     fn drop(&mut self) {
-        // Best-effort release with the same ordering guarantee: the charge
-        // refunds only after the pool authority accepted the release. If the
-        // release fails here (invalid handle or changed owner), the reservation is
-        // deliberately forgotten rather than refunded — budget bytes stay
-        // charged instead of silently uncounting backing that may still be
-        // allocated.
-        if self.release_storage().is_err() {
-            if let Some(state) = self.state.take() {
-                drop(state.handle);
-                std::mem::forget(state.reservation);
-            }
+        if let Err(error) = self.release_storage() {
+            tracing::warn!(%error, "final reassembly release failed");
+            self.abandon_state();
         }
     }
 }
@@ -555,6 +560,7 @@ mod tests {
         // Drop keeps the same ordering guarantee: the charge is deliberately
         // not refunded when the pool authority cannot confirm storage release.
         drop(backing);
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
     }
 

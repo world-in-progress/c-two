@@ -425,9 +425,9 @@ impl<C> ChunkRegistry<C> {
         drop(removed);
     }
 
-    /// Nonblocking connection teardown. Busy or failed releases leave their
-    /// complete assembler, pool authority, reservation and counters here for
-    /// the same connection owner to retry. Finished carriers are independent.
+    /// Nonblocking connection teardown. Busy releases retain the complete
+    /// assembler for retry; an actual release error abandons its obligation.
+    /// Finished carriers are independent.
     pub fn try_cleanup_connection(&self, conn_id: u64) -> bool {
         self.try_drain_shard(self.shard(conn_id), |(cid, _), _| *cid == conn_id, None)
             .0
@@ -481,38 +481,59 @@ impl<C> ChunkRegistry<C> {
     ) -> (bool, GcStats) {
         // Declared before the guard so unwinding also drops contexts unlocked.
         let mut removed = Vec::new();
+        let mut failures = HashMap::new();
         let Some(mut shard) = shard.try_lock() else {
             return (false, GcStats::default());
         };
         let mut complete = true;
         let mut stats = GcStats::default();
-        for (_, tracked) in shard.extract_if(|key, tracked| {
+        for (key, tracked) in shard.extract_if(|key, tracked| {
             if !matches(key, tracked) {
                 return false;
             }
-            // Never probe a lock then perform a blocking Drop. try_release
-            // validates and mutates under its acquired pool guard; a retained
-            // entry still owns the entire carrier when that attempt fails.
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline)
-                || !matches!(tracked.inner.try_release(), Ok(true))
-            {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 complete = false;
                 return false;
             }
+            // The physical release and validation occur under the same pool
+            // guard. A busy pool retains the entry; an actual error exits the
+            // recovery loop and is abandoned outside the shard lock.
+            match tracked.inner.try_release() {
+                Ok(true) => {
+                    stats.expired += 1;
+                    stats.freed_bytes += tracked.total_bytes;
+                    true
+                }
+                Ok(false) => {
+                    complete = false;
+                    false
+                }
+                Err(error) => {
+                    failures.insert(*key, error);
+                    true
+                }
+            }
+        }) {
             self.active_count.fetch_sub(1, Ordering::Relaxed);
             self.total_bytes
                 .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-            stats.expired += 1;
-            stats.freed_bytes += tracked.total_bytes;
-            true
-        }) {
-            removed.push(tracked);
+            removed.push((key, tracked));
         }
         stats.remaining = shard.len();
         drop(shard);
-        // Only successfully released entries leave the table; context Drop
-        // runs after both shard and pool guards are gone.
-        drop(removed);
+        // All context Drop and failed-release finalization run after both
+        // shard and pool guards are gone. Do not let an Err take the ordinary
+        // assembler Drop, which would retry the same physical release.
+        for (key, tracked) in removed {
+            if let Some(error) = failures.remove(&key) {
+                warn!(conn_id = key.0, request_id = key.1, %error, "final chunk release failed");
+                let TrackedAssembler { inner, context, .. } = tracked;
+                inner.abandon();
+                drop(context);
+            } else {
+                drop(tracked);
+            }
+        }
         (complete, stats)
     }
 }
@@ -646,6 +667,50 @@ mod tests {
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
         assert_eq!(reassembly_used(&budget), 0);
+    }
+
+    #[test]
+    fn failed_nonblocking_extraction_abandons_once_without_refunding() {
+        for exit in ["abort", "connection", "gc"] {
+            let (pool, budget) = budgeted_pool(4096);
+            let reg = ChunkRegistry::new(
+                Arc::clone(&pool),
+                ChunkConfig {
+                    assembler_timeout: Duration::ZERO,
+                    ..ChunkConfig::default()
+                },
+            );
+            reg.insert(1, 7, 1, 4096, ()).unwrap();
+            let original = std::mem::replace(
+                &mut *pool.write(),
+                MemPool::new_with_prefix(base_config(), unique_prefix("failed")),
+            );
+
+            match exit {
+                "abort" => assert!(reg.try_abort(1, 7)),
+                "connection" => assert!(reg.try_cleanup_connection(1)),
+                "gc" => {
+                    let stats = reg.try_gc_sweep();
+                    assert_eq!(stats.expired, 0, "failed release did not free storage");
+                    assert_eq!(stats.remaining, 0);
+                }
+                _ => unreachable!(),
+            }
+            assert!(!reg.contains(1, 7), "{exit}");
+            assert_eq!(reg.active_count(), 0, "{exit}");
+            assert_eq!(reg.total_bytes(), 0, "{exit}");
+            assert_eq!(original.stats().alloc_count, 1, "{exit}");
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 4096, "{exit}");
+            assert_eq!(budget.snapshot().abandoned_releases, 1, "{exit}");
+            assert!(reg.try_cleanup_connection(1));
+            assert_eq!(reg.try_gc_sweep().remaining, 0);
+            assert_eq!(budget.snapshot().abandoned_releases, 1, "{exit}");
+            assert!(
+                budget.reserve(BudgetKind::Reassembly, 4096).is_err(),
+                "{exit}"
+            );
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 4096, "{exit}");
+        }
     }
 
     #[test]

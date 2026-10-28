@@ -1,5 +1,10 @@
 use c_two::generated::{HeldResponse, open_borrowed, open_held, open_owned};
+use c2_ipc::{ResponseData, ResponseLease};
+use c2_mem::{MemPool, PoolConfig};
+use c2_wire::chunk::ReassemblyBacking;
 use fastdb::{BuildPolicy, Builder, CompiledSpec, Payload};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 const VALUE_SPEC: &[u8] = br#"{
   "schema": "fastdb.payload.v1",
@@ -106,6 +111,30 @@ fn held_drop_runs_the_same_invalidation_path() {
             .symbol(),
         "VIEW_INVALIDATED"
     );
+}
+
+#[test]
+fn held_open_failure_keeps_payload_error_and_abandons_failed_cleanup_once() {
+    let spec = CompiledSpec::compile(VALUE_SPEC).expect("compile value spec");
+    let invalid_bytes = [0xa5; 512];
+    let expected = open_owned(&spec, &invalid_bytes).expect_err("invalid payload");
+    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default())));
+    let budget = pool.read().budget().unwrap().clone();
+    let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, invalid_bytes.len()).unwrap();
+    backing.write_at(0, &invalid_bytes).unwrap();
+    let response =
+        HeldResponse::from_response_lease(ResponseLease::new(ResponseData::Handle(backing)))
+            .unwrap();
+    let original = std::mem::replace(&mut *pool.write(), MemPool::new(PoolConfig::default()));
+
+    let error = open_held(&spec, response).err().expect("invalid payload");
+    assert_eq!(error.symbol(), expected.symbol());
+    assert_eq!(error.message(), expected.message());
+    assert_eq!(budget.snapshot().abandoned_releases, 1);
+    assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+    *pool.write() = original;
+    assert_eq!(pool.read().stats().alloc_count, 1);
+    pool.write().destroy();
 }
 
 #[test]

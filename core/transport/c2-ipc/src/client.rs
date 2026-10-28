@@ -1168,6 +1168,9 @@ fn dedicated_retire_backing(job: DedicatedRetireJob) {
 /// be dispatched twice, no matter how the public surface interleaves.
 pub(crate) struct RequestReleaseState {
     pool: Arc<StdMutex<MemPool>>,
+    /// The allocating pool's original accounting state. Final abandonment
+    /// must not wait for the pool lock after a failed release attempt.
+    budget: c2_mem::MemoryBudget,
     alloc: PoolAllocation,
     handle: MemHandle,
     phase: AtomicU8,
@@ -1177,6 +1180,8 @@ pub(crate) struct RequestReleaseState {
     permit: StdMutex<Option<DedicatedRetirePermit>>,
     #[cfg(test)]
     dispatch_seam: StdMutex<Option<DispatchPermitSeam>>,
+    #[cfg(test)]
+    release_error_seam: StdMutex<Option<ReleaseErrorSeam>>,
 }
 
 /// Park after the dispatch CAS while the permit lock still excludes release.
@@ -1185,6 +1190,14 @@ pub(crate) struct RequestReleaseState {
 pub(crate) struct DispatchPermitSeam {
     pub entered: std::sync::mpsc::Sender<()>,
     pub resume: std::sync::mpsc::Receiver<()>,
+}
+
+/// Park after an actual nonblocking release error, with its pool guard gone.
+/// This proves final pending teardown does not reacquire the pool lock.
+#[cfg(test)]
+struct ReleaseErrorSeam {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl RequestReleaseState {
@@ -1266,7 +1279,15 @@ impl RequestReleaseState {
     /// carries only dispatched allocations. If any required local lock is
     /// busy, leave the entry, phase, pool and permit untouched for a retry.
     fn try_release_dispatched(&self) -> Result<bool, IpcError> {
-        self.release_inner(true)
+        let result = self.release_inner(true);
+        #[cfg(test)]
+        if result.is_err() {
+            if let Some(seam) = self.release_error_seam.lock().take() {
+                let _ = seam.entered.send(());
+                let _ = seam.resume.recv();
+            }
+        }
+        result
     }
 
     fn release_inner(&self, nonblocking: bool) -> Result<bool, IpcError> {
@@ -1389,21 +1410,48 @@ impl RequestReleaseState {
                 ));
             }
         }
-        let bytes = {
-            let pool = self.pool.lock();
-            pool.copy_handle_data(&self.handle)
-                .map_err(|error| IpcError::Pool(format!("prealloc copy failed: {error}")))?
+        let copy = self
+            .pool
+            .lock()
+            .copy_handle_data(&self.handle)
+            .map_err(|error| IpcError::Pool(format!("prealloc copy failed: {error}")));
+        let release = {
+            let mut pool = self.pool.lock();
+            pool.validate_handle(&self.handle)
+                .and_then(|()| {
+                    // SAFETY: the original permit lock still fences dispatch of this armed block.
+                    unsafe { pool.free(&self.alloc) }.map(|_| ())
+                })
+                .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))
         };
-        let mut pool = self.pool.lock();
-        pool.validate_handle(&self.handle)
-            .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))?;
-        // SAFETY: the private phase/permit transaction is the sole release
-        // authority, and the block is still armed so no peer free exists.
-        unsafe { pool.free(&self.alloc) }
-            .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))?;
-        drop(pool);
-        self.phase.store(Self::PHASE_RELEASED, Ordering::Release);
-        Ok(bytes)
+        if release.is_ok() {
+            self.phase.store(Self::PHASE_RELEASED, Ordering::Release);
+        }
+        match (copy, release) {
+            (Ok(bytes), Ok(())) => Ok(bytes),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(primary), Err(cleanup)) => Err(IpcError::Pool(format!(
+                "{primary}; cleanup also failed: {cleanup}"
+            ))),
+        }
+    }
+
+    /// Finalize an obligation that cannot be returned to a live owner.
+    /// The caller already observed a release error, so another free would
+    /// only retry the failed operation under its caller's lock.
+    fn final_abandon(&mut self) -> Option<DedicatedRetirePermit> {
+        if self.phase.load(Ordering::Acquire) != Self::PHASE_RELEASED {
+            self.budget.record_abandoned_release();
+            self.phase.store(Self::PHASE_RELEASED, Ordering::Release);
+        }
+        self.permit.get_mut().take()
+    }
+
+    fn return_permit(&mut self) {
+        if let Some(permit) = self.permit.get_mut().take() {
+            permit.release();
+        }
     }
 }
 
@@ -1411,10 +1459,16 @@ impl Drop for RequestReleaseState {
     fn drop(&mut self) {
         // Backstop: the last shared owner still resolves dedicated ownership
         // (a no-op for dispatched buddy blocks and already-released blocks).
-        let _ = self.release_once();
-        // And any retention slot that no settle path consumed is returned.
-        if let Some(permit) = self.permit.get_mut().take() {
-            permit.release();
+        if let Err(error) = self.release_once() {
+            eprintln!(
+                "Warning: final request release failed: {error}; allocation={:?}",
+                self.alloc
+            );
+            if let Some(permit) = self.final_abandon() {
+                permit.release();
+            }
+        } else {
+            self.return_permit();
         }
     }
 }
@@ -1430,20 +1484,11 @@ impl Drop for RequestReleaseState {
 /// can therefore never leak or free an unrelated allocation in a replacement
 /// pool that happens to have a matching segment index and generation.
 ///
-/// The token is an RAII release guard. While it is armed — before the frame
-/// write begins — dropping it frees the allocation through the owning pool,
-/// so cancelling the call while the body stream stalls or while the writer
-/// lock is unavailable, or panicking between allocation and dispatch (for
-/// example in a fill callback), cannot leak the charge or its shared-domain
-/// budget. Callers that observe a concrete error still call
-/// [`RequestBlock::release`], which is idempotent with `Drop`. Once
-/// [`RequestBlock::try_dispatch`] flips the phase at the writer seam, the
-/// transition is one linearizable state: a released block can never be
-/// dispatched and a dispatched block can never carry a second frame, and a
-/// dispatched buddy block is never freed locally, because the server owns
-/// its cross-process free. It is deliberately not `Clone`: one charge has
-/// exactly one release authority, shared only through
-/// [`RequestReleaseState`].
+/// The token retains the original shared release state. Armed cancellation
+/// leaves final cleanup to that state's last owner. After dispatch, pending
+/// and the live caller share the same transaction; a published buddy block
+/// remains the server's release responsibility. Explicit failure preserves
+/// the original obligation for retry. Final failure is abandoned and counted.
 pub struct RequestBlock {
     release: Arc<RequestReleaseState>,
 }
@@ -1459,16 +1504,28 @@ impl std::fmt::Debug for RequestBlock {
 
 impl RequestBlock {
     pub(crate) fn new(pool: Arc<StdMutex<MemPool>>, handle: MemHandle) -> Self {
+        let budget = pool.lock().budget().expect("request owner budget").clone();
+        Self::new_with_budget(pool, handle, budget)
+    }
+
+    fn new_with_budget(
+        pool: Arc<StdMutex<MemPool>>,
+        handle: MemHandle,
+        budget: c2_mem::MemoryBudget,
+    ) -> Self {
         let alloc = handle.shm_allocation().expect("request allocation is SHM");
         Self {
             release: Arc::new(RequestReleaseState {
                 pool,
+                budget,
                 alloc,
                 handle,
                 phase: AtomicU8::new(RequestReleaseState::PHASE_ARMED),
                 permit: StdMutex::new(None),
                 #[cfg(test)]
                 dispatch_seam: StdMutex::new(None),
+                #[cfg(test)]
+                release_error_seam: StdMutex::new(None),
             }),
         }
     }
@@ -1503,12 +1560,11 @@ impl RequestBlock {
 
     /// Release the allocation in the pool that owns it, exactly once.
     ///
-    /// Idempotent with `Drop` and with terminal observers of the shared
-    /// release state. Before dispatch this frees the block through its exact
+    /// Idempotent with terminal observers of the shared release state. Before dispatch this frees the block through its exact
     /// owner; after dispatch it settles dedicated owner release and never
     /// frees a buddy block the peer may own. Returns the pool's error for
-    /// diagnostics; error-path callers may ignore it because ownership is
-    /// carried by this token, not by the client slot.
+    /// diagnostics; a failed explicit release retains this token's original
+    /// obligation until retry or final shared-state cleanup.
     pub fn release(&self) -> Result<(), IpcError> {
         self.release.release_once()
     }
@@ -1534,19 +1590,6 @@ impl RequestBlock {
     #[cfg(test)]
     pub(crate) fn set_dispatch_seam_for_test(&self, seam: DispatchPermitSeam) {
         *self.release.dispatch_seam.lock() = Some(seam);
-    }
-}
-
-impl Drop for RequestBlock {
-    fn drop(&mut self) {
-        if self.release.phase.load(Ordering::Acquire) == RequestReleaseState::PHASE_ARMED {
-            let _ = self.release.release_once();
-        } else {
-            // Published requests retain their release authority in pending
-            // until settlement succeeds. Dropping the caller's token must not
-            // stall its runtime while an external owner holds the pool lock.
-            let _ = self.release.try_release_dispatched();
-        }
     }
 }
 
@@ -2131,23 +2174,55 @@ impl PendingResponse {
         }
     }
 
-    fn try_release_request(&mut self) -> bool {
-        if self
-            .request
-            .as_ref()
-            .is_some_and(|request| !matches!(request.try_release_dispatched(), Ok(true)))
-        {
-            return false;
+    fn try_release_request(
+        &mut self,
+        detached: &mut Vec<Arc<RequestReleaseState>>,
+        returned_permits: &mut Vec<DedicatedRetirePermit>,
+    ) -> bool {
+        if let Some(request) = self.request.as_ref() {
+            match request.try_release_dispatched() {
+                Ok(false) => return false,
+                Err(error) => {
+                    eprintln!(
+                        "Warning: pending request release failed; ending pending ownership: {error}"
+                    );
+                    if let Some(request) = self.request.take() {
+                        match Arc::try_unwrap(request) {
+                            Ok(mut owner) => {
+                                if let Some(permit) = owner.final_abandon() {
+                                    returned_permits.push(permit);
+                                }
+                            }
+                            // A caller may disappear concurrently. Drop this
+                            // reference after the pending-map lock is gone.
+                            Err(shared) => detached.push(shared),
+                        }
+                    }
+                    return true;
+                }
+                Ok(true) => {}
+            }
         }
-        self.request.take();
+        if let Some(request) = self.request.take() {
+            detached.push(request);
+        }
         true
     }
 
-    fn try_settle(&mut self) -> bool {
-        let request_released = self.try_release_request();
+    fn try_settle(
+        &mut self,
+        detached: &mut Vec<Arc<RequestReleaseState>>,
+        returned_permits: &mut Vec<DedicatedRetirePermit>,
+    ) -> bool {
+        let request_released = self.try_release_request(detached, returned_permits);
         if let Some(response) = self.response.as_mut() {
-            if !matches!(try_release_unclaimed_response(response), Ok(true)) {
-                return false;
+            match try_release_unclaimed_response(response) {
+                Ok(false) => return false,
+                Err(error) => {
+                    eprintln!("Warning: unclaimed response release failed: {error}");
+                    crate::ResponseLease::new(self.response.take().unwrap()).abandon();
+                }
+                Ok(true) => {}
             }
         }
         self.response.take();
@@ -2279,13 +2354,21 @@ impl Drop for SendGuard {
             // Dropping the control future drops rx too. If metadata is busy,
             // maintenance/receive/close observes that closed receiver and owns
             // deferred settlement; timeout never waits for the pending map.
+            let mut detached = Vec::new();
+            let mut returned_permits = Vec::new();
             if let Some(mut pending) = self.pending.try_lock() {
                 if let Some(entry) = pending.get_mut(&self.rid) {
                     entry.close_waiter();
-                    if entry.try_release_request() && entry.response.is_none() {
+                    if entry.try_release_request(&mut detached, &mut returned_permits)
+                        && entry.response.is_none()
+                    {
                         pending.remove(&self.rid);
                     }
                 }
+            }
+            drop(detached);
+            for permit in returned_permits {
+                permit.release();
             }
             if !self.sent && self.write_started.load(Ordering::Acquire) {
                 if let Some(abort) = &self.control_abort {
@@ -2297,12 +2380,21 @@ impl Drop for SendGuard {
         if self.sent {
             // Cancelled while waiting for a delayed reply on an otherwise
             // healthy connection: resolve this entry exactly like a drain.
+            let mut detached = Vec::new();
+            let mut returned_permits = Vec::new();
             let mut pending = self.pending.lock();
             if let Some(entry) = pending.get_mut(&self.rid) {
                 entry.close_waiter();
-                if entry.try_release_request() && entry.response.is_none() {
+                if entry.try_release_request(&mut detached, &mut returned_permits)
+                    && entry.response.is_none()
+                {
                     pending.remove(&self.rid);
                 }
+            }
+            drop(pending);
+            drop(detached);
+            for permit in returned_permits {
+                permit.release();
             }
             return;
         }
@@ -4219,7 +4311,8 @@ impl IpcClient {
             let handle = pool
                 .alloc_shm_handle(data.len())
                 .map_err(|e| IpcError::Shm(format!("buddy alloc failed: {e}")))?;
-            RequestBlock::new(Arc::clone(&pool_arc), handle)
+            let budget = pool.budget().expect("request owner budget").clone();
+            RequestBlock::new_with_budget(Arc::clone(&pool_arc), handle, budget)
         };
         // Write data into the SHM region; a failure drops the block, which
         // releases through the owning pool while it is still armed.
@@ -4244,9 +4337,16 @@ impl IpcClient {
             return Ok(None);
         };
         // The guard must drop before the owned `Arc` moves into the token.
-        let handle = pool_arc.lock().alloc_shm_handle(data_size);
+        let (handle, budget) = {
+            let mut pool = pool_arc.lock();
+            let handle = pool.alloc_shm_handle(data_size);
+            let budget = pool.budget().expect("request owner budget").clone();
+            (handle, budget)
+        };
         match handle {
-            Ok(handle) => Ok(Some(RequestBlock::new(pool_arc, handle))),
+            Ok(handle) => Ok(Some(RequestBlock::new_with_budget(
+                pool_arc, handle, budget,
+            ))),
             Err(_) => Ok(None),
         }
     }
@@ -4348,7 +4448,9 @@ impl IpcClient {
     ) -> Result<ResponseData, IpcError> {
         let data_size = block.len();
         if data_size > u32::MAX as usize {
-            let _ = block.release();
+            if let Err(cleanup) = block.release() {
+                eprintln!("Warning: preallocated request cleanup failed: {cleanup}");
+            }
             return Err(IpcError::Config(format!(
                 "buddy request payload size {data_size} exceeds wire limit {}",
                 u32::MAX
@@ -4393,13 +4495,17 @@ impl IpcClient {
         let ctrl = match encode_call_control(identity, method_idx) {
             Ok(ctrl) => ctrl,
             Err(err) => {
-                let _ = block.release();
+                if let Err(cleanup) = block.release() {
+                    eprintln!("Warning: preallocated request cleanup failed: {cleanup}");
+                }
                 return Err(err.into());
             }
         };
 
         if let Err(error) = IpcCallControl::check_preparation(control) {
-            let _ = block.release();
+            if let Err(cleanup) = block.release() {
+                eprintln!("Warning: preallocated request cleanup failed: {cleanup}");
+            }
             return Err(error);
         }
 
@@ -4497,15 +4603,26 @@ impl IpcClient {
             // settlement succeeds; a partial write never permits local buddy
             // free, and dedicated backing retains its retire permit.
             if block.release.phase.load(Ordering::Acquire) == RequestReleaseState::PHASE_ARMED {
-                let _ = block.release();
+                if let Err(cleanup) = block.release() {
+                    eprintln!("Warning: preallocated request cleanup failed: {cleanup}");
+                }
                 self.pending.lock().remove(&rid);
             } else {
+                let mut detached = Vec::new();
+                let mut returned_permits = Vec::new();
                 let mut pending = self.pending.lock();
                 if let Some(entry) = pending.get_mut(&rid) {
                     entry.close_waiter();
-                    if entry.try_release_request() && entry.response.is_none() {
+                    if entry.try_release_request(&mut detached, &mut returned_permits)
+                        && entry.response.is_none()
+                    {
                         pending.remove(&rid);
                     }
+                }
+                drop(pending);
+                drop(detached);
+                for permit in returned_permits {
+                    permit.release();
                 }
             }
             return Err(e);
@@ -5719,6 +5836,8 @@ fn try_drain_pending(
     close_waiters: bool,
     deadline: Option<std::time::Instant>,
 ) -> bool {
+    let mut detached = Vec::new();
+    let mut returned_permits = Vec::new();
     let Some(mut pending) = pending.try_lock() else {
         return false;
     };
@@ -5729,13 +5848,19 @@ fn try_drain_pending(
         if close_waiters || entry.tx.as_ref().is_some_and(|tx| tx.is_closed()) {
             entry.close_waiter();
         }
-        entry.tx.is_some() || !entry.try_settle()
+        entry.tx.is_some() || !entry.try_settle(&mut detached, &mut returned_permits)
     });
-    if close_waiters {
+    let complete = if close_waiters {
         pending.is_empty()
     } else {
         pending.values().all(|entry| entry.tx.is_some())
+    };
+    drop(pending);
+    drop(detached);
+    for permit in returned_permits {
+        permit.release();
     }
+    complete
 }
 
 async fn complete_unary_pending(
@@ -5743,6 +5868,8 @@ async fn complete_unary_pending(
     rid: u32,
     result: Result<ResponseData, IpcError>,
 ) {
+    let mut detached = Vec::new();
+    let mut returned_permits = Vec::new();
     {
         let mut pending = pending.lock();
         let entry = pending.entry(rid).or_insert_with(|| PendingResponse {
@@ -5757,20 +5884,26 @@ async fn complete_unary_pending(
         if let Some(Ok(response)) = undelivered {
             entry.response = Some(response);
         }
-        if entry.try_settle() {
+        if entry.try_settle(&mut detached, &mut returned_permits) {
             pending.remove(&rid);
         }
+    }
+    drop(detached);
+    for permit in returned_permits {
+        permit.release();
     }
 
     // At most this one received frame is retained. Pause the receive loop
     // before accepting another unclaimed response; cancellation can now drop
     // this future because the complete carrier already lives in pending.
     loop {
+        let mut detached = Vec::new();
+        let mut returned_permits = Vec::new();
         let waiting = {
             let mut pending = pending.lock();
             match pending.get_mut(&rid) {
                 Some(entry) if entry.response.is_some() => {
-                    if entry.try_settle() {
+                    if entry.try_settle(&mut detached, &mut returned_permits) {
                         pending.remove(&rid);
                         false
                     } else {
@@ -5780,6 +5913,10 @@ async fn complete_unary_pending(
                 _ => false,
             }
         };
+        drop(detached);
+        for permit in returned_permits {
+            permit.release();
+        }
         if !waiting {
             return;
         }
@@ -5906,6 +6043,12 @@ async fn recv_loop_inner(
         conn_id,
         connection: connection.as_ref().map(|state| state.publisher.clone()),
     };
+    let memory_budget = chunk_registry
+        .pool()
+        .read()
+        .budget()
+        .expect("receive owner budget")
+        .clone();
     let mut header_buf = [0u8; HEADER_SIZE];
     let mut recv_buf = Vec::with_capacity(4096); // reusable buffer
     loop {
@@ -6117,7 +6260,13 @@ async fn recv_loop_inner(
         // rejected inside the decoder before any lease is minted, any
         // segment is lazy-opened, or any release cleanup could touch a
         // mapping this connection was never promised.
-        let result = decode_response(&hdr, &recv_buf, &server_pool, shm_response_allowed);
+        let result = decode_response(
+            &hdr,
+            &recv_buf,
+            &server_pool,
+            shm_response_allowed,
+            &memory_budget,
+        );
 
         // Dispatch to pending caller.
         complete_unary_pending(&pending, rid, result).await;
@@ -6188,6 +6337,7 @@ fn decode_response(
     payload: &[u8],
     server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
     shm_response_allowed: bool,
+    memory_budget: &c2_mem::MemoryBudget,
 ) -> Result<ResponseData, IpcError> {
     let is_v2 = hdr.is_reply_v2();
     let is_buddy = hdr.is_buddy();
@@ -6229,6 +6379,7 @@ fn decode_response(
                 bp.data_size,
                 bp.is_dedicated,
                 bp.allocation_id,
+                memory_budget.clone(),
             ))),
             ReplyControl::RouteNotFound(route) => Err(IpcError::RouteNotFound(route)),
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
@@ -9377,5 +9528,147 @@ mod connect_deadline_tests {
         assert!(client.pending.lock().contains_key(&other));
         client.pending.lock().remove(&other);
         drop(reader);
+    }
+}
+
+#[cfg(test)]
+mod abandoned_release_tests {
+    use super::*;
+    use c2_mem::PoolConfig;
+    use c2_wire::chunk::ReassemblyBacking;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn pool() -> MemPool {
+        MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 65536,
+                max_segments: 1,
+                min_block_size: 4096,
+                ..PoolConfig::default()
+            },
+            format!("/r07-{}-{}", std::process::id(), {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            }),
+        )
+    }
+
+    #[test]
+    fn unclaimed_response_release_error_ends_recovery_and_counts_once() {
+        let pool = Arc::new(RwLock::new(pool()));
+        let budget = pool.read().budget().unwrap().clone();
+        let backing = ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
+        let original = std::mem::replace(&mut *pool.write(), self::pool());
+        let mut pending = PendingResponse {
+            tx: None,
+            request: None,
+            response: Some(ResponseData::Handle(backing)),
+        };
+        let mut detached = Vec::new();
+        let mut returned_permits = Vec::new();
+        assert!(pending.try_settle(&mut detached, &mut returned_permits));
+        assert!(pending.response.is_none());
+        assert!(pending.try_settle(&mut detached, &mut returned_permits));
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+        assert_eq!(original.stats().alloc_count, 1);
+        *pool.write() = original;
+        pool.write().destroy();
+    }
+
+    #[test]
+    fn final_request_drop_failure_counts_once_without_refunding() {
+        let pool = Arc::new(StdMutex::new(pool()));
+        let budget = pool.lock().budget().unwrap().clone();
+        let handle = pool.lock().try_alloc_shm(4096).unwrap();
+        let charged = budget.snapshot().shm.used_bytes;
+        let block = RequestBlock::new(Arc::clone(&pool), handle);
+        let mut original = std::mem::replace(&mut *pool.lock(), self::pool());
+
+        drop(block);
+        assert_eq!(original.stats().alloc_count, 1);
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        original.destroy();
+    }
+
+    #[test]
+    fn pending_request_error_does_not_retry_free_under_pending_lock() {
+        let _retire_guard = dedicated_retire_test_control::production_guard();
+        let pool = Arc::new(StdMutex::new(pool()));
+        let budget = pool.lock().budget().unwrap().clone();
+        let handle = pool.lock().try_alloc_shm(65537).unwrap();
+        assert!(handle.is_dedicated());
+        let charged = budget.snapshot().shm.used_bytes;
+        let block = RequestBlock::new(Arc::clone(&pool), handle);
+        let (permit, returned) = dedicated_retire_test_control::reserve_permit();
+        let executor = permit.executor;
+        let request = block.try_dispatch(Some(permit)).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *request.release_error_seam.lock() = Some(ReleaseErrorSeam {
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+        let mut original = std::mem::replace(&mut *pool.lock(), self::pool());
+
+        let (tx, _rx) = oneshot::channel();
+        let mut entry = PendingResponse::unary(tx);
+        entry.request = Some(request);
+        let pending = Arc::new(StdMutex::new(HashMap::from([(1, entry)])));
+        drop(block); // pending is the final RequestReleaseState owner
+
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder_pool = Arc::clone(&pool);
+        let holder = std::thread::spawn(move || {
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let _pool_guard = holder_pool.lock();
+            let _executor_guard = executor.state.lock();
+            resume_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (settled_tx, settled_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_pending = Arc::clone(&pending);
+        let worker = std::thread::spawn(move || {
+            let mut detached = Vec::new();
+            let mut returned_permits = Vec::new();
+            let settled = worker_pending
+                .lock()
+                .get_mut(&1)
+                .unwrap()
+                .try_settle(&mut detached, &mut returned_permits);
+            settled_tx.send(settled).unwrap();
+            drop(detached);
+            for permit in returned_permits {
+                permit.release();
+            }
+            done_tx.send(settled).unwrap();
+        });
+        let result = settled_rx.recv_timeout(Duration::from_secs(2));
+        if result.is_err() {
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            worker.join().unwrap();
+            panic!("pending release retried a failed free while holding the pending lock");
+        }
+        assert!(result.unwrap());
+        assert!(pool.try_lock().is_none(), "holder still owns the pool lock");
+        assert!(pending.try_lock().is_some(), "pending lock was returned");
+        assert!(pending.lock()[&1].request.is_none());
+        assert!(
+            !returned.load(Ordering::Acquire),
+            "permit waits only after pending guard returns"
+        );
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        assert_eq!(original.stats().alloc_count, 1);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+        assert!(returned.load(Ordering::Acquire));
+        original.destroy();
     }
 }

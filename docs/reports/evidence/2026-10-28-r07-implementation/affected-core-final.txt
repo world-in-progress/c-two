@@ -1,0 +1,41 @@
+command: cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire -p c2-local -p c2-ipc -p c2-server
+exit_code: 101
+
+running 243 tests
+
+test result: ok. 243 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.77s
+
+
+running 7 tests
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.77s
+
+
+running 1 test
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.18s
+
+
+running 158 tests
+
+running 1 test
+test unix_managed::tests::cross_user_cannot_connect_to_0600_socket_in_0755_directory ... ignored, requires root to spawn a child as a second ordinary uid; run explicitly on a suitable host
+test unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases ... FAILED
+
+failures:
+
+---- unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases stdout ----
+R17C_TEST_ROOT <task-temp>/ipc
+R17C_TEST_ROOT <task-temp>/ipc
+
+thread 'unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases' (14755716) panicked at transport/c2-local/src/unix_managed/tests.rs:4157:9:
+assertion failed: matches!(reap_managed_at(&endpoint, &credential, root),
+    EndpointReapResult::Reaped)
+
+
+failures:
+    unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases
+
+test result: FAILED. 156 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.46s
+
+error: test failed, to rerun pass `-p c2-local --lib`

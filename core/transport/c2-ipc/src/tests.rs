@@ -561,6 +561,8 @@ mod response_lease_tests {
         let prefix = unique_prefix('x');
         let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());
         let allocation = producer.alloc(4096).unwrap();
+        let budget = producer.budget().unwrap().clone();
+        let charged = budget.snapshot().shm.used_bytes;
         let segment_capacity = producer
             .segment(allocation.seg_idx as usize)
             .unwrap()
@@ -570,7 +572,7 @@ mod response_lease_tests {
         let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
             reader,
         ))));
-        let lease = ResponseLease::new(ResponseData::Shm(ServerShmResponse::admit(
+        let mut carrier = ServerShmResponse::admit(
             server_pool,
             u16::try_from(allocation.seg_idx).unwrap(),
             allocation.generation,
@@ -578,7 +580,10 @@ mod response_lease_tests {
             2,
             false,
             allocation.allocation_id,
-        )));
+            budget.clone(),
+        );
+        assert!(carrier.try_release().is_err());
+        let lease = ResponseLease::new(ResponseData::Shm(carrier));
 
         assert!(
             lease
@@ -589,6 +594,8 @@ mod response_lease_tests {
         drop(lease);
 
         assert_eq!(producer.stats().alloc_count, 1);
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
         // SAFETY: test holds sole release authority for its own allocation.
         unsafe { producer.free(&allocation) }.unwrap();
     }
@@ -600,12 +607,15 @@ mod response_lease_tests {
         let pool = empty_reassembly_pool('c');
         let mut handle = ReassemblyBacking::admit(Arc::clone(&pool), 1, 16).unwrap();
         handle.write_at(0, b"combined failure").unwrap();
+        let budget = pool.read().budget().unwrap().clone();
         let lease = ResponseLease::new(ResponseData::Handle(handle));
         *pool.write() = MemPool::new_with_prefix(pool_config(), unique_prefix('z'));
 
         let error = lease.into_owned_bytes().unwrap_err();
         assert!(error.contains("response handle copy failed"), "{error}");
         assert!(error.contains("response handle release failed"), "{error}");
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 16);
     }
 
     #[test]
@@ -674,6 +684,7 @@ mod response_lease_tests {
             u32::try_from(payload.len()).unwrap(),
             allocation.is_dedicated,
             allocation.allocation_id,
+            producer.budget().unwrap().clone(),
         )));
 
         assert_eq!(lease.copy_bytes().unwrap(), payload);

@@ -1246,7 +1246,13 @@ impl CrmCallback for CoreCallback {
         let bytes = match lease.copy_bytes() {
             Ok(bytes) => bytes,
             Err(copy_error) => {
-                let release_error = lease.release().err();
+                let release_error = match lease.release() {
+                    Ok(()) => None,
+                    Err(error) => {
+                        lease.abandon();
+                        Some(error)
+                    }
+                };
                 return Err(CrmError::UserError(
                     protocol_violation(
                         "request transport bytes could not be copied",
@@ -1259,6 +1265,7 @@ impl CrmCallback for CoreCallback {
         };
         let result = self.service.invoke(method_idx, bytes);
         if let Err(release_error) = lease.release() {
+            lease.abandon();
             return Err(CrmError::UserError(
                 protocol_violation(
                     "request transport lease could not be released",

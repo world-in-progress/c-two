@@ -1,0 +1,44 @@
+{
+  "previous_cleanup_record": "cleanup.json",
+  "current_cleanup": [
+    {
+      "path": "core/target",
+      "state": "removed",
+      "exists_after": false
+    },
+    {
+      "path": ".venv",
+      "state": "removed",
+      "exists_after": false
+    },
+    {
+      "path": "sdk/rust/target",
+      "state": "already_absent"
+    },
+    {
+      "path": "sdk/python/src/c_two/_native.cpython-313-darwin.so",
+      "state": "removed",
+      "exists_after": false
+    }
+  ],
+  "windows": "windows-cleanup-final.txt",
+  "local_task_executable_processes": 0,
+  "scope": "Task-created build artifacts and virtual environment inside this checkout only.",
+  "generated_python_cache_directories_removed": [
+    ".pytest_cache",
+    "tools/local_rc/__pycache__",
+    "tests/repo/__pycache__",
+    "sdk/python/.pytest_cache",
+    "sdk/python/tests/__pycache__",
+    "sdk/python/tests/unit/__pycache__",
+    "sdk/python/tests/integration/__pycache__",
+    "sdk/python/tests/fixtures/__pycache__",
+    "sdk/python/src/c_two/__pycache__",
+    "sdk/python/src/c_two/transport/__pycache__",
+    "sdk/python/src/c_two/transport/server/__pycache__",
+    "sdk/python/src/c_two/transport/client/__pycache__",
+    "sdk/python/src/c_two/config/__pycache__",
+    "sdk/python/src/c_two/crm/__pycache__",
+    "sdk/python/src/c_two/mem/__pycache__"
+  ]
+}

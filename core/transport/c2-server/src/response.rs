@@ -10,13 +10,13 @@ use crate::dispatcher::PreparedShmResponse;
 /// [`try_prepare_shm_response`]. Safe access cannot replace the pool advertised
 /// to connected peers or release a backing still owned by a prepared response.
 pub struct ResponsePool {
-    pub(crate) inner: parking_lot::RwLock<MemPool>,
+    pub(crate) inner: std::sync::Arc<parking_lot::RwLock<MemPool>>,
 }
 
 impl ResponsePool {
     pub(crate) fn new(pool: MemPool) -> Self {
         Self {
-            inner: parking_lot::RwLock::new(pool),
+            inner: std::sync::Arc::new(parking_lot::RwLock::new(pool)),
         }
     }
 
@@ -71,7 +71,7 @@ where
     // Allocate the backing as the unique write owner. SHM-only: a tier
     // failure returns None so the caller falls back to owned inline bytes
     // and native transport selection.
-    let mut handle = {
+    let handle = {
         let mut pool = response_pool.inner.write();
         match pool.alloc_shm_handle(len) {
             Ok(handle) => handle,
@@ -79,40 +79,25 @@ where
         }
     };
 
-    let coordinates = handle
+    let mut prepared = PreparedShmResponse::new(
+        std::sync::Arc::clone(&response_pool.inner),
+        handle,
+        data_size,
+    );
+    let coordinates = prepared
         .shm_allocation()
         .expect("SHM response backing carries coordinates");
     if coordinates.seg_idx > u16::MAX as u32 {
-        let mut pool = response_pool.inner.write();
-        // Only this exact owner may authorize the raw release.
-        if pool.validate_handle(&handle).is_ok() {
-            let _ = unsafe { pool.free(&coordinates) };
-        }
-        return Err(format!(
+        return Err(prepared.rollback(format!(
             "response segment index {} exceeds buddy response wire limit {}",
             coordinates.seg_idx,
-            u16::MAX
-        ));
+            u16::MAX,
+        )));
     }
-
-    let write_result = {
-        let pool = response_pool.read();
-        match pool.validate_handle(&handle) {
-            Ok(()) => write_into(pool.handle_slice_mut(&mut handle)),
-            Err(err) => Err(format!("response allocation data pointer failed: {err}")),
-        }
-    };
-
-    if let Err(err) = write_result {
-        let mut pool = response_pool.inner.write();
-        // Only this exact owner may authorize the raw release.
-        if pool.validate_handle(&handle).is_ok() {
-            let _ = unsafe { pool.free(&coordinates) };
-        }
-        return Err(err);
+    if let Err(error) = prepared.fill(write_into) {
+        return Err(prepared.rollback(error));
     }
-
-    Ok(Some(PreparedShmResponse::new(handle, data_size)))
+    Ok(Some(prepared))
 }
 
 #[cfg(test)]
@@ -164,7 +149,7 @@ mod tests {
         let pool = test_pool();
         let payload = b"x".repeat(8192);
 
-        let prepared = super::try_prepare_shm_response(&pool, 1024, payload.len(), |dst| {
+        let mut prepared = super::try_prepare_shm_response(&pool, 1024, payload.len(), |dst| {
             dst.copy_from_slice(&payload);
             Ok(())
         })
@@ -172,10 +157,8 @@ mod tests {
         .expect("large payload should allocate response SHM");
 
         assert_eq!(prepared.data_size() as usize, payload.len());
-        let handle = prepared.into_handle();
-        assert_eq!(pool.read().handle_slice(&handle), payload.as_slice());
-        // The prepared owner releases cleanly through the response pool.
-        pool.inner.write().release_handle(handle).unwrap();
+        assert_eq!(prepared.copy_logical_bytes(&pool.read()).unwrap(), payload);
+        prepared.release().unwrap();
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
@@ -192,6 +175,20 @@ mod tests {
         assert!(err.contains("copy failed"));
         assert_eq!(pool.read().stats().alloc_count, 0);
         assert_eq!(pool.read().stats().buddy_occupied_bytes, 0);
+    }
+
+    #[test]
+    fn fill_panic_releases_original_allocation() {
+        let pool = test_pool();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::try_prepare_shm_response(&pool, 1024, 8192, |_| panic!("fill panic"))
+        }));
+        assert!(panic.is_err());
+        assert_eq!(pool.read().stats().alloc_count, 0);
+        assert_eq!(
+            pool.read().budget().unwrap().snapshot().abandoned_releases,
+            0
+        );
     }
 
     #[test]

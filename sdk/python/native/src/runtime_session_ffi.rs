@@ -1944,6 +1944,7 @@ fn memory_scope_dict<'py>(
     let dict = PyDict::new(py);
     dict.set_item("role", role)?;
     dict.set_item("state", state)?;
+    dict.set_item("abandoned_releases", scope.abandoned_releases)?;
     let limits = PyDict::new(py);
     limits.set_item("shm_backing_bytes", scope.limits.shm_backing_budget_bytes)?;
     limits.set_item("file_backing_bytes", scope.limits.file_backing_budget_bytes)?;

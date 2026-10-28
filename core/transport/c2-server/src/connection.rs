@@ -9,12 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Instant;
 
 use tokio::sync::Notify;
-use tracing::warn;
 
 use c2_config::MAX_IPC_POOL_SEGMENTS;
 use c2_local::{ConnectionEndReason, ConnectionObservation, ConnectionPublisher};
+use c2_mem::MemPool;
 use c2_mem::config::PoolConfig;
-use c2_mem::{FreeResult, MemPool};
 
 // ---------------------------------------------------------------------------
 // Peer SHM state (set once during handshake, read concurrently)
@@ -35,30 +34,6 @@ impl PeerShmState {
         Self {
             prefix: String::new(),
             pool: None,
-        }
-    }
-
-    fn ensure_segment(
-        &self,
-        seg_idx: u32,
-        generation: u32,
-        data_size: usize,
-        dedicated: bool,
-    ) -> Result<(), String> {
-        let pool_arc = self.pool.as_ref().ok_or("peer pool not initialised")?;
-        let mut pool = pool_arc.write();
-        if dedicated {
-            if generation != 0 {
-                return Err("dedicated generation must be zero".into());
-            }
-            let name = MemPool::dedicated_segment_name(&self.prefix, seg_idx);
-            // SAFETY: the private peer cache and canonical name come from one handshake.
-            unsafe { pool.open_dedicated_at(seg_idx, &name, data_size) }
-        } else {
-            // Open with exactly the frame's data span: the mapped region must
-            // hold the advertised payload, and the allocator header supplies
-            // the real segment geometry. Never clamp up to a local guess.
-            pool.ensure_peer_segment(seg_idx, generation, data_size)
         }
     }
 }
@@ -235,7 +210,6 @@ impl Connection {
 
     /// Get a shared reference to the peer's MemPool.
     /// Returns None if handshake hasn't completed yet.
-    #[cfg(test)]
     pub(crate) fn peer_pool_arc(&self) -> Option<Arc<RwLock<MemPool>>> {
         let state = self.peer_shm.lock();
         state.pool.clone()
@@ -249,7 +223,7 @@ impl Connection {
     /// Initialise the peer SHM cache from its handshake pool incarnation.
     ///
     /// Always creates a `MemPool` with the peer's prefix so that later
-    /// `read_peer_data` / `free_peer_block` can lazy-open segments by
+    /// admitted request carriers can lazy-open segments by
     /// resolving names through MemPool's prefix, index, and generation authority.
     pub fn init_peer_shm(&self, prefix: String) {
         let mut state = self.peer_shm.lock();
@@ -277,123 +251,6 @@ impl Connection {
         let peer_prefix = state.prefix.clone();
         let pool = MemPool::open_peer(cfg, peer_prefix);
         state.pool = Some(Arc::new(RwLock::new(pool)));
-    }
-
-    /// Ensure the peer's SHM segment at `seg_idx` is mapped (lazy-open).
-    /// Does NOT read data — just ensures the segment is available for peer access.
-    pub fn ensure_peer_segment(
-        &self,
-        seg_idx: u16,
-        generation: u32,
-        data_size: u32,
-        is_dedicated: bool,
-    ) -> Result<(), String> {
-        let state = self.peer_shm.lock();
-        state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated)
-    }
-
-    /// Ensure the peer's SHM segment is mapped and return the pool Arc.
-    /// Combines `ensure_peer_segment` + `peer_pool_arc` under one lock.
-    pub(crate) fn ensure_and_get_peer_pool(
-        &self,
-        seg_idx: u16,
-        generation: u32,
-        data_size: u32,
-        is_dedicated: bool,
-    ) -> Result<Arc<RwLock<MemPool>>, String> {
-        let state = self.peer_shm.lock();
-        state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated)?;
-        state
-            .pool
-            .clone()
-            .ok_or_else(|| "peer pool not initialised".to_string())
-    }
-
-    /// Read `data_size` bytes from the peer's SHM at `(seg_idx, generation, offset)`.
-    ///
-    /// Lazy-opens the segment if it hasn't been seen before — the name is
-    /// derived by MemPool from its prefix, index, and generation.
-    ///
-    /// Crate-private: only the server's frame-receive paths may pass peer
-    /// coordinates through this raw seam; every admission funnels into a
-    /// [`crate::PeerShmRequest`] carrier that owns the read/release
-    /// authority for its block.
-    pub(crate) fn read_peer_data(
-        &self,
-        seg_idx: u16,
-        generation: u32,
-        offset: u32,
-        data_size: u32,
-        is_dedicated: bool,
-    ) -> Result<Vec<u8>, String> {
-        let state = self.peer_shm.lock();
-        // Lazy-open the segment if the pool hasn't mapped it yet.
-        state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated)?;
-        let pool_arc = state.pool.as_ref().ok_or("peer pool not initialised")?;
-        let pool = pool_arc.read();
-        // SAFETY: the coordinates come from a frame decoded on this exact
-        // connection; the peer completed and published the write
-        // (write-then-publish protocol) and no other local access to the
-        // block exists.
-        unsafe { pool.copy_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated) }
-    }
-
-    /// Free a buddy block in the peer's SHM pool.
-    ///
-    /// Lazy-opens the segment if not yet mapped.
-    /// Returns `FreeResult` so callers can trigger deferred GC on idle segments.
-    ///
-    /// Crate-private: same frame-admission boundary as
-    /// [`Connection::read_peer_data`].
-    pub(crate) fn free_peer_block(
-        &self,
-        seg_idx: u16,
-        generation: u32,
-        offset: u32,
-        data_size: u32,
-        is_dedicated: bool,
-        allocation_id: u64,
-    ) -> FreeResult {
-        let state = self.peer_shm.lock();
-        // Lazy-open the segment before freeing.
-        let lazy_res =
-            state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated);
-        if let Err(e) = lazy_res {
-            warn!(
-                conn_id = self.conn_id,
-                seg_idx, "lazy-open for free failed: {e}"
-            );
-            return FreeResult::Normal;
-        }
-        if let Some(pool_arc) = state.pool.as_ref() {
-            let mut pool = pool_arc.write();
-            match pool
-                .validate_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
-                .and_then(|_| {
-                    // SAFETY: the coordinates come from a frame received on
-                    // this connection and the server is the sole releaser
-                    // for the peer's block (read-then-release protocol).
-                    unsafe {
-                        pool.free_at(
-                            seg_idx as u32,
-                            generation,
-                            offset,
-                            data_size,
-                            is_dedicated,
-                            allocation_id,
-                        )
-                    }
-                }) {
-                Ok(result) => return result,
-                Err(e) => {
-                    warn!(
-                        conn_id = self.conn_id,
-                        seg_idx, offset, "peer free_at failed: {e}"
-                    );
-                }
-            }
-        }
-        FreeResult::Normal
     }
 
     /// Run buddy GC on the peer's SHM pool — reclaim idle trailing segments.

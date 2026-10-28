@@ -34,9 +34,18 @@ pub fn open_owned(spec: &CompiledSpec, bytes: &[u8]) -> Result<Payload, PayloadE
 /// Open a copy-backed FastDB payload while retaining the Core response lease.
 pub fn open_held(
     spec: &CompiledSpec,
-    response: HeldResponse,
+    mut response: HeldResponse,
 ) -> Result<Held<Payload>, PayloadError> {
-    let payload = Payload::open_copy(spec, response.bytes(), &OpenOptions::default())?;
+    let payload = match Payload::open_copy(spec, response.bytes(), &OpenOptions::default()) {
+        Ok(payload) => payload,
+        Err(error) => {
+            if let Err(cleanup_error) = response.invalidate_then_release(|| Ok(())) {
+                eprintln!("Warning: held payload open cleanup failed: {cleanup_error}");
+                response.abandon();
+            }
+            return Err(error);
+        }
+    };
     Ok(Held::new(payload, response, invalidate_payload))
 }
 
@@ -61,7 +70,9 @@ impl BorrowedPayload {
 
 impl Drop for BorrowedPayload {
     fn drop(&mut self) {
-        let _ = self.payload.invalidate();
+        if let Err(error) = self.payload.invalidate() {
+            eprintln!("Warning: borrowed payload invalidation failed: {error}");
+        }
     }
 }
 

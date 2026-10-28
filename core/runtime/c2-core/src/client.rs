@@ -385,6 +385,19 @@ pub struct HeldResponse {
     connection: Option<Arc<ClientConnection>>,
 }
 
+struct HeldPinRelease<'a> {
+    response: &'a mut crate::lifetime::HeldResponse,
+    connection: &'a mut Option<Arc<ClientConnection>>,
+}
+
+impl Drop for HeldPinRelease<'_> {
+    fn drop(&mut self) {
+        if !self.response.has_pending_release() {
+            self.connection.take();
+        }
+    }
+}
+
 impl HeldResponse {
     // Receive carriers already bind their pool; inline bytes need no transport lease.
     fn from_ipc_response(response: c2_ipc::ResponseData) -> Result<Self, LifecycleError> {
@@ -420,13 +433,25 @@ impl HeldResponse {
         self.response.is_released()
     }
 
+    pub fn has_pending_release(&self) -> bool {
+        self.response.has_pending_release()
+    }
+
     pub fn invalidate_then_release<F>(&mut self, invalidate: F) -> Result<(), LifecycleError>
     where
         F: FnOnce() -> Result<(), String>,
     {
-        let result = self.response.invalidate_then_release(invalidate);
+        let release = HeldPinRelease {
+            response: &mut self.response,
+            connection: &mut self.connection,
+        };
+        release.response.invalidate_then_release(invalidate)
+    }
+
+    /// End a pending transport obligation before returning its concrete pin.
+    pub fn abandon(mut self) {
+        self.response.abandon();
         self.connection.take();
-        result
     }
 }
 

@@ -1,10 +1,9 @@
-//! R02 baseline (merged): Connection is publicly constructible and serves
-//! bare-coordinate read/free; ServerPoolState's bare-coordinate methods and
-//! public raw pool field still type-check on a borrowed state. Never run.
+//! A connection's ServerPoolState must not expose bare-coordinate methods
+//! or its raw pool. Retired Connection raw read/free methods have no probe
+//! call sites. Compiled only, never run.
 #![forbid(unsafe_code)]
 
 use c2_ipc::ServerPoolState;
-use c2_server::Connection;
 
 #[allow(dead_code)]
 fn raw_server_pool_access(state: &mut ServerPoolState) -> Result<(), String> {
@@ -14,10 +13,4 @@ fn raw_server_pool_access(state: &mut ServerPoolState) -> Result<(), String> {
     Ok(())
 }
 
-fn main() {
-    let connection = Connection::new(41);
-    connection.init_peer_shm("/forged-peer-prefix".to_string());
-    let read = connection.read_peer_data(0, 1, 0, 4096, false);
-    let freed = connection.free_peer_block(0, 1, 0, 4096, false, 7);
-    let _ = (read.is_ok(), matches!(freed, c2_mem::FreeResult::Normal));
-}
+fn main() {}

@@ -108,7 +108,7 @@ def test_memory_stats_is_observable_without_freezing_an_unused_runtime() -> None
     # always an explicit list with scope labels.
     assert isinstance(first['retired'], list)
     assert all(
-        {'role', 'state', 'limits', 'cells'} <= set(scope)
+        {'role', 'state', 'abandoned_releases', 'limits', 'cells'} <= set(scope)
         for scope in first['retired']
     )
     # The retained-buffer counters stay Rust-owned and are composed, not
@@ -132,8 +132,9 @@ def test_memory_stats_typed_shape_is_declared_for_the_public_facade() -> None:
         'rejected_allocations',
         'rejected_bytes',
     }
-    assert set(MemoryScopeStats.__annotations__) == {'role', 'state', 'limits', 'cells'}
-    assert set(RetiredScopeStats.__annotations__) == {'role', 'state', 'limits', 'cells'}
+    scope_fields = {'role', 'state', 'abandoned_releases', 'limits', 'cells'}
+    assert set(MemoryScopeStats.__annotations__) == scope_fields
+    assert set(RetiredScopeStats.__annotations__) == scope_fields
     assert set(MemoryStats.__annotations__) == {
         'runtime_outgoing',
         'server',

@@ -63,6 +63,10 @@ finally:
 
 A portable method carries zero or one `Payload` envelope in each direction; C-Two embeds each nested specification as an opaque JSON value and never reinterprets it. Methods without an explicit binding can still use ordinary Python values for Python-scoped prototyping, but portable descriptor export and codegen diagnose and reject them.
 
+`cc.hold(echo.echo)(source)` retains a response as `HeldResult`. Explicit `release()` first attempts FastDB invalidation once, then releases native storage. When native cleanup fails, the original response stays with the result for another `release()` call; invalidation does not replay and the value stays inaccessible. Release an additional exported memoryview before retrying an export rejection, which occurs before invalidation. Manually constructed `HeldResult(release_cb=...)` callbacks still run once. Use `with cc.hold(...) as held` for normal scopes and materialize values that must outlive them.
+
+`cc.memory_stats()` includes `abandoned_releases` in each native memory scope. Final consuming cleanup failures retain unreturned charges and count one abandoned obligation, with the error returned or logged by its native carrier. No background recovery runs. The counter includes uncertain published SHM outcomes that a peer may later release. An abnormal same-user SHM peer can assert invalid, replayed or stale allocation coordinates; unreleaseable asserted references also count and can make this counter exceed actual unreleased allocations. See [memory policy](memory-policy.en.md#statistics-and-payload-lifetime) for its accounting limits.
+
 ## Remote connections and deadlines
 
 Use the resource process's `cc.server_address()` value for direct IPC. Direct IPC works without a relay. For discovery by resource name, set `cc.set_relay_anchor(...)` before registration or connection and run `c3 relay` separately. Calls in the registering process prefer same-process dispatch when no explicit address is supplied.

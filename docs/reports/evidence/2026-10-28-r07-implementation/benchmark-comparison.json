@@ -1,0 +1,31 @@
+{
+  "profile": "cargo test dev profile; 7 samples x 2000 iterations; median ns/operation",
+  "operations": {
+    "small": "256-byte inline ResponseData::into_bytes",
+    "shm": "8192-byte prepared fill and unpublished successful release",
+    "chunk": "4 x 2048-byte reassembly writes and consuming response copy/release",
+    "held": "same backing and Core Held invalidation/release"
+  },
+  "results": {
+    "small": {
+      "baseline_ns": 103,
+      "candidate_ns": 89,
+      "delta_percent": -13.59
+    },
+    "chunk": {
+      "baseline_ns": 4482,
+      "candidate_ns": 4552,
+      "delta_percent": 1.56
+    },
+    "held": {
+      "baseline_ns": 4552,
+      "candidate_ns": 4603,
+      "delta_percent": 1.12
+    },
+    "shm": {
+      "baseline_ns": 2240,
+      "candidate_ns": 2347,
+      "delta_percent": 4.78
+    }
+  }
+}

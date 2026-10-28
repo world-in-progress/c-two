@@ -20,7 +20,9 @@ impl CrmCallback for ForgedPublisher {
         let mut other_pool = MemPool::new(PoolConfig::default());
         let handle = other_pool.alloc_shm_handle(4096).unwrap();
         Ok(ResponseMeta::ShmAlloc(PreparedShmResponse::new(
-            handle, 4096,
+            Arc::new(parking_lot::RwLock::new(other_pool)),
+            handle,
+            4096,
         )))
     }
 }

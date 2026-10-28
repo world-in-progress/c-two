@@ -1,0 +1,19 @@
+#< CLIXML
+TASK_DIRECTORY_BEFORE_CLEANUP
+
+Name                              Mode  
+----                              ----  
+cargo-cache                       d-----
+source                            d-----
+target                            d-----
+continuation-source-update.tar.gz -a----
+source.tar.gz                     -a----
+
+
+TASK_EXECUTABLE_PROCESSES 0
+TASK_REPARSE_POINTS 0
+TASK_ENTRY_COUNT_BEFORE 7743
+TASK_ROOT_EXISTS_AFTER False
+WINDOWS_TASK_CLEANUP_COMPLETE
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>正在准备首次使用模块。</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><Obj S="progress" RefId="1"><TNRef RefId="0" /><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>正在准备首次使用模块。</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><Obj S="progress" RefId="2"><TNRef RefId="0" /><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>正在准备首次使用模块。</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj></Objs>
+SSH_EXIT 0

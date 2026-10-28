@@ -17,6 +17,7 @@ fn main() {
         4096,
         false,
         7,
+        c2_mem::MemoryBudget::new(0, 0, 0),
     )));
     let _ = lease.copy_bytes();
     let _ = lease.release();

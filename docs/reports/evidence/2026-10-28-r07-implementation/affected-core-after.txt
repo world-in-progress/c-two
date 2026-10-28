@@ -1,0 +1,71 @@
+command: cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire -p c2-local -p c2-ipc -p c2-server
+exit_code: 101
+
+running 243 tests
+
+test result: ok. 243 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.46s
+
+
+running 7 tests
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.78s
+
+
+running 1 test
+test r02_unique_write_ownership_boundary_gate ... FAILED
+
+failures:
+
+---- r02_unique_write_ownership_boundary_gate stdout ----
+[r02-gate] positive_owner_roundtrip: exit=0 ok=true
+[r02-gate] control_same_handle_double_mut_borrow: exit=101 ok=true
+[r02-gate] control_move_handle_during_borrow: exit=101 ok=true
+[r02-gate] vuln_same_pool_duplicate_handle_double_write: exit=101 ok=true
+[r02-gate] vuln_same_pool_duplicate_handle_read_write: exit=101 ok=true
+[r02-gate] vuln_second_mapping_double_write: exit=101 ok=true
+[r02-gate] vuln_shared_allocator_free_during_borrow: exit=101 ok=true
+[r02-gate] vuln_peer_free_at_during_owner_borrow: exit=101 ok=true
+[r02-gate] vuln_raw_coordinate_copy_during_borrow: exit=101 ok=true
+[r02-gate] vuln_request_data_shm_bare_coordinates: exit=101 ok=false
+[r02-gate] vuln_request_data_shm_bare_coordinates diagnostics: error[E0624]: associated function `admit` is private
+error[E0061]: this function takes 8 arguments but 7 arguments were supplied
+Some errors have detailed explanations: E0061, E0624.
+For more information about an error, try `rustc --explain E0061`.
+[r02-gate] vuln_response_data_shm_bare_coordinates: exit=101 ok=false
+[r02-gate] vuln_response_data_shm_bare_coordinates diagnostics: error[E0624]: associated function `admit` is private
+error[E0061]: this function takes 8 arguments but 7 arguments were supplied
+Some errors have detailed explanations: E0061, E0624.
+For more information about an error, try `rustc --explain E0061`.
+[r02-gate] vuln_response_meta_shm_alloc_publication: exit=101 ok=false
+[r02-gate] vuln_response_meta_shm_alloc_publication diagnostics: error[E0624]: associated function `new` is private
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+Some errors have detailed explanations: E0061, E0624.
+For more information about an error, try `rustc --explain E0061`.
+[r02-gate] vuln_connection_server_pool_raw_access: exit=101 ok=false
+[r02-gate] vuln_connection_server_pool_raw_access diagnostics: error[E0624]: method `copy_response` is private
+error[E0624]: method `release_response` is private
+error[E0616]: field `pool` of struct `ServerPoolState` is private
+error[E0599]: no method named `read_peer_data` found for struct `Connection` in the current scope
+[r02-gate] vuln_client_pool_slot_substitution: exit=101 ok=true
+[r02-gate] vuln_connection_pool_replacement: exit=101 ok=true
+[r02-gate] vuln_dedicated_rebind_after_destroy: exit=101 ok=true
+[r02-gate] vuln_injected_pool_destroy_during_fill: exit=101 ok=true
+[r02-gate] vuln_prealloc_published_span_expansion: exit=101 ok=true
+[r02-gate] vuln_async_injected_pool_replacement: exit=101 ok=true
+[r02-gate] vuln_server_response_pool_replacement: exit=101 ok=true
+[r02-gate] vuln_response_read_guard_recovers_write_lock: exit=101 ok=true
+
+thread 'r02_unique_write_ownership_boundary_gate' (14739777) panicked at transport/c2-ipc/tests/ownership_api.rs:201:5:
+R02 ownership gate failures: ["vuln_request_data_shm_bare_coordinates", "vuln_response_data_shm_bare_coordinates", "vuln_response_meta_shm_alloc_publication", "vuln_connection_server_pool_raw_access"]
+On the unmodified baseline the vuln_* probes still compile, which is the
+recorded red baseline; the controls must already fail with their listed
+rustc error codes, and the positive round-trip must always compile.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    r02_unique_write_ownership_boundary_gate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.41s
+
+error: test failed, to rerun pass `-p c2-ipc --test ownership_api`

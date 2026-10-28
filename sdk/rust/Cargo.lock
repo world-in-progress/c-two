@@ -108,7 +108,11 @@ dependencies = [
  "c2-core",
  "c2-error",
  "c2-http",
+ "c2-ipc",
+ "c2-mem",
+ "c2-wire",
  "fastdb",
+ "parking_lot",
  "serde_json",
 ]
 

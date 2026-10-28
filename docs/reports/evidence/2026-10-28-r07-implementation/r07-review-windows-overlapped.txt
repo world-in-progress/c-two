@@ -1,0 +1,82 @@
+
+running 2 tests
+test server::tests::windows_overlapped_flush_peer_close_keeps_dedicated_allocation ... FAILED
+test server::tests::windows_overlapped_flush_peer_close_keeps_buddy_allocation ... FAILED
+
+failures:
+
+failures:
+    server::tests::windows_overlapped_flush_peer_close_keeps_buddy_allocation
+    server::tests::windows_overlapped_flush_peer_close_keeps_dedicated_allocation
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 202 filtered out; finished in 0.11s
+
+#< CLIXML
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+   --> foundation\c2-mem\src\alloc\buddy.rs:535:14
+    |
+535 |             .fetch_update(Ordering::Release, Ordering::Relaxed, |prev| {
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+535 -             .fetch_update(Ordering::Release, Ordering::Relaxed, |prev| {
+535 +             .try_update(Ordering::Release, Ordering::Relaxed, |prev| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> foundation\c2-mem\src\alloc\spinlock.rs:295:14
+    |
+295 |             .fetch_update(Ordering::Release, Ordering::Relaxed, |word| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+295 -             .fetch_update(Ordering::Release, Ordering::Relaxed, |word| {
+295 +             .try_update(Ordering::Release, Ordering::Relaxed, |word| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> foundation\c2-mem\src\handle.rs:15:18
+   |
+15 |             NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+   |                  ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+15 -             NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+15 +             NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+   |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> transport\c2-local\src\observation.rs:278:14
+    |
+278 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+278 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+278 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+    |
+
+warning: `c2-mem` (lib) generated 3 warnings (run `cargo fix --lib -p c2-mem` to apply 3 suggestions)
+warning: `c2-local` (lib) generated 1 warning (run `cargo fix --lib -p c2-local` to apply 1 suggestion)
+   Compiling c2-server v0.1.0 (C:\Users\74265\AppData\Local\Temp\r07-review-1c161a48\source\core\transport\c2-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.68s
+     Running unittests src\lib.rs (C:\Users\74265\AppData\Local\Temp\r07-review-1c161a48\target\debug\deps\c2_server-692bfc66f823e53b.exe)
+
+thread 'server::tests::windows_overlapped_flush_peer_close_keeps_dedicated_allocation' (18320) panicked at transport\c2-server\src\server.rs:11478:9:
+assertion `left == right` failed: possibly published allocation must remain live
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'server::tests::windows_overlapped_flush_peer_close_keeps_buddy_allocation' (24404) panicked at transport\c2-server\src\server.rs:11478:9:
+assertion `left == right` failed: possibly published allocation must remain live
+  left: 0
+ right: 1
+error: test failed, to rerun pass `-p c2-server --lib`
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>����׼���״�ʹ��ģ�顣</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><Obj S="progress" RefId="1"><TNRef RefId="0" /><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>����׼���״�ʹ��ģ�顣</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj></Objs>
