@@ -1,6 +1,6 @@
 # R07：失败释放与 Prepared 发布界线
 
-状态：按用户收窄的边界重新提案，待确认，尚未实施。本次只增加隔离基线证据、重写方案及清单；不发版。生产基线为 `ba6179a937d26419cf1d0bf28e0d74ba5867c256`，规划输入 `d8ae4e76` 的生产代码与它相同。R07a 的四处低层失败返还及显式 request/response lease 保留已验收，不重复实现。
+状态：用户已确认，已实施并于 2026-10-28 验收关闭，实现与测试来源 `000985b6417714df80e88fe56c50b1e5445853b8`，见[验收记录](../reports/2026-10-28-r07-failed-release-acceptance.md)；实施中的两处修订见第 10 节。未发版。生产基线为 `ba6179a937d26419cf1d0bf28e0d74ba5867c256`，规划输入 `d8ae4e76` 的生产代码与它相同。R07a 的四处低层失败返还及显式 request/response lease 保留已验收，不重复实现。
 
 ## 1. 处理边界与关闭标准
 
@@ -127,4 +127,13 @@ CoreCallback 的请求方向同样使用 `RequestLease::abandon(self)`：copy �
 - 平台：macOS 本机 UDS/POSIX SHM，隔离 Linux UDS/POSIX SHM，Windows 开发机优先验证 Named Pipe、真实 overlapped flush、named mapping 与 file spill；已通过且不受影响的旧验收不重跑。本轮 source candidate 的完整 relay、真实 Rust/Python 18 行及 Node 12 行跨语言、三系统及确切候选 GitHub Actions 按原门禁执行，含 Windows ARM64、Windows 2022/2025 与 Python 3.14t。
 - 收尾：本批正常场景 socket/lease、SHM、spill 零残留；受控不可释放的反例不靠 free/reset 伪造成功，以隔离进程真实退出/原 owner teardown 后无 OS backing 残留验收，计费在放弃前不下降。保留文本日志与候选/run URL，清掉测试用 target、临时环境及 checkout；历史目录不动，发版仍等单独指令。
 
-独立审查及差量复核已执行，意见已落实；最后请求方向补充由 Host 按审查具体建议核对，详情见[审查与基线复核记录](../reports/2026-10-28-r07-narrow-plan-review.md)。当前方案等待用户确认实施，不把文档审查或红色反例当成修复后验收。
+独立审查及差量复核已执行，意见已落实；最后请求方向补充由 Host 按审查具体建议核对，详情见[审查与基线复核记录](../reports/2026-10-28-r07-narrow-plan-review.md)。
+
+## 10. 实施中的修订（2026-10-28）
+
+验收时发现两处方案未覆盖的情形，由 Host 决定纳入本批并已告知用户：
+
+- chunk 注册表的 abort、连接清理与 GC 抽取原先把永久释放错误与暂忙一样保留，`abort_reply_assembly` 会每 5 ms 重试且永不退出，接收任务卡住、close 无法确认，GC 每轮再耗一次完整自旋预算。这是基线就有的同类问题，违反第 1 节与第 5 节。现在暂忙照旧保留，真实错误交给原 `ReassemblyBacking` 放弃：计一次，扣住原计费，移除条目。若错误其实会自行消失，该块要到客户端重组池拆除时才回收，这与第 1 节对 `Contended` 的取舍一致。
+- 第 5 节"request 只撤去 pending 的引用"在 pending 是 `RequestReleaseState` 唯一持有者时，会让最终 Drop 在 pending 表锁里阻塞重做一次释放，违反既有的"不在 pending 锁内等待 pool 锁"不变量。改为：拿到真实错误且唯一持有时直接最终放弃（计一次、置 released、归还 permit）；非唯一持有时只撤去引用。被省掉的那次重试不可能成功，因为已派发 dedicated 的错误只来自确定性的代次与身份校验，所以结果与原写法等价。所有引用与 permit 在 pending 表锁之外丢弃。
+
+另按用户要求在本批完成以下发版前事项：Windows 真实 overlapped flush 的端到端回归（填满管道后发 prepared 帧并关闭对端，自然触发，不加测试开关）；在文档中写明计数可能被同用户异常对端抬高；Python cleanup 错误在 3.11 起通过 `add_note` 可见，同时保留 `__context__` 链给 3.10；新的对端请求回归同时在 Windows 上运行。Unix 上"整帧写完、flush 之前"的窗口实际不存在（UDS flush 为空操作，没有挂起点），因此 Unix 只做分层回归。
