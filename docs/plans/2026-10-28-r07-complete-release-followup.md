@@ -59,6 +59,8 @@ Python 双错误统一沿现有异常链保留主错误和本次 cleanup 原因�
 
 `ResponseData::into_bytes`、两类 lease 的 `into_owned_bytes`、Core Held 拷贝失败、Rust FastDB 开启失败以及 request preparation 错误退出共用已有释放事务。copy 失败仍尝试 cleanup，copy/release 双失败保留原主次；copy 成功但 release 失败仍返回错误，不能返回 `Ok(bytes)` 掩盖失败。消费式返回形状保持，不添加“失败块仍可发布”的逃逸入口。
 
+明确的最后出口使用消费式 `ReassemblyBacking::abandon(self)`，消耗原 state 后交给 reservation 放弃退款及计数；各 crate 内的 SHM carrier/lease 用私有 abandon 入口结束同一义务。消费出口已取得本次真实 release Err 时直接走 abandon，不让嵌套 Drop 再做一次自旋。直接丢弃活 owner 时，由最低层 Drop 尝试一次，失败后走同一 abandon。
+
 最低层接收载体以现有 move-only owner 和一个明确的未完成义务保存状态；成功后解除，失败后保持。原 release、try_release、Drop 共用同一清理动作，外层 lease 不再额外兜一轮造成重复归还/计数。重组沿用原 state Option。没有存活持有者的最后一步失败就放弃，不等待未来业务调用、GC、timer 或后台 worker 来恢复。
 
 无 waiter 的 `PendingResponse` 区分两种结果：本地 pool/permit 锁暂忙的 `Ok(false)` 保留原暂存/维护语义；实际释放 `Err` 必须退出该 pending 的恢复循环，不能继续每 5 ms 消耗共享锁的完整自旋预算。无人领取的 response 由原 carrier 明确放弃、计数并清空；request 只撤去 pending 的引用，存活 caller 仍持原释放事务，最后一个 `RequestReleaseState` 才进行最终结算。保留原信号、锁序及迟到回复的唯一责任，不加重试队列。
@@ -89,10 +91,12 @@ Prepared 在 fill 之前绑定并持有原 response pool 的原锁与 handle。�
 | --- | --- |
 | Rust statistics | `BudgetSnapshot`、`MemoryScopeStats` 新增 `abandoned_releases: u64`；使用 struct literal 的低层调用者需要更新，不留旧形状兼容。既有 memory stats 观察入口不变。 |
 | Rust Core/Held | Core HeldResponse 新增 `has_pending_release()`，SDK Held 的 release 签名不变；显式失败保留、再次原生清理替代原先失败后空成功。 |
-| Rust memory/local | `BudgetReservation::abandon(self)` 和 MemoryBudget 的窄计数入口；LocalWriteHalf 增加共用 writer 的进度入口。无 typed allocator 错误改造，无裸 owner 全面重构。 |
+| Rust memory/local | `BudgetReservation::abandon(self)`、`ReassemblyBacking::abandon(self)` 和 MemoryBudget 的窄计数入口；LocalWriteHalf 增加共用 writer 的进度入口。无 typed allocator 错误改造，无裸 owner 全面重构。 |
 | Python | `MemoryScopeStats` TypedDict 及各 scope 返回值增加一个字段；正式 Held 的失败后释放可以再次尝试，用户回调不重放。公开 HeldResult 构造、hold/release、memory_stats 入口签名不变；native 私有投影同步状态。 |
 | ABI / 协议 | C/FFI ABI 6、IPC 14、SHM 3、业务帧、CRM hash、owner-control 与凭据格式全部不变，不加能力位、开关、旧格式兼容。 |
 | 生命周期 | Host、Runtime、listener、relay 关闭事务不改；pin/tracking 在成功原生释放或最终放弃时结束，不把逻辑失效等同物理释放。 |
+
+SHM carrier 的可更新 release/try_release、唯一放弃入口、RequestLease 保留 FreeResult 的内部辅助方法均留在所属 crate 内；只把跨 crate 的 ReassemblyBacking 消费式 abandon 列为新增 Rust 面。它不返还 handle 或 payload，也不构成失败块重新发布入口。
 
 ## 8. 替换范围、规模与成本
 
