@@ -61,6 +61,14 @@ impl<T> Held<T> {
     }
 }
 
+/// Report failed cleanup while the caller preserves its primary decode error.
+/// A pending response remains owned by `held` for its final Drop attempt.
+pub fn release_held_after_error<T>(held: &mut Held<T>) {
+    if let Err(cleanup_error) = held.release() {
+        eprintln!("Warning: held payload decode cleanup failed: {cleanup_error}");
+    }
+}
+
 impl<T> fmt::Debug for Held<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

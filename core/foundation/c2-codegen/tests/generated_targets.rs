@@ -200,6 +200,28 @@ fn generated_rust_project_compiles_against_public_c_two_and_fastdb_apis() {
     .publish_new_tree(&generated)
     .unwrap();
 
+    // Inject a wrong expected digest only at the post-open held guard. The
+    // payload still opens through real FastDB, so this exercises generated
+    // cleanup after validation rather than the earlier open-failure path.
+    let module = generated.join("rust/c_two_contract.rs");
+    let source = std::fs::read_to_string(&module).unwrap();
+    assert_eq!(source.matches("payload.require_spec_sha256(").count(), 1);
+    let source = source
+        .lines()
+        .map(|line| {
+            if line
+                .trim_start()
+                .starts_with("payload.require_spec_sha256(")
+            {
+                "        payload.require_spec_sha256(&[0; 32])"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&module, source).unwrap();
+
     let manifest = format!(
         r#"[package]
 name = "c-two-generated-contract-check"
@@ -210,8 +232,15 @@ publish = false
 [dependencies]
 c-two = {{ version = "0.1.0", path = {c_two:?} }}
 fastdb = "=0.2.3"
+c2-ipc = {{ path = {ipc:?} }}
+c2-mem = {{ path = {mem:?} }}
+c2-wire = {{ path = {wire:?} }}
+parking_lot = "0.12"
 "#,
         c_two = repository.join("sdk/rust"),
+        ipc = repository.join("core/transport/c2-ipc"),
+        mem = repository.join("core/foundation/c2-mem"),
+        wire = repository.join("core/protocol/c2-wire"),
     );
     std::fs::write(tempdir.path().join("Cargo.toml"), manifest).unwrap();
     // Reuse the graph available to the enclosing Core test invocation, rather
@@ -227,9 +256,54 @@ fastdb = "=0.2.3"
         "#[path = \"../generated/rust/c_two_contract.rs\"]\npub mod contract;\n",
     )
     .unwrap();
+    std::fs::write(
+        tempdir.path().join("src/main.rs"),
+        r##"use std::sync::Arc;
+use c_two_generated_contract_check::contract;
+use c_two::generated::{AdapterFailurePhase, HeldResponse, fastdb_adapter_error};
+use c2_ipc::{ResponseData, ResponseLease};
+use c2_mem::{MemPool, PoolConfig};
+use c2_wire::chunk::ReassemblyBacking;
+use fastdb::{BuildPolicy, Builder, CompiledSpec};
+use parking_lot::RwLock;
+
+fn main() {
+    let spec = CompiledSpec::compile(br#"{
+        "schema":"fastdb.payload.v1", "profile":"record.v1",
+        "entries":[{"id":"value","cardinality":"one","type":{"kind":"str","nullable":true}}],
+        "components":[]
+    }"#).unwrap();
+    let mut builder = Builder::create(&spec).unwrap();
+    builder.entry_begin(0, 1).unwrap().value_str("held").unwrap();
+    let payload = builder.freeze().unwrap().execute(BuildPolicy::AllowStaging).unwrap().payload;
+    let expected = fastdb_adapter_error(
+        AdapterFailurePhase::ClientOutputDeserializing,
+        payload.require_spec_sha256(&[0; 32]).unwrap_err(),
+    );
+    let bytes = payload.binary_bytes().unwrap();
+    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default())));
+    let budget = pool.read().budget().unwrap().clone();
+    let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len()).unwrap();
+    backing.write_at(0, &bytes).unwrap();
+    let response = HeldResponse::from_response_lease(ResponseLease::new(ResponseData::Handle(backing))).unwrap();
+    let original = std::mem::replace(&mut *pool.write(), MemPool::new(PoolConfig::default()));
+    let error = contract::decode_method_1_echo_output_held(response).unwrap_err();
+    match error {
+        c_two::Error::Semantic(error) => assert_eq!(error, expected),
+        error => panic!("primary semantic error was replaced: {error}"),
+    }
+    assert_eq!(budget.snapshot().abandoned_releases, 1);
+    assert_eq!(budget.snapshot().reassembly.used_bytes, bytes.len() as u64);
+    *pool.write() = original;
+    assert_eq!(pool.read().stats().alloc_count, 1);
+    pool.write().destroy();
+}
+"##,
+    )
+    .unwrap();
 
     let output = Command::new(env!("CARGO"))
-        .args(["check", "--quiet", "--offline"])
+        .args(["run", "--quiet", "--offline"])
         .current_dir(tempdir.path())
         .env(
             "CARGO_TARGET_DIR",
@@ -244,6 +318,26 @@ fastdb = "=0.2.3"
         "generated Rust project failed to compile:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.lines().any(|line| {
+            line.starts_with("Warning: held payload decode cleanup failed:")
+                && line.contains("pool owner incarnation mismatch")
+        }),
+        "generated held cleanup discarded its failure reason:\n{stderr}",
+    );
+    assert_eq!(
+        stderr
+            .matches("held payload decode cleanup failed:")
+            .count(),
+        1
+    );
+    assert_eq!(
+        stderr
+            .matches("final Rust held value release failed:")
+            .count(),
+        1
     );
 }
 
@@ -315,6 +409,105 @@ fn generated_typescript_project_typechecks_against_fastdb_source() {
 }
 
 #[test]
+fn generated_python_reports_cleanup_failures_without_replacing_primary() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let generated = tempdir.path().join("generated");
+    compile_contract_artifacts(
+        DESCRIPTOR.as_bytes(),
+        ContractCodegenTarget::Python,
+        &Default::default(),
+    )
+    .unwrap()
+    .publish_new_tree(&generated)
+    .unwrap();
+    let script = r#"import contextlib
+import importlib.util
+import io
+import sys
+import types
+
+primary = ValueError("primary decode failed")
+cleanup = RuntimeError("payload cleanup failed")
+events = []
+class CompiledSpec:
+    @staticmethod
+    def compile(*args, **kwargs):
+        return CompiledSpec()
+class Payload:
+    @staticmethod
+    def open_copy(*args, **kwargs):
+        return Payload()
+    def require_spec_sha256(self, expected):
+        raise primary
+    def close(self):
+        events.append("payload:close")
+        raise cleanup
+
+package = types.ModuleType("fastdb4py")
+package.__path__ = []
+payload = types.ModuleType("fastdb4py.payload")
+for name, value in {"Payload": Payload, "CompiledSpec": CompiledSpec,
+                    "Builder": type("Builder", (), {}), "View": type("View", (), {}),
+                    "GraphIdentity": type("GraphIdentity", (), {}),
+                    "ObjectHandle": type("ObjectHandle", (), {}), "PayloadError": Exception}.items():
+    setattr(payload, name, value)
+sys.modules[package.__name__] = package
+sys.modules[payload.__name__] = payload
+spec = importlib.util.spec_from_file_location("contract", sys.argv[1])
+contract = importlib.util.module_from_spec(spec)
+sys.modules["contract"] = contract
+spec.loader.exec_module(contract)
+
+class Response:
+    def __init__(self, fail_copy):
+        self.fail_copy = fail_copy
+    def __bytes__(self):
+        if self.fail_copy:
+            raise primary
+        return b"response"
+    def release(self):
+        events.append("response:release")
+        raise cleanup
+
+for fail_copy in (True, False):
+    events.clear()
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        try:
+            contract._copy_and_release_response(Response(fail_copy))
+        except BaseException as error:
+            assert error is (primary if fail_copy else cleanup), error
+        else:
+            raise AssertionError("missing response failure")
+    assert events == ["response:release"], events
+    warning = stderr.getvalue()
+    assert (warning.count("Warning:") == 1 and "payload cleanup failed" in warning) if fail_copy else not warning, warning
+
+events.clear()
+stderr = io.StringIO()
+with contextlib.redirect_stderr(stderr):
+    try:
+        contract.decode_method_1_echo_output(b"response")
+    except BaseException as error:
+        assert error is primary, error
+    else:
+        raise AssertionError("missing digest failure")
+assert events == ["payload:close"], events
+assert stderr.getvalue().count("Warning:") == 1 and "payload cleanup failed" in stderr.getvalue(), stderr.getvalue()
+"#;
+    let output = Command::new(if cfg!(windows) { "python" } else { "python3" })
+        .args(["-c", script])
+        .arg(generated.join("python/c_two_contract.py"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated Python discarded a cleanup failure or replaced its primary error:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn generated_typescript_payload_lifecycle_is_failure_safe() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -354,6 +547,7 @@ fn generated_typescript_payload_lifecycle_is_failure_safe() {
         r#"export const events: string[];
 export function setFailInvalidate(value: boolean): void;
 export function setFailResponseRequire(value: boolean): void;
+export function setFailDispose(value: boolean): void;
 export class PayloadError extends Error {
   readonly code: number;
   readonly symbol: string;
@@ -391,11 +585,15 @@ export class Payload {
         r#"export const events = [];
 let failInvalidate = false;
 let failResponseRequire = false;
+let failDispose = false;
 export function setFailInvalidate(value) {
   failInvalidate = value;
 }
 export function setFailResponseRequire(value) {
   failResponseRequire = value;
+}
+export function setFailDispose(value) {
+  failDispose = value;
 }
 export class PayloadError extends Error {
   constructor(code, symbol, path, message, detailsJson) {
@@ -452,6 +650,9 @@ export class Payload {
   }
   dispose() {
     events.push(`${this.label}:dispose`);
+    if (failDispose) {
+      throw new Error("response dispose failed");
+    }
   }
 }
 "#,
@@ -466,9 +667,13 @@ import {
   events,
   setFailInvalidate,
   setFailResponseRequire,
+  setFailDispose,
 } from "fastdb4ts/payload";
 
+const warnings: string[] = [];
+console.warn = (...args: unknown[]): void => { warnings.push(args.map(String).join(" ")); };
 let responseReleaseThrows = false;
+const transportReleaseError = new Error("transport release failed");
 const transport: C2EncodedClientTransport = {
   async call(_routeName, _contract, _method, _payload) {
     events.push("transport:call");
@@ -476,7 +681,7 @@ const transport: C2EncodedClientTransport = {
     response.release = (): void => {
       events.push("transport:release");
       if (responseReleaseThrows) {
-        throw new Error("transport release failed");
+        throw transportReleaseError;
       }
     };
     return response;
@@ -577,6 +782,77 @@ requireEvents([
   "response:invalidate",
   "response:dispose",
 ]);
+
+for (const hold of [false, true]) {
+  events.length = 0;
+  warnings.length = 0;
+  setFailResponseRequire(true);
+  setFailDispose(true);
+  responseReleaseThrows = true;
+  let primary: unknown;
+  try {
+    if (hold) {
+      await client.hold_method_1_echo(new Payload());
+    } else {
+      await client.method_1_echo(new Payload());
+    }
+  } catch (error) {
+    primary = error;
+  }
+  setFailResponseRequire(false);
+  setFailDispose(false);
+  responseReleaseThrows = false;
+  if (!String(primary).includes("response digest guard failed")) {
+    throw new Error(`lost primary digest error: ${String(primary)}`);
+  }
+  if (warnings.length !== 2 ||
+      !warnings[0]?.includes("Warning:") || !warnings[0]?.includes("response dispose failed") ||
+      !warnings[1]?.includes("Warning:") || !warnings[1]?.includes("transport release failed")) {
+    throw new Error(`discarded decode cleanup failures: ${JSON.stringify(warnings)}`);
+  }
+  requireEvents([
+    "request:require", "request:binary", "transport:call", "response:openCopy",
+    "response:require", "response:dispose", "transport:release",
+  ]);
+}
+
+warnings.length = 0;
+responseReleaseThrows = true;
+setFailInvalidate(true);
+let primary: unknown;
+try {
+  await client.method_1_echo(new Payload());
+} catch (error) {
+  primary = error;
+}
+responseReleaseThrows = false;
+setFailInvalidate(false);
+if (primary !== transportReleaseError || warnings.length !== 1 ||
+    !warnings[0]?.includes("Warning:") || !warnings[0]?.includes("response invalidate failed")) {
+  throw new Error(`discarded value cleanup error or replaced primary: ${JSON.stringify(warnings)}`);
+}
+
+const multiplyFailingHeld = await client.hold_method_1_echo(new Payload());
+events.length = 0;
+warnings.length = 0;
+responseReleaseThrows = true;
+setFailInvalidate(true);
+setFailDispose(true);
+let firstReleaseError: unknown;
+try {
+  multiplyFailingHeld.release();
+} catch (error) {
+  firstReleaseError = error;
+}
+multiplyFailingHeld.release();
+responseReleaseThrows = false;
+setFailInvalidate(false);
+setFailDispose(false);
+if (!String(firstReleaseError).includes("response invalidate failed") || warnings.length !== 2 ||
+    !warnings[0]?.includes("response dispose failed") || !warnings[1]?.includes("transport release failed")) {
+  throw new Error(`lost secondary held cleanup errors: ${JSON.stringify(warnings)}`);
+}
+requireEvents(["response:invalidate", "response:dispose", "transport:release"]);
 "#,
     )
     .unwrap();

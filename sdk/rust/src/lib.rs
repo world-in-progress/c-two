@@ -50,6 +50,7 @@ pub mod generated {
     pub use c2_error::{C2Error, ErrorCode};
 
     pub use crate::error::{adapter_error, fastdb_adapter_error, fastdb_cause_details};
+    pub use crate::held::release_held_after_error;
     pub use crate::payload::{
         BorrowedPayload, charge_payload_input, open_borrowed, open_held, open_owned,
     };

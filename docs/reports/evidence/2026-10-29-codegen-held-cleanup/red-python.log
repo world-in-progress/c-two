@@ -1,0 +1,27 @@
+$ cargo test --manifest-path core/Cargo.toml --offline --quiet --no-run --test generated_targets
+
+exit_code=0
+$ $WORK/target/debug/deps/generated_targets-0f5d395a0f9255e6 --format=terse --nocapture generated_python_reports_cleanup_failures_without_replacing_primary --exact
+
+running 1 test
+
+thread 'generated_python_reports_cleanup_failures_without_replacing_primary' (19288051) panicked at foundation/c2-codegen/tests/generated_targets.rs:485:5:
+generated Python discarded a cleanup failure or replaced its primary error:
+Traceback (most recent call last):
+  File "<string>", line 62, in <module>
+    assert (warning.count("Warning:") == 1 and "payload cleanup failed" in warning) if fail_copy else not warning, warning
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+generated_python_reports_cleanup_failures_without_replacing_primary --- FAILED
+
+failures:
+
+failures:
+    generated_python_reports_cleanup_failures_without_replacing_primary
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.08s
+
+
+exit_code=101

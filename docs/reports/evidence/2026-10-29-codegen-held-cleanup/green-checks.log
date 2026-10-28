@@ -1,0 +1,10 @@
+$ rustfmt --check --edition 2024 core/foundation/c2-codegen/src/tests.rs core/foundation/c2-codegen/src/targets.rs core/foundation/c2-codegen/tests/generated_targets.rs core/foundation/c2-codegen/tests/typescript_transport_contract.rs sdk/rust/src/lib.rs sdk/rust/src/held.rs sdk/rust/tests/payload_lifetime.rs
+
+exit_code=0
+$ git diff --check
+
+exit_code=0
+$ rg "$LOCAL_PATH_PATTERN" docs/reports/evidence/2026-10-29-codegen-held-cleanup
+
+exit_code=1
+privacy_scan_matches=0

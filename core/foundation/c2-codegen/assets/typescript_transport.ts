@@ -453,8 +453,9 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
     connectionPromise = undefined;
     try {
       await open.connection.close();
-    } catch {
+    } catch (cleanupError) {
       // Preserve the primary stream failure, including uncertain writes.
+      console.warn("Warning: IPC connection cleanup failed:", cleanupError);
     }
   };
 
@@ -1991,7 +1992,8 @@ function encodeIpcBuddyPayload(block: C2IpcRequestShmBlock): Uint8Array {
 async function closeIpcConnectionAfterWriteFailure(connection: C2IpcConnection): Promise<void> {
   try {
     await connection.close();
-  } catch {
+  } catch (cleanupError) {
+    console.warn("Warning: IPC write failure cleanup failed:", cleanupError);
   }
 }
 
@@ -2047,7 +2049,8 @@ async function releaseIpcRequestShmBlock(writer: C2IpcRequestShmWriter, block: C
 async function tryReleaseIpcRequestShmBlock(writer: C2IpcRequestShmWriter, block: C2IpcRequestShmBlock): Promise<void> {
   try {
     await releaseIpcRequestShmBlock(writer, block);
-  } catch {
+  } catch (cleanupError) {
+    console.warn("Warning: IPC request SHM cleanup failed:", cleanupError);
   }
 }
 
@@ -3051,7 +3054,8 @@ function releaseAllocatedResponsePayload(value: C2AllocatedResponsePayload<C2Res
 function tryReleaseAllocatedResponsePayload(value: C2AllocatedResponsePayload<C2ResponsePayload>): void {
   try {
     releaseAllocatedResponsePayload(value);
-  } catch {
+  } catch (cleanupError) {
+    console.warn("Warning: allocated response payload cleanup failed:", cleanupError);
   }
 }
 
@@ -3066,7 +3070,8 @@ function releaseInvalidAllocatedResponsePayload(value: Partial<C2AllocatedRespon
 function tryReleaseInvalidAllocatedResponsePayload(value: Partial<C2AllocatedResponsePayload<C2ResponsePayload>>): void {
   try {
     releaseInvalidAllocatedResponsePayload(value);
-  } catch {
+  } catch (cleanupError) {
+    console.warn("Warning: invalid allocated response payload cleanup failed:", cleanupError);
   }
 }
 
@@ -3124,6 +3129,8 @@ class DefaultC2HeldResult<T> implements C2HeldResult<T> {
       } catch (error) {
         if (releaseError === undefined) {
           releaseError = error;
+        } else {
+          console.warn("Warning: held response cleanup failed:", error);
         }
       }
     }
@@ -3136,7 +3143,8 @@ class DefaultC2HeldResult<T> implements C2HeldResult<T> {
 function tryReleaseResponsePayload(value: C2ResponsePayload | undefined): void {
   try {
     releaseHeldValue(value);
-  } catch {
+  } catch (cleanupError) {
+    console.warn("Warning: response payload cleanup failed:", cleanupError);
   }
 }
 
@@ -3164,6 +3172,8 @@ function releaseHeldValue(value: unknown): void {
   } catch (error) {
     if (releaseError === undefined) {
       releaseError = error;
+    } else {
+      console.warn("Warning: held value cleanup failed:", error);
     }
   }
   if (releaseError !== undefined) {
@@ -3401,7 +3411,8 @@ async function callPreparedLocalIpcAndClose<Payload extends C2ResponsePayload>(
   } catch (error) {
     try {
       await transport.close();
-    } catch {
+    } catch (cleanupError) {
+      console.warn("Warning: local IPC transport cleanup failed:", cleanupError);
     }
     throw error;
   }
