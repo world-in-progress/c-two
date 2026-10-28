@@ -39,7 +39,25 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 
 2026-10-28：R07 收尾已按[收窄方案](2026-10-28-r07-complete-release-followup.md)验收关闭，实现/测试来源 `000985b6`，见[验收记录](../reports/2026-10-28-r07-failed-release-acceptance.md)。显式失败保留原义务、失效只执行一次；消费式出口与最终载体 Drop 保守放弃，不退预算，计入新的 `abandoned_releases`；Prepared 整帧写完即移交释放权；对端请求与 chunk 注册表不再吞错或无限重试。验收中纳入两处方案修订（方案第 10 节）及用户要求的发版前事项。生产净 +499、测试净 +1409、测试依赖 +9、文档 +17、证据 +1090 行，作为正确性修复不计瘦身收益。本机完整检查、7 处定向变异、独立审查及确切候选 [Actions 40711889990](https://github.com/Dsssyc/c-two/actions/runs/40711889990) 第 2 次尝试 10/10、147/147 适用门禁通过；第 1 次的 Windows 2022 失败于测试夹具编译第三方 crate，单独重跑通过。未发版。
 
-发版前待办（用户要求下次发版前完成）：c2-codegen 生成的客户端在 spec 哈希不匹配时丢弃 held 释放错误的原因；c2-ipc 夹具在默认命名空间用 Drop 关闭监听、协调锁被占时留下 socket 与 lease，改为显式 close；定位 c2-local `final_lease_stat_io_releases_close_and_drop_leases` 的低频偶发失败；SDK 边界测试按文本禁止 PyO3 crate 的开发依赖，导致原生层释放失败跟踪的真实分配测试被移除，待定是否收窄到正式依赖并恢复该用例；清除 main 上历史文档中的本机主目录路径。
+2026-10-29：发版前待办已完成，均并入 `socu/r15-expiry-gc`。
+
+- c2-local `final_lease_stat_io_releases_close_and_drop_leases` 的低频失败根因在测试：探测 lease 的普通 `File` 被并行测试 fork 出的子进程继承，测试只关掉自己那份描述符，flock 留在子进程里，reap 因此报 `Busy`。改用产品现有 `Lease` 显式解锁，并补一条留住复制描述符的确定性回归；默认命名空间里靠 Drop 关闭监听的测试夹具改为临时 root 加显式 `close()` 并断言结果。产品 Drop 不阻塞的设计不变，同地址重绑与预算内 sweep 都会经身份校验回收这类过期条目。实现 `f04cf89e`，仅测试与证据。
+- 生成的 Rust、Python 与 TypeScript 客户端及 TypeScript 传输资产不再静默丢弃解码或 spec 哈希失败后的清理错误：主错误照常返回，清理失败输出警告。Rust 生成代码共用隐藏接缝 `c_two::generated::release_held_after_error`。实现 `d7a74d9a`。
+- SDK 边界测试只检查进入发布扩展的依赖表（含目标专属表与改名依赖），开发依赖不受限；PyO3 层"释放失败时保留 tracking、重试成功或最终放弃后才归还"的真实分配测试恢复。实现 `4b56f16b`，仅测试与开发依赖。
+- 公开文档中的本机主目录与工作目录路径改为占位符（`ae7dde22`）；四个被其他 0.7.4 证据按 SHA-256 钉住的验证文件不再随仓库保留，引用改为指向提交 `8936c5c9` 中未改动的原文件（`ca2da90f`）。
+
+每项均经 Host 读差异、定向变异与受影响测试验收；并入后的 [Actions 40736828028](https://github.com/Dsssyc/c-two/actions/runs/40736828028) 首次运行 10/10 jobs 通过（候选 `4b56f16b`）。
+
+默认 v3 命名空间里此前留下 19 对过期的测试 socket 与 lease（1 对来自 R07 首轮 Core 全量，18 对来自修复前的负载诊断）。经用户同意，用本分支临时构建的 `c3 endpoint sweep`，按这 19 个测试地址逐一限定范围执行：19 个均经身份校验回收，没有 busy、unverified 或 I/O 错误，只剩命名空间自身的 gate 与 marker。
+
+仅记录、不处理：同时编译 workspace 并以 32 线程运行 c2-local 时，`managed_parallel_first_initialization_shares_one_gate_inode` 曾因协调锁有界等待耗尽返回 `WouldBlock`。正常完整运行未复现；有界等待属于设计，用户判断问题不大。
+
+上游 Dependabot：[PR #200](https://github.com/world-in-progress/c-two/pull/200)（`/core` 的 rust-minor-and-patch 分组 4 项升级，只改 `core/Cargo.lock`，上游 CI 10 项全过）已按以往分组升级的方式以合并提交 `cff5b491` 并入上游 main；集成分支没有改动 `core/Cargo.lock`，之后合并 main 不会冲突。[PR #201](https://github.com/world-in-progress/c-two/pull/201)（`parking_lot` 0.12.5 → 0.13.0）不能原样合并：它只升级了 `/core`，`cli`、`sdk/rust` 与 `sdk/python/native` 仍用 0.12，依赖图里两个版本的 `Mutex` 类型不兼容而编译失败，那两个工作区的 lockfile 也没有更新，带 `--locked` 的构建因此拒绝；上游六条源码线全部失败。
+
+发版前待办（新增）：
+
+- 四个工作区一起升级到 `parking_lot` 0.13 并更新各自的 lockfile，在集成分支完成并验收后，#201 由主线的同一升级取代。等 hey-my-buddy 中版本更新完成后再派微任务，更新期间不运行微任务。
+- CI 太慢：六条源码线一次完整验证约一小时，Windows 2022 偶有夹具编译失败需要重跑。等 hey-my-buddy 更新完成后再评估提速的办法。
 
 ### 继续暂缓、不单独开批的项目
 
