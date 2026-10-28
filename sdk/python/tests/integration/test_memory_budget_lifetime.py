@@ -376,11 +376,13 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         assert route in _get_default_runtime().names
         assert hooks == []
         assert not proceed.is_set()
-        proceed.set()
+        # The caller's wait expiry does not expire Core's cleanup budget. Keep
+        # the callback blocked until the actual client close wakes this call.
         call_thread.join(timeout=10)
         assert not call_thread.is_alive()
         assert isinstance(call_outcome.get('error'), ClientCallResource), call_outcome
         assert 'held' not in call_outcome
+        proceed.set()
         completed = cc.shutdown(timeout=10)
         assert completed['completed'] is True, completed
         assert hooks == ['stopped']

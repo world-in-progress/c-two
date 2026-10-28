@@ -420,8 +420,11 @@ def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: b
         if owner_bound:
             assert not serve_done.is_set(), 'serve exited while callback was draining'
         assert session.native_terminal_outcome() is None
-        with pytest.raises(RuntimeError, match='still draining'):
+        with pytest.raises(cc.error.CoreError) as retired:
             session.ensure_host_started()
+        assert retired.value.category == 'lifecycle'
+        assert retired.value.lifecycle_kind == 'runtime_retired'
+        assert retired.value.io_operation is None
         assert session.native_terminal_outcome() is None
         assert read_value(resource.borrowed) == 7
         assert read_value(retained) == 7
