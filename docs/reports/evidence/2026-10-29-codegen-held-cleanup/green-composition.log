@@ -1,0 +1,11 @@
+$ cargo test --manifest-path core/Cargo.toml --offline --quiet --no-run --test composition
+
+exit_code=0
+$ $WORK/target/debug/deps/composition-9929da06caf47784 --format=terse --nocapture
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+exit_code=0

@@ -103,7 +103,7 @@ def test_infer_crm_rejects_ambiguous_resource_signatures():
 
 
 def test_grid_resource_infer_smoke_uses_python_fallback_shapes(monkeypatch):
-    pytest.importorskip('pyarrow', reason='grid examples require pyarrow file support')
+    pytest.importorskip('pandas', reason='grid examples require examples dependencies')
     root = Path(__file__).resolve().parents[4]
     monkeypatch.syspath_prepend(str(root / 'examples/python'))
     for module_name in (

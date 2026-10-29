@@ -36,23 +36,6 @@ impl NamespaceDirectories {
         #[cfg(not(target_os = "macos"))]
         let split = false;
         let records = if split {
-            if let Some(sockets) = &sockets {
-                // A cold switch must archive the old namespace first. Never
-                // adopt old coordination records or silently start a second gate.
-                if sockets
-                    .stat(&gate_name())
-                    .map_err(NamespaceError::Io)?
-                    .is_some()
-                    || sockets
-                        .stat(&marker_name())
-                        .map_err(NamespaceError::Io)?
-                        .is_some()
-                {
-                    return Err(NamespaceError::Unverified(
-                        EndpointUnverifiedReason::InitializationIncomplete,
-                    ));
-                }
-            }
             #[cfg(target_os = "macos")]
             let records_root = coordination_root().map_err(NamespaceError::Io)?;
             #[cfg(not(target_os = "macos"))]
@@ -117,20 +100,6 @@ impl NamespaceDirectories {
         self.sockets
             .as_ref()
             .map_or(Ok(None), |directory| directory.stat(name))
-    }
-
-    pub(super) fn verify_slot(&self, lease: &CString) -> Result<(), NamespaceError> {
-        if self.split()
-            && self
-                .socket_stat(lease)
-                .map_err(NamespaceError::Io)?
-                .is_some()
-        {
-            return Err(NamespaceError::Unverified(
-                EndpointUnverifiedReason::InitializationIncomplete,
-            ));
-        }
-        Ok(())
     }
 
     pub(super) fn socket_directory(&self) -> io::Result<&EndpointDirectory> {
@@ -229,7 +198,10 @@ fn coordination_root() -> io::Result<PathBuf> {
     }
     let path = CStr::from_bytes_with_nul(&path[..actual])
         .map_err(|_| io::Error::other("invalid Darwin user directory"))?;
-    Ok(Path::new(OsStr::from_bytes(path.to_bytes())).join("c2-ipc-coordination"))
+    Ok(Path::new(OsStr::from_bytes(path.to_bytes())).join(format!(
+        "c2-ipc-coordination-v{}",
+        c2_config::UNIX_NAMESPACE_FORMAT_VERSION
+    )))
 }
 
 #[cfg(test)]

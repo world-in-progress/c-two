@@ -1,4 +1,6 @@
 # tests/unit/test_held_result.py
+import sys
+import traceback
 import warnings
 import pytest
 
@@ -38,6 +40,31 @@ class TestHeldResultBasic:
         with pytest.raises(Exception):
             _ = held.value
 
+    def test_context_manager_preserves_body_and_release_errors(self):
+        from c_two.crm.transferable import HeldResult
+
+        body_error = ValueError('body failed')
+        prior = KeyError('body context')
+        explicit_cause = LookupError('body cause')
+
+        def release():
+            raise RuntimeError('cleanup failed')
+
+        with pytest.raises(ValueError, match='body failed') as raised:
+            with HeldResult('value', release_cb=release):
+                try:
+                    raise prior
+                except KeyError:
+                    raise body_error from explicit_cause
+
+        assert raised.value is body_error
+        assert body_error.__cause__ is explicit_cause
+        assert isinstance(body_error.__context__, RuntimeError)
+        assert str(body_error.__context__) == 'cleanup failed'
+        assert body_error.__context__.__context__ is prior
+        if sys.version_info >= (3, 11):
+            assert 'cleanup failed' in ''.join(traceback.format_exception(body_error))
+
     def test_none_release_cb(self):
         from c_two.crm.transferable import HeldResult
         hr = HeldResult('no-shm', release_cb=None)
@@ -63,6 +90,60 @@ class TestHeldResultBasic:
             warnings.simplefilter('always')
             hr.__del__()
             assert len(w) == 0
+
+    def test_del_reports_pending_native_cleanup_after_release_failure(self):
+        from c_two.crm.transferable import HeldResult
+
+        class Response:
+            is_released = True
+            has_pending_release = True
+            abandoned = 0
+
+            def release(self):
+                raise RuntimeError('native cleanup failed')
+
+            def _abandon_after_failed_release(self):
+                self.abandoned += 1
+                self.has_pending_release = False
+
+        response = Response()
+        held = HeldResult('value')
+        held._native_response = response
+        held._released = True
+        held._release_attempted = True
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            held.__del__()
+
+        assert response.abandoned == 1
+        assert len(caught) == 2
+        assert 'pending native cleanup after release() failed' in str(caught[0].message)
+        assert 'final release failed: native cleanup failed' in str(caught[1].message)
+
+    def test_del_reports_prior_release_rejected_before_invalidation(self):
+        from c_two.crm.transferable import HeldResult
+
+        class Response:
+            is_released = False
+            has_pending_release = False
+
+            def release(self):
+                raise BufferError('another export is active')
+
+            def _abandon_after_failed_release(self):
+                pass
+
+        held = HeldResult('value')
+        held._native_response = Response()
+        with pytest.raises(BufferError, match='another export'):
+            held.release()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            held.__del__()
+
+        assert len(caught) == 2
+        assert 'release() did not complete' in str(caught[0].message)
+        assert 'without release()' not in str(caught[0].message)
 
     def test_release_cb_exception_is_propagated_after_owner_is_closed(self):
         from c_two.crm.transferable import HeldResult
@@ -126,6 +207,41 @@ class TestHeldResultBasic:
         assert events == ['invalidate', 'release']
         with pytest.raises(RuntimeError, match='no longer accessible'):
             _ = held.value
+
+    def test_manual_callback_errors_keep_primary_chain_and_run_once(self):
+        from c_two.crm.transferable import HeldResult
+
+        original = LookupError('original cause')
+        original_context = KeyError('original context')
+        calls = []
+
+        def invalidate(_value):
+            calls.append('invalidate')
+            try:
+                raise original_context
+            except KeyError:
+                raise ValueError('invalidator failed') from original
+
+        def release():
+            calls.append('release')
+            try:
+                raise OSError('cleanup context')
+            except OSError:
+                raise RuntimeError('cleanup failed')
+
+        held = HeldResult('value', release_cb=release, invalidate_cb=invalidate)
+        with pytest.raises(ValueError, match='invalidator failed') as raised:
+            held.release()
+        assert raised.value.__cause__ is original
+        assert isinstance(raised.value.__context__, RuntimeError)
+        assert str(raised.value.__context__) == 'cleanup failed'
+        assert isinstance(raised.value.__context__.__context__, OSError)
+        assert raised.value.__context__.__context__.__context__ is original_context
+        if sys.version_info >= (3, 11):
+            assert 'cleanup failed' in ''.join(traceback.format_exception(raised.value))
+            assert any('cleanup failed' in note for note in raised.value.__notes__)
+        held.release()
+        assert calls == ['invalidate', 'release']
 
 
 class TestHoldFunction:

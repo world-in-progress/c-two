@@ -1,6 +1,6 @@
-"""Process-level CRM registry — the SOTA ``cc.register / cc.connect`` API.
+"""Runtime-scoped CRM registration and the default ``cc.register / cc.connect`` API.
 
-Provides a singleton :class:`_ProcessRegistry` that manages:
+Each :class:`Runtime` owns the existing native session and Python bindings:
 
 1. **CRM registration** — registers CRM objects to a process-level
    :class:`Server`, making them accessible via IPC.
@@ -28,7 +28,7 @@ Usage::
     cc.unregister('grid')
 
 Module-level functions (:func:`register`, :func:`connect`, etc.) delegate
-to the global :class:`_ProcessRegistry` singleton.
+to one default :class:`Runtime`; explicit instances use the same implementation.
 """
 from __future__ import annotations
 
@@ -49,9 +49,10 @@ from c_two.crm.methods import rpc_method_names
 from c_two.crm.meta import _SHUTDOWN_ATTR, get_shutdown_method
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.lifecycle import LifecycleConfig
-from c_two.config.settings import settings
+from c_two.config.settings import C2Settings, _clean_optional_str, settings
 from c_two.error import (
     CCError,
+    CoreError,
     ResourceNotFound,
     ResourceUnavailable,
     RegistryUnavailable,
@@ -68,13 +69,14 @@ from .server.native import NativeServerBridge as Server
 if TYPE_CHECKING:
     from c_two._native import NativeOwnerBootstrap, OwnedChild
     from c_two.mem import MemoryStats
+    from .endpoint import EndpointCredential
 
 CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
 _UNSET = object()
 
 
-def _runtime_session_kwargs_from_settings() -> dict[str, int]:
+def _runtime_session_kwargs_from_settings(settings: C2Settings) -> dict[str, int]:
     kwargs: dict[str, int] = {}
     shm_overrides = settings._shm_overrides()  # noqa: SLF001
     if 'shm_threshold' in shm_overrides:
@@ -158,44 +160,31 @@ def _relay_cleanup_exception(error: dict[str, object]) -> RuntimeError:
     )
 
 
-class _ProcessRegistry:
-    """Process-level singleton managing CRM registration and discovery.
+class Runtime:
+    """Independent CRM bindings over one native runtime session.
 
-    Normally accessed via the module-level :func:`register` /
-    :func:`connect` / :func:`unregister` functions.
+    Configuration, routes and observations belong to this instance. A completed
+    ``shutdown`` preserves the existing session-replacement behavior, so this
+    object can be configured and used again. Endpoint directories remain owned
+    by their caller; Runtime never removes them.
     """
 
-    _instance: _ProcessRegistry | None = None
-    _instance_lock = threading.Lock()
-
-    @classmethod
-    def get(cls, *, connect_attempt=None) -> _ProcessRegistry:
-        """Return the global singleton, creating it on first access."""
-        if cls._instance is None:
-            with _connect_lock(cls._instance_lock, connect_attempt, 'registry_init_wait'):
-                if cls._instance is None:
-                    cls._instance = cls()
-        if connect_attempt is not None:
-            _connect_native_call(connect_attempt.check, 'registry_init')
-        return cls._instance
-
-    @classmethod
-    def reset(cls) -> None:
-        """Destroy the global singleton (for testing / process exit)."""
-        with cls._instance_lock:
-            inst = cls._instance
-        if inst is not None:
-            outcome = inst.shutdown()
-            if outcome['completed']:
-                with cls._instance_lock:
-                    if cls._instance is inst:
-                        cls._instance = None
-
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._initialize(C2Settings())
+
+    @classmethod
+    def _with_settings(cls, code_overrides: C2Settings) -> Runtime:
+        instance = cls.__new__(cls)
+        instance._initialize(code_overrides)
+        return instance
+
+    def _initialize(self, code_overrides: C2Settings) -> None:
         from c_two._native import RuntimeSession
+
+        self._lock = threading.Lock()
+        self._settings = code_overrides
         self._server: Server | None = None
-        self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings())
+        self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings(code_overrides))
 
     # ------------------------------------------------------------------
     # Public API
@@ -226,8 +215,10 @@ class _ProcessRegistry:
 
         Convenience wrapper — equivalent to setting ``C2_RELAY_ANCHOR_ADDRESS``.
         """
-        settings.relay_anchor_address = address
-        self._runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
+        requested = _clean_optional_str(address)
+        with self._lock:
+            self._runtime_session.set_relay_anchor_address(requested)
+            self._settings._relay_anchor_address = requested  # noqa: SLF001
 
     def set_transport_policy(
         self,
@@ -235,7 +226,7 @@ class _ProcessRegistry:
         shm_threshold: int | None | object = _UNSET,
         remote_payload_chunk_size: int | None | object = _UNSET,
     ) -> None:
-        """Set process transport policy. Must be called before use."""
+        """Set this Runtime's transport policy before use."""
         with self._lock:
             if self._server is not None or self._runtime_session.client_config_frozen:
                 import warnings
@@ -246,20 +237,26 @@ class _ProcessRegistry:
                     stacklevel=3,
                 )
                 return
-            previous_threshold = settings._shm_threshold  # noqa: SLF001
-            previous_chunk_size = settings._remote_payload_chunk_size_override()  # noqa: SLF001
-            try:
-                if shm_threshold is not _UNSET:
-                    settings.shm_threshold = shm_threshold  # type: ignore[assignment]
-                if remote_payload_chunk_size is not _UNSET:
-                    settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
-                old_session, _retired_observation = self._swap_runtime_session(
-                    preserve_server_identity=True,
-                )
-            except Exception:
-                settings.shm_threshold = previous_threshold
-                settings.remote_payload_chunk_size = previous_chunk_size
-                raise
+            runtime_session = self._runtime_session
+            retired = runtime_session.retired
+            if not retired:
+                previous_threshold = self._settings._shm_threshold  # noqa: SLF001
+                previous_chunk_size = self._settings._remote_payload_chunk_size_override()  # noqa: SLF001
+                try:
+                    if shm_threshold is not _UNSET:
+                        self._settings.shm_threshold = shm_threshold  # type: ignore[assignment]
+                    if remote_payload_chunk_size is not _UNSET:
+                        self._settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
+                    old_session, _retired_observation = self._swap_runtime_session(
+                        preserve_server_identity=True,
+                    )
+                except Exception:
+                    self._settings.shm_threshold = previous_threshold
+                    self._settings.remote_payload_chunk_size = previous_chunk_size
+                    raise
+
+        if retired:
+            return runtime_session.check_active()
 
         # Close the replaced session's client-only barrier outside the lock.
         # The retirement observation needs no fence: it observes through weak
@@ -288,7 +285,7 @@ class _ProcessRegistry:
         runtime_session = self._runtime_session
         retired_observation = runtime_session.retire_memory_observation()
         kwargs = {
-            **_runtime_session_kwargs_from_settings(),
+            **_runtime_session_kwargs_from_settings(self._settings),
             **runtime_session.call_execution_limits_overrides,
         }
         if preserve_server_identity:
@@ -306,8 +303,8 @@ class _ProcessRegistry:
         # Core inherits lazy sources or the accepted domain without local lookup.
         new_session.inherit_local_endpoint_selection(runtime_session)
         new_session.adopt_retired_memory_observation(retired_observation)
+        new_session.set_relay_anchor_address(self._settings._relay_anchor_address)  # noqa: SLF001
         if preserve_server_identity:
-            new_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
             runtime_session.transfer_unstarted_lifecycle_to(new_session)
         self._runtime_session = new_session
         self._server = None
@@ -323,10 +320,7 @@ class _ProcessRegistry:
         input ownership as part of this close.
         """
         try:
-            old_session.shutdown(
-                route_names=[],
-                relay_anchor_address=None,
-            )
+            old_session.begin_shutdown().observe()
         except Exception:
             log.warning(
                 'Error shutting down replaced RuntimeSession', exc_info=True,
@@ -413,6 +407,56 @@ class _ProcessRegistry:
                     stacklevel=3,
                 )
 
+    def _ensure_server_bridge(self) -> Server:
+        # Called under the existing instance lock, by register and empty start.
+        if self._server is None:
+            try:
+                self._server = self._runtime_session.ensure_server_bridge()
+            except Exception:
+                self._runtime_session.clear_server_identity()
+                raise
+        return self._server
+
+    @contextmanager
+    def _active_binding(self):
+        with self._lock:
+            session = self._runtime_session
+            if not session.retired:
+                yield
+                return
+        # Core retirement is irreversible. Project its original refusal only
+        # after unlocking, since an exception initializer may read this Runtime.
+        session.check_active()
+
+    def start(self) -> None:
+        """Start this instance's Host and await its native readiness/PONG."""
+        with self._active_binding():
+            self._sync_relay_override()
+            self._ensure_server_bridge().start()
+
+    def local_endpoint_context(self):
+        """Read this instance's native context without creating or freezing it."""
+        with self._lock:
+            return self._runtime_session.local_endpoint_context()
+
+    def connection_events(self):
+        """Subscribe to this session's native physical connection events."""
+        with self._lock:
+            return self._runtime_session.connection_events()
+
+    def prepare_owner_takeover(self, ticket):
+        """Prepare takeover in this instance's existing endpoint context."""
+        return self._runtime_session.prepare_owner_takeover(ticket)
+
+    def hold_stats(self) -> dict:
+        return dict(self._runtime_session.hold_stats())
+
+    def memory_stats(self) -> MemoryStats:
+        return dict(self._runtime_session.memory_stats())
+
+    def call_execution_snapshot(self) -> dict:
+        return dict(self._runtime_session.call_execution_snapshot())
+
     def register(
         self,
         crm_class: type,
@@ -487,7 +531,7 @@ class _ProcessRegistry:
             input_lifetime_map,
             bridge=method_bridge_map,
         )
-        with self._lock:
+        with self._active_binding():
             created_server = False
             try:
                 self._sync_relay_override()
@@ -496,12 +540,7 @@ class _ProcessRegistry:
                 # server config does not leave a visible server id/address.
                 server = self._server
                 if server is None:
-                    try:
-                        server = self._runtime_session.ensure_server_bridge()
-                    except Exception:
-                        self._runtime_session.clear_server_identity()
-                        raise
-                    self._server = server
+                    server = self._ensure_server_bridge()
                     created_server = True
 
                 server.register_crm(
@@ -547,12 +586,11 @@ class _ProcessRegistry:
         name: str,
         address: str | None = None,
         timeout: float | None = None,
-        _connect_attempt=None,
     ) -> CRM:
         """Obtain a CRM instance connected to a registered resource.
 
         **Thread preference**: when the target *name* is registered in
-        this process and no explicit *address* is given, returns a
+        this Runtime and no explicit *address* is given, returns a
         zero-serialization local proxy.
 
         Parameters
@@ -578,9 +616,11 @@ class _ProcessRegistry:
         """
         from c_two._native import ConnectAttempt
 
-        attempt = _connect_attempt
-        if attempt is None:
-            attempt = _connect_native_call(ConnectAttempt, timeout_seconds=timeout)
+        attempt = _connect_native_call(ConnectAttempt, timeout_seconds=timeout)
+        return self._connect(crm_class, name=name, address=address, attempt=attempt)
+
+    def _connect(self, crm_class: type[CRM], *, name: str, address: str | None, attempt) -> CRM:
+        # Module-level connect creates this same attempt before the default lock.
         _connect_native_call(attempt.check, 'python_contract')
         expected_contract = crm_contract(crm_class)
         with _connect_lock(self._lock, attempt, 'registry_snapshot_wait'):
@@ -592,6 +632,8 @@ class _ProcessRegistry:
                 else None
             )
             lease_tracker = runtime_session.lease_tracker()
+
+            remote = address is not None or local is None
 
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
@@ -652,7 +694,8 @@ class _ProcessRegistry:
             )
         else:
             try:
-                self._sync_relay_override(connect_attempt=attempt, runtime_session=runtime_session)
+                with _connect_lock(self._lock, attempt, 'registry_relay_wait'):
+                    self._sync_relay_override(connect_attempt=attempt, runtime_session=runtime_session)
                 client = runtime_session.connect_via_relay(
                     name,
                     *expected_contract.native_args(),
@@ -676,6 +719,8 @@ class _ProcessRegistry:
                         f'Name {name!r} is not registered locally '
                         f'and no address was provided',
                     ) from exc
+                if isinstance(exc, CoreError) and exc.lifecycle_kind == 'runtime_retired':
+                    raise
                 raise RegistryUnavailable(f"Relay unavailable: {exc}") from exc
             mode = getattr(client, 'mode', 'http')
             if mode == 'ipc':
@@ -699,19 +744,16 @@ class _ProcessRegistry:
             crm = crm_class()
             crm.client = proxy
             _connect_native_call(attempt.check, 'python_connect_finish')
+            if remote:
+                with _connect_lock(self._lock, attempt, 'python_connect_finish'):
+                    same_session = self._runtime_session is runtime_session
+                _connect_native_call(runtime_session.check_active, connect_attempt=attempt)
+                if not same_session:
+                    raise RuntimeError('Runtime session was replaced during connect')
             return crm
         except Exception:
             proxy.terminate()
             raise
-
-    def close(self, crm: object) -> None:
-        """Close a connection obtained from :func:`connect`.
-
-        Terminates the underlying proxy and releases pool references.
-        """
-        proxy = getattr(crm, 'client', None)
-        if proxy is not None and hasattr(proxy, 'terminate'):
-            proxy.terminate()
 
     def unregister(self, name: str) -> None:
         """Remove a CRM from the registry and server.
@@ -734,13 +776,17 @@ class _ProcessRegistry:
         if relay_error is not None:
             raise _relay_cleanup_exception(dict(relay_error))
 
-    def get_server_address(self) -> str | None:
+    def server_address(self) -> str | None:
         """IPC address of the auto-created server, or ``None``."""
         return self._runtime_session.server_address
 
-    def get_server_id(self) -> str | None:
+    def server_id(self) -> str | None:
         """Server identity of the auto-created server, or ``None``."""
         return self._runtime_session.server_id
+
+    def server_credential(self) -> EndpointCredential | None:
+        """Credential captured from the bound listener, if one is present."""
+        return self._runtime_session.server_credential
 
     @property
     def names(self) -> list[str]:
@@ -751,14 +797,14 @@ class _ProcessRegistry:
 
     def shutdown(self, *, timeout: float = 30.0) -> dict:
         """Consume native shutdown; retain the session until Core proves completion."""
+        from c_two._native import RuntimeSession
+
+        timeout = RuntimeSession.shutdown_timeout_seconds(timeout)
         with self._lock:
             server = self._server
             runtime_session = self._runtime_session
-        if server is not None:
-            outcome = server.shutdown(timeout=timeout)
-        else:
-            outcome = dict(runtime_session.shutdown(route_names=[],
-                relay_anchor_address=None, timeout_seconds=timeout))
+            observation = runtime_session.begin_shutdown(timeout_seconds=timeout)
+        outcome = dict(observation.observe())
         for key, description in (
                 ('ipc_client_close_error', 'IPC client cache'),
                 ('runtime_barrier_error', 'runtime barrier')):
@@ -766,12 +812,18 @@ class _ProcessRegistry:
                 log.warning('Shutdown could not confirm %s cleanup: %s', description, outcome[key])
         if not outcome['completed']:
             return outcome
+        slots = []
         with self._lock:
             if self._runtime_session is runtime_session:
                 self._swap_runtime_session(preserve_server_identity=False)
+                if server is not None:
+                    slots = server._take_shutdown_slots(outcome)
                 if self._serve_stop is not None:
                     self._serve_stop.set()
                     self._serve_stop = None
+
+        for slot in slots:
+            server._invoke_shutdown(slot)
 
         for relay_error in outcome.get('relay_errors') or []:
             error = dict(relay_error)
@@ -801,7 +853,7 @@ class _ProcessRegistry:
 
     _serve_stop: threading.Event | None = None
 
-    def serve(self, blocking: bool = True) -> None:
+    def _serve(self, blocking: bool = True) -> None:
         """Keep the process alive as a CRM resource server.
 
         Transitions the process from a computation script into a
@@ -926,35 +978,52 @@ class _ProcessRegistry:
         return self._server is not None and self._server.is_started()
 
     def native_lifecycle_snapshot(self) -> dict | None:
-        """Thin read-only Core host lifecycle observation, or ``None``."""
-        with self._lock:
-            server = self._server
-        if server is None:
-            return None
-        return server.native_lifecycle_snapshot()
+        """Read the current native Host lifecycle, if any."""
+        return self._runtime_session.native_lifecycle_snapshot()
 
     def native_terminal_outcome(self) -> dict | None:
-        """Terminal native shutdown outcome, or ``None`` while not terminal."""
-        with self._lock:
-            server = self._server
-        if server is None:
-            return None
-        return server.native_terminal_outcome()
+        """Read the current native Host terminal outcome, if any."""
+        return self._runtime_session.native_terminal_outcome()
 
     def _sync_relay_override(self, connect_attempt=None, *, runtime_session=None) -> None:
         session = self._runtime_session if runtime_session is None else runtime_session
         if connect_attempt is None:
-            session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
+            session.set_relay_anchor_address(self._settings._relay_anchor_address)  # noqa: SLF001
         else:
             session.set_relay_anchor_address(
-                settings._relay_anchor_address, connect_attempt=connect_attempt,  # noqa: SLF001
+                self._settings._relay_anchor_address, connect_attempt=connect_attempt,  # noqa: SLF001
             )
 
 
 
 # ------------------------------------------------------------------
-# Module-level API (delegates to singleton)
+# Module-level API (delegates to the default Runtime)
 # ------------------------------------------------------------------
+
+_default_runtime: Runtime | None = None
+_default_runtime_lock = threading.Lock()
+
+
+def _get_default_runtime(*, connect_attempt=None) -> Runtime:
+    global _default_runtime
+    if _default_runtime is None:
+        with _connect_lock(_default_runtime_lock, connect_attempt, 'registry_init_wait'):
+            if _default_runtime is None:
+                _default_runtime = Runtime._with_settings(settings)
+    if connect_attempt is not None:
+        _connect_native_call(connect_attempt.check, 'registry_init')
+    return _default_runtime
+
+
+def _reset_default_runtime() -> None:
+    global _default_runtime
+    with _default_runtime_lock:
+        instance = _default_runtime
+    if instance is not None and instance.shutdown()['completed']:
+        with _default_runtime_lock:
+            if _default_runtime is instance:
+                _default_runtime = None
+
 
 def set_local_endpoint(*, root: str | None = None) -> None:
     """Configure local IPC through Core. Call before the first local attempt.
@@ -965,7 +1034,7 @@ def set_local_endpoint(*, root: str | None = None) -> None:
     The Unix root container must already exist; Windows rejects root overrides.
     Completed shutdown preserves the native selection in the fresh session.
     """
-    _ProcessRegistry.get().set_local_endpoint(root=root)
+    _get_default_runtime().set_local_endpoint(root=root)
 
 
 def set_transport_policy(
@@ -974,7 +1043,7 @@ def set_transport_policy(
     remote_payload_chunk_size: int | None | object = _UNSET,
 ) -> None:
     """Set process transport policy. Call before register()/connect()."""
-    _ProcessRegistry.get().set_transport_policy(
+    _get_default_runtime().set_transport_policy(
         shm_threshold=shm_threshold,
         remote_payload_chunk_size=remote_payload_chunk_size,
     )
@@ -990,9 +1059,9 @@ def set_server(
 ) -> None:
     """Configure IPC server and its native lifecycle. Call before register().
 
-    See :meth:`_ProcessRegistry.set_server`.
+    See :meth:`Runtime.set_server`.
     """
-    _ProcessRegistry.get().set_server(
+    _get_default_runtime().set_server(
         server_id=server_id,
         ipc_overrides=ipc_overrides,
         lifecycle=lifecycle,
@@ -1019,7 +1088,7 @@ def prepare_owner_takeover(ticket):
     Save ``successor_ticket`` before committing when recovery after a lost
     acknowledgement is required. ``inspect`` observes state, not a receipt.
     """
-    return _ProcessRegistry.get()._runtime_session.prepare_owner_takeover(ticket)
+    return _get_default_runtime().prepare_owner_takeover(ticket)
 
 
 def adopt_owner_stdin():
@@ -1058,12 +1127,12 @@ def set_client(
     ipc_overrides: ClientIPCOverrides | Mapping[str, object] | None = None,
 ) -> None:
     """Configure IPC client. Call before connect()."""
-    _ProcessRegistry.get().set_client(ipc_overrides=ipc_overrides)
+    _get_default_runtime().set_client(ipc_overrides=ipc_overrides)
 
 
 def set_relay_anchor(address: str) -> None:
     """Set the relay anchor address for name resolution."""
-    _ProcessRegistry.get().set_relay_anchor(address)
+    _get_default_runtime().set_relay_anchor(address)
 
 
 def register(
@@ -1077,9 +1146,9 @@ def register(
 ) -> str:
     """Register a CRM in the current process.
 
-    See :meth:`_ProcessRegistry.register`.
+    See :meth:`Runtime.register`.
     """
-    return _ProcessRegistry.get().register(
+    return _get_default_runtime().register(
         crm_class,
         crm_instance,
         name=name,
@@ -1098,66 +1167,71 @@ def connect(
 ) -> CRM:
     """Obtain a CRM proxy for a registered resource.
 
-    See :meth:`_ProcessRegistry.connect`.
+    See :meth:`Runtime.connect`.
     """
     from c_two._native import ConnectAttempt
 
     attempt = _connect_native_call(ConnectAttempt, timeout_seconds=timeout)
-    registry = _ProcessRegistry.get(connect_attempt=attempt)
-    return registry.connect(
-        crm_class, name=name, address=address, timeout=timeout, _connect_attempt=attempt,
+    registry = _get_default_runtime(connect_attempt=attempt)
+    return registry._connect(
+        crm_class, name=name, address=address, attempt=attempt,
     )
 
 
 def close(crm: object) -> None:
     """Close a connection obtained from :func:`connect`.
 
-    See :meth:`_ProcessRegistry.close`.
+    The proxy carries its own native client and release callback.
     """
-    _ProcessRegistry.get().close(crm)
+    proxy = getattr(crm, 'client', None)
+    if proxy is not None and hasattr(proxy, 'terminate'):
+        proxy.terminate()
 
 
 def unregister(name: str) -> None:
     """Remove a CRM from the registry.
 
-    See :meth:`_ProcessRegistry.unregister`.
+    See :meth:`Runtime.unregister`.
     """
-    _ProcessRegistry.get().unregister(name)
+    _get_default_runtime().unregister(name)
 
 
 def server_address() -> str | None:
     """IPC address of the auto-created server, or ``None``."""
-    return _ProcessRegistry.get().get_server_address()
+    return _get_default_runtime().server_address()
 
 
 def server_id() -> str | None:
     """Server identity of the auto-created server, or ``None``."""
-    return _ProcessRegistry.get().get_server_id()
+    return _get_default_runtime().server_id()
+
+
+def server_credential() -> EndpointCredential | None:
+    """Return the bound listener's credential snapshot, if one is present."""
+    return _get_default_runtime().server_credential()
 
 
 def shutdown(*, timeout: float = 30.0) -> dict:
     """Full cleanup — shuts down server and pooled clients.
 
-    See :meth:`_ProcessRegistry.shutdown`.
+    See :meth:`Runtime.shutdown`.
     """
-    return _ProcessRegistry.get().shutdown(timeout=timeout)
+    return _get_default_runtime().shutdown(timeout=timeout)
 
 
 def connection_events():
     """Subscribe to outgoing and accepted IPC connections without starting or configuring a server."""
-    registry = _ProcessRegistry.get()
-    with registry._lock:
-        return registry._runtime_session.connection_events()
+    return _get_default_runtime().connection_events()
 
 
 def native_lifecycle_snapshot() -> dict | None:
     """Thin read-only Core host lifecycle observation, or ``None``."""
-    return _ProcessRegistry.get().native_lifecycle_snapshot()
+    return _get_default_runtime().native_lifecycle_snapshot()
 
 
 def native_terminal_outcome() -> dict | None:
     """Terminal native shutdown outcome, or ``None`` while not terminal."""
-    return _ProcessRegistry.get().native_terminal_outcome()
+    return _get_default_runtime().native_terminal_outcome()
 
 
 def serve(blocking: bool = True) -> None:
@@ -1167,9 +1241,9 @@ def serve(blocking: bool = True) -> None:
     long-running resource service.  Blocks until ``SIGINT`` or
     ``SIGTERM``, then calls :func:`shutdown` for graceful cleanup.
 
-    See :meth:`_ProcessRegistry.serve`.
+    Explicit Runtime instances use ``start`` and let their application own signals.
     """
-    _ProcessRegistry.get().serve(blocking=blocking)
+    _get_default_runtime()._serve(blocking=blocking)
 
 
 def hold_stats() -> dict:
@@ -1181,8 +1255,7 @@ def hold_stats() -> dict:
     - oldest_hold_seconds: age of oldest active hold
     - by_storage: retained counts by inline, SHM, handle, and file-spill storage
     """
-    inst = _ProcessRegistry.get()
-    return dict(inst._runtime_session.hold_stats())  # noqa: SLF001
+    return _get_default_runtime().hold_stats()
 
 
 def set_call_execution_limits(
@@ -1197,7 +1270,7 @@ def set_call_execution_limits(
     the first business call does. Limits are per Runtime/domain and shared by
     its call views.
     """
-    _ProcessRegistry.get().set_call_execution_limits(
+    _get_default_runtime().set_call_execution_limits(
         max_outstanding_calls=max_outstanding_calls,
         retained_input_budget_bytes=retained_input_budget_bytes,
     )
@@ -1213,8 +1286,7 @@ def call_execution_snapshot() -> dict:
     shared process-wide limit across replacement sessions. Counters measure
     retained input, not process memory usage.
     """
-    inst = _ProcessRegistry.get()
-    return dict(inst._runtime_session.call_execution_snapshot())  # noqa: SLF001
+    return _get_default_runtime().call_execution_snapshot()
 
 
 def memory_stats() -> MemoryStats:
@@ -1250,9 +1322,8 @@ def memory_stats() -> MemoryStats:
     The three cells are C-Two-owned backing/reassembly accounting, not process
     RSS: never sum or present them as RAM usage.
     """
-    inst = _ProcessRegistry.get()
-    return dict(inst._runtime_session.memory_stats())  # noqa: SLF001
+    return _get_default_runtime().memory_stats()
 
 
 # Auto-cleanup on process exit.
-atexit.register(lambda: _ProcessRegistry.reset())
+atexit.register(_reset_default_runtime)

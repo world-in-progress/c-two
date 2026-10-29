@@ -12,7 +12,14 @@ fn main() {
         MemPool::new(PoolConfig::default()),
     ));
     let mut lease = RequestLease::new(RequestData::Shm(PeerShmRequest::admit(
-        pool, 0, 1, 0, 4096, false, 7,
+        pool,
+        0,
+        1,
+        0,
+        4096,
+        false,
+        7,
+        c2_mem::MemoryBudget::new(0, 0, 0),
     )));
     let _ = lease.copy_bytes();
     let _ = lease.release();

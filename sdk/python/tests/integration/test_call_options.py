@@ -13,7 +13,7 @@ from tests.fixtures import local_server
 from c_two._native import RuntimeSession
 
 import c_two as cc
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 
 
 @pytest.fixture(params=['bound', 'class'])
@@ -48,7 +48,7 @@ class TimedResource:
 
 @pytest.fixture
 def ipc_connection(unique_ipc_address, request):
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     if hasattr(request, 'param'):
         slots, budget = request.param
         cc.set_call_execution_limits(
@@ -64,7 +64,7 @@ def ipc_connection(unique_ipc_address, request):
     finally:
         cc.close(connection)
         server.shutdown()
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
 
 
 class SlowPickle:
@@ -165,7 +165,7 @@ def http_connection(start_c3_relay):
     resource = TimedResource()
     name = 'timed-call-options'
     cc.register(TimedContract, resource, name=name)
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     identity = registry._runtime_session.ensure_server()
     relay = start_c3_relay()
     from c_two.config.ipc import _resolve_server_ipc_config
@@ -262,7 +262,7 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
     from c_two._native import NativePreparedCall, RuntimeSession
 
     connection, resource = ipc_connection
-    session = _ProcessRegistry.get()._runtime_session
+    session = _get_default_runtime()._runtime_session
     replacement = RuntimeSession(max_outstanding_calls=1)
     view = cc.with_call_options(connection, timeout=30 if owner_kind == 'prepared' else 1)
     owner = None
@@ -364,7 +364,7 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
 def portable_connection(unique_ipc_address, request):
     from tests.integration.test_portable_payload_runtime import Echo, EchoResource
 
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     if hasattr(request, 'param'):
         if isinstance(request.param, dict):
             cc.set_call_execution_limits(**request.param)
@@ -379,7 +379,7 @@ def portable_connection(unique_ipc_address, request):
     finally:
         cc.close(connection)
         server.shutdown()
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
 
 
 @pytest.mark.parametrize('portable_connection', [1], indirect=True)

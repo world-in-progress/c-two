@@ -1,0 +1,161 @@
+command: cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire -p c2-server
+exit_code: 101
+
+running 186 tests
+
+running 1 test
+
+test result: ok. 186 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.72s
+
+
+running 204 tests
+test response::tests::r07_shm_success_benchmark ... ignored, manual same-environment R07 SHM preparation microbenchmark
+test server::tests::buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization ... FAILED
+test server::tests::cancelled_reply_waiting_for_writer_releases_unpublished_allocation ... FAILED
+test server::tests::chunk_peer_release_failure_does_not_admit_successful_input ... FAILED
+test server::tests::chunked_connection_cleanup_releases_route_pending_capacity ... FAILED
+test server::tests::discarded_waiting_buddy_chunk_returns_its_peer_block ... FAILED
+test server::tests::first_chunked_chunk_holds_route_pending_until_feed_error_aborts ... FAILED
+test server::tests::handshake_metadata_does_not_control_peer_mapping_or_release ... FAILED
+test server::tests::inline_dispatch_rejects_when_server_pending_capacity_is_exhausted ... FAILED
+test server::tests::inline_response_over_max_payload_is_rejected_before_transport ... FAILED
+test server::tests::lost_admission_commit_rolls_back_staged_publication_exactly_once ... FAILED
+test server::tests::malformed_shutdown_signal_does_not_stop_server ... FAILED
+test server::tests::prepared_reply_rejects_a_foreign_pool_before_transport ... FAILED
+test server::tests::prepared_shm_response_over_max_payload_is_rejected_and_freed ... FAILED
+test server::tests::remote_callbacks_respect_server_wide_execution_limit_across_routes ... FAILED
+test server::tests::route_waiters_do_not_occupy_blocking_execution_threads ... FAILED
+test server::tests::shm_reply_write_failure_releases_only_its_allocation ... FAILED
+test server::tests::trailing_inline_uses_one_peer_lease_and_cleanup_error_stops_callback ... FAILED
+test server::tests::shutdown_signal_waits_for_active_connection_drain_before_stopped ... FAILED
+test server::tests::unregister_cancels_request_waiting_for_server_execution_slot ... FAILED
+test server::tests::unregister_closes_admission_before_waiting_on_blocking_pool_drain ... FAILED
+
+failures:
+
+---- server::tests::buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization stdout ----
+
+thread 'server::tests::buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization' (14767413) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::cancelled_reply_waiting_for_writer_releases_unpublished_allocation stdout ----
+
+thread 'server::tests::cancelled_reply_waiting_for_writer_releases_unpublished_allocation' (14767491) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::chunk_peer_release_failure_does_not_admit_successful_input stdout ----
+
+thread 'server::tests::chunk_peer_release_failure_does_not_admit_successful_input' (14768781) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::chunked_connection_cleanup_releases_route_pending_capacity stdout ----
+
+thread 'server::tests::chunked_connection_cleanup_releases_route_pending_capacity' (14768783) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::discarded_waiting_buddy_chunk_returns_its_peer_block stdout ----
+
+thread 'server::tests::discarded_waiting_buddy_chunk_returns_its_peer_block' (14768805) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::first_chunked_chunk_holds_route_pending_until_feed_error_aborts stdout ----
+
+thread 'server::tests::first_chunked_chunk_holds_route_pending_until_feed_error_aborts' (14768850) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::handshake_metadata_does_not_control_peer_mapping_or_release stdout ----
+
+thread 'server::tests::handshake_metadata_does_not_control_peer_mapping_or_release' (14768860) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::inline_dispatch_rejects_when_server_pending_capacity_is_exhausted stdout ----
+
+thread 'server::tests::inline_dispatch_rejects_when_server_pending_capacity_is_exhausted' (14768891) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::inline_response_over_max_payload_is_rejected_before_transport stdout ----
+
+thread 'server::tests::inline_response_over_max_payload_is_rejected_before_transport' (14768899) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::lost_admission_commit_rolls_back_staged_publication_exactly_once stdout ----
+
+thread 'server::tests::lost_admission_commit_rolls_back_staged_publication_exactly_once' (14768910) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::malformed_shutdown_signal_does_not_stop_server stdout ----
+
+thread 'server::tests::malformed_shutdown_signal_does_not_stop_server' (14768917) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::prepared_reply_rejects_a_foreign_pool_before_transport stdout ----
+
+thread 'server::tests::prepared_reply_rejects_a_foreign_pool_before_transport' (14768966) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::prepared_shm_response_over_max_payload_is_rejected_and_freed stdout ----
+
+thread 'server::tests::prepared_shm_response_over_max_payload_is_rejected_and_freed' (14768967) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::remote_callbacks_respect_server_wide_execution_limit_across_routes stdout ----
+
+thread 'server::tests::remote_callbacks_respect_server_wide_execution_limit_across_routes' (14768987) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::route_waiters_do_not_occupy_blocking_execution_threads stdout ----
+
+thread 'server::tests::route_waiters_do_not_occupy_blocking_execution_threads' (14769008) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::shm_reply_write_failure_releases_only_its_allocation stdout ----
+
+thread 'server::tests::shm_reply_write_failure_releases_only_its_allocation' (14769048) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::trailing_inline_uses_one_peer_lease_and_cleanup_error_stops_callback stdout ----
+
+thread 'server::tests::trailing_inline_uses_one_peer_lease_and_cleanup_error_stops_callback' (14769087) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::shutdown_signal_waits_for_active_connection_drain_before_stopped stdout ----
+
+thread 'server::tests::shutdown_signal_waits_for_active_connection_drain_before_stopped' (14769078) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::unregister_cancels_request_waiting_for_server_execution_slot stdout ----
+
+thread 'server::tests::unregister_cancels_request_waiting_for_server_execution_slot' (14769114) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+---- server::tests::unregister_closes_admission_before_waiting_on_blocking_pool_drain stdout ----
+
+thread 'server::tests::unregister_closes_admission_before_waiting_on_blocking_pool_drain' (14769118) panicked at transport/c2-server/src/server.rs:4884:9:
+task root must have no socket or lease after listener close
+
+
+failures:
+    server::tests::buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization
+    server::tests::cancelled_reply_waiting_for_writer_releases_unpublished_allocation
+    server::tests::chunk_peer_release_failure_does_not_admit_successful_input
+    server::tests::chunked_connection_cleanup_releases_route_pending_capacity
+    server::tests::discarded_waiting_buddy_chunk_returns_its_peer_block
+    server::tests::first_chunked_chunk_holds_route_pending_until_feed_error_aborts
+    server::tests::handshake_metadata_does_not_control_peer_mapping_or_release
+    server::tests::inline_dispatch_rejects_when_server_pending_capacity_is_exhausted
+    server::tests::inline_response_over_max_payload_is_rejected_before_transport
+    server::tests::lost_admission_commit_rolls_back_staged_publication_exactly_once
+    server::tests::malformed_shutdown_signal_does_not_stop_server
+    server::tests::prepared_reply_rejects_a_foreign_pool_before_transport
+    server::tests::prepared_shm_response_over_max_payload_is_rejected_and_freed
+    server::tests::remote_callbacks_respect_server_wide_execution_limit_across_routes
+    server::tests::route_waiters_do_not_occupy_blocking_execution_threads
+    server::tests::shm_reply_write_failure_releases_only_its_allocation
+    server::tests::shutdown_signal_waits_for_active_connection_drain_before_stopped
+    server::tests::trailing_inline_uses_one_peer_lease_and_cleanup_error_stops_callback
+    server::tests::unregister_cancels_request_waiting_for_server_execution_slot
+    server::tests::unregister_closes_admission_before_waiting_on_blocking_pool_drain
+
+test result: FAILED. 183 passed; 20 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.62s
+
+error: test failed, to rerun pass `-p c2-server --lib`

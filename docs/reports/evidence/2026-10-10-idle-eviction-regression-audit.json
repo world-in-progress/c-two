@@ -40,7 +40,7 @@
     "fallback_denied_original_cause": "static: Core discards nonterminal acquire error and error body contains candidates without original typed cause"
   },
   "rust_exact_token_probe": {
-    "command": "CARGO_BUILD_JOBS=2 C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= CARGO_TARGET_DIR=/Users/soku/Desktop/codespace/WorldInProgress/c-two/core/target cargo run --manifest-path /tmp/c2-idle-history-probe/Cargo.toml --offline > /tmp/c2-idle-history-probe.log 2>&1",
+    "command": "CARGO_BUILD_JOBS=2 C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= CARGO_TARGET_DIR=<c-two>/core/target cargo run --manifest-path /tmp/c2-idle-history-probe/Cargo.toml --offline > /tmp/c2-idle-history-probe.log 2>&1",
     "exit_code": 0,
     "exit_meaning": "Expected current defect contrast reproduced, not a successful fix",
     "scenario": [

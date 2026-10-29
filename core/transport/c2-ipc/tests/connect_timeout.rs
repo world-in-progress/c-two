@@ -7,7 +7,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use c2_config::{ConnectDeadline, ConnectOptions, LocalEndpoint};
+use c2_config::{ConnectDeadline, ConnectOptions, LocalEndpointContext};
 use c2_contract::ExpectedRouteContract;
 use c2_error::ErrorCode;
 use c2_ipc::{ClientPool, IpcError};
@@ -16,7 +16,7 @@ use c2_wire::flags;
 use c2_wire::frame::{FrameHeader, decode_frame_body, encode_frame};
 use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MethodEntry, RouteInfo, ServerIdentity,
-    encode_server_handshake,
+    VersionPreambleKind, encode_server_handshake, encode_version_preamble,
 };
 use c2_wire::route_catalog_control::{
     RouteContractWire, RouteLookupResponse, RouteMethodWire, RouteRecordWire, RouteStateWire,
@@ -29,6 +29,10 @@ const ROUTE_UID: &str = "connect-timeout-grid-0001";
 const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const SIGNATURE_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 static ADDRESS_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn test_pool(peer: &Peer) -> ClientPool {
+    ClientPool::with_endpoint_context(Duration::from_secs(60), peer.context.clone())
+}
 
 fn expected() -> ExpectedRouteContract {
     ExpectedRouteContract {
@@ -117,6 +121,14 @@ async fn read_frame(stream: &mut LocalStream) -> (FrameHeader, Vec<u8>) {
 }
 
 async fn read_handshake(stream: &mut LocalStream) {
+    let mut hello = [0u8; 25];
+    stream.read_exact(&mut hello).await.expect("version Hello");
+    assert_eq!(hello, encode_version_preamble(VersionPreambleKind::Hello));
+    stream
+        .write_all(&encode_version_preamble(VersionPreambleKind::Accepted))
+        .await
+        .expect("version Accepted");
+    // Fixtures retain control over the metadata reply and their pause/EOF stage.
     let (header, _) = read_frame(stream).await;
     assert!(header.is_handshake());
 }
@@ -149,6 +161,9 @@ async fn reply(stream: &mut LocalStream, header: FrameHeader, response: &RouteLo
 // No endpoint sweep or cleanup of addresses belonging to other tests is used.
 struct Peer {
     address: String,
+    context: LocalEndpointContext,
+    #[cfg(unix)]
+    _root: tempfile::TempDir,
     credential: EndpointCredential,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
@@ -165,7 +180,13 @@ impl Peer {
             std::process::id(),
             ADDRESS_SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let endpoint = LocalEndpoint::from_address(&address).expect("fixture endpoint");
+        #[cfg(unix)]
+        let root = tempfile::tempdir_in("/tmp").expect("fixture root");
+        #[cfg(unix)]
+        let context = LocalEndpointContext::with_unix_root(root.path()).expect("fixture context");
+        #[cfg(windows)]
+        let context = LocalEndpointContext::default_for_platform().expect("fixture context");
+        let endpoint = context.endpoint(&address).expect("fixture endpoint");
         let (ready_tx, ready_rx) = mpsc::channel();
         let (stop, stopped) = oneshot::channel();
         let thread = thread::spawn(move || {
@@ -189,6 +210,9 @@ impl Peer {
             .expect("listener readiness");
         Self {
             address,
+            context,
+            #[cfg(unix)]
+            _root: root,
             credential,
             stop: Some(stop),
             thread: Some(thread),
@@ -287,7 +311,7 @@ fn first_handshake_timeout_cannot_publish_late_client_and_next_connect_recovers(
         healthy.write_all(&handshake()).await.unwrap();
         std::future::pending::<()>().await;
     });
-    let pool = ClientPool::new(Duration::from_secs(60));
+    let pool = test_pool(&peer);
     let started = Instant::now();
     let error = pool
         .acquire_with_deadline(&peer.address, None, deadline(Duration::from_millis(100)))
@@ -353,7 +377,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
         reply(&mut healthy, lookup, &ready_reply()).await;
         std::future::pending::<()>().await;
     });
-    let pool = ClientPool::new(Duration::from_secs(60));
+    let pool = test_pool(&peer);
     let mut cfg = c2_ipc::ClientIpcConfig::default();
     cfg.base.pool_segment_size = 1024 * 1024;
     cfg.base.max_pool_segments = 1;
@@ -429,7 +453,7 @@ fn cached_client_route_timeout_removes_pending_and_preserves_healthy_stream() {
         reply(&mut stream, second, &ready_reply()).await;
         std::future::pending::<()>().await;
     });
-    let pool = ClientPool::new(Duration::from_secs(60));
+    let pool = test_pool(&peer);
     let original = pool.acquire(&peer.address, None).unwrap();
     assert!(pool.release_if_same(&peer.address, &original));
     let cached = pool
@@ -481,7 +505,7 @@ fn handshake_and_route_lookup_consume_one_absolute_budget() {
         read_lookup(&mut stream).await;
         std::future::pending::<()>().await;
     });
-    let pool = ClientPool::new(Duration::from_secs(60));
+    let pool = test_pool(&peer);
     let budget = deadline(Duration::from_millis(350));
     let client = pool
         .acquire_with_deadline(&peer.address, None, budget)
@@ -520,7 +544,7 @@ fn transient_handshake_retry_keeps_original_budget() {
         observed.fetch_add(1, Ordering::SeqCst);
         std::future::pending::<()>().await;
     });
-    let pool = ClientPool::new(Duration::from_secs(60));
+    let pool = test_pool(&peer);
     let budget = deadline(Duration::from_millis(350));
     let started = Instant::now();
     let error = pool
@@ -586,7 +610,7 @@ fn route_acquisition_respects_deadlines_and_last_lookup_result() {
                     reply(&mut stream, header, response).await;
                 }
             });
-            let pool = ClientPool::new(Duration::from_secs(60));
+            let pool = test_pool(&peer);
             let client = pool.acquire(&peer.address, None).unwrap();
             let budget = deadline(Duration::from_millis(timeout_ms));
             let started = Instant::now();

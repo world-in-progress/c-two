@@ -292,6 +292,53 @@ impl PyCoreResponse {
     }
 }
 
+fn attach_cleanup_error(py: Python<'_>, primary: &PyErr, cleanup: PyErr) {
+    if cleanup.value(py).is(primary.value(py)) {
+        return;
+    }
+    let previous = primary.context(py);
+    let mut cursor = cleanup.clone_ref(py);
+    let mut seen = vec![cursor.clone_ref(py)];
+    loop {
+        match cursor.context(py) {
+            Some(next) if next.value(py).is(primary.value(py)) => {
+                let replacement = previous
+                    .filter(|prior| !seen.iter().any(|error| error.value(py).is(prior.value(py))));
+                cursor.set_context(py, replacement);
+                break;
+            }
+            Some(next) if seen.iter().any(|error| error.value(py).is(next.value(py))) => {
+                break;
+            }
+            Some(next) => {
+                seen.push(next.clone_ref(py));
+                cursor = next;
+            }
+            None => {
+                let replacement = previous
+                    .filter(|prior| !seen.iter().any(|error| error.value(py).is(prior.value(py))));
+                cursor.set_context(py, replacement);
+                break;
+            }
+        }
+    }
+    primary.set_context(py, Some(cleanup.clone_ref(py)));
+    if py.version_info() >= (3, 11) {
+        if let Err(error) = py
+            .get_type::<pyo3::exceptions::PyBaseException>()
+            .call_method1(
+                "add_note",
+                (
+                    primary.value(py),
+                    format!("C-Two Core release also failed: {cleanup}"),
+                ),
+            )
+        {
+            eprintln!("Warning: attaching Core cleanup note failed: {error}");
+        }
+    }
+}
+
 #[pymethods]
 impl PyCoreResponse {
     fn __len__(&self) -> PyResult<usize> {
@@ -318,6 +365,14 @@ impl PyCoreResponse {
             .is_none_or(HeldResponse::is_released)
     }
 
+    #[getter]
+    fn has_pending_release(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(HeldResponse::has_pending_release)
+    }
+
     fn release(&self) -> PyResult<()> {
         #[cfg(test)]
         if let Some(pause) = self.before_release.lock().take() {
@@ -328,10 +383,11 @@ impl PyCoreResponse {
         let Some(held) = inner.as_mut() else {
             return Ok(());
         };
-        held.invalidate_then_release(|| Ok(()))
-            .map_err(lifecycle_error_to_py)?;
-        self.lease.lock().take();
-        Ok(())
+        let result = held.invalidate_then_release(|| Ok(()));
+        if !held.has_pending_release() {
+            self.lease.lock().take();
+        }
+        result.map_err(lifecycle_error_to_py)
     }
 
     fn invalidate_then_release(
@@ -360,16 +416,34 @@ impl PyCoreResponse {
                     Err(message)
                 }
             });
-        self.lease.lock().take();
+        let pending_release = held.has_pending_release();
+        if !pending_release {
+            self.lease.lock().take();
+        }
 
         if let Some(error) = python_error {
-            if let Err(release_error) = release_result {
-                let note = format!("C-Two Core release also reported: {release_error}");
-                let _ = error.value(py).call_method1("add_note", (note,));
+            if pending_release {
+                if let Err(release_error) = release_result {
+                    let cleanup_error = lifecycle_error_to_py(release_error);
+                    attach_cleanup_error(py, &error, cleanup_error);
+                }
             }
             return Err(error);
         }
         release_result.map_err(lifecycle_error_to_py)
+    }
+
+    /// Only a consuming Python error path may call this after an actual native
+    /// release failure. Export rejection has not entered Core and keeps its owner.
+    fn _abandon_after_failed_release(&self) {
+        let mut inner = self.inner.lock();
+        if inner
+            .as_ref()
+            .is_some_and(|held| held.is_released() && held.has_pending_release())
+        {
+            inner.take().unwrap().abandon();
+            self.lease.lock().take();
+        }
     }
 
     #[pyo3(signature = (tracker, route_name, method_name, direction="client_response"))]
@@ -795,6 +869,87 @@ mod payload_tests {
         assert_eq!(error.value(py).str().unwrap().to_str().unwrap(), message);
     }
 
+    #[test]
+    fn cleanup_note_preserves_both_context_chains_and_explicit_causes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let errors = module(
+                py,
+                r#"
+def primary():
+    try:
+        raise KeyError('prior context')
+    except KeyError:
+        raise ValueError('primary') from LookupError('explicit cause')
+
+def cleanup():
+    try:
+        raise TypeError('cleanup context')
+    except TypeError:
+        raise RuntimeError('cleanup') from OSError('cleanup cause')
+"#,
+            );
+            let primary = errors.getattr("primary").unwrap().call0().unwrap_err();
+            let cleanup = errors.getattr("cleanup").unwrap().call0().unwrap_err();
+            let original_context = primary.context(py).unwrap();
+            let original_cause = primary.cause(py).unwrap();
+            let cleanup_context = cleanup.context(py).unwrap();
+            let cleanup_cause = cleanup.cause(py).unwrap();
+
+            attach_cleanup_error(py, &primary, cleanup.clone_ref(py));
+
+            let attached = primary.context(py).unwrap();
+            assert!(attached.value(py).is(cleanup.value(py)));
+            assert!(
+                attached
+                    .context(py)
+                    .unwrap()
+                    .value(py)
+                    .is(cleanup_context.value(py))
+            );
+            assert!(
+                attached
+                    .context(py)
+                    .unwrap()
+                    .context(py)
+                    .unwrap()
+                    .value(py)
+                    .is(original_context.value(py))
+            );
+            assert!(
+                primary
+                    .cause(py)
+                    .unwrap()
+                    .value(py)
+                    .is(original_cause.value(py))
+            );
+            assert!(
+                attached
+                    .cause(py)
+                    .unwrap()
+                    .value(py)
+                    .is(cleanup_cause.value(py))
+            );
+            if py.version_info() >= (3, 11) {
+                let notes = primary.value(py).getattr("__notes__").unwrap();
+                let notes: Vec<String> = notes.extract().unwrap();
+                assert!(notes.iter().any(|note| note.contains("cleanup")));
+                let traceback: Vec<String> = py
+                    .import("traceback")
+                    .unwrap()
+                    .call_method1("format_exception", (primary.value(py),))
+                    .unwrap()
+                    .extract()
+                    .unwrap();
+                assert!(
+                    traceback
+                        .join("")
+                        .contains("C-Two Core release also failed")
+                );
+            }
+        });
+    }
+
     fn response_release_race(invalidate: bool) {
         Python::initialize();
         Python::attach(|py| {
@@ -837,6 +992,9 @@ mod payload_tests {
             let owner = response.borrow(py);
             assert!(!owner.is_released());
             assert!(owner.lease.lock().is_some());
+            owner._abandon_after_failed_release();
+            assert!(!owner.is_released());
+            assert!(!owner.has_pending_release());
             assert_counts(&tracker, 1, 32);
             assert_eq!(calls.len(), 0);
             assert_eq!(exported.to_vec(py).unwrap(), vec![b'r'; 32]);
@@ -861,6 +1019,100 @@ mod payload_tests {
                 PyMemoryView::from(response.bind(py).as_any()).map(|_| ()),
                 "buffer already released",
             );
+        });
+    }
+
+    #[test]
+    fn failed_native_response_keeps_tracking_until_retry_or_abandonment() {
+        Python::initialize();
+        Python::attach(|py| {
+            for abandon in [false, true] {
+                let config = c2_mem::PoolConfig {
+                    segment_size: 65536,
+                    min_block_size: 4096,
+                    max_segments: 1,
+                    ..Default::default()
+                };
+                let pool = Arc::new(parking_lot::RwLock::new(c2_mem::MemPool::new(
+                    config.clone(),
+                )));
+                let budget = pool.read().budget().unwrap().clone();
+                let backing =
+                    c2_wire::chunk::ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
+                let held = HeldResponse::from_response_lease(c2_ipc::ResponseLease::new(
+                    c2_ipc::ResponseData::Handle(backing),
+                ))
+                .unwrap();
+                let response = Py::new(py, PyCoreResponse::new(held)).unwrap();
+                let tracker = tracker();
+                let owner = response.borrow(py);
+                owner
+                    .track_retained(&tracker, "retry", "release", "client_response")
+                    .unwrap();
+                let original = std::mem::replace(&mut *pool.write(), c2_mem::MemPool::new(config));
+                let globals = pyo3::types::PyDict::new(py);
+                py.run(
+                    c"def invalidator(value):
+ try:
+  raise KeyError('prior')
+ except KeyError:
+  raise ValueError('primary')",
+                    Some(&globals),
+                    None,
+                )
+                .unwrap();
+                let invalidator = globals.get_item("invalidator").unwrap().unwrap().unbind();
+                let error = owner
+                    .invalidate_then_release(py, invalidator, py.None())
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyValueError>(py));
+                let cleanup = error
+                    .context(py)
+                    .expect("cleanup error stays in exception chain");
+                assert!(
+                    cleanup
+                        .to_string()
+                        .contains("pool owner incarnation mismatch")
+                );
+                assert!(
+                    cleanup
+                        .context(py)
+                        .unwrap()
+                        .is_instance_of::<pyo3::exceptions::PyKeyError>(py)
+                );
+                assert!(owner.is_released());
+                assert!(owner.has_pending_release());
+                assert_counts(&tracker, 1, 512);
+                // A direct release retry must retain tracking on native failure too.
+                let retry_error = owner.release().unwrap_err();
+                assert!(
+                    retry_error
+                        .to_string()
+                        .contains("pool owner incarnation mismatch")
+                );
+                assert!(owner.has_pending_release());
+                assert_counts(&tracker, 1, 512);
+                assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+                assert_eq!(budget.snapshot().abandoned_releases, 0);
+                if abandon {
+                    owner._abandon_after_failed_release();
+                    assert_eq!(budget.snapshot().abandoned_releases, 1);
+                    assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+                } else {
+                    *pool.write() = original;
+                    owner.release().unwrap();
+                    assert_eq!(budget.snapshot().abandoned_releases, 0);
+                    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+                    assert!(!owner.has_pending_release());
+                    assert_counts(&tracker, 0, 0);
+                    pool.write().destroy();
+                    continue;
+                }
+                assert!(!owner.has_pending_release());
+                assert_counts(&tracker, 0, 0);
+                *pool.write() = original;
+                pool.write().destroy();
+            }
         });
     }
 

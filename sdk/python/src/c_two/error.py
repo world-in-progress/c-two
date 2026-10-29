@@ -64,7 +64,7 @@ class CoreError(CCBaseError, RuntimeError):
     differ from that diagnostic. Fields without a native value remain None.
     """
 
-    category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle']
+    category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch']
     message: str
     code: int | None
     name: str | None
@@ -80,12 +80,22 @@ class CoreError(CCBaseError, RuntimeError):
         'permission_denied', 'not_found', 'connection_refused', 'address_in_use', 'other',
     ] | None
     raw_os_error: int | None
+    endpoint_unverified_reason: Literal[
+        'unsafe-directory', 'symlink', 'unexpected-object', 'foreign-owner',
+        'missing-ownership', 'invalid-ownership', 'invalid-record',
+        'record-mismatch', 'coordinator-missing', 'coordinator-replaced',
+        'initialization-incomplete', 'unsupported-namespace-format',
+    ] | None
+    # Only protocol_version_mismatch supplies these nonzero u32 values.
+    local_protocol_version: int | None
+    peer_protocol_version: int | None
     lifecycle_kind: Literal[
         'invalid_server_id', 'config_frozen', 'client_config_frozen',
         'duplicate_route', 'missing_route', 'relay_duplicate_route',
         'missing_relay_address', 'relay_http', 'register_failure',
         'held_response_copy', 'held_response_release', 'response_copy',
         'configuration', 'server', 'startup_timeout', 'relay',
+        'runtime_retired', 'shutdown_wait_timeout',
     ] | None
     startup_stage: Literal['readiness', 'responsiveness', 'owner_control'] | None
     timeout_seconds: float | None
@@ -102,7 +112,7 @@ class CoreError(CCBaseError, RuntimeError):
 
     def __init__(
         self,
-        category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle'],
+        category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch'],
         message: str,
     ):
         super().__init__(message)
@@ -119,6 +129,9 @@ class CoreError(CCBaseError, RuntimeError):
         self.io_operation = None
         self.io_kind = None
         self.raw_os_error = None
+        self.endpoint_unverified_reason = None
+        self.local_protocol_version = None
+        self.peer_protocol_version = None
         self.lifecycle_kind = None
         self.startup_stage = None
         self.timeout_seconds = None

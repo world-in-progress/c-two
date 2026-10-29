@@ -1,0 +1,23 @@
+$ cargo test --manifest-path core/Cargo.toml --offline --quiet --no-run --test generated_targets
+
+exit_code=0
+$ $WORK/target/debug/deps/generated_targets-0f5d395a0f9255e6 --format=terse --nocapture generated_rust_project_compiles_against_public_c_two_and_fastdb_apis --exact
+
+running 1 test
+
+thread 'generated_rust_project_compiles_against_public_c_two_and_fastdb_apis' (19267603) panicked at foundation/c2-codegen/tests/generated_targets.rs:317:5:
+generated held cleanup discarded its failure reason:
+Warning: final Rust held value release failed: held response release failed; transport cleanup: response handle release failed: reassembly release validation failed: pool owner incarnation mismatch
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+generated_rust_project_compiles_against_public_c_two_and_fastdb_apis --- FAILED
+
+failures:
+
+failures:
+    generated_rust_project_compiles_against_public_c_two_and_fastdb_apis
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 14.82s
+
+
+exit_code=101

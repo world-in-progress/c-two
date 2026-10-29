@@ -1,0 +1,22 @@
+=== complete native crate tests; restored source ===
+$ uv run python tools/dev/test_native.py -- --format=terse
+   Compiling c2-python-native v0.1.0 ($CHECKOUT/sdk/python/native)
+    Finished `test` profile [unoptimized] target(s) in 2.31s
+     Running unittests src/lib.rs ($VALIDATION_DIR/cargo-target/debug/deps/c2_ffi-545003616faebc9f)
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+   Doc-tests c2_ffi
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+exit_code=0
+
+=== complete Python SDK boundary module; Python 3.12 ===
+$ uv run python -m pytest sdk/python/tests/unit/test_sdk_boundary.py -q --timeout=30 --tb=short
+...................................................................      [100%]
+67 passed in 0.64s
+exit_code=0

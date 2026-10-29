@@ -70,6 +70,8 @@ pub struct BudgetCellSnapshot {
 /// Consistent view of all three cells, taken under one lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetSnapshot {
+    /// Release obligations abandoned by this process; saturating history, not live blocks.
+    pub abandoned_releases: u64,
     pub shm: BudgetCellSnapshot,
     pub file: BudgetCellSnapshot,
     pub reassembly: BudgetCellSnapshot,
@@ -183,6 +185,7 @@ impl BudgetCell {
 
 #[derive(Debug)]
 struct BudgetCells {
+    abandoned_releases: u64,
     shm: BudgetCell,
     file: BudgetCell,
     reassembly: BudgetCell,
@@ -191,6 +194,7 @@ struct BudgetCells {
 impl BudgetCells {
     fn new(shm_limit: u64, file_limit: u64, reassembly_limit: u64) -> Self {
         Self {
+            abandoned_releases: 0,
             shm: BudgetCell::new(shm_limit),
             file: BudgetCell::new(file_limit),
             reassembly: BudgetCell::new(reassembly_limit),
@@ -203,6 +207,10 @@ impl BudgetCells {
             BudgetKind::File => &mut self.file,
             BudgetKind::Reassembly => &mut self.reassembly,
         }
+    }
+
+    fn record_abandoned_release(&mut self) {
+        self.abandoned_releases = self.abandoned_releases.saturating_add(1);
     }
 }
 
@@ -263,10 +271,17 @@ impl MemoryBudget {
         })
     }
 
+    /// Record one obligation whose final owner cannot confirm release.
+    pub fn record_abandoned_release(&self) {
+        let mut cells = lock_cells(&self.state.cells);
+        cells.record_abandoned_release();
+    }
+
     /// Consistent snapshot of all three cells.
     pub fn snapshot(&self) -> BudgetSnapshot {
         let cells = lock_cells(&self.state.cells);
         BudgetSnapshot {
+            abandoned_releases: cells.abandoned_releases,
             shm: cells.shm.snapshot(),
             file: cells.file.snapshot(),
             reassembly: cells.reassembly.snapshot(),
@@ -401,6 +416,16 @@ pub struct BudgetReservation {
 }
 
 impl BudgetReservation {
+    /// Consume the guard without refunding an unconfirmed allocation.
+    /// Accounting has no payload ownership and is not pinned after abandonment.
+    pub fn abandon(mut self) {
+        {
+            let mut cells = lock_cells(&self.state.cells);
+            cells.record_abandoned_release();
+        }
+        self.bytes = 0;
+    }
+
     /// The cell this guard charges.
     pub fn kind(&self) -> BudgetKind {
         self.kind
@@ -426,6 +451,23 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn abandonment_keeps_charge_saturates_and_does_not_pin_retired_scope() {
+        let budget = MemoryBudget::new(100, 100, 100);
+        let observer =
+            BudgetObserver::new(c2_config::MemoryBudgetLimits::default(), budget.clone())
+                .downgrade();
+        let reservation = budget.reserve(BudgetKind::Reassembly, 60).unwrap();
+        reservation.abandon();
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 60);
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        lock_cells(&budget.state.cells).abandoned_releases = u64::MAX;
+        budget.record_abandoned_release();
+        assert_eq!(budget.snapshot().abandoned_releases, u64::MAX);
+        drop(budget);
+        assert!(observer.upgrade().is_none());
+    }
 
     #[test]
     fn from_limits_builds_the_canonical_cells() {

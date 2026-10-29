@@ -125,7 +125,7 @@ def test_benchmark_http_calls_and_cleanup(script, start_c3_relay, monkeypatch, t
     finally:
         module.cc.shutdown()
         module.cc.set_relay_anchor(original_anchor or '')
-        module._ProcessRegistry.reset()
+        module._reset_default_runtime()
 
 
 @pytest.mark.parametrize('body_fails', [False, True])
@@ -163,7 +163,7 @@ def test_relay_session_keeps_anchor_while_native_call_drains(body_fails, start_c
             finish.set()
             assert shutdown()['completed']
             module.cc.set_relay_anchor(original or '')
-            module._ProcessRegistry.reset()
+            module._reset_default_runtime()
 
 
 def test_three_mode_relay_large_payload_rows_have_explicit_path_label():

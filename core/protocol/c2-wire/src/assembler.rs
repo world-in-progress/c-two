@@ -206,6 +206,12 @@ impl ChunkAssembler {
         self.backing.try_release()
     }
 
+    /// End a failed final release without another pool access or budget refund.
+    pub(crate) fn abandon(self) {
+        let Self { backing, .. } = self;
+        backing.abandon();
+    }
+
     /// One past the last byte written (actual data length).
     pub fn written_end(&self) -> usize {
         self.written_end

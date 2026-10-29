@@ -1,0 +1,32 @@
+[
+  {
+    "operation": "shutil.rmtree(core/target)",
+    "result": "PermissionError EACCES at task-created read-only Go module cache",
+    "retained": "core/target/r07-go-modules",
+    "retry": false
+  },
+  {
+    "path": "core/target/maturin",
+    "result": "removed"
+  },
+  {
+    "path": "core/target/r07-tools",
+    "result": "removed"
+  },
+  {
+    "path": "core/target/r07-fastdb",
+    "result": "removed"
+  },
+  {
+    "path": "sdk/rust/target",
+    "result": "removed"
+  },
+  {
+    "path": ".venv",
+    "result": "removed"
+  },
+  {
+    "path": "sdk/python/src/c_two/_native.cpython-313-darwin.so",
+    "result": "removed"
+  }
+]

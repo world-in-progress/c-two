@@ -385,6 +385,19 @@ pub struct HeldResponse {
     connection: Option<Arc<ClientConnection>>,
 }
 
+struct HeldPinRelease<'a> {
+    response: &'a mut crate::lifetime::HeldResponse,
+    connection: &'a mut Option<Arc<ClientConnection>>,
+}
+
+impl Drop for HeldPinRelease<'_> {
+    fn drop(&mut self) {
+        if !self.response.has_pending_release() {
+            self.connection.take();
+        }
+    }
+}
+
 impl HeldResponse {
     // Receive carriers already bind their pool; inline bytes need no transport lease.
     fn from_ipc_response(response: c2_ipc::ResponseData) -> Result<Self, LifecycleError> {
@@ -420,13 +433,25 @@ impl HeldResponse {
         self.response.is_released()
     }
 
+    pub fn has_pending_release(&self) -> bool {
+        self.response.has_pending_release()
+    }
+
     pub fn invalidate_then_release<F>(&mut self, invalidate: F) -> Result<(), LifecycleError>
     where
         F: FnOnce() -> Result<(), String>,
     {
-        let result = self.response.invalidate_then_release(invalidate);
+        let release = HeldPinRelease {
+            response: &mut self.response,
+            connection: &mut self.connection,
+        };
+        release.response.invalidate_then_release(invalidate)
+    }
+
+    /// End a pending transport obligation before returning its concrete pin.
+    pub fn abandon(mut self) {
+        self.response.abandon();
         self.connection.take();
-        result
     }
 }
 
@@ -483,6 +508,7 @@ impl Runtime {
         let deadline = attempt.deadline();
         crate::connect_deadline::check(deadline, "connect_start")?;
         validate_expected_route_contract(&expected)?;
+        self.ensure_active_with_attempt(attempt)?;
         match mode {
             Connect::DirectIpc { address } => {
                 let connection = self.acquire_direct_ipc(&address, &expected, deadline)?;
@@ -534,9 +560,7 @@ impl Runtime {
             ClientInner::Ipc(_) => None,
             ClientInner::Http(_, default) => *default,
         };
-        self.record_path_with_deadline(observed_path, deadline)?;
-        crate::connect_deadline::check(deadline, "connect_finish")?;
-        Ok(Client {
+        self.publish_client_with_deadline(observed_path, deadline, || Client {
             inner: Arc::new(ClientConnection {
                 expected,
                 observed_path,
@@ -665,6 +689,7 @@ impl Runtime {
             settings.remote_payload_chunk_size,
             deadline,
         )?;
+        self.ensure_active_with_deadline(deadline)?;
         let resolved = self.reconcile_relay_connection_with_deadline(resolved, deadline)?;
         match resolved {
             RelayResolvedConnection::Http {
@@ -696,6 +721,7 @@ impl Runtime {
                 }
                 Err(error) if local_candidate_failure_is_terminal(&error) => Err(error),
                 Err(direct_error) => {
+                    self.ensure_active_with_deadline(deadline)?;
                     let resolved =
                         Runtime::resolve_relay_connection_after_local_ipc_failures_with_deadline(
                             client,
@@ -807,6 +833,9 @@ fn retain_local_ipc_cause(mut resolution: Error, direct: &Error) -> Error {
             };
             (kind, phase)
         }
+        Error::ProtocolVersionMismatch { .. } => {
+            ("protocol_version_mismatch".into(), "pre_dispatch")
+        }
         Error::Contract(_) => ("contract".into(), "pre_dispatch"),
         Error::Admission(_) => ("admission".into(), "pre_dispatch"),
         Error::Lifecycle(_) => ("lifecycle".into(), "pre_dispatch"),
@@ -822,6 +851,9 @@ fn retain_local_ipc_cause(mut resolution: Error, direct: &Error) -> Error {
 
 fn local_candidate_failure_is_terminal(error: &Error) -> bool {
     matches!(
+        error,
+        Error::ProtocolVersionMismatch { .. } | Error::Lifecycle(LifecycleError::RuntimeRetired)
+    ) || matches!(
         error,
         Error::Semantic(error)
             if matches!(
@@ -846,6 +878,47 @@ fn relay_default(seconds: f64) -> Result<Option<Duration>, LifecycleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_pool_is_a_terminal_relay_candidate_failure() {
+        let error = normalize_ipc_error(c2_ipc::IpcError::PoolRetired, TransportPhase::PreDispatch);
+        assert!(matches!(
+            error,
+            Error::Lifecycle(LifecycleError::RuntimeRetired)
+        ));
+        assert!(local_candidate_failure_is_terminal(&error));
+        assert!(error.local_io_cause().is_none());
+    }
+
+    #[test]
+    fn protocol_version_mismatch_is_terminal_with_both_versions() {
+        let error = normalize_ipc_error(
+            c2_ipc::IpcError::ProtocolVersionMismatch {
+                local: 14,
+                peer: 15,
+            },
+            TransportPhase::PreDispatch,
+        );
+        assert!(matches!(
+            error,
+            Error::ProtocolVersionMismatch {
+                local: 14,
+                peer: 15
+            }
+        ));
+        assert!(local_candidate_failure_is_terminal(&error));
+        assert!(error.local_io_cause().is_none());
+        assert_eq!(
+            error.to_string(),
+            "IPC protocol version mismatch: local=14, peer=15"
+        );
+        assert!(!is_stale_pooled_session_error(
+            &c2_ipc::IpcError::ProtocolVersionMismatch {
+                local: 14,
+                peer: 15
+            }
+        ));
+    }
 
     #[test]
     fn held_inline_response_preserves_bytes_and_release_lifetime() {

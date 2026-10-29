@@ -31,6 +31,7 @@ pub use ipc::{
 pub use lifecycle::{MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace};
 pub use local::{
     LocalEndpoint, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
+    UNIX_NAMESPACE_FORMAT_VERSION,
 };
 pub use memory::MemoryBudgetLimits;
 pub use pool::{PoolConfig, default_spill_dir};

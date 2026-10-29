@@ -1,0 +1,29 @@
+command: cargo test --manifest-path core/Cargo.toml -p c2-server --lib full_frame_flush -- --nocapture
+exit_code: 101
+note: behavior-preserving extraction of existing send completion; formal regression is layered per Host decision
+running 2 tests
+R07_PUBLICATION kind=TimedOut live=0 reused=true
+R07_PUBLICATION kind=BrokenPipe live=0 reused=true
+
+thread 'server::tests::full_frame_flush_timeout_keeps_published_shm' (14597042) panicked at transport/c2-server/src/server.rs:11087:9:
+assertion `left == right` failed: complete frame must transfer release authority before flush
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'server::tests::full_frame_flush_error_keeps_published_shm' (14597041) panicked at transport/c2-server/src/server.rs:11087:9:
+assertion `left == right` failed: complete frame must transfer release authority before flush
+  left: 0
+ right: 1
+test server::tests::full_frame_flush_timeout_keeps_published_shm ... FAILED
+test server::tests::full_frame_flush_error_keeps_published_shm ... FAILED
+
+failures:
+
+failures:
+    server::tests::full_frame_flush_error_keeps_published_shm
+    server::tests::full_frame_flush_timeout_keeps_published_shm
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 195 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p c2-server --lib`

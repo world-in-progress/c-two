@@ -16,7 +16,7 @@ from tests.fixtures import local_server
 import c_two as cc
 from c_two.config import settings
 from c_two.transport import ConcurrencyConfig, ConcurrencyMode
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from c_two.transport.server.native import CRMSlot, NativeServerBridge
 from c_two.transport.wire import MethodTable
 
@@ -210,12 +210,14 @@ class TestServerNameCollision:
                 relay_anchor_address=None,
                 timeout_seconds=None,
             ):
+                assert route_names is None
+                closed = ['grid']  # The native journal owns the registered route list.
                 events.append(
-                    f'native_shutdown:{list(route_names or [])}:{relay_anchor_address}'
+                    f'native_shutdown:{route_names}:{relay_anchor_address}'
                 )
                 return {
                     'completed': True,
-                    'removed_routes': list(route_names or []),
+                    'removed_routes': list(closed),
                     'route_outcomes': [
                         {
                             'route_name': name,
@@ -224,7 +226,7 @@ class TestServerNameCollision:
                             'closed_reason': 'shutdown',
                             'close_error': None,
                         }
-                        for name in list(route_names or [])
+                        for name in closed
                     ],
                     'relay_errors': [],
                     'server_was_started': True,
@@ -274,7 +276,7 @@ class TestServerNameCollision:
         bridge.shutdown()
 
         assert events == [
-            "native_shutdown:['grid']:None",
+            'native_shutdown:None:None',
             'crm_shutdown',
         ]
         assert bridge.names == []
@@ -288,13 +290,15 @@ class TestServerNameCollision:
                 route_names=None,
                 relay_anchor_address=None,
                 timeout_seconds=None,
-            ):  # noqa: ANN001, ARG002
+            ):  # noqa: ANN001
+                assert route_names is None
+                closed = ['grid']  # The native journal owns the registered route list.
                 events.append(
-                    f'native_shutdown:{list(route_names or [])}:{relay_anchor_address}:{timeout_seconds}'
+                    f'native_shutdown:{route_names}:{relay_anchor_address}:{timeout_seconds}'
                 )
                 return {
                     'completed': True,
-                    'removed_routes': list(route_names or []),
+                    'removed_routes': list(closed),
                     'route_outcomes': [
                         {
                             'route_name': name,
@@ -303,7 +307,7 @@ class TestServerNameCollision:
                             'closed_reason': 'shutdown',
                             'close_error': None,
                         }
-                        for name in list(route_names or [])
+                        for name in closed
                     ],
                     'relay_errors': [],
                     'server_was_started': True,
@@ -350,7 +354,7 @@ class TestServerNameCollision:
         bridge.shutdown(timeout=1.25)
 
         assert events == [
-            "native_shutdown:['grid']:None:1.25",
+            'native_shutdown:None:None:1.25',
             'crm_shutdown',
         ]
 
@@ -365,7 +369,7 @@ class TestServerNameCollision:
                 relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                events.append(f'native_shutdown:{list(route_names or [])}')
+                events.append(f'native_shutdown:{route_names}')
                 return {
                     'completed': True,
                     'removed_routes': [],
@@ -417,7 +421,7 @@ class TestServerNameCollision:
         bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
         bridge.shutdown()
 
-        assert events == ["native_shutdown:['grid']"]
+        assert events == ['native_shutdown:None']
         assert bridge.names == ['grid']
 
     def test_shutdown_drains_native_runtime_even_when_lifecycle_stopped(self):
@@ -431,7 +435,7 @@ class TestServerNameCollision:
                 relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                events.append(f'native_shutdown:{list(route_names or [])}')
+                events.append(f'native_shutdown:{route_names}')
                 return {
                     'completed': True,
                     'removed_routes': [],
@@ -458,7 +462,7 @@ class TestServerNameCollision:
         bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
         bridge.shutdown()
 
-        assert events == ['native_shutdown:[]']
+        assert events == ['native_shutdown:None']
 
     def test_shutdown_keeps_slot_and_skips_hook_when_native_route_not_drained(self):
         events: list[str] = []
@@ -470,7 +474,7 @@ class TestServerNameCollision:
                 relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                events.append(f'native_shutdown:{list(route_names or [])}')
+                events.append(f'native_shutdown:{route_names}')
                 return {
                     'completed': False,
                     'removed_routes': ['grid'],
@@ -527,7 +531,7 @@ class TestServerNameCollision:
         bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
         bridge.shutdown()
 
-        assert events == ["native_shutdown:['grid']"]
+        assert events == ['native_shutdown:None']
         assert bridge.names == ['grid']
 
     def test_register_rolls_back_python_slot_when_rust_registration_fails(self, monkeypatch):
@@ -603,39 +607,39 @@ class TestRegistryNameCollision:
     @pytest.fixture(autouse=True)
     def _clean_registry(self):
         """Reset the global registry before/after each test."""
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         settings.relay_anchor_address = None
         yield
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         settings.relay_anchor_address = None
 
     def test_duplicate_name_raises(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='hello')
         with pytest.raises(ValueError, match='already registered'):
             registry.register(Hello, HelloImpl(), name='hello')
 
     def test_duplicate_name_different_icrm_raises(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='shared')
         with pytest.raises(ValueError, match='already registered'):
             registry.register(Counter, CounterImpl(), name='shared')
 
     def test_same_icrm_different_names_ok(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='hello_1')
         registry.register(Hello, HelloImpl(), name='hello_2')
         assert set(registry.names) == {'hello_1', 'hello_2'}
 
     def test_reregister_after_unregister(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='temp')
         registry.unregister('temp')
         registry.register(Counter, CounterImpl(), name='temp')
         assert registry.names == ['temp']
 
     def test_unregister_uses_native_outcome_and_preserves_slot_on_failure(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='temp')
 
         class FailingServer:
@@ -647,9 +651,10 @@ class TestRegistryNameCollision:
                 assert name == 'temp'
                 raise RuntimeError('native unregister failed')
 
-            def shutdown(self, *, timeout):
-                return dict(registry._runtime_session.shutdown(  # noqa: SLF001
-                    route_names=['temp'], timeout_seconds=timeout))
+            def _take_shutdown_slots(self, outcome):  # noqa: ANN001, ARG002
+                # Runtime.shutdown consumes the native journal here after a
+                # completed transaction; this double holds no Python slots.
+                return []
 
         registry._server = FailingServer()  # noqa: SLF001
 
@@ -660,7 +665,7 @@ class TestRegistryNameCollision:
 
     def test_registry_no_longer_exposes_legacy_relay_unregister(self):
         """Relay unregister cleanup is returned by native RuntimeSession."""
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         registry.register(Hello, HelloImpl(), name='temp')
 
         assert not hasattr(registry, '_relay_unregister')
@@ -669,6 +674,6 @@ class TestRegistryNameCollision:
         registry.shutdown()
 
     def test_unregister_nonexistent_raises(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         with pytest.raises(KeyError):
             registry.unregister('nope')

@@ -1,0 +1,923 @@
+{
+  "schema": "c-two.runtime-retirement-acceptance.v1",
+  "status": "accepted",
+  "baseline": "9e8da3aacbfe64f704279a61a1c7f7198574d6c0",
+  "implementation_commit": "e66d250982d76fef2815a4d6fa3f06c77c1060ab",
+  "candidate": "f747a7c9edd0171293c4f65fa4acefb3dac30b0e",
+  "protocols": {
+    "ipc": 14,
+    "shm": 3,
+    "c_ffi_abi": 6
+  },
+  "local_builds": {
+    "baseline": {
+      "native_sha256": "b531496d2ba91193b311d797f6c3c522a48fe79d8880b7c975c71be26e40b458",
+      "python": "3.12.10",
+      "platform": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    "candidate": {
+      "native_sha256": "f5423339461bc8b81e721bf85d7461e67706f1d14815eafebc496729826f7234",
+      "python": "3.12.10",
+      "platform": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    "source_commits": {
+      "baseline": "9e8da3aacbfe64f704279a61a1c7f7198574d6c0",
+      "candidate": "e66d250982d76fef2815a4d6fa3f06c77c1060ab"
+    }
+  },
+  "local_logs": [
+    {
+      "name": "core-review-unit.log",
+      "original_sha256": "f001468f3bfebfc800fe06663eafc4e42db6a36e62498cd37c5b041c570297d8"
+    },
+    {
+      "name": "core-review-integration.log",
+      "original_sha256": "907532379ae4819fb6b10de8222a289de56a355a0a909c8fcfbcb298dc7eaa81"
+    },
+    {
+      "name": "pool-review-tests.log",
+      "original_sha256": "7cf588444bdaecd22d2250051fa88cc696e5eafdd6a4505634cdeb9b33a6e2f9"
+    },
+    {
+      "name": "core-failed-start-retirement.log",
+      "original_sha256": "e4b634920adad5e434faedfe8469e4c5e30c0fbdce2fc4a36b4bdf0956554eba"
+    },
+    {
+      "name": "native-default-parallel.log",
+      "original_sha256": "205baf257a92a3ea8f3b95f2dd1cd05b16a35581b074f87996e153811408f512"
+    },
+    {
+      "name": "python-final-affected.log",
+      "original_sha256": "334e925253eb7c52545559d655d2b3234b12690663b8db13533c8617640d37e4"
+    },
+    {
+      "name": "python-held-retirement.log",
+      "original_sha256": "48d7720e36fa73d4466ba56d46a9bf3512f01f395e9e35759d2821e14d0b4299"
+    },
+    {
+      "name": "ci-repair-baseline-memory.log",
+      "original_sha256": "4d30655d6add2f9c65a7578e48ebb39f379803dd59124a0ea4fe805dbd27ec20"
+    },
+    {
+      "name": "ci-repair-candidate-memory.log",
+      "original_sha256": "f143e3f7ca2a30f29708c00666ef3eb7205521e5958772f9dd684365f069076f"
+    },
+    {
+      "name": "ci-repair-owner-tests-system-sdk.log",
+      "original_sha256": "cf8333f99ab223b82271f2d03b8dfccefcb166d0e4941261ef623ad73c7a8510"
+    }
+  ],
+  "local_log_normalization": "Task/repository/Cargo home paths replaced by placeholders; trailing whitespace removed. Original hashes retained.",
+  "windows": {
+    "final_native_python_gates": {
+      "source": "e66d250982d76fef2815a4d6fa3f06c77c1060ab",
+      "gates": [
+        {
+          "gate": "python-build",
+          "exit_code": 0,
+          "seconds": 134.11
+        },
+        {
+          "gate": "native-retirement",
+          "exit_code": 0,
+          "seconds": 117.66
+        },
+        {
+          "gate": "python-retirement",
+          "exit_code": 0,
+          "seconds": 10.28
+        }
+      ]
+    },
+    "production_core_and_pool_identical_between_sources": true,
+    "endpoint": {
+      "source": "e66d250982d76fef2815a4d6fa3f06c77c1060ab",
+      "native_sha256": "40dc74b06c588382907d4057bdd7355447f5fc88c9329e07c830a1eb1675c47c",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "python": "3.12.13",
+      "client_physically_closed_before_peer": true,
+      "endpoint_absent": {
+        "io_operation": "connect",
+        "io_kind": "not_found",
+        "raw_os_error": 2
+      }
+    },
+    "initial_developer_run": {
+      "source": "793c6b392b3de5f57da6a955a317deadb2e41041",
+      "gates": [
+        {
+          "gate": "core-retirement-unit",
+          "exit_code": 0,
+          "seconds": 61.05
+        },
+        {
+          "gate": "core-retirement-integration",
+          "exit_code": 0,
+          "seconds": 5.64
+        },
+        {
+          "gate": "pool-close-report",
+          "exit_code": 0,
+          "seconds": 41.81
+        },
+        {
+          "gate": "python-build",
+          "exit_code": 1,
+          "seconds": 78.91
+        }
+      ]
+    }
+  },
+  "performance": {
+    "cached_connect_us": {
+      "baseline": {
+        "n": 2000,
+        "p50": 161.41649999999998,
+        "p95": 218.666,
+        "round_medians": [
+          162.687,
+          158.22899999999998,
+          158.6465,
+          166.64600000000002
+        ]
+      },
+      "candidate": {
+        "n": 2000,
+        "p50": 164.6455,
+        "p95": 239.0,
+        "round_medians": [
+          161.25,
+          177.72899999999998,
+          159.1455,
+          164.0
+        ]
+      },
+      "delta_us": 3.2290000000000134,
+      "delta_percent": 2.00041507528661
+    },
+    "empty_shutdown_us": {
+      "baseline": {
+        "n": 200,
+        "p50": 7.083,
+        "p95": 9.167,
+        "round_medians": [
+          7.021,
+          7.146,
+          7.0625,
+          7.041
+        ]
+      },
+      "candidate": {
+        "n": 200,
+        "p50": 58.146,
+        "p95": 91.333,
+        "round_medians": [
+          57.9585,
+          61.688,
+          51.6665,
+          59.208
+        ]
+      },
+      "delta_us": 51.063,
+      "delta_percent": 720.9233375688267
+    },
+    "hosted_shutdown_us": {
+      "baseline": {
+        "n": 80,
+        "p50": 1673.229,
+        "p95": 1808.709,
+        "round_medians": [
+          1652.7915,
+          1667.896,
+          1699.8545,
+          1700.8955
+        ]
+      },
+      "candidate": {
+        "n": 80,
+        "p50": 1673.0005,
+        "p95": 1807.917,
+        "round_medians": [
+          1674.229,
+          1672.6045,
+          1683.1875,
+          1621.021
+        ]
+      },
+      "delta_us": -0.22849999999993997,
+      "delta_percent": -0.013656229960146149
+    }
+  },
+  "source_line_counts": {
+    "docs": {
+      "added": 318,
+      "deleted": 16,
+      "net": 302
+    },
+    "production": {
+      "added": 1230,
+      "deleted": 310,
+      "net": 920
+    },
+    "tests": {
+      "added": 1868,
+      "deleted": 30,
+      "net": 1838
+    },
+    "evidence": {
+      "added": 870,
+      "deleted": 0,
+      "net": 870
+    }
+  },
+  "review": {
+    "core_run": "ae7a792c-2727-48e3-b67e-0943b0f59d0f",
+    "sdk_run": "a07fa982-ec0c-427d-939b-2f8a2fb242c9",
+    "ci_fixture_run": "82639ea7-6d11-4a20-a19d-24e1e78a2957",
+    "verdict": "No remaining static blockers; Host runs runtime/CI validation."
+  },
+  "ci": {
+    "candidate_run": 40639884911,
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/40639884911",
+    "status": "success",
+    "previous_runs": [
+      {
+        "run": 40633709730,
+        "source": "793c6b392b3de5f57da6a955a317deadb2e41041",
+        "status": "cancelled_for_verified_sdk_repairs"
+      },
+      {
+        "run": 40635311574,
+        "source": "e66d250982d76fef2815a4d6fa3f06c77c1060ab",
+        "status": "failed",
+        "reason": "Retired-error test expectation, caller-wait/courtesy-close fixture ordering, downstream retained-frame cascade; Windows 2025 node-gyp development-file setup exited 6."
+      }
+    ],
+    "jobs_successful": 10,
+    "gates_passed": 147,
+    "lanes": [
+      {
+        "lane": "final-linux312",
+        "platform": "linux",
+        "scope": "full",
+        "runner": {
+          "requested_label": "ubuntu-24.04",
+          "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+          "machine": "x86_64",
+          "python_platform": "linux-x86_64",
+          "image": "ubuntu24",
+          "image_version": "20261023.334.3"
+        },
+        "source_sha": "f747a7c9edd0171293c4f65fa4acefb3dac30b0e",
+        "fastdb_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+        "receipt_sha256": "eafcf81111f1853ab70dd347e644e7b4a815d65f8c104745507158f67433ab7c",
+        "gates_passed": 25,
+        "gate_ids": [
+          "python310-install",
+          "fastdb-npm-install",
+          "fastdb-wasm-build",
+          "fastdb-npm-build",
+          "c2-mem-npm-install",
+          "c2-mem-build",
+          "c2-mem-node-tests",
+          "c2-mem-node-package",
+          "fastdb-rust-test",
+          "core-check",
+          "core-test",
+          "cli-build",
+          "cli-test",
+          "cli-artifact",
+          "cli-smoke",
+          "rust-sdk-test",
+          "fastdb-wheel-build",
+          "python-wheel-build",
+          "wheel-consumer",
+          "python-build",
+          "python-native-test",
+          "source-harness-tests",
+          "ipc-memory-matrix",
+          "typescript-packages",
+          "python-suite"
+        ],
+        "python_groups": [
+          {
+            "id": "collect-full",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          }
+        ]
+      },
+      {
+        "lane": "final-linux314t",
+        "platform": "linux",
+        "scope": "python",
+        "runner": {
+          "requested_label": "ubuntu-24.04",
+          "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+          "machine": "x86_64",
+          "python_platform": "linux-x86_64",
+          "image": "ubuntu24",
+          "image_version": "20261023.334.3"
+        },
+        "source_sha": "f747a7c9edd0171293c4f65fa4acefb3dac30b0e",
+        "fastdb_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+        "receipt_sha256": "c6184d6a554340b30da65645a3ad9aa97507c2ede69a1898f68e8df9b00a4375",
+        "gates_passed": 16,
+        "gate_ids": [
+          "python310-install",
+          "fastdb-npm-install",
+          "fastdb-wasm-build",
+          "fastdb-npm-build",
+          "c2-mem-npm-install",
+          "c2-mem-build",
+          "c2-mem-node-tests",
+          "c2-mem-node-package",
+          "cli-build",
+          "cli-test",
+          "cli-artifact",
+          "cli-smoke",
+          "python-build",
+          "python-native-test",
+          "typescript-packages",
+          "python-suite"
+        ],
+        "python_groups": [
+          {
+            "id": "collect-full",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          }
+        ]
+      },
+      {
+        "lane": "final-macos",
+        "platform": "macos",
+        "scope": "full",
+        "runner": {
+          "requested_label": "macos-15",
+          "os": "macOS-15.7.9-arm64-arm-64bit",
+          "machine": "arm64",
+          "python_platform": "macosx-10.13-universal2",
+          "image": "macos15",
+          "image_version": "20260907.0337.1"
+        },
+        "source_sha": "f747a7c9edd0171293c4f65fa4acefb3dac30b0e",
+        "fastdb_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+        "receipt_sha256": "df6c4ea0319b7e7fad08900efb665e1392adec2111972faa108b7a2cfd40958f",
+        "gates_passed": 25,
+        "gate_ids": [
+          "python310-install",
+          "fastdb-npm-install",
+          "fastdb-wasm-build",
+          "fastdb-npm-build",
+          "c2-mem-npm-install",
+          "c2-mem-build",
+          "c2-mem-node-tests",
+          "c2-mem-node-package",
+          "fastdb-rust-test",
+          "core-check",
+          "core-test",
+          "cli-build",
+          "cli-test",
+          "cli-artifact",
+          "cli-smoke",
+          "rust-sdk-test",
+          "fastdb-wheel-build",
+          "python-wheel-build",
+          "wheel-consumer",
+          "python-build",
+          "python-native-test",
+          "source-harness-tests",
+          "ipc-memory-matrix",
+          "typescript-packages",
+          "python-suite"
+        ],
+        "python_groups": [
+          {
+            "id": "collect-full",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          }
+        ]
+      },
+      {
+        "lane": "final-win2022",
+        "platform": "windows",
+        "scope": "full",
+        "runner": {
+          "requested_label": "windows-2022",
+          "os": "Windows-2022Server-10.0.20348-SP0",
+          "machine": "AMD64",
+          "python_platform": "win-amd64",
+          "image": "win22",
+          "image_version": "20261022.344.1"
+        },
+        "source_sha": "f747a7c9edd0171293c4f65fa4acefb3dac30b0e",
+        "fastdb_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+        "receipt_sha256": "35085c96a218d168be33733e250f00891614010920e6cef9ba2c9b6ddabf4662",
+        "gates_passed": 27,
+        "gate_ids": [
+          "python310-install",
+          "fastdb-npm-install",
+          "fastdb-wasm-build",
+          "fastdb-npm-build",
+          "c2-mem-npm-install",
+          "c2-mem-build",
+          "c2-mem-node-tests",
+          "c2-mem-node-package",
+          "fastdb-rust-test",
+          "core-check",
+          "core-test",
+          "cli-build",
+          "cli-test",
+          "cli-artifact",
+          "cli-smoke",
+          "rust-sdk-test",
+          "fastdb-wheel-build",
+          "python-wheel-build",
+          "wheel-consumer",
+          "windows-standard-user-consumer",
+          "python-build",
+          "python-native-test",
+          "source-harness-tests",
+          "ipc-memory-matrix",
+          "typescript-packages",
+          "python-suite",
+          "windows-pipe-identity-test"
+        ],
+        "python_groups": [
+          {
+            "id": "collect-full",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          }
+        ]
+      },
+      {
+        "lane": "final-win2025",
+        "platform": "windows",
+        "scope": "full",
+        "runner": {
+          "requested_label": "windows-2025",
+          "os": "Windows-2025Server-10.0.26100-SP0",
+          "machine": "AMD64",
+          "python_platform": "win-amd64",
+          "image": "win25-vs2026",
+          "image_version": "20261021.278.1"
+        },
+        "source_sha": "f747a7c9edd0171293c4f65fa4acefb3dac30b0e",
+        "fastdb_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+        "receipt_sha256": "ebdfe9177cd5644bcd88b84d911355c58d66a6deb272545dc4acc51a35c027a0",
+        "gates_passed": 27,
+        "gate_ids": [
+          "python310-install",
+          "fastdb-npm-install",
+          "fastdb-wasm-build",
+          "fastdb-npm-build",
+          "c2-mem-npm-install",
+          "c2-mem-build",
+          "c2-mem-node-tests",
+          "c2-mem-node-package",
+          "fastdb-rust-test",
+          "core-check",
+          "core-test",
+          "cli-build",
+          "cli-test",
+          "cli-artifact",
+          "cli-smoke",
+          "rust-sdk-test",
+          "fastdb-wheel-build",
+          "python-wheel-build",
+          "wheel-consumer",
+          "windows-standard-user-consumer",
+          "python-build",
+          "python-native-test",
+          "source-harness-tests",
+          "ipc-memory-matrix",
+          "typescript-packages",
+          "python-suite",
+          "windows-pipe-identity-test"
+        ],
+        "python_groups": [
+          {
+            "id": "collect-full",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          }
+        ]
+      },
+      {
+        "lane": "final-winarm64",
+        "platform": "windows",
+        "scope": "full",
+        "runner": {
+          "requested_label": "windows-11-arm",
+          "os": "Windows-11-10.0.26200-SP0",
+          "machine": "ARM64",
+          "python_platform": "win-arm64",
+          "image": "win11-vs2026-arm64",
+          "image_version": "20261022.194.1"
+        },
+        "source_sha": "f747a7c9edd0171293c4f65fa4acefb3dac30b0e",
+        "fastdb_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+        "receipt_sha256": "b0884f185ae8b33cdc89f81734e1c98056bd70c7ec8c204d5e83a53adbfca885",
+        "gates_passed": 27,
+        "gate_ids": [
+          "python310-install",
+          "fastdb-npm-install",
+          "fastdb-wasm-build",
+          "fastdb-npm-build",
+          "c2-mem-npm-install",
+          "c2-mem-build",
+          "c2-mem-node-tests",
+          "c2-mem-node-package",
+          "fastdb-rust-test",
+          "core-check",
+          "core-test",
+          "cli-build",
+          "cli-test",
+          "cli-artifact",
+          "cli-smoke",
+          "rust-sdk-test",
+          "fastdb-wheel-build",
+          "python-wheel-build",
+          "wheel-consumer",
+          "windows-standard-user-consumer",
+          "python-build",
+          "python-native-test",
+          "source-harness-tests",
+          "ipc-memory-matrix",
+          "typescript-packages",
+          "python-suite",
+          "windows-pipe-identity-test"
+        ],
+        "python_groups": [
+          {
+            "id": "collect-full",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "collect-typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "ordinary",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "portable",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          },
+          {
+            "id": "typescript",
+            "status": "passed",
+            "exit_code": 0,
+            "cleanup_confirmed": true,
+            "process_exited": true
+          }
+        ]
+      }
+    ]
+  },
+  "cleanup": {
+    "initial_local": {
+      "removed_bytes": {
+        "baseline": 20212852,
+        "baseline-env": 66170172,
+        "analysis-cache": 3612317,
+        "target": 1216844641,
+        "env": 259458565
+      },
+      "active_task_build_or_test": false,
+      "historical_namespaces_touched": false
+    },
+    "windows": {
+      "historical_namespaces_touched": false,
+      "removed": [
+        {
+          "scope": "source-env-tools",
+          "bytes": 351911554,
+          "absent": true
+        },
+        {
+          "scope": "cargo-target",
+          "bytes": 2020395626,
+          "absent": true
+        }
+      ],
+      "free_c": 31235305472,
+      "active_task_processes": 0
+    },
+    "recheck": {
+      "removed_bytes": {
+        "baseline": 20212852,
+        "baseline-env": 259322529,
+        "env": 259458561,
+        "recheck-target": 682536602,
+        "fastdb-sdk": 2515840,
+        ".fastdb-core-0.2.3-aarch64-apple-darwin.tar.gz.download": 946654
+      },
+      "active_task_build_or_test": false,
+      "historical_namespaces_touched": false
+    },
+    "ci_branches": {
+      "deleted": [
+        "socu/runtime-retirement-ci",
+        "socu/runtime-retirement-acceptance-ci"
+      ],
+      "expected_sha": "f747a7c9edd0171293c4f65fa4acefb3dac30b0e",
+      "main_or_tags_modified": false
+    },
+    "buddy_checkouts": {
+      "checked": 7,
+      "remaining": []
+    },
+    "final_local": {
+      "python_cache_files": 38,
+      "python_cache_bytes": 1128003,
+      "temporary_download_logical_bytes": 271878781,
+      "remaining_build_roots": [],
+      "historical_namespaces_touched": false
+    }
+  },
+  "not_released": true,
+  "r07_final_drop": "separate; not closed",
+  "ci_test_repair": {
+    "production_changed": false,
+    "same_memory_tests": {
+      "baseline_passed": 2,
+      "candidate_passed": 2,
+      "fixture_sha256": "f6dec4fedd3a49dd6bfb913716d6c4ce88de21d8fb624385b98565f1eb18c98c"
+    },
+    "owner_error_migration_passed": 2,
+    "assertions_and_timeouts_retained": true
+  },
+  "final_line_counts": {
+    "docs": {
+      "added": 366,
+      "deleted": 19,
+      "net": 347
+    },
+    "production": {
+      "added": 1230,
+      "deleted": 310,
+      "net": 920
+    },
+    "tests": {
+      "added": 1868,
+      "deleted": 30,
+      "net": 1838
+    },
+    "evidence": {
+      "added": 1969,
+      "deleted": 0,
+      "net": 1969
+    }
+  }
+}

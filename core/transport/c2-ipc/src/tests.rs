@@ -1,5 +1,19 @@
 //! c2-ipc unit tests.
 
+/// Common first exchange for manual peers that exercise ordinary IPC traffic.
+pub(crate) async fn accept_version_preamble(stream: &mut c2_local::LocalStream) {
+    use c2_wire::handshake::{VersionPreambleKind, encode_version_preamble};
+    use tokio::io::AsyncReadExt as _;
+
+    let mut hello = [0u8; 25];
+    stream.read_exact(&mut hello).await.expect("version Hello");
+    assert_eq!(hello, encode_version_preamble(VersionPreambleKind::Hello));
+    stream
+        .write_all(&encode_version_preamble(VersionPreambleKind::Accepted))
+        .await
+        .expect("version Accepted");
+}
+
 pub(crate) async fn close_listener(listener: c2_local::LocalListener) {
     let outcome = tokio::task::spawn_blocking(move || listener.close())
         .await
@@ -107,7 +121,7 @@ mod client_tests {
 
     #[test]
     fn handshake_client_message() {
-        // Client sends: [version][segments][cap_flags]
+        // Same-version client metadata: [prefix][segments][cap_flags]
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &encoded);
@@ -547,6 +561,8 @@ mod response_lease_tests {
         let prefix = unique_prefix('x');
         let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());
         let allocation = producer.alloc(4096).unwrap();
+        let budget = producer.budget().unwrap().clone();
+        let charged = budget.snapshot().shm.used_bytes;
         let segment_capacity = producer
             .segment(allocation.seg_idx as usize)
             .unwrap()
@@ -556,7 +572,7 @@ mod response_lease_tests {
         let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
             reader,
         ))));
-        let lease = ResponseLease::new(ResponseData::Shm(ServerShmResponse::admit(
+        let mut carrier = ServerShmResponse::admit(
             server_pool,
             u16::try_from(allocation.seg_idx).unwrap(),
             allocation.generation,
@@ -564,7 +580,10 @@ mod response_lease_tests {
             2,
             false,
             allocation.allocation_id,
-        )));
+            budget.clone(),
+        );
+        assert!(carrier.try_release().is_err());
+        let lease = ResponseLease::new(ResponseData::Shm(carrier));
 
         assert!(
             lease
@@ -575,6 +594,8 @@ mod response_lease_tests {
         drop(lease);
 
         assert_eq!(producer.stats().alloc_count, 1);
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
         // SAFETY: test holds sole release authority for its own allocation.
         unsafe { producer.free(&allocation) }.unwrap();
     }
@@ -586,12 +607,59 @@ mod response_lease_tests {
         let pool = empty_reassembly_pool('c');
         let mut handle = ReassemblyBacking::admit(Arc::clone(&pool), 1, 16).unwrap();
         handle.write_at(0, b"combined failure").unwrap();
+        let budget = pool.read().budget().unwrap().clone();
         let lease = ResponseLease::new(ResponseData::Handle(handle));
         *pool.write() = MemPool::new_with_prefix(pool_config(), unique_prefix('z'));
 
         let error = lease.into_owned_bytes().unwrap_err();
         assert!(error.contains("response handle copy failed"), "{error}");
         assert!(error.contains("response handle release failed"), "{error}");
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 16);
+    }
+
+    #[test]
+    fn contended_reassembly_release_retains_backing_for_real_retry() {
+        use c2_mem::{BuddySegment, MemoryBudget, SegmentHeader, ShmSpinlock};
+        use c2_wire::chunk::ReassemblyBacking;
+        use std::mem::offset_of;
+
+        // Exact-fit reassembly budget: a first release failing on real SHM
+        // contention must keep the backing so the retry after unlock frees
+        // storage, refunds the charge, and re-admits the same capacity.
+        let capacity = 4096usize;
+        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
+            pool_config(),
+            unique_prefix('k'),
+            MemoryBudget::new(8 * 1024 * 1024, 16 * 1024 * 1024, capacity as u64),
+        )));
+        let backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, capacity).unwrap();
+        let mut lease = ResponseLease::new(ResponseData::Handle(backing));
+
+        let name = pool.read().segment_name(0).unwrap().to_string();
+        let word = pool.read().segment(0).unwrap().base_ptr();
+        let lock = unsafe { ShmSpinlock::new(word.add(offset_of!(SegmentHeader, spinlock))) };
+        lock.try_lock().unwrap();
+
+        let first = lease.release();
+        lock.unlock();
+        let second = lease.release();
+        let live_after = pool.read().stats().alloc_count;
+        let snapshot = pool.read().budget().unwrap().snapshot();
+        let charge_after = snapshot.reassembly.used_bytes;
+        let readmitted = ReassemblyBacking::admit(Arc::clone(&pool), 1, capacity)
+            .map(|mut again| again.release().is_ok())
+            .unwrap_or(false);
+        pool.write().destroy();
+        let reopened = BuddySegment::open(&name, SEGMENT_SIZE);
+
+        let first_error = first.expect_err("contended response release must fail");
+        assert!(first_error.contains("spin budget"), "got: {first_error}");
+        assert!(second.is_ok(), "retry must succeed: {second:?}");
+        assert_eq!(live_after, 0, "retry must free the allocation");
+        assert_eq!(charge_after, 0, "retry must refund the charge");
+        assert!(readmitted, "same-capacity admission must succeed again");
+        assert!(reopened.is_err(), "SHM gone after destroy");
     }
 
     fn assert_shm_response(payload: Vec<u8>, expected_dedicated: bool, label: char) {
@@ -616,6 +684,7 @@ mod response_lease_tests {
             u32::try_from(payload.len()).unwrap(),
             allocation.is_dedicated,
             allocation.allocation_id,
+            producer.budget().unwrap().clone(),
         )));
 
         assert_eq!(lease.copy_bytes().unwrap(), payload);
@@ -909,6 +978,121 @@ mod lazy_policy_roundtrip_tests {
 
     fn response_bytes(_client: &IpcClient, response: ResponseData) -> Vec<u8> {
         response.into_bytes().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_shm_leases_keep_failed_release_authority() {
+        struct RetainedRequest(Arc<Mutex<Option<RequestLease>>>);
+        impl CrmCallback for RetainedRequest {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                request: RequestData,
+                _: Arc<c2_server::ResponsePool>,
+            ) -> Result<ResponseMeta, CrmError> {
+                assert_eq!(request_kind(&request), "shm_buddy");
+                let request = RequestLease::new(request);
+                let bytes = request.copy_bytes().map_err(CrmError::InternalError)?;
+                *self.0.lock() = Some(request);
+                Ok(ResponseMeta::Inline(bytes))
+            }
+        }
+
+        #[cfg(unix)]
+        let root = tempfile::Builder::new()
+            .prefix("r7")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let label = "release_retry";
+        let endpoint = context.endpoint(&unique_address(label)).unwrap();
+        let base = small_base(64 * 1024, 2);
+        let retained = Arc::new(Mutex::new(None));
+        let server = Arc::new(
+            Server::new_with_endpoint(endpoint.clone(), server_config(base.clone(), 1024)).unwrap(),
+        );
+        let built = server
+            .build_route(
+                route_spec(label),
+                Arc::new(RetainedRequest(retained.clone())),
+            )
+            .unwrap();
+        let reservation = server.reserve_route(built).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+        let serving = tokio::spawn({
+            let server = server.clone();
+            async move { server.run().await }
+        });
+        server
+            .wait_until_ready(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut client = IpcClient::with_endpoint(endpoint.clone(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let payload = vec![0xA7; 8192];
+        let response = echo_roundtrip(&client, label, &payload).await;
+        assert!(matches!(&response, ResponseData::Shm(carrier) if !carrier.is_dedicated()));
+        let mut response = ResponseLease::new(response);
+        let mut request = retained.lock().take().unwrap();
+        let request_snapshot = request.copy_bytes().unwrap();
+        let response_snapshot = response.copy_bytes().unwrap();
+        let request_pool = client.request_pool().unwrap();
+        let response_pool = server.response_pool_arc();
+        let request_base = request_pool.lock().segment(0).unwrap().base_ptr();
+        let response_base = response_pool.read().segment(0).unwrap().base_ptr();
+        // SAFETY: these are this round trip's live mappings; the pools and
+        // carriers outlive both bounded lock attempts. No lock word is reset.
+        let request_lock = unsafe {
+            c2_mem::ShmSpinlock::new(
+                request_base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
+            )
+        };
+        let response_lock = unsafe {
+            c2_mem::ShmSpinlock::new(
+                response_base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
+            )
+        };
+        let request_failure = request_lock.with_lock(|| request.release()).unwrap();
+        let response_failure = response_lock.with_lock(|| response.release()).unwrap();
+        let request_retained = request.copy_bytes().unwrap();
+        let response_retained = response.copy_bytes().unwrap();
+        request.release().unwrap();
+        response.release().unwrap();
+        request.release().unwrap();
+        response.release().unwrap();
+        let request_live = request_pool.lock().stats().alloc_count;
+        let response_live = response_pool.read().stats().alloc_count;
+        client.close().await;
+        stop_server(&server).await;
+        serving.await.unwrap().unwrap();
+        #[cfg(unix)]
+        {
+            assert!(!std::path::Path::new(endpoint.os_name()).exists());
+            assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".lease")
+            }));
+        }
+        #[cfg(windows)]
+        assert!(
+            c2_local::LocalStream::connect(&endpoint, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(request_failure.unwrap_err().contains("spin budget"));
+        assert!(response_failure.unwrap_err().contains("spin budget"));
+        assert_eq!(request_snapshot, payload);
+        assert_eq!(response_snapshot, payload);
+        assert_eq!(request_retained, payload);
+        assert_eq!(response_retained, payload);
+        assert_eq!((request_live, response_live), (0, 0));
     }
 
     // Fake callback state is a transport seam, not a Core deadline model.
@@ -3859,6 +4043,126 @@ mod lazy_policy_roundtrip_tests {
 
     // ── Linearizable dispatch state and physical dedicated retirement ─────
 
+    #[tokio::test]
+    async fn handshake_version_mismatch_is_reported_by_real_client() {
+        use tokio::io::AsyncReadExt as _;
+
+        let local = u32::from(c2_wire::handshake::HANDSHAKE_VERSION);
+        for peer in [1, local + 1, u32::MAX] {
+            let address = unique_address("version_mismatch");
+            #[cfg(unix)]
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            #[cfg(unix)]
+            let endpoint = c2_config::LocalEndpointContext::with_unix_root(root.path())
+                .unwrap()
+                .endpoint(&address)
+                .unwrap();
+            #[cfg(windows)]
+            let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+            let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
+            let handler = tokio::spawn(async move {
+                let exchange = timeout(Duration::from_secs(5), async {
+                    let mut stream = listener.accept().await?;
+                    let mut hello = [0; 25];
+                    stream.read_exact(&mut hello).await?;
+                    let mut refusal = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\0\0\0\0";
+                    refusal[21..].copy_from_slice(&peer.to_le_bytes());
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, &refusal).await?;
+                    // Keep the pipe alive until local close, and detect metadata sent too early.
+                    let trailing = stream.read(&mut [0]).await;
+                    Ok::<_, std::io::Error>((hello, trailing))
+                })
+                .await;
+                crate::tests::close_listener(listener).await;
+                exchange
+            });
+            let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default());
+            let connected = timeout(Duration::from_secs(5), client.connect()).await;
+            client.close().await;
+            let (hello, trailing) = handler.await.expect("peer joined").unwrap().unwrap();
+            let error = connected.unwrap().expect_err("peer version differs");
+            assert!(
+                matches!(
+                    &error,
+                    IpcError::ProtocolVersionMismatch { local: actual_local, peer: actual_peer }
+                        if *actual_local == local && *actual_peer == peer
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("IPC protocol version mismatch: local={local}, peer={peer}"),
+            );
+            assert!(std::error::Error::source(&error).is_none());
+            let mut expected = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\0\0\0\0";
+            expected[21..].copy_from_slice(&local.to_le_bytes());
+            assert_eq!(hello, expected, "client sends only the fixed Hello first");
+            assert!(
+                matches!(trailing, Ok(0) | Err(_)),
+                "metadata requires acceptance: {trailing:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_version_responses_close_without_metadata_or_typed_mismatch() {
+        use tokio::io::AsyncReadExt as _;
+
+        let local = c2_wire::handshake::HANDSHAKE_VERSION;
+        for (kind, peer, header_only) in [
+            (2, local + 1, false), // Accepted with a different version.
+            (3, local, false),     // VersionMismatch with the same version.
+            (1, local, false),     // Hello is never a response.
+            (3, local + 1, true),  // Invalid length must fail before payload read.
+        ] {
+            let address = unique_address("invalid_version_reply");
+            #[cfg(unix)]
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            #[cfg(unix)]
+            let endpoint = c2_config::LocalEndpointContext::with_unix_root(root.path())
+                .unwrap()
+                .endpoint(&address)
+                .unwrap();
+            #[cfg(windows)]
+            let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+            let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
+            let handler = tokio::spawn(async move {
+                let exchange = timeout(Duration::from_secs(3), async {
+                    let mut stream = listener.accept().await?;
+                    let mut hello = [0u8; 25];
+                    stream.read_exact(&mut hello).await?;
+                    let mut response = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\0\0\0\0";
+                    response[20] = kind;
+                    response[21..].copy_from_slice(&peer.to_le_bytes());
+                    if header_only {
+                        response[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+                    }
+                    tokio::io::AsyncWriteExt::write_all(
+                        &mut stream,
+                        &response[..if header_only { 16 } else { 25 }],
+                    )
+                    .await?;
+                    Ok::<_, std::io::Error>(stream.read(&mut [0]).await)
+                })
+                .await;
+                crate::tests::close_listener(listener).await;
+                exchange
+            });
+            let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default());
+            let connected = timeout(Duration::from_secs(2), client.connect()).await;
+            client.close().await;
+            let trailing = handler.await.unwrap().unwrap().unwrap();
+            let error = connected
+                .expect("reject without waiting for more bytes")
+                .unwrap_err();
+            assert!(matches!(error, IpcError::Protocol(_)), "{error:?}");
+            assert!(
+                matches!(trailing, Ok(0) | Err(_)),
+                "metadata sent: {trailing:?}"
+            );
+        }
+    }
+
     /// Raw handshake-only peer: completes the client handshake and hands the
     /// accepted stream back to the test, so tests can observe exactly which
     /// bytes the client wrote after connecting.
@@ -3885,6 +4189,7 @@ mod lazy_policy_roundtrip_tests {
         tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept client");
             crate::tests::close_listener(listener).await;
+            crate::tests::accept_version_preamble(&mut stream).await;
             let mut len_buf = [0u8; 4];
             use tokio::io::AsyncReadExt as _;
             stream
@@ -4737,6 +5042,7 @@ mod lazy_policy_roundtrip_tests {
             epoch: u64,
         ) -> (c2_local::LocalStream, String) {
             let mut peer = listener.accept().await.unwrap();
+            crate::tests::accept_version_preamble(&mut peer).await;
             let bytes = read_frame(&mut peer).await;
             let (header, payload) = frame::decode_frame(&bytes).unwrap();
             assert!(header.is_handshake());
@@ -5971,9 +6277,9 @@ mod lazy_policy_roundtrip_tests {
         stop_server(&server).await;
     }
 
-    // ── Handshake v13 per-direction SHM negotiation ────────────────────────
+    // ── Per-direction SHM negotiation after version acceptance ─────────────
 
-    /// A peer that completes the v13 handshake and then answers call frames
+    /// A peer that completes the handshake and then answers call frames
     /// with a plain inline success reply. `ack_shm_request`/`ack_shm_response`
     /// control the ACK's SHM bits independently of what the client offered,
     /// so a non-intersecting ACK is representable. The returned mpsc channel
@@ -5983,18 +6289,27 @@ mod lazy_policy_roundtrip_tests {
         ack_shm_request: bool,
         ack_shm_response: bool,
     ) -> (
-        String,
+        c2_local::LocalEndpoint,
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::mpsc::Receiver<c2_wire::frame::FrameHeader>,
     ) {
         let address = unique_address(label);
-        let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+        #[cfg(unix)]
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let endpoint = context.endpoint(&address).unwrap();
         let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let (header_tx, header_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
+            #[cfg(unix)]
+            let _root = root;
             let mut peer = listener.accept().await.unwrap();
-            drop(listener);
+            crate::tests::accept_version_preamble(&mut peer).await;
+            crate::tests::close_listener(listener).await;
             let (header, payload) = read_raw_frame(&mut peer).await.expect("handshake frame");
             assert!(header.is_handshake());
             decode_handshake(&payload).expect("client handshake");
@@ -6035,7 +6350,7 @@ mod lazy_policy_roundtrip_tests {
             }
             let _ = done_tx.send(());
         });
-        (address, done_rx, header_rx)
+        (endpoint, done_rx, header_rx)
     }
 
     async fn read_raw_frame(
@@ -6099,10 +6414,10 @@ mod lazy_policy_roundtrip_tests {
     /// coordinates the peer never agreed to map.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ack_without_shm_bits_never_writes_buddy_request_frames() {
-        let (address, _done, mut header_rx) =
+        let (endpoint, done, mut header_rx) =
             capped_ack_peer("negotiation_drop", false, false).await;
         let base = small_base(64 * 1024, 2);
-        let mut client = IpcClient::with_config(&address, client_config(base, 1024));
+        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024));
         client.connect().await.unwrap();
         assert!(!client.shm_request_available());
         assert!(
@@ -6127,6 +6442,7 @@ mod lazy_policy_roundtrip_tests {
             "an un-negotiated direction must never publish SHM coordinates"
         );
         client.close_shared().await;
+        done.await.unwrap();
     }
 
     /// Boundary negative: a buddy reply frame on a connection whose ACK
@@ -6135,12 +6451,19 @@ mod lazy_policy_roundtrip_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unnegotiated_buddy_reply_rejected_before_lease_or_lazy_open() {
         let address = unique_address("negotiation_bad_reply");
-        let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+        #[cfg(unix)]
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let endpoint = context.endpoint(&address).unwrap();
         let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
         let peer_task = tokio::spawn(async move {
             use tokio::io::AsyncReadExt as _;
             let mut peer = listener.accept().await.unwrap();
-            drop(listener);
+            crate::tests::accept_version_preamble(&mut peer).await;
+            crate::tests::close_listener(listener).await;
             let (header, payload) = read_raw_frame(&mut peer).await.unwrap();
             let client_handshake = decode_handshake(&payload).unwrap();
             // ACK the request direction only: the client may use SHM
@@ -6188,7 +6511,7 @@ mod lazy_policy_roundtrip_tests {
         });
 
         let base = small_base(64 * 1024, 2);
-        let mut client = IpcClient::with_config(&address, client_config(base, 1024));
+        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024));
         client.connect().await.unwrap();
         let server_pool_probe = Arc::clone(client.server_pool_arc());
         let result = client.call_inline(&raw_peer_identity(), 0, b"probe").await;
@@ -6219,10 +6542,10 @@ mod lazy_policy_roundtrip_tests {
     /// coordinates it did not ACK.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unnegotiated_direction_copy_consumes_current_pool_prealloc_block() {
-        let (address, _done, mut header_rx) =
+        let (endpoint, done, mut header_rx) =
             capped_ack_peer("prealloc_direction_copy", false, false).await;
         let base = small_base(64 * 1024, 2);
-        let mut client = IpcClient::with_config(&address, client_config(base, 1024));
+        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024));
         client.connect().await.unwrap();
         assert!(!client.shm_request_available());
         assert!(
@@ -6268,6 +6591,7 @@ mod lazy_policy_roundtrip_tests {
 
         drop(block);
         client.close_shared().await;
+        done.await.unwrap();
     }
 
     /// A block from a retired pool incarnation (after a confirmed close plus

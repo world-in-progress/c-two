@@ -16,6 +16,7 @@ public surface exposes no way to create charges or synthetic holds.
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import pytest
@@ -28,7 +29,7 @@ from c_two.mem import (
     MemoryStats,
     RetiredScopeStats,
 )
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import Runtime, _reset_default_runtime
 
 import c_two as cc
 
@@ -42,14 +43,14 @@ except ImportError:  # pragma: no cover - lean environments without FastDB
 def _clean_registry():
     """Start and end each facade test from the process-level singleton.
 
-    The public facade reads ``_ProcessRegistry``, so a session left installed
+    The public facade reads the default ``Runtime``, so a session left installed
     by another test file must never leak into these assertions.
     """
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings.shm_threshold = None
     yield
     settings.shm_threshold = None
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
 
 
 SPEC = {
@@ -107,7 +108,7 @@ def test_memory_stats_is_observable_without_freezing_an_unused_runtime() -> None
     # always an explicit list with scope labels.
     assert isinstance(first['retired'], list)
     assert all(
-        {'role', 'state', 'limits', 'cells'} <= set(scope)
+        {'role', 'state', 'abandoned_releases', 'limits', 'cells'} <= set(scope)
         for scope in first['retired']
     )
     # The retained-buffer counters stay Rust-owned and are composed, not
@@ -131,8 +132,9 @@ def test_memory_stats_typed_shape_is_declared_for_the_public_facade() -> None:
         'rejected_allocations',
         'rejected_bytes',
     }
-    assert set(MemoryScopeStats.__annotations__) == {'role', 'state', 'limits', 'cells'}
-    assert set(RetiredScopeStats.__annotations__) == {'role', 'state', 'limits', 'cells'}
+    scope_fields = {'role', 'state', 'abandoned_releases', 'limits', 'cells'}
+    assert set(MemoryScopeStats.__annotations__) == scope_fields
+    assert set(RetiredScopeStats.__annotations__) == scope_fields
     assert set(MemoryStats.__annotations__) == {
         'runtime_outgoing',
         'server',
@@ -383,6 +385,11 @@ def test_failed_session_replacement_preserves_previous_and_own_observations() ->
             # Let the swap reach the deliberately failing constructor.
             return {}
 
+        retired = False
+
+        def check_active(self, connect_attempt=None) -> None:  # noqa: ARG002
+            return None
+
         def retire_memory_observation(self):
             return _StubObservation()
 
@@ -392,7 +399,7 @@ def test_failed_session_replacement_preserves_previous_and_own_observations() ->
     class _StubObservation:
         pass
 
-    registry = _ProcessRegistry()
+    registry = Runtime()
     installed = FailingSwapSession()
     registry._runtime_session = installed  # noqa: SLF001
     registry._server = None  # noqa: SLF001
@@ -423,16 +430,16 @@ def test_failed_native_replacement_retry_carries_own_holds_through_the_registry(
     first = _native.RuntimeSession()
     lease = _track_retained_lease(first)
 
-    registry = _ProcessRegistry()
+    registry = Runtime()
     registry._runtime_session = first  # noqa: SLF001
     registry._server = None  # noqa: SLF001
 
     calls = {'count': 0}
     original_kwargs = registry_module._runtime_session_kwargs_from_settings
 
-    def invalid_then_valid_kwargs():
+    def invalid_then_valid_kwargs(code_overrides):
         calls['count'] += 1
-        kwargs = dict(original_kwargs())
+        kwargs = dict(original_kwargs(code_overrides))
         if calls['count'] == 1:
             kwargs['server_id'] = 'bad/name'
         return kwargs
@@ -463,12 +470,13 @@ def test_failed_native_replacement_retry_carries_own_holds_through_the_registry(
             route_names=[], relay_anchor_address=None,
         )
         lease.release()
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
 
 
 @pytest.mark.timeout(120)
-def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records() -> None:
-    """One long-lived hold spans repeated ``cc.shutdown()`` session swaps.
+@pytest.mark.parametrize("scope", ["default", "explicit"])
+def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records(scope, tmp_path) -> None:
+    """One long-lived hold spans repeated ``api.shutdown()`` session swaps.
 
     The live old proxy keeps the retired session's Runtime, budget domain,
     and lease tracker alive, so its retired record stays observable — with
@@ -496,30 +504,33 @@ def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records() -> 
         def echo(self, payload: Payload) -> Payload:
             return payload
 
-    _ProcessRegistry.reset()
-    settings.shm_threshold = 1
+    _reset_default_runtime()
+    api = cc if scope == 'default' else cc.Runtime()
+    if os.name != 'nt':
+        api.set_local_endpoint(root=str(tmp_path))
+    api.set_transport_policy(shm_threshold=1)
     proxy = None
     try:
-        cc.register(HoldEcho, HoldEchoResource(), name='mem-stats-swap-hold')
+        api.register(HoldEcho, HoldEchoResource(), name='mem-stats-swap-hold')
         time.sleep(0.2)
-        address = cc.server_address()
+        address = api.server_address()
         assert address is not None
 
-        proxy = cc.connect(HoldEcho, name='mem-stats-swap-hold', address=address)
+        proxy = api.connect(HoldEcho, name='mem-stats-swap-hold', address=address)
         assert proxy.client._mode == 'ipc'  # noqa: SLF001
         held = cc.hold(proxy.echo)(_build_payload())
         try:
-            before = cc.memory_stats()
+            before = api.memory_stats()
             assert before['runtime_outgoing'] is not None
             assert before['holds']['active_holds'] >= 1
 
             for swap in range(3):
-                cc.shutdown()
-                after = cc.memory_stats()
+                api.shutdown()
+                after = api.memory_stats()
                 assert after['runtime_outgoing'] is None
                 # The hold must survive every swap.
-                assert cc.hold_stats()['active_holds'] >= 1, (
-                    'retained hold metadata must not disappear across cc.shutdown()'
+                assert api.hold_stats()['active_holds'] >= 1, (
+                    'retained hold metadata must not disappear across api.shutdown()'
                 )
                 assert after['holds']['active_holds'] >= 1
                 assert after['holds']['total_held_bytes'] >= 1
@@ -540,13 +551,13 @@ def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records() -> 
 
         # The hold's owners are gone; the still-referenced old proxy keeps the
         # record alive but drained, then detaching it when the proxy drops.
-        assert cc.hold_stats()['active_holds'] == 0
+        assert api.hold_stats()['active_holds'] == 0
         cc.close(proxy)
         proxy = None
 
         deadline = time.monotonic() + 5.0
         while True:
-            drained = cc.memory_stats()
+            drained = api.memory_stats()
             retired = [
                 scope for scope in drained['retired']
                 if scope['role'] == 'runtime_outgoing'
@@ -562,5 +573,5 @@ def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records() -> 
         if proxy is not None:
             cc.close(proxy)
             proxy = None
-        cc.shutdown()
-        _ProcessRegistry.reset()
+        api.shutdown()
+        _reset_default_runtime()

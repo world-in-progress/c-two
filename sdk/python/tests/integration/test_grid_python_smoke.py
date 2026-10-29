@@ -7,23 +7,22 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 
 
 @pytest.fixture(autouse=True)
 def clean_runtime():
     previous_relay = settings.relay_anchor_address
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     try:
         yield
     finally:
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         settings.relay_anchor_address = previous_relay
 
 
 def _load_grid(monkeypatch):
     pytest.importorskip('pandas', reason='grid smoke tests require examples dependencies')
-    pytest.importorskip('pyarrow', reason='grid smoke tests require examples dependencies')
     root = Path(__file__).resolve().parents[4]
     monkeypatch.syspath_prepend(str(root / 'examples/python'))
     for module_name in (

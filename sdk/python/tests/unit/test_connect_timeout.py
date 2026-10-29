@@ -13,7 +13,8 @@ import pytest
 import c_two as cc
 from c_two import _native
 from c_two.crm.contract import crm_contract
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport import registry as registry_module
+from c_two.transport.registry import Runtime, _reset_default_runtime
 
 
 @cc.crm(namespace='test.connect_timeout', version='0.1.0')
@@ -36,7 +37,7 @@ def test_public_connect_timeout_is_optional_keyword():
     assert timeout.default is None
 
 
-@pytest.mark.parametrize('category', ['semantic', 'contract', 'admission', 'transport', 'lifecycle'])
+@pytest.mark.parametrize('category', ['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch'])
 def test_public_core_error_has_complete_independent_fields(category):
     error = cc.error.CoreError(category, 'native diagnostic')
     assert isinstance(error, cc.error.CCBaseError)
@@ -52,6 +53,7 @@ def test_public_core_error_has_complete_independent_fields(category):
         'raw_os_error', 'lifecycle_kind', 'startup_stage', 'timeout_seconds',
         'route_name', 'status_code', 'body', 'relay_duplicate', 'failure_source',
         'registration_failure', 'rollback', 'relay_cleanup_error',
+        'local_protocol_version', 'peer_protocol_version', 'endpoint_unverified_reason',
     }
     assert all(getattr(error, field) is None for field in optional)
     assert optional | {'category', 'message', 'details'} == set(cc.error.CoreError.__annotations__)
@@ -64,15 +66,22 @@ def test_public_core_error_has_complete_independent_fields(category):
 
 def test_public_core_error_annotations_expose_native_literal_values():
     hints = get_type_hints(cc.error.CoreError)
-    assert hints['category'] == Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle']
+    assert hints['category'] == Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch']
     assert hints['transport_kind'] == Literal['ipc', 'http'] | None
     assert hints['transport_phase'] == str | None
     assert hints['io_operation'] == Literal['bind', 'connect'] | None
     assert hints['io_kind'] == Literal[
         'permission_denied', 'not_found', 'connection_refused', 'address_in_use', 'other',
     ] | None
+    assert hints['endpoint_unverified_reason'] == Literal[
+        'unsafe-directory', 'symlink', 'unexpected-object', 'foreign-owner',
+        'missing-ownership', 'invalid-ownership', 'invalid-record', 'record-mismatch',
+        'coordinator-missing', 'coordinator-replaced', 'initialization-incomplete',
+        'unsupported-namespace-format',
+    ] | None
     assert hints['startup_stage'] == Literal['readiness', 'responsiveness', 'owner_control'] | None
     assert hints['code'] == int | None
+    assert hints['local_protocol_version'] == hints['peer_protocol_version'] == int | None
     assert hints['details'] == dict[str, str]
     assert hints['error_bytes'] == bytes | None
     assert hints['fallback_eligible'] == hints['route_withdrawal'] == bool | None
@@ -95,7 +104,7 @@ def test_native_connect_rejects_invalid_options_before_transport(timeout, mode):
 
 @pytest.mark.parametrize('address', ['ipc://unused', 'http://127.0.0.1:9', None])
 def test_public_zero_timeout_has_connect_semantics_without_transport(address):
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     try:
         with pytest.raises(cc.error.CallDeadlineExceeded) as failure:
             cc.connect(ConnectContract, name='connect-timeout', address=address, timeout=0)
@@ -105,12 +114,12 @@ def test_public_zero_timeout_has_connect_semantics_without_transport(address):
         assert isinstance(failure.value.__cause__, cc.error.CoreError)
         assert failure.value.__cause__.error_bytes == cc.error.CCError.serialize(failure.value)
     finally:
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
 
 
 @pytest.mark.parametrize('timeout', [None, 0.25])
 def test_local_connect_keeps_direct_objects_and_does_not_invoke_resource(timeout, monkeypatch):
-    registry = _ProcessRegistry()
+    registry = Runtime()
     resource = Resource()
     contract = crm_contract(ConnectContract)
 
@@ -126,7 +135,7 @@ def test_local_connect_keeps_direct_objects_and_does_not_invoke_resource(timeout
     value = object()
     assert connection.echo(value) is value
     assert resource.calls == 1
-    registry.close(connection)
+    cc.close(connection)
 
 
 def test_native_local_zero_validation_runs_no_python_callback():
@@ -147,7 +156,7 @@ def test_native_local_zero_validation_runs_no_python_callback():
     (None, 'connect_via_relay'),
 ])
 def test_registry_projects_budget_with_full_expected_contract(timeout, address, method, monkeypatch):
-    registry = _ProcessRegistry()
+    registry = Runtime()
     captured = []
     sync_attempts = []
     attempts = []
@@ -216,7 +225,7 @@ def local_registry(monkeypatch):
     """Exercise actual Python slot glue without binding a transport listener."""
     from c_two.transport.server.native import NativeServerBridge
 
-    registry = _ProcessRegistry()
+    registry = Runtime()
     resource = Resource()
     contract = crm_contract(ConnectContract)
     server = object.__new__(NativeServerBridge)
@@ -227,8 +236,8 @@ def local_registry(monkeypatch):
         abi_hash=contract.abi_hash, signature_hash=contract.signature_hash,
     )}
     registry._server = server
-    monkeypatch.setattr(_ProcessRegistry, '_instance', registry)
-    monkeypatch.setattr(_ProcessRegistry, '_instance_lock', threading.Lock())
+    monkeypatch.setattr(registry_module, '_default_runtime', registry)
+    monkeypatch.setattr(registry_module, '_default_runtime_lock', threading.Lock())
     return registry, server, resource
 
 
@@ -240,8 +249,8 @@ def local_registry(monkeypatch):
 def test_connect_deadline_bounds_python_lock_before_owner_releases(target, stage, local_registry, monkeypatch):
     registry, server, resource = local_registry
     if target == 'singleton':
-        monkeypatch.setattr(_ProcessRegistry, '_instance', None)
-        lock = _ProcessRegistry._instance_lock
+        monkeypatch.setattr(registry_module, '_default_runtime', None)
+        lock = registry_module._default_runtime_lock
     else:
         lock = registry._lock if target == 'registry' else server._slots_lock
     # Keep the owner locked until the waiter has returned. The watchdog allows
@@ -261,7 +270,7 @@ def test_connect_deadline_bounds_python_lock_before_owner_releases(target, stage
     assert not lock.locked()
     # Timeout released only this waiter's state; the same resource remains usable.
     if target == 'singleton':
-        monkeypatch.setattr(_ProcessRegistry, '_instance', registry)
+        monkeypatch.setattr(registry_module, '_default_runtime', registry)
     connection = cc.connect(ConnectContract, name='connect-timeout', timeout=0.5)
     try:
         assert resource.calls == 0
@@ -304,7 +313,7 @@ def test_public_connect_carries_one_attempt_through_singleton_snapshot_and_local
 
 
 def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
-    registry = _ProcessRegistry()
+    registry = Runtime()
     observed = []
 
     class ReplacedSession:
@@ -331,17 +340,17 @@ def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
 
 
 def test_zero_budget_expires_before_singleton_lookup(monkeypatch):
-    def must_not_lookup(cls, *, connect_attempt=None):
+    def must_not_lookup(*, connect_attempt=None):
         raise AssertionError('zero deadline reached singleton lookup')
 
-    monkeypatch.setattr(_ProcessRegistry, 'get', classmethod(must_not_lookup))
+    monkeypatch.setattr(registry_module, '_get_default_runtime', must_not_lookup)
     with pytest.raises(cc.error.CallDeadlineExceeded) as failure:
         cc.connect(ConnectContract, name='connect-timeout', timeout=0)
     assert failure.value.details['stage'] == 'connect_start'
 
 
 def test_python_preparation_and_native_entry_keep_original_attempt_budget(monkeypatch):
-    registry = _ProcessRegistry()
+    registry = Runtime()
     native_session = registry._runtime_session
     observed = []
 
@@ -403,7 +412,7 @@ def test_expiry_after_python_lock_acquisition_releases_only_new_acquisition():
 
 
 def test_relay_override_deadline_keeps_canonical_error_before_registry_wrapping():
-    registry = _ProcessRegistry()
+    registry = Runtime()
 
     class Session:
         def lease_tracker(self):

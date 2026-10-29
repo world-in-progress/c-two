@@ -33,6 +33,10 @@ const UNIX_ROOT_NOT_APPLICABLE: &str =
 /// Domain tag binding every namespace id to this exact identity scheme.
 const NAMESPACE_ID_DOMAIN: &str = "c2.local-endpoint-namespace.v1";
 
+/// Current Unix managed-namespace disk format. Default directory names and
+/// gate, marker, and lease records all use this one version.
+pub const UNIX_NAMESPACE_FORMAT_VERSION: u8 = 3;
+
 /// Immutable platform endpoint context: the resolved root/scope identity a
 /// runtime freezes before its first local bind/connect.
 ///
@@ -100,7 +104,7 @@ impl LocalEndpointPlatform {
 }
 
 impl LocalEndpointContext {
-    /// Context for the platform default: `/tmp/c2-<uidhex>` on
+    /// Context for the platform default: `/tmp/c2-v3-<uidhex>` on
     /// Unix, the current TokenUser scope on Windows. Pure derivation; it never
     /// reads `C2_IPC_ROOT` or any other environment variable.
     pub fn default_for_platform() -> io::Result<Self> {
@@ -115,7 +119,9 @@ impl LocalEndpointContext {
         #[cfg(unix)]
         {
             let uid = unsafe { libc::geteuid() };
-            return Self::with_unix_root(Path::new(&format!("/tmp/c2-{uid:x}")));
+            return Self::with_unix_root(Path::new(&format!(
+                "/tmp/c2-v{UNIX_NAMESPACE_FORMAT_VERSION}-{uid:x}"
+            )));
         }
     }
 
@@ -298,7 +304,7 @@ pub struct LocalEndpoint {
 }
 
 impl LocalEndpoint {
-    /// Pure platform-default derivation from `/tmp/c2-<uidhex>` (Unix) or the current
+    /// Pure platform-default derivation from `/tmp/c2-v3-<uidhex>` (Unix) or the current
     /// TokenUser scope (Windows). It does not read the process environment;
     /// environment-resolved roots go through `ConfigResolver` and a frozen
     /// `LocalEndpointContext`.
@@ -425,7 +431,10 @@ mod tests {
         ] {
             let endpoint = LocalEndpoint::from_address(&format!("ipc://{server_id}")).unwrap();
             #[cfg(unix)]
-            let expected = format!("/tmp/c2-{:x}/{digest}", unsafe { libc::geteuid() });
+            let expected = format!(
+                "/tmp/c2-v{UNIX_NAMESPACE_FORMAT_VERSION}-{:x}/{digest}",
+                unsafe { libc::geteuid() }
+            );
             #[cfg(windows)]
             let expected = format!(
                 r"\\.\pipe\c_two-{}-{digest}",
@@ -468,9 +477,10 @@ mod tests {
         );
         assert_eq!(
             context.unix_root(),
-            Some(Path::new(&format!("/tmp/c2-{:x}", unsafe {
-                libc::geteuid()
-            })))
+            Some(Path::new(&format!(
+                "/tmp/c2-v{UNIX_NAMESPACE_FORMAT_VERSION}-{:x}",
+                unsafe { libc::geteuid() }
+            )))
         );
         assert_eq!(context.unix_uid(), Some(unsafe { libc::geteuid() }));
 
@@ -479,7 +489,10 @@ mod tests {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
-            let expected = format!("/tmp/c2-{:x}/{digest}", unsafe { libc::geteuid() });
+            let expected = format!(
+                "/tmp/c2-v{UNIX_NAMESPACE_FORMAT_VERSION}-{:x}/{digest}",
+                unsafe { libc::geteuid() }
+            );
             let via_context = context.endpoint(&format!("ipc://{server_id}")).unwrap();
             let via_default = LocalEndpoint::from_address(&format!("ipc://{server_id}")).unwrap();
             assert_eq!(via_context.os_name(), OsStr::new(&expected));
@@ -659,7 +672,7 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let expected = format!("/tmp/c2-{uid:x}/{digest}");
+        let expected = format!("/tmp/c2-v{UNIX_NAMESPACE_FORMAT_VERSION}-{uid:x}/{digest}");
         let expected_path = std::path::Path::new(&expected);
         let existed_before = expected_path.exists();
         assert!(!existed_before);

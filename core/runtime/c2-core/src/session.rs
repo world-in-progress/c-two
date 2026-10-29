@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -34,6 +34,8 @@ use crate::{
 #[cfg(test)]
 thread_local! {
     static FORCE_SERVER_RUNTIME_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FORCE_SHUTDOWN_SPAWN_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -70,8 +72,19 @@ fn connect_state_lock<'a, T>(
 fn connect_error_to_ipc(error: crate::Error) -> c2_ipc::IpcError {
     match error {
         crate::Error::Semantic(error) => c2_ipc::IpcError::LocalCallRejected(error),
+        crate::Error::Lifecycle(LifecycleError::RuntimeRetired) => c2_ipc::IpcError::PoolRetired,
         other => c2_ipc::IpcError::Config(other.to_string()),
     }
+}
+
+fn shutdown_lock<'a, T>(
+    mutex: &'a Mutex<T>,
+    deadline: Instant,
+    stage: &'static str,
+) -> Result<parking_lot::MutexGuard<'a, T>, LifecycleError> {
+    mutex
+        .try_lock_until(deadline)
+        .ok_or(LifecycleError::ShutdownWaitTimeout { stage })
 }
 
 pub type ServerIpcConfigOverrides = c2_config::ServerIpcConfigOverrides;
@@ -171,10 +184,183 @@ impl fmt::Debug for Runtime {
 }
 
 struct ShutdownTransaction {
-    server: std::sync::Weak<c2_server::Server>,
-    outcome: Mutex<Option<ShutdownOutcome>>,
+    runtime: Weak<Mutex<RuntimeState>>,
+    server: Weak<c2_server::Server>,
+    shutdown_timeout: Duration,
+    outcome: Mutex<ShutdownProgress>,
     completed: Condvar,
     delivered: AtomicBool,
+}
+
+#[derive(Default)]
+struct ShutdownProgress {
+    outcome: Option<ShutdownOutcome>,
+    retirement: Option<RetirementExecution>,
+}
+
+#[cfg(test)]
+struct ShutdownPublicationGate {
+    entered: std::sync::mpsc::SyncSender<()>,
+    proceed: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+struct RetirementExecution {
+    executor: tokio::runtime::Runtime,
+    seed: Option<c2_ipc::pool::ClientCloseSeed>,
+    shutdown_timeout: Duration,
+    // Kept until after result publication so Host Drop cannot wait on this driver.
+    _host: Option<crate::Host>,
+}
+
+pub(crate) struct ShutdownWork {
+    pub(crate) server: Option<Arc<c2_server::Server>>,
+    pub(crate) route_names: Vec<String>,
+    pub(crate) relay_anchor_address: Option<String>,
+    pub(crate) relay_use_proxy: bool,
+    pub(crate) shutdown_timeout: Duration,
+    relay_cleanup_config_error: Option<String>,
+    scopes: HashMap<String, RelayRegistrationScope>,
+}
+
+impl ShutdownWork {
+    pub(crate) fn new(server: Option<Arc<c2_server::Server>>, shutdown_timeout: Duration) -> Self {
+        Self {
+            server,
+            route_names: Vec::new(),
+            relay_anchor_address: None,
+            relay_use_proxy: false,
+            shutdown_timeout,
+            relay_cleanup_config_error: None,
+            scopes: HashMap::new(),
+        }
+    }
+}
+
+impl ShutdownTransaction {
+    fn new(
+        runtime: &Runtime,
+        server: Weak<c2_server::Server>,
+        shutdown_timeout: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            runtime: Arc::downgrade(&runtime.state),
+            server,
+            shutdown_timeout,
+            outcome: Mutex::new(ShutdownProgress::default()),
+            completed: Condvar::new(),
+            delivered: AtomicBool::new(false),
+        })
+    }
+
+    fn observe_until(&self, deadline: Instant) -> Option<ShutdownOutcome> {
+        let mut outcome = self.outcome.try_lock_until(deadline)?;
+        while outcome.outcome.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            self.completed.wait_for(&mut outcome, remaining);
+        }
+        outcome.outcome.clone()
+    }
+
+    fn observation(&self, deadline: Instant) -> (ShutdownOutcome, bool) {
+        match self.observe_until(deadline) {
+            Some(outcome) => (outcome, true),
+            None => (
+                ShutdownOutcome {
+                    server_was_started: self.server.upgrade().is_some_and(|s| s.is_running()),
+                    runtime_barrier_error: Some(
+                        "native shutdown transaction is still draining after the caller deadline"
+                            .into(),
+                    ),
+                    ..Default::default()
+                },
+                false,
+            ),
+        }
+    }
+}
+
+/// One explicitly selected target belonging to this Runtime. ClientsOnly covers
+/// the outgoing client scope; it does not discover independently owned Hosts.
+#[derive(Debug)]
+pub enum RuntimeShutdownTarget<'a> {
+    Host(&'a crate::Host),
+    FailedStart(&'a FailedStartShutdownReceipt),
+    ClientsOnly,
+}
+
+/// Non-consuming observation of this Runtime's permanent retirement.
+#[derive(Clone)]
+pub struct RuntimeShutdownReceipt {
+    transaction: Arc<ShutdownTransaction>,
+}
+
+impl fmt::Debug for RuntimeShutdownReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeShutdownReceipt")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeShutdownReceipt {
+    pub fn observe_until(&self, deadline: Instant) -> (ShutdownOutcome, bool) {
+        self.transaction.observation(deadline)
+    }
+
+    pub fn terminal_outcome(&self) -> Option<ShutdownOutcome> {
+        self.transaction.outcome.lock().outcome.clone()
+    }
+}
+
+/// Read-only observation of the native cleanup transaction for one failed
+/// Host start. It retains the transaction, whose Server reference is weak.
+#[derive(Clone)]
+pub struct FailedStartShutdownReceipt {
+    transaction: Arc<ShutdownTransaction>,
+}
+
+impl fmt::Debug for FailedStartShutdownReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedStartShutdownReceipt")
+            .finish_non_exhaustive()
+    }
+}
+
+impl FailedStartShutdownReceipt {
+    /// Wait within this caller's budget without consuming the transaction's
+    /// one-time route handoff. Completion is separate from cleanup success.
+    pub fn observe_with_timeout(&self, timeout: Duration) -> (ShutdownOutcome, bool) {
+        self.transaction.observation(Instant::now() + timeout)
+    }
+
+    /// Return the original terminal outcome, including cleanup errors.
+    pub fn terminal_outcome(&self) -> Option<ShutdownOutcome> {
+        self.transaction.outcome.lock().outcome.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_transaction_for_test(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.transaction, &other.transaction)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivered_for_test(&self) -> bool {
+        self.transaction.delivered.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_terminal_error_for_test(&self, message: &str) {
+        self.transaction
+            .outcome
+            .lock()
+            .outcome
+            .as_mut()
+            .expect("test transaction is terminal")
+            .runtime_barrier_error = Some(message.to_string());
+    }
 }
 
 struct RuntimeState {
@@ -221,9 +407,12 @@ struct RuntimeState {
     lifecycle_policy: c2_config::ServerLifecyclePolicy,
     lifecycle_frozen: bool,
     shutdown_transactions: HashMap<String, Arc<ShutdownTransaction>>,
+    retirement: Option<Arc<ShutdownTransaction>>,
     registration_scopes: HashMap<String, HashMap<String, RelayRegistrationScope>>,
     #[cfg(test)]
     forced_relay_config_error: Option<String>,
+    #[cfg(test)]
+    shutdown_publication_gate: Option<Arc<ShutdownPublicationGate>>,
 }
 
 #[derive(Clone)]
@@ -255,11 +444,19 @@ pub(crate) enum RelayResolvedConnection {
 }
 
 impl RuntimeState {
+    fn ensure_active(&self) -> Result<(), LifecycleError> {
+        if self.retirement.is_some() {
+            return Err(LifecycleError::RuntimeRetired);
+        }
+        Ok(())
+    }
+
     fn ensure_no_pending_teardown(&self) -> Result<(), LifecycleError> {
+        self.ensure_active()?;
         if self
             .shutdown_transactions
             .values()
-            .any(|transaction| transaction.outcome.lock().is_none())
+            .any(|transaction| transaction.outcome.lock().outcome.is_none())
         {
             return Err(LifecycleError::Configuration("pending native teardown must finish before starting a new Host or resetting server identity".into()));
         }
@@ -276,6 +473,178 @@ impl Drop for RuntimeState {
 }
 
 impl Runtime {
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    pub fn ensure_active(&self) -> Result<(), LifecycleError> {
+        self.state.lock().ensure_active()
+    }
+
+    pub fn ensure_active_with_attempt(
+        &self,
+        attempt: &crate::ConnectAttempt,
+    ) -> Result<(), crate::Error> {
+        self.ensure_active_with_deadline(attempt.deadline())
+    }
+
+    pub(crate) fn ensure_active_with_deadline(
+        &self,
+        deadline: ConnectDeadline,
+    ) -> Result<(), crate::Error> {
+        connect_state_lock(&self.state, deadline, "runtime_admission_wait")?.ensure_active()?;
+        Ok(())
+    }
+
+    pub fn retirement_receipt(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<RuntimeShutdownReceipt>, LifecycleError> {
+        Ok(
+            shutdown_lock(&self.state, deadline, "core_retirement_wait")?
+                .retirement
+                .clone()
+                .map(|transaction| RuntimeShutdownReceipt { transaction }),
+        )
+    }
+
+    /// Permanently close this Runtime's admission and hand its selected scope
+    /// to one native driver. The deadline bounds lock acquisition and receipt
+    /// observation, never the driver's cleanup budget.
+    pub fn begin_session_retirement(
+        &self,
+        target: RuntimeShutdownTarget<'_>,
+        deadline: Instant,
+    ) -> Result<RuntimeShutdownReceipt, LifecycleError> {
+        let owned = match &target {
+            RuntimeShutdownTarget::Host(host) => host.belongs_to(self),
+            RuntimeShutdownTarget::FailedStart(receipt) => {
+                Weak::ptr_eq(&receipt.transaction.runtime, &Arc::downgrade(&self.state))
+            }
+            RuntimeShutdownTarget::ClientsOnly => true,
+        };
+        if !owned {
+            return Err(LifecycleError::Configuration(
+                "shutdown target belongs to another Runtime".into(),
+            )
+            .into());
+        }
+        let required_server = match &target {
+            RuntimeShutdownTarget::Host(host) => Some(host.retirement_server()),
+            RuntimeShutdownTarget::FailedStart(receipt) => Some(receipt.transaction.server.clone()),
+            RuntimeShutdownTarget::ClientsOnly => None,
+        };
+        let observe_existing = |transaction: &Arc<ShutdownTransaction>| {
+            if required_server
+                .as_ref()
+                .is_some_and(|server| !Weak::ptr_eq(server, &transaction.server))
+            {
+                return Err(LifecycleError::Configuration(
+                    "shutdown target is outside the existing retirement scope".into(),
+                )
+                .into());
+            }
+            Ok(RuntimeShutdownReceipt {
+                transaction: transaction.clone(),
+            })
+        };
+        {
+            let state = shutdown_lock(&self.state, deadline, "core_retirement_wait")?;
+            if let Some(transaction) = &state.retirement {
+                return observe_existing(transaction);
+            }
+        }
+        let (mut work, selected, host) = match target {
+            RuntimeShutdownTarget::Host(host) => {
+                (host.retirement_work(deadline)?, None, Some(host.clone()))
+            }
+            RuntimeShutdownTarget::FailedStart(receipt) => (
+                ShutdownWork::new(
+                    receipt.transaction.server.upgrade(),
+                    receipt.transaction.shutdown_timeout,
+                ),
+                Some(receipt.transaction.clone()),
+                None,
+            ),
+            RuntimeShutdownTarget::ClientsOnly => {
+                (ShutdownWork::new(None, Duration::from_secs(5)), None, None)
+            }
+        };
+        // All fallible executor preparation precedes seal and ownership handoff.
+        // A pending-to-terminal race needs this same executor, not a spare worker.
+        let mut execution = RetirementExecution {
+            executor: Self::server_runtime()?,
+            seed: None,
+            shutdown_timeout: work.shutdown_timeout,
+            _host: host,
+        };
+        let mut state = shutdown_lock(&self.state, deadline, "core_retirement_wait")?;
+        if let Some(transaction) = &state.retirement {
+            return observe_existing(transaction);
+        }
+        let key = work
+            .server
+            .as_ref()
+            .map(|server| format!("{}:{:p}", server.server_instance_id(), server.as_ref()));
+        let existing = selected.or_else(|| {
+            key.as_ref()
+                .and_then(|key| state.shutdown_transactions.get(key).cloned())
+        });
+        // Acquire the original pool locks within this caller's deadline before
+        // spawning or publishing. An uncommitted guard leaves admission intact.
+        let pool = state.client_pool.clone();
+        let seal = pool
+            .as_ref()
+            .map(|pool| {
+                pool.prepare_seal(deadline)
+                    .ok_or(LifecycleError::ShutdownWaitTimeout {
+                        stage: "core_pool_seal_wait",
+                    })
+            })
+            .transpose()?;
+        let historical = if let Some(transaction) = &existing {
+            let mut progress =
+                shutdown_lock(&transaction.outcome, deadline, "core_shutdown_outcome_wait")?;
+            if progress.outcome.is_none() {
+                execution.seed = seal.map(|seal| seal.commit());
+                progress.retirement = Some(execution);
+                state.call_execution_observer.close();
+                state.retirement = Some(transaction.clone());
+                return Ok(RuntimeShutdownReceipt {
+                    transaction: transaction.clone(),
+                });
+            }
+            progress.outcome.clone()
+        } else {
+            None
+        };
+        if let Some(key) = &key {
+            work.scopes = state
+                .registration_scopes
+                .get(key)
+                .cloned()
+                .unwrap_or_default();
+        }
+        let transaction = ShutdownTransaction::new(
+            self,
+            required_server.unwrap_or_default(),
+            work.shutdown_timeout,
+        );
+        // The new worker first takes RuntimeState. It cannot execute until this
+        // section has published both the scope and its permanent admission fence.
+        self.spawn_shutdown_driver(transaction.clone(), work, historical)?;
+        execution.seed = seal.map(|seal| seal.commit());
+        transaction.outcome.lock().retirement = Some(execution);
+        if existing.is_none() {
+            if let Some(key) = key {
+                state.shutdown_transactions.insert(key, transaction.clone());
+            }
+        }
+        state.call_execution_observer.close();
+        state.retirement = Some(transaction.clone());
+        Ok(RuntimeShutdownReceipt { transaction })
+    }
+
     /// Subscribe to future outgoing and accepted IPC connections without starting a host or
     /// resolving configuration. The receiver retains metadata alone.
     pub fn connection_events(&self) -> c2_local::ConnectionEvents {
@@ -325,9 +694,12 @@ impl Runtime {
                 lifecycle_policy: Default::default(),
                 lifecycle_frozen: false,
                 shutdown_transactions: HashMap::new(),
+                retirement: None,
                 registration_scopes: HashMap::new(),
                 #[cfg(test)]
                 forced_relay_config_error: None,
+                #[cfg(test)]
+                shutdown_publication_gate: None,
             })),
         })
     }
@@ -635,6 +1007,7 @@ impl Runtime {
 
     pub fn ensure_server(&self) -> Result<RuntimeIdentity, LifecycleError> {
         let mut state = self.state.lock();
+        state.ensure_active()?;
         if let Some(identity) = &state.identity {
             return Ok(identity.clone());
         }
@@ -736,15 +1109,18 @@ impl Runtime {
         self.state.lock().path_counters
     }
 
-    pub(crate) fn record_path_with_deadline(
+    pub(crate) fn publish_client_with_deadline(
         &self,
         path: ObservedPath,
         deadline: ConnectDeadline,
-    ) -> Result<(), crate::Error> {
-        connect_state_lock(&self.state, deadline, "connect_finish")?
-            .path_counters
-            .record(path);
-        Ok(())
+        publish: impl FnOnce() -> crate::Client,
+    ) -> Result<crate::Client, crate::Error> {
+        let mut state = connect_state_lock(&self.state, deadline, "connect_finish")?;
+        state.ensure_active()?;
+        let client = publish();
+        connect_stage_check(deadline, "connect_finish")?;
+        state.path_counters.record(path);
+        Ok(client)
     }
 
     /// Read-only snapshot of this Runtime's outgoing client memory domain.
@@ -804,6 +1180,9 @@ impl Runtime {
             let (overrides, revision) = {
                 let mut state = connect_state_lock(&self.state, deadline, "runtime_config_wait")
                     .map_err(connect_error_to_ipc)?;
+                state
+                    .ensure_active()
+                    .map_err(|_| c2_ipc::IpcError::PoolRetired)?;
                 if let Some(config) = state.frozen_client_config.clone() {
                     let events = state.connection_event_source.clone();
                     let pool = state
@@ -832,6 +1211,9 @@ impl Runtime {
             let resolved = resolve_client_config(overrides);
             let mut state = connect_state_lock(&self.state, deadline, "runtime_config_wait")
                 .map_err(connect_error_to_ipc)?;
+            state
+                .ensure_active()
+                .map_err(|_| c2_ipc::IpcError::PoolRetired)?;
             if state.client_config_revision != revision || state.frozen_client_config.is_some() {
                 continue;
             }
@@ -874,7 +1256,8 @@ impl Runtime {
         connect_stage_check(deadline, "pool_discard")
     }
 
-    pub(crate) fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
+    /// Resolve this Runtime's server IPC configuration without starting a Host.
+    pub fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
         let runtime_overrides = c2_config::RuntimeConfigOverrides {
             server_ipc: self.server_ipc_overrides().unwrap_or_default(),
             shm_threshold: self.shm_threshold_override(),
@@ -1530,7 +1913,7 @@ impl Runtime {
             .shutdown_transactions
             .get(&format!("{}:{:p}", server.server_instance_id(), server))
             .cloned();
-        transaction.is_some_and(|transaction| transaction.outcome.lock().is_none())
+        transaction.is_some_and(|transaction| transaction.outcome.lock().outcome.is_none())
     }
 
     /// Observe a pending native transaction without consuming the route journal.
@@ -1544,8 +1927,29 @@ impl Runtime {
             .shutdown_transactions
             .get(&format!("{}:{:p}", server.server_instance_id(), server))
             .cloned()?;
-        let outcome = transaction.outcome.lock().clone();
+        let outcome = transaction.outcome.lock().outcome.clone();
         outcome
+    }
+
+    pub(crate) fn shutdown_observation_until(
+        &self,
+        server: &c2_server::Server,
+        deadline: Instant,
+    ) -> Result<Option<ShutdownOutcome>, LifecycleError> {
+        let transaction = shutdown_lock(&self.state, deadline, "core_shutdown_outcome_wait")?
+            .shutdown_transactions
+            .get(&format!("{}:{:p}", server.server_instance_id(), server))
+            .cloned();
+        transaction
+            .map(|transaction| {
+                Ok(
+                    shutdown_lock(&transaction.outcome, deadline, "core_shutdown_outcome_wait")?
+                        .outcome
+                        .clone(),
+                )
+            })
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub(crate) fn shutdown(
@@ -1591,79 +1995,272 @@ impl Runtime {
                 scopes,
             );
         }
-        let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
-        let transaction = {
-            let mut state = self.state.lock();
-            // A completed transaction retains only a Weak concrete Server identity.
-            // Repeated Persistent hosts do not inherit old outcomes or retain stale pools.
-            state.shutdown_transactions.retain(|_, transaction| {
-                transaction.server.strong_count() > 0 || transaction.outcome.lock().is_none()
-            });
-            if let Some(transaction) = state.shutdown_transactions.get(&key) {
-                Arc::clone(transaction)
-            } else {
-                let transaction = Arc::new(ShutdownTransaction {
-                    server: Arc::downgrade(server),
-                    outcome: Mutex::new(None),
-                    completed: Condvar::new(),
-                    delivered: AtomicBool::new(false),
-                });
-                state
-                    .shutdown_transactions
-                    .insert(key, Arc::clone(&transaction));
-                let worker_runtime = self.clone();
-                let worker_server = Arc::clone(server);
-                let worker_transaction = Arc::clone(&transaction);
-                let relay = relay_anchor_address.map(str::to_owned);
-                // Only actual pending work retains Runtime/Server. No watcher retains Host.
-                let spawn = std::thread::Builder::new()
-                    .name("c2-shutdown".into())
-                    .spawn(move || {
-                        let outcome = worker_runtime.shutdown_transaction(
-                            Some(&worker_server),
-                            route_names,
-                            relay.as_deref(),
-                            relay_use_proxy,
-                            relay_cleanup_config_error,
-                            shutdown_timeout,
-                            scopes.clone(),
-                        );
-                        worker_runtime.retire_registration_scopes(&worker_server, &scopes);
-                        *worker_transaction.outcome.lock() = Some(outcome);
-                        worker_transaction.completed.notify_all();
-                    });
-                if let Err(error) = spawn {
-                    *transaction.outcome.lock() = Some(ShutdownOutcome {
-                        runtime_barrier_error: Some(error.to_string()),
-                        ..Default::default()
-                    });
-                    transaction.completed.notify_all();
-                }
-                transaction
-            }
+        let receipt = self.begin_server_shutdown_transaction(
+            server,
+            route_names,
+            relay_anchor_address,
+            relay_use_proxy,
+            relay_cleanup_config_error,
+            shutdown_timeout,
+            scopes,
+        );
+        let Some(result) = receipt.transaction.observe_until(deadline) else {
+            return ShutdownOutcome {
+                server_was_started: server.is_running(),
+                runtime_barrier_error: Some(
+                    "native shutdown transaction is still draining after the caller deadline"
+                        .into(),
+                ),
+                ..Default::default()
+            };
         };
-        let mut result = transaction.outcome.lock();
-        while result.is_none() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return ShutdownOutcome {
-                    server_was_started: server.is_running(),
-                    runtime_barrier_error: Some(
-                        "native shutdown transaction is still draining after the caller deadline"
-                            .into(),
-                    ),
-                    ..Default::default()
-                };
-            }
-            transaction.completed.wait_for(&mut result, remaining);
-        }
-        if transaction.delivered.swap(true, Ordering::AcqRel) {
+        if receipt.transaction.delivered.swap(true, Ordering::AcqRel) {
             return ShutdownOutcome {
                 ipc_clients_drained: true,
                 ..Default::default()
             };
         }
-        result.as_ref().unwrap().clone()
+        result
+    }
+
+    /// Start the existing transaction for this concrete Server without using
+    /// another caller wait budget. The failed Host's normal Drop remains the
+    /// one bounded Core shutdown waiter.
+    pub(crate) fn begin_failed_start_shutdown(
+        &self,
+        server: &Arc<c2_server::Server>,
+        route_names: Vec<String>,
+        relay_anchor_address: Option<&str>,
+        relay_use_proxy: bool,
+        shutdown_timeout: Duration,
+    ) -> FailedStartShutdownReceipt {
+        {
+            let state = self.state.lock();
+            state.call_execution_observer.close();
+        }
+        let scopes = self.capture_registration_scopes(server, &route_names);
+        self.begin_server_shutdown_transaction(
+            server,
+            route_names,
+            relay_anchor_address,
+            relay_use_proxy,
+            None,
+            shutdown_timeout,
+            scopes,
+        )
+    }
+
+    fn begin_server_shutdown_transaction(
+        &self,
+        server: &Arc<c2_server::Server>,
+        route_names: Vec<String>,
+        relay_anchor_address: Option<&str>,
+        relay_use_proxy: bool,
+        relay_cleanup_config_error: Option<String>,
+        shutdown_timeout: Duration,
+        scopes: HashMap<String, RelayRegistrationScope>,
+    ) -> FailedStartShutdownReceipt {
+        let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
+        let mut state = self.state.lock();
+        state.shutdown_transactions.retain(|_, transaction| {
+            transaction.server.strong_count() > 0 || transaction.outcome.lock().outcome.is_none()
+        });
+        let transaction = if let Some(transaction) = state.shutdown_transactions.get(&key) {
+            transaction.clone()
+        } else {
+            let work = ShutdownWork {
+                server: Some(server.clone()),
+                route_names,
+                relay_anchor_address: relay_anchor_address.map(str::to_owned),
+                relay_use_proxy,
+                relay_cleanup_config_error,
+                shutdown_timeout,
+                scopes,
+            };
+            let transaction =
+                ShutdownTransaction::new(self, Arc::downgrade(server), work.shutdown_timeout);
+            // Preserve the non-fallible legacy failed-start/Drop fallback.
+            if let Err(error) = self.spawn_shutdown_driver(transaction.clone(), work, None) {
+                transaction.outcome.lock().outcome = Some(ShutdownOutcome {
+                    runtime_barrier_error: Some(error.to_string()),
+                    ..Default::default()
+                });
+                transaction.completed.notify_all();
+            }
+            state.shutdown_transactions.insert(key, transaction.clone());
+            transaction
+        };
+        FailedStartShutdownReceipt { transaction }
+    }
+
+    fn spawn_shutdown_driver(
+        &self,
+        transaction: Arc<ShutdownTransaction>,
+        work: ShutdownWork,
+        historical: Option<ShutdownOutcome>,
+    ) -> Result<(), LifecycleError> {
+        #[cfg(test)]
+        if FORCE_SHUTDOWN_SPAWN_FAILURE.with(std::cell::Cell::get) {
+            return Err(LifecycleError::Server(crate::ServerFailure::new(
+                "failed to spawn shutdown worker: injected test failure".into(),
+            )));
+        }
+        let runtime = self.clone();
+        std::thread::Builder::new()
+            .name("c2-shutdown".into())
+            .spawn(move || {
+                // Publication and startup use the same state fence.
+                drop(runtime.state.lock());
+                runtime.drive_shutdown_transaction(transaction, work, historical);
+            })
+            .map(|_| ())
+            .map_err(|error| {
+                LifecycleError::Server(crate::ServerFailure::new(format!(
+                    "failed to spawn shutdown worker: {error}"
+                )))
+            })
+    }
+
+    fn drive_shutdown_transaction(
+        &self,
+        transaction: Arc<ShutdownTransaction>,
+        mut work: ShutdownWork,
+        historical: Option<ShutdownOutcome>,
+    ) {
+        let (pool, mut execution) = {
+            let state = self.state.lock();
+            let mut progress = transaction.outcome.lock();
+            (state.client_pool.clone(), progress.retirement.take())
+        };
+        let mut observation = pool.as_ref().map(|pool| pool.observe_closes());
+        if let Some(execution) = execution.as_mut() {
+            work.shutdown_timeout = execution.shutdown_timeout;
+            if let (Some(observer), Some(seed)) = (observation.as_mut(), execution.seed.take()) {
+                observer.merge_seed(seed);
+            }
+        }
+        let needs_final_drain = execution.is_none() || historical.is_some();
+        let mut outcome = if let Some(historical) = historical {
+            // The original journal is immutable and may already have been delivered.
+            // Only the new sealed client scope and any still-live Server remain.
+            historical
+        } else {
+            let outcome = self.execute_shutdown(
+                &work,
+                execution.as_ref().map(|e| &e.executor),
+                observation.as_mut(),
+            );
+            if let Some(server) = &work.server {
+                self.retire_registration_scopes(server, &work.scopes);
+            }
+            outcome
+        };
+        #[cfg(test)]
+        {
+            let gate = self.state.lock().shutdown_publication_gate.take();
+            if let Some(gate) = gate {
+                gate.entered.send(()).unwrap();
+                gate.proceed.lock().recv().unwrap();
+            }
+        }
+        {
+            let state = self.state.lock();
+            let mut progress = transaction.outcome.lock();
+            if execution.is_none() {
+                execution = progress.retirement.take();
+            }
+            if execution.is_none() {
+                progress.outcome = Some(outcome);
+                transaction.completed.notify_all();
+                return;
+            }
+            drop(progress);
+            drop(state);
+        }
+        let execution = execution.as_mut().expect("retirement owns its executor");
+        // An ordinary transaction may have started before the first pool was
+        // created. Once sealed, that pool can never change or admit new entries.
+        let late_pool = if pool.is_none() {
+            self.state.lock().client_pool.clone()
+        } else {
+            None
+        };
+        let mut late_observation = late_pool.as_ref().map(|pool| pool.observe_closes());
+        let observer = observation.as_mut().or(late_observation.as_mut());
+        if let Some(observer) = observer {
+            if let Some(seed) = execution.seed.take() {
+                observer.merge_seed(seed);
+            }
+            // A newly sealed scope already drained these same entries and
+            // records in execute_shutdown. Only an upgraded/old journal needs
+            // a further pass; admission cannot reopen the sealed pool.
+            if needs_final_drain || !outcome.ipc_clients_drained {
+                Self::drain_ipc_clients(
+                    &mut outcome,
+                    Some(observer),
+                    execution.shutdown_timeout,
+                    true,
+                );
+            }
+        } else {
+            outcome.ipc_clients_drained = true;
+        }
+        if let Some(server) = &work.server {
+            // A prior error is not a stopped Server. Finish its existing native
+            // lifecycle without replaying route unregister or relay withdrawal.
+            let mut needs_completion = server.lifecycle_state().is_running()
+                || outcome.route_close_error.is_some()
+                || outcome.runtime_barrier_error.is_some()
+                || outcome
+                    .route_outcomes
+                    .iter()
+                    .any(|close| !close.active_drained || !close.local_removed);
+            while needs_completion {
+                let completion = execution.executor.block_on(async {
+                    if server.lifecycle_state().is_running() {
+                        server.close_business_admission("shutdown").await;
+                        server.request_shutdown_signal_with_reason("shutdown");
+                    }
+                    server.observe_shutdown_completion_unbounded().await
+                });
+                match completion {
+                    Ok(completion) => {
+                        if outcome.runtime_barrier_error.is_none() {
+                            outcome.runtime_barrier_error = completion.runtime_error;
+                        }
+                        for close in completion.route_outcomes {
+                            if !outcome.removed_routes.contains(&close.route_name) {
+                                outcome.removed_routes.push(close.route_name.clone());
+                            }
+                            let close = route_close_from_server_outcome(close);
+                            if let Some(previous) = outcome
+                                .route_outcomes
+                                .iter_mut()
+                                .find(|old| old.route_name == close.route_name)
+                            {
+                                if !previous.local_removed || !previous.active_drained {
+                                    *previous = close;
+                                }
+                            } else {
+                                outcome.route_outcomes.push(close);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if outcome.runtime_barrier_error.is_none() {
+                            outcome.runtime_barrier_error = Some(error.to_string());
+                        }
+                    }
+                }
+                needs_completion = server.lifecycle_state().is_running();
+            }
+        }
+        {
+            let _state = self.state.lock();
+            transaction.outcome.lock().outcome = Some(outcome);
+            transaction.completed.notify_all();
+        }
+        // execution (including its Host clone) drops only after publication.
     }
 
     fn shutdown_transaction(
@@ -1676,14 +2273,50 @@ impl Runtime {
         shutdown_timeout: Duration,
         scopes: HashMap<String, RelayRegistrationScope>,
     ) -> ShutdownOutcome {
+        let work = ShutdownWork {
+            server: server.cloned(),
+            route_names,
+            relay_anchor_address: relay_anchor_address.map(str::to_owned),
+            relay_use_proxy,
+            relay_cleanup_config_error,
+            shutdown_timeout,
+            scopes,
+        };
+        let pool = self.state.lock().client_pool.clone();
+        let mut observation = pool.as_ref().map(|pool| pool.observe_closes());
+        self.execute_shutdown(&work, None, observation.as_mut())
+    }
+
+    fn with_shutdown_executor<T>(
+        prepared: Option<&tokio::runtime::Runtime>,
+        execute: impl FnOnce(&tokio::runtime::Runtime) -> T,
+    ) -> Result<T, LifecycleError> {
+        if let Some(prepared) = prepared {
+            return Ok(execute(prepared));
+        }
+        Ok(execute(&Self::server_runtime()?))
+    }
+
+    fn execute_shutdown(
+        &self,
+        work: &ShutdownWork,
+        executor: Option<&tokio::runtime::Runtime>,
+        observation: Option<&mut c2_ipc::pool::ClientCloseObservation<'_>>,
+    ) -> ShutdownOutcome {
+        let server = work.server.as_ref();
+        let route_names = &work.route_names;
+        let relay_anchor_address = work.relay_anchor_address.as_deref();
+        let relay_use_proxy = work.relay_use_proxy;
+        let scopes = &work.scopes;
+        let shutdown_timeout = work.shutdown_timeout;
         let (mut effective_relay_anchor_address, mut relay_config_errors) =
             match self.effective_relay_anchor_address_arg(relay_anchor_address) {
                 Ok(address) => (address, Vec::new()),
                 Err(err) => (None, vec![err.to_string()]),
             };
-        if let Some(message) = relay_cleanup_config_error {
+        if let Some(message) = &work.relay_cleanup_config_error {
             effective_relay_anchor_address = None;
-            relay_config_errors.push(message);
+            relay_config_errors.push(message.clone());
         }
         let server_was_started = server.map(|server| server.is_running()).unwrap_or(false);
         let mut outcome = ShutdownOutcome {
@@ -1691,7 +2324,7 @@ impl Runtime {
             ..Default::default()
         };
         for message in relay_config_errors {
-            for route_name in &route_names {
+            for route_name in route_names {
                 outcome.relay_errors.push(RelayCleanupError {
                     route_name: route_name.clone(),
                     status_code: None,
@@ -1708,14 +2341,14 @@ impl Runtime {
                 server.lifecycle_state(),
                 ServerLifecycleState::Starting | ServerLifecycleState::Ready
             ) {
-                match Self::server_runtime() {
-                    Ok(rt) => {
-                        rt.block_on(server.close_business_admission("shutdown"));
-                        server.request_shutdown_signal_with_reason("shutdown");
-                    }
+                match Self::with_shutdown_executor(executor, |rt| {
+                    rt.block_on(server.close_business_admission("shutdown"));
+                    server.request_shutdown_signal_with_reason("shutdown");
+                }) {
+                    Ok(()) => {}
                     Err(err) => {
                         outcome.route_close_error = Some(err.to_string());
-                        for route_name in &route_names {
+                        for route_name in route_names {
                             outcome.route_outcomes.push(route_close_failure(
                                 route_name,
                                 "shutdown",
@@ -1728,49 +2361,12 @@ impl Runtime {
             }
         }
 
-        // Close this Runtime's outgoing IPC client cache before touching the
-        // server, in both hosted and hostless lifecycles. The cache handle is
-        // cloned under the state lock; every connect and close barrier runs
-        // outside it. Other Runtimes keep their own caches untouched. The
-        // drain report is only a completed claim when every detached client
-        // confirmed its bounded close AND the drain was not blocked behind a
-        // concurrent drain transaction or in-flight detached-close barriers.
-        let client_pool = self.state.lock().client_pool.clone();
-        if let Some(client_pool) = client_pool {
-            let mut observation = client_pool.observe_closes();
-            let mut client_close = observation.close_all(shutdown_timeout);
-            outcome
-                .ipc_client_close_details
-                .append(&mut client_close.abnormal);
-            if server.is_some() {
-                // This native transaction owns outstanding client barriers as well as routes.
-                // Its callers time out independently; keep retrying actual unconfirmed work.
-                while !client_close.unconfirmed.is_empty() || client_close.error.is_some() {
-                    client_close = observation.close_all(Duration::from_secs(1));
-                    outcome
-                        .ipc_client_close_details
-                        .append(&mut client_close.abnormal);
-                }
-            }
-            outcome.ipc_clients_abnormally_closed = outcome.ipc_client_close_details.len();
-            outcome.ipc_clients_drained =
-                client_close.unconfirmed.is_empty() && client_close.error.is_none();
-            if client_close.error.is_some() || !client_close.unconfirmed.is_empty() {
-                let mut detail = client_close.error.unwrap_or_default();
-                if !client_close.unconfirmed.is_empty() {
-                    if !detail.is_empty() {
-                        detail.push_str("; ");
-                    }
-                    detail.push_str(&format!(
-                        "unconfirmed IPC client cache closes for {:?}",
-                        client_close.unconfirmed
-                    ));
-                }
-                outcome.ipc_client_close_error = Some(detail);
-            }
-        } else {
-            outcome.ipc_clients_drained = true;
-        }
+        Self::drain_ipc_clients(
+            &mut outcome,
+            observation,
+            shutdown_timeout,
+            server.is_some() || executor.is_some(),
+        );
 
         if let Some(server) = server {
             let recorded_direct_shutdown_outcomes = if matches!(
@@ -1779,8 +2375,10 @@ impl Runtime {
                     | ServerLifecycleState::Stopped
                     | ServerLifecycleState::Failed(_)
             ) {
-                match Self::server_runtime() {
-                    Ok(rt) => match rt.block_on(server.observe_shutdown_completion_unbounded()) {
+                match Self::with_shutdown_executor(executor, |rt| {
+                    rt.block_on(server.observe_shutdown_completion_unbounded())
+                }) {
+                    Ok(completion) => match completion {
                         Ok(completion) => {
                             outcome.runtime_barrier_error = completion.runtime_error;
                             completion.route_outcomes
@@ -1813,12 +2411,15 @@ impl Runtime {
                 .cloned()
                 .collect();
             if !pending_runtime_unregisters.is_empty() {
-                match Self::server_runtime() {
-                    Ok(rt) => {
-                        let close_outcomes = rt.block_on(server.unregister_routes_for_shutdown(
+                match Self::with_shutdown_executor(executor, |rt| {
+                    rt.block_on(
+                        server.unregister_routes_for_shutdown(
                             &pending_runtime_unregisters,
                             "shutdown",
-                        ));
+                        ),
+                    )
+                }) {
+                    Ok(close_outcomes) => {
                         for close in close_outcomes {
                             outcome.removed_routes.push(close.route_name.clone());
                             outcome
@@ -1840,11 +2441,13 @@ impl Runtime {
                 }
             }
             if can_signal_shutdown && server_was_started {
-                match Self::server_runtime() {
-                    Ok(rt) => match rt.block_on(async {
+                match Self::with_shutdown_executor(executor, |rt| {
+                    rt.block_on(async {
                         server.request_shutdown_signal_with_reason("shutdown");
                         server.observe_shutdown_completion_unbounded().await
-                    }) {
+                    })
+                }) {
+                    Ok(completion) => match completion {
                         Ok(completion) => {
                             if let Some(error) = completion.runtime_error {
                                 outcome.runtime_barrier_error = Some(error);
@@ -1885,7 +2488,7 @@ impl Runtime {
                 }
             }
         } else if effective_relay_anchor_address.is_some() {
-            for route_name in &route_names {
+            for route_name in route_names {
                 outcome.relay_errors.push(RelayCleanupError {
                     route_name: route_name.clone(),
                     status_code: None,
@@ -1895,6 +2498,43 @@ impl Runtime {
         }
 
         outcome
+    }
+
+    fn drain_ipc_clients(
+        outcome: &mut ShutdownOutcome,
+        observation: Option<&mut c2_ipc::pool::ClientCloseObservation<'_>>,
+        timeout: Duration,
+        keep_draining: bool,
+    ) {
+        let Some(observation) = observation else {
+            outcome.ipc_clients_drained = true;
+            return;
+        };
+        let mut report = observation.close_all(timeout);
+        outcome
+            .ipc_client_close_details
+            .append(&mut report.abnormal);
+        while keep_draining && (!report.unconfirmed.is_empty() || report.error.is_some()) {
+            report = observation.close_all(Duration::from_secs(1));
+            outcome
+                .ipc_client_close_details
+                .append(&mut report.abnormal);
+        }
+        outcome.ipc_clients_abnormally_closed = outcome.ipc_client_close_details.len();
+        outcome.ipc_clients_drained = report.unconfirmed.is_empty() && report.error.is_none();
+        if !outcome.ipc_clients_drained {
+            let mut detail = report.error.unwrap_or_default();
+            if !report.unconfirmed.is_empty() {
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&format!(
+                    "unconfirmed IPC client cache closes for {:?}",
+                    report.unconfirmed
+                ));
+            }
+            outcome.ipc_client_close_error = Some(detail);
+        }
     }
 
     /// Shut down a client-only (hostless) Runtime.
@@ -4421,5 +5061,316 @@ mod tests {
             .expect("runtime b domain stays observable");
         assert_eq!(b_after.limits.shm_backing_budget_bytes, 2222);
         assert_eq!(b_after.shm.limit_bytes, 2222);
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use crate::{Host, HostOptions};
+    use std::sync::mpsc;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn hosted_runtime() -> (Runtime, Host, Option<tempfile::TempDir>) {
+        let runtime = Runtime::new(RuntimeOptions {
+            server_id: Some(format!("retire-unit-{}", uuid::Uuid::new_v4().simple())),
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap();
+        #[cfg(unix)]
+        let root = {
+            let root = tempfile::Builder::new()
+                .prefix("c2-retire-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            runtime
+                .set_local_endpoint_with_sources(
+                    c2_config::LocalEndpointOptions {
+                        unix_root: Some(root.path().to_path_buf()),
+                    },
+                    c2_config::ConfigSources::empty(),
+                )
+                .unwrap();
+            Some(root)
+        };
+        #[cfg(not(unix))]
+        let root = {
+            runtime
+                .set_local_endpoint_with_sources(
+                    c2_config::LocalEndpointOptions::default(),
+                    c2_config::ConfigSources::empty(),
+                )
+                .unwrap();
+            None
+        };
+        let host = runtime
+            .host(HostOptions::default().without_relay())
+            .unwrap();
+        (runtime, host, root)
+    }
+
+    #[test]
+    fn retirement_executor_and_spawn_failures_keep_owner_and_admission() {
+        let (runtime, host, _root) = hosted_runtime();
+        for flag in [&FORCE_SERVER_RUNTIME_FAILURE, &FORCE_SHUTDOWN_SPAWN_FAILURE] {
+            flag.with(|flag| flag.set(true));
+            let result = runtime.begin_session_retirement(
+                RuntimeShutdownTarget::Host(&host),
+                Instant::now() + WAIT,
+            );
+            flag.with(|flag| flag.set(false));
+            assert!(matches!(result, Err(LifecycleError::Server(_))));
+            assert!(
+                runtime
+                    .retirement_receipt(Instant::now())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(runtime.state.lock().shutdown_transactions.is_empty());
+            runtime.ensure_active().unwrap();
+            assert!(host.is_running());
+            assert!(
+                runtime
+                    .ping_direct_ipc(host.local_endpoint().address(), WAIT)
+                    .unwrap()
+            );
+        }
+        assert!(host.shutdown().runtime_barrier_error.is_none());
+    }
+
+    #[test]
+    fn zero_budget_contended_core_lock_does_not_publish_retirement() {
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        let state = runtime.state.lock();
+        let result =
+            runtime.begin_session_retirement(RuntimeShutdownTarget::ClientsOnly, Instant::now());
+        assert!(matches!(
+            result,
+            Err(LifecycleError::ShutdownWaitTimeout {
+                stage: "core_retirement_wait"
+            })
+        ));
+        assert!(state.retirement.is_none());
+        drop(state);
+        runtime.ensure_active().unwrap();
+    }
+
+    #[test]
+    fn contended_pool_seal_keeps_original_owner_and_does_not_spawn() {
+        let (runtime, host, _root) = hosted_runtime();
+        let _client = runtime
+            .acquire_ipc_client_with_deadline(
+                host.local_endpoint().address(),
+                ConnectDeadline::default(),
+            )
+            .unwrap();
+        let pool = runtime.state.lock().client_pool.clone().unwrap();
+        let guard = pool.prepare_seal(Instant::now()).unwrap();
+        let result =
+            runtime.begin_session_retirement(RuntimeShutdownTarget::Host(&host), Instant::now());
+        assert!(matches!(
+            result,
+            Err(LifecycleError::ShutdownWaitTimeout {
+                stage: "core_pool_seal_wait"
+            })
+        ));
+        assert!(runtime.state.lock().shutdown_transactions.is_empty());
+        assert!(
+            runtime
+                .retirement_receipt(Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.is_running());
+        drop(guard);
+        let receipt = runtime
+            .begin_session_retirement(RuntimeShutdownTarget::Host(&host), Instant::now() + WAIT)
+            .unwrap();
+        assert!(receipt.observe_until(Instant::now() + WAIT).1);
+        assert!(!host.is_running());
+    }
+
+    #[test]
+    fn pending_upgrade_and_terminal_publication_are_serialized_on_same_transaction() {
+        for upgrade_wins in [true, false] {
+            let (runtime, host, _root) = hosted_runtime();
+            let (entered, observed) = mpsc::sync_channel(1);
+            let (proceed, delayed) = mpsc::channel();
+            runtime.state.lock().shutdown_publication_gate =
+                Some(Arc::new(ShutdownPublicationGate {
+                    entered,
+                    proceed: Mutex::new(delayed),
+                }));
+            host.shutdown_with_timeout(Duration::ZERO);
+            observed
+                .recv_timeout(WAIT)
+                .expect("real driver reached publication");
+            let original = runtime
+                .state
+                .lock()
+                .shutdown_transactions
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            assert!(original.outcome.lock().outcome.is_none());
+            let receipt = if upgrade_wins {
+                let progress = original.outcome.lock();
+                let contended = runtime
+                    .begin_session_retirement(RuntimeShutdownTarget::Host(&host), Instant::now());
+                assert!(matches!(
+                    contended,
+                    Err(LifecycleError::ShutdownWaitTimeout {
+                        stage: "core_shutdown_outcome_wait"
+                    })
+                ));
+                assert!(progress.retirement.is_none());
+                drop(progress);
+                FORCE_SERVER_RUNTIME_FAILURE.with(|flag| flag.set(true));
+                let rejected = runtime.begin_session_retirement(
+                    RuntimeShutdownTarget::Host(&host),
+                    Instant::now() + WAIT,
+                );
+                FORCE_SERVER_RUNTIME_FAILURE.with(|flag| flag.set(false));
+                assert!(rejected.is_err());
+                assert!(
+                    runtime
+                        .retirement_receipt(Instant::now())
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(original.outcome.lock().retirement.is_none());
+                // Any attempt to spawn a second driver would fail this upgrade.
+                FORCE_SHUTDOWN_SPAWN_FAILURE.with(|flag| flag.set(true));
+                let receipt = runtime.begin_session_retirement(
+                    RuntimeShutdownTarget::Host(&host),
+                    Instant::now() + WAIT,
+                );
+                FORCE_SHUTDOWN_SPAWN_FAILURE.with(|flag| flag.set(false));
+                let receipt = receipt.unwrap();
+                assert!(Arc::ptr_eq(&receipt.transaction, &original));
+                assert!(!receipt.observe_until(Instant::now()).1);
+                proceed.send(()).unwrap();
+                receipt
+            } else {
+                proceed.send(()).unwrap();
+                let original_outcome = original.observe_until(Instant::now() + WAIT).unwrap();
+                let server = host
+                    .retirement_work(Instant::now() + WAIT)
+                    .unwrap()
+                    .server
+                    .unwrap();
+                // Exercise the existing delivered branch before Runtime retirement.
+                let delivered =
+                    runtime.shutdown(Some(&server), Vec::new(), None, false, None, WAIT);
+                assert_eq!(delivered, original_outcome);
+                assert!(original.delivered.load(Ordering::Acquire));
+                let receipt = runtime
+                    .begin_session_retirement(
+                        RuntimeShutdownTarget::Host(&host),
+                        Instant::now() + WAIT,
+                    )
+                    .unwrap();
+                assert!(!Arc::ptr_eq(&receipt.transaction, &original));
+                receipt
+            };
+            let (outcome, completed) = receipt.observe_until(Instant::now() + WAIT);
+            assert!(completed && outcome.ipc_clients_drained, "{outcome:?}");
+            assert!(!host.is_running());
+            assert_eq!(receipt.terminal_outcome(), Some(outcome.clone()));
+            assert_eq!(original.outcome.lock().outcome.as_ref(), Some(&outcome));
+        }
+    }
+
+    #[test]
+    fn terminal_shutdown_error_with_live_server_requires_actual_native_completion() {
+        let (runtime, host, _root) = hosted_runtime();
+        let server = host
+            .retirement_work(Instant::now() + WAIT)
+            .unwrap()
+            .server
+            .unwrap();
+        FORCE_SHUTDOWN_SPAWN_FAILURE.with(|flag| flag.set(true));
+        let failed = runtime.begin_failed_start_shutdown(&server, Vec::new(), None, false, WAIT);
+        FORCE_SHUTDOWN_SPAWN_FAILURE.with(|flag| flag.set(false));
+        let historical = failed.terminal_outcome().unwrap();
+        assert!(historical.runtime_barrier_error.is_some());
+        assert!(server.lifecycle_state().is_running());
+        let receipt = runtime
+            .begin_session_retirement(RuntimeShutdownTarget::FailedStart(&failed), Instant::now())
+            .unwrap();
+        let (outcome, completed) = receipt.observe_until(Instant::now() + WAIT);
+        assert!(completed && outcome.ipc_clients_drained, "{outcome:?}");
+        assert!(!server.lifecycle_state().is_running());
+        assert_eq!(
+            outcome.runtime_barrier_error,
+            historical.runtime_barrier_error
+        );
+        assert_eq!(failed.terminal_outcome(), Some(historical));
+    }
+
+    #[test]
+    fn failed_start_receipt_keeps_terminal_error_after_map_pruning() {
+        let (runtime, host, _root) = hosted_runtime();
+        let server = host
+            .retirement_work(Instant::now() + WAIT)
+            .unwrap()
+            .server
+            .unwrap();
+        let failed = runtime.begin_failed_start_shutdown(&server, Vec::new(), None, false, WAIT);
+        assert!(failed.observe_with_timeout(WAIT).1);
+        failed.set_terminal_error_for_test("retained failed-start cleanup error");
+        let historical = failed.terminal_outcome().unwrap();
+        drop(host);
+        drop(server);
+        let other_host = runtime
+            .host(HostOptions::default().without_relay())
+            .unwrap();
+        let other_server = other_host
+            .retirement_work(Instant::now() + WAIT)
+            .unwrap()
+            .server
+            .unwrap();
+        let other_failed =
+            runtime.begin_failed_start_shutdown(&other_server, Vec::new(), None, false, WAIT);
+        assert!(other_failed.observe_with_timeout(WAIT).1);
+        drop(other_host);
+        drop(other_server);
+        // Remove only the optional index, after the real transaction completed.
+        runtime.state.lock().shutdown_transactions.clear();
+        assert!(failed.transaction.server.upgrade().is_none());
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (proceed, delayed) = mpsc::channel();
+        runtime.state.lock().shutdown_publication_gate = Some(Arc::new(ShutdownPublicationGate {
+            entered,
+            proceed: Mutex::new(delayed),
+        }));
+        let receipt = runtime
+            .begin_session_retirement(
+                RuntimeShutdownTarget::FailedStart(&failed),
+                Instant::now() + WAIT,
+            )
+            .unwrap();
+        observed.recv_timeout(WAIT).unwrap();
+        assert!(!receipt.observe_until(Instant::now()).1);
+        let again = runtime
+            .begin_session_retirement(RuntimeShutdownTarget::FailedStart(&failed), Instant::now());
+        // Always release the driver before asserting, including regression failure.
+        proceed.send(()).unwrap();
+        let again = again.unwrap();
+        assert!(Arc::ptr_eq(&receipt.transaction, &again.transaction));
+        assert!(matches!(
+            runtime.begin_session_retirement(
+                RuntimeShutdownTarget::FailedStart(&other_failed),
+                Instant::now() + WAIT,
+            ),
+            Err(LifecycleError::Configuration(_))
+        ));
+        let (outcome, completed) = receipt.observe_until(Instant::now() + WAIT);
+        assert!(completed && outcome.ipc_clients_drained, "{outcome:?}");
+        assert_eq!(outcome, historical);
+        assert_eq!(failed.terminal_outcome(), Some(historical));
     }
 }

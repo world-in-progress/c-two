@@ -1,0 +1,107 @@
+{
+  "schema": "c-two.r17c.acceptance-evidence.v1",
+  "implementation": {
+    "source_sha": "1e74b4c9463071ae6162619fc20eca4f55634b75",
+    "baseline_sha": "f4ab1c7bf9e629a3d2e22df236d0ed7285c12670",
+    "scope": "Unix unlink_verified final lease stat error classification"
+  },
+  "ci": {
+    "workflow": ".github/workflows/ci.yml",
+    "workflow_sha": "1e74b4c9463071ae6162619fc20eca4f55634b75",
+    "run_id": 40462218729,
+    "run_attempt": 1,
+    "run_url": "https://github.com/Dsssyc/c-two/actions/runs/40462218729",
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": {
+      "total": 10,
+      "completed_success": 10
+    },
+    "full_source_lines": [
+      {
+        "platform": "linux-x86_64",
+        "scope": "full",
+        "gates": 25,
+        "passed": 25,
+        "source_sha_verified": true
+      },
+      {
+        "platform": "macos-arm64",
+        "scope": "full",
+        "gates": 25,
+        "passed": 25,
+        "source_sha_verified": true
+      },
+      {
+        "platform": "windows-2022-x86_64",
+        "scope": "full",
+        "gates": 27,
+        "passed": 27,
+        "source_sha_verified": true
+      },
+      {
+        "platform": "windows-2025-x86_64",
+        "scope": "full",
+        "gates": 27,
+        "passed": 27,
+        "source_sha_verified": true
+      },
+      {
+        "platform": "windows-11-arm64",
+        "scope": "full",
+        "gates": 27,
+        "passed": 27,
+        "source_sha_verified": true
+      }
+    ],
+    "python_314t": {
+      "platform": "linux-x86_64",
+      "gates": 16,
+      "passed": 16,
+      "source_sha_verified": true
+    },
+    "applicable_gates_total": 147,
+    "aggregate_test_jobs": "both passed",
+    "fastdb_source_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4"
+  },
+  "local_validation": {
+    "baseline_expected_failures": 2,
+    "baseline_controls_passed": 2,
+    "candidate_new_scenarios_passed": 4,
+    "candidate_related_existing_tests_passed": 10,
+    "linux_and_macos_core_logs_contain_all_four_new_scenarios": true,
+    "new_scenario_ids": [
+      "final_lease_stat_rollback_keeps_initialization_error",
+      "final_lease_stat_short_circuits_directory_and_keeps_ownership_denials",
+      "final_lease_stat_io_releases_close_and_drop_leases",
+      "final_lease_stat_io_preserves_stale_bind_reap_and_sweep"
+    ]
+  },
+  "cleanup": {
+    "isolated_endpoint_roots_recorded": 14,
+    "isolated_endpoint_roots_remaining": 0,
+    "baseline_private_cargo_target_remaining": false,
+    "candidate_private_cargo_target_remaining": false,
+    "scope_note": "Evidence covers this run's isolated resources only; it makes no claim about historical default IPC directories."
+  },
+  "diff_counts": {
+    "production_added": 7,
+    "production_removed": 1,
+    "production_net": 6,
+    "test_scenarios_added": 241,
+    "cfg_test_fault_hooks_added": 14,
+    "tests_net": 255,
+    "non_document_net": 261
+  },
+  "release": {
+    "published": false,
+    "ci_branch_cleanup": "deleted with exact source SHA lease"
+  },
+  "remaining_r17_scope": [
+    "gate_entry_is_current and gate_still_named classification",
+    "directory pin classification",
+    "NamespaceDirectories::same_as",
+    "sweep directory invalidation",
+    "owner context mapping"
+  ]
+}

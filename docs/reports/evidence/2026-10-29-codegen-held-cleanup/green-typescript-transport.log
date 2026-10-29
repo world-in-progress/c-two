@@ -1,0 +1,11 @@
+$ cargo test --manifest-path core/Cargo.toml --offline --quiet --no-run --test typescript_transport_contract
+
+exit_code=0
+$ $WORK/target/debug/deps/typescript_transport_contract-ec85a91bdcd9dd65 --format=terse --nocapture
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.50s
+
+
+exit_code=0

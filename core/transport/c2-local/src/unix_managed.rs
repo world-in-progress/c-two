@@ -1,20 +1,20 @@
-//! Managed v2 Unix endpoint namespace: one fixed coordinator gate, one lease
+//! Managed Unix endpoint namespace: one fixed coordinator gate, one lease
 //! per live listener, and identity-checked retirement.
 //!
-//! The namespace is the `managed-v2` directory derived by
-//! [`c2_config::LocalEndpoint`] (default `/tmp/c2-<uidhex>`). macOS keeps the
+//! The namespace is derived by [`c2_config::LocalEndpoint`] (default
+//! `/tmp/c2-v3-<uidhex>`). macOS keeps the
 //! default namespace's coordination records in its non-temporary user directory;
 //! other namespaces keep them beside the socket. Both locations are accessed
 //! through verified directory descriptors:
 //!
 //! - `.gate` is the single long-lived coordinator lock. Every open, create,
 //!   delete, and retire of an endpoint lease happens while holding it.
-//! - `.gate.marker` records the gate device/inode and random identity so a
+//! - `.gate.marker` records the gate inode and random identity so a
 //!   replaced, missing, or damaged gate is detected instead of creating a
 //!   second lock.
 //! - `<sha256(address)>.lease` is the per-endpoint lease, locked exclusively by
-//!   its listener for life. It stores the bounded owner record (protocol,
-//!   complete logical address, fresh incarnation, socket identity).
+//!   its listener for life. It stores the bounded owner record (complete
+//!   logical address, fresh incarnation, socket identity).
 //! - `<32-character endpoint id>` is the Unix socket.
 //!
 //! While the gate is held, an endpoint lease is only ever *tried*
@@ -152,17 +152,14 @@ pub(crate) mod barrier {
 }
 
 const GATE_MAGIC: &[u8; 8] = b"c2mgatv2";
-// Version 1 had only dev/ino and could accept a recycled inode. Existing
-// markers are never upgraded online: their namespace must remain unverified.
-const GATE_VERSION: u8 = 2;
+const GATE_VERSION: u8 = c2_config::UNIX_NAMESPACE_FORMAT_VERSION;
 const GATE_IDENTITY_LEN: usize = 8 + 1 + 16;
-const MARKER_LEN: usize = 8 + 1 + 8 + 8 + 16;
+const MARKER_LEN: usize = 8 + 1 + 8 + 16;
 
 const RECORD_MAGIC: &[u8; 8] = b"c2mgrec2";
-const RECORD_VERSION: u8 = 2;
-const RECORD_PROTOCOL: u8 = 2;
+const RECORD_VERSION: u8 = c2_config::UNIX_NAMESPACE_FORMAT_VERSION;
 const RECORD_ADDRESS_LIMIT: usize = 1024;
-const RECORD_FIXED_LEN: usize = 8 + 1 + 1 + 2 + 16 + 8 + 8 + 8 + 8;
+const RECORD_FIXED_LEN: usize = 8 + 1 + 2 + 16 + 8 + 8 + 8;
 const RECORD_MAX_LEN: usize = RECORD_FIXED_LEN + RECORD_ADDRESS_LIMIT;
 
 /// A bounded, self-describing owner record written into an endpoint lease.
@@ -185,10 +182,8 @@ impl OwnerRecord {
         let mut bytes = Vec::with_capacity(RECORD_FIXED_LEN + address.len());
         bytes.extend_from_slice(RECORD_MAGIC);
         bytes.push(RECORD_VERSION);
-        bytes.push(RECORD_PROTOCOL);
         bytes.extend_from_slice(&(address.len() as u16).to_le_bytes());
         bytes.extend_from_slice(&self.incarnation);
-        bytes.extend_from_slice(&self.identity.device.to_le_bytes());
         bytes.extend_from_slice(&self.identity.inode.to_le_bytes());
         bytes.extend_from_slice(&self.identity.changed_secs.to_le_bytes());
         bytes.extend_from_slice(&self.identity.changed_nanos.to_le_bytes());
@@ -200,21 +195,19 @@ impl OwnerRecord {
         if bytes.len() < RECORD_FIXED_LEN || bytes.len() > RECORD_MAX_LEN {
             return None;
         }
-        if &bytes[..8] != RECORD_MAGIC || bytes[8] != RECORD_VERSION || bytes[9] != RECORD_PROTOCOL
-        {
+        if &bytes[..8] != RECORD_MAGIC || bytes[8] != RECORD_VERSION {
             return None;
         }
-        let address_len = u16::from_le_bytes(bytes[10..12].try_into().ok()?) as usize;
+        let address_len = u16::from_le_bytes(bytes[9..11].try_into().ok()?) as usize;
         if address_len > RECORD_ADDRESS_LIMIT || bytes.len() != RECORD_FIXED_LEN + address_len {
             return None;
         }
         let mut incarnation = [0_u8; 16];
-        incarnation.copy_from_slice(&bytes[12..28]);
+        incarnation.copy_from_slice(&bytes[11..27]);
         let identity = SocketIdentity {
-            device: u64::from_le_bytes(bytes[28..36].try_into().ok()?),
-            inode: u64::from_le_bytes(bytes[36..44].try_into().ok()?),
-            changed_secs: i64::from_le_bytes(bytes[44..52].try_into().ok()?),
-            changed_nanos: i64::from_le_bytes(bytes[52..60].try_into().ok()?),
+            inode: u64::from_le_bytes(bytes[27..35].try_into().ok()?),
+            changed_secs: i64::from_le_bytes(bytes[35..43].try_into().ok()?),
+            changed_nanos: i64::from_le_bytes(bytes[43..51].try_into().ok()?),
         };
         let address = std::str::from_utf8(&bytes[RECORD_FIXED_LEN..]).ok()?;
         Some(Self {
@@ -451,8 +444,14 @@ impl ManagedNamespace {
         // view, so two concurrent first initializations cannot both write one.
         let marker_stat = directory.stat(&marker_name()).map_err(NamespaceError::Io)?;
         match marker_stat {
-            Some(_) => validate_marker(&directory, &gate)?,
+            Some(_) => {
+                let marker = open_verified_marker(&directory)?;
+                reject_other_namespace_format(&gate)?;
+                reject_other_namespace_format(&marker)?;
+                validate_marker_contents(&gate, &marker)?;
+            }
             None => {
+                reject_other_namespace_format(&gate)?;
                 if !create {
                     return Err(NamespaceError::Unverified(
                         EndpointUnverifiedReason::InitializationIncomplete,
@@ -517,39 +516,43 @@ impl ContextBinding {
         })?;
         let namespace =
             ManagedNamespace::open_existing_shared(root).map_err(context_binding_error)?;
-        Self::from_namespace(root, &namespace)
+        Self::from_namespace(root, &namespace).map_err(context_binding_error)
     }
 
-    fn from_namespace(root: &Path, namespace: &ManagedNamespace) -> io::Result<Self> {
+    fn from_namespace(root: &Path, namespace: &ManagedNamespace) -> Result<Self, NamespaceError> {
         namespace.directories.validate()?;
         if !namespace.gate_still_named() {
-            return Err(changed_context());
+            return Err(NamespaceError::Unverified(
+                EndpointUnverifiedReason::CoordinatorReplaced,
+            ));
         }
-        validate_marker(&namespace.directories.records, &namespace.gate)
-            .map_err(context_binding_error)?;
+        validate_marker(&namespace.directories.records, &namespace.gate)?;
         // Do not dup the locked file description: an independent read-only open is the pin.
         let gate_pin = namespace
             .directories
             .records
             .open_file(&gate_name(), libc::O_RDONLY, 0)?
-            .ok_or_else(changed_context)?;
-        verify_gate_file(&gate_pin).map_err(context_binding_error)?;
+            .ok_or(NamespaceError::Unverified(
+                EndpointUnverifiedReason::CoordinatorReplaced,
+            ))?;
+        verify_gate_file(&gate_pin)?;
         let original = fstat(namespace.gate.as_raw_fd())?;
         let pinned = fstat(gate_pin.as_raw_fd())?;
-        let nonce = gate_nonce(&namespace.gate).map_err(context_binding_error)?;
-        if !same_file(&original, &pinned)
-            || gate_nonce(&gate_pin).map_err(context_binding_error)? != nonce
-        {
-            return Err(changed_context());
+        let nonce = gate_nonce(&namespace.gate)?;
+        if !same_file(&original, &pinned) || gate_nonce(&gate_pin)? != nonce {
+            return Err(NamespaceError::Unverified(
+                EndpointUnverifiedReason::CoordinatorReplaced,
+            ));
         }
         let digest = context_digest(&namespace.directories, &pinned, nonce)?;
         // Fence both roles and the marker again after opening the independent gate pin.
         namespace.directories.validate()?;
         if !gate_entry_is_current(&namespace.directories.records, &gate_pin) {
-            return Err(changed_context());
+            return Err(NamespaceError::Unverified(
+                EndpointUnverifiedReason::CoordinatorReplaced,
+            ));
         }
-        validate_marker(&namespace.directories.records, &gate_pin)
-            .map_err(context_binding_error)?;
+        validate_marker(&namespace.directories.records, &gate_pin)?;
         Ok(Self {
             root: root.to_owned(),
             directories: namespace.directories.clone(),
@@ -745,6 +748,23 @@ fn has_endpoint_entries(
     Ok(false)
 }
 
+/// Recognize a different format from its unchanged magic and independent
+/// version byte. The remaining bytes are never interpreted across formats.
+fn reject_other_namespace_format(file: &File) -> Result<(), NamespaceError> {
+    if file.metadata().map_err(NamespaceError::Io)?.len() < 9 {
+        return Ok(());
+    }
+    let mut header = [0_u8; 9];
+    file.read_exact_at(&mut header, 0)
+        .map_err(NamespaceError::Io)?;
+    if &header[..8] == GATE_MAGIC && header[8] != c2_config::UNIX_NAMESPACE_FORMAT_VERSION {
+        return Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::UnsupportedNamespaceFormat,
+        ));
+    }
+    Ok(())
+}
+
 fn gate_nonce(gate: &File) -> Result<[u8; 16], NamespaceError> {
     let bytes = read_bounded(gate, GATE_IDENTITY_LEN).map_err(NamespaceError::Io)?;
     let Some(bytes) = bytes.filter(|bytes| {
@@ -775,7 +795,6 @@ fn write_marker(directory: &EndpointDirectory, gate: &File) -> Result<(), Namesp
     let mut bytes = Vec::with_capacity(MARKER_LEN);
     bytes.extend_from_slice(GATE_MAGIC);
     bytes.push(GATE_VERSION);
-    bytes.extend_from_slice(&(stat.st_dev as u64).to_le_bytes());
     bytes.extend_from_slice(&(stat.st_ino as u64).to_le_bytes());
     bytes.extend_from_slice(&nonce);
     let mut file = directory
@@ -804,6 +823,10 @@ fn write_marker(directory: &EndpointDirectory, gate: &File) -> Result<(), Namesp
 }
 
 fn validate_marker(directory: &EndpointDirectory, gate: &File) -> Result<(), NamespaceError> {
+    validate_marker_contents(gate, &open_verified_marker(directory)?)
+}
+
+fn open_verified_marker(directory: &EndpointDirectory) -> Result<File, NamespaceError> {
     let stat = directory
         .stat(&marker_name())
         .map_err(NamespaceError::Io)?
@@ -835,18 +858,18 @@ fn validate_marker(directory: &EndpointDirectory, gate: &File) -> Result<(), Nam
             EndpointUnverifiedReason::CoordinatorReplaced,
         ));
     }
-    let Some(bytes) = read_bounded(&file, MARKER_LEN).map_err(NamespaceError::Io)? else {
+    Ok(file)
+}
+
+fn validate_marker_contents(gate: &File, marker: &File) -> Result<(), NamespaceError> {
+    let Some(bytes) = read_bounded(marker, MARKER_LEN).map_err(NamespaceError::Io)? else {
         return Err(NamespaceError::Unverified(
             EndpointUnverifiedReason::CoordinatorReplaced,
         ));
     };
     let gate_stat = fstat(gate.as_raw_fd()).map_err(NamespaceError::Io)?;
-    let decoded = bytes.len() == MARKER_LEN
-        && &bytes[..8] == GATE_MAGIC
-        && bytes[8] == GATE_VERSION
-        && u64::from_le_bytes(bytes[9..17].try_into().unwrap()) == gate_stat.st_dev as u64
-        && u64::from_le_bytes(bytes[17..25].try_into().unwrap()) == gate_stat.st_ino as u64
-        && bytes[25..41] == gate_nonce(gate)?;
+    let decoded =
+        marker_matches_gate_inode(&bytes, &gate_stat) && bytes[17..33] == gate_nonce(gate)?;
     if !decoded {
         return Err(NamespaceError::Unverified(
             EndpointUnverifiedReason::CoordinatorReplaced,
@@ -855,29 +878,60 @@ fn validate_marker(directory: &EndpointDirectory, gate: &File) -> Result<(), Nam
     Ok(())
 }
 
+// Check the stored fields before reading the live gate nonce, preserving the
+// original refusal/error order. Device numbers are not persistent identities.
+fn marker_matches_gate_inode(bytes: &[u8], gate_stat: &libc::stat) -> bool {
+    bytes.len() == MARKER_LEN
+        && &bytes[..8] == GATE_MAGIC
+        && bytes[8] == GATE_VERSION
+        && u64::from_le_bytes(bytes[9..17].try_into().unwrap()) == gate_stat.st_ino as u64
+}
+
 /// Verifies that a lease entry is a private regular file naming the open file.
 fn verify_lease_entry(
     directory: &EndpointDirectory,
     name: &CString,
     file: &File,
-) -> Result<libc::stat, EndpointUnverifiedReason> {
-    let opened = fstat(file.as_raw_fd()).map_err(|_| EndpointUnverifiedReason::InvalidOwnership)?;
+) -> Result<libc::stat, NamespaceError> {
+    let opened = fstat(file.as_raw_fd());
+    #[cfg(test)]
+    let opened =
+        if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::VerifyLeaseFstat)
+        {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            opened
+        };
+    let opened = opened?;
     if stat_is(&opened, libc::S_IFLNK) {
-        return Err(EndpointUnverifiedReason::Symlink);
+        return Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::Symlink,
+        ));
     }
     if !stat_is(&opened, libc::S_IFREG)
         || opened.st_uid != unsafe { libc::geteuid() }
         || opened.st_mode as libc::mode_t & 0o077 != 0
     {
-        return Err(EndpointUnverifiedReason::InvalidOwnership);
+        return Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::InvalidOwnership,
+        ));
     }
-    let current = directory
-        .stat(name)
-        .ok()
-        .flatten()
-        .ok_or(EndpointUnverifiedReason::InvalidOwnership)?;
+    let current = directory.stat(name);
+    #[cfg(test)]
+    let current = if crate::unix_common::fault::take_if(
+        crate::unix_common::fault::Failure::VerifyLeaseStat,
+    ) {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    } else {
+        current
+    };
+    let current = current?.ok_or(NamespaceError::Unverified(
+        EndpointUnverifiedReason::InvalidOwnership,
+    ))?;
     if !same_file(&opened, &current) {
-        return Err(EndpointUnverifiedReason::InvalidOwnership);
+        return Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::InvalidOwnership,
+        ));
     }
     Ok(opened)
 }
@@ -898,16 +952,11 @@ fn open_lease(directory: &EndpointDirectory, name: &CString) -> io::Result<Optio
     directory.open_file(name, libc::O_RDWR, 0o600)
 }
 
-fn try_lock_lease(file: &File) -> Result<(), EndpointReapResult> {
+fn try_lock_lease(file: &File) -> io::Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         Ok(())
     } else {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            Err(EndpointReapResult::Busy)
-        } else {
-            Err(EndpointReapResult::IoError(error))
-        }
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -939,21 +988,22 @@ fn namespace_bind_error(error: NamespaceError) -> io::Error {
             "managed endpoint namespace is absent",
         ),
         NamespaceError::Busy => io::Error::new(
-            io::ErrorKind::AddrInUse,
+            io::ErrorKind::WouldBlock,
             "managed endpoint namespace gate is busy",
         ),
-        NamespaceError::Unverified(_) => io::Error::new(
-            io::ErrorKind::AddrInUse,
-            "managed endpoint namespace is unverifiable",
-        ),
+        NamespaceError::Unverified(reason) => unverified_bind_error(reason),
         NamespaceError::Io(error) => error,
     }
+}
+
+fn unverified_bind_error(reason: EndpointUnverifiedReason) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
 fn endpoint_in_use() -> io::Error {
     io::Error::new(
         io::ErrorKind::AddrInUse,
-        "managed IPC endpoint already has an active or unverifiable listener",
+        "managed IPC endpoint already has an active listener or held lease",
     )
 }
 
@@ -961,20 +1011,17 @@ fn identity_of(stat: &libc::stat) -> SocketIdentity {
     SocketIdentity::from_stat(stat)
 }
 
-fn socket_identity(
+fn verified_socket_stat(
     directory: &EndpointDirectory,
     names: &EndpointNames,
-) -> io::Result<SocketIdentity> {
+) -> io::Result<libc::stat> {
     let stat = directory
         .stat(&names.socket)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bound socket disappeared"))?;
     if let Some(reason) = socket_unverified(&stat) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("bound managed endpoint is unsafe: {reason:?}"),
-        ));
+        return Err(unverified_bind_error(reason));
     }
-    Ok(identity_of(&stat))
+    Ok(stat)
 }
 
 /// Opens the coordinator gate with a short, bounded retry instead of an
@@ -984,7 +1031,7 @@ fn socket_identity(
 /// coordinator another process holds would stall `Server::start`. The bounded
 /// wait lets a transient same-address race resolve (the existing
 /// winner/loser semantics), while a persistently held or otherwise busy gate
-/// degrades to `Busy` and surfaces as `AddrInUse`. Retrying the whole start
+/// degrades to `Busy` and surfaces as `WouldBlock`. Retrying the whole start
 /// attempt, with the caller's own timeout, is left to the layer above.
 fn open_root_bounded(root: &Path, create: bool) -> Result<ManagedNamespace, NamespaceError> {
     const ATTEMPTS: usize = 50;
@@ -1035,21 +1082,31 @@ fn remove_stale_managed_socket(
     endpoint: &LocalEndpoint,
     names: &EndpointNames,
     lease: &File,
+    lease_created: bool,
 ) -> io::Result<()> {
     let Some(socket_stat) = namespace.directories.socket_stat(&names.socket)? else {
         return Ok(());
     };
-    if !stat_is(&socket_stat, libc::S_IFSOCK) || socket_stat.st_uid != unsafe { libc::geteuid() } {
-        return Err(endpoint_in_use());
+    if let Some(reason) = socket_unverified(&socket_stat) {
+        return Err(unverified_bind_error(reason));
     }
     if probe_listener_is_live(namespace.directories.socket_directory()?, &names.socket_os)? {
         return Err(endpoint_in_use());
     }
+    if lease_created {
+        return Err(unverified_bind_error(
+            EndpointUnverifiedReason::MissingOwnership,
+        ));
+    }
     let Some(record) = read_record(lease)? else {
-        return Err(endpoint_in_use());
+        return Err(unverified_bind_error(
+            EndpointUnverifiedReason::InvalidRecord,
+        ));
     };
     if !record_matches_endpoint(&record, endpoint) || record.identity != identity_of(&socket_stat) {
-        return Err(endpoint_in_use());
+        return Err(unverified_bind_error(
+            EndpointUnverifiedReason::RecordMismatch,
+        ));
     }
     let opened_lock = fstat(lease.as_raw_fd())?;
     match crate::unix_common::unlink_verified(
@@ -1057,11 +1114,16 @@ fn remove_stale_managed_socket(
         &namespace.directories.records,
         names,
         &opened_lock,
-        record.identity,
+        &socket_stat,
     ) {
         EndpointReapResult::Reaped | EndpointReapResult::AlreadyAbsent => Ok(()),
         EndpointReapResult::IoError(error) => Err(error),
-        _ => Err(endpoint_in_use()),
+        EndpointReapResult::Unverified(reason) => Err(unverified_bind_error(reason)),
+        EndpointReapResult::StaleTarget => Err(unverified_bind_error(
+            EndpointUnverifiedReason::RecordMismatch,
+        )),
+        EndpointReapResult::Busy => Err(endpoint_in_use()),
+        EndpointReapResult::NotApplicable => unreachable!("Unix socket reap is applicable"),
     }
 }
 
@@ -1082,7 +1144,7 @@ fn retire_owned(
     };
     let opened_lock = match verify_lease_entry(&namespace.directories.records, &names.lock, lease) {
         Ok(stat) => stat,
-        Err(reason) => return EndpointReapResult::Unverified(reason),
+        Err(error) => return namespace_reap_error(error),
     };
     match read_record(lease) {
         Ok(Some(record)) if record == *expected => {}
@@ -1106,7 +1168,7 @@ fn retire_owned(
             &namespace.directories.records,
             &names,
             &opened_lock,
-            expected.identity,
+            &socket_stat,
         ) {
             EndpointReapResult::Reaped | EndpointReapResult::AlreadyAbsent => {}
             other => return other,
@@ -1384,10 +1446,6 @@ fn bind_at(
     let namespace = open_root_bounded(root, true).map_err(namespace_bind_error)?;
     let gate_pin = namespace.gate.try_clone()?;
     let names = managed_names(endpoint)?;
-    namespace
-        .directories
-        .verify_slot(&names.lock)
-        .map_err(namespace_bind_error)?;
     let (file, created) = match namespace.directories.records.open_file(
         &names.lock,
         libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
@@ -1415,19 +1473,13 @@ fn bind_at(
         created,
         socket_bound: false,
     };
-    if let Err(reason) =
-        verify_lease_entry(&namespace.directories.records, &names.lock, lease.file())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("managed lease is unverifiable: {reason:?}"),
-        ));
-    }
-    if let Err(result) = try_lock_lease(lease.file()) {
-        return Err(match result {
-            EndpointReapResult::Busy => endpoint_in_use(),
-            EndpointReapResult::IoError(error) => error,
-            _ => endpoint_in_use(),
+    verify_lease_entry(&namespace.directories.records, &names.lock, lease.file())
+        .map_err(namespace_bind_error)?;
+    if let Err(error) = try_lock_lease(lease.file()) {
+        return Err(if error.kind() == io::ErrorKind::WouldBlock {
+            endpoint_in_use()
+        } else {
+            error
         });
     }
     #[cfg(test)]
@@ -1456,15 +1508,14 @@ fn bind_at(
             return Err(io::Error::other("injected replacement after lease lock"));
         }
     }
-    remove_stale_managed_socket(&namespace, endpoint, &names, lease.file())?;
+    remove_stale_managed_socket(&namespace, endpoint, &names, lease.file(), created)?;
     // The socket must be created in the directory this call verified. Re-check
     // the gate identity after the stale-socket work, then bind through the
     // verified descriptor: an absolute path could have been redirected to a
     // replacement directory by a concurrent rename in between.
     if !namespace.gate_still_named() {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            "managed namespace identity changed before bind",
+        return Err(unverified_bind_error(
+            EndpointUnverifiedReason::CoordinatorReplaced,
         ));
     }
     let socket = bind_in_verified_directory(&namespace, &names)?;
@@ -1483,7 +1534,13 @@ fn bind_at(
     socket.set_nonblocking(true)?;
     let std_listener: std::os::unix::net::UnixListener = socket.into();
     let inner = tokio::net::UnixListener::from_std(std_listener)?;
-    let identity = socket_identity(namespace.directories.socket_directory()?, &names)?;
+    let socket_stat = verified_socket_stat(namespace.directories.socket_directory()?, &names)?;
+    if !guard.matches(&socket_stat) {
+        return Err(unverified_bind_error(
+            EndpointUnverifiedReason::RecordMismatch,
+        ));
+    }
+    let identity = identity_of(&socket_stat);
     let record = OwnerRecord {
         address: endpoint.address().to_owned(),
         incarnation: uuid::Uuid::new_v4().into_bytes(),
@@ -1505,21 +1562,19 @@ fn bind_at(
     match read_record(lease.file()) {
         Ok(Some(readback)) if readback == record => {}
         Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed owner record did not read back",
+            return Err(unverified_bind_error(
+                EndpointUnverifiedReason::InvalidRecord,
             ));
         }
         Err(error) => return Err(error),
     }
     // The recorded identity must still name the entry this bind created. A
     // foreign replacement stays in place and is never withdrawn by rollback.
-    match socket_identity(namespace.directories.socket_directory()?, &names) {
-        Ok(current) if current == identity => {}
+    match verified_socket_stat(namespace.directories.socket_directory()?, &names) {
+        Ok(current) if guard.matches(&current) && identity_of(&current) == identity => {}
         Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed socket was replaced while recording its identity",
+            return Err(unverified_bind_error(
+                EndpointUnverifiedReason::RecordMismatch,
             ));
         }
         Err(error) => return Err(error),
@@ -1529,7 +1584,8 @@ fn bind_at(
         SocketIdentity::from_stat(&fstat(namespace.gate.as_raw_fd()).map_err(|error| error)?);
     let context_binding = capture_context
         .then(|| ContextBinding::from_namespace(root, &namespace))
-        .transpose()?;
+        .transpose()
+        .map_err(namespace_bind_error)?;
     guard.disarm();
     drop(guard);
     lease_guard.created = false;
@@ -1568,36 +1624,50 @@ fn slot_name(stem: &OsStr, suffix: &str) -> io::Result<CString> {
 pub(crate) fn read_lease_record(
     namespace: &ManagedNamespace,
     stem: &OsStr,
-) -> Result<Option<OwnerRecord>, EndpointUnverifiedReason> {
+) -> Result<Option<OwnerRecord>, NamespaceError> {
     let mut lease = stem.as_bytes().to_vec();
     lease.extend_from_slice(LEASE_SUFFIX.as_bytes());
-    let name = CString::new(lease).map_err(|_| EndpointUnverifiedReason::InvalidRecord)?;
-    namespace
-        .directories
-        .verify_slot(&name)
-        .map_err(|error| match error {
-            NamespaceError::Unverified(reason) => reason,
-            _ => EndpointUnverifiedReason::InvalidOwnership,
-        })?;
-    let stat = match namespace.directories.records.stat(&name) {
-        Ok(Some(stat)) => stat,
-        Ok(None) => return Ok(None),
-        Err(_) => return Err(EndpointUnverifiedReason::InvalidOwnership),
+    let name = CString::new(lease)
+        .map_err(|_| NamespaceError::Unverified(EndpointUnverifiedReason::InvalidRecord))?;
+    let stat = namespace.directories.records.stat(&name);
+    #[cfg(test)]
+    let stat =
+        if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::ReadLeaseStat) {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            stat
+        };
+    let Some(stat) = stat? else {
+        return Ok(None);
     };
     if let Some(reason) = lease_entry_unverified(&stat) {
-        return Err(reason);
+        return Err(NamespaceError::Unverified(reason));
     }
-    let file = match open_lease(&namespace.directories.records, &name) {
-        Ok(Some(file)) => file,
-        Ok(None) => return Ok(None),
-        Err(_) => return Err(EndpointUnverifiedReason::InvalidOwnership),
+    let file = open_lease(&namespace.directories.records, &name);
+    #[cfg(test)]
+    let file =
+        if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::ReadLeaseOpen) {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            file
+        };
+    let Some(file) = file? else {
+        return Ok(None);
     };
     let _ = verify_lease_entry(&namespace.directories.records, &name, &file)?;
-    match read_record(&file) {
-        Ok(Some(record)) => Ok(Some(record)),
-        Ok(None) => Err(EndpointUnverifiedReason::InvalidRecord),
-        Err(_) => Err(EndpointUnverifiedReason::InvalidOwnership),
-    }
+    let record = read_record(&file);
+    #[cfg(test)]
+    let record = if crate::unix_common::fault::take_if(
+        crate::unix_common::fault::Failure::ReadLeaseRecord,
+    ) {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    } else {
+        record
+    };
+    let record = record?.ok_or(NamespaceError::Unverified(
+        EndpointUnverifiedReason::InvalidRecord,
+    ))?;
+    Ok(Some(record))
 }
 
 /// Shared reap core. `expected` carries the credential proof for a public reap;
@@ -1614,9 +1684,6 @@ fn reap_locked(
         Ok(names) => names,
         Err(error) => return EndpointReapResult::IoError(error),
     };
-    if let Err(error) = namespace.directories.verify_slot(&names.lock) {
-        return namespace_reap_error(error);
-    }
     let socket_stat = match namespace.directories.socket_stat(&names.socket) {
         Ok(stat) => stat,
         Err(error) => return EndpointReapResult::IoError(error),
@@ -1648,10 +1715,14 @@ fn reap_locked(
     let opened_lock = match verify_lease_entry(&namespace.directories.records, &names.lock, &lease)
     {
         Ok(stat) => stat,
-        Err(reason) => return EndpointReapResult::Unverified(reason),
+        Err(error) => return namespace_reap_error(error),
     };
-    if let Err(result) = try_lock_lease(&lease) {
-        return result;
+    if let Err(error) = try_lock_lease(&lease) {
+        return if error.kind() == io::ErrorKind::WouldBlock {
+            EndpointReapResult::Busy
+        } else {
+            EndpointReapResult::IoError(error)
+        };
     }
     let record = match read_record(&lease) {
         Ok(Some(record)) => record,
@@ -1701,7 +1772,7 @@ fn reap_locked(
                 &namespace.directories.records,
                 &names,
                 &opened_lock,
-                record.identity,
+                &socket_stat,
             ) {
                 EndpointReapResult::Reaped | EndpointReapResult::AlreadyAbsent => {}
                 other => return other,
@@ -1795,17 +1866,27 @@ fn reap_slot_with_directory(
         Ok(None) => {
             // A socket without any lease is an unregistered object, not proof
             // that the slot is already clean.
-            let socket = slot_name(stem, "").ok();
-            let present = socket
-                .and_then(|name| namespace.directories.socket_stat(&name).ok().flatten())
-                .is_some();
-            return if present {
-                EndpointReapResult::Unverified(EndpointUnverifiedReason::MissingOwnership)
-            } else {
-                EndpointReapResult::AlreadyAbsent
+            let socket = slot_name(stem, "").and_then(|name| {
+                let stat = namespace.directories.socket_stat(&name);
+                #[cfg(test)]
+                let stat = if crate::unix_common::fault::take_if(
+                    crate::unix_common::fault::Failure::MissingLeaseSocketStat,
+                ) {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    stat
+                };
+                stat
+            });
+            return match socket {
+                Ok(Some(_)) => {
+                    EndpointReapResult::Unverified(EndpointUnverifiedReason::MissingOwnership)
+                }
+                Ok(None) => EndpointReapResult::AlreadyAbsent,
+                Err(error) => EndpointReapResult::IoError(error),
             };
         }
-        Err(reason) => return EndpointReapResult::Unverified(reason),
+        Err(error) => return namespace_reap_error(error),
     };
     let address = record.address.clone();
     let Ok(endpoint) = context.endpoint(&address) else {
@@ -1855,9 +1936,6 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
         Ok(names) => names,
         Err(error) => return EndpointInspection::IoError(error),
     };
-    if let Err(error) = namespace.directories.verify_slot(&names.lock) {
-        return namespace_inspection_error(error);
-    }
     let socket_stat = match namespace.directories.socket_stat(&names.socket) {
         Ok(Some(stat)) => stat,
         Ok(None) => return EndpointInspection::Absent,
@@ -1885,7 +1963,7 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
     let opened_lock = match verify_lease_entry(&namespace.directories.records, &names.lock, &lease)
     {
         Ok(stat) => stat,
-        Err(reason) => return EndpointInspection::Unverified(reason),
+        Err(error) => return namespace_inspection_error(error),
     };
     let record = match read_record(&lease) {
         Ok(Some(record)) => record,
@@ -1897,20 +1975,44 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
     }
     // Re-verify both entries after reading so a concurrent replacement cannot
     // be reported as a present endpoint.
+    #[cfg(test)]
+    if crate::unix_common::fault::take_if(
+        crate::unix_common::fault::Failure::InspectSocketReplacementThenLeaseStat,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = namespace.directory().path().join(&names.socket_os);
+        fs::remove_file(&path).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::unix_common::fault::inject(
+            crate::unix_common::fault::Failure::InspectFinalLeaseStat,
+        );
+    }
     let current_socket = match namespace.directories.socket_stat(&names.socket) {
         Ok(Some(stat)) => stat,
         Ok(None) => return EndpointInspection::Absent,
         Err(error) => return EndpointInspection::IoError(error),
     };
-    let current_lock = namespace
-        .directories
-        .records
-        .stat(&names.lock)
-        .ok()
-        .flatten();
-    if !same_file(&socket_stat, &current_socket)
-        || identity_of(&current_socket) != record.identity
-        || current_lock.is_none_or(|current| !same_file(&opened_lock, &current))
+    let current_lock = namespace.directories.records.stat(&names.lock);
+    #[cfg(test)]
+    let current_lock = if crate::unix_common::fault::take_if(
+        crate::unix_common::fault::Failure::InspectFinalLeaseStat,
+    ) {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    } else {
+        current_lock
+    };
+    // A socket identity already known to be wrong takes precedence over a
+    // concurrent error while re-reading the lease entry.
+    if !same_file(&socket_stat, &current_socket) || identity_of(&current_socket) != record.identity
+    {
+        return EndpointInspection::Unverified(EndpointUnverifiedReason::RecordMismatch);
+    }
+    let current_lock = match current_lock {
+        Ok(stat) => stat,
+        Err(error) => return EndpointInspection::IoError(error),
+    };
+    if current_lock.is_none_or(|current| !same_file(&opened_lock, &current))
         || !namespace.gate_still_named()
     {
         return EndpointInspection::Unverified(EndpointUnverifiedReason::RecordMismatch);
@@ -2089,13 +2191,6 @@ impl ManagedSweep {
             .strip_suffix(LEASE_SUFFIX.as_bytes())
             .filter(|stem| is_endpoint_stem(stem))
         {
-            if self.directories.split() && !in_records {
-                // Historical colocated leases belong to the cold-switch
-                // boundary. Never report one absent by reading the new root.
-                batch.endpoints_examined += 1;
-                batch.unverified += 1;
-                return;
-            }
             // A socket slot is handled through its short entry, which retires
             // both objects. Only a socket-less slot is a lease-only candidate.
             let socket = match CString::new(stem) {

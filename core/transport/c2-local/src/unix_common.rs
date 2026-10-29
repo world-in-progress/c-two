@@ -40,6 +40,16 @@ pub(crate) mod fault {
         /// The managed socket entry is replaced by a foreign object before the
         /// owner record is written.
         ManagedRecordWriteAfterReplacement,
+        VerifyLeaseFstat,
+        VerifyLeaseStat,
+        FinalLeaseStat,
+        SocketPermissionsThenFinalLeaseStat,
+        ReadLeaseStat,
+        ReadLeaseOpen,
+        ReadLeaseRecord,
+        MissingLeaseSocketStat,
+        InspectFinalLeaseStat,
+        InspectSocketReplacementThenLeaseStat,
     }
 
     thread_local! {
@@ -79,7 +89,6 @@ pub(crate) type SocketIdentity = UnixSocketIdentity;
 impl UnixSocketIdentity {
     pub(crate) fn from_stat(stat: &libc::stat) -> Self {
         Self {
-            device: stat.st_dev as u64,
             inode: stat.st_ino as u64,
             changed_secs: stat.st_ctime,
             changed_nanos: stat.st_ctime_nsec,
@@ -606,6 +615,10 @@ fn lock_entry_matches(
     name: &CString,
     opened: &libc::stat,
 ) -> io::Result<bool> {
+    #[cfg(test)]
+    if fault::take_if(fault::Failure::FinalLeaseStat) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
     Ok(directory
         .stat(name)?
         .is_some_and(|current| stat_is(&current, libc::S_IFREG) && same_file(opened, &current)))
@@ -635,13 +648,19 @@ pub(crate) fn unlink_verified(
     ownership_directory: &EndpointDirectory,
     names: &EndpointNames,
     opened_lock: &libc::stat,
-    expected: SocketIdentity,
+    expected: &libc::stat,
 ) -> EndpointReapResult {
     if !directory.path_still_names_open_directory()
         || !ownership_directory.path_still_names_open_directory()
-        || !lock_entry_matches(ownership_directory, &names.lock, opened_lock).unwrap_or(false)
     {
         return EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership);
+    }
+    match lock_entry_matches(ownership_directory, &names.lock, opened_lock) {
+        Ok(true) => {}
+        Ok(false) => {
+            return EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership);
+        }
+        Err(error) => return EndpointReapResult::IoError(error),
     }
     let current = match directory.stat(&names.socket) {
         Ok(Some(stat)) => stat,
@@ -656,13 +675,49 @@ pub(crate) fn unlink_verified(
     if let Some(reason) = socket_unverified(&current) {
         return EndpointReapResult::Unverified(reason);
     }
-    if SocketIdentity::from_stat(&current) != expected {
+    if !same_verified_socket(expected, &current) {
         return EndpointReapResult::StaleTarget;
     }
     match directory.unlink(&names.socket) {
         Ok(()) => EndpointReapResult::Reaped,
         Err(error) if error.kind() == io::ErrorKind::NotFound => EndpointReapResult::AlreadyAbsent,
         Err(error) => EndpointReapResult::IoError(error),
+    }
+}
+
+fn same_verified_socket(expected: &libc::stat, current: &libc::stat) -> bool {
+    same_file(expected, current)
+        && SocketIdentity::from_stat(expected) == SocketIdentity::from_stat(current)
+}
+
+#[cfg(test)]
+mod verified_socket_tests {
+    use super::*;
+
+    #[test]
+    fn final_socket_comparison_rejects_device_and_persistent_identity_changes() {
+        let mut expected = unsafe { std::mem::zeroed::<libc::stat>() };
+        expected.st_dev = 7;
+        expected.st_ino = 11;
+        expected.st_ctime = 13;
+        expected.st_ctime_nsec = 17;
+        let mut current = expected;
+        assert!(same_verified_socket(&expected, &current));
+        current.st_dev += 1;
+        assert_eq!(
+            SocketIdentity::from_stat(&expected),
+            SocketIdentity::from_stat(&current)
+        );
+        assert!(!same_verified_socket(&expected, &current));
+        current.st_dev = expected.st_dev;
+        current.st_ino += 1;
+        assert!(!same_verified_socket(&expected, &current));
+        current.st_ino = expected.st_ino;
+        current.st_ctime += 1;
+        assert!(!same_verified_socket(&expected, &current));
+        current.st_ctime = expected.st_ctime;
+        current.st_ctime_nsec += 1;
+        assert!(!same_verified_socket(&expected, &current));
     }
 }
 
@@ -696,10 +751,7 @@ impl<'a> BoundSocketGuard<'a> {
             .stat(&names.socket)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bound socket disappeared"))?;
         if let Some(reason) = socket_unverified(&stat) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bound endpoint is unsafe: {reason:?}"),
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
         }
         Ok(Self {
             directory,
@@ -745,7 +797,7 @@ impl<'a> BoundSocketGuard<'a> {
             self.ownership_directory,
             self.names,
             &opened_lock,
-            SocketIdentity::from_stat(&current),
+            &current,
         )
     }
 }
@@ -878,6 +930,14 @@ pub(crate) fn set_socket_permissions(
     guard: &BoundSocketGuard<'_>,
 ) -> io::Result<()> {
     #[cfg(test)]
+    if fault::take_if(fault::Failure::SocketPermissionsThenFinalLeaseStat) {
+        fault::inject(fault::Failure::FinalLeaseStat);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected socket permission failure before rollback stat",
+        ));
+    }
+    #[cfg(test)]
     if fault::take_if(fault::Failure::SocketPermissionsWithDuplicate) {
         fault::retain_duplicate(guard.ownership);
         return Err(io::Error::new(
@@ -905,10 +965,9 @@ pub(crate) fn set_socket_permissions(
         .stat(&names.socket)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bound socket disappeared"))?;
     if !guard.matches(&current) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bound socket was replaced before chmod",
-        ));
+        let reason =
+            socket_unverified(&current).unwrap_or(EndpointUnverifiedReason::RecordMismatch);
+        return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
     }
     if unsafe {
         libc::fchmodat(
@@ -939,10 +998,9 @@ pub(crate) fn set_socket_permissions(
         .stat(&names.socket)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bound socket disappeared"))?;
     if !same_file(&current, &changed) || socket_unverified(&changed).is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bound socket was replaced",
-        ));
+        let reason =
+            socket_unverified(&changed).unwrap_or(EndpointUnverifiedReason::RecordMismatch);
+        return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
     }
     if changed.st_mode as libc::mode_t & 0o7777 != 0o600 {
         return Err(io::Error::new(
@@ -972,10 +1030,14 @@ pub(crate) fn listen_verified_socket(
             "bound socket disappeared before listen",
         )
     })?;
-    if !guard.matches(&stat) || stat.st_mode as libc::mode_t & 0o7777 != 0o600 {
+    if !guard.matches(&stat) {
+        let reason = socket_unverified(&stat).unwrap_or(EndpointUnverifiedReason::RecordMismatch);
+        return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+    }
+    if stat.st_mode as libc::mode_t & 0o7777 != 0o600 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "bound socket identity/mode changed before listen",
+            "bound socket mode changed before listen",
         ));
     }
     #[cfg(test)]

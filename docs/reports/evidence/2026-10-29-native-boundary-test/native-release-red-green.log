@@ -1,0 +1,56 @@
+Mutation: discard the retained tracking guard while the native release is still pending.
+--- core_ffi.rs (current)
++++ core_ffi.rs (mutation)
+@@ -384,9 +384,7 @@
+             return Ok(());
+         };
+         let result = held.invalidate_then_release(|| Ok(()));
+-        if !held.has_pending_release() {
+-            self.lease.lock().take();
+-        }
++        self.lease.lock().take();
+         result.map_err(lifecycle_error_to_py)
+     }
+
+
+=== temporary release mutation ===
+$ uv run python tools/dev/test_native.py failed_native_response_keeps_tracking_until_retry_or_abandonment -- --format=terse
+   Compiling c2-python-native v0.1.0 ($CHECKOUT/sdk/python/native)
+    Finished `test` profile [unoptimized] target(s) in 2.56s
+     Running unittests src/lib.rs ($VALIDATION_DIR/cargo-target/debug/deps/c2_ffi-545003616faebc9f)
+
+running 1 test
+core_ffi::payload_tests::failed_native_response_keeps_tracking_until_retry_or_abandonment --- FAILED
+
+failures:
+
+---- core_ffi::payload_tests::failed_native_response_keeps_tracking_until_retry_or_abandonment stdout ----
+
+thread 'core_ffi::payload_tests::failed_native_response_keeps_tracking_until_retry_or_abandonment' (19308073) panicked at src/core_ffi.rs:857:9:
+assertion `left == right` failed
+  left: (0, 0)
+ right: (1, 1)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Warning: final held response release failed: response handle release failed: reassembly release validation failed: pool owner incarnation mismatch
+
+
+failures:
+    core_ffi::payload_tests::failed_native_response_keeps_tracking_until_retry_or_abandonment
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `--lib`
+exit_code=101
+
+Production source restored byte-for-byte before the green run: true
+
+=== restored current release implementation ===
+$ uv run python tools/dev/test_native.py failed_native_response_keeps_tracking_until_retry_or_abandonment -- --format=terse
+   Compiling c2-python-native v0.1.0 ($CHECKOUT/sdk/python/native)
+    Finished `test` profile [unoptimized] target(s) in 2.61s
+     Running unittests src/lib.rs ($VALIDATION_DIR/cargo-target/debug/deps/c2_ffi-545003616faebc9f)
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.08s
+exit_code=0

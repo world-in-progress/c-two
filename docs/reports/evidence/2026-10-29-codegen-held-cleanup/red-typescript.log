@@ -1,0 +1,33 @@
+$ cargo test --manifest-path core/Cargo.toml --offline --quiet --no-run --test generated_targets
+
+exit_code=0
+$ $WORK/target/debug/deps/generated_targets-0f5d395a0f9255e6 --format=terse --nocapture generated_typescript_payload_lifecycle_is_failure_safe --exact
+
+running 1 test
+
+thread 'generated_typescript_payload_lifecycle_is_failure_safe' (19285835) panicked at foundation/c2-codegen/tests/generated_targets.rs:853:5:
+generated TypeScript lifecycle project failed at runtime:
+stdout:
+
+stderr:
+file://$WORK/.tmpqjzEP5/dist/smoke.js:140
+        throw new Error(`discarded decode cleanup failures: ${JSON.stringify(warnings)}`);
+              ^
+
+Error: discarded decode cleanup failures: []
+    at file://$WORK/.tmpqjzEP5/dist/smoke.js:140:15
+
+Node.js v25.8.1
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+generated_typescript_payload_lifecycle_is_failure_safe --- FAILED
+
+failures:
+
+failures:
+    generated_typescript_payload_lifecycle_is_failure_safe
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.86s
+
+
+exit_code=101

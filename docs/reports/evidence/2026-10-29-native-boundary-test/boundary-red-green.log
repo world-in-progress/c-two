@@ -1,0 +1,27 @@
+=== Python 3.10; restored dev-dependency; original whole-file guard ===
+$ uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_python_native_does_not_build_transport_runtime_directly -q --timeout=30 --tb=short
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_________ test_python_native_does_not_build_transport_runtime_directly _________
+sdk/python/tests/unit/test_sdk_boundary.py:866: in test_python_native_does_not_build_transport_runtime_directly
+    assert "c2-ipc" not in cargo
+E   assert 'c2-ipc' not in '[package]\n...7b042c4" }\n'
+E
+E     'c2-ipc' is contained here:
+E       ndencies]
+E       c2-ipc = { version = "0.1.0", path = "../../../core/transport/c2-ipc" }
+E     ? ++++++
+E
+E       # Deployable Python extension builds statically link the FastDB payload Core...
+E
+E     ...Full output truncated (7 lines hidden), use '-vv' to show
+=========================== short test summary info ============================
+FAILED sdk/python/tests/unit/test_sdk_boundary.py::test_python_native_does_not_build_transport_runtime_directly
+1 failed in 0.10s
+exit_code=1
+
+=== Python 3.10; dependency-table guard and production negative cases ===
+$ uv run pytest sdk/python/tests/unit/test_sdk_boundary.py -k 'native_transport_dependencies or python_native_does_not_build_transport_runtime_directly' -q --timeout=30 --tb=short
+..........................                                               [100%]
+26 passed, 41 deselected in 0.08s
+exit_code=0

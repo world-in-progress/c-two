@@ -68,6 +68,7 @@ class MemoryScopeStats(TypedDict):
 
     role: str
     state: str
+    abandoned_releases: int
     limits: MemoryLimits
     cells: dict[str, MemoryCellStats]
 

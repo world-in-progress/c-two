@@ -222,7 +222,7 @@ about them:
   replaced by the platform branches described above.
 - **`pytest` collection of `sdk/python/tests/`.** No workspace `.venv` exists
   and `uv` cannot initialize its cache in this sandbox (`Operation not
-  permitted` on `/Users/soku/.cache/uv`), so `pytest` cannot be installed or
+  permitted` on `~/.cache/uv`), so `pytest` cannot be installed or
   run here. The added cases in
   `sdk/python/tests/unit/test_ipc_address_validation.py` are therefore
   **authored but not executed under pytest**. Their behaviour was executed
@@ -236,7 +236,7 @@ about them:
   invalid-address shapes, per-call UUID isolation, strict `managed-v2`
   selection, and non-canonical protocol rejection. All passed.
 - **TypeScript pack check.** `tests/c2-mem-ffi-pack-check.test.mjs` fails with
-  `npm error code EPERM` against `/Users/soku/.npm/_cacache`, a pre-existing
+  `npm error code EPERM` against `~/.npm/_cacache`, a pre-existing
   sandbox npm-cache permission problem unrelated to this change. The other two
   TypeScript test files pass; `node --test tests/c2-mem-ffi-node-loader.test.mjs`
   was re-run after the platform split and reports 15 passed, 0 failed.

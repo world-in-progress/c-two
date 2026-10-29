@@ -17,7 +17,7 @@ import pytest
 import c_two as cc
 from c_two.config.settings import settings
 from c_two.error import ContractMismatch, ResourceAlreadyRegistered, RouteStale
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
 from c_two.transport.client.proxy import CRMProxy
 
 # Re-use the existing test fixtures.
@@ -118,11 +118,11 @@ def _clean_registry(monkeypatch):
     """
     with monkeypatch.context() as patch:
         patch.setattr(settings, 'relay_anchor_address', None)
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         try:
             yield
         finally:
-            _ProcessRegistry.reset()
+            _reset_default_runtime()
 
 
 # ------------------------------------------------------------------
@@ -417,7 +417,7 @@ class TestRegisterConnect:
     def test_unregister(self):
         cc.register(Hello, HelloImpl(), name='hello')
         cc.unregister('hello')
-        assert 'hello' not in _ProcessRegistry.get().names
+        assert 'hello' not in _get_default_runtime().names
 
     def test_server_address_populated(self):
         assert cc.server_address() is None
@@ -431,7 +431,7 @@ class TestRegisterConnect:
         assert cc.server_address() is not None
         cc.shutdown()
         assert cc.server_address() is None
-        assert _ProcessRegistry.get().names == []
+        assert _get_default_runtime().names == []
 
 
 # ------------------------------------------------------------------
@@ -444,7 +444,7 @@ class TestMultiCRM:
     def test_register_two_crms(self):
         cc.register(Hello, HelloImpl(), name='hello')
         cc.register(Counter, CounterImpl(), name='counter')
-        reg = _ProcessRegistry.get()
+        reg = _get_default_runtime()
         assert sorted(reg.names) == ['counter', 'hello']
 
     def test_same_icrm_different_names(self):
@@ -617,7 +617,7 @@ class TestErrors:
             cc.close(crm)
 
     def test_unreachable_relay_registration_rolls_back_local_registration(self):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         previous_relay = settings.relay_anchor_address
         try:
             registry.set_relay_anchor('http://127.0.0.1:9')
@@ -625,8 +625,8 @@ class TestErrors:
                 registry.register(Hello, HelloImpl(), name='hello')
 
             assert 'hello' not in registry.names
-            assert registry.get_server_address() is None
-            assert registry.get_server_id() is None
+            assert registry.server_address() is None
+            assert registry.server_id() is None
         finally:
             settings.relay_anchor_address = previous_relay
 
@@ -634,7 +634,7 @@ class TestErrors:
         self,
         start_c3_relay,
     ):
-        registry = _ProcessRegistry.get()
+        registry = _get_default_runtime()
         previous_relay = settings.relay_anchor_address
         relay = start_c3_relay()
         try:
@@ -654,7 +654,7 @@ class TestErrors:
             settings.relay_anchor_address = previous_relay
 
     def test_set_relay_anchor_updates_native_relay_projection_without_python_cache(self):
-        registry = _ProcessRegistry()
+        registry = Runtime()
         previous_relay = settings.relay_anchor_address
 
         try:
@@ -671,8 +671,8 @@ class TestErrors:
         relay = start_c3_relay()
         relay_url = relay.url
 
-        first = _ProcessRegistry()
-        second = _ProcessRegistry()
+        first = Runtime()
+        second = Runtime()
         previous_relay = settings.relay_anchor_address
         try:
             first.set_relay_anchor(relay_url)
@@ -684,7 +684,7 @@ class TestErrors:
                 second.register(Hello, HelloImpl(), name='hello')
 
             assert second.names == []
-            assert second.get_server_address() is None
+            assert second.server_address() is None
         finally:
             second.shutdown()
             first.shutdown()

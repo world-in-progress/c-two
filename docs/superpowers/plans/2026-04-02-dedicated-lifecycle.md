@@ -722,13 +722,13 @@ Expected: compiles with no errors.
 
 - [ ] **Step 3: Rebuild Python extension**
 
-Run: `cd /Users/soku/Desktop/codespace/WorldInProgress/c-two && uv sync --reinstall-package c-two 2>&1 | tail -10`
+Run: `cd <c-two> && uv sync --reinstall-package c-two 2>&1 | tail -10`
 
 Expected: maturin rebuilds successfully.
 
 - [ ] **Step 4: Run Python test suite**
 
-Run: `cd /Users/soku/Desktop/codespace/WorldInProgress/c-two && C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 2>&1 | tail -20`
+Run: `cd <c-two> && C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 2>&1 | tail -20`
 
 Expected: all tests pass.
 

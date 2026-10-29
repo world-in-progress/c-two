@@ -4,7 +4,7 @@ Thanks for your interest in contributing! C-Two is a resource-oriented RPC frame
 
 ## Dev Setup
 
-**Prerequisites:** Python ≥ 3.10, Rust toolchain, [uv](https://docs.astral.sh/uv/) package manager.
+**Prerequisites:** Python ≥ 3.10, Rust ≥ 1.95, [uv](https://docs.astral.sh/uv/) package manager.
 
 ```bash
 git clone https://github.com/world-in-progress/c-two.git

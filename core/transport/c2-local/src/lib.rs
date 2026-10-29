@@ -120,7 +120,6 @@ impl EndpointCredential {
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UnixSocketIdentity {
-    pub(crate) device: u64,
     pub(crate) inode: u64,
     pub(crate) changed_secs: i64,
     pub(crate) changed_nanos: i64,
@@ -146,7 +145,38 @@ pub enum EndpointUnverifiedReason {
     /// A managed namespace contains endpoint objects but no verifiable first
     /// initialization identity. Nothing in it may be retired automatically.
     InitializationIncomplete,
+    /// A recognizable gate or marker belongs to a different namespace disk
+    /// format and must not be adopted or rewritten in place.
+    UnsupportedNamespaceFormat,
 }
+
+impl EndpointUnverifiedReason {
+    /// Canonical spelling shared by inspect, bind diagnostics, and CLI output.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsafeDirectory => "unsafe-directory",
+            Self::Symlink => "symlink",
+            Self::UnexpectedObject => "unexpected-object",
+            Self::ForeignOwner => "foreign-owner",
+            Self::MissingOwnership => "missing-ownership",
+            Self::InvalidOwnership => "invalid-ownership",
+            Self::InvalidRecord => "invalid-record",
+            Self::RecordMismatch => "record-mismatch",
+            Self::CoordinatorMissing => "coordinator-missing",
+            Self::CoordinatorReplaced => "coordinator-replaced",
+            Self::InitializationIncomplete => "initialization-incomplete",
+            Self::UnsupportedNamespaceFormat => "unsupported-namespace-format",
+        }
+    }
+}
+
+impl std::fmt::Display for EndpointUnverifiedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for EndpointUnverifiedReason {}
 
 /// A read-only observation of a local endpoint.
 #[derive(Debug)]
@@ -180,6 +210,33 @@ pub enum EndpointReapResult {
 pub struct EndpointIoError {
     pub kind: io::ErrorKind,
     pub raw_os_error: Option<i32>,
+}
+
+/// Native I/O details and an optional named refusal for a listener bind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EndpointBindCause {
+    pub error: EndpointIoError,
+    pub unverified_reason: Option<EndpointUnverifiedReason>,
+}
+
+impl From<&io::Error> for EndpointBindCause {
+    fn from(error: &io::Error) -> Self {
+        let mut source = error
+            .get_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static));
+        let mut unverified_reason = None;
+        while let Some(current) = source {
+            if let Some(reason) = current.downcast_ref::<EndpointUnverifiedReason>() {
+                unverified_reason = Some(*reason);
+                break;
+            }
+            source = current.source();
+        }
+        Self {
+            error: EndpointIoError::from(error),
+            unverified_reason,
+        }
+    }
 }
 
 impl From<&io::Error> for EndpointIoError {
@@ -522,7 +579,7 @@ impl LocalStream {
         timeout: Duration,
     ) -> io::Result<()> {
         let abort = self.abort_handle();
-        write_complete(self, abort, bytes, timeout).await
+        write_complete(self, abort, bytes, timeout, &mut false).await
     }
 
     /// A connected pair for local-transport tests, using the real OS backend.
@@ -652,13 +709,23 @@ impl LocalWriteHalf {
         self.write_all_with_timeout(bytes, DEFAULT_WRITE_TIMEOUT)
             .await
     }
+    /// Record full-frame admission before flush; cancellation keeps this fact visible.
+    pub async fn write_all_with_progress(
+        &mut self,
+        bytes: &[u8],
+        frame_written: &mut bool,
+    ) -> io::Result<()> {
+        let abort = self.abort_handle();
+        write_complete(self, abort, bytes, DEFAULT_WRITE_TIMEOUT, frame_written).await
+    }
+
     pub async fn write_all_with_timeout(
         &mut self,
         bytes: &[u8],
         timeout: Duration,
     ) -> io::Result<()> {
         let abort = self.abort_handle();
-        write_complete(self, abort, bytes, timeout).await
+        write_complete(self, abort, bytes, timeout, &mut false).await
     }
 }
 impl AsyncWrite for LocalWriteHalf {
@@ -682,7 +749,9 @@ async fn write_complete<W: AsyncWrite + Unpin>(
     abort: AbortHandle,
     bytes: &[u8],
     timeout: Duration,
+    frame_written: &mut bool,
 ) -> io::Result<()> {
+    *frame_written = false;
     let mut guard = AbortOnDrop(Some(abort.clone()));
     let result = tokio::time::timeout(timeout, async {
         // Keep the native failure ahead of AbortOnDrop and any awakened
@@ -690,6 +759,7 @@ async fn write_complete<W: AsyncWrite + Unpin>(
         AsyncWriteExt::write_all(writer, bytes)
             .await
             .inspect_err(|error| abort.close_io("write", error))?;
+        *frame_written = true;
         AsyncWriteExt::flush(writer)
             .await
             .inspect_err(|error| abort.close_io("flush", error))
@@ -831,5 +901,117 @@ mod write_observation_tests {
             matches!(events.recv().await.unwrap(), Some(ConnectionEvent::Closed(record)) if record == closed)
         );
         assert!(events.recv().await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod frame_progress_tests {
+    use super::*;
+
+    struct FaultWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+        flush: u8,
+    }
+    impl AsyncWrite for FaultWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let count = bytes.len().min(this.limit.saturating_sub(this.bytes.len()));
+            if count == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "partial write",
+                )));
+            }
+            this.bytes.extend_from_slice(&bytes[..count]);
+            Poll::Ready(Ok(count))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match self.flush {
+                1 => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "flush after full frame",
+                ))),
+                2 => Poll::Pending,
+                _ => Poll::Ready(Ok(())),
+            }
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    fn abort() -> AbortHandle {
+        AbortHandle(Arc::new(AbortState {
+            stream: Mutex::new(None),
+            closed: AtomicBool::new(false),
+            reader: AtomicWaker::new(),
+            writer: AtomicWaker::new(),
+            connection: OnceLock::new(),
+        }))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_frame_progress_survives_flush_error_and_original_deadline() {
+        for fault in [1, 2] {
+            let mut writer = FaultWriter {
+                bytes: Vec::new(),
+                limit: 100,
+                flush: fault,
+            };
+            let abort = abort();
+            let mut frame_written = false;
+            let start = tokio::time::Instant::now();
+            let error = write_complete(
+                &mut writer,
+                abort.clone(),
+                b"complete frame",
+                DEFAULT_WRITE_TIMEOUT,
+                &mut frame_written,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(writer.bytes, b"complete frame");
+            assert!(frame_written);
+            assert!(abort.is_aborted());
+            assert_eq!(
+                error.kind(),
+                if fault == 1 {
+                    io::ErrorKind::BrokenPipe
+                } else {
+                    io::ErrorKind::TimedOut
+                }
+            );
+            if fault == 2 {
+                assert_eq!(start.elapsed(), DEFAULT_WRITE_TIMEOUT);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_frame_does_not_transfer_release_authority() {
+        let mut writer = FaultWriter {
+            bytes: Vec::new(),
+            limit: 3,
+            flush: 0,
+        };
+        let abort = abort();
+        let mut frame_written = true;
+        write_complete(
+            &mut writer,
+            abort.clone(),
+            b"complete frame",
+            DEFAULT_WRITE_TIMEOUT,
+            &mut frame_written,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(writer.bytes, b"com");
+        assert!(!frame_written);
+        assert!(abort.is_aborted());
     }
 }

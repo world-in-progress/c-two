@@ -1,0 +1,13 @@
+summary: attempt 1, before Host authorized the Tokio feature adjustment; historical diagnostic evidence
+command: remove task-created "$TASK_TMP" recursively; assert path absent
+exit_code: 0
+summary: removed verified FastDB SDK, minimal reproduction (manifest, source, lockfile), and temporary diagnostic logs; build target directories created=0; virtual environments created=0; retained build products=0
+summary: single designated CARGO_TARGET_DIR="$TASK_TMP/target"; compilation not started
+summary: provisional manifest edits reverted=3; lockfiles changed=0; runtime files changed=0; test files changed=0; commits created=0
+summary: requested workspace checks run=0; affected test suites run=0; blocker requires Host decision before implementation
+
+summary: attempt 2 final cleanup
+command: remove task-created "$TASK_TMP" recursively; assert path absent
+exit_code: 0
+summary: removed the single Rust target directory (2.8G before cleanup), Python virtual environment, task-local uv cache, verified FastDB SDK, scripts, metadata and raw temporary logs
+summary: retained task build products=0; retained task virtual environments=0; CARGO_TARGET_DIR values used=1; nested Cargo checks honored that directory

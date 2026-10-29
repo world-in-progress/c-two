@@ -29,7 +29,7 @@ import time
 
 import c_two as cc
 import _relay_support as relay
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 
 # Configurable via CLI --segment-size (bytes)
 _SEGMENT_SIZE: int = 2 * 1024 * 1024 * 1024  # default 2GB
@@ -141,7 +141,7 @@ def _measure(proxy, payload, rounds: int, validate_len: bool = True) -> float:
 # ---------------------------------------------------------------------------
 
 def bench_thread(payload_size: int) -> float:
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     cc.register(Echo, EchoImpl(), name='echo_thread')
     try:
         crm = cc.connect(Echo, name='echo_thread')
@@ -161,7 +161,7 @@ def bench_thread(payload_size: int) -> float:
 def bench_ipc(payload_size: int) -> float:
     global _ipc_counter
     _ipc_counter += 1
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
 
     ipc_overrides = {
         'pool_segment_size': _SEGMENT_SIZE,
@@ -191,7 +191,7 @@ def bench_ipc(payload_size: int) -> float:
 def bench_relay(payload_size: int) -> float | None:
     global _ipc_counter
     _ipc_counter += 1
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     relay_url = f'http://127.0.0.1:{_relay_port}'
     route_name = f'echo_relay_{os.getpid()}_{_ipc_counter}'
 
@@ -231,7 +231,7 @@ def bench_ipc_dict(payload_size: int) -> float | None:
         return None
     global _ipc_counter
     _ipc_counter += 1
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
 
     ipc_overrides = {
         'pool_segment_size': _SEGMENT_SIZE,

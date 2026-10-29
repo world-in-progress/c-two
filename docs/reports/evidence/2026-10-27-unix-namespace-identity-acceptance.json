@@ -1,0 +1,161 @@
+{
+  "schema": "c-two.unix-namespace-identity-acceptance.v1",
+  "approved_plan_sha": "8ef1ce21a64e631bb2144173b677d50a927e0235",
+  "diff_baseline_sha": "c9298e262d9a2cfabe1dc3652ecc91c9df883741",
+  "production_sha": "496bf0ae040a97790ab8a847416ccfde17edf1dc",
+  "exact_validation_sha": "9f9d4de3be39ff26410249511fa966d1212714f1",
+  "ci": {
+    "run_id": 40492839892,
+    "attempt": 1,
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/40492839892",
+    "status": "completed",
+    "conclusion": "success",
+    "jobs_passed": 10,
+    "jobs_total": 10,
+    "source_gates_passed": 147,
+    "source_gates_total": 147,
+    "workflow_sha": "9f9d4de3be39ff26410249511fa966d1212714f1",
+    "fastdb_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+    "lanes": [
+      {
+        "lane": "ubuntu-py312",
+        "runner": "ubuntu-24.04",
+        "machine": "x86_64",
+        "gates": 25,
+        "passed": 25,
+        "portable_rows": 18,
+        "node_rows": 12,
+        "run_receipt_sha256": "8e3a130ea7f7a72416e7a5a38977cf794de9f8b54acf2ba7c10045757ef58ef5",
+        "artifact_digest": "sha256:0a82148314026511a323d2bb2d98a51c451dddf6c635b80e7018e727d5339358"
+      },
+      {
+        "lane": "macos-py312",
+        "runner": "macos-15",
+        "machine": "arm64",
+        "gates": 25,
+        "passed": 25,
+        "portable_rows": 18,
+        "node_rows": 12,
+        "run_receipt_sha256": "16dfba12c2d0dd8e919da490cc5eb822dd5f05c4ae450c2a772d4a580952525d",
+        "artifact_digest": "sha256:1777f6889a7ee6984e28bc9a17a3a38189dfd7fa02652cbc62d104f2fa288031"
+      },
+      {
+        "lane": "windows-2022",
+        "runner": "windows-2022",
+        "machine": "AMD64",
+        "gates": 27,
+        "passed": 27,
+        "portable_rows": 18,
+        "node_rows": 12,
+        "run_receipt_sha256": "85230fe93a26ea4cb4f1ee7eb9d345088afd153e85559565f076f937c0ac3bb1",
+        "artifact_digest": "sha256:f7d33a569a7c85f5263b50fff835b9bd8a7a3b10e8a0a17aa5bbab09d3bcffc6"
+      },
+      {
+        "lane": "windows-2025",
+        "runner": "windows-2025",
+        "machine": "AMD64",
+        "gates": 27,
+        "passed": 27,
+        "portable_rows": 18,
+        "node_rows": 12,
+        "run_receipt_sha256": "093daf6304042c831043adad0018f1c4a0caa902d7647b0aaad97a93638d875a",
+        "artifact_digest": "sha256:308bdbcdfad52e89b6cf24f06a25aad7862e3e1fdcdd5a5ea2c5337affe1907a"
+      },
+      {
+        "lane": "windows-arm64",
+        "runner": "windows-11-arm",
+        "machine": "ARM64",
+        "gates": 27,
+        "passed": 27,
+        "portable_rows": 18,
+        "node_rows": 12,
+        "run_receipt_sha256": "b05527f461b5ac25ccbb8759729858be04c837d6846f1c98a08ad8aa5b4ac433",
+        "artifact_digest": "sha256:7f46bbeba25d278557b92f8a34c8064ccd60ac714c36729465582a0209123a84"
+      },
+      {
+        "lane": "ubuntu-py314t",
+        "runner": "ubuntu-24.04",
+        "machine": "x86_64",
+        "gates": 16,
+        "passed": 16,
+        "portable_rows": 18,
+        "node_rows": 12,
+        "run_receipt_sha256": "6abd7361f5ec7db6cf65627ef3c5d2db73361e0221777ef24c1d90e5fd1bbd77",
+        "artifact_digest": "sha256:87eaaccf3c04182b8cf0cd60ff963bedbec4c5a71756872f6b010bfa7a536da1"
+      }
+    ],
+    "all_sources_verified": true,
+    "all_python_stage_cleanup_confirmed": true,
+    "all_node_cleanup_confirmed": true,
+    "full_lanes_ipc_memory_rows": 9,
+    "unix_new_cases_executed": true,
+    "windows_common_credential_call_tests_per_lane": 3,
+    "windows_new_unix_setup_skips_per_lane": 3
+  },
+  "baseline": {
+    "rust_expected_counterexample_failures": 3,
+    "python_getter_absent": true,
+    "python_inspect_busy_while_gate_held": true,
+    "scope": "device-only comparisons and binding reason; no physical machine reboot claim"
+  },
+  "local_candidate": {
+    "python_focused_passed": 78,
+    "core_host_lifecycle_focused_passed": 4,
+    "cli_focused_passed": 3,
+    "runner_tests_passed": 95,
+    "runner_platform_inapplicable_skips": 1,
+    "final_inventory_rows_passed": 32,
+    "socket_lease_remaining": 0
+  },
+  "windows_developer": {
+    "source_sha": "63c7fef0738965354a625f26befc7944ea446467",
+    "archive_sha256": "c4a237ffb6be1f359f6880c79b8da7867c9e186f757bbf447a93e3aab310eb5c",
+    "os": "Microsoft Windows NT 10.0.26200.0",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "steps_passed": 3,
+    "each_rust_filter_exactly_one_test": true,
+    "core_host_probe_schema": 1,
+    "kernel_managed": true,
+    "reap_not_applicable": true,
+    "terminal_credential_none": true,
+    "source_reuse_proof": "63c7fef0..9f9d4de3 changes only the Python test runner and its repository tests",
+    "task_directory_removed": true
+  },
+  "review": {
+    "exact_source_review": "9f9d4de3be39ff26410249511fa966d1212714f1",
+    "source_blockers": 0,
+    "documentation_blockers": 0,
+    "source_review_sha256": "33bd43812b5a3adab2bd8351a76bbed4936f8e7b436932227bc5a9acc75dab5b"
+  },
+  "cleanup": {
+    "local_cargo_outputs_removed": true,
+    "local_task_environments_and_archive_removed": true,
+    "local_generated_extension_removed": true,
+    "local_task_endpoint_root_removed": true,
+    "windows_task_directory_removed": true,
+    "historical_namespace_access_or_cleanup": false,
+    "ci_branch_deleted_with_exact_sha_lease": true
+  },
+  "diff_counts": {
+    "production": {
+      "added": 376,
+      "removed": 285,
+      "net": 91
+    },
+    "tests": {
+      "added": 866,
+      "removed": 173,
+      "net": 693
+    },
+    "documentation": {
+      "added": 299,
+      "removed": 47,
+      "net": 252
+    }
+  },
+  "release": {
+    "published": false,
+    "version_bumped": false,
+    "local_branch_or_tag_changed": false
+  }
+}

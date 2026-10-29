@@ -16,7 +16,7 @@ import sys
 import time
 
 import c_two as cc
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 from c_two.transport.client.util import ping
 
 
@@ -86,7 +86,7 @@ def main() -> None:
                         help='Maximum payload size in MB (default: 512)')
     args = parser.parse_args()
 
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
 
     cc.set_server(ipc_overrides={
         'pool_segment_size': SEGMENT_SIZE,

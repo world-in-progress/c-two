@@ -6,7 +6,7 @@
 use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 
-use c2_mem::MemPool;
+use c2_mem::{MemPool, ReleaseHandleError};
 
 use crate::client::{
     ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RequestBlock,
@@ -70,12 +70,106 @@ impl std::error::Error for IpcCallError {
     }
 }
 
+/// Failed request preparation, retaining any allocation that failed cleanup.
+///
+/// The pending block is deliberately private: incomplete input can only be
+/// released, never recovered as a publishable request. Cleanup does not replay
+/// the fill callback or replace the original failure diagnostics.
+///
+/// ```compile_fail
+/// fn publishable(error: c2_ipc::RequestPreparationError) -> c2_ipc::RequestBlock {
+///     error.pending.unwrap()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct RequestPreparationError {
+    source: IpcError,
+    release_error: Option<IpcError>,
+    pending: Option<RequestBlock>,
+}
+
+impl RequestPreparationError {
+    pub fn source_error(&self) -> &IpcError {
+        &self.source
+    }
+
+    pub fn release_error(&self) -> Option<&IpcError> {
+        self.release_error.as_ref()
+    }
+
+    pub fn has_pending_release(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Attempt pending cleanup once through the block's original owner.
+    pub fn release(&mut self) -> Result<(), IpcError> {
+        if let Some(block) = &self.pending {
+            block.release()?;
+        }
+        self.pending.take();
+        Ok(())
+    }
+
+    fn rollback(
+        source: IpcError,
+        pool: Arc<Mutex<MemPool>>,
+        failure: Option<ReleaseHandleError>,
+    ) -> Self {
+        match failure {
+            Some(error) => Self {
+                source,
+                release_error: Some(IpcError::Pool(error.reason)),
+                pending: Some(RequestBlock::new(pool, error.handle)),
+            },
+            None => Self::from(source),
+        }
+    }
+
+    fn release_failed_block(source: IpcError, block: RequestBlock) -> Self {
+        match block.release() {
+            Ok(()) => Self::from(source),
+            Err(error) => Self {
+                source,
+                release_error: Some(error),
+                pending: Some(block),
+            },
+        }
+    }
+}
+
+impl From<IpcError> for RequestPreparationError {
+    fn from(source: IpcError) -> Self {
+        Self {
+            source,
+            release_error: None,
+            pending: None,
+        }
+    }
+}
+
+impl std::fmt::Display for RequestPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)?;
+        if let Some(error) = &self.release_error {
+            write!(f, "; request cleanup also failed: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RequestPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
     match error {
         IpcError::LocalCallRejected(_)
         | IpcError::Config(_)
         | IpcError::Handshake(_)
         | IpcError::Protocol(_)
+        | IpcError::ProtocolVersionMismatch { .. }
         | IpcError::IdentityMismatch { .. }
         | IpcError::ContractMismatch(_)
         | IpcError::RouteNotFound(_)
@@ -86,7 +180,8 @@ pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
         | IpcError::WatchUnavailable(_)
         | IpcError::MethodNotFound { .. }
         | IpcError::Shm(_)
-        | IpcError::Pool(_) => TransportPhase::PreDispatch,
+        | IpcError::Pool(_)
+        | IpcError::PoolRetired => TransportPhase::PreDispatch,
         IpcError::Io(_)
         | IpcError::Connect(_)
         | IpcError::Decode(_)
@@ -381,9 +476,12 @@ impl SyncClient {
     /// that installs a fresh incarnation) can never redirect the coordinates
     /// into a replacement pool.
     ///
-    /// On error, the caller should fall back to the canonical route-bound call
-    /// path.
-    pub fn pool_alloc_and_write(&self, data: &[u8]) -> Result<RequestBlock, IpcError> {
+    /// On error, settle any pending cleanup before choosing a canonical
+    /// route-bound fallback.
+    pub fn pool_alloc_and_write(
+        &self,
+        data: &[u8],
+    ) -> Result<RequestBlock, RequestPreparationError> {
         let pool_arc = self
             .inner
             .select_request_pool()
@@ -395,8 +493,13 @@ impl SyncClient {
         let ptr = match pool.data_ptr(&handle.shm_allocation().expect("SHM allocation")) {
             Ok(ptr) => ptr,
             Err(e) => {
-                let _ = pool.release_handle(handle);
-                return Err(IpcError::Pool(format!("data_ptr failed: {e}")));
+                let failure = pool.release_handle(handle).err();
+                drop(pool);
+                return Err(RequestPreparationError::rollback(
+                    IpcError::Pool(format!("data_ptr failed: {e}")),
+                    pool_arc,
+                    failure,
+                ));
             }
         };
         unsafe {
@@ -410,15 +513,14 @@ impl SyncClient {
     ///
     /// The fill callback receives exactly `data_size` bytes and runs without
     /// any pool lock held; the returned [`RequestBlock`] keeps the owning pool
-    /// alive. On callback failure the allocation is released through that same
-    /// owner before the error is returned, and a panicking callback unwinds
-    /// through the block's armed `Drop` release, so neither path can strand
-    /// the allocation or its shared-domain charge.
+    /// alive. Callback failure attempts release through that same owner; if
+    /// cleanup fails the error retains the block. A panicking callback uses
+    /// the existing armed `Drop` fallback, outside this explicit-error recovery.
     pub fn pool_alloc_and_fill<F>(
         &self,
         data_size: usize,
         fill: F,
-    ) -> Result<RequestBlock, IpcError>
+    ) -> Result<RequestBlock, RequestPreparationError>
     where
         F: FnOnce(&mut [u8]) -> Result<(), String>,
     {
@@ -434,16 +536,23 @@ impl SyncClient {
             match pool.data_ptr(&handle.shm_allocation().expect("SHM allocation")) {
                 Ok(ptr) => (handle, ptr),
                 Err(e) => {
-                    let _ = pool.release_handle(handle);
-                    return Err(IpcError::Pool(format!("data_ptr failed: {e}")));
+                    let failure = pool.release_handle(handle).err();
+                    drop(pool);
+                    return Err(RequestPreparationError::rollback(
+                        IpcError::Pool(format!("data_ptr failed: {e}")),
+                        pool_arc,
+                        failure,
+                    ));
                 }
             }
         };
         let block = RequestBlock::new(pool_arc, handle);
         let destination = unsafe { std::slice::from_raw_parts_mut(ptr, data_size) };
         if let Err(err) = fill(destination) {
-            let _ = block.release();
-            return Err(IpcError::Pool(format!("fill failed: {err}")));
+            return Err(RequestPreparationError::release_failed_block(
+                IpcError::Pool(format!("fill failed: {err}")),
+                block,
+            ));
         }
         Ok(block)
     }
@@ -452,8 +561,8 @@ impl SyncClient {
     ///
     /// Used on send failure for cleanup. Never resolves the client's current
     /// pool slot: the block already carries its owner.
-    pub fn pool_free(&self, block: &RequestBlock) {
-        let _ = block.release();
+    pub fn pool_free(&self, block: &RequestBlock) -> Result<(), IpcError> {
+        block.release()
     }
 
     /// Publish the block's original requested length through its allocating
@@ -478,7 +587,9 @@ impl SyncClient {
         })() {
             Ok(target) => target,
             Err(err) => {
-                let _ = block.release();
+                if let Err(cleanup) = block.release() {
+                    eprintln!("Warning: preallocated request cleanup failed: {cleanup}");
+                }
                 return Err(err);
             }
         };
@@ -766,6 +877,10 @@ pub(crate) mod tests {
 
     #[test]
     fn call_phase_is_transport_owned_and_dispatch_uncertainty_is_not_retry_safe() {
+        assert_eq!(
+            call_error_phase(&IpcError::PoolRetired),
+            TransportPhase::PreDispatch
+        );
         let before_dispatch = IpcCallError::new(
             TransportPhase::PreDispatch,
             IpcError::MethodNotFound {
@@ -1186,7 +1301,7 @@ pub(crate) mod tests {
             "the replacement pool must hold only its own live canary"
         );
 
-        client.pool_free(&block);
+        client.pool_free(&block).unwrap();
 
         assert_eq!(
             old_pool.lock().stats().alloc_count,
@@ -1277,5 +1392,134 @@ pub(crate) mod tests {
             0,
             "a panicking fill callback must release the allocation through the owning pool"
         );
+    }
+
+    #[test]
+    fn preparation_error_retains_cleanup_and_never_replays_fill() {
+        let inner = IpcClient::with_pool(
+            "ipc://r07_preparation_error",
+            MemPool::new(c2_mem::PoolConfig {
+                segment_size: 65_536,
+                spill_threshold: 1.0,
+                ..c2_mem::PoolConfig::default()
+            }),
+            ClientIpcConfig::default(),
+        );
+        let pool = inner.request_pool().unwrap();
+        let client = SyncClient {
+            inner,
+            rt: get_or_create_runtime().handle().clone(),
+        };
+        let mut held_lock = None;
+        let mut fills = 0;
+        let mut error = client
+            .pool_alloc_and_fill(64, |bytes| {
+                fills += 1;
+                bytes[0] = 0xAB;
+                let base = pool.lock().segment(0).unwrap().base_ptr();
+                // SAFETY: this test owns the backing and keeps its pool alive.
+                let lock = unsafe {
+                    c2_mem::ShmSpinlock::new(
+                        base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
+                    )
+                };
+                lock.try_lock().unwrap();
+                held_lock = Some(lock);
+                Err("injected fill failure".into())
+            })
+            .unwrap_err();
+        let original_cleanup = error.release_error().unwrap().to_string();
+        let retained = error.has_pending_release();
+        let rejected_again = error.release().is_err() && error.has_pending_release();
+        let live = pool.lock().stats().alloc_count;
+        held_lock.take().unwrap().unlock();
+        error.release().unwrap();
+        error.release().unwrap();
+        assert!(retained && rejected_again);
+        assert_eq!(live, 1);
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+        assert!(!error.has_pending_release());
+        assert!(
+            error
+                .source_error()
+                .to_string()
+                .contains("fill failed: injected fill failure")
+        );
+        assert_eq!(error.release_error().unwrap().to_string(), original_cleanup);
+        assert_eq!(fills, 1);
+
+        let block = client.pool_alloc_and_write(b"ready").unwrap();
+        let base = pool.lock().segment(0).unwrap().base_ptr();
+        // SAFETY: same owned live backing; with_lock restores the word.
+        let lock = unsafe {
+            c2_mem::ShmSpinlock::new(
+                base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
+            )
+        };
+        let rejected = lock
+            .with_lock(|| client.pool_free(&block))
+            .unwrap()
+            .is_err();
+        client.pool_free(&block).unwrap();
+        assert!(rejected);
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+    }
+
+    #[test]
+    fn preparation_rollback_keeps_returned_handle_and_allocation_failure_has_no_owner() {
+        let mut memory = MemPool::new(c2_mem::PoolConfig {
+            segment_size: 65_536,
+            spill_threshold: 1.0,
+            ..c2_mem::PoolConfig::default()
+        });
+        let handle = memory.alloc_shm_handle(64).unwrap();
+        let base = memory.segment(0).unwrap().base_ptr();
+        // SAFETY: the moved pool below outlives this lock.
+        let lock = unsafe {
+            c2_mem::ShmSpinlock::new(
+                base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
+            )
+        };
+        let failure = lock
+            .with_lock(|| memory.release_handle(handle))
+            .unwrap()
+            .err();
+        let pool = Arc::new(Mutex::new(memory));
+        let mut error = RequestPreparationError::rollback(
+            IpcError::Pool("data_ptr failed: injected".into()),
+            pool.clone(),
+            failure,
+        );
+        let retained = error.has_pending_release();
+        error.release().unwrap();
+        assert!(retained);
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+        assert!(
+            error
+                .to_string()
+                .starts_with("Pool error: data_ptr failed: injected")
+        );
+
+        let inner = IpcClient::with_pool(
+            "ipc://r07_no_allocation",
+            MemPool::new_with_prefix_and_budget(
+                c2_mem::PoolConfig {
+                    spill_threshold: 1.0,
+                    ..c2_mem::PoolConfig::default()
+                },
+                "/r07denied".into(),
+                c2_mem::MemoryBudget::new(0, 0, 0),
+            ),
+            ClientIpcConfig::default(),
+        );
+        let client = SyncClient {
+            inner,
+            rt: get_or_create_runtime().handle().clone(),
+        };
+        let mut error = client.pool_alloc_and_write(b"no allocation").unwrap_err();
+        assert!(!error.has_pending_release());
+        assert!(error.release_error().is_none());
+        assert!(error.source_error().to_string().contains("alloc failed"));
+        error.release().unwrap();
     }
 }

@@ -75,6 +75,8 @@ impl MemoryCellStats {
 pub struct MemoryScopeStats {
     /// Resolved limits the scope's budget enforces.
     pub limits: MemoryBudgetLimits,
+    /// Release obligations this process conservatively abandoned.
+    pub abandoned_releases: u64,
     /// Owner-created buddy/dedicated mapped backing, including headers.
     pub shm: MemoryCellStats,
     /// Owner-created file-spill backing length.
@@ -89,6 +91,7 @@ impl MemoryScopeStats {
     pub const fn from_budget(limits: MemoryBudgetLimits, budget: BudgetSnapshot) -> Self {
         Self {
             limits,
+            abandoned_releases: budget.abandoned_releases,
             shm: MemoryCellStats::from_cell(budget.shm),
             file: MemoryCellStats::from_cell(budget.file),
             reassembly: MemoryCellStats::from_cell(budget.reassembly),

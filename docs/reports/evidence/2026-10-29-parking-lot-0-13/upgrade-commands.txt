@@ -1,0 +1,90 @@
+summary: attempt 2; all cargo builds/checks/tests explicitly use Rust 1.99.0 and one shared target directory
+environment: RUSTUP_TOOLCHAIN=1.99.0 CARGO_TARGET_DIR="$TASK_TMP/target" CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 FASTDB_PAYLOAD_LINK_MODE=system FASTDB_PAYLOAD_SYSTEM_LIB_DIR="$TASK_TMP/fastdb-sdk/lib" DYLD_LIBRARY_PATH="$TASK_TMP/fastdb-sdk/lib" UV_PROJECT_ENVIRONMENT="$TASK_TMP/venv" UV_CACHE_DIR="$TASK_TMP/uv-cache" C2_RELAY_ANCHOR_ADDRESS=
+command: python3 .github/scripts/prepare_fastdb_sdk.py --output "$TASK_TMP/fastdb-sdk"
+exit_code: 0
+FASTDB_SDK_PREPARED {"bundle": "fastdb-core-0.2.3-aarch64-apple-darwin.tar.gz", "bundle_sha256": "5187a11cf47d24bbdbf6a0541ade2e6797a04d763df52971b45a0b3d94c69157", "lib_dir": "$TASK_TMP/fastdb-sdk/lib", "link_mode": "system", "source_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4", "target": "aarch64-apple-darwin", "version": "0.2.3"}
+command: cargo update --manifest-path core/Cargo.toml -p parking_lot --precise 0.13.0
+exit_code: 0
+Updating lock_api v0.4.14 -> v0.5.0
+Updating parking_lot v0.12.5 -> v0.13.0
+Updating parking_lot_core v0.9.12 -> v0.10.0
+Updating redox_syscall v0.5.18 -> v0.9.5
+Removing signal-hook-registry v1.4.8
+Updating smallvec v1.15.1 -> v1.16.4
+command: cargo update --manifest-path core/Cargo.toml -p smallvec --precise 1.15.2
+exit_code: 0
+Downgrading smallvec v1.16.4 -> v1.15.2
+command: cargo update --manifest-path core/Cargo.toml -p redox_syscall --precise 0.9.2
+exit_code: 0
+Downgrading redox_syscall v0.9.5 -> v0.9.2
+command: cargo update --manifest-path core/Cargo.toml -p rustls --precise 0.23.46
+exit_code: 0
+Updating rustls v0.23.45 -> v0.23.46
+command: cargo update --manifest-path cli/Cargo.toml -p parking_lot --precise 0.13.0
+exit_code: 0
+Updating libc v0.2.190 -> v0.2.191
+Updating lock_api v0.4.14 -> v0.5.0
+Updating parking_lot v0.12.5 -> v0.13.0
+Updating parking_lot_core v0.9.12 -> v0.10.0
+Updating redox_syscall v0.5.18 -> v0.9.5
+Removing signal-hook-registry v1.4.8
+Updating smallvec v1.15.1 -> v1.16.4
+command: cargo update --manifest-path cli/Cargo.toml -p smallvec --precise 1.15.2
+exit_code: 0
+Downgrading smallvec v1.16.4 -> v1.15.2
+command: cargo update --manifest-path cli/Cargo.toml -p redox_syscall --precise 0.9.2
+exit_code: 0
+Downgrading redox_syscall v0.9.5 -> v0.9.2
+command: cargo update --manifest-path cli/Cargo.toml -p rustls --precise 0.23.46
+exit_code: 0
+Updating rustls v0.23.45 -> v0.23.46
+command: cargo update --manifest-path sdk/rust/Cargo.toml -p parking_lot --precise 0.13.0
+exit_code: 0
+Updating libc v0.2.190 -> v0.2.191
+Updating lock_api v0.4.14 -> v0.5.0
+Updating parking_lot v0.12.5 -> v0.13.0
+Updating parking_lot_core v0.9.12 -> v0.10.0
+Updating redox_syscall v0.5.18 -> v0.9.5
+Removing signal-hook-registry v1.4.8
+command: cargo update --manifest-path sdk/rust/Cargo.toml -p smallvec --precise 1.15.2
+exit_code: 0
+command: cargo update --manifest-path sdk/rust/Cargo.toml -p redox_syscall --precise 0.9.2
+exit_code: 0
+Downgrading redox_syscall v0.9.5 -> v0.9.2
+command: cargo update --manifest-path sdk/rust/Cargo.toml -p rustls --precise 0.23.46
+exit_code: 0
+Updating rustls v0.23.45 -> v0.23.46
+command: cargo update --manifest-path sdk/python/native/Cargo.toml -p parking_lot --precise 0.13.0
+exit_code: 0
+Updating libc v0.2.190 -> v0.2.191
+Updating lock_api v0.4.14 -> v0.5.0
+Updating parking_lot v0.12.5 -> v0.13.0
+Updating parking_lot_core v0.9.12 -> v0.10.0
+Updating redox_syscall v0.5.18 -> v0.9.5
+Removing signal-hook-registry v1.4.8
+Updating smallvec v1.15.1 -> v1.16.4
+command: cargo update --manifest-path sdk/python/native/Cargo.toml -p smallvec --precise 1.15.2
+exit_code: 0
+Downgrading smallvec v1.16.4 -> v1.15.2
+command: cargo update --manifest-path sdk/python/native/Cargo.toml -p redox_syscall --precise 0.9.2
+exit_code: 0
+Downgrading redox_syscall v0.9.5 -> v0.9.2
+command: cargo update --manifest-path sdk/python/native/Cargo.toml -p rustls --precise 0.23.46
+exit_code: 0
+Updating rustls v0.23.45 -> v0.23.46
+summary: parking_lot_core 0.10 requires libc >=0.2.191, smallvec >=1.15.2 and redox_syscall >=0.9.2; these mandatory transitive upgrades were retained at the minimum versions
+command: uv lock --upgrade-package msgpack==1.2.3
+exit_code: 0
+Using CPython 3.13.3
+Resolved 46 packages in 1.58s
+Updated msgpack v1.2.1 -> v1.2.3
+command: cargo update --manifest-path core/Cargo.toml -p smallvec --precise 1.15.1
+exit_code: 101
+    Updating crates.io index
+error: failed to select a version for the requirement `smallvec = "^1.15.2"`
+candidate versions found which didn't match: 1.15.1
+location searched: crates.io index
+required by package `parking_lot_core v0.10.0`
+    ... which satisfies dependency `parking_lot_core = "^0.10.0"` (locked to 0.10.0) of package `parking_lot v0.13.0`
+    ... which satisfies dependency `parking_lot = "^0.13"` (locked to 0.13.0) of package `c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)`
+summary: mandatory minimum smallvec 1.15.2 was then selected successfully

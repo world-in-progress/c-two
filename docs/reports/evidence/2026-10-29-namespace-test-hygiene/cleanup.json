@@ -1,0 +1,14 @@
+{
+  "only_target_directory": "$TASK_TMP/target",
+  "allocated_kib_before_removal": 3325720,
+  "removed": "Entire task-owned CARGO_TARGET_DIR, including Rust binaries, rlibs, incremental state and build caches.",
+  "target_exists_after_removal": false,
+  "checkout_target_directories": {
+    "target": false,
+    "core/target": false,
+    "cli/target": false,
+    "sdk/rust/target": false
+  },
+  "source_hashes_unchanged_since_validation": true,
+  "historical_namespace_cleanup": "No manual sweep, reap or unlink; original pair and 18 diagnosis-load pairs preserved."
+}

@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tools.dev import test_python as runner
 
+RUNTIME_BIND_DENIAL_TEST = 'tests/unit/test_runtime.py::test_public_start_preserves_native_bind_denial_and_cleanup'
+
 
 
 @pytest.mark.parametrize('groups', [
@@ -139,6 +141,12 @@ def test_only_declared_windows_setup_skip_is_not_applicable(
 
 
 @pytest.mark.parametrize('platform,nodeid,phase,reason,accepted', [
+    ('win32', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', True),
+    ('linux', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
+    ('darwin', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
+    ('win32', RUNTIME_BIND_DENIAL_TEST, 'call', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
+    ('win32', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix filesystem root capability', False),
+    ('win32', 'tests/unit/test_runtime.py::test_other_runtime_case', 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
     ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'setup', 'Skipped: Unix filesystem root capability', True),
     ('win32', 'tests/integration/test_endpoint_context.py::test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state[normal]', 'setup', 'Skipped: Unix filesystem root capability', True),
     ('win32', 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup', 'setup', 'Skipped: OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes', True),
@@ -155,6 +163,16 @@ def test_only_declared_windows_setup_skip_is_not_applicable(
       for case in ('unwritable', 'not_directory', 'missing', 'refused', 'inaccessible')),
     ('linux', 'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[unwritable]', 'setup', 'Skipped: Unix filesystem root capability', False),
     ('win32', 'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[unwritable]', 'setup', 'Skipped: permission experiments require a non-root effective uid', False),
+    *((platform, nodeid, 'setup', 'Skipped: Unix filesystem root capability', platform == 'win32')
+      for platform in ('win32', 'linux', 'darwin') for nodeid in (
+          'tests/integration/test_endpoint_context.py::test_server_credential_does_not_wait_for_the_namespace_gate',
+          'tests/integration/test_local_io_cause.py::test_bind_unverified_reason_survives_the_startup_watch[missing-lease-missing-ownership]',
+          'tests/integration/test_local_io_cause.py::test_bind_unverified_reason_survives_the_startup_watch[old-format-unsupported-namespace-format]',
+      )),
+    ('win32', 'tests/integration/test_local_io_cause.py::test_bind_unverified_reason_survives_the_startup_watch[unknown]', 'setup', 'Skipped: Unix filesystem root capability', False),
+    ('win32', 'tests/integration/test_endpoint_context.py::test_server_credential_does_not_wait_for_the_namespace_gate', 'call', 'Skipped: Unix filesystem root capability', False),
+    ('win32', 'tests/integration/test_endpoint_context.py::test_server_credential_does_not_wait_for_the_namespace_gate', 'setup', 'Skipped: missing native', False),
+    ('win32', 'tests/unit/test_runtime_session.py::test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook', 'setup', 'Skipped: Unix filesystem root capability', False),
 ])
 def test_windows_platform_skip_allowlist(tmp_path, monkeypatch, platform, nodeid, phase, reason, accepted):
     monkeypatch.setattr(runner.sys, 'platform', platform)

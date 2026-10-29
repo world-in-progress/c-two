@@ -57,6 +57,14 @@ fn consume_generated(execute: bool) {
         &ContractCodegenOptions::default(),
     )
     .unwrap();
+    let source = std::str::from_utf8(tree.get("rust/c_two_contract.rs").unwrap().bytes()).unwrap();
+    assert_eq!(
+        source
+            .matches("c_two::generated::release_held_after_error(&mut held)")
+            .count(),
+        2
+    );
+    assert!(!source.contains("let _ = held.release()"));
     let temp = tempfile::tempdir().unwrap();
     tree.publish_new_tree(&temp.path().join("generated"))
         .unwrap();
@@ -80,13 +88,14 @@ fn consume_generated(execute: bool) {
     .unwrap();
     std::fs::create_dir(temp.path().join("src")).unwrap();
     std::fs::write(temp.path().join("src/main.rs"), CONSUMER).unwrap();
-    // Use a separate target directory: the outer Cargo test may hold its lock.
     let output = Command::new(env!("CARGO"))
         .args([if execute { "run" } else { "build" }, "--offline"])
         .current_dir(temp.path())
         .env(
             "CARGO_TARGET_DIR",
-            repository.join("sdk/rust/target/call-options-consumer"),
+            std::env::var_os("CARGO_TARGET_DIR")
+                .map(Into::into)
+                .unwrap_or_else(|| repository.join("sdk/rust/target/call-options-consumer")),
         )
         .output()
         .unwrap();

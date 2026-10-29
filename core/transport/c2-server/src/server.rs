@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use c2_local::{
     ConnectionEndReason, ConnectionEventSource, ConnectionEvents, DEFAULT_CONNECT_TIMEOUT,
-    EndpointReapResult, LocalEndpoint, LocalListener, LocalReadHalf, LocalStream, LocalWriteHalf,
+    EndpointCredential, EndpointReapResult, LocalEndpoint, LocalListener, LocalReadHalf,
+    LocalStream, LocalWriteHalf,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
@@ -46,8 +47,10 @@ use c2_wire::flags::{
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, MAX_ROUTES,
-    MethodEntry, RouteInfo, decode_handshake, encode_server_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, HANDSHAKE_VERSION,
+    MAX_ROUTES, MethodEntry, RouteInfo, VERSION_PREAMBLE_BODY_LEN, VersionPreambleKind,
+    decode_handshake, decode_version_preamble_payload, encode_server_handshake,
+    encode_version_preamble, validate_version_preamble_header,
 };
 use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES};
 use c2_wire::registration_control::{
@@ -75,7 +78,7 @@ use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
 use crate::dispatcher::{
     BuiltRoute, CrmCallback, CrmError, CrmRoute, Dispatcher, PeerShmRequest, PreparedShmResponse,
-    RequestData, ResponseMeta, RouteBuildSpec, cleanup_request,
+    RequestData, ResponseMeta, RouteBuildSpec,
 };
 use crate::heartbeat::run_heartbeat;
 use crate::response::try_prepare_shm_response;
@@ -200,7 +203,7 @@ impl std::error::Error for ServerStartupTimeout {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerFailure {
     pub message: String,
-    pub bind_error: Option<c2_local::EndpointIoError>,
+    pub bind_cause: Option<c2_local::EndpointBindCause>,
     pub startup_timeout: Option<ServerStartupTimeout>,
 }
 
@@ -208,7 +211,7 @@ impl ServerFailure {
     pub fn new(message: String) -> Self {
         Self {
             message,
-            bind_error: None,
+            bind_cause: None,
             startup_timeout: None,
         }
     }
@@ -219,13 +222,13 @@ impl From<&ServerError> for ServerFailure {
         if let ServerError::Failed(failure) = error {
             return failure.clone();
         }
-        let bind_error = match error {
+        let bind_cause = match error {
             ServerError::Bind(source) => Some(source.into()),
             _ => None,
         };
         Self {
             message: error.to_string(),
-            bind_error,
+            bind_cause,
             startup_timeout: match error {
                 ServerError::StartupTimeout(timeout) => Some(*timeout),
                 _ => None,
@@ -271,6 +274,13 @@ impl ServerLifecycleState {
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Starting | Self::Ready | Self::Stopping)
     }
+}
+
+/// The listener credential is published with readiness on the existing watch.
+#[derive(Debug, Clone)]
+struct LifecycleSnapshot {
+    state: ServerLifecycleState,
+    credential: Option<EndpointCredential>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,7 +336,7 @@ pub struct Server {
     /// revisioned watch history. It must not be held across awaits.
     route_catalog: parking_lot::RwLock<RouteCatalog>,
     shutdown_tx: watch::Sender<bool>,
-    lifecycle_tx: watch::Sender<ServerLifecycleState>,
+    lifecycle_tx: watch::Sender<LifecycleSnapshot>,
     connection_event_source: ConnectionEventSource,
     route_registration: Mutex<()>,
     /// Sharded chunk reassembly lifecycle manager.
@@ -605,7 +615,10 @@ impl Server {
                 .map_err(|e| ServerError::Config(format!("response pool prewarm: {e}")))?;
         }
         let chunk_admission_gate = ChunkAdmissionGate::new(config.max_total_chunks as usize);
-        let (lifecycle_tx, _lifecycle_rx) = watch::channel(ServerLifecycleState::Initialized);
+        let (lifecycle_tx, _lifecycle_rx) = watch::channel(LifecycleSnapshot {
+            state: ServerLifecycleState::Initialized,
+            credential: None,
+        });
         let pending_requests = Arc::new(Semaphore::new(config.max_pending_requests as usize));
         let chunk_processing_permits = Arc::new(Semaphore::new(config.max_total_chunks as usize));
         let route_catalog = RouteCatalog::new(identity.clone(), config.max_payload_size);
@@ -1170,11 +1183,33 @@ impl Server {
     }
 
     fn set_lifecycle_state(&self, state: ServerLifecycleState) {
-        self.lifecycle_tx.send_replace(state);
+        self.lifecycle_tx.send_modify(|snapshot| {
+            if matches!(
+                &state,
+                ServerLifecycleState::Starting
+                    | ServerLifecycleState::Stopped
+                    | ServerLifecycleState::Failed(_)
+            ) {
+                snapshot.credential = None;
+            }
+            snapshot.state = state;
+        });
+    }
+
+    fn publish_ready(&self, credential: EndpointCredential) {
+        self.lifecycle_tx.send_replace(LifecycleSnapshot {
+            state: ServerLifecycleState::Ready,
+            credential: Some(credential),
+        });
     }
 
     pub fn lifecycle_state(&self) -> ServerLifecycleState {
-        self.lifecycle_tx.borrow().clone()
+        self.lifecycle_tx.borrow().state.clone()
+    }
+
+    /// Credential captured from the bound listener; it does not prove liveness.
+    pub fn endpoint_credential(&self) -> Option<EndpointCredential> {
+        self.lifecycle_tx.borrow().credential.clone()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -1221,7 +1256,7 @@ impl Server {
         let mut rx = self.lifecycle_tx.subscribe();
         let wait = async {
             loop {
-                let state = rx.borrow().clone();
+                let state = rx.borrow().state.clone();
                 match state {
                     ServerLifecycleState::Ready => return Ok(()),
                     ServerLifecycleState::Failed(mut failure) => {
@@ -1282,7 +1317,7 @@ impl Server {
         let mut rx = self.lifecycle_tx.subscribe();
         let wait = async {
             loop {
-                let state = rx.borrow().clone();
+                let state = rx.borrow().state.clone();
                 match state {
                     ServerLifecycleState::Initialized
                     | ServerLifecycleState::Stopped
@@ -1317,7 +1352,7 @@ impl Server {
         let mut rx = self.lifecycle_tx.subscribe();
         loop {
             if matches!(
-                *rx.borrow(),
+                &rx.borrow().state,
                 ServerLifecycleState::Initialized
                     | ServerLifecycleState::Stopped
                     | ServerLifecycleState::Failed(_)
@@ -1495,7 +1530,7 @@ impl Server {
                 return Err(ServerError::Io(error));
             }
         }
-        self.set_lifecycle_state(ServerLifecycleState::Ready);
+        self.publish_ready(listener.credential());
         info!(endpoint = ?self.endpoint.os_name(), "server listening");
 
         // Spawn periodic GC sweep for expired chunk assemblies. The same
@@ -1867,17 +1902,13 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
     let _ = receiver.wait_for(|requested| *requested).await;
 }
 
-async fn wait_for_control_peer_close(reader: &mut LocalReadHalf) {
+async fn wait_for_control_peer_close(reader: &mut LocalReadHalf, deadline: tokio::time::Instant) {
     // The control client consumes the complete acknowledgement and closes its
     // one-exchange connection. Retain the pipe until that EOF where possible.
     // A timeout or unexpected byte only ends the wait; neither proves that the
     // peer consumed the acknowledgement.
     let mut byte = [0_u8; 1];
-    let _ = tokio::time::timeout(
-        Duration::from_millis(CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS),
-        reader.read(&mut byte),
-    )
-    .await;
+    let _ = tokio::time::timeout_at(deadline, reader.read(&mut byte)).await;
 }
 
 async fn handle_post_shutdown_connection(
@@ -1927,7 +1958,11 @@ async fn handle_post_shutdown_connection(
         )
     {
         handle_shutdown_signal(&server, payload, header.request_id, &writer).await;
-        wait_for_control_peer_close(&mut reader).await;
+        wait_for_control_peer_close(
+            &mut reader,
+            tokio::time::Instant::now() + Duration::from_millis(CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS),
+        )
+        .await;
     }
 }
 
@@ -2051,32 +2086,85 @@ fn handle_connection(
                 conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
                 break;
             }
-            if total_len < 12 || (total_len as u64) > max_frame {
+            let variable_frame_over_limit = u64::from(total_len) > max_frame;
+            // Only the fixed-size preamble can reach header inspection outside
+            // the variable-frame budget; its exact flags and bytes are checked below.
+            if total_len < 12
+                || (variable_frame_over_limit && total_len != VERSION_PREAMBLE_BODY_LEN)
+            {
                 warn!(conn_id, total_len, "invalid frame length");
                 conn.end(ConnectionEndReason::ProtocolError, "frame_length");
                 break;
             }
 
-            // Read the type before allocating on every frame. A business
-            // connection cannot evade the owner limit by switching roles.
+            // Inspect the fixed header before reading any payload byte or
+            // allocating. Even a header-only invalid preamble must be rejected
+            // without waiting for an owner-control type byte.
             let mut prefix = [0u8; 13];
-            let prefix_len = (total_len as usize).min(prefix.len());
-            if prefix_len != 0 {
-                tokio::select! {
-                    result = reader.read_exact(&mut prefix[..prefix_len]) => {
-                        if let Err(error) = result {
-                            conn.end_read("read_frame_prefix", &error);
-                            break;
-                        }
+            let mut prefix_len = FRAME_FIXED_BODY_LEN as usize;
+            tokio::select! {
+                result = reader.read_exact(&mut prefix[..prefix_len]) => {
+                    if let Err(error) = result {
+                        conn.end_read("read_frame_prefix", &error);
+                        break;
                     }
+                }
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
+                    conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
+                    break;
+                }
+            }
+            let (header, _) = decode_frame_body(&prefix[..prefix_len], total_len)
+                .expect("validated fixed frame header");
+            if header.is_handshake() {
+                if conn.handshake_done() || conn.ordinary_protocol() {
+                    conn.end(ConnectionEndReason::ProtocolError, "duplicate_handshake");
+                    break;
+                }
+                let mut version_header = [0u8; 16];
+                version_header[..4].copy_from_slice(&len_buf);
+                version_header[4..].copy_from_slice(&prefix[..prefix_len]);
+                let result = tokio::select! {
+                    biased;
                     _ = wait_for_shutdown(&mut shutdown_rx) => {
                         conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
                         break;
                     }
+                    result = negotiate_handshake(&server, &conn, &version_header, &mut reader, &writer) => result,
+                };
+                if let Err(error) = result {
+                    warn!(conn_id, %error, "handshake failed");
+                    match &error {
+                        ServerError::Io(error) => conn.end_io("handshake", error),
+                        _ => conn.end(ConnectionEndReason::ProtocolError, "handshake"),
+                    }
+                    break;
                 }
-                let (header, payload) = decode_frame_body(&prefix[..prefix_len], total_len)
-                    .expect("validated fixed frame prefix");
-                if header.is_ctrl() && payload.first() == Some(&MsgType::OwnerControl.as_byte()) {
+                continue;
+            }
+            if variable_frame_over_limit {
+                conn.end(ConnectionEndReason::ProtocolError, "frame_length");
+                break;
+            }
+            if header.is_ctrl() {
+                // OwnerControl has its own protocol. Only CTRL needs this
+                // separate byte before choosing that bounded setup path.
+                if total_len > FRAME_FIXED_BODY_LEN {
+                    tokio::select! {
+                        result = reader.read_exact(&mut prefix[prefix_len..prefix_len + 1]) => {
+                            if let Err(error) = result {
+                                conn.end_read("read_frame_prefix", &error);
+                                break;
+                            }
+                        }
+                        _ = wait_for_shutdown(&mut shutdown_rx) => {
+                            conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
+                            break;
+                        }
+                    }
+                    prefix_len += 1;
+                }
+                if prefix[12..prefix_len].first() == Some(&MsgType::OwnerControl.as_byte()) {
                     use crate::owner_control::{OwnerReadError, OwnerSession};
                     use c2_wire::owner_control::{
                         MAX_OWNER_PAYLOAD_SIZE, OwnerRejection, OwnerResponse, OwnerWireError,
@@ -2146,6 +2234,10 @@ fn handle_connection(
                     return;
                 }
             }
+            if !conn.handshake_done() && !header.is_signal() {
+                conn.end(ConnectionEndReason::ProtocolError, "frame_before_handshake");
+                break;
+            }
 
             // 2. Read the remaining body (request_id + flags + payload).
             let mut body = vec![0u8; total_len as usize];
@@ -2173,13 +2265,6 @@ fn handle_connection(
                 }
             };
 
-            if header.is_handshake()
-                || header.is_signal()
-                || header.is_ctrl()
-                || header.is_call_v2()
-            {
-                conn.select_ordinary_protocol();
-            }
             conn.touch();
             let flags = header.flags;
             let request_id = header.request_id;
@@ -2193,23 +2278,20 @@ fn handle_connection(
                     )
                 {
                     handle_shutdown_signal(&server, payload, request_id, &writer).await;
-                    wait_for_control_peer_close(&mut reader).await;
+                    wait_for_control_peer_close(
+                        &mut reader,
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS),
+                    )
+                    .await;
                 }
                 break;
             }
 
             // 4. Dispatch by frame type.
-            if header.is_handshake() {
-                if let Err(e) = handle_handshake(&server, &conn, payload, request_id, &writer).await
-                {
-                    warn!(conn_id, %e, "handshake failed");
-                    match &e {
-                        ServerError::Io(error) => conn.end_io("handshake", error),
-                        _ => conn.end(ConnectionEndReason::ProtocolError, "handshake"),
-                    }
-                    break;
-                }
-            } else if header.is_signal() {
+            if header.is_signal() {
+                // A standalone control exchange still commits the ordinary role.
+                conn.select_ordinary_protocol();
                 if matches!(
                     payload.first().and_then(|&b| MsgType::from_byte(b)),
                     Some(MsgType::ShutdownClient)
@@ -2218,7 +2300,12 @@ fn handle_connection(
                     // Malformed shutdown also ends this handler, preserving
                     // the existing negative ACK and frame policy.
                     conn.end(ConnectionEndReason::LocalClose, "shutdown_control_close");
-                    wait_for_control_peer_close(&mut reader).await;
+                    wait_for_control_peer_close(
+                        &mut reader,
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS),
+                    )
+                    .await;
                     break;
                 }
                 if matches!(
@@ -2270,7 +2357,7 @@ fn handle_connection(
                         Ok(permit) => permit,
                         Err(limit) => {
                             if c2_wire::flags::is_buddy(flags) {
-                                cleanup_buddy_request_block(&conn, payload);
+                                cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
                             }
                             // The frame cannot be processed, so the request is
                             // terminal: publish the abort and release (or fence)
@@ -2298,7 +2385,7 @@ fn handle_connection(
                         Ok(ordering) => ordering,
                         Err(error) => {
                             if c2_wire::flags::is_buddy(flags) {
-                                cleanup_buddy_request_block(&conn, payload);
+                                cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
                             }
                             drop(chunk_processing_permit);
                             warn!(
@@ -2346,7 +2433,7 @@ fn handle_connection(
                                     ?e,
                                     "buddy call control decode error"
                                 );
-                                cleanup_buddy_request_block(&conn, payload);
+                                cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
                                 continue;
                             }
                         };
@@ -2356,7 +2443,7 @@ fn handle_connection(
                         {
                             Ok(admission) => admission,
                             Err(err) => {
-                                cleanup_buddy_request_block(&conn, payload);
+                                cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
                                 write_route_admission_error(&writer, request_id, err).await;
                                 continue;
                             }
@@ -2365,7 +2452,7 @@ fn handle_connection(
                         Ok(permit) => permit,
                         Err(limit) => {
                             drop(route_admission.pending_permit);
-                            cleanup_buddy_request_block(&conn, payload);
+                            cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
                             write_server_pending_capacity_error(&writer, request_id, limit).await;
                             continue;
                         }
@@ -2464,6 +2551,77 @@ fn handle_connection(
 // Handshake
 // ---------------------------------------------------------------------------
 
+async fn negotiate_handshake(
+    server: &Server,
+    conn: &Connection,
+    header: &[u8; 16],
+    reader: &mut LocalReadHalf,
+    writer: &Arc<Mutex<LocalWriteHalf>>,
+) -> Result<(), ServerError> {
+    validate_version_preamble_header(header, false)
+        .map_err(|error| ServerError::Protocol(format!("version preamble header: {error}")))?;
+    let mut payload = [0u8; 9];
+    reader.read_exact(&mut payload).await?;
+    let (kind, peer) = decode_version_preamble_payload(&payload)
+        .map_err(|error| ServerError::Protocol(format!("version preamble payload: {error}")))?;
+    if kind != VersionPreambleKind::Hello {
+        return Err(ServerError::Protocol("expected version Hello".into()));
+    }
+    conn.touch();
+    if peer != HANDSHAKE_VERSION {
+        // One absolute budget covers writer acquisition, write, asynchronous
+        // flush and waiting for peer EOF. The caller retains shutdown and
+        // heartbeat cancellation; no synchronous pipe-consumption flush runs.
+        let deadline = tokio::time::Instant::now() + DEFAULT_CONNECT_TIMEOUT;
+        tokio::time::timeout_at(deadline, async {
+            let mut writer = writer.lock().await;
+            writer
+                .write_all(&encode_version_preamble(
+                    VersionPreambleKind::VersionMismatch,
+                ))
+                .await // LocalWriteHalf::write_all already drains the async adapter.
+        })
+        .await
+        .map_err(|_| {
+            ServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "version rejection deadline expired",
+            ))
+        })??;
+        conn.end(ConnectionEndReason::ProtocolError, "handshake_version");
+        wait_for_control_peer_close(reader, deadline).await;
+        return Err(ServerError::Protocol(format!(
+            "IPC protocol version mismatch: local={HANDSHAKE_VERSION}, peer={peer}"
+        )));
+    }
+    writer
+        .lock()
+        .await
+        .write_all(&encode_version_preamble(VersionPreambleKind::Accepted))
+        .await?;
+
+    // This same stack owns both reads. Metadata cannot be interleaved with a
+    // second Hello, owner-control selection, or normal route dispatch.
+    let mut metadata_header = [0u8; 16];
+    reader.read_exact(&mut metadata_header).await?;
+    let (total_len, body) = frame::decode_total_len(&metadata_header)
+        .map_err(|error| ServerError::Protocol(format!("handshake metadata header: {error}")))?;
+    let (header, _) = decode_frame_body(body, total_len)
+        .map_err(|error| ServerError::Protocol(format!("handshake metadata header: {error}")))?;
+    if total_len < FRAME_FIXED_BODY_LEN
+        || u64::from(total_len) > server.config.max_frame_size
+        || header.request_id != 0
+        || header.flags != FLAG_HANDSHAKE
+    {
+        return Err(ServerError::Protocol(
+            "invalid handshake metadata header".into(),
+        ));
+    }
+    let mut metadata = vec![0u8; header.payload_len()];
+    reader.read_exact(&mut metadata).await?;
+    handle_handshake(server, conn, &metadata, 0, writer).await
+}
+
 async fn handle_handshake(
     server: &Server,
     conn: &Connection,
@@ -2476,7 +2634,6 @@ async fn handle_handshake(
 
     // Frames identify peer backings by pool incarnation, index and generation.
     conn.init_peer_shm(client_hs.prefix);
-    conn.set_handshake_done(true);
 
     if client_hs.capability_flags & CAP_CHUNKED != 0 {
         conn.set_chunked_capable(true);
@@ -2538,6 +2695,11 @@ async fn handle_handshake(
     let frame = encode_frame(request_id, FLAG_HANDSHAKE | FLAG_RESPONSE, &hs_bytes);
 
     writer.lock().await.write_all(&frame).await?;
+    // Heartbeat and business admission open only after the complete final ACK
+    // has been written; neither may interleave with version/metadata exchange.
+    conn.set_handshake_done(true);
+    conn.select_ordinary_protocol();
+    conn.touch();
     Ok(())
 }
 
@@ -2914,12 +3076,12 @@ where
         result = route_pending_permit.async_activate() => match result {
             Ok(guard) => guard,
             Err(err) => {
-                cleanup_request(request);
+                drop(request);
                 return Err(RouteExecutionError::Acquire(err));
             }
         },
         _ = conn.wait_cancelled() => {
-            cleanup_request(request);
+            drop(request);
             return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
         }
     };
@@ -2927,25 +3089,25 @@ where
         result = execution_scheduler.async_acquire(0) => match result {
             Ok(guard) => guard,
             Err(err) => {
-                cleanup_request(request);
+                drop(request);
                 return Err(RouteExecutionError::Acquire(err));
             }
         },
         err = route_guard.wait_rejected() => {
-            cleanup_request(request);
+            drop(request);
             return Err(RouteExecutionError::Acquire(err));
         },
         _ = conn.wait_cancelled() => {
-            cleanup_request(request);
+            drop(request);
             return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
         }
     };
     if let Err(err) = route_guard.check_admission() {
-        cleanup_request(request);
+        drop(request);
         return Err(RouteExecutionError::Acquire(err));
     }
     if conn.is_cancelled() {
-        cleanup_request(request);
+        drop(request);
         return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
     }
 
@@ -2953,7 +3115,7 @@ where
         let mut route_guard = route_guard;
         let _execution_guard = execution_guard;
         if let Err(err) = route_guard.commit() {
-            cleanup_request(request);
+            drop(request);
             return Err(RouteExecutionError::Acquire(err));
         }
         f(request).map_err(RouteExecutionError::Crm)
@@ -3393,27 +3555,82 @@ fn schedule_peer_buddy_gc_if_idle(conn: &Arc<Connection>, free_result: c2_mem::F
     }
 }
 
-fn cleanup_buddy_request_block(conn: &Arc<Connection>, payload: &[u8]) {
-    let (bp, _) = match decode_buddy_payload(payload) {
-        Ok(decoded) => decoded,
-        Err(e) => {
-            warn!(
-                conn_id = conn.conn_id(),
-                ?e,
-                "buddy request cleanup decode error"
-            );
-            return;
-        }
-    };
-    let free_result = conn.free_peer_block(
+fn admit_peer_request(
+    conn: &Arc<Connection>,
+    bp: BuddyPayload,
+    budget: &MemoryBudget,
+) -> Result<RequestData, String> {
+    let pool = conn
+        .peer_pool_arc()
+        .ok_or_else(|| "peer pool not initialised".to_string())?;
+    let mut carrier = PeerShmRequest::admit(
+        pool,
         bp.seg_idx,
         bp.generation,
         bp.offset,
         bp.data_size,
         bp.is_dedicated,
         bp.allocation_id,
+        budget.clone(),
     );
-    schedule_peer_buddy_gc_if_idle(conn, free_result);
+    // Bind the obligation before the first fallible map, and pin that mapping
+    // before a callback can stall beyond the sender's existing crash timeout.
+    if let Err(primary) = carrier.ensure_mapped() {
+        return Err(match carrier.release() {
+            Ok(result) => {
+                schedule_peer_buddy_gc_if_idle(conn, result);
+                primary
+            }
+            Err(cleanup) => {
+                carrier.abandon();
+                format!("{primary}; request release also failed: {cleanup}")
+            }
+        });
+    }
+    Ok(RequestData::Shm(carrier))
+}
+
+fn consume_peer_request(
+    conn: &Arc<Connection>,
+    bp: BuddyPayload,
+    budget: &MemoryBudget,
+) -> Result<Vec<u8>, String> {
+    let mut lease = crate::RequestLease::new(admit_peer_request(conn, bp, budget)?);
+    let copy = lease.copy_bytes();
+    match lease.release_with_result() {
+        Ok(result) => {
+            schedule_peer_buddy_gc_if_idle(conn, result);
+            copy
+        }
+        Err(cleanup) => {
+            lease.abandon();
+            Err(match copy {
+                Ok(_) => cleanup,
+                Err(primary) => format!("{primary}; request release also failed: {cleanup}"),
+            })
+        }
+    }
+}
+
+fn cleanup_buddy_request_block(conn: &Arc<Connection>, payload: &[u8], budget: &MemoryBudget) {
+    let result = decode_buddy_payload(payload)
+        .map_err(|error| format!("buddy request cleanup decode error: {error}"))
+        .and_then(|(bp, _)| admit_peer_request(conn, bp, budget));
+    match result {
+        Ok(request) => {
+            let mut lease = crate::RequestLease::new(request);
+            match lease.release_with_result() {
+                Ok(result) => schedule_peer_buddy_gc_if_idle(conn, result),
+                Err(error) => {
+                    warn!(conn_id = conn.conn_id(), %error, "buddy request cleanup failed");
+                    lease.abandon();
+                }
+            }
+        }
+        Err(error) => {
+            warn!(conn_id = conn.conn_id(), %error, "buddy request cleanup admission failed")
+        }
+    }
 }
 
 struct AdmittedBuddyCall<'a> {
@@ -3453,27 +3670,6 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
         }
     };
 
-    // 2. Ensure peer SHM segment is mapped and get pool Arc (single lock).
-    let peer_pool = match conn.ensure_and_get_peer_pool(
-        bp.seg_idx,
-        bp.generation,
-        bp.data_size,
-        bp.is_dedicated,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(conn_id = conn.conn_id(), %e, "ensure_and_get_peer_pool failed");
-            let msg = format!("buddy SHM segment open: {e}");
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, msg)),
-            )
-            .await;
-            return;
-        }
-    };
-
     // 3. Check for extra inline args appended after control header.
     let inline_start = BUDDY_PAYLOAD_SIZE + ctrl_consumed;
     let extra_args = if inline_start < payload.len() {
@@ -3484,52 +3680,31 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
 
     // 4. Build request — zero-copy SHM or fallback to inline if extra args present.
     let request = if extra_args.is_empty() {
-        RequestData::Shm(PeerShmRequest::admit(
-            peer_pool,
-            bp.seg_idx,
-            bp.generation,
-            bp.offset,
-            bp.data_size,
-            bp.is_dedicated,
-            bp.allocation_id,
-        ))
-    } else {
-        // Rare edge case: extra inline args after buddy payload — fall back to copy.
-        warn!(
-            conn_id = conn.conn_id(),
-            extra_len = extra_args.len(),
-            "buddy call has trailing inline args, falling back to copy"
-        );
-        let args = match conn.read_peer_data(
-            bp.seg_idx,
-            bp.generation,
-            bp.offset,
-            bp.data_size,
-            bp.is_dedicated,
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(conn_id = conn.conn_id(), %e, "buddy SHM read failed (fallback)");
-                let msg = format!("buddy SHM read: {e}");
+        match admit_peer_request(conn, bp, &server.memory_budget) {
+            Ok(request) => request,
+            Err(error) => {
                 write_reply(
                     writer,
                     request_id,
-                    &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, msg)),
+                    &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, error)),
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        let mut combined = match consume_peer_request(conn, bp, &server.memory_budget) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                write_reply(
+                    writer,
+                    request_id,
+                    &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, error)),
                 )
                 .await;
                 return;
             }
         };
-        let free_result = conn.free_peer_block(
-            bp.seg_idx,
-            bp.generation,
-            bp.offset,
-            bp.data_size,
-            bp.is_dedicated,
-            bp.allocation_id,
-        );
-        schedule_peer_buddy_gc_if_idle(conn, free_result);
-        let mut combined = args;
         combined.extend_from_slice(extra_args);
         RequestData::Inline(combined)
     };
@@ -3729,7 +3904,7 @@ async fn dispatch_chunked_call(
                         conn_id = conn.conn_id(),
                         request_id, reason, "releasing discarded buddy chunk frame"
                     );
-                    cleanup_buddy_request_block(conn, payload);
+                    cleanup_buddy_request_block(conn, payload, &server.memory_budget);
                 }
                 return;
             }
@@ -3763,23 +3938,8 @@ async fn dispatch_chunked_call(
             }
         };
         offset = bp_consumed;
-        match conn.read_peer_data(
-            bp.seg_idx,
-            bp.generation,
-            bp.offset,
-            bp.data_size,
-            bp.is_dedicated,
-        ) {
+        match consume_peer_request(conn, bp, &server.memory_budget) {
             Ok(data) => {
-                let free_result = conn.free_peer_block(
-                    bp.seg_idx,
-                    bp.generation,
-                    bp.offset,
-                    bp.data_size,
-                    bp.is_dedicated,
-                    bp.allocation_id,
-                );
-                schedule_peer_buddy_gc_if_idle(conn, free_result);
                 shm_data = Some(data);
             }
             Err(e) => {
@@ -4054,7 +4214,7 @@ async fn dispatch_chunked_call(
         let _pending_permit = match server.try_acquire_pending_request() {
             Ok(permit) => permit,
             Err(limit) => {
-                cleanup_request(request);
+                drop(request);
                 write_server_pending_capacity_error(writer, request_id, limit).await;
                 return;
             }
@@ -4256,17 +4416,11 @@ async fn write_reply_with_data(
 
 /// Send a filled SHM owner once; publication never falls back to another transport.
 async fn send_prepared_shm_response(
-    response_pool: &crate::ResponsePool,
     writer: &Arc<Mutex<LocalWriteHalf>>,
     request_id: u64,
     prepared: PreparedShmResponse,
 ) -> Result<(), ResponseSendError> {
     let data_size = prepared.data_size();
-    prepared
-        .validate_pool(&response_pool.read())
-        .map_err(|error| {
-            ResponseSendError::UserVisible(format!("prepared SHM response owner mismatch: {error}"))
-        })?;
     // CRM already wrote into our response pool — send the backing's
     // read-only coordinates in the reply frame.
     let allocation = prepared
@@ -4283,26 +4437,68 @@ async fn send_prepared_shm_response(
     let buddy_bytes = encode_buddy_payload(&bp);
     let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
     let frame = frame::encode_frame_parts(request_id, flags, &[&buddy_bytes, &SUCCESS_REPLY]);
-    if let Err(err) = writer.lock().await.write_all(&frame).await {
-        let mut pool = response_pool.inner.write();
-        let _ = prepared.release_through(&mut pool);
-        return Err(ResponseSendError::Transport(format!(
-            "prepared SHM reply write failed: {err}"
-        )));
-    }
+    let mut send = PreparedSend {
+        prepared: Some(prepared),
+        frame_written: false,
+    };
+    let result = writer
+        .lock()
+        .await
+        .write_all_with_progress(&frame, &mut send.frame_written)
+        .await;
+    send.finish(result)
+}
 
-    // Dedicated backings keep a server-side lifecycle; release the
-    // consumed owner now. A published buddy backing transfers the
-    // cross-process release to the receiving client: dropping the
-    // owner here without freeing hands over exactly that.
+struct PreparedSend {
+    prepared: Option<PreparedShmResponse>,
+    frame_written: bool,
+}
+
+impl PreparedSend {
+    fn finish(mut self, result: std::io::Result<()>) -> Result<(), ResponseSendError> {
+        finish_prepared_shm_send(
+            self.prepared.take().expect("live prepared send"),
+            result,
+            self.frame_written,
+        )
+    }
+}
+
+impl Drop for PreparedSend {
+    fn drop(&mut self) {
+        if let Some(mut prepared) = self.prepared.take() {
+            if self.frame_written {
+                prepared.abandon();
+            }
+            // An unpublished owner uses its one final cleanup; no writer guard survives here.
+        }
+    }
+}
+
+fn finish_prepared_shm_send(
+    mut prepared: PreparedShmResponse,
+    result: std::io::Result<()>,
+    frame_written: bool,
+) -> Result<(), ResponseSendError> {
+    if let Err(error) = result {
+        let message = format!("prepared SHM reply write failed: {error}");
+        let message = if frame_written {
+            prepared.abandon();
+            message
+        } else {
+            prepared.rollback(message)
+        };
+        return Err(ResponseSendError::Transport(message));
+    }
     if prepared.is_dedicated() {
-        let mut pool = response_pool.inner.write();
-        let _ = prepared.release_through(&mut pool);
+        if let Err(error) = prepared.release() {
+            prepared.abandon();
+            return Err(ResponseSendError::Transport(format!(
+                "prepared SHM reply cleanup failed: {error}"
+            )));
+        }
     } else {
-        // Consume the owner at the publish boundary: the value is
-        // dropped without freeing, so the only remaining release
-        // authority is the receiving client's read-then-release.
-        drop(prepared.into_handle());
+        prepared.transfer();
     }
     Ok(())
 }
@@ -4383,45 +4579,42 @@ async fn send_response_meta(
         ResponseMeta::Empty => {
             write_reply_with_data(writer, request_id, &[]).await?;
         }
-        ResponseMeta::ShmAlloc(prepared) => {
+        ResponseMeta::ShmAlloc(mut prepared) => {
             let data_size = prepared.data_size();
             if u64::from(data_size) > max_payload_size {
-                let mut pool = response_pool.inner.write();
-                let _ = prepared.release_through(&mut pool);
-                return Err(ResponseSendError::UserVisible(format!(
+                return Err(ResponseSendError::UserVisible(prepared.rollback(format!(
                     "response payload size {data_size} exceeds max_payload_size {max_payload_size}"
-                )));
+                ))));
             }
             // Preserve the original owner validation ahead of the direction
             // gate: a foreign backing is rejected on identity before any
             // transport decision, exactly as on the negotiated path.
-            prepared
-                .validate_pool(&response_pool.read())
-                .map_err(|error| {
-                    ResponseSendError::UserVisible(format!(
-                        "prepared SHM response owner mismatch: {error}"
-                    ))
-                })?;
+            let validation = prepared.validate_pool(&response_pool.read());
+            if let Err(error) = validation {
+                return Err(ResponseSendError::UserVisible(prepared.rollback(format!(
+                    "prepared SHM response owner mismatch: {error}"
+                ))));
+            }
             if !shm_response_allowed {
                 // The peer never agreed to map response coordinates. Copy the
                 // logical bytes out, release the backing through its original
                 // owner, and send the owned bytes through the existing owned
                 // path — the peer is never handed an invisible mapping.
-                let bytes = {
-                    let pool = response_pool.read();
-                    prepared.copy_logical_bytes(&pool).map_err(|error| {
-                        ResponseSendError::UserVisible(format!(
-                            "prepared SHM response copy failed: {error}"
-                        ))
-                    })?
+                let copy = prepared.copy_logical_bytes(&response_pool.read());
+                let bytes = match copy {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return Err(ResponseSendError::UserVisible(
+                            prepared
+                                .rollback(format!("prepared SHM response copy failed: {error}")),
+                        ));
+                    }
                 };
-                {
-                    let mut pool = response_pool.inner.write();
-                    prepared.release_through(&mut pool).map_err(|error| {
-                        ResponseSendError::UserVisible(format!(
-                            "prepared SHM response release failed: {error}"
-                        ))
-                    })?;
+                if let Err(error) = prepared.release() {
+                    prepared.abandon();
+                    return Err(ResponseSendError::UserVisible(format!(
+                        "prepared SHM response release failed: {error}"
+                    )));
                 }
                 return smart_reply_with_data(
                     response_pool,
@@ -4434,7 +4627,7 @@ async fn send_response_meta(
                 )
                 .await;
             }
-            send_prepared_shm_response(response_pool, writer, request_id, prepared).await?;
+            send_prepared_shm_response(writer, request_id, prepared).await?;
         }
     }
     Ok(())
@@ -4457,11 +4650,11 @@ async fn smart_reply_with_data(
                 Ok(())
             }) {
                 Ok(Some(prepared)) => {
-                    return send_prepared_shm_response(response_pool, writer, request_id, prepared)
-                        .await;
+                    return send_prepared_shm_response(writer, request_id, prepared).await;
                 }
                 // Preserve pre-write fallback. Once prepared, a write error returns above.
-                Ok(None) | Err(_) => {}
+                Ok(None) => {}
+                Err(error) => return Err(ResponseSendError::UserVisible(error)),
             }
         }
 
@@ -4664,8 +4857,57 @@ mod tests {
         ))
     }
 
+    fn poison_response_pool(pool: &crate::ResponsePool) {
+        use c2_mem::{SegmentHeader, ShmSpinlock};
+        let ptr = pool.read().segment(0).unwrap().base_ptr();
+        let lock =
+            unsafe { ShmSpinlock::new(ptr.add(std::mem::offset_of!(SegmentHeader, spinlock))) };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || lock.with_lock(|| panic!("poison release"))
+            ))
+            .is_err()
+        );
+    }
+
+    async fn isolated_pair() -> (LocalStream, LocalStream) {
+        #[cfg(unix)]
+        let root = tempfile::Builder::new()
+            .prefix("r07")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let endpoint = context
+            .endpoint(&format!("ipc://r07-{}", uuid::Uuid::new_v4().simple()))
+            .unwrap();
+        let mut listener = LocalListener::bind(&endpoint).unwrap();
+        let pair = tokio::try_join!(
+            LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+            listener.accept()
+        )
+        .unwrap();
+        assert!(matches!(
+            listener.close(),
+            EndpointReapResult::Reaped | EndpointReapResult::NotApplicable
+        ));
+        #[cfg(unix)]
+        assert!(
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .all(|entry| matches!(
+                    entry.unwrap().file_name().to_str(),
+                    Some(".gate" | ".gate.marker")
+                )),
+            "task root must have no socket or lease after listener close"
+        );
+        pair
+    }
+
     async fn closed_writer() -> Arc<Mutex<LocalWriteHalf>> {
-        let (client, server) = LocalStream::pair().await.unwrap();
+        let (client, server) = isolated_pair().await;
         client.abort_handle().abort();
         drop(client);
         let (_reader, writer) = server.into_split();
@@ -4770,6 +5012,20 @@ mod tests {
 
     #[tokio::test]
     async fn run_sets_ready_then_shutdown_sets_stopped() {
+        #[cfg(unix)]
+        let directory = tempfile::Builder::new()
+            .prefix("c2-ready-credential-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&unique_readiness_address("ready_state"))
+            .unwrap();
+        #[cfg(unix)]
+        let server =
+            Arc::new(Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap());
+        #[cfg(not(unix))]
         let server = Arc::new(
             Server::new(
                 &unique_readiness_address("ready_state"),
@@ -4777,6 +5033,7 @@ mod tests {
             )
             .unwrap(),
         );
+        assert!(server.endpoint_credential().is_none());
         let runner = {
             let server = Arc::clone(&server);
             tokio::spawn(async move { server.run().await })
@@ -4790,12 +5047,73 @@ mod tests {
         assert!(server.is_ready());
         assert!(server.is_running());
         assert!(endpoint_connects(server.local_endpoint()).await);
+        let credential = server
+            .endpoint_credential()
+            .expect("bound listener credential");
+        assert_eq!(credential.endpoint(), server.local_endpoint());
 
         server.request_shutdown_signal();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopping);
+        assert_eq!(server.endpoint_credential(), Some(credential.clone()));
         runner.await.unwrap().unwrap();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(server.endpoint_credential().is_none());
         assert!(!server.is_ready());
         assert!(!server.is_running());
+
+        server.begin_start_attempt().unwrap();
+        assert!(server.endpoint_credential().is_none());
+        let restarted = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let next = server.endpoint_credential().expect("restarted credential");
+        #[cfg(unix)]
+        assert_ne!(next, credential);
+        #[cfg(not(unix))]
+        assert_eq!(next, credential);
+        server.request_shutdown_signal();
+        restarted.await.unwrap().unwrap();
+        assert!(server.endpoint_credential().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_run_keeps_snapshot_until_runtime_finalization() {
+        let directory = tempfile::Builder::new()
+            .prefix("c2-cancel-credential-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(directory.path())
+            .unwrap()
+            .endpoint(&unique_readiness_address("cancel_credential"))
+            .unwrap();
+        let server =
+            Arc::new(Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap());
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let credential = server.endpoint_credential().expect("ready credential");
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Ready);
+        assert_eq!(server.endpoint_credential(), Some(credential.clone()));
+        server.finalize_runtime_stopped();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(server.endpoint_credential().is_none());
+        assert!(matches!(
+            c2_local::reap_endpoint(server.local_endpoint(), &credential),
+            EndpointReapResult::Reaped | EndpointReapResult::AlreadyAbsent
+        ));
     }
 
     /// A transient namespace operation must not turn a successful shutdown
@@ -4921,6 +5239,7 @@ mod tests {
             server.lifecycle_state(),
             ServerLifecycleState::Failed(_)
         ));
+        assert!(server.endpoint_credential().is_none());
         assert!(!server.is_running());
         assert!(socket.exists(), "unverified socket must be preserved");
         assert!(tokio::net::UnixStream::connect(socket).await.is_err());
@@ -5025,6 +5344,7 @@ mod tests {
         let mut client = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
             .await
             .unwrap();
+        negotiate_test_version(&mut client).await;
         let payload = c2_wire::handshake::encode_client_handshake(&[], CAP_CALL_V2, "").unwrap();
         let frame = encode_frame(0, FLAG_HANDSHAKE, &payload);
         for bytes in frame.chunks(3) {
@@ -5205,11 +5525,13 @@ mod tests {
             second.lifecycle_state(),
             ServerLifecycleState::Failed(_)
         ));
+        assert!(second.endpoint_credential().is_none());
 
         first.request_shutdown_signal();
         first_runner.await.unwrap().unwrap();
 
         second.begin_start_attempt().unwrap();
+        assert!(second.endpoint_credential().is_none());
         let second_runner = {
             let second = Arc::clone(&second);
             tokio::spawn(async move { second.run().await })
@@ -5219,6 +5541,7 @@ mod tests {
             .await
             .unwrap();
         assert!(endpoint_connects(second.local_endpoint()).await);
+        assert!(second.endpoint_credential().is_some());
 
         second.request_shutdown_signal();
         second_runner.await.unwrap().unwrap();
@@ -5230,10 +5553,10 @@ mod tests {
         assert_eq!(a, b);
         assert!(!a.message.contains("config error"));
         assert!(a.startup_timeout.is_none());
-        let cause = a.bind_error.expect("actual bind cause");
-        assert_eq!(cause.kind, std::io::ErrorKind::AddrInUse);
+        let cause = a.bind_cause.expect("actual bind cause");
+        assert_eq!(cause.error.kind, std::io::ErrorKind::AddrInUse);
         assert_eq!(
-            cause.raw_os_error, None,
+            cause.error.raw_os_error, None,
             "listener lease owns the rejection"
         );
         assert_eq!(second.lifecycle_state(), ServerLifecycleState::Stopped);
@@ -5282,6 +5605,7 @@ mod tests {
         server.set_lifecycle_state(ServerLifecycleState::Stopping);
         server.finalize_runtime_stopped();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(server.endpoint_credential().is_none());
 
         server.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new(
             "bind failed".to_string(),
@@ -6422,6 +6746,7 @@ mod tests {
             128,
             alloc.is_dedicated,
             alloc.allocation_id,
+            pool.read().budget().unwrap().clone(),
         ));
         let scheduler = Scheduler::with_limits(
             ConcurrencyMode::Parallel,
@@ -7501,6 +7826,7 @@ mod tests {
             let mut peer = Some(peer);
             let abort = stream.abort_handle();
             let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+            handshake_test_client(peer.as_mut().unwrap()).await;
             let observation = match events.recv().await.unwrap().unwrap() {
                 c2_local::ConnectionEvent::Opened(observation) => observation,
                 _ => panic!("expected Opened"),
@@ -7640,6 +7966,7 @@ mod tests {
         let mut client = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
             .await
             .expect("connect client");
+        handshake_test_client(&mut client).await;
         client
             .write_all(&12u32.to_le_bytes())
             .await
@@ -8462,9 +8789,12 @@ mod tests {
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
         use c2_wire::handshake::encode_client_handshake;
 
-        let mut peer_pool = small_response_pool("rq").inner.into_inner();
+        let mut peer_pool = Arc::try_unwrap(small_response_pool("rq").inner)
+            .ok()
+            .unwrap()
+            .into_inner();
         let server = ordering_test_server("ipc://peer_geometry", 4);
-        let (stream, mut client) = LocalStream::pair().await.unwrap();
+        let (stream, mut client) = isolated_pair().await;
         let (_reader, writer) = stream.into_split();
         let writer = Arc::new(Mutex::new(writer));
         let data = vec![0x5a; 32 * 1024];
@@ -8508,12 +8838,7 @@ mod tests {
             assert_eq!(flags, FLAG_HANDSHAKE | FLAG_RESPONSE);
             assert!(conn.handshake_done() && conn.chunked_capable());
             assert_eq!(conn.peer_pool_arc().unwrap().read().segment_count(), 0);
-            assert_eq!(
-                conn.read_peer_data(seg_idx, generation, offset, len as u32, false)
-                    .unwrap(),
-                data,
-                "announced_size={announced_size:?}",
-            );
+
             assert_eq!(peer_pool.stats().alloc_count, 1);
             let payload = encode_buddy_payload(&BuddyPayload {
                 seg_idx,
@@ -8523,9 +8848,231 @@ mod tests {
                 is_dedicated: false,
                 allocation_id,
             });
-            cleanup_buddy_request_block(&conn, &payload);
+            let (bp, _) = decode_buddy_payload(&payload).unwrap();
+            let mut lease = crate::RequestLease::new(
+                admit_peer_request(&conn, bp, &server.memory_budget).unwrap(),
+            );
+            assert_eq!(
+                lease.copy_bytes().unwrap(),
+                data,
+                "announced_size={announced_size:?}"
+            );
+            let freed = lease.release_with_result().unwrap();
+            schedule_peer_buddy_gc_if_idle(&conn, freed);
             assert_eq!(peer_pool.stats().alloc_count, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn trailing_inline_uses_one_peer_lease_and_cleanup_error_stops_callback() {
+        struct InlineCallback(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+        impl CrmCallback for InlineCallback {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                request: RequestData,
+                _: Arc<crate::ResponsePool>,
+            ) -> Result<ResponseMeta, CrmError> {
+                assert!(matches!(request, RequestData::Inline(_)));
+                self.0.lock().unwrap().push(
+                    crate::RequestLease::new(request)
+                        .into_owned_bytes()
+                        .unwrap(),
+                );
+                Ok(ResponseMeta::Inline(b"ok".to_vec()))
+            }
+        }
+        #[cfg(unix)]
+        let root = tempfile::Builder::new()
+            .prefix("r07tail")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let server = Arc::new(
+            Server::new_with_endpoint(
+                context.endpoint("ipc://trailing").unwrap(),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut route = make_host_route(&server, "grid");
+        route.callback = Arc::new(InlineCallback(seen.clone()));
+        server.register_route(route).await.unwrap();
+        for poison in [false, true] {
+            let pool = small_response_pool("tail");
+            let mut handle = pool.inner.write().alloc_shm_handle(128).unwrap();
+            pool.read().handle_slice_mut(&mut handle).fill(7);
+            let a = handle.shm_allocation().unwrap();
+            if poison {
+                poison_response_pool(&pool);
+            }
+            let conn = Arc::new(Connection::new(77));
+            conn.init_peer_shm(pool.read().prefix().to_owned());
+            let mut payload = encode_buddy_payload(&BuddyPayload {
+                seg_idx: a.seg_idx as u16,
+                generation: a.generation,
+                offset: a.offset,
+                data_size: 128,
+                is_dedicated: false,
+                allocation_id: a.allocation_id,
+            })
+            .to_vec();
+            let control = c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap();
+            payload.extend_from_slice(&control);
+            payload.extend_from_slice(b"tail");
+            let admission = reserve_route_execution(&server, &call_identity("grid"), 0)
+                .await
+                .ok()
+                .unwrap();
+            let (mut peer, stream) = isolated_pair().await;
+            let (_reader, half) = stream.into_split();
+            let writer = Arc::new(Mutex::new(half));
+            dispatch_admitted_buddy_call(AdmittedBuddyCall {
+                server: &server,
+                conn: &conn,
+                request_id: 8,
+                payload: &payload,
+                ctrl_consumed: control.len(),
+                route: admission.route,
+                method_idx: 0,
+                writer: &writer,
+                _pending_permit: server.try_acquire_pending_request().unwrap(),
+                route_pending_permit: admission.pending_permit,
+            })
+            .await;
+            let (_, _, reply) = read_reply_frame(&mut peer).await;
+            let (control, _) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+            if poison {
+                assert!(matches!(control, ReplyControl::Error(_)));
+            } else {
+                assert!(matches!(control, ReplyControl::Success));
+            }
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            assert_eq!(
+                seen.lock().unwrap()[0],
+                [vec![7; 128], b"tail".to_vec()].concat()
+            );
+            assert_eq!(
+                server.memory_budget.snapshot().abandoned_releases,
+                u64::from(poison)
+            );
+            if !poison {
+                assert_eq!(pool.read().stats().alloc_count, 0);
+            }
+            pool.inner.write().destroy();
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_peer_release_failure_does_not_admit_successful_input() {
+        #[cfg(unix)]
+        let root = tempfile::Builder::new()
+            .prefix("r07chunk")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let server = Server::new_with_endpoint(
+            context.endpoint("ipc://chunk").unwrap(),
+            ServerIpcConfig::default(),
+        )
+        .unwrap();
+        let pool = small_response_pool("chunkfail");
+        let mut handle = pool.inner.write().alloc_shm_handle(128).unwrap();
+        pool.read().handle_slice_mut(&mut handle).fill(7);
+        let a = handle.shm_allocation().unwrap();
+        let conn = Arc::new(Connection::new(79));
+        conn.init_peer_shm(pool.read().prefix().to_owned());
+        conn.peer_pool_arc()
+            .unwrap()
+            .write()
+            .ensure_peer_segment(a.seg_idx, a.generation, 128)
+            .unwrap();
+        poison_response_pool(&pool);
+        let mut payload = encode_buddy_payload(&BuddyPayload {
+            seg_idx: a.seg_idx as u16,
+            generation: a.generation,
+            offset: a.offset,
+            data_size: 128,
+            is_dedicated: false,
+            allocation_id: a.allocation_id,
+        })
+        .to_vec();
+        payload.extend_from_slice(&c2_wire::chunk::encode_chunk_header(0, 1));
+        payload.extend_from_slice(
+            &c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap(),
+        );
+        let (mut peer, stream) = isolated_pair().await;
+        let (_reader, half) = stream.into_split();
+        let writer = Arc::new(Mutex::new(half));
+        let ordering = chunk_frame_ordering(
+            &server,
+            conn.conn_id(),
+            9,
+            FLAG_CHUNKED | FLAG_BUDDY,
+            &payload,
+        )
+        .unwrap();
+        dispatch_chunked_call(
+            &server,
+            &conn,
+            9,
+            FLAG_CHUNKED | FLAG_BUDDY,
+            &payload,
+            &writer,
+            server.try_acquire_chunk_processing_permit().unwrap(),
+            ordering,
+        )
+        .await;
+        let (_, _, reply) = read_reply_frame(&mut peer).await;
+        let (control, _) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+        let ReplyControl::Error(error) = control else {
+            panic!("chunk cleanup failure must remain an error");
+        };
+        let message = String::from_utf8_lossy(&error);
+        assert!(message.contains("request SHM release failed"), "{message}");
+        assert!(message.contains("poisoned"), "{message}");
+        assert!(
+            !message.contains("request release also failed"),
+            "copy must have succeeded: {message}"
+        );
+        assert_eq!(server.memory_budget.snapshot().abandoned_releases, 1);
+        assert_eq!(server.memory_budget.snapshot().reassembly.used_bytes, 0);
+        assert_eq!(server.chunk_admission_gate.len(), 0);
+        drop(handle);
+        pool.inner.write().destroy();
+    }
+
+    #[test]
+    fn peer_mapping_failure_and_discard_cleanup_abandon_each_obligation_once() {
+        let pool = small_response_pool("mapfail");
+        let handle = pool.inner.write().alloc_shm_handle(128).unwrap();
+        let a = handle.shm_allocation().unwrap();
+        let conn = Arc::new(Connection::new(78));
+        conn.init_peer_shm(pool.read().prefix().to_owned());
+        let budget = MemoryBudget::new(0, 0, 0);
+        let bp = || BuddyPayload {
+            seg_idx: a.seg_idx as u16,
+            generation: a.generation + 1,
+            offset: a.offset,
+            data_size: 128,
+            is_dedicated: false,
+            allocation_id: a.allocation_id,
+        };
+        let error = consume_peer_request(&conn, bp(), &budget).unwrap_err();
+        assert!(error.contains("request release also failed"));
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        cleanup_buddy_request_block(&conn, &encode_buddy_payload(&bp()), &budget);
+        assert_eq!(budget.snapshot().abandoned_releases, 2);
+        assert_eq!(pool.read().stats().alloc_count, 1);
+        pool.inner.write().release_handle(handle).unwrap();
     }
 
     #[tokio::test]
@@ -8569,7 +9116,7 @@ mod tests {
                         });
                         // The carrier moves on to cleanup unchanged: no
                         // reconstruction from bare coordinates exists.
-                        cleanup_request(RequestData::Shm(carrier));
+                        drop(carrier);
                         Ok(ResponseMeta::Inline(b"ok".to_vec()))
                     }
                     other => {
@@ -9014,6 +9561,46 @@ mod tests {
         (header.request_id, header.flags, payload.to_vec())
     }
 
+    async fn negotiate_test_version(client: &mut LocalStream) {
+        client
+            .write_all(&encode_version_preamble(VersionPreambleKind::Hello))
+            .await
+            .expect("write version Hello");
+        let mut accepted = [0u8; 25];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut accepted))
+            .await
+            .expect("version acceptance within timeout")
+            .expect("read version Accepted");
+        assert_eq!(
+            accepted,
+            encode_version_preamble(VersionPreambleKind::Accepted)
+        );
+    }
+
+    /// Ordinary raw business fixtures use the same complete two-stage handshake.
+    async fn handshake_test_client(client: &mut LocalStream) {
+        negotiate_test_version(client).await;
+        let metadata = c2_wire::handshake::encode_client_handshake(
+            &[],
+            CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+            "",
+        )
+        .unwrap();
+        client
+            .write_all(&encode_frame(0, FLAG_HANDSHAKE, &metadata))
+            .await
+            .expect("write client metadata");
+        let (rid, flags, payload) = read_reply_frame(client).await;
+        assert_eq!(rid, 0);
+        assert_eq!(flags, FLAG_HANDSHAKE | FLAG_RESPONSE);
+        assert!(
+            decode_handshake(&payload)
+                .unwrap()
+                .server_identity
+                .is_some()
+        );
+    }
+
     /// Poll until `check` holds, with a bounded wait so a regression fails the
     /// test instead of hanging it.
     async fn wait_until(label: &str, mut check: impl FnMut() -> bool) {
@@ -9087,6 +9674,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // Hold the route gate the first chunk must pass through.
         let dispatcher_guard = server.dispatcher.write().await;
@@ -9165,7 +9753,7 @@ mod tests {
         handler.await.expect("connection handler completes");
     }
 
-    // ── Handshake v13 SHM direction negotiation ─────────────────────────────
+    // ── Same-version metadata SHM direction negotiation ─────────────────────
 
     /// The ACK's SHM bits are the intersection of the client's offer with the
     /// connection's actual native shared-memory reachability, in either
@@ -9221,41 +9809,318 @@ mod tests {
         }
     }
 
-    /// Version 12 is the pre-negotiation handshake: the server rejects it and
-    /// closes the connection, with no compatibility fallback.
+    async fn version_fence_connection() -> (Arc<Server>, LocalStream, LocalStream) {
+        use c2_local::EndpointReapResult::{AlreadyAbsent, NotApplicable, Reaped};
+
+        let address = unique_readiness_address("version_fence");
+        #[cfg(unix)]
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(unix)]
+        let endpoint = c2_config::LocalEndpointContext::with_unix_root(root.path())
+            .unwrap()
+            .endpoint(&address)
+            .unwrap();
+        #[cfg(windows)]
+        let endpoint = parse_local_endpoint(&address).unwrap();
+        let server = Server::new_with_endpoint(endpoint.clone(), Default::default()).unwrap();
+        let mut listener = LocalListener::bind(&endpoint).unwrap();
+        let pair = tokio::try_join!(
+            LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+            listener.accept()
+        );
+        let closed = tokio::task::spawn_blocking(move || listener.close())
+            .await
+            .unwrap();
+        assert!(matches!(closed, Reaped | AlreadyAbsent | NotApplicable));
+        let (client, stream) = pair.unwrap();
+        (Arc::new(server), client, stream)
+    }
+
+    #[tokio::test]
+    async fn handshake_version_mismatch_returns_fixed_preamble() {
+        let local = HANDSHAKE_VERSION;
+        for (max_frame, peer) in [
+            (u32::MAX, 1),
+            (u32::MAX, local + 1),
+            (u32::MAX, u32::MAX),
+            (17, local + 1),
+        ] {
+            let (mut server, mut client, stream) = version_fence_connection().await;
+            let config = &mut Arc::get_mut(&mut server).unwrap().config;
+            config.max_frame_size = u64::from(max_frame);
+            config.shm_threshold = config.shm_threshold.min(config.max_frame_size);
+            config.validate().unwrap();
+            let handler = tokio::spawn(handle_connection(server, stream));
+            let mut hello = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\0\0\0\0";
+            hello[21..].copy_from_slice(&peer.to_le_bytes());
+            let reply = tokio::time::timeout(Duration::from_secs(5), async {
+                client.write_all(&hello).await?;
+                let mut reply = [0; 25];
+                client.read_exact(&mut reply).await?;
+                Ok::<_, std::io::Error>(reply)
+            })
+            .await;
+            drop(client);
+            handler.await.expect("connection handler completes");
+            let mut expected = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\0\0\0\0";
+            expected[21..].copy_from_slice(&local.to_le_bytes());
+            assert_eq!(reply.unwrap().expect("version refusal"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_preamble_headers_are_rejected_without_reading_payload() {
+        for (max_frame, length, rid, flags) in [
+            (u32::MAX, 20u32, 0u64, FLAG_HANDSHAKE),
+            (u32::MAX, 21, 1, FLAG_HANDSHAKE),
+            (u32::MAX, 21, 0, FLAG_HANDSHAKE | FLAG_RESPONSE),
+            (u32::MAX, 21, 0, FLAG_HANDSHAKE | FLAG_CTRL),
+            (u32::MAX, 21, 0, FLAG_RESPONSE),
+            (u32::MAX, 21, 0, 0),
+            (17, 21, 0, FLAG_SIGNAL), // Fixed length does not exempt ordinary frames.
+        ] {
+            let (mut server, mut client, stream) = version_fence_connection().await;
+            let config = &mut Arc::get_mut(&mut server).unwrap().config;
+            config.max_frame_size = u64::from(max_frame);
+            config.shm_threshold = config.shm_threshold.min(config.max_frame_size);
+            config.validate().unwrap();
+            let handler = tokio::spawn(handle_connection(server, stream));
+            let mut header = [0u8; 16];
+            header[..4].copy_from_slice(&length.to_le_bytes());
+            header[4..12].copy_from_slice(&rid.to_le_bytes());
+            header[12..].copy_from_slice(&flags.to_le_bytes());
+            client.write_all(&header).await.unwrap();
+            let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut [0])).await;
+            drop(client);
+            handler.await.unwrap();
+            assert!(
+                matches!(read, Ok(Ok(0) | Err(_))),
+                "waited for payload: {read:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_and_established_connections_reject_handshake_or_owner_role_changes() {
+        let metadata = c2_wire::handshake::encode_client_handshake(&[], CAP_CALL_V2, "").unwrap();
+        let mut wrong_rid = encode_frame(1, FLAG_HANDSHAKE, &metadata);
+        wrong_rid.truncate(16);
+        let mut wrong_flags = encode_frame(0, FLAG_HANDSHAKE | FLAG_RESPONSE, &metadata);
+        wrong_flags.truncate(16);
+        let owner = encode_frame(1, FLAG_CTRL, &[MsgType::OwnerControl.as_byte()]);
+        let hello = encode_version_preamble(VersionPreambleKind::Hello).to_vec();
+        for (established, frame) in [
+            (false, wrong_rid),
+            (false, wrong_flags),
+            (false, owner.clone()),
+            (false, hello.clone()),
+            (true, owner),
+            (true, hello),
+        ] {
+            let (server, mut client, stream) = version_fence_connection().await;
+            let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+            if established {
+                handshake_test_client(&mut client).await;
+            } else {
+                negotiate_test_version(&mut client).await;
+                let conn_id = server.active_connection_ids()[0];
+                let conn = server.active_connection(conn_id).unwrap();
+                assert!(!conn.handshake_done() && !conn.ordinary_protocol());
+            }
+            client.write_all(&frame).await.unwrap();
+            let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut [0])).await;
+            drop(client);
+            handler.await.unwrap();
+            assert!(
+                matches!(read, Ok(Ok(0) | Err(_))),
+                "accepted role change: {read:?}"
+            );
+            assert_eq!(server.active_connection_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_ack_must_finish_before_handshake_and_heartbeat_admission() {
+        let server = ordering_test_server("ipc://metadata_ack_gate", 3);
+        let conn = Connection::observed(c2_local::ConnectionPublisher::new(
+            c2_local::ConnectionSide::Server,
+        ));
+        let (stream, mut client) = LocalStream::pair().await.unwrap();
+        let (_reader, writer) = stream.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+        let held = writer.lock().await;
+        let metadata = c2_wire::handshake::encode_client_handshake(&[], CAP_CALL_V2, "").unwrap();
+        let handshake = handle_handshake(&server, &conn, &metadata, 0, &writer);
+        tokio::pin!(handshake);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut handshake)
+                .await
+                .is_err()
+        );
+        assert!(!conn.handshake_done() && !conn.ordinary_protocol());
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), handshake)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(conn.handshake_done() && conn.ordinary_protocol());
+        let (rid, flags, payload) = read_reply_frame(&mut client).await;
+        assert_eq!((rid, flags), (0, FLAG_HANDSHAKE | FLAG_RESPONSE));
+        assert!(
+            decode_handshake(&payload)
+                .unwrap()
+                .server_identity
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn version_rejection_survives_delayed_read_and_shutdown_interrupts_peer_wait() {
+        let (server, mut client, stream) = version_fence_connection().await;
+        let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+        let mut hello = encode_version_preamble(VersionPreambleKind::Hello);
+        hello[21..].copy_from_slice(&(HANDSHAKE_VERSION + 1).to_le_bytes());
+        client.write_all(&hello).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !handler.is_finished(),
+            "50 ms control ACK window must not close version refusal"
+        );
+        let mut reply = [0u8; 25];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reply,
+            encode_version_preamble(VersionPreambleKind::VersionMismatch)
+        );
+        assert!(
+            !handler.is_finished(),
+            "reply consumption does not close the peer"
+        );
+        server.request_shutdown_signal();
+        tokio::time::timeout(Duration::from_secs(1), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.active_connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn version_rejection_peer_wait_expires_within_the_single_send_budget() {
+        let (server, mut client, stream) = version_fence_connection().await;
+        let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+        let started = tokio::time::Instant::now();
+        let mut hello = encode_version_preamble(VersionPreambleKind::Hello);
+        hello[21..].copy_from_slice(&(HANDSHAKE_VERSION + 1).to_le_bytes());
+        client.write_all(&hello).await.unwrap();
+        let mut reply = [0u8; 25];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(
+            reply,
+            encode_version_preamble(VersionPreambleKind::VersionMismatch)
+        );
+        tokio::time::timeout_at(
+            started + DEFAULT_CONNECT_TIMEOUT + Duration::from_secs(1),
+            handler,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(started.elapsed() >= DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(server.active_connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unhandshaken_call_and_route_control_are_rejected() {
+        let frames = [
+            inline_call_frame(1, "grid", b"unhandshaken"),
+            encode_frame(2, FLAG_CTRL, b"\x0e{\"selector\":{\"type\":\"all\"}}"),
+        ];
+        let mut observations = Vec::new();
+        for frame in frames {
+            let (server, mut client, stream) = version_fence_connection().await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut route = make_host_route(&server, "grid");
+            route.callback = Arc::new(EchoRequestBytes {
+                calls: Arc::clone(&calls),
+            });
+            server.register_route(route).await.unwrap();
+            let handler = tokio::spawn(handle_connection(server, stream));
+            let read = tokio::time::timeout(Duration::from_secs(5), async {
+                client.write_all(&frame).await?;
+                client.read(&mut [0]).await
+            })
+            .await;
+            drop(client);
+            handler.await.expect("connection handler completes");
+            observations.push((read, calls.load(Ordering::SeqCst)));
+        }
+        for (read, calls) in observations {
+            assert_eq!(calls, 0, "unhandshaken CALL must not invoke the callback");
+            // Rejecting before reading the body may close with an OS reset.
+            assert!(
+                matches!(read, Ok(Ok(0) | Err(_))),
+                "unhandshaken RPC must close without a reply: {read:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_connection_cannot_switch_to_owner_control() {
+        let (server, mut client, stream) = version_fence_connection().await;
+        let handler = tokio::spawn(handle_connection(server, stream));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            client
+                .write_all(&encode_frame(
+                    0,
+                    FLAG_SIGNAL,
+                    &c2_wire::msg_type::PING_BYTES,
+                ))
+                .await?;
+            let mut pong = [0; 17];
+            client.read_exact(&mut pong).await?;
+            let owner = c2_wire::owner_control::encode_owner_request(
+                &c2_wire::owner_control::OwnerRequest::Hello,
+            )
+            .unwrap();
+            client
+                .write_all(&encode_frame(1, FLAG_CTRL, &owner))
+                .await?;
+            Ok::<_, std::io::Error>((pong, client.read(&mut [0]).await))
+        })
+        .await;
+        drop(client);
+        handler.await.unwrap();
+        let (pong, closed) = outcome.unwrap().unwrap();
+        assert_eq!(
+            pong.as_slice(),
+            encode_frame(0, FLAG_RESPONSE | FLAG_SIGNAL, &PONG_BYTES)
+        );
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "ordinary role cannot become owner control: {closed:?}"
+        );
+    }
+
+    /// Retain rejection of the pre-negotiation, single-frame version 12 format.
     #[tokio::test]
     async fn handshake_version_twelve_is_rejected_without_fallback() {
-        let server = ordering_test_server("ipc://shm_v12_reject", 8);
-        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
-        let handler = {
-            let server = Arc::clone(&server);
-            tokio::spawn(async move { handle_connection(server, server_stream).await })
-        };
-
-        let mut handshake = c2_wire::handshake::encode_client_handshake(
-            &[],
-            CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
-            "",
-        )
-        .unwrap();
-        assert_eq!(handshake[0], 13, "current codec encodes version 13");
-        handshake[0] = 12;
-        client
-            .write_all(&encode_frame(0, FLAG_HANDSHAKE, &handshake))
-            .await
-            .expect("write v12 handshake");
-
-        // The server must terminate the connection instead of replying or
-        // downgrading: the peer observes EOF.
-        use tokio::io::AsyncReadExt as _;
-        let mut probe = [0u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut probe))
-            .await
-            .expect("read must settle")
-            .expect("read");
-        assert_eq!(read, 0, "server must close the v12 connection");
+        let (server, mut client, stream) = version_fence_connection().await;
+        let handler = tokio::spawn(handle_connection(server, stream));
+        let legacy = encode_frame(0, FLAG_HANDSHAKE, &[12, 0, 0, 0, 7, 0]);
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            client.write_all(&legacy).await?;
+            client.read(&mut [0]).await
+        })
+        .await;
         drop(client);
         handler.await.expect("connection handler completes");
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "server must close the v12 connection: {read:?}"
+        );
     }
 
     #[tokio::test]
@@ -9291,7 +10156,7 @@ mod tests {
     }
 
     /// Shared fixture for the un-negotiated buddy frame rejections: a real
-    /// connection handler over a local pair with one echo route, a v13
+    /// connection handler over a local pair with one echo route, a two-stage
     /// handshake that offers no SHM directions, and the observed ACK.
     async fn unnegotiated_shm_connection(
         server: &Arc<Server>,
@@ -9307,6 +10172,7 @@ mod tests {
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
 
+        negotiate_test_version(&mut client).await;
         let handshake = c2_wire::handshake::encode_client_handshake(
             &[],
             CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
@@ -9577,6 +10443,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // First chunk targets a route that is not in the catalog, so admission
         // is refused immediately; later chunks must not feed anything.
@@ -9633,6 +10500,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // Park the first chunk on the route gate and two later chunks on its
         // admission; every chunk-processing permit is then held.
@@ -9702,6 +10570,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // First chunk + middle chunk of a three-chunk request: the assembly
         // stays incomplete and keeps the route pending permit while it waits.
@@ -9843,6 +10712,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // Stall the first chunk's route admission and fill both chunk-processing
         // permits: the first chunk parks on the held dispatcher gate, one later
@@ -9936,6 +10806,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         let dispatcher_guard = server.dispatcher.write().await;
         client
@@ -10005,6 +10876,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         let dispatcher_guard = server.dispatcher.write().await;
         client
@@ -10066,6 +10938,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         // The first chunk of a two-chunk request is admitted and its assembly
         // and stored route admission are published.
@@ -10404,6 +11277,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { handle_connection(server, server_stream).await })
         };
+        handshake_test_client(&mut client).await;
 
         let dispatcher_guard = server.dispatcher.write().await;
         let data: Vec<u8> = (0..96u8).map(|i| i.wrapping_mul(7)).collect();
@@ -10483,6 +11357,220 @@ mod tests {
         assert!(err.contains("inline reply frame"));
     }
 
+    fn published_frame_error_keeps_peer_allocation(kind: std::io::ErrorKind) {
+        let pool = small_response_pool("r07publish");
+        let prepared = try_prepare_shm_response(&pool, 1024, 8192, |dst| {
+            dst.fill(0xA5);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        let original = prepared.shm_allocation().unwrap();
+        let result = finish_prepared_shm_send(
+            prepared,
+            Err(std::io::Error::new(kind, "flush failed after full frame")),
+            true,
+        );
+        assert!(result.is_err());
+        let live = pool.read().stats().alloc_count;
+        let abandoned = pool.read().budget().unwrap().snapshot().abandoned_releases;
+        let next = pool.inner.write().alloc_shm_handle(8192).unwrap();
+        let replacement = next.shm_allocation().unwrap();
+        let reused =
+            replacement.seg_idx == original.seg_idx && replacement.offset == original.offset;
+        pool.inner.write().release_handle(next).unwrap();
+        pool.inner.write().destroy();
+        assert_eq!(
+            live, 1,
+            "complete frame must transfer release authority before flush"
+        );
+        assert!(
+            !reused,
+            "peer-visible allocation must not be reused locally"
+        );
+        assert_eq!(abandoned, 1);
+    }
+
+    #[test]
+    fn prepared_cancellation_observes_frame_fact_for_buddy_and_dedicated() {
+        for len in [8192, 65537] {
+            for frame_written in [false, true] {
+                let pool = small_response_pool("r07cancel");
+                let prepared = try_prepare_shm_response(&pool, 1024, len, |dst| {
+                    dst.fill(7);
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+                let allocation = prepared.shm_allocation().unwrap();
+                let name = if prepared.is_dedicated() {
+                    MemPool::dedicated_segment_name(pool.read().prefix(), allocation.seg_idx)
+                } else {
+                    pool.read()
+                        .segment_name(allocation.seg_idx as usize)
+                        .unwrap()
+                        .to_owned()
+                };
+                drop(PreparedSend {
+                    prepared: Some(prepared),
+                    frame_written,
+                });
+                let stats = pool.read();
+                let snapshot = stats.budget().unwrap().snapshot();
+                assert_eq!(snapshot.abandoned_releases, u64::from(frame_written));
+                if frame_written {
+                    assert_eq!(stats.stats().alloc_count, 1);
+                } else {
+                    assert_eq!(stats.stats().alloc_count, 0);
+                }
+                drop(stats);
+                pool.inner.write().destroy();
+                if allocation.is_dedicated {
+                    assert!(c2_mem::DedicatedSegment::open(&name, len).is_err());
+                } else {
+                    assert!(c2_mem::BuddySegment::open(&name, 65536).is_err());
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    async fn windows_overlapped_flush_peer_close_preserves_allocation(len: usize) {
+        let pool = crate::ResponsePool::new(MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 65536,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 2,
+                dedicated_crash_timeout_secs: 60.0,
+                ..PoolConfig::default()
+            },
+            unique_response_pool_prefix("overlapped"),
+        ));
+        let prepared = try_prepare_shm_response(&pool, 1024, len, |dst| {
+            dst.fill(7);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        let original = prepared.shm_allocation().unwrap();
+        assert_eq!(original.is_dedicated, len > 65536);
+        let budget = pool.read().budget().unwrap().clone();
+        let (peer, stream) = isolated_pair().await;
+        let (_reader, mut half) = stream.into_split();
+        // Tokio reserves 64 KiB in the pipe; Mio 1.2 also posts one 4 KiB
+        // read-ahead even though this peer never calls read. Fill both before
+        // publication, and wait for that padding write's native completion.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            half.write_all(&vec![0; 65536 + 4096]),
+        )
+        .await
+        .expect("padding write must finish before prepared publication")
+        .unwrap();
+        let writer = Arc::new(Mutex::new(half));
+        let mut send = Box::pin(send_prepared_shm_response(&writer, 73, prepared));
+        tokio::select! {
+            result = &mut send => panic!("a non-reading full pipe must keep the send pending: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+        drop(peer);
+        let error = tokio::time::timeout(Duration::from_secs(5), send)
+            .await
+            .expect("peer close must finish the overlapped write")
+            .unwrap_err();
+        assert!(matches!(error, ResponseSendError::Transport(_)));
+        assert_eq!(
+            pool.read().stats().alloc_count,
+            1,
+            "possibly published allocation must remain live"
+        );
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        let next = pool.inner.write().alloc_shm_handle(len).unwrap();
+        let replacement = next.shm_allocation().unwrap();
+        assert!(
+            replacement.is_dedicated != original.is_dedicated
+                || replacement.seg_idx != original.seg_idx
+                || replacement.offset != original.offset,
+            "peer-visible coordinates must not be reused locally"
+        );
+        pool.inner.write().release_handle(next).unwrap();
+        drop(writer);
+        pool.inner.write().destroy();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_overlapped_flush_peer_close_keeps_buddy_allocation() {
+        windows_overlapped_flush_peer_close_preserves_allocation(8192).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_overlapped_flush_peer_close_keeps_dedicated_allocation() {
+        windows_overlapped_flush_peer_close_preserves_allocation(65537).await;
+    }
+
+    #[test]
+    fn prepared_rollback_preserves_primary_and_cleanup_failure_once() {
+        let pool = small_response_pool("rollback");
+        let prepared = try_prepare_shm_response(&pool, 1024, 8192, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        let budget = pool.read().budget().unwrap().clone();
+        let charged = budget.snapshot().shm.used_bytes;
+        poison_response_pool(&pool);
+        let error = prepared.rollback("fill failed first".into());
+        assert!(
+            error.starts_with("fill failed first; prepared SHM cleanup also failed:"),
+            "{error}"
+        );
+        assert!(error.contains("poisoned"), "{error}");
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        pool.inner.write().destroy();
+    }
+
+    #[test]
+    fn dedicated_successful_send_settle_failure_is_transport_error() {
+        let pool = crate::ResponsePool::new(MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 65536,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 1,
+                dedicated_crash_timeout_secs: 60.0,
+                ..PoolConfig::default()
+            },
+            unique_response_pool_prefix("settle"),
+        ));
+        let prepared = try_prepare_shm_response(&pool, 1024, 65537, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        let allocation = prepared.shm_allocation().unwrap();
+        let budget = pool.read().budget().unwrap().clone();
+        let charged = budget.snapshot().shm.used_bytes;
+        // Fault fixture: an earlier raw settlement leaves this private owner armed.
+        // The second actual settlement must report its native refusal, without a retry.
+        unsafe { pool.inner.write().free(&allocation) }.unwrap();
+        let error = finish_prepared_shm_send(prepared, Ok(()), true).unwrap_err();
+        assert!(matches!(error, ResponseSendError::Transport(_)));
+        assert!(error.to_string().contains("already been released"));
+        assert_eq!(budget.snapshot().abandoned_releases, 1);
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        pool.inner.write().destroy();
+    }
+
+    #[test]
+    fn full_frame_flush_error_keeps_published_shm() {
+        published_frame_error_keeps_peer_allocation(std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn full_frame_flush_timeout_keeps_published_shm() {
+        published_frame_error_keeps_peer_allocation(std::io::ErrorKind::TimedOut);
+    }
+
     #[tokio::test]
     async fn shm_reply_write_failure_releases_only_its_allocation() {
         for prepared in [false, true] {
@@ -10557,10 +11645,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_reply_waiting_for_writer_keeps_unpublished_allocation() {
+    async fn cancelled_reply_waiting_for_writer_releases_unpublished_allocation() {
         for prepared in [false, true] {
             let pool = small_response_pool("cancelreply");
-            let (mut peer, stream) = LocalStream::pair().await.unwrap();
+            let (mut peer, stream) = isolated_pair().await;
             let (reader, half) = stream.into_split();
             let writer = Arc::new(Mutex::new(half));
             let meta = if prepared {
@@ -10586,9 +11674,6 @@ mod tests {
             drop(guard);
             drop((reader, writer));
             assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
-            // Both paths currently retain their allocation before publication.
-            assert_eq!(pool.read().stats().alloc_count, 1);
-            pool.inner.write().destroy(); // Only this test's isolated pool.
             assert_eq!(pool.read().stats().alloc_count, 0);
         }
     }
@@ -10621,9 +11706,8 @@ mod tests {
         assert!(error.to_string().contains("owner mismatch"));
         assert_eq!(target.read().handle_slice(&live)[0], 0x5A);
         assert_eq!(target.read().stats().alloc_count, 1);
-        assert_eq!(origin.read().stats().alloc_count, 1);
+        assert_eq!(origin.read().stats().alloc_count, 0);
         target.inner.write().release_handle(live).unwrap();
-        origin.inner.write().destroy();
     }
 
     #[tokio::test]

@@ -2,14 +2,14 @@
 
 C-Two exposes stateful Python resources through typed CRM contracts over same-process calls, local IPC, or an external HTTP relay. This package projects the shared Rust runtime into Python.
 
-Python C-Two **0.9.0** pairs with c3 **0.5.0**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.9.0.md).
+Python C-Two **0.10.0** pairs with c3 **0.6.0**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.10.0.md).
 
 Install the matching published versions:
 
 ```bash
-uv pip install 'c-two==0.9.0'
+uv pip install 'c-two==0.10.0'
 # Only for FastDB Payload contracts:
-uv pip install 'c-two[fastdb]==0.9.0'
+uv pip install 'c-two[fastdb]==0.10.0'
 ```
 
 The base package has no Python runtime dependencies. Ordinary CRM definition,
@@ -28,6 +28,8 @@ IPC uses lazy buddy pools, idle decay and finite backing/reassembly budgets; `po
 
 Use `cc.connection_events()` for one cancellable, bounded stream of incoming and outgoing physical IPC events, tagged by `side`. `ConnectionObservation.snapshot()` retains late inspection; its old blocking `wait_closed()` is removed. Physical observations work without a pending call. OwnerBound hosts support explicit, single-use recovery tickets during the original grace period. Bind/connect failures preserve `io_kind`, `raw_os_error` and `io_operation` on public `cc.error.CoreError`. These features share the Rust implementation on macOS, Linux and Windows x64 and ARM64; see the lifecycle guide for API examples.
 
+`cc.server_credential() -> EndpointCredential | None` reads the listener's lifecycle snapshot without inspection or a gate lock. `CoreError.endpoint_unverified_reason` reports unverifiable Unix binds; Unix credentials use schema 4 without `device`, and default endpoint directories carry namespace disk format 3. `cc.Runtime()` creates independent Python bindings and native sessions: configure and shut down an explicit instance through its methods, while `cc.serve()` handles signals only for the module-level default runtime. See the [independent runtime example](https://github.com/world-in-progress/c-two/blob/main/examples/python/independent_runtime.py). IPC handshake 14 and namespace format 3 do not interoperate with 0.9.x, so upgrade SDKs, c3 and Node consumers together; the [release notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.10.0.md) cover snapshot semantics and custom-root migration.
+
 ## Development
 
 Use canonical main for source development and run commands from the repository root. Python patch-release provenance is recorded with its release notes; the c3 release's `rc-manifest.json` identifies that CLI release's source, which can differ from a later Python patch:
@@ -42,7 +44,7 @@ Prerequisites:
 - Python 3.10 or newer
 - Python 3.12 for standard local development
 - Python 3.14.3t when testing free-threading support
-- Rust toolchain
+- Rust 1.95 or newer
 - `uv`
 - for full interoperability tests: the FastDB `v0.2.3` source checkout at `../fastdb`
 

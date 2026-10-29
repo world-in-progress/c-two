@@ -1,0 +1,225 @@
+{
+  "schema": "c-two.r07-evaluation.v1",
+  "status": "evaluation_complete_implementation_pending_approval",
+  "baseline": "7a1dd40fd12bb2d5d35dd4fffb55bdf653ab7be0",
+  "production_modified": false,
+  "scope": "Real native memory/carrier/Core methods; no complete RPC or Python SDK execution",
+  "platforms": {
+    "macos": {
+      "sha256": "a660e49a24f3f6d5803073e117f887b1455656aa9a26afc6afbffcee7c8fc5f3",
+      "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)\nbinary: rustc\ncommit-hash: f8297e351a40c1439a467bbbb6879088047f50b3\ncommit-date: 2025-10-28\nhost: aarch64-apple-darwin\nrelease: 1.91.0\nLLVM version: 21.1.2\n"
+    },
+    "windows": {
+      "probe_sha256": "be81e9c26c63f5d5b016d7c9b9550ffe818fe11e563a8c7786cceda39223536f",
+      "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\r\nbinary: rustc\r\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\r\ncommit-date: 2026-10-13\r\nhost: x86_64-pc-windows-msvc\r\nrelease: 1.99.1\r\nLLVM version: 23.1.1\r\n",
+      "binary_sha256": "2af1cf3d5e43979e19c0aefd4b9518a5be77302f626c9552a12a397992accfec",
+      "os": "Microsoft Windows NT 10.0.26200.0"
+    }
+  },
+  "same_semantic_results_on_both_platforms": true,
+  "scenarios": [
+    {
+      "case": "handle-contention",
+      "exit_code": 1,
+      "reported_success": true,
+      "after_failure": {
+        "alloc_count": 1,
+        "reassembly_charge": 0,
+        "shm_charge": 12288
+      },
+      "cleanup": {
+        "reassembly_charge": 0,
+        "shm_charge": 0,
+        "shm_name_absent": true
+      }
+    },
+    {
+      "case": "handle-poison",
+      "exit_code": 1,
+      "reported_success": true,
+      "after_failure": {
+        "alloc_count": 1,
+        "reassembly_charge": 0,
+        "shm_charge": 12288
+      },
+      "cleanup": {
+        "reassembly_charge": 0,
+        "shm_charge": 0,
+        "shm_name_absent": true
+      }
+    },
+    {
+      "case": "handle-wrong-pool",
+      "exit_code": 1,
+      "reported_success": false,
+      "after_failure": {
+        "alloc_count": 1,
+        "reassembly_charge": 0,
+        "shm_charge": 12288
+      },
+      "cleanup": {
+        "reassembly_charge": 0,
+        "shm_charge": 0,
+        "shm_name_absent": true
+      }
+    },
+    {
+      "case": "reassembly-control",
+      "exit_code": 0,
+      "after_failure": {
+        "alloc_count": 1,
+        "reassembly_charge": 4096,
+        "shm_charge": 12288
+      },
+      "after_retry": {
+        "alloc_count": 0,
+        "reassembly_charge": 0,
+        "shm_charge": 12288
+      },
+      "cleanup": {
+        "reassembly_charge": 0,
+        "shm_charge": 0,
+        "shm_name_absent": true
+      }
+    },
+    {
+      "case": "response-lease",
+      "exit_code": 1,
+      "after_failure": {
+        "alloc_count": 1,
+        "reassembly_charge": 4096,
+        "shm_charge": 12288
+      },
+      "after_retry": {
+        "alloc_count": 1,
+        "reassembly_charge": 4096,
+        "shm_charge": 12288
+      },
+      "cleanup": {
+        "reassembly_charge": 4096,
+        "shm_charge": 0,
+        "shm_name_absent": true
+      }
+    },
+    {
+      "case": "request-lease",
+      "exit_code": 1,
+      "after_failure": {
+        "alloc_count": 1,
+        "reassembly_charge": 4096,
+        "shm_charge": 12288
+      },
+      "after_retry": {
+        "alloc_count": 1,
+        "reassembly_charge": 4096,
+        "shm_charge": 12288
+      },
+      "cleanup": {
+        "reassembly_charge": 4096,
+        "shm_charge": 0,
+        "shm_name_absent": true
+      }
+    },
+    {
+      "case": "core-held",
+      "exit_code": 1,
+      "after_failure": {
+        "alloc_count": 1,
+        "reassembly_charge": 4096,
+        "shm_charge": 12288
+      },
+      "after_retry": {
+        "alloc_count": 1,
+        "reassembly_charge": 4096,
+        "shm_charge": 12288
+      },
+      "logical_released": true,
+      "invalidations": 1,
+      "cleanup": {
+        "reassembly_charge": 4096,
+        "shm_charge": 0,
+        "shm_name_absent": true
+      }
+    }
+  ],
+  "source_verification": {
+    "source": "7a1dd40fd12bb2d5d35dd4fffb55bdf653ab7be0",
+    "exported_nonmanifest_files_verified": 180,
+    "production_modified": false,
+    "changes": "Subset workspace members plus standalone evaluation binary; existing registry dependency versions/checksums preserved",
+    "probe_sha256": "be81e9c26c63f5d5b016d7c9b9550ffe818fe11e563a8c7786cceda39223536f",
+    "cargo_lock_sha256": "aef76b5d421f04e384ff666505d5349567114496cc187a0769ebf42540161b6e",
+    "registry_dependencies": 205,
+    "crate_manifests_verified": 11
+  },
+  "unverified": [
+    "Linux runtime",
+    "Windows ARM64 runtime",
+    "dead-holder experiment",
+    "complete RPC and Python SDK failure paths"
+  ],
+  "proposed_first_batch": {
+    "name": "R07a",
+    "public_rust_signatures_changed": 4,
+    "new_concrete_errors": [
+      "ReleaseHandleError",
+      "RequestPreparationError"
+    ],
+    "transport_lease_failure_semantics_changed": true,
+    "python_signature_changes": false,
+    "ffi_abi": 6,
+    "ipc": 14,
+    "shm": 3,
+    "production_lines_changed_estimate": [
+      140,
+      240
+    ],
+    "production_net_estimate": [
+      90,
+      160
+    ],
+    "test_lines_changed_estimate": [
+      220,
+      400
+    ],
+    "test_net_estimate": [
+      180,
+      300
+    ],
+    "estimates_are_not_numstat": true,
+    "full_r07_closed": false
+  },
+  "cleanup": {
+    "mac_removed_build_logical_bytes": 416382143,
+    "windows_removed_build_logical_bytes": 509463053,
+    "remaining_targets": 0,
+    "probe_scope_directories_remaining": 0,
+    "task_owned_shm_reopen_checks_failed": 14,
+    "ipc_endpoints_created": false,
+    "historical_ipc_namespace_used": false,
+    "native_poison_or_identity_relaxed": false
+  },
+  "independent_static_review": {
+    "run": "5cc2f3dc-23b6-4250-b055-8c7d724dc5b7",
+    "artifact": "20b2b746-b6f8-43e4-9c9b-72559d88f1a2",
+    "state": "accepted",
+    "checkout_reclaimed": true,
+    "worker_ran_probes": false
+  },
+  "private_evidence_root": "~/.codex/diagnostics/c2-r07-evaluation-dzwd7ix1/",
+  "evidence_sha256": {
+    "source/core/r07-probe/src/main.rs": "be81e9c26c63f5d5b016d7c9b9550ffe818fe11e563a8c7786cceda39223536f",
+    "source/core/r07-probe/Cargo.toml": "b3011d4d3efc5a1f6b8c04563a4321cd93650de1734796e7d2b10d1194e79028",
+    "source-verification.json": "f0a3e695bbcbb09b1566f4b6d373f4aa3236292794c72bff93ab09b07b8b6af9",
+    "mac-results.json": "a2c7998e565773965d93d9582dcba8fe3716ac66bbabff13e6433ea5629ad21a",
+    "mac-binary.json": "7ec054f1d3c1fb9e69b00a2fa6eb8e5caf63669257de548a9744d172c49951be",
+    "mac-cleanup.json": "f20bb177d49a7367aea763942cf9b5677c01458a0c63b362bab0cff1be7639d5",
+    "mac-build.log": "b99139371260913687900ce48834b12d3f7858df8932bfe49a9f82935365b11c",
+    "windows/windows-results.json": "c6f3471abc5d74d418b5126e60e6fddf60475bf0535a3267d8852a281f380381",
+    "windows/windows-source.json": "bd2ca3bb5fc473543f0a428b3c4e371da9489b2c4b6755c6a91bb4cdde54cd1c",
+    "windows/windows-cleanup.json": "f07576eb160d470da37a50fa52a99317c5c688fd4b5552b10b9537a8aa599532",
+    "windows/source-hashes.json": "2b10e610422b52e0a08e8bffc99aac71d7f7875e8319124779dfc5885f6a1386",
+    "callchain-final-outcome.json": "6942f43b38a00d4318f00420b5841fe013d62cbd189996016ae6716b9a4d01ab",
+    "callchain-accepted.json": "a7cb3bd23f98be66f20330654776d2dfa2c394d11abc356c8fda783241cee738"
+  }
+}

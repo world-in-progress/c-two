@@ -20,7 +20,7 @@ from c_two.config.settings import settings
 from c_two.config.ipc import _resolve_server_ipc_config
 from c_two.error import ResourceNotFound
 from c_two.crm.contract import crm_contract
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
 
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
@@ -30,7 +30,7 @@ DEFAULT_MAX_PAYLOAD_SIZE = int(_resolve_server_ipc_config()['max_payload_size'])
 
 
 def _server_instance_id_for(
-    registry: _ProcessRegistry,
+    registry: Runtime,
     address: str,
     *,
     route_name: str = 'hello',
@@ -81,9 +81,9 @@ def _registration_scope(http: httpx.Client, relay_url: str, name: str) -> dict:
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Ensure a clean registry for every test."""
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     yield
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
 
 
 @pytest.fixture
@@ -98,7 +98,7 @@ def relay_stack(start_c3_relay):
     cc.register(Counter, CounterImpl(), name='counter')
     ipc_addr = cc.server_address()
     server_id = cc.server_id()
-    server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
+    server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
     relay = start_c3_relay()
     relay_url = relay.url
@@ -323,7 +323,7 @@ class TestCcConnectHttp:
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
         server_instance_id = _server_instance_id_for(
-            _ProcessRegistry.get(),
+            _get_default_runtime(),
             ipc_addr,
             route_name=slashed_name,
         )
@@ -355,21 +355,21 @@ class TestCcConnectHttp:
         relay = start_c3_relay()
         relay_url = relay.url
         previous_relay = settings.relay_anchor_address
-        registrar = _ProcessRegistry()
-        resolver = _ProcessRegistry()
+        registrar = Runtime()
+        resolver = Runtime()
         crm = None
         try:
             monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', relay_url)
             settings.relay_anchor_address = None
             registrar.register(Hello, HelloImpl(), name=name)
-            assert registrar.get_server_address() is not None
+            assert registrar.server_address() is not None
 
             crm = resolver.connect(Hello, name=name)
             assert crm.client._mode == 'ipc'
             assert crm.greeting('EnvRelay') == 'Hello, EnvRelay!'
         finally:
             if crm is not None:
-                resolver.close(crm)
+                cc.close(crm)
             resolver.shutdown()
             settings.relay_anchor_address = previous_relay
             registrar.shutdown()
@@ -380,13 +380,13 @@ class TestCcConnectHttp:
         relay = start_c3_relay()
         relay_url = relay.url
         previous_relay = settings.relay_anchor_address
-        registrar = _ProcessRegistry()
-        resolver = _ProcessRegistry()
+        registrar = Runtime()
+        resolver = Runtime()
         crm = None
         try:
             registrar.set_relay_anchor(relay_url)
             registrar.register(Hello, HelloImpl(), name=name)
-            assert registrar.get_server_address() is not None
+            assert registrar.server_address() is not None
 
             resolver.set_relay_anchor(relay_url)
             crm = resolver.connect(Hello, name=name)
@@ -394,7 +394,7 @@ class TestCcConnectHttp:
             assert crm.greeting('RuntimeRelay') == 'Hello, RuntimeRelay!'
         finally:
             if crm is not None:
-                resolver.close(crm)
+                cc.close(crm)
             resolver.shutdown()
             settings.relay_anchor_address = previous_relay
             registrar.shutdown()
@@ -405,8 +405,8 @@ class TestCcConnectHttp:
         relay = start_c3_relay()
         relay_url = relay.url
         previous_relay = settings.relay_anchor_address
-        registrar = _ProcessRegistry()
-        resolver = _ProcessRegistry()
+        registrar = Runtime()
+        resolver = Runtime()
         crm = None
         try:
             registrar.set_relay_anchor(relay_url)
@@ -419,7 +419,7 @@ class TestCcConnectHttp:
             assert crm.greeting('Identity') == 'Hello, Identity!'
         finally:
             if crm is not None:
-                resolver.close(crm)
+                cc.close(crm)
             resolver.shutdown()
             settings.relay_anchor_address = previous_relay
             registrar.shutdown()
@@ -430,12 +430,12 @@ class TestCcConnectHttp:
         relay = start_c3_relay()
         relay_url = relay.url
         previous_relay = settings.relay_anchor_address
-        registrar = _ProcessRegistry()
-        resolver = _ProcessRegistry()
+        registrar = Runtime()
+        resolver = Runtime()
         try:
             registrar.register(Hello, HelloImpl(), name=name)
-            ipc_addr = registrar.get_server_address()
-            server_id = registrar.get_server_id()
+            ipc_addr = registrar.server_address()
+            server_id = registrar.server_id()
             assert ipc_addr is not None
             assert server_id is not None
             server_instance_id = _server_instance_id_for(
@@ -472,7 +472,7 @@ class TestCcConnectHttp:
     def test_no_address_relay_connect_maps_missing_route_to_resource_not_found(self, start_c3_relay):
         relay = start_c3_relay()
         previous_relay = settings.relay_anchor_address
-        registry = _ProcessRegistry()
+        registry = Runtime()
         try:
             registry.set_relay_anchor(relay.url)
             with pytest.raises(ResourceNotFound, match="route not found: missing-route"):
@@ -504,8 +504,8 @@ class TestCcConnectHttp:
         relay = start_c3_relay()
         relay_url = relay.url
         previous_relay = settings.relay_anchor_address
-        registrar = _ProcessRegistry()
-        resolver = _ProcessRegistry()
+        registrar = Runtime()
+        resolver = Runtime()
         crm = None
         try:
             registrar.set_relay_anchor(relay_url)
@@ -519,7 +519,7 @@ class TestCcConnectHttp:
             assert crm.greeting('NoProxy') == 'Hello, NoProxy!'
         finally:
             if crm is not None:
-                resolver.close(crm)
+                cc.close(crm)
             resolver.shutdown()
             settings.relay_anchor_address = previous_relay
             registrar.shutdown()
@@ -544,7 +544,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
-        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
+        server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -586,7 +586,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
-        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
+        server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -622,7 +622,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
-        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
+        server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -701,7 +701,7 @@ class TestRelayControlPlane:
         cc.register(Counter, CounterImpl(), name='counter')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
-        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
+        server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url

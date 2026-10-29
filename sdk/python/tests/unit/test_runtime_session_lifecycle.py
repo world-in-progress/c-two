@@ -94,9 +94,13 @@ class TestRuntimeSessionLifecycleProjection:
 
         session = RuntimeSession(server_id='unit-host-started')
         assert session.host_started is False
+        assert session.server_credential is None
         assert session.native_lifecycle_snapshot() is None
         session.ensure_host_started()
         assert session.host_started is True
+        credential = session.server_credential
+        assert type(credential) is cc.EndpointCredential  # No route was registered.
+        assert credential.address == session.server_address
         snapshot = session.native_lifecycle_snapshot()
         assert snapshot['phase'] == 'persistent'
         assert snapshot['terminal'] is False
@@ -106,6 +110,7 @@ class TestRuntimeSessionLifecycleProjection:
         session.shutdown(route_names=[], timeout_seconds=5.0)
         # A completed shutdown releases the session's host handle.
         assert session.host_started is False
+        assert session.server_credential is None
         assert session.native_lifecycle_snapshot()['terminal'] is True
         assert session.native_terminal_outcome() == session.shutdown(route_names=[], timeout_seconds=0)
 
@@ -119,6 +124,7 @@ class TestRuntimeSessionLifecycleProjection:
         assert session.owner_control_attached is False
         # The refused attempt left no host and no consumed capability behind.
         assert session.native_lifecycle_snapshot() is None
+        assert session.server_credential is None
         session.shutdown(route_names=[], timeout_seconds=1.0)
 
 
@@ -203,13 +209,13 @@ class TestSetServerKeywords:
         finally:
             keepalive.close()
         # The rejected call attached nothing.
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
 
-        session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+        session = _get_default_runtime()._runtime_session  # noqa: SLF001
         assert session.owner_control_attached is False
 
     def test_owner_bound_set_server_arms_a_real_running_host(self) -> None:
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
 
         keepalive, receiver = cc.owner_control_pair()
         try:
@@ -218,7 +224,7 @@ class TestSetServerKeywords:
                 lifecycle=cc.LifecycleConfig.owner_bound(0.2),
                 owner_control=receiver,
             )
-            session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+            session = _get_default_runtime()._runtime_session  # noqa: SLF001
             assert session.lifecycle_policy['policy'] == 'owner_bound'
             assert session.owner_control_attached is True
 
@@ -232,7 +238,7 @@ class TestSetServerKeywords:
                     return 'pong'
 
             cc.register(Echo, EchoResource(), name='owner-bound-set-server')
-            server = _ProcessRegistry.get()._server  # noqa: SLF001
+            server = _get_default_runtime()._server  # noqa: SLF001
             assert server.is_started() is True
             assert session.owner_control_attached is False
             assert server.native_lifecycle_snapshot()['phase'] == 'armed'
@@ -250,7 +256,7 @@ class TestSetServerKeywords:
             cc.shutdown()
 
     def test_ordinary_business_clients_never_end_an_owner_bound_server(self) -> None:
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
 
         keepalive, receiver = cc.owner_control_pair()
         proxy = None
@@ -278,7 +284,7 @@ class TestSetServerKeywords:
             cc.close(proxy)
             proxy = None
             # The server is armed and idle; its slot is still registered.
-            server = _ProcessRegistry.get()._server  # noqa: SLF001
+            server = _get_default_runtime()._server  # noqa: SLF001
             assert 'owner-business' in server.names
             assert server.native_lifecycle_snapshot()['phase'] == 'armed'
         finally:

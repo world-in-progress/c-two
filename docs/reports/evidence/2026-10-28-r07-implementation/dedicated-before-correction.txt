@@ -1,0 +1,18 @@
+command: cargo test --manifest-path core/Cargo.toml -p c2-ipc --lib dedicated_backing_retires_within_bounded_crash_timeout -- --nocapture
+exit_code: 101
+
+running 1 test
+
+thread 'tests::lazy_policy_roundtrip_tests::dedicated_backing_retires_within_bounded_crash_timeout' (14730765) panicked at transport/c2-ipc/src/tests.rs:4722:14:
+callback must finish for shutdown: Elapsed(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::lazy_policy_roundtrip_tests::dedicated_backing_retires_within_bounded_crash_timeout ... FAILED
+
+failures:
+
+failures:
+    tests::lazy_policy_roundtrip_tests::dedicated_backing_retires_within_bounded_crash_timeout
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 242 filtered out; finished in 5.28s
+
+error: test failed, to rerun pass `-p c2-ipc --lib`

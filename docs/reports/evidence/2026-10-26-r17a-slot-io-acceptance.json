@@ -1,0 +1,248 @@
+{
+  "schema": "c-two.r17a-slot-io-acceptance.v1",
+  "date": "2026-10-26",
+  "base": "074d620b8c2aa3c59521c1614603ee62c363f9c7",
+  "production_source": "9212f3ed9a648421dd6d6c6c6a8c976aa000bfb8",
+  "final_source": "f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+  "protocols": {
+    "ipc": 14,
+    "shm": 3,
+    "c_ffi_abi": 6,
+    "changed": false
+  },
+  "line_counts": {
+    "production": {
+      "added": 22,
+      "deleted": 17,
+      "net": 5
+    },
+    "tests": {
+      "added": 209,
+      "deleted": 6,
+      "net": 203
+    },
+    "docs": {
+      "added": 308,
+      "deleted": 10,
+      "net": 298
+    }
+  },
+  "baseline_counterexamples": {
+    "platform": "macOS arm64",
+    "expected_failures": 3,
+    "socket_replacement_priority": "compound control passed before the pure I/O red assertion",
+    "injection": "existing thread-local one-shot fault replaces stat Result, not final classification"
+  },
+  "mac_targeted": {
+    "passed": 19,
+    "groups": [
+      2,
+      13,
+      4
+    ],
+    "socket_lease_residues": 0
+  },
+  "windows_developer": {
+    "platform": "Windows 11 x64 build26200",
+    "credential_tests_passed": 10,
+    "native_observation": "KernelManaged / NotApplicable / StaleTarget / scoped sweep",
+    "hashes_verified": true,
+    "listener_created": false
+  },
+  "fixture_diagnosis": {
+    "baseline": "074d620b8c2aa3c59521c1614603ee62c363f9c7",
+    "initial_candidate": "9212f3ed9a648421dd6d6c6c6a8c976aa000bfb8",
+    "fixed_candidate": "f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+    "platform": "Linux aarch64 container, rustc 1.99.1, unprivileged nobody",
+    "image": "rust@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb",
+    "controlled_cases": {
+      "baseline_normal": "passed,reaped1,busy1",
+      "baseline_held_shared": "expected failed,reaped0,busy2",
+      "baseline_held_private": "passed,reaped1,busy1",
+      "candidate_fresh_normal": "passed,reaped1,busy1",
+      "candidate_fresh_held_shared": "expected failed,reaped0,busy2",
+      "candidate_fresh_held_private": "passed,reaped1,busy1"
+    },
+    "ci_boundary": "Shared gate contention is sufficient to cause the identical failure; the original CI did not record the transient gate holder.",
+    "discarded": "First shared-target candidate probe was not freshly compiled; its result is superseded by candidate-fresh-driver.log from a new container. Baseline remains valid.",
+    "final_source_suite": "118 passed, 0 failed, 1 preexisting ignored",
+    "endpoint_residues": 0
+  },
+  "initial_ci": {
+    "run_id": 40292592087,
+    "source": "9212f3ed9a648421dd6d6c6c6a8c976aa000bfb8",
+    "failure": "Linux core-test: managed_public_sweep_targets_the_selected_namespace_only, reaped0",
+    "other_five_lanes": "passed"
+  },
+  "final_ci": {
+    "run_id": 40299316629,
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/40299316629",
+    "attempt": 1,
+    "jobs_passed": 10,
+    "gates_passed": 147,
+    "fastdb_source": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+    "lanes": [
+      {
+        "lane": "source-macos-15-py3.12-full",
+        "gates": 25,
+        "verified_text_files": 173,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-ubuntu-24.04-py3.12-full",
+        "gates": 25,
+        "verified_text_files": 173,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-ubuntu-24.04-py3.14t-python",
+        "gates": 16,
+        "verified_text_files": 152,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-windows-11-arm-py3.12-full",
+        "gates": 27,
+        "verified_text_files": 179,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-windows-2022-py3.12-full",
+        "gates": 27,
+        "verified_text_files": 179,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      },
+      {
+        "lane": "source-windows-2025-py3.12-full",
+        "gates": 27,
+        "verified_text_files": 179,
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "typescript_cleanup_verified": true
+      }
+    ]
+  },
+  "artifacts": [
+    {
+      "artifact_id": 12639806575,
+      "name": "workflow-policy-f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+      "github_digest": "sha256:8b769354221346fffdb482f32f0c921ec747c2721b918f326322ff2d1eaadf31",
+      "text_files": 2,
+      "range_bytes": 14329
+    },
+    {
+      "artifact_id": 12639668262,
+      "name": "source-ubuntu-24.04-py3.14t-python-f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+      "github_digest": "sha256:68bad03b085ed510dc2cd4a1d2cd742f813856921e9bdf809c212699f123483b",
+      "text_files": 156,
+      "range_bytes": 442622
+    },
+    {
+      "artifact_id": 12641025441,
+      "name": "source-ubuntu-24.04-py3.12-full-f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+      "github_digest": "sha256:de8564ebc329a3a02928839bcf9b36d4c58aea3005826cd2a4f67ea8c1cda1b0",
+      "text_files": 177,
+      "range_bytes": 555612
+    },
+    {
+      "artifact_id": 12640965735,
+      "name": "source-macos-15-py3.12-full-f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+      "github_digest": "sha256:fe30243f206eb14a02b2d4625f54315d7cc915e8b51fe7b17f6d279cc60a8d4b",
+      "text_files": 177,
+      "range_bytes": 706466
+    },
+    {
+      "artifact_id": 12640676591,
+      "name": "source-windows-2025-py3.12-full-f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+      "github_digest": "sha256:9a47435daaae6f211f03f1ba137780c2d715dc363c08d0c74152d660bf927553",
+      "text_files": 183,
+      "range_bytes": 548288
+    },
+    {
+      "artifact_id": 12640527666,
+      "name": "source-windows-2022-py3.12-full-f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+      "github_digest": "sha256:3e0395f6fb8792c62c3d8e2da3f8f7f6ac4944b6291e5179dce78928b4699170",
+      "text_files": 183,
+      "range_bytes": 619929
+    },
+    {
+      "artifact_id": 12642360189,
+      "name": "source-windows-11-arm-py3.12-full-f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a",
+      "github_digest": "sha256:bd0c3d4cd5c2c49036852982d03640decb243c4d4dc851c92ab269997d9d7a6a",
+      "text_files": 183,
+      "range_bytes": 639550
+    }
+  ],
+  "hash_policy": "Range-downloaded text verified by ZIP CRC and run-evidence SHA-256. Recorded GitHub archive digests are not independently recomputed.",
+  "reviews": [
+    {
+      "run": "39c3e032-69a2-4843-9016-eae5637ed70a",
+      "input": "caa68ca0f391271ca1af8d9497a3a6b0a9688359",
+      "artifact": "10107c3c-7b6a-41ce-80a4-e3d5df25bd00",
+      "result": "no blockers, Python annotation nit fixed"
+    },
+    {
+      "run": "19d62c69-a153-474e-8d99-d5945951e031",
+      "input": "26efd744b55ec31f16716a9ca39d9db0f772e916",
+      "artifact": "ecebd83e-1902-4d07-931d-c98254176799",
+      "result": "no blockers"
+    }
+  ],
+  "review_boundary": "Static reviews; no independent test execution; accepted and workspaces reclaimed.",
+  "cleanup": {
+    "mac_target_bytes": [
+      157729056,
+      157730043
+    ],
+    "windows_target_bytes": 213807471,
+    "windows_target_temp_archive_remaining": false,
+    "linux_task_containers_targets_registry_image_remaining": false,
+    "historical_namespaces_touched": false,
+    "local_branch_or_tag_moved": false,
+    "ci_branch": "socu/r17a-slot-io-ci",
+    "ci_branch_deleted_with_expected_sha": "f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a"
+  },
+  "evidence_root": "~/.codex/diagnostics/c2-r17a-implementation-j4rx68ra/",
+  "evidence_hashes": [
+    {
+      "path": "native-results.json",
+      "sha256": "cc80c85e29381c29d0c0668185d88a7aae47ee5d7c464167ebb617fbc84897e9"
+    },
+    {
+      "path": "windows-verified.json",
+      "sha256": "b8dfac5d4a0f8bcf7350943ac11c5f27fa8851315f296dc67e19e9e026ac36c0"
+    },
+    {
+      "path": "sweep-race/receipt.json",
+      "sha256": "92684315bb578e64c52ca69ec68ac22d10cff507160d8945c81bfefe6d0b778d"
+    },
+    {
+      "path": "final-ci-audit.json",
+      "sha256": "895ff173c83e23a6752b6d3e67896719bc4d608fc3092727ebe7bb48bce02c59"
+    },
+    {
+      "path": "review-outcome.json",
+      "sha256": "a75f3304f2ce2a23479cfb14443b017f47e045501160d3b285503eebd93e2d8c"
+    },
+    {
+      "path": "review-fixture-outcome.json",
+      "sha256": "2b4269852b047e839fce0b2911238f4efca349da8dbf87d8c3cd2ab3fa40a1b7"
+    },
+    {
+      "path": "linux-cleanup.json",
+      "sha256": "eeb4cdb3878fe6672f5c2335e4816f0c2a8e66ca67557b0018456e1f8c666789"
+    }
+  ],
+  "release": false,
+  "r17_status": "partial; read_lease_record, verify_lease_entry and gate_still_named remain separate"
+}

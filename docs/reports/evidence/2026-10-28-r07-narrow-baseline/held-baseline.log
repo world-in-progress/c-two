@@ -1,0 +1,135 @@
+   Compiling smallvec v1.15.1
+   Compiling syn v2.0.117
+   Compiling errno v0.3.14
+   Compiling memchr v2.8.0
+   Compiling stable_deref_trait v1.2.1
+   Compiling futures-channel v0.3.34
+   Compiling parking_lot_core v0.9.12
+   Compiling parking_lot v0.12.5
+   Compiling serde_core v1.0.229
+   Compiling signal-hook-registry v1.4.8
+   Compiling futures-io v0.3.34
+   Compiling log v0.4.29
+   Compiling futures-util v0.3.34
+   Compiling http v1.4.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v1.3.0
+   Compiling serde_json v1.0.154
+   Compiling cc v1.2.58
+   Compiling serde v1.0.229
+   Compiling percent-encoding v2.3.2
+   Compiling synstructure v0.13.2
+   Compiling writeable v0.6.2
+   Compiling litemap v0.8.1
+   Compiling rustix v1.1.5
+   Compiling ring v0.17.14
+   Compiling http-body v1.0.1
+   Compiling icu_properties_data v2.1.2
+   Compiling icu_normalizer_data v2.1.1
+   Compiling zerofrom-derive v0.1.6
+   Compiling yoke-derive v0.8.1
+   Compiling tokio-macros v2.7.0
+   Compiling zerovec-derive v0.11.2
+   Compiling tokio v1.53.3
+   Compiling displaydoc v0.2.5
+   Compiling tracing-attributes v0.1.31
+   Compiling zerofrom v0.1.6
+   Compiling tower-service v0.3.3
+   Compiling yoke v0.8.1
+   Compiling tracing v0.1.44
+   Compiling zerovec v0.11.5
+   Compiling zerotrie v0.2.3
+   Compiling tinystr v0.8.2
+   Compiling icu_locale_core v2.1.1
+   Compiling potential_utf v0.1.4
+   Compiling icu_collections v2.1.1
+   Compiling httparse v1.10.1
+   Compiling icu_provider v2.1.1
+   Compiling zeroize v1.8.2
+   Compiling rustls-pki-types v1.14.0
+   Compiling gethostname v1.1.0
+   Compiling getrandom v0.2.17
+   Compiling tower-layer v0.3.3
+   Compiling untrusted v0.9.0
+   Compiling try-lock v0.2.5
+   Compiling c2-config v0.1.0 (<isolated>/source/core/foundation/c2-config)
+   Compiling want v0.3.1
+   Compiling icu_normalizer v2.1.1
+   Compiling icu_properties v2.1.2
+   Compiling form_urlencoded v1.2.2
+   Compiling sync_wrapper v1.0.2
+   Compiling httpdate v1.0.3
+   Compiling rustls v0.23.45
+   Compiling atomic-waker v1.1.2
+   Compiling pin-utils v0.1.0
+   Compiling hyper v1.8.1
+   Compiling rustls-webpki v0.103.15
+   Compiling idna_adapter v1.2.1
+   Compiling tokio-util v0.7.20
+   Compiling utf8_iter v1.0.4
+   Compiling subtle v2.6.1
+   Compiling base64 v0.22.1
+   Compiling ipnet v2.12.0
+   Compiling c2-mem v0.1.0 (<isolated>/source/core/foundation/c2-mem)
+   Compiling idna v1.1.0
+   Compiling hyper-util v0.1.20
+   Compiling c2-contract v0.1.0 (<isolated>/source/core/foundation/c2-contract)
+   Compiling tower v0.5.3
+   Compiling c2-error v0.1.0 (<isolated>/source/core/foundation/c2-error)
+   Compiling http-body-util v0.1.3
+   Compiling ryu v1.0.23
+   Compiling c2-local v0.1.0 (<isolated>/source/core/transport/c2-local)
+   Compiling serde_urlencoded v0.7.1
+   Compiling c2-wire v0.1.0 (<isolated>/source/core/protocol/c2-wire)
+   Compiling url v2.5.8
+   Compiling webpki-roots v1.0.6
+   Compiling futures-executor v0.3.34
+   Compiling mime v0.3.17
+   Compiling tower-http v0.6.11
+   Compiling axum-core v0.5.6
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.7
+   Compiling serde_path_to_error v0.1.20
+   Compiling matchit v0.8.4
+   Compiling reqwest v0.12.28
+   Compiling c2-ipc v0.1.0 (<isolated>/source/core/transport/c2-ipc)
+   Compiling axum v0.8.9
+   Compiling futures v0.3.34
+   Compiling tower-http v0.7.1
+   Compiling hex v0.4.3
+   Compiling tempfile v3.27.0
+   Compiling c2-server v0.1.0 (<isolated>/source/core/transport/c2-server)
+   Compiling c2-http v0.1.0 (<isolated>/source/core/transport/c2-http)
+   Compiling c2-core v0.1.0 (<isolated>/source/core/runtime/c2-core)
+    Finished `test` profile [unoptimized] target(s) in 20.30s
+     Running unittests src/lib.rs (<isolated>/target/debug/deps/c2_core-f707dba5adb6ead0)
+
+running 2 tests
+test lifetime::r07_narrow_baseline::r07_baseline_failed_held_release_keeps_native_retry_obligation ... R07_HELD_BASELINE first_error=held response release failed; transport cleanup: response handle release failed: reassembly release validation failed: pool owner incarnation mismatch second_ok=true invalidations=1 remaining=1 reassembly_charge=512
+
+thread 'lifetime::r07_narrow_baseline::r07_baseline_failed_held_release_keeps_native_retry_obligation' (13763195) panicked at runtime/c2-core/src/lifetime.rs:139:9:
+assertion `left == right` failed: second release reported success with its old allocation still live
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback ...
+thread 'lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback' (13763196) panicked at runtime/c2-core/src/lifetime.rs:148:73:
+R07 injected invalidator panic
+R07_INVALIDATOR_BASELINE callback_count=2
+
+thread 'lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback' (13763196) panicked at runtime/c2-core/src/lifetime.rs:152:9:
+assertion `left == right` failed: caught invalidator panic must not replay user code
+  left: 2
+ right: 1
+FAILED
+
+failures:
+
+failures:
+    lifetime::r07_narrow_baseline::r07_baseline_failed_held_release_keeps_native_retry_obligation
+    lifetime::r07_narrow_baseline::r07_baseline_invalidation_panic_does_not_replay_user_callback
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 140 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p c2-core --lib`

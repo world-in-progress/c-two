@@ -7,7 +7,7 @@ import pytest
 
 import c_two as cc
 from c_two import error
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport import registry as registry_module
 from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec, Payload, PayloadError
 
 
@@ -81,7 +81,7 @@ class EchoResource:
 def cleanup_runtime():
     yield
     cc.shutdown()
-    _ProcessRegistry._instance = None
+    registry_module._default_runtime = None
 
 
 def build_payload(value: int = 7, *, spec_value: object = SPEC) -> Payload:

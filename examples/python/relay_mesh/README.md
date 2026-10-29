@@ -10,7 +10,7 @@ This is the advanced multi-relay example. For the basic relay smoke test, use
 
 ## Prerequisites
 
-Install the examples dependency group (includes pandas, numpy, pyarrow):
+Install the examples dependency group (includes pandas and numpy):
 
 ```bash
 uv sync --group examples

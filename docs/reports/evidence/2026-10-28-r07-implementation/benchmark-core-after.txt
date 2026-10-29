@@ -1,0 +1,9 @@
+command: cargo test --manifest-path core/Cargo.toml -p c2-core --lib r07_success_path_benchmark -- --ignored --nocapture
+exit_code: 0
+
+running 1 test
+R07_BENCH mode=small median_ns=89 samples_ns=[89, 89, 89, 89, 89, 89, 157] iterations=2000
+R07_BENCH mode=chunk median_ns=4552 samples_ns=[4410, 4472, 4541, 4552, 4625, 4636, 4809] iterations=2000
+R07_BENCH mode=held median_ns=4603 samples_ns=[4449, 4539, 4548, 4603, 4608, 4637, 4642] iterations=2000
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 144 filtered out; finished in 0.13s

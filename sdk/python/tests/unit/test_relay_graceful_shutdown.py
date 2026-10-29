@@ -9,7 +9,7 @@ import pytest
 
 import c_two as cc
 from c_two.config import settings
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import Runtime
 
 
 # -- Helpers ---------------------------------------------------------------
@@ -41,7 +41,7 @@ class TestUnregisterRelayAbsence:
     """Explicit unregister reports relay failures; shutdown stays best-effort."""
 
     def setup_method(self):
-        self.registry = _ProcessRegistry()
+        self.registry = Runtime()
         settings.relay_anchor_address = None
 
     def teardown_method(self):
@@ -111,5 +111,5 @@ class TestUnregisterRelayAbsence:
             self.registry.register(IRelayShutdownCRM, RelayShutdownCRM(), name='test_relay_fail')
 
         assert 'test_relay_fail' not in self.registry.names
-        assert self.registry.get_server_id() is None
-        assert self.registry.get_server_address() is None
+        assert self.registry.server_id() is None
+        assert self.registry.server_address() is None

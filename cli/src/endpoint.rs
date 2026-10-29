@@ -127,8 +127,8 @@ fn inspect(args: InspectArgs) -> Result<ExitCode> {
 
 fn reap(args: ReapArgs) -> Result<ExitCode> {
     let credential = read_credential(&args.credential)?;
-    // Reap follows the credential's captured context, including historical
-    // schema-2 /tmp credentials. Environment and .env cannot retarget it.
+    // Reap follows the credential's captured context. Unsupported historical
+    // schemas are rejected by the codec; environment and .env cannot retarget it.
     // An explicit override only checks the context, before native endpoint IO.
     if let Some(root) = args.ipc_root {
         let context = resolve_context(Some(root))?;
@@ -304,20 +304,7 @@ fn reap_report(result: &EndpointReapResult) -> (&'static str, Option<String>) {
 }
 
 fn reason_name(reason: EndpointUnverifiedReason) -> String {
-    match reason {
-        EndpointUnverifiedReason::UnsafeDirectory => "unsafe-directory",
-        EndpointUnverifiedReason::Symlink => "symlink",
-        EndpointUnverifiedReason::UnexpectedObject => "unexpected-object",
-        EndpointUnverifiedReason::ForeignOwner => "foreign-owner",
-        EndpointUnverifiedReason::MissingOwnership => "missing-ownership",
-        EndpointUnverifiedReason::InvalidOwnership => "invalid-ownership",
-        EndpointUnverifiedReason::InvalidRecord => "invalid-record",
-        EndpointUnverifiedReason::RecordMismatch => "record-mismatch",
-        EndpointUnverifiedReason::CoordinatorMissing => "coordinator-missing",
-        EndpointUnverifiedReason::CoordinatorReplaced => "coordinator-replaced",
-        EndpointUnverifiedReason::InitializationIncomplete => "initialization-incomplete",
-    }
-    .to_string()
+    reason.as_str().to_string()
 }
 
 fn io_reason(error: &std::io::Error) -> Option<String> {

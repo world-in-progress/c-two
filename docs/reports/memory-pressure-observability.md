@@ -56,7 +56,7 @@ Additional compile sweep: `cargo check --manifest-path core/Cargo.toml --workspa
 
 ## Honest remaining scope
 
-- Python behavioral execution of the updated `test_mem_pool.py` was not run here: the Host venv's editable install points at the integrator worktree (`/Users/soku/.codex/worktrees/c2-memory-policy/c-two`), not this checkout, and rebuilding the extension into the Host venv is explicitly forbidden. The projection is compile-verified (`cargo check` above) and the Python test edits are syntax-checked; the integrator should run `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_mem_pool.py -q` after the next extension rebuild.
+- Python behavioral execution of the updated `test_mem_pool.py` was not run here: the Host venv's editable install points at the integrator worktree (`~/.codex/worktrees/c2-memory-policy/c-two`), not this checkout, and rebuilding the extension into the Host venv is explicitly forbidden. The projection is compile-verified (`cargo check` above) and the Python test edits are syntax-checked; the integrator should run `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_mem_pool.py -q` after the next extension rebuild.
 - Windows validation of the pressure seams and stats is pending, as with prior slices.
 - The engine's latch is keyed to the largest denied backing; the exact interaction between interleaved tier sizes at availability levels inside the recovery band is heuristic by design and documented, not a stability guarantee for mixed-size bursts.
 - The plan's step-three measurement work (workload-class benchmarks, RSS/commit comparison, promotion re-evaluation) remains open and out of this slice.

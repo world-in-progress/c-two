@@ -527,7 +527,7 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
              \x20           c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,\n\
              \x20           error,\n\
              \x20       );\n\
-             \x20       let _ = held.release();\n\
+             \x20       c_two::generated::release_held_after_error(&mut held);\n\
              \x20       return Err(c_two::Error::Semantic(semantic));\n\
              \x20   }}\n\
              \x20   Ok(held)\n\
@@ -668,8 +668,8 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
          \x20       if release is not None:\n\
          \x20           try:\n\
          \x20               release()\n\
-         \x20           except BaseException:\n\
-         \x20               pass\n\
+         \x20           except BaseException as cleanup_error:\n\
+         \x20               print(f\"Warning: response copy cleanup failed: {cleanup_error}\", file=sys.stderr)\n\
          \x20       raise\n\
          \x20   release = getattr(response, \"release\", None)\n\
          \x20   if release is not None:\n\
@@ -742,8 +742,8 @@ fn render_python_direction(
              \x20   except BaseException:\n\
              \x20       try:\n\
              \x20           payload.close()\n\
-             \x20       except BaseException:\n\
-             \x20           pass\n\
+             \x20       except BaseException as cleanup_error:\n\
+             \x20           print(f\"Warning: payload decode cleanup failed: {{cleanup_error}}\", file=sys.stderr)\n\
              \x20       raise\n\
              \x20   return payload\n\n"
         ));
@@ -898,7 +898,8 @@ function normalizeFastDbPayloadError(error: unknown): unknown {
          function tryReleaseHeldValue(value: unknown): void {\n\
          \x20 try {\n\
          \x20   releaseHeldValue(value);\n\
-         \x20 } catch {\n\
+         \x20 } catch (cleanupError) {\n\
+         \x20   console.warn(\"Warning: held payload decode cleanup failed:\", cleanupError);\n\
          \x20 }\n\
          }\n\n\
          function contractResponseBytes(response: C2ResponsePayload): Uint8Array {\n\
@@ -1010,7 +1011,8 @@ fn render_typescript_direction(
              \x20 }} catch (error) {{\n\
              \x20   try {{\n\
              \x20     payload?.dispose();\n\
-             \x20   }} catch {{\n\
+             \x20   }} catch (cleanupError) {{\n\
+             \x20     console.warn(\"Warning: payload decode cleanup failed:\", cleanupError);\n\
              \x20   }}\n\
              \x20   throw normalizeFastDbPayloadError(error);\n\
              \x20 }}\n\

@@ -9,7 +9,7 @@ import pytest
 
 import c_two as cc
 from c_two.config import settings
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 
 
@@ -28,7 +28,7 @@ def _clean_env_and_registry(monkeypatch):
     finally:
         try:
             assert cc.shutdown()['completed']
-            _ProcessRegistry.reset()
+            _reset_default_runtime()
         finally:
             settings._relay_anchor_address = previous_override_relay  # noqa: SLF001
             settings._shm_threshold = previous_override_shm_threshold  # noqa: SLF001
@@ -325,7 +325,7 @@ def test_remote_ipc_scheduler_max_workers_shares_with_local_thread_calls():
     direct_address = cc.server_address()
     assert direct_address is not None
 
-    resource = _ProcessRegistry.get()._server._slots['mixed_limit_workers'].crm_instance.resource  # noqa: SLF001
+    resource = _get_default_runtime()._server._slots['mixed_limit_workers'].crm_instance.resource  # noqa: SLF001
     local = cc.connect(SharedLimitProbe, name='mixed_limit_workers')
     remote = cc.connect(
         SharedLimitProbe,
@@ -383,7 +383,7 @@ def test_remote_ipc_scheduler_max_pending_shares_with_local_thread_calls():
     direct_address = cc.server_address()
     assert direct_address is not None
 
-    resource = _ProcessRegistry.get()._server._slots['mixed_limit_pending'].crm_instance.resource  # noqa: SLF001
+    resource = _get_default_runtime()._server._slots['mixed_limit_pending'].crm_instance.resource  # noqa: SLF001
     local = cc.connect(SharedLimitProbe, name='mixed_limit_pending')
     remote = cc.connect(
         SharedLimitProbe,

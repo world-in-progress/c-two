@@ -6,8 +6,8 @@
 Complete the C-Two and FastDB memory ownership redesign for FDB-first CRM payloads. Defer all benchmark work. Focus only on functional semantics, public APIs, implementation, tests, and docs for materialized values, client held responses, and explicit server-side borrowed input.
 
 ## Repositories
-- C-Two: `/Users/soku/Desktop/codespace/WorldInProgress/c-two`
-- FastDB: `/Users/soku/Desktop/codespace/WorldInProgress/fastdb`
+- C-Two: `<c-two>`
+- FastDB: `<fastdb>`
 - PyPI `fastdb4py` may be stale. Prefer the local FastDB checkout for development and C-Two tests.
 
 ## Design Decisions

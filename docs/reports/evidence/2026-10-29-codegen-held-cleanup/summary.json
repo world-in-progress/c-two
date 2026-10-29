@@ -1,0 +1,63 @@
+{
+  "base_commit": "f04cf89ecf2dac11c978faabd282f0395684e038",
+  "platform": "aarch64-apple-darwin",
+  "versions": {
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "cargo": "cargo 1.91.0 (ea2d97820 2025-10-10)",
+    "node": "v25.8.1",
+    "typescript": "Version 5.2.2",
+    "python": "Python 3.14.5"
+  },
+  "fastdb_core_sdk": {
+    "version": "0.2.3",
+    "source_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4",
+    "bundle_sha256": "5187a11cf47d24bbdbf6a0541ade2e6797a04d763df52971b45a0b3d94c69157",
+    "link_mode": "system",
+    "preparer": ".github/scripts/prepare_fastdb_sdk.py"
+  },
+  "red": {
+    "runs": 3,
+    "expected_failures": 3,
+    "production_fix_present": false
+  },
+  "green": {
+    "reported_passes": 39,
+    "actual_executed_cases": 38,
+    "internal_early_return_skips": 1,
+    "failures": 0,
+    "suites": {
+      "generated_targets": {
+        "reported_passes": 8,
+        "executed": 7,
+        "internal_early_return_skips": 1
+      },
+      "payload_lifetime": 6,
+      "codegen_lib": 2,
+      "composition": 12,
+      "typescript_transport_contract": 8,
+      "sdk_lib": 3
+    }
+  },
+  "validation_not_run": [
+    "generated_rust_sdk (requires sibling FastDB fixtures)",
+    "FastDB TypeScript source composition (requires sibling source)",
+    "cross-language matrices",
+    "full workspace/SDK suites",
+    "Linux/Windows hosted gates"
+  ],
+  "cleanup": {
+    "cargo_target_directory_count": 1,
+    "cargo_target_directory": "$WORK/target",
+    "build_allocated_bytes_removed": 984088576,
+    "temporary_allocated_bytes_removed": 987607040,
+    "removed": [
+      "$WORK/target",
+      "$WORK/fastdb-sdk",
+      "$WORK temporary consumers, scripts and logs",
+      "sdk/rust/.held-cleanup-work.json"
+    ],
+    "temporary_root_absent": true,
+    "virtual_environments_created": 0,
+    "checkout_build_directories_created": 0
+  }
+}

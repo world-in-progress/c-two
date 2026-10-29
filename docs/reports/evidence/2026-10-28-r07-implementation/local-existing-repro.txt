@@ -1,0 +1,8 @@
+command: cargo test --manifest-path core/Cargo.toml -p c2-local --lib final_lease_stat_io_releases_close_and_drop_leases -- --nocapture
+exit_code: 0
+
+running 1 test
+R17C_TEST_ROOT <task-temp>/ipc
+R17C_TEST_ROOT <task-temp>/ipc
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 157 filtered out; finished in 0.06s

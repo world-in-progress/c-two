@@ -45,12 +45,12 @@ IS_WINDOWS = sys.platform == 'win32'
 #: A well-formed managed-v2 credential document. Managed-v2 is a Unix
 #: filesystem namespace, so this document is only meaningful on POSIX.
 def _unix_document(address: str) -> str:
-    root = f'/tmp/c2-{os.geteuid():x}' if not IS_WINDOWS else '/tmp/c2-unix'
+    root = cc.local_endpoint_context().root if not IS_WINDOWS else '/tmp/c2-unix'
     namespace = cc.local_endpoint_context(root=root).namespace_id if not IS_WINDOWS else '0' * 64
     return json.dumps({
-        'schemaVersion': 3, 'address': address, 'protocol': 'managed-v2', 'platform': 'unix',
+        'schemaVersion': 4, 'address': address, 'protocol': 'managed-v2', 'platform': 'unix',
         'incarnation': '00112233445566778899aabbccddeeff',
-        'device': 1, 'inode': 2, 'changedSecs': 3, 'changedNanos': 4,
+        'inode': 2, 'changedSecs': 3, 'changedNanos': 4,
         'unixRoot': root, 'namespaceId': namespace,
     }, separators=(',', ':'))
 
@@ -78,24 +78,26 @@ def native_namespace():
                 return observed
             time.sleep(0.01)
 
+    credential = None
     try:
+        assert session.server_credential is None
         bridge.start()
+        credential = session.server_credential
+        assert type(credential) is cc.EndpointCredential
     finally:
-        try:
-            observed = inspect()
-        finally:
-            outcome = session.shutdown(timeout_seconds=5.0)
+        outcome = session.shutdown(timeout_seconds=5.0)
         assert outcome['completed'] and outcome['runtime_barrier_error'] is None, outcome
+        assert session.server_credential is None
         if IS_WINDOWS:
+            observed = inspect()
             assert (observed['status'], observed['reason']) == (
                 'not-applicable', 'kernel-managed',
             ), observed
         else:
-            assert observed['status'] in {'present', 'absent'}, observed
-            if observed['status'] == 'present':
+            if credential is not None:
                 deadline = time.monotonic() + 1.0
                 while True:
-                    reaped = cc.reap_endpoint(address, observed['credential'], context=context)
+                    reaped = cc.reap_endpoint(address, credential, context=context)
                     if reaped['status'] != 'busy' or time.monotonic() >= deadline:
                         break
                     time.sleep(0.05)
@@ -160,6 +162,18 @@ def test_credential_from_json_rejects_a_non_string_document() -> None:
         cc.EndpointCredential.from_json(b'{}')  # type: ignore[arg-type]
 
 
+def test_credential_rejects_device_and_retired_unix_schema() -> None:
+    document = json.loads(_native_document())
+    document['device'] = 1
+    with pytest.raises(ValueError, match='malformed-json'):
+        cc.EndpointCredential.from_json(json.dumps(document))
+    if not IS_WINDOWS:
+        document.pop('device')
+        document['schemaVersion'] = 3
+        with pytest.raises(ValueError):
+            cc.EndpointCredential.from_json(json.dumps(document))
+
+
 @pytest.mark.parametrize(
     ('document', 'fragment'),
     [
@@ -173,7 +187,6 @@ def test_credential_from_json_rejects_a_non_string_document() -> None:
                     'address': 'ipc://x',
                     'protocol': 'legacy-v1',
                     'platform': 'unix',
-                    'device': 1,
                     'inode': 2,
                     'changedSecs': 3,
                     'changedNanos': 4,
@@ -191,7 +204,6 @@ def test_credential_from_json_rejects_a_non_string_document() -> None:
                     'address': 'ipc://x',
                     'protocol': 'legacy-v1',
                     'platform': 'unix',
-                    'device': 1,
                     'inode': 2,
                     'changedSecs': 3,
                     'changedNanos': 4,
@@ -208,7 +220,6 @@ def test_credential_from_json_rejects_a_non_string_document() -> None:
                     'address': 'ipc://x',
                     'protocol': 'managed-v2',
                     'platform': 'unix',
-                    'device': 1,
                     'inode': 2,
                     'changedSecs': 3,
                     'changedNanos': 4,
@@ -272,7 +283,7 @@ def test_windows_kernel_managed_credential_parses_without_unix_fields() -> None:
             )
 
 
-def test_inspect_reports_absent_for_an_unbound_endpoint() -> None:
+def test_inspect_preserves_platform_and_io_status_fields(tmp_path: Path) -> None:
     result = cc.inspect_endpoint(
         'ipc://unit-absent-endpoint'
     )
@@ -295,6 +306,22 @@ def test_inspect_reports_absent_for_an_unbound_endpoint() -> None:
         'raw_os_error',
         'retryable',
     }
+    assert result['io_kind'] is None and result['raw_os_error'] is None
+    if not IS_WINDOWS:
+        # Policy rejects other-writable roots even when the test runs as root.
+        previous_mode = tmp_path.stat().st_mode
+        try:
+            tmp_path.chmod(0o777)
+            denied = cc.inspect_endpoint('ipc://policy-denial', root=str(tmp_path))
+        finally:
+            tmp_path.chmod(previous_mode)
+        assert set(denied) == set(result)
+        assert denied['status'] == 'io-error'
+        assert denied['credential'] is None
+        assert denied['io_kind'] == 'PermissionDenied'
+        assert denied['raw_os_error'] is None  # Native policy refusal, not an OS errno.
+        assert denied['retryable'] is True
+        assert not list(tmp_path.iterdir()), 'inspection must not create ownership files'
 
 
 def test_inspect_rejects_an_invalid_address() -> None:
@@ -394,17 +421,21 @@ def _assert_new_incarnation_preserved() -> None:
         cc.set_server(server_id=server_id)
         cc.register(ScopeProbe, ProbeResource(), name='scope-probe')
         address = cc.server_address()
+        first_credential = cc.server_credential()
         first = cc.inspect_endpoint(address)
         assert first['status'] == 'present', first
         assert type(first['credential']) is cc.EndpointCredential
-        old = cc.EndpointCredential.from_json(first['credential'].to_json())
+        assert first_credential.to_json() == first['credential'].to_json()
+        old = cc.EndpointCredential.from_json(first_credential.to_json())
         cc.shutdown()
+        assert cc.server_credential() is None
         cc.set_server(server_id=server_id)
         cc.register(ScopeProbe, ProbeResource(), name='scope-probe')
         assert cc.server_address() == address
         second = cc.inspect_endpoint(address)
         assert second['status'] == 'present', second
-        current = second['credential']
+        current = cc.server_credential()
+        assert current.to_json() == second['credential'].to_json()
         assert current.to_json() != old.to_json()
         result = cc.reap_endpoint(address, old)
         assert result['status'] in {'busy', 'stale-target'}

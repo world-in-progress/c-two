@@ -1,0 +1,31 @@
+command: CARGO_TARGET_DIR="$PWD/core/target" cargo test --manifest-path core/Cargo.toml -p c2-core --lib lifetime::tests:: -- --nocapture
+exit_code: 101
+running 2 tests
+
+thread 'lifetime::tests::caught_invalidator_panic_does_not_replay_callback' (14571371) panicked at runtime/c2-core/src/lifetime.rs:167:17:
+R07 injected invalidator panic
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+R07_INVALIDATOR callback_count=2
+
+thread 'lifetime::tests::caught_invalidator_panic_does_not_replay_callback' (14571371) panicked at runtime/c2-core/src/lifetime.rs:177:9:
+assertion `left == right` failed: caught panic must not replay user code
+  left: 2
+ right: 1
+test lifetime::tests::caught_invalidator_panic_does_not_replay_callback ... FAILED
+R07_HELD first_error=held response release failed; transport cleanup: response handle release failed: reassembly release validation failed: pool owner incarnation mismatch second=Ok(()) invalidations=1 remaining=1 reassembly_charge=512
+
+thread 'lifetime::tests::failed_held_release_retries_original_lease_without_reinvalidating' (14571372) panicked at runtime/c2-core/src/lifetime.rs:156:9:
+assertion `left == right` failed: retry must release the original allocation
+  left: 1
+ right: 0
+test lifetime::tests::failed_held_release_retries_original_lease_without_reinvalidating ... FAILED
+
+failures:
+
+failures:
+    lifetime::tests::caught_invalidator_panic_does_not_replay_callback
+    lifetime::tests::failed_held_release_retries_original_lease_without_reinvalidating
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 140 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p c2-core --lib`

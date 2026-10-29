@@ -1,0 +1,18 @@
+$ cargo test --manifest-path sdk/rust/Cargo.toml --offline --quiet --no-run --lib
+
+exit_code=0
+$ $WORK/target/debug/deps/c_two-aee0ecad6d1c4ae4 --format=terse --nocapture
+
+running 3 tests
+
+thread 'held::tests::failed_invalidation_consumes_held_owners_once' (19310939) panicked at src/held.rs:190:21:
+invalidation panic
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+.
+thread 'held::tests::invalidator_unwind_releases_response_before_value_drop' (19310941) panicked at src/held.rs:133:21:
+invalidation panic
+..
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+exit_code=0

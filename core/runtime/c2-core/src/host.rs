@@ -17,7 +17,10 @@ use c2_server::{
     SchedulerSnapshot, Server, ServerFailure, ServerIdentity, ServerRuntimeBuilder,
 };
 
-use crate::{Error, LifecycleError, RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome};
+use crate::{
+    Error, FailedStartShutdownReceipt, LifecycleError, RegisterOutcome, Runtime, ShutdownOutcome,
+    UnregisterOutcome,
+};
 
 /// One generated method entry validated against an admitted release.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,6 +457,9 @@ pub struct HostOptions {
 struct StartupGateForTest {
     entered: std::sync::mpsc::SyncSender<Arc<Server>>,
     proceed: Mutex<std::sync::mpsc::Receiver<()>>,
+    thread_join: Option<std::sync::mpsc::SyncSender<std::thread::JoinHandle<()>>>,
+    fail_spawn: bool,
+    fail_wait_runtime: bool,
 }
 
 impl Default for HostOptions {
@@ -620,6 +626,19 @@ impl HostInner {
         outcome
     }
 
+    fn begin_failed_start_shutdown(&self) -> FailedStartShutdownReceipt {
+        // The Server shutdown request and its own wait already ran. Start the
+        // original Core transaction here, before a host thread can postpone
+        // HostInner::drop by upgrading its Weak reference.
+        self.runtime.begin_failed_start_shutdown(
+            &self.server,
+            self.route_names.lock().iter().cloned().collect(),
+            self.relay_anchor_address.as_deref(),
+            self.relay_use_proxy,
+            self.shutdown_timeout,
+        )
+    }
+
     fn finish_owner_shutdown_from_host_thread(&self) {
         let Some(_gate) = self.shutdown_gate.try_lock() else {
             return;
@@ -699,6 +718,39 @@ impl Drop for HostInner {
 }
 
 impl Host {
+    pub(crate) fn belongs_to(&self, runtime: &Runtime) -> bool {
+        self.inner.runtime.same_instance(runtime)
+    }
+
+    pub(crate) fn retirement_server(&self) -> std::sync::Weak<Server> {
+        Arc::downgrade(&self.inner.server)
+    }
+
+    pub(crate) fn retirement_work(
+        &self,
+        deadline: Instant,
+    ) -> Result<crate::session::ShutdownWork, LifecycleError> {
+        let routes = self.inner.route_names.try_lock_until(deadline).ok_or(
+            LifecycleError::ShutdownWaitTimeout {
+                stage: "core_host_routes_wait",
+            },
+        )?;
+        let mut work = crate::session::ShutdownWork::new(
+            Some(self.inner.server.clone()),
+            self.inner.shutdown_timeout,
+        );
+        work.route_names = routes.iter().cloned().collect();
+        work.relay_anchor_address = self.inner.relay_anchor_address.clone();
+        work.relay_use_proxy = self.inner.relay_use_proxy;
+        Ok(work)
+    }
+
+    /// Read the credential published by this host's bound listener.
+    /// The snapshot does not prove the listener is still alive.
+    pub fn endpoint_credential(&self) -> Option<c2_local::EndpointCredential> {
+        self.inner.server.endpoint_credential()
+    }
+
     /// Exact native endpoint retained for bind, readiness, and credentials.
     pub fn local_endpoint(&self) -> &c2_config::LocalEndpoint {
         self.inner.server.local_endpoint()
@@ -734,6 +786,7 @@ impl Host {
     }
 
     pub fn register(&self, definition: ServiceDefinition) -> Result<Registration, Error> {
+        self.inner.runtime.ensure_active()?;
         let route_name = definition.expected.route_name.clone();
         let route_spec = route_spec(&definition)?;
         let callback: Arc<dyn CrmCallback> = Arc::new(CoreCallback {
@@ -780,6 +833,27 @@ impl Host {
     pub fn shutdown_outcome(&self) -> Option<ShutdownOutcome> {
         self.inner.refresh_shutdown_outcome();
         self.inner.shutdown_outcome.lock().clone()
+    }
+
+    /// Observe the same journal within an existing caller deadline.
+    pub fn shutdown_outcome_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<ShutdownOutcome>, LifecycleError> {
+        let cached = self
+            .inner
+            .shutdown_outcome
+            .try_lock_until(deadline)
+            .ok_or(LifecycleError::ShutdownWaitTimeout {
+                stage: "core_host_outcome_wait",
+            })?
+            .clone();
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        self.inner
+            .runtime
+            .shutdown_observation_until(&self.inner.server, deadline)
     }
 
     /// Read-only lifecycle observation for this host.
@@ -849,6 +923,16 @@ impl Drop for Registration {
 
 impl Runtime {
     pub fn host(&self, options: HostOptions) -> Result<Host, Error> {
+        self.host_with_failed_start_receipt(options, |_| {})
+    }
+
+    /// Start one Host and deliver that attempt's native cleanup receipt if
+    /// startup fails after the concrete HostInner has been constructed.
+    pub fn host_with_failed_start_receipt(
+        &self,
+        options: HostOptions,
+        on_failed_start: impl FnOnce(FailedStartShutdownReceipt),
+    ) -> Result<Host, Error> {
         options
             .lifecycle
             .validate()
@@ -955,7 +1039,17 @@ impl Runtime {
         let owner_startup_timeout = startup_timeout;
         #[cfg(test)]
         let startup_gate = options.startup_gate.clone();
-        let thread = std::thread::Builder::new()
+        #[cfg(test)]
+        let fail_spawn = options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.fail_spawn);
+        #[cfg(not(test))]
+        let fail_spawn = false;
+        let thread = if fail_spawn {
+            Err(std::io::Error::other("injected host thread spawn failure"))
+        } else {
+            std::thread::Builder::new()
             .name(format!("c2-host-{}", server.server_id()))
             .spawn(move || {
                 #[cfg(test)]
@@ -1037,9 +1131,56 @@ impl Runtime {
 
                 }
             })
-            .map_err(|error| LifecycleError::Server(ServerFailure::new(error.to_string())))?;
-        *inner.thread.lock() = Some(thread);
-        let wait_runtime = Runtime::server_runtime()?;
+        };
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                // No host thread exists to move Starting to a terminal state.
+                // Let the original HostInner Drop run its Core shutdown after
+                // the transaction is available for independent observation.
+                server.finalize_runtime_stopped();
+                on_failed_start(inner.begin_failed_start_shutdown());
+                return Err(LifecycleError::Server(ServerFailure::new(error.to_string())).into());
+            }
+        };
+        #[cfg(test)]
+        if let Some(join) = options
+            .startup_gate
+            .as_ref()
+            .and_then(|gate| gate.thread_join.as_ref())
+        {
+            join.send(thread).expect("test owns host thread");
+        } else {
+            *inner.thread.lock() = Some(thread);
+        }
+        #[cfg(not(test))]
+        {
+            *inner.thread.lock() = Some(thread);
+        }
+        #[cfg(test)]
+        let wait_runtime = if options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.fail_wait_runtime)
+        {
+            Err(LifecycleError::Server(ServerFailure::new(
+                "failed to create runtime: injected test failure".to_string(),
+            )))
+        } else {
+            Runtime::server_runtime()
+        };
+        #[cfg(not(test))]
+        let wait_runtime = Runtime::server_runtime();
+        let wait_runtime = match wait_runtime {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                // The host thread may already own the accept loop. Signal its
+                // existing shutdown path before returning the startup error.
+                server.request_shutdown_signal_with_reason("shutdown");
+                on_failed_start(inner.begin_failed_start_shutdown());
+                return Err(error.into());
+            }
+        };
         if let Err(error) = wait_runtime.block_on(server.wait_until_responsive(startup_timeout)) {
             let _ = wait_runtime.block_on(server.shutdown_and_wait(options.shutdown_timeout));
             if let Some(thread) = inner.thread.lock().take() {
@@ -1047,6 +1188,7 @@ impl Runtime {
                     let _ = thread.join();
                 }
             }
+            on_failed_start(inner.begin_failed_start_shutdown());
             return Err(LifecycleError::from(error).into());
         }
 
@@ -1104,7 +1246,13 @@ impl CrmCallback for CoreCallback {
         let bytes = match lease.copy_bytes() {
             Ok(bytes) => bytes,
             Err(copy_error) => {
-                let release_error = lease.release().err();
+                let release_error = match lease.release() {
+                    Ok(()) => None,
+                    Err(error) => {
+                        lease.abandon();
+                        Some(error)
+                    }
+                };
                 return Err(CrmError::UserError(
                     protocol_violation(
                         "request transport bytes could not be copied",
@@ -1117,6 +1265,7 @@ impl CrmCallback for CoreCallback {
         };
         let result = self.service.invoke(method_idx, bytes);
         if let Err(release_error) = lease.release() {
+            lease.abandon();
             return Err(CrmError::UserError(
                 protocol_violation(
                     "request transport lease could not be released",
@@ -1147,6 +1296,36 @@ fn protocol_violation(message: &str, cause: String, release_error: Option<String
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_host_projects_bound_listener_credential_until_shutdown() {
+        let directory = tempfile::Builder::new()
+            .prefix("c2-host-credential-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let runtime = Runtime::new(crate::RuntimeOptions {
+            server_id: Some(format!("credential-{}", uuid::Uuid::new_v4().simple())),
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap();
+        runtime
+            .set_local_endpoint(c2_config::LocalEndpointOptions {
+                unix_root: Some(directory.path().to_path_buf()),
+            })
+            .unwrap();
+        let host = runtime
+            .host(HostOptions::default().without_relay())
+            .unwrap();
+        let credential = host
+            .endpoint_credential()
+            .expect("bound listener credential");
+        assert_eq!(credential.endpoint(), host.local_endpoint());
+        assert!(host.is_running());
+        assert!(host.shutdown().runtime_barrier_error.is_none());
+        assert!(host.endpoint_credential().is_none());
+    }
 
     #[test]
     fn unrepresentable_startup_timeout_does_not_freeze_configuration() {
@@ -1205,6 +1384,9 @@ mod lifecycle_tests {
             options.startup_gate = Some(Arc::new(StartupGateForTest {
                 entered,
                 proceed: Mutex::new(delayed),
+                thread_join: None,
+                fail_spawn: false,
+                fail_wait_runtime: false,
             }));
             let started = Instant::now();
             let host_runtime = runtime.clone();
@@ -1252,6 +1434,318 @@ mod lifecycle_tests {
                 "{error}"
             );
         }
+    }
+
+    struct FailedAttempt {
+        server: Arc<Server>,
+        proceed: std::sync::mpsc::Sender<()>,
+        host_thread: std::thread::JoinHandle<()>,
+        receipt: FailedStartShutdownReceipt,
+    }
+
+    struct GatedAttempt {
+        observed: std::sync::mpsc::Receiver<Arc<Server>>,
+        proceed: std::sync::mpsc::Sender<()>,
+        host_thread: std::sync::mpsc::Receiver<std::thread::JoinHandle<()>>,
+        caller: std::thread::JoinHandle<(Result<Host, Error>, Option<FailedStartShutdownReceipt>)>,
+    }
+
+    fn receipt_test_runtime() -> (Runtime, Option<tempfile::TempDir>) {
+        let runtime = Runtime::new(crate::RuntimeOptions {
+            server_id: Some(format!("receipt-{}", uuid::Uuid::new_v4().simple())),
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let parent = std::env::var_os("C2_FAILED_START_TEST_ROOT")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let directory = tempfile::Builder::new()
+                .prefix("ipc-")
+                .tempdir_in(parent)
+                .unwrap();
+            eprintln!("RECEIPT_CREATED_ROOT {}", directory.path().display());
+            runtime
+                .set_local_endpoint(c2_config::LocalEndpointOptions {
+                    unix_root: Some(directory.path().to_path_buf()),
+                })
+                .unwrap();
+            (runtime, Some(directory))
+        }
+        #[cfg(not(unix))]
+        {
+            runtime
+                .set_local_endpoint_with_sources(
+                    c2_config::LocalEndpointOptions::default(),
+                    c2_config::ConfigSources::empty(),
+                )
+                .unwrap();
+            (runtime, None)
+        }
+    }
+
+    fn launch_failed_attempt(runtime: &Runtime) -> GatedAttempt {
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (proceed, delayed) = std::sync::mpsc::channel();
+        let (join_sender, host_thread) = std::sync::mpsc::sync_channel(1);
+        let mut options = HostOptions::default()
+            .without_relay()
+            .with_startup_timeout(Duration::from_millis(30))
+            .with_shutdown_timeout(Duration::ZERO);
+        options.startup_gate = Some(Arc::new(StartupGateForTest {
+            entered,
+            proceed: Mutex::new(delayed),
+            thread_join: Some(join_sender),
+            fail_spawn: false,
+            fail_wait_runtime: false,
+        }));
+        let runtime = runtime.clone();
+        let caller = std::thread::spawn(move || {
+            let mut receipt = None;
+            let result = runtime.host_with_failed_start_receipt(options, |observed| {
+                receipt = Some(observed);
+            });
+            (result, receipt)
+        });
+        GatedAttempt {
+            observed,
+            proceed,
+            host_thread,
+            caller,
+        }
+    }
+
+    fn failed_attempt(gated: GatedAttempt) -> FailedAttempt {
+        let server = gated
+            .observed
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let host_thread = gated
+            .host_thread
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let (result, receipt) = gated.caller.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(Error::Lifecycle(LifecycleError::StartupTimeout(
+                crate::ServerStartupTimeout {
+                    stage: crate::ServerStartupStage::Readiness,
+                    timeout,
+                }
+            ))) if timeout == Duration::from_millis(30)
+        ));
+        FailedAttempt {
+            server,
+            proceed: gated.proceed,
+            host_thread,
+            receipt: receipt.expect("failed start must deliver its transaction"),
+        }
+    }
+
+    fn finish_failed_attempt(
+        attempt: FailedAttempt,
+    ) -> (ShutdownOutcome, FailedStartShutdownReceipt) {
+        attempt.proceed.send(()).unwrap();
+        attempt.host_thread.join().unwrap();
+        let (outcome, completed) = attempt.receipt.observe_with_timeout(Duration::from_secs(5));
+        assert!(
+            completed,
+            "failed Host cleanup did not publish a terminal outcome"
+        );
+        drop(attempt.server);
+        (outcome, attempt.receipt)
+    }
+
+    fn close_receipt_root(directory: Option<tempfile::TempDir>) {
+        if let Some(directory) = directory {
+            let root = directory.path().to_path_buf();
+            directory.close().unwrap();
+            eprintln!(
+                "RECEIPT_REMOVED_ROOT {} exists={}",
+                root.display(),
+                root.exists()
+            );
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn failed_start_runtime_retirement_observes_original_pending_cleanup() {
+        let (runtime, directory) = receipt_test_runtime();
+        let attempt = failed_attempt(launch_failed_attempt(&runtime));
+        let failed_receipt = attempt.receipt.clone();
+        let receipt = runtime
+            .begin_session_retirement(
+                crate::RuntimeShutdownTarget::FailedStart(&failed_receipt),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(!receipt.observe_until(Instant::now()).1);
+        assert!(matches!(
+            runtime.ensure_active(),
+            Err(LifecycleError::RuntimeRetired)
+        ));
+        let (original, _) = finish_failed_attempt(attempt);
+        let (outcome, completed) = receipt.observe_until(Instant::now() + Duration::from_secs(5));
+        assert!(completed && outcome.ipc_clients_drained, "{outcome:?}");
+        assert_eq!(outcome, original);
+        assert_eq!(failed_receipt.terminal_outcome(), Some(outcome));
+        drop(runtime);
+        close_receipt_root(directory);
+    }
+
+    #[test]
+    fn failed_host_thread_spawn_delivers_terminal_receipt() {
+        let (runtime, directory) = receipt_test_runtime();
+        let (entered, _observed) = std::sync::mpsc::sync_channel(1);
+        let (_proceed, delayed) = std::sync::mpsc::channel();
+        let mut options = HostOptions::default()
+            .without_relay()
+            .with_shutdown_timeout(Duration::ZERO);
+        options.startup_gate = Some(Arc::new(StartupGateForTest {
+            entered,
+            proceed: Mutex::new(delayed),
+            thread_join: None,
+            fail_spawn: true,
+            fail_wait_runtime: false,
+        }));
+        let mut receipt = None;
+        let error = runtime
+            .host_with_failed_start_receipt(options, |observed| receipt = Some(observed))
+            .expect_err("injected host thread spawn must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("injected host thread spawn failure")
+        );
+        let receipt = receipt.expect("spawn failure must deliver its transaction");
+        let (outcome, completed) = receipt.observe_with_timeout(Duration::from_secs(5));
+        assert!(completed, "spawn failure cleanup must reach terminal state");
+        assert!(!outcome.server_was_started);
+        assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+        drop(receipt);
+        drop(runtime);
+        close_receipt_root(directory);
+    }
+
+    #[test]
+    fn failed_wait_runtime_construction_delivers_running_thread_receipt() {
+        let (runtime, directory) = receipt_test_runtime();
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (proceed, delayed) = std::sync::mpsc::channel();
+        let (join_sender, host_thread) = std::sync::mpsc::sync_channel(1);
+        let mut options = HostOptions::default()
+            .without_relay()
+            .with_shutdown_timeout(Duration::ZERO);
+        options.startup_gate = Some(Arc::new(StartupGateForTest {
+            entered,
+            proceed: Mutex::new(delayed),
+            thread_join: Some(join_sender),
+            fail_spawn: false,
+            fail_wait_runtime: true,
+        }));
+        let mut receipt = None;
+        let error = runtime
+            .host_with_failed_start_receipt(options, |observed| receipt = Some(observed))
+            .expect_err("injected wait runtime construction must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create runtime: injected test failure")
+        );
+        let receipt = receipt.expect("wait runtime failure must deliver its transaction");
+        let server = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let host_thread = host_thread.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(!receipt.observe_with_timeout(Duration::ZERO).1);
+        proceed.send(()).unwrap();
+        host_thread.join().unwrap();
+        let (outcome, completed) = receipt.observe_with_timeout(Duration::from_secs(5));
+        assert!(completed, "host thread cleanup must reach terminal state");
+        assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+        drop(server);
+        drop(receipt);
+        drop(runtime);
+        close_receipt_root(directory);
+    }
+
+    #[test]
+    fn failed_first_start_receipt_tracks_pending_terminal_and_error() {
+        let (runtime, directory) = receipt_test_runtime();
+        let attempt = failed_attempt(launch_failed_attempt(&runtime));
+        assert!(runtime.shutdown_pending(&attempt.server));
+        let (pending, completed) = attempt.receipt.observe_with_timeout(Duration::ZERO);
+        assert!(!completed);
+        assert!(pending.runtime_barrier_error.is_some());
+        assert!(attempt.receipt.terminal_outcome().is_none());
+        assert!(!attempt.receipt.delivered_for_test());
+
+        let (terminal, receipt) = finish_failed_attempt(attempt);
+        assert_eq!(receipt.terminal_outcome(), Some(terminal.clone()));
+        assert_eq!(
+            receipt.observe_with_timeout(Duration::ZERO),
+            (terminal, true)
+        );
+        assert!(!receipt.delivered_for_test());
+
+        // A terminal cleanup failure remains terminal and retains its field.
+        // This test-only injection isolates receipt projection from OS faults.
+        receipt.set_terminal_error_for_test("terminal cleanup failure");
+        let (failed, completed) = receipt.observe_with_timeout(Duration::ZERO);
+        assert!(completed);
+        assert_eq!(
+            failed.runtime_barrier_error.as_deref(),
+            Some("terminal cleanup failure")
+        );
+        assert_eq!(receipt.terminal_outcome(), Some(failed));
+        assert!(!receipt.delivered_for_test());
+        drop(receipt);
+        drop(runtime);
+        close_receipt_root(directory);
+    }
+
+    #[test]
+    fn failed_restart_receipt_does_not_replace_old_host_journal() {
+        let (runtime, directory) = receipt_test_runtime();
+        let old_host = runtime
+            .host(HostOptions::default().without_relay())
+            .unwrap();
+        let old_outcome = old_host.shutdown();
+        assert!(old_outcome.runtime_barrier_error.is_none());
+        let attempt = failed_attempt(launch_failed_attempt(&runtime));
+        assert!(runtime.shutdown_pending(&attempt.server));
+        assert!(!attempt.receipt.observe_with_timeout(Duration::ZERO).1);
+        assert_eq!(old_host.shutdown_outcome(), Some(old_outcome.clone()));
+        assert_eq!(old_host.shutdown_with_timeout(Duration::ZERO), old_outcome);
+        let (_, receipt) = finish_failed_attempt(attempt);
+        assert!(receipt.terminal_outcome().is_some());
+        assert_eq!(old_host.shutdown_outcome(), Some(old_outcome));
+        drop(receipt);
+        drop(old_host);
+        drop(runtime);
+        close_receipt_root(directory);
+    }
+
+    #[test]
+    fn concurrent_failed_starts_keep_receipts_on_their_own_transactions() {
+        let (runtime, directory) = receipt_test_runtime();
+        let first = launch_failed_attempt(&runtime);
+        let second = launch_failed_attempt(&runtime);
+        let first = failed_attempt(first);
+        let second = failed_attempt(second);
+        assert!(!Arc::ptr_eq(&first.server, &second.server));
+        assert!(!first.receipt.same_transaction_for_test(&second.receipt));
+        assert!(!first.receipt.observe_with_timeout(Duration::ZERO).1);
+        assert!(!second.receipt.observe_with_timeout(Duration::ZERO).1);
+        let (_, first_receipt) = finish_failed_attempt(first);
+        let (_, second_receipt) = finish_failed_attempt(second);
+        assert!(first_receipt.terminal_outcome().is_some());
+        assert!(second_receipt.terminal_outcome().is_some());
+        drop(first_receipt);
+        drop(second_receipt);
+        drop(runtime);
+        close_receipt_root(directory);
     }
 
     #[test]

@@ -18,7 +18,7 @@ from tests.fixtures import local_server
 import c_two as cc
 from c_two.transport.server import Server
 from c_two.transport.client.util import ping
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime
 from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 
 
@@ -292,7 +292,7 @@ class TestUnregisterDrain:
         assert addr is not None
         local = cc.connect(IDrain, name='drain_route')
         remote = cc.connect(IDrain, name='drain_route', address=addr)
-        impl = _ProcessRegistry.get()._server._slots['drain_route'].crm_instance.resource  # noqa: SLF001
+        impl = _get_default_runtime()._server._slots['drain_route'].crm_instance.resource  # noqa: SLF001
 
         errors: list[BaseException] = []
 

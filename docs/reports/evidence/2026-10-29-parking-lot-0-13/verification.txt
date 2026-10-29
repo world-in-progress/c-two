@@ -1,0 +1,15 @@
+summary: implementation source before the change=2dd26d6f5417006938f84277925c2f352d8ead03; HEAD in the lock audit refers to this commit
+command: git diff --check
+exit_code: 0
+command: RUSTUP_TOOLCHAIN=1.99.0 cargo fmt --manifest-path core/Cargo.toml --all -- --check
+exit_code: 0
+command: RUSTUP_TOOLCHAIN=1.99.0 cargo fmt --manifest-path sdk/rust/Cargo.toml -- --check
+exit_code: 0
+command: rg -n '[/]Users[/]|[/]var[/]folders|[.]local[/]share' docs/reports/evidence/2026-10-29-parking-lot-0-13
+exit_code: 1
+summary: prohibited absolute-path matches=0
+command: rg -n 'parking_lot.{0,25}0\.12' core cli sdk/rust sdk/python/native --glob '!Cargo.lock' --glob '!*.md'
+exit_code: 1
+summary: obsolete parking_lot declarations including generated consumer manifests=0
+command: test ! -e "$TASK_TMP"
+exit_code: 0

@@ -5,9 +5,9 @@ from ..endpoint import LocalEndpointContext, _selected_context, _selection
 
 
 def _session():
-    from ..registry import _ProcessRegistry
+    from ..registry import _get_default_runtime
 
-    return _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+    return _get_default_runtime()._runtime_session  # noqa: SLF001
 
 
 def _endpoint_name_from_address(

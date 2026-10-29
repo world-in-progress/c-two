@@ -12,7 +12,7 @@ import uuid
 import pytest
 
 import c_two as cc
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport import registry as registry_module
 from tests.fixtures.process_control import (
     interrupt_python_process,
     python_process_options,
@@ -62,7 +62,7 @@ def test_client_shutdown_with_live_proxy(monkeypatch, freeze: bool, hosted: bool
             environment.setenv('C2_RELAY_ANCHOR_ADDRESS', '')
             # Keep this test's immutable Runtime namespace independent
             # of any process session used by earlier tests.
-            environment.setattr(_ProcessRegistry, '_instance', None)
+            environment.setattr(registry_module, '_default_runtime', None)
             cc.shutdown()
             context = cc.local_endpoint_context()
             child_env = os.environ.copy()

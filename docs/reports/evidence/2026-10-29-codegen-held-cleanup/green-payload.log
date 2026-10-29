@@ -1,0 +1,11 @@
+$ cargo test --manifest-path sdk/rust/Cargo.toml --offline --quiet --no-run --test payload_lifetime
+
+exit_code=0
+$ $WORK/target/debug/deps/payload_lifetime-c7cde1392dc92e47 --format=terse --nocapture
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+exit_code=0

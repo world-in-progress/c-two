@@ -24,7 +24,10 @@ P = ParamSpec("P")
 class HeldResult(Generic[R]):
     """A result whose C-Two lease must be released explicitly."""
 
-    __slots__ = ("_value", "_release_cb", "_invalidate_cb", "_released", "_buffer")
+    __slots__ = (
+        "_value", "_release_cb", "_invalidate_cb", "_released", "_buffer",
+        "_native_response", "_release_attempted",
+    )
 
     def __init__(
         self,
@@ -38,6 +41,8 @@ class HeldResult(Generic[R]):
         self._invalidate_cb = invalidate_cb
         self._buffer = buffer
         self._released = False
+        self._native_response: object | None = None
+        self._release_attempted = False
 
     @property
     def value(self) -> R:
@@ -54,6 +59,10 @@ class HeldResult(Generic[R]):
         return self._buffer
 
     def release(self) -> None:
+        self._release_attempted = True
+        if self._native_response is not None:
+            self._release_native_response()
+            return
         if self._released:
             return
 
@@ -77,8 +86,44 @@ class HeldResult(Generic[R]):
         except BaseException as exc:
             if first_error is None:
                 first_error = exc
+            else:
+                _attach_cleanup_error(first_error, exc)
         finally:
             self._buffer = None
+
+        if first_error is not None:
+            raise first_error
+
+    def _release_native_response(self) -> None:
+        response = self._native_response
+        assert response is not None
+        first_error: BaseException | None = None
+        if self._buffer is not None:
+            try:
+                self._buffer.release()
+            except BaseException as exc:
+                first_error = exc
+            else:
+                self._buffer = None
+
+        try:
+            if response.is_released or self._invalidate_cb is None:
+                response.release()
+            else:
+                response.invalidate_then_release(self._invalidate_cb, self._value)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+            else:
+                _attach_cleanup_error(first_error, exc)
+        finally:
+            if response.is_released:
+                self._released = True
+                self._value = None  # type: ignore[assignment]
+                self._invalidate_cb = None
+                self._buffer = None
+                if not response.has_pending_release:
+                    self._native_response = None
 
         if first_error is not None:
             raise first_error
@@ -89,28 +134,47 @@ class HeldResult(Generic[R]):
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         try:
             self.release()
-        except BaseException:
+        except BaseException as cleanup_error:
             if exc_type is None:
                 raise
+            _attach_cleanup_error(exc_value, cleanup_error)
 
     def __del__(
         self,
         _is_finalizing=sys.is_finalizing,
         _warn=warnings.warn,
     ) -> None:
-        if getattr(self, "_released", True):
+        response = getattr(self, "_native_response", None)
+        if getattr(self, "_released", True) and response is None:
             return
         if not _is_finalizing():
+            if not getattr(self, "_release_attempted", False):
+                message = (
+                    "HeldResult was garbage-collected without release() — "
+                    "potential SHM leak. Use 'with cc.hold(...)' or call .release()."
+                )
+            elif getattr(self, "_released", False) and response is not None:
+                message = "HeldResult has pending native cleanup after release() failed"
+            else:
+                message = "HeldResult release() did not complete before garbage collection"
             _warn(
-                "HeldResult was garbage-collected without release() — "
-                "potential SHM leak. Use 'with cc.hold(...)' or call .release().",
+                message,
                 ResourceWarning,
                 stacklevel=2,
             )
         try:
             self.release()
-        except BaseException:
-            pass
+        except BaseException as cleanup_error:
+            response = self._native_response
+            if response is not None:
+                response._abandon_after_failed_release()
+                self._native_response = None
+            if not _is_finalizing():
+                _warn(
+                    f"HeldResult final release failed: {cleanup_error}",
+                    ResourceWarning,
+                    stacklevel=2,
+                )
 
 
 Held = HeldResult
@@ -273,19 +337,9 @@ def _build_transfer_wrapper(
                             )
                         raise
 
-                    def release_cb() -> None:
-                        _invalidate_and_release_held_response(
-                            view,
-                            response,
-                            output.invalidate,
-                            result,
-                        )
-
-                    return HeldResult(
-                        result,
-                        release_cb,
-                        buffer=view,
-                    )
+                    held = HeldResult(result, buffer=view, invalidate_cb=output.invalidate)
+                    held._native_response = response
+                    return held
 
                 try:
                     result = output_decoder(view)
@@ -395,6 +449,8 @@ def _build_transfer_wrapper(
                 except BaseException as exc:
                     if first_error is None:
                         first_error = exc
+                    else:
+                        _attach_cleanup_error(first_error, exc)
             if first_error is not None:
                 raise first_error
 
@@ -430,8 +486,8 @@ def _build_transfer_wrapper(
             if _release_fn is not None:
                 try:
                     release_input_buffer()
-                except Exception:
-                    pass
+                except Exception as cleanup_error:
+                    _attach_cleanup_error(exc, cleanup_error)
             details = _cause_details(exc)
             if stage == "deserialize_input":
                 if input_hook == "scoped_owner":
@@ -613,7 +669,11 @@ def _resolved_hints(func: Callable[..., object]) -> dict[str, Any]:
 def _release_response(response: object) -> None:
     release = getattr(response, "release", None)
     if callable(release):
-        release()
+        try:
+            release()
+        except BaseException:
+            response._abandon_after_failed_release()
+            raise
 
 
 def _release_view_and_response(view: memoryview, response: object) -> None:
@@ -627,6 +687,8 @@ def _release_view_and_response(view: memoryview, response: object) -> None:
     except BaseException as exc:
         if first_error is None:
             first_error = exc
+        else:
+            _attach_cleanup_error(first_error, exc)
     if first_error is not None:
         raise first_error
 
@@ -648,19 +710,26 @@ def _invalidate_and_release_held_response(
         try:
             core_release(invalidator, value)
         except BaseException as exc:
+            response._abandon_after_failed_release()
             if first_error is None:
                 first_error = exc
+            else:
+                _attach_cleanup_error(first_error, exc)
     else:
         try:
             invalidator(value)
         except BaseException as exc:
             if first_error is None:
                 first_error = exc
+            else:
+                _attach_cleanup_error(first_error, exc)
         try:
             _release_response(response)
         except BaseException as exc:
             if first_error is None:
                 first_error = exc
+            else:
+                _attach_cleanup_error(first_error, exc)
 
     if first_error is not None:
         raise first_error
@@ -673,12 +742,32 @@ def _cleanup_preserving_primary(
     try:
         cleanup()
     except BaseException as cleanup_error:
-        add_note = getattr(primary, "add_note", None)
-        if callable(add_note):
-            add_note(
-                "C-Two cleanup also failed with "
-                f"{type(cleanup_error).__name__}: {cleanup_error}",
-            )
+        _attach_cleanup_error(primary, cleanup_error)
+
+
+def _attach_cleanup_error(primary: BaseException, cleanup: BaseException) -> None:
+    if cleanup is primary:
+        return
+    previous = primary.__context__
+    cursor = cleanup
+    seen = {id(cleanup)}
+    while cursor.__context__ is not None:
+        following = cursor.__context__
+        if following is primary:
+            cursor.__context__ = previous if id(previous) not in seen else None
+            break
+        if id(following) in seen:
+            break
+        seen.add(id(following))
+        cursor = following
+    else:
+        if previous is not None and id(previous) not in seen:
+            cursor.__context__ = previous
+    primary.__context__ = cleanup
+    if sys.version_info >= (3, 11):
+        BaseException.add_note(
+            primary, f"C-Two cleanup also failed: {type(cleanup).__name__}: {cleanup}",
+        )
 
 
 def _cause_details(exc: BaseException) -> dict[str, str]:

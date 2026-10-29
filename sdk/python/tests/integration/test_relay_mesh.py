@@ -20,7 +20,7 @@ import c_two as cc
 from c_two.config.ipc import _resolve_server_ipc_config
 from c_two.config.settings import settings
 from c_two.crm.contract import crm_contract
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 
 
 @cc.crm(namespace="test.mesh", version="0.1.0")
@@ -42,9 +42,9 @@ DEFAULT_MAX_PAYLOAD_SIZE = int(_resolve_server_ipc_config()['max_payload_size'])
 def _clean_registry():
     previous_relay = settings.relay_anchor_address
     settings.relay_anchor_address = None
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     yield
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     settings.relay_anchor_address = previous_relay
 
 
@@ -58,7 +58,7 @@ def _http_post(url: str, body: dict) -> urllib.request.Request:
 
 
 def _server_instance_id_for(address: str) -> str:
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     identity = dict(registry._runtime_session.ensure_server())  # noqa: SLF001
     assert identity["ipc_address"] == address
     instance_id = identity["server_instance_id"]

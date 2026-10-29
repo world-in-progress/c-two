@@ -1,0 +1,11 @@
+summary: attempt 1, before Host authorized the Tokio feature adjustment; historical diagnostic evidence
+command: python3 .github/scripts/prepare_fastdb_sdk.py --output "$TASK_TMP/fastdb-sdk"
+exit_code: 0
+FASTDB_SDK_PREPARED {"bundle": "fastdb-core-0.2.3-aarch64-apple-darwin.tar.gz", "bundle_sha256": "5187a11cf47d24bbdbf6a0541ade2e6797a04d763df52971b45a0b3d94c69157", "lib_dir": "$TASK_TMP/fastdb-sdk/lib", "link_mode": "system", "source_sha": "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4", "target": "aarch64-apple-darwin", "version": "0.2.3"}
+
+command: rustc --version
+exit_code: 0
+rustc 1.91.0 (f8297e351 2025-10-28)
+summary: default Rust below parking_lot 0.13 MSRV 1.95; subsequent resolution used preinstalled Rust 1.99.0
+summary: reviewed upstream changelog https://raw.githubusercontent.com/Amanieu/parking_lot/master/CHANGELOG.md
+summary: 0.13 raw lock acquisition state changed; recursive RwLock reads replaced by RecursiveRwLock; Rust MSRV 1.95; removed const_* constructors; fairness behavior changed

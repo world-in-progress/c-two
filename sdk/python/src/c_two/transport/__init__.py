@@ -8,6 +8,7 @@ Provides the complete transport stack for C-Two:
 from __future__ import annotations
 
 __all__ = [
+    'Runtime',
     'CRMProxy',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
@@ -17,10 +18,11 @@ __all__ = [
     'set_transport_policy', 'set_server', 'set_client',
     'set_relay_anchor',
     'register', 'connect', 'close',
-    'unregister', 'server_address', 'server_id', 'shutdown', 'serve',
+    'unregister', 'server_address', 'server_id', 'server_credential', 'shutdown', 'serve',
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    'Runtime': ('.registry', 'Runtime'),
     'with_call_options': ('.client.proxy', 'with_call_options'),
     'set_call_execution_limits': ('.registry', 'set_call_execution_limits'),
     'call_execution_snapshot': ('.registry', 'call_execution_snapshot'),
@@ -40,6 +42,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'unregister':        ('.registry',            'unregister'),
     'server_address':    ('.registry',            'server_address'),
     'server_id':         ('.registry',            'server_id'),
+    'server_credential': ('.registry',            'server_credential'),
     'shutdown':          ('.registry',            'shutdown'),
     'serve':             ('.registry',            'serve'),
 }

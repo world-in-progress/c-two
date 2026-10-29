@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.10.0] — companion c3 0.6.0
+
+Release candidate; publication is pending. See the [release notes](docs/releases/0.10.0.md) for IPC 14 version diagnostics, Unix namespace format 3 and credential schema 4, listener credential snapshots, independent Python runtimes, failed-release ownership, the Rust 1.95 build requirement and the coordinated upgrade.
+
+## [0.9.0] — companion c3 0.5.0
+
+Published 2026-10-25. See the [release notes](docs/releases/0.9.0.md) for Windows user-scoped IPC, native server identity checks, cross-session transfer, IPC 13 and C/FFI ABI 6, plus the full wheel inventory and migration requirements.
+
 ## [0.8.2] — companion c3 0.4.1
 
 ### Added

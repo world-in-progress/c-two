@@ -4,16 +4,16 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
 
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     yield
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
 
 
 def test_direct_ipc_is_selected_by_the_single_core_client():
@@ -28,7 +28,7 @@ def test_direct_ipc_is_selected_by_the_single_core_client():
         assert proxy.client.observed_path == "direct_ipc"
         assert proxy.client.route_uid
         assert proxy.client.route_revision == 1
-        counters = _ProcessRegistry.get()._runtime_session.path_counters()  # noqa: SLF001
+        counters = _get_default_runtime()._runtime_session.path_counters()  # noqa: SLF001
         assert counters == {
             "direct_ipc": 1,
             "explicit_relay": 0,
@@ -90,7 +90,7 @@ def test_semantic_error_fields_match_direct_explicit_and_relay_aware(
         address = cc.server_address()
         assert address is not None
 
-        client_registry = _ProcessRegistry()
+        client_registry = Runtime()
         client_registry.set_relay_anchor(relay.url)
         proxies = [
             client_registry.connect(
@@ -127,8 +127,8 @@ def test_semantic_error_fields_match_direct_explicit_and_relay_aware(
     finally:
         for proxy in proxies:
             if client_registry is not None:
-                client_registry.close(proxy)
+                cc.close(proxy)
         if client_registry is not None:
             client_registry.shutdown()
-        _ProcessRegistry.reset()
+        _reset_default_runtime()
         settings._relay_anchor_address = previous_anchor  # noqa: SLF001

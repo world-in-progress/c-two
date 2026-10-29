@@ -8,7 +8,7 @@ import time
 import pytest
 
 import c_two as cc
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import Runtime
 
 
 # -- Helpers ---------------------------------------------------------------
@@ -30,7 +30,7 @@ class TestServeBasic:
     """Basic cc.serve() behavior tests."""
 
     def setup_method(self):
-        self.registry = _ProcessRegistry()
+        self.registry = Runtime()
 
     def teardown_method(self):
         self.registry._serve_stop = None
@@ -42,7 +42,7 @@ class TestServeBasic:
     def test_serve_no_crm_warns(self, caplog):
         """serve() with no CRM registered logs a warning but doesn't crash."""
         with caplog.at_level(logging.WARNING):
-            self.registry.serve(blocking=False)
+            self.registry._serve(blocking=False)
 
         assert any('no crm registered' in r.message.lower() for r in caplog.records)
 
@@ -51,7 +51,7 @@ class TestServeBasic:
         self.registry.register(IServeCRM, ServeCRM(), name='svc')
 
         start = time.monotonic()
-        self.registry.serve(blocking=False)
+        self.registry._serve(blocking=False)
         elapsed = time.monotonic() - start
 
         assert elapsed < 1.0  # Should return nearly instantly.
@@ -60,8 +60,8 @@ class TestServeBasic:
         """Calling serve() twice is a no-op (idempotent)."""
         self.registry.register(IServeCRM, ServeCRM(), name='svc')
 
-        self.registry.serve(blocking=False)
-        self.registry.serve(blocking=False)  # Should not raise.
+        self.registry._serve(blocking=False)
+        self.registry._serve(blocking=False)  # Should not raise.
 
     def test_serve_blocking_unblocks_on_stop(self):
         """serve(blocking=True) blocks until the stop event is set."""
@@ -70,7 +70,7 @@ class TestServeBasic:
         done = threading.Event()
 
         def _run():
-            self.registry.serve(blocking=True)
+            self.registry._serve(blocking=True)
             done.set()
 
         t = threading.Thread(target=_run, daemon=True)
@@ -88,7 +88,7 @@ class TestServeBasic:
     def test_serve_prints_banner(self, capsys):
         """serve() prints a banner with CRM route info."""
         self.registry.register(IServeCRM, ServeCRM(), name='my_service')
-        self.registry.serve(blocking=False)
+        self.registry._serve(blocking=False)
 
         captured = capsys.readouterr()
         assert 'C-Two Resource Server' in captured.out
@@ -97,7 +97,7 @@ class TestServeBasic:
 
     def test_serve_no_crm_prints_empty_banner(self, capsys):
         """serve() with no CRM shows (no CRM routes registered)."""
-        self.registry.serve(blocking=False)
+        self.registry._serve(blocking=False)
 
         captured = capsys.readouterr()
         assert 'no CRM routes registered' in captured.out

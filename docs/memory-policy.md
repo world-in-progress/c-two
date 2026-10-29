@@ -4,7 +4,7 @@
 
 本文说明 IPC 内存预算、惰性分配与层级回退。Rust resolver 统一提供默认值及校验，Python 提供类型化覆盖门面。
 
-Windows 由原生管道会话信息和 IPC 13 的方向能力决定能否传共享引用。不同会话复用现有 owned/inline/chunked 通路；显式预分配的 SHM 载荷先复制，并通过原所有者释放。buddy 池配置开关不代表跨进程可达性；分片重组仍可使用接收方自己的本地内存池。
+Windows 由原生管道会话信息和握手协商的方向能力决定能否传共享引用。不同会话复用现有 owned/inline/chunked 通路；显式预分配的 SHM 载荷先复制，并通过原所有者释放。buddy 池配置开关不代表跨进程可达性；分片重组仍可使用接收方自己的本地内存池。
 
 ## 1. 三个有限预算单元
 
@@ -40,9 +40,13 @@ C-Two 对自有 IPC 后备与在途组装维护三个有限的字节预算。三
 
 服务端响应对称：不大于 `shm_threshold` 走 inline；否则先尝试 buddy 复用，再尝试 buddy 池扩展，再尝试 dedicated SHM；都不可用或负载无法被 buddy 元数据表示时走分块回退。
 
-SHM 头部版本 3 在同一分配器锁下维护每次 buddy 分配的层级与不回绕标识。释放必须携带该标识并匹配活记录，错误父块、子块或旧标识不会修改位图和计数；长度仍按原规则向上取整，trim 仍释放原容量。每个最小块增加 8 字节元数据，默认 256 MiB/4 KiB backing 的映射和创建预算增加 512 KiB。该分配标识格式由 IPC 12 / C/FFI ABI 5 引入；当前发行使用 IPC 13 / C/FFI ABI 6，SHM header 仍为 3，旧握手与 ABI 直接拒绝。
+SHM 头部版本 3 在同一分配器锁下维护每次 buddy 分配的层级与不回绕标识。释放必须携带该标识并匹配活记录，错误父块、子块或旧标识不会修改位图和计数；长度仍按原规则向上取整，trim 仍释放原容量。每个最小块增加 8 字节元数据，默认 256 MiB/4 KiB backing 的映射和创建预算增加 512 KiB。该分配标识格式由 IPC 12 / C/FFI ABI 5 引入；0.9.x 使用 IPC 13 / C/FFI ABI 6；0.10.0 使用 [IPC 14 固定前导](ipc-handshake.md)，C/FFI ABI 6 与 SHM header 3 保持，旧握手与 ABI 直接拒绝。
 
 接收端组装是完整预留：按 `total_chunks × chunk_size` 一次性预留全部容量，存储层级为 buddy 复用 → GC 后复用 → buddy 扩展 → dedicated SHM → 文件 mmap 最终回退。组装完成时逻辑长度可以裁剪，但容量计费保持到存储真正释放。注意这是"接收全量、组装完成后一次交给资源"，不是流式或增量资源输入。
+
+低层 Rust 的显式释放失败会保留原释放权：`MemPool::release_handle` 返回的 `ReleaseHandleError` 包含原 `handle` 与 `reason`；`RequestLease::release` / `ResponseLease::release` 只有成功后才清空 carrier。竞争解除后可由调用者再次释放，poison、过期身份或错误 pool 不因重试恢复有效。重组 reservation 仍在存储释放成功后归还；空闲映射的 SHM charge 继续遵循原 GC 策略。
+
+`SyncClient::pool_alloc_and_write/fill` 返回 `RequestPreparationError`：`source_error()` 查询准备错误，`release_error()` 查询首次清理错误，`has_pending_release()` 表示是否仍持有待清理块，`release()` 只尝试清理且不重放填充回调。失败块不能取出或发布，`pool_free` 也返回原释放结果。消费式调用、Core/SDK Held 和最终 Drop 的失败接管仍是独立范围；本变化不保证它们能保留失败 owner，也不新增后台重试。
 
 FastDB 载荷内容对该层不透明：C-Two 只搬运字节或共享内存指针，嵌套规格作为不透明 JSON 委托 FastDB Core，这是保持中立的边界。
 
@@ -125,6 +129,8 @@ c3 relay --bind 127.0.0.1:8080 \
 
 `cc.memory_stats()` 返回只读、按方向标注的快照：`runtime_outgoing`（本 Runtime 出站客户端域，首次连接尝试时冻结；观察它不会触发冻结或连接）、`server`（本进程服务端方向，无主机时为 `None`）、`retired`（先前会话关闭时仍有持有者的域，`state="retired"`）、`holds`（与 `cc.hold_stats()` 同源的保留租约计数）与 `budget_cells_note`。每个域含 `role`、`state`、`limits`（三个已解析上限）与 `cells`（`shm`/`file`/`reassembly`），每格为 `limit_bytes`、`used_bytes`、`peak_bytes`、`rejected_allocations`、`rejected_bytes`，峰值跨释放保留高水位。
 
+每个域还在 `limits`、`cells` 同级返回 `abandoned_releases: int`；Rust `BudgetSnapshot` 和 `MemoryScopeStats` 对应字段为饱和 `u64`。它记录本进程最终放弃且尚不能确认完成的释放义务，每个义务由最低层载体计一次。显式失败仍由持有者负责时不计，成功移交给接收方也不计。整帧已发布但发送结果不明时会计数，对端随后仍可能正常释放。同一用户下行为异常的 SHM 对端还可能声称无效、重放或过期的分配坐标；本进程无法释放这些被声称的引用时也会计数，因此计数可能高于实际未释放分配数。该数既不是当前泄漏块数，零也不证明没有任何内存问题。计数不回减、不保留错误历史，不延长 retired 域寿命，也不承诺进程退出后可查。
+
 `cc.hold_stats()` 返回 `active_holds`、`total_held_bytes`、`oldest_hold_seconds` 与 `by_storage`；inline、SHM、handle、文件后备都是可保留租约，hold 不是 SHM 专属。
 
 读数纪律：三个单元是独立的计费口径，分别描述后备与组装/保留容量，不要把任何单元格求和当成物理内存占用，也不要把它们当成零拷贝证明——适配层仍可能有拷贝路径。retired 域的呈现方式属于实现中的行为，本文不对其细节作稳定性承诺。
@@ -132,6 +138,12 @@ c3 relay --bind 127.0.0.1:8080 \
 ## 9. held 生命周期与 FastDB 边界
 
 `cc.hold(proxy.method)(args)` 返回 `HeldResult`，提供 `.value`、`.unsafe_buffer` 与 `.release()`；安全层为显式 `release()`、`with` 上下文与 `__del__` 兜底。`release()` 的顺序固定：先执行 FastDB 检查视图失效回调，再释放传输租约。对便携方法，`held.value` 是 FastDB `Payload` 持有者，释放持有会使该持有者与其检查视图失效。需要在租约范围之外长期保存的数据，必须先通过 FastDB 官方 API 物化；`unsafe_buffer` 是显式不安全逃生口，无法机械失效用户自行导出的裸指针或 NumPy 别名。
+
+显式原生释放失败时，正式 `HeldResult` 保留原 lease、预算及具体连接，后续 `release()` 只重试原生清理。invalidator 在进入前就标记为已尝试，异常或 Rust unwind 后均不重放；逻辑失效开始后，值与 buffer 不可恢复。仍有活跃导出时，原生边界在失效之前拒绝释放；关闭额外导出后可以重试，但本次已 release 的 memoryview 不会重新成为可用 buffer。手工 `HeldResult(release_cb=...)` 的任意回调仍只执行一次。主异常与本次 cleanup 原因通过既有异常链保留，支持 Python 3.10。
+
+消费式出口和最终载体 Drop 失败后，无法把义务交回持有者，便返回或记录错误，保守放弃：不修改未经确认的分配、不退尚未释放的预算、只记一次放弃计数。重组保留原分配容量的计费，不按 trimmed 长度退款；最后一个真实 accounting owner 消失后，弱观察自然脱离。本机制不建后台接管、重试队列或恢复计时器。`Contended` 只说明原自旋预算耗尽，不证明持锁者存活或以后必然恢复；poison/dead-holder 使段持续拒绝分配与释放，不偷锁、不重置锁字。
+
+Prepared SHM 回复在整帧写完、flush 之前移交 buddy 的跨进程释放权；随后的 flush 错误、原期限到期或取消均不能本地 free，只记录结果不明和一次放弃。dedicated 成功发送仍用原生命周期；结果不明时不设置 `freed_at`，即便以后收到 `read_done`，也可能留到原 pool teardown。fill 错误、panic、等待 writer 取消和未完整成帧的失败通过原 pool 清理；失败原因不会被 inline/chunk fallback 抹成成功。
 
 关闭后的持有生命周期：`cc.shutdown()` 不强制释放仍被持有的数据，也不清零计账。其预算计费与保留租约转入 retired 域，继续出现在 `cc.memory_stats()['retired']`，只要旧代理、在途调用或 held 仍持有计数所有者，记录就继续可观察；计费归零与记录删除是两个时刻。最后一个真实所有者消失后，弱观察记录才移除，统计自身不会挽留池、连接、Runtime、回调或 payload。
 
@@ -147,5 +159,6 @@ c3 relay --bind 127.0.0.1:8080 \
 - `docs/reports/memory-budget-contract.md` 与 `docs/plans/2026-09-26-memory-policy.md` — 目标契约与计划背景。
 - [内存阶段验收](reports/memory-native-final-validation.md) — 该阶段固定源码与开发产物证据，保留其历史状态。
 - [0.7.0 统一验收](reports/canonical-local-endpoint-validation.md) — 该版本唯一端点的确切源码、Windows/Linux 门禁与开发产物哈希，保留为历史记录。
-- [0.8.0 发布说明](releases/0.8.0.md) — 当前所有权、分块准入与回复路径变化。
+- [0.10.0 更新说明](releases/0.10.0.md) — 释放失败时的所有权保留与 `abandoned_releases` 计数。
+- [0.8.0 发布说明](releases/0.8.0.md) — 引入当前所有权、分块准入与回复路径模型。
 - [0.7.4 发布记录](reports/0.7.4-publication.zh-CN.md) — 保留该版本的源码、平台门禁与公开产物验证。

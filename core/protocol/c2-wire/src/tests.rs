@@ -1173,30 +1173,58 @@ mod handshake_tests {
     }
 
     #[test]
-    fn shm_direction_negotiation_bumps_handshake_version() {
-        assert_eq!(HANDSHAKE_VERSION, 13);
+    fn fixed_version_preamble_has_handwritten_golden() {
+        assert_eq!(HANDSHAKE_VERSION, 14);
+        for (kind, golden) in [
+            (
+                VersionPreambleKind::Hello,
+                *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\x0e\0\0\0",
+            ),
+            (
+                VersionPreambleKind::Accepted,
+                *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x02\x0e\0\0\0",
+            ),
+            (
+                VersionPreambleKind::VersionMismatch,
+                *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\x0e\0\0\0",
+            ),
+        ] {
+            assert_eq!(encode_version_preamble(kind), golden);
+            validate_version_preamble_header(
+                golden[..16].try_into().unwrap(),
+                kind != VersionPreambleKind::Hello,
+            )
+            .unwrap();
+            assert_eq!(
+                decode_version_preamble_payload(golden[16..].try_into().unwrap()).unwrap(),
+                (kind, 14)
+            );
+        }
+    }
 
-        let client = encode_client_handshake(&[], CAP_CALL_V2, "")
-            .expect("current client handshake encodes");
-        let server = encode_server_handshake(
-            &[("seg0".into(), 4096)],
-            CAP_CALL_V2,
-            &[route_hash("grid")],
-            "test-prefix",
-            &test_identity(),
-        )
-        .expect("current server handshake encodes");
-        // Version 12 is the pre-negotiation handshake: it must be rejected in
-        // both directions with no compatibility fallback.
-        for version in [9_u8, 10, 11, 12] {
-            for mut encoded in [client.clone(), server.clone()] {
-                encoded[0] = version;
-                assert!(matches!(
-                    decode_handshake(&encoded),
-                    Err(crate::frame::DecodeError::InvalidValue { field: "handshake version", value })
-                        if value == u64::from(version)
-                ));
-            }
+    #[test]
+    fn fixed_version_preamble_validates_before_variable_metadata() {
+        // Handwritten response envelope; invalid fields never require a body allocation.
+        let header = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0";
+        for (offset, value) in [(0, 18), (3, 255), (4, 1), (11, 1), (12, 4), (12, 134)] {
+            let mut invalid = header;
+            invalid[offset] = value;
+            assert!(validate_version_preamble_header(&invalid, true).is_err());
+        }
+        assert!(validate_version_preamble_header(&header, false).is_err());
+        let payload = *b"C2IP\x03\x0f\0\0\0";
+        for version in [1_u32, 13, 15, u32::MAX] {
+            let mut bytes = payload;
+            bytes[5..].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                decode_version_preamble_payload(&bytes).unwrap(),
+                (VersionPreambleKind::VersionMismatch, version)
+            );
+        }
+        for (offset, value) in [(0, b'X'), (4, 0), (4, 4), (5, 0)] {
+            let mut invalid = payload;
+            invalid[offset] = value;
+            assert!(decode_version_preamble_payload(&invalid).is_err());
         }
     }
 
@@ -1610,7 +1638,7 @@ mod handshake_tests {
         );
 
         let mut excessive = encoded.clone();
-        excessive[2..4].copy_from_slice(&((MAX_SEGMENTS + 1) as u16).to_le_bytes());
+        excessive[1..3].copy_from_slice(&((MAX_SEGMENTS + 1) as u16).to_le_bytes());
         let err = decode_handshake(&excessive).unwrap_err();
         assert_eq!(err.to_string(), "segment count: invalid value 17");
         let mut too_many = segments;
@@ -1669,9 +1697,9 @@ mod handshake_tests {
     #[test]
     fn handshake_rejects_truncated_segment_and_route_fields() {
         let client = encode_client_handshake(&[("seg".into(), 256)], CAP_CALL_V2, "").unwrap();
-        let err = decode_handshake(&client[..8]).unwrap_err();
+        let err = decode_handshake(&client[..7]).unwrap_err();
         assert_eq!(err.to_string(), "segment entry: need 5 bytes, have 4");
-        let err = decode_handshake(&client[..9]).unwrap_err();
+        let err = decode_handshake(&client[..8]).unwrap_err();
         assert_eq!(err.to_string(), "segment name: need 3 bytes, have 0");
         let err = decode_handshake(&client[..client.len() - 1]).unwrap_err();
         assert_eq!(err.to_string(), "capability flags: need 2 bytes, have 1");
@@ -1725,16 +1753,18 @@ mod handshake_tests {
     }
 
     #[test]
-    fn wrong_version() {
-        let buf = [4, 0, 0]; // version 4
-        let result = decode_handshake(&buf);
-        assert!(result.is_err());
+    fn metadata_rejects_truncated_prefix() {
+        let buf = [4, 0, 0];
+        assert_eq!(
+            decode_handshake(&buf).unwrap_err().to_string(),
+            "prefix: need 4 bytes, have 2"
+        );
     }
 
     #[test]
     fn empty_handshake() {
-        // Version 13, prefix_len=0, 0 segments, cap_flags=0
-        let buf = [13, 0, 0, 0, 0, 0];
+        // prefix_len=0, 0 segments, cap_flags=0
+        let buf = [0, 0, 0, 0, 0];
         let decoded = decode_handshake(&buf).unwrap();
         assert_eq!(decoded.prefix, "");
         assert!(decoded.segments.is_empty());
@@ -1842,21 +1872,9 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn legacy_v10_client_handshake_fixture_is_rejected() {
-        let bytes = hex_to_bytes("0a0001000000001004736567300300");
-        assert!(matches!(
-            decode_handshake(&bytes),
-            Err(DecodeError::InvalidValue {
-                field: "handshake version",
-                value: 10
-            })
-        ));
-    }
-
-    #[test]
     fn canonical_client_handshake_fixture_decodes() {
-        // v13: [0d][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
-        let bytes = hex_to_bytes("0d0001000000001004736567300300");
+        // IPC 14 metadata: [00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
+        let bytes = hex_to_bytes("0001000000001004736567300300");
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
@@ -1869,10 +1887,10 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_server_handshake_fixture_decodes() {
-        // v13: client handshake prefix, server identity, then route table
+        // IPC 14 metadata: client prefix, server identity, then route table
         // with per-route full CRM tag and contract hashes.
         let bytes = hex_to_bytes(
-            "0d00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -1957,8 +1975,8 @@ mod cross_lang_tests {
     fn rust_encode_matches_canonical_client_handshake_fixture() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
-        // v13: [0d][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
-        let expected = hex_to_bytes("0d0001000000001004736567300300");
+        // IPC 14 metadata: [00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
+        let expected = hex_to_bytes("0001000000001004736567300300");
         assert_eq!(encoded, expected);
     }
 
@@ -1998,10 +2016,10 @@ mod cross_lang_tests {
             &identity,
         )
         .unwrap();
-        // v13: [0d][00 prefix_len] then segments/caps, identity, and route table
+        // IPC 14 metadata: [00 prefix_len] then segments/caps, identity, and route table
         // with per-route full CRM tag and contract hash metadata.
         let expected = hex_to_bytes(
-            "0d00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

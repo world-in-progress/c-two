@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import c_two as cc
 import _relay_support as relay
 from c_two.crm.contract import CRMContract, crm_contract
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
 
@@ -90,7 +90,7 @@ def cleanup_stale():
 
 def main():
     cleanup_stale()
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     relay_url = f'http://127.0.0.1:{RELAY_PORT}'
     route_name = f'hello_bench_{os.getpid()}'
 

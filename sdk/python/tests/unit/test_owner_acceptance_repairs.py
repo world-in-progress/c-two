@@ -11,7 +11,7 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _get_default_runtime
 
 
 @cc.crm(namespace='test.owner.acceptance', version='0.1.0')
@@ -52,7 +52,7 @@ def test_shutdown_completion_and_hook_consume_the_same_native_snapshot():
         for _ in range(10):
             resource = EchoResource()
             cc.register(Echo, resource, name='acceptance-echo')
-            registry = _ProcessRegistry.get()
+            registry = _get_default_runtime()
             session = registry._runtime_session
             entered = threading.Event()
             results = []
@@ -93,13 +93,13 @@ def test_transport_swap_failure_preserves_native_owner_for_retry(monkeypatch, fa
     cc.shutdown()
     keepalive, receiver = cc.owner_control_pair()
     cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(0), owner_control=receiver)
-    registry = _ProcessRegistry.get()
+    registry = _get_default_runtime()
     old = registry._runtime_session
     previous_threshold = settings._shm_threshold
     original_kwargs = registry_module._runtime_session_kwargs_from_settings
 
-    def invalid_kwargs():
-        return {**original_kwargs(), 'server_id': 'invalid/server'}
+    def invalid_kwargs(code_overrides):
+        return {**original_kwargs(code_overrides), 'server_id': 'invalid/server'}
 
     class AdoptionBoundary:
         fail_adoption = True

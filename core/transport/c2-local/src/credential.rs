@@ -9,7 +9,7 @@
 //!
 //! The logical [`LocalEndpoint`] is rebuilt from the recorded address and
 //! context through the platform's sole `c2-config` derivation. All Unix
-//! credentials use the existing schema 3 with
+//! credentials use schema 4 with
 //! `unixRoot` and `namespaceId`. Windows uses kernel-managed schema 1.
 //! Recorded protocol metadata must match that backend; a root in a document
 //! describes a namespace and is never accepted as deletion authority.
@@ -28,14 +28,14 @@ use crate::EndpointCredential;
 use crate::UnixSocketIdentity;
 
 /// Unix credential schema. Windows kernel-managed endpoints encode schema 1.
-pub const ENDPOINT_CREDENTIAL_SCHEMA_VERSION: u32 = 3;
+pub const ENDPOINT_CREDENTIAL_SCHEMA_VERSION: u32 = 4;
 
 /// Maximum accepted JSON document size, in bytes. The rule is enforced on
 /// both encode and decode so a caller can bound the file it will read.
 pub const ENDPOINT_CREDENTIAL_MAX_BYTES: usize = 32 * 1024;
 
 const SCHEMA_VERSION_V1: u32 = 1;
-const SCHEMA_VERSION_V3: u32 = 3;
+const SCHEMA_VERSION_V4: u32 = 4;
 #[cfg(windows)]
 const PROTOCOL_WINDOWS: &str = "named-pipe";
 const PLATFORM_UNIX: &str = "unix";
@@ -137,8 +137,6 @@ struct CredentialWire {
     #[serde(default, deserialize_with = "present_value")]
     incarnation: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "present_value")]
-    device: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "present_value")]
     inode: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "present_value")]
     changedSecs: Option<serde_json::Value>,
@@ -150,7 +148,7 @@ struct CredentialWire {
     namespaceId: Option<serde_json::Value>,
 }
 
-/// The encoded document form. Schema 3 adds the context root/id to the logical
+/// The encoded document form. Schema 4 adds the context root/id to the logical
 /// address, protocol, platform, and native object identity. The socket name is
 /// never serialized.
 #[derive(Serialize)]
@@ -164,8 +162,6 @@ struct CredentialDocument<'a> {
     platform: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     incarnation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    device: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inode: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,7 +183,7 @@ impl EndpointCredential {
     pub fn to_json(&self) -> Result<String, EndpointCredentialError> {
         let endpoint = self.endpoint();
         #[cfg(unix)]
-        let schema_version = SCHEMA_VERSION_V3;
+        let schema_version = SCHEMA_VERSION_V4;
         #[cfg(not(unix))]
         let schema_version = SCHEMA_VERSION_V1;
         let document = CredentialDocument {
@@ -195,7 +191,7 @@ impl EndpointCredential {
             address: endpoint.address(),
             protocol: endpoint.protocol(),
             platform: platform_name(),
-            unixRoot: (schema_version == SCHEMA_VERSION_V3)
+            unixRoot: (schema_version == SCHEMA_VERSION_V4)
                 .then(|| {
                     endpoint
                         .context()
@@ -203,16 +199,12 @@ impl EndpointCredential {
                         .and_then(|root| root.to_str())
                 })
                 .flatten(),
-            namespaceId: (schema_version == SCHEMA_VERSION_V3)
+            namespaceId: (schema_version == SCHEMA_VERSION_V4)
                 .then(|| endpoint.context().namespace_id()),
             #[cfg(unix)]
             incarnation: Some(encode_incarnation(self.incarnation())),
             #[cfg(not(unix))]
             incarnation: None,
-            #[cfg(unix)]
-            device: Some(self.identity().device),
-            #[cfg(not(unix))]
-            device: None,
             #[cfg(unix)]
             inode: Some(self.identity().inode),
             #[cfg(not(unix))]
@@ -309,7 +301,7 @@ fn recorded_context(
             EndpointCredentialError::new(EndpointCredentialErrorKind::UnsupportedPlatform)
         });
     }
-    if schema_version != SCHEMA_VERSION_V3 {
+    if schema_version != SCHEMA_VERSION_V4 {
         return Err(EndpointCredentialError::at(
             EndpointCredentialErrorKind::InvalidValue,
             "schemaVersion",
@@ -385,7 +377,7 @@ fn schema_version(wire: &CredentialWire) -> Result<u32, EndpointCredentialError>
         EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, "schemaVersion")
     })?;
     match version {
-        SCHEMA_VERSION_V1 | SCHEMA_VERSION_V3 => Ok(version),
+        SCHEMA_VERSION_V1 | SCHEMA_VERSION_V4 => Ok(version),
         _ => Err(EndpointCredentialError::at(
             EndpointCredentialErrorKind::UnsupportedSchemaVersion,
             "schemaVersion",
@@ -475,12 +467,6 @@ fn unix_credential(
     endpoint: LocalEndpoint,
 ) -> Result<EndpointCredential, EndpointCredentialError> {
     let endpoint = bind_namespace(endpoint)?;
-    let device = required_u64(
-        wire.device.as_ref().ok_or_else(|| {
-            EndpointCredentialError::at(EndpointCredentialErrorKind::MissingField, "device")
-        })?,
-        "device",
-    )?;
     let inode = required_u64(
         wire.inode.as_ref().ok_or_else(|| {
             EndpointCredentialError::at(EndpointCredentialErrorKind::MissingField, "inode")
@@ -500,12 +486,11 @@ fn unix_credential(
         "changedNanos",
     )?;
     let identity = UnixSocketIdentity {
-        device,
         inode,
         changed_secs,
         changed_nanos,
     };
-    if schema_version != SCHEMA_VERSION_V3 {
+    if schema_version != SCHEMA_VERSION_V4 {
         return Err(EndpointCredentialError::at(
             EndpointCredentialErrorKind::InvalidValue,
             "schemaVersion",
@@ -557,14 +542,10 @@ fn windows_credential(
     }
     // The socket identity fields must be absent: a named pipe is a kernel
     // object with no filesystem inode to record.
-    if wire.device.is_some()
-        || wire.inode.is_some()
-        || wire.changedSecs.is_some()
-        || wire.changedNanos.is_some()
-    {
+    if wire.inode.is_some() || wire.changedSecs.is_some() || wire.changedNanos.is_some() {
         return Err(EndpointCredentialError::at(
             EndpointCredentialErrorKind::InvalidValue,
-            "device",
+            "inode",
         ));
     }
     let endpoint = bind_namespace(endpoint)?;

@@ -1,6 +1,6 @@
 # @c-two/c2-mem-ffi
 
-The TypeScript substrate is built from source with its matching native library and Node addon. Endpoint directory behavior is documented in the [0.7.3 guide](../../../../../docs/releases/0.7.3.md).
+The TypeScript substrate is built from source with its matching native library and Node addon. Endpoint directory behavior is documented in the [lifecycle guide](../../../../../docs/local-endpoint-lifecycle.en.md).
 
 TypeScript facade and Node-API loader for the Rust `c2-mem-ffi` memory pool. The native library owns backing names, pool incarnations, buddy generations, allocation and release. JavaScript passes the native block coordinates through unchanged; it does not implement a second allocator or construct OS object names.
 

@@ -84,6 +84,8 @@ pub struct ChunkRegistry<C> {
     active_count: AtomicUsize,
     total_bytes: AtomicU64,
     generations: AtomicU64,
+    // A completed full sweep proves no entry can expire before this time.
+    gc_not_before: Mutex<Option<Instant>>,
     #[cfg(test)]
     admission_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -103,6 +105,7 @@ impl<C> ChunkRegistry<C> {
             active_count: AtomicUsize::new(0),
             total_bytes: AtomicU64::new(0),
             generations: AtomicU64::new(0),
+            gc_not_before: Mutex::new(None),
             #[cfg(test)]
             admission_probe: Mutex::new(None),
             #[cfg(test)]
@@ -165,13 +168,16 @@ impl<C> ChunkRegistry<C> {
         if self.active_count() >= self.config.soft_limit as usize
             || self.total_bytes() >= self.config.max_reassembly_bytes
         {
-            let stats = self.gc_sweep();
-            warn!(
-                expired = stats.expired,
-                remaining = stats.remaining,
-                freed_bytes = stats.freed_bytes,
-                "chunk registry soft limit reached, swept expired entries"
-            );
+            let not_before = *self.gc_not_before.lock();
+            if not_before.is_none_or(|bound| Instant::now() >= bound) {
+                let stats = self.gc_sweep();
+                warn!(
+                    expired = stats.expired,
+                    remaining = stats.remaining,
+                    freed_bytes = stats.freed_bytes,
+                    "chunk registry soft limit reached, swept expired entries"
+                );
+            }
         }
 
         loop {
@@ -347,6 +353,7 @@ impl<C> ChunkRegistry<C> {
         let mut stats = GcStats::default();
         let timeout = self.config.assembler_timeout;
         let now = Instant::now();
+        let mut oldest_live = now;
 
         for shard_mutex in &self.shards {
             let mut removed = Vec::new();
@@ -355,7 +362,14 @@ impl<C> ChunkRegistry<C> {
                 let mut shard = shard_mutex.lock();
                 let expired_keys: Vec<(u64, u64)> = shard
                     .iter()
-                    .filter(|(_, tracked)| now.duration_since(tracked.last_activity) >= timeout)
+                    .filter(|(_, tracked)| {
+                        if now.duration_since(tracked.last_activity) >= timeout {
+                            true
+                        } else {
+                            oldest_live = oldest_live.min(tracked.last_activity);
+                            false
+                        }
+                    })
                     .map(|(key, _)| *key)
                     .collect();
                 for key in expired_keys {
@@ -377,6 +391,10 @@ impl<C> ChunkRegistry<C> {
             // shard lock.
             drop(removed);
         }
+        // Feed only moves activity forward; new entries in an already scanned
+        // shard cannot predate `now`. Publish after every shard and context Drop,
+        // without holding this lock across either. An older proof is still safe.
+        *self.gc_not_before.lock() = oldest_live.checked_add(timeout);
         stats
     }
 
@@ -407,9 +425,9 @@ impl<C> ChunkRegistry<C> {
         drop(removed);
     }
 
-    /// Nonblocking connection teardown. Busy or failed releases leave their
-    /// complete assembler, pool authority, reservation and counters here for
-    /// the same connection owner to retry. Finished carriers are independent.
+    /// Nonblocking connection teardown. Busy releases retain the complete
+    /// assembler for retry; an actual release error abandons its obligation.
+    /// Finished carriers are independent.
     pub fn try_cleanup_connection(&self, conn_id: u64) -> bool {
         self.try_drain_shard(self.shard(conn_id), |(cid, _), _| *cid == conn_id, None)
             .0
@@ -463,38 +481,59 @@ impl<C> ChunkRegistry<C> {
     ) -> (bool, GcStats) {
         // Declared before the guard so unwinding also drops contexts unlocked.
         let mut removed = Vec::new();
+        let mut failures = HashMap::new();
         let Some(mut shard) = shard.try_lock() else {
             return (false, GcStats::default());
         };
         let mut complete = true;
         let mut stats = GcStats::default();
-        for (_, tracked) in shard.extract_if(|key, tracked| {
+        for (key, tracked) in shard.extract_if(|key, tracked| {
             if !matches(key, tracked) {
                 return false;
             }
-            // Never probe a lock then perform a blocking Drop. try_release
-            // validates and mutates under its acquired pool guard; a retained
-            // entry still owns the entire carrier when that attempt fails.
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline)
-                || !matches!(tracked.inner.try_release(), Ok(true))
-            {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 complete = false;
                 return false;
             }
+            // The physical release and validation occur under the same pool
+            // guard. A busy pool retains the entry; an actual error exits the
+            // recovery loop and is abandoned outside the shard lock.
+            match tracked.inner.try_release() {
+                Ok(true) => {
+                    stats.expired += 1;
+                    stats.freed_bytes += tracked.total_bytes;
+                    true
+                }
+                Ok(false) => {
+                    complete = false;
+                    false
+                }
+                Err(error) => {
+                    failures.insert(*key, error);
+                    true
+                }
+            }
+        }) {
             self.active_count.fetch_sub(1, Ordering::Relaxed);
             self.total_bytes
                 .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-            stats.expired += 1;
-            stats.freed_bytes += tracked.total_bytes;
-            true
-        }) {
-            removed.push(tracked);
+            removed.push((key, tracked));
         }
         stats.remaining = shard.len();
         drop(shard);
-        // Only successfully released entries leave the table; context Drop
-        // runs after both shard and pool guards are gone.
-        drop(removed);
+        // All context Drop and failed-release finalization run after both
+        // shard and pool guards are gone. Do not let an Err take the ordinary
+        // assembler Drop, which would retry the same physical release.
+        for (key, tracked) in removed {
+            if let Some(error) = failures.remove(&key) {
+                warn!(conn_id = key.0, request_id = key.1, %error, "final chunk release failed");
+                let TrackedAssembler { inner, context, .. } = tracked;
+                inner.abandon();
+                drop(context);
+            } else {
+                drop(tracked);
+            }
+        }
         (complete, stats)
     }
 }
@@ -631,6 +670,50 @@ mod tests {
     }
 
     #[test]
+    fn failed_nonblocking_extraction_abandons_once_without_refunding() {
+        for exit in ["abort", "connection", "gc"] {
+            let (pool, budget) = budgeted_pool(4096);
+            let reg = ChunkRegistry::new(
+                Arc::clone(&pool),
+                ChunkConfig {
+                    assembler_timeout: Duration::ZERO,
+                    ..ChunkConfig::default()
+                },
+            );
+            reg.insert(1, 7, 1, 4096, ()).unwrap();
+            let original = std::mem::replace(
+                &mut *pool.write(),
+                MemPool::new_with_prefix(base_config(), unique_prefix("failed")),
+            );
+
+            match exit {
+                "abort" => assert!(reg.try_abort(1, 7)),
+                "connection" => assert!(reg.try_cleanup_connection(1)),
+                "gc" => {
+                    let stats = reg.try_gc_sweep();
+                    assert_eq!(stats.expired, 0, "failed release did not free storage");
+                    assert_eq!(stats.remaining, 0);
+                }
+                _ => unreachable!(),
+            }
+            assert!(!reg.contains(1, 7), "{exit}");
+            assert_eq!(reg.active_count(), 0, "{exit}");
+            assert_eq!(reg.total_bytes(), 0, "{exit}");
+            assert_eq!(original.stats().alloc_count, 1, "{exit}");
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 4096, "{exit}");
+            assert_eq!(budget.snapshot().abandoned_releases, 1, "{exit}");
+            assert!(reg.try_cleanup_connection(1));
+            assert_eq!(reg.try_gc_sweep().remaining, 0);
+            assert_eq!(budget.snapshot().abandoned_releases, 1, "{exit}");
+            assert!(
+                budget.reserve(BudgetKind::Reassembly, 4096).is_err(),
+                "{exit}"
+            );
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 4096, "{exit}");
+        }
+    }
+
+    #[test]
     fn take_id_releases_only_its_own_generation() {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
@@ -749,6 +832,7 @@ mod tests {
             fn drop(&mut self) {
                 let registry = self.registry.upgrade().unwrap();
                 assert!(registry.shard(1).try_lock().is_some());
+                assert!(registry.gc_not_before.try_lock().is_some());
                 assert_eq!(registry.pool.try_write().unwrap().stats().alloc_count, 0);
                 self.dropped.fetch_add(1, Ordering::SeqCst);
             }
@@ -821,54 +905,161 @@ mod tests {
     }
 
     #[test]
-    fn feed_updates_last_activity() {
-        let pool = test_pool();
-        let cfg = ChunkConfig {
-            assembler_timeout: Duration::from_secs(60),
-            ..ChunkConfig::default()
-        };
-        let reg = ChunkRegistry::new(pool.clone(), cfg);
-        reg.insert(1, 1, 3, 1024, ()).unwrap();
-        // Make the entry stale without relying on a scheduler waking within
-        // a narrow expiry window. A feed must replace this old activity time.
-        let stale = Instant::now() - Duration::from_secs(120);
-        {
-            let mut shard = reg.shard(1).lock();
-            let entry = shard.get_mut(&(1, 1)).unwrap();
-            entry.last_activity = stale;
+    fn gc_sweep_reentrant_feed_preserves_expiry_progress() {
+        struct Context(Option<Box<dyn FnOnce() + Send>>);
+        impl Drop for Context {
+            fn drop(&mut self) {
+                if let Some(action) = self.0.take() {
+                    action();
+                }
+            }
         }
-        let before_feed = Instant::now();
-        reg.feed(1, 1, 0, &[0u8; 1024]).unwrap();
-        let after_feed = Instant::now();
-        let refreshed = reg.shard(1).lock().get(&(1, 1)).unwrap().last_activity;
-        assert!((before_feed..=after_feed).contains(&refreshed));
-        let stats = reg.gc_sweep();
-        assert_eq!(stats.expired, 0);
+        let (pool, budget) = budgeted_pool(64);
+        let reg = Arc::new(ChunkRegistry::new(
+            pool,
+            ChunkConfig {
+                soft_limit: 1,
+                assembler_timeout: Duration::from_secs(1),
+                ..ChunkConfig::default()
+            },
+        ));
+        let weak = Arc::downgrade(&reg);
+        reg.insert(
+            1,
+            1,
+            1,
+            64,
+            Context(Some(Box::new(move || {
+                let reg = weak.upgrade().unwrap();
+                // Shard 0 was already scanned. The removed backing is freed before
+                // this context inserts and refreshes a new generation there.
+                reg.insert(0, 2, 1, 64, Context(None))
+                    .unwrap_or_else(|(e, _)| panic!("{e}"));
+                reg.shard(0).lock().get_mut(&(0, 2)).unwrap().last_activity =
+                    Instant::now() - Duration::from_secs(2);
+                let before = Instant::now();
+                reg.feed(0, 2, 0, &[42; 64]).unwrap();
+                let after = Instant::now();
+                assert!((before..=after).contains(&reg.shard(0).lock()[&(0, 2)].last_activity));
+                assert_eq!(reg.gc_sweep().expired, 0); // nested scan publishes first
+                thread::sleep(Duration::from_millis(1100)); // slow outer scan crosses expiry
+            }))),
+        )
+        .unwrap_or_else(|(e, _)| panic!("{e}"));
+        reg.shard(1).lock().get_mut(&(1, 1)).unwrap().last_activity =
+            Instant::now() - Duration::from_secs(2);
+        assert_eq!(reg.gc_sweep().expired, 1);
+        assert!(reg.contains(0, 2));
+        // No timer: the next pressure admission must collect the late entry,
+        // despite the outer scan completing after the nested scan.
+        reg.insert(15, 3, 1, 64, Context(None))
+            .unwrap_or_else(|(e, _)| panic!("{e}"));
+        assert!(!reg.contains(0, 2));
         assert_eq!(reg.active_count(), 1);
-        // Cleanup.
-        reg.abort(1, 1);
+        assert_eq!(reassembly_used(&budget), 64);
+        drop(reg);
+        assert_eq!(reassembly_used(&budget), 0);
     }
 
     #[test]
-    fn soft_limit_triggers_gc() {
-        let pool = test_pool();
-        let cfg = ChunkConfig {
-            soft_limit: 2,
-            assembler_timeout: Duration::from_millis(10),
-            ..ChunkConfig::default()
-        };
-        let reg = ChunkRegistry::new(pool.clone(), cfg);
+    fn pressure_gc_preserves_admission_without_timer() {
+        for (soft_limit, byte_limit, expired, partial) in [
+            (2, 4096, true, false),
+            (512, 128, true, false),
+            (2, 4096, true, true),
+            (2, 4096, false, false),
+            (512, 4096, true, false),
+        ] {
+            let (pool, budget) = budgeted_pool(128);
+            let reg = ChunkRegistry::new(
+                pool,
+                ChunkConfig {
+                    soft_limit,
+                    max_reassembly_bytes: byte_limit,
+                    ..ChunkConfig::default()
+                },
+            );
+            let second = if partial { 17 } else { 15 };
+            reg.insert(1, 1, 1, 64, ()).unwrap();
+            reg.insert(second, 2, 1, 64, ()).unwrap();
+            let activity = Instant::now() - Duration::from_secs(if expired { 61 } else { 30 });
+            for (conn, rid) in [(1, 1), (second, 2)] {
+                reg.shard(conn)
+                    .lock()
+                    .get_mut(&(conn, rid))
+                    .unwrap()
+                    .last_activity = activity;
+            }
+            if partial {
+                let _busy = reg.shard(1).lock();
+                assert_eq!(reg.try_gc_sweep().expired, 0);
+            }
+            let result = reg.insert(7, 3, 1, 64, ());
+            let reclaimed = expired && (soft_limit == 2 || byte_limit == 128);
+            if !expired {
+                assert_eq!(
+                    *reg.gc_not_before.lock(),
+                    activity.checked_add(reg.config.assembler_timeout)
+                );
+            }
+            assert_eq!(result.is_ok(), reclaimed);
+            if !reclaimed {
+                assert!(matches!(
+                    result,
+                    Err((ChunkAdmissionError::Capacity(_), ()))
+                ));
+            }
+            assert_eq!(reg.active_count(), if reclaimed { 1 } else { 2 });
+            assert_eq!(reassembly_used(&budget), if reclaimed { 64 } else { 128 });
+            assert_eq!(
+                budget.snapshot().reassembly.rejected_allocations,
+                u64::from(!reclaimed)
+            );
+            drop(reg);
+            assert_eq!(reassembly_used(&budget), 0);
+        }
+    }
+
+    #[test]
+    fn pressure_gc_skips_a_proven_fresh_unrelated_shard() {
+        let (pool, budget) = budgeted_pool(128);
+        let reg = Arc::new(ChunkRegistry::new(
+            pool,
+            ChunkConfig {
+                soft_limit: 1,
+                ..ChunkConfig::default()
+            },
+        ));
         reg.insert(1, 1, 1, 64, ()).unwrap();
-        reg.insert(1, 2, 1, 64, ()).unwrap();
+        assert_eq!(reg.gc_sweep().expired, 0);
+        let busy = reg.shard(0).lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_reg = reg.clone();
+        let worker = thread::spawn(move || tx.send(worker_reg.insert(2, 2, 1, 64, ())).unwrap());
+        let observed = rx.recv_timeout(Duration::from_secs(2));
+        drop(busy); // even the baseline failure releases and joins its worker
+        worker.join().unwrap();
+        observed
+            .expect("fresh pressure admission unnecessarily scanned a locked shard")
+            .unwrap();
         assert_eq!(reg.active_count(), 2);
-        // Let both expire.
-        std::thread::sleep(Duration::from_millis(30));
-        // This insert exceeds soft_limit (2) → triggers gc_sweep internally.
-        reg.insert(1, 3, 1, 64, ()).unwrap();
-        // GC should have cleaned up the 2 expired ones; only the new one remains.
-        assert!(reg.active_count() <= 2);
-        // Cleanup remaining.
-        reg.abort(1, 3);
+        drop(reg);
+        assert_eq!(reassembly_used(&budget), 0);
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            let reg = ChunkRegistry::<()>::new(
+                test_pool(),
+                ChunkConfig {
+                    assembler_timeout: timeout,
+                    ..ChunkConfig::default()
+                },
+            );
+            reg.gc_sweep();
+            assert!(
+                reg.gc_not_before
+                    .lock()
+                    .is_none_or(|bound| bound <= Instant::now())
+            );
+        }
     }
 
     #[test]

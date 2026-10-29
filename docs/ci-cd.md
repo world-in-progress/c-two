@@ -33,7 +33,7 @@ The protected check names remain
 policy success and either successful source checks or an intentional scope
 decision to omit them. A failed scope decision cannot produce a green gate.
 
-Full source coverage includes Linux, macOS, Windows Server 2022/2025 x64, Windows 11 ARM64 and free-threaded Python, including relay, cross-language and endpoint-cleanup checks. ARM64 uses native Rust, Python and Node consumers and builds the pinned Arrow/PyArrow prerequisite for grid examples. A policy-only green run is never sufficient for a release candidate. To qualify a commit whose daily checks did not need native compilation:
+Full source coverage includes Linux, macOS, Windows Server 2022/2025 x64, Windows 11 ARM64 and free-threaded Python, including relay, cross-language and endpoint-cleanup checks. ARM64 uses native Rust, Python and Node consumers. A policy-only green run is never sufficient for a release candidate. To qualify a commit whose daily checks did not need native compilation:
 
 ```bash
 gh workflow run ci.yml --ref main -F force_full=true

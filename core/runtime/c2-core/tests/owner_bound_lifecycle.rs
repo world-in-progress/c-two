@@ -980,7 +980,10 @@ fn check_live_owner_refuses_ordinary_shutdown(handshaken: bool) {
             use c2_local::LocalStream;
             use c2_wire::flags::{FLAG_HANDSHAKE, FLAG_RESPONSE, FLAG_SIGNAL};
             use c2_wire::frame::{self, FrameHeader, encode_frame};
-            use c2_wire::handshake::{CAP_CALL_V2, decode_handshake, encode_client_handshake};
+            use c2_wire::handshake::{
+                CAP_CALL_V2, VersionPreambleKind, decode_handshake, encode_client_handshake,
+                encode_version_preamble,
+            };
             use c2_wire::shutdown_control::{decode_shutdown_ack, encode_shutdown_initiate};
             use tokio::io::AsyncReadExt;
 
@@ -1005,6 +1008,16 @@ fn check_live_owner_refuses_ordinary_shutdown(handshaken: bool) {
                     let mut stream = LocalStream::connect(&endpoint, Duration::from_millis(500))
                         .await
                         .unwrap();
+                    stream
+                        .write_all(&encode_version_preamble(VersionPreambleKind::Hello))
+                        .await
+                        .unwrap();
+                    let mut accepted = [0; 25];
+                    stream.read_exact(&mut accepted).await.unwrap();
+                    assert_eq!(
+                        accepted,
+                        encode_version_preamble(VersionPreambleKind::Accepted)
+                    );
                     let handshake = encode_client_handshake(&[], CAP_CALL_V2, "").unwrap();
                     stream
                         .write_all(&encode_frame(0, FLAG_HANDSHAKE, &handshake))

@@ -27,7 +27,6 @@ from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...crm.payload_plan import PayloadPlanKind
 from ...error import ResourceAlreadyRegistered
-from c_two.config.ipc import _resolve_server_ipc_config
 from ..input_lifetime import (
     InputLifetime,
     InputLifetimeLike,
@@ -146,7 +145,7 @@ class NativeServerBridge:
         lease_tracker: object | None = None,
     ) -> None:
         # Keep config failures at bridge construction, before CRM binding work.
-        _resolve_server_ipc_config(runtime_session.server_ipc_overrides)
+        runtime_session._preflight_server_config()
 
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
@@ -392,33 +391,29 @@ class NativeServerBridge:
         self._runtime_session.ensure_host_started()
 
     def shutdown(self, *, timeout: float = 5.0) -> dict[str, Any]:
-        with self._slots_lock:
-            slots_by_name = dict(self._slots)
-            route_names = list(slots_by_name)
-
         outcome = dict(self._runtime_session.shutdown(
-            route_names=route_names,
+            route_names=None,
             relay_anchor_address=None,
             timeout_seconds=float(timeout),
         ))
 
-        if not outcome['completed']:
-            return outcome
-
-        close_by_route = _close_outcome_by_route(outcome)
-        removed_names = [
-            name for name in route_names if _close_outcome_is_hook_safe(close_by_route.get(name))
-        ]
-        removed_slots: list[CRMSlot] = []
-        with self._slots_lock:
-            for name in removed_names:
-                slot = self._slots.pop(name, None)
-                if slot is not None:
-                    removed_slots.append(slot)
-
-        for slot in removed_slots:
+        for slot in self._take_shutdown_slots(outcome):
             self._invoke_shutdown(slot)
         return outcome
+
+    def _take_shutdown_slots(self, outcome: dict[str, Any]) -> list[CRMSlot]:
+        """Consume the native journal once; the caller invokes hooks outside locks."""
+        if not outcome['completed']:
+            return []
+        close_by_route = _close_outcome_by_route(outcome)
+        removed_slots: list[CRMSlot] = []
+        with self._slots_lock:
+            for name, close in close_by_route.items():
+                if _close_outcome_is_hook_safe(close):
+                    slot = self._slots.pop(name, None)
+                    if slot is not None:
+                        removed_slots.append(slot)
+        return removed_slots
 
     # ------------------------------------------------------------------
     # CRM instance helpers

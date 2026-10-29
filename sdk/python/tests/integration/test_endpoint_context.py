@@ -53,12 +53,12 @@ cc.set_server(server_id=address.removeprefix('ipc://'))
 resource = Resource(label)
 cc.register(Echo, resource, name='same-route')
 context = cc.local_endpoint_context()
-observed = cc.inspect_endpoint(address)
-assert observed['status'] == 'present', observed
+credential = cc.server_credential()
+assert credential is not None
 print(json.dumps({
     'address': cc.server_address(), 'root': context.root,
     'namespace_id': context.namespace_id,
-    'credential': observed['credential'].to_json(),
+    'credential': credential.to_json(),
 }), flush=True)
 assert sys.stdin.readline().strip() == 'stop'
 outcome = cc.shutdown(timeout=5)
@@ -66,6 +66,62 @@ assert outcome['completed'], outcome
 assert resource.hooks == 1
 print(json.dumps({'completed': True, 'hooks': resource.hooks}), flush=True)
 '''
+
+
+@UNIX_ONLY
+def test_server_credential_does_not_wait_for_the_namespace_gate() -> None:
+    with tempfile.TemporaryDirectory(prefix='c2-own-', dir='/tmp') as root:
+        _run_isolated(CONTRACT + textwrap.dedent('''
+            import json
+            from pathlib import Path
+            import subprocess
+            import sys
+            from c_two.transport.registry import _get_default_runtime
+
+            class Resource:
+                def value(self): return 'ready'
+                def done(self): pass
+
+            assert cc.server_credential() is None
+            assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
+            holder = None
+            try:
+                cc.register(Echo, Resource(), name='own')
+                address = cc.server_address()
+                credential = cc.server_credential()
+                observed = cc.inspect_endpoint(address)
+                assert observed['status'] == 'present', observed
+                assert credential.to_json() == observed['credential'].to_json()
+                document = json.loads(credential.to_json())
+                assert document['schemaVersion'] == 4 and 'device' not in document
+                gate = Path(credential.context.root) / '.gate'
+                holder = subprocess.Popen([
+                    sys.executable, '-c',
+                    "import fcntl,sys; f=open(sys.argv[1],'rb'); "
+                    "fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); "
+                    "assert sys.stdin.readline().strip() == 'release'", str(gate),
+                ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert holder.stdout.readline().strip() == 'locked'
+                held = cc.inspect_endpoint(address)
+                assert (held['status'], held['io_kind'], held['retryable']) == (
+                    'io-error', 'WouldBlock', True,
+                ), held
+                # The holder cannot release until the own-listener query returns.
+                assert cc.server_credential().to_json() == credential.to_json()
+                _, stderr = holder.communicate('release\\n', timeout=5)
+                assert holder.returncode == 0, stderr
+                assert cc.reap_endpoint(address, credential)['status'] == 'busy'
+                cc.unregister('own')
+                assert cc.server_credential().to_json() == credential.to_json()
+            finally:
+                if holder is not None and holder.poll() is None:
+                    holder.kill()
+                    holder.communicate(timeout=5)
+                stopped = cc.shutdown(timeout=5)
+            assert stopped['completed'], stopped
+            assert cc.server_credential() is None
+            assert cc.reap_endpoint(address, credential)['status'] == 'already-absent'
+        '''), C2_IPC_ROOT=root)
 
 
 @pytest.fixture
@@ -186,9 +242,9 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
         import os
         from pathlib import Path
         from c_two import _native
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         from c_two.transport.client import util
-        session = _ProcessRegistry.get()._runtime_session
+        session = _get_default_runtime()._runtime_session
         captured = cc.local_endpoint_context()
         assert captured.root == {missing!r}
         assert not session.local_endpoint_frozen
@@ -228,7 +284,7 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
         else:
             raise AssertionError('failed local attempt left root mutable')
         assert cc.shutdown()['completed']
-        replacement = _ProcessRegistry.get()._runtime_session
+        replacement = _get_default_runtime()._runtime_session
         assert replacement is not session
         assert not replacement.local_endpoint_frozen
         assert cc.local_endpoint_context() == captured
@@ -248,19 +304,19 @@ def test_used_selection_survives_repeated_shutdown_then_refreezes(source: str) -
         import c_two as cc
         from c_two import _native
         from c_two.transport.client import util
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         if {source!r} == 'code':
             cc.set_local_endpoint(root={missing!r})
         context = cc.local_endpoint_context()
         assert not util.ping('ipc://failed-inheritance', .01)
-        assert _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        assert _get_default_runtime()._runtime_session.local_endpoint_frozen
         os.environ['C2_IPC_ROOT'] = {changed!r}
         for _ in range(2):
             assert cc.shutdown()['completed']
-            assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+            assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
             assert cc.local_endpoint_context() == context
         assert not util.ping('ipc://failed-inheritance', .01)
-        assert _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        assert _get_default_runtime()._runtime_session.local_endpoint_frozen
         try:
             cc.set_local_endpoint(root={changed!r})
         except cc.error.CoreError as error:
@@ -386,7 +442,7 @@ def test_common_owner_bound_transfer_default_context_and_business_disconnect() -
         import subprocess
         import sys
         import time
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         keepalive, receiver = cc.owner_control_pair()
         class Resource:
             hooks = 0
@@ -396,10 +452,10 @@ def test_common_owner_bound_transfer_default_context_and_business_disconnect() -
         try:
             cc.set_server(server_id={address.removeprefix('ipc://')!r},
                 lifecycle=cc.LifecycleConfig.owner_bound(.05), owner_control=receiver)
-            original = _ProcessRegistry.get()._runtime_session
+            original = _get_default_runtime()._runtime_session
             context = cc.local_endpoint_context()
             cc.set_transport_policy(shm_threshold=8192)
-            replacement = _ProcessRegistry.get()._runtime_session
+            replacement = _get_default_runtime()._runtime_session
             assert replacement is not original
             assert replacement.owner_control_attached
             assert not original.owner_control_attached
@@ -431,7 +487,7 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
     _run_isolated('''
         import threading
         import c_two as cc
-        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.registry import _get_default_runtime
         @cc.crm(namespace='test.endpoint.active', version='0.1.0')
         class Blocking:
             def wait(self) -> str: ...
@@ -450,7 +506,7 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
         results = []
         cc.register(Blocking, resource, name='blocking')
         proxy = cc.connect(Blocking, name='blocking')
-        session = _ProcessRegistry.get()._runtime_session
+        session = _get_default_runtime()._runtime_session
         context = cc.local_endpoint_context()
         worker = threading.Thread(target=lambda: results.append(proxy.wait()))
         worker.start()
@@ -458,8 +514,8 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
             assert resource.entered.wait(5)
             pending = cc.shutdown(timeout=0)
             assert not pending['completed'], pending
-            assert _ProcessRegistry.get()._runtime_session is session
-            assert _ProcessRegistry.get().names == ['blocking']
+            assert _get_default_runtime()._runtime_session is session
+            assert _get_default_runtime().names == ['blocking']
             assert cc.local_endpoint_context() == context
             assert resource.hooks == 0
         finally:
@@ -470,6 +526,6 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
         assert results == ['drained']
         assert resource.hooks == 1
         assert cc.local_endpoint_context() == context
-        assert _ProcessRegistry.get()._runtime_session is not session
+        assert _get_default_runtime()._runtime_session is not session
         cc.close(proxy)
     ''')

@@ -6,16 +6,16 @@ import pytest
 
 import c_two as cc
 from c_two.crm.transferable import HeldResult
-from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.registry import _reset_default_runtime
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
 
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
     yield
-    _ProcessRegistry.reset()
+    _reset_default_runtime()
 
 
 @pytest.mark.parametrize("fail_invalidation", [False, True], ids=["success", "failure"])

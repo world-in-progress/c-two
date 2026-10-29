@@ -18,16 +18,16 @@ pub use c2_core::{
     Connect, ConnectOptions, ConnectionClosed, ConnectionEndReason, ConnectionEvent,
     ConnectionEvents, ConnectionEventsError, ConnectionObservation, ConnectionSide,
     DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, ENDPOINT_CREDENTIAL_MAX_BYTES,
-    ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential, EndpointCredentialError,
-    EndpointCredentialErrorKind, EndpointInspection, EndpointIoError, EndpointReapResult,
-    EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, EnvFilePolicy, EnvMap, Host,
-    HostOptions, LifecycleError, LocalEndpoint, LocalEndpointContext, LocalEndpointNamespace,
-    LocalEndpointOptions, LocalIoCause, MemoryCellStats, MemoryScopeStats, ObservedPath,
-    ObservedRoute, PathCounters, Registration, RouteConcurrency, RouteConcurrencyError,
-    RouteConcurrencyGuard, RouteConcurrencySnapshot, Runtime, RuntimeIdentity, RuntimeMemoryStats,
-    RuntimeOptions, ServerFailure, ServerStartupStage, ServerStartupTimeout,
-    ServiceConcurrencyMode, ServiceDefinition, SweepBatch, SweepBudget, direct_ipc_endpoint,
-    direct_ipc_endpoint_with_context, inspect_endpoint, ping_direct_ipc,
+    ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointBindCause, EndpointCredential,
+    EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
+    EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, EnvFilePolicy,
+    EnvMap, Host, HostOptions, LifecycleError, LocalEndpoint, LocalEndpointContext,
+    LocalEndpointNamespace, LocalEndpointOptions, LocalIoCause, MemoryCellStats, MemoryScopeStats,
+    ObservedPath, ObservedRoute, PathCounters, Registration, RouteConcurrency,
+    RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot, Runtime,
+    RuntimeIdentity, RuntimeMemoryStats, RuntimeOptions, ServerFailure, ServerStartupStage,
+    ServerStartupTimeout, ServiceConcurrencyMode, ServiceDefinition, SweepBatch, SweepBudget,
+    direct_ipc_endpoint, direct_ipc_endpoint_with_context, inspect_endpoint, ping_direct_ipc,
     ping_direct_ipc_with_context, reap_endpoint, shutdown_direct_ipc,
     shutdown_direct_ipc_with_context,
 };
@@ -50,6 +50,7 @@ pub mod generated {
     pub use c2_error::{C2Error, ErrorCode};
 
     pub use crate::error::{adapter_error, fastdb_adapter_error, fastdb_cause_details};
+    pub use crate::held::release_held_after_error;
     pub use crate::payload::{
         BorrowedPayload, charge_payload_input, open_borrowed, open_held, open_owned,
     };

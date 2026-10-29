@@ -20,11 +20,13 @@ python resource.py
 $env:C2_ENV_FILE = ''
 ```
 
-Set process policy before registering resources or connecting clients. Each native configuration domain freezes when first used: local endpoints on the first bind/connect attempt, including a failed attempt; call admission on the first remote business call. Queries do not freeze configuration. Later environment changes do not alter a frozen choice.
+Set Runtime policy before registering resources or connecting clients. Each native configuration domain freezes when first used: local endpoints on the first bind/connect attempt, including a failed attempt; call admission on the first remote business call. Queries do not freeze configuration. Later environment changes do not alter a frozen choice.
+
+Python exposes `cc.Runtime()` for an independently configured instance. The module-level functions use the default Runtime; each explicit instance owns its code overrides and native session and does not copy the default Runtime's overrides. All instances still read the same process environment and `.env` through the native resolver. Configure a particular instance with `runtime.set_*()` before its freeze point instead of changing `os.environ` to target one Runtime. `None` retains each setter's existing clear/inherit meaning.
 
 ## SDK and transport configuration
 
-`cc.set_server(...)` sets server identity, IPC overrides and lifecycle policy. `cc.set_client(...)` sets client IPC overrides. `cc.set_transport_policy(...)` controls process transport policy.
+`cc.set_server(...)` sets server identity, IPC overrides and lifecycle policy. `cc.set_client(...)` sets client IPC overrides. `cc.set_transport_policy(...)` controls the default Runtime transport policy; `runtime.set_transport_policy(...)` configures that explicit instance.
 
 ```python
 import c_two as cc
@@ -60,7 +62,7 @@ An explicit `address='ipc://...'` uses local IPC independently of relay discover
 
 `cc.set_server(startup_timeout=seconds)` configures the Core startup wait before the first registration. The native `RuntimeSession` constructor and `set_server_options` accept the same keyword. Values must be finite, non-negative seconds representable by the native clock; zero expires immediately. Omitted/`None` selects the existing finite five-second default, not unlimited waiting. This default bounds unattended startup; it is not a performance guarantee for a busy runner. Applications should choose their deployment budget explicitly.
 
-Core owns and freezes server configuration on the first Host start attempt, including failure. The setting survives pre-use RuntimeSession replacement by `set_transport_policy`. A completed `cc.shutdown()` creates a fresh session that can be configured again. Rust resolution is explicit `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > five seconds. Readiness and its direct IPC ping share the wait budget; owner startup fencing uses the configured duration too. Configuration/contract validation precedes this wait, and cleanup after expiry retains its separate shutdown budget, so this is not a total wall-clock limit on `cc.register()`.
+Core owns and freezes server configuration on the first Host start attempt, including failure. `runtime.start()` is also a first Host attempt, even with no CRM. The setting survives pre-use RuntimeSession replacement by `set_transport_policy`. `cc.shutdown()` or explicit `runtime.shutdown()` creates a configurable fresh session when it consumes a completed result. After pending, call SDK shutdown again; background completion alone does not replace the session. Rust resolution is explicit `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > five seconds. Readiness and its direct IPC ping share the wait budget; owner startup fencing uses the configured duration too. Configuration/contract validation precedes this wait, and cleanup after expiry retains its separate shutdown budget, so this is not a total wall-clock limit on `cc.register()` or `runtime.start()`.
 
 Startup expiry raises public `c_two.error.CoreError` with `category='lifecycle'`, `lifecycle_kind='startup_timeout'`, `startup_stage` (`readiness`, `responsiveness` or `owner_control`) and `timeout_seconds`. Its `io_operation`, `io_kind` and `raw_os_error` are `None`. Local bind failures retain their original structured OS cause and no longer carry the misleading `config error` message prefix. These diagnostics do not authorize retry, takeover or endpoint cleanup. See the [public error field table](local-endpoint-lifecycle.en.md#public-structured-python-errors) for types and value ranges.
 
@@ -133,12 +135,12 @@ After an HTTP caller disconnects, an already-dispatched forward retains its inpu
 
 | Platform | Endpoint | Location configuration |
 | --- | --- | --- |
-| Unix | UDS in the final owner-controlled directory | `cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, c3 `--ipc-root`; default `/tmp/c2-<uidhex>` |
+| Unix | UDS in the final owner-controlled directory | `cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, c3 `--ipc-root`; default `/tmp/c2-v3-<uidhex>` |
 | Windows | Named Pipe scoped to the current TokenUser SID | Automatic; Unix root overrides are rejected |
 
 On Unix, the socket is `<root>/<32-character id>`. Applications provision custom directories. Mode `0755` is accepted when the current user owns the directory and has read, write and traversal access, with no group or other write permission. C-Two creates its default directory with mode `0700` and sets and verifies each socket as `0600` before listening. Spaces and Unicode are preserved. Bind, connect and liveness probes address the short name through an open directory descriptor, so filesystem directory-opening limits govern the configured path. C-Two manages its endpoint, lease and coordinator files, preserves unrelated files and directories, and does not change existing permissions or recursively create parents.
 
-For the macOS default namespace, only gate/marker/lease records move to `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination`; the socket path stays unchanged and aliases share one coordinator. Non-default custom roots and Linux retain colocated records. See the [lifecycle guide](local-endpoint-lifecycle.en.md) for record cleanup and the separate old-layout cold switch.
+For the macOS default namespace, gate/marker/lease records live in `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`, separate from sockets under `/tmp/c2-v3-<uidhex>`; aliases share one coordinator. Both default locations change with namespace disk format 3. Non-default custom roots and Linux retain colocated records. The `v3` default-directory suffix is the namespace disk format version; custom roots gain no suffix. Different formats have separate default directories and need no same-path cold switch. Sharing one custom physical root across formats is unsupported; on `unsupported-namespace-format`, rebuild only after all old processes exit, cannot restart and the full root is safely archived offline. See the [lifecycle guide](local-endpoint-lifecycle.en.md) for record and exact-reap rules.
 
 macOS also rejects extended ACL allow entries that can change directory contents, attributes or permissions, including inherited entries; read, traversal and deny entries are accepted.
 
@@ -146,7 +148,7 @@ macOS also rejects extended ACL allow entries that can change directory contents
 from pathlib import Path
 import c_two as cc
 
-ipc_dir = Path('/Users/me/Library/Application Support/my-app/ipc')
+ipc_dir = Path.home() / 'my-app' / 'ipc'
 ipc_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 cc.set_local_endpoint(root=str(ipc_dir))
 ```
@@ -176,4 +178,4 @@ An expired deadline ends caller waiting while the dispatched native transaction 
 
 `@cc.read` and `@cc.write` declare access semantics; writes are the default. Registration's `cc.ConcurrencyConfig` sets the route mode, `max_pending` and `max_workers`. The native route handle governs both same-process calls and remote dispatch. See the [Python SDK guide](python-usage.md).
 
-`cc.LifecycleConfig` selects default `Persistent` or explicit `OwnerBound`. OwnerBound uses a private receiver capability prepared by the controller before readiness. `cc.shutdown(timeout=...)` bounds this caller's observation of native drain. Listener closure, work drain and held leases are separate observations; see the [lifecycle guide](local-endpoint-lifecycle.en.md).
+`cc.LifecycleConfig` selects default `Persistent` or explicit `OwnerBound`. OwnerBound uses a private receiver capability prepared by the controller before readiness. After acquiring the Python instance lock, `cc.shutdown(timeout=...)` uses one deadline for Native owner/Core/pool lock waits and drain observation. The instance-lock wait is outside that deadline; expiry does not cancel an already-started native drain. Listener closure, work drain and held leases are separate observations; see the [lifecycle guide](local-endpoint-lifecycle.en.md).

@@ -1,0 +1,262 @@
+[
+  {
+    "step": "validation-handoff",
+    "summary": [
+      "Full checks were subsequently executed by Host; early collection failures caused by absent sibling FastDB files are superseded by the Host results below."
+    ]
+  },
+  {
+    "step": "matrix-receipt",
+    "exit": 0,
+    "summary": [
+      "26 passed in 0.06s"
+    ],
+    "command": "uv run pytest tests/repo/test_portable_matrix_receipt.py -q"
+  },
+  {
+    "step": "python310-syntax",
+    "exit": 0,
+    "summary": [
+      "1 passed in 0.05s"
+    ],
+    "command": "uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs"
+  },
+  {
+    "step": "uv-sync-final",
+    "exit": 0,
+    "summary": [
+      "Resolved 46 packages; installed c-two 0.9.0."
+    ],
+    "command": "uv sync --reinstall-package c-two"
+  },
+  {
+    "step": "native-final",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+    ],
+    "command": "uv run python tools/dev/test_native.py"
+  },
+  {
+    "step": "rust-sdk-final",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+      "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.80s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "command": "cargo test --manifest-path sdk/rust/Cargo.toml --all-features"
+  },
+  {
+    "step": "python-focused",
+    "exit": 0,
+    "summary": [
+      "44 passed in 0.82s"
+    ],
+    "command": "uv run pytest sdk/python/tests/unit/test_held_result.py sdk/python/tests/unit/test_portable_payload_runtime.py sdk/python/tests/unit/test_memory_stats_facade.py -q --timeout=30"
+  },
+  {
+    "step": "local-final",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 157 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.53s",
+      "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-local"
+  },
+  {
+    "step": "server-wire-final",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 203 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.67s",
+      "test result: ok. 167 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-server -p c2-wire"
+  },
+  {
+    "step": "ipc-carrier-final",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 235 filtered out; finished in 1.70s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-ipc --lib response_lease_tests"
+  },
+  {
+    "step": "server-carrier-final",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 186 filtered out; finished in 1.76s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-server --lib dispatcher::tests"
+  },
+  {
+    "step": "host-core-workspace",
+    "executor": "Host",
+    "summary": [
+      "Complete check executed by Host: 1923 passed; 0 failed; 7 ignored."
+    ]
+  },
+  {
+    "step": "host-python-ordinary",
+    "executor": "Host",
+    "summary": [
+      "Complete check executed by Host: 1292 passed."
+    ]
+  },
+  {
+    "step": "host-cross-language-portable-matrix",
+    "executor": "Host",
+    "summary": [
+      "Complete check executed by Host: cross-language and 18-row matrix, 25 passed."
+    ]
+  },
+  {
+    "step": "host-ci",
+    "executor": "Host",
+    "source_commit": "728967a9",
+    "source_relationship": "Implementation at 728967a9 matches f73b5dde with evidence-only content removed.",
+    "summary": [
+      "Ubuntu 3.12 and 3.14t, macOS 15, Windows 2022 and 2025 Core, Rust, native, portable and TypeScript gates passed.",
+      "Python ordinary boundary failed; Windows ARM64 pending at review."
+    ]
+  },
+  {
+    "step": "affected-core-after",
+    "exit": 101,
+    "summary": [
+      "test result: ok. 243 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.46s",
+      "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.78s",
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.41s",
+      "1 failed case(s); failure output retained in affected-core-after.txt"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire -p c2-local -p c2-ipc -p c2-server"
+  },
+  {
+    "step": "affected-core-final",
+    "exit": 101,
+    "summary": [
+      "test result: ok. 243 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.77s",
+      "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.77s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.18s",
+      "test result: FAILED. 156 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.46s",
+      "1 failed case(s); failure output retained in affected-core-final.txt"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire -p c2-local -p c2-ipc -p c2-server"
+  },
+  {
+    "step": "affected-core",
+    "exit": 101,
+    "summary": [
+      "test result: ok. 144 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 10.08s",
+      "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.16s",
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+      "test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.48s",
+      "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s",
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+      "test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.14s",
+      "test result: ok. 7 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 5.04s",
+      "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s",
+      "test result: FAILED. 242 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.62s",
+      "1 failed case(s); failure output retained in affected-core.txt"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire -p c2-local -p c2-ipc -p c2-server -p c2-core"
+  },
+  {
+    "step": "benchmark-core-after",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 144 filtered out; finished in 0.13s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-core --lib r07_success_path_benchmark -- --ignored --nocapture"
+  },
+  {
+    "step": "benchmark-shm-after",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 203 filtered out; finished in 0.03s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-server --lib r07_shm_success_benchmark -- --ignored --nocapture"
+  },
+  {
+    "step": "dedicated-after-correction",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.28s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-ipc --lib dedicated_backing_retires_within_bounded_crash_timeout -- --nocapture"
+  },
+  {
+    "step": "dedicated-before-correction",
+    "exit": 101,
+    "summary": [
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 242 filtered out; finished in 5.28s",
+      "1 failed case(s); failure output retained in dedicated-before-correction.txt"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-ipc --lib dedicated_backing_retires_within_bounded_crash_timeout -- --nocapture"
+  },
+  {
+    "step": "held-before",
+    "exit": 101,
+    "summary": [
+      "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 140 filtered out; finished in 0.00s",
+      "2 failed case(s); failure output retained in held-before.txt"
+    ],
+    "command": "CARGO_TARGET_DIR=\"$PWD/core/target\" cargo test --manifest-path core/Cargo.toml -p c2-core --lib lifetime::tests:: -- --nocapture"
+  },
+  {
+    "step": "local-existing-repro",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 157 filtered out; finished in 0.06s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-local --lib final_lease_stat_io_releases_close_and_drop_leases -- --nocapture"
+  },
+  {
+    "step": "local-progress",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 156 filtered out; finished in 0.00s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-local --lib frame_progress_tests -- --nocapture"
+  },
+  {
+    "step": "prepared-after",
+    "exit": 0,
+    "summary": [
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.00s"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-server --lib full_frame_flush -- --nocapture"
+  },
+  {
+    "step": "prepared-before",
+    "exit": 101,
+    "summary": [
+      "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 195 filtered out; finished in 0.00s",
+      "2 failed case(s); failure output retained in prepared-before.txt"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-server --lib full_frame_flush -- --nocapture"
+  },
+  {
+    "step": "remaining-core-final",
+    "exit": 101,
+    "summary": [
+      "test result: ok. 186 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.72s",
+      "test result: FAILED. 183 passed; 20 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.62s",
+      "20 failed case(s); failure output retained in remaining-core-final.txt"
+    ],
+    "command": "cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire -p c2-server"
+  }
+]

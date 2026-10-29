@@ -1910,6 +1910,7 @@ async fn acquire_request_client_for_route(
                 | c2_ipc::IpcError::ContractMismatch(_)
                 | c2_ipc::IpcError::IdentityMismatch { .. }
                 | c2_ipc::IpcError::Protocol(_)
+                | c2_ipc::IpcError::ProtocolVersionMismatch { .. }
                 | c2_ipc::IpcError::Handshake(_)
                 | c2_ipc::IpcError::CatalogCompacted { .. }
                 | c2_ipc::IpcError::WatchUnavailable(_)
@@ -2076,6 +2077,17 @@ fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Respo
                 ("route".to_string(), route_name.clone()),
             ])),
         ),
+        c2_ipc::IpcError::ProtocolVersionMismatch { local, peer } => semantic_error_response(
+            StatusCode::BAD_GATEWAY,
+            C2Error::new(ErrorCode::ProtocolViolation, error.to_string()).with_details(
+                BTreeMap::from([
+                    ("route".to_string(), route_name.to_string()),
+                    ("transport".to_string(), "ipc".to_string()),
+                    ("local_protocol_version".to_string(), local.to_string()),
+                    ("peer_protocol_version".to_string(), peer.to_string()),
+                ]),
+            ),
+        ),
         c2_ipc::IpcError::Protocol(message) | c2_ipc::IpcError::Handshake(message) => {
             semantic_error_response(
                 StatusCode::BAD_GATEWAY,
@@ -2104,6 +2116,7 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::Decode(_) => "decode",
         c2_ipc::IpcError::Handshake(_) => "handshake",
         c2_ipc::IpcError::Protocol(_) => "protocol",
+        c2_ipc::IpcError::ProtocolVersionMismatch { .. } => "protocol-version-mismatch",
         c2_ipc::IpcError::IdentityMismatch { .. } => "identity-mismatch",
         c2_ipc::IpcError::ContractMismatch(_) => "contract-mismatch",
         c2_ipc::IpcError::RouteNotFound(_) => "route-missing",
@@ -2119,6 +2132,7 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::LocalCallRejected(_) => "local-call-rejected",
         c2_ipc::IpcError::Closed => "closed",
         c2_ipc::IpcError::Pool(_) => "pool",
+        c2_ipc::IpcError::PoolRetired => "pool-retired",
     }
 }
 
@@ -2373,6 +2387,14 @@ mod tests {
                 c2_ipc::IpcError::MethodNotFound {
                     route_name: "grid".into(),
                     method_name: "missing".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::ProtocolViolation,
+            ),
+            (
+                c2_ipc::IpcError::ProtocolVersionMismatch {
+                    local: 14,
+                    peer: 15,
                 },
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::ProtocolViolation,

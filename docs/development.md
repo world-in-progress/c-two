@@ -19,12 +19,12 @@ case "$(uname -s)" in
   Linux) export LD_LIBRARY_PATH="$FASTDB_PAYLOAD_SYSTEM_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
 esac
 FASTDB_PAYLOAD_LINK_MODE=source uv sync        # compile the Python extension with static FastDB
-FASTDB_PAYLOAD_LINK_MODE=source uv sync --group examples  # optional: pandas/pyarrow
+FASTDB_PAYLOAD_LINK_MODE=source uv sync --group examples  # optional: pandas
 FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link  # build and link the native c3 CLI
 cp .env.example .env                          # optional: local environment configuration
 ```
 
-Requires [uv](https://github.com/astral-sh/uv) and a Rust toolchain. The setup above uses the Core SDK for development and testing. Deployable CLI and Python-extension builds select `FASTDB_PAYLOAD_LINK_MODE=source` and statically link the same immutable FastDB 0.2.3 source; this is separate from the Core/Rust SDK system-link contract. On Linux/macOS, run the Python suite with `C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/ -q -n 4 --timeout=30`. See the [test guide](../sdk/python/tests/README.md) for focused commands and per-test timeout overrides. Run the Rust suites with `cargo test --manifest-path core/Cargo.toml --workspace` and `cargo test --manifest-path sdk/rust/Cargo.toml --all-features`. Python 3.10 remains the supported minimum. On Windows, follow the [Windows build guide](windows-native-usage.md) and omit the Python worker flag.
+Requires [uv](https://github.com/astral-sh/uv) and Rust 1.95 or newer. The setup above uses the Core SDK for development and testing. Deployable CLI and Python-extension builds select `FASTDB_PAYLOAD_LINK_MODE=source` and statically link the same immutable FastDB 0.2.3 source; this is separate from the Core/Rust SDK system-link contract. On Linux/macOS, run the Python suite with `C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/ -q -n 4 --timeout=30`. See the [test guide](../sdk/python/tests/README.md) for focused commands and per-test timeout overrides. Run the Rust suites with `cargo test --manifest-path core/Cargo.toml --workspace` and `cargo test --manifest-path sdk/rust/Cargo.toml --all-features`. Python 3.10 remains the supported minimum. On Windows, follow the [Windows build guide](windows-native-usage.md) and omit the Python worker flag.
 
 The workspace dev group includes `c-two[fastdb]` and pins Python
 `fastdb4py==0.2.3`. Bare installs omit FastDB and NumPy; the native CoreSDK

@@ -277,6 +277,17 @@ async fn split_sweep_counts_lease_only_and_unknown_socket_in_one_budget() {
     assert!(unverified >= 1);
     assert!(!fixture.lease(&orphan).exists());
     assert_eq!(fs::read(fixture.socket(&unknown)).unwrap(), b"foreign");
+    fault::inject(Failure::MissingLeaseSocketStat);
+    let outcome = reap_slot(unknown.context(), &endpoint_stem(&unknown).unwrap());
+    let reached = !fault::take_if(Failure::MissingLeaseSocketStat);
+    assert_eq!(fs::read(fixture.socket(&unknown)).unwrap(), b"foreign");
+    fs::remove_file(fixture.socket(&unknown)).unwrap();
+    fixture.assert_only_coordinator();
+    assert!(reached);
+    let EndpointReapResult::IoError(error) = outcome else {
+        panic!("split socket stat error was lost: {outcome:?}");
+    };
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
 }
 
 #[tokio::test]
@@ -323,6 +334,27 @@ async fn split_invalid_lease_and_failed_bind_preserve_foreign_records() {
     assert!(!fixture.lease(&failed).exists());
     assert!(lease.exists(), "rollback may remove only its own new lease");
     assert!(invalid_lease.exists());
+}
+
+#[tokio::test]
+async fn split_lease_read_preserves_native_slot_io_cause() {
+    let fixture = SplitFixture::new();
+    let endpoint = fixture.endpoint(&fixture.sockets, "slot-io");
+    let listener = crate::LocalListener::bind(&endpoint).unwrap();
+    let bytes = fs::read(fixture.lease(&endpoint)).unwrap();
+    let namespace = ManagedNamespace::open_root(&fixture.sockets, false, false).unwrap();
+    fault::inject(Failure::ReadLeaseStat);
+    let result = read_lease_record(&namespace, &endpoint_stem(&endpoint).unwrap())
+        .map_err(namespace_reap_error);
+    assert!(!fault::take_if(Failure::ReadLeaseStat));
+    drop(namespace);
+    assert_eq!(fs::read(fixture.lease(&endpoint)).unwrap(), bytes);
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    fixture.assert_only_coordinator();
+    let Err(EndpointReapResult::IoError(error)) = result else {
+        panic!("split slot I/O cause was lost: {result:?}");
+    };
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
 }
 
 #[test]
@@ -402,32 +434,6 @@ async fn custom_root_keeps_socket_and_records_together() {
     assert!(fixture.slot(&custom, &endpoint, "").exists());
     assert!(!fixture.records.exists());
     assert!(matches!(listener.close(), EndpointReapResult::Reaped));
-}
-
-#[tokio::test]
-async fn split_preserves_legacy_lease_and_refuses_slot_adoption() {
-    let fixture = SplitFixture::new();
-    let endpoint = fixture.endpoint(&fixture.sockets, "legacy");
-    let listener = crate::LocalListener::bind(&endpoint).unwrap();
-    let credential = listener.credential();
-    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
-    let legacy = fixture.slot(&fixture.sockets, &endpoint, LEASE_SUFFIX);
-    fs::write(&legacy, b"old-format-or-incomplete").unwrap();
-    assert!(crate::LocalListener::bind(&endpoint).is_err());
-    assert!(matches!(
-        inspect_managed(&endpoint),
-        EndpointInspection::Unverified(_)
-    ));
-    assert!(matches!(
-        crate::reap_endpoint(&endpoint, &credential),
-        EndpointReapResult::Unverified(_)
-    ));
-    let batch = sweep(&endpoint).next_batch(SweepBudget::default());
-    assert!(batch.round_complete, "{batch:?}");
-    assert_eq!(batch.unverified, 1);
-    assert_eq!(batch.already_absent, 0);
-    assert_eq!(fs::read(legacy).unwrap(), b"old-format-or-incomplete");
-    assert!(!fixture.lease(&endpoint).exists());
 }
 
 #[tokio::test]

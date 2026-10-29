@@ -1,0 +1,8 @@
+command: cargo test --manifest-path core/Cargo.toml -p c2-server --lib full_frame_flush -- --nocapture
+exit_code: 0
+
+running 2 tests
+R07_PUBLICATION kind=BrokenPipe live=1 reused=false
+R07_PUBLICATION kind=TimedOut live=1 reused=false
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.00s

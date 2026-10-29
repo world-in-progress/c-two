@@ -99,15 +99,6 @@ jobs:
           ref: ${{ env.FASTDB_SOURCE_SHA }}
           path: fastdb
           persist-credentials: false
-      # PyArrow has no Windows ARM64 wheel. Build its matching Arrow C++
-      # dependency so the locked PyArrow sdist and grid examples run natively.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        if: matrix.os == 'windows-11-arm'
-        with:
-          repository: apache/arrow
-          ref: 31b4b6c0a0a7e7c117312d285541a21446675ec6 # apache-arrow-24.0.0
-          path: arrow
-          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
@@ -190,25 +181,6 @@ jobs:
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.16.0
-      - name: Build the native Arrow prerequisite for grid examples
-        if: matrix.os == 'windows-11-arm'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $prefix = Join-Path $env:RUNNER_TEMP 'arrow-native'
-          $build = Join-Path $env:RUNNER_TEMP 'arrow-build'
-          # Match Arrow's MSVC ARM64 CI: xsimd lacks MSVC ARM64 intrinsics.
-          cmake -S ../arrow/cpp -B $build --preset ninja-release-python-minimal `
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" `
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DARROW_DEPENDENCY_SOURCE=BUNDLED -DARROW_BUILD_STATIC=OFF -DARROW_SIMD_LEVEL=NONE
-          if ($LASTEXITCODE -ne 0) { throw 'Arrow configure failed' }
-          cmake --build $build --target install --parallel 2
-          if ($LASTEXITCODE -ne 0) { throw 'Arrow build failed' }
-          "CMAKE_PREFIX_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "PYARROW_BUNDLE_ARROW_CPP=ON" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "SKBUILD_CMAKE_ARGS=-DARROW_SIMD_LEVEL=NONE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Remove-Item -LiteralPath $build -Recurse -Force
       - name: Cache the pinned Emscripten SDK
         id: emsdk_cache
         uses: actions/cache@v4

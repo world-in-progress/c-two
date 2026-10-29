@@ -1,0 +1,254 @@
+summary: test-core-initial
+command: cargo test --locked --manifest-path core/Cargo.toml --workspace --exclude c2-codegen
+exit_code: 101
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_config-1b2c1b980b475235)
+test result: ok. 135 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_contract-a7a35cf7e48452c7)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/admission.rs ($TASK_TMP/target/debug/deps/admission-6e10dc33273544cf)
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.47s
+     Running tests/descriptor.rs ($TASK_TMP/target/debug/deps/descriptor-fc0cb0242381a09b)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/release.rs ($TASK_TMP/target/debug/deps/release-9ce291212572b3c3)
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_core-4e986ddd3aaaf357)
+test result: ok. 144 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.07s
+     Running tests/call_deadlines.rs ($TASK_TMP/target/debug/deps/call_deadlines-f3d6d537f723ce5b)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.02s
+     Running tests/call_execution_observer.rs ($TASK_TMP/target/debug/deps/call_execution_observer-6e9ba008e032c899)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/client_modes.rs ($TASK_TMP/target/debug/deps/client_modes-14b6f47f0c0ea868)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.14s
+     Running tests/connect_timeout.rs ($TASK_TMP/target/debug/deps/connect_timeout-2a0c7add09217377)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+     Running tests/connection_observation.rs ($TASK_TMP/target/debug/deps/connection_observation-7b3e2e97badeff6e)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/endpoint_context.rs ($TASK_TMP/target/debug/deps/endpoint_context-29671e36141f7fcf)
+test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.48s
+     Running tests/error_normalization.rs ($TASK_TMP/target/debug/deps/error_normalization-8aa728d6395a760f)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+     Running tests/host_routes.rs ($TASK_TMP/target/debug/deps/host_routes-65e0a4760fb3a2b6)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/lifetime_ordering.rs ($TASK_TMP/target/debug/deps/lifetime_ordering-e2d68bc8e0a2b463)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/local_endpoint_context.rs ($TASK_TMP/target/debug/deps/local_endpoint_context-8a6065da7d6d70b3)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/native_endpoint.rs ($TASK_TMP/target/debug/deps/native_endpoint-dba72af2b0f87066)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/owner_bound_lifecycle.rs ($TASK_TMP/target/debug/deps/owner_bound_lifecycle-eff67e38715d7a79)
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.14s
+     Running tests/relay_endpoint_context.rs ($TASK_TMP/target/debug/deps/relay_endpoint_context-4eb40365e9623ab2)
+test result: ok. 7 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 5.03s
+     Running tests/runtime_retirement.rs ($TASK_TMP/target/debug/deps/runtime_retirement-5d67c5bb207b502d)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_error-980a4bfaa200d2a7)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_http-2acbae06a2ae0c3c)
+test result: ok. 417 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.47s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_ipc-bd42b460ad383f55)
+test result: FAILED. 244 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.98s
+failures:
+
+---- client::abandoned_release_tests::pending_request_error_does_not_retry_free_under_pending_lock stdout ----
+
+thread 'client::abandoned_release_tests::pending_request_error_does_not_retry_free_under_pending_lock' (21069874) panicked at transport/c2-ipc/src/client.rs:9656:9:
+assertion failed: result.unwrap()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Warning: final request release failed: Pool error: prealloc free failed: pool owner incarnation mismatch; allocation=PoolAllocation { seg_idx: 256, generation: 0, allocation_id: 0, offset: 0, actual_size: 69632, level: 0, is_dedicated: true }
+
+
+failures:
+    client::abandoned_release_tests::pending_request_error_does_not_retry_free_under_pending_lock
+
+test result: FAILED. 244 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.98s
+
+error: test failed, to rerun pass `-p c2-ipc --lib`
+summary: probe-release-test
+command: cargo test --locked --manifest-path core/Cargo.toml -p c2-ipc --lib client::abandoned_release_tests::pending_request_error_does_not_retry_free_under_pending_lock -- --exact --nocapture
+exit_code: 0
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_ipc-86d588add291c026)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 0.00s
+summary: test-core-interrupted
+command: cargo test --locked --manifest-path core/Cargo.toml --workspace --exclude c2-codegen
+exit_code: -2
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_config-1b2c1b980b475235)
+test result: ok. 135 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_contract-a7a35cf7e48452c7)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/admission.rs ($TASK_TMP/target/debug/deps/admission-6e10dc33273544cf)
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.36s
+     Running tests/descriptor.rs ($TASK_TMP/target/debug/deps/descriptor-fc0cb0242381a09b)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/release.rs ($TASK_TMP/target/debug/deps/release-9ce291212572b3c3)
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_core-4e986ddd3aaaf357)
+test result: ok. 144 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.08s
+     Running tests/call_deadlines.rs ($TASK_TMP/target/debug/deps/call_deadlines-f3d6d537f723ce5b)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s
+     Running tests/call_execution_observer.rs ($TASK_TMP/target/debug/deps/call_execution_observer-6e9ba008e032c899)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/client_modes.rs ($TASK_TMP/target/debug/deps/client_modes-14b6f47f0c0ea868)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.16s
+     Running tests/connect_timeout.rs ($TASK_TMP/target/debug/deps/connect_timeout-2a0c7add09217377)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+     Running tests/connection_observation.rs ($TASK_TMP/target/debug/deps/connection_observation-7b3e2e97badeff6e)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests/endpoint_context.rs ($TASK_TMP/target/debug/deps/endpoint_context-29671e36141f7fcf)
+test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.48s
+     Running tests/error_normalization.rs ($TASK_TMP/target/debug/deps/error_normalization-8aa728d6395a760f)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+     Running tests/host_routes.rs ($TASK_TMP/target/debug/deps/host_routes-65e0a4760fb3a2b6)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/lifetime_ordering.rs ($TASK_TMP/target/debug/deps/lifetime_ordering-e2d68bc8e0a2b463)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/local_endpoint_context.rs ($TASK_TMP/target/debug/deps/local_endpoint_context-8a6065da7d6d70b3)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/native_endpoint.rs ($TASK_TMP/target/debug/deps/native_endpoint-dba72af2b0f87066)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/owner_bound_lifecycle.rs ($TASK_TMP/target/debug/deps/owner_bound_lifecycle-eff67e38715d7a79)
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.14s
+     Running tests/relay_endpoint_context.rs ($TASK_TMP/target/debug/deps/relay_endpoint_context-4eb40365e9623ab2)
+test result: ok. 7 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 5.04s
+     Running tests/runtime_retirement.rs ($TASK_TMP/target/debug/deps/runtime_retirement-5d67c5bb207b502d)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_error-980a4bfaa200d2a7)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_http-2acbae06a2ae0c3c)
+test result: ok. 417 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.48s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_ipc-bd42b460ad383f55)
+summary: task interrupted before nested Cargo consumers ran, to make those consumers honor the single CARGO_TARGET_DIR requirement
+summary: test-core
+command: cargo test --locked --manifest-path core/Cargo.toml --workspace --exclude c2-codegen
+exit_code: 0
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_config-1b2c1b980b475235)
+test result: ok. 135 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_contract-a7a35cf7e48452c7)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/admission.rs ($TASK_TMP/target/debug/deps/admission-6e10dc33273544cf)
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.28s
+     Running tests/descriptor.rs ($TASK_TMP/target/debug/deps/descriptor-fc0cb0242381a09b)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/release.rs ($TASK_TMP/target/debug/deps/release-9ce291212572b3c3)
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_core-4e986ddd3aaaf357)
+test result: ok. 144 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.07s
+     Running tests/call_deadlines.rs ($TASK_TMP/target/debug/deps/call_deadlines-f3d6d537f723ce5b)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.02s
+     Running tests/call_execution_observer.rs ($TASK_TMP/target/debug/deps/call_execution_observer-6e9ba008e032c899)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/client_modes.rs ($TASK_TMP/target/debug/deps/client_modes-14b6f47f0c0ea868)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.14s
+     Running tests/connect_timeout.rs ($TASK_TMP/target/debug/deps/connect_timeout-2a0c7add09217377)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+     Running tests/connection_observation.rs ($TASK_TMP/target/debug/deps/connection_observation-7b3e2e97badeff6e)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/endpoint_context.rs ($TASK_TMP/target/debug/deps/endpoint_context-29671e36141f7fcf)
+test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.48s
+     Running tests/error_normalization.rs ($TASK_TMP/target/debug/deps/error_normalization-8aa728d6395a760f)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+     Running tests/host_routes.rs ($TASK_TMP/target/debug/deps/host_routes-65e0a4760fb3a2b6)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/lifetime_ordering.rs ($TASK_TMP/target/debug/deps/lifetime_ordering-e2d68bc8e0a2b463)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/local_endpoint_context.rs ($TASK_TMP/target/debug/deps/local_endpoint_context-8a6065da7d6d70b3)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/native_endpoint.rs ($TASK_TMP/target/debug/deps/native_endpoint-dba72af2b0f87066)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/owner_bound_lifecycle.rs ($TASK_TMP/target/debug/deps/owner_bound_lifecycle-eff67e38715d7a79)
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.13s
+     Running tests/relay_endpoint_context.rs ($TASK_TMP/target/debug/deps/relay_endpoint_context-4eb40365e9623ab2)
+test result: ok. 7 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 5.03s
+     Running tests/runtime_retirement.rs ($TASK_TMP/target/debug/deps/runtime_retirement-5d67c5bb207b502d)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_error-980a4bfaa200d2a7)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_http-2acbae06a2ae0c3c)
+test result: ok. 417 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.45s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_ipc-bd42b460ad383f55)
+test result: ok. 245 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.29s
+     Running tests/connect_timeout.rs ($TASK_TMP/target/debug/deps/connect_timeout-ab243cbc8052cec1)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.92s
+     Running tests/ownership_api.rs ($TASK_TMP/target/debug/deps/ownership_api-f7265b00c2edae82)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.99s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_local-a82dc73ed6ea026f)
+test result: ok. 157 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.57s
+     Running tests/endpoint_context.rs ($TASK_TMP/target/debug/deps/endpoint_context-c7643dce57479ab1)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+     Running tests/windows_identity.rs ($TASK_TMP/target/debug/deps/windows_identity-b910c9de7d1760d6)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_local_security-e6b6ae465ec5baf8)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_mem-ed377040dec2de5c)
+test result: ok. 186 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.52s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_mem_ffi-54ef19d6558ea396)
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_server-e90f37039a1bb431)
+test result: ok. 205 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.66s
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_wire-def2793071b5417e)
+test result: ok. 168 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+   Doc-tests c2_config
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests c2_contract
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests c2_core
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests c2_error
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests c2_http
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests c2_ipc
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+   Doc-tests c2_local
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests c2_local_security
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests c2_mem
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+   Doc-tests c2_mem_ffi
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests c2_server
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests c2_wire
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+summary: test-core {"failed": 0, "ignored": 5, "passed": 1895, "result_lines": 45}
+summary: test-rust-sdk
+command: cargo test --locked --manifest-path sdk/rust/Cargo.toml --all-features
+exit_code: 0
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c_two-dbb98b2b14526892)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/connect_timeout.rs ($TASK_TMP/target/debug/deps/connect_timeout-f3ce4168184eeef5)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/payload_lifetime.rs ($TASK_TMP/target/debug/deps/payload_lifetime-3996acb22a8e1cd4)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/public_api.rs ($TASK_TMP/target/debug/deps/public_api-a5a6d6f6d2d5cb03)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.30s
+   Doc-tests c_two
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+summary: test-rust-sdk {"failed": 0, "ignored": 0, "passed": 23, "result_lines": 5}
+summary: test-python-native
+command: uv run --no-sync python tools/dev/test_native.py
+exit_code: 0
+     Running unittests src/lib.rs ($TASK_TMP/target/debug/deps/c2_ffi-8dcda2b60472afa8)
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+   Doc-tests c2_ffi
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+summary: test-python-native {"failed": 0, "ignored": 0, "passed": 19, "result_lines": 2}
+summary: test-cli
+command: cargo test --locked --manifest-path cli/Cargo.toml
+exit_code: 0
+     Running unittests src/main.rs ($TASK_TMP/target/debug/deps/c3-912994cda97d4086)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/cli_help.rs ($TASK_TMP/target/debug/deps/cli_help-67333f4998a221df)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+     Running tests/contract_commands.rs ($TASK_TMP/target/debug/deps/contract_commands-8ec5d6390758af3d)
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+     Running tests/endpoint_cli.rs ($TASK_TMP/target/debug/deps/endpoint_cli-8c499005f8178088)
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+     Running tests/registry_commands.rs ($TASK_TMP/target/debug/deps/registry_commands-26d02ff7e5e89a86)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/relay_args.rs ($TASK_TMP/target/debug/deps/relay_args-3e69b58cc8e44120)
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+summary: test-cli {"failed": 0, "ignored": 0, "passed": 76, "result_lines": 6}
+summary: test-only cleanup fixture now retries legitimate nonblocking deferrals for at most one second before asserting release-error cleanup; original deadlock, accounting and permit-return assertions retained
+summary: generated consumers use parking_lot 0.13; nested consumer checks inherit the caller CARGO_TARGET_DIR
+summary: c2-codegen and cross-language matrices deferred to Host as assigned; Linux/macOS/Windows hosted CI not run by this worker

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use c2_wire::chunk::ReassemblyBacking;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::client::ServerPoolState;
 
@@ -37,14 +37,22 @@ pub struct ServerShmResponse {
     data_size: u32,
     is_dedicated: bool,
     allocation_id: u64,
+    budget: c2_mem::MemoryBudget,
+    released: bool,
 }
 
 impl std::fmt::Debug for ServerShmResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ServerShmResponse(seg={}, gen={}, off={}, size={}, ded={})",
-            self.seg_idx, self.generation, self.offset, self.data_size, self.is_dedicated
+            "ServerShmResponse(pool={:p}, seg={}, gen={}, off={}, size={}, ded={}, allocation_id={})",
+            Arc::as_ptr(&self.server_pool),
+            self.seg_idx,
+            self.generation,
+            self.offset,
+            self.data_size,
+            self.is_dedicated,
+            self.allocation_id
         )
     }
 }
@@ -60,6 +68,7 @@ impl ServerShmResponse {
         data_size: u32,
         is_dedicated: bool,
         allocation_id: u64,
+        budget: c2_mem::MemoryBudget,
     ) -> Self {
         Self {
             server_pool,
@@ -69,6 +78,8 @@ impl ServerShmResponse {
             data_size,
             is_dedicated,
             allocation_id,
+            budget,
+            released: false,
         }
     }
 
@@ -91,10 +102,31 @@ impl ServerShmResponse {
     ///
     /// `Ok(false)` means the pool lock was contended and nothing happened.
     /// Used by the receive loop when a reply arrives whose waiter is gone.
-    pub(crate) fn try_release(&self) -> Result<bool, String> {
-        let Some(mut server_pool) = self.server_pool.try_lock() else {
+    pub(crate) fn try_release(&mut self) -> Result<bool, String> {
+        if self.released {
+            return Ok(true);
+        }
+        let Some(server_pool) = self.server_pool.try_lock() else {
             return Ok(false);
         };
+        self.release_with_guard(server_pool)?;
+        self.released = true;
+        Ok(true)
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        if self.released {
+            return Ok(());
+        }
+        self.release_with_guard(self.server_pool.lock())?;
+        self.released = true;
+        Ok(())
+    }
+
+    fn release_with_guard(
+        &self,
+        mut server_pool: MutexGuard<'_, Option<ServerPoolState>>,
+    ) -> Result<(), String> {
         let state = server_pool
             .as_mut()
             .ok_or_else(|| "server pool not initialised".to_string())?;
@@ -106,7 +138,24 @@ impl ServerShmResponse {
             self.is_dedicated,
             self.allocation_id,
         )?;
-        Ok(true)
+        Ok(())
+    }
+
+    fn abandon(&mut self) {
+        if !self.released {
+            eprintln!("Warning: abandoning server SHM response release: {self:?}");
+            self.budget.record_abandoned_release();
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for ServerShmResponse {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            eprintln!("Warning: final server SHM response release failed: {error}; {self:?}");
+            self.abandon();
+        }
     }
 }
 
@@ -179,31 +228,21 @@ impl ResponseLease {
     ///
     /// SHM coordinates are validated before any coordinate-derived free is
     /// attempted; reassembly backing release (storage first, then budget
-    /// refund) is owned by the carrier.
+    /// refund) is owned by the carrier. Failure retains the original carrier
+    /// for another explicit release attempt.
     pub fn release(&mut self) -> Result<(), String> {
-        let Some(response) = self.response.take() else {
+        let Some(response) = self.response.as_mut() else {
             return Ok(());
         };
         match response {
             ResponseData::Inline(_) => Ok(()),
-            ResponseData::Shm(carrier) => {
-                let mut server_pool = carrier.server_pool.lock();
-                let state = server_pool
-                    .as_mut()
-                    .ok_or_else(|| "server pool not initialised".to_string())?;
-                state.release_response(
-                    carrier.seg_idx,
-                    carrier.generation,
-                    carrier.offset,
-                    carrier.data_size,
-                    carrier.is_dedicated,
-                    carrier.allocation_id,
-                )
-            }
-            ResponseData::Handle(mut backing) => backing
+            ResponseData::Shm(carrier) => carrier.release(),
+            ResponseData::Handle(backing) => backing
                 .release()
                 .map_err(|error| format!("response handle release failed: {error}")),
-        }
+        }?;
+        self.response.take();
+        Ok(())
     }
 
     /// Materialize owned bytes and release the backing allocation.
@@ -221,17 +260,25 @@ impl ResponseLease {
 
         let copy_result = self.copy_bytes();
         let release_result = self.release();
+        if release_result.is_err() {
+            self.abandon();
+        }
         combine_copy_and_release(copy_result, release_result)
+    }
+
+    /// Consume this obligation without another free or budget refund.
+    pub fn abandon(mut self) {
+        if let Some(response) = self.response.take() {
+            match response {
+                ResponseData::Inline(_) => {}
+                ResponseData::Shm(mut carrier) => carrier.abandon(),
+                ResponseData::Handle(backing) => backing.abandon(),
+            }
+        }
     }
 
     pub fn is_released(&self) -> bool {
         self.response.is_none()
-    }
-}
-
-impl Drop for ResponseLease {
-    fn drop(&mut self) {
-        let _ = self.release();
     }
 }
 

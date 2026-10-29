@@ -81,7 +81,6 @@ def _example_env() -> dict[str, str]:
 
 def test_ipc_example():
     pytest.importorskip("pandas", reason="Python grid examples require examples dependencies")
-    pytest.importorskip("pyarrow", reason="Python grid examples require examples dependencies")
 
     root = _repo_root()
     crm_proc: subprocess.Popen[str] | None = None
@@ -129,7 +128,6 @@ def test_ipc_example():
 
 def test_relay_example(start_c3_relay):
     pytest.importorskip("pandas", reason="Python grid examples require examples dependencies")
-    pytest.importorskip("pyarrow", reason="Python grid examples require examples dependencies")
 
     root = _repo_root()
     relay = start_c3_relay()

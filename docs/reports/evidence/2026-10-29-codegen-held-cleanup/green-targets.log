@@ -1,0 +1,12 @@
+$ cargo test --manifest-path core/Cargo.toml --offline --quiet --no-run --test generated_targets
+
+exit_code=0
+$ $WORK/target/debug/deps/generated_targets-0f5d395a0f9255e6 --format=terse --nocapture
+
+running 8 tests
+skipping sibling composition check because FastDB TypeScript source is unavailable
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.45s
+
+
+exit_code=0

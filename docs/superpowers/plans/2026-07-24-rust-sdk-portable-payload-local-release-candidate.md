@@ -2003,7 +2003,7 @@ DYLD_LIBRARY_PATH="$C2_LRC_ROOT/candidate/fastdb/core/lib"
 Use the platform runtime-library variable equivalent outside macOS.
 
 - [ ] Scan `.crate` contents, normalized manifests, generated source, build
-  diagnostics, and the final binary dependency report for `/Users/soku`,
+  diagnostics, and the final binary dependency report for `~`,
   `../fastdb`, `../c-two`, `../toodle`, and the three repository roots.
 
 ### Task 11.4 — Build C-Two Python and Node artifacts

@@ -1,0 +1,101 @@
+{
+  "input_commit": "2113550e1d37e8f6ba6a1b6cfdd1a34d64ced3ca",
+  "platform": "Darwin arm64",
+  "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+  "cargo": "cargo 1.91.0 (ea2d97820 2025-10-10)",
+  "target_directory": "$TASK_TMP/target (the only CARGO_TARGET_DIR used)",
+  "diagnostic_build": {
+    "command": "CARGO_TARGET_DIR=$TASK_TMP/target cargo test --manifest-path core/Cargo.toml -p c2-local --no-run",
+    "exit_code": 0
+  },
+  "crate_load_before": {
+    "command": "$CARGO_TARGET_DIR/debug/deps/c2_local-<hash> --test-threads=N",
+    "runs": 101,
+    "threads": {
+      "32": 1,
+      "16": 100
+    },
+    "exit_counts": {
+      "101": 74,
+      "0": 27
+    },
+    "target_failures": 0,
+    "failed_tests": {
+      "tests::another_process_cannot_displace_the_listener": 13,
+      "tests::cancelled_accept_can_accept_the_next_client": 21,
+      "tests::cancelling_a_partial_write_poisoned_the_connection": 20,
+      "tests::completed_reply_remains_readable_after_server_stream_is_dropped": 21,
+      "tests::connected_pair_allows_same_session_shm_and_abort_is_an_error": 11,
+      "tests::duplicate_listener_cannot_displace_owner_and_restart_works": 2,
+      "tests::listener_ownership_can_be_released_on_another_thread": 5,
+      "tests::listener_restarts_after_cancelling_a_pending_accept": 6,
+      "tests::listener_restarts_after_owner_process_exits_without_destructors": 2,
+      "tests::listener_restarts_after_server_closes_even_with_an_old_client_handle": 5,
+      "tests::owned_halves_exchange_bytes_and_abort_wakes_a_pending_read": 9,
+      "unix_managed::tests::final_lease_stat_io_preserves_stale_bind_reap_and_sweep": 1
+    }
+  },
+  "short_fork_load": {
+    "command": "$CARGO_TARGET_DIR/debug/deps/c2_local-<hash> final_lease_stat_io_ --test-threads=4",
+    "runs": 100,
+    "exit_counts": {
+      "0": 100
+    },
+    "per_run": {
+      "passed": 3,
+      "failed": 0
+    },
+    "load": "temporary sibling test: four threads, each 200 raw fork/_exit/waitpid cycles; no held-child interval"
+  },
+  "amplified_fork_load": {
+    "command": "CARGO_TARGET_DIR=$TASK_TMP/target cargo test --manifest-path core/Cargo.toml -p c2-local --lib final_lease_stat_io_ -- --test-threads=4",
+    "exit_code": 101,
+    "passed": 2,
+    "failed": 1,
+    "actual_result": "close=false: Busy",
+    "load": "temporary sibling test: four threads, each 40 fork/waitpid cycles; child poll(NULL, 0, 10) before _exit(0); temporary 1 ms delay after successful probe flock and before closing the plain File",
+    "temporary_diagnostics_retained": false
+  },
+  "deterministic_regression": {
+    "command": "CARGO_TARGET_DIR=$TASK_TMP/target cargo test --manifest-path core/Cargo.toml -p c2-local --lib final_lease_stat_io_releases_close_and_drop_leases -- --exact unix_managed::tests::final_lease_stat_io_releases_close_and_drop_leases",
+    "trigger": "Keep unlocked.try_clone() open across probe cleanup and reap, duplicating a fork-inherited open file description. No retry, delay or relaxed assertion.",
+    "before": {
+      "exit_code": 101,
+      "passed": 0,
+      "failed": 1,
+      "actual_result": "close=true: Busy",
+      "probe_cleanup": "drop(unlocked)"
+    },
+    "after": {
+      "exit_code": 0,
+      "passed": 1,
+      "failed": 0,
+      "probe_cleanup": "drop(Lease(Some(unlocked)))"
+    }
+  },
+  "additional_high_load_observation": {
+    "command": "$CARGO_TARGET_DIR/debug/deps/c2_local-<hash> --test-threads=32",
+    "concurrent_command": "CARGO_TARGET_DIR=$TASK_TMP/target cargo test --manifest-path core/Cargo.toml --workspace --exclude c2-codegen --features c2-http/relay --no-run",
+    "exit_code": 101,
+    "passed": 156,
+    "failed": 1,
+    "ignored": 1,
+    "test": "unix_managed::tests::managed_parallel_first_initialization_shares_one_gate_inode",
+    "actual_result": "WouldBlock: managed endpoint namespace gate is busy",
+    "status": "Not repaired or attributed further; independent from the reproduced probe OFD bug. Retained for Host follow-up."
+  },
+  "workspace_build": {
+    "command": "CARGO_TARGET_DIR=$TASK_TMP/target cargo test --manifest-path core/Cargo.toml --workspace --exclude c2-codegen --features c2-http/relay --no-run",
+    "exit_code": 0
+  },
+  "static_checks": {
+    "command": "rustfmt --edition 2024 --check core/transport/c2-local/src/tests.rs core/transport/c2-local/src/unix_managed/tests.rs core/transport/c2-ipc/src/tests.rs core/transport/c2-ipc/tests/connect_timeout.rs; git diff --check",
+    "exit_code": 0
+  },
+  "source_files": {
+    "core/transport/c2-local/src/tests.rs": "241ec3585b6cba4ce39f578759979d8f8d9004a44035d0d73950cd54ecc0fde3",
+    "core/transport/c2-local/src/unix_managed/tests.rs": "9fbe7a24ad43c0fe92b9f7a60e08db17842d23275982d6a2715b57441f4fef4d",
+    "core/transport/c2-ipc/src/tests.rs": "9225a1375726e949a270325c642ce8bb0062174e545a6f101643c30644759083",
+    "core/transport/c2-ipc/tests/connect_timeout.rs": "8d01504d2c629d29da882e18956d3b8ea32f2865dedce3fbcac6390ed5964a76"
+  }
+}

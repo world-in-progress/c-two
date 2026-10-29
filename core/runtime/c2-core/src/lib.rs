@@ -54,10 +54,10 @@ pub use identity::{
 pub use c2_local::{
     ConnectionClosed, ConnectionEndReason, ConnectionEvent, ConnectionEvents,
     ConnectionEventsError, ConnectionObservation, ConnectionSide, ENDPOINT_CREDENTIAL_MAX_BYTES,
-    ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential, EndpointCredentialError,
-    EndpointCredentialErrorKind, EndpointInspection, EndpointIoError, EndpointReapResult,
-    EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, LocalEndpoint, SweepBatch,
-    SweepBudget, inspect_endpoint, reap_endpoint,
+    ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointBindCause, EndpointCredential,
+    EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
+    EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, LocalEndpoint,
+    SweepBatch, SweepBudget, inspect_endpoint, reap_endpoint,
 };
 pub use call_execution::{CallExecutionObservation, CallExecutionObserver};
 // Blocking waits for the connection-observation surface stay with Core's
@@ -72,7 +72,10 @@ pub use outcome::{
     RouteCloseOutcome, ShutdownOutcome, UnregisterOutcome,
 };
 pub use owner_bound::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot};
-pub use session::{Runtime, RuntimeIdentity, RuntimeOptions};
+pub use session::{
+    FailedStartShutdownReceipt, Runtime, RuntimeIdentity, RuntimeOptions, RuntimeShutdownReceipt,
+    RuntimeShutdownTarget,
+};
 
 // SDK facades use the canonical Core owner capability types.
 pub use c2_config::{

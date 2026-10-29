@@ -7,7 +7,7 @@ use c2_error::{C2Error, C2ErrorEnvelope, ErrorCode};
 use c2_http::client::HttpError;
 use c2_ipc::IpcError;
 use c2_ipc::client::ChunkError;
-use c2_local::EndpointIoError;
+use c2_local::{EndpointBindCause, EndpointIoError};
 use c2_server::{ServerError, ServerFailure, ServerStartupTimeout};
 
 use crate::RegisterFailureOutcome;
@@ -15,6 +15,10 @@ use crate::RegisterFailureOutcome;
 /// Failures in process runtime setup, route lifecycle, and relay projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleError {
+    RuntimeRetired,
+    ShutdownWaitTimeout {
+        stage: &'static str,
+    },
     InvalidServerId(String),
     ClientConfigFrozen,
     ConfigFrozen,
@@ -45,6 +49,10 @@ pub enum LifecycleError {
 impl fmt::Display for LifecycleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RuntimeRetired => formatter.write_str("runtime is retired"),
+            Self::ShutdownWaitTimeout { stage } => {
+                write!(formatter, "shutdown wait deadline exceeded at {stage}")
+            }
             Self::InvalidServerId(message) => formatter.write_str(message),
             Self::ConfigFrozen => formatter.write_str("runtime configuration is frozen"),
             Self::ClientConfigFrozen => formatter.write_str("client IPC configuration is frozen"),
@@ -126,7 +134,7 @@ impl From<ServerError> for LifecycleError {
 /// Facts from the actual local endpoint operation, not a retry or cleanup permit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalIoCause {
-    Bind(EndpointIoError),
+    Bind(EndpointBindCause),
     Connect(EndpointIoError),
 }
 
@@ -140,7 +148,8 @@ impl LocalIoCause {
 
     pub fn error(self) -> EndpointIoError {
         match self {
-            Self::Bind(error) | Self::Connect(error) => error,
+            Self::Bind(cause) => cause.error,
+            Self::Connect(error) => error,
         }
     }
 }
@@ -148,7 +157,7 @@ impl LocalIoCause {
 impl LifecycleError {
     pub fn local_io_cause(&self) -> Option<LocalIoCause> {
         match self {
-            Self::Server(failure) => failure.bind_error.map(LocalIoCause::Bind),
+            Self::Server(failure) => failure.bind_cause.map(LocalIoCause::Bind),
             _ => None,
         }
     }
@@ -237,6 +246,11 @@ impl StdError for TransportError {
 /// The language-neutral local C-Two error facade.
 #[derive(Debug)]
 pub enum Error {
+    /// A complete fixed IPC preamble proved that the peer uses another version.
+    ProtocolVersionMismatch {
+        local: u32,
+        peer: u32,
+    },
     Semantic(C2Error),
     Contract(ContractError),
     Admission(ContractError),
@@ -257,6 +271,10 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProtocolVersionMismatch { local, peer } => write!(
+                formatter,
+                "IPC protocol version mismatch: local={local}, peer={peer}"
+            ),
             Self::Semantic(error) => error.fmt(formatter),
             Self::Contract(error) => write!(formatter, "contract error: {error}"),
             Self::Admission(error) => write!(formatter, "contract admission error: {error}"),
@@ -269,6 +287,7 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
+            Self::ProtocolVersionMismatch { .. } => None,
             Self::Semantic(error) => Some(error),
             Self::Contract(error) | Self::Admission(error) => Some(error),
             Self::Transport(error) => Some(error),
@@ -302,6 +321,10 @@ impl From<LifecycleError> for Error {
 /// Normalize an IPC error without flattening its transport source.
 pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
     match error {
+        IpcError::PoolRetired => LifecycleError::RuntimeRetired.into(),
+        IpcError::ProtocolVersionMismatch { local, peer } => {
+            Error::ProtocolVersionMismatch { local, peer }
+        }
         IpcError::LocalCallRejected(error) => Error::Semantic(error),
         IpcError::Chunk(ChunkError::Capacity(message)) => {
             let semantic = C2Error::new(ErrorCode::ResourceUnavailable, message.clone())

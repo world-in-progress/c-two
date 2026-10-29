@@ -1,0 +1,119 @@
+{
+  "source_commit": "d8ae4e764e5599d843380c852a49d96bfb6ac816",
+  "production_baseline": "ba6179a937d26419cf1d0bf28e0d74ba5867c256",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+  "baseline_only": true,
+  "production_fix_applied": false,
+  "fault_seam": "temporary compile-time fixture: only poll_flush injects BrokenPipe/Pending; pair explicitly derives the task-owned LocalEndpointContext rather than platform default; native write_complete and send_prepared_shm_response bodies unchanged",
+  "native_transport": "macOS Unix socket, native LocalStream::pair using an explicit task-owned LocalEndpointContext",
+  "prepared_tests": {
+    "exit_code": 101,
+    "expected_red": 2,
+    "complete_frame_received": true,
+    "live_allocations_after_error": 0,
+    "same_address_reused": true,
+    "original_allocation_id": 67,
+    "replacement_allocation_id": 131
+  },
+  "held_tests": {
+    "exit_code": 101,
+    "expected_red": 2,
+    "second_release_reported_ok": true,
+    "remaining_allocations": 1,
+    "remaining_reassembly_bytes": 512,
+    "callback_count_after_caught_panic": 2
+  },
+  "fixture_setup_failure": "first Core test build omitted tests/fixtures/contracts/portable-release.contract.json; added exact pinned fixture, no source logic or assertions changed",
+  "endpoint_residuals": {
+    "socket": 0,
+    "lease": 0,
+    "remaining_task_coordination_files": [
+      ".gate",
+      ".gate.marker"
+    ],
+    "context_explicit": true,
+    "default_namespace_used_in_final_run": false,
+    "note": "initial default-namespace access is recorded separately; no historical manual cleanup was performed"
+  },
+  "not_run": [
+    "Linux",
+    "Windows",
+    "full relay",
+    "cross-language",
+    "GitHub Actions",
+    "post-fix tests"
+  ],
+  "files": {
+    "held-fixture-missing.log": "41b496af86aeda74e78a590dec25b6ae94ce61d6fe2f90b97b649daaf84112a7",
+    "held-baseline.log": "18099bdc0450ac3ebe44415f86340015b818fcc81185e3e3c7e95818d2d5ad82",
+    "baseline.log": "9e204887cb034a3a6f605cdbbb66175b8def8f13416bf2f13f32392bdffc1ae1",
+    "baseline-test-only.patch": "63d081f07e6a2e466d9292287da2a703f8d32544502d91e0342f048832506a71",
+    "initial-default-namespace.log": "b70b703b624e90e5a8ed5f002220ec06c8011bee8ec8bf17dfb90fcce640767c"
+  },
+  "commands": {
+    "prepared": [
+      "cargo",
+      "test",
+      "--manifest-path",
+      "<isolated>/source/core/Cargo.toml",
+      "-p",
+      "c2-server",
+      "--lib",
+      "--locked",
+      "--offline",
+      "--features",
+      "c2-local/r07-baseline",
+      "r07_baseline_full_frame_flush",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "held": [
+      "cargo",
+      "test",
+      "--manifest-path",
+      "<isolated>/source/core/Cargo.toml",
+      "-p",
+      "c2-core",
+      "--lib",
+      "--locked",
+      "--offline",
+      "--features",
+      "c2-local/r07-baseline",
+      "r07_narrow_baseline",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ]
+  },
+  "unchanged_production_function_sha256": {
+    "c2-local::write_complete": "d6ffa10fff7fa865ce6eb54f1b6a07ad61ed186611d60530006975dc75b9870b",
+    "c2-server::send_prepared_shm_response": "5865240ac7858b87d448a9f09d2fba0b4aaec13a8771db36284d40fcf338cdbd"
+  },
+  "reproduce": [
+    "Export pinned core/ and tests/fixtures/contracts/portable-release.contract.json into an isolated directory.",
+    "Apply baseline-test-only.patch; it explicitly projects C2_IPC_ROOT through with_unix_root for LocalStream::pair. Merely setting the environment is not sufficient.",
+    "Run both recorded commands with task-owned C2_IPC_ROOT/CARGO_TARGET_DIR and debug=0/incremental=0. Each exits 101 with two assertion failures, not a build failure.",
+    "Verify only task .gate/.gate.marker remain and no socket/lease. After the process exits, remove task source/target/root; never manually remove historical namespace files."
+  ],
+  "cleanup": {
+    "final_target_bytes_removed": 458971693,
+    "first_target_bytes_removed": 458964090,
+    "source_removed": true,
+    "endpoints_removed": true,
+    "final_explicit_namespace_socket_lease_residuals": 0,
+    "historical_manual_cleanup": false
+  },
+  "initial_isolation_error": {
+    "default_namespace_was_accessed": true,
+    "cause": "LocalStream::pair -> LocalEndpoint::from_address ignores C2_IPC_ROOT",
+    "own_test_endpoints_closed_by_existing_native_pair": true,
+    "historical_existing_endpoints_manually_removed": false,
+    "historical_existing_coordination_files_manually_removed": false,
+    "superseded_for_isolation_acceptance": true,
+    "correction": "temporary fixture now calls with_unix_root(...).endpoint(...) explicitly; all four baseline assertions reproduced again without a production fix"
+  },
+  "fixture_patch_application": "git apply --unidiff-zero baseline-test-only.patch; zero context avoids whitespace-only context lines in this retained evidence file",
+  "log_normalization": "absolute isolated prefix replaced with <isolated>; trailing line whitespace stripped, substantive output unchanged"
+}
