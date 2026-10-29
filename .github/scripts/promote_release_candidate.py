@@ -29,12 +29,12 @@ Contract, fail-closed on every deviation:
   Source Validation run for the same source cannot substitute the bound one.
 - ``check-source --source-sha`` is the read-only companion the Release
   Candidate workflow uses to fill ``source_validation_run_id``: it reads only
-  GitHub metadata (workflow-run listings and job listings, never artifact
+  GitHub metadata (workflow-run, job, and artifact listings, never artifact
   downloads) and returns the newest successful canonical-main Source
   Validation run whose complete job inventory carries the five platform
   ``py3.12`` full source jobs plus the Ubuntu ``py3.14t`` source job — a
-  policy-only green run is not a full gate — as JSON ``{"source_sha",
-  "run_id", "run_url"}``.
+  policy-only green run is not a full gate — and exactly one full-scope
+  artifact per platform, as JSON ``{"source_sha", "run_id", "run_url"}``.
 - The promoting run itself must be on ``refs/heads/main`` of the canonical
   repository; the trusted validation code is the current ``main`` checkout,
   never the candidate SHA.
@@ -356,13 +356,13 @@ def require_gate_success(workflow_name: str, run: dict[str, Any]) -> None:
 
 
 def find_full_source_validation_run(api: GitHubApi, source_sha: str) -> dict[str, Any]:
-    """The newest successful canonical-main Source Validation run with the full job inventory.
+    """The newest successful canonical-main Source Validation run with full jobs and artifacts.
 
-    Reads only run and job metadata, never artifact bytes. Successful runs
+    Reads only run, job, and artifact metadata, never artifact bytes. Successful runs
     whose job inventory lacks one of the five platform ``py3.12`` full source
     jobs or the Ubuntu ``py3.14t`` source job — policy-only green runs — do
-    not qualify as full gates; when nothing qualifies, the failure explains
-    whether runs are pending, failed, or merely policy-only.
+    not qualify as full gates, nor do runs without exactly one full-scope
+    artifact per platform. When nothing qualifies, the failure explains why.
     """
     runs: list[dict[str, Any]] = []
     seen_ids: set[Any] = set()
@@ -383,10 +383,17 @@ def find_full_source_validation_run(api: GitHubApi, source_sha: str) -> dict[str
          if run.get("status") == "completed" and run.get("conclusion") == "success"),
         key=lambda run: (run.get("run_number") or 0, run.get("id") or 0), reverse=True,
     )
+    artifact_errors: list[str] = []
     for run in successful:
         try:
             require_passed_jobs(api, run["id"], set(CHECK_SOURCE_REQUIRED_JOBS))
         except PromotionError:
+            continue
+        artifacts = api.run_artifacts(run["id"])
+        try:
+            require_full_source_artifacts(run["id"], source_sha, artifacts)
+        except PromotionError as error:
+            artifact_errors.append(str(error))
             continue
         return run
     if any(run.get("status") != "completed" for run in runs):
@@ -396,6 +403,12 @@ def find_full_source_validation_run(api: GitHubApi, source_sha: str) -> dict[str
         raise PromotionError(
             f"Source Validation run(s) {identifiers} for {source_sha} are still running; the "
             "source gate is incomplete — rerun check-source after they finish")
+    if artifact_errors:
+        raise PromotionError(
+            "; ".join(artifact_errors) + ". Duplicate full-scope artifacts indicate a rerun. "
+            "For release, dispatch a new full Source Validation run on the same source SHA "
+            f"{source_sha}: gh workflow run ci.yml --ref main -F force_full=true. "
+            "Rerunning jobs is not a substitute for a new full run.")
     if successful:
         identifiers = ", ".join(str(run.get("id")) for run in successful)
         raise PromotionError(
@@ -419,6 +432,22 @@ def require_passed_jobs(api: GitHubApi, run_id: int, names: set[str]) -> None:
         _require(len(matches) == 1 and matches[0].get("status") == "completed"
                  and matches[0].get("conclusion") == "success",
                  f"run {run_id} required job {name!r} did not complete successfully")
+
+
+def require_full_source_artifacts(
+    run_id: int, source_sha: str, artifacts: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Select exactly one full-scope artifact per platform using only metadata."""
+    artifacts_by_label: dict[str, dict[str, Any]] = {}
+    for label in SOURCE_VALIDATION_LANES:
+        expected_name = f"source-{label}-py3.12-full-{source_sha}"
+        matches = [entry for entry in artifacts if entry.get("name") == expected_name]
+        _require(len(matches) == 1,
+                 f"Source Validation run {run_id} retains {len(matches)} {expected_name} "
+                 "artifacts; the run bound by rc-context.json must carry exactly one "
+                 "full-scope artifact per platform")
+        artifacts_by_label[label] = matches[0]
+    return artifacts_by_label
 
 
 def download_and_extract_artifact(
@@ -1198,16 +1227,7 @@ def verify_source_validation(
     fastdb_pin = _source_fastdb_pin()
     run_id = source_run.get("id")
     require_passed_jobs(api, run_id, set(CHECK_SOURCE_REQUIRED_JOBS))
-    artifacts = api.run_artifacts(run_id)
-    artifacts_by_label: dict[str, dict[str, Any]] = {}
-    for label in SOURCE_VALIDATION_LANES:
-        expected_name = f"source-{label}-py3.12-full-{source_sha}"
-        matches = [entry for entry in artifacts if entry.get("name") == expected_name]
-        _require(len(matches) == 1,
-                 f"Source Validation run {run_id} retains {len(matches)} {expected_name} "
-                 "artifacts; the run bound by rc-context.json must carry exactly one "
-                 "full-scope artifact per platform")
-        artifacts_by_label[label] = matches[0]
+    artifacts_by_label = require_full_source_artifacts(run_id, source_sha, api.run_artifacts(run_id))
 
     validated: dict[str, Any] = {}
     for label, target_platform in SOURCE_VALIDATION_LANES.items():
