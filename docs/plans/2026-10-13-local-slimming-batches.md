@@ -2,7 +2,7 @@
 
 ## 纯瘦身收束与当前剩余清单（2026-10-28 复核）
 
-当前发版候选为 `6facfc2e`（C-Two 0.10.0 / c3 0.6.0），[Actions 40824590087](https://github.com/Dsssyc/c-two/actions/runs/40824590087) 10/10 通过；此前已验收的实现/测试候选依次为 `eee0fe57`、`b995c567`、`000985b6`（R07 收尾）与 `f747a7c9`，更早以 `d9e3ac9e` 合入主线安全依赖修复 `cc407052`。正式发行仍为 C-Two 0.9.0 / c3 0.5.0，0.10.0 使用 IPC 14、Unix namespace 磁盘格式 3 与凭据 schema 4，与 0.9.x 不互通。合入 main、包构建与发布等用户指令。
+当前发版候选为 `6facfc2e`（C-Two 0.10.0 / c3 0.6.0），[Actions 40824590087](https://github.com/Dsssyc/c-two/actions/runs/40824590087) 10/10 通过；此前已验收的实现/测试候选依次为 `eee0fe57`、`b995c567`、`000985b6`（R07 收尾）与 `f747a7c9`，更早以 `d9e3ac9e` 合入主线安全依赖修复 `cc407052`。该候选已以 [PR #202](https://github.com/world-in-progress/c-two/pull/202) 合入上游 main（`4c3e587d`，内容树与 `6747bf73` 相同）。正式发行仍为 C-Two 0.9.0 / c3 0.5.0，0.10.0 使用 IPC 14、Unix namespace 磁盘格式 3 与凭据 schema 4，与 0.9.x 不互通。2026-10-29 用户决定等 FastDB 0.2.4 修复内存泄漏后，把 0.10.0 改为依赖 0.2.4 再发。
 
 用户确认收束纯瘦身，停止按减行数继续挑批次。当时最后一个纯瘦身实现提交为 `6afec0f3`（R25 三个 Python prepared-call 入口退役），验收记录提交为 `3382b3ba`。收束时的筛选基于 `3382b3ba`，当时没有新的生产代码或测试修改；下表中的行数是静态方案估算，不是已实现的净减量。后续 R01、R02、R03、R16、R18 正确性修复单列记录，不计作纯瘦身收益。既有验证仍只绑定各批实现提交。
 
@@ -60,6 +60,18 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 - CI 提速（`eee0fe57`）：ARM64 线每轮约 20 分钟花在从源码编译 Arrow C++ 和 PyArrow 上（pyarrow 24 没有 Windows ARM64 wheel），而 C-Two 只有网格示例用 pyarrow。先试的精确键缓存方案（微任务 `cf917f09`）机制正确，但一次独立审查（黑板 Opus 5.5，输入约 32.3 万 token、几乎全部命中缓存，输出约 1.6 万）指出缓存键混入 PATH、镜像版本、Python 与构建工具哈希等常变输入，运行时检查多与工具保证重复，Host 核对后决定精简；返工途中用户决定直接去掉 pyarrow，该微任务取消、结束不验收。网格示例删除没有调用方的 Arrow 文件持久化和从未赋值 Redis 客户端的早期读取方法，`dev`、`examples` 组不再安装 pyarrow，CI 删除 Arrow 检出与构建。Actions [40817116138](https://github.com/Dsssyc/c-two/actions/runs/40817116138)（缓存全冷、仍构建 Arrow）ARM64 线 54 分钟，其中 Arrow 17.2 分钟；最终候选的 [40824590087](https://github.com/Dsssyc/c-two/actions/runs/40824590087) 为 18.9 分钟。稳定节省约 19 分钟：Arrow 构建，以及 `python-build` 从约 150 秒降到 18 秒；其余差额来自同一分支上已热的 Cargo、emsdk 与 FastDB WASM 缓存，冷缓存下的 ARM64 线估计约 35 分钟，未实测。构建并行度：现有两槽各 2 个 job 已占满 4 核，是否值得改为共享 job 池，要先测单独构建的时长，尚未测量。Windows 2022 的偶发夹具编译失败本轮未出现，仍留观察。
 - 发版准备（`6facfc2e`）：C-Two 0.10.0、c3 0.6.0，两份 lockfile 各只改版本号一行。`docs/releases/0.10.0.md` 汇总自 0.9.0 以来的变更，补入 `unreleased.md` 漏收的 R15 与 R17c；CHANGELOG 增加 0.10.0 条目，`unreleased.md` 指向候选说明。中英文 README、SDK 与 c3 README 和 23 份现行文档切到新版本，补齐中文 README 缺的两句，构建前提写明 Rust 1.95；历史目录未改。
 - 取消的 Arrow 缓存微任务检出含未封存的半成品，hey-my-buddy 拦下了回收，留给用户在控制台清理。
+
+2026-10-29：经用户授权开始发版，途中暂停，没有上传任何文件。main 首轮 Source Validation（[40857187478](https://github.com/world-in-progress/c-two/actions/runs/40857187478)）有两处已发布版本里就有的测试失败，只重跑失败的 job 后通过；第一次 Release Candidate（[40870564100](https://github.com/world-in-progress/c-two/actions/runs/40870564100)）绑定了这次重跑过的运行，CLI 与 Python 晋升预演都因同一条线有两份完整产物而拒绝。随后在同一来源上重新发起的完整资格验证（[40874415766](https://github.com/world-in-progress/c-two/actions/runs/40874415766)）首轮 10/10 通过，两处测试失败没有再出现。此时 FastDB 发现内存泄漏、将发布 0.2.4。C-Two 在 Python extra（`fastdb4py==0.2.3`）、`c_two._native` 与 c3 静态链接的 FastDB Core（`fastdb-sys` rev `abba785`，只经 c2-codegen 使用）以及 Rust SDK（`fastdb = "=0.2.3"`）三处精确锁定，用户无法自行升级，因此用户决定等 0.2.4 发布后让 0.10.0 依赖它再发。上游 Dependabot [PR #201](https://github.com/world-in-progress/c-two/pull/201) 已关闭，留言指向取代它的 #202。
+
+等待 0.2.4 期间，经用户同意先修掉这次暴露的三处问题，均由路由派出的微任务实现、Host 验收，并入 `socu/0100-release-fixes`：
+
+- 发布工具（`60059bb3`）：候选构建入口 `find_full_source_validation_run` 原先只读运行与 job 元数据，接受了重跑后成功的运行；晋升核验 `verify_source_validation` 要求每条线恰好一份完整产物，拒绝同一运行。现在两处共用 `require_full_source_artifacts`，入口只列产物元数据，跳过重复产物的运行，并在没有合格运行时说明要重新发起完整运行而不是重跑；两处测试夹具不再给同一运行重复登记产物。Host 运行发布工具测试 496 项通过；去掉入口检查的变异使 10 个新测试与元数据测试失败。顺带项留给下一批：入口报错沿用了“rc-context.json 绑定的运行”的措辞，产物为 0 份时也被说成重跑造成。
+- `c2-codegen` 的 `generated_call_options_consumer`（`f1c6a97e`）：zero-bytes 一段在有期限调用返回后立即断言 `used_operations` 为 0，而 Core 按设计在唤醒调用方之后才归还 permit。现在与 views 一段共用有界等待，零槽位与零期限两段保留立即断言，生产代码不改。Host 用官方 FastDB 0.2.3 CoreSDK 验证：在 `guard.finish(result)` 之后临时插入 50 ms 暂停，原测试在 `main.rs:103` 读到 2 个未归还的 permit 而失败，与 CI 的失败位置相同；修复后的测试加不加暂停都通过。
+- `test_install_c3_powershell.py::test_powershell_selects_native_os_target`（`b0331f6f`）：失败的是 SysWOW64 参数，即在 ARM64 上模拟运行的 x86 Windows PowerShell（失败那次超时前完成 63 项，按同一来源的收集顺序，第 64 项正是它）。同一来源的 [40874415766](https://github.com/world-in-progress/c-two/actions/runs/40874415766) 里，pwsh 4.5 秒、System32 2.6 秒、SysWOW64 12.3 秒，是这组 68 项里最慢的一项（次慢 7.3 秒）；失败那次超过 30 秒。原先子进程限时与 pytest 单项限时都是 30 秒，pytest 先触发，子进程自己的报错出不来。现在 SysWOW64 的子进程限时为 120 秒，pwsh 与 System32 仍为 30 秒；每个参数的 pytest-timeout 标记比自己的子进程限时多 30 秒，让子进程限时先触发。Host 核对了三个参数实际拿到的标记，并用小实验确认标记会覆盖命令行的 `--timeout=30`；Windows 上的效果待下一次完整 CI。
+
+发版前待办（新增）：
+
+- 升级到 FastDB 0.2.4：三处锁定、五份 lockfile、CI 与发布工具里写死的版本与源码 rev（`ci.yml`、`local-endpoint-validation.yml`、`release-candidate.yml`、`promote_release_candidate.py`、`prepare_fastdb_sdk.py`）、测试夹具与文档，约 38 个文件。前提是 0.2.4 已在 PyPI（含 sdist）与 crates.io 发布，并有固定的源码提交。
 
 ### 继续暂缓、不单独开批的项目
 
