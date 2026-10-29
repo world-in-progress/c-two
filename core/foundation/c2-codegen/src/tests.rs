@@ -218,6 +218,13 @@ fn assert_idle(runtime: &Runtime) {
     assert_eq!(snapshot.used_operations, 0);
     assert_eq!(snapshot.used_retained_bytes, 0);
 }
+fn wait_for_idle(runtime: &Runtime) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while runtime.call_execution_snapshot().unwrap().used_operations != 0 {
+        assert!(std::time::Instant::now() < deadline, "native input charges did not drain");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 fn main() {
     // Zero slots and zero timeout must win before even inspecting an invalid
     // FastDB input. If the serializer ran, this would be a FastDB stale error.
@@ -272,6 +279,7 @@ fn main() {
         let checked = held.value().unwrap().entry_view(0).unwrap();
         held.release().unwrap();
         assert_eq!(checked.acquire().unwrap_err().symbol(), "VIEW_INVALIDATED");
+        wait_for_idle(&runtime);
         assert_idle(&runtime);
         registration.close().unwrap();
     }
@@ -308,11 +316,7 @@ fn main() {
         }
         // Route close drains callbacks; allow the expired client's native
         // continuation to observe its terminal reply before checking charges.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while runtime.call_execution_snapshot().unwrap().used_operations != 0 {
-            assert!(std::time::Instant::now() < deadline, "native input charges did not drain");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_for_idle(&runtime);
         assert_idle(&runtime);
     }
     println!("OK call options");
