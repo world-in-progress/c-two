@@ -1,0 +1,342 @@
+{
+  "schema": "c-two.drop-pyarrow-local-evidence.v1",
+  "recorded_at": "2026-10-29T05:32:52.361028+00:00",
+  "source_inputs": {
+    "base_commit": "b995c567429786c67ed3cee30a0c58a68cd028fa",
+    "changed_source_sha256": {
+      ".github/workflows/ci.yml": "e76148f60fba13314c62339ca564b185d7cbcbe833f122ac7c905cccdd65ac20",
+      ".gitignore": "f5cde3058dd2a22689ce54c37b0233f5bb9828d011d7bf8b4c310e3101709bc7",
+      "AGENTS.md": "145d9d17676e1d29c87a8901b3d73fbd4cae58b93f0b20c6e987a330113054e6",
+      "docs/ci-cd.md": "3d0e7acec215f96df07761e3bad3a58b362139497362e95a36a17bfe1da8977f",
+      "docs/development.md": "56932983cbf75f690d8f74142202ea34d5c2b4c1e139fb6e49a7eda442493660",
+      "docs/local-development-testing.md": "cf16957fae6778e9589adc11af06309305f75999eecd9ac6bbfd9beb12ac07f0",
+      "docs/windows-native-usage.md": "5476d7d63d806b9a860a3aada92d04543819c1bb706e28761d732a8e1e520093",
+      "examples/python/grid/nested_grid.py": "d2167f32e906e68ae3f7149528bcef49de349a6b05206804454dea0619a28cc9",
+      "examples/python/relay_mesh/README.md": "4eca1182b6f6cbba7fc42ab4a03b0deb579f99845b296a4d8c636616f14b5807",
+      "pyproject.toml": "334a1ceea4f089d3d1b3f467506d4b405f14351e8bc9fb6de90326547060aea4",
+      "sdk/python/tests/integration/test_grid_python_smoke.py": "9fc69b86ab5f66627ed12282ed06bb403604a78ba861f90d2ac895f3bc4dc938",
+      "sdk/python/tests/integration/test_python_examples.py": "94dcbbc35a3ea56e11b439e8c1dd38a7ad5827ca152bb6b1706ed1d861334b78",
+      "sdk/python/tests/unit/test_contract_infer.py": "5e44c387129e5affb4d973b559a8dd070e0395beae38b345e635575f1cd94b48",
+      "tools/dev/test_python.py": "01fc75abf5e68596a2bc3aa3bc7e580bd71e2f6e45c15985ae39375427e6c296",
+      "uv.lock": "3a943122429b66c6be8adff17d9edc6dd682189f7d53822a2a0a7d9180932fdf"
+    }
+  },
+  "tools": {
+    "uv": "0.10.12",
+    "rustc": "1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "1.99.0 (5f94df478 2026-08-27)",
+    "actionlint": "1.7.12"
+  },
+  "environment": {
+    "python": "3.12.12",
+    "platform": "darwin",
+    "machine": "arm64",
+    "versions": {
+      "c-two": "0.9.0",
+      "numpy": "2.4.4",
+      "pandas": "3.0.2",
+      "fastdb4py": "0.2.3",
+      "pytest": "9.0.3",
+      "pytest-xdist": "3.8.0",
+      "pytest-timeout": "2.4.0"
+    },
+    "native_sha256": "ec9ba56cbfc55c3233124637d2ff4ebd7f97a4649e783b1f9d79a714b64d6324",
+    "installed_python_sources_match_checkout": true,
+    "python_source_files_compared": 33,
+    "pyarrow_distribution_present": false
+  },
+  "isolation": {
+    "project_environment": "$TASK_TMP/dev",
+    "cargo_home": "$TASK_TMP/cargo-home",
+    "uv_cache": "$TASK_TMP/uv-cache",
+    "cargo_target_dir": "$TASK_TMP/target",
+    "cargo_target_directories_used": 1,
+    "ipc_root": "$TASK_TMP/ipc",
+    "env_file_disabled": true,
+    "relay_anchor_cleared": true,
+    "no_editable_build": true
+  },
+  "c3": {
+    "version": "c3 0.5.0",
+    "sha256": "7f399049fcab37410078a3f4f4464f09f80dc80517089c28c2839e8cc5172669"
+  },
+  "grid_tests": {
+    "counts": {
+      "tests": 12,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "expected_tests_by_file": {
+      "sdk/python/tests/integration/test_grid_python_smoke.py": [
+        "test_grid_python_payloads_work_thread_local",
+        "test_grid_python_payloads_work_direct_ipc_with_bad_relay",
+        "test_grid_python_payloads_work_explicit_http_relay"
+      ],
+      "sdk/python/tests/integration/test_python_examples.py": [
+        "test_ipc_example",
+        "test_relay_example",
+        "test_ipc_client_requires_address"
+      ],
+      "sdk/python/tests/unit/test_contract_infer.py": [
+        "test_infer_crm_from_resource_builds_python_only_descriptor",
+        "test_infer_crm_requires_explicit_public_methods",
+        "test_infer_crm_rejects_ambiguous_resource_signatures",
+        "test_grid_resource_infer_smoke_uses_python_fallback_shapes",
+        "test_contract_infer_cli_writes_descriptor",
+        "test_contract_infer_cli_writes_python_only_diagnostics"
+      ]
+    },
+    "executed_test_names": [
+      "test_grid_python_payloads_work_thread_local",
+      "test_grid_python_payloads_work_direct_ipc_with_bad_relay",
+      "test_grid_python_payloads_work_explicit_http_relay",
+      "test_ipc_example",
+      "test_relay_example",
+      "test_ipc_client_requires_address",
+      "test_infer_crm_from_resource_builds_python_only_descriptor",
+      "test_infer_crm_requires_explicit_public_methods",
+      "test_infer_crm_rejects_ambiguous_resource_signatures",
+      "test_grid_resource_infer_smoke_uses_python_fallback_shapes",
+      "test_contract_infer_cli_writes_descriptor",
+      "test_contract_infer_cli_writes_python_only_diagnostics"
+    ],
+    "all_requested_tests_executed": true,
+    "pyarrow_skips": 0
+  },
+  "pytest_output": "............                                                             [100%]\n12 passed in 5.78s\n",
+  "pyarrow_import_stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'pyarrow'\n",
+  "reference_hygiene": {
+    "grep_command": [
+      "git",
+      "grep",
+      "-n",
+      "-i",
+      "-E",
+      "pyarrow|arrow c\\+\\+|apache/arrow"
+    ],
+    "grep_exit_code": 0,
+    "matching_lines": 15,
+    "matching_files": [
+      "docs/plans/2026-05-06-unified-buffer-lease-rust-authority.md",
+      "docs/releases/0.8.0.md",
+      "docs/reports/0.7.5-preparation.md",
+      "docs/reports/2026-10-23-081-startup-release-acceptance.md",
+      "docs/reports/2026-10-23-082-client-observation-release-acceptance.md",
+      "docs/reports/2026-10-23-r13-080-release-acceptance.md",
+      "docs/reports/evidence/2026-10-23-r13-080-release-acceptance.json",
+      "docs/superpowers/plans/2026-04-25-monorepo-layout-migration.md",
+      "docs/superpowers/plans/2026-04-27-relay-independence-idle-timeout.md",
+      "docs/superpowers/specs/2026-03-31-disk-spill-memhandle-design.md",
+      "docs/vision/toodle-distributed.md"
+    ],
+    "unexpected_matches": [],
+    "removed_ci_variables_present": false
+  },
+  "ci_variables": {
+    "CMAKE_PREFIX_PATH": {
+      "base_occurrences": 1,
+      "candidate_occurrences": 0
+    },
+    "PYARROW_BUNDLE_ARROW_CPP": {
+      "base_occurrences": 1,
+      "candidate_occurrences": 0
+    },
+    "SKBUILD_CMAKE_ARGS": {
+      "base_occurrences": 1,
+      "candidate_occurrences": 0
+    }
+  },
+  "grid_ast_comparison": {
+    "command": "python grid-ast-comparison.py",
+    "exit_code": 0,
+    "base_commit": "b995c567429786c67ed3cee30a0c58a68cd028fa",
+    "removed_methods": [
+      "_get_grid_info",
+      "_load_grid_from_file",
+      "terminate"
+    ],
+    "unchanged_methods": [
+      "_initialize_default_grid",
+      "_get_local_ids",
+      "_get_parent_global_id",
+      "_get_coordinates",
+      "_get_grid_children_global_ids",
+      "get_schema",
+      "get_parent_keys",
+      "get_grid_infos",
+      "subdivide_grids",
+      "delete_grids",
+      "get_active_grid_infos",
+      "hello",
+      "none_hello"
+    ],
+    "constructor_parameters": [
+      "self",
+      "epsg",
+      "bounds",
+      "first_size",
+      "subdivide_rules"
+    ],
+    "initialization": "self._initialize_default_grid(batch_size=50000)"
+  },
+  "commands": [
+    {
+      "id": "lock",
+      "command": "uv lock",
+      "exit_code": 0,
+      "summary": "Removed pyarrow 24.0.0; resolved 45 packages"
+    },
+    {
+      "id": "lock-inventory",
+      "command": "Parsed TOML name/version comparison against the base commit (README.md contains the script)",
+      "exit_code": 0,
+      "summary": "46 -> 45 package entries; only pyarrow 24.0.0 removed; no additions or retained-version changes"
+    },
+    {
+      "id": "locked",
+      "command": "uv lock --locked",
+      "exit_code": 0,
+      "summary": "Resolved 45 packages"
+    },
+    {
+      "id": "dev-sync-initial",
+      "command": "uv sync --locked --group dev --no-editable",
+      "exit_code": 1,
+      "summary": "FastDB source compilation could not find the C++ standard header algorithm"
+    },
+    {
+      "id": "cpp-probe-before",
+      "command": "clang++ -std=c++17 -fsyntax-only \"$TASK_TMP/cpp-probe.cc\"",
+      "exit_code": 1,
+      "summary": "Minimal algorithm/vector include probe reproduces the missing standard header"
+    },
+    {
+      "id": "cpp-probe-after",
+      "command": "CPLUS_INCLUDE_PATH=\"$(xcrun --show-sdk-path)/usr/include/c++/v1\" clang++ -std=c++17 -fsyntax-only \"$TASK_TMP/cpp-probe.cc\"",
+      "exit_code": 0,
+      "summary": "The same probe passes with the installed SDK standard-header directory"
+    },
+    {
+      "id": "dev-sync",
+      "command": "uv sync --locked --group dev --no-editable",
+      "exit_code": 0,
+      "summary": "Built this checkout native extension; installed the isolated dev environment using task-only CPLUS_INCLUDE_PATH"
+    },
+    {
+      "id": "c3-build",
+      "command": [
+        "cargo",
+        "build",
+        "--manifest-path",
+        "cli/Cargo.toml",
+        "--bin",
+        "c3",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "duration_seconds": 74.1
+    },
+    {
+      "id": "c3-version",
+      "command": [
+        "$TASK_TMP/target/debug/c3",
+        "--version"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "duration_seconds": 0.807
+    },
+    {
+      "id": "pyarrow-import",
+      "command": [
+        "$TASK_TMP/dev/bin/python",
+        "-c",
+        "import pyarrow"
+      ],
+      "exit_code": 1,
+      "expected_exit_code": 1,
+      "duration_seconds": 0.039,
+      "summary": "import pyarrow raises ModuleNotFoundError in the isolated dev environment"
+    },
+    {
+      "id": "environment",
+      "command": [
+        "$TASK_TMP/dev/bin/python",
+        "-c",
+        "import hashlib, importlib.metadata, json, platform, sys\nfrom pathlib import Path\nimport c_two, c_two._native as native, numpy, pandas\nimport pytest, xdist, pytest_timeout, httpx\nfrom fastdb4py.payload import Payload\nsources = Path('sdk/python/src/c_two')\ninstalled = Path(c_two.__file__).parent\nsource_files = sorted(sources.rglob('*.py'))\nassert source_files\nfor source in source_files:\n    copy = installed / source.relative_to(sources)\n    assert copy.read_bytes() == source.read_bytes(), str(source)\ntry:\n    importlib.metadata.distribution('pyarrow')\nexcept importlib.metadata.PackageNotFoundError:\n    pass\nelse:\n    raise AssertionError('pyarrow distribution present')\nprint(json.dumps({'python': platform.python_version(), 'platform': sys.platform, 'machine': platform.machine(), 'versions': {name: importlib.metadata.version(name) for name in ('c-two','numpy','pandas','fastdb4py','pytest','pytest-xdist','pytest-timeout')}, 'native_sha256': hashlib.sha256(Path(native.__file__).read_bytes()).hexdigest(), 'installed_python_sources_match_checkout': True, 'python_source_files_compared': len(source_files), 'pyarrow_distribution_present': False}, indent=2))\n"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "duration_seconds": 7.71
+    },
+    {
+      "id": "grid-tests",
+      "command": [
+        "$TASK_TMP/dev/bin/python",
+        "-m",
+        "pytest",
+        "sdk/python/tests/integration/test_grid_python_smoke.py",
+        "sdk/python/tests/integration/test_python_examples.py",
+        "sdk/python/tests/unit/test_contract_infer.py",
+        "-q",
+        "--timeout=30",
+        "-ra",
+        "-o",
+        "cache_dir=$TASK_TMP/pytest-cache",
+        "--junitxml=$TASK_TMP/grid-tests.xml"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "duration_seconds": 6.597,
+      "summary": {
+        "tests": 12,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "id": "actionlint",
+      "command": "actionlint .github/workflows/ci.yml",
+      "exit_code": 0,
+      "summary": "No diagnostics"
+    },
+    {
+      "id": "reference-hygiene",
+      "command": "git grep -n -i -E 'pyarrow|arrow c\\+\\+|apache/arrow' followed by the historical-directory allowlist assertion",
+      "exit_code": 0,
+      "summary": "All matches are in permitted historical documentation directories"
+    },
+    {
+      "id": "grid-ast",
+      "command": "Parsed AST comparison of NestedGrid against the base commit",
+      "exit_code": 0,
+      "summary": "13 retained methods unchanged; only constructor and three removed methods differ; all 11 retained constants have readers"
+    },
+    {
+      "id": "diff-check",
+      "command": "git diff --check",
+      "exit_code": 0,
+      "summary": "No whitespace errors"
+    },
+    {
+      "id": "evidence-path-check",
+      "command": "Check evidence files for machine-specific paths, trailing whitespace and JSON validity",
+      "exit_code": 0,
+      "summary": "Evidence contains normalized task placeholders and relative repository paths"
+    }
+  ],
+  "not_run": [
+    "full workflow-policy suite",
+    "full Python suite",
+    "hosted Linux/macOS/Windows CI"
+  ],
+  "cleanup": {
+    "command": "Remove the task-owned temporary directory after all build/test subprocesses returned",
+    "exit_code": 0,
+    "task_temporary_directory_absent": true,
+    "cargo_target_directory_absent": true
+  }
+}

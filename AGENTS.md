@@ -79,7 +79,7 @@ c3 relay --bind 0.0.0.0:8300
 uv run python examples/python/relay_mesh/resource.py
 uv run python examples/python/relay_mesh/client.py
 
-# Example dependencies such as pandas and pyarrow
+# Example dependencies such as pandas
 uv sync --group examples
 
 # CLI tool
@@ -87,7 +87,7 @@ c3 --version
 c3 relay --upstream grid=my_server@ipc://my_server --bind 0.0.0.0:8080
 ```
 
-Windows ARM64 uses the same native source gates on `windows-11-arm`, including Rust/Python/Node interoperability and standard-user consumers. Release wheels cover Python 3.11–3.14 and 3.14t on ARM64; other platforms retain 3.10. Windows syntax-only 3.10 checks install/find `3.10-windows-x86_64-none`; runtime tests must use the native architecture. The ARM64 source lane builds the locked PyArrow dependency from pinned Arrow C++ sources so grid tests still execute.
+Windows ARM64 uses the same native source gates on `windows-11-arm`, including Rust/Python/Node interoperability and standard-user consumers. Release wheels cover Python 3.11–3.14 and 3.14t on ARM64; other platforms retain 3.10. Windows syntax-only 3.10 checks install/find `3.10-windows-x86_64-none`; runtime tests must use the native architecture.
 
 The full Python suite runs the real relay benchmark and requires `hey` v0.1.4 on PATH. Install it with `go install github.com/rakyll/hey@v0.1.4` and expose the Go binary directory (`go env GOPATH` plus `/bin`, or `GOBIN`). Both CI suite entry points provision this prerequisite.
 

@@ -19,7 +19,7 @@ case "$(uname -s)" in
   Linux) export LD_LIBRARY_PATH="$FASTDB_PAYLOAD_SYSTEM_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
 esac
 FASTDB_PAYLOAD_LINK_MODE=source uv sync        # compile the Python extension with static FastDB
-FASTDB_PAYLOAD_LINK_MODE=source uv sync --group examples  # optional: pandas/pyarrow
+FASTDB_PAYLOAD_LINK_MODE=source uv sync --group examples  # optional: pandas
 FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link  # build and link the native c3 CLI
 cp .env.example .env                          # optional: local environment configuration
 ```

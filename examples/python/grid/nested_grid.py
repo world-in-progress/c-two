@@ -1,8 +1,5 @@
-import os
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.ipc as ipc
 
 from grid.grid_py_crm import (
     GridSchema,
@@ -25,15 +22,6 @@ ATTR_LEVEL = 'level'
 ATTR_GLOBAL_ID = 'global_id'
 ATTR_ELEVATION = 'elevation'
 
-GRID_SCHEMA: pa.Schema = pa.schema([
-    (ATTR_DELETED, pa.bool_()),
-    (ATTR_ACTIVATE, pa.bool_()), 
-    (ATTR_TYPE, pa.int8()),
-    (ATTR_LEVEL, pa.int8()),
-    (ATTR_GLOBAL_ID, pa.int32()),
-    (ATTR_ELEVATION, pa.float64())
-])
-
 # @cc.crm
 class NestedGrid:
     """
@@ -42,7 +30,7 @@ class NestedGrid:
     The Grid Resource.  
     Grid is a 2D grid system that can be subdivided into smaller grids by pre-declared subdivide rules.  
     """
-    def __init__(self, epsg: int, bounds: list, first_size: list[float], subdivide_rules: list[list[int]], grid_file_path: str = None):
+    def __init__(self, epsg: int, bounds: list, first_size: list[float], subdivide_rules: list[list[int]]):
         """Method to initialize Grid
 
         Args:
@@ -50,13 +38,11 @@ class NestedGrid:
             bounds (list): bounding box of the grid (organized as [min_x, min_y, max_x, max_y])
             first_size (list[float]): [width, height] of the first level grid
             subdivide_rules (list[list[int]]): list of subdivision rules per level
-            grid_file_path (str, optional): path to .arrow file containing grid data. If provided, grid data will be loaded from this file
         """
         self.epsg: int = epsg
         self.bounds: list = bounds
         self.first_size: list[float] = first_size
         self.subdivide_rules: list[list[int]] = subdivide_rules
-        self.grid_file_path = grid_file_path
         
         # Initialize grid DataFrame
         self.grids = pd.DataFrame(columns=[
@@ -80,98 +66,7 @@ class NestedGrid:
             'subdivide_rules': subdivide_rules
         }
         
-        # Load from Arrow file if file exists
-        if grid_file_path and os.path.exists(grid_file_path):
-            try:
-                # Load grid data from Arrow file
-                self._load_grid_from_file(grid_file_path, batch_size=50000)
-            except Exception as e:
-                print(f'Failed to load grid data from file: {str(e)}, the grid will be initialized using default method')
-                self._initialize_default_grid(batch_size=50000)
-        else:
-            # Initialize grid data using default method
-            print('grid file does not exist, initializing default grid data...')
-            self._initialize_default_grid(batch_size=50000)
-            print('Successfully initialized default grid data')
-     
-    def terminate(self):
-        """Save the grid data to Arrow file
-
-        Args:
-            grid_file_path (str, optional): The file path to save the grid data. If None, the path provided during initialization is used
-
-        Returns:
-            bool: Whether the save was successful
-        """
-        
-        save_path = self.grid_file_path
-        if not save_path:
-            print('No file path provided for saving grid data')
-            return False
-        
-        try:
-            if self.grids.empty:
-                print('No grid data to save')
-                return False
-            
-            # Reset index to include level and globale_id columns in the table
-            df = self.grids.reset_index()
-            table = pa.Table.from_pandas(df, schema=GRID_SCHEMA)
-            
-            # Write to Arrow file
-            with pa.ipc.new_file(save_path, GRID_SCHEMA) as writer:
-                writer.write_table(table)
-            
-            print(f'Successfully saved grid data to {save_path}')
-            return True
-        
-        except Exception as e:
-            print(f'Failed to save grid data: {str(e)}')
-            return False
-
-    def _load_grid_from_file(self, file_path: str, batch_size: int = 50000):
-        """Load grid data from file streaming
-
-        Args:
-            file_path (str): Arrow file path
-            batch_size (int): number of records processed per batch
-        """
-        
-        try:
-            with pa.ipc.open_file(self.grid_file_path)  as reader:
-                # Open the Arrow file and read the table
-                all_batches = []
-                for i in range(reader.num_record_batches):
-                    batch = reader.get_batch(i)
-                    all_batches.append(batch)
-                    
-                    if len(all_batches) >= batch_size / batch.num_rows:
-                        partial_table = pa.Table.from_batches(all_batches, schema=GRID_SCHEMA)
-                        all_batches = []
-                        partial_df = partial_table.to_pandas(use_threads=True)
-                        partial_df.set_index([ATTR_LEVEL, ATTR_GLOBAL_ID], inplace=True)
-                        
-                        if hasattr(self, 'grids') and not self.grids.empty:
-                            self.grids = pd.concat([self.grids, partial_df])
-                        else:
-                            self.grids = partial_df
-                
-                if all_batches:
-                    partial_table = pa.Table.from_batches(all_batches, schema=GRID_SCHEMA)
-                    partial_df = partial_table.to_pandas(use_threads=True)
-                    partial_df.set_index([ATTR_LEVEL, ATTR_GLOBAL_ID], inplace=True)
-                        
-                    if hasattr(self, 'grids') and not self.grids.empty:
-                        self.grids = pd.concat([self.grids, partial_df])
-                    else:
-                        self.grids = partial_df
-            
-                self.grids = self.grids.sort_index()
-                print(f'Successfully loaded {len(self.grids)} grid records from {self.grid_file_path}')
-        
-        except Exception as e:
-            print(f'Error loading grid data from file: {str(e)}')
-            raise e
+        self._initialize_default_grid(batch_size=50000)
 
     def _initialize_default_grid(self, batch_size: int = 10000):
         """Initialize grid data (ONLY Level 1) as pandas DataFrame"""
@@ -252,32 +147,6 @@ class NestedGrid:
         max_ys = bbox[1] + (bbox[3] - bbox[1]) * (global_ys + 1) / height
         return (min_xs, min_ys, max_xs, max_ys)
 
-    def _get_grid_info(self, level: int, global_id: int) -> pd.DataFrame:
-        key = f'{level}-{global_id}'
-        buffer = self._redis_client.get(key)
-        if buffer is None:
-            return pd.DataFrame(columns=[ATTR_LEVEL, ATTR_GLOBAL_ID, ATTR_LOCAL_ID, ATTR_TYPE, 
-                                        ATTR_ELEVATION, ATTR_DELETED, ATTR_ACTIVATE, 
-                                        ATTR_MIN_X, ATTR_MIN_Y, ATTR_MAX_X, ATTR_MAX_Y])
-        
-        reader = ipc.open_stream(buffer)
-        grid_record = reader.read_next_batch()
-        table = pa.Table.from_batches([grid_record], schema=GRID_SCHEMA)
-        df = table.to_pandas(use_threads=True)
-        
-        # Calculate computed attributes
-        local_id = self._get_local_ids(level, np.array([global_id]))[0]
-        min_x, min_y, max_x, max_y = self._get_coordinates(level, np.array([global_id]))
-        df[ATTR_LOCAL_ID] = local_id
-        df[ATTR_MIN_X] = min_x
-        df[ATTR_MIN_Y] = min_y
-        df[ATTR_MAX_X] = max_x
-        df[ATTR_MAX_Y] = max_y
-        
-        column_order = [ATTR_LEVEL, ATTR_GLOBAL_ID, ATTR_LOCAL_ID, ATTR_TYPE, ATTR_ELEVATION, 
-                        ATTR_DELETED, ATTR_ACTIVATE, ATTR_MIN_X, ATTR_MIN_Y, ATTR_MAX_X, ATTR_MAX_Y]
-        return df[column_order]
-    
     def _get_grid_children_global_ids(self, level: int, global_id: int) -> list[int] | None:
         if (level < 0) or (level >= len(self.level_info)):
             return None

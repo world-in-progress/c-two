@@ -23,7 +23,6 @@ def clean_runtime():
 
 def _load_grid(monkeypatch):
     pytest.importorskip('pandas', reason='grid smoke tests require examples dependencies')
-    pytest.importorskip('pyarrow', reason='grid smoke tests require examples dependencies')
     root = Path(__file__).resolve().parents[4]
     monkeypatch.syspath_prepend(str(root / 'examples/python'))
     for module_name in (

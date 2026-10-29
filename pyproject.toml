@@ -23,7 +23,6 @@ dev = [
     "httpx>=0.28.1",
     "numpy>=2.2.4",
     "pandas>=2.2.0",
-    "pyarrow>=23.0.1",
 ]
 banner = [
     "pillow>=13.0.0",
@@ -31,7 +30,6 @@ banner = [
 examples = [
     "numpy>=2.2.4",
     "pandas>=2.2.0",
-    "pyarrow>=23.0.1",
 ]
 benchmark = [
     "numpy>=2.2.4",

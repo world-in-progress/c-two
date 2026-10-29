@@ -6,7 +6,7 @@
 
 Use an installed Python 3.12 interpreter, uv, Git and the appropriate Rust compiler toolchain. Windows builds need an MSVC Developer PowerShell (or the environment from `vcvars64.bat`); macOS builds need the Xcode command-line tools. Repository installer checks also require PowerShell (`pwsh` on macOS/Unix, or Windows PowerShell). The official FastDB SDK preparation script chooses a published host target and checks pinned manifests and archives. An unsupported host target fails with its available-target list.
 
-The Windows commands below show x64 tools. For ARM64, follow the [native Windows prerequisites](windows-native-usage.md): use ARM64 Python, Rust, MSVC and Node, and prepare the pinned Arrow/PyArrow dependency before the full grid-example suite. The x64 Emscripten build tool does not substitute for native ARM64 test consumers.
+The Windows commands below show x64 tools. For ARM64, follow the [native Windows prerequisites](windows-native-usage.md): use ARM64 Python, Rust, MSVC and Node. The x64 Emscripten build tool does not substitute for native ARM64 test consumers.
 
 Python/TypeScript payload preparation additionally needs Node 22 with Node-API at least 10, CMake, Ninja and an activated Emscripten 5.0.2 SDK. A Node version number alone is insufficient: Node 22.11 has Node-API 9 and is rejected before native code is loaded. Use `--tool-path DIRECTORY` repeatedly to select tools only for this run. Providing all three prebuilt npm tarballs avoids the WASM preparation prerequisites. Node-only preparation installs/builds the c2-mem package without requiring FastDB WASM.
 
