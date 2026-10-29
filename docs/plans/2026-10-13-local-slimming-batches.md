@@ -2,7 +2,7 @@
 
 ## 纯瘦身收束与当前剩余清单（2026-10-28 复核）
 
-当前已验收实现/测试候选为 `000985b6`（R07 收尾），上一个为 `f747a7c9`；此前以 `d9e3ac9e` 合入主线安全依赖修复 `cc407052`。正式发行仍为 C-Two 0.9.0 / c3 0.5.0；未发布源码使用 IPC 14、Unix namespace 磁盘格式 3 与凭据 schema 4，不能与正式 wheel 的 IPC 13/旧目录格式混淆。R17c 和持久身份/自身凭据补强均已完成各自验收，本轮不发版。
+当前发版候选为 `6facfc2e`（C-Two 0.10.0 / c3 0.6.0），[Actions 40824590087](https://github.com/Dsssyc/c-two/actions/runs/40824590087) 10/10 通过；此前已验收的实现/测试候选依次为 `eee0fe57`、`b995c567`、`000985b6`（R07 收尾）与 `f747a7c9`，更早以 `d9e3ac9e` 合入主线安全依赖修复 `cc407052`。正式发行仍为 C-Two 0.9.0 / c3 0.5.0，0.10.0 使用 IPC 14、Unix namespace 磁盘格式 3 与凭据 schema 4，与 0.9.x 不互通。合入 main、包构建与发布等用户指令。
 
 用户确认收束纯瘦身，停止按减行数继续挑批次。当时最后一个纯瘦身实现提交为 `6afec0f3`（R25 三个 Python prepared-call 入口退役），验收记录提交为 `3382b3ba`。收束时的筛选基于 `3382b3ba`，当时没有新的生产代码或测试修改；下表中的行数是静态方案估算，不是已实现的净减量。后续 R01、R02、R03、R16、R18 正确性修复单列记录，不计作纯瘦身收益。既有验证仍只绑定各批实现提交。
 
@@ -54,10 +54,12 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 
 上游 Dependabot：[PR #200](https://github.com/world-in-progress/c-two/pull/200)（`/core` 的 rust-minor-and-patch 分组 4 项升级，只改 `core/Cargo.lock`，上游 CI 10 项全过）已按以往分组升级的方式以合并提交 `cff5b491` 并入上游 main；集成分支没有改动 `core/Cargo.lock`，之后合并 main 不会冲突。[PR #201](https://github.com/world-in-progress/c-two/pull/201)（`parking_lot` 0.12.5 → 0.13.0）不能原样合并：它只升级了 `/core`，`cli`、`sdk/rust` 与 `sdk/python/native` 仍用 0.12，依赖图里两个版本的 `Mutex` 类型不兼容而编译失败，那两个工作区的 lockfile 也没有更新，带 `--locked` 的构建因此拒绝；上游六条源码线全部失败。
 
-发版前待办（新增）：
+2026-10-29：hey-my-buddy 更新后补做的两项发版前待办已完成，并按用户确定的版本号准备好 C-Two 0.10.0 / c3 0.6.0 发版候选。
 
-- 四个工作区一起升级到 `parking_lot` 0.13 并更新各自的 lockfile，在集成分支完成并验收后，#201 由主线的同一升级取代。等 hey-my-buddy 中版本更新完成后再派微任务，更新期间不运行微任务。
-- CI 太慢：六条源码线一次完整验证约一小时，Windows 2022 偶有夹具编译失败需要重跑。等 hey-my-buddy 更新完成后再评估提速的办法。
+- 依赖与安全（`b995c567`，取代上游 [PR #201](https://github.com/world-in-progress/c-two/pull/201)）：四个 Rust 工作区一起升到 `parking_lot` 0.13。`c2-http` 的 tokio 由 `full` 改为实际用到的 6 个特性，`full` 带入的 tokio `parking_lot` 特性曾使依赖图里出现两份 parking_lot，现在只剩一份。0.13 要求 Rust 1.95，面向用户的 Rust 包都声明 `rust-version = "1.95"`，四份依赖图里声明的最高 rust-version 也正是 1.95。四份 Cargo.lock 的 rustls 升到 0.23.46，`uv.lock` 的 msgpack 升到 1.2.3，修复上游 Dependabot 告警；`parking_lot_core` 0.10 强制要求的 smallvec、redox_syscall、libc 取最低版本，其余依赖不变。0.13 去掉了自动的最终公平性，Host 审计生产代码全部 96 个 loop/while：62 个每轮阻塞等待，其余 34 个都有界，没有依赖该公平性的忙等或紧循环。R07 的 `pending_request_error_does_not_retry_free_under_pending_lock` 只做一次非阻塞 settle，与其他测试共用的 retire executor 锁被占时按设计推迟，因此偶发失败；改为 1 秒内重试，Host 用占锁变异复现了原写法失败、新写法通过，回归变异仍被捕获。Host 在 Rust 1.99、带 FastDB 同级检出的环境中验收：Core 全量（含 c2-codegen）1929、Rust SDK 23、cli 76、native 19、Python 普通组 1274、跨语言矩阵 25 项通过；普通组另 3 项为与 R07 相同的本机环境限制。
+- CI 提速（`eee0fe57`）：ARM64 线每轮约 20 分钟花在从源码编译 Arrow C++ 和 PyArrow 上（pyarrow 24 没有 Windows ARM64 wheel），而 C-Two 只有网格示例用 pyarrow。先试的精确键缓存方案（微任务 `cf917f09`）机制正确，但一次独立审查（黑板 Opus 5.5，输入约 32.3 万 token、几乎全部命中缓存，输出约 1.6 万）指出缓存键混入 PATH、镜像版本、Python 与构建工具哈希等常变输入，运行时检查多与工具保证重复，Host 核对后决定精简；返工途中用户决定直接去掉 pyarrow，该微任务取消、结束不验收。网格示例删除没有调用方的 Arrow 文件持久化和从未赋值 Redis 客户端的早期读取方法，`dev`、`examples` 组不再安装 pyarrow，CI 删除 Arrow 检出与构建。Actions [40817116138](https://github.com/Dsssyc/c-two/actions/runs/40817116138)（缓存全冷、仍构建 Arrow）ARM64 线 54 分钟，其中 Arrow 17.2 分钟；最终候选的 [40824590087](https://github.com/Dsssyc/c-two/actions/runs/40824590087) 为 18.9 分钟。稳定节省约 19 分钟：Arrow 构建，以及 `python-build` 从约 150 秒降到 18 秒；其余差额来自同一分支上已热的 Cargo、emsdk 与 FastDB WASM 缓存，冷缓存下的 ARM64 线估计约 35 分钟，未实测。构建并行度：现有两槽各 2 个 job 已占满 4 核，是否值得改为共享 job 池，要先测单独构建的时长，尚未测量。Windows 2022 的偶发夹具编译失败本轮未出现，仍留观察。
+- 发版准备（`6facfc2e`）：C-Two 0.10.0、c3 0.6.0，两份 lockfile 各只改版本号一行。`docs/releases/0.10.0.md` 汇总自 0.9.0 以来的变更，补入 `unreleased.md` 漏收的 R15 与 R17c；CHANGELOG 增加 0.10.0 条目，`unreleased.md` 指向候选说明。中英文 README、SDK 与 c3 README 和 23 份现行文档切到新版本，补齐中文 README 缺的两句，构建前提写明 Rust 1.95；历史目录未改。
+- 取消的 Arrow 缓存微任务检出含未封存的半成品，hey-my-buddy 拦下了回收，留给用户在控制台清理。
 
 ### 继续暂缓、不单独开批的项目
 
