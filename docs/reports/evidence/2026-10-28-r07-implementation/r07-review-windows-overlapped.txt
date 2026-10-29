@@ -64,9 +64,9 @@ help: replace the use of the deprecated method
 
 warning: `c2-mem` (lib) generated 3 warnings (run `cargo fix --lib -p c2-mem` to apply 3 suggestions)
 warning: `c2-local` (lib) generated 1 warning (run `cargo fix --lib -p c2-local` to apply 1 suggestion)
-   Compiling c2-server v0.1.0 (C:\Users\74265\AppData\Local\Temp\r07-review-1c161a48\source\core\transport\c2-server)
+   Compiling c2-server v0.1.0 (~\AppData\Local\Temp\r07-review-1c161a48\source\core\transport\c2-server)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 8.68s
-     Running unittests src\lib.rs (C:\Users\74265\AppData\Local\Temp\r07-review-1c161a48\target\debug\deps\c2_server-692bfc66f823e53b.exe)
+     Running unittests src\lib.rs (~\AppData\Local\Temp\r07-review-1c161a48\target\debug\deps\c2_server-692bfc66f823e53b.exe)
 
 thread 'server::tests::windows_overlapped_flush_peer_close_keeps_dedicated_allocation' (18320) panicked at transport\c2-server\src\server.rs:11478:9:
 assertion `left == right` failed: possibly published allocation must remain live
