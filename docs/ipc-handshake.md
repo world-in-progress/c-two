@@ -1,6 +1,6 @@
 # IPC RPC 握手与固定版本前导规范
 
-状态：本文描述当前源码（IPC 握手版本 14）的规范边界，作为以后协议演进的依据；已发布的 C-Two 0.9.0 仍使用无固定前导的握手 13，两者不兼容。实现背景与批准边界见 [方案](plans/2026-10-25-ipc-version-mismatch.md)；未发布的变更记录见 [unreleased](releases/unreleased.md)。 本次实现的三系统门禁、旧版混用边界及延迟证据见[验收记录](reports/2026-10-26-ipc14-version-diagnostics-acceptance.md)。
+状态：本文描述 C-Two 0.10.0 起使用的 IPC 握手版本 14 的规范边界，作为以后协议演进的依据；0.9.x 使用无固定前导的握手 13，两者不兼容。实现背景与批准边界见 [方案](plans/2026-10-25-ipc-version-mismatch.md)；版本变更见 [0.10.0 更新说明](releases/0.10.0.md)。本次实现的三系统门禁、旧版混用边界及延迟证据见[验收记录](reports/2026-10-26-ipc14-version-diagnostics-acceptance.md)。
 
 ## 适用范围
 
@@ -53,7 +53,7 @@ Core relay-local 路由获取把类型化版本不符列为终态：完成本地
 
 ## 兼容性
 
-版本 14 之前的 RPC 握手没有此格式：新端不解析旧 payload、不尝试旧管道名、不凭 EOF 或错误码 2 猜版本；与旧端（含已发布 0.9.0 及更早 wheel）混用仍是连接/协议失败，旧 wheel 一侧只能观察到 generic connection failure，没有类型化投影。低层手工握手调用者必须采用新时序；旧单帧 RPC 握手入口不保留。C/FFI ABI 6、SHM 3、owner control 1、正常业务帧/call/reply 布局与 CRM hash 不因本变化改变。
+版本 14 之前的 RPC 握手没有此格式：新端不解析旧 payload、不尝试旧管道名、不凭 EOF 或错误码 2 猜版本；与旧端（含 0.9.x 及更早 wheel）混用仍是连接/协议失败，旧 wheel 一侧只能观察到 generic connection failure，没有类型化投影。低层手工握手调用者必须采用新时序；旧单帧 RPC 握手入口不保留。C/FFI ABI 6、SHM 3、owner control 1、正常业务帧/call/reply 布局与 CRM hash 不因本变化改变。
 
 ## Windows 固定命名
 

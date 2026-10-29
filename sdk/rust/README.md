@@ -13,14 +13,7 @@ This source-only package has no crates.io release. It reuses
 `c2-contract` for release identity and `c2-core` for route, transport, retry,
 host, and lifetime behavior. It does not expose a second runtime state machine.
 
-This guide describes the current source-only SDK, whose independent version
-remains 0.1.0. Python 0.9.0 / c3 0.5.0 are the latest published pair; see
-[unreleased changes](../../docs/releases/unreleased.md) for changes since that pair.
-Rust `c2-core` owns default `Persistent`, explicit `OwnerBound`, shutdown drain
-transactions and local endpoint maintenance. SDKs use the one OS endpoint
-derived by `LocalEndpoint::from_address`; there is no backend selector.
-See [lifecycle integration](../../docs/local-endpoint-lifecycle.en.md) and the
-[owned-child example](examples/owned_child.rs). Use matching builds and local endpoint configuration for clients, hosts and relays.
+This guide describes the current source-only SDK, whose independent version remains 0.1.0. It requires Rust 1.95 or newer and matches Python C-Two 0.10.0 / c3 0.6.0; see the [0.10.0 release notes](../../docs/releases/0.10.0.md) for the Rust API changes in that release. Rust `c2-core` owns default `Persistent`, explicit `OwnerBound`, shutdown drain transactions and local endpoint maintenance. SDKs use the one OS endpoint derived by `LocalEndpoint::from_address`; there is no backend selector. See [lifecycle integration](../../docs/local-endpoint-lifecycle.en.md) and the [owned-child example](examples/owned_child.rs). Use matching builds and local endpoint configuration for clients, hosts and relays.
 
 [IPC memory policy](../../docs/memory-policy.en.md) is also shared Core behavior:
 lazy buddy allocation, idle decay, finite direction-scoped backing/reassembly
@@ -47,7 +40,7 @@ see [connection configuration](../../docs/configuration.en.md#connection-deadlin
 | `Error::local_io_cause()` | Returns `Option<LocalIoCause>` for bind/connect failures. `Bind(EndpointBindCause { error, unverified_reason })` preserves OS details or the typed binding refusal; `Connect(EndpointIoError)` keeps its OS cause. `error()` still returns the unchanged `EndpointIoError`. |
 | `Error::ProtocolVersionMismatch { local, peer }` | A complete fixed RPC preamble reported a different nonzero `u32` version. Terminal before metadata or dispatch; no retry or relay fallback. |
 
-Timeouts above use `Option<Duration>`. The [lifecycle guide](../../docs/local-endpoint-lifecycle.en.md) specifies ticket protection, original grace deadlines, `NotSent`/`Indeterminate` outcomes and observation ordering. The [0.8.0 Rust migration notes](../../docs/releases/0.8.0.md#rust-migration-and-transport-behavior) cover removed low-level APIs, move-only allocation owners, `ChunkRegistry<C>`, SHM response preparation and structured lifecycle failures. Published 0.9.0 uses IPC handshake 13 and C/FFI ABI 6. Current unpublished source uses [IPC 14](../../docs/ipc-handshake.md), keeping ABI 6 and SHM 3. Recompile and upgrade peers together; pre-14 peers still yield generic connection/protocol failures.
+Timeouts above use `Option<Duration>`. The [lifecycle guide](../../docs/local-endpoint-lifecycle.en.md) specifies ticket protection, original grace deadlines, `NotSent`/`Indeterminate` outcomes and observation ordering. The [0.8.0 Rust migration notes](../../docs/releases/0.8.0.md#rust-migration-and-transport-behavior) cover removed low-level APIs, move-only allocation owners, `ChunkRegistry<C>`, SHM response preparation and structured lifecycle failures. C-Two 0.10.0 uses [IPC handshake 14](../../docs/ipc-handshake.md), keeping C/FFI ABI 6 and SHM 3. Recompile and upgrade peers together; pre-14 peers, including 0.9.x, yield generic connection/protocol failures.
 
 The low-level readiness failure now exposes `ServerFailure.bind_cause:
 Option<EndpointBindCause>`; migrate field access and exhaustive matches to

@@ -1,8 +1,8 @@
 # C-Two 当前路线图
 
-状态更新：2026-10-22；产品排序沿用 7 月设计优先级。
+状态更新：2026-10-29；产品排序沿用 7 月设计优先级。
 
-这是 C-Two 0.x 的当前维护路线图，以 Python 0.8.0 / c3 0.4.0 为源码基线。FastDB 固定 0.2.3。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。当前 API 边界和发行范围见[0.8.0 发布与迁移说明](releases/0.8.0.md)。
+这是 C-Two 0.x 的当前维护路线图，以 C-Two 0.10.0 / c3 0.6.0 为源码基线。FastDB 固定 0.2.3。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。当前 API 边界和发行范围见[0.10.0 更新与迁移说明](releases/0.10.0.md)。
 
 当前用法见[生命周期接入](local-endpoint-lifecycle.md)与[内存策略](memory-policy.md)。正式候选矩阵为 35 wheel、1 sdist 和 6 CLI target，包含原生 Windows ARM64。[CI 与发行流程](ci-cd.md)区分源码验证、包验证与发布；各次发行保留确切源码与产物收据。
 
@@ -14,9 +14,9 @@ Portable-payload 架构与历史本地候选参考为：
 
 `docs/plans/`、`docs/reviews/` 与较早日期的 `docs/superpowers/` 文档只保留历史证据；除非本路线图明确引用，否则不再是当前权威。
 
-## 0.8.0 维护
+## 0.10.0 维护
 
-[当前瘦身记录](plans/2026-10-13-local-slimming-batches.md)跟踪所有权与运行时收敛。[发布说明](releases/0.8.0.md)涵盖物理连接通知、显式所有者恢复、结构化本地 OS 原因、分块准入和 SHM 回复收敛。两份控制会话重构继续暂缓。[0.7.4 实施](plans/0.7.4.zh-CN.md)与[验证记录](reports/0.7.4-final-validation.zh-CN.md)保留为历史证据。
+[当前瘦身记录](plans/2026-10-13-local-slimming-batches.md)跟踪所有权与运行时收敛。[0.10.0 更新说明](releases/0.10.0.md)涵盖 IPC 14 版本诊断、Unix 命名空间格式 3、独立 Python Runtime 与释放失败时的所有权；[0.9.0](releases/0.9.0.md) 与 [0.8.0](releases/0.8.0.md) 说明涵盖 Windows 用户作用域、物理连接通知、显式所有者恢复、结构化本地 OS 原因、分块准入和 SHM 回复收敛。两份控制会话重构继续暂缓。[0.7.4 实施](plans/0.7.4.zh-CN.md)与[验证记录](reports/0.7.4-final-validation.zh-CN.md)保留为历史证据。
 
 ## 状态定义
 
@@ -51,7 +51,7 @@ Portable-payload 架构与历史本地候选参考为：
 
 | 顺序 | Workstream | 为何在这里 | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Immutable FastDB package distribution | FastDB 0.2.3 已发布；Python 0.8.0 / c3 0.4.0 使用同一源码的协调发行门禁；官方 C-Two Rust/TypeScript 分发仍未闭环。 | 经授权的 FastDB Rust/Python/TypeScript artifacts 可按 immutable identity 获取；C-Two 固定它们并通过 clean-environment package、codegen、runtime 与 interoperability gates。 |
+| 1 | Immutable FastDB package distribution | FastDB 0.2.3 已发布；Python 0.10.0 / c3 0.6.0 使用同一源码的协调发行门禁；官方 C-Two Rust/TypeScript 分发仍未闭环。 | 经授权的 FastDB Rust/Python/TypeScript artifacts 可按 immutable identity 获取；C-Two 固定它们并通过 clean-environment package、codegen、runtime 与 interoperability gates。 |
 | 2 | Contract compatibility | Exact release matching 是安全底线；semver/range 规则必须建立在稳定 release content 上。 | Rust-owned 规则拒绝 ambiguity 与 ABI-incompatible match，并在各 SDK 投影同一行为。 |
 | 3 | Call metadata 与 admission hooks | 上层需要 transport-consistent identity/policy mechanism，但 policy 不属于 C-Two。 | Thread-local、IPC 与 relay call 携带有界 metadata；hook 可准入/拒绝；下游系统仍是 policy authority。 |
 | 4 | Dry-run mechanism | Impact analysis 依赖同一个显式 metadata/admission boundary。 | Dry-run 明确评估内容、禁止的副作用与 unsupported method failure。 |
@@ -71,7 +71,7 @@ Portable-payload 架构与历史本地候选参考为：
 | Portable-payload benchmark | 当前有 correctness proof，但没有审阅后的显式 `Payload` throughput claim。 | 可复现 benchmark 记录 workload、environment、distribution、copy/direct/staged facts 与 retained-owner behavior。 |
 | Artifact publication hardening | 当前只支持 new-tree publication，不是 power-loss 或 hostile-parent durability receipt。 | Versioned prior-manifest/update protocol 与 platform-specific durable/no-follow publication 通过 fault/race tests。 |
 
-7 月 [deferred-capabilities 记录](./issues/contract-release-deferred-capabilities.md)保留原始理由、owner 和验收条件。其当时未完成的包分发、Host timeout 与分配所有权条目属于历史状态；当前运行时结论见[工作记录](plans/2026-10-13-local-slimming-batches.md)与[0.8.0 说明](releases/0.8.0.md)，产品优先级以上表为准。
+7 月 [deferred-capabilities 记录](./issues/contract-release-deferred-capabilities.md)保留原始理由、owner 和验收条件。其当时未完成的包分发、Host timeout 与分配所有权条目属于历史状态；当前运行时结论见[工作记录](plans/2026-10-13-local-slimming-batches.md)与[0.10.0 说明](releases/0.10.0.md)，产品优先级以上表为准。
 
 ## Handoff 规则
 

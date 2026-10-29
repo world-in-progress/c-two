@@ -40,7 +40,7 @@ C-Two 对自有 IPC 后备与在途组装维护三个有限的字节预算。三
 
 服务端响应对称：不大于 `shm_threshold` 走 inline；否则先尝试 buddy 复用，再尝试 buddy 池扩展，再尝试 dedicated SHM；都不可用或负载无法被 buddy 元数据表示时走分块回退。
 
-SHM 头部版本 3 在同一分配器锁下维护每次 buddy 分配的层级与不回绕标识。释放必须携带该标识并匹配活记录，错误父块、子块或旧标识不会修改位图和计数；长度仍按原规则向上取整，trim 仍释放原容量。每个最小块增加 8 字节元数据，默认 256 MiB/4 KiB backing 的映射和创建预算增加 512 KiB。该分配标识格式由 IPC 12 / C/FFI ABI 5 引入；已发布的 0.9.0 使用 IPC 13 / C/FFI ABI 6；当前未发布源码使用 [IPC 14 固定前导](ipc-handshake.md)，C/FFI ABI 6 与 SHM header 3 保持，旧握手与 ABI 直接拒绝。
+SHM 头部版本 3 在同一分配器锁下维护每次 buddy 分配的层级与不回绕标识。释放必须携带该标识并匹配活记录，错误父块、子块或旧标识不会修改位图和计数；长度仍按原规则向上取整，trim 仍释放原容量。每个最小块增加 8 字节元数据，默认 256 MiB/4 KiB backing 的映射和创建预算增加 512 KiB。该分配标识格式由 IPC 12 / C/FFI ABI 5 引入；0.9.x 使用 IPC 13 / C/FFI ABI 6；0.10.0 使用 [IPC 14 固定前导](ipc-handshake.md)，C/FFI ABI 6 与 SHM header 3 保持，旧握手与 ABI 直接拒绝。
 
 接收端组装是完整预留：按 `total_chunks × chunk_size` 一次性预留全部容量，存储层级为 buddy 复用 → GC 后复用 → buddy 扩展 → dedicated SHM → 文件 mmap 最终回退。组装完成时逻辑长度可以裁剪，但容量计费保持到存储真正释放。注意这是"接收全量、组装完成后一次交给资源"，不是流式或增量资源输入。
 
@@ -159,5 +159,6 @@ Prepared SHM 回复在整帧写完、flush 之前移交 buddy 的跨进程释放
 - `docs/reports/memory-budget-contract.md` 与 `docs/plans/2026-09-26-memory-policy.md` — 目标契约与计划背景。
 - [内存阶段验收](reports/memory-native-final-validation.md) — 该阶段固定源码与开发产物证据，保留其历史状态。
 - [0.7.0 统一验收](reports/canonical-local-endpoint-validation.md) — 该版本唯一端点的确切源码、Windows/Linux 门禁与开发产物哈希，保留为历史记录。
-- [0.8.0 发布说明](releases/0.8.0.md) — 当前所有权、分块准入与回复路径变化。
+- [0.10.0 更新说明](releases/0.10.0.md) — 释放失败时的所有权保留与 `abandoned_releases` 计数。
+- [0.8.0 发布说明](releases/0.8.0.md) — 引入当前所有权、分块准入与回复路径模型。
 - [0.7.4 发布记录](reports/0.7.4-publication.zh-CN.md) — 保留该版本的源码、平台门禁与公开产物验证。

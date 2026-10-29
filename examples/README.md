@@ -30,7 +30,7 @@ If the selected bin directory is not already on `PATH`, the tool prints the exac
 uv run python examples/python/local.py
 ```
 
-### Independent Runtime preflight (current unpublished source)
+### Independent Runtime preflight
 
 `independent_runtime.py` creates an explicit `cc.Runtime()`, starts an empty Host using its normal readiness/PONG path, and inspects its structured shutdown result. On Unix it creates a fresh private endpoint directory with the standard library and removes that directory only after completed, error-free cleanup. If cleanup is incomplete or reports an error, it keeps the path for the caller to inspect; a start error is re-raised even when cleanup succeeds. Windows uses the normal per-user Named Pipe endpoint and creates no Unix directory.
 

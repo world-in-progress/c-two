@@ -28,7 +28,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-**C-Two 0.9.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.3`）。Windows IPC 改为按用户作用域，在发送前核对服务端身份，并自动选择跨登录会话可用的数据通路。本版还修复 Python 缓冲导出与释放的竞争，退役旧手工包装。见[更新说明](docs/releases/0.9.0.md)。
+**C-Two 0.10.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.3`）。IPC 握手 14 把版本不匹配报告为结构化错误，Unix 端点改用带版本号默认目录的命名空间格式 3，Python 新增独立的 `cc.Runtime()` 实例与 `cc.server_credential()`。内存释放失败时由原持有者保留以便重试；已无法交还时保守放弃并计数。见[更新说明](docs/releases/0.10.0.md)。
 
 ## 特点
 
@@ -53,14 +53,14 @@ uv pip install 'c-two[fastdb]'
 Windows PowerShell 使用相同命令。Linux、macOS 的 c3 安装命令：
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-installer.sh | sh -s -- --version 0.5.0
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.sh | sh -s -- --version 0.6.0
 ```
 
-Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
+Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
 
-C3 0.5.0 配合已发布的 C-Two 0.9.0 使用。该发行版的 IPC 握手 13 和 C/FFI ABI 6 要求通信各端一起升级；SHM 3 与所有者控制 1 的格式保持。Windows 先停止旧服务，再升级并重启。见 [0.9.0 迁移说明](docs/releases/0.9.0.md)。 当前未发布源码使用 IPC 14 固定版本前导；采用该前导的不同版本能返回结构化版本错误，与已发布 0.9.0 混用仍是连接或协议失败。构建源码时两端应一同升级，见[握手规范](docs/ipc-handshake.md)和[未发布变更](docs/releases/unreleased.md)。
+C3 0.6.0 配合 C-Two 0.10.0 使用。IPC 握手 14 与 0.9.x（IPC 13）的对端无法互通，Unix 命名空间格式 3 使用新的默认目录，因此同一主机上的 Python 与 Rust SDK、c3 和 Node 使用方要一起升级；先停止旧服务，再升级并重启。C/FFI ABI 6、SHM 3 与所有者控制 1 的格式保持不变。见 [0.10.0 迁移说明](docs/releases/0.10.0.md)、[握手规范](docs/ipc-handshake.md)和[端点生命周期指南](docs/local-endpoint-lifecycle.md)。
 
-源码构建与测试见[开发指南](docs/development.md)。
+源码构建需要 Rust 1.95 或更新版本；构建与测试见[开发指南](docs/development.md)。
 
 ## 快速开始
 
@@ -91,9 +91,9 @@ finally:
 
 运行 `python counter.py`。示例使用同进程调用；本地注册时保持 `C2_RELAY_ANCHOR_ADDRESS` 未设置。
 
-同机的其他进程将资源进程的 `cc.server_address()` 传给客户端的 `address` 参数。两端的完整用法见 [IPC 示例](examples/python/ipc_resource.py)。
+同机的其他进程将资源进程的 `cc.server_address()` 传给客户端的 `address` 参数。两端的完整用法见 [IPC 示例](examples/python/ipc_resource.py)。资源进程还可以在注册后取得 `credential = cc.server_credential()`，交给它的控制方供之后精确清理，见[生命周期指南](docs/local-endpoint-lifecycle.md)。
 
-当前未发布源码还提供 `runtime = cc.Runtime()`，供应用分别拥有 Python 配置、路由和原生会话。用 `runtime.set_*()` 配置后，可以调用 `runtime.start()` 等待空 Host 就绪，或用 `runtime.register()` 承载资源。模块函数继续使用默认 Runtime；`cc.serve()` 负责默认 Runtime 的进程信号处理，没有实例版。应用结束时调用 `runtime.shutdown()` 并检查结构化结果；若结果为 pending，再调用 shutdown 观察完成并换代。见[独立 Runtime 示例](examples/python/independent_runtime.py)及 [Python API 指南](docs/python-usage.md#independent-python-runtimes)。
+`runtime = cc.Runtime()` 让应用分别拥有自己的 Python 配置、路由和原生会话。用 `runtime.set_*()` 配置后，可以调用 `runtime.start()` 等待空 Host 就绪，或用 `runtime.register()` 承载资源。模块函数继续使用默认 Runtime；`cc.serve()` 负责默认 Runtime 的进程信号处理，没有实例版。应用结束时调用 `runtime.shutdown()` 并检查结构化结果；若结果为 pending，再调用 shutdown 观察完成并换代。见[独立 Runtime 示例](examples/python/independent_runtime.py)及 [Python API 指南](docs/python-usage.md#independent-python-runtimes)。
 
 使用 relay 时，启动 `c3 relay --bind 0.0.0.0:8300`，在两端设置 `cc.set_relay_anchor('http://relay-host:8300')`，再按名称连接。Relay 独立运行；显式 IPC 地址直接连接端点。
 

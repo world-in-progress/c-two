@@ -1,6 +1,6 @@
 # C-Two CLI (C3)
 
-C3 **0.5.0** accompanies C-Two **0.9.0**, sharing its native ownership, connection observation and local OS error handling. See the [release notes](../docs/releases/0.9.0.md).
+C3 **0.6.0** accompanies C-Two **0.10.0**, sharing its IPC handshake 14, Unix namespace format 3 and endpoint maintenance behavior. See the [release notes](../docs/releases/0.10.0.md).
 
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
@@ -20,7 +20,7 @@ are described in the [0.7.4 guide](../docs/releases/0.7.4.md).
 
 ## Build and install for development
 
-Run CLI development commands from the repository root. Build the debug binary with:
+Building c3 requires Rust 1.95 or newer. Run CLI development commands from the repository root. Build the debug binary with:
 
 ```bash
 cargo build --manifest-path cli/Cargo.toml
@@ -109,7 +109,7 @@ Useful options:
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
-| `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-v3-<uidhex>` (Unix, current source) | Final owner-controlled endpoint directory; custom directories are application-provisioned, and `0755` is accepted when other identities cannot modify them. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
+| `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-v3-<uidhex>` (Unix) | Final owner-controlled endpoint directory; custom directories are application-provisioned, and `0755` is accepted when other identities cannot modify them. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
 | `--ipc-pool-enabled <true\|false>` | `C2_IPC_POOL_ENABLED` | Rust resolver | Enable buddy for data-plane upstream IPC; `false` still permits dedicated SHM. |
 | `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |
 | `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
@@ -196,12 +196,7 @@ the namespace hint is a routing-domain signal, not an authentication
 credential. On Windows these commands keep their TokenUser-scoped Named
 Pipe behavior and `--ipc-root` is rejected as not applicable.
 
-Current unpublished source uses Unix namespace disk format 3 and credential
-schema 4 without `device`. Default directory names include the disk format
-version; custom roots gain no suffix. Old default directories remain untouched,
-and old Unix credential schemas are rejected. Upgrade local SDKs, c3 and Node
-consumers together; follow the [unreleased migration notes](../docs/releases/unreleased.md)
-before rebuilding a custom root that reports `unsupported-namespace-format`.
+Unix endpoints use namespace disk format 3 and credential schema 4 without `device`. Default directory names include the disk format version; custom roots gain no suffix. Old default directories remain untouched, and old Unix credential schemas are rejected. Upgrade local SDKs, c3 and Node consumers together; follow the [0.10.0 migration notes](../docs/releases/0.10.0.md) before rebuilding a custom root that reports `unsupported-namespace-format`.
 
 Inspect reports observation, not process liveness. Reap refuses stale or
 unverified objects. Keep sweep addresses scoped to the current run; report
@@ -265,7 +260,7 @@ uv run --python 3.11 --group banner tools/dev/generate_banner.py
 
 ## Release
 
-The coordinated [c3 0.5.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.5.0)
+The coordinated [c3 0.6.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.6.0)
 uses the following binary target convention. Installation and checksum
 verification are in the [Windows guide](../docs/windows-native-usage.md):
 
@@ -283,14 +278,14 @@ The matching release's `rc-manifest.json` identifies the artifact source.
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.5.0
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.6.0
 ```
 
 The installer detects Linux/macOS and x86_64/aarch64. It defaults to
 `/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.5.0 --bin-dir "$HOME/bin"
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.6.0 --bin-dir "$HOME/bin"
 ```
 
 ### Windows x64 / ARM64
@@ -299,7 +294,7 @@ Download the PowerShell installer and select the coordinated version explicitly:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.5.0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.6.0
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```

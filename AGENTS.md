@@ -20,7 +20,7 @@ The core abstraction is resources, not services.
 
 ## Build, Test, And Run
 
-Package manager: `uv`, not direct `pip`. Build backend: `maturin`, which compiles the Rust native extension through PyO3.
+Package manager: `uv`, not direct `pip`. Build backend: `maturin`, which compiles the Rust native extension through PyO3. Source builds require Rust 1.95 or newer; every user-facing Rust package declares that `rust-version`.
 
 Native Rust tests embed Python and import the real public exception class. After building the extension, run `uv run python tools/dev/test_native.py`; this forwards that interpreter's library and installed-package paths to Cargo. Both shared CI and local test runners reuse this entry point.
 
@@ -124,7 +124,7 @@ Path: `sdk/python/src/c_two/crm/`
 - Resource implementations are plain Python classes and are not decorated.
 - Portable methods declare zero or one input and zero or one output with `@cc.transfer(input=FASTDB_SPEC, output=FASTDB_SPEC)`. Their Python parameter and return type is `fastdb4py.payload.Payload`; C-Two embeds each nested specification as an opaque JSON value and delegates it to FastDB Core.
 - Python-only fallback values use pickle and must not be treated as portable descriptor or codegen inputs.
-- C-Two 0.9.0 source uses FastDB 0.2.3 (the historical C-Two 0.7.6 release retains 0.2.2). Python FastDB payloads require the optional `c-two[fastdb]` extra, pinned to `fastdb4py==0.2.3`. Ordinary imports, CRM definitions, calls and error wrapping must not import FastDB or NumPy. The dev group selects the extra for full tests; native Core/Rust pins are independent.
+- C-Two 0.10.0 source uses FastDB 0.2.3 (the historical C-Two 0.7.6 release retains 0.2.2). Python FastDB payloads require the optional `c-two[fastdb]` extra, pinned to `fastdb4py==0.2.3`. Ordinary imports, CRM definitions, calls and error wrapping must not import FastDB or NumPy. The dev group selects the extra for full tests; native Core/Rust pins are independent.
 - FastDB retained response owners are selected by call-site `cc.hold(...)`; server-side borrowed inputs are selected only by `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})`.
 - CRM methods can use `@cc.read` or `@cc.write`; writes are the default.
 - `@cc.transfer(input=..., output=...)` is the only portable FastDB binding authoring surface. `@cc.transferable` and `@cc.transfer(buffer='hold')` are obsolete and must not be reintroduced as codec or lifetime selection mechanisms.
@@ -191,7 +191,7 @@ Failed Host startup cleanup is observed through the concrete attempt's existing 
 Transport modes:
 
 - Thread-local: same-process `cc.connect()` returns a zero-serialization proxy. It passes Python objects directly and may use the native route-concurrency handle through a thin Python adapter; do not route this path through Rust bytes dispatch for symmetry.
-- IPC (`ipc://`): Rust `c2-local` owns local streams (Unix UDS or Windows byte-mode Named Pipes), while `c2-mem` owns POSIX SHM or Windows named mappings. `c2-config::LocalEndpoint` derives the OS endpoint from the logical address; SDKs must use that authority. Remote IPC concurrency semantics and route capacity limits belong to Rust `c2-server`; Python only projects the native handle for same-process calls. The RPC IPC handshake is version 14 and opens with the permanent fixed 25-byte version preamble (see `docs/ipc-handshake.md`): native identity checks precede the preamble, un-negotiated CALL/ordinary-CTRL frames are fenced until the final metadata ACK, a complete `VersionMismatch` is a typed terminal error with no route/HTTP fallback and no retry, and handshake-13-or-older peers (published 0.9.0 wheels) are incompatible with no compatibility path.
+- IPC (`ipc://`): Rust `c2-local` owns local streams (Unix UDS or Windows byte-mode Named Pipes), while `c2-mem` owns POSIX SHM or Windows named mappings. `c2-config::LocalEndpoint` derives the OS endpoint from the logical address; SDKs must use that authority. Remote IPC concurrency semantics and route capacity limits belong to Rust `c2-server`; Python only projects the native handle for same-process calls. The RPC IPC handshake is version 14 and opens with the permanent fixed 25-byte version preamble (see `docs/ipc-handshake.md`): native identity checks precede the preamble, un-negotiated CALL/ordinary-CTRL frames are fenced until the final metadata ACK, a complete `VersionMismatch` is a typed terminal error with no route/HTTP fallback and no retry, and handshake-13-or-older peers (0.9.x and older wheels) are incompatible with no compatibility path.
 - HTTP (`http://`): relay-based cross-machine transport through Rust.
 
 Optional connection deadlines belong to Core. `cc.connect(..., timeout=...)` creates one native `ConnectAttempt` before SDK binding locks; the same absolute deadline covers singleton/registry/local-slot/relay override waits, pools, OS connection, handshake and live route/relay acquisition. SDKs project the attempt and never restart its budget, implement their own timer or leave a waiting thread after returning. Omitted/None retains existing phase guards; zero expires before transport. Connect expiry uses `CallDeadlineExceeded` with `operation=connect`, `transport_phase=pre_dispatch` and `stage`; it cannot execute or replay a business method. Preserve healthy shared clients on waiter expiry and isolate partial control writes.
@@ -408,7 +408,7 @@ The C-Two transport design reduces the practical blast radius of those unsafe es
 
 ### SOTA API Pattern
 
-The module-level registration, connection, configuration and shutdown API on `cc` delegates to the default Python Runtime. `cc.close(proxy)` follows that proxy's owner. Current source also exposes `cc.Runtime()` for application-owned instances with the same register/connect/configure/shutdown methods and an empty-Host `start()`:
+The module-level registration, connection, configuration and shutdown API on `cc` delegates to the default Python Runtime. `cc.close(proxy)` follows that proxy's owner. `cc.Runtime()` also creates application-owned instances with the same register/connect/configure/shutdown methods and an empty-Host `start()`:
 
 ```python
 import c_two as cc

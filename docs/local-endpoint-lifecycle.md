@@ -8,7 +8,7 @@
 
 Unix 的最终端点目录由显式代码 `cc.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-v3-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外子目录或 `.sock` 后缀；默认 root 的 `v3` 与 namespace 磁盘格式版本相同，自定义 root 不追加版本名。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 或准备 owner 接管时冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯上下文查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前用户 TokenUser SID 的 Named Pipe，明确拒绝 Unix root 配置。
 
-当前未发布 Python 源码可用 `runtime = cc.Runtime()` 分别拥有端点上下文、路由和原生会话。在 `runtime.start()` 或 `runtime.register()` 前调用 `runtime.set_local_endpoint(root=...)`；维护该实例的自定义 Unix root 时，将 `runtime.local_endpoint_context()` 传给现有 inspect/reap/sweep helper。显式 Runtime 不删除调用方创建的目录。Windows 使用原有用户范围的管道命名空间并拒绝 Unix root。[应用自有目录预检示例](../examples/python/independent_runtime.py)仅在确认关闭完成且排空无错误后删除新建的私有 Unix 目录。
+Python 的 `runtime = cc.Runtime()` 分别拥有自己的端点上下文、路由和原生会话。在 `runtime.start()` 或 `runtime.register()` 前调用 `runtime.set_local_endpoint(root=...)`；维护该实例的自定义 Unix root 时，将 `runtime.local_endpoint_context()` 传给现有 inspect/reap/sweep helper。显式 Runtime 不删除调用方创建的目录。Windows 使用原有用户范围的管道命名空间并拒绝 Unix root。[应用自有目录预检示例](../examples/python/independent_runtime.py)仅在确认关闭完成且排空无错误后删除新建的私有 Unix 目录。
 
 macOS 还会检查目录句柄上的扩展 ACL：只读、遍历和 deny 条目可用；授予新增、删除、修改属性或权限等能力的 allow 条目会被拒绝，包括继承条目。启动失败会显式释放监听租约锁，重复文件描述符不会继续占有该锁。
 
@@ -76,7 +76,7 @@ Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时�
 
 服务进程可在监听 Ready 后直接调用 `cc.server_credential() -> EndpointCredential | None` 并把凭据交给控制器；此查询读取现有生命周期 watch 中由 listener 发布的值，不调用 inspect、不做文件 I/O、不取 namespace gate，也不等待 readiness。Ready 和仍持有 listener 的 Stopping 阶段有值；启动前、绑定失败及 Stopped/Failed 终态返回 None。run 取消到现有 finalize 发布终态之间允许返回旧快照。控制器也可在协调 gate 空闲时调用 `cc.inspect_endpoint(address)` 取得 present 凭据；present 和 getter 快照均不证明存活或授予删除、owner 权限，WouldBlock 表示协调争用。子进程正常退出或 kill()+wait() 确认退出后，再用 `cc.reap_endpoint(address, credential)` 精确收尾；旧凭据不能删除新 incarnation。Windows getter 返回 kernel-managed schema 1 凭据，但 reap 为 NotApplicable。
 
-`cc.EndpointCredential` 是不可变原生对象；server_credential 与 inspect 交付同一类型，reap 接收该对象。需要保存或跨进程传递时显式使用 `credential.to_json()` 与 `cc.EndpointCredential.from_json(document=...)`，两者继续执行唯一 Rust codec 的严格校验和 32 KiB 限制；inspect 本身不保证 JSON 导出成功。凭据不能手工构造、继承、修改或浅复制，同进程可共享其引用。Python 包装壳、`_native` 槽和旧 `_native.PyEndpointCredential` 导出已退出，见[未发布变更](releases/unreleased.md)。
+`cc.EndpointCredential` 是不可变原生对象；server_credential 与 inspect 交付同一类型，reap 接收该对象。需要保存或跨进程传递时显式使用 `credential.to_json()` 与 `cc.EndpointCredential.from_json(document=...)`，两者继续执行唯一 Rust codec 的严格校验和 32 KiB 限制；inspect 本身不保证 JSON 导出成功。凭据不能手工构造、继承、修改或浅复制，同进程可共享其引用。Python 包装壳、`_native` 槽和旧 `_native.PyEndpointCredential` 导出已退出，见 [0.9.0 更新说明](releases/0.9.0.md)。
 
 ```python
 import c_two as cc

@@ -22,7 +22,7 @@ $env:C2_ENV_FILE = ''
 
 Set Runtime policy before registering resources or connecting clients. Each native configuration domain freezes when first used: local endpoints on the first bind/connect attempt, including a failed attempt; call admission on the first remote business call. Queries do not freeze configuration. Later environment changes do not alter a frozen choice.
 
-Current unpublished Python source exposes `cc.Runtime()` for an independently configured instance. The module-level functions use the default Runtime; each explicit instance owns its code overrides and native session and does not copy the default Runtime's overrides. All instances still read the same process environment and `.env` through the native resolver. Configure a particular instance with `runtime.set_*()` before its freeze point instead of changing `os.environ` to target one Runtime. `None` retains each setter's existing clear/inherit meaning.
+Python exposes `cc.Runtime()` for an independently configured instance. The module-level functions use the default Runtime; each explicit instance owns its code overrides and native session and does not copy the default Runtime's overrides. All instances still read the same process environment and `.env` through the native resolver. Configure a particular instance with `runtime.set_*()` before its freeze point instead of changing `os.environ` to target one Runtime. `None` retains each setter's existing clear/inherit meaning.
 
 ## SDK and transport configuration
 

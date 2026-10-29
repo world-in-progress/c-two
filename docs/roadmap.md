@@ -1,8 +1,8 @@
 # C-Two Current Roadmap
 
-Status refreshed: 2026-10-22; product ordering retains the July design priorities.
+Status refreshed: 2026-10-29; product ordering retains the July design priorities.
 
-This is the maintained roadmap for C-Two's 0.x line, using Python 0.8.0 / c3 0.4.0 as the source baseline. FastDB is pinned to 0.2.3. Rust SDK/Core/TypeScript retain independent 0.1.0 versions with no C-Two crates.io/npm publication. See the [0.8.0 release and migration notes](releases/0.8.0.md) for the current API boundaries and release scope.
+This is the maintained roadmap for C-Two's 0.x line, using C-Two 0.10.0 / c3 0.6.0 as the source baseline. FastDB is pinned to 0.2.3. Rust SDK/Core/TypeScript retain independent 0.1.0 versions with no C-Two crates.io/npm publication. See the [0.10.0 release and migration notes](releases/0.10.0.md) for the current API boundaries and release scope.
 
 Current usage is documented in [lifecycle integration](local-endpoint-lifecycle.en.md) and [memory policy](memory-policy.en.md). The release qualification matrix contains 35 wheels, one sdist and six CLI targets, including native Windows ARM64. [CI and release qualification](ci-cd.md) distinguishes source validation, package validation and publication; each release retains its exact source and artifact receipts. Portable-payload architecture and historical local-candidate references are:
 
@@ -14,9 +14,9 @@ Current usage is documented in [lifecycle integration](local-endpoint-lifecycle.
 
 Documents under `docs/plans/`, `docs/reviews/`, and older `docs/superpowers/` dates are retained evidence. They are not current authority unless this roadmap explicitly says otherwise.
 
-## 0.8.0 maintenance
+## 0.10.0 maintenance
 
-The [current slimming record](plans/2026-10-13-local-slimming-batches.md) tracks ownership and runtime convergence. The [release notes](releases/0.8.0.md) cover physical connection observations, explicit owner recovery, structured local OS causes, chunk admission and SHM response convergence. Two control-session refactors remain deferred. The [0.7.4 implementation](plans/0.7.4.md) and [validation](reports/0.7.4-final-validation.md) remain historical evidence.
+The [current slimming record](plans/2026-10-13-local-slimming-batches.md) tracks ownership and runtime convergence. The [0.10.0 release notes](releases/0.10.0.md) cover IPC 14 version diagnostics, Unix namespace format 3, independent Python runtimes and failed-release ownership; the [0.9.0](releases/0.9.0.md) and [0.8.0](releases/0.8.0.md) notes cover Windows user scope, physical connection observations, explicit owner recovery, structured local OS causes, chunk admission and SHM response convergence. Two control-session refactors remain deferred. The [0.7.4 implementation](plans/0.7.4.md) and [validation](reports/0.7.4-final-validation.md) remain historical evidence.
 
 ## Status Definitions
 
@@ -55,7 +55,7 @@ Start at the first incomplete item whose prerequisites and authorization are ava
 
 | Order | Workstream | Why it comes here | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Official immutable FastDB and C-Two package distribution | FastDB 0.2.3 is published; Python 0.8.0 / c3 0.4.0 use a coordinated source-bound release pipeline. Official C-Two Rust/TypeScript distribution remains open. | Authorized FastDB and C-Two Rust/Python/TypeScript/CLI artifacts are immutable and fetchable; production manifests pin them and repeat clean-environment package, codegen, runtime, and interoperability gates without local registries or sibling paths. |
+| 1 | Official immutable FastDB and C-Two package distribution | FastDB 0.2.3 is published; Python 0.10.0 / c3 0.6.0 use a coordinated source-bound release pipeline. Official C-Two Rust/TypeScript distribution remains open. | Authorized FastDB and C-Two Rust/Python/TypeScript/CLI artifacts are immutable and fetchable; production manifests pin them and repeat clean-environment package, codegen, runtime, and interoperability gates without local registries or sibling paths. |
 | 2 | Contract compatibility | Exact release matching is the safety floor; semver/range rules need stable official release content first. | Rust-owned rules reject ambiguity and ABI-incompatible matches and project identical behavior across SDKs. |
 | 3 | Call metadata and admission hooks | Upper layers need a transport-consistent mechanism for identity and policy decisions, but C-Two must not own policy. | Thread-local, IPC, and relay calls carry bounded metadata; hooks can accept/reject calls; downstream systems remain the policy authority. |
 | 4 | Dry-run mechanism | Impact analysis depends on the same explicit metadata/admission boundary. | Dry-run semantics state what is evaluated, which side effects are forbidden, and how unsupported methods fail. |
@@ -75,7 +75,7 @@ These tracks must not be smuggled into unrelated feature work or used to oversta
 | Portable-payload benchmark | The current suite has correctness proof but no reviewed explicit-`Payload` throughput claim. | A reproducible benchmark records workload, environment, distributions, copy/direct/staged facts, and retained-owner behavior. |
 | Artifact publication hardening | Publication is new-tree-only and not a power-loss or hostile-parent durability receipt. | A versioned prior-manifest/update protocol and platform-specific durable/no-follow publication pass fault and race tests. |
 
-The [July deferred-capabilities record](./issues/contract-release-deferred-capabilities.md) preserves original reasons, owners and closure criteria. Its then-open package, host-timeout and allocation-ownership rows are historical; current runtime dispositions are in the [work record](plans/2026-10-13-local-slimming-batches.md) and [0.8.0 notes](releases/0.8.0.md), while the product work above remains the current priority list.
+The [July deferred-capabilities record](./issues/contract-release-deferred-capabilities.md) preserves original reasons, owners and closure criteria. Its then-open package, host-timeout and allocation-ownership rows are historical; current runtime dispositions are in the [work record](plans/2026-10-13-local-slimming-batches.md) and [0.10.0 notes](releases/0.10.0.md), while the product work above remains the current priority list.
 
 ## Handoff Rules
 

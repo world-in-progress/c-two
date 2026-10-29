@@ -28,7 +28,7 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
 
-**C-Two 0.9.0** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.3`). Windows IPC is user-scoped, verifies the server before sending, and selects a usable data path across login sessions. The release also synchronizes Python buffer export/release and retires old manual Python projections. See the [release notes](docs/releases/0.9.0.md).
+**C-Two 0.10.0** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.3`). IPC handshake 14 reports a version mismatch as a typed error, Unix endpoints use namespace format 3 with versioned default directories, and Python adds independent `cc.Runtime()` instances and `cc.server_credential()`. A failed memory release stays with its owner for retry, or is abandoned conservatively and counted when it can no longer be returned. See the [release notes](docs/releases/0.10.0.md).
 
 ## Features
 
@@ -53,14 +53,14 @@ uv pip install 'c-two[fastdb]'
 The same command works in Windows PowerShell. For c3 on Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-installer.sh | sh -s -- --version 0.5.0
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.sh | sh -s -- --version 0.6.0
 ```
 
-On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.5.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
+On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
-C3 0.5.0 pairs with C-Two 0.9.0. The published 0.9.0 speaks IPC handshake 13; C/FFI ABI 6 requires a coordinated upgrade, and SHM 3 and owner control 1 keep their formats. Stop old Windows services before upgrading and restarting. See the [0.9.0 migration notes](docs/releases/0.9.0.md). Current source (unpublished) uses IPC handshake 14, which cannot interoperate with published 0.9.0 IPC 13 peers. It also uses Unix namespace disk format 3 with versioned default directories and provides `cc.server_credential()` after listener readiness. Upgrade the Python and Rust SDKs, c3 and Node consumers on one host together; see the [handshake spec](docs/ipc-handshake.md), [endpoint lifecycle guide](docs/local-endpoint-lifecycle.en.md) and [unreleased notes](docs/releases/unreleased.md).
+C3 0.6.0 pairs with C-Two 0.10.0. IPC handshake 14 cannot interoperate with 0.9.x peers (IPC 13), and Unix namespace format 3 uses new default directories, so upgrade the Python and Rust SDKs, c3 and Node consumers on one host together; stop old services before upgrading and restarting. C/FFI ABI 6, SHM 3 and owner control 1 keep their formats. See the [0.10.0 migration notes](docs/releases/0.10.0.md), the [handshake spec](docs/ipc-handshake.md) and the [endpoint lifecycle guide](docs/local-endpoint-lifecycle.en.md).
 
-For source builds and tests, see the [development guide](docs/development.md).
+Source builds need Rust 1.95 or newer; for builds and tests, see the [development guide](docs/development.md).
 
 ## Quickstart
 
@@ -91,9 +91,9 @@ finally:
 
 Run with `python counter.py`. This example uses the same-process path; keep `C2_RELAY_ANCHOR_ADDRESS` unset for local registration.
 
-For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`; the [IPC example](examples/python/ipc_resource.py) shows this connection. Current unpublished source also lets the resource process capture `credential = cc.server_credential()` after registration and pass it to its controller for later exact cleanup, as described in the [lifecycle guide](docs/local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
+For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`; the [IPC example](examples/python/ipc_resource.py) shows this connection. The resource process can also capture `credential = cc.server_credential()` after registration and pass it to its controller for later exact cleanup, as described in the [lifecycle guide](docs/local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
 
-Current unpublished source also exposes `runtime = cc.Runtime()` for an application-owned Python runtime with its own configuration, routes and native session. Configure it through `runtime.set_*()`, then use `runtime.start()` for an empty Host readiness check or `runtime.register()` for resources. The module functions continue to use the default runtime; `cc.serve()` owns its process signal handling and has no instance equivalent. Call `runtime.shutdown()` and inspect its structured outcome when the application is done; if it returns pending, call shutdown again to observe completion and replace the session. See the [independent runtime example](examples/python/independent_runtime.py) and [Python API guide](docs/python-usage.md#independent-python-runtimes).
+`runtime = cc.Runtime()` creates an application-owned Python runtime with its own configuration, routes and native session. Configure it through `runtime.set_*()`, then use `runtime.start()` for an empty Host readiness check or `runtime.register()` for resources. The module functions continue to use the default runtime; `cc.serve()` owns its process signal handling and has no instance equivalent. Call `runtime.shutdown()` and inspect its structured outcome when the application is done; if it returns pending, call shutdown again to observe completion and replace the session. See the [independent runtime example](examples/python/independent_runtime.py) and [Python API guide](docs/python-usage.md#independent-python-runtimes).
 
 For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_anchor('http://relay-host:8300')` on both sides, then connect by name. The relay is a separate process. Explicit IPC addresses bypass relay discovery.
 
