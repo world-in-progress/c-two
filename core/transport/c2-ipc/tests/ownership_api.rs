@@ -132,7 +132,7 @@ fn r02_unique_write_ownership_boundary_gate() {
         format!(
             "[package]\nname = \"r02-ownership-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
              publish = false\n\n[dependencies]\nc2-mem = {{ path = {:?} }}\n\
-             c2-ipc = {{ path = {:?} }}\nc2-server = {{ path = {:?} }}\nparking_lot = \"0.12\"\n\n\
+             c2-ipc = {{ path = {:?} }}\nc2-server = {{ path = {:?} }}\nparking_lot = \"0.13\"\n\n\
              [profile.dev]\ndebug = 0\nincremental = false\n",
             repository.join("core/foundation/c2-mem"),
             repository.join("core/transport/c2-ipc"),
@@ -166,7 +166,12 @@ fn r02_unique_write_ownership_boundary_gate() {
         let output = Command::new(env!("CARGO"))
             .args(&arguments)
             .current_dir(&consumer)
-            .env("CARGO_TARGET_DIR", session.0.join("target"))
+            .env(
+                "CARGO_TARGET_DIR",
+                std::env::var_os("CARGO_TARGET_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| session.0.join("target")),
+            )
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_TERM_COLOR", "never")
             .output()

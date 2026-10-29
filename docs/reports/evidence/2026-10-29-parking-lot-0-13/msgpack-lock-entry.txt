@@ -1,0 +1,7 @@
+command: parse msgpack package entry from uv.lock
+exit_code: 0
+name = 'msgpack'
+version = '1.2.3'
+source = {'registry': 'https://pypi.org/simple'}
+sdist_sha256 = 'sha256:32edb81a2b5eb7cd7c9d941b2bfbbb082fd2cd09e0e725930316af6b708db186'
+summary: msgpack package entries=1

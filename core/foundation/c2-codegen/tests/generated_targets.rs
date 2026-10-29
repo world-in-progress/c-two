@@ -235,7 +235,7 @@ fastdb = "=0.2.3"
 c2-ipc = {{ path = {ipc:?} }}
 c2-mem = {{ path = {mem:?} }}
 c2-wire = {{ path = {wire:?} }}
-parking_lot = "0.12"
+parking_lot = "0.13"
 "#,
         c_two = repository.join("sdk/rust"),
         ipc = repository.join("core/transport/c2-ipc"),

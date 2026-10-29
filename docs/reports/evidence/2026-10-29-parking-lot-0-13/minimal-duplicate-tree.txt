@@ -1,0 +1,43 @@
+summary: attempt 1, before Host authorized the Tokio feature adjustment; historical diagnostic evidence
+command: mkdir -p "$TASK_TMP/repro/src"
+exit_code: 0
+command: cat > "$TASK_TMP/repro/Cargo.toml" <<'TOML'
+[package]
+name = "parking-lot-resolution-probe"
+version = "0.0.0"
+edition = "2024"
+[dependencies]
+tokio = { version = "=1.54.1", features = ["full"] }
+parking_lot = "=0.13.0"
+TOML
+exit_code: 0
+command: echo 'fn main() {}' > "$TASK_TMP/repro/src/main.rs"
+exit_code: 0
+command: RUSTUP_TOOLCHAIN=1.99.0 CARGO_TARGET_DIR="$TASK_TMP/target" cargo tree --manifest-path "$TASK_TMP/repro/Cargo.toml" -d
+exit_code: 0
+    Updating crates.io index
+     Locking 28 packages to highest Rust 1.99.0 compatible versions
+ Downloading crates ...
+  Downloaded parking_lot v0.13.0
+  Downloaded parking_lot_core v0.10.0
+  Downloaded lock_api v0.5.0
+lock_api v0.4.14
+└── parking_lot v0.12.5
+    └── tokio v1.54.1
+        └── parking-lot-resolution-probe v0.0.0 ($TASK_TMP/repro)
+
+lock_api v0.5.0
+└── parking_lot v0.13.0
+    └── parking-lot-resolution-probe v0.0.0 ($TASK_TMP/repro)
+
+parking_lot v0.12.5 (*)
+
+parking_lot v0.13.0 (*)
+
+parking_lot_core v0.9.12
+└── parking_lot v0.12.5 (*)
+
+parking_lot_core v0.10.0
+└── parking_lot v0.13.0 (*)
+
+summary: parking_lot versions=2; lock_api versions=2; parking_lot_core versions=2

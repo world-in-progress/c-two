@@ -1,0 +1,21 @@
+summary: attempt 1, before Host authorized the Tokio feature adjustment; historical diagnostic evidence
+command: inspect registry tokio-1.54.1/Cargo.toml lines 72-85 and 901-903
+exit_code: 0
+tokio-1.54.1/Cargo.toml:72: full = [
+tokio-1.54.1/Cargo.toml:73:     "fs",
+tokio-1.54.1/Cargo.toml:74:     "io-util",
+tokio-1.54.1/Cargo.toml:75:     "io-std",
+tokio-1.54.1/Cargo.toml:76:     "macros",
+tokio-1.54.1/Cargo.toml:77:     "net",
+tokio-1.54.1/Cargo.toml:78:     "parking_lot",
+tokio-1.54.1/Cargo.toml:79:     "process",
+tokio-1.54.1/Cargo.toml:80:     "rt",
+tokio-1.54.1/Cargo.toml:81:     "rt-multi-thread",
+tokio-1.54.1/Cargo.toml:82:     "signal",
+tokio-1.54.1/Cargo.toml:83:     "sync",
+tokio-1.54.1/Cargo.toml:84:     "time",
+tokio-1.54.1/Cargo.toml:85: ]
+tokio-1.54.1/Cargo.toml:901: [dependencies.parking_lot]
+tokio-1.54.1/Cargo.toml:902: version = "0.12.0"
+tokio-1.54.1/Cargo.toml:903: optional = true
+summary: core/transport/c2-http/Cargo.toml:26 enables tokio/full; full enables optional parking_lot ^0.12.0

@@ -325,7 +325,12 @@ fn cargo(root: &Path, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO"))
         .args(arguments)
         .current_dir(root)
-        .env("CARGO_TARGET_DIR", repository().join("core/target"))
+        .env(
+            "CARGO_TARGET_DIR",
+            std::env::var_os("CARGO_TARGET_DIR")
+                .map(Into::into)
+                .unwrap_or_else(|| repository().join("core/target")),
+        )
         .output()
         .expect("nested cargo")
 }

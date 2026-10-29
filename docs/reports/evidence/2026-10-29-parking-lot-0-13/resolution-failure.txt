@@ -1,0 +1,17 @@
+summary: attempt 1, before Host authorized the Tokio feature adjustment; historical diagnostic evidence
+command: RUSTUP_TOOLCHAIN=1.99.0 CARGO_TARGET_DIR="$TASK_TMP/target" cargo update --manifest-path core/Cargo.toml -p parking_lot --precise 0.13.0
+exit_code: 101
+    Updating crates.io index
+error: failed to select a version for `tokio-util`.
+    ... required by package `reqwest v0.12.0`
+    ... which satisfies dependency `reqwest = "^0.12"` of package `c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)`
+    ... which satisfies path dependency `c2-http` (locked to 0.1.0) of package `c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)`
+versions that meet the requirements `^0.7.1` are: 0.7.20, 0.7.19, 0.7.18, 0.7.17, 0.7.16, 0.7.15, 0.7.14, 0.7.13, 0.7.12, 0.7.11, 0.7.10, 0.7.9, 0.7.8, 0.7.7, 0.7.6, 0.7.5, 0.7.4, 0.7.3, 0.7.2, 0.7.1
+
+all possible versions conflict with previously selected packages
+
+  previously selected package `tokio-util v0.7.0`
+    ... which satisfies dependency `tokio-util = "^0.7"` of package `c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)`
+    ... which satisfies path dependency `c2-http` (locked to 0.1.0) of package `c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)`
+
+failed to select a version for `tokio-util` which could resolve this conflict

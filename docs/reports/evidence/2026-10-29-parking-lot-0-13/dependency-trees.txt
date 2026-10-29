@@ -1,0 +1,162 @@
+command: cargo tree --locked --manifest-path core/Cargo.toml -d
+exit_code: 0
+summary: duplicate parking_lot versions=0; duplicate lock_api versions=0; duplicate parking_lot_core versions=0
+command: cargo tree --locked --manifest-path core/Cargo.toml -e features -i tokio
+exit_code: 0
+summary: tokio parking_lot feature activations=0
+command: cargo tree --locked --manifest-path core/Cargo.toml -i rustls
+exit_code: 0
+rustls v0.23.46
+├── hyper-rustls v0.27.7
+│   └── reqwest v0.12.28
+│       └── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)
+│           └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│           [dev-dependencies]
+│           └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+├── reqwest v0.12.28 (*)
+└── tokio-rustls v0.26.4
+    ├── hyper-rustls v0.27.7 (*)
+    └── reqwest v0.12.28 (*)
+command: cargo tree --locked --manifest-path core/Cargo.toml -i parking_lot
+exit_code: 0
+parking_lot v0.13.0
+├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+├── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│   [dev-dependencies]
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+├── c2-ipc v0.1.0 ($CHECKOUT/core/transport/c2-ipc)
+│   ├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│   └── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http) (*)
+│   [dev-dependencies]
+│   └── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http) (*)
+├── c2-server v0.1.0 ($CHECKOUT/core/transport/c2-server)
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│   [dev-dependencies]
+│   ├── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http) (*)
+│   └── c2-ipc v0.1.0 ($CHECKOUT/core/transport/c2-ipc) (*)
+└── c2-wire v0.1.0 ($CHECKOUT/core/protocol/c2-wire)
+    ├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+    ├── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http) (*)
+    ├── c2-ipc v0.1.0 ($CHECKOUT/core/transport/c2-ipc) (*)
+    └── c2-server v0.1.0 ($CHECKOUT/core/transport/c2-server) (*)
+command: cargo tree --locked --manifest-path cli/Cargo.toml -d
+exit_code: 0
+summary: duplicate parking_lot versions=0; duplicate lock_api versions=0; duplicate parking_lot_core versions=0
+command: cargo tree --locked --manifest-path cli/Cargo.toml -e features -i tokio
+exit_code: 0
+summary: tokio parking_lot feature activations=0
+command: cargo tree --locked --manifest-path cli/Cargo.toml -i rustls
+exit_code: 0
+rustls v0.23.46
+├── hyper-rustls v0.27.9
+│   └── reqwest v0.12.28
+│       ├── c2-cli v0.5.0 ($CHECKOUT/cli)
+│       └── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)
+│           ├── c2-cli v0.5.0 ($CHECKOUT/cli)
+│           └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│               └── c2-cli v0.5.0 ($CHECKOUT/cli)
+├── reqwest v0.12.28 (*)
+└── tokio-rustls v0.26.4
+    ├── hyper-rustls v0.27.9 (*)
+    └── reqwest v0.12.28 (*)
+command: cargo tree --locked --manifest-path cli/Cargo.toml -i parking_lot
+exit_code: 0
+parking_lot v0.13.0
+├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│   └── c2-cli v0.5.0 ($CHECKOUT/cli)
+├── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)
+│   ├── c2-cli v0.5.0 ($CHECKOUT/cli)
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+├── c2-ipc v0.1.0 ($CHECKOUT/core/transport/c2-ipc)
+│   ├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+│   └── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http) (*)
+├── c2-server v0.1.0 ($CHECKOUT/core/transport/c2-server)
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+└── c2-wire v0.1.0 ($CHECKOUT/core/protocol/c2-wire)
+    ├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+    ├── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http) (*)
+    ├── c2-ipc v0.1.0 ($CHECKOUT/core/transport/c2-ipc) (*)
+    └── c2-server v0.1.0 ($CHECKOUT/core/transport/c2-server) (*)
+command: cargo tree --locked --manifest-path sdk/rust/Cargo.toml -d
+exit_code: 0
+summary: duplicate parking_lot versions=0; duplicate lock_api versions=0; duplicate parking_lot_core versions=0
+command: cargo tree --locked --manifest-path sdk/rust/Cargo.toml -e features -i tokio
+exit_code: 0
+summary: tokio parking_lot feature activations=0
+command: cargo tree --locked --manifest-path sdk/rust/Cargo.toml -i rustls
+exit_code: 0
+rustls v0.23.46
+├── hyper-rustls v0.27.9
+│   └── reqwest v0.12.28
+│       └── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)
+│           └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│               └── c-two v0.1.0 ($CHECKOUT/sdk/rust)
+│           [dev-dependencies]
+│           └── c-two v0.1.0 ($CHECKOUT/sdk/rust)
+├── reqwest v0.12.28 (*)
+└── tokio-rustls v0.26.4
+    ├── hyper-rustls v0.27.9 (*)
+    └── reqwest v0.12.28 (*)
+command: cargo tree --locked --manifest-path sdk/rust/Cargo.toml -i parking_lot
+exit_code: 0
+parking_lot v0.13.0
+├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│   └── c-two v0.1.0 ($CHECKOUT/sdk/rust)
+├── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+│   [dev-dependencies]
+│   └── c-two v0.1.0 ($CHECKOUT/sdk/rust)
+├── c2-ipc v0.1.0 ($CHECKOUT/core/transport/c2-ipc)
+│   ├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+│   └── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http) (*)
+│   [dev-dependencies]
+│   └── c-two v0.1.0 ($CHECKOUT/sdk/rust)
+├── c2-server v0.1.0 ($CHECKOUT/core/transport/c2-server)
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+└── c2-wire v0.1.0 ($CHECKOUT/core/protocol/c2-wire)
+    ├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+    ├── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http) (*)
+    ├── c2-ipc v0.1.0 ($CHECKOUT/core/transport/c2-ipc) (*)
+    └── c2-server v0.1.0 ($CHECKOUT/core/transport/c2-server) (*)
+    [dev-dependencies]
+    └── c-two v0.1.0 ($CHECKOUT/sdk/rust)
+[dev-dependencies]
+└── c-two v0.1.0 ($CHECKOUT/sdk/rust)
+command: cargo tree --locked --manifest-path sdk/python/native/Cargo.toml -d
+exit_code: 0
+summary: duplicate parking_lot versions=0; duplicate lock_api versions=0; duplicate parking_lot_core versions=0
+command: cargo tree --locked --manifest-path sdk/python/native/Cargo.toml -e features -i tokio
+exit_code: 0
+summary: tokio parking_lot feature activations=0
+command: cargo tree --locked --manifest-path sdk/python/native/Cargo.toml -i rustls
+exit_code: 0
+rustls v0.23.46
+├── hyper-rustls v0.27.9
+│   └── reqwest v0.12.28
+│       └── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)
+│           └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│               └── c2-python-native v0.1.0 ($CHECKOUT/sdk/python/native)
+├── reqwest v0.12.28 (*)
+└── tokio-rustls v0.26.4
+    ├── hyper-rustls v0.27.9 (*)
+    └── reqwest v0.12.28 (*)
+command: cargo tree --locked --manifest-path sdk/python/native/Cargo.toml -i parking_lot
+exit_code: 0
+parking_lot v0.13.0
+├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core)
+│   └── c2-python-native v0.1.0 ($CHECKOUT/sdk/python/native)
+├── c2-http v0.1.0 ($CHECKOUT/core/transport/c2-http)
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+├── c2-ipc v0.1.0 ($CHECKOUT/core/transport/c2-ipc)
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+│   [dev-dependencies]
+│   └── c2-python-native v0.1.0 ($CHECKOUT/sdk/python/native)
+├── c2-python-native v0.1.0 ($CHECKOUT/sdk/python/native)
+├── c2-server v0.1.0 ($CHECKOUT/core/transport/c2-server)
+│   └── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+└── c2-wire v0.1.0 ($CHECKOUT/core/protocol/c2-wire)
+    ├── c2-core v0.1.0 ($CHECKOUT/core/runtime/c2-core) (*)
+    ├── c2-ipc v0.1.0 ($CHECKOUT/core/transport/c2-ipc) (*)
+    ├── c2-python-native v0.1.0 ($CHECKOUT/sdk/python/native)
+    └── c2-server v0.1.0 ($CHECKOUT/core/transport/c2-server) (*)

@@ -9634,11 +9634,22 @@ mod abandoned_release_tests {
         let worker = std::thread::spawn(move || {
             let mut detached = Vec::new();
             let mut returned_permits = Vec::new();
-            let settled = worker_pending
-                .lock()
-                .get_mut(&1)
-                .unwrap()
-                .try_settle(&mut detached, &mut returned_permits);
+            // Other production-path tests and the retire workers share the
+            // executor. A busy executor legitimately defers this nonblocking
+            // attempt; reach the injected release error before checking that
+            // error cleanup itself never waits under the pending-map lock.
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let settled = loop {
+                let settled = worker_pending
+                    .lock()
+                    .get_mut(&1)
+                    .unwrap()
+                    .try_settle(&mut detached, &mut returned_permits);
+                if settled || std::time::Instant::now() >= deadline {
+                    break settled;
+                }
+                std::thread::yield_now();
+            };
             settled_tx.send(settled).unwrap();
             drop(detached);
             for permit in returned_permits {

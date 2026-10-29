@@ -493,7 +493,12 @@ fn assert_external_crate_rejected(name: &str, source: &str, expected_stderr: &st
         }
         command
             .current_dir(&root)
-            .env("CARGO_TARGET_DIR", sdk.join("target/compile-fail"))
+            .env(
+                "CARGO_TARGET_DIR",
+                std::env::var_os("CARGO_TARGET_DIR")
+                    .map(Into::into)
+                    .unwrap_or_else(|| sdk.join("target/compile-fail")),
+            )
             .output()
             .expect("external cargo check")
     };

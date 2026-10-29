@@ -1,0 +1,29 @@
+command: compare parsed package versions in git show HEAD:core/Cargo.lock and core/Cargo.lock
+exit_code: 0
+summary: core/Cargo.lock changed package names=lock_api,parking_lot,parking_lot_core,redox_syscall,rustls,signal-hook-registry,smallvec
+summary: parking_lot versions=0.13.0; count=1
+summary: lock_api versions=0.5.0; count=1
+summary: rustls versions=0.23.46; count=1
+command: compare parsed package versions in git show HEAD:cli/Cargo.lock and cli/Cargo.lock
+exit_code: 0
+summary: cli/Cargo.lock changed package names=libc,lock_api,parking_lot,parking_lot_core,redox_syscall,rustls,signal-hook-registry,smallvec
+summary: parking_lot versions=0.13.0; count=1
+summary: lock_api versions=0.5.0; count=1
+summary: rustls versions=0.23.46; count=1
+command: compare parsed package versions in git show HEAD:sdk/rust/Cargo.lock and sdk/rust/Cargo.lock
+exit_code: 0
+summary: sdk/rust/Cargo.lock changed package names=libc,lock_api,parking_lot,parking_lot_core,redox_syscall,rustls,signal-hook-registry
+summary: parking_lot versions=0.13.0; count=1
+summary: lock_api versions=0.5.0; count=1
+summary: rustls versions=0.23.46; count=1
+command: compare parsed package versions in git show HEAD:sdk/python/native/Cargo.lock and sdk/python/native/Cargo.lock
+exit_code: 0
+summary: sdk/python/native/Cargo.lock changed package names=libc,lock_api,parking_lot,parking_lot_core,redox_syscall,rustls,signal-hook-registry,smallvec
+summary: parking_lot versions=0.13.0; count=1
+summary: lock_api versions=0.5.0; count=1
+summary: rustls versions=0.23.46; count=1
+command: compare parsed package versions in git show HEAD:uv.lock and uv.lock
+exit_code: 0
+summary: uv.lock changed package names=msgpack
+summary: msgpack versions=1.2.3; count=1
+summary: no package versions changed outside approved direct upgrades and mandatory parking_lot_core transitive upgrades; signal-hook-registry removed with unused Tokio signal feature

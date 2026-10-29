@@ -1,0 +1,41 @@
+command: uv sync --frozen --no-dev --config-settings build-args=--profile dev
+exit_code: 0
+summary: editable Python native extension built and installed in task-owned virtual environment
+command: cargo check --locked --manifest-path core/Cargo.toml --all-targets
+exit_code: 101
+error: couldn't read `foundation/c2-codegen/tests/../../../../../fastdb/tests/golden/payload/v1/binary/spec/graph-all-values.source.json`: No such file or directory (os error 2)
+  --> foundation/c2-codegen/tests/generated_rust_sdk.rs:11:26
+   |
+11 |   const GRAPH_SPEC: &str = include_str!(
+   |  __________________________^
+12 | |     "../../../../../fastdb/tests/golden/payload/v1/binary/spec/graph-all-values.source.json"
+13 | | );
+   | |_^
+
+error: couldn't read `foundation/c2-codegen/tests/../../../../../fastdb/tests/golden/payload/v1/spec/valid/record-all-types.source.json`: No such file or directory (os error 2)
+  --> foundation/c2-codegen/tests/generated_rust_sdk.rs:14:27
+   |
+14 |   const RECORD_SPEC: &str = include_str!(
+   |  ___________________________^
+15 | |     "../../../../../fastdb/tests/golden/payload/v1/spec/valid/record-all-types.source.json"
+16 | | );
+   | |_^
+
+error: could not compile `c2-codegen` (test "generated_rust_sdk") due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+command: cargo check --locked --manifest-path core/Cargo.toml --all-targets --workspace --exclude c2-codegen
+exit_code: 0
+    Finished `dev` profile [unoptimized] target(s) in 6.99s
+command: cargo check --locked --manifest-path cli/Cargo.toml --all-targets
+exit_code: 0
+    Finished `dev` profile [unoptimized] target(s) in 10.10s
+command: cargo check --locked --manifest-path sdk/rust/Cargo.toml --all-targets
+exit_code: 0
+    Finished `dev` profile [unoptimized] target(s) in 10.92s
+command: cargo check --locked --manifest-path sdk/python/native/Cargo.toml --all-targets
+exit_code: 0
+    Finished `dev` profile [unoptimized] target(s) in 5.91s
+summary: complete Core all-targets check blocked by two missing sibling FastDB compile-time fixtures in c2-codegen; all remaining workspace targets checked successfully
+command: cargo metadata --locked --no-deps --format-version 1 --manifest-path core/Cargo.toml
+exit_code: 0
+summary: core package rust-version=1.95: 13/13
