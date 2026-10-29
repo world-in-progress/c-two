@@ -204,14 +204,19 @@ def test_installer_rejects_unsupported_target_overrides():
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell host architectures")
-@pytest.mark.parametrize("shell", ["pwsh", "System32", "SysWOW64"])
-def test_powershell_selects_native_os_target(shell):
+@pytest.mark.parametrize("shell,subprocess_timeout", [
+    pytest.param("pwsh", 30, marks=pytest.mark.timeout(60)),
+    pytest.param("System32", 30, marks=pytest.mark.timeout(60)),
+    # On ARM64, emulated x86 Windows PowerShell usually takes ~12s and has exceeded 30s.
+    pytest.param("SysWOW64", 120, marks=pytest.mark.timeout(150)),
+])
+def test_powershell_selects_native_os_target(shell, subprocess_timeout):
     powershell = (pwsh if shell == "pwsh" else
                   Path(os.environ["SystemRoot"]) / shell / "WindowsPowerShell/v1.0/powershell.exe")
     result = subprocess.run(
         [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(_installer()), "-PrintTarget"],
         env={key: value for key, value in os.environ.items() if not key.startswith("C3_")},
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=subprocess_timeout,
     )
     architecture = "aarch64" if sysconfig.get_platform() == "win-arm64" else "x86_64"
     assert result.returncode == 0, result.stderr
