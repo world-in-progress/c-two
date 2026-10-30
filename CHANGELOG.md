@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [0.10.0] — companion c3 0.6.0
 
-Release candidate; publication is pending. See the [release notes](docs/releases/0.10.0.md) for IPC 14 version diagnostics, Unix namespace format 3 and credential schema 4, listener credential snapshots, independent Python runtimes, failed-release ownership, the Rust 1.95 build requirement, FastDB 0.2.4 and the coordinated upgrade.
+Published 2026-10-30. See the [release notes](docs/releases/0.10.0.md) for IPC 14 version diagnostics, Unix namespace format 3 and credential schema 4, listener credential snapshots, independent Python runtimes, failed-release ownership, the Rust 1.95 build requirement, FastDB 0.2.4 and the coordinated upgrade.
 
 ## [0.9.0] — companion c3 0.5.0
 

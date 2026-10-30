@@ -1,0 +1,99 @@
+{
+  "version": "0.10.0",
+  "cli_version": "0.6.0",
+  "source_sha": "4b1d91610fd1a0745cea0b5bb841ab0928ed723b",
+  "pull_request": "https://github.com/world-in-progress/c-two/pull/203",
+  "pull_request_head": "cceecc658f48b9b01188f5fae59b42a5aef2f87d",
+  "implementation_sha": "1b4a970190e7a2a6dac092e9d3f28ca4f3e45bda",
+  "protocols": {
+    "ipc": 14,
+    "shm": 3,
+    "c_ffi_abi": 6,
+    "owner_control": 1,
+    "unix_namespace_format": 3,
+    "unix_endpoint_credential_json": 4,
+    "windows_endpoint_credential_json": 1
+  },
+  "fastdb": {
+    "version": "0.2.4",
+    "source_sha": "f82fa13adeae2b87a295bf984821c85c44b55a3d",
+    "release_manifest_sha256": "8a07ab93409811bb5e11418876ba082594758c2b3b87a766699c447586a9c5bf"
+  },
+  "first_attempt": {
+    "source_sha": "4c3e587daf7b737af80e37729a803a2e9145ea2f",
+    "pull_request": "https://github.com/world-in-progress/c-two/pull/202",
+    "pull_request_source_validation": {"run_id": 40843023208, "source": "6747bf73", "attempt": 1, "jobs_passed": 10},
+    "main_push_source_validation": {
+      "run_id": 40857187478,
+      "attempt_1_failed_source_jobs": ["source (windows-2025, py3.12)", "source (windows-11-arm, py3.12)"],
+      "passing_attempt": 2,
+      "disposition": "failed-job rerun left two full artifacts in two lanes"
+    },
+    "release_candidate": {"run_id": 40870564100, "successful_jobs": 38, "expected_skipped_jobs": 1},
+    "dry_runs": {"cli": 40874071148, "python": 40874076753, "result": "refused at candidate verification; nothing uploaded"},
+    "fresh_full_qualification": {"run_id": 40874415766, "attempt": 1, "jobs_passed": 10},
+    "paused_for": "FastDB 0.2.4 memory release fix"
+  },
+  "release_fixes": {
+    "commits": {
+      "check_source_artifact_rule": "60059bb3",
+      "codegen_consumer_permit_wait": "f1c6a97e",
+      "powershell_hang_guard": ["b0331f6f", "6ff74cb7"],
+      "fastdb_0_2_4_and_error_wording": "1b4a9701"
+    },
+    "fork_full_ci": [
+      {"run_id": 40900123908, "source": "53881d45", "attempt": 1, "jobs_passed": 10},
+      {"run_id": 40913057564, "source": "6ff74cb7", "attempt": 1, "jobs_passed": 10},
+      {"run_id": 41002689847, "source": "1b4a9701", "attempt": 1, "jobs_passed": 10, "core_sdk": "0.2.4 on every source lane", "fastdb4py": "0.2.4"}
+    ]
+  },
+  "source_validation": {
+    "pull_request": {"run_id": 41008027942, "source": "cceecc65", "attempt": 1, "jobs_passed": 10},
+    "canonical": {"run_id": 41010698934, "source": "4b1d9161", "event": "push", "attempt": 1, "jobs_passed": 10, "full_artifacts_per_lane": 1}
+  },
+  "release_candidate": {
+    "run_id": 41013847454,
+    "source": "4b1d91610fd1a0745cea0b5bb841ab0928ed723b",
+    "successful_jobs": 38,
+    "expected_skipped_jobs": ["linux (aarch64-unknown-linux-gnu) / sdist"],
+    "manifest_sha256": "bbc0937cbeb503b1ab666b824a9003bbbaeaf9f2fe350ada3635536441dab2b2"
+  },
+  "promotion": {
+    "dry_run": {"cli": 41016119599, "python": 41016124301},
+    "publication": {"cli": 41016376334, "python": 41016379589},
+    "result": "success",
+    "pypi_environment": "approved under the user release authorization"
+  },
+  "publication": {
+    "pypi_url": "https://pypi.org/project/c-two/0.10.0/",
+    "cli_url": "https://github.com/world-in-progress/c-two/releases/tag/c3-v0.6.0",
+    "manifest_url": "https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/rc-manifest.json",
+    "manifest_sha256": "bbc0937cbeb503b1ab666b824a9003bbbaeaf9f2fe350ada3635536441dab2b2",
+    "python_files": 36,
+    "wheels": 35,
+    "sdists": 1,
+    "cli_assets": 17,
+    "every_file_name_size_sha256_matched_plan": true,
+    "yanked_files": 0,
+    "windows_arm64_wheels": [
+      "c_two-0.10.0-cp311-cp311-win_arm64.whl",
+      "c_two-0.10.0-cp312-cp312-win_arm64.whl",
+      "c_two-0.10.0-cp313-cp313-win_arm64.whl",
+      "c_two-0.10.0-cp314-cp314-win_arm64.whl",
+      "c_two-0.10.0-cp314-cp314t-win_arm64.whl"
+    ],
+    "tag_source": "4b1d91610fd1a0745cea0b5bb841ab0928ed723b",
+    "smoke": {
+      "pypi": "c-two[fastdb]==0.10.0 with fastdb4py 0.2.4 on CPython 3.13, macOS ARM64; one same-process CRM call",
+      "cli": "c3-aarch64-apple-darwin SHA-256 matched its .sha256 asset; --version reports c3 0.6.0"
+    }
+  },
+  "cleanup": {
+    "fork_branches_deleted": ["socu/0100-release-fixes", "socu/0100-release-fixes-ci", "socu/r15-expiry-gc-ci", "socu/076-ci-release-gates"],
+    "upstream_branches_deleted": ["dependabot/cargo/core/parking_lot-0.13.0", "dependabot/cargo/core/rust-minor-and-patch-a9788e4297"],
+    "deletion_rule": "exact SHA lease; fork branches contained in main; upstream branches belong to merged #200 and closed #201",
+    "fork_ci_branch_caches_deleted": true,
+    "retired_codex_worktree": "slimming-batches, clean, branch contained in main",
+    "first_attempt_runs_retained_in_actions": true
+  }
+}
