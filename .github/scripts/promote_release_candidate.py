@@ -1064,7 +1064,7 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "6 installed-wheel lifecycle smokes, "
         "4 Windows standard-user lifecycle/cleanup receipts, an isolated auditwheel-repaired "
         "sdist build/import/lifecycle proof, and the 18-row Rust/Python portable matrix plus "
-        "12-row TypeScript real-call receipt on Ubuntu 24.04, macOS 15, Windows Server 2022/2025 "
+        "12-row TypeScript real-call receipt on Ubuntu 24.04, macOS 15, Windows Server 2025 "
         "and Windows 11 ARM64 CI runners "
         "(the Source Validation gates exercise each lane's own debug c3 build; the released executables "
         "are the exact tested release candidates).",

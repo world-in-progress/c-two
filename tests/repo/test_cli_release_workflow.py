@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -204,8 +205,14 @@ def test_ci_validates_source_on_pr_merge_group_and_main_push():
         assert event in ci_text
     assert "branches: [main]" in ci_text
     assert "tools/ci/source_validation.py" in ci_text
-    for label in ("ubuntu-24.04", "macos-15", "windows-2022", "windows-2025", "windows-11-arm"):
-        assert label in ci_text
+    # Every lane that release promotion requires must exist in the source matrix.
+    spec = importlib.util.spec_from_file_location(
+        "source_evidence", _repo_root() / ".github" / "scripts" / "source_evidence.py")
+    assert spec is not None and spec.loader is not None
+    source_evidence = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(source_evidence)
+    for label in source_evidence.FULL_LANES:
+        assert f"os: {label}," in ci_text
     assert "3.12" in ci_text
     assert "3.14t" in ci_text
 

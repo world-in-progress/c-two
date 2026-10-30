@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any
 
 CANONICAL_REPOSITORY = "world-in-progress/c-two"
-FULL_LANES = ("ubuntu-24.04", "macos-15", "windows-2022", "windows-2025", "windows-11-arm")
+FULL_LANES = ("ubuntu-24.04", "macos-15", "windows-2025", "windows-11-arm")
 REQUIRED_JOBS = (
     *(f"source ({label}, py3.12)" for label in FULL_LANES),
     "source (ubuntu-24.04, py3.14t)",

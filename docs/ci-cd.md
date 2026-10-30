@@ -19,7 +19,7 @@ On a main push, the selector first applies the changed-path rules. Policy-only c
 
 Workflow policy always runs the pinned, hash-checked actionlint binary and automatically discovers all `tests/repo/` tests. Python tools come from the locked `ci-policy` dependency group, which installs neither C-Two nor its runtime dependencies. The development group includes that same tool group. Source jobs and workflow policy run in parallel after scope selection. The protected check names remain `test (py3.12)` and `test (py3.14t)`. Their always-running aggregation requires successful scope selection, policy success and either successful source checks or an intentional scope decision to omit them. A failed scope decision cannot produce a green gate.
 
-Full source coverage includes Linux, macOS, Windows Server 2022/2025 x64, Windows 11 ARM64 and free-threaded Python, including relay, cross-language and endpoint-cleanup checks. ARM64 uses native Rust, Python and Node consumers. A policy-only green run cannot supply release source evidence. To qualify a commit without retained full source evidence:
+Full source coverage includes Linux, macOS, Windows Server 2025 x64, Windows 11 ARM64 and free-threaded Python, including relay, cross-language and endpoint-cleanup checks. ARM64 uses native Rust, Python and Node consumers. A policy-only green run cannot supply release source evidence. To qualify a commit without retained full source evidence:
 
 ```bash
 gh workflow run ci.yml --ref main -F force_full=true

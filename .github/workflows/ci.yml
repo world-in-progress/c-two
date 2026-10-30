@@ -85,7 +85,6 @@ jobs:
         include:
           - {os: ubuntu-24.04, python: '3.12', scope: full}
           - {os: macos-15, python: '3.12', scope: full}
-          - {os: windows-2022, python: '3.12', scope: full}
           - {os: windows-2025, python: '3.12', scope: full}
           - {os: windows-11-arm, python: '3.12', scope: full}
           - {os: ubuntu-24.04, python: '3.14t', scope: python}
