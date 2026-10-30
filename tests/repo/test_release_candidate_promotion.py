@@ -59,8 +59,8 @@ SOURCE_SHA = "a" * 40
 OTHER_SHA = "b" * 40
 C_TWO_VERSION = "0.6.0"
 C3_VERSION = "0.2.0"
-FASTDB_VERSION = "0.2.3"
-FASTDB_CORE_VERSION = "0.2.3"
+FASTDB_VERSION = "0.2.4"
+FASTDB_CORE_VERSION = "0.2.4"
 FASTDB_SOURCE_REV = promote.SOURCE_VALIDATION_FASTDB_SHA
 CLI_TARGETS = promote.CLI_TARGETS
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
@@ -1327,18 +1327,19 @@ def test_check_source_writes_only_github_metadata(tmp_path: Path, environment) -
         "run_id": 201,
         "run_url": f"https://github.com/{REPOSITORY}/actions/runs/201",
     }
-    # Run listings and job listings only: no artifact bytes are ever touched.
+    # Run, job, and artifact listings only: no artifact bytes are ever touched.
     assert api.paths
     assert all("/actions/artifacts/" not in path and not path.endswith("/zip")
                for path in api.paths)
     assert any("/actions/workflows/ci.yml/runs" in path for path in api.paths)
     assert any("/actions/runs/201/jobs" in path for path in api.paths)
+    assert any("/actions/runs/201/artifacts" in path for path in api.paths)
 
 
 def test_check_source_accepts_an_explicit_dispatch_source_run(
     tmp_path: Path, environment,
 ) -> None:
-    world = _default_world()
+    world = World()
     world.set_source_runs(_run(201, "Source Validation", event="workflow_dispatch"))
     environment(world)
     code, plan = run_check_source(tmp_path)
@@ -1349,7 +1350,7 @@ def test_check_source_accepts_an_explicit_dispatch_source_run(
 def test_check_source_skips_policy_only_green_runs(tmp_path: Path, environment) -> None:
     """The newest green run is ignored when its job inventory is policy-only;
     the newest run that actually executed the full source lanes is returned."""
-    world = _default_world()
+    world = World()
     world.set_source_runs(_run(201, "Source Validation"), _run(202, "Source Validation"))
     world.jobs_by_run = {202: [
         {"name": "changes", "status": "completed", "conclusion": "success"}]}
@@ -1357,6 +1358,52 @@ def test_check_source_skips_policy_only_green_runs(tmp_path: Path, environment) 
     code, plan = run_check_source(tmp_path)
     assert code == 0
     assert json.loads(plan.read_text())["run_id"] == 201
+
+
+@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
+def test_check_source_skips_runs_with_duplicate_full_artifacts(
+    tmp_path: Path, environment, label,
+) -> None:
+    world = World()
+    world.set_source_runs(_run(201, "Source Validation"), _run(202, "Source Validation"))
+    name = f"source-{label}-py3.12-full-{SOURCE_SHA}"
+    artifact = next(entry for entry in world.artifacts_by_run[202] if entry["name"] == name)
+    world.artifacts_by_run[202].append(dict(artifact, id=artifact["id"] + 100000))
+    api = environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 0
+    assert json.loads(plan.read_text())["run_id"] == 201
+    assert any("/actions/runs/202/artifacts" in path for path in api.paths)
+    assert all("/actions/artifacts/" not in path and not path.endswith("/zip")
+               for path in api.paths)
+
+
+@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
+@pytest.mark.parametrize("count, reason, unexpected_reason", [
+    (0, "Full-scope artifacts are missing or expired.", "Duplicate full-scope artifacts"),
+    (2, "Duplicate full-scope artifacts indicate a rerun.", "missing or expired"),
+])
+def test_check_source_rejects_invalid_full_artifact_counts_with_fresh_run_guidance(
+    tmp_path: Path, environment, capsys, label, count, reason, unexpected_reason,
+) -> None:
+    world = _default_world()
+    name = f"source-{label}-py3.12-full-{SOURCE_SHA}"
+    artifact = next(entry for entry in world.artifacts_by_run[201] if entry["name"] == name)
+    if count == 0:
+        world.artifacts_by_run[201].remove(artifact)
+    else:
+        world.artifacts_by_run[201].append(dict(artifact, id=artifact["id"] + 100000))
+    environment(world)
+    code, plan = run_check_source(tmp_path)
+    assert code == 1 and not plan.exists()
+    err = capsys.readouterr().err
+    assert f"Source Validation run 201 retains {count} {name} artifacts" in err
+    assert "release qualification requires exactly one full-scope artifact per platform" in err
+    assert "the run bound by rc-context.json" not in err
+    assert reason in err and unexpected_reason not in err
+    assert "new full Source Validation run" in err and "same source SHA" in err
+    assert "gh workflow run ci.yml --ref main -F force_full=true" in err
+    assert "Rerunning jobs is not a substitute" in err
 
 
 def test_check_source_rejects_a_policy_only_green_run_as_the_full_gate(
@@ -1667,7 +1714,7 @@ def test_fastdb_provisioning_missing_wheel_with_null_digest_is_rejected(
     assert "not a distinct retained wheel" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("core_version, accepted", [("0.2.3", True), ("0.2.1", False)])
+@pytest.mark.parametrize("core_version, accepted", [("0.2.4", True), ("0.2.1", False)])
 def test_python_fastdb_version_is_independent_of_native_core(
     tmp_path: Path, environment, monkeypatch, core_version, accepted,
 ) -> None:
@@ -1679,7 +1726,7 @@ def test_python_fastdb_version_is_independent_of_native_core(
     if accepted:
         assert json.loads(plan_path.read_text())["versions"]["fastdb_version"] == "0.2.2"
         body = body_path.read_text()
-        assert "Native FastDB Core: `0.2.3`" in body
+        assert "Native FastDB Core: `0.2.4`" in body
         assert "Optional Python FastDB: `fastdb4py==0.2.2`" in body
 
 
@@ -2090,15 +2137,38 @@ def test_source_fastdb_pin_drift_fails_closed(
 
 
 @pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-def test_missing_source_lane_artifact_fails_closed(tmp_path, environment, capsys, label):
+def test_duplicate_source_lane_artifacts_fail_closed(tmp_path, environment, capsys, label):
     world = _default_world()
-    world.artifacts_by_run[201] = [
-        artifact for artifact in world.artifacts_by_run[201]
-        if artifact["name"] != f"source-{label}-py3.12-full-{SOURCE_SHA}"]
+    name = f"source-{label}-py3.12-full-{SOURCE_SHA}"
+    artifact = next(entry for entry in world.artifacts_by_run[201] if entry["name"] == name)
+    world.artifacts_by_run[201].append(dict(artifact, id=artifact["id"] + 100000))
     environment(world)
     code, plan, _ = run_prepare(tmp_path)
     assert code == 1 and not plan.exists()
-    assert f"source-{label}-py3.12-full-{SOURCE_SHA}" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert f"Source Validation run 201 retains 2 {name} artifacts" in err
+    assert "release qualification requires exactly one full-scope artifact per platform" in err
+    assert "the run bound by rc-context.json" not in err
+    assert "Duplicate full-scope artifacts indicate a rerun." in err
+    assert "missing or expired" not in err
+
+
+@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
+def test_missing_source_lane_artifact_fails_closed(tmp_path, environment, capsys, label):
+    world = _default_world()
+    name = f"source-{label}-py3.12-full-{SOURCE_SHA}"
+    world.artifacts_by_run[201] = [
+        artifact for artifact in world.artifacts_by_run[201]
+        if artifact["name"] != name]
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1 and not plan.exists()
+    err = capsys.readouterr().err
+    assert f"Source Validation run 201 retains 0 {name} artifacts" in err
+    assert "release qualification requires exactly one full-scope artifact per platform" in err
+    assert "the run bound by rc-context.json" not in err
+    assert "Full-scope artifacts are missing or expired." in err
+    assert "Duplicate full-scope artifacts" not in err
 
 
 @pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)

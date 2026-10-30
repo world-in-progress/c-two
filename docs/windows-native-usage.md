@@ -2,7 +2,7 @@
 
 The native Windows backend uses byte-mode Named Pipes for `ipc://` control traffic and named file mappings for shared payload memory. It uses the process TokenUser SID across logons. Same-session peers may use SHM; different sessions use owned/inline/chunked transfers. Native connections require a matching user and a server integrity of at least Medium before sending. Ordinary SDK code continues to use logical `ipc://` addresses; do not construct pipe or mapping names in an SDK. HTTP relay still provides the network path.
 
-This guide covers Python C-Two **0.10.0**, c3 **0.6.0** and FastDB **0.2.3** on Windows x64 and ARM64. Install the matching Python and c3 versions together; see the [0.10.0 migration notes](releases/0.10.0.md) and [lifecycle guide](local-endpoint-lifecycle.en.md) for endpoint behavior.
+This guide covers Python C-Two **0.10.0**, c3 **0.6.0** and FastDB **0.2.4** on Windows x64 and ARM64. Install the matching Python and c3 versions together; see the [0.10.0 migration notes](releases/0.10.0.md) and [lifecycle guide](local-endpoint-lifecycle.en.md) for endpoint behavior.
 
 Unix root overrides (`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-root`) are rejected on Windows. Pipe names derive from the logical address and current TokenUser SID.
 
@@ -54,11 +54,11 @@ Python resource servers using `cc.serve()` accept Ctrl+C; automated subprocess s
 ## Build from source
 
 Use canonical main for source development. The matching c3 release's `rc-manifest.json` identifies release source; main is a development checkout convention.
-Use a Developer PowerShell targeting your native x64 or ARM64 architecture with the MSVC C++ toolchain, CMake, Ninja, Git, Rust 1.95 or newer and uv available. Python and Rust resolve FastDB 0.2.3 from their registries; Python requires the optional `fastdb` extra. The Python extension and c3 use source-mode native builds. The Rust binding also requires the matching Core SDK: extract `fastdb-core-0.2.3-x86_64-pc-windows-msvc.tar.gz` or `fastdb-core-0.2.3-aarch64-pc-windows-msvc.tar.gz` from that release and configure its absolute `lib` directory below. The full source-based interoperability checks additionally use the sibling FastDB release checkout for fixtures and TypeScript sources; Python consumers use the published wheel:
+Use a Developer PowerShell targeting your native x64 or ARM64 architecture with the MSVC C++ toolchain, CMake, Ninja, Git, Rust 1.95 or newer and uv available. Python and Rust resolve FastDB 0.2.4 from their registries; Python requires the optional `fastdb` extra. The Python extension and c3 use source-mode native builds. The Rust binding also requires the matching Core SDK: extract `fastdb-core-0.2.4-x86_64-pc-windows-msvc.tar.gz` or `fastdb-core-0.2.4-aarch64-pc-windows-msvc.tar.gz` from that release and configure its absolute `lib` directory below. The full source-based interoperability checks additionally use the sibling FastDB release checkout for fixtures and TypeScript sources; Python consumers use the published wheel:
 
 ```powershell
 git clone https://github.com/world-in-progress/fastdb.git
-git -C fastdb checkout v0.2.3
+git -C fastdb checkout v0.2.4
 git clone https://github.com/world-in-progress/c-two.git
 Set-Location c-two
 $env:FASTDB_PAYLOAD_SYSTEM_LIB_DIR = 'C:\path\to\fastdb-core-sdk\lib'

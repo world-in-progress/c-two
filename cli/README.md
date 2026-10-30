@@ -5,8 +5,8 @@ C3 **0.6.0** accompanies C-Two **0.10.0**, sharing its IPC handshake 14, Unix na
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
 This guide covers the native c3 interface. Configuration is documented in the
-[configuration guide](../docs/configuration.en.md); endpoint directory changes
-are described in the [0.7.4 guide](../docs/releases/0.7.4.md).
+[configuration guide](../docs/configuration.en.md); endpoint directories and
+their maintenance are described in the [lifecycle guide](../docs/local-endpoint-lifecycle.en.md).
 
 ## Scope
 

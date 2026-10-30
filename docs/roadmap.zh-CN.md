@@ -2,7 +2,7 @@
 
 状态更新：2026-10-29；产品排序沿用 7 月设计优先级。
 
-这是 C-Two 0.x 的当前维护路线图，以 C-Two 0.10.0 / c3 0.6.0 为源码基线。FastDB 固定 0.2.3。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。当前 API 边界和发行范围见[0.10.0 更新与迁移说明](releases/0.10.0.md)。
+这是 C-Two 0.x 的当前维护路线图，以 C-Two 0.10.0 / c3 0.6.0 为源码基线。FastDB 固定 0.2.4。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。当前 API 边界和发行范围见[0.10.0 更新与迁移说明](releases/0.10.0.md)。
 
 当前用法见[生命周期接入](local-endpoint-lifecycle.md)与[内存策略](memory-policy.md)。正式候选矩阵为 35 wheel、1 sdist 和 6 CLI target，包含原生 Windows ARM64。[CI 与发行流程](ci-cd.md)区分源码验证、包验证与发布；各次发行保留确切源码与产物收据。
 
@@ -43,7 +43,7 @@ Portable-payload 架构与历史本地候选参考为：
 | 真实 backing 边界 | 已证明的 Rust/Python receive adapter 是 copy-backed。`cc.hold()` 与 borrowed-input policy 负责 owner/lease invalidation，不代表已直接构造到最终 response shared memory。 |
 | Python-only prototype | 没有 portable binding 的普通 Python method 仍可在本地使用 pickle；portable descriptor export/codegen 会诊断并拒绝它们。 |
 
-历史 7 月本地候选使用当时的 FastDB 源码与包 metadata，并未出版。当前依赖为正式 FastDB 0.2.3，原生源码固定 `abba785ef2a7d3fbee1bbc608393a3e6c7b042c4`；旧报告保留各自确切输入，不作为当前产物证明。
+历史 7 月本地候选使用当时的 FastDB 源码与包 metadata，并未出版。当前依赖为正式 FastDB 0.2.4，原生源码固定 `f82fa13adeae2b87a295bf984821c85c44b55a3d`；旧报告保留各自确切输入，不作为当前产物证明。
 
 ## 有序产品工作
 
@@ -51,7 +51,7 @@ Portable-payload 架构与历史本地候选参考为：
 
 | 顺序 | Workstream | 为何在这里 | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Immutable FastDB package distribution | FastDB 0.2.3 已发布；Python 0.10.0 / c3 0.6.0 使用同一源码的协调发行门禁；官方 C-Two Rust/TypeScript 分发仍未闭环。 | 经授权的 FastDB Rust/Python/TypeScript artifacts 可按 immutable identity 获取；C-Two 固定它们并通过 clean-environment package、codegen、runtime 与 interoperability gates。 |
+| 1 | Immutable FastDB package distribution | FastDB 0.2.4 已发布；Python 0.10.0 / c3 0.6.0 使用同一源码的协调发行门禁；官方 C-Two Rust/TypeScript 分发仍未闭环。 | 经授权的 FastDB Rust/Python/TypeScript artifacts 可按 immutable identity 获取；C-Two 固定它们并通过 clean-environment package、codegen、runtime 与 interoperability gates。 |
 | 2 | Contract compatibility | Exact release matching 是安全底线；semver/range 规则必须建立在稳定 release content 上。 | Rust-owned 规则拒绝 ambiguity 与 ABI-incompatible match，并在各 SDK 投影同一行为。 |
 | 3 | Call metadata 与 admission hooks | 上层需要 transport-consistent identity/policy mechanism，但 policy 不属于 C-Two。 | Thread-local、IPC 与 relay call 携带有界 metadata；hook 可准入/拒绝；下游系统仍是 policy authority。 |
 | 4 | Dry-run mechanism | Impact analysis 依赖同一个显式 metadata/admission boundary。 | Dry-run 明确评估内容、禁止的副作用与 unsupported method failure。 |

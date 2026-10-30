@@ -14,7 +14,7 @@ uv pip install 'c-two[fastdb]==0.10.0'
 
 The base package has no Python runtime dependencies. Ordinary CRM definition,
 registration, direct/IPC/relay calls and errors do not load FastDB or NumPy.
-The `fastdb` extra pins `fastdb4py==0.2.3`; using FastDB payloads without it
+The `fastdb` extra pins `fastdb4py==0.2.4`; using FastDB payloads without it
 reports the extra to install. The exact pin selects the validated 0.x binding
 instead of allowing an untested later native interface.
 
@@ -46,13 +46,13 @@ Prerequisites:
 - Python 3.14.3t when testing free-threading support
 - Rust 1.95 or newer
 - `uv`
-- for full interoperability tests: the FastDB `v0.2.3` source checkout at `../fastdb`
+- for full interoperability tests: the FastDB `v0.2.4` source checkout at `../fastdb`
 
 The default workspace dev group selects `c-two[fastdb]` and resolves
-`fastdb4py==0.2.3` from PyPI. Bare package installation omits it. The Python native extension and
-c3 pin FastDB source `abba785ef2a7d3fbee1bbc608393a3e6c7b042c4` for their source-mode static
+`fastdb4py==0.2.4` from PyPI. Bare package installation omits it. The Python native extension and
+c3 pin FastDB source `f82fa13adeae2b87a295bf984821c85c44b55a3d` for their source-mode static
 builds. Core and Rust SDK tests use the published Rust bindings with the matching
-[FastDB Core SDK](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.3)
+[FastDB Core SDK](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.4)
 in system link mode. Golden specs and TypeScript interoperability fixtures still
 need the sibling source checkout; it is not a Python package override.
 

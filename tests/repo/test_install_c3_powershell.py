@@ -204,6 +204,9 @@ def test_installer_rejects_unsupported_target_overrides():
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell host architectures")
+# These limits only guard against hangs: Windows 11 ARM64 varies ~4x across
+# hosts and runs (slowest ~50s), and pytest's timeout must exceed the subprocess timeout.
+@pytest.mark.timeout(210)
 @pytest.mark.parametrize("shell", ["pwsh", "System32", "SysWOW64"])
 def test_powershell_selects_native_os_target(shell):
     powershell = (pwsh if shell == "pwsh" else
@@ -211,7 +214,7 @@ def test_powershell_selects_native_os_target(shell):
     result = subprocess.run(
         [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(_installer()), "-PrintTarget"],
         env={key: value for key, value in os.environ.items() if not key.startswith("C3_")},
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=180,
     )
     architecture = "aarch64" if sysconfig.get_platform() == "win-arm64" else "x86_64"
     assert result.returncode == 0, result.stderr

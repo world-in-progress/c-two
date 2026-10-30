@@ -34,7 +34,7 @@ c2-ipc = { version = "0.1.0", path = "../../../core/transport/c2-ipc" }
 # from the official FastDB repository checkout instead of requiring a
 # system-installed libfastdb. The safe fastdb crate itself still comes from
 # crates.io; this patch reroutes only the raw fastdb-sys bindings to the
-# immutable v0.2.3 source at this rev, whose checkout layout lets its build
+# immutable v0.2.4 source at this rev, whose checkout layout lets its build
 # script drive source-mode CMake builds.
 [patch.crates-io]
-fastdb-sys = { git = "https://github.com/world-in-progress/fastdb", rev = "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4" }
+fastdb-sys = { git = "https://github.com/world-in-progress/fastdb", rev = "f82fa13adeae2b87a295bf984821c85c44b55a3d" }

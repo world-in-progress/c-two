@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FASTDB_SOURCE_SHA: abba785ef2a7d3fbee1bbc608393a3e6c7b042c4
+  FASTDB_SOURCE_SHA: f82fa13adeae2b87a295bf984821c85c44b55a3d
   EMSDK_SOURCE_SHA: c817c0ca4ba889ee24a185fd954cff7de1bd8afa
   EMSDK_VERSION: "5.0.2"
   C2_ENV_FILE: ""

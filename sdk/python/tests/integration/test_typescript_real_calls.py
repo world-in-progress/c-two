@@ -45,7 +45,7 @@ C2_MEM_TYPESCRIPT = (
 NODE_FIXTURE = (
     REPOSITORY / "sdk/python/tests/fixtures/typescript_real_call.mjs"
 )
-FASTDB_COMMIT = os.environ.get("C2_TYPESCRIPT_FASTDB_SOURCE_SHA", "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4")
+FASTDB_COMMIT = os.environ.get("C2_TYPESCRIPT_FASTDB_SOURCE_SHA", "f82fa13adeae2b87a295bf984821c85c44b55a3d")
 sys.path.insert(0, str(REPOSITORY))
 
 from tools.local_rc.typescript_receipt import (  # noqa: E402
