@@ -1,6 +1,6 @@
 # C-Two CLI (C3)
 
-C3 **0.6.0** accompanies C-Two **0.10.0**, sharing its IPC handshake 14, Unix namespace format 3 and endpoint maintenance behavior. See the [release notes](../docs/releases/0.10.0.md).
+C3 **0.6.0** accompanies C-Two **0.10.x**, sharing its IPC handshake 14, Unix namespace format 3 and endpoint maintenance behavior. See the [release notes](../docs/releases/0.10.0.md).
 
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 

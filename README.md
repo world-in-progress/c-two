@@ -28,7 +28,7 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
 
-**C-Two 0.10.0** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.4`). IPC handshake 14 reports a version mismatch as a typed error, Unix endpoints use namespace format 3 with versioned default directories, and Python adds independent `cc.Runtime()` instances and `cc.server_credential()`. A failed memory release stays with its owner for retry, or is abandoned conservatively and counted when it can no longer be returned. See the [release notes](docs/releases/0.10.0.md).
+**C-Two 0.10.1** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.4`). IPC handshake 14 reports a version mismatch as a typed error, Unix endpoints use namespace format 3 with versioned default directories, and Python adds independent `cc.Runtime()` instances and `cc.server_credential()`. A failed memory release stays with its owner for retry, or is abandoned conservatively and counted when it can no longer be returned. See the [0.10.0 release notes](docs/releases/0.10.0.md); 0.10.1 keeps `cc.serve()` running when stdout cannot encode its messages ([notes](docs/releases/0.10.1.md)).
 
 ## Features
 
@@ -58,7 +58,7 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.
 
 On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/windows-native-usage.md#install-python-and-c3).
 
-C3 0.6.0 pairs with C-Two 0.10.0. IPC handshake 14 cannot interoperate with 0.9.x peers (IPC 13), and Unix namespace format 3 uses new default directories, so upgrade the Python and Rust SDKs, c3 and Node consumers on one host together; stop old services before upgrading and restarting. C/FFI ABI 6, SHM 3 and owner control 1 keep their formats. See the [0.10.0 migration notes](docs/releases/0.10.0.md), the [handshake spec](docs/ipc-handshake.md) and the [endpoint lifecycle guide](docs/local-endpoint-lifecycle.en.md).
+C3 0.6.0 pairs with C-Two 0.10.x. IPC handshake 14 cannot interoperate with 0.9.x peers (IPC 13), and Unix namespace format 3 uses new default directories, so upgrade the Python and Rust SDKs, c3 and Node consumers on one host together; stop old services before upgrading and restarting. C/FFI ABI 6, SHM 3 and owner control 1 keep their formats. See the [0.10.0 migration notes](docs/releases/0.10.0.md), the [handshake spec](docs/ipc-handshake.md) and the [endpoint lifecycle guide](docs/local-endpoint-lifecycle.en.md).
 
 Source builds need Rust 1.95 or newer; for builds and tests, see the [development guide](docs/development.md).
 

@@ -1,6 +1,6 @@
 # IPC Memory Pressure And Backpressure
 
-This guide describes C-Two 0.10.0 / c3 0.6.0. See the [release notes](releases/0.10.0.md) for upgrades and release scope, and [memory policy](memory-policy.en.md) for configuration and retained-owner accounting.
+This guide describes C-Two 0.10.1 / c3 0.6.0. See the [release notes](releases/0.10.0.md) for upgrades and release scope, and [memory policy](memory-policy.en.md) for configuration and retained-owner accounting.
 
 ## Current Model
 

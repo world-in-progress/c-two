@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.10.1] — companion c3 0.6.0
+
+Release candidate; publication is pending. See the [release notes](docs/releases/0.10.1.md).
+
 ### Fixed
 
 - Python `cc.serve()` startup and shutdown messages use ASCII text, escape route names that stdout cannot encode, and flush output so piped banners appear immediately. Non-UTF-8 stdout no longer raises `UnicodeEncodeError` or skips graceful shutdown.

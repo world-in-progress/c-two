@@ -2,7 +2,7 @@
 
 Status refreshed: 2026-10-29; product ordering retains the July design priorities.
 
-This is the maintained roadmap for C-Two's 0.x line, using C-Two 0.10.0 / c3 0.6.0 as the source baseline. FastDB is pinned to 0.2.4. Rust SDK/Core/TypeScript retain independent 0.1.0 versions with no C-Two crates.io/npm publication. See the [0.10.0 release and migration notes](releases/0.10.0.md) for the current API boundaries and release scope.
+This is the maintained roadmap for C-Two's 0.x line, using C-Two 0.10.1 / c3 0.6.0 as the source baseline. FastDB is pinned to 0.2.4. Rust SDK/Core/TypeScript retain independent 0.1.0 versions with no C-Two crates.io/npm publication. See the [0.10.0 release and migration notes](releases/0.10.0.md) for the current API boundaries and release scope.
 
 Current usage is documented in [lifecycle integration](local-endpoint-lifecycle.en.md) and [memory policy](memory-policy.en.md). The release qualification matrix contains 35 wheels, one sdist and six CLI targets, including native Windows ARM64. [CI and release qualification](ci-cd.md) distinguishes source validation, package validation and publication; each release retains its exact source and artifact receipts. Portable-payload architecture and historical local-candidate references are:
 
@@ -55,7 +55,7 @@ Start at the first incomplete item whose prerequisites and authorization are ava
 
 | Order | Workstream | Why it comes here | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Official immutable FastDB and C-Two package distribution | FastDB 0.2.4 is published; Python 0.10.0 / c3 0.6.0 use a coordinated source-bound release pipeline. Official C-Two Rust/TypeScript distribution remains open. | Authorized FastDB and C-Two Rust/Python/TypeScript/CLI artifacts are immutable and fetchable; production manifests pin them and repeat clean-environment package, codegen, runtime, and interoperability gates without local registries or sibling paths. |
+| 1 | Official immutable FastDB and C-Two package distribution | FastDB 0.2.4 is published; Python 0.10.1 / c3 0.6.0 use a coordinated source-bound release pipeline. Official C-Two Rust/TypeScript distribution remains open. | Authorized FastDB and C-Two Rust/Python/TypeScript/CLI artifacts are immutable and fetchable; production manifests pin them and repeat clean-environment package, codegen, runtime, and interoperability gates without local registries or sibling paths. |
 | 2 | Contract compatibility | Exact release matching is the safety floor; semver/range rules need stable official release content first. | Rust-owned rules reject ambiguity and ABI-incompatible matches and project identical behavior across SDKs. |
 | 3 | Call metadata and admission hooks | Upper layers need a transport-consistent mechanism for identity and policy decisions, but C-Two must not own policy. | Thread-local, IPC, and relay calls carry bounded metadata; hooks can accept/reject calls; downstream systems remain the policy authority. |
 | 4 | Dry-run mechanism | Impact analysis depends on the same explicit metadata/admission boundary. | Dry-run semantics state what is evaluated, which side effects are forbidden, and how unsupported methods fail. |

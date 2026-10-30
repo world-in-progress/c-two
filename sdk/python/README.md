@@ -2,14 +2,14 @@
 
 C-Two exposes stateful Python resources through typed CRM contracts over same-process calls, local IPC, or an external HTTP relay. This package projects the shared Rust runtime into Python.
 
-Python C-Two **0.10.0** pairs with c3 **0.6.0**. See the [release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.10.0.md).
+Python C-Two **0.10.1** pairs with c3 **0.6.0**. See the [0.10.0 release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.10.0.md) and the [0.10.1 patch notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.10.1.md).
 
 Install the matching published versions:
 
 ```bash
-uv pip install 'c-two==0.10.0'
+uv pip install 'c-two==0.10.1'
 # Only for FastDB Payload contracts:
-uv pip install 'c-two[fastdb]==0.10.0'
+uv pip install 'c-two[fastdb]==0.10.1'
 ```
 
 The base package has no Python runtime dependencies. Ordinary CRM definition,
