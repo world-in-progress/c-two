@@ -47,9 +47,7 @@ cc.serve()
 
 @pytest.mark.parametrize('freeze', [
     False,
-    pytest.param(True, marks=pytest.mark.skipif(
-        os.name == 'nt', reason='SIGSTOP/SIGCONT are POSIX process controls',
-    )),
+    pytest.param(True, marks=pytest.mark.platform('posix')),
 ])
 @pytest.mark.parametrize('hosted', [False, True])
 def test_client_shutdown_with_live_proxy(monkeypatch, freeze: bool, hosted: bool) -> None:

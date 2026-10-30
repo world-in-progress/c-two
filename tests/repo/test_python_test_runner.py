@@ -15,9 +15,6 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tools.dev import test_python as runner
 
-RUNTIME_BIND_DENIAL_TEST = 'tests/unit/test_runtime.py::test_public_start_preserves_native_bind_denial_and_cleanup'
-
-
 
 @pytest.mark.parametrize('groups', [
     {'ordinary': ['a'], 'matrix': ['c']},  # 缺b
@@ -36,7 +33,7 @@ def test_partition_uses_nodeids_including_parameter_values() -> None:
         runner.validate_partition(['a[x]', 'a[y]'], {'one': ['a[x]'], 'two': ['a[x]']})
 
 
-def synthetic_suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bool=False, skip: bool=False) -> tuple[Path, SimpleNamespace, dict[str, str], dict]:
+def synthetic_suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bool=False, skip: bool=False, platform_skip: bool=False) -> tuple[Path, SimpleNamespace, dict[str, str], dict]:
     root = tmp_path / 'checkout with spaces'
     root.mkdir()
     (root / 'pytest.ini').write_text('[pytest]\n')
@@ -50,13 +47,19 @@ def synthetic_suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bo
     }
     if skip:
         files['sdk/python/tests/unit/test_beta.py'] = 'import pytest\ndef test_case():\n    pytest.skip("missing input")\n'
+    if platform_skip:
+        platform = 'posix' if os.name == 'nt' else 'windows'
+        files['sdk/python/tests/unit/test_beta.py'] = (
+            f'import pytest\n@pytest.mark.platform({platform!r})\n'
+            'def test_case(missing_prerequisite):\n    assert False\n'
+        )
     for relative, text in files.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding='utf-8')
     (root / 'sdk/python/tests/conftest.py').write_text(
-        'from pathlib import Path\nimport pytest\n'
-        + fixture_source({'pytest_configure', 'pytest_collection_modifyitems', '_SERIAL_MATRIX_FILES'}), encoding='utf-8'
+        'import os\nfrom pathlib import Path\nimport pytest\n'
+        + fixture_source({'pytest_configure', 'pytest_runtest_setup', 'pytest_collection_modifyitems', '_SERIAL_MATRIX_FILES'}), encoding='utf-8'
     )
     c3 = root / 'prebuilt c3'
     native = root / 'native bytes'
@@ -70,9 +73,12 @@ def synthetic_suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bo
     return root, options, environment, info
 
 
-@pytest.mark.parametrize('fail,skip,expected', [(False, False, 0), (True, False, 1), (False, True, 1)])
-def test_real_pure_pytest_execution_and_matrix_serial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: bool, skip: bool, expected: int) -> None:
-    root, options, environment, info = synthetic_suite(tmp_path, monkeypatch, fail=fail, skip=skip)
+@pytest.mark.parametrize('fail,skip,platform_skip,expected', [
+    (False, False, False, 0), (True, False, False, 1),
+    (False, True, False, 1), (False, False, True, 0),
+])
+def test_real_pure_pytest_execution_and_matrix_serial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: bool, skip: bool, platform_skip: bool, expected: int) -> None:
+    root, options, environment, info = synthetic_suite(tmp_path, monkeypatch, fail=fail, skip=skip, platform_skip=platform_skip)
     evidence = {'steps': []}
     output = root / 'new evidence'
     assert runner.execute(options, output, environment, info, evidence) == expected
@@ -91,8 +97,16 @@ def test_real_pure_pytest_execution_and_matrix_serial(tmp_path: Path, monkeypatc
         assert step['command'][step['command'].index('-n') + 1] == '0'
         assert (output / name / 'junit.xml').is_file()
         assert (output / name / 'collected-master.json').is_file()
-    calls = [r['nodeid'] for r in json.loads((output / 'ordinary/reports.json').read_text(encoding="utf-8"))['reports'] if r['when'] == 'call']
-    assert set(calls) == set(plan['ordinary'])
+    reports = json.loads((output / 'ordinary/reports.json').read_text(encoding="utf-8"))['reports']
+    calls = [r['nodeid'] for r in reports if r['when'] == 'call']
+    expected_calls = set(plan['ordinary'])
+    if platform_skip:
+        skipped = [r for r in reports if r['outcome'] == 'skipped']
+        assert len(skipped) == 1
+        assert skipped[0]['when'] == 'setup'
+        assert skipped[0]['skip_reason'] == f"Skipped: platform: {'posix' if os.name == 'nt' else 'windows'} only"
+        expected_calls.remove(skipped[0]['nodeid'])
+    assert set(calls) == expected_calls
 
 
 def test_collection_skip_stops_before_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -104,90 +118,26 @@ def test_collection_skip_stops_before_execution(tmp_path: Path, monkeypatch: pyt
     assert [s['id'] for s in evidence['steps']] == ['collect-full']
 
 
-@pytest.mark.parametrize('platform,nodeid,phase,reason,accepted', [
-    *((platform, nodeid, 'setup', 'Skipped: Windows named-pipe platform contract', True)
-      for platform in ('darwin', 'linux') for nodeid in sorted(runner.WINDOWS_ENDPOINT_TESTS)),
-    ('win32', runner.WINDOWS_ENDPOINT_TEST, 'setup', 'Skipped: Windows named-pipe platform contract', False),
-    ('darwin', runner.WINDOWS_ENDPOINT_TEST, 'call', 'Skipped: Windows named-pipe platform contract', False),
-    ('darwin', runner.WINDOWS_ENDPOINT_TEST, 'setup', 'Skipped: missing native', False),
-    ('darwin', 'unexpected::test_skip', 'setup', 'Skipped: Windows named-pipe platform contract', False),
-    ('darwin', 'tests/unit/test_endpoint_context.py::test_admin_probes_surface_windows_root_not_applicable[other-ping]',
-     'setup', 'Skipped: Windows named-pipe platform contract', False),
-    ('linux', 'tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[busy-None]', 'setup', 'Skipped: Windows named-pipe platform contract', True),
-    ('win32', 'tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[busy-None]', 'setup', 'Skipped: Windows named-pipe platform contract', False),
-    ('linux', 'tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[busy-unknown]', 'setup', 'Skipped: Windows named-pipe platform contract', False),
-    *((platform, runner.WINDOWS_SERVE_DEFAULT_STDOUT_TEST, 'setup', 'Skipped: Windows default stdout code page', True)
-      for platform in ('darwin', 'linux')),
-    ('win32', runner.WINDOWS_SERVE_DEFAULT_STDOUT_TEST, 'setup', 'Skipped: Windows default stdout code page', False),
-    *((platform, runner.WINDOWS_SERVE_DEFAULT_STDOUT_TEST, 'call', 'Skipped: Windows default stdout code page', False)
-      for platform in ('darwin', 'linux')),
-    *((platform, runner.WINDOWS_SERVE_DEFAULT_STDOUT_TEST, 'setup', 'Skipped: missing native', False)
-      for platform in ('darwin', 'linux')),
-    ('darwin', 'tests/integration/test_serve.py::TestServeSubprocess::test_serve_with_non_utf8_stdout[cp1252]', 'setup', 'Skipped: Windows default stdout code page', False),
+@pytest.mark.parametrize('phase,reason,accepted', [
+    ('setup', 'Skipped: platform: windows only', True),
+    ('setup', 'Skipped: platform: posix only', True),
+    ('call', 'Skipped: platform: windows only', False),
+    ('teardown', 'Skipped: platform: posix only', False),
+    ('setup', 'Skipped: missing native', False),
+    ('setup', 'Skipped: missing input', False),
+    ('setup', 'Skipped: permission experiments require a non-root effective uid', False),
+    ('setup', 'Skipped: missing input (platform: windows only)', False),
+    ('setup', 'Skipped: platform', False),
+    ('setup', None, False),
 ])
-def test_only_declared_windows_setup_skip_is_not_applicable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    platform: str, nodeid: str, phase: str, reason: str, accepted: bool,
-) -> None:
-    monkeypatch.setattr(runner.sys, 'platform', platform)
-    (tmp_path / 'collected-master.json').write_text(json.dumps({
-        'nodeids': [nodeid], 'collection_problems': [],
-    }))
-    (tmp_path / 'reports.json').write_text(json.dumps({
-        'exit_status': 0,
-        'reports': [
-            {'nodeid': nodeid, 'when': phase, 'outcome': 'skipped', 'skip_reason': reason},
-            {'nodeid': nodeid, 'when': 'teardown', 'outcome': 'passed'},
-        ],
-    }))
-    (tmp_path / 'junit.xml').write_text('<testsuite/>')
-    if accepted:
-        runner.validate_execution(tmp_path, [nodeid], 1)
-    else:
-        with pytest.raises(runner.RunnerError):
-            runner.validate_execution(tmp_path, [nodeid], 1)
-
-
-@pytest.mark.parametrize('platform,nodeid,phase,reason,accepted', [
-    ('win32', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', True),
-    ('linux', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
-    ('darwin', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
-    ('win32', RUNTIME_BIND_DENIAL_TEST, 'call', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
-    ('win32', RUNTIME_BIND_DENIAL_TEST, 'setup', 'Skipped: Unix filesystem root capability', False),
-    ('win32', 'tests/unit/test_runtime.py::test_other_runtime_case', 'setup', 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names', False),
-    ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'setup', 'Skipped: Unix filesystem root capability', True),
-    ('win32', 'tests/integration/test_endpoint_context.py::test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state[normal]', 'setup', 'Skipped: Unix filesystem root capability', True),
-    ('win32', 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup', 'setup', 'Skipped: OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes', True),
-    ('linux', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'setup', 'Skipped: Unix filesystem root capability', False),
-    ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'call', 'Skipped: Unix filesystem root capability', False),
-    ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[relative]', 'setup', 'Skipped: missing native', False),
-    ('win32', 'tests/unit/test_endpoint_context.py::test_root_validation_is_native[unknown]', 'setup', 'Skipped: Unix filesystem root capability', False),
-    ('win32', 'unexpected::test_case', 'setup', 'Skipped: Unix filesystem root capability', False),
-    ('win32', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[False-True]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', True),
-    ('win32', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[True-True]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', True),
-    ('win32', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[False-False]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', False),
-    ('linux', 'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[False-True]', 'setup', 'Skipped: SIGSTOP/SIGCONT are POSIX process controls', False),
-    *(('win32', f'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[{case}]', 'setup', 'Skipped: Unix filesystem root capability', True)
-      for case in ('unwritable', 'not_directory', 'missing', 'refused', 'inaccessible')),
-    ('linux', 'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[unwritable]', 'setup', 'Skipped: Unix filesystem root capability', False),
-    ('win32', 'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[unwritable]', 'setup', 'Skipped: permission experiments require a non-root effective uid', False),
-    *((platform, nodeid, 'setup', 'Skipped: Unix filesystem root capability', platform == 'win32')
-      for platform in ('win32', 'linux', 'darwin') for nodeid in (
-          'tests/integration/test_endpoint_context.py::test_server_credential_does_not_wait_for_the_namespace_gate',
-          'tests/integration/test_local_io_cause.py::test_bind_unverified_reason_survives_the_startup_watch[missing-lease-missing-ownership]',
-          'tests/integration/test_local_io_cause.py::test_bind_unverified_reason_survives_the_startup_watch[old-format-unsupported-namespace-format]',
-      )),
-    ('win32', 'tests/integration/test_local_io_cause.py::test_bind_unverified_reason_survives_the_startup_watch[unknown]', 'setup', 'Skipped: Unix filesystem root capability', False),
-    ('win32', 'tests/integration/test_endpoint_context.py::test_server_credential_does_not_wait_for_the_namespace_gate', 'call', 'Skipped: Unix filesystem root capability', False),
-    ('win32', 'tests/integration/test_endpoint_context.py::test_server_credential_does_not_wait_for_the_namespace_gate', 'setup', 'Skipped: missing native', False),
-    ('win32', 'tests/unit/test_runtime_session.py::test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook', 'setup', 'Skipped: Unix filesystem root capability', False),
-])
-def test_windows_platform_skip_allowlist(tmp_path, monkeypatch, platform, nodeid, phase, reason, accepted):
-    monkeypatch.setattr(runner.sys, 'platform', platform)
+def test_execution_accepts_only_platform_setup_skips(tmp_path, phase, reason, accepted):
+    nodeid = 'tests/unit/test_new_case.py::test_case[unregistered]'
+    skipped = {'nodeid': nodeid, 'when': phase, 'outcome': 'skipped'}
+    if reason is not None:
+        skipped['skip_reason'] = reason
     runner.write_json(tmp_path / 'collected-master.json', {'nodeids': [nodeid], 'collection_problems': []})
     runner.write_json(tmp_path / 'reports.json', {'exit_status': 0, 'reports': [
-        {'nodeid': nodeid, 'when': phase, 'outcome': 'skipped', 'skip_reason': reason},
-        {'nodeid': nodeid, 'when': 'teardown', 'outcome': 'passed'},
+        skipped, {'nodeid': nodeid, 'when': 'teardown', 'outcome': 'passed'},
     ]})
     (tmp_path / 'junit.xml').write_text('<testsuite/>')
     if accepted:
@@ -195,6 +145,28 @@ def test_windows_platform_skip_allowlist(tmp_path, monkeypatch, platform, nodeid
     else:
         with pytest.raises(runner.RunnerError):
             runner.validate_execution(tmp_path, [nodeid], 1)
+
+
+@pytest.mark.parametrize('calls', [0, 1, 2])
+@pytest.mark.parametrize('platform_calls', [0, 1])
+def test_applicable_tests_execute_exactly_once(tmp_path, calls, platform_calls):
+    expected = ['ordinary', 'platform_only']
+    reports = [
+        {'nodeid': 'platform_only', 'when': 'setup', 'outcome': 'skipped', 'skip_reason': 'Skipped: platform: windows only'},
+        {'nodeid': 'platform_only', 'when': 'teardown', 'outcome': 'passed'},
+        {'nodeid': 'ordinary', 'when': 'setup', 'outcome': 'passed'},
+        {'nodeid': 'ordinary', 'when': 'teardown', 'outcome': 'passed'},
+        *[{'nodeid': 'ordinary', 'when': 'call', 'outcome': 'passed'} for _ in range(calls)],
+        *[{'nodeid': 'platform_only', 'when': 'call', 'outcome': 'passed'} for _ in range(platform_calls)],
+    ]
+    runner.write_json(tmp_path / 'collected-master.json', {'nodeids': expected, 'collection_problems': []})
+    runner.write_json(tmp_path / 'reports.json', {'exit_status': 0, 'reports': reports})
+    (tmp_path / 'junit.xml').write_text('<testsuite/>')
+    if calls == 1 and platform_calls == 0:
+        runner.validate_execution(tmp_path, expected, 1)
+    else:
+        with pytest.raises(runner.RunnerError):
+            runner.validate_execution(tmp_path, expected, 1)
 
 
 def test_capture_resolves_selected_environment_tools(tmp_path, monkeypatch):

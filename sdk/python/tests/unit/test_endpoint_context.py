@@ -20,7 +20,6 @@ from c_two import _native
 from c_two.transport.client import util
 
 IS_WINDOWS = sys.platform == 'win32'
-UNIX_ONLY = pytest.mark.skipif(IS_WINDOWS, reason='Unix filesystem root capability')
 REPO = Path(__file__).resolve().parents[4]
 
 
@@ -72,7 +71,7 @@ def test_shutdown_preserves_unused_endpoint_policy_without_resolving_it() -> Non
     ''', C2_IPC_ROOT='relative')
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('replace', ['shutdown', 'transport_policy'])
 def test_unused_code_root_survives_session_replacement_and_env_change(replace: str) -> None:
     root = _unused_root()
@@ -102,7 +101,7 @@ def test_unused_code_root_survives_session_replacement_and_env_change(replace: s
     ''', C2_IPC_ROOT='relative')
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_unused_environment_policy_is_still_lazy_after_shutdown() -> None:
     root, other = _unused_root(), _unused_root()
     _run_isolated(f'''
@@ -176,7 +175,7 @@ def test_admin_probes_surface_invalid_root_configuration(
     ''', **updates)
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('probe', ['ping', 'shutdown'])
 def test_admin_probes_accept_long_directory_and_report_missing_endpoint(probe: str) -> None:
     _run_isolated(f'''
@@ -189,7 +188,7 @@ def test_admin_probes_accept_long_directory_and_report_missing_endpoint(probe: s
     ''')
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('probe', ['ping', 'shutdown'])
 @pytest.mark.parametrize('selection', ['context', 'runtime', 'environment', 'dotenv'])
 def test_admin_probes_accept_long_directory_in_all_contexts(
@@ -268,7 +267,7 @@ def test_admin_invalid_targets_remain_negative_in_native_and_public_contexts(pro
     ''')
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('probe', ['ping', 'shutdown'])
 def test_admin_runtime_configuration_precedence_and_freeze(probe: str) -> None:
     root = _unused_root()
@@ -295,7 +294,7 @@ def test_admin_runtime_configuration_precedence_and_freeze(probe: str) -> None:
     ''', C2_IPC_ROOT='relative')
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason='Windows named-pipe platform contract')
+@pytest.mark.platform('windows')
 @pytest.mark.parametrize('probe', ['ping', 'shutdown'])
 @pytest.mark.parametrize('source', ['environment', 'dotenv'])
 def test_admin_probes_surface_windows_root_not_applicable(
@@ -360,7 +359,7 @@ def test_common_default_is_opaque_native_and_query_does_not_freeze() -> None:
     ''')
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_query_validates_without_creating_root_or_runtime_domains() -> None:
     root = _unused_root()
     session = _native.RuntimeSession(use_process_relay_anchor=False)
@@ -379,7 +378,7 @@ def test_query_validates_without_creating_root_or_runtime_domains() -> None:
     assert session.local_endpoint_context().root == root + ' '
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_public_code_override_wins_env_and_dotenv_and_survives_session_replacement(tmp_path: Path) -> None:
     code, env, file = (_unused_root() for _ in range(3))
     dotenv = tmp_path / 'endpoint.env'
@@ -409,7 +408,7 @@ def test_public_code_override_wins_env_and_dotenv_and_survives_session_replaceme
     ''', C2_IPC_ROOT=env, C2_ENV_FILE=str(dotenv))
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_env_over_dotenv_and_captured_context_survives_env_flip(tmp_path: Path) -> None:
     env, file, next_env = (_unused_root() for _ in range(3))
     dotenv = tmp_path / 'endpoint.env'
@@ -433,7 +432,7 @@ def test_env_over_dotenv_and_captured_context_survives_env_flip(tmp_path: Path) 
     ''', C2_IPC_ROOT=env, C2_ENV_FILE=str(dotenv))
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('root', ['', 'relative', ' /tmp/leading', '/tmp/a/../b', '/tmp/a\0b'])
 def test_root_validation_is_native(root: str) -> None:
     session = _native.RuntimeSession(use_process_relay_anchor=False)
@@ -444,7 +443,7 @@ def test_root_validation_is_native(root: str) -> None:
     assert not session.local_endpoint_frozen
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_space_in_root_is_not_trimmed() -> None:
     root = _unused_root() + ' '
     _run_isolated(f'''
@@ -458,7 +457,7 @@ def test_space_in_root_is_not_trimmed() -> None:
     ''', C2_IPC_ROOT=root)
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_native_context_handoff_ignores_new_process_selection() -> None:
     first, second = _unused_root(), _unused_root()
     _run_isolated(f'''
@@ -477,7 +476,7 @@ def test_native_context_handoff_ignores_new_process_selection() -> None:
     ''', C2_IPC_ROOT=first)
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_admin_name_defaults_to_runtime_code_context_without_freezing() -> None:
     root, other = _unused_root(), _unused_root()
     _run_isolated(f'''
@@ -542,7 +541,7 @@ def test_timeout_rejection_is_native_and_does_not_freeze_context() -> None:
     assert not session.local_endpoint_frozen
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_public_replacement_preserves_root_and_native_retirement_observations() -> None:
     root = _unused_root()
     _run_isolated(f'''
@@ -572,7 +571,7 @@ def test_public_replacement_preserves_root_and_native_retirement_observations() 
     ''')
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_credential_retains_recorded_directory_under_new_environment() -> None:
     root = _unused_root()
     other = _unused_root()
@@ -606,7 +605,7 @@ def test_credential_retains_recorded_directory_under_new_environment() -> None:
     ''', C2_IPC_ROOT=root)
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_public_python_rpc_and_maintenance_use_a_long_final_directory(tmp_path: Path) -> None:
     root = tmp_path
     for _ in range(4):
@@ -645,7 +644,7 @@ def test_public_python_rpc_and_maintenance_use_a_long_final_directory(tmp_path: 
     ''')
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason='Windows named-pipe platform contract')
+@pytest.mark.platform('windows')
 def test_windows_root_override_is_explicitly_unsupported_and_preserves_default() -> None:
     _run_isolated('''
         import c_two as cc

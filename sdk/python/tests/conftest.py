@@ -54,6 +54,7 @@ _SERIAL_MATRIX_FILES = (
 
 def pytest_configure(config: Any) -> None:
     """在controller创建workers前拒绝误用，让UsageError引导实际可见。"""
+    config.addinivalue_line('markers', 'platform(name): run only on windows or posix (non-Windows)')
     if not (getattr(config.option, 'numprocesses', 0) or hasattr(config, 'workerinput')):
         return
     ignores = [Path(value).resolve() for value in (getattr(config.option, 'ignore', None) or [])]
@@ -69,6 +70,18 @@ def pytest_configure(config: Any) -> None:
                     '完整portable/TypeScript矩阵必须单进程运行；使用 '
                     '`python tools/dev/test_python.py --help`编排，或对完整矩阵使用`-n0`。'
                 )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: Any) -> None:
+    marker = item.get_closest_marker('platform')
+    if marker is None:
+        return
+    platform, = marker.args
+    if platform not in ('windows', 'posix'):
+        raise pytest.UsageError(f'unknown platform: {platform}')
+    if (os.name == 'nt') != (platform == 'windows'):
+        pytest.skip(f'platform: {platform} only')
 
 
 def pytest_collection_finish(session: Any) -> None:

@@ -36,63 +36,6 @@ PORTABLE = (
     f"{SDK}/integration/test_portable_payload_matrix.py",
 )
 TYPESCRIPT = f"{SDK}/integration/test_typescript_real_calls.py"
-# The SDK pyproject is pytest's root, so nodeids start with tests/.
-WINDOWS_ENDPOINT_TEST = "tests/unit/test_endpoint_context.py::test_windows_root_override_is_explicitly_unsupported_and_preserves_default"
-WINDOWS_SERVE_DEFAULT_STDOUT_TEST = (
-    "tests/integration/test_serve.py::TestServeSubprocess::"
-    "test_serve_with_non_utf8_stdout[windows-default]"
-)
-WINDOWS_ENDPOINT_TESTS = frozenset((
-    WINDOWS_ENDPOINT_TEST,
-    *(
-        "tests/unit/test_endpoint_context.py::test_admin_probes_surface_windows_root_not_applicable"
-        f"[{source}-{probe}]"
-        for source in ("environment", "dotenv") for probe in ("ping", "shutdown")
-    ),
-    *(f"tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[{case}]"
-      for case in ("missing-2", "denied-2", "busy-0.2", "busy-None", "busy-10")),
-))
-# Frozen platform cases, including exact parameter IDs. A matching reason on
-# any other test remains a failure; unavailable prerequisites are never allowed.
-UNIX_ENDPOINT_TESTS = frozenset(
-    f'tests/{scope}/test_endpoint_context.py::{name}{suffix}'
-    for scope, name, suffixes in (
-        ('unit', 'test_unused_code_root_survives_session_replacement_and_env_change', ('[shutdown]', '[transport_policy]')),
-        ('unit', 'test_unused_environment_policy_is_still_lazy_after_shutdown', ('',)),
-        ('unit', 'test_admin_probes_accept_long_directory_and_report_missing_endpoint', ('[ping]', '[shutdown]')),
-        ('unit', 'test_admin_probes_accept_long_directory_in_all_contexts', tuple(f'[{source}-{probe}]' for source in ('context', 'runtime', 'environment', 'dotenv') for probe in ('ping', 'shutdown'))),
-        ('unit', 'test_admin_runtime_configuration_precedence_and_freeze', ('[ping]', '[shutdown]')),
-        ('unit', 'test_query_validates_without_creating_root_or_runtime_domains', ('',)),
-        ('unit', 'test_public_code_override_wins_env_and_dotenv_and_survives_session_replacement', ('',)),
-        ('unit', 'test_env_over_dotenv_and_captured_context_survives_env_flip', ('',)),
-        ('unit', 'test_root_validation_is_native', ('[]', '[relative]', '[ /tmp/leading]', '[/tmp/a/../b]', '[/tmp/a\\x00b]')),
-        ('unit', 'test_space_in_root_is_not_trimmed', ('',)),
-        ('unit', 'test_native_context_handoff_ignores_new_process_selection', ('',)),
-        ('unit', 'test_admin_name_defaults_to_runtime_code_context_without_freezing', ('',)),
-        ('unit', 'test_public_replacement_preserves_root_and_native_retirement_observations', ('',)),
-        ('unit', 'test_credential_retains_recorded_directory_under_new_environment', ('',)),
-        ('unit', 'test_public_python_rpc_and_maintenance_use_a_long_final_directory', ('',)),
-        ('integration', 'test_same_logical_address_registers_connects_and_stays_isolated', ('',)),
-        ('integration', 'test_server_credential_does_not_wait_for_the_namespace_gate', ('',)),
-        ('integration', 'test_first_failed_local_attempt_freezes_context_without_creating_missing_container', tuple(f'[{attempt}]' for attempt in ('bind', 'connect', 'ping', 'shutdown'))),
-        ('integration', 'test_used_selection_survives_repeated_shutdown_then_refreezes', ('[environment]', '[code]')),
-        ('integration', 'test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state', ('[normal]', '[abnormal]')),
-        ('integration', 'test_sweep_captures_code_context_once_and_keeps_it_across_env_flip', ('',)),
-    )
-    for suffix in suffixes
-) | frozenset(
-    f'tests/integration/test_local_io_cause.py::test_unix_local_io_cause[{case}]'
-    for case in ('unwritable', 'not_directory', 'missing', 'refused', 'inaccessible')
-) | frozenset(
-    f'tests/integration/test_local_io_cause.py::test_bind_unverified_reason_survives_the_startup_watch[{case}]'
-    for case in ('missing-lease-missing-ownership', 'old-format-unsupported-namespace-format')
-)
-UNIX_SOCKET_COUNT_TEST = 'tests/integration/test_client_pool_idle_cleanup.py::test_client_pool_idle_cleanup'
-UNIX_RUNTIME_BIND_DENIAL_TEST = 'tests/unit/test_runtime.py::test_public_start_preserves_native_bind_denial_and_cleanup'
-POSIX_FROZEN_PEER_TESTS = frozenset(
-    f'tests/integration/test_frozen_peer_shutdown.py::test_client_shutdown_with_live_proxy[{hosted}-True]'
-    for hosted in ('False', 'True')
-)
 FASTDB_SHA = "f82fa13adeae2b87a295bf984821c85c44b55a3d"
 PLUGIN = "tools.dev.test_python"
 
@@ -236,24 +179,13 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
     calls = Counter(row["nodeid"] for row in reports if row["when"] == "call")
     if any(count != 1 for count in calls.values()):
         raise RunnerError("同一nodeid被执行多次")
-    allowed_skips = (
-        {**dict.fromkeys(UNIX_ENDPOINT_TESTS, 'Skipped: Unix filesystem root capability'),
-         UNIX_SOCKET_COUNT_TEST: 'Skipped: OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes',
-         UNIX_RUNTIME_BIND_DENIAL_TEST: 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names',
-         **dict.fromkeys(POSIX_FROZEN_PEER_TESTS, 'Skipped: SIGSTOP/SIGCONT are POSIX process controls')}
-        if sys.platform == 'win32' else
-        {**dict.fromkeys(WINDOWS_ENDPOINT_TESTS, 'Skipped: Windows named-pipe platform contract'),
-         WINDOWS_SERVE_DEFAULT_STDOUT_TEST: 'Skipped: Windows default stdout code page'}
-    )
-    platform_skips = {
-        row["nodeid"] for row in reports
-        if row["nodeid"] in allowed_skips
-        and row["when"] == "setup" and row["outcome"] == "skipped"
-        and row.get("skip_reason") == allowed_skips[row['nodeid']]
-    }
-    problems = [row for row in reports if row["outcome"] != "passed" and not (
-        row["nodeid"] in platform_skips and row["when"] == "setup" and row["outcome"] == "skipped"
-    )]
+    platform_skips = set()
+    problems = []
+    for row in reports:
+        if row["when"] == "setup" and row["outcome"] == "skipped" and row.get("skip_reason", "").startswith("Skipped: platform: "):
+            platform_skips.add(row["nodeid"])
+        elif row["outcome"] != "passed":
+            problems.append(row)
     if problems or set(calls) != set(expected) - platform_skips or evidence["exit_status"] != 0:
         raise RunnerError(f"实际测试有失败/skip/未执行call：{problems}")
     if not (directory / "junit.xml").is_file():
