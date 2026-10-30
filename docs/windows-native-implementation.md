@@ -2,7 +2,7 @@
 
 Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
 
-## C-Two 0.10.0 release candidate
+## C-Two 0.10.0 release (2026-10-30)
 
 C-Two 0.10.0 moves the RPC IPC handshake to version 14 behind a permanent fixed 25-byte version preamble; it is incompatible with 0.9.x (handshake 13). The wire sequence, malformed/mismatch distinction, error surfaces and the one shared rejection budget — bounded `write_all`, adapter async flush and bounded peer-close wait, never a synchronous `FlushFileBuffers` that would park a Tokio worker until the client consumes — are specified in [the handshake spec](ipc-handshake.md). SHM 3, C/FFI ABI 6, owner control 1 and business frame layouts do not change.
 
