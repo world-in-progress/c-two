@@ -103,6 +103,7 @@ def test_clean_environment_strips_fastdb_sdk_without_touching_other_paths(tmp_pa
         "LD_LIBRARY_PATH": str(sdk / "lib"),
         "C2_RELAY_ANCHOR_ADDRESS": "http://relay.example:8080",
         "VIRTUAL_ENV": "/somewhere/else",
+        "PYTHONUTF8": "1",
         "HOME": "/home/runner",
         "SYSTEMROOT": r"C:\Windows",
     }
@@ -121,7 +122,8 @@ def test_clean_environment_strips_fastdb_sdk_without_touching_other_paths(tmp_pa
     assert system_python in path_entries
     assert cleaned["HOME"] == "/home/runner"
     assert cleaned["SYSTEMROOT"] == r"C:\Windows"
-    assert cleaned["C2_ENV_FILE"] == "" and cleaned["PYTHONUTF8"] == "1"
+    assert cleaned["C2_ENV_FILE"] == ""
+    assert "PYTHONUTF8" not in cleaned
 
 
 def test_clean_environment_keeps_path_when_no_fastdb_sdk_is_exported(monkeypatch, tmp_path):
@@ -154,14 +156,14 @@ def test_standard_user_driver_forwards_source_identity(tmp_path):
     driver_source = wrapper.split("    @'\n", 1)[1].split("\n'@ | Set-Content", 1)[0]
     helper = tmp_path / "helper.py"
     receipt = tmp_path / "receipt.json"
-    helper.write_text("import json, pathlib, sys\npathlib.Path(sys.argv[sys.argv.index('--receipt')+1]).write_text(json.dumps(sys.argv))\n")
+    helper.write_text("import json, os, pathlib, sys\nassert 'PYTHONUTF8' not in os.environ\npathlib.Path(sys.argv[sys.argv.index('--receipt')+1]).write_text(json.dumps(sys.argv))\n")
     config = {"workspace": str(tmp_path), "staged": {"helper": str(helper), "fastdb": "fastdb.whl", "ctwo": "ctwo.whl", "cli": "c3-platform.exe"},
               "receipt": str(receipt), "source_sha": "a" * 40}
     config_path = tmp_path / "inputs.json"
     config_path.write_text(json.dumps(config))
     driver = tmp_path / "driver.py"
     driver.write_text(driver_source)
-    environment = dict(os.environ, SystemRoot=str(tmp_path / "windows"))
+    environment = dict(os.environ, SystemRoot=str(tmp_path / "windows"), PYTHONUTF8="1")
     subprocess.run([sys.executable, "-I", str(driver), str(config_path)], check=True, env=environment)
     args = json.loads(receipt.read_text())
     assert args[args.index("--source-sha") + 1] == "a" * 40

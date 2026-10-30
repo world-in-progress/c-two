@@ -395,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         "C2_TYPESCRIPT_RECEIPT": str(args.output / "typescript.v1.json"), "C2_PORTABLE_MATRIX_EVIDENCE_STAGE": "development",
         "C2_TYPESCRIPT_EVIDENCE_STAGE": "development", "C2_TYPESCRIPT_FASTDB_SOURCE_SHA": FASTDB_SHA,
         "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost", "PYTHONUTF8": "1",
+        "PYTHONWARNDEFAULTENCODING": "1",
         "CARGO_BUILD_JOBS": "2", "CMAKE_BUILD_PARALLEL_LEVEL": "2", "CARGO_TARGET_DIR": str(ROOT / "core/target"),
         "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
         "PYTHONPATH": str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")})

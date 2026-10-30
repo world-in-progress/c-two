@@ -43,6 +43,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 timeout = 30
+filterwarnings = ["error::EncodingWarning:c_two"]
 
 [tool.uv]
 package = true

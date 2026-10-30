@@ -2,6 +2,7 @@ import sys
 import ast
 import inspect
 import logging
+import tokenize
 from pathlib import Path
 from typing import Type, TypeVar, get_type_hints, get_origin, get_args
 
@@ -28,7 +29,7 @@ def generate_crm_template(crm_class: Type[T], output_path: str | Path) -> None:
         raise ValueError(f'Could not retrieve source file for {crm_class.__name__}')
     
     # Parse source code using AST
-    with open(source_file, 'r') as f:
+    with tokenize.open(source_file) as f:
         source_code = f.read()
     tree = ast.parse(source_code)
     
@@ -65,7 +66,7 @@ def generate_crm_template(crm_class: Type[T], output_path: str | Path) -> None:
     output_path = Path(output_path) if isinstance(output_path, str) else output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    with open(output_path, 'w') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         f.write(template_content)
 
     logger.info(f'CRM template generated successfully at {output_path}')

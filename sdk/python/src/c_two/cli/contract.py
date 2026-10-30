@@ -110,11 +110,13 @@ def _load_contract(target: str) -> type:
 
 def _write_payload(payload: str, out: str | None) -> None:
     if out:
-        Path(out).write_text(payload)
+        Path(out).write_text(payload, encoding='utf-8')
     else:
-        sys.stdout.write(payload)
         if not payload.endswith('\n'):
-            sys.stdout.write('\n')
+            payload += '\n'
+        sys.stdout.flush()
+        sys.stdout.buffer.write(payload.encode('utf-8'))
+        sys.stdout.buffer.flush()
 
 
 def json_payload(value: object, *, pretty: bool) -> str:

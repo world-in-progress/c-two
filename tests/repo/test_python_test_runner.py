@@ -446,6 +446,7 @@ def test_run_step_requires_finite_positive_timeout(tmp_path, timeout):
 def test_main_normalizes_fixture_path_and_preserves_venv_python_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv('C2_PORTABLE_MATRIX_FIXTURE_ROOT', 'fixtures')
+    monkeypatch.setenv('PYTHONWARNDEFAULTENCODING', '0')
     for key in ('PYTEST_ADDOPTS', 'PYTEST_PLUGINS', 'PYTEST_DISABLE_PLUGIN_AUTOLOAD'):
         monkeypatch.delenv(key, raising=False)
     selected = tmp_path / 'chosen venv/python'
@@ -455,6 +456,7 @@ def test_main_normalizes_fixture_path_and_preserves_venv_python_link(tmp_path: P
         assert options.python == str(selected)
         assert environment['C2_PORTABLE_MATRIX_FIXTURE_ROOT'] == str(tmp_path / 'fixtures')
         assert environment['CTWO_TEST_C3_BIN'] == str(tmp_path / 'prebuilt c3')
+        assert environment['PYTHONWARNDEFAULTENCODING'] == '1'
         raise runner.RunnerError('probe only')
     monkeypatch.setattr(runner, 'preflight', probe)
     assert runner.main(['--python', str(selected), '--c3', 'prebuilt c3', '--output', 'evidence']) == 1
