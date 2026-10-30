@@ -199,6 +199,7 @@ benchmarks/results/*
 sdk/python/benchmarks/results/*
 !sdk/python/benchmarks/results/.gitkeep
 .superpowers/
+.mimosa/
 .worktrees/
 .bin/
 
