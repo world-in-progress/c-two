@@ -131,6 +131,28 @@ def test_explicit_full_validation_does_not_lookup_previous_evidence(tmp_path, mo
     assert output.read_text() == "source=true\n"
 
 
+def test_push_outside_the_canonical_repository_runs_policy_only(tmp_path, monkeypatch, capsys):
+    spec = importlib.util.spec_from_file_location("ci_scope", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def unexpected_lookup(*args, **kwargs):
+        raise AssertionError("a fork push mirrors canonical main and needs no evidence lookup")
+
+    monkeypatch.setattr(module, "GitHubApi", unexpected_lookup)
+    output = tmp_path / "outputs"
+    for key, value in {
+        "EVENT_NAME": "push", "FORCE_FULL": "false", "GITHUB_SHA": "a" * 40,
+        "GITHUB_TOKEN": "token", "GITHUB_REPOSITORY": "contributor/c-two",
+        "CHANGED_FILES_JSON": '["core/runtime.rs"]', "CHANGED_FILES": "1",
+        "GITHUB_OUTPUT": str(output),
+    }.items():
+        monkeypatch.setenv(key, value)
+    module.main()
+    assert output.read_text() == "source=false\n"
+    assert "outside world-in-progress/c-two" in capsys.readouterr().out
+
+
 def test_scope_lookup_permissions_and_attempt_names_stay_on_the_producer():
     workflow = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
     jobs = workflow["jobs"]
