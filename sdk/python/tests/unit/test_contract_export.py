@@ -219,7 +219,7 @@ def test_contract_export_cli_writes_utf8_stdout_in_order(
 
     target, payload = unicode_contract
     raw = io.BytesIO()
-    with io.TextIOWrapper(io.BufferedWriter(raw), encoding=encoding) as stdout:
+    with io.TextIOWrapper(io.BufferedWriter(raw), encoding=encoding, newline="\n") as stdout:
         with monkeypatch.context() as patch:
             patch.setattr(sys, "stdout", stdout)
             stdout.write("before\n")
