@@ -75,7 +75,7 @@ fn consume_generated(execute: bool) {
     std::fs::write(
         temp.path().join("Cargo.toml"),
         format!(
-            "[package]\nname = \"call-options-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nc-two = {{ version = \"0.1.0\", path = {:?} }}\nfastdb = \"=0.2.3\"\n",
+            "[package]\nname = \"call-options-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nc-two = {{ version = \"0.1.0\", path = {:?} }}\nfastdb = \"=0.2.4\"\n",
             repository.join("sdk/rust")
         ),
     ).unwrap();

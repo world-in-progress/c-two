@@ -1,6 +1,6 @@
 # Python SDK usage
 
-This guide describes the Python APIs of C-Two 0.10.0 / c3 0.6.0; the [release notes](releases/0.10.0.md) describe the migration from 0.9.x, including `cc.Runtime()`, `cc.server_credential()`, Unix schema 4 and the additional binding reason. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.3 extra. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
+This guide describes the Python APIs of C-Two 0.10.0 / c3 0.6.0; the [release notes](releases/0.10.0.md) describe the migration from 0.9.x, including `cc.Runtime()`, `cc.server_credential()`, Unix schema 4 and the additional binding reason. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.4 extra. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 

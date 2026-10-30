@@ -16,8 +16,8 @@ The stages and chronological evidence below retain the claims and open items of 
 
 ## C-Two 0.8.0 source (2026-10-22)
 
-The active dependency pins now select FastDB 0.2.3, source
-`abba785ef2a7d3fbee1bbc608393a3e6c7b042c4`, for Python, Rust, native source builds
+The active dependency pins now select FastDB 0.2.4, source
+`f82fa13adeae2b87a295bf984821c85c44b55a3d`, for Python, Rust, native source builds
 and the official CoreSDK. The existing SDK preparation helper also recognizes
 its `aarch64-pc-windows-msvc` bundle and requires the same verified
 `lib/fastdb.dll` and `lib/fastdb.lib` pair as Windows x64. C-Two's release gates

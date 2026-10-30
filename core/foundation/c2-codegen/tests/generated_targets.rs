@@ -231,7 +231,7 @@ publish = false
 
 [dependencies]
 c-two = {{ version = "0.1.0", path = {c_two:?} }}
-fastdb = "=0.2.3"
+fastdb = "=0.2.4"
 c2-ipc = {{ path = {ipc:?} }}
 c2-mem = {{ path = {mem:?} }}
 c2-wire = {{ path = {wire:?} }}

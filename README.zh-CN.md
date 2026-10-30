@@ -28,7 +28,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-**C-Two 0.10.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.3`）。IPC 握手 14 把版本不匹配报告为结构化错误，Unix 端点改用带版本号默认目录的命名空间格式 3，Python 新增独立的 `cc.Runtime()` 实例与 `cc.server_credential()`。内存释放失败时由原持有者保留以便重试；已无法交还时保守放弃并计数。见[更新说明](docs/releases/0.10.0.md)。
+**C-Two 0.10.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.4`）。IPC 握手 14 把版本不匹配报告为结构化错误，Unix 端点改用带版本号默认目录的命名空间格式 3，Python 新增独立的 `cc.Runtime()` 实例与 `cc.server_credential()`。内存释放失败时由原持有者保留以便重试；已无法交还时保守放弃并计数。见[更新说明](docs/releases/0.10.0.md)。
 
 ## 特点
 

@@ -28,7 +28,7 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
 
-**C-Two 0.10.0** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.3`). IPC handshake 14 reports a version mismatch as a typed error, Unix endpoints use namespace format 3 with versioned default directories, and Python adds independent `cc.Runtime()` instances and `cc.server_credential()`. A failed memory release stays with its owner for retry, or is abandoned conservatively and counted when it can no longer be returned. See the [release notes](docs/releases/0.10.0.md).
+**C-Two 0.10.0** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.4`). IPC handshake 14 reports a version mismatch as a typed error, Unix endpoints use namespace format 3 with versioned default directories, and Python adds independent `cc.Runtime()` instances and `cc.server_credential()`. A failed memory release stays with its owner for retry, or is abandoned conservatively and counted when it can no longer be returned. See the [release notes](docs/releases/0.10.0.md).
 
 ## Features
 

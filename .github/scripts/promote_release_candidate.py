@@ -186,8 +186,8 @@ CHECK_SOURCE_REQUIRED_JOBS = (
 )
 # Frozen FastDB source pin of the Source Validation gates; cross-checked against
 # the trusted checkout's ci.yml so silent pin drift fails closed.
-SOURCE_VALIDATION_FASTDB_CORE_VERSION = "0.2.3"
-SOURCE_VALIDATION_FASTDB_SHA = "abba785ef2a7d3fbee1bbc608393a3e6c7b042c4"
+SOURCE_VALIDATION_FASTDB_CORE_VERSION = "0.2.4"
+SOURCE_VALIDATION_FASTDB_SHA = "f82fa13adeae2b87a295bf984821c85c44b55a3d"
 SMOKE_SCHEMA = "c-two.installed-wheel-smoke.v1"
 STANDARD_USER_WRAPPER_SCHEMA = "c-two.standard-user-wrapper.v1"
 SDIST_INSPECT_SCHEMA = "c-two.release-candidate.sdist-inspection.v1"
@@ -405,7 +405,7 @@ def find_full_source_validation_run(api: GitHubApi, source_sha: str) -> dict[str
             "source gate is incomplete — rerun check-source after they finish")
     if artifact_errors:
         raise PromotionError(
-            "; ".join(artifact_errors) + ". Duplicate full-scope artifacts indicate a rerun. "
+            "; ".join(artifact_errors) + " "
             "For release, dispatch a new full Source Validation run on the same source SHA "
             f"{source_sha}: gh workflow run ci.yml --ref main -F force_full=true. "
             "Rerunning jobs is not a substitute for a new full run.")
@@ -442,10 +442,15 @@ def require_full_source_artifacts(
     for label in SOURCE_VALIDATION_LANES:
         expected_name = f"source-{label}-py3.12-full-{source_sha}"
         matches = [entry for entry in artifacts if entry.get("name") == expected_name]
-        _require(len(matches) == 1,
-                 f"Source Validation run {run_id} retains {len(matches)} {expected_name} "
-                 "artifacts; the run bound by rc-context.json must carry exactly one "
-                 "full-scope artifact per platform")
+        if len(matches) != 1:
+            reason = (
+                "Duplicate full-scope artifacts indicate a rerun."
+                if len(matches) > 1 else "Full-scope artifacts are missing or expired."
+            )
+            raise PromotionError(
+                f"Source Validation run {run_id} retains {len(matches)} {expected_name} "
+                "artifacts; release qualification requires exactly one "
+                f"full-scope artifact per platform. {reason}")
         artifacts_by_label[label] = matches[0]
     return artifacts_by_label
 

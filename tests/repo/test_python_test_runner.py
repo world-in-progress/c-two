@@ -393,7 +393,7 @@ def test_main_preflight_failure_preserves_failure_receipt(tmp_path: Path, monkey
 
 
 def test_actual_missing_c3_is_rejected_before_test_collection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(runner, 'capture', lambda *args: json.dumps({'versions': {'fastdb4py': '0.2.3'}}))
+    monkeypatch.setattr(runner, 'capture', lambda *args: json.dumps({'versions': {'fastdb4py': '0.2.4'}}))
     with pytest.raises(runner.RunnerError, match='预建c3不存在'):
         runner.preflight(SimpleNamespace(python=sys.executable, c3=tmp_path / 'missing'), {})
 
