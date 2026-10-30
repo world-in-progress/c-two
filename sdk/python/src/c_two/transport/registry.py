@@ -76,6 +76,16 @@ log = logging.getLogger(__name__)
 _UNSET = object()
 
 
+def _print_serve_message(message: str) -> None:
+    """Print and flush serve output using the current stdout's encoding."""
+    stdout = sys.stdout
+    if stdout is None:
+        return
+    encoding = getattr(stdout, 'encoding', None) or 'utf-8'
+    message = message.encode(encoding, errors='backslashreplace').decode(encoding)
+    print(message, file=stdout, flush=True)
+
+
 def _runtime_session_kwargs_from_settings(settings: C2Settings) -> dict[str, int]:
     kwargs: dict[str, int] = {}
     shm_overrides = settings._shm_overrides()  # noqa: SLF001
@@ -929,14 +939,14 @@ class Runtime:
         # still draining reaches the same consume path, which returns without
         # fabricating a stopped SDK state while the transaction is incomplete;
         # the loop stays alive until the real structured terminal appears.
-        print('\n Shutting down…')
+        _print_serve_message('\n Shutting down...')
         while True:
             outcome = self.shutdown(timeout=0.1)
             if outcome['completed']:
                 break
             threading.Event().wait(0.05)
         self._serve_stop = None
-        print(' Resource server stopped.')
+        _print_serve_message(' Resource server stopped.')
 
     def _native_host_terminated(self) -> bool:
         """Whether the Core host reached its structured terminal outcome.
@@ -956,19 +966,19 @@ class Runtime:
         addr: str | None,
     ) -> None:
         """Print a human-readable startup banner to stdout."""
-        lines = [' ── C-Two Resource Server ────────────────']
+        lines = [' -- C-Two Resource Server ----------------']
         if addr:
             lines.append(f'  IPC: {addr}')
         if names:
             lines.append('  CRM routes:')
             for n in names:
-                lines.append(f'    • {n}')
+                lines.append(f'    - {n}')
         else:
             lines.append('  (no CRM routes registered)')
-        lines.append(' ─────────────────────────────────────────')
+        lines.append(' -----------------------------------------')
         count = len(names)
         lines.append(f'  Serving {count} CRM resource(s). Ctrl+C to stop.')
-        print('\n'.join(lines))
+        _print_serve_message('\n'.join(lines))
 
     # ------------------------------------------------------------------
     # Internals

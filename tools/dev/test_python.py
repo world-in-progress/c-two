@@ -38,6 +38,10 @@ PORTABLE = (
 TYPESCRIPT = f"{SDK}/integration/test_typescript_real_calls.py"
 # The SDK pyproject is pytest's root, so nodeids start with tests/.
 WINDOWS_ENDPOINT_TEST = "tests/unit/test_endpoint_context.py::test_windows_root_override_is_explicitly_unsupported_and_preserves_default"
+WINDOWS_SERVE_DEFAULT_STDOUT_TEST = (
+    "tests/integration/test_serve.py::TestServeSubprocess::"
+    "test_serve_with_non_utf8_stdout[windows-default]"
+)
 WINDOWS_ENDPOINT_TESTS = frozenset((
     WINDOWS_ENDPOINT_TEST,
     *(
@@ -238,7 +242,8 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
          UNIX_RUNTIME_BIND_DENIAL_TEST: 'Skipped: Unix sandbox/permissions; Windows uses kernel pipe names',
          **dict.fromkeys(POSIX_FROZEN_PEER_TESTS, 'Skipped: SIGSTOP/SIGCONT are POSIX process controls')}
         if sys.platform == 'win32' else
-        dict.fromkeys(WINDOWS_ENDPOINT_TESTS, 'Skipped: Windows named-pipe platform contract')
+        {**dict.fromkeys(WINDOWS_ENDPOINT_TESTS, 'Skipped: Windows named-pipe platform contract'),
+         WINDOWS_SERVE_DEFAULT_STDOUT_TEST: 'Skipped: Windows default stdout code page'}
     )
     platform_skips = {
         row["nodeid"] for row in reports

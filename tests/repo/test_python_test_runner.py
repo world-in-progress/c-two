@@ -116,6 +116,14 @@ def test_collection_skip_stops_before_execution(tmp_path: Path, monkeypatch: pyt
     ('linux', 'tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[busy-None]', 'setup', 'Skipped: Windows named-pipe platform contract', True),
     ('win32', 'tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[busy-None]', 'setup', 'Skipped: Windows named-pipe platform contract', False),
     ('linux', 'tests/integration/test_local_io_cause.py::test_windows_connect_cause_and_busy_deadline[busy-unknown]', 'setup', 'Skipped: Windows named-pipe platform contract', False),
+    *((platform, runner.WINDOWS_SERVE_DEFAULT_STDOUT_TEST, 'setup', 'Skipped: Windows default stdout code page', True)
+      for platform in ('darwin', 'linux')),
+    ('win32', runner.WINDOWS_SERVE_DEFAULT_STDOUT_TEST, 'setup', 'Skipped: Windows default stdout code page', False),
+    *((platform, runner.WINDOWS_SERVE_DEFAULT_STDOUT_TEST, 'call', 'Skipped: Windows default stdout code page', False)
+      for platform in ('darwin', 'linux')),
+    *((platform, runner.WINDOWS_SERVE_DEFAULT_STDOUT_TEST, 'setup', 'Skipped: missing native', False)
+      for platform in ('darwin', 'linux')),
+    ('darwin', 'tests/integration/test_serve.py::TestServeSubprocess::test_serve_with_non_utf8_stdout[cp1252]', 'setup', 'Skipped: Windows default stdout code page', False),
 ])
 def test_only_declared_windows_setup_skip_is_not_applicable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

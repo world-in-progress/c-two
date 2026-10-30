@@ -2,7 +2,7 @@
 
 The native Windows backend uses byte-mode Named Pipes for `ipc://` control traffic and named file mappings for shared payload memory. It uses the process TokenUser SID across logons. Same-session peers may use SHM; different sessions use owned/inline/chunked transfers. Native connections require a matching user and a server integrity of at least Medium before sending. Ordinary SDK code continues to use logical `ipc://` addresses; do not construct pipe or mapping names in an SDK. HTTP relay still provides the network path.
 
-This guide covers Python C-Two **0.10.0**, c3 **0.6.0** and FastDB **0.2.4** on Windows x64 and ARM64. Install the matching Python and c3 versions together; see the [0.10.0 migration notes](releases/0.10.0.md) and [lifecycle guide](local-endpoint-lifecycle.en.md) for endpoint behavior.
+This guide covers Python C-Two **0.10.1**, c3 **0.6.0** and FastDB **0.2.4** on Windows x64 and ARM64. Install the matching Python and c3 versions together; see the [0.10.0 migration notes](releases/0.10.0.md) and [lifecycle guide](local-endpoint-lifecycle.en.md) for endpoint behavior.
 
 Unix root overrides (`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-root`) are rejected on Windows. Pipe names derive from the logical address and current TokenUser SID.
 
@@ -11,7 +11,7 @@ Unix root overrides (`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-ro
 In an activated Python environment, explicitly select the documented version:
 
 ```powershell
-uv pip install 'c-two==0.10.0'
+uv pip install 'c-two==0.10.1'
 ```
 
 For the published [c3 0.6.0 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.6.0), download `c3-x86_64-pc-windows-msvc.exe` (x64) or `c3-aarch64-pc-windows-msvc.exe` (ARM64), its `.exe.sha256` checksum and optionally `c3-installer.ps1`. Verify the standalone executable before running it:

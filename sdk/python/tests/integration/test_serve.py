@@ -13,7 +13,11 @@ import time
 
 import pytest
 
-from tests.fixtures.process_control import interrupt_python_process, python_process_options
+from tests.fixtures.process_control import (
+    interrupt_python_process,
+    python_process_options,
+    readline_with_timeout,
+)
 
 
 _SERVE_SCRIPT = textwrap.dedent("""\
@@ -64,6 +68,69 @@ def _wait_for_output(proc: subprocess.Popen, pattern: str, timeout: float = 10.0
 
 class TestServeSubprocess:
     """Start a serve() subprocess, verify it blocks, send a console interrupt."""
+
+    @pytest.mark.parametrize('encoding', [
+        'cp1252',
+        'gbk',
+        pytest.param(None, marks=pytest.mark.skipif(
+            sys.platform != 'win32', reason='Windows default stdout code page',
+        ), id='windows-default'),
+    ])
+    def test_serve_with_non_utf8_stdout(self, tmp_path, encoding):
+        """Piped banners and shutdown messages survive strict stdout encodings."""
+        env = os.environ.copy()
+        env.pop('C2_RELAY_ANCHOR_ADDRESS', None)
+        env.pop('PYTHONUTF8', None)
+        env.pop('PYTHONUNBUFFERED', None)
+        env.pop('PYTHONIOENCODING', None)
+        if encoding is not None:
+            env['PYTHONIOENCODING'] = encoding
+        marker = tmp_path / 'shutdown_marker.txt'
+        env['SHUTDOWN_MARKER'] = str(marker)
+        script = _SERVE_SCRIPT
+        if encoding is not None:
+            # Snowman is unencodable in both cp1252 and GBK (Chinese is valid GBK).
+            script = script.replace("name='ping'", "name='route_\\u2603'")
+        # The default-code-page case uses the ASCII route so its byte assertion
+        # also holds on Windows configured with a UTF-8 system code page.
+        proc = subprocess.Popen(
+            [sys.executable, '-c', script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=str(tmp_path),
+            **python_process_options(),
+        )
+
+        output = bytearray()
+        try:
+            deadline = time.monotonic() + 10.0
+            while b'Serving 1 CRM resource(s)' not in output:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0, 'serve() banner did not appear'
+                line = readline_with_timeout(proc.stdout, timeout=remaining)
+                assert line, (
+                    f'serve() exited before its banner: {proc.stderr.read()!r}'
+                )
+                output.extend(line)
+
+            assert proc.poll() is None
+            interrupt_python_process(proc)
+            tail, stderr = proc.communicate(timeout=10.0)
+            output.extend(tail)
+            assert proc.returncode == 0, stderr
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate(timeout=10.0)
+
+        text = output.decode('ascii')
+        assert 'C-Two Resource Server' in text
+        if encoding is not None:
+            assert 'route_\\u2603' in text
+        assert 'Shutting down...' in text
+        assert 'Resource server stopped.' in text
+        assert marker.read_text() == 'cleaned'
 
     def test_serve_blocks_and_sigint_shuts_down(self, tmp_path):
         """Process blocks on cc.serve(), A console interrupt triggers graceful exit."""

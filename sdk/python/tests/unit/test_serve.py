@@ -1,7 +1,9 @@
 """Unit tests for ``cc.serve()`` — CRM resource daemon mode."""
 from __future__ import annotations
 
+import io
 import logging
+import sys
 import threading
 import time
 
@@ -110,3 +112,32 @@ class TestServeExport:
     def test_serve_exists(self):
         assert hasattr(cc, 'serve')
         assert callable(cc.serve)
+
+
+@pytest.mark.parametrize('encoding', ['cp1252', 'gbk', 'ascii'])
+def test_serve_banner_with_strict_stdout_encoding(monkeypatch, encoding):
+    """Unencodable route names are escaped and piped output is flushed."""
+    buffer = io.BytesIO()
+    with io.TextIOWrapper(buffer, encoding=encoding, errors='strict') as stdout:
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, 'stdout', stdout)
+            Runtime._print_serve_banner(['route_\u2603'], 'ipc://test')
+
+        # Read before closing/flushing the wrapper to verify banner visibility.
+        output = buffer.getvalue().decode('ascii')
+        assert 'C-Two Resource Server' in output
+        assert 'route_\\u2603' in output
+        assert 'IPC: ipc://test' in output
+        assert 'Serving 1 CRM resource(s)' in output
+
+
+def test_serve_banner_without_stdout(monkeypatch):
+    monkeypatch.setattr(sys, 'stdout', None)
+    Runtime._print_serve_banner(['route_\u2603'], None)
+
+
+def test_serve_banner_without_stdout_encoding(monkeypatch):
+    stdout = io.StringIO()
+    monkeypatch.setattr(sys, 'stdout', stdout)
+    Runtime._print_serve_banner(['route_\u2603'], None)
+    assert 'route_\u2603' in stdout.getvalue()
