@@ -25,7 +25,7 @@ name: Release Candidate
 #   That build proves the sdist is installable; the publishable wheels are
 #   the repo source-mode builds.
 # Every job checks out the dispatch SHA on canonical main. All artifacts bind
-# to that immutable commit and its successful full source-validation run.
+# to that immutable commit. Source evidence is selected later at promotion.
 
 # A candidate is built once, on an explicit release qualification request.
 # PRs and ordinary main pushes run Source Validation without packaging 35 wheels.
@@ -47,9 +47,6 @@ jobs:
   # ── Source-bound context: versions, commit, official FastDB byte identities ──
   context:
     if: github.repository == 'world-in-progress/c-two' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
-      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -67,13 +64,6 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-
-      - name: Require completed full source validation before packaging
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          python -m pip install --quiet packaging
-          python .github/scripts/promote_release_candidate.py check-source --source-sha "${{ github.sha }}" --plan-output source-gate.json
 
       # Python FastDB and the native Core have independent exact pins. Validate
       # both from repository metadata; the optional Python extra is what
@@ -173,11 +163,10 @@ jobs:
               re.MULTILINE).group(1)
           source_sha = os.environ["GITHUB_SHA"]
           context = {
-              "schema": "c-two.release-candidate.context.v1",
+              "schema": "c-two.release-candidate.context.v2",
               "source_commit_sha": source_sha,
               "event": os.environ.get("GITHUB_EVENT_NAME", ""),
               "ref": os.environ.get("GITHUB_REF", ""),
-              "source_validation_run_id": json.loads(pathlib.Path("source-gate.json").read_text())["run_id"],
               "c_two_version": pyproject["project"]["version"],
               "c3_version": cli_version,
               "fastdb_version": os.environ["FASTDB_VERSION"],

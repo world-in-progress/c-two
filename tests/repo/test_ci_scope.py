@@ -47,7 +47,8 @@ def test_scope_preserves_runtime_and_unknown_input_coverage(paths, expected):
 def test_event_selects_real_workflow_output(tmp_path, event, force, count, expected):
     output = tmp_path / "outputs"
     result = subprocess.run([sys.executable, str(SCRIPT)], env={
-        **os.environ, "EVENT_NAME": event, "FORCE_FULL": str(force).lower(),
+        **os.environ, "GITHUB_REPOSITORY": "", "GITHUB_TOKEN": "", "GITHUB_SHA": "a" * 40,
+        "EVENT_NAME": event, "FORCE_FULL": str(force).lower(),
         "CHANGED_FILES": str(count), "CHANGED_FILES_JSON": json.dumps([".github/workflows/ci.yml"]),
         "GITHUB_OUTPUT": str(output),
     }, capture_output=True, text=True)
@@ -68,5 +69,101 @@ def test_workflow_keeps_required_names_and_uses_full_diff():
     assert jobs["required"]["name"] == "test (py${{ matrix.python }})"
     assert jobs["required"]["if"] == "always()"
     assert "workflow-policy" in jobs["required"]["needs"]
-    assert set(jobs["source"]["needs"]) == {"changes", "workflow-policy"}
+    assert set(jobs["source"]["needs"]) == {"changes"}
     assert "if" not in jobs["workflow-policy"]
+
+
+@pytest.mark.parametrize("paths,runtime", [(["docs/releases/0.10.1.md"], False), (["core/runtime.rs"], True)])
+@pytest.mark.parametrize("lookup", ["same-tree-pr", "fork-pr", "different-tree", "no-run", "api-error"])
+def test_push_keeps_path_scope_and_reuses_qualified_pr_evidence(tmp_path, monkeypatch, capsys, paths, runtime, lookup):
+    from test_source_evidence import FakeApi, SOURCE_SHA
+
+    spec = importlib.util.spec_from_file_location("ci_scope", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    api = FakeApi()
+    if lookup == "fork-pr":
+        api.runs[0]["head_repository"] = {"full_name": "contributor/c-two"}
+    elif lookup == "different-tree":
+        api.trees[api.runs[0]["head_sha"]] = "d" * 40
+    elif lookup == "no-run":
+        api.runs = []
+    elif lookup == "api-error":
+        def failed_request(path):
+            raise module.PromotionError("GitHub API unavailable")
+        api.get_json = failed_request
+    monkeypatch.setattr(module, "GitHubApi", lambda *args: api)
+    output = tmp_path / "outputs"
+    for key, value in {
+        "EVENT_NAME": "push", "FORCE_FULL": "false", "GITHUB_SHA": SOURCE_SHA,
+        "GITHUB_TOKEN": "token", "GITHUB_REPOSITORY": api.repository,
+        "CHANGED_FILES_JSON": json.dumps(paths), "CHANGED_FILES": "1",
+        "GITHUB_OUTPUT": str(output),
+    }.items():
+        monkeypatch.setenv(key, value)
+    module.main()
+    reuse = runtime and lookup in {"same-tree-pr", "fork-pr"}
+    assert output.read_text() == f"source={str(runtime and not reuse).lower()}\n"
+    console = capsys.readouterr().out
+    if not runtime:
+        assert api.paths == []
+        assert "Workflow policy validation" in console
+    elif reuse:
+        assert "201" in console and api.runs[0]["html_url"] in console
+    else:
+        assert "requiring full validation" in console
+
+
+def test_explicit_full_validation_does_not_lookup_previous_evidence(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("ci_scope", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def unexpected_lookup(*args, **kwargs):
+        raise AssertionError("forced source validation cannot be omitted")
+
+    monkeypatch.setattr(module, "GitHubApi", unexpected_lookup)
+    output = tmp_path / "outputs"
+    monkeypatch.setenv("EVENT_NAME", "push")
+    monkeypatch.setenv("FORCE_FULL", "true")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    module.main()
+    assert output.read_text() == "source=true\n"
+
+
+def test_scope_lookup_permissions_and_attempt_names_stay_on_the_producer():
+    workflow = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    jobs = workflow["jobs"]
+    assert "actions" not in workflow["permissions"]
+    assert jobs["changes"]["permissions"]["actions"] == "read"
+    select = next(step for step in jobs["changes"]["steps"] if step.get("id") == "select")
+    assert select["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+    for name, job in jobs.items():
+        if name != "changes":
+            assert "actions" not in job.get("permissions", {})
+    upload = next(step for step in jobs["source"]["steps"] if step.get("uses") == "actions/upload-artifact@v4")
+    assert upload["with"]["name"].endswith("-a${{ github.run_attempt }}")
+    assert set(jobs["required"]["needs"]) == {"changes", "workflow-policy", "source"}
+
+
+@pytest.mark.parametrize("missing", ["GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_SHA"])
+def test_runtime_push_missing_workflow_configuration_fails(tmp_path, monkeypatch, missing):
+    from test_source_evidence import FakeApi, SOURCE_SHA
+
+    spec = importlib.util.spec_from_file_location("ci_scope", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    api = FakeApi()
+    monkeypatch.setattr(module, "GitHubApi", lambda *args: api)
+    output = tmp_path / "outputs"
+    for key, value in {
+        "EVENT_NAME": "push", "FORCE_FULL": "false", "GITHUB_SHA": SOURCE_SHA,
+        "GITHUB_TOKEN": "token", "GITHUB_REPOSITORY": api.repository,
+        "CHANGED_FILES_JSON": '["core/runtime.rs"]', "CHANGED_FILES": "1",
+        "GITHUB_OUTPUT": str(output),
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv(missing)
+    with pytest.raises(KeyError, match=missing):
+        module.main()
+    assert not output.exists() and api.paths == []

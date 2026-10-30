@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -25,6 +27,17 @@ SPEC = {
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
+
+
+@pytest.fixture
+def unicode_contract(monkeypatch):
+    @cc.crm(namespace="测试.契约🙂", version="0.1.0")
+    class 问候:
+        def ping(self) -> None:
+            ...
+
+    monkeypatch.setattr(sys.modules[__name__], "UnicodeContract", 问候, raising=False)
+    return f"{__name__}:UnicodeContract", cc.export_contract_descriptor(问候)
 
 
 def test_portable_export_rejects_python_pickle() -> None:
@@ -181,6 +194,42 @@ def test_contract_export_cli_writes_v2_descriptor(tmp_path, monkeypatch) -> None
     assert descriptor["schema"] == "c-two.contract.v2"
     assert descriptor["crm"]["name"] == "Ping"
     assert descriptor["methods"][0]["name"] == "ping"
+
+
+def test_contract_export_cli_writes_non_ascii_utf8(tmp_path, unicode_contract) -> None:
+    from c_two.cli.contract import main
+
+    target, payload = unicode_contract
+    out_path = tmp_path / "契约.json"
+    assert main(["export", target, "--out", str(out_path)]) == 0
+
+    encoded = out_path.read_bytes()
+    assert "测试.契约🙂" in payload
+    assert encoded == payload.encode("utf-8")
+    descriptor = json.loads(encoded.decode("utf-8"))
+    assert descriptor["crm"]["name"] == "问候"
+    assert descriptor["crm"]["namespace"] == "测试.契约🙂"
+
+
+@pytest.mark.parametrize("encoding", ["cp1252", "gbk"])
+def test_contract_export_cli_writes_utf8_stdout_in_order(
+    monkeypatch, unicode_contract, encoding,
+) -> None:
+    from c_two.cli.contract import main
+
+    target, payload = unicode_contract
+    raw = io.BytesIO()
+    with io.TextIOWrapper(io.BufferedWriter(raw), encoding=encoding, newline="\n") as stdout:
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "stdout", stdout)
+            stdout.write("before\n")
+            assert main(["export", target]) == 0
+            encoded = raw.getvalue()
+
+    assert encoded == b"before\n" + (payload + "\n").encode("utf-8")
+    descriptor = json.loads(encoded.split(b"\n", 1)[1].decode("utf-8"))
+    assert descriptor["crm"]["name"] == "问候"
+    assert descriptor["crm"]["namespace"] == "测试.契约🙂"
 
 
 def test_contract_diagnose_cli_writes_python_only_diagnostics(

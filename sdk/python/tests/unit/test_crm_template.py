@@ -1,4 +1,6 @@
 import ast
+import importlib.util
+import sys
 import pytest
 import c_two as cc
 from c_two.crm.template import (
@@ -44,6 +46,32 @@ def _get_method_node(class_node, method_name):
 # ── generate_crm_template ───────────────────────────────────────────
 
 class TestGenerateCrmTemplate:
+    @pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "gbk"])
+    def test_preserves_chinese_docstring_as_utf8(self, tmp_path, monkeypatch, encoding):
+        source_path = tmp_path / "chinese_contract.py"
+        source_path.write_text(
+            f"# coding: {encoding}\n"
+            'import c_two as cc\n'
+            '@cc.crm(namespace="test.template-encoding", version="0.1.0")\n'
+            'class ChineseContract:\n'
+            '    def greeting(self, name: str) -> str:\n'
+            '        """返回中文问候。"""\n'
+            '        ...\n',
+            encoding=encoding,
+        )
+        spec = importlib.util.spec_from_file_location(source_path.stem, source_path)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, source_path.stem, module)
+        spec.loader.exec_module(module)
+
+        output = tmp_path / "chinese_impl.py"
+        generate_crm_template(module.ChineseContract, output)
+
+        tree = ast.parse(output.read_bytes().decode("utf-8"))
+        cls = _get_class_node(tree, "ChineseContractImpl")
+        method = _get_method_node(cls, "greeting")
+        assert ast.get_docstring(method) == "返回中文问候。"
+
     def test_generates_valid_python(self, tmp_path):
         source, _ = _generate_and_parse(tmp_path)
         # ast.parse raises SyntaxError on invalid code

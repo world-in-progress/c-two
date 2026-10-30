@@ -293,7 +293,7 @@ def test_failed_native_start_reports_cleanup_without_closing_other_listener(tmp_
     assert {p.name for p in tmp_path.iterdir()} <= {'.gate', '.gate.marker'}
 
 
-@pytest.mark.skipif(os.name == 'nt', reason='Unix sandbox/permissions; Windows uses kernel pipe names')
+@pytest.mark.platform('posix')
 def test_public_start_preserves_native_bind_denial_and_cleanup(tmp_path):
     if sys.platform != 'darwin' and os.geteuid() == 0:
         pytest.skip('filesystem permission denial requires an unprivileged uid')

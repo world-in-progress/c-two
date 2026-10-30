@@ -16,7 +16,7 @@ import uuid
 
 import pytest
 
-from tests.unit.test_endpoint_context import IS_WINDOWS, UNIX_ONLY, _run_isolated
+from tests.unit.test_endpoint_context import IS_WINDOWS, _run_isolated
 
 
 COMMON = '''
@@ -61,7 +61,7 @@ def _assert_io(report: dict, operation: str, kind: str, raw: int | None) -> None
     assert error['endpoint_unverified_reason'] is None, error
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('case,reason', [
     ('missing-lease', 'missing-ownership'),
     ('old-format', 'unsupported-namespace-format'),
@@ -120,7 +120,7 @@ def test_bind_unverified_reason_survives_the_startup_watch(case, reason) -> None
         assert error['endpoint_unverified_reason'] == report['inspect_reason'] == reason
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('case,operation,kind,raw', [
     ('unwritable', 'bind', 'permission_denied', errno.EACCES),
     ('not_directory', 'bind', 'other', errno.ENOTDIR),
@@ -271,7 +271,7 @@ invalid = ctypes.c_void_p(-1).value
 '''
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason='Windows named-pipe platform contract')
+@pytest.mark.platform('windows')
 @pytest.mark.parametrize('case, timeout', [
     ('missing', 2), ('denied', 2), ('busy', 0.2), ('busy', None), ('busy', 10),
 ])

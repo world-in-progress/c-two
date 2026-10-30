@@ -143,7 +143,7 @@ environment = {name: os.environ[name] for name in
 environment.update({
     "PATH": os.pathsep.join((str(root / "tools"), str(pathlib.Path(sys.executable).parent),
                              str(pathlib.Path(system) / "System32"), system)),
-    "PATHEXT": ".COM;.EXE;.BAT;.CMD", "PYTHONUTF8": "1",
+    "PATHEXT": ".COM;.EXE;.BAT;.CMD",
     "TEMP": str(root / "temp"), "TMP": str(root / "temp"),
     "USERPROFILE": str(root / "profile"), "HOME": str(root / "profile"),
     "LOCALAPPDATA": str(root / "profile/AppData/Local"),

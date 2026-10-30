@@ -104,10 +104,7 @@ def _message(process: subprocess.Popen, log: Path, timeout: float = 15) -> dict:
     return json.loads(line)
 
 
-@pytest.mark.skipif(
-    sys.platform not in ('linux', 'darwin'),
-    reason='OS socket counting needs Linux /proc or macOS lsof; Rust covers Named Pipes',
-)
+@pytest.mark.platform('posix')
 @pytest.mark.timeout(240)
 def test_client_pool_idle_cleanup(tmp_path):
     if sys.platform == 'darwin':

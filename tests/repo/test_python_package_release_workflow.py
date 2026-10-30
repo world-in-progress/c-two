@@ -19,13 +19,13 @@ def _workflow_text() -> str:
     )
 
 
-def test_python_release_requires_an_explicit_candidate_and_defaults_to_preview():
+def test_python_release_requires_one_explicit_candidate():
     workflow = yaml.load(_workflow_text(), Loader=yaml.BaseLoader)
     assert set(workflow["on"]) == {"workflow_dispatch"}
     inputs = workflow["on"]["workflow_dispatch"]["inputs"]
-    assert set(inputs) == {"candidate_run_id", "dry_run"}
+    assert set(inputs) == {"candidate_run_id"}
     assert inputs["candidate_run_id"]["required"] == "true"
-    assert inputs["dry_run"]["default"] == "true"
+    assert "GITHUB_STEP_SUMMARY" in _workflow_text()
     assert "workflow_run" not in _workflow_text()
 
 
@@ -73,7 +73,7 @@ def test_publish_uploads_only_the_plan_staged_distribution():
 
     assert "needs: prepare" in publish
     assert "needs.prepare.outputs.action == 'upload'" in publish
-    assert "inputs.dry_run != true" in publish
+    assert "environment: pypi" in publish
     assert "packages-dir: staging/dist" in publish
     # The staging artifact is downloaded back into ./staging so the plan's
     # staging/dist layout is restored exactly; the directory holds only the

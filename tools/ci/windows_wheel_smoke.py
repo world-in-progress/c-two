@@ -274,6 +274,8 @@ def clean_environment() -> dict[str, str]:
     loaders, LD_LIBRARY_PATH, and PATH entries that live inside an exported
     FastDB SDK are dropped. Every other OS/Python PATH entry is preserved
     because Windows system DLLs and the toolchain still need them.
+    PYTHON* variables, including inherited PYTHONUTF8, are removed so product
+    processes use the platform's default encoding.
     """
     excluded = ("PYTHON", "C2_", "FASTDB_", "DYLD_", "LD_LIBRARY_PATH", "UV_", "PIP_", "CONDA_")
     environment = {key: value for key, value in os.environ.items()
@@ -304,7 +306,7 @@ def clean_environment() -> dict[str, str]:
                 continue
             kept.append(entry)
         environment["PATH"] = os.pathsep.join(kept)
-    environment.update({"C2_ENV_FILE":"", "C2_RELAY_ANCHOR_ADDRESS":"", "PYTHONUTF8":"1"})
+    environment.update({"C2_ENV_FILE":"", "C2_RELAY_ANCHOR_ADDRESS":""})
     return environment
 
 
@@ -460,7 +462,7 @@ def main() -> int:
                 try:
                     relay = subprocess.Popen([str(executable), "relay", "--bind", f"127.0.0.1:{port}",
                                               "--advertise-url", url], cwd=work, env=environment,
-                                             stdout=relay_log, stderr=subprocess.STDOUT, text=True)
+                                             stdout=relay_log, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
                     deadline = time.monotonic() + 30
                     while True:
                         if relay.poll() is not None:

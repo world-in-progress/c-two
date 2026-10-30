@@ -1,22 +1,7 @@
-"""Tests for .github/scripts/promote_release_candidate.py and the promotion
-workflow contracts.
+"""Byte-exact candidate promotion and environment-protected publish contracts.
 
-The promotion must be a byte-exact, fail-closed preparation step: unsafe ZIP
-members, API digest mismatches, inventory deviations, provenance gaps, and
-remote-state conflicts must all refuse promotion, while idempotent reruns
-skip only byte-identical remote assets. Promotion is explicit only: the
-candidate is one successful ``workflow_dispatch`` ``Release Candidate`` run
-named by ``--candidate-run-id``, and its ``rc-context.json`` binds the exact
-successful ``Source Validation`` run (a canonical main push or dispatch)
-through ``source_validation_run_id`` — evidence is never mixed across runs
-and pending gates fail as incomplete, never deferred success. ``check-source``
-exercises the read-only metadata-only companion that fills that binding.
-Fixtures mirror the real candidate receipt schemas
-(``c-two.installed-wheel-smoke.v1`` rows with FastDB decisions,
-``cp314``/``cp314t`` tag pairs) and the Source Validation evidence recorded
-by tools/ci/source_validation.py. The publish-layout tests simulate the
-GitHub artifact roundtrip and drive the workflow's actual publish shell with
-a fake ``gh``. Nothing here touches the network or publishes.
+Network-free fixtures exercise candidate bytes, receipts and remote state;
+source proof is selected using shared tree-bound metadata verification.
 """
 
 from __future__ import annotations
@@ -24,9 +9,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import stat
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 import zipfile
@@ -54,6 +41,8 @@ assert _spec is not None and _spec.loader is not None
 promote = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(promote)
 
+from source_evidence import FULL_LANES
+
 REPOSITORY = "world-in-progress/c-two"
 SOURCE_SHA = "a" * 40
 OTHER_SHA = "b" * 40
@@ -61,7 +50,7 @@ C_TWO_VERSION = "0.6.0"
 C3_VERSION = "0.2.0"
 FASTDB_VERSION = "0.2.4"
 FASTDB_CORE_VERSION = "0.2.4"
-FASTDB_SOURCE_REV = promote.SOURCE_VALIDATION_FASTDB_SHA
+FASTDB_SOURCE_REV = promote.FASTDB_SOURCE_REV
 CLI_TARGETS = promote.CLI_TARGETS
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
 WINDOWS_ARM64_TARGET = "aarch64-pc-windows-msvc"
@@ -108,7 +97,7 @@ def _run(run_id: int, name: str, sha: str = SOURCE_SHA, **overrides: Any) -> dic
         "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_id}",
     }
     if name == "Source Validation":
-        run["runner_labels"] = list(promote.SOURCE_VALIDATION_LANES)
+        run["runner_labels"] = list(FULL_LANES)
     run.update(overrides)
     return run
 
@@ -127,110 +116,6 @@ def _fastdb_wheel_name(target: str, python: str) -> str:
     # The macOS Intel sdist build retains this tag; its receipt proves that target.
     platform = "macosx_15_0_universal2" if target == "x86_64-apple-darwin" else PLATFORM_TAGS[target]
     return f"fastdb4py-{FASTDB_VERSION}-{interpreter}-{abi}-{platform}.whl"
-
-
-def _matrix_receipt(c3_sha: str | None = None) -> dict[str, Any]:
-    """A valid 18-row portable-matrix receipt (mirrors the frozen row contract)."""
-    rows = []
-    for index, row_id in enumerate(promote.portable_matrix_receipt.EXPECTED_ROW_IDS, start=1):
-        payload, client_role, host_role, transport = row_id.split("__")
-        rows.append({
-            "id": row_id,
-            "payload": payload,
-            "client_language": client_role.removesuffix("-client"),
-            "host_language": host_role.removesuffix("-host"),
-            "transport": transport,
-            "observed_path": "DirectIpc" if transport == "direct" else "ExplicitRelay",
-            "descriptor_sha256": _digest("a"),
-            "contract_release_ref": {
-                "schema": "c-two.contract-release-ref.v1",
-                "contract_schema": "c-two.contract.v2",
-                "descriptor_sha256": _digest("a"),
-                "crm": {"namespace": f"test.portable-matrix.{payload}",
-                        "name": "PortableMatrix", "version": "0.1.0"},
-            },
-            "fastdb_spec_sha256": None if payload == "no-payload" else _digest("b"),
-            "route": {"uid": f"matrix-route-{index:02d}", "revision": 1},
-            "logical_result_sha256": _digest("c"),
-            "packages": {"client_sha256": _digest("d"), "host_sha256": _digest("e")},
-            "c3_sha256": None if transport == "direct" else (c3_sha or _digest("f")),
-            "path_counters": {"requests": 1, "responses": 1},
-            "status": "passed",
-        })
-    return {"schema": "c-two.portable-matrix-receipt.v1",
-            "evidence_stage": "development", "rows": rows}
-
-
-def _typescript_receipt(c3_sha: str | None = None) -> dict[str, Any]:
-    """A valid 12-row TypeScript real-call receipt (mirrors the frozen contract)."""
-    module = promote.typescript_receipt
-    observed_paths = {
-        "direct-ipc": "DirectIpc",
-        "explicit-relay": "ExplicitRelay",
-        "relay-aware-local-ipc": "RelayAwareLocalIpc",
-        "relay-aware-http": "RelayAwareHttp",
-    }
-    host_languages = {
-        "direct-ipc": "rust",
-        "explicit-relay": "python",
-        "relay-aware-local-ipc": "python",
-        "relay-aware-http": "rust",
-    }
-    rows = []
-    for index, row_id in enumerate(module.EXPECTED_ROW_IDS, start=1):
-        payload, mode = row_id.split("__")
-        rows.append({
-            "id": row_id,
-            "payload": payload,
-            "mode": mode,
-            "host_language": host_languages[mode],
-            "observed_path": observed_paths[mode],
-            "descriptor_sha256": _digest("a"),
-            "contract_release_ref": {
-                "schema": "c-two.contract-release-ref.v1",
-                "contract_schema": "c-two.contract.v2",
-                "descriptor_sha256": _digest("a"),
-                "crm": {"namespace": f"test.typescript.{payload}",
-                        "name": "Portable", "version": "0.1.0"},
-            },
-            "fastdb_spec_sha256": None if payload == "no-payload" else _digest("b"),
-            "route": {"uid": f"typescript-route-{index}", "revision": 1},
-            "logical_result_sha256": _digest("c"),
-            "path_counters": {
-                "requests": 2 if row_id == module.OPAQUE_ROW_ID else 1,
-                "responses": 2 if row_id == module.OPAQUE_ROW_ID else 1,
-            },
-            "lifetime": {
-                "close_idempotent": True,
-                "checked_view_invalidated": None if payload == "no-payload" else True,
-                "materialized_survived": None if payload == "no-payload" else True,
-            },
-            "status": "passed",
-        })
-    return {
-        "schema": "c-two.typescript-real-call-receipt.v1",
-        "evidence_stage": "development",
-        "runtime": {"node_version": "v22.14.0", "platform": "win32",
-                    "arch": "AMD64", "browser_runtime": "unverified"},
-        "packages": {"fastdb4ts_sha256": _digest("d"),
-                     "c2_mem_ffi_sha256": _digest("e"),
-                     "c3_sha256": c3_sha or _digest("f")},
-        "rows": rows,
-        "negative_evidence": {
-            "digest_mismatch": {
-                "verified": True,
-                "row_id": module.DIGEST_ROW_ID,
-                "fields": dict(module.FROZEN_FASTDB_DIGEST_MISMATCH_CAUSE),
-            },
-            "opaque_allocator": {
-                "verified": True, "released": 1, "row_id": module.OPAQUE_ROW_ID,
-            },
-        },
-        "cleanup": {
-            "host_processes_stopped": True, "relay_processes_stopped": True,
-            "node_processes_stopped": True, "response_readers_closed": True,
-        },
-    }
 
 
 def _wheel_entry(name: str, data: bytes, distribution: str, version: str) -> dict[str, Any]:
@@ -295,8 +180,7 @@ def _smoke_body(
 class CandidateBuilder:
     """Builds a structurally exact synthetic candidate plus its manifest."""
 
-    def __init__(self, source_validation_run_id: int = 201) -> None:
-        self.source_validation_run_id = source_validation_run_id
+    def __init__(self) -> None:
         self.members: dict[str, bytes] = {}
         self.cli: list[dict[str, Any]] = []
         self.wheels: list[dict[str, Any]] = []
@@ -380,12 +264,11 @@ class CandidateBuilder:
             self.installers.append(self._put(name, data))
 
         self._record_receipt("rc-context.json", {
-            "schema": "c-two.release-candidate.context.v1",
+            "schema": "c-two.release-candidate.context.v2",
             "source_commit_sha": SOURCE_SHA,
             "event": "workflow_dispatch",
             "ref": "refs/heads/main",
             "pull_request_head_sha": None,
-            "source_validation_run_id": self.source_validation_run_id,
             "c_two_version": C_TWO_VERSION,
             "c3_version": C3_VERSION,
             "fastdb_version": FASTDB_VERSION,
@@ -608,6 +491,10 @@ class FakeApi(promote.GitHubApi):
         self.paths.append(path)
         world = self.world
         repo = f"/repos/{REPOSITORY}"
+        if "/git/commits/" in path:
+            return 200, {"tree": {"sha": "c" * 40}}
+        if "/commits/" in path and "/pulls?" in path:
+            return 200, []
         if "/actions/workflows/" in path and "/runs?" in path:
             workflow_file = path.split("/actions/workflows/", 1)[1].split("/runs", 1)[0]
             params = dict(
@@ -636,7 +523,7 @@ class FakeApi(promote.GitHubApi):
                     names.append("source (ubuntu-24.04, py3.14t)")
                 names.append("workflow policy")
             jobs = getattr(world, "jobs_by_run", {}).get(run_id, [
-                {"name": name, "status": "completed", "conclusion": "success"} for name in names])
+                {"name": name, "status": "completed", "conclusion": "success", "run_attempt": 1} for name in names])
             return 200, {"jobs": jobs}
         if "/actions/runs/" in path and "/artifacts" in path:
             run_id = int(path.split("/actions/runs/", 1)[1].split("/artifacts", 1)[0])
@@ -682,86 +569,6 @@ class FakeUrlOpen:
         return FakeResponse(200, json.dumps(self.world.pypi).encode())
 
 
-def _source_receipt_bytes(payload: dict[str, Any]) -> bytes:
-    return json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n"
-
-
-def _mutate_source_json(members: dict[str, bytes], name: str, mutate: Any) -> None:
-    payload = json.loads(members[name])
-    mutate(payload)
-    members[name] = _source_receipt_bytes(payload)
-
-
-def _build_source_members(label: str) -> tuple[dict[str, bytes], str]:
-    """Mirror one platform's full source runner artifact and Python run evidence."""
-    target_platform = promote.SOURCE_VALIDATION_LANES[label]
-    source_c3 = f"source-debug-c3-bytes-{label}".encode()
-    c3_name = "c3.exe" if target_platform == "windows" else "c3"
-    platform_tag = {"linux": "linux_x86_64", "macos": "macosx_11_0_arm64",
-                    "windows": "win_amd64"}[target_platform]
-    if label == "windows-11-arm":
-        platform_tag = "win_arm64"
-    fastdb_name = f"fastdb4py-{FASTDB_VERSION}-cp312-cp312-{platform_tag}.whl"
-    ctwo_name = f"c_two-0.6.0-cp312-cp312-{platform_tag}.whl"
-    members: dict[str, bytes] = {
-        f"wheels/fastdb/{fastdb_name}": b"source fastdb wheel",
-        f"wheels/c-two/{ctwo_name}": b"source wheel",
-        f"cli/{c3_name}": source_c3,
-        "python-suite/ordinary/junit.xml": b"<testsuite tests='829' failures='0'/>",
-        "python-suite/typescript/junit.xml": b"<testsuite tests='13' failures='0'/>",
-    }
-    fastdb_info = {"name": fastdb_name, "sha256": _sha(b"source fastdb wheel"), "bytes": 19,
-                   "distribution": "fastdb4py", "version": FASTDB_VERSION}
-    ctwo_info = {"name": ctwo_name, "sha256": _sha(b"source wheel"), "bytes": 12,
-                 "distribution": "c-two", "version": C_TWO_VERSION}
-    c3_info = {"name": c3_name, "sha256": _sha(source_c3), "bytes": len(source_c3)}
-    artifacts = [fastdb_info, ctwo_info, c3_info]
-    ordinary = _smoke_body(administrator=True if target_platform == "windows" else None,
-                           artifacts=artifacts)
-    members[promote.MATRIX_RECEIPT_NAME] = _source_receipt_bytes(_matrix_receipt(c3_sha=_sha(source_c3)))
-    members[promote.TYPESCRIPT_RECEIPT_NAME] = _source_receipt_bytes(_typescript_receipt(c3_sha=_sha(source_c3)))
-    if label == "windows-11-arm":
-        _mutate_source_json(members, promote.TYPESCRIPT_RECEIPT_NAME,
-                            lambda receipt: receipt["runtime"].update(arch="arm64"))
-    members[promote.SOURCE_WHEEL_RECEIPT] = _source_receipt_bytes(ordinary)
-    members[promote.PYTHON_RUN_RECEIPT_NAME] = _source_receipt_bytes({
-        "schema": "c-two.python-test-run.v1", "status": "passed", "workers": 2,
-        "namespace": "source-test-run", "inputs": {"c3_sha256": _sha(source_c3)},
-        "steps": [{"id": name, "status": "passed", "exit_code": 0,
-                   "process_exited": True, "cleanup_confirmed": True}
-                  for name in ("collect-full", "collect-ordinary", "collect-portable",
-                               "collect-typescript", "ordinary", "portable", "typescript")],
-    })
-    if target_platform == "windows":
-        standard = _smoke_body(administrator=False, artifacts=artifacts)
-        wrapper = {
-            "schema": "c-two.standard-user-wrapper.v1", "status": "passed", "errors": [],
-            "cleanup": {"processes_exited": True, "workspace_removed": True, "account_removed": True},
-            "account_sid": "S-1-5-21-source",
-        }
-        members[promote.SOURCE_STANDARD_USER_RECEIPT] = _source_receipt_bytes(standard)
-        members[promote.SOURCE_STANDARD_USER_WRAPPER] = _source_receipt_bytes(wrapper)
-
-    gates = promote.expected_source_full_gates(target_platform)
-    evidence = {
-        "schema": "c-two.source-run-evidence.v1", "platform": target_platform,
-        "scope": "full", "status": "passed", "applicable_gates": gates,
-        "steps": [{"id": gate, "status": "passed"} for gate in gates],
-        "sources": {
-            "c-two": {"expected_sha": SOURCE_SHA, "actual_sha": SOURCE_SHA, "verified": True},
-            "fastdb": {"expected_sha": promote.SOURCE_VALIDATION_FASTDB_SHA,
-                       "actual_sha": promote.SOURCE_VALIDATION_FASTDB_SHA, "verified": True},
-        },
-        "runner": {"requested_label": label, "os": target_platform, "machine": "test-arch",
-                   "python_platform": "win-arm64" if label == "windows-11-arm" else "test-platform"},
-        "toolchains": {"rustc": {"exit_code": 0, "output": "host: aarch64-pc-windows-msvc"}},
-        "artifacts": [{"path": name, "sha256": _sha(data), "bytes": len(data)}
-                      for name, data in members.items()],
-    }
-    members["run-evidence.json"] = _source_receipt_bytes(evidence)
-    return members, _sha(source_c3)
-
-
 class World:
     """Everything the promotion script reads: runs, artifacts, remote state."""
 
@@ -780,7 +587,6 @@ class World:
         self.releases: dict[str, dict[str, Any]] = {}
         self.release_asset_bytes: dict[int, bytes] = {}
         self.pypi: dict[str, Any] | None = None
-        self.source_c3_sha: dict[str, str] = {}
         self._add_candidate_artifacts()
 
     def set_source_runs(self, *runs: dict[str, Any]) -> None:
@@ -840,33 +646,10 @@ class World:
                 entry["digest"] = f"sha256:{_sha(self.artifact_zips[8003])}"
 
     def _add_source_validation(self, run_id: int, label: str) -> None:
-        members, source_c3_sha = _build_source_members(label)
-        self.source_c3_sha[label] = source_c3_sha
-        artifact_id = 9000 + run_id * 10 + list(promote.SOURCE_VALIDATION_LANES).index(label)
-        self._register_artifact(run_id, artifact_id,
-                                f"source-{label}-py3.12-full-{SOURCE_SHA}", members)
-
-    def mutate_source_artifacts(self, mutate: Any, *, resync_evidence: bool = True, label: str | None = None) -> None:
-        """Rewrite source artifacts, independently preserving their API and file digests."""
-        for run_id, entries in self.artifacts_by_run.items():
-            if run_id < 200:
-                continue
-            for entry in entries:
-                if label is not None and entry["name"] != f"source-{label}-py3.12-full-{SOURCE_SHA}":
-                    continue
-                with zipfile.ZipFile(io.BytesIO(self.artifact_zips[entry["id"]])) as archive:
-                    extracted = {info.filename: archive.read(info.filename)
-                                 for info in archive.infolist()}
-                mutate(extracted)
-                if resync_evidence:
-                    evidence = json.loads(extracted["run-evidence.json"])
-                    for item in evidence["artifacts"]:
-                        item["sha256"] = _sha(extracted[item["path"]])
-                        item["bytes"] = len(extracted[item["path"]])
-                    extracted["run-evidence.json"] = _source_receipt_bytes(evidence)
-                blob = _zip_bytes(extracted)
-                self.artifact_zips[entry["id"]] = blob
-                entry["digest"] = f"sha256:{_sha(blob)}"
+        self.artifacts_by_run.setdefault(run_id, []).append({
+            "id": 9000 + run_id * 10 + list(FULL_LANES).index(label),
+            "name": f"source-{label}-py3.12-full-{SOURCE_SHA}-a1", "expired": False,
+        })
 
 
 def _default_world() -> World:
@@ -1007,7 +790,6 @@ def run_prepare(
     target: str = "github-release",
     candidate_run_id: int = 101,
     extra: list[str] | None = None,
-    dry_run: bool = False,
 ) -> tuple[int, Path, Path]:
     download_dir = tmp_path / "candidate-download"
     plan = tmp_path / "promotion-plan.json"
@@ -1016,20 +798,9 @@ def run_prepare(
             "--download-dir", str(download_dir), "--plan-output", str(plan)]
     if target == "github-release":
         argv += ["--release-body-output", str(body)]
-    if dry_run:
-        argv.append("--dry-run")
     argv += ["--candidate-run-id", str(candidate_run_id)]
     argv += extra or []
     return promote.main(argv), plan, body
-
-
-def run_check_source(
-    tmp_path: Path, *, extra: list[str] | None = None,
-) -> tuple[int, Path]:
-    plan = tmp_path / "source-check.json"
-    argv = ["check-source", "--source-sha", SOURCE_SHA, "--plan-output", str(plan)]
-    argv += extra or []
-    return promote.main(argv), plan
 
 
 # ── Authenticated GitHub API redirects ────────────────────────────────────────
@@ -1154,24 +925,6 @@ def test_github_artifact_redirect_refuses_http_downgrade(
 # ── Sequencing and provenance ────────────────────────────────────────────────
 
 
-def test_pending_source_gate_reports_incomplete_and_fails(
-    tmp_path: Path, environment, capsys,
-) -> None:
-    world = World()
-    world.set_source_runs(
-        _run(201, "Source Validation", status="in_progress", conclusion=None),
-    )
-    api = environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1
-    assert not plan.exists()
-    # The bound run is fetched by identity; there is no deferral exit and no
-    # run scanning.
-    assert f"/repos/{REPOSITORY}/actions/runs/201" in api.paths
-    assert not any("/actions/workflows/" in path for path in api.paths)
-    assert "incomplete" in capsys.readouterr().err
-
-
 def test_failed_or_missing_gate_fails_closed(tmp_path: Path, environment) -> None:
     world = World()
     world.set_source_runs(_run(201, "Source Validation", conclusion="failure"))
@@ -1250,270 +1003,6 @@ def test_candidate_run_id_resolves_source_sha(tmp_path: Path, environment) -> No
     code, plan, _ = run_prepare(tmp_path)
     assert code == 0
     assert json.loads(plan.read_text())["source_sha"] == SOURCE_SHA
-
-
-# ── Source-run binding from the candidate context ────────────────────────────
-
-
-def test_promotion_binds_the_context_named_source_validation_run(
-    tmp_path: Path, environment,
-) -> None:
-    api = environment(_default_world())
-    code, plan_path, _ = run_prepare(tmp_path)
-    assert code == 0
-    plan = json.loads(plan_path.read_text())
-    lanes = plan["source_validation"]
-    assert set(lanes) == {"ubuntu-24.04", "macos-15", "windows-2022", "windows-2025", "windows-11-arm"}
-    # All five platform lanes share the single bound run, fetched by identity.
-    assert {entry["run_id"] for entry in lanes.values()} == {201}
-    assert f"/repos/{REPOSITORY}/actions/runs/201" in api.paths
-    assert not any("/actions/workflows/" in path for path in api.paths)
-
-
-def test_context_named_source_run_must_exist(tmp_path: Path, environment, capsys) -> None:
-    builder = CandidateBuilder(source_validation_run_id=999)
-    world = World(candidate=builder)
-    world.set_source_runs(_run(201, "Source Validation"))
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert "999" in capsys.readouterr().err
-
-
-def test_context_named_failed_run_is_not_substituted_by_another_success(
-    tmp_path: Path, environment, capsys,
-) -> None:
-    """The bound run is used even when another successful full run exists for
-    the same source; there is no fallback scan."""
-    builder = CandidateBuilder(source_validation_run_id=202)
-    world = World(candidate=builder)
-    world.set_source_runs(
-        _run(201, "Source Validation"),
-        _run(202, "Source Validation", conclusion="failure"),
-    )
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    err = capsys.readouterr().err
-    assert "202" in err and "not success" in err
-
-
-def test_context_named_policy_only_source_run_is_rejected(
-    tmp_path: Path, environment, capsys,
-) -> None:
-    """A green run without the full source jobs cannot carry the promotion
-    even when its SHA matches and a complete sibling run exists."""
-    builder = CandidateBuilder(source_validation_run_id=202)
-    world = World(candidate=builder)
-    world.set_source_runs(_run(201, "Source Validation"), _run(202, "Source Validation"))
-    world.jobs_by_run = {202: [
-        {"name": "changes", "status": "completed", "conclusion": "success"}]}
-    world.artifacts_by_run.pop(202, None)
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert "202" in capsys.readouterr().err
-
-
-# ── check-source: read-only full-source-run resolution ───────────────────────
-
-
-def test_check_source_writes_only_github_metadata(tmp_path: Path, environment) -> None:
-    api = environment(_default_world())
-    code, plan = run_check_source(tmp_path)
-    assert code == 0
-    assert json.loads(plan.read_text()) == {
-        "source_sha": SOURCE_SHA,
-        "run_id": 201,
-        "run_url": f"https://github.com/{REPOSITORY}/actions/runs/201",
-    }
-    # Run, job, and artifact listings only: no artifact bytes are ever touched.
-    assert api.paths
-    assert all("/actions/artifacts/" not in path and not path.endswith("/zip")
-               for path in api.paths)
-    assert any("/actions/workflows/ci.yml/runs" in path for path in api.paths)
-    assert any("/actions/runs/201/jobs" in path for path in api.paths)
-    assert any("/actions/runs/201/artifacts" in path for path in api.paths)
-
-
-def test_check_source_accepts_an_explicit_dispatch_source_run(
-    tmp_path: Path, environment,
-) -> None:
-    world = World()
-    world.set_source_runs(_run(201, "Source Validation", event="workflow_dispatch"))
-    environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 0
-    assert json.loads(plan.read_text())["run_id"] == 201
-
-
-def test_check_source_skips_policy_only_green_runs(tmp_path: Path, environment) -> None:
-    """The newest green run is ignored when its job inventory is policy-only;
-    the newest run that actually executed the full source lanes is returned."""
-    world = World()
-    world.set_source_runs(_run(201, "Source Validation"), _run(202, "Source Validation"))
-    world.jobs_by_run = {202: [
-        {"name": "changes", "status": "completed", "conclusion": "success"}]}
-    environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 0
-    assert json.loads(plan.read_text())["run_id"] == 201
-
-
-@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-def test_check_source_skips_runs_with_duplicate_full_artifacts(
-    tmp_path: Path, environment, label,
-) -> None:
-    world = World()
-    world.set_source_runs(_run(201, "Source Validation"), _run(202, "Source Validation"))
-    name = f"source-{label}-py3.12-full-{SOURCE_SHA}"
-    artifact = next(entry for entry in world.artifacts_by_run[202] if entry["name"] == name)
-    world.artifacts_by_run[202].append(dict(artifact, id=artifact["id"] + 100000))
-    api = environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 0
-    assert json.loads(plan.read_text())["run_id"] == 201
-    assert any("/actions/runs/202/artifacts" in path for path in api.paths)
-    assert all("/actions/artifacts/" not in path and not path.endswith("/zip")
-               for path in api.paths)
-
-
-@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-@pytest.mark.parametrize("count, reason, unexpected_reason", [
-    (0, "Full-scope artifacts are missing or expired.", "Duplicate full-scope artifacts"),
-    (2, "Duplicate full-scope artifacts indicate a rerun.", "missing or expired"),
-])
-def test_check_source_rejects_invalid_full_artifact_counts_with_fresh_run_guidance(
-    tmp_path: Path, environment, capsys, label, count, reason, unexpected_reason,
-) -> None:
-    world = _default_world()
-    name = f"source-{label}-py3.12-full-{SOURCE_SHA}"
-    artifact = next(entry for entry in world.artifacts_by_run[201] if entry["name"] == name)
-    if count == 0:
-        world.artifacts_by_run[201].remove(artifact)
-    else:
-        world.artifacts_by_run[201].append(dict(artifact, id=artifact["id"] + 100000))
-    environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 1 and not plan.exists()
-    err = capsys.readouterr().err
-    assert f"Source Validation run 201 retains {count} {name} artifacts" in err
-    assert "release qualification requires exactly one full-scope artifact per platform" in err
-    assert "the run bound by rc-context.json" not in err
-    assert reason in err and unexpected_reason not in err
-    assert "new full Source Validation run" in err and "same source SHA" in err
-    assert "gh workflow run ci.yml --ref main -F force_full=true" in err
-    assert "Rerunning jobs is not a substitute" in err
-
-
-def test_check_source_rejects_a_policy_only_green_run_as_the_full_gate(
-    tmp_path: Path, environment, capsys,
-) -> None:
-    world = _default_world()
-    world.jobs_by_run = {201: [
-        {"name": "changes", "status": "completed", "conclusion": "success"}]}
-    environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert "policy-only" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("victim", promote.CHECK_SOURCE_REQUIRED_JOBS)
-def test_check_source_requires_the_complete_source_job_inventory(
-    tmp_path: Path, environment, capsys, victim,
-) -> None:
-    world = _default_world()
-    world.jobs_by_run = {201: [
-        {"name": name, "status": "completed", "conclusion": "success"}
-        for name in promote.CHECK_SOURCE_REQUIRED_JOBS if name != victim]}
-    environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert victim in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("victim", ["source (ubuntu-24.04, py3.14t)", "workflow policy"])
-def test_promotion_rechecks_nonartifact_source_jobs(tmp_path, environment, capsys, victim):
-    world = _default_world()
-    world.jobs_by_run = {201: [
-        {"name": name, "status": "completed", "conclusion": "success"}
-        for name in promote.CHECK_SOURCE_REQUIRED_JOBS if name != victim]}
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert victim in capsys.readouterr().err
-
-
-def test_check_source_reports_pending_runs_as_incomplete(
-    tmp_path: Path, environment, capsys,
-) -> None:
-    world = World()
-    world.set_source_runs(
-        _run(201, "Source Validation", status="in_progress", conclusion=None))
-    environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 1 and not plan.exists()
-    err = capsys.readouterr().err
-    assert "201=in_progress" in err and "still running" in err
-
-
-def test_check_source_failed_runs_fail_closed(tmp_path: Path, environment) -> None:
-    world = World()
-    world.set_source_runs(_run(201, "Source Validation", conclusion="failure"))
-    environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 1 and not plan.exists()
-
-
-def test_check_source_no_runs_fails_closed(tmp_path: Path, environment) -> None:
-    world = World()
-    world.set_source_runs()
-    environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 1 and not plan.exists()
-
-
-@pytest.mark.parametrize("override", [
-    {"head_branch": "feature"},
-    {"event": "merge_group"},
-    {"event": "pull_request"},
-    {"head_sha": OTHER_SHA},
-    {"path": ".github/workflows/spoof.yml"},
-    {"name": "Windows Native"},
-    {"repository": {"full_name": "attacker/c-two"}},
-    {"head_repository": {"full_name": "attacker/c-two"}},
-])
-def test_check_source_rejects_off_canonical_runs(
-    tmp_path: Path, environment, override,
-) -> None:
-    """Off-main, fork, merge-group, spoofed-path, and foreign-repository runs
-    are filtered out by the canonical query or fail provenance validation."""
-    world = _default_world()
-    world.runs_by_id[201].update(override)
-    environment(world)
-    code, plan = run_check_source(tmp_path)
-    assert code == 1 and not plan.exists()
-
-
-@pytest.mark.parametrize("field, value", [
-    ("GITHUB_REPOSITORY", "attacker/c-two"),
-    ("GITHUB_REF", "refs/heads/feature"),
-    ("GITHUB_TOKEN", ""),
-])
-def test_check_source_requires_canonical_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field, value,
-) -> None:
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    monkeypatch.setenv("GITHUB_REF", promote.EXPECT_REF)
-    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
-    monkeypatch.setenv(field, value)
-
-    def explode(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("no API access is permitted outside the canonical environment")
-
-    monkeypatch.setattr(promote, "GitHubApi", explode)
-    code, plan = run_check_source(tmp_path)
-    assert code == 1 and not plan.exists()
 
 
 # ── ZIP safety and API digests ───────────────────────────────────────────────
@@ -1660,15 +1149,14 @@ def test_happy_path_github_release_plan(tmp_path: Path, environment) -> None:
         staged = tmp_path / "candidate-download" / asset["staged_path"]
         assert staged.is_file()
         assert _sha(staged.read_bytes()) == asset["sha256"]
-    assert set(plan["source_validation"]) == set(promote.SOURCE_VALIDATION_LANES)
-    for label, source in plan["source_validation"].items():
-        assert source["gates_passed"] == len(promote.expected_source_full_gates(promote.SOURCE_VALIDATION_LANES[label]))
-        # The source debug c3 is intentionally distinct from the released bytes.
-        assert source["source_c3_sha256"] not in {
-            asset["sha256"] for asset in release["assets"]}
+    assert plan["source_validation"]["run_id"] == 201
+    assert set(plan["source_validation"]["artifacts"]) == set(FULL_LANES)
+    # Source proof is checked via metadata only; only candidate ZIPs download.
+    assert not any("/actions/artifacts/" in path and int(path.split("/actions/artifacts/")[1].split("/")[0]) >= 9000
+                   for path in api.paths)
     body = body_path.read_text()
     assert "actions/runs/101" in body
-    assert "Source Validation bound run:" in body and "actions/runs/201" in body
+    assert "Source Validation run:" in body and "actions/runs/201" in body
     assert "Windows 11 ARM64 CI runners" in body
     assert "35 executed Python ABI rows" in body
     assert "debug c3 build" in body
@@ -1854,7 +1342,7 @@ def test_windows_arm64_inventory_deviations_fail_closed(tmp_path, environment, c
         "pr-candidate-context",
         "push-manifest-event",
         "push-context-event",
-        "missing-source-run-binding",
+        "old-context-schema",
         "two-fastdb-sdists",
     ],
 )
@@ -1893,9 +1381,9 @@ def test_inventory_and_manifest_deviations_fail_closed(
         context = json.loads(builder.members["rc-context.json"])
         context["event"] = "push"
         builder._rewrite_json("rc-context.json", context)
-    elif mutation == "missing-source-run-binding":
+    elif mutation == "old-context-schema":
         context = json.loads(builder.members["rc-context.json"])
-        context.pop("source_validation_run_id")
+        context["schema"] = "c-two.release-candidate.context.v1"
         builder._rewrite_json("rc-context.json", context)
     elif mutation == "two-fastdb-sdists":
         extra = builder._put("fastdb4py-0.2.1.post.tar.gz", b"second sdist")
@@ -1992,395 +1480,6 @@ def test_missing_abi_receipt_fails_closed(tmp_path: Path, environment) -> None:
     environment(world)
     code, plan, _ = run_prepare(tmp_path)
     assert code == 1
-
-
-@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        "matrix-seventeen-rows",
-        "typescript-eleven-rows",
-        "wrong-evidence-stage",
-        "windows-source-mismatch",
-        "windows-fastdb-pin-mismatch",
-        "windows-evidence-failed",
-        "missing-gate-in-steps",
-        "gate-not-run",
-        "gate-failed",
-        "internal-artifact-hash-lie",
-        "internal-artifact-missing",
-        "matrix-c3-cross-bind-broken",
-    ],
-)
-def test_source_validation_deviations_fail_closed(tmp_path: Path, environment, mutate: str, label: str, capsys) -> None:
-    world = _default_world()
-
-    def mutation(members: dict[str, bytes]) -> None:
-        if mutate == "matrix-seventeen-rows":
-            matrix = json.loads(members[promote.MATRIX_RECEIPT_NAME])
-            matrix["rows"].pop()
-            members[promote.MATRIX_RECEIPT_NAME] = _source_receipt_bytes(matrix)
-        elif mutate == "typescript-eleven-rows":
-            typescript = json.loads(members[promote.TYPESCRIPT_RECEIPT_NAME])
-            typescript["rows"].pop()
-            members[promote.TYPESCRIPT_RECEIPT_NAME] = _source_receipt_bytes(typescript)
-        elif mutate == "wrong-evidence-stage":
-            matrix = json.loads(members[promote.MATRIX_RECEIPT_NAME])
-            matrix["evidence_stage"] = "candidate"
-            members[promote.MATRIX_RECEIPT_NAME] = _source_receipt_bytes(matrix)
-        elif mutate == "windows-source-mismatch":
-            evidence = json.loads(members["run-evidence.json"])
-            evidence["sources"]["c-two"]["actual_sha"] = OTHER_SHA
-            members["run-evidence.json"] = _source_receipt_bytes(evidence)
-        elif mutate == "windows-fastdb-pin-mismatch":
-            evidence = json.loads(members["run-evidence.json"])
-            evidence["sources"]["fastdb"]["actual_sha"] = OTHER_SHA
-            members["run-evidence.json"] = _source_receipt_bytes(evidence)
-        elif mutate == "windows-evidence-failed":
-            evidence = json.loads(members["run-evidence.json"])
-            evidence["status"] = "failed"
-            members["run-evidence.json"] = _source_receipt_bytes(evidence)
-        elif mutate == "missing-gate-in-steps":
-            evidence = json.loads(members["run-evidence.json"])
-            evidence["steps"] = evidence["steps"][:-1]
-            members["run-evidence.json"] = _source_receipt_bytes(evidence)
-        elif mutate == "gate-not-run":
-            evidence = json.loads(members["run-evidence.json"])
-            evidence["steps"][0]["status"] = "not_run"
-            members["run-evidence.json"] = _source_receipt_bytes(evidence)
-        elif mutate == "gate-failed":
-            evidence = json.loads(members["run-evidence.json"])
-            evidence["steps"][-1]["status"] = "failed"
-            members["run-evidence.json"] = _source_receipt_bytes(evidence)
-        elif mutate == "internal-artifact-hash-lie":
-            evidence = json.loads(members["run-evidence.json"])
-            evidence["artifacts"][0]["sha256"] = _digest("0")
-            members["run-evidence.json"] = _source_receipt_bytes(evidence)
-        elif mutate == "internal-artifact-missing":
-            evidence = json.loads(members["run-evidence.json"])
-            evidence["artifacts"].append(
-                {"path": "wheels/c-two/never-built.whl", "sha256": _digest("1"), "bytes": 1})
-            members["run-evidence.json"] = _source_receipt_bytes(evidence)
-        elif mutate == "matrix-c3-cross-bind-broken":
-            matrix = json.loads(members[promote.MATRIX_RECEIPT_NAME])
-            matrix["rows"][1]["c3_sha256"] = _digest("9")
-            members[promote.MATRIX_RECEIPT_NAME] = _source_receipt_bytes(matrix)
-
-    if mutate in ("internal-artifact-missing", "internal-artifact-hash-lie"):
-        # Preserve the phantom record or digest lie for the integrity check.
-        world.mutate_source_artifacts(mutation, resync_evidence=False, label=label)
-    else:
-        world.mutate_source_artifacts(mutation, label=label)
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1
-    assert not plan.exists()
-    assert label in capsys.readouterr().err
-
-
-def test_missing_2025_source_artifact_fails_closed(tmp_path: Path, environment) -> None:
-    world = World()
-    world.set_source_runs(_run(201, "Source Validation", runner_labels=["windows-2022"]))
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1
-
-
-def test_missing_arm64_source_artifact_cannot_use_another_run(tmp_path, environment, capsys):
-    world = World()
-    world.set_source_runs(_run(201, "Source Validation"), _run(202, "Source Validation"))
-    name = f"source-windows-11-arm-py3.12-full-{SOURCE_SHA}"
-    world.artifacts_by_run[201] = [entry for entry in world.artifacts_by_run[201]
-                                   if entry["name"] != name]
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert name in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("wrong", ["python", "rust", "node", "pe", "missing-pe"])
-def test_arm64_source_rejects_emulated_or_unproven_consumers(tmp_path, environment, wrong):
-    world = _default_world()
-
-    def change(members):
-        if wrong in {"python", "rust"}:
-            def evidence(body):
-                if wrong == "python":
-                    body["runner"]["python_platform"] = "win-amd64"
-                else:
-                    body["toolchains"]["rustc"]["output"] = "host: x86_64-pc-windows-msvc"
-            _mutate_source_json(members, "run-evidence.json", evidence)
-        elif wrong == "node":
-            _mutate_source_json(members, promote.TYPESCRIPT_RECEIPT_NAME,
-                                lambda body: body["runtime"].update(arch="x64"))
-        else:
-            def consumer(body):
-                if wrong == "missing-pe":
-                    body.pop("native_architecture")
-                else:
-                    body["native_architecture"]["pe_machines"]["c3.exe"] = 0x8664
-            _mutate_source_json(members, promote.SOURCE_WHEEL_RECEIPT, consumer)
-
-    world.mutate_source_artifacts(change, label="windows-11-arm")
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-
-
-def test_source_fastdb_pin_drift_fails_closed(
-    tmp_path: Path, environment, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    environment(_default_world())
-    monkeypatch.setattr(promote, "SOURCE_VALIDATION_FASTDB_SHA", "9" * 40)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1
-
-
-@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-def test_duplicate_source_lane_artifacts_fail_closed(tmp_path, environment, capsys, label):
-    world = _default_world()
-    name = f"source-{label}-py3.12-full-{SOURCE_SHA}"
-    artifact = next(entry for entry in world.artifacts_by_run[201] if entry["name"] == name)
-    world.artifacts_by_run[201].append(dict(artifact, id=artifact["id"] + 100000))
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    err = capsys.readouterr().err
-    assert f"Source Validation run 201 retains 2 {name} artifacts" in err
-    assert "release qualification requires exactly one full-scope artifact per platform" in err
-    assert "the run bound by rc-context.json" not in err
-    assert "Duplicate full-scope artifacts indicate a rerun." in err
-    assert "missing or expired" not in err
-
-
-@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-def test_missing_source_lane_artifact_fails_closed(tmp_path, environment, capsys, label):
-    world = _default_world()
-    name = f"source-{label}-py3.12-full-{SOURCE_SHA}"
-    world.artifacts_by_run[201] = [
-        artifact for artifact in world.artifacts_by_run[201]
-        if artifact["name"] != name]
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    err = capsys.readouterr().err
-    assert f"Source Validation run 201 retains 0 {name} artifacts" in err
-    assert "release qualification requires exactly one full-scope artifact per platform" in err
-    assert "the run bound by rc-context.json" not in err
-    assert "Full-scope artifacts are missing or expired." in err
-    assert "Duplicate full-scope artifacts" not in err
-
-
-@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-@pytest.mark.parametrize("status,conclusion", [
-    ("completed", "skipped"), ("completed", "failure"), ("in_progress", None)])
-def test_source_lane_job_must_complete_successfully(tmp_path, environment, capsys, label, status, conclusion):
-    world = _default_world()
-    world.jobs_by_run = {201: [
-        {"name": name,
-         "status": status if name == f"source ({label}, py3.12)" else "completed",
-         "conclusion": conclusion if name == f"source ({label}, py3.12)" else "success"}
-        for name in promote.CHECK_SOURCE_REQUIRED_JOBS]}
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert f"source ({label}, py3.12)" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-@pytest.mark.parametrize("mutate", [
-    "old-schema", "wrong-platform", "missing-platform", "wrong-label", "python-scope",
-    "missing-memory-gate", "duplicate-gate", "duplicate-step", "unbound-c3",
-    "artifact-size-lie", "unsafe-artifact-path"])
-def test_source_evidence_contract_deviations(tmp_path, environment, capsys, label, mutate):
-    world = _default_world()
-
-    def change(evidence):
-        if mutate == "old-schema":
-            evidence["schema"] = "c-two.native-run-evidence.v1"
-        elif mutate == "wrong-platform":
-            evidence["platform"] = "windows" if evidence["platform"] == "linux" else "linux"
-        elif mutate == "missing-platform":
-            evidence.pop("platform")
-        elif mutate == "wrong-label":
-            evidence["runner"]["requested_label"] = "ubuntu-latest"
-        elif mutate == "python-scope":
-            evidence["scope"] = "python"
-        elif mutate == "missing-memory-gate":
-            evidence["applicable_gates"].remove("ipc-memory-matrix")
-            evidence["steps"] = [step for step in evidence["steps"] if step["id"] != "ipc-memory-matrix"]
-        elif mutate == "duplicate-gate":
-            evidence["applicable_gates"].append(evidence["applicable_gates"][0])
-        elif mutate == "duplicate-step":
-            evidence["steps"].append(dict(evidence["steps"][0]))
-        elif mutate == "unbound-c3":
-            evidence["artifacts"] = [record for record in evidence["artifacts"]
-                                     if not record["path"].startswith("cli/")]
-        elif mutate == "artifact-size-lie":
-            evidence["artifacts"][0]["bytes"] += 1
-        elif mutate == "unsafe-artifact-path":
-            evidence["artifacts"][0]["path"] = "../candidate/rc-manifest.json"
-
-    world.mutate_source_artifacts(
-        lambda members: _mutate_source_json(members, "run-evidence.json", change),
-        label=label, resync_evidence=False)
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert label in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-@pytest.mark.parametrize("mutate", [
-    "schema", "failed", "missing-inputs", "wrong-c3", "missing-ordinary", "missing-collection",
-    "duplicate-step", "failed-step", "exit-code", "process-alive", "unclean",
-    "validation-error", "cleanup-error", "missing-receipt"])
-def test_python_run_receipt_is_independently_verified(tmp_path, environment, capsys, label, mutate):
-    world = _default_world()
-
-    def change(payload):
-        if mutate == "schema":
-            payload["schema"] = "c-two.python-test-run.v0"
-        elif mutate == "failed":
-            payload["status"] = "failed"
-        elif mutate == "missing-inputs":
-            payload.pop("inputs")
-        elif mutate == "wrong-c3":
-            payload["inputs"]["c3_sha256"] = _digest("0")
-        elif mutate == "missing-ordinary":
-            payload["steps"] = [step for step in payload["steps"] if step["id"] != "ordinary"]
-        elif mutate == "missing-collection":
-            payload["steps"] = [step for step in payload["steps"] if step["id"] != "collect-full"]
-        elif mutate == "duplicate-step":
-            payload["steps"][-1] = dict(payload["steps"][0])
-        else:
-            key, value = {"failed-step": ("status", "failed"), "exit-code": ("exit_code", 1),
-                          "process-alive": ("process_exited", False), "unclean": ("cleanup_confirmed", False),
-                          "validation-error": ("validation_error", "partition incomplete"),
-                          "cleanup-error": ("cleanup_error", "process retained")}[mutate]
-            payload["steps"][-1][key] = value
-
-    def mutation(members):
-        if mutate == "missing-receipt":
-            members.pop(promote.PYTHON_RUN_RECEIPT_NAME)
-            _mutate_source_json(members, "run-evidence.json", lambda evidence: evidence.update(
-                artifacts=[record for record in evidence["artifacts"]
-                           if record["path"] != promote.PYTHON_RUN_RECEIPT_NAME]))
-        else:
-            _mutate_source_json(members, promote.PYTHON_RUN_RECEIPT_NAME, change)
-
-    world.mutate_source_artifacts(mutation, label=label)
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert label in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("label", promote.SOURCE_VALIDATION_LANES)
-@pytest.mark.parametrize("mutate", ["identity", "missing-identity", "processes", "directory",
-                                     "borrowed", "held", "c3-rc-bytes", "c3-other-lane", "typescript-c3"])
-def test_source_wheel_identity_cleanup_and_c3_binding(tmp_path, environment, capsys, label, mutate):
-    world = _default_world()
-
-    def change(payload):
-        if mutate == "identity":
-            payload["identity"]["administrator"] = False
-        elif mutate == "missing-identity":
-            payload.pop("identity")
-        elif mutate == "processes":
-            payload["cleanup"]["processes_exited"] = False
-        elif mutate == "directory":
-            payload["cleanup"]["temporary_directory_removed"] = False
-        elif mutate == "borrowed":
-            payload["borrowed_inputs_invalidated"] = 3
-        elif mutate == "held":
-            payload["checks"][0]["held_view_invalidated"] = False
-        elif mutate == "c3-rc-bytes":
-            payload["artifacts"][-1]["sha256"] = world.manifest["cli"][0]["sha256"]
-        elif mutate == "c3-other-lane":
-            other = next(lane for lane in promote.SOURCE_VALIDATION_LANES if lane != label)
-            payload["artifacts"][-1]["sha256"] = world.source_c3_sha[other]
-        elif mutate == "typescript-c3":
-            payload["packages"]["c3_sha256"] = _digest("0")
-
-    receipt = promote.TYPESCRIPT_RECEIPT_NAME if mutate == "typescript-c3" else promote.SOURCE_WHEEL_RECEIPT
-    world.mutate_source_artifacts(lambda members: _mutate_source_json(members, receipt, change), label=label)
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert label in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("label", ["windows-2022", "windows-2025", "windows-11-arm"])
-@pytest.mark.parametrize("mutate", ["identity", "processes", "directory", "borrowed", "held", "c3",
-                                     "wrapper-failed", "wrapper-errors", "wrapper-processes",
-                                     "wrapper-workspace", "wrapper-account"])
-def test_windows_standard_user_constraints_are_preserved(tmp_path, environment, capsys, label, mutate):
-    world = _default_world()
-
-    def change(payload):
-        if mutate == "identity":
-            payload["identity"]["administrator"] = True
-        elif mutate == "processes":
-            payload["cleanup"]["processes_exited"] = False
-        elif mutate == "directory":
-            payload["cleanup"]["temporary_directory_removed"] = False
-        elif mutate == "borrowed":
-            payload["borrowed_inputs_invalidated"] = 3
-        elif mutate == "held":
-            payload["checks"][0]["held_view_invalidated"] = False
-        elif mutate == "c3":
-            payload["artifacts"][-1]["sha256"] = _digest("0")
-        elif mutate == "wrapper-failed":
-            payload["status"] = "failed"
-        elif mutate == "wrapper-errors":
-            payload["errors"].append("account cleanup failed")
-        else:
-            key = {"wrapper-processes": "processes_exited", "wrapper-workspace": "workspace_removed",
-                   "wrapper-account": "account_removed"}[mutate]
-            payload["cleanup"][key] = False
-
-    receipt = promote.SOURCE_STANDARD_USER_WRAPPER if mutate.startswith("wrapper-") else promote.SOURCE_STANDARD_USER_RECEIPT
-    world.mutate_source_artifacts(lambda members: _mutate_source_json(members, receipt, change), label=label)
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert label in capsys.readouterr().err
-
-
-def test_extra_python_lane_has_no_full_receipt_contract(tmp_path, environment):
-    world = _default_world()
-    world._register_artifact(201, 12001, f"source-ubuntu-24.04-py3.14t-python-{SOURCE_SHA}",
-                             {"run-evidence.json": b"separate python-only evidence"})
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 0
-    assert set(json.loads(plan.read_text())["source_validation"]) == set(promote.SOURCE_VALIDATION_LANES)
-
-
-def test_source_gate_inventory_is_platform_specific_and_dynamic(tmp_path, environment, monkeypatch, capsys):
-    for platform in ("linux", "macos", "windows"):
-        gates = promote.expected_source_full_gates(platform)
-        assert "ipc-memory-matrix" in gates and "python-suite" in gates and "wheel-consumer" in gates
-        assert ("windows-standard-user-consumer" in gates) is (platform == "windows")
-    world = _default_world()
-    original = promote.expected_source_full_gates
-    monkeypatch.setattr(promote, "expected_source_full_gates", lambda platform: original(platform) + ["future-source-gate"])
-    environment(world)
-    code, plan, _ = run_prepare(tmp_path)
-    assert code == 1 and not plan.exists()
-    assert "future-source-gate" in capsys.readouterr().err
-
-
-def test_source_fastdb_pin_comes_from_ci_and_rejects_drift(tmp_path, monkeypatch):
-    workflow = tmp_path / ".github/workflows/ci.yml"
-    workflow.parent.mkdir(parents=True)
-    workflow.write_text(f"env:\n  FASTDB_SOURCE_SHA: {FASTDB_SOURCE_REV}\n")
-    monkeypatch.setattr(promote, "REPO_ROOT", tmp_path)
-    assert promote._source_fastdb_pin() == FASTDB_SOURCE_REV
-    workflow.write_text(f"env:\n  FASTDB_SOURCE_SHA: {OTHER_SHA}\n")
-    with pytest.raises(promote.PromotionError, match="ci.yml FastDB pin"):
-        promote._source_fastdb_pin()
 
 
 # ── Idempotency and remote conflicts ────────────────────────────────────────
@@ -2532,7 +1631,7 @@ def test_pypi_idempotency_is_byte_exact_and_stages_only_missing(
     assert code == 1
 
 
-def test_dry_run_performs_the_full_read_only_remote_comparison(
+def test_prepare_performs_the_full_read_only_remote_comparison(
     tmp_path: Path, environment
 ) -> None:
     world = _default_world()
@@ -2541,10 +1640,9 @@ def test_dry_run_performs_the_full_read_only_remote_comparison(
     world.releases["c3-v0.2.0"] = {
         "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "assets": []}
     api = environment(world)
-    code, plan, _ = run_prepare(tmp_path, dry_run=True)
+    code, plan, _ = run_prepare(tmp_path)
     assert code == 0
     payload = json.loads(plan.read_text())
-    assert payload["dry_run"] is True
     assert payload["github_release"]["release_exists"] is True
     assert payload["github_release"]["action"] == "upload"
     assert any("/releases/tags/" in path for path in api.paths)
@@ -2801,8 +1899,7 @@ def test_successful_run_cannot_hide_skipped_manifest_job(tmp_path, environment):
 
 
 @pytest.mark.parametrize("workflow_file,workflow_name,run_id,allowed_events", [
-    ("release-candidate.yml", "Release Candidate", 101, (promote.CANDIDATE_EVENT,)),
-    ("ci.yml", "Source Validation", 201, promote.SOURCE_GATE_EVENTS)])
+    ("release-candidate.yml", "Release Candidate", 101, (promote.CANDIDATE_EVENT,))])
 @pytest.mark.parametrize("override", [{"event": "pull_request"}, {"event": "merge_group"},
                                        {"head_branch": "feature"}, {"head_sha": OTHER_SHA},
                                        {"path": ".github/workflows/spoof.yml"}, {"name": "Windows Native"},
@@ -2819,17 +1916,13 @@ def test_gate_rechecks_provenance_returned_by_the_api(
             SOURCE_SHA, allowed_events)
 
 
-def test_candidate_gate_rejects_push_events_but_source_gate_accepts_them():
+def test_candidate_gate_rejects_push_events():
     world = _default_world()
     push_candidate = dict(world.runs_by_id[101], event="push")
     with pytest.raises(promote.PromotionError, match="event"):
         promote.validate_gate_run(
             FakeApi(world), push_candidate, "release-candidate.yml", "Release Candidate",
             SOURCE_SHA, (promote.CANDIDATE_EVENT,))
-    push_source = dict(world.runs_by_id[201], event="push")
-    promote.validate_gate_run(
-        FakeApi(world), push_source, "ci.yml", "Source Validation",
-        SOURCE_SHA, promote.SOURCE_GATE_EVENTS)
 
 
 @pytest.mark.parametrize("workflow_name,group,collection,relative", [
@@ -2860,3 +1953,40 @@ def test_provisioning_receipt_must_derive_from_the_retained_source(tmp_path, env
     code, _, _ = run_prepare(tmp_path)
     assert code == 1
     assert "built-wheel derivation" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("workflow,target,step_name,group", [
+    ("cli-release.yml", "github-release", "Verify the tested candidate and stage release bytes", "github_release"),
+    ("python-package-release.yml", "pypi", "Verify the tested candidate and stage distribution files", "pypi"),
+])
+def test_prepare_summary_exposes_plan_before_environment_approval(
+    tmp_path, environment, workflow, target, step_name, group,
+):
+    environment(_default_world())
+    summary = tmp_path / "summary.md"
+    summary.write_text("已有摘要\n", encoding="utf-8")
+    code, plan_path, _ = run_prepare(tmp_path, target=target, extra=["--summary-output", str(summary)])
+    assert code == 0
+    plan = json.loads(plan_path.read_text())
+    step = _extract_step(_workflow_text(workflow), step_name)
+    assert '--summary-output "$GITHUB_STEP_SUMMARY"' in step["run"]
+    assert "Publication plan" not in step["run"]
+    script = step["run"].split("python - <<'PY'\n", 1)[1].split("\nPY", 1)[0]
+    outputs = tmp_path / "outputs"
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=tmp_path,
+        env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_OUTPUT": str(outputs)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    text = summary.read_text(encoding="utf-8")
+    assert text.startswith("已有摘要\n")
+    assert plan["candidate_run"]["url"] in text and plan["source_sha"] in text
+    source = plan["source_validation"]
+    for value in (source["run_url"], source["tested_sha"], source["tree_sha"], source["event"]):
+        assert value in text
+    for job, attempt in source["job_attempts"].items():
+        assert f"| {job} | {attempt} |" in text
+    for entry in plan[group].get("assets", plan[group].get("files", [])):
+        assert entry["name"] in text and entry["sha256"] in text and entry["disposition"] in text
+    assert f"action={plan[group]['action']}\n" in outputs.read_text()

@@ -426,7 +426,7 @@ def candidate_tree(tmp_path: Path) -> Path:
             **fastdb_decision(target, "3.12")}, indent=2).encode())
 
     retain("rc-context.json", json.dumps(
-        {"schema": "c-two.release-candidate.context.v1",
+        {"schema": "c-two.release-candidate.context.v2",
          "source_commit_sha": SOURCE_SHA}).encode())
     retain("rc-fastdb-public.json", json.dumps(
         {"schema": "c-two.fastdb-release.listing.v1",
@@ -895,3 +895,16 @@ def test_provisioning_receipt_cannot_change_its_sdist_derivation(rc, tmp_path, c
                     lambda payload: payload["built_wheel"].update(derived_from_sdist_sha256="0" * 64))
     assert rc.main(manifest_args(root, root / "rc-manifest.json")) == 1
     assert "built-wheel derivation" in capsys.readouterr().err
+
+
+def test_candidate_context_starts_packaging_without_source_actions_authority():
+    import yaml
+
+    root = Path(__file__).resolve().parents[2]
+    workflow = yaml.load((root / '.github/workflows/release-candidate.yml').read_text(), Loader=yaml.BaseLoader)
+    context = workflow['jobs']['context']
+    assert 'actions' not in context.get('permissions', {})
+    assert 'actions' not in workflow['permissions']
+    commands = '\n'.join(step.get('run', '') for step in context['steps'])
+    assert 'promote_release_candidate.py' not in commands
+    assert 'c-two.release-candidate.context.v2' in commands

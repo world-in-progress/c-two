@@ -1,94 +1,20 @@
-"""Prepare an exact-tested-candidate promotion without ever publishing.
+"""Prepare a read-only promotion of exact, verified Release Candidate bytes.
 
-This is step 2 of the release plan: the ``Release Candidate`` workflow — an
-explicit ``workflow_dispatch`` on canonical ``main`` only — builds and
-validates byte-exact artifacts bound to one source commit, and this script
-promotes those retained bytes — it never rebuilds, never executes candidate
-code, and never mutates remote state. Publication (GitHub release assets,
-PyPI upload) is performed by the calling workflow only after this script
-returns exit code 0 with a plan.
-
-Contract, fail-closed on every deviation:
-
-- Promotion is explicit only. ``prepare`` requires ``--candidate-run-id``
-  naming one successful ``workflow_dispatch`` ``Release Candidate`` run on
-  ``refs/heads/main`` of the canonical repository; push-era candidates,
-  PR/fork/merge-group runs, and version scanning are all rejected. There is
-  no automatic ``workflow_run`` listener, no deferred exit code, and no
-  already-published skip: a gate that has not completed successfully is an
-  explicit incomplete-gate failure, never a deferred or faked success.
-- The candidate's ``rc-manifest.json`` (schema ``c-two.release-candidate.v1``,
-  sidecar-verified by ``release_candidate.py``) and ``rc-context.json`` must
-  record ``event: workflow_dispatch`` on ``refs/heads/main``, and the context
-  must bind exactly one successful ``Source Validation`` run through
-  ``source_validation_run_id`` (selected by ``check-source``). That bound run
-  — a canonical ``main`` push or explicit dispatch for the exact same source
-  SHA — is the only accepted source of the five full-scope platform artifacts
-  (``ubuntu-24.04``, ``macos-15``, ``windows-2022``, ``windows-2025``, ``windows-11-arm``) and
-  their receipts. Evidence is never mixed across runs, and a different
-  Source Validation run for the same source cannot substitute the bound one.
-- ``check-source --source-sha`` is the read-only companion the Release
-  Candidate workflow uses to fill ``source_validation_run_id``: it reads only
-  GitHub metadata (workflow-run, job, and artifact listings, never artifact
-  downloads) and returns the newest successful canonical-main Source
-  Validation run whose complete job inventory carries the five platform
-  ``py3.12`` full source jobs plus the Ubuntu ``py3.14t`` source job — a
-  policy-only green run is not a full gate — and exactly one full-scope
-  artifact per platform, as JSON ``{"source_sha", "run_id", "run_url"}``.
-- The promoting run itself must be on ``refs/heads/main`` of the canonical
-  repository; the trusted validation code is the current ``main`` checkout,
-  never the candidate SHA.
-- Candidate ``rc-*`` ZIPs match the producer's collection scope; compiler-cache
-  diagnostics are not release inputs. Each selected ZIP is downloaded through
-  the authenticated GitHub Actions API, its SHA-256 is checked against the
-  API-reported ``digest``, and it is
-  extracted only through the reviewed safe-name/safe-member validators in
-  ``tools/local_rc/artifact_manifest.py``. A repeated member name across
-  artifact ZIPs is accepted only when its SHA-256 is identical.
-- The candidate's ``rc-manifest.json`` (schema ``c-two.release-candidate.v1``,
-  sidecar-verified by ``release_candidate.py``) is re-hashed entry by entry
-  against the extracted bytes: 6 exact CLI names, 35 unique platform/ABI
-  wheel rows, 1 sdist, canonical installer assets, FastDB proof inputs,
-  versions/source identity, and the executed receipts that bind the tested
-  bytes. The receipt reader mirrors the reviewed candidate contract:
-  ``c-two.installed-wheel-smoke.v1`` ABI rows with ``source_commit_sha``,
-  ``row``, ``wheel_abi`` (interpreter ``cp314`` / ABI ``cp314t`` pairs for
-  free-threaded rows), FastDB decisions cross-bound against the verified
-  published listing and the single retained sdist, plus lifecycle cleanup
-  (processes exited, temporary directory removed, borrowed inputs
-  invalidated).
-- The Source Validation full-scope evidence is re-validated with the trusted
-  runner source: the full gate inventory from ``tools/ci/source_validation.py``
-  must be present and passing with no skipped gates, every internal artifact
-  hash in ``run-evidence.json`` is verified against the extracted bytes, the
-  strict 18-row Rust/Python portable matrix and 12-row TypeScript receipts
-  are re-validated through ``tools/local_rc``, the ordinary wheel receipts
-  and Windows standard-user receipts bind each source lane's debug ``c3`` (a different build from the
-  released candidate executables, never claimed byte-equal), and both source
-  pins (C-Two commit and the frozen FastDB revision) must match exactly.
-- FastDB dependency-proof inputs are never classified or staged as C-Two
-  packages; the PyPI staging directory holds exactly the registry-missing
-  files after byte-exact remote resolution.
-- Idempotent reruns skip only remote assets/registry files whose bytes
-  already match. Differing bytes, versions, tag sources, or foreign assets
-  fail; tags are never moved and assets are never clobbered. ``--dry-run``
-  performs the identical read-only verification, including all remote
-  comparisons, and never publishes.
-
-Exit codes: ``0`` plan ready, ``1`` validation failure with diagnostics on
-stderr.
+Only explicit successful canonical-main candidates qualify. Source Validation
+is selected by matching Git trees and checking the latest required jobs and
+attempt-bound artifacts. Candidate API digests, manifests, receipts and remote
+publication state are verified before staging; publication belongs to the
+calling workflow's environment-protected job.
 """
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import re
 import stat
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Iterable
@@ -108,10 +34,7 @@ from tools.local_rc.artifact_manifest import (  # noqa: E402
     sha256_file,
     zip_inventory,
 )
-from tools.local_rc import (  # noqa: E402
-    portable_matrix_receipt,
-    typescript_receipt,
-)
+from source_evidence import GitHubApi, PromotionError, find_source_evidence  # noqa: E402
 import release_candidate as rc_helper  # noqa: E402
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename  # noqa: E402
 
@@ -119,15 +42,10 @@ EXPECT_REPOSITORY = "world-in-progress/c-two"
 EXPECT_REF = "refs/heads/main"
 CANDIDATE_WORKFLOW_FILE = "release-candidate.yml"
 CANDIDATE_WORKFLOW_NAME = "Release Candidate"
-SOURCE_VALIDATION_WORKFLOW_FILE = "ci.yml"
-SOURCE_VALIDATION_WORKFLOW_NAME = "Source Validation"
-# Candidates exist only as explicit canonical-main dispatches; the source
-# gate additionally still accepts canonical main pushes.
 CANDIDATE_EVENT = "workflow_dispatch"
-SOURCE_GATE_EVENTS = ("push", "workflow_dispatch")
 MANIFEST_SCHEMA = "c-two.release-candidate.v1"
 MANIFEST_NAME = "rc-manifest.json"
-CONTEXT_SCHEMA = "c-two.release-candidate.context.v1"
+CONTEXT_SCHEMA = "c-two.release-candidate.context.v2"
 PLAN_SCHEMA = "c-two.release-promotion-plan.v1"
 PYPI_HOST = "https://pypi.org"
 
@@ -170,141 +88,14 @@ EXPECTED_RECEIPT_PREFIX_COUNTS = {
 # asset names; the promotion publishes those exact bytes under the same names.
 EXPECTED_INSTALLER_NAMES = ("c3-installer.sh", "c3-installer.ps1")
 FASTDB_LICENSE_ASSETS = ("fastdb-LICENSE", "fastdb-THIRD_PARTY_NOTICES.txt")
-SOURCE_VALIDATION_LANES = {
-    "ubuntu-24.04": "linux",
-    "macos-15": "macos",
-    "windows-2022": "windows",
-    "windows-2025": "windows",
-    "windows-11-arm": "windows",
-}
-# The complete source-job inventory check-source demands from one successful
-# run: the five platform py3.12 full lanes plus the Ubuntu py3.14t lane.
-CHECK_SOURCE_REQUIRED_JOBS = (
-    *(f"source ({label}, py3.12)" for label in SOURCE_VALIDATION_LANES),
-    "source (ubuntu-24.04, py3.14t)",
-    "workflow policy",
-)
-# Frozen FastDB source pin of the Source Validation gates; cross-checked against
-# the trusted checkout's ci.yml so silent pin drift fails closed.
-SOURCE_VALIDATION_FASTDB_CORE_VERSION = "0.2.4"
-SOURCE_VALIDATION_FASTDB_SHA = "f82fa13adeae2b87a295bf984821c85c44b55a3d"
+FASTDB_CORE_VERSION = "0.2.4"
+FASTDB_SOURCE_REV = "f82fa13adeae2b87a295bf984821c85c44b55a3d"
 SMOKE_SCHEMA = "c-two.installed-wheel-smoke.v1"
 STANDARD_USER_WRAPPER_SCHEMA = "c-two.standard-user-wrapper.v1"
 SDIST_INSPECT_SCHEMA = "c-two.release-candidate.sdist-inspection.v1"
 SDIST_PROOF_SCHEMA = "c-two.release-candidate.sdist-proof.v1"
-SOURCE_EVIDENCE_SCHEMA = "c-two.source-run-evidence.v1"
-MATRIX_RECEIPT_NAME = "python-suite/portable.v1.json"
-TYPESCRIPT_RECEIPT_NAME = "python-suite/typescript.v1.json"
-SOURCE_WHEEL_RECEIPT = "installed-wheel-full-receipt.v1.json"
-SOURCE_STANDARD_USER_RECEIPT = "installed-wheel-standard-user-full-receipt.v1.json"
-SOURCE_STANDARD_USER_WRAPPER = SOURCE_STANDARD_USER_RECEIPT + ".wrapper.json"
-PYTHON_RUN_RECEIPT_NAME = "python-suite/run.json"
 TAG_PREFIX = "c3-v"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-
-
-class PromotionError(RuntimeError):
-    """A fail-closed condition: the candidate must not be promoted."""
-
-
-def _url_origin(url: str) -> tuple[str, str | None, int | None]:
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        port = parsed.port
-    except ValueError as error:
-        raise PromotionError("GitHub API redirect has an invalid origin") from error
-    if port is None:
-        port = {"http": 80, "https": 443}.get(parsed.scheme)
-    return parsed.scheme, parsed.hostname, port
-
-
-class _GitHubApiRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Keep API auth on its origin and use signed artifact URLs without it."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        source_origin = _url_origin(req.full_url)
-        target_origin = _url_origin(newurl)
-        cross_origin = source_origin != target_origin
-        if cross_origin and (source_origin[0] != "https" or target_origin[0] != "https"):
-            raise PromotionError("GitHub API cross-origin redirect requires HTTPS")
-        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if cross_origin and redirected is not None:
-            redirected.remove_header("Authorization")
-        return redirected
-
-
-class GitHubApi:
-    """Read-only authenticated access to the canonical repository's Actions API."""
-
-    def __init__(self, base_url: str, repository: str, token: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.repository = repository
-        self.token = token
-        self._opener = urllib.request.build_opener(_GitHubApiRedirectHandler())
-
-    def _request(self, path: str, accept: str) -> tuple[int, bytes]:
-        if not path.startswith("/"):
-            raise PromotionError(f"internal: API path must be absolute: {path}")
-        request = urllib.request.Request(
-            f"{self.base_url}{path}",
-            headers={
-                "Accept": accept,
-                "Authorization": f"Bearer {self.token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "c-two-release-promotion",
-            },
-            method="GET",
-        )
-        try:
-            with self._opener.open(request, timeout=120) as response:
-                return response.status, response.read()
-        except urllib.error.HTTPError as error:
-            return error.code, error.read()
-        except (urllib.error.URLError, OSError) as error:
-            raise PromotionError(f"GitHub API request failed for {path}: {error}") from error
-
-    def get_json(self, path: str) -> tuple[int, Any]:
-        status, body = self._request(path, "application/vnd.github+json")
-        if status not in (200, 404):
-            raise PromotionError(f"GitHub API {path} returned HTTP {status}: {body[:400]!r}")
-        if status == 404:
-            return status, None
-        try:
-            return status, json.loads(body.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as error:
-            raise PromotionError(f"GitHub API {path} returned invalid JSON: {error}") from error
-
-    def get_bytes(self, path: str, accept: str = "application/vnd.github+json") -> tuple[int, bytes]:
-        return self._request(path, accept)
-
-    def list_all(self, path: str, key: str) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        page = 1
-        while True:
-            separator = "&" if "?" in path else "?"
-            status, payload = self.get_json(f"{path}{separator}per_page=100&page={page}")
-            if status == 404:
-                raise PromotionError(f"GitHub API listing not found: {path}")
-            batch = payload.get(key) if isinstance(payload, dict) else None
-            if not isinstance(batch, list):
-                raise PromotionError(f"GitHub API listing {path} returned no {key} list")
-            items.extend(entry for entry in batch if isinstance(entry, dict))
-            if len(batch) < 100:
-                return items
-            page += 1
-
-    def workflow_runs(self, workflow_file: str, *, event: str, branch: str, head_sha: str) -> list[dict[str, Any]]:
-        return self.list_all(
-            f"/repos/{self.repository}/actions/workflows/{workflow_file}/runs"
-            f"?event={event}&branch={branch}&head_sha={head_sha}",
-            "workflow_runs",
-        )
-
-    def run_jobs(self, run_id: int) -> list[dict[str, Any]]:
-        return self.list_all(f"/repos/{self.repository}/actions/runs/{run_id}/jobs?filter=latest", "jobs")
-
-    def run_artifacts(self, run_id: int) -> list[dict[str, Any]]:
-        return self.list_all(f"/repos/{self.repository}/actions/runs/{run_id}/artifacts", "artifacts")
 
 
 def _sidecar_name(name: str) -> str:
@@ -355,76 +146,6 @@ def require_gate_success(workflow_name: str, run: dict[str, Any]) -> None:
              f"{workflow_name} run {run_id} conclusion {run.get('conclusion')!r} is not success")
 
 
-def find_full_source_validation_run(api: GitHubApi, source_sha: str) -> dict[str, Any]:
-    """The newest successful canonical-main Source Validation run with full jobs and artifacts.
-
-    Reads only run, job, and artifact metadata, never artifact bytes. Successful runs
-    whose job inventory lacks one of the five platform ``py3.12`` full source
-    jobs or the Ubuntu ``py3.14t`` source job — policy-only green runs — do
-    not qualify as full gates, nor do runs without exactly one full-scope
-    artifact per platform. When nothing qualifies, the failure explains why.
-    """
-    runs: list[dict[str, Any]] = []
-    seen_ids: set[Any] = set()
-    for event in SOURCE_GATE_EVENTS:
-        for run in api.workflow_runs(
-            SOURCE_VALIDATION_WORKFLOW_FILE, event=event, branch="main", head_sha=source_sha,
-        ):
-            if run.get("id") in seen_ids:
-                continue
-            seen_ids.add(run.get("id"))
-            runs.append(run)
-    for run in runs:
-        validate_gate_run(
-            api, run, SOURCE_VALIDATION_WORKFLOW_FILE, SOURCE_VALIDATION_WORKFLOW_NAME,
-            source_sha, SOURCE_GATE_EVENTS)
-    successful = sorted(
-        (run for run in runs
-         if run.get("status") == "completed" and run.get("conclusion") == "success"),
-        key=lambda run: (run.get("run_number") or 0, run.get("id") or 0), reverse=True,
-    )
-    artifact_errors: list[str] = []
-    for run in successful:
-        try:
-            require_passed_jobs(api, run["id"], set(CHECK_SOURCE_REQUIRED_JOBS))
-        except PromotionError:
-            continue
-        artifacts = api.run_artifacts(run["id"])
-        try:
-            require_full_source_artifacts(run["id"], source_sha, artifacts)
-        except PromotionError as error:
-            artifact_errors.append(str(error))
-            continue
-        return run
-    if any(run.get("status") != "completed" for run in runs):
-        identifiers = ", ".join(
-            f"{run.get('id')}={run.get('status')}"
-            for run in runs if run.get("status") != "completed")
-        raise PromotionError(
-            f"Source Validation run(s) {identifiers} for {source_sha} are still running; the "
-            "source gate is incomplete — rerun check-source after they finish")
-    if artifact_errors:
-        raise PromotionError(
-            "; ".join(artifact_errors) + " "
-            "For release, dispatch a new full Source Validation run on the same source SHA "
-            f"{source_sha}: gh workflow run ci.yml --ref main -F force_full=true. "
-            "Rerunning jobs is not a substitute for a new full run.")
-    if successful:
-        identifiers = ", ".join(str(run.get("id")) for run in successful)
-        raise PromotionError(
-            f"successful Source Validation run(s) {identifiers} for {source_sha} lack the "
-            f"complete source job inventory {list(CHECK_SOURCE_REQUIRED_JOBS)}; a "
-            "policy-only green run is not a full source gate")
-    if runs:
-        outcomes = ", ".join(f"{run.get('id')}={run.get('conclusion')}" for run in runs)
-        raise PromotionError(
-            f"Source Validation run(s) for {source_sha} did not succeed: {outcomes}")
-    raise PromotionError(
-        f"no successful Source Validation run exists for {source_sha} on canonical main "
-        f"(events {list(SOURCE_GATE_EVENTS)}); the full source gate must pass before "
-        "promotion")
-
-
 def require_passed_jobs(api: GitHubApi, run_id: int, names: set[str]) -> None:
     jobs = api.run_jobs(run_id)
     for name in names:
@@ -434,30 +155,9 @@ def require_passed_jobs(api: GitHubApi, run_id: int, names: set[str]) -> None:
                  f"run {run_id} required job {name!r} did not complete successfully")
 
 
-def require_full_source_artifacts(
-    run_id: int, source_sha: str, artifacts: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    """Select exactly one full-scope artifact per platform using only metadata."""
-    artifacts_by_label: dict[str, dict[str, Any]] = {}
-    for label in SOURCE_VALIDATION_LANES:
-        expected_name = f"source-{label}-py3.12-full-{source_sha}"
-        matches = [entry for entry in artifacts if entry.get("name") == expected_name]
-        if len(matches) != 1:
-            reason = (
-                "Duplicate full-scope artifacts indicate a rerun."
-                if len(matches) > 1 else "Full-scope artifacts are missing or expired."
-            )
-            raise PromotionError(
-                f"Source Validation run {run_id} retains {len(matches)} {expected_name} "
-                "artifacts; release qualification requires exactly one "
-                f"full-scope artifact per platform. {reason}")
-        artifacts_by_label[label] = matches[0]
-    return artifacts_by_label
-
-
 def download_and_extract_artifact(
     api: GitHubApi, artifact: dict[str, Any], destination: Path,
-    seen_members: dict[str, tuple[str, str]], *, allow_nested: bool = False,
+    seen_members: dict[str, tuple[str, str]],
 ) -> None:
     """Download one artifact ZIP, verify its API digest, and safely extract it flat.
 
@@ -499,7 +199,7 @@ def download_and_extract_artifact(
             if info.is_dir():
                 continue
             relative = checked_relative_path(info.filename)
-            _require(allow_nested or "/" not in relative,
+            _require("/" not in relative,
                      f"candidate artifact {name} contains a non-flat member {relative!r}")
             record = by_relative[relative]
             member_mode = (info.external_attr >> 16) & 0xFFFF
@@ -577,12 +277,8 @@ def wheel_platform_matches_target(platform: str, target: str) -> bool:
 
 def verify_manifest_binding(
     manifest: dict[str, Any], extraction: Path, source_sha: str,
-) -> tuple[dict[str, Any], int]:
-    """Re-hash every manifest entry against the extracted bytes and enforce the inventory.
-
-    Returns the verified version metadata plus the ``source_validation_run_id``
-    the candidate context binds its Source Validation evidence to.
-    """
+) -> dict[str, Any]:
+    """Re-hash every candidate entry and enforce the source-bound inventory."""
     _require(manifest.get("schema") == MANIFEST_SCHEMA,
              f"rc-manifest schema {manifest.get('schema')!r} is not {MANIFEST_SCHEMA}")
     _require(manifest.get("source_commit_sha") == source_sha,
@@ -596,7 +292,7 @@ def verify_manifest_binding(
     for key in ("c_two_version", "c3_version", "fastdb_version",
                 "fastdb_source_rev", "fastdb_sdist_sha256"):
         _require(isinstance(meta.get(key), str) and meta[key], f"rc-manifest meta.{key} is missing")
-    _require(meta.get("fastdb_source_rev") == SOURCE_VALIDATION_FASTDB_SHA,
+    _require(meta.get("fastdb_source_rev") == FASTDB_SOURCE_REV,
              "rc-manifest FastDB source differs from the verified source pair")
     c_two_version, c3_version = meta["c_two_version"], meta["c3_version"]
 
@@ -693,11 +389,6 @@ def verify_manifest_binding(
              f"rc-context event {context.get('event')!r} is not a {CANDIDATE_EVENT} candidate")
     _require(context.get("ref") == EXPECT_REF,
              f"rc-context ref {context.get('ref')!r} is not {EXPECT_REF}")
-    source_run_id = context.get("source_validation_run_id")
-    _require(isinstance(source_run_id, int) and not isinstance(source_run_id, bool)
-             and source_run_id > 0,
-             "rc-context source_validation_run_id is missing or malformed; the candidate "
-             "must bind the exact successful Source Validation run chosen by check-source")
     _require(context.get("c_two_version") == c_two_version, "rc-context c_two_version mismatch")
     _require(context.get("c3_version") == c3_version, "rc-context c3_version mismatch")
     _require(context.get("fastdb_version") == meta["fastdb_version"],
@@ -710,7 +401,7 @@ def verify_manifest_binding(
     versions = {"c_two_version": c_two_version, "c3_version": c3_version,
                 "fastdb_version": meta["fastdb_version"],
                 "fastdb_source_rev": meta["fastdb_source_rev"]}
-    return versions, source_run_id
+    return versions
 
 
 def map_wheel_rows(
@@ -1114,8 +805,8 @@ def verify_candidate_receipts(
              (fastdb.get("name"), fastdb.get("sha256")) == (decision["filename"], decision["sha256"]),
              "sdist-proof lifecycle FastDB bytes differ")
     sdk = proof.get("sdk") or {}
-    _require(sdk.get("version") == SOURCE_VALIDATION_FASTDB_CORE_VERSION
-             and sdk.get("source_sha") == SOURCE_VALIDATION_FASTDB_SHA,
+    _require(sdk.get("version") == FASTDB_CORE_VERSION
+             and sdk.get("source_sha") == FASTDB_SOURCE_REV,
              "sdist-proof Core SDK source/version mismatch")
     bundled = proof.get("bundled_fastdb_libs")
     elf = proof.get("elf_dynamic") or {}
@@ -1136,266 +827,6 @@ def verify_candidate_receipts(
         _require(published or referenced,
                  f"retained FastDB wheel {entry['name']} is neither the verified published "
                  "file nor a receipt-built wheel")
-
-
-def expected_source_full_gates(target_platform: str) -> list[str]:
-    """Derive the full-scope gate inventory from the trusted runner source.
-
-    The promoting checkout is current ``main`` code; its ``source_validation.py``
-    defines exactly which gates a full run must have executed and passed.
-    """
-    runner_source = REPO_ROOT / "tools" / "ci" / "source_validation.py"
-    try:
-        spec = importlib.util.spec_from_file_location("c_two_source_validation_gates", runner_source)
-        _require(spec is not None and spec.loader is not None,
-                 f"cannot load trusted runner source {runner_source}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        names = [name for name, _, _ in module.gates(
-            "python", Path("."), "full", target_platform=target_platform)]
-        _require(names and len(names) == len(set(names)),
-                 f"trusted {target_platform} full-scope gate inventory is empty or duplicated")
-        return names
-    except OSError as error:
-        raise PromotionError(f"cannot read trusted runner source {runner_source}: {error}") from error
-
-
-def _source_fastdb_pin() -> str:
-    """Read the frozen FastDB pin from the trusted ci.yml."""
-    workflow = REPO_ROOT / ".github" / "workflows" / "ci.yml"
-    try:
-        text = workflow.read_text(encoding="utf-8")
-    except OSError as error:
-        raise PromotionError(f"cannot read {workflow}: {error}") from error
-    match = re.search(r"^\s*FASTDB_SOURCE_SHA:\s*([0-9a-f]{40})\s*$", text, re.MULTILINE)
-    _require(match is not None, "ci.yml has no FASTDB_SOURCE_SHA pin")
-    pin = match.group(1)
-    _require(pin == SOURCE_VALIDATION_FASTDB_SHA,
-             f"ci.yml FastDB pin {pin} differs from the frozen promotion pin "
-             f"{SOURCE_VALIDATION_FASTDB_SHA}; update the promotion contract deliberately")
-    return pin
-
-
-def _verify_source_wheel_receipt(
-    receipt_name: str, payload: Any, *, expect_admin: bool | None,
-    source_c3_sha: str, c3_name: str,
-) -> None:
-    _require(isinstance(payload, dict) and payload.get("schema") == SMOKE_SCHEMA,
-             f"{receipt_name} schema mismatch")
-    _require(payload.get("status") == "passed", f"{receipt_name} status is not passed")
-    identity = payload.get("identity")
-    _require(isinstance(identity, dict) and "administrator" in identity
-             and identity["administrator"] is expect_admin,
-             f"{receipt_name} identity {identity!r}, expected administrator={expect_admin}")
-    _verify_lifecycle_cleanup(receipt_name, payload)
-    artifacts = payload.get("artifacts")
-    _require(isinstance(artifacts, list), f"{receipt_name} artifacts are missing")
-    recorded = [item for item in artifacts
-                if isinstance(item, dict) and item.get("name") == c3_name]
-    _require(len(recorded) == 1, f"{receipt_name} does not bind exactly one c3 executable")
-    _require(recorded[0].get("sha256") == source_c3_sha,
-             f"{receipt_name} c3 bytes do not match the source lane's own {c3_name}")
-
-
-def _verify_python_run_receipt(receipt_name: str, payload: Any, source_c3_sha: str) -> None:
-    """Verify fields emitted by tools/dev/test_python.py after its strict partition."""
-    _require(isinstance(payload, dict) and payload.get("schema") == "c-two.python-test-run.v1",
-             f"{receipt_name} schema mismatch")
-    _require(payload.get("status") == "passed", f"{receipt_name} status is not passed")
-    inputs = payload.get("inputs")
-    _require(isinstance(inputs, dict) and inputs.get("c3_sha256") == source_c3_sha,
-             f"{receipt_name} input c3 hash does not match the source lane's own build")
-    steps = payload.get("steps")
-    expected = {"collect-full", "collect-ordinary", "collect-portable", "collect-typescript",
-                "ordinary", "portable", "typescript"}
-    _require(isinstance(steps, list) and len(steps) == len(expected)
-             and all(isinstance(step, dict) and isinstance(step.get("id"), str) for step in steps)
-             and {step["id"] for step in steps} == expected,
-             f"{receipt_name} collection/execution steps differ from the complete Python partition")
-    for step in steps:
-        _require(step.get("status") == "passed" and step.get("exit_code") == 0
-                 and step.get("process_exited") is True and step.get("cleanup_confirmed") is True
-                 and not step.get("validation_error") and not step.get("error")
-                 and not step.get("cleanup_error"),
-                 f"{receipt_name} step {step['id']} did not pass with confirmed cleanup")
-
-
-def verify_source_validation(
-    api: GitHubApi, source_sha: str, source_run: dict[str, Any], download_root: Path,
-) -> dict[str, Any]:
-    """Re-validate full-scope source evidence for all five platform/runner lanes.
-
-    Every lane's full-scope artifact must come from the single Source
-    Validation run bound by the candidate context through
-    ``source_validation_run_id``; evidence is never mixed across runs.
-    """
-    fastdb_pin = _source_fastdb_pin()
-    run_id = source_run.get("id")
-    require_passed_jobs(api, run_id, set(CHECK_SOURCE_REQUIRED_JOBS))
-    artifacts_by_label = require_full_source_artifacts(run_id, source_sha, api.run_artifacts(run_id))
-
-    validated: dict[str, Any] = {}
-    for label, target_platform in SOURCE_VALIDATION_LANES.items():
-        expected_gates = expected_source_full_gates(target_platform)
-        artifact = artifacts_by_label[label]
-        destination = download_root / "source-validation" / label
-        # Each runner image extracts into its own directory; the duplicate
-        # check is scoped to one destination.
-        seen_members: dict[str, tuple[str, str]] = {}
-        download_and_extract_artifact(api, artifact, destination, seen_members, allow_nested=True)
-
-        evidence = _load_json_file(destination / "run-evidence.json")
-        _require(isinstance(evidence, dict) and evidence.get("schema") == SOURCE_EVIDENCE_SCHEMA,
-                 f"{label} run-evidence schema mismatch")
-        _require(evidence.get("status") == "passed",
-                 f"{label} run-evidence status {evidence.get('status')!r} is not passed")
-        _require(evidence.get("scope") == "full", f"{label} evidence scope is not full")
-        _require(evidence.get("platform") == target_platform,
-                 f"{label} evidence platform {evidence.get('platform')!r} is not {target_platform}")
-        runner = evidence.get("runner")
-        _require(isinstance(runner, dict) and runner.get("requested_label") == label,
-                 f"{label} evidence runner label mismatch: {runner!r}")
-        if label == "windows-11-arm":
-            _require(runner.get("python_platform") == "win-arm64",
-                     f"{label} source Python is not native ARM64")
-            rustc = evidence.get("toolchains", {}).get("rustc", {})
-            _require(rustc.get("exit_code") == 0
-                     and "host: aarch64-pc-windows-msvc" in rustc.get("output", "").splitlines(),
-                     f"{label} source Rust host is not native ARM64")
-        sources = evidence.get("sources")
-        _require(isinstance(sources, dict), f"{label} evidence sources are missing")
-        for name, expected_sha in (("c-two", source_sha), ("fastdb", fastdb_pin)):
-            source = sources.get(name)
-            _require(isinstance(source, dict) and source.get("verified") is True,
-                     f"{label} evidence {name} source is not verified")
-            _require(source.get("actual_sha") == expected_sha,
-                     f"{label} evidence {name} SHA {source.get('actual_sha')!r} is not {expected_sha}")
-            _require(source.get("expected_sha") == expected_sha,
-                     f"{label} evidence {name} expected_sha differs from the frozen pin")
-
-        # Full gate inventory: every applicable gate ran and passed; nothing
-        # was skipped, failed, timed out, or left not_run.
-        applicable = evidence.get("applicable_gates")
-        _require(isinstance(applicable, list) and applicable
-                 and all(isinstance(name, str) for name in applicable)
-                 and len(applicable) == len(set(applicable)),
-                 f"{label} evidence has no applicable gate inventory")
-        _require(set(applicable) == set(expected_gates),
-                 f"{label} applicable gates differ from the trusted full-scope inventory: "
-                 f"missing {sorted(set(expected_gates) - set(applicable))}, "
-                 f"unexpected {sorted(set(applicable) - set(expected_gates))}")
-        steps = evidence.get("steps")
-        _require(isinstance(steps, list) and len(steps) == len(applicable)
-                 and all(isinstance(step, dict) and isinstance(step.get("id"), str) for step in steps),
-                 f"{label} evidence has missing, duplicate or malformed step records")
-        step_status = {step.get("id"): step.get("status") for step in steps
-                       if isinstance(step, dict)}
-        _require(set(step_status) == set(applicable),
-                 f"{label} recorded steps differ from the applicable gate inventory")
-        not_passed = sorted(name for name, status in step_status.items() if status != "passed")
-        _require(not not_passed, f"{label} gates are not all passed: {not_passed}")
-
-        # Every internal artifact the runner recorded must be present and
-        # byte-identical: CLI, wheels, receipts, JUnit, logs, cleanup evidence.
-        recorded_artifacts = evidence.get("artifacts")
-        _require(isinstance(recorded_artifacts, list) and recorded_artifacts,
-                 f"{label} evidence records no internal artifacts")
-        recorded_paths: set[str] = set()
-        for record in recorded_artifacts:
-            _require(isinstance(record, dict) and isinstance(record.get("path"), str),
-                     f"{label} malformed internal artifact record {record!r}")
-            try:
-                relative = checked_relative_path(record["path"])
-            except CandidateError as error:
-                raise PromotionError(f"{label} invalid internal artifact path: {error}") from error
-            _require(relative not in recorded_paths, f"{label} duplicate internal artifact {relative}")
-            recorded_paths.add(relative)
-            target = destination / relative
-            _require(target.is_file(),
-                     f"{label} recorded artifact {record['path']} is absent from the ZIP")
-            _require(sha256_file(target) == record.get("sha256"),
-                     f"{label} recorded artifact {record['path']} SHA-256 mismatch")
-            _require(target.stat().st_size == record.get("bytes"),
-                     f"{label} recorded artifact {record['path']} size mismatch")
-
-        c3_name = "c3.exe" if target_platform == "windows" else "c3"
-        c3_path = f"cli/{c3_name}"
-        required_paths = {c3_path, MATRIX_RECEIPT_NAME, TYPESCRIPT_RECEIPT_NAME,
-                          PYTHON_RUN_RECEIPT_NAME, SOURCE_WHEEL_RECEIPT}
-        if target_platform == "windows":
-            required_paths.update({SOURCE_STANDARD_USER_RECEIPT, SOURCE_STANDARD_USER_WRAPPER})
-        _require(required_paths <= recorded_paths,
-                 f"{label} required source artifacts are not hash-bound: {sorted(required_paths - recorded_paths)}")
-        source_c3 = destination / c3_path
-        _require(source_c3.is_file(), f"{label} is missing its {c3_path} build")
-        source_c3_sha = sha256_file(source_c3)
-        _verify_python_run_receipt(
-            f"{label}/{PYTHON_RUN_RECEIPT_NAME}",
-            _load_json_file(destination / PYTHON_RUN_RECEIPT_NAME), source_c3_sha)
-
-        for receipt_name, validator in (
-            (MATRIX_RECEIPT_NAME, portable_matrix_receipt),
-            (TYPESCRIPT_RECEIPT_NAME, typescript_receipt),
-        ):
-            receipt_path = destination / receipt_name
-            _require(receipt_path.is_file(), f"{label} is missing {receipt_name}")
-            try:
-                validator.load_and_validate_receipt(receipt_path, expected_stage="development")
-            except Exception as error:  # noqa: BLE001 - validator errors are fail-closed evidence
-                raise PromotionError(
-                    f"{label} {receipt_name} failed the reviewed receipt validator: {error}"
-                ) from error
-        matrix = _load_json_file(destination / MATRIX_RECEIPT_NAME)
-        typescript = _load_json_file(destination / TYPESCRIPT_RECEIPT_NAME)
-        _require(len(matrix.get("rows", [])) == 18,
-                 f"{label} portable matrix has {len(matrix.get('rows', []))} rows, expected 18")
-        _require(len(typescript.get("rows", [])) == 12,
-                 f"{label} TypeScript receipt has {len(typescript.get('rows', []))} rows, expected 12")
-        if label == "windows-11-arm":
-            _require(typescript.get("runtime", {}).get("arch") == "arm64",
-                     f"{label} TypeScript did not use native ARM64 Node")
-        # Bind the source debug c3 to its own matrix and wheel receipts;
-        # released candidate executables have their separate byte identities.
-        relay_c3 = {row.get("c3_sha256") for row in matrix.get("rows", []) if row.get("c3_sha256")}
-        _require(relay_c3 == {source_c3_sha},
-                 f"{label} portable matrix c3 hashes do not match the source {c3_name} build")
-        _require(typescript.get("packages", {}).get("c3_sha256") == source_c3_sha,
-                 f"{label} TypeScript receipt c3 hash does not match the source {c3_name} build")
-
-        ordinary = _load_json_file(destination / SOURCE_WHEEL_RECEIPT)
-        _verify_source_wheel_receipt(
-            f"{label}/{SOURCE_WHEEL_RECEIPT}", ordinary,
-            expect_admin=True if target_platform == "windows" else None,
-            source_c3_sha=source_c3_sha, c3_name=c3_name)
-        if target_platform == "windows":
-            python_platform = "win-arm64" if label == "windows-11-arm" else "win-amd64"
-            _verify_windows_architecture(f"{label}/{SOURCE_WHEEL_RECEIPT}", ordinary, python_platform)
-            standard = _load_json_file(destination / SOURCE_STANDARD_USER_RECEIPT)
-            _verify_source_wheel_receipt(
-                f"{label}/{SOURCE_STANDARD_USER_RECEIPT}", standard,
-                expect_admin=False, source_c3_sha=source_c3_sha, c3_name=c3_name)
-            _verify_windows_architecture(f"{label}/{SOURCE_STANDARD_USER_RECEIPT}", standard, python_platform)
-            wrapper = _load_json_file(destination / SOURCE_STANDARD_USER_WRAPPER)
-            _require(isinstance(wrapper, dict) and wrapper.get("schema") == STANDARD_USER_WRAPPER_SCHEMA,
-                     f"{label} standard-user wrapper schema mismatch")
-            _require(wrapper.get("status") == "passed",
-                     f"{label} standard-user wrapper status is not passed")
-            _require(not wrapper.get("errors"), f"{label} standard-user wrapper errors present")
-            wrapper_cleanup = wrapper.get("cleanup")
-            _require(isinstance(wrapper_cleanup, dict), f"{label} standard-user wrapper has no cleanup")
-            for key in ("processes_exited", "workspace_removed", "account_removed"):
-                _require(wrapper_cleanup.get(key) is True,
-                         f"{label} standard-user wrapper cleanup.{key} is not true")
-
-        validated[label] = {
-            "platform": target_platform,
-            "run_id": source_run.get("id"),
-            "run_url": source_run.get("html_url"),
-            "artifact": artifact.get("name"),
-            "gates_passed": len(applicable),
-            "source_c3_sha256": source_c3_sha,
-        }
-    return validated
 
 
 def stage_github_release_assets(
@@ -1611,7 +1042,7 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "",
         f"- c3 version: `{versions['c3_version']}` (Python package `c-two=={versions['c_two_version']}`)",
         f"- Source commit: `{plan['source_sha']}` (Release Candidate dispatch on canonical `main`)",
-        f"- Native FastDB Core: `{SOURCE_VALIDATION_FASTDB_CORE_VERSION}`, statically linked "
+        f"- Native FastDB Core: `{FASTDB_CORE_VERSION}`, statically linked "
         f"from source `{versions['fastdb_source_rev']}`",
         f"- Optional Python FastDB: `fastdb4py=={versions['fastdb_version']}`; "
         "its upstream LICENSE and THIRD_PARTY_NOTICES are attached verbatim",
@@ -1620,12 +1051,12 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "Validation provenance:",
         "",
         f"- Release Candidate run: {candidate['url']}",
-        f"- Source Validation bound run: "
-        f"{next(iter(plan['source_validation'].values()))['run_url']}",
+        f"- Source Validation run: {plan['source_validation']['run_url']}",
+        f"- Source Validation tested commit: `{plan['source_validation']['tested_sha']}` "
+        f"({plan['source_validation']['event']}, same tree as the release source)",
     ]
-    for label, entry in sorted(plan["source_validation"].items()):
-        lines.append(f"- Source Validation full-scope run ({label}, py3.12, {entry['gates_passed']} gates): "
-                     f"{entry['run_url']}")
+    for name, attempt in sorted(plan["source_validation"]["job_attempts"].items()):
+        lines.append(f"- {name}: attempt {attempt}")
     lines += [
         "",
         "Validated coverage: 35 executed Python ABI rows (6 platforms, with Python 3.10–3.14 "
@@ -1633,13 +1064,32 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "6 installed-wheel lifecycle smokes, "
         "4 Windows standard-user lifecycle/cleanup receipts, an isolated auditwheel-repaired "
         "sdist build/import/lifecycle proof, and the 18-row Rust/Python portable matrix plus "
-        "12-row TypeScript real-call receipt on Ubuntu 24.04, macOS 15, Windows Server 2022/2025 "
+        "12-row TypeScript real-call receipt on Ubuntu 24.04, macOS 15, Windows Server 2025 "
         "and Windows 11 ARM64 CI runners "
         "(the Source Validation gates exercise each lane's own debug c3 build; the released executables "
         "are the exact tested release candidates).",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_promotion_summary(path: Path, plan: dict[str, Any]) -> None:
+    github_release = plan["target"] == "github-release"
+    group = plan["github_release"] if github_release else plan["pypi"]
+    entries = group["assets"] if github_release else group["files"]
+    evidence = plan["source_validation"]
+    with path.open("a", encoding="utf-8") as summary:
+        summary.write(f"## Publication plan\n\nCandidate: {plan['candidate_run']['url']}\n\n")
+        summary.write(f"Source: `{plan['source_sha']}`\n\nVersions: `{plan['versions']}`\n\n")
+        summary.write(f"Source Validation: {evidence['run_url']} ({evidence['event']})\n\n")
+        summary.write(f"Tested commit: `{evidence['tested_sha']}`; tree: `{evidence['tree_sha']}`\n\n")
+        summary.write(f"Action: **{group['action']}**\n\n")
+        summary.write("| Required job | Attempt |\n| --- | --- |\n")
+        for name, attempt in sorted(evidence["job_attempts"].items()):
+            summary.write(f"| {name} | {attempt} |\n")
+        summary.write("\n| File | Disposition | SHA-256 |\n| --- | --- | --- |\n")
+        for entry in entries:
+            summary.write(f"| {entry['name']} | {entry['disposition']} | `{entry['sha256']}` |\n")
 
 
 def command_prepare(options: argparse.Namespace) -> int:
@@ -1697,28 +1147,18 @@ def command_prepare(options: argparse.Namespace) -> int:
     verify_sidecars(extraction)
     manifest = _load_json_file(extraction / MANIFEST_NAME)
     _require(isinstance(manifest, dict), "rc-manifest.json is not an object")
-    versions, source_run_id = verify_manifest_binding(manifest, extraction, source_sha)
+    versions = verify_manifest_binding(manifest, extraction, source_sha)
     manifest_sha = sha256_file(extraction / MANIFEST_NAME)
     wheel_by_row = verify_wheel_rows(manifest["wheels"], versions["c_two_version"])
     verify_candidate_receipts(extraction, manifest, source_sha, wheel_by_row)
 
-    # The Source Validation evidence comes only from the run the candidate
-    # context bound by identity; a different run for the same source never
-    # substitutes it and receipts are never mixed across runs.
-    status, source_run = api.get_json(f"/repos/{repository}/actions/runs/{source_run_id}")
-    _require(status == 200 and isinstance(source_run, dict),
-             f"Source Validation run {source_run_id} bound by rc-context.json not found")
-    validate_gate_run(api, source_run, SOURCE_VALIDATION_WORKFLOW_FILE,
-                      SOURCE_VALIDATION_WORKFLOW_NAME, source_sha, SOURCE_GATE_EVENTS)
-    require_gate_success(SOURCE_VALIDATION_WORKFLOW_NAME, source_run)
-    source_validation = verify_source_validation(api, source_sha, source_run, download_dir)
+    source_validation = find_source_evidence(api, source_sha)
 
     staging = download_dir / "staging"
     plan: dict[str, Any] = {
         "schema": PLAN_SCHEMA,
         "target": options.target,
         "repository": repository,
-        "dry_run": bool(options.dry_run),
         "source_sha": source_sha,
         "versions": versions,
         "candidate_run": {"id": candidate.get("id"), "url": candidate.get("html_url")},
@@ -1729,8 +1169,6 @@ def command_prepare(options: argparse.Namespace) -> int:
         tag = f"{TAG_PREFIX}{versions['c3_version']}"
         title = f"c3 {versions['c3_version']}"
         assets = stage_github_release_assets(extraction, manifest, staging, download_dir)
-        # Read-only remote comparison runs identically in dry runs; only the
-        # caller's publishing steps are suppressed.
         plan["github_release"] = github_release_state(api, tag, title, source_sha, assets)
     else:
         files = stage_pypi_files(extraction, manifest, staging / "dist", download_dir)
@@ -1754,52 +1192,12 @@ def command_prepare(options: argparse.Namespace) -> int:
     )
     if options.release_body_output and options.target == "github-release":
         write_release_body(Path(options.release_body_output), plan, manifest_sha)
+    if options.summary_output:
+        write_promotion_summary(Path(options.summary_output), plan)
     summary = plan.get("github_release") or plan.get("pypi")
     print(
         f"promotion plan {options.plan_output}: target={options.target} "
         f"source={source_sha[:12]} candidate_run={candidate.get('id')} action={summary['action']}"
-        + (" [dry run]" if options.dry_run else "")
-    )
-    return 0
-
-
-def command_check_source(options: argparse.Namespace) -> int:
-    repository = os.environ.get("GITHUB_REPOSITORY", "")
-    if repository != options.expect_repository:
-        print(
-            f"error: refusing to check from repository {repository!r}; "
-            f"source checks are only valid on {options.expect_repository}",
-            file=sys.stderr,
-        )
-        return 1
-    ref = os.environ.get("GITHUB_REF", "")
-    if ref != EXPECT_REF:
-        print(
-            f"error: refusing to check from ref {ref!r}; only {EXPECT_REF} names canonical main",
-            file=sys.stderr,
-        )
-        return 1
-    token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
-        print("error: GITHUB_TOKEN is required for authenticated run provenance", file=sys.stderr)
-        return 1
-    source_sha = options.source_sha
-    _require(bool(SHA_PATTERN.match(source_sha)), f"source SHA {source_sha!r} is malformed")
-
-    api = GitHubApi(
-        os.environ.get("GITHUB_API_URL", "https://api.github.com"), repository, token
-    )
-    run = find_full_source_validation_run(api, source_sha)
-    Path(options.plan_output).write_text(
-        json.dumps(
-            {"source_sha": source_sha, "run_id": run.get("id"), "run_url": run.get("html_url")},
-            indent=2, sort_keys=True,
-        ) + "\n",
-        encoding="utf-8",
-    )
-    print(
-        f"source check {options.plan_output}: source={source_sha[:12]} "
-        f"source_validation_run={run.get('id')} ({run.get('event')})"
     )
     return 0
 
@@ -1820,20 +1218,10 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--download-dir", default="candidate-download")
     prepare.add_argument("--plan-output", default="promotion-plan.json")
     prepare.add_argument("--release-body-output", default=None)
+    prepare.add_argument("--summary-output", default=None,
+                         help="Append the publication plan summary as UTF-8 Markdown")
     prepare.add_argument("--pypi-project", default="c-two")
-    prepare.add_argument("--dry-run", action="store_true",
-                         help="Identical read-only verification including remote comparison; "
-                              "the caller still performs no publishing")
     prepare.set_defaults(handler=command_prepare)
-    check_source = subparsers.add_parser(
-        "check-source",
-        help="Read-only: resolve the successful full Source Validation run for one source SHA "
-             "using only GitHub metadata (no artifact downloads)",
-    )
-    check_source.add_argument("--source-sha", required=True)
-    check_source.add_argument("--expect-repository", default=EXPECT_REPOSITORY)
-    check_source.add_argument("--plan-output", default="source-check.json")
-    check_source.set_defaults(handler=command_check_source)
     options = parser.parse_args(argv)
     try:
         return options.handler(options)

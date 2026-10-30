@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -25,13 +26,13 @@ def _workflow_text() -> str:
     )
 
 
-def test_cli_release_requires_an_explicit_candidate_and_defaults_to_preview():
+def test_cli_release_requires_one_explicit_candidate():
     workflow = yaml.load(_workflow_text(), Loader=yaml.BaseLoader)
     assert set(workflow["on"]) == {"workflow_dispatch"}
     inputs = workflow["on"]["workflow_dispatch"]["inputs"]
-    assert set(inputs) == {"candidate_run_id", "dry_run"}
+    assert set(inputs) == {"candidate_run_id"}
     assert inputs["candidate_run_id"]["required"] == "true"
-    assert inputs["dry_run"]["default"] == "true"
+    assert "GITHUB_STEP_SUMMARY" in _workflow_text()
     assert "workflow_run" not in _workflow_text()
 
 
@@ -75,7 +76,7 @@ def test_cli_release_accepts_explicit_manual_candidate_inputs():
     assert "workflow_dispatch:" in text
     assert "candidate_run_id:" in text
     assert "required: true" in text
-    assert "dry_run:" in text
+    assert "GITHUB_STEP_SUMMARY" in text
 
 
 def test_cli_release_fails_closed_outside_the_canonical_repository():
@@ -105,7 +106,7 @@ def test_cli_release_publishes_only_verified_staged_bytes():
 
     assert "needs: prepare" in publish
     assert "needs.prepare.outputs.action == 'upload'" in publish
-    assert "inputs.dry_run != true" in publish
+    assert "environment: github-release" in publish
     assert "permissions:" in publish
     assert "contents: write" in publish
     # The staging artifact is downloaded back into ./staging so the plan's
@@ -156,7 +157,7 @@ def test_cli_release_body_links_provenance_and_arm64_coverage():
     ).read_text(encoding="utf-8")
 
     assert "Windows 11 ARM64" in script
-    assert "Source Validation full-scope run" in script
+    assert "Source Validation tested commit" in script
 
 
 def test_readmes_document_the_c3_installer_asset():
@@ -204,8 +205,14 @@ def test_ci_validates_source_on_pr_merge_group_and_main_push():
         assert event in ci_text
     assert "branches: [main]" in ci_text
     assert "tools/ci/source_validation.py" in ci_text
-    for label in ("ubuntu-24.04", "macos-15", "windows-2022", "windows-2025", "windows-11-arm"):
-        assert label in ci_text
+    # Every lane that release promotion requires must exist in the source matrix.
+    spec = importlib.util.spec_from_file_location(
+        "source_evidence", _repo_root() / ".github" / "scripts" / "source_evidence.py")
+    assert spec is not None and spec.loader is not None
+    source_evidence = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(source_evidence)
+    for label in source_evidence.FULL_LANES:
+        assert f"os: {label}," in ci_text
     assert "3.12" in ci_text
     assert "3.14t" in ci_text
 

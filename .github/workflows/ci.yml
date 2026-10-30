@@ -39,6 +39,10 @@ env:
 
 jobs:
   changes:
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -62,6 +66,7 @@ jobs:
       - name: Select required source checks
         id: select
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           FORCE_FULL: ${{ github.event_name == 'workflow_dispatch' && inputs.force_full }}
           CHANGED_FILES_JSON: ${{ steps.filter.outputs.changed_files }}
@@ -69,7 +74,7 @@ jobs:
         run: python .github/scripts/ci_scope.py
 
   source:
-    needs: [changes, workflow-policy]
+    needs: [changes]
     if: needs.changes.outputs.source == 'true'
     name: source (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -80,7 +85,6 @@ jobs:
         include:
           - {os: ubuntu-24.04, python: '3.12', scope: full}
           - {os: macos-15, python: '3.12', scope: full}
-          - {os: windows-2022, python: '3.12', scope: full}
           - {os: windows-2025, python: '3.12', scope: full}
           - {os: windows-11-arm, python: '3.12', scope: full}
           - {os: ubuntu-24.04, python: '3.14t', scope: python}
@@ -274,7 +278,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: source-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.scope }}-${{ github.event.pull_request.head.sha || github.sha }}
+          name: source-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.scope }}-${{ github.event.pull_request.head.sha || github.sha }}-a${{ github.run_attempt }}
           path: |
             c-two/artifacts/source/
             !c-two/artifacts/source/python-suite/ordinary/tmp/**

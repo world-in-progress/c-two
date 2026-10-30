@@ -72,9 +72,7 @@ class TestServeSubprocess:
     @pytest.mark.parametrize('encoding', [
         'cp1252',
         'gbk',
-        pytest.param(None, marks=pytest.mark.skipif(
-            sys.platform != 'win32', reason='Windows default stdout code page',
-        ), id='windows-default'),
+        pytest.param(None, marks=pytest.mark.platform('windows'), id='windows-default'),
     ])
     def test_serve_with_non_utf8_stdout(self, tmp_path, encoding):
         """Piped banners and shutdown messages survive strict stdout encodings."""

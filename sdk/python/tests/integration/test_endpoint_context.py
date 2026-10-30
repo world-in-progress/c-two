@@ -18,7 +18,7 @@ import uuid
 
 import pytest
 
-from tests.unit.test_endpoint_context import IS_WINDOWS, UNIX_ONLY, _isolated_env, _run_isolated
+from tests.unit.test_endpoint_context import IS_WINDOWS, _isolated_env, _run_isolated
 
 
 CONTRACT = '''
@@ -68,7 +68,7 @@ print(json.dumps({'completed': True, 'hooks': resource.hooks}), flush=True)
 '''
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_server_credential_does_not_wait_for_the_namespace_gate() -> None:
     with tempfile.TemporaryDirectory(prefix='c2-own-', dir='/tmp') as root:
         _run_isolated(CONTRACT + textwrap.dedent('''
@@ -126,8 +126,6 @@ def test_server_credential_does_not_wait_for_the_namespace_gate() -> None:
 
 @pytest.fixture
 def short_roots():
-    if IS_WINDOWS:
-        pytest.skip('Unix filesystem root capability')
     with ExitStack() as stack:
         roots = [
             stack.enter_context(tempfile.TemporaryDirectory(prefix='c2-', dir='/tmp')),
@@ -183,7 +181,7 @@ class _ResourceProcess:
             stream.close()
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_same_logical_address_registers_connects_and_stays_isolated(short_roots) -> None:
     first, second = short_roots
     address = f'ipc://context-{uuid.uuid4().hex[:12]}'
@@ -232,7 +230,7 @@ def test_same_logical_address_registers_connects_and_stays_isolated(short_roots)
         b.stop()
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('attempt', ['bind', 'connect', 'ping', 'shutdown'])
 def test_first_failed_local_attempt_freezes_context_without_creating_missing_container(attempt, short_roots) -> None:
     missing = f'/tmp/q-{uuid.uuid4().hex[:8]}'
@@ -293,7 +291,7 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
     '''), C2_IPC_ROOT=missing)
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('source', ['environment', 'code'])
 def test_used_selection_survives_repeated_shutdown_then_refreezes(source: str) -> None:
     missing = f'/tmp/q-{uuid.uuid4().hex[:8]}'
@@ -331,7 +329,7 @@ def test_used_selection_survives_repeated_shutdown_then_refreezes(source: str) -
     ''', C2_IPC_ROOT=missing)
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 @pytest.mark.parametrize('abnormal', [False, True], ids=['normal', 'abnormal'])
 def test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state(abnormal, short_roots) -> None:
     root, other = short_roots
@@ -386,7 +384,7 @@ def test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state(ab
         resource.close()
 
 
-@UNIX_ONLY
+@pytest.mark.platform('posix')
 def test_sweep_captures_code_context_once_and_keeps_it_across_env_flip(short_roots) -> None:
     root, other = short_roots
     address = f'ipc://sweep-context-{uuid.uuid4().hex[:12]}'
