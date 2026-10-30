@@ -13,6 +13,7 @@ Release candidate; publication is pending. See the [release notes](docs/releases
 ### Fixed
 
 - Python `cc.serve()` startup and shutdown messages use ASCII text, escape route names that stdout cannot encode, and flush output so piped banners appear immediately. Non-UTF-8 stdout no longer raises `UnicodeEncodeError` or skips graceful shutdown.
+- A zero-timeout shutdown right after a completed shutdown no longer fails intermittently with `shutdown_wait_timeout` at `core_retirement_wait`; the Core shutdown driver wakes waiters only after releasing its locks and retirement resources.
 
 ## [0.10.0] — companion c3 0.6.0
 
