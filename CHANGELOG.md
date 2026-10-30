@@ -14,6 +14,7 @@ Release candidate; publication is pending. See the [release notes](docs/releases
 
 - Python `cc.serve()` startup and shutdown messages use ASCII text, escape route names that stdout cannot encode, and flush output so piped banners appear immediately. Non-UTF-8 stdout no longer raises `UnicodeEncodeError` or skips graceful shutdown.
 - A zero-timeout shutdown right after a completed shutdown no longer fails intermittently with `shutdown_wait_timeout` at `core_retirement_wait`; the Core shutdown driver wakes waiters only after releasing its locks and retirement resources.
+- `generate_crm_template` reads the CRM source file with its declared encoding (UTF-8 by default) and writes the template as UTF-8, and `python -m c_two.cli.contract`, which the `c3 contract` subcommands run, writes its JSON as UTF-8 to files and stdout. Both previously used the platform's default encoding, so on Windows non-ASCII text such as Chinese docstrings could fail to decode, come out garbled, or be rejected by `c3` as non-UTF-8 output.
 
 ## [0.10.0] — companion c3 0.6.0
 
