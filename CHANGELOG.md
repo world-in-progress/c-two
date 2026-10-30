@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [0.10.1] — companion c3 0.6.0
 
-Release candidate; publication is pending. See the [release notes](docs/releases/0.10.1.md).
+Published 2026-10-30. See the [release notes](docs/releases/0.10.1.md).
 
 ### Fixed
 
