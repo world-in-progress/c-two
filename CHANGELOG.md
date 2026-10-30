@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Fixed
+
+- Python `cc.serve()` startup and shutdown messages use ASCII text, escape route names that stdout cannot encode, and flush output so piped banners appear immediately. Non-UTF-8 stdout no longer raises `UnicodeEncodeError` or skips graceful shutdown.
+
 ## [0.10.0] — companion c3 0.6.0
 
 Published 2026-10-30. See the [release notes](docs/releases/0.10.0.md) for IPC 14 version diagnostics, Unix namespace format 3 and credential schema 4, listener credential snapshots, independent Python runtimes, failed-release ownership, the Rust 1.95 build requirement, FastDB 0.2.4 and the coordinated upgrade.
