@@ -1,0 +1,103 @@
+{
+  "version": "0.10.1",
+  "cli_version": "0.6.0",
+  "cli_published": false,
+  "source_sha": "1a69b78a44f58ceaa671fcf6b0c892b0206f4c45",
+  "source_tree": "26400c100908108a4b521046be18eef8d1690547",
+  "pull_request": "https://github.com/world-in-progress/c-two/pull/208",
+  "pull_request_head": "2036a5277ee3d446d88e040468bd48b8cf99de74",
+  "fixes": {
+    "serve_output_encoding": {"commit": "51cb141e", "pull_request": 206, "merge": "028e791d"},
+    "zero_timeout_shutdown": {"commit": "57d27fc2", "pull_request": 207, "merge": "399286f5"},
+    "template_and_contract_utf8": {"commit": "73845204", "test_fix": "2036a527", "pull_request": 208, "merge": "1a69b78a"}
+  },
+  "protocols_unchanged_from": "0.10.0",
+  "fastdb": {"version": "0.2.4", "source_sha": "f82fa13adeae2b87a295bf984821c85c44b55a3d"},
+  "first_attempt": {
+    "source_sha": "028e791d",
+    "pull_request_source_validation": [
+      {"run_id": 41033002408, "source": "26c15dfe", "attempt": 1, "result": "failure", "cause": "unregistered POSIX platform skip of the Windows default-code-page test"},
+      {"run_id": 41036889359, "source": "4f509564", "attempt": 1, "jobs_passed": 10}
+    ],
+    "main_push_source_validation": {"run_id": 41039841188, "attempt": 1, "result": "failure", "cause": "intermittent zero-timeout shutdown failure on windows-2025, present since 0.10.0"},
+    "fresh_full_qualification": {"run_id": 41044322502, "event": "workflow_dispatch", "result": "failure", "cause": "macOS hosted runner lost communication"},
+    "release_candidate": null,
+    "paused_for": "fix the intermittent shutdown failure, then simplify the release flow"
+  },
+  "shutdown_fix": {
+    "pull_request_source_validation": {"run_id": 41055663146, "source": "e7f9f090", "attempt": 1, "jobs_passed": 10},
+    "main_push_source_validation": {"run_id": 41059030180, "source": "399286f5", "attempt": 1, "jobs_passed": 10}
+  },
+  "release_flow_change": {
+    "pull_request": 208,
+    "fork_full_ci": {"run_id": 41061490204, "source": "34a3127e", "attempt": 1, "jobs_passed": 9, "minutes": 21.4},
+    "pull_request_source_validation": [
+      {"run_id": 41066825012, "source": "49e63bc7", "attempt": 1, "result": "failure",
+       "causes": ["ubuntu-24.04 py3.12: sccache could not read the Actions cache backend",
+                  "windows-2025 and windows-11-arm: test_contract_export_cli_writes_utf8_stdout_in_order[cp1252] and [gbk] only, test TextIOWrapper without newline wrote CRLF"]},
+      {"run_id": 41074242324, "source": "2036a527", "attempt": 1, "jobs_passed": 9}
+    ]
+  },
+  "source_validation": {
+    "selected": {
+      "run_id": 41074242324,
+      "event": "pull_request",
+      "tested_sha": "2036a5277ee3d446d88e040468bd48b8cf99de74",
+      "tree_sha": "26400c100908108a4b521046be18eef8d1690547",
+      "job_attempts": {
+        "source (macos-15, py3.12)": 1,
+        "source (ubuntu-24.04, py3.12)": 1,
+        "source (ubuntu-24.04, py3.14t)": 1,
+        "source (windows-11-arm, py3.12)": 1,
+        "source (windows-2025, py3.12)": 1,
+        "workflow policy": 1
+      },
+      "full_artifacts_per_lane": 1
+    },
+    "main_push": {"run_id": 41077179561, "source": "1a69b78a", "attempt": 1, "scope": "workflow policy only; source lanes skipped for the same tree"}
+  },
+  "release_candidate": {
+    "run_id": 41077234739,
+    "source": "1a69b78a44f58ceaa671fcf6b0c892b0206f4c45",
+    "successful_jobs": 38,
+    "expected_skipped_jobs": ["linux (aarch64-unknown-linux-gnu) / sdist"],
+    "manifest_sha256": "43706736c5ad0d952c2f668c131c1461947196fb972e354433ab019f4591f744"
+  },
+  "promotion": {
+    "python": 41081182309,
+    "result": "success",
+    "pypi_environment": "approved under the user release authorization after checking the plan"
+  },
+  "timing_minutes": {
+    "merge_to_publication": 32,
+    "release_candidate": 25,
+    "prepare_approve_publish": 6,
+    "previous_release_merge_to_publication": {"version": "0.10.0", "minutes": 65}
+  },
+  "publication": {
+    "pypi_url": "https://pypi.org/project/c-two/0.10.1/",
+    "python_files": 36,
+    "wheels": 35,
+    "sdists": 1,
+    "every_file_name_size_sha256_matched_plan": true,
+    "plan_files_matched_candidate_manifest": true,
+    "yanked_files": 0,
+    "windows_arm64_wheels": [
+      "c_two-0.10.1-cp311-cp311-win_arm64.whl",
+      "c_two-0.10.1-cp312-cp312-win_arm64.whl",
+      "c_two-0.10.1-cp313-cp313-win_arm64.whl",
+      "c_two-0.10.1-cp314-cp314-win_arm64.whl",
+      "c_two-0.10.1-cp314-cp314t-win_arm64.whl"
+    ],
+    "smoke": {
+      "pypi": "c-two[fastdb]==0.10.1 with fastdb4py 0.2.4 on CPython 3.13, macOS ARM64; one same-process CRM call",
+      "serve": "cc.serve() with cp1252 stdout and UTF-8 mode off: ASCII banner, non-ASCII route name escaped, graceful SIGINT shutdown, exit 0; the same script exits 1 with UnicodeEncodeError on 0.10.0"
+    }
+  },
+  "cleanup": {
+    "fork_branches_deleted": ["socu/release-agility-review"],
+    "deletion_rule": "exact SHA lease; branch contained in main",
+    "caches_deleted": ["fork refs/heads/socu/release-agility-review", "upstream refs/pull/208/merge"],
+    "first_attempt_runs_retained_in_actions": true
+  }
+}

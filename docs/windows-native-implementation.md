@@ -2,9 +2,9 @@
 
 Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
 
-## C-Two 0.10.1 release candidate
+## C-Two 0.10.1 release (2026-10-30)
 
-C-Two 0.10.1 writes the `cc.serve()` banner and shutdown messages as ASCII with stdout's own encoding, so a server whose output goes to a pipe or file under the ANSI code page (for example cp1252 or GBK) no longer exits with `UnicodeEncodeError`. Its regression test runs a subprocess `cc.serve()` without UTF-8 mode, including the Windows default code page; see the [patch notes](releases/0.10.1.md). Protocols and formats are unchanged from 0.10.0.
+C-Two 0.10.1 writes the `cc.serve()` banner and shutdown messages as ASCII with stdout's own encoding, so a server whose output goes to a pipe or file under the ANSI code page (for example cp1252 or GBK) no longer exits with `UnicodeEncodeError`. Its regression test runs a subprocess `cc.serve()` without UTF-8 mode, including the Windows default code page. The CRM template generator and the contract export that `c3 contract` runs now read and write UTF-8 regardless of the code page; see the [patch notes](releases/0.10.1.md). Protocols and formats are unchanged from 0.10.0.
 
 ## C-Two 0.10.0 release (2026-10-30)
 

@@ -1,6 +1,6 @@
 # 发版敏捷性审查
 
-日期：2026-10-30。输入：upstream main `028e791d`（0.10.1 发版提交）。范围：`docs/ci-cd.md`、`.github/workflows/`、`.github/scripts/`、`tools/ci/`、`tools/dev/test_python.py`、`tools/local_rc/`、`tests/repo/`，以及测试与生产代码里和发版相关的机制。状态：用户已于 2026-10-30 批准方案 A（含 A5 取消预演），并要求在 0.10.1 之前落地；第 4 节其余事项仍待决定。本文本身没有改动任何工作流、脚本或代码。
+日期：2026-10-30。输入：upstream main `028e791d`（0.10.1 发版提交）。范围：`docs/ci-cd.md`、`.github/workflows/`、`.github/scripts/`、`tools/ci/`、`tools/dev/test_python.py`、`tools/local_rc/`、`tests/repo/`，以及测试与生产代码里和发版相关的机制。状态：用户已于 2026-10-30 批准方案 A（含 A5 取消预演）；方案 A 经 [PR #208](https://github.com/world-in-progress/c-two/pull/208) 合入（`1a69b78a`），0.10.1 是第一个走新流程的版本，从合入到发布完成 32 分钟，见[发布验收](../reports/2026-10-30-0101-release-acceptance.md)。第 4 节其余事项仍待决定。
 
 ## 结论
 
