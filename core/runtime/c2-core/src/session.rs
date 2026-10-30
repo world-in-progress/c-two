@@ -2171,13 +2171,15 @@ impl Runtime {
             }
             if execution.is_none() {
                 progress.outcome = Some(outcome);
+                drop(progress);
+                drop(state);
                 transaction.completed.notify_all();
                 return;
             }
             drop(progress);
             drop(state);
         }
-        let execution = execution.as_mut().expect("retirement owns its executor");
+        let mut execution = execution.expect("retirement owns its executor");
         // An ordinary transaction may have started before the first pool was
         // created. Once sealed, that pool can never change or admit new entries.
         let late_pool = if pool.is_none() {
@@ -2258,9 +2260,10 @@ impl Runtime {
         {
             let _state = self.state.lock();
             transaction.outcome.lock().outcome = Some(outcome);
-            transaction.completed.notify_all();
         }
-        // execution (including its Host clone) drops only after publication.
+        // Host Drop must observe the published result before waiters are notified.
+        drop(execution);
+        transaction.completed.notify_all();
     }
 
     fn shutdown_transaction(
