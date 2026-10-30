@@ -135,6 +135,7 @@
 
 - 10 月卡住发版的偶发失败分三类：测试里写死的短期限（codegen 消费者，已修；`c2-ipc` 用 1 秒的 `PROBE_BUDGET` 断言 ACK 语义，在繁忙的 Windows 2025 上超时，未修），测试环境本身（ARM64 上模拟的 x86 PowerShell 每次运行要编译 `Add-Type`，已修），以及产品语义（零期限的第二次 shutdown 在 `try_lock_until` 遇到短暂锁竞争时失败，另行修复中）。前两类应在测试里改：验证语义的测试给宽裕的期限，验证期限行为的测试留出余量。第三类是真实的产品边角，应在产品里修。
 - 已核对的测试接缝（`c2-ipc` control 的 `test_seam`）在 `#[cfg(test)]` 里；生产代码中没有读取测试专用环境变量（`CTWO_*`、`C2_PORTABLE_MATRIX_*`、`C2_TYPESCRIPT_*`）的地方。
+- 验收方案 A 时又遇到一处同类偶发失败：`tests/repo/test_local_test_platform.py::test_stop_cleans_orphan_grandchild_without_touching_unrelated_process` 在整组运行时失败一次，单独重跑 3/3 通过；它用 5 秒的固定期限等待子进程启动与退出，属于“测试里写死的短期限”。
 - 规模：Python SDK 源码 6.8 千行，测试 2.8 万行、937 个测试；Rust 共 2094 个测试。粗略检索：Python 测试中零期限或亚秒期限 92 处，`time.sleep` 70 处；Rust（含生产代码）1 秒及以下的 `Duration` 字面量 528 处。这些数字没有逐项分类，只说明“短期限断言”这一类偶发失败的来源还有不少；建议遇到一处修一处，不做一次性的大扫除。
 - `PYTHONUTF8=1` 一项（D13）同时属于测试与产品：测试环境与用户环境不一致，产品缺陷就藏了起来。
 
@@ -191,10 +192,10 @@ A7 平台跳过规则。在 `sdk/python/tests/conftest.py` 定义唯一的平台
 - B1 候选重整：Intel macOS 的两个 ABI 组拆成每个 ABI 一个 job，与 Windows 相同，关键路径从 c3 4.9 + 15.6 分钟变为 c3 4.9 + 单个 ABI 约 7.5 分钟，候选约 13 分钟；3.12 行不再把同一份字节重新下载后再跑一遍生命周期，Windows 普通用户检查保留；每个 job 在全部检查通过后才上传产物，这样候选也能只重跑失败的 job。
 - B2 删除：D8–D11、D15、D16 列出的代码，以及它们在 `tests/repo` 里的测试（`test_release_candidate_promotion.py` 2862 行、`test_source_validation.py` 739 行、`test_python_test_runner.py` 515 行都会大幅缩小）。估计共约 8 千行。`AGENTS.md` 中关于本地候选证据的段落改为只指向历史报告。
 - B3 FastDB 版本只出现一次：版本只写在 `sdk/python/pyproject.toml` 的 extra、`sdk/rust` 与 `c2-codegen` 的 Cargo 依赖里，源码提交只写在 `cli/` 与 `sdk/python/native/` 的 `fastdb-sys` 补丁里；工作流、`prepare_fastdb_sdk.py`、测试运行器与夹具在运行时从这些声明读取，不再保存常量，也不再互相断言。目标：下次升级只改依赖声明与锁文件。
-- B4 去掉 `PYTHONUTF8=1`：被测的产品进程按用户的平台默认编码运行，工具只为自己的输入输出指定 UTF-8，不再用会传给子进程的环境变量。去掉后只影响 Windows 线（GitHub 的 Windows runner 默认 cp1252；Linux 与 macOS 本来就是 UTF-8）。会先暴露三类问题：工具自身（`tools/dev/test_python.py` 向重定向的标准输出打印中文“开始”，源验证驱动转印子进程日志，都会抛 `UnicodeEncodeError`）；测试与工具里 86 + 34 处不指定编码的文件或子进程读写，其中处理非 ASCII 内容的那些；以及产品里依赖默认编码的 3 处——`c_two/crm/template.py` 用默认编码读取用户的 CRM 源文件、写出生成的代码，含中文注释的 UTF-8 源文件在 Windows 上会解码失败或乱码，`c_two/cli/contract.py` 写出契约文件，属于 `cc.serve()` 那一类、目前被 CI 遮住的问题。建议顺序：先修这 3 处产品代码，再让安装后冒烟在默认编码下运行，最后清理工具与测试。
+- B4 不再让 `PYTHONUTF8=1` 遮住产品缺陷。缺陷本身与这个变量无关，它只让 CI 看不见：Windows 用户的 Python 用系统代码页（英文系统 cp1252，中文系统 GBK），`cc.serve()` 的崩溃就是用户先遇到的。这一类缺陷分两种，各用最小的办法兜住：一是读写文件或子进程文本时不指定编码。`python -X warn_default_encoding` 会对每一处发出 `EncodingWarning`，而且在 UTF-8 模式下照样发出（已实测），所以在 SDK 测试里把来自 `c_two` 包的 `EncodingWarning` 当作错误，任何平台、任何开发机上都能拦住，不必等 Windows CI；已实测它指向 `c_two/crm/template.py:31` 读取用户 CRM 源文件的那一行，同文件写出生成代码与 `c_two/cli/contract.py` 写出契约文件也属此类，先把这 3 处改为显式 UTF-8。二是向非 UTF-8 的标准输出打印，`EncodingWarning` 管不到，由 0.10.1 那样的针对性测试覆盖，并让 Windows 上的安装后冒烟（最接近用户的环境）不再设 `PYTHONUTF8`。工具自己的输入输出改为显式 UTF-8，不再用会传给子进程的环境变量；全局去掉这个变量并不必要。
 - B5 条线 gate 精简：source-harness-tests 只在 Windows 线跑 PowerShell 安装器测试；`core-check` 只在 Linux 跑；删掉 `fastdb-rust-test`；wheel 构建与安装消费者只留 Linux 一条作为早期信号，其余由候选覆盖。ARM64 线预计再省 2.5–3 分钟。
 - B6 修完已知的偶发失败：`c2-ipc` 的 1 秒 `PROBE_BUDGET`（测试侧），零期限第二次 shutdown（产品侧，另行修复中）。
-- B7（可选，由用户决定）：Windows x64 现在有 Server 2022 和 Server 2025 两条线，可以只留一条；Windows ARM64 线不在讨论范围内，任何方案都保留。约束要求的是 Windows x64 与 ARM64，不是两个 Server 版本；10 月最近三次 main 失败都在 Windows 2025。代价是少了 Server 2022 的覆盖，收益是少一条线的偶发失败暴露，墙钟不变（关键路径在 ARM64）。
+- B7 Windows x64 只保留一条线：用户 2026-10-30 同意，保留 Server 2025（与候选构建 x64 wheel 的 `windows-latest` 一致），去掉 Server 2022；已并入方案 A 的改动。Windows ARM64 线不受影响。约束要求的是 Windows x64 与 ARM64，不是两个 Server 版本；代价是少了 Server 2022 的覆盖，收益是少一条线的偶发失败暴露与机时，墙钟不变（关键路径在 ARM64）。
 
 方案 A 加 B 之后的预计时长：PR CI 约 17–18 分钟 → 约 2 分钟 → 候选约 13 分钟 → 约 7 分钟，共约 40 分钟。
 
@@ -218,8 +219,8 @@ A7 平台跳过规则。在 `sdk/python/tests/conftest.py` 定义唯一的平台
 | 1. 接受同树的 PR 运行作为发版证据（A1） | 2026-10-30 随方案 A 批准 |
 | 2. 取消预演，改为一次触发加环境审批（A5） | 批准；CLI 发布前需要用户建 `github-release` 环境，届时给出具体步骤 |
 | 3. 删除 `local-endpoint-validation.yml` 与 `tools/local_rc` 的本地候选工具（D15、D16） | 待定 |
-| 4. 去掉 `PYTHONUTF8=1`（B4） | 待定 |
-| 5. 只保留一条 Windows x64 线（B7，只涉及 Server 2022 与 2025，ARM64 不动） | 待定 |
+| 4. 不再让 `PYTHONUTF8=1` 遮住产品缺陷（B4） | 待定；建议按 B4 的做法，不全局去掉 |
+| 5. 只保留一条 Windows x64 线（B7） | 批准；保留 Server 2025，已并入方案 A |
 | 6. 方案 A 与 0.10.1 的先后 | 方案 A 先落地 |
 | 7. 候选与 PR CI 同时跑（可选，见下） | 待定 |
 
@@ -233,6 +234,8 @@ A7 平台跳过规则。在 `sdk/python/tests/conftest.py` 定义唯一的平台
 - 微任务 2，平台跳过：A7。涉及 `sdk/python/tests/conftest.py`、现有带平台跳过的测试文件、`tools/dev/test_python.py`、`tests/repo/test_python_test_runner.py`。验收：三张冻结表删除；平台跳过只来自统一标记，其他任何跳过仍判失败；原来冻结表里的每个用例改用标记后，在对应平台上仍被跳过、在其他平台上照常执行。
 
 两者合入后在 fork 上跑一次完整 CI（推送前问用户），然后开 PR；0.10.1 用新流程发布，作为方案 A 的实际验收。实现方不删除文件以外的任何东西，不用 git stash，不动分支与标签。
+
+进展（2026-10-30）：两个微任务都已验收，与 Host 的两处改动一起集成在分支 `socu/release-agility-review` 上：平台标记（test: express platform skips with one marker…）、发版证据（ci: bind release evidence to Git trees…）、贡献者文档里的跳过规则、B7（ci: keep one Windows x64 source lane on Server 2025）。微任务 1 首轮有两处问题，由同一微任务修复：只改文档的 push 被误判为需要完整验证；step summary 代码在两个工作流里各复制了一份。本机复核：actionlint 无报错，`tests/repo` 除上面那个已知的偶发失败外全部通过，受影响的 SDK 测试文件在 macOS 上 94 passed、11 个 `platform: windows only` 跳过。分支已同步到包含 #207 的 main。Windows 与 Linux 上的实际执行等 fork 完整 CI。
 
 ## 6. 验证边界
 
