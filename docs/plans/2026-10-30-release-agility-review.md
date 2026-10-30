@@ -235,7 +235,7 @@ A7 平台跳过规则。在 `sdk/python/tests/conftest.py` 定义唯一的平台
 
 两者合入后在 fork 上跑一次完整 CI（推送前问用户），然后开 PR；0.10.1 用新流程发布，作为方案 A 的实际验收。实现方不删除文件以外的任何东西，不用 git stash，不动分支与标签。
 
-进展（2026-10-30）：两个微任务都已验收，与 Host 的两处改动一起集成在分支 `socu/release-agility-review` 上：平台标记（test: express platform skips with one marker…）、发版证据（ci: bind release evidence to Git trees…）、贡献者文档里的跳过规则、B7（ci: keep one Windows x64 source lane on Server 2025）。微任务 1 首轮有两处问题，由同一微任务修复：只改文档的 push 被误判为需要完整验证；step summary 代码在两个工作流里各复制了一份。本机复核：actionlint 无报错，`tests/repo` 除上面那个已知的偶发失败外全部通过，受影响的 SDK 测试文件在 macOS 上 94 passed、11 个 `platform: windows only` 跳过。分支已同步到包含 #207 的 main。Windows 与 Linux 上的实际执行等 fork 完整 CI。
+进展（2026-10-30）：两个微任务都已验收，与 Host 的两处改动一起集成在分支 `socu/release-agility-review` 上：平台标记（test: express platform skips with one marker…）、发版证据（ci: bind release evidence to Git trees…）、贡献者文档里的跳过规则、B7（ci: keep one Windows x64 source lane on Server 2025）。微任务 1 首轮有两处问题，由同一微任务修复：只改文档的 push 被误判为需要完整验证；step summary 代码在两个工作流里各复制了一份。本机复核：actionlint 无报错，`tests/repo` 除上面那个已知的偶发失败外全部通过，受影响的 SDK 测试文件在 macOS 上 94 passed、11 个 `platform: windows only` 跳过。分支已同步到包含 #207 的 main。fork 上的完整 CI [41061490204](https://github.com/Dsssyc/c-two/actions/runs/41061490204)（方案 A 加 B7，fork 缓存为空）首轮 9/9 通过，墙钟 21.4 分钟；五条完整线在开始后 0.2 分钟就启动（原来要等 policy 约 2 分钟），证据产物名带 `-a1`。B4 随后实施（编码修复与 `EncodingWarning` 门禁），由 PR CI 一并验证。
 
 ## 6. 验证边界
 
