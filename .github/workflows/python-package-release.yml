@@ -1,5 +1,5 @@
 name: Python Package Release
-run-name: Python Package Release · candidate ${{ inputs.candidate_run_id }}${{ inputs.dry_run && ' · dry run' || '' }}
+run-name: Python Package Release · candidate ${{ inputs.candidate_run_id }}
 
 # Promotion never builds. Select one verified, immutable candidate explicitly.
 # Ordinary pushes and completed validation runs cannot publish a release.
@@ -10,10 +10,6 @@ on:
         description: "Successful Release Candidate run on canonical main"
         required: true
         type: string
-      dry_run:
-        description: "Verify and stage the exact candidate without publishing"
-        default: true
-        type: boolean
 
 permissions:
   contents: read
@@ -59,7 +55,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
-          DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
           set -euo pipefail
           args=(
@@ -68,8 +63,7 @@ jobs:
             --plan-output promotion-plan.json
           )
           args+=(--candidate-run-id "$CANDIDATE_RUN_ID")
-          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
-          python .github/scripts/promote_release_candidate.py prepare "${args[@]}"
+          python .github/scripts/promote_release_candidate.py prepare "${args[@]}" --summary-output "$GITHUB_STEP_SUMMARY"
           python - <<'PY'
           import json, os, pathlib
           plan = json.loads(pathlib.Path("promotion-plan.json").read_text(encoding="utf-8"))
@@ -100,8 +94,7 @@ jobs:
     name: publish verified candidate
     needs: prepare
     if: >-
-      needs.prepare.outputs.action == 'upload' &&
-      inputs.dry_run != true
+      needs.prepare.outputs.action == 'upload'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: pypi
