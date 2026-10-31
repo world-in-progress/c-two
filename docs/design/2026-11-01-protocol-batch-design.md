@@ -57,7 +57,7 @@ payload 为 `[type:u8=0x17][release_count:u8][loan_id:u64 LE × count]`。协议
 
 接收边界一次验类型/方向/阶段/count/精确长度，再按本连接借出表移走真实 handle，本地释放，不按对端坐标 free。零/未知/重复/未借出/已释放 ID 报 ProtocolViolation 并停用，已结算的不回滚，剩余等 peer end。第二次查不到就不碰 allocator；正常 carrier 只发一次，不增历史 tombstone/重试，内层不重复验证。
 
-IPC 15 descriptor 保持 23 B：`slot:u16, generation:u32, offset:u32, data_size:u32, kind:u8, loan_id:u64`，整数 LE，kind 为 0 buddy/1 dedicated。loan_id 替换 allocation_id 和 dedicated 零身份，按连接方向分配，不是 request_id；表存真实分配/容量（旧式 `c2-wire/src/buddy.rs:1-32,78-100`）。
+IPC 15 descriptor 保持 23 B：`slot:u16, generation:u32, offset:u32, data_size:u32, kind:u8, loan_id:u64`，整数 LE，kind 为 0 buddy/1 dedicated。loan_id 替换 allocation_id 和 dedicated 零身份，在借出方进程内唯一（进程级计数器，checked 递增，0 不用；Host 2026-11-01 在 P3 定），借出表仍按物理连接分开，所以别的连接的 ID 在本连接就是未知 ID；它不是 request_id。表存真实分配/容量（旧式 `c2-wire/src/buddy.rs:1-32,78-100`）。
 
 SHM 4 段内无头，数据从 0 开始；格式由握手确定，kind/generation 在 OS 名中，接纳 descriptor 按 OS 实际视图 span 和 checked 算术验范围一次。位图/记录/计数/线程锁移到属主，删 magic/version/data_offset/几何头与 dedicated 头；代价是段不能独立自描述（`c2-mem/src/alloc/buddy.rs:31-81`；`dedicated.rs:13-20`）。
 
