@@ -131,7 +131,7 @@ Host 业务完成看 listener_closed/work_drained，区别保留连接；每次�
 | B7 | 120–240 | 20–50 | 100–200 |
 | F5 | 60–140 | 0–25 | 40–90 |
 | B9 | 10–35 | 0–15 | 10–25 |
-| D7 | 30–70 | 5–20 | 20–50 |
+| D7（不实施，见第十节） | 0 | 0 | 0 |
 | 自动心跳及两设置，整项删除 | 160–300 | 0–20 | 100–180 |
 | E-host，新增纳入范围 | 20–60 | 20–60 | 0–20 |
 
@@ -163,7 +163,7 @@ F5：`c2-http/src/relay/{peer,types,route_table,peer_handlers}.rs` 去 DigestDif
 
 B9：PreparedShmResponse::new 已 crate-private，producer 是固定 pool helper；去 `c2-server/src/dispatcher.rs:106`、`server.rs:4554` 的重验，unsafe write 仍履行原所有权契约（`dispatcher.rs:56-86,106-117`；`response.rs:30-38,74-86`）。
 
-D7：身份核验期间留临时 handle，删除长期 pin/finalizer，涉及 `c2-local/src/windows.rs:39-67,118-160`、`c2-mem-ffi/src/lib.rs:598-655`、`c2-mem-ffi/include/c2_mem_ffi.h:126-141`、`c2-mem-ffi/bindings/typescript/native/node_c2_mem_ffi_loader.c:1180-1185,1361-1377`。pipe owner、TokenUser、integrity、活性及 PID 回查仍在首字节前完成；第十节条件先闭合。这里的 process pin 不等于第四节租约需要的连接 OS 句柄引用。
+D7 不实施（见第十节）。原计划是：身份核验期间留临时 handle，删除长期 pin/finalizer，涉及 `c2-local/src/windows.rs:39-67,118-160`、`c2-mem-ffi/src/lib.rs:598-655`、`c2-mem-ffi/include/c2_mem_ffi.h:126-141`、`c2-mem-ffi/bindings/typescript/native/node_c2_mem_ffi_loader.c:1180-1185,1361-1377`。pipe owner、TokenUser、integrity、活性及 PID 回查仍在首字节前完成；第十节条件先闭合。这里的 process pin 不等于第四节租约需要的连接 OS 句柄引用。
 
 自动心跳整项删除：`c2-server/src/heartbeat.rs`、server spawn / 收尾、公开 `run_heartbeat` / `HeartbeatResult`，以及 `heartbeat_interval` / `heartbeat_timeout`、`heartbeat_interval_secs` / `heartbeat_timeout_secs` 与 `C2_IPC_HEARTBEAT_INTERVAL` / `C2_IPC_HEARTBEAT_TIMEOUT` 在 c2-config、Python、CLI / env 的定义、投影、文档和旧测试。手动 PING / PONG 留。原 R35 因仅省禁用空任务而暂缓，本次按整项退役删除；自动探测不能证明远端读完，停用既不能回收未读块又妨碍暂停后恢复。存活结算依 OS 结束事实，调用等待依业务截止时间（`c2-config/src/ipc.rs:48-49,131-132,196-197,481-506`；`docs/design/2026-10-23-r35-heartbeat-task-ownership.md:3-13,29-31`；`docs/research/2026-11-01-shared-memory-lending-survey.md:39-46`）。
 
@@ -267,7 +267,7 @@ P9 补齐基准工具：当前只在内存中收集 `latencies`，输出 median 
 
 ## 十、待用户决定与术语建议
 
-已批准（用户 2026-11-01）。D7：删除连接期 process pin，仅在身份核验期临时持有，并随 ABI 7 切净；静态阅读不能证明 PID 复用竞态无影响，实施前独立评审明确退出 / PID 更换条件，在 Windows x64 / ARM64 原生执行。条件未闭合不批准该子项，身份检查仍在首字节前完成（`c2-local/src/windows.rs:39-67,118-160`；`c2-mem-ffi/src/lib.rs:598-655`）。性能门槛固定为第八节的 5% / 10% / 5%，不在测后修改。
+已批准（用户 2026-11-01）。D7：删除连接期 process pin，仅在身份核验期临时持有，并随 ABI 7 切净；静态阅读不能证明 PID 复用竞态无影响，实施前独立评审明确退出 / PID 更换条件，在 Windows x64 / ARM64 原生执行。条件未闭合不批准该子项，身份检查仍在首字节前完成（`c2-local/src/windows.rs:39-67,118-160`；`c2-mem-ffi/src/lib.rs:598-655`）。结果（2026-11-01）：P2 的分析指出，现有的长期 pin 覆盖的是 `OpenProcess` 成功之后的 PID 复用窗口，从第一次取得 PID 到 `OpenProcess` 之间本来就没有覆盖；改成只在核验期临时持有，会在第一个字节之前和连接期间留下无人覆盖的进程退出与 PID 复用窗口，要证明安全还需要在 Windows 原生机器上验证旧管道的身份、句柄继承与复制行为。条件未闭合，按批准时的规则 D7 不实施，保留现有 pin，第五节的 D7 一行与 ABI 7 里相关的符号删除一并取消。性能门槛固定为第八节的 5% / 10% / 5%，不在测后修改。
 
 ### 建议由 Host 加入 CONTEXT.md
 
