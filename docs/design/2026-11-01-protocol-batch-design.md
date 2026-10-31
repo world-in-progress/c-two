@@ -49,7 +49,7 @@ peer OS 映射只读，属主可写；本地锁仍串行分配，锁内不等对
 
 共同状态机随 P3 放在拟新增 `c2-wire/src/connection/`，参照已有 chunk registry（`c2-wire/src/chunk/registry.rs:1-22,79-93`）。ConnectionCore 管借出表、释放队列、写帧进度、停用和 peer end；c2-ipc/c2-server 只接池、业务调度和 I/O，Node FFI 复用它，不各写合并/关闭算法。
 
-wire 已依赖 mem/config，local 只依赖 config/security；P3 增加 wire 对 local 及所需 Tokio 的依赖，local 产生 OS 读端事实，wire 消费它，mem 保留本地分配，不反依赖 wire（`c2-wire/Cargo.toml:10-18`；`c2-local/Cargo.toml:10-18`；`c2-mem/Cargo.toml:13-19`）。
+Host 批注（2026-11-01）：ConnectionCore 写成不做 I/O 的同步状态机，与 chunk registry 一样只用 parking_lot。驱动方（c2-ipc、c2-server、Node FFI）把收到的帧、写完成和读端结束的事实交给它，再按它给出的下一步去读写；读端结束仍由 c2-local 判定，经驱动方转交。这样 c2-wire 不新增对 c2-local 与 Tokio 的依赖，仍只依赖 config、contract、error 与 mem，状态机也能脱离真实流单独测试；mem 保留本地分配，不反依赖 wire（`c2-wire/Cargo.toml:10-18`；`c2-local/Cargo.toml:10-18`；`c2-mem/Cargo.toml:13-19`）。
 
 分配填满交写任务后，先在连接锁内登记并转移 handle，再提交第一字节。写前取消本地释放；提交后不能证明未完整送达，就留到释放记录/peer end，完整帧后的 flush 失败也算借出。快速释放、写完成、peer end 只移走一次 handle，结束同时封新借出；响应/截止时间不删借出表（`c2-ipc/src/client.rs:4246-4266`；`c2-server/src/server.rs:4403-4466`）。
 

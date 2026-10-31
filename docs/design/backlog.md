@@ -15,13 +15,13 @@
 同一块代码里的事合成一批做，免得先做的被后面的批次推翻。
 
 1. **协议批。** 核心是[单一属主释放](2026-10-31-single-owner-release-evaluation.md)：握手 15、SHM 格式 4、C ABI 7，Rust、Python、Node 同时改，按 AGENTS.md 用确切候选跑全平台门禁。
-   - 一并做：[复审](2026-10-31-over-defense-review.md)第五节的 B1、B4、B7、F5、A9（删 Windows 进程 pin 时含 D7）；单一属主要删掉的 C-U1 结算层、C2 退休执行器与 R07 的保留重试；同在释放路径上的内存重复校验 A1、A4、A6、A11，wire 与服务端的 B3、B6、B9，以及 C7；R13 剩下的"写锁前取消时保留未发布的分配"；客户端请求 id 计数器是 `AtomicU32` 而线上格式是 u64，核实是否截断（`c2-ipc/src/client.rs`）；SHM 释放坐标无法认证的问题；心跳两项设置与 R35 的去留。B4 删掉恒为 1 的 `route_revision` 之后，TypeScript 里它超过 2^53−1 就失真的问题随之消失。
+   - 一并做：[复审](2026-10-31-over-defense-review.md)第五节的 B1、B4、B7、F5、A9（删 Windows 进程 pin 时含 D7）；单一属主要删掉的 C-U1 结算层、C2 退休执行器与 R07 的保留重试；同在释放路径上的内存重复校验 A1、A4、A6、A11，wire 与服务端的 B3、B6、B9，以及 C7；R13 剩下的"写锁前取消时保留未发布的分配"；客户端请求 id 计数器是 `AtomicU32` 而线上格式是 u64，核实是否截断（`c2-ipc/src/client.rs`）；SHM 释放坐标无法认证的问题；心跳两项设置与 R35 的去留；E-host（低层 Host 关闭不退休整个 Runtime），因为它与本批的关闭路径是同一处改动。B4 删掉恒为 1 的 `route_revision` 之后，TypeScript 里它超过 2^53−1 就失真的问题随之消失。
    - 删除所有者子系统（[接口审查](2026-10-31-api-surface-review.md)第六节）：`OwnerBound` 生命周期、所有者监督与缺席宽限、恢复凭证与接管、托管子进程，以及 Python 与 Rust 的公开名字、文档与测试；握手 15 同时去掉所有者控制这种连接角色与 0x16 帧。普通 Host 也在用的关闭、生命周期观测、准入锁与代次和端点凭据保留，不留空的 API 壳。依据：用户 2026-11-01 的标准是"下游看不见、内部机制也不需要，就可以删"；独立评估与 Host 核对都满足（C ABI、CLI、relay、端点维护都不依赖它）。按文件粗算约 3.7 千行生产代码、5.9 千行测试与夹具。
    - 步骤：详细设计（消息格式、借出表、两个方向的发送时机、各条关闭路径的失败场景、端到端基准与验收计划，附流式 RPC 草图）→ 独立审查 → 用户批准，同时确认单一属主的决定 2、3 → 实施。
-   - 状态：连接内顺序的核实与所有者子系统的去留已于 2026-11-01 定下；详细设计初稿经独立审查（结论：改过后实施），修订进行中。
+   - 状态：[详细设计](2026-11-01-protocol-batch-design.md)已完成，经独立审查与一轮修订，Host 加了一条批注；待用户批准，要定的是决定 2、3、自动心跳的去留、D7 与性能门槛。
 2. **流式 RPC**（[路线图](roadmap.zh-CN.md)第 7 项，用户确认是必备能力）：排在协议批之后，设计要回答单一属主评估"与流式 RPC 的关系"一节的八个问题，并定下同一连接内调用的顺序契约。现状（2026-11-01 核实，写在[运行时生命周期](../reference/runtime-lifecycle.md)）：非分片的 IPC 调用在接收循环里按帧序预约路由，`exclusive` 与 `read_parallel` 下后到的调用不会先于先到的写执行；`parallel` 与不同路由之间没有顺序；分片请求的首片在另一个任务里才预约，后到的非分片调用可能先执行。旧 Python 服务端的连接级写屏障连跨路由也保证顺序，Rust 里没有。一并设计：分片的结构调整（B2：先缩小重组池锁，再把首片准入搬回接收循环、删排序闸门，分片请求也就按帧序预约了；以及 C03、C04、R14 的剩余）；relay 的 HTTP 响应现在整体物化，改为流式发送；HTTP 载荷的内存预算与消费生命周期（[提案](2026-10-06-http-memory-budget.md)，未实施）。
 3. **按区域的结构调整与重复校验。** 不碰协议，可以与协议批的设计并行；各区先出方案：
-   - **Core 与 Python：** E1、E2、E4、E-host；E13；C5、C6；G5、G9；R06 回调重入导致自锁的风险。顺带：`c2-core/src/control.rs` 里 `direct_ipc_endpoint`、`ping_direct_ipc`、`shutdown_direct_ipc` 每次克隆上下文，可以直接借用；`register` 的签名写 `Literal['materialized', 'borrowed']`，服务端桥里另有私有别名 `_InputLifetime`，统一成一处。
+   - **Core 与 Python：** E1、E2、E4、E13；C5、C6；G5、G9；R06 回调重入导致自锁的风险。顺带：`c2-core/src/control.rs` 里 `direct_ipc_endpoint`、`ping_direct_ipc`、`shutdown_direct_ipc` 每次克隆上下文，可以直接借用；`register` 的签名写 `Literal['materialized', 'borrowed']`，服务端桥里另有私有别名 `_InputLifetime`，统一成一处。
    - **本地端点：** tmpfiles（D-tmp）先在 Linux 上复现 systemd-tmpfiles 清掉 gate 与 marker 的情形，再实施目录 flock（本机与 Windows 测试机都不是 Linux）；之后 D1、D2、D5、D6、D10 的复查只留在所有权、发布与 unlink 边界；R17 剩下的 gate/context 与目录 pin 的错误分类。顺带：c2-local 的 Drop 在门锁短暂争用后由后台线程完成退役，`managed_drop_after_gate_contention_settles_ownership` 两种终态都接受，要有一个能观察后台重试的点才能确定地守住。
    - **relay：** F2（删 watch 闸门，轮询降到秒级）、F3、F6；F4、F8、F10；relay-aware 调用没有每次调用的路由回执，`observed_route` 仍是连接时的值；F7 剩下的 `/_admin/unregister` 与注销 202/204/404 的区分，等用户答复。顺带：`LocalEndpointNamespaceRequired` 的消息写成 "the resource namespace"，应为资源一方的本地端点命名空间。
    - **契约、代码生成与 CLI：** H1、H4、H6、H8（用校验过的构造器加私有字段，取代 C01）、H9；R29 等剩下的 codegen 同次缓存与 typed projection。
