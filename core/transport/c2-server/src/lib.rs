@@ -1,14 +1,13 @@
 mod admission;
-mod catalog;
 mod chunk_ordering;
 pub mod config;
 pub mod connection;
 mod dispatcher;
-pub mod heartbeat;
 pub mod response;
 pub mod runtime;
 mod scheduler;
 pub mod server;
+mod writer;
 
 pub use c2_local::{
     ConnectionClosed, ConnectionEndReason, ConnectionEvent, ConnectionEventSource,
@@ -17,10 +16,8 @@ pub use c2_local::{
 pub use config::ServerIpcConfig;
 pub use connection::Connection;
 pub use dispatcher::{
-    BuiltRoute, CrmCallback, CrmError, PeerShmRequest, PreparedShmResponse, RequestData,
-    RequestLease, ResponseMeta, RouteBuildSpec,
+    BuiltRoute, CrmCallback, CrmError, PreparedShmResponse, ResponseMeta, RouteBuildSpec,
 };
-pub use heartbeat::{HeartbeatResult, run_heartbeat};
 pub use runtime::{ServerRuntimeBuilder, ServerRuntimeOptions};
 pub use scheduler::{
     AccessLevel, ConcurrencyMode, RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard,

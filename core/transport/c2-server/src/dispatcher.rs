@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use c2_mem::{MemHandle, MemPool};
+use c2_wire::buddy::BuddyPayload;
 use c2_wire::chunk::ReassemblyBacking;
+use c2_wire::connection::{ConnectionCore, PreparedLoan, RemoteLoan};
 use c2_wire::handshake::MAX_METHODS;
 
 use crate::server::ServerError;
@@ -58,10 +60,8 @@ pub enum ResponseMeta {
 ///
 /// The only producer is the real allocation/fill helper; a `ShmAlloc`
 /// response cannot be hand-assembled from wire coordinates. The send path
-/// consumes the owner exactly once: it either releases it back to the
-/// response pool (error paths, or a dedicated backing whose lifecycle stays
-/// server-side) or, for a buddy backing, transfers the cross-process release
-/// responsibility to the receiving client through `transfer()`. Dropping an
+/// consumes the owner exactly once: it either releases it locally or moves
+/// the original handle into the physical connection's loan book. Dropping an
 /// unpublished carrier cleans up through its original pool.
 pub struct PreparedShmResponse {
     pool: Arc<parking_lot::RwLock<MemPool>>,
@@ -103,173 +103,98 @@ impl PreparedShmResponse {
         self.handle.as_ref().is_some_and(MemHandle::is_dedicated)
     }
 
-    pub(crate) fn validate_pool(&self, pool: &MemPool) -> Result<(), String> {
-        pool.validate_handle(self.handle.as_ref().expect("live prepared owner"))
-    }
-
     pub(crate) fn fill(
         &mut self,
         write_into: impl FnOnce(&mut [u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let pool = self.pool.read();
         let handle = self.handle.as_mut().expect("live prepared owner");
-        pool.validate_handle(handle)?;
         write_into(pool.handle_slice_mut(handle))
     }
 
-    pub(crate) fn copy_logical_bytes(&self, pool: &MemPool) -> Result<Vec<u8>, String> {
-        self.validate_pool(pool)?;
-        Ok(
-            pool.handle_slice(self.handle.as_ref().expect("live prepared owner"))
-                [..self.data_size as usize]
-                .to_vec(),
-        )
+    pub(crate) fn copy_logical_bytes(&self) -> Result<Vec<u8>, String> {
+        let pool = self.pool.read();
+        let handle = self.handle.as_ref().expect("live prepared owner");
+        Ok(pool.handle_slice(handle)[..self.data_size as usize].to_vec())
     }
 
-    pub(crate) fn release(&mut self) -> Result<(), String> {
-        let Some(handle) = self.handle.as_ref() else {
-            return Ok(());
-        };
-        let mut pool = self.pool.write();
-        pool.validate_handle(handle)?;
-        let a = handle.shm_allocation().expect("prepared SHM allocation");
-        // SAFETY: the original pool and private owner remain bound until success.
-        unsafe {
-            pool.free_at(
-                a.seg_idx,
-                a.generation,
-                a.offset,
-                self.data_size,
-                a.is_dedicated,
-                a.allocation_id,
-            )
-        }?;
-        drop(pool);
-        self.handle.take();
-        Ok(())
-    }
-
-    pub(crate) fn transfer(&mut self) {
-        self.handle.take();
-    }
-
-    pub(crate) fn abandon(&mut self) {
+    pub(crate) fn release(&mut self) {
         if let Some(handle) = self.handle.take() {
-            tracing::warn!(
-                ?handle,
-                "abandoning prepared SHM release; peer may already own it"
-            );
-            self.pool
-                .read()
-                .budget()
-                .expect("response owner budget")
-                .record_abandoned_release();
+            self.pool.write().release_handle(handle);
         }
     }
 
-    pub(crate) fn rollback(mut self, error: String) -> String {
-        match self.release() {
-            Ok(_) => error,
-            Err(cleanup) => {
-                self.abandon();
-                format!("{error}; prepared SHM cleanup also failed: {cleanup}")
-            }
-        }
+    pub(crate) fn into_loan(mut self, core: &ConnectionCore) -> Result<PreparedLoan, String> {
+        let handle = self.handle.take().expect("live prepared owner");
+        core.prepare_loan(Arc::clone(&self.pool), handle)
+            .map_err(|error| error.to_string())
     }
 }
 
 impl Drop for PreparedShmResponse {
     fn drop(&mut self) {
-        if let Err(error) = self.release() {
-            tracing::warn!(%error, "final prepared SHM release failed");
-            self.abandon();
-        }
+        self.release();
     }
 }
 
 /// Move-only receive carrier for one admitted peer SHM request block.
 ///
-/// Minted only at this crate's frame-admission path: the coordinates come
-/// from a decoded request frame and the pool from the connection that
-/// received it. There is no public constructor from bare coordinates, so a
-/// [`RequestLease`] over this carrier is the only safe read/release surface.
-pub struct PeerShmRequest {
+/// Minted only at this crate's frame-admission path from a decoded descriptor,
+/// its original peer mapping, and a read interval on that physical connection.
+pub(crate) struct PeerShmRequest {
     pool: Arc<parking_lot::RwLock<MemPool>>,
-    seg_idx: u16,
-    generation: u32,
-    offset: u32,
-    data_size: u32,
-    is_dedicated: bool,
-    allocation_id: u64,
-    budget: c2_mem::MemoryBudget,
-    released: bool,
+    payload: BuddyPayload,
+    loan: RemoteLoan,
 }
 
 impl std::fmt::Debug for PeerShmRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "PeerShmRequest(pool={:p}, seg={}, gen={}, off={}, size={}, ded={}, allocation_id={})",
-            Arc::as_ptr(&self.pool),
-            self.seg_idx,
-            self.generation,
-            self.offset,
-            self.data_size,
-            self.is_dedicated,
-            self.allocation_id
-        )
+        f.debug_struct("PeerShmRequest")
+            .field("pool", &Arc::as_ptr(&self.pool))
+            .field("payload", &self.payload)
+            .finish()
     }
 }
 
 impl PeerShmRequest {
-    /// Admit one received SHM request block. Crate-private: only the decode
-    /// path that actually received the frame may call this.
+    /// The loan is admitted before mapping, so even a mapping failure ends
+    /// the remote read interval and queues its release.
     pub(crate) fn admit(
         pool: Arc<parking_lot::RwLock<MemPool>>,
-        seg_idx: u16,
-        generation: u32,
-        offset: u32,
-        data_size: u32,
-        is_dedicated: bool,
-        allocation_id: u64,
-        budget: c2_mem::MemoryBudget,
-    ) -> Self {
-        Self {
-            pool,
-            seg_idx,
-            generation,
-            offset,
-            data_size,
-            is_dedicated,
-            allocation_id,
-            budget,
-            released: false,
+        payload: BuddyPayload,
+        loan: RemoteLoan,
+    ) -> Result<Self, String> {
+        let end = (payload.offset as usize)
+            .checked_add(payload.data_size as usize)
+            .ok_or_else(|| "request SHM span overflow".to_string())?;
+        {
+            let mut mapped = pool.write();
+            if payload.is_dedicated {
+                mapped.ensure_peer_dedicated(
+                    u32::from(payload.seg_idx),
+                    payload.generation,
+                    end,
+                )?;
+            } else {
+                mapped.ensure_peer_segment(u32::from(payload.seg_idx), payload.generation, end)?;
+            }
+            mapped.validate_data_at(
+                u32::from(payload.seg_idx),
+                payload.generation,
+                payload.offset,
+                payload.data_size,
+                payload.is_dedicated,
+            )?;
         }
-    }
-
-    /// Whether the backing is a dedicated (non-buddy) segment.
-    pub fn is_dedicated(&self) -> bool {
-        self.is_dedicated
-    }
-
-    /// The peer's segment index (diagnostics and transport probes).
-    pub fn seg_idx(&self) -> u16 {
-        self.seg_idx
-    }
-
-    /// Read-only transport facts for in-crate probes.
-    #[cfg(test)]
-    pub(crate) fn coordinates(&self) -> (u32, u32, u32, u64) {
-        (
-            self.generation,
-            self.offset,
-            self.data_size,
-            self.allocation_id,
-        )
+        Ok(Self {
+            pool,
+            payload,
+            loan,
+        })
     }
 
     /// Copy the request bytes out of the peer's published block.
-    fn copy_bytes(&self) -> Result<Vec<u8>, String> {
+    fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
         // Frame admission established the mapping before dispatch. The live
         // carrier keeps it in the original peer cache until release.
         let pool = self.pool.read();
@@ -278,88 +203,19 @@ impl PeerShmRequest {
         // published the block (write-then-publish protocol) and the carrier
         // is the only local authority for it, so no conflicting access or
         // release can race this copy.
-        unsafe {
+        let copied = unsafe {
             pool.copy_data_at(
-                u32::from(self.seg_idx),
-                self.generation,
-                self.offset,
-                self.data_size,
-                self.is_dedicated,
+                u32::from(self.payload.seg_idx),
+                self.payload.generation,
+                self.payload.offset,
+                self.payload.data_size,
+                self.payload.is_dedicated,
             )
         }
-        .map_err(|error| format!("request SHM copy failed: {error}"))
-    }
-
-    /// Validate then release the peer's block exactly once.
-    pub(crate) fn release(&mut self) -> Result<(), String> {
-        if self.released {
-            return Ok(());
-        }
-        let mut pool = self.mapped_pool()?;
-        pool.validate_data_at(
-            u32::from(self.seg_idx),
-            self.generation,
-            self.offset,
-            self.data_size,
-            self.is_dedicated,
-        )
-        .map_err(|error| format!("request SHM release validation failed: {error}"))?;
-        // SAFETY: this carrier is the sole release authority for the
-        // admitted block (read-then-release protocol) and the complete span
-        // was just validated against the live backing.
-        unsafe {
-            pool.free_at(
-                u32::from(self.seg_idx),
-                self.generation,
-                self.offset,
-                self.data_size,
-                self.is_dedicated,
-                self.allocation_id,
-            )
-        }
-        .map_err(|error| format!("request SHM release failed: {error}"))?;
+        .map_err(|error| format!("request SHM copy failed: {error}"));
         drop(pool);
-        self.released = true;
-        Ok(())
-    }
-
-    pub(crate) fn ensure_mapped(&self) -> Result<(), String> {
-        drop(self.mapped_pool()?);
-        Ok(())
-    }
-
-    fn mapped_pool(&self) -> Result<parking_lot::RwLockWriteGuard<'_, MemPool>, String> {
-        let mut pool = self.pool.write();
-        let index = u32::from(self.seg_idx);
-        if self.is_dedicated {
-            if self.generation != 0 {
-                return Err("dedicated generation must be zero".into());
-            }
-            let name = MemPool::dedicated_segment_name(pool.prefix(), index);
-            // SAFETY: the admitted reference and canonical name share the original handshake pool.
-            // Revalidate cached entries too: a previous lease may already have set read_done.
-            unsafe { pool.open_dedicated_at(index, &name, self.data_size as usize) }?;
-        } else if pool.segment_generation(index as usize) != Some(self.generation) {
-            pool.ensure_peer_segment(index, self.generation, self.data_size as usize)?;
-        }
-        Ok(pool)
-    }
-
-    pub(crate) fn abandon(&mut self) {
-        if !self.released {
-            tracing::warn!(carrier = ?self, "abandoning peer SHM request release");
-            self.budget.record_abandoned_release();
-            self.released = true;
-        }
-    }
-}
-
-impl Drop for PeerShmRequest {
-    fn drop(&mut self) {
-        if let Err(error) = self.release() {
-            tracing::warn!(%error, carrier = ?self, "final peer SHM request release failed");
-            self.abandon();
-        }
+        self.loan.finish();
+        copied
     }
 }
 
@@ -367,114 +223,30 @@ impl Drop for PeerShmRequest {
 ///
 /// Pure Rust types with no language-binding dependency. Binding-specific
 /// callback implementations convert these into SDK-visible objects.
-pub enum RequestData {
-    /// SHM block received from the peer. The carrier binds the coordinates
-    /// to the exact connection pool that received the frame and is the only
-    /// local read/release authority for the block.
+pub(crate) enum RequestData {
+    /// SHM block received from the peer. The carrier binds the descriptor
+    /// to the original connection and ends its read interval after copying.
     Shm(PeerShmRequest),
     /// Inline bytes from a local IPC frame.
     Inline(Vec<u8>),
-    /// Reassembled chunked transfer. The carrier owns the reassembly pool,
-    /// the handle, and the reassembly budget charge; release frees storage
-    /// through the pool authority first and refunds the charge after.
+    /// Reassembled chunked transfer. Consuming it copies logical bytes and
+    /// releases the local backing and its budget charge before callback entry.
     Handle(ReassemblyBacking),
 }
 
 impl RequestData {
-    fn copy_bytes(&self) -> Result<Vec<u8>, String> {
+    pub(crate) fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
         match self {
-            Self::Inline(data) => Ok(data.clone()),
-            Self::Shm(carrier) => carrier.copy_bytes(),
-            Self::Handle(backing) => backing
-                .copy_bytes()
-                .map_err(|error| format!("request handle copy failed: {error}")),
-        }
-    }
-
-    fn release(&mut self) -> Result<(), String> {
-        match self {
-            Self::Inline(_) => Ok(()),
-            Self::Shm(carrier) => carrier.release(),
-            Self::Handle(backing) => backing
-                .release()
-                .map_err(|error| format!("request handle release failed: {error}")),
-        }
-    }
-}
-
-/// Owns one request transport allocation until it is explicitly released.
-///
-/// `copy_bytes` validates and copies without changing transport ownership.
-/// `release` is idempotent and validates public coordinates before deriving a
-/// buddy allocation level. Dropping an unreleased lease performs the same
-/// best-effort cleanup.
-pub struct RequestLease {
-    request: Option<RequestData>,
-}
-
-impl RequestLease {
-    pub fn new(request: RequestData) -> Self {
-        Self {
-            request: Some(request),
-        }
-    }
-
-    pub fn copy_bytes(&self) -> Result<Vec<u8>, String> {
-        self.request
-            .as_ref()
-            .ok_or_else(|| "request lease is already released".to_string())?
-            .copy_bytes()
-    }
-
-    /// Failure retains the original carrier; success ends its release authority.
-    pub fn release(&mut self) -> Result<(), String> {
-        if let Some(request) = self.request.as_mut() {
-            request.release()?;
-        }
-        self.request.take();
-        Ok(())
-    }
-
-    /// Consume this obligation without another free or invalidation.
-    pub fn abandon(mut self) {
-        if let Some(request) = self.request.take() {
-            match request {
-                RequestData::Inline(_) => {}
-                RequestData::Shm(mut carrier) => carrier.abandon(),
-                RequestData::Handle(backing) => backing.abandon(),
+            Self::Inline(data) => Ok(data),
+            Self::Shm(carrier) => carrier.into_owned_bytes(),
+            Self::Handle(mut backing) => {
+                let copied = backing
+                    .copy_bytes()
+                    .map_err(|error| format!("request handle copy failed: {error}"));
+                backing.release();
+                copied
             }
         }
-    }
-
-    pub fn into_owned_bytes(mut self) -> Result<Vec<u8>, String> {
-        let Some(request) = self.request.take() else {
-            return Err("request lease is already released".to_string());
-        };
-        self.request = match request {
-            RequestData::Inline(data) => return Ok(data),
-            transport_request => Some(transport_request),
-        };
-        let copy_result = self.copy_bytes();
-        let release_result = self.release();
-        if release_result.is_err() {
-            self.abandon();
-        }
-        combine_copy_and_release("request", copy_result, release_result)
-    }
-}
-
-fn combine_copy_and_release(
-    kind: &str,
-    copy_result: Result<Vec<u8>, String>,
-    release_result: Result<(), String>,
-) -> Result<Vec<u8>, String> {
-    match (copy_result, release_result) {
-        (Ok(bytes), Ok(())) => Ok(bytes),
-        (Err(copy_error), Ok(())) => Err(copy_error),
-        (Ok(_), Err(release_error)) => Err(release_error),
-        (Err(copy_error), Err(release_error)) => Err(format!(
-            "{kind} copy failed: {copy_error}; {kind} release also failed: {release_error}"
-        )),
     }
 }
 
@@ -493,14 +265,14 @@ impl std::fmt::Debug for RequestData {
 /// Implementations may enter language runtimes internally, so callers should
 /// not hold unrelated runtime locks while invoking this callback.
 ///
-/// Uses pure Rust types (`RequestData`, `ResponseMeta`) in the trait
+/// Uses owned bytes and pure Rust response metadata in the trait
 /// interface; language bindings handle conversion at the boundary.
 pub trait CrmCallback: Send + Sync + 'static {
     fn invoke(
         &self,
         route_name: &str,
         method_idx: u16,
-        request: RequestData,
+        request: Vec<u8>,
         response_pool: Arc<crate::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError>;
 }
@@ -568,10 +340,6 @@ impl BuiltRoute {
         self.route.route_uid()
     }
 
-    pub fn route_revision(&self) -> u64 {
-        self.route.route_revision()
-    }
-
     pub fn crm_ns(&self) -> &str {
         self.route.crm_ns()
     }
@@ -611,8 +379,6 @@ pub(crate) struct CrmRoute {
     pub(crate) name: String,
     /// Unique identity for this committed route registration.
     pub(crate) route_uid: String,
-    /// Monotonic revision for this route identity. Starts at 1 on creation.
-    pub(crate) route_revision: u64,
     /// CRM namespace from the language-neutral contract descriptor.
     pub(crate) crm_ns: String,
     /// CRM contract class/model name from the language-neutral contract descriptor.
@@ -640,7 +406,6 @@ impl CrmRoute {
         Self {
             name: spec.name,
             route_uid: uuid::Uuid::new_v4().simple().to_string(),
-            route_revision: 1,
             crm_ns: spec.crm_ns,
             crm_name: spec.crm_name,
             crm_ver: spec.crm_ver,
@@ -667,10 +432,6 @@ impl CrmRoute {
 
     pub(crate) fn route_uid(&self) -> &str {
         &self.route_uid
-    }
-
-    pub(crate) fn route_revision(&self) -> u64 {
-        self.route_revision
     }
 
     pub(crate) fn crm_ns(&self) -> &str {
@@ -705,24 +466,35 @@ impl CrmRoute {
 /// Route dispatcher — resolves (route_name, method_idx) to CrmRoute.
 pub(crate) struct Dispatcher {
     routes: HashMap<String, Arc<CrmRoute>>,
+    removed: HashMap<String, String>,
 }
 
 impl Dispatcher {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
+            removed: HashMap::new(),
         }
     }
 
     /// Register a CRM route.
     pub fn register(&mut self, route: CrmRoute) {
         let name = route.name.clone();
+        self.removed.remove(&name);
         self.routes.insert(name, Arc::new(route));
     }
 
     /// Remove a CRM route. Returns the removed route if it existed.
     pub fn unregister(&mut self, name: &str) -> Option<Arc<CrmRoute>> {
-        self.routes.remove(name)
+        let route = self.routes.remove(name)?;
+        self.removed
+            .insert(name.to_owned(), route.route_uid.clone());
+        Some(route)
+    }
+
+    /// Identity of the latest removed registration for a route name.
+    pub(crate) fn removed_uid(&self, name: &str) -> Option<String> {
+        self.removed.get(name).cloned()
     }
 
     /// Resolve a route by explicit name.
@@ -737,7 +509,12 @@ impl Dispatcher {
 
     /// Remove and return all registered routes.
     pub fn take_all(&mut self) -> Vec<Arc<CrmRoute>> {
-        self.routes.drain().map(|(_, route)| route).collect()
+        let routes: Vec<_> = self.routes.drain().map(|(_, route)| route).collect();
+        for route in &routes {
+            self.removed
+                .insert(route.name.clone(), route.route_uid.clone());
+        }
+        routes
     }
 
     /// Number of registered routes.
@@ -762,6 +539,7 @@ mod tests {
     use super::*;
     use crate::scheduler::ConcurrencyMode;
     use c2_mem::PoolConfig;
+    use c2_wire::connection::WriteRequest;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -772,7 +550,7 @@ mod tests {
             &self,
             _route: &str,
             _method_idx: u16,
-            _request: RequestData,
+            _request: Vec<u8>,
             _response_pool: Arc<crate::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(b"echo".to_vec()))
@@ -783,7 +561,6 @@ mod tests {
         CrmRoute {
             name: name.to_string(),
             route_uid: format!("{name}-uid-0001"),
-            route_revision: 1,
             crm_ns: "test.grid".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "0.1.0".to_string(),
@@ -808,273 +585,114 @@ mod tests {
             min_block_size: 4096,
             max_segments: 1,
             max_dedicated_segments: 2,
-            dedicated_crash_timeout_secs: 5.0,
-            buddy_idle_decay_secs: 1.0,
             spill_threshold: 0.8,
-            spill_dir: std::env::temp_dir().join("c_two_request_data_test_spill"),
             ..PoolConfig::default()
         }
     }
 
-    fn request_pool_prefix() -> String {
-        format!(
-            "/c2rq{:08x}{:04x}",
-            std::process::id(),
-            REQUEST_POOL_SEQ.fetch_add(1, Ordering::Relaxed),
-        )
-    }
-
     fn request_test_pool() -> MemPool {
-        MemPool::new_with_prefix(request_pool_config(), request_pool_prefix()).unwrap()
+        let suffix = REQUEST_POOL_SEQ.fetch_add(1, Ordering::Relaxed);
+        MemPool::new_with_prefix(
+            request_pool_config(),
+            format!("/c2rq{:08x}{suffix:04x}", std::process::id()),
+        )
+        .unwrap()
     }
 
-    fn request_pool_with_reassembly_budget(limit: u64) -> Arc<parking_lot::RwLock<MemPool>> {
-        Arc::new(parking_lot::RwLock::new(
-            MemPool::new_with_prefix_and_budget(
-                request_pool_config(),
-                request_pool_prefix(),
-                c2_mem::MemoryBudget::new(8 * 1024 * 1024, 16 * 1024 * 1024, limit),
-            )
-            .unwrap(),
-        ))
-    }
-
-    #[test]
-    fn request_data_inline_materializes_owned_bytes() {
-        assert_eq!(
-            RequestLease::new(RequestData::Inline(b"inline".to_vec()))
-                .into_owned_bytes()
-                .unwrap(),
-            b"inline",
-        );
+    fn server_core() -> ConnectionCore {
+        let core = ConnectionCore::new(c2_wire::connection::ConnectionSide::Server, || {});
+        core.finish_handshake().unwrap();
+        core
     }
 
     #[test]
-    fn request_lease_copy_retains_backing_until_idempotent_release() {
+    fn inline_request_moves_owned_bytes() {
+        let bytes = b"inline".to_vec();
+        let pointer = bytes.as_ptr();
+        let received = RequestData::Inline(bytes).into_owned_bytes().unwrap();
+        assert_eq!(received, b"inline");
+        assert_eq!(received.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn peer_request_copy_ends_remote_read_and_queues_release() {
+        let mut owner = request_test_pool();
         let payload = b"borrowed request".repeat(128);
-        let mut pool = request_test_pool();
-        let mut handle = pool.alloc_handle(payload.len()).unwrap();
-        pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
-        let coordinates = handle.shm_allocation().unwrap();
-        let pool = Arc::new(parking_lot::RwLock::new(pool));
-        let mut lease = RequestLease::new(RequestData::Shm(PeerShmRequest::admit(
-            Arc::clone(&pool),
-            u16::try_from(coordinates.seg_idx).unwrap(),
-            coordinates.generation,
-            coordinates.offset,
-            u32::try_from(payload.len()).unwrap(),
-            coordinates.is_dedicated,
-            coordinates.allocation_id,
-            pool.read().budget().unwrap().clone(),
-        )));
-
-        assert_eq!(lease.copy_bytes().unwrap(), payload);
-        assert_eq!(pool.read().stats().alloc_count, 1);
-        lease.release().unwrap();
-        lease.release().unwrap();
-        assert_eq!(pool.read().stats().alloc_count, 0);
-    }
-
-    #[test]
-    fn request_data_shm_materializes_and_releases_buddy_and_dedicated_allocations() {
-        for payload in [b"buddy".repeat(32), b"dedicated".repeat(5000)] {
-            let mut pool = request_test_pool();
-            let mut handle = pool.alloc_handle(payload.len()).unwrap();
-            pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
-            let coordinates = handle.shm_allocation().unwrap();
-            let pool = Arc::new(parking_lot::RwLock::new(pool));
-            let request = RequestData::Shm(PeerShmRequest::admit(
-                Arc::clone(&pool),
-                u16::try_from(coordinates.seg_idx).unwrap(),
-                coordinates.generation,
-                coordinates.offset,
-                u32::try_from(payload.len()).unwrap(),
-                coordinates.is_dedicated,
-                coordinates.allocation_id,
-                pool.read().budget().unwrap().clone(),
-            ));
-
-            assert_eq!(
-                RequestLease::new(request).into_owned_bytes().unwrap(),
-                payload
-            );
-            assert_eq!(pool.read().stats().alloc_count, 0);
-        }
-    }
-
-    #[test]
-    fn dedicated_request_replay_is_rejected_before_copy() {
-        let mut producer = request_test_pool();
-        let handle = producer.alloc_shm_handle(65537).unwrap();
-        let a = handle.shm_allocation().unwrap();
-        assert!(a.is_dedicated);
-        let budget = producer.budget().unwrap().clone();
+        let mut handle = owner.alloc_shm_handle(payload.len()).unwrap();
+        owner
+            .handle_slice_mut(&mut handle)
+            .copy_from_slice(&payload);
+        let allocation = handle.shm_allocation().unwrap();
         let peer = Arc::new(parking_lot::RwLock::new(
-            MemPool::open_peer(request_pool_config(), producer.prefix().to_owned()).unwrap(),
+            MemPool::open_peer(request_pool_config(), owner.prefix().to_owned()).unwrap(),
         ));
-        let admit = || {
-            PeerShmRequest::admit(
-                peer.clone(),
-                a.seg_idx as u16,
-                a.generation,
-                a.offset,
-                65537,
-                true,
-                a.allocation_id,
-                budget.clone(),
-            )
+        let core = server_core();
+        let loan = core.admit_remote_loan(7, Box::new(())).unwrap();
+        let descriptor = BuddyPayload {
+            seg_idx: allocation.seg_idx as u16,
+            generation: allocation.generation,
+            offset: allocation.offset,
+            data_size: payload.len() as u32,
+            is_dedicated: allocation.is_dedicated,
+            loan_id: 7,
         };
-        let first = admit();
-        first.ensure_mapped().unwrap();
-        let mut first = RequestLease::new(RequestData::Shm(first));
-        assert_eq!(first.copy_bytes().unwrap().len(), 65537);
-        first.release().unwrap();
-        let mut replay = admit();
-        assert!(
-            replay
-                .ensure_mapped()
-                .unwrap_err()
-                .contains("already been released")
+        let carrier = PeerShmRequest::admit(peer, descriptor, loan).unwrap();
+        assert_eq!(
+            RequestData::Shm(carrier).into_owned_bytes().unwrap(),
+            payload
         );
+        assert_eq!(owner.stats().alloc_count, 1);
         assert!(
-            replay
-                .release()
-                .unwrap_err()
-                .contains("already been released")
+            !core
+                .begin_write(WriteRequest::Releases)
+                .unwrap()
+                .unwrap()
+                .release_bytes()
+                .is_empty()
         );
-        replay.abandon();
-        assert_eq!(budget.snapshot().abandoned_releases, 1);
-        producer.release_handle(handle).unwrap();
-        producer.gc_dedicated();
-        assert_eq!(producer.stats().dedicated_segments, 0);
+        owner.release_handle(handle);
     }
 
     #[test]
-    fn request_data_shm_rejects_invalid_span_without_freeing_unproven_coordinates() {
-        let mut pool = request_test_pool();
-        let live = pool.alloc_handle(4096).unwrap();
-        let capacity = pool
-            .segment(live.shm_allocation().unwrap().seg_idx as usize)
-            .unwrap()
-            .allocator()
-            .data_size();
-        let coordinates = live.shm_allocation().unwrap();
-        let pool = Arc::new(parking_lot::RwLock::new(pool));
-        // In-crate admission of a deliberately invalid span: an outside
-        // caller cannot construct this carrier at all.
-        let request = RequestData::Shm(PeerShmRequest::admit(
-            Arc::clone(&pool),
-            u16::try_from(coordinates.seg_idx).unwrap(),
-            coordinates.generation,
-            u32::try_from(capacity - 1).unwrap(),
-            2,
-            false,
-            coordinates.allocation_id,
-            pool.read().budget().unwrap().clone(),
+    fn invalid_peer_span_still_queues_release() {
+        let mut owner = request_test_pool();
+        let handle = owner.alloc_shm_handle(4096).unwrap();
+        let allocation = handle.shm_allocation().unwrap();
+        let peer = Arc::new(parking_lot::RwLock::new(
+            MemPool::open_peer(request_pool_config(), owner.prefix().to_owned()).unwrap(),
         ));
-
+        let core = server_core();
+        let loan = core.admit_remote_loan(9, Box::new(())).unwrap();
+        let descriptor = BuddyPayload {
+            seg_idx: allocation.seg_idx as u16,
+            generation: allocation.generation,
+            offset: u32::MAX,
+            data_size: 2,
+            is_dedicated: allocation.is_dedicated,
+            loan_id: 9,
+        };
+        assert!(PeerShmRequest::admit(peer, descriptor, loan).is_err());
         assert!(
-            RequestLease::new(request)
-                .into_owned_bytes()
-                .unwrap_err()
-                .contains("outside buddy segment")
+            !core
+                .begin_write(WriteRequest::Releases)
+                .unwrap()
+                .unwrap()
+                .release_bytes()
+                .is_empty()
         );
-        assert_eq!(pool.read().stats().alloc_count, 1);
-        pool.write().release_handle(live).unwrap();
-        assert_eq!(pool.read().stats().alloc_count, 0);
+        owner.release_handle(handle);
     }
 
     #[test]
-    fn request_data_handle_materializes_and_releases_reassembly_allocation() {
-        use c2_wire::chunk::ReassemblyBacking;
-
+    fn reassembly_request_copies_then_releases_local_backing() {
         let payload = b"reassembled".repeat(512);
-        for logical_len in [payload.len(), 4096, 1, 0] {
-            let pool = Arc::new(parking_lot::RwLock::new(request_test_pool()));
-            let mut backing =
-                ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
-            backing.write_at(0, &payload).unwrap();
-            backing.trim_to(logical_len).unwrap();
-            let request = RequestData::Handle(backing);
-
-            assert_eq!(
-                RequestLease::new(request).into_owned_bytes().unwrap(),
-                payload[..logical_len]
-            );
-            assert_eq!(pool.read().stats().alloc_count, 0);
-        }
-    }
-
-    #[test]
-    fn file_spill_request_lease_preserves_trim_and_release_state() {
-        use c2_wire::chunk::ReassemblyBacking;
-
-        let payload = b"file-backed request".repeat(256);
-        for logical_len in [payload.len(), 1, 0] {
-            let pool = Arc::new(parking_lot::RwLock::new(
-                MemPool::new(PoolConfig {
-                    spill_threshold: 0.0,
-                    ..PoolConfig::default()
-                })
-                .unwrap(),
-            ));
-            let mut backing =
-                ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
-            assert!(backing.is_file_spill());
-            backing.write_at(0, &payload).unwrap();
-            backing.trim_to(logical_len).unwrap();
-            #[cfg(windows)]
-            let path = backing.file_spill_path().unwrap();
-            let mut lease = RequestLease::new(RequestData::Handle(backing));
-            #[cfg(windows)]
-            assert!(path.exists());
-            assert_eq!(lease.copy_bytes().unwrap(), payload[..logical_len]);
-            lease.release().unwrap();
-            lease.release().unwrap();
-            assert!(lease.copy_bytes().unwrap_err().contains("already released"));
-            #[cfg(windows)]
-            assert!(!path.exists());
-        }
-    }
-
-    #[test]
-    fn contended_reassembly_request_release_retains_backing_for_real_retry() {
-        use c2_mem::{BuddySegment, SegmentHeader, ShmSpinlock};
-        use c2_wire::chunk::ReassemblyBacking;
-        use std::mem::offset_of;
-
-        // Exact-fit reassembly budget: a first release failing on real SHM
-        // contention must keep the backing so the retry after unlock frees
-        // storage, refunds the charge, and re-admits the same capacity.
-        let capacity = 4096usize;
-        let pool = request_pool_with_reassembly_budget(capacity as u64);
-        let backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, capacity).unwrap();
-        let mut lease = RequestLease::new(RequestData::Handle(backing));
-
-        let name = pool.read().segment_name(0).unwrap().to_string();
-        let word = pool.read().segment(0).unwrap().base_ptr();
-        let lock = unsafe { ShmSpinlock::new(word.add(offset_of!(SegmentHeader, spinlock))) };
-        lock.try_lock().unwrap();
-
-        let first = lease.release();
-        lock.unlock();
-        let second = lease.release();
-        let live_after = pool.read().stats().alloc_count;
-        let snapshot = pool.read().budget().unwrap().snapshot();
-        let charge_after = snapshot.reassembly.used_bytes;
-        let readmitted = ReassemblyBacking::admit(Arc::clone(&pool), 1, capacity)
-            .map(|mut again| again.release().is_ok())
-            .unwrap_or(false);
-        pool.write().destroy();
-        let reopened = BuddySegment::open(&name, 64 * 1024);
-
-        let first_error = first.expect_err("contended request release must fail");
-        assert!(first_error.contains("spin budget"), "got: {first_error}");
-        assert!(second.is_ok(), "retry must succeed: {second:?}");
-        assert_eq!(live_after, 0, "retry must free the allocation");
-        assert_eq!(charge_after, 0, "retry must refund the charge");
-        assert!(readmitted, "same-capacity admission must succeed again");
-        assert!(reopened.is_err(), "SHM gone after destroy");
+        let pool = Arc::new(parking_lot::RwLock::new(request_test_pool()));
+        let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
+        backing.write_at(0, &payload).unwrap();
+        backing.trim_to(4096).unwrap();
+        let bytes = RequestData::Handle(backing).into_owned_bytes().unwrap();
+        assert_eq!(bytes, payload[..4096]);
+        assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     #[test]
@@ -1092,12 +710,7 @@ mod tests {
         ));
         let result = route
             .callback
-            .invoke(
-                "grid",
-                0,
-                RequestData::Inline(b"test".to_vec()),
-                pool.clone(),
-            )
+            .invoke("grid", 0, b"test".to_vec(), pool.clone())
             .unwrap();
         assert!(matches!(result, ResponseMeta::Inline(ref v) if v == b"echo"));
     }
@@ -1131,7 +744,18 @@ mod tests {
 
         assert!(d.unregister("grid").is_some());
         assert!(d.resolve("grid").is_none());
+        assert_eq!(d.removed_uid("grid"), Some("grid-uid-0001".into()));
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn registering_again_clears_removed_identity() {
+        let mut d = Dispatcher::new();
+        d.register(make_route("grid"));
+        d.unregister("grid");
+        assert!(d.removed_uid("grid").is_some());
+        d.register(make_route("grid"));
+        assert!(d.removed_uid("grid").is_none());
     }
 
     #[test]
@@ -1195,7 +819,7 @@ mod tests {
                 &self,
                 _route: &str,
                 _method_idx: u16,
-                _request: RequestData,
+                _request: Vec<u8>,
                 _response_pool: Arc<crate::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 Err(CrmError::InternalError("method not found".into()))
@@ -1206,9 +830,7 @@ mod tests {
             MemPool::new(PoolConfig::default()).unwrap(),
         ));
         let cb: Arc<dyn CrmCallback> = Arc::new(FailCallback);
-        let err = cb
-            .invoke("grid", 99, RequestData::Inline(b"test".to_vec()), pool)
-            .unwrap_err();
+        let err = cb.invoke("grid", 99, b"test".to_vec(), pool).unwrap_err();
         assert!(matches!(err, CrmError::InternalError(_)));
     }
 }

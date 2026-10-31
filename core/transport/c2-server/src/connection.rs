@@ -1,19 +1,17 @@
 //! Per-client connection state.
 //!
-//! Tracks handshake status, the peer SHM cache, activity timestamps, and
-//! in-flight request counting for one IPC peer.
+//! Tracks one physical IPC peer and projects its shared connection core.
 
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::time::Instant;
-
 use tokio::sync::Notify;
 
 use c2_config::MAX_IPC_POOL_SEGMENTS;
-use c2_local::{ConnectionEndReason, ConnectionObservation, ConnectionPublisher};
+use c2_local::{ConnectionEndReason, ConnectionObservation, ConnectionPublisher, RemoteReadGuard};
 use c2_mem::MemPool;
 use c2_mem::config::PoolConfig;
+use c2_wire::connection::{ConnectionCore, ConnectionError, ConnectionSide};
 
 // ---------------------------------------------------------------------------
 // Peer SHM state (set once during handshake, read concurrently)
@@ -24,13 +22,38 @@ use c2_mem::config::PoolConfig;
 const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
 
 struct PeerShmState {
-    /// MemPool opened over the client's SHM segments for data access + free.
+    /// MemPool opened over the client's SHM segments for data access.
     pool: Option<Arc<RwLock<MemPool>>>,
 }
 
 impl PeerShmState {
     fn new() -> Self {
         Self { pool: None }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PendingEnd {
+    Explicit {
+        reason: ConnectionEndReason,
+        operation: &'static str,
+    },
+    Read {
+        operation: &'static str,
+        kind: std::io::ErrorKind,
+        os_error: Option<i32>,
+    },
+    Io {
+        operation: &'static str,
+        kind: std::io::ErrorKind,
+        os_error: Option<i32>,
+    },
+}
+
+fn restore_error(kind: std::io::ErrorKind, os_error: Option<i32>) -> std::io::Error {
+    match os_error {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(kind, "connection I/O ended"),
     }
 }
 
@@ -55,6 +78,8 @@ impl Drop for FlightGuard<'_> {
 
 /// Per-client connection state.
 pub struct Connection {
+    pub(crate) core: ConnectionCore,
+    pub(crate) writer_wake: Arc<Notify>,
     conn_id: u64,
     ordinary_protocol: AtomicBool,
     handshake_done: AtomicBool,
@@ -80,8 +105,10 @@ pub struct Connection {
     /// Client's SHM pool incarnation prefix and opened peer cache.
     peer_shm: Mutex<PeerShmState>,
 
-    /// Monotonic timestamp of the last frame received/sent.
-    last_activity: Mutex<Instant>,
+    /// Retain the accepted OS stream until the last admitted remote read ends.
+    remote_read_guard: Mutex<Option<Arc<RemoteReadGuard>>>,
+    /// The first requested end is retained until the physical stream retires.
+    first_end: Mutex<Option<PendingEnd>>,
 
     /// Number of requests currently being processed.
     inflight: AtomicI32,
@@ -96,8 +123,7 @@ pub struct Connection {
 impl Connection {
     /// Create a new connection with the given `conn_id`.
     ///
-    /// All fields start at their default/empty state; `last_activity` is set
-    /// to the current instant.
+    /// All fields start at their default/empty state.
     pub fn new(conn_id: u64) -> Self {
         let connection = Self::with_publisher(
             conn_id,
@@ -112,7 +138,14 @@ impl Connection {
     }
 
     fn with_publisher(conn_id: u64, publisher: ConnectionPublisher) -> Self {
+        let writer_wake = Arc::new(Notify::new());
+        let notify = writer_wake.clone();
         Self {
+            core: ConnectionCore::new(ConnectionSide::Server, move || {
+                notify.notify_waiters();
+                notify.notify_one();
+            }),
+            writer_wake,
             conn_id,
             ordinary_protocol: AtomicBool::new(false),
             handshake_done: AtomicBool::new(false),
@@ -121,7 +154,8 @@ impl Connection {
             shm_request_capable: AtomicBool::new(false),
             shm_response_capable: AtomicBool::new(false),
             peer_shm: Mutex::new(PeerShmState::new()),
-            last_activity: Mutex::new(Instant::now()),
+            remote_read_guard: Mutex::new(None),
+            first_end: Mutex::new(None),
             inflight: AtomicI32::new(0),
             idle_notify: Notify::new(),
             publisher,
@@ -145,23 +179,97 @@ impl Connection {
     }
 
     pub(crate) fn end(&self, reason: ConnectionEndReason, operation: &'static str) {
-        self.publisher.close(reason, operation, None);
+        self.record_end(PendingEnd::Explicit { reason, operation });
+        drop(self.core.deactivate());
     }
 
     pub(crate) fn end_read(&self, operation: &'static str, error: &std::io::Error) {
-        self.publisher.close_read_error(operation, error);
+        self.record_end(PendingEnd::Read {
+            operation,
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        });
+        drop(self.core.deactivate());
     }
 
     pub(crate) fn end_io(&self, operation: &'static str, error: &std::io::Error) {
-        self.publisher.close_io(operation, error);
+        self.record_end(PendingEnd::Io {
+            operation,
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        });
+        drop(self.core.deactivate());
+    }
+
+    fn record_end(&self, end: PendingEnd) {
+        self.first_end.lock().get_or_insert(end);
+    }
+
+    /// Publish the final retained reason at the close-ready boundary.
+    /// The caller has joined the writer and is about to drop the final stream
+    /// owners; this wins over c2-local's fallback retirement reason.
+    pub(crate) fn publish_physical_close(&self) {
+        let end = *self.first_end.lock();
+        match end {
+            Some(PendingEnd::Explicit { reason, operation }) => {
+                self.publisher.close(reason, operation, None);
+            }
+            Some(PendingEnd::Read {
+                operation,
+                kind,
+                os_error,
+            }) => {
+                self.publisher
+                    .close_read_error(operation, &restore_error(kind, os_error));
+            }
+            Some(PendingEnd::Io {
+                operation,
+                kind,
+                os_error,
+            }) => {
+                self.publisher
+                    .close_io(operation, &restore_error(kind, os_error));
+            }
+            None => {
+                self.publisher
+                    .close(ConnectionEndReason::LocalClose, "stream_retired", None);
+            }
+        }
+    }
+
+    pub(crate) fn install_remote_read_guard(&self, guard: RemoteReadGuard) {
+        *self.remote_read_guard.lock() = Some(Arc::new(guard));
+    }
+
+    pub(crate) fn remote_read_guard(&self) -> Arc<RemoteReadGuard> {
+        self.remote_read_guard
+            .lock()
+            .as_ref()
+            .expect("accepted stream guard installed")
+            .clone()
+    }
+
+    pub(crate) fn try_close(&self) -> bool {
+        self.core.try_close()
+    }
+
+    pub(crate) fn clear_remote_read_guard(&self) {
+        self.remote_read_guard.lock().take();
     }
 
     pub fn handshake_done(&self) -> bool {
         self.handshake_done.load(Ordering::Relaxed)
     }
 
-    pub fn set_handshake_done(&self, v: bool) {
-        self.handshake_done.store(v, Ordering::Relaxed);
+    pub fn set_handshake_done(&self, v: bool) -> Result<(), ConnectionError> {
+        if !v {
+            return Err(ConnectionError::ProtocolViolation(
+                "handshake completion cannot be undone".into(),
+            ));
+        }
+        self.core.finish_handshake()?;
+        self.handshake_done.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub fn chunked_capable(&self) -> bool {
@@ -228,8 +336,7 @@ impl Connection {
             segment_size: MIN_BUDDY_SEGMENT_SIZE,
             min_block_size: 4096,
             max_segments: MAX_IPC_POOL_SEGMENTS as usize,
-            max_dedicated_segments: 4,
-            dedicated_crash_timeout_secs: 0.0,
+            max_dedicated_segments: MAX_IPC_POOL_SEGMENTS as usize,
             buddy_idle_decay_secs: 60.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c_two_request_cache"),
@@ -239,16 +346,6 @@ impl Connection {
         let pool = MemPool::open_peer(cfg, prefix)?;
         self.peer_shm.lock().pool = Some(Arc::new(RwLock::new(pool)));
         Ok(())
-    }
-
-    /// Record activity — updates the last-activity timestamp to *now*.
-    pub fn touch(&self) {
-        *self.last_activity.lock() = Instant::now();
-    }
-
-    /// Seconds elapsed since the last `touch()`.
-    pub fn idle_seconds(&self) -> f64 {
-        self.last_activity.lock().elapsed().as_secs_f64()
     }
 
     /// Mark a new request as in-flight.
@@ -271,11 +368,19 @@ impl Connection {
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.publisher.is_closed()
+        self.core.is_deactivated()
     }
 
     pub(crate) async fn wait_cancelled(&self) {
-        self.connection_observation().wait_closed(None).await;
+        loop {
+            let notified = self.writer_wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Current number of in-flight requests.
@@ -336,28 +441,6 @@ mod tests {
         conn.init_peer_shm("prefix".into()).unwrap();
         assert_eq!(conn.peer_pool_arc().unwrap().read().prefix(), "prefix");
         assert_eq!(conn.peer_pool_arc().unwrap().read().segment_count(), 0);
-    }
-
-    #[test]
-    fn touch_updates_activity() {
-        let conn = Connection::new(1);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let idle_before = conn.idle_seconds();
-        assert!(idle_before >= 0.015, "idle_before={idle_before}");
-        conn.touch();
-        let idle_after = conn.idle_seconds();
-        assert!(
-            idle_after < idle_before,
-            "touch should reset idle: before={idle_before}, after={idle_after}"
-        );
-    }
-
-    #[test]
-    fn idle_seconds_increases() {
-        let conn = Connection::new(1);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let idle = conn.idle_seconds();
-        assert!(idle >= 0.04, "idle={idle}");
     }
 
     #[test]

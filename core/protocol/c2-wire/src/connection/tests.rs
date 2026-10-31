@@ -41,7 +41,10 @@ fn published(core: &ConnectionCore) -> (u64, MemoryBudget, WriteBatch) {
     let (pool, budget, handle) = allocation();
     let loan = core.prepare_loan(pool, handle).unwrap();
     let id = loan.id();
-    let mut write = core.begin_write(vec![loan], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![loan]))
+        .unwrap()
+        .unwrap();
     write.begin_io().unwrap();
     (id, budget, write)
 }
@@ -65,7 +68,10 @@ fn cancellation_before_first_write_releases_the_prepared_owner() {
     let core = established(ConnectionSide::Client);
     let (pool, budget, handle) = allocation();
     let loan = core.prepare_loan(pool, handle).unwrap();
-    let write = core.begin_write(vec![loan], true).unwrap().unwrap();
+    let write = core
+        .begin_write(WriteRequest::Business(vec![loan]))
+        .unwrap()
+        .unwrap();
     drop(write);
     assert_eq!(budget.snapshot().file.used_bytes, 0);
     assert!(!core.is_deactivated());
@@ -96,10 +102,10 @@ fn remote_read_drop_queues_release_and_wakes_idle_writer() {
     });
     core.finish_handshake().unwrap();
     let node = core.admit_remote_loan(17, Box::new(())).unwrap();
-    assert!(core.begin_write(vec![], false).unwrap().is_none());
+    assert!(core.begin_write(WriteRequest::Releases).unwrap().is_none());
     drop(node);
     assert!(wakes.load(Ordering::SeqCst) > 0);
-    let mut write = core.begin_write(vec![], false).unwrap().unwrap();
+    let mut write = core.begin_write(WriteRequest::Releases).unwrap().unwrap();
     let (header, payload) = decode_frame(write.release_bytes()).unwrap();
     assert_eq!(header.flags, FLAG_CTRL | FLAG_RESPONSE);
     assert_eq!(
@@ -210,7 +216,10 @@ fn sequence_exhaustion_issues_last_u64_then_stops_without_wrapping() {
     let (pool, retained, handle) = allocation();
     let last = core.prepare_loan_from(pool, handle, &sequence).unwrap();
     assert_eq!(last.id(), u64::MAX);
-    let mut write = core.begin_write(vec![last], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![last]))
+        .unwrap()
+        .unwrap();
     write.begin_io().unwrap();
     write.frame_completed();
     write.flush_completed();
@@ -232,14 +241,18 @@ fn deactivation_between_reservation_and_io_revokes_unpublished_owner() {
     let core = established(ConnectionSide::Client);
     let (pool, budget, handle) = allocation();
     let loan = core.prepare_loan(pool, handle).unwrap();
-    let mut write = core.begin_write(vec![loan], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![loan]))
+        .unwrap()
+        .unwrap();
     let reclaims = core.deactivate();
     assert!(!core.try_close()); // actual allocator release has not completed
     assert_eq!(write.begin_io(), Err(ConnectionError::Deactivated));
     reclaims.release();
     assert_eq!(budget.snapshot().file.used_bytes, 0);
-    assert!(core.try_close());
+    assert!(!core.try_close());
     drop(write);
+    assert!(core.try_close());
     let (pool, rejected, handle) = allocation();
     assert!(matches!(
         core.prepare_loan(pool, handle),
@@ -259,7 +272,7 @@ fn partial_write_cancellation_keeps_loans_and_never_replays_release_prefix() {
     assert!(core.is_deactivated());
     assert_eq!(budget.snapshot().file.used_bytes, 512);
     assert!(matches!(
-        core.begin_write(vec![], false),
+        core.begin_write(WriteRequest::Releases),
         Err(ConnectionError::WriterBroken)
     ));
     let outcome = receive(&core, &[id], true);
@@ -290,7 +303,10 @@ fn release_queue_batches_and_cosubmits_with_one_business_frame() {
     for id in 1..=130 {
         core.admit_remote_loan(id, Box::new(())).unwrap().finish();
     }
-    let mut write = core.begin_write(vec![], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![]))
+        .unwrap()
+        .unwrap();
     let (ids, frames) = release_ids(write.release_bytes(), true);
     assert_eq!(ids, (1..=130).collect::<Vec<_>>());
     assert_eq!(frames, 3);
@@ -312,28 +328,34 @@ fn release_queue_batches_and_cosubmits_with_one_business_frame() {
 #[test]
 fn releases_wait_for_current_frame_and_advance_between_chunks() {
     let core = established(ConnectionSide::Client);
-    let mut first = core.begin_write(vec![], true).unwrap().unwrap();
+    let mut first = core
+        .begin_write(WriteRequest::Business(vec![]))
+        .unwrap()
+        .unwrap();
     first.begin_io().unwrap();
     core.admit_remote_loan(7, Box::new(())).unwrap().finish();
     assert!(matches!(
-        core.begin_write(vec![], false),
+        core.begin_write(WriteRequest::Releases),
         Err(ConnectionError::WriterBusy)
     ));
     first.frame_completed();
     first.flush_completed();
-    let mut second = core.begin_write(vec![], true).unwrap().unwrap();
+    let mut second = core
+        .begin_write(WriteRequest::Business(vec![]))
+        .unwrap()
+        .unwrap();
     assert_eq!(release_ids(second.release_bytes(), false).0, [7]);
     assert_eq!(second.frame_count(), 2);
     second.begin_io().unwrap();
     second.frame_completed();
     core.admit_remote_loan(8, Box::new(())).unwrap().finish();
     assert!(matches!(
-        core.begin_write(vec![], false),
+        core.begin_write(WriteRequest::Releases),
         Err(ConnectionError::WriterBusy)
     ));
     second.frame_completed();
     second.flush_completed();
-    let mut idle = core.begin_write(vec![], false).unwrap().unwrap();
+    let mut idle = core.begin_write(WriteRequest::Releases).unwrap().unwrap();
     assert_eq!(release_ids(idle.release_bytes(), false).0, [8]);
     idle.begin_io().unwrap();
     idle.frame_completed();
@@ -346,7 +368,10 @@ fn cancelled_unsubmitted_prefix_restores_fifo_even_with_new_admissions() {
     for id in 1..=130 {
         core.admit_remote_loan(id, Box::new(())).unwrap().finish();
     }
-    let write = core.begin_write(vec![], true).unwrap().unwrap();
+    let write = core
+        .begin_write(WriteRequest::Business(vec![]))
+        .unwrap()
+        .unwrap();
     let mut nodes = Vec::new();
     for id in 131..=194 {
         nodes.push(core.admit_remote_loan(id, Box::new(())).unwrap());
@@ -357,7 +382,7 @@ fn cancelled_unsubmitted_prefix_restores_fifo_even_with_new_admissions() {
     let capacity = core.shared.state.lock().releases.capacity();
     drop(write);
     assert_eq!(core.shared.state.lock().releases.capacity(), capacity);
-    let mut retry = core.begin_write(vec![], false).unwrap().unwrap();
+    let mut retry = core.begin_write(WriteRequest::Releases).unwrap().unwrap();
     let (ids, frames) = release_ids(retry.release_bytes(), false);
     assert_eq!(ids, (1..=194).collect::<Vec<_>>());
     assert_eq!(frames, 4);
@@ -427,7 +452,10 @@ fn peer_end_before_first_write_fences_publication() {
     let core = established(ConnectionSide::Client);
     let (pool, budget, handle) = allocation();
     let loan = core.prepare_loan(pool, handle).unwrap();
-    let mut write = core.begin_write(vec![loan], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![loan]))
+        .unwrap()
+        .unwrap();
     core.peer_end().release();
     assert_eq!(write.begin_io(), Err(ConnectionError::PeerEnded));
     drop(write);
@@ -441,7 +469,10 @@ fn release_reclaims_do_not_take_pool_lock_in_the_receive_state_machine() {
     let (pool, budget, handle) = allocation();
     let loan = core.prepare_loan(pool.clone(), handle).unwrap();
     let id = loan.id();
-    let mut write = core.begin_write(vec![loan], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![loan]))
+        .unwrap()
+        .unwrap();
     write.begin_io().unwrap();
     write.frame_completed();
     write.flush_completed();
@@ -550,7 +581,7 @@ fn remote_node_drop_allocates_nothing_with_a_reserved_prefix_in_flight() {
     for node in nodes {
         node.finish();
     }
-    let write = core.begin_write(vec![], false).unwrap().unwrap();
+    let write = core.begin_write(WriteRequest::Releases).unwrap().unwrap();
     let mut nodes = Vec::new();
     for id in 131..=260 {
         nodes.push(core.admit_remote_loan(id, Box::new(())).unwrap());
@@ -561,7 +592,7 @@ fn remote_node_drop_allocates_nothing_with_a_reserved_prefix_in_flight() {
     TRACK_ALLOCATIONS.with(|on| on.set(false));
     assert_eq!(ALLOCATIONS.with(|count| count.get()), 0);
     drop(write); // restores original prefix into its reserved queue positions
-    let next = core.begin_write(vec![], false).unwrap().unwrap();
+    let next = core.begin_write(WriteRequest::Releases).unwrap().unwrap();
     assert_eq!(
         release_ids(next.release_bytes(), true).0,
         (1..=260).collect::<Vec<_>>()
@@ -598,12 +629,12 @@ fn copy_failure_unwind_ends_read_and_queues_exactly_one_record() {
         panic!("injected copy failure");
     }));
     assert!(result.is_err());
-    let mut write = core.begin_write(vec![], false).unwrap().unwrap();
+    let mut write = core.begin_write(WriteRequest::Releases).unwrap().unwrap();
     assert_eq!(release_ids(write.release_bytes(), false), (vec![71], 1));
     write.begin_io().unwrap();
     write.frame_completed();
     write.flush_completed();
-    assert!(core.begin_write(vec![], false).unwrap().is_none());
+    assert!(core.begin_write(WriteRequest::Releases).unwrap().is_none());
 }
 
 #[test]
@@ -679,7 +710,10 @@ fn real_shm_release_and_peer_end_consume_each_original_handle_once() {
     let (pool, _budget, handle) = shm_allocation();
     let first = core.prepare_loan(pool.clone(), handle).unwrap();
     let first_id = first.id();
-    let mut write = core.begin_write(vec![first], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![first]))
+        .unwrap()
+        .unwrap();
     write.begin_io().unwrap();
     write.frame_completed();
     write.flush_completed();
@@ -689,7 +723,10 @@ fn real_shm_release_and_peer_end_consume_each_original_handle_once() {
     let second = core
         .prepare_loan(pool.clone(), pool.write().alloc_handle(512).unwrap())
         .unwrap();
-    let mut write = core.begin_write(vec![second], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![second]))
+        .unwrap()
+        .unwrap();
     write.begin_io().unwrap();
     write.frame_completed();
     write.flush_completed();
@@ -702,7 +739,10 @@ fn final_core_drop_does_not_free_unconfirmed_shm_from_a_live_original_pool() {
     let core = established(ConnectionSide::Server);
     let (pool, budget, handle) = shm_allocation();
     let loan = core.prepare_loan(pool.clone(), handle).unwrap();
-    let mut write = core.begin_write(vec![loan], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![loan]))
+        .unwrap()
+        .unwrap();
     write.begin_io().unwrap();
     write.frame_completed();
     write.flush_completed();
@@ -716,7 +756,10 @@ fn final_core_drop_does_not_free_unconfirmed_shm_from_a_live_original_pool() {
 #[test]
 fn review_started_inline_frame_must_finish_before_physical_close() {
     let core = established(ConnectionSide::Client);
-    let mut write = core.begin_write(vec![], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![]))
+        .unwrap()
+        .unwrap();
     write.begin_io().unwrap();
     core.deactivate().release();
     assert!(
@@ -731,11 +774,14 @@ fn review_started_inline_frame_must_finish_before_physical_close() {
 #[test]
 fn review_writer_is_not_available_until_flush_has_resolved() {
     let core = established(ConnectionSide::Client);
-    let mut write = core.begin_write(vec![], true).unwrap().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Business(vec![]))
+        .unwrap()
+        .unwrap();
     write.begin_io().unwrap();
     write.frame_completed();
     assert!(matches!(
-        core.begin_write(vec![], true),
+        core.begin_write(WriteRequest::Business(vec![])),
         Err(ConnectionError::WriterBusy)
     ));
     write.write_failed();
@@ -752,4 +798,153 @@ fn review_cancellation_during_flush_keeps_uncertain_loan_and_deactivates() {
     assert_eq!(budget.snapshot().file.used_bytes, 512);
     core.peer_end().release();
     assert_eq!(budget.snapshot().file.used_bytes, 0);
+}
+
+#[test]
+fn queued_control_keeps_deactivated_connection_open_through_flush() {
+    let core = established(ConnectionSide::Server);
+    let control = core.prepare_control_frame().unwrap();
+    core.deactivate().release();
+    assert!(!core.try_close());
+    assert!(matches!(
+        core.begin_write(WriteRequest::Business(vec![])),
+        Err(ConnectionError::Deactivated)
+    ));
+    let mut write = core
+        .begin_write(WriteRequest::Control(control))
+        .unwrap()
+        .unwrap();
+    assert_eq!(write.frame_count(), 1);
+    assert!(!write.has_business_frame());
+    write.begin_io().unwrap();
+    assert!(!core.try_close());
+    write.frame_completed();
+    assert!(!core.try_close(), "a complete frame still owns its flush");
+    write.flush_completed();
+    assert!(core.try_close());
+}
+
+#[test]
+fn control_can_be_queued_after_deactivation_and_dropped_without_io() {
+    let core = established(ConnectionSide::Server);
+    core.deactivate().release();
+    let control = core.prepare_control_frame().unwrap();
+    assert!(!core.try_close());
+    drop(control);
+    assert!(core.try_close());
+    assert!(matches!(
+        core.prepare_control_frame(),
+        Err(ConnectionError::Closed)
+    ));
+}
+
+#[test]
+fn negotiation_controls_use_the_same_writer_before_handshake() {
+    let core = ConnectionCore::new(ConnectionSide::Server, || {});
+    let control = core.prepare_control_frame().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Control(control))
+        .unwrap()
+        .unwrap();
+    write.begin_io().unwrap();
+    write.frame_completed();
+    write.flush_completed();
+    core.finish_handshake().unwrap();
+    assert!(!core.is_deactivated());
+}
+
+#[test]
+fn foreign_control_token_is_rejected_and_releases_its_original_reservation() {
+    let original = established(ConnectionSide::Server);
+    let other = established(ConnectionSide::Server);
+    let control = original.prepare_control_frame().unwrap();
+    original.deactivate().release();
+    assert!(!original.try_close());
+    assert!(matches!(
+        other.begin_write(WriteRequest::Control(control)),
+        Err(ConnectionError::ProtocolViolation(_))
+    ));
+    assert!(original.try_close());
+    assert!(other.try_close());
+}
+
+#[test]
+fn deadline_deactivation_keeps_the_whole_started_batch_until_flush() {
+    let core = established(ConnectionSide::Server);
+    core.admit_remote_loan(17, Box::new(())).unwrap().finish();
+    let (id, budget, mut write) = published(&core);
+    assert_eq!(write.frame_count(), 2);
+    core.deactivate().release(); // the driver records a caller timeout
+    receive(&core, &[id], false).reclaims.release();
+    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    for _ in 0..2 {
+        let control = core.prepare_control_frame().unwrap();
+        assert!(matches!(
+            core.begin_write(WriteRequest::Control(control)),
+            Err(ConnectionError::WriterBusy)
+        ));
+        assert!(matches!(
+            core.begin_write(WriteRequest::Releases),
+            Err(ConnectionError::WriterBusy)
+        ));
+        assert!(!core.try_close());
+        write.frame_completed();
+    }
+    let control = core.prepare_control_frame().unwrap();
+    assert!(matches!(
+        core.begin_write(WriteRequest::Control(control)),
+        Err(ConnectionError::WriterBusy)
+    ));
+    assert!(!core.try_close());
+    write.flush_completed();
+    assert!(core.try_close());
+}
+
+#[test]
+fn failed_batch_blocks_all_later_frames_but_still_settles_loans() {
+    for peer_end in [false, true] {
+        let core = established(ConnectionSide::Server);
+        let (id, budget, mut write) = published(&core);
+        let queued = core.prepare_control_frame().unwrap();
+        write.write_failed();
+        drop(write);
+        assert!(matches!(
+            core.begin_write(WriteRequest::Control(queued)),
+            Err(ConnectionError::WriterBroken)
+        ));
+        assert!(matches!(
+            core.begin_write(WriteRequest::Business(vec![])),
+            Err(ConnectionError::WriterBroken)
+        ));
+        assert!(matches!(
+            core.begin_write(WriteRequest::Releases),
+            Err(ConnectionError::WriterBroken)
+        ));
+        assert!(matches!(
+            core.prepare_control_frame(),
+            Err(ConnectionError::WriterBroken)
+        ));
+        assert_eq!(budget.snapshot().file.used_bytes, 512);
+        if peer_end {
+            core.peer_end().release();
+        } else {
+            receive(&core, &[id], false).reclaims.release();
+        }
+        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert!(core.try_close());
+    }
+}
+
+#[test]
+fn failed_control_ends_its_reservation_even_if_the_batch_is_retained() {
+    let core = established(ConnectionSide::Server);
+    let control = core.prepare_control_frame().unwrap();
+    let mut write = core
+        .begin_write(WriteRequest::Control(control))
+        .unwrap()
+        .unwrap();
+    write.begin_io().unwrap();
+    write.write_failed();
+    assert!(core.try_close());
+    drop(write);
 }

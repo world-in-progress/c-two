@@ -103,6 +103,7 @@ struct State {
     remote_reads: usize,
     releases: VecDeque<u64>,
     inflight_releases: usize,
+    pending_controls: usize,
     writer: WriterState,
 }
 
@@ -254,45 +255,59 @@ impl ConnectionCore {
         result
     }
 
-    /// Acquire the unique writer for queued releases plus at most one business
-    /// frame (one chunk). Business bytes and their budget guards stay outside
-    /// the core. An idle writer uses `business = false` and an empty loan list.
-    /// Rejected submissions consume/cancel their unpublished loan tokens.
+    /// Reserve a control frame before handing its bytes to the driver's queue.
+    /// The move-only token keeps a deactivated connection open until that
+    /// submission is flushed or discarded. Controls carry no new loans and
+    /// remain admissible after deactivation, including standalone negotiation
+    /// signals before the RPC handshake. Closed/ended/broken streams reject it.
+    pub fn prepare_control_frame(&self) -> Result<ControlFrame, ConnectionError> {
+        let mut state = self.shared.state.lock();
+        check_writable(&state)?;
+        state.pending_controls += 1;
+        Ok(ControlFrame {
+            shared: self.shared.clone(),
+        })
+    }
+
+    /// Reserve the unique writer for queued releases and at most one supplied
+    /// frame (one chunk or one control frame). Frame bytes and budget guards
+    /// stay with the driver. Business writes require a live completed handshake;
+    /// control writes can finish negotiation or run after deactivation.
+    /// Rejected requests consume/cancel their original preparation tokens.
     pub fn begin_write(
         &self,
-        loans: Vec<PreparedLoan>,
-        business: bool,
+        request: WriteRequest,
     ) -> Result<Option<WriteBatch>, ConnectionError> {
+        let (loans, control, business) = match request {
+            WriteRequest::Business(loans) => (loans, None, true),
+            WriteRequest::Control(control) => (Vec::new(), Some(control), false),
+            WriteRequest::Releases => (Vec::new(), None, false),
+        };
+        let has_frame = business || control.is_some();
         let result = (|| {
             let mut state = self.shared.state.lock();
-            if state.closed {
-                return Err(ConnectionError::Closed);
-            }
-            if state.peer_ended {
-                return Err(ConnectionError::PeerEnded);
-            }
-            if !state.handshake_done {
+            check_writable(&state)?;
+            if !state.handshake_done && control.is_none() {
                 return Err(ConnectionError::BeforeHandshake);
             }
             if business && state.deactivated {
                 return Err(ConnectionError::Deactivated);
             }
-            if state.writer == WriterState::Broken {
-                return Err(ConnectionError::WriterBroken);
-            }
             if state.writer != WriterState::Idle {
                 return Err(ConnectionError::WriterBusy);
             }
-            if !business && !loans.is_empty()
+            if control
+                .as_ref()
+                .is_some_and(|control| !Arc::ptr_eq(&control.shared, &self.shared))
                 || loans
                     .iter()
                     .any(|loan| !Arc::ptr_eq(&loan.shared, &self.shared))
             {
                 return Err(ConnectionError::ProtocolViolation(
-                    "loan token belongs to another write/connection".into(),
+                    "preparation token belongs to another connection".into(),
                 ));
             }
-            if !business && state.releases.is_empty() {
+            if !has_frame && state.releases.is_empty() {
                 return Ok(None);
             }
             let count = state.releases.len();
@@ -324,8 +339,9 @@ impl ConnectionCore {
                 loans,
                 prefix,
                 release_count: count,
-                frames_remaining: frames + usize::from(business),
+                frames_remaining: frames + usize::from(has_frame),
                 business,
+                control,
                 attempted: false,
                 finished: false,
             }))
@@ -413,10 +429,13 @@ impl ConnectionCore {
 
     /// Atomically seal incoming reads and new writes when B=L=0. Outstanding
     /// release records may be discarded: the peer will settle them on EOF.
+    /// Queued controls and the unique writer reservation (including its flush)
+    /// must finish before this seal can close the physical stream.
     pub fn try_close(&self) -> bool {
         let mut state = self.shared.state.lock();
         if state.deactivated
-            && state.writer != WriterState::InFrame
+            && matches!(state.writer, WriterState::Idle | WriterState::Broken)
+            && state.pending_controls == 0
             && state.remote_reads == 0
             && state.prepared.is_empty()
             && state.published.is_empty()
@@ -426,6 +445,39 @@ impl ConnectionCore {
             state.releases.clear();
         }
         state.closed
+    }
+}
+
+fn check_writable(state: &State) -> Result<(), ConnectionError> {
+    if state.closed {
+        Err(ConnectionError::Closed)
+    } else if state.peer_ended {
+        Err(ConnectionError::PeerEnded)
+    } else if state.writer == WriterState::Broken {
+        Err(ConnectionError::WriterBroken)
+    } else {
+        Ok(())
+    }
+}
+
+/// One driver submission. Only business frames can carry prepared loans;
+/// queued controls retain their original connection's close reservation.
+pub enum WriteRequest {
+    Business(Vec<PreparedLoan>),
+    Control(ControlFrame),
+    Releases,
+}
+
+/// An outstanding control frame, bound to its original physical connection.
+/// Drop cancels a queued frame without allocating or waiting for network I/O.
+pub struct ControlFrame {
+    shared: Arc<Shared>,
+}
+
+impl Drop for ControlFrame {
+    fn drop(&mut self) {
+        self.shared.state.lock().pending_controls -= 1;
+        (self.shared.wake)();
     }
 }
 
@@ -514,6 +566,13 @@ impl Drop for RemoteLoan {
 /// Drivers may co-submit `release_bytes()` and their one business frame. Call
 /// begin_io before the first write attempt, then frame_completed for each whole
 /// frame, including each release frame, then consume it with flush_completed.
+/// From begin_io until flush_completed or write_failed this batch alone owns
+/// the writer, including every co-submitted release/control/business frame.
+/// A caller deadline only deactivates admission and records its reason: it
+/// never cancels this batch or permits any later frame to interleave, even at
+/// a completed prefix boundary. Drivers continue the same in-progress I/O.
+/// write_failed permanently breaks the writer; no frame may be sent afterward.
+/// Published loans then wait for received release records or peer end.
 /// No partial/uncertain submission is replayed.
 pub struct WriteBatch {
     shared: Arc<Shared>,
@@ -522,6 +581,7 @@ pub struct WriteBatch {
     release_count: usize,
     frames_remaining: usize,
     business: bool,
+    control: Option<ControlFrame>,
     attempted: bool,
     finished: bool,
 }
@@ -539,7 +599,8 @@ impl WriteBatch {
 
     /// Publish every owner before any byte of this co-submission can be sent.
     /// A deactivation before this point cancels it; after this point the driver
-    /// keeps writing its started frame even if a business waiter has gone away.
+    /// keeps writing this entire co-submission through flush or an actual I/O
+    /// failure even after a deadline or a business waiter has gone away.
     pub fn begin_io(&mut self) -> Result<(), ConnectionError> {
         assert!(self.frames_remaining > 0, "write batch is already complete");
         assert!(!self.attempted, "write submission must not be replayed");
@@ -614,6 +675,9 @@ impl WriteBatch {
         stop_locked(&mut state, &mut reclaims);
         drop(state);
         drop(reclaims);
+        // Failure ends this control submission immediately; retaining the
+        // failed batch object must not retain a queued-frame close reservation.
+        self.control.take();
         (self.shared.wake)();
     }
 }
