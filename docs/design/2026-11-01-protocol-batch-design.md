@@ -1,8 +1,8 @@
 # 协议批详细设计
 
-日期：2026-11-01；代码依据为本次输入 `dac630f0131b706402e1fb2b89204443a998a06e`。本稿按独立评估、Host 代码复核与用户当日同意的方向制定：请求与响应复制完成即释放传输租约，SDK hold 只保留本地副本；删除自动心跳及两项设置，保留手动 ping；本批不加每连接借出额度。只修订设计，未改代码、构建或运行测试。范围以 `docs/design/backlog.md:17-20` 为准，并将 E-host 并入本批；Host 同步待办中的旧状态。已有论证见[单一属主评估](2026-10-31-single-owner-release-evaluation.md)、[过度防御复审](2026-10-31-over-defense-review.md)与[共享内存借出调研](../research/2026-11-01-shared-memory-lending-survey.md)。第十节只留 D7 和性能门槛待定。
+日期：2026-11-01；代码依据为本次输入 `dac630f0131b706402e1fb2b89204443a998a06e`。本稿按独立评估、Host 代码复核与用户当日同意的方向制定：请求与响应复制完成即释放传输租约，SDK hold 只保留本地副本；删除自动心跳及两项设置，保留手动 ping；本批不加每连接借出额度。只修订设计，未改代码、构建或运行测试。范围以 `docs/design/backlog.md:17-20` 为准，并将 E-host 并入本批；Host 同步待办中的旧状态。已有论证见[单一属主评估](2026-10-31-single-owner-release-evaluation.md)、[过度防御复审](2026-10-31-over-defense-review.md)与[共享内存借出调研](../research/2026-11-01-shared-memory-lending-survey.md)。用户 2026-11-01 批准本设计，包括第十节的 D7（按所列条件）与性能门槛。
 
-引用中的 `c2-*` 按 `AGENTS.md:107-122` 的 crate 根展开，行号属于上述代码输入。本文先定义几个设计用语：“物理连接 / physical connection”是一对已建立的 OS 流，不是 proxy；“借出 / lending”是属主通过该连接发布一个分配供对端读取；“借出表 / loan book”按连接保存尚未释放的真实分配；“停用 / deactivation”停止业务准入而保留尚需结算的连接；“连接负责方 / connection coordinator”是统一管理该连接写队列、借出表和结束状态的内部对象，代码名拟为 `ConnectionCore`。“释放 / release”统一指结束租约或分配；跨进程时借用方交付释放记录，属主收到后回收分配。下文不用“归还”另指同一动作。“属主 / pool owner”与待删除子系统的“所有者 / owner”仍按 `CONTEXT.md:59-68,126-128` 区分。
+引用中的 `c2-*` 按 `AGENTS.md:107-122` 的 crate 根展开，行号属于上述代码输入。本文先定义几个设计用语：“物理连接 / physical connection”是一对已建立的 OS 流，不是 proxy；“借出 / lending”是属主通过该连接发布一个分配供对端读取；“借出表 / loan book”按连接保存尚未释放的真实分配；“停用 / deactivation”停止业务准入而保留尚需结算的连接；“连接核心 / connection core”是统一管理该连接写队列、借出表和结束状态的内部对象，代码名 `ConnectionCore`。“释放 / release”统一指结束租约或分配；跨进程时借用方交付释放记录，属主收到后回收分配。下文不用“归还”另指同一动作。“属主 / pool owner”与待删除子系统的“所有者 / owner”仍按 `CONTEXT.md:59-68,126-128` 区分。
 
 ## 一、现状与需要替换的路径
 
@@ -214,6 +214,8 @@ P0 按第五节所有者清单删能力、导出、配置、测试和 0x16 角�
 | P8 SDK/ABI，等 P6/P7 | c2-mem-ffi/**、c2-codegen/**、sdk/python/**、sdk/rust/**、examples/** | ABI 7 一次消费、Node 控制读取/立即释放、删除 Python peer 裸入口；互通/本地 hold 统计/exports/FastDB checked view/borrowed。 |
 | P9 整体验收，等全部 | .github/**、tools/**、tests/repo/**、必要根 manifest/lock | 全平台 runner、逐次原始延迟样本、多进程同时起跑、异常对端/回退/释放拥塞基准、P99/失败率/占用/句柄、receipt/source/hash；代码修正回交原块。 |
 
+**给各块的共同要求。** 0.x 一次切干净：不留别名、旧路径、兼容参数或"已删除"的提示，不加防御性检查，校验只在边界上做一次，出错直接失败。缺陷修复先写能复现的测试；被取代的代码与测试一并删除。测试只用测试自己创建的端点，临时探针用新建的 0700 目录作 IPC 根；不启动、停止或重启任何日常服务。写入范围之外什么也不删，不用 git stash，不动分支与标签；要改范围外的文件就停下来问。依赖相邻 `../fastdb` 的门禁由 Host 补跑；需要链接 FastDB 时，按仓库脚本准备官方 CoreSDK 并以 system 方式链接。Python 套件经 `tools/dev/test_python.py` 运行，它拒绝没有登记的跳过。一步检查做完、后面不再需要的构建产物立即删掉，cargo 共用 `CARGO_TARGET_DIR=<检出>/core/target`，只留 `target/<块名>-validation/` 下的报告与日志。
+
 P3 单独测共同算法；P4/P5 的测试不各复制一套状态机断言。M7 迁移由 P1 写者在 P6 / P8 接入时完成 c2-mem 的删除，各文件仍只有一个写者，整候选不留旧记账别名；这只是顺序，不作为中间状态的验收理由。跨语言测试归 P8，根锁文件由 P9 单一更新。先跑影响范围检查，接线齐后跑 core workspace，全量长任务 Host 统一调度，Cargo 共用 `<checkout>/core/target`。Host 另行更新 backlog、当前参考文档和下节术语，避免实施者同时写文档（`AGENTS.md:198-210`）。本次仅写本设计，未执行上述检查。
 
 ## 八、故障验收与基准
@@ -265,11 +267,11 @@ P9 补齐基准工具：当前只在内存中收集 `latencies`，输出 median 
 
 ## 十、待用户决定与术语建议
 
-D7 建议删除连接期 process pin，仅在身份核验期临时持有，并随 ABI 7 切净；静态阅读不能证明 PID 复用竞态无影响，实施前独立评审明确退出 / PID 更换条件，在 Windows x64 / ARM64 原生执行。条件未闭合不批准该子项，身份检查仍在首字节前完成（`c2-local/src/windows.rs:39-67,118-160`；`c2-mem-ffi/src/lib.rs:598-655`）。性能门槛建议在批准时接受第八节的 5% / 10% / 5% 值，届时固定，不在测后决定。
+已批准（用户 2026-11-01）。D7：删除连接期 process pin，仅在身份核验期临时持有，并随 ABI 7 切净；静态阅读不能证明 PID 复用竞态无影响，实施前独立评审明确退出 / PID 更换条件，在 Windows x64 / ARM64 原生执行。条件未闭合不批准该子项，身份检查仍在首字节前完成（`c2-local/src/windows.rs:39-67,118-160`；`c2-mem-ffi/src/lib.rs:598-655`）。性能门槛固定为第八节的 5% / 10% / 5%，不在测后修改。
 
 ### 建议由 Host 加入 CONTEXT.md
 
-本稿开头已给操作定义，下面的中英词条由 Host 同步进 CONTEXT.md，本 worker 不修改术语表。借出 / lending：将本进程分配发布给某连接对端读取。借出表 / loan book：按物理连接保存尚未收到释放证明的真实分配。停用 / deactivation：拒绝新业务但不等于关闭 OS 流。物理连接 / physical connection：一次实际 OS 流连接，区别于 proxy。连接负责方 / connection coordinator：管理该流共同状态机的内部对象；此处不用 owner，避免与所有者混淆。
+本稿开头已给操作定义，下面的中英词条由 Host 同步进 CONTEXT.md，本 worker 不修改术语表。借出 / lending：将本进程分配发布给某连接对端读取。借出表 / loan book：按物理连接保存尚未收到释放证明的真实分配。停用 / deactivation：拒绝新业务但不等于关闭 OS 流。物理连接 / physical connection：一次实际 OS 流连接，区别于 proxy。连接核心 / connection core：管理该流共同状态机的内部对象，代码名 `ConnectionCore`；不用 owner，避免与所有者混淆。
 
 hold 改为“调用返回后继续保留 SDK 可用的本地响应副本，直到释放”；租约仍指传输对 buffer 的访问权，复制完成即结束，借用输入仍只在资源方法期间有效。载荷所有者与 checked view 的失效针对本地副本，不能再写成远端回收的前提（`CONTEXT.md:110-124`；`docs/reference/payload-lifetime.md:58,68-70`）。
 

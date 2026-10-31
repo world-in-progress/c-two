@@ -56,6 +56,15 @@ This page routes each subject to the document that owns it. It states no behavio
 
 The dated plans and reviews in `design/` belong to work still in progress; each states its own status, and the backlog links to them.
 
+## Decisions
+
+`decisions/` holds one ADR per decision; later changes add dated notes instead of rewriting it.
+
+| Decision | Subject |
+| --- | --- |
+| [0001](decisions/0001-single-owner-release.md) | Single-owner release of shared memory |
+| [0002](decisions/0002-remove-owner-subsystem.md) | Removal of the owner subsystem |
+
 ## Records
 
 - `acceptance/` holds the verification records of completed work, release qualification reports and reviews, with frozen manifests, receipts and logs under `acceptance/evidence/`. Records are not rewritten; later changes update their links only.

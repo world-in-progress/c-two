@@ -97,6 +97,22 @@ _Avoid_: token, certificate
 The exchange that opens an IPC connection: the fixed version preamble, identity checks and route metadata.
 _Avoid_: hello (for the whole exchange)
 
+**物理连接 / physical connection**:
+One established OS stream between two processes. Several proxies may share it, and the loans made over it are settled on it.
+_Avoid_: connection (for a proxy), channel
+
+**连接核心 / connection core**:
+The internal state machine of one physical connection, holding its write queue, loan book and end state (`ConnectionCore`). It does no I/O itself.
+_Avoid_: 负责方, coordinator, owner (for this object)
+
+**停用 / deactivation**:
+A physical connection refusing new calls while it stays open to settle its loans.
+_Avoid_: close, shutdown (for this state)
+
+**对端结束 / peer end**:
+Proof that the peer's side of a physical connection is gone: a read returns EOF, or ECONNRESET on a Unix local stream.
+_Avoid_: disconnect; timeout (as proof)
+
 **分片 / chunk**:
 One piece of a payload sent in several parts; over IPC the receiver puts the pieces back together by reassembly.
 _Avoid_: 分块, fragment, segment
@@ -110,6 +126,14 @@ _Avoid_: 组装, 拼装, assembly
 **租约 / lease**:
 The transport's claim on a buffer from the moment a call delivers it until it is released.
 _Avoid_: 句柄 (for the claim), lock
+
+**借出 / loan**:
+An allocation a pool owner has published to the peer of a physical connection, named by a `loan_id`. It ends with a release record from the peer or with peer end.
+_Avoid_: 归还 (for the release), share
+
+**借出表 / loan book**:
+A pool owner's per-connection record of the loans it has made and not yet seen released.
+_Avoid_: pending table
 
 **hold**:
 Keeping a response's lease after the call returns, with `cc.hold(...)` and `HeldResult`, until it is released.
