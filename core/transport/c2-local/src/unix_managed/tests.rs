@@ -1445,7 +1445,7 @@ async fn managed_drop_after_gate_contention_settles_ownership() {
     let namespace = TestNamespace::new();
     let root = namespace.path();
     let endpoint = managed_endpoint_at(root, "drop-transient-gate");
-    let listener = bind_managed_at(&endpoint, root).unwrap();
+    let mut listener = bind_managed_at(&endpoint, root).unwrap();
     let credential = listener.credential();
     let duplicate = listener.duplicate_lease_fd_for_test();
     let lease_probe = OpenOptions::new()
@@ -1455,6 +1455,13 @@ async fn managed_drop_after_gate_contention_settles_ownership() {
         .unwrap();
     let gate = ManagedNamespace::open_root(root, false, true).unwrap();
 
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    listener.retry_observer = Some(DropRetryObserver {
+        started: started_tx,
+        resume: resume_rx,
+    });
+
     // Drop must return while this thread still holds the gate. A channel
     // observes that ordering without comparing scheduler-dependent durations.
     let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
@@ -1463,25 +1470,22 @@ async fn managed_drop_after_gate_contention_settles_ownership() {
         dropped_tx.send(()).unwrap();
     });
     let dropped = dropped_rx.recv_timeout(Duration::from_secs(10));
+    let started = started_rx.recv_timeout(Duration::from_secs(10));
     // Release before reporting a failed fixture, so a blocked Drop can finish.
     drop(gate);
+    resume_tx.send(()).unwrap();
     dropper.join().unwrap();
     dropped.expect("Drop waited for the gate instead of handing off retirement");
+    started.expect("Drop must start its background retirement retry");
 
     let released = wait_for_released_lease(lease_probe);
-    // A paused caller may resume after the bounded worker gave up, or after it
-    // retired the slot. Observe the actual terminal state before choosing the
-    // exact reaper result; no speed comparison selects the expected branch.
-    let socket_remains = socket_path_at(root, &endpoint).exists();
-    assert_eq!(socket_remains, lease_path_at(root, &endpoint).exists());
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
     drop(released);
     let reaped = reap_managed_at(&endpoint, &credential, root);
     assert!(
-        matches!(
-            (socket_remains, reaped),
-            (true, EndpointReapResult::Reaped) | (false, EndpointReapResult::AlreadyAbsent)
-        ),
-        "the settled slot must be fully retired or retain a complete reapable record"
+        matches!(reaped, EndpointReapResult::AlreadyAbsent),
+        "the background retry must retire the complete slot: {reaped:?}"
     );
     assert!(!socket_path_at(root, &endpoint).exists());
     assert!(!lease_path_at(root, &endpoint).exists());

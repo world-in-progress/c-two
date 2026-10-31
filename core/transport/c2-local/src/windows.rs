@@ -27,7 +27,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
     SECURITY_SQOS_PRESENT,
 };
-use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{
     GetNamedPipeClientSessionId, GetNamedPipeServerProcessId, GetNamedPipeServerSessionId,
 };
@@ -189,18 +188,6 @@ pub fn shared_memory_available(stream: &Stream) -> io::Result<bool> {
         return Err(io::Error::last_os_error());
     }
     Ok(peer_session == current_session_id()?)
-}
-
-pub fn cancel(raw: usize) {
-    // Tokio/mio retain their buffers until cancelled overlapped operations
-    // complete. They remain the sole owners that close this handle.
-    unsafe {
-        CancelIoEx(raw as HANDLE, std::ptr::null());
-    }
-}
-
-pub fn cancel_stream(stream: &Stream) {
-    cancel(raw_handle(stream));
 }
 
 impl AsyncRead for Stream {

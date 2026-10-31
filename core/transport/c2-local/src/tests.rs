@@ -1,7 +1,7 @@
 use super::*;
 use tokio::io::AsyncReadExt;
 
-struct TestEndpoint {
+pub(super) struct TestEndpoint {
     _root: Option<tempfile::TempDir>,
     endpoint: LocalEndpoint,
 }
@@ -37,7 +37,7 @@ fn isolated_endpoint(label: &str) -> TestEndpoint {
     }
 }
 
-async fn isolated_pair() -> (TestEndpoint, LocalStream, LocalStream) {
+pub(super) async fn isolated_pair() -> (TestEndpoint, LocalStream, LocalStream) {
     let fixture = isolated_endpoint("c2-pair-test");
     let mut listener = LocalListener::bind(&fixture.endpoint).unwrap();
     let (client, server) = tokio::try_join!(
@@ -47,6 +47,44 @@ async fn isolated_pair() -> (TestEndpoint, LocalStream, LocalStream) {
     .unwrap();
     close_listener(listener);
     (fixture, client, server)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn peer_close_with_unread_data_records_the_native_read_end() {
+    let (local, peer) = tokio::net::UnixStream::pair().unwrap();
+    let publisher = ConnectionPublisher::new(ConnectionSide::Client);
+    let observation = publisher.observation();
+    let mut local = LocalStream::from_inner(local).with_connection_publisher(publisher);
+    let mut peer = LocalStream::from_inner(peer);
+    // The closing peer leaves its receive queue nonempty. Drain its outgoing
+    // bytes first so the following read observes the OS-specific end result.
+    peer.write_all(b"sent before close").await.unwrap();
+    local.write_all(b"unread by peer").await.unwrap();
+    drop(peer);
+    let mut payload = [0; 17];
+    local.read_exact(&mut payload).await.unwrap();
+    assert_eq!(&payload, b"sent before close");
+    let result = local.read(&mut [0]).await;
+    #[cfg(target_os = "linux")]
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECONNRESET));
+    #[cfg(target_os = "macos")]
+    assert_eq!(result.unwrap(), 0);
+    assert!(local.peer_ended());
+    assert!(
+        observation.snapshot().is_none(),
+        "the local stream is still open"
+    );
+    drop(local);
+    let closed = observation.snapshot().unwrap();
+    assert!(closed.is_peer_end());
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(closed.reason(), ConnectionEndReason::ConnectionReset);
+        assert_eq!(closed.os_error(), Some(libc::ECONNRESET));
+    }
+    #[cfg(target_os = "macos")]
+    assert_eq!(closed.reason(), ConnectionEndReason::PeerEof);
 }
 
 pub(super) fn close_listener(listener: LocalListener) {
@@ -65,19 +103,148 @@ pub(super) fn close_listener(listener: LocalListener) {
 #[tokio::test]
 async fn owned_halves_exchange_bytes_and_abort_wakes_a_pending_read() {
     let (_fixture, client, server) = isolated_pair().await;
+    let abort = server.abort_handle();
     let (mut reader, _) = server.into_split();
     let (_, mut writer) = client.into_split();
     writer.write_all(b"hello").await.unwrap();
     let mut bytes = [0; 5];
     reader.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"hello");
-    writer.abort_handle().abort();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), reader.read_exact(&mut bytes))
-            .await
-            .unwrap()
-            .is_err()
+    let mut read = Box::pin(reader.read_exact(&mut bytes));
+    assert!(futures_util::poll!(&mut read).is_pending());
+    abort.abort();
+    assert_eq!(
+        read.await.unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
     );
+}
+
+#[tokio::test]
+async fn remote_read_guards_retain_the_os_stream_after_abort_and_io_owners_drop() {
+    for side in [ConnectionSide::Client, ConnectionSide::Server] {
+        let (_fixture, client, server) = isolated_pair().await;
+        let (stream, mut peer) = match side {
+            ConnectionSide::Client => (client, server),
+            ConnectionSide::Server => (server, client),
+        };
+        let publisher = ConnectionPublisher::new(side);
+        let observation = publisher.observation();
+        let stream = stream.with_connection_publisher(publisher);
+        let abort = stream.abort_handle();
+        let first = stream.retain_for_remote_read();
+        let (mut reader, writer) = stream.into_split();
+        let last = reader.retain_for_remote_read();
+        abort.abort();
+        assert_eq!(
+            reader.read(&mut [0]).await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert!(!reader.peer_ended());
+        drop(reader);
+        drop(writer);
+        assert_eq!(Arc::strong_count(&last._owner), 2);
+        assert!(observation.snapshot().is_none());
+        assert!(futures_util::poll!(std::pin::pin!(peer.read(&mut [0]))).is_pending());
+        drop(first);
+        assert!(observation.snapshot().is_none());
+        assert!(futures_util::poll!(std::pin::pin!(peer.read(&mut [0]))).is_pending());
+        drop(last);
+        let closed = observation
+            .snapshot()
+            .expect("last guard retires the stream");
+        assert_eq!(closed.reason(), ConnectionEndReason::LocalClose);
+        assert!(!closed.is_peer_end());
+        // Retaining the abort handle must not retain the OS connection.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), peer.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        abort.abort();
+        assert_eq!(observation.snapshot(), Some(closed));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_read_guard_retains_the_os_stream_after_executor_shutdown() {
+    use std::io::Read;
+
+    let (local, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    local.set_nonblocking(true).unwrap();
+    peer.set_nonblocking(true).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let publisher = ConnectionPublisher::new(ConnectionSide::Client);
+    let observation = publisher.observation();
+    let guard = {
+        let _entered = runtime.enter();
+        let stream = LocalStream::from_inner(tokio::net::UnixStream::from_std(local).unwrap())
+            .with_connection_publisher(publisher);
+        stream.retain_for_remote_read()
+    };
+    drop(runtime);
+    assert!(observation.snapshot().is_none());
+    assert_eq!(
+        peer.read(&mut [0]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(guard);
+    assert!(observation.snapshot().is_some());
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn remote_read_guard_retains_native_pipe_handles_after_executor_shutdown() {
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE};
+
+    for side in [ConnectionSide::Client, ConnectionSide::Server] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_fixture, client, server) = runtime.block_on(isolated_pair());
+        let (stream, peer) = match side {
+            ConnectionSide::Client => (client, server),
+            ConnectionSide::Server => (server, client),
+        };
+        let publisher = ConnectionPublisher::new(side);
+        let observation = publisher.observation();
+        let stream = stream.with_connection_publisher(publisher);
+        let raw = platform::raw_handle(&stream.owner.stream.lock().unwrap());
+        let guard = stream.retain_for_remote_read();
+        let owner = Arc::downgrade(&guard._owner);
+        drop(stream);
+        drop(runtime);
+        let mut flags = 0;
+        assert_ne!(
+            unsafe { GetHandleInformation(raw as HANDLE, &mut flags) },
+            0
+        );
+        assert!(observation.snapshot().is_none());
+        drop(guard);
+        assert!(owner.upgrade().is_none());
+        assert!(observation.snapshot().is_some());
+        drop(peer);
+    }
+}
+
+#[tokio::test]
+async fn empty_read_buffer_is_not_peer_end() {
+    let (_fixture, mut stream, mut peer) = isolated_pair().await;
+    peer.write_all(b"x").await.unwrap();
+    assert_eq!(stream.read(&mut []).await.unwrap(), 0);
+    assert!(!stream.peer_ended());
+    assert_eq!(stream.read(&mut [0]).await.unwrap(), 1);
+    assert!(!stream.peer_ended());
+    drop(peer);
+    assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    assert!(stream.peer_ended());
 }
 
 #[tokio::test]

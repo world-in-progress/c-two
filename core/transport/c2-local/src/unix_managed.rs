@@ -1064,10 +1064,23 @@ struct DropRetirement {
     root: PathBuf,
     endpoint: LocalEndpoint,
     record: OwnerRecord,
+    #[cfg(test)]
+    retry_observer: Option<DropRetryObserver>,
+}
+
+#[cfg(test)]
+struct DropRetryObserver {
+    started: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl DropRetirement {
     fn run(self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.retry_observer {
+            observer.started.send(()).unwrap();
+            observer.resume.recv().unwrap();
+        }
         if let Ok(namespace) = open_root_bounded(&self.root, false) {
             let _ = retire_listener_with_namespace(
                 &namespace,
@@ -1135,6 +1148,8 @@ pub(crate) struct ManagedListener {
     directories_pin: Option<NamespaceDirectories>,
     #[cfg(test)]
     gate_identity: SocketIdentity,
+    #[cfg(test)]
+    retry_observer: Option<DropRetryObserver>,
     cleaned: bool,
 }
 
@@ -1227,6 +1242,8 @@ impl ManagedListener {
                     root: self.root.clone(),
                     endpoint: self.endpoint.clone(),
                     record: self.record.clone(),
+                    #[cfg(test)]
+                    retry_observer: self.retry_observer.take(),
                 };
                 let _ = std::thread::Builder::new()
                     .name("c2-local-drop-retire".into())
@@ -1456,6 +1473,8 @@ fn bind_at(endpoint: &LocalEndpoint, root: &Path) -> io::Result<ManagedListener>
             .then(|| namespace.directories.clone()),
         #[cfg(test)]
         gate_identity,
+        #[cfg(test)]
+        retry_observer: None,
         cleaned: false,
     })
 }

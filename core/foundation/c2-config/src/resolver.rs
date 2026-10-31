@@ -106,8 +106,6 @@ pub struct ServerIpcConfigOverrides {
     pub max_pending_requests: Option<u32>,
     pub max_execution_workers: Option<u32>,
     pub pool_decay_seconds: Option<f64>,
-    pub heartbeat_interval_secs: Option<f64>,
-    pub heartbeat_timeout_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -553,8 +551,6 @@ fn resolve_server_ipc_config(
         max_pending_requests: optional_u32("C2_IPC_MAX_PENDING_REQUESTS"),
         max_execution_workers: optional_u32("C2_IPC_MAX_EXECUTION_WORKERS"),
         pool_decay_seconds: optional_f64("C2_IPC_POOL_DECAY_SECONDS"),
-        heartbeat_interval_secs: optional_f64("C2_IPC_HEARTBEAT_INTERVAL"),
-        heartbeat_timeout_secs: optional_f64("C2_IPC_HEARTBEAT_TIMEOUT"),
     );
 
     validate_pool_memory_product(&cfg.base)?;
@@ -766,8 +762,7 @@ mod tests {
     #[test]
     fn oversized_ipc_duration_override_is_rejected() {
         let overrides = ServerIpcConfigOverrides {
-            heartbeat_interval_secs: Some(1e100),
-            heartbeat_timeout_secs: Some(2e100),
+            pool_decay_seconds: Some(1e100),
             ..Default::default()
         };
 
@@ -778,7 +773,7 @@ mod tests {
         )
         .expect_err("oversized IPC duration override should fail without panicking");
 
-        assert!(err.to_string().contains("heartbeat_interval_secs"));
+        assert!(err.to_string().contains("pool_decay_seconds"));
         assert!(err.to_string().contains("representable duration"));
     }
 

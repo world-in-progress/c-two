@@ -1,8 +1,9 @@
 //! Local byte streams. Protocol framing and runtime policy stay in their owners.
 //!
 //! `write_all` is an inherent method on the stream and its owned write half:
-//! cancelling a partially written operation aborts the connection so the next
-//! frame can never reuse a truncated stream. A completed write has drained the
+//! cancelling a partially written operation stops local I/O so the next frame
+//! can never reuse a truncated stream. Remote read guards retain the actual OS
+//! stream until their last read ends. A completed write has drained the
 //! transport adapter; peer consumption still requires a protocol acknowledgement.
 
 use std::io;
@@ -390,33 +391,40 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct AbortState {
-    stream: Mutex<Option<platform::Stream>>,
     closed: AtomicBool,
+    peer_ended: AtomicBool,
     reader: AtomicWaker,
     writer: AtomicWaker,
     connection: OnceLock<ConnectionPublisher>,
+    end: Mutex<Option<observation::ConnectionEnd>>,
 }
 
-/// Abort pending local I/O without outliving or double-closing its OS handle.
+/// Stop pending local I/O without closing a stream retained by a remote reader.
+/// This metadata-only handle does not extend the OS stream's lifetime.
 #[derive(Clone)]
 pub struct AbortHandle(Arc<AbortState>);
 
 impl AbortHandle {
+    fn new() -> Self {
+        Self(Arc::new(AbortState {
+            closed: AtomicBool::new(false),
+            peer_ended: AtomicBool::new(false),
+            reader: AtomicWaker::new(),
+            writer: AtomicWaker::new(),
+            connection: OnceLock::new(),
+            end: Mutex::new(None),
+        }))
+    }
+
+    /// Wake local I/O waiters with ConnectionAborted. The OS stream closes
+    /// only when its I/O owners and all remote read guards have been dropped.
     pub fn abort(&self) {
-        if let Some(connection) = self.0.connection.get() {
-            connection.close(ConnectionEndReason::LocalClose, "local_abort", None);
-        }
+        self.record_end(observation::ConnectionEnd::new(
+            ConnectionEndReason::LocalClose,
+            "local_abort",
+            None,
+        ));
         self.0.closed.store(true, Ordering::Release);
-        let stream = self
-            .0
-            .stream
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(stream) = stream {
-            platform::cancel_stream(&stream);
-            drop(stream);
-        }
         self.0.reader.wake();
         self.0.writer.wake();
     }
@@ -426,10 +434,56 @@ impl AbortHandle {
     }
 
     fn close_io(&self, operation: &'static str, error: &io::Error) {
-        if let Some(connection) = self.0.connection.get() {
-            connection.close_io(operation, error);
+        self.record_end(observation::ConnectionEnd::io(operation, error));
+    }
+
+    fn record_end(&self, end: observation::ConnectionEnd) {
+        if end.is_peer_end() {
+            self.0.peer_ended.store(true, Ordering::Release);
+        }
+        self.0
+            .end
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_or_insert(end);
+    }
+}
+
+struct StreamOwner {
+    // Rust drops fields in declaration order: close the OS stream before
+    // publishing its physical close, even if an observer runs immediately.
+    stream: Mutex<platform::Stream>,
+    abort: AbortHandle,
+    _retirement: StreamRetirement,
+}
+
+impl Drop for StreamOwner {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+struct StreamRetirement(AbortHandle);
+
+impl Drop for StreamRetirement {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.0.connection.get() {
+            let end = self
+                .0
+                .0
+                .end
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            connection.close_end(end.expect("stream retirement records its end"));
         }
     }
+}
+
+/// Retains the original OS stream while an admitted payload reads peer memory.
+/// Drop this guard when that remote read interval ends, before handing the
+/// local copy to an application. It provides no I/O or cancellation authority.
+pub struct RemoteReadGuard {
+    _owner: Arc<StreamOwner>,
 }
 
 struct AbortOnDrop(Option<AbortHandle>);
@@ -442,7 +496,7 @@ impl Drop for AbortOnDrop {
 }
 
 pub struct LocalStream {
-    abort: AbortHandle,
+    owner: Arc<StreamOwner>,
 }
 
 async fn connect_native(
@@ -467,14 +521,13 @@ pub async fn connect_unix_stream(
 
 impl LocalStream {
     fn from_inner(inner: platform::Stream) -> Self {
+        let abort = AbortHandle::new();
         Self {
-            abort: AbortHandle(Arc::new(AbortState {
-                stream: Mutex::new(Some(inner)),
-                closed: AtomicBool::new(false),
-                reader: AtomicWaker::new(),
-                writer: AtomicWaker::new(),
-                connection: OnceLock::new(),
-            })),
+            owner: Arc::new(StreamOwner {
+                stream: Mutex::new(inner),
+                _retirement: StreamRetirement(abort.clone()),
+                abort,
+            }),
         }
     }
 
@@ -489,27 +542,40 @@ impl LocalStream {
     /// query failures remain errors. Unix connected streams return true.
     pub fn shared_memory_available(&self) -> io::Result<bool> {
         let stream = self
-            .abort
-            .0
+            .owner
             .stream
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if self.abort.is_aborted() {
+        if self.owner.abort.is_aborted() {
             return Err(aborted());
         }
-        let stream = stream.as_ref().ok_or_else(aborted)?;
-        platform::shared_memory_available(stream)
+        platform::shared_memory_available(&stream)
     }
 
     pub fn abort_handle(&self) -> AbortHandle {
-        self.abort.clone()
+        self.owner.abort.clone()
+    }
+
+    /// Retain this physical stream for one already-admitted remote read.
+    /// The connection core seals new admission when deactivating the connection.
+    pub fn retain_for_remote_read(&self) -> RemoteReadGuard {
+        RemoteReadGuard {
+            _owner: self.owner.clone(),
+        }
+    }
+
+    /// Native read-side proof, available before this stream physically closes.
+    /// Local cancellation and write failures never set this fact.
+    pub fn peer_ended(&self) -> bool {
+        self.owner.abort.0.peer_ended.load(Ordering::Acquire)
     }
 
     /// Bind this physical stream to its transport's existing terminal record
     /// before sharing or splitting it. Abort handles retain only the same
     /// metadata publisher; observers never gain stream cancellation authority.
     pub fn with_connection_publisher(self, publisher: ConnectionPublisher) -> Self {
-        self.abort
+        self.owner
+            .abort
             .0
             .connection
             .set(publisher)
@@ -519,9 +585,11 @@ impl LocalStream {
 
     pub fn into_split(self) -> (LocalReadHalf, LocalWriteHalf) {
         let abort = self.abort_handle();
-        let (reader, writer) = tokio::io::split(self);
+        let writer = Self {
+            owner: self.owner.clone(),
+        };
         (
-            LocalReadHalf(reader),
+            LocalReadHalf(self),
             LocalWriteHalf {
                 inner: writer,
                 abort,
@@ -569,12 +637,6 @@ impl LocalStream {
     }
 }
 
-impl Drop for LocalStream {
-    fn drop(&mut self) {
-        self.abort.abort();
-    }
-}
-
 fn aborted() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, "local connection aborted")
 }
@@ -586,20 +648,34 @@ impl AsyncRead for LocalStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        this.abort.0.reader.register(cx.waker());
+        this.owner.abort.0.reader.register(cx.waker());
         let mut stream = this
-            .abort
-            .0
+            .owner
             .stream
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if this.abort.is_aborted() {
+        if this.owner.abort.is_aborted() {
             return Poll::Ready(Err(aborted()));
         }
-        match stream.as_mut() {
-            Some(stream) => Pin::new(stream).poll_read(cx, buf),
-            None => Poll::Ready(Err(aborted())),
+        let before = buf.filled().len();
+        let had_capacity = buf.remaining() != 0;
+        let result = Pin::new(&mut *stream).poll_read(cx, buf);
+        match &result {
+            Poll::Ready(Ok(())) if had_capacity && buf.filled().len() == before => {
+                this.owner.abort.record_end(observation::ConnectionEnd::new(
+                    ConnectionEndReason::PeerEof,
+                    "read",
+                    None,
+                ));
+            }
+            Poll::Ready(Err(error)) => {
+                this.owner
+                    .abort
+                    .record_end(observation::ConnectionEnd::read_error("read", error));
+            }
+            _ => {}
         }
+        result
     }
 }
 
@@ -610,44 +686,45 @@ impl AsyncWrite for LocalStream {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        this.abort.0.writer.register(cx.waker());
+        this.owner.abort.0.writer.register(cx.waker());
         let mut stream = this
-            .abort
-            .0
+            .owner
             .stream
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if this.abort.is_aborted() {
+        if this.owner.abort.is_aborted() {
             return Poll::Ready(Err(aborted()));
         }
-        match stream.as_mut() {
-            Some(stream) => Pin::new(stream).poll_write(cx, bytes),
-            None => Poll::Ready(Err(aborted())),
-        }
+        Pin::new(&mut *stream).poll_write(cx, bytes)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        this.abort.0.writer.register(cx.waker());
+        this.owner.abort.0.writer.register(cx.waker());
         let mut stream = this
-            .abort
-            .0
+            .owner
             .stream
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if this.abort.is_aborted() {
+        if this.owner.abort.is_aborted() {
             return Poll::Ready(Err(aborted()));
         }
-        match stream.as_mut() {
-            Some(stream) => platform::poll_flush(stream, cx),
-            None => Poll::Ready(Err(aborted())),
-        }
+        platform::poll_flush(&mut stream, cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_flush(cx)
     }
 }
 
-pub struct LocalReadHalf(tokio::io::ReadHalf<LocalStream>);
+pub struct LocalReadHalf(LocalStream);
+impl LocalReadHalf {
+    pub fn retain_for_remote_read(&self) -> RemoteReadGuard {
+        self.0.retain_for_remote_read()
+    }
+
+    pub fn peer_ended(&self) -> bool {
+        self.0.peer_ended()
+    }
+}
 impl AsyncRead for LocalReadHalf {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -659,7 +736,7 @@ impl AsyncRead for LocalReadHalf {
 }
 
 pub struct LocalWriteHalf {
-    inner: tokio::io::WriteHalf<LocalStream>,
+    inner: LocalStream,
     abort: AbortHandle,
 }
 impl LocalWriteHalf {
@@ -715,8 +792,8 @@ async fn write_complete<W: AsyncWrite + Unpin>(
     *frame_written = false;
     let mut guard = AbortOnDrop(Some(abort.clone()));
     let result = tokio::time::timeout(timeout, async {
-        // Keep the native failure ahead of AbortOnDrop and any awakened
-        // reader. An outer inspect_err would see only the winning local abort.
+        // Record the native failure before local cancellation can win the
+        // final stream owner's end cause.
         AsyncWriteExt::write_all(writer, bytes)
             .await
             .inspect_err(|error| abort.close_io("write", error))?;
@@ -784,13 +861,33 @@ mod write_observation_tests {
     use super::*;
 
     #[tokio::test]
-    async fn native_write_error_is_published_before_abort_without_a_reader_task() {
-        let (stream, peer) = LocalStream::pair().await.unwrap();
+    async fn native_write_error_is_retained_until_physical_close_without_a_reader_task() {
+        let (_fixture, stream, peer) = crate::tests::isolated_pair().await;
         let publisher = ConnectionPublisher::new(ConnectionSide::Client);
         let observation = publisher.observation();
         let stream = stream.with_connection_publisher(publisher);
         let abort = stream.abort_handle();
-        let (_reader, mut writer) = stream.into_split();
+        let (reader, mut writer) = stream.into_split();
+        // Closing without shutdown can still admit a small write on macOS.
+        // Make the peer's read direction unavailable before testing a native
+        // write failure; this does not manufacture read-side peer-end proof.
+        {
+            let native = peer.owner.stream.lock().unwrap();
+            #[cfg(unix)]
+            socket2::SockRef::from(&*native)
+                .shutdown(std::net::Shutdown::Read)
+                .unwrap();
+            #[cfg(windows)]
+            assert_ne!(
+                unsafe {
+                    windows_sys::Win32::System::Pipes::DisconnectNamedPipe(platform::raw_handle(
+                        &native,
+                    )
+                        as windows_sys::Win32::Foundation::HANDLE)
+                },
+                0
+            );
+        }
         drop(peer);
 
         let error = writer
@@ -799,16 +896,20 @@ mod write_observation_tests {
             .expect_err("closed native peer must reject the write or its flush");
         assert_ne!(error.kind(), io::ErrorKind::TimedOut);
         assert!(abort.is_aborted());
+        assert!(observation.snapshot().is_none());
+        drop(writer);
+        assert!(observation.snapshot().is_none());
+        drop(reader);
         let closed = observation
             .snapshot()
-            .expect("sender records the native error");
+            .expect("physical close retains the native error");
         assert!(matches!(
             closed.reason(),
             ConnectionEndReason::IoError | ConnectionEndReason::ConnectionReset
         ));
         assert!(matches!(closed.operation(), "write" | "flush"));
         assert_eq!(closed.os_error(), error.raw_os_error());
-        drop(writer);
+        assert!(!closed.is_peer_end());
         abort.abort();
         assert_eq!(observation.snapshot(), Some(closed));
     }
@@ -821,7 +922,7 @@ mod write_observation_tests {
         let events = source.subscribe();
         let publisher = source.open_connection(ConnectionSide::Server);
         let observation = publisher.observation();
-        let (stream, mut peer) = LocalStream::pair().await.unwrap();
+        let (_fixture, stream, mut peer) = crate::tests::isolated_pair().await;
         let stream = stream.with_connection_publisher(publisher);
         let abort = stream.abort_handle();
         drop(stream);
@@ -894,13 +995,7 @@ mod frame_progress_tests {
     }
 
     fn abort() -> AbortHandle {
-        AbortHandle(Arc::new(AbortState {
-            stream: Mutex::new(None),
-            closed: AtomicBool::new(false),
-            reader: AtomicWaker::new(),
-            writer: AtomicWaker::new(),
-            connection: OnceLock::new(),
-        }))
+        AbortHandle::new()
     }
 
     #[tokio::test(start_paused = true)]

@@ -23,8 +23,9 @@ pub use connect_options::{
 };
 pub use identity::{validate_relay_id, validate_server_id};
 pub use ipc::{
-    BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig, MAX_EXECUTION_WORKERS,
-    MAX_IPC_POOL_SEGMENTS, PoolRoleTuning, SERVER_IPC_OVERRIDE_KEYS, ServerIpcConfig,
+    BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig, IPC_RELEASE_BATCH_CAPACITY,
+    MAX_EXECUTION_WORKERS, MAX_IPC_POOL_SEGMENTS, PoolRoleTuning, SERVER_IPC_OVERRIDE_KEYS,
+    ServerIpcConfig,
 };
 pub use local::{
     LocalEndpoint, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
