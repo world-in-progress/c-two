@@ -7,10 +7,10 @@ use crate::alloc::BuddyAllocator;
 use crate::budget::BudgetReservation;
 use crate::segment::ShmRegion;
 
-/// A SHM region with a buddy allocator attached.
+/// A payload mapping, with local allocator state only in its owner process.
 pub struct BuddySegment {
     region: ShmRegion,
-    allocator: BuddyAllocator,
+    allocator: Option<BuddyAllocator>,
     /// Owner-creation budget charge for this backing. Declared last so it is
     /// dropped after `region` (munmap + shm_unlink), returning the charge
     /// exactly when the backing is actually released.
@@ -25,7 +25,7 @@ impl BuddySegment {
     ///
     /// `size` is the desired minimum data capacity. The geometry is validated
     /// first through [`BuddyAllocator::checked_layout`]: unsupported layouts
-    /// (data capacity beyond the wire's `u32` coordinates, header/bitmap
+    /// (data capacity beyond the wire's `u32` coordinates,
     /// overflow, spans beyond one addressable `isize` mapping) return an
     /// error before any region is created. The caller that created this
     /// backing is responsible for reserving `layout.total_size` bytes in a
@@ -44,7 +44,7 @@ impl BuddySegment {
 
         Ok(Self {
             region,
-            allocator,
+            allocator: Some(allocator),
             budget_guard: None,
         })
     }
@@ -55,11 +55,9 @@ impl BuddySegment {
     pub fn open(name: &str, expected_size: usize) -> Result<Self, String> {
         let region = ShmRegion::open(name, expected_size)?;
 
-        let allocator = unsafe { BuddyAllocator::attach(region.base_ptr(), region.size())? };
-
         Ok(Self {
             region,
-            allocator,
+            allocator: None,
             budget_guard: None,
         })
     }
@@ -74,7 +72,13 @@ impl BuddySegment {
     }
 
     pub fn allocator(&self) -> &BuddyAllocator {
-        &self.allocator
+        self.allocator
+            .as_ref()
+            .expect("peer mappings have no allocator")
+    }
+
+    pub fn is_owner(&self) -> bool {
+        self.allocator.is_some()
     }
 
     pub fn name(&self) -> &str {

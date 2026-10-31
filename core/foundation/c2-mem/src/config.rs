@@ -7,10 +7,8 @@ pub use c2_config::PoolConfig;
 pub struct PoolAllocation {
     /// Index of the segment (buddy or dedicated).
     pub seg_idx: u32,
-    /// Concrete backing incarnation within this segment slot; dedicated is 0.
+    /// Concrete backing incarnation within this kind's reusable segment slot.
     pub generation: u32,
-    /// Allocation instance within the backing; dedicated allocations use 0.
-    pub allocation_id: u64,
     /// Offset within the segment's data region.
     pub offset: u32,
     /// Actual allocated size.
@@ -25,19 +23,16 @@ pub struct PoolAllocation {
 ///
 /// Scope notes: byte fields describe this pool's own backing capacities,
 /// never whole-process RSS or the OS commit charge. Buddy fields cover the
-/// data region only (allocator metadata is excluded; the mapped backing is
-/// larger and charged to the owner's memory budget). Dedicated fields count
-/// mapped capacity including freed-but-pending-GC entries, which stay mapped
-/// until the peer signals `read_done` or the crash timeout fires. File and
-/// live-reassembly bytes belong to the budget cells, not to these fields.
+/// data region only (allocator metadata is local). Dedicated fields count
+/// live mappings, released locally when the allocation owner is consumed.
+/// File and live-reassembly bytes belong to the budget cells.
 #[derive(Debug, Clone)]
 pub struct PoolStats {
     /// Live buddy segments (mapped buddy backings).
     pub total_segments: usize,
-    /// Dedicated entries, including freed-but-pending-GC ones.
+    /// Live dedicated mappings.
     pub dedicated_segments: usize,
-    /// Active allocations: live buddy blocks plus dedicated entries that are
-    /// not pending-GC.
+    /// Active local allocations. Peer mappings expose no allocator counters.
     pub alloc_count: u32,
     /// Sum of buddy data-region capacity across live segments.
     pub buddy_data_bytes: u64,
@@ -45,14 +40,12 @@ pub struct PoolStats {
     pub buddy_occupied_bytes: u64,
     /// Buddy data capacity free for reuse without any new mapping.
     pub buddy_idle_bytes: u64,
-    /// Dedicated mapped capacity, including pending-free entries.
+    /// Dedicated mapped capacity.
     pub dedicated_mapped_bytes: u64,
-    /// Dedicated entries actively backing allocations (not pending-free).
+    /// Dedicated entries actively backing local allocations.
     pub dedicated_active_count: usize,
     /// Mapped capacity of active dedicated entries.
     pub dedicated_active_bytes: u64,
-    /// Mapped capacity of freed-but-pending-GC dedicated entries.
-    pub dedicated_pending_free_bytes: u64,
     /// Successful allocations served from an already-mapped buddy segment.
     pub buddy_reused_allocs: u64,
     /// Successful allocations served by a newly created buddy segment.

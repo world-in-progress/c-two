@@ -20,7 +20,7 @@ pub mod retention;
 pub mod segment;
 pub mod spill;
 
-pub use alloc::{Allocation, BuddyAllocator, BuddyLayout, SegmentHeader, ShmSpinlock};
+pub use alloc::{Allocation, BuddyAllocator, BuddyLayout};
 pub use buddy_segment::BuddySegment;
 pub use budget::{
     BudgetCellSnapshot, BudgetError, BudgetKind, BudgetObserver, BudgetObserverWeak,
@@ -33,7 +33,7 @@ pub use lease::{
     BufferLeaseGuard, BufferLeaseMeta, BufferLeaseObserver, BufferLeaseSnapshot, BufferLeaseStats,
     BufferLeaseTracker, BufferStorage, HoldBucketStats, LeaseDirection,
 };
-pub use pool::{MemPool, ReleaseHandleError};
+pub use pool::MemPool;
 pub use retention::{
     RetentionBudget, RetentionError, RetentionPermit, RetentionRejectReason, RetentionSnapshot,
 };

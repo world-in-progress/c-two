@@ -21,6 +21,9 @@ impl PoolIncarnation {
 /// Move-only allocation authority. Coordinates can be inspected but cannot
 /// reconstruct this owner. Read through `MemPool::handle_slice`, write through
 /// `MemPool::handle_slice_mut`, and consume it with `MemPool::release_handle`.
+/// Retain the original pool alongside every SHM handle, including entries in
+/// a connection's loan book, until it is released. The handle does not keep
+/// that pool alive by itself.
 pub struct MemHandle {
     pub(crate) backing: HandleBacking,
 }
@@ -95,12 +98,16 @@ impl std::fmt::Debug for MemHandle {
                 allocation: a, len, ..
             } if !a.is_dedicated => write!(
                 f,
-                "MemHandle::Buddy(seg={}, gen={}, allocation={}, off={}, capacity={}, len={len})",
-                a.seg_idx, a.generation, a.allocation_id, a.offset, a.actual_size
+                "MemHandle::Buddy(seg={}, gen={}, off={}, capacity={}, len={len})",
+                a.seg_idx, a.generation, a.offset, a.actual_size
             ),
             HandleBacking::Shm {
                 allocation: a, len, ..
-            } => write!(f, "MemHandle::Dedicated(seg={}, len={len})", a.seg_idx),
+            } => write!(
+                f,
+                "MemHandle::Dedicated(seg={}, gen={}, len={len})",
+                a.seg_idx, a.generation
+            ),
             HandleBacking::FileSpill { path, len, .. } => write!(
                 f,
                 "MemHandle::FileSpill(path={}, len={len})",
