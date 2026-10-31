@@ -425,7 +425,7 @@ impl<C> ChunkRegistry<C> {
     }
 
     /// Nonblocking connection teardown. Busy releases retain the complete
-    /// assembler for retry; an actual release error abandons its obligation.
+    /// assembler until its local pool lock is available.
     /// Finished carriers are independent.
     pub fn try_cleanup_connection(&self, conn_id: u64) -> bool {
         self.try_drain_shard(self.shard(conn_id), |(cid, _), _| *cid == conn_id, None)
@@ -480,13 +480,12 @@ impl<C> ChunkRegistry<C> {
     ) -> (bool, GcStats) {
         // Declared before the guard so unwinding also drops contexts unlocked.
         let mut removed = Vec::new();
-        let mut failures = HashMap::new();
         let Some(mut shard) = shard.try_lock() else {
             return (false, GcStats::default());
         };
         let mut complete = true;
         let mut stats = GcStats::default();
-        for (key, tracked) in shard.extract_if(|key, tracked| {
+        for (_, tracked) in shard.extract_if(|key, tracked| {
             if !matches(key, tracked) {
                 return false;
             }
@@ -494,45 +493,24 @@ impl<C> ChunkRegistry<C> {
                 complete = false;
                 return false;
             }
-            // The physical release and validation occur under the same pool
-            // guard. A busy pool retains the entry; an actual error exits the
-            // recovery loop and is abandoned outside the shard lock.
-            match tracked.inner.try_release() {
-                Ok(true) => {
-                    stats.expired += 1;
-                    stats.freed_bytes += tracked.total_bytes;
-                    true
-                }
-                Ok(false) => {
-                    complete = false;
-                    false
-                }
-                Err(error) => {
-                    failures.insert(*key, error);
-                    true
-                }
+            if tracked.inner.try_release() {
+                stats.expired += 1;
+                stats.freed_bytes += tracked.total_bytes;
+                true
+            } else {
+                complete = false;
+                false
             }
         }) {
             self.active_count.fetch_sub(1, Ordering::Relaxed);
             self.total_bytes
                 .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-            removed.push((key, tracked));
+            removed.push(tracked);
         }
         stats.remaining = shard.len();
         drop(shard);
-        // All context Drop and failed-release finalization run after both
-        // shard and pool guards are gone. Do not let an Err take the ordinary
-        // assembler Drop, which would retry the same physical release.
-        for (key, tracked) in removed {
-            if let Some(error) = failures.remove(&key) {
-                warn!(conn_id = key.0, request_id = key.1, %error, "final chunk release failed");
-                let TrackedAssembler { inner, context, .. } = tracked;
-                inner.abandon();
-                drop(context);
-            } else {
-                drop(tracked);
-            }
-        }
+        // Context Drop runs outside both shard and pool guards.
+        drop(removed);
         (complete, stats)
     }
 }
@@ -599,7 +577,7 @@ mod tests {
             min_block_size: 4096,
             max_segments: 2,
             max_dedicated_segments: 2,
-            dedicated_crash_timeout_secs: 0.0,
+
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_reg_test"),
@@ -685,7 +663,7 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0xa5)
         );
-        backing.release().unwrap();
+        backing.release();
         assert_eq!(reassembly_used(&budget), 0);
         std::fs::remove_dir(&spill_dir).unwrap();
     }
@@ -708,7 +686,7 @@ mod tests {
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
         assert_eq!(finished.copy_bytes().unwrap(), data);
-        finished.release().unwrap();
+        finished.release();
     }
 
     #[test]
@@ -726,50 +704,6 @@ mod tests {
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
         assert_eq!(reassembly_used(&budget), 0);
-    }
-
-    #[test]
-    fn failed_nonblocking_extraction_abandons_once_without_refunding() {
-        for exit in ["abort", "connection", "gc"] {
-            let (pool, budget) = budgeted_pool(4096);
-            let reg = ChunkRegistry::new(
-                Arc::clone(&pool),
-                ChunkConfig {
-                    assembler_timeout: Duration::ZERO,
-                    ..ChunkConfig::default()
-                },
-            );
-            reg.insert(1, 7, 1, 4096, ()).unwrap();
-            let original = std::mem::replace(
-                &mut *pool.write(),
-                MemPool::new_with_prefix(base_config(), unique_prefix("failed")).unwrap(),
-            );
-
-            match exit {
-                "abort" => assert!(reg.try_abort(1, 7)),
-                "connection" => assert!(reg.try_cleanup_connection(1)),
-                "gc" => {
-                    let stats = reg.try_gc_sweep();
-                    assert_eq!(stats.expired, 0, "failed release did not free storage");
-                    assert_eq!(stats.remaining, 0);
-                }
-                _ => unreachable!(),
-            }
-            assert!(!reg.contains(1, 7), "{exit}");
-            assert_eq!(reg.active_count(), 0, "{exit}");
-            assert_eq!(reg.total_bytes(), 0, "{exit}");
-            assert_eq!(original.stats().alloc_count, 1, "{exit}");
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 4096, "{exit}");
-            assert_eq!(budget.snapshot().abandoned_releases, 1, "{exit}");
-            assert!(reg.try_cleanup_connection(1));
-            assert_eq!(reg.try_gc_sweep().remaining, 0);
-            assert_eq!(budget.snapshot().abandoned_releases, 1, "{exit}");
-            assert!(
-                budget.reserve(BudgetKind::Reassembly, 4096).is_err(),
-                "{exit}"
-            );
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 4096, "{exit}");
-        }
     }
 
     #[test]
@@ -878,7 +812,7 @@ mod tests {
         assert_eq!(&slice[128..256], &[1u8; 128]);
         assert_eq!(&slice[256..384], &[2u8; 128]);
         assert_eq!(&slice[384..384 + 64], &[3u8; 64]);
-        finished.release().unwrap();
+        finished.release();
     }
 
     #[test]
@@ -959,7 +893,7 @@ mod tests {
         assert!(complete);
         let (assembler, ()) = reg.take(2, 100).unwrap();
         let mut finished = assembler.finish().unwrap();
-        finished.release().unwrap();
+        finished.release();
         assert_eq!(reassembly_used(&budget), 0);
     }
 
@@ -1165,7 +1099,7 @@ mod tests {
         assert_eq!(&backing.copy_bytes().unwrap()[0..256], &[9u8; 256]);
         assert_eq!(&backing.copy_bytes().unwrap()[256..384], &[8u8; 128]);
 
-        backing.release().unwrap();
+        backing.release();
         assert_eq!(reassembly_used(&budget), 0);
     }
 
@@ -1268,7 +1202,7 @@ mod tests {
                     min_block_size: 4096,
                     max_segments: 4,
                     max_dedicated_segments: 8,
-                    dedicated_crash_timeout_secs: 0.0,
+
                     buddy_idle_decay_secs: 0.0,
                     spill_threshold: 1.0,
                     spill_dir: std::env::temp_dir().join("c2_reg_test"),
@@ -1363,7 +1297,7 @@ mod tests {
                     let (assembler, ()) = reg.take(conn_id, req_id).unwrap();
                     let mut finished = assembler.finish().unwrap();
                     assert_eq!(finished.copy_bytes().unwrap(), &[conn_id as u8; 64]);
-                    finished.release().unwrap();
+                    finished.release();
                 }
             });
             handles.push(h);
@@ -1390,7 +1324,7 @@ mod tests {
                     reg.feed(conn_id, req_id, 0, &[0u8; 64]).unwrap();
                     let (assembler, ()) = reg.take(conn_id, req_id).unwrap();
                     let mut finished = assembler.finish().unwrap();
-                    finished.release().unwrap();
+                    finished.release();
                 }
             });
             handles.push(h);
@@ -1426,7 +1360,7 @@ mod tests {
         let expected_first = [vec![1; 512], vec![3; 100]].concat();
         assert_eq!(first.len(), 612);
         assert_eq!(first.copy_bytes().unwrap(), expected_first);
-        first.release().unwrap();
+        first.release();
         assert_eq!(reassembly_used(&budget), 1024);
         assert_eq!(pool.read().stats().alloc_count, 1);
 
@@ -1439,7 +1373,7 @@ mod tests {
         let expected_second = [vec![2; 512], vec![4; 200]].concat();
         assert_eq!(second.len(), 712);
         assert_eq!(second.copy_bytes().unwrap(), expected_second);
-        second.release().unwrap();
+        second.release();
         assert_eq!(reassembly_used(&budget), 0);
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
@@ -1525,7 +1459,7 @@ mod tests {
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
 
-        finished.release().unwrap();
+        finished.release();
         assert_no_shm_mappings(&pool);
     }
 
@@ -1548,7 +1482,7 @@ mod tests {
         assert_eq!(&slice[0..512], &[7u8; 512]);
         assert_eq!(&slice[512..768], &[6u8; 256]);
         let mut held = held;
-        held.release().unwrap();
+        held.release();
         assert_eq!(reassembly_used(&budget), 0);
 
         // Abort path on a fresh file-backed registry.
@@ -1569,7 +1503,7 @@ mod tests {
         let mut finished = assembler.finish().unwrap();
         assert!(finished.is_file_spill());
         assert_eq!(finished.copy_bytes().unwrap(), &[9u8; 1024]);
-        finished.release().unwrap();
+        finished.release();
         assert_no_shm_mappings(&pool);
     }
 
@@ -1595,7 +1529,7 @@ mod tests {
         let (assembler, ()) = reg.take(1, 721).unwrap();
         let mut finished = assembler.finish().unwrap();
         assert!(finished.is_file_spill());
-        finished.release().unwrap();
+        finished.release();
         assert_eq!(reassembly_used(&budget), 0);
     }
 
@@ -1683,9 +1617,9 @@ mod tests {
         let (assembler, ()) = reg.take(other_conn, 22).unwrap();
         let mut other = assembler.finish().unwrap();
         assert_eq!(other.copy_bytes().unwrap(), &[33; 1024]);
-        other.release().unwrap();
+        other.release();
         assert_eq!(held.copy_bytes().unwrap(), &[11; 512]);
-        held.release().unwrap();
+        held.release();
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }
@@ -1779,7 +1713,7 @@ mod tests {
         assert_eq!(released_other.remaining, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
         assert_eq!(held.copy_bytes().unwrap(), &[11; 512]);
-        held.release().unwrap();
+        held.release();
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }
@@ -1979,7 +1913,7 @@ mod tests {
         let bytes = finished.copy_bytes().unwrap();
         assert_eq!(&bytes[..64], &[0x11; 64]);
         assert_eq!(&bytes[64..], &[0x22; 64]);
-        finished.release().unwrap();
+        finished.release();
         assert_eq!(reassembly_used(&budget), 0);
         assert_no_shm_mappings(&pool);
     }
@@ -2187,7 +2121,7 @@ mod tests {
         assert_eq!(carrier.copy_bytes().unwrap(), &[0x11; 64]);
         reg.abort(1, 22);
         assert_eq!(reassembly_used(&budget), 64);
-        carrier.release().unwrap();
+        carrier.release();
         assert_eq!(reassembly_used(&budget), 0);
         assert_no_shm_mappings(&pool);
     }

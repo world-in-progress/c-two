@@ -185,19 +185,9 @@ impl ChunkAssembler {
         drop(self)
     }
 
-    /// Try to release without consuming the assembler on pool contention.
-    ///
-    /// Cleanup owners retain this assembler on `Ok(false)` or an error and
-    /// retry it later. Only a successful release permits removing the entry;
-    /// its subsequent Drop then has no storage or reservation left to release.
-    pub fn try_release(&mut self) -> Result<bool, String> {
+    /// Try to release without consuming the assembler on local pool contention.
+    pub fn try_release(&mut self) -> bool {
         self.backing.try_release()
-    }
-
-    /// End a failed final release without another pool access or budget refund.
-    pub(crate) fn abandon(self) {
-        let Self { backing, .. } = self;
-        backing.abandon();
     }
 
     /// One past the last byte written (actual data length).
@@ -220,7 +210,7 @@ mod tests {
                 min_block_size: 4096,
                 max_segments: 2,
                 max_dedicated_segments: 2,
-                dedicated_crash_timeout_secs: 0.0,
+
                 buddy_idle_decay_secs: 0.0,
                 spill_threshold: 1.0,
                 spill_dir: std::env::temp_dir().join("c2_asm_test"),
@@ -240,7 +230,7 @@ mod tests {
                         min_block_size: 4096,
                         max_segments: 2,
                         max_dedicated_segments: 2,
-                        dedicated_crash_timeout_secs: 0.0,
+
                         buddy_idle_decay_secs: 0.0,
                         spill_threshold: 1.0,
                         spill_dir: std::env::temp_dir().join("c2_asm_test_budget"),
@@ -274,7 +264,7 @@ mod tests {
         assert!(!asm.feed_chunk(0, &[27; 4096]).unwrap());
         {
             let _reader = pool.read();
-            assert!(!asm.try_release().unwrap());
+            assert!(!asm.try_release());
             assert_eq!(asm.received(), 1);
             assert_eq!(asm.written_end(), 4096);
             assert_eq!(asm.capacity_bytes(), 8192);
@@ -286,12 +276,12 @@ mod tests {
         assert!(asm.feed_chunk(1, &[38; 1024]).unwrap());
         assert_eq!(&asm.backing.copy_bytes().unwrap()[..4096], &[27; 4096]);
         assert_eq!(&asm.backing.copy_bytes().unwrap()[4096..5120], &[38; 1024]);
-        assert!(asm.try_release().unwrap());
+        assert!(asm.try_release());
         assert_eq!(asm.capacity_bytes(), 0);
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
         let _writer = pool.write();
-        assert!(asm.try_release().unwrap());
+        assert!(asm.try_release());
         drop(asm); // successful cleanup's Drop must not reacquire the pool
     }
 
@@ -305,7 +295,7 @@ mod tests {
         let mut backing = asm.finish().unwrap();
         assert_eq!(backing.len(), data.len());
         assert_eq!(&backing.copy_bytes().unwrap()[..data.len()], data);
-        backing.release().unwrap();
+        backing.release();
     }
 
     #[test]
@@ -323,7 +313,7 @@ mod tests {
         assert_eq!(&slice[16..18], b"cc");
         // Trim happened but the full capacity stays charged until release.
         assert_eq!(backing.capacity_bytes(), 24);
-        backing.release().unwrap();
+        backing.release();
     }
 
     #[test]
@@ -337,7 +327,7 @@ mod tests {
         let slice = backing.copy_bytes().unwrap();
         assert_eq!(&slice[0..8], b"firstttt");
         assert_eq!(&slice[8..14], b"second");
-        backing.release().unwrap();
+        backing.release();
     }
 
     #[test]
@@ -378,7 +368,7 @@ mod tests {
             assert_eq!(backing.len(), (total_chunks - 1) * chunk_size + last_size);
             assert_eq!(backing.copy_bytes().unwrap(), chunks.concat());
             assert_eq!(backing.capacity_bytes(), (total_chunks * chunk_size) as u64);
-            backing.release().unwrap();
+            backing.release();
         }
     }
 
@@ -396,7 +386,7 @@ mod tests {
         assert_eq!(asm.received(), 2);
         let mut backing = asm.finish().unwrap();
         assert_eq!(backing.copy_bytes().unwrap(), b"data0000tail");
-        backing.release().unwrap();
+        backing.release();
     }
 
     #[test]
@@ -445,7 +435,7 @@ mod tests {
         assert_eq!(after.buddy_expanded_allocs, before.buddy_expanded_allocs);
         assert_eq!(after.dedicated_allocs, 0);
         assert_eq!(after.file_spill_allocs, 0);
-        guard.release_handle(handle).unwrap();
+        guard.release_handle(handle);
         assert_eq!(guard.stats().alloc_count, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }
@@ -545,8 +535,8 @@ mod tests {
         );
         assert_eq!(backing.copy_bytes().unwrap(), b"firsttttsec");
         // Idempotent release refunds exactly once.
-        backing.release().unwrap();
-        backing.release().unwrap();
+        backing.release();
+        backing.release();
         assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
         assert!(backing.is_released());
     }

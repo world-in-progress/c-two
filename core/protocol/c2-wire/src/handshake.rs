@@ -1,42 +1,14 @@
-//! Fixed version preamble, followed by capability and method-table metadata.
+//! IPC 15 metadata follows the permanent fixed version preamble.
 //!
-//! ## Client → Server
-//!
-//! ```text
-//! [1B prefix_len][prefix UTF-8]
-//! [2B seg_count LE]
-//! [per-segment: [4B size LE][1B name_len][name UTF-8]]
-//! [2B capability_flags LE]
-//! ```
-//!
-//! ## Server → Client (ACK)
-//!
-//! Same prefix, plus:
-//!
-//! ```text
-//! [1B server_id_len][server_id UTF-8]
-//! [1B server_instance_id_len][server_instance_id UTF-8]
-//! [2B route_count LE]
-//! [per-route:
-//!     [1B name_len][route_name UTF-8]
-//!     [1B route_uid_len][route_uid UTF-8]
-//!     [8B route_revision LE]
-//!     [1B crm_ns_len][crm_ns UTF-8]
-//!     [1B crm_name_len][crm_name UTF-8]
-//!     [1B crm_ver_len][crm_ver UTF-8]
-//!     [1B abi_hash_len][abi_hash UTF-8]
-//!     [1B signature_hash_len][signature_hash UTF-8]
-//!     [8B max_payload_size LE]
-//!     [2B method_count LE]
-//!     [per-method: [1B name_len][method_name UTF-8][2B method_idx LE]]
-//! ]
-//! ```
+//! Client metadata is `[prefix_len:u8][prefix][SHM direction bits:u16 LE]`.
+//! Server metadata appends identity and routes; routes carry full contract
+//! identity, payload limit and method table, without a revision.
 
 use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
-/// RPC protocol version; version 14 requires the fixed preamble before metadata.
-pub const HANDSHAKE_VERSION: u32 = 14;
+/// RPC protocol version; metadata from earlier versions is not supported.
+pub const HANDSHAKE_VERSION: u32 = 15;
 
 /// Fixed preamble body length, independent of configurable variable-frame limits.
 pub const VERSION_PREAMBLE_BODY_LEN: u32 = 21;
@@ -130,17 +102,8 @@ pub fn decode_version_preamble_payload(
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
-/// Supports v2 call/reply frames (control-plane routing).
-pub const CAP_CALL_V2: u16 = 1 << 0;
-
-/// Supports method indexing (2-byte index vs UTF-8 name).
-pub const CAP_METHOD_IDX: u16 = 1 << 1;
-
-/// Supports chunked transfer for large payloads.
-pub const CAP_CHUNKED: u16 = 1 << 2;
-
 /// Client may carry request bodies in its own SHM blocks (client-relative
-/// direction: client writes, server reads and cross-process frees).
+/// direction: client writes, server reads and sends release records).
 ///
 /// The client offers the bit only when its native local stream can actually
 /// reach shared memory with the peer (same TokenSessionId on Windows); the
@@ -162,7 +125,6 @@ pub const CAP_SHM_RESPONSE: u16 = 1 << 4;
 
 // ── Safety limits ────────────────────────────────────────────────────────
 
-pub const MAX_SEGMENTS: usize = 16;
 pub const MAX_ROUTES: usize = 64;
 pub const MAX_METHODS: usize = c2_contract::MAX_CONTRACT_METHODS;
 const MAX_HANDSHAKE_NAME_BYTES: usize = c2_contract::MAX_WIRE_TEXT_BYTES;
@@ -171,31 +133,30 @@ const MAX_HANDSHAKE_NAME_BYTES: usize = c2_contract::MAX_WIRE_TEXT_BYTES;
 
 /// A single method in a route's method table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MethodEntry {
-    pub name: String,
+pub struct MethodEntry<S = String> {
+    pub name: S,
     pub index: u16,
 }
 
 /// Route info exchanged during handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteInfo {
-    pub name: String,
-    pub route_uid: String,
-    pub route_revision: u64,
-    pub crm_ns: String,
-    pub crm_name: String,
-    pub crm_ver: String,
-    pub abi_hash: String,
-    pub signature_hash: String,
+pub struct RouteInfo<S = String> {
+    pub name: S,
+    pub route_uid: S,
+    pub crm_ns: S,
+    pub crm_name: S,
+    pub crm_ver: S,
+    pub abi_hash: S,
+    pub signature_hash: S,
     pub max_payload_size: u64,
-    pub methods: Vec<MethodEntry>,
+    pub methods: Vec<MethodEntry<S>>,
 }
 
 /// Server identity exchanged in server→client handshake ACKs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerIdentity {
-    pub server_id: String,
-    pub server_instance_id: String,
+pub struct ServerIdentity<S = String> {
+    pub server_id: S,
+    pub server_instance_id: S,
 }
 
 /// Decoded handshake payload.
@@ -203,8 +164,6 @@ pub struct ServerIdentity {
 pub struct Handshake {
     /// Pool prefix for deterministic segment naming.
     pub prefix: String,
-    /// SHM segments: `(name, size)`.
-    pub segments: Vec<(String, u32)>,
     /// Capability flags.
     pub capability_flags: u16,
     /// Server identity (only present in server→client ACK).
@@ -213,144 +172,75 @@ pub struct Handshake {
     pub routes: Vec<RouteInfo>,
 }
 
-// ── Encoding: Client → Server ────────────────────────────────────────────
-
-/// Encode client→server metadata, sent only after version acceptance.
+/// Encode already validated client metadata after version acceptance.
+/// Only wire-width failures remain; contract validation belongs to admission.
 pub fn encode_client_handshake(
-    segments: &[(String, u32)],
     capability_flags: u16,
     prefix: &str,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_name_len("prefix", prefix)?;
-    if segments.len() > MAX_SEGMENTS {
-        return Err(EncodeError::FieldTooLong {
-            field: "segment count",
-            max: MAX_SEGMENTS,
-            actual: segments.len(),
-        });
-    }
-    let mut buf = Vec::with_capacity(64);
-    // Prefix
-    let prefix_b = prefix.as_bytes();
-    buf.push(prefix_b.len() as u8);
-    buf.extend_from_slice(prefix_b);
-    // Segments
-    buf.extend_from_slice(&(segments.len() as u16).to_le_bytes());
-    for (name, size) in segments {
-        validate_name_len("segment name", name)?;
-        buf.extend_from_slice(&size.to_le_bytes());
-        let name_b = name.as_bytes();
-        buf.push(name_b.len() as u8);
-        buf.extend_from_slice(name_b);
-    }
+    let mut buf = Vec::with_capacity(3 + prefix.len());
+    push_text(&mut buf, "prefix", prefix)?;
     buf.extend_from_slice(&capability_flags.to_le_bytes());
     Ok(buf)
 }
 
-// ── Encoding: Server → Client (ACK) ─────────────────────────────────────
-
-/// Encode server→client metadata ACK after version acceptance.
-pub fn encode_server_handshake(
-    segments: &[(String, u32)],
+/// Borrow route/method/identity text from the authoritative catalog instead of
+/// cloning it into an intermediate directory for encoding.
+pub fn encode_server_handshake<S: AsRef<str>, I: AsRef<str>>(
     capability_flags: u16,
-    routes: &[RouteInfo],
+    routes: &[RouteInfo<S>],
     prefix: &str,
-    identity: &ServerIdentity,
+    identity: &ServerIdentity<I>,
 ) -> Result<Vec<u8>, EncodeError> {
-    if routes.len() > MAX_ROUTES {
-        return Err(EncodeError::FieldTooLong {
-            field: "route count",
-            max: MAX_ROUTES,
-            actual: routes.len(),
-        });
-    }
-    let mut buf = encode_client_handshake(segments, capability_flags, prefix)?;
-    validate_name_len("server_id", &identity.server_id)?;
-    validate_name_len("server_instance_id", &identity.server_instance_id)?;
-    let server_id_b = identity.server_id.as_bytes();
-    buf.push(server_id_b.len() as u8);
-    buf.extend_from_slice(server_id_b);
-    let instance_b = identity.server_instance_id.as_bytes();
-    buf.push(instance_b.len() as u8);
-    buf.extend_from_slice(instance_b);
-    buf.extend_from_slice(&(routes.len() as u16).to_le_bytes());
+    let mut buf = encode_client_handshake(capability_flags, prefix)?;
+    push_text(&mut buf, "server_id", identity.server_id.as_ref())?;
+    push_text(
+        &mut buf,
+        "server_instance_id",
+        identity.server_instance_id.as_ref(),
+    )?;
+    push_count(&mut buf, "route count", routes.len())?;
     for route in routes {
-        validate_name_len("route name", &route.name)?;
-        validate_route_uid(&route.route_uid).map_err(|reason| EncodeError::InvalidText {
-            field: "route_uid",
-            reason,
-        })?;
-        validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver).map_err(|reason| {
-            EncodeError::InvalidText {
-                field: "crm tag",
-                reason,
-            }
-        })?;
-        validate_contract_hash("abi_hash", &route.abi_hash)?;
-        validate_contract_hash("signature_hash", &route.signature_hash)?;
-        if route.max_payload_size == 0 {
-            return Err(EncodeError::InvalidText {
-                field: "max_payload_size",
-                reason: "must be > 0".to_string(),
-            });
+        for (field, text) in [
+            ("route name", route.name.as_ref()),
+            ("route_uid", route.route_uid.as_ref()),
+            ("crm_ns", route.crm_ns.as_ref()),
+            ("crm_name", route.crm_name.as_ref()),
+            ("crm_ver", route.crm_ver.as_ref()),
+            ("abi_hash", route.abi_hash.as_ref()),
+            ("signature_hash", route.signature_hash.as_ref()),
+        ] {
+            push_text(&mut buf, field, text)?;
         }
-        if route.methods.len() > MAX_METHODS {
-            return Err(EncodeError::FieldTooLong {
-                field: "method count",
-                max: MAX_METHODS,
-                actual: route.methods.len(),
-            });
-        }
-        let name_b = route.name.as_bytes();
-        buf.push(name_b.len() as u8);
-        buf.extend_from_slice(name_b);
-        let route_uid_b = route.route_uid.as_bytes();
-        buf.push(route_uid_b.len() as u8);
-        buf.extend_from_slice(route_uid_b);
-        buf.extend_from_slice(&route.route_revision.to_le_bytes());
-        let crm_ns_b = route.crm_ns.as_bytes();
-        buf.push(crm_ns_b.len() as u8);
-        buf.extend_from_slice(crm_ns_b);
-        let crm_name_b = route.crm_name.as_bytes();
-        buf.push(crm_name_b.len() as u8);
-        buf.extend_from_slice(crm_name_b);
-        let crm_ver_b = route.crm_ver.as_bytes();
-        buf.push(crm_ver_b.len() as u8);
-        buf.extend_from_slice(crm_ver_b);
-        let abi_hash_b = route.abi_hash.as_bytes();
-        buf.push(abi_hash_b.len() as u8);
-        buf.extend_from_slice(abi_hash_b);
-        let signature_hash_b = route.signature_hash.as_bytes();
-        buf.push(signature_hash_b.len() as u8);
-        buf.extend_from_slice(signature_hash_b);
         buf.extend_from_slice(&route.max_payload_size.to_le_bytes());
-        buf.extend_from_slice(&(route.methods.len() as u16).to_le_bytes());
-        for m in &route.methods {
-            validate_name_len("method name", &m.name)?;
-            let m_b = m.name.as_bytes();
-            buf.push(m_b.len() as u8);
-            buf.extend_from_slice(m_b);
-            buf.extend_from_slice(&m.index.to_le_bytes());
+        push_count(&mut buf, "method count", route.methods.len())?;
+        for method in &route.methods {
+            push_text(&mut buf, "method name", method.name.as_ref())?;
+            buf.extend_from_slice(&method.index.to_le_bytes());
         }
     }
     Ok(buf)
 }
 
-fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
-    let actual = value.len();
-    if actual > MAX_HANDSHAKE_NAME_BYTES {
-        return Err(EncodeError::FieldTooLong {
-            field,
-            max: MAX_HANDSHAKE_NAME_BYTES,
-            actual,
-        });
-    }
+fn push_text(buf: &mut Vec<u8>, field: &'static str, value: &str) -> Result<(), EncodeError> {
+    let len = u8::try_from(value.len()).map_err(|_| EncodeError::FieldTooLong {
+        field,
+        max: u8::MAX as usize,
+        actual: value.len(),
+    })?;
+    buf.push(len);
+    buf.extend_from_slice(value.as_bytes());
     Ok(())
 }
 
-fn validate_contract_hash(field: &'static str, value: &str) -> Result<(), EncodeError> {
-    validate_contract_hash_text(field, value)
-        .map_err(|reason| EncodeError::InvalidText { field, reason })
+fn push_count(buf: &mut Vec<u8>, field: &'static str, count: usize) -> Result<(), EncodeError> {
+    let count = u16::try_from(count).map_err(|_| EncodeError::FieldTooLong {
+        field,
+        max: u16::MAX as usize,
+        actual: count,
+    })?;
+    buf.extend_from_slice(&count.to_le_bytes());
+    Ok(())
 }
 
 fn validate_contract_hash_text(_field: &'static str, value: &str) -> Result<(), String> {
@@ -382,9 +272,9 @@ fn validate_route_uid(value: &str) -> Result<(), String> {
 
 /// Decode metadata from either direction after the fixed version exchange.
 ///
-/// Client payloads have no route section (detected by exhausting bytes
-/// after `capability_flags`).
-pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
+/// The expected direction is supplied by the receive boundary. Client metadata
+/// cannot masquerade as a server ACK by appending superseded fields.
+pub fn decode_handshake(buf: &[u8], response: bool) -> Result<Handshake, DecodeError> {
     let len = buf.len();
     if len < 3 {
         return Err(DecodeError::BufferTooShort { need: 3, have: len });
@@ -399,40 +289,26 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
     let prefix = read_str(buf, off, prefix_len)?;
     off += prefix_len;
 
-    // Segments
-    check_remaining(buf, off, 2, "segment count")?;
-    let seg_count = read_u16(buf, off) as usize;
-    off += 2;
-    if seg_count > MAX_SEGMENTS {
-        return Err(DecodeError::InvalidValue {
-            field: "segment count",
-            value: seg_count as u64,
-        });
-    }
-    let mut segments = Vec::with_capacity(seg_count);
-    for _ in 0..seg_count {
-        check_remaining(buf, off, 5, "segment entry")?;
-        let size = read_u32(buf, off);
-        off += 4;
-        let name_len = buf[off] as usize;
-        off += 1;
-        check_remaining(buf, off, name_len, "segment name")?;
-        let name = read_str(buf, off, name_len)?;
-        off += name_len;
-        segments.push((name, size));
-    }
-
     // Capability flags
     check_remaining(buf, off, 2, "capability flags")?;
     let capability_flags = read_u16(buf, off);
     off += 2;
 
-    // Client handshakes end after capability flags. Server ACKs append
-    // identity and route table data.
-    if off == len {
+    if capability_flags & !(CAP_SHM_REQUEST | CAP_SHM_RESPONSE) != 0 {
+        return Err(DecodeError::InvalidValue {
+            field: "capability flags",
+            value: capability_flags.into(),
+        });
+    }
+    if !response {
+        if off != len {
+            return Err(DecodeError::InvalidValue {
+                field: "trailing bytes",
+                value: (len - off) as u64,
+            });
+        }
         return Ok(Handshake {
             prefix,
-            segments,
             capability_flags,
             server_identity: None,
             routes: Vec::new(),
@@ -453,6 +329,14 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
     let server_instance_id = read_str(buf, off, instance_len)?;
     off += instance_len;
 
+    for (field, value) in [
+        ("server_id", &server_id),
+        ("server_instance_id", &server_instance_id),
+    ] {
+        c2_config::validate_server_id(value)
+            .map_err(|reason| DecodeError::InvalidText { field, reason })?;
+    }
+
     // Routes (server→client ACK)
     let mut routes = Vec::new();
     check_remaining(buf, off, 2, "route count")?;
@@ -472,6 +356,12 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         check_remaining(buf, off, r_len, "route name")?;
         let r_name = read_str(buf, off, r_len)?;
         off += r_len;
+        c2_contract::validate_call_route_key("route_name", &r_name).map_err(|err| {
+            DecodeError::InvalidText {
+                field: "route_name",
+                reason: err.to_string(),
+            }
+        })?;
 
         check_remaining(buf, off, 1, "route_uid length")?;
         let route_uid_len = buf[off] as usize;
@@ -483,10 +373,6 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
             field: "route_uid",
             reason,
         })?;
-
-        check_remaining(buf, off, 8, "route_revision")?;
-        let route_revision = read_u64(buf, off);
-        off += 8;
 
         check_remaining(buf, off, 1, "crm namespace length")?;
         let crm_ns_len = buf[off] as usize;
@@ -579,7 +465,6 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         routes.push(RouteInfo {
             name: r_name,
             route_uid,
-            route_revision,
             crm_ns,
             crm_name,
             crm_ver,
@@ -598,7 +483,6 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
 
     Ok(Handshake {
         prefix,
-        segments,
         capability_flags,
         server_identity: Some(ServerIdentity {
             server_id,
@@ -631,11 +515,6 @@ fn check_remaining(
 #[inline]
 fn read_u16(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
-}
-
-#[inline]
-fn read_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 
 #[inline]
