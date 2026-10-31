@@ -83,7 +83,7 @@ pub async fn run_heartbeat(
         }
 
         // Before the peer's first frame, retain the same timeout but do not
-        // inject a business Ping into a possible owner-control session.
+        // inject a business Ping before the RPC handshake completes.
         if conn.ordinary_protocol() && idle >= config.heartbeat_interval_secs {
             let mut w = writer.lock().await;
             if let Err(error) = w.write_all(&ping_frame).await {

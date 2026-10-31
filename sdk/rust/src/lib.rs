@@ -2,8 +2,8 @@
 //!
 //! Contract identity and runtime behavior are re-exported from their
 //! authoritative Core crates. Portable payload values continue to use the
-//! official [`fastdb`] crate directly. Endpoint administration, owner control,
-//! diagnostics and contract tooling live in [`endpoint`], [`owner`], [`observe`]
+//! official [`fastdb`] crate directly. Endpoint administration, diagnostics
+//! and contract tooling live in [`endpoint`], [`observe`]
 //! and [`contract`].
 
 mod error;
@@ -13,7 +13,6 @@ mod payload;
 pub mod contract;
 pub mod endpoint;
 pub mod observe;
-pub mod owner;
 
 pub use c2_contract::ContractRelease;
 pub use c2_core::{

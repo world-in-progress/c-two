@@ -1257,7 +1257,7 @@ mod tests {
             let ready = acquire_step(exact.acquire_route_token(&contract, old.route_uid(), old.route_revision())).await.unwrap();
             assert_eq!((ready.route_uid(), ready.route_revision()), (old.route_uid(), old.route_revision()));
             match transition {
-                AcquireTransition::Closed => { assert_eq!(fixture.server.close_business_admission("OwnerMissing").await, 2); }
+                AcquireTransition::Closed => { assert_eq!(fixture.server.close_business_admission("maintenance").await, 2); }
                 AcquireTransition::Removed | AcquireTransition::Reregistered => {
                     assert!(fixture.server.unregister_route("b").await);
                     if matches!(transition, AcquireTransition::Reregistered) {

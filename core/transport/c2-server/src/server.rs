@@ -67,7 +67,7 @@ use c2_wire::route_catalog_control::{
 };
 use c2_wire::shutdown_control::{DirectShutdownAck, decode_shutdown_initiate, encode_shutdown_ack};
 
-use crate::admission::{AdmissionGate, OwnerAdmissionControl};
+use crate::admission::AdmissionGate;
 use crate::catalog::{RouteCatalog, RouteWatchBatch};
 use crate::chunk_ordering::{
     ChunkAdmissionGate, ChunkAdmissionOutcome, ChunkAdmissionOwner, ChunkAdmissionWaiter,
@@ -92,33 +92,13 @@ const POST_SHUTDOWN_DUPLICATE_INITIATE_READ_TIMEOUT_MS: u64 = 100;
 pub(crate) const CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS: u64 = 50;
 /// Default journal reason for an explicit direct IPC shutdown transaction.
 pub const DIRECT_IPC_SHUTDOWN_REASON: &str = "direct_ipc_shutdown";
-/// Journal reason for the shutdown transaction an owner-bound host starts
-/// after its controller's grace window expired. The owner control EOF is a
-/// separate channel from business stream EOF, idle eviction, ping failures,
-/// cancellation, and relay reconnects, and must stay distinguishable here.
-pub const OWNER_BOUND_SHUTDOWN_REASON: &str = "owner_bound_grace_expired";
-/// Journal reason when an owner-bound host stops because its own control
-/// watcher failed locally and the owner relationship can no longer be
-/// observed. This is not a business-stream failure and not a peer EOF.
-pub const OWNER_WATCHER_ERROR_SHUTDOWN_REASON: &str = "owner_bound_watcher_error";
-/// Admission-closure reason when the controller closed the control channel.
-pub const OWNER_MISSING_ADMISSION_REASON: &str = "owner_missing";
-/// Admission-closure reason when the control watcher itself failed.
-pub const OWNER_WATCHER_ERROR_ADMISSION_REASON: &str = "owner_watcher_error";
-
 fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
     C2Error::new(code, message).to_wire_bytes()
 }
 
 fn close_reason_to_route_state_reason(closed_reason: &str) -> RouteStateReasonWire {
     match closed_reason {
-        "shutdown"
-        | "direct_ipc_shutdown"
-        | OWNER_BOUND_SHUTDOWN_REASON
-        | OWNER_WATCHER_ERROR_SHUTDOWN_REASON => RouteStateReasonWire::Shutdown,
-        OWNER_MISSING_ADMISSION_REASON | OWNER_WATCHER_ERROR_ADMISSION_REASON => {
-            RouteStateReasonWire::OwnerWatchDisconnected
-        }
+        "shutdown" | "direct_ipc_shutdown" => RouteStateReasonWire::Shutdown,
         _ => RouteStateReasonWire::ExplicitUnregister,
     }
 }
@@ -165,7 +145,6 @@ impl std::error::Error for ServerError {
 pub enum ServerStartupStage {
     Readiness,
     Responsiveness,
-    OwnerControl,
 }
 
 impl ServerStartupStage {
@@ -173,7 +152,6 @@ impl ServerStartupStage {
         match self {
             Self::Readiness => "readiness",
             Self::Responsiveness => "responsiveness",
-            Self::OwnerControl => "owner_control",
         }
     }
 }
@@ -348,7 +326,6 @@ pub struct Server {
     /// never reset by shutdown.
     memory_budget: MemoryBudget,
     admission: Arc<AdmissionGate>,
-    owner_control: Option<Arc<dyn crate::owner_control::OwnerControlHandler>>,
     pending_requests: Arc<Semaphore>,
     chunk_processing_permits: Arc<Semaphore>,
     /// Bounded per-request first-chunk admission ordering (see
@@ -359,7 +336,7 @@ pub struct Server {
     active_connections_notify: Notify,
     shutdown_route_outcomes: parking_lot::Mutex<Vec<ServerRouteCloseOutcome>>,
     /// Close reason stamped into the run loop's shutdown route journal.
-    /// `direct_ipc_shutdown` is the default; owner-bound owners select their
+    /// `direct_ipc_shutdown` is the default; callers may select their
     /// own reason so a control-EOF shutdown is distinguishable in outcomes.
     shutdown_close_reason: parking_lot::Mutex<&'static str>,
     run_entered: AtomicBool,
@@ -489,28 +466,6 @@ impl Server {
         config: ServerIpcConfig,
         identity: ServerIdentity,
     ) -> Result<Self, ServerError> {
-        Self::new_with_admission(endpoint, config, identity, false)
-    }
-
-    /// Construct an owner-bound host and issue its sole admission authority.
-    /// The authority is bound to this concrete gate and is never reissued by a
-    /// builder, server handle, route handle, or runtime projection.
-    pub fn new_owner_bound_with_identity_and_endpoint(
-        endpoint: LocalEndpoint,
-        config: ServerIpcConfig,
-        identity: ServerIdentity,
-    ) -> Result<(Self, OwnerAdmissionControl), ServerError> {
-        let server = Self::new_with_admission(endpoint, config, identity, true)?;
-        let control = OwnerAdmissionControl::new(Arc::clone(&server.admission));
-        Ok((server, control))
-    }
-
-    fn new_with_admission(
-        endpoint: LocalEndpoint,
-        config: ServerIpcConfig,
-        identity: ServerIdentity,
-        owner_bound: bool,
-    ) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
         validate_server_identity(&identity)?;
         // One server direction, one finite budget: the response pool, the
@@ -540,7 +495,7 @@ impl Server {
             config,
             identity,
             Arc::new(parking_lot::RwLock::new(reassembly_pool)),
-            Arc::new(AdmissionGate::new(owner_bound)),
+            Arc::new(AdmissionGate::new()),
         )
     }
 
@@ -562,7 +517,7 @@ impl Server {
             config,
             identity,
             reassembly_pool,
-            Arc::new(AdmissionGate::new(false)),
+            Arc::new(AdmissionGate::new()),
         )
     }
 
@@ -643,7 +598,6 @@ impl Server {
             response_pool: Arc::new(crate::ResponsePool::new(response_pool)),
             memory_budget,
             admission,
-            owner_control: None,
             pending_requests,
             chunk_processing_permits,
             chunk_admission_gate,
@@ -660,17 +614,6 @@ impl Server {
     /// Consuming the server prevents replacing the feed of an active host.
     pub fn with_connection_event_source(mut self, source: ConnectionEventSource) -> Self {
         self.connection_event_source = source;
-        self
-    }
-
-    /// Core installs the owner protocol before readiness. This hook holds no
-    /// admission authority; the constructor issues that authority separately.
-    #[doc(hidden)]
-    pub fn with_owner_control_handler(
-        mut self,
-        handler: Arc<dyn crate::owner_control::OwnerControlHandler>,
-    ) -> Self {
-        self.owner_control = Some(handler);
         self
     }
 
@@ -1232,7 +1175,7 @@ impl Server {
                 if !matches!(self.lifecycle_state(), ServerLifecycleState::Initialized)
                     || registration.is_closed()
                 {
-                    registration.begin_start(self.admission.owner_bound);
+                    registration.begin_start();
                     self.admission.notify.notify_waiters();
                 }
                 self.shutdown_tx.send_replace(false);
@@ -1335,7 +1278,7 @@ impl Server {
         })?
     }
 
-    /// Observe initiation so an owner can cancel control observation and its grace immediately.
+    /// Observe initiation of the shutdown transaction.
     pub async fn wait_for_shutdown_requested(&self) {
         let mut rx = self.shutdown_tx.subscribe();
         wait_for_shutdown(&mut rx).await;
@@ -1499,12 +1442,7 @@ impl Server {
         }
 
         self.run_entered.store(true, Ordering::Release);
-        let startup = if self.owner_control.is_some() {
-            LocalListener::bind_with_context_binding(&self.endpoint)
-        } else {
-            LocalListener::bind(&self.endpoint)
-        }
-        .map_err(ServerError::Bind);
+        let startup = LocalListener::bind(&self.endpoint).map_err(ServerError::Bind);
 
         let mut listener = match startup {
             Ok(listener) => listener,
@@ -1514,17 +1452,6 @@ impl Server {
             }
         };
 
-        if let Some(owner) = &self.owner_control {
-            let bound = listener
-                .context_binding()
-                .and_then(|binding| owner.bound(binding));
-            if let Err(error) = bound {
-                self.set_lifecycle_state(ServerLifecycleState::Failed(ServerFailure::new(
-                    error.to_string(),
-                )));
-                return Err(ServerError::Io(error));
-            }
-        }
         self.publish_ready(listener.credential());
         info!(endpoint = ?self.endpoint.os_name(), "server listening");
 
@@ -1676,9 +1603,7 @@ impl Server {
 
     /// Initiate the shutdown transaction with an explicit journal reason.
     ///
-    /// Owner-bound hosts use this so the recorded route-close reason says the
-    /// controller relationship ended, not an anonymous direct IPC stop. The
-    /// reason must be a static string because it is stored for the lifetime of
+    /// The reason must be a static string because it is stored for the lifetime of
     /// the shutdown transaction.
     pub fn request_shutdown_signal_with_reason(&self, close_reason: &'static str) {
         *self.shutdown_close_reason.lock() = close_reason;
@@ -1730,9 +1655,7 @@ impl Server {
     /// Reject a start attempt that has not published readiness yet.
     ///
     /// This moves an unpolled `Starting` or cancelled `Stopping` attempt to `Failed`, which makes every
-    /// readiness waiter fail fast with `message`. It exists for owners that
-    /// must refuse to serve before readiness — for example an owner-bound
-    /// host whose controller capability is already gone. It never touches a
+    /// readiness waiter fail fast with `message`. It never touches a
     /// server that is running or already terminal.
     pub fn reject_start_attempt(&self, failure: ServerFailure) -> Result<(), ServerError> {
         match self.lifecycle_state() {
@@ -2094,9 +2017,9 @@ fn handle_connection(
 
             // Inspect the fixed header before reading any payload byte or
             // allocating. Even a header-only invalid preamble must be rejected
-            // without waiting for an owner-control type byte.
-            let mut prefix = [0u8; 13];
-            let mut prefix_len = FRAME_FIXED_BODY_LEN as usize;
+            // before reading the body.
+            let mut prefix = [0u8; FRAME_FIXED_BODY_LEN as usize];
+            let prefix_len = FRAME_FIXED_BODY_LEN as usize;
             tokio::select! {
                 result = reader.read_exact(&mut prefix[..prefix_len]) => {
                     if let Err(error) = result {
@@ -2140,94 +2063,6 @@ fn handle_connection(
             if variable_frame_over_limit {
                 conn.end(ConnectionEndReason::ProtocolError, "frame_length");
                 break;
-            }
-            if header.is_ctrl() {
-                // OwnerControl has its own protocol. Only CTRL needs this
-                // separate byte before choosing that bounded setup path.
-                if total_len > FRAME_FIXED_BODY_LEN {
-                    tokio::select! {
-                        result = reader.read_exact(&mut prefix[prefix_len..prefix_len + 1]) => {
-                            if let Err(error) = result {
-                                conn.end_read("read_frame_prefix", &error);
-                                break;
-                            }
-                        }
-                        _ = wait_for_shutdown(&mut shutdown_rx) => {
-                            conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
-                            break;
-                        }
-                    }
-                    prefix_len += 1;
-                }
-                if prefix[12..prefix_len].first() == Some(&MsgType::OwnerControl.as_byte()) {
-                    use crate::owner_control::{OwnerReadError, OwnerSession};
-                    use c2_wire::owner_control::{
-                        MAX_OWNER_PAYLOAD_SIZE, OwnerRejection, OwnerResponse, OwnerWireError,
-                    };
-                    if conn.ordinary_protocol() {
-                        conn.end(ConnectionEndReason::ProtocolError, "owner_role_change");
-                        break;
-                    }
-                    // The original unclassified heartbeat deadline stops only
-                    // after a role is known. The candidate then has one setup
-                    // deadline, including the rest of this first frame.
-                    let started = std::time::Instant::now();
-                    if let Some(heartbeat) = registration.heartbeat.take() {
-                        heartbeat.abort();
-                        let _ = heartbeat.await;
-                    }
-                    if total_len as usize > 12 + MAX_OWNER_PAYLOAD_SIZE {
-                        conn.end(ConnectionEndReason::ProtocolError, "owner_frame_length");
-                        break;
-                    }
-                    let handler = server.owner_control.clone();
-                    let deadline = handler
-                        .as_ref()
-                        .map_or(started + DEFAULT_CONNECT_TIMEOUT, |owner| {
-                            owner.setup_deadline(started)
-                        });
-                    let mut body = vec![0; total_len as usize];
-                    body[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
-                    let read = tokio::select! {
-                        biased;
-                        _ = wait_for_shutdown(&mut shutdown_rx) => None,
-                        result = tokio::time::timeout_at(deadline.into(), reader.read_exact(&mut body[prefix_len..])) => Some(result),
-                    };
-                    match read {
-                        Some(Ok(Ok(_))) => {}
-                        Some(Ok(Err(error))) => {
-                            conn.end_read("owner_read_body", &error);
-                            break;
-                        }
-                        _ => {
-                            conn.end(ConnectionEndReason::LocalClose, "owner_setup_ended");
-                            break;
-                        }
-                    }
-                    let session = OwnerSession::accepted(reader, writer, abort, Arc::clone(&conn));
-                    let first = OwnerSession::decode(header.request_id, header.flags, &body[12..]);
-                    match (handler, first) {
-                        (Some(handler), Ok(first)) => handler.serve(session, first, deadline).await,
-                        (handler, first) => {
-                            let reason = match first {
-                                Err(OwnerReadError::Protocol {
-                                    error: OwnerWireError::UnsupportedVersion,
-                                    ..
-                                }) => OwnerRejection::UnsupportedVersion,
-                                Err(_) => OwnerRejection::Malformed,
-                                Ok(_) if handler.is_none() => OwnerRejection::Unavailable,
-                                Ok(_) => unreachable!(),
-                            };
-                            let _ = tokio::time::timeout_at(
-                                deadline.into(),
-                                session.reply(header.request_id, &OwnerResponse::Rejected(reason)),
-                            )
-                            .await;
-                            conn.end(ConnectionEndReason::ProtocolError, "owner_protocol");
-                        }
-                    }
-                    return;
-                }
             }
             if !conn.handshake_done() && !header.is_signal() {
                 conn.end(ConnectionEndReason::ProtocolError, "frame_before_handshake");
@@ -2610,7 +2445,7 @@ async fn negotiate_handshake(
         .await?;
 
     // This same stack owns both reads. Metadata cannot be interleaved with a
-    // second Hello, owner-control selection, or normal route dispatch.
+    // second Hello or normal route dispatch.
     let mut metadata_header = [0u8; 16];
     reader.read_exact(&mut metadata_header).await?;
     let (total_len, body) = frame::decode_total_len(&metadata_header)
@@ -2723,7 +2558,7 @@ async fn handle_shutdown_signal(
     request_id: u64,
     writer: &Arc<Mutex<LocalWriteHalf>>,
 ) {
-    if decode_shutdown_initiate(payload).is_err() || server.admission.owner_bound {
+    if decode_shutdown_initiate(payload).is_err() {
         let outcome = DirectShutdownAck {
             acknowledged: false,
             shutdown_started: false,
@@ -5595,18 +5430,17 @@ mod tests {
         route
     }
 
-    struct OwnerAdmissionFixture {
+    struct AdmissionFixture {
         server: Arc<Server>,
-        control: OwnerAdmissionControl,
         #[cfg(unix)]
         _root: tempfile::TempDir,
     }
 
-    fn owner_admission_fixture() -> OwnerAdmissionFixture {
-        let address = unique_readiness_address("owner_admission");
+    fn admission_fixture() -> AdmissionFixture {
+        let address = unique_readiness_address("admission");
         #[cfg(unix)]
         let root = tempfile::Builder::new()
-            .prefix("c2-owner-admission-")
+            .prefix("c2-admission-")
             .tempdir_in("/tmp")
             .unwrap();
         #[cfg(unix)]
@@ -5616,7 +5450,7 @@ mod tests {
             .unwrap();
         #[cfg(windows)]
         let endpoint = parse_local_endpoint(&address).unwrap();
-        let (server, control) = Server::new_owner_bound_with_identity_and_endpoint(
+        let server = Server::new_with_identity_and_endpoint(
             endpoint,
             ServerIpcConfig {
                 max_execution_workers: 1,
@@ -5628,19 +5462,14 @@ mod tests {
             },
         )
         .unwrap();
-        OwnerAdmissionFixture {
+        AdmissionFixture {
             server: Arc::new(server),
-            control,
             #[cfg(unix)]
             _root: root,
         }
     }
 
-    fn owner_admission_built_route(
-        server: &Server,
-        name: &str,
-        mode: ConcurrencyMode,
-    ) -> BuiltRoute {
+    fn admission_built_route(server: &Server, name: &str, mode: ConcurrencyMode) -> BuiltRoute {
         let route = make_route(name);
         server
             .build_route(
@@ -5661,192 +5490,35 @@ mod tests {
             .unwrap()
     }
 
-    async fn owner_admission_route(
-        server: &Server,
-        name: &str,
-        mode: ConcurrencyMode,
-    ) -> Arc<CrmRoute> {
-        let built = owner_admission_built_route(server, name, mode);
+    async fn admission_route(server: &Server, name: &str, mode: ConcurrencyMode) -> Arc<CrmRoute> {
+        let built = admission_built_route(server, name, mode);
         let reservation = server.reserve_route(built).await.unwrap();
         server.commit_reserved_route(reservation).await.unwrap();
         server.dispatcher.read().await.resolve(name).unwrap()
     }
 
-    async fn owner_admission_poll_once<F: std::future::Future>(
+    async fn admission_poll_once<F: std::future::Future>(
         mut future: std::pin::Pin<&mut F>,
     ) -> std::task::Poll<F::Output> {
         std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
     }
 
     #[tokio::test]
-    async fn owner_admission_pause_resume_preserves_catalog_counts_and_committed_work() {
-        let fixture = owner_admission_fixture();
+    async fn admission_dispatcher_waiter_keeps_original_generation() {
+        let fixture = admission_fixture();
         let server = &fixture.server;
-        let route = owner_admission_route(server, "grid", ConcurrencyMode::Parallel).await;
-        let handle = crate::RouteConcurrencyHandle::new(route.scheduler.as_ref().clone());
-        // Owner-bound parallel routes must always enter native admission, even
-        // while open, so Python cannot cache/use its unconstrained shortcut.
-        assert!(!handle.is_unconstrained());
-        assert!(!handle.snapshot().closed);
-        let mut committed = handle.blocking_acquire(0).unwrap();
-        committed.commit().unwrap();
-        let mut old_guard = handle.blocking_acquire(0).unwrap();
-        let old_pending = route.scheduler.reserve_pending(0).unwrap();
-        let catalog = server
-            .route_catalog
-            .read()
-            .list(&RouteSelector::All)
-            .unwrap();
-        let snapshot = handle.snapshot();
-        assert_eq!((snapshot.pending, snapshot.active_workers), (3, 2));
-
-        assert!(fixture.control.pause());
-        assert!(!route.scheduler.route_closed());
-        let paused = handle.snapshot();
-        assert!(paused.closed);
-        assert!(!paused.is_unconstrained);
-        assert_eq!((paused.pending, paused.active_workers), (3, 2));
-        assert_eq!(
-            handle.blocking_acquire(0).unwrap_err(),
-            SchedulerAcquireError::Unavailable
-        );
-        assert_eq!(
-            server
-                .route_catalog
-                .read()
-                .list(&RouteSelector::All)
-                .unwrap(),
-            catalog
-        );
-
-        assert!(
-            fixture
-                .control
-                .resume(std::time::Instant::now() + Duration::from_secs(5))
-        );
-        assert!(!handle.snapshot().closed);
-        assert!(!handle.is_unconstrained());
-        // Both old forms sleep through the entire pause/resume sequence.
-        assert_eq!(
-            old_pending.try_activate().unwrap_err(),
-            SchedulerAcquireError::Unavailable
-        );
-        assert_eq!(
-            old_guard.commit().unwrap_err(),
-            SchedulerAcquireError::Unavailable
-        );
-        drop(old_guard);
-        committed.commit().unwrap();
-        assert_eq!(
-            (handle.snapshot().pending, handle.snapshot().active_workers),
-            (1, 1)
-        );
-        assert_eq!(
-            server
-                .route_catalog
-                .read()
-                .list(&RouteSelector::All)
-                .unwrap(),
-            catalog
-        );
-        drop(committed);
-        let mut fresh = handle.blocking_acquire(0).unwrap();
-        fresh.commit().unwrap();
-        drop(fresh);
-        assert_eq!(
-            (handle.snapshot().pending, handle.snapshot().active_workers),
-            (0, 0)
-        );
-    }
-
-    #[tokio::test]
-    async fn owner_admission_async_route_waiter_rejects_after_full_pause_resume() {
-        let fixture = owner_admission_fixture();
-        let route =
-            owner_admission_route(&fixture.server, "grid", ConcurrencyMode::Exclusive).await;
-        let mut active = route.scheduler.blocking_acquire(0).unwrap();
-        active.commit().unwrap();
-        let pending = route.scheduler.reserve_pending(0).unwrap();
-        let mut waiter = Box::pin(pending.async_activate());
-        assert!(
-            owner_admission_poll_once(waiter.as_mut())
-                .await
-                .is_pending()
-        );
-        assert!(fixture.control.pause());
-        assert!(
-            fixture
-                .control
-                .resume(std::time::Instant::now() + Duration::from_secs(5))
-        );
-        let result = tokio::time::timeout(Duration::from_secs(2), waiter)
-            .await
-            .unwrap();
-        assert_eq!(result.unwrap_err(), SchedulerAcquireError::Unavailable);
-        let snapshot = route.scheduler.snapshot();
-        assert_eq!((snapshot.pending, snapshot.active_workers), (1, 1));
-        drop(active);
-        let mut fresh = route.scheduler.blocking_acquire(0).unwrap();
-        fresh.commit().unwrap();
-    }
-
-    #[tokio::test]
-    async fn owner_admission_blocking_waiter_wakes_while_committed_work_remains() {
-        let fixture = owner_admission_fixture();
-        let route =
-            owner_admission_route(&fixture.server, "grid", ConcurrencyMode::Exclusive).await;
-        let mut active = route.scheduler.blocking_acquire(0).unwrap();
-        active.commit().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let scheduler = route.scheduler.clone();
-        let waiter = std::thread::spawn(move || {
-            tx.send(scheduler.blocking_acquire(0).map(|_| ())).unwrap();
-        });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while route.scheduler.snapshot().pending != 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(fixture.control.pause());
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .unwrap_err(),
-            SchedulerAcquireError::Unavailable
-        );
-        waiter.join().unwrap();
-        assert_eq!(route.scheduler.snapshot().active_workers, 1);
-        assert!(
-            fixture
-                .control
-                .resume(std::time::Instant::now() + Duration::from_secs(5))
-        );
-        drop(active);
-        assert_eq!(route.scheduler.snapshot().pending, 0);
-    }
-
-    #[tokio::test]
-    async fn owner_admission_dispatcher_waiter_keeps_original_generation() {
-        let fixture = owner_admission_fixture();
-        let server = &fixture.server;
-        let route = owner_admission_route(server, "grid", ConcurrencyMode::Parallel).await;
+        let route = admission_route(server, "grid", ConcurrencyMode::Parallel).await;
         let mut identity = call_identity("grid");
         identity.route_uid = route.route_uid.clone();
         let dispatcher = server.dispatcher.write().await;
         let mut request = Box::pin(reserve_route_execution(server, &identity, 0));
-        assert!(
-            owner_admission_poll_once(request.as_mut())
-                .await
-                .is_pending()
-        );
-        assert!(fixture.control.pause());
-        assert!(
-            fixture
-                .control
-                .resume(std::time::Instant::now() + Duration::from_secs(5))
-        );
+        assert!(admission_poll_once(request.as_mut()).await.is_pending());
+        {
+            let mut admission = server.admission.lock();
+            admission.terminate();
+            admission.begin_start();
+        }
+        server.admission.notify.notify_waiters();
         drop(dispatcher);
         assert!(matches!(
             request.await,
@@ -5858,10 +5530,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_admission_global_queue_rejects_old_route_guard() {
-        let fixture = owner_admission_fixture();
+    async fn admission_global_queue_rejects_old_route_guard() {
+        let fixture = admission_fixture();
         let server = &fixture.server;
-        let route = owner_admission_route(server, "grid", ConcurrencyMode::Parallel).await;
+        let route = admission_route(server, "grid", ConcurrencyMode::Parallel).await;
         let global = server.execution_scheduler.blocking_acquire(0).unwrap();
         let conn = Connection::new(1);
         let pending = route.scheduler.reserve_pending(0).unwrap();
@@ -5872,23 +5544,19 @@ mod tests {
             RequestData::Inline(vec![]),
             |_| panic!("old global waiter must not invoke the resource"),
         ));
-        assert!(
-            owner_admission_poll_once(request.as_mut())
-                .await
-                .is_pending()
-        );
+        assert!(admission_poll_once(request.as_mut()).await.is_pending());
         assert_eq!(route.scheduler.snapshot().active_workers, 1);
         let global_snapshot = server.execution_scheduler.snapshot();
         assert_eq!(
             (global_snapshot.pending, global_snapshot.active_workers),
             (2, 1)
         );
-        assert!(fixture.control.pause());
-        assert!(
-            fixture
-                .control
-                .resume(std::time::Instant::now() + Duration::from_secs(5))
-        );
+        {
+            let mut admission = server.admission.lock();
+            admission.terminate();
+            admission.begin_start();
+        }
+        server.admission.notify.notify_waiters();
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(2), request)
                 .await
@@ -5914,226 +5582,18 @@ mod tests {
         assert_eq!(server.execution_scheduler.snapshot().pending, 0);
     }
 
-    #[test]
-    fn owner_admission_blocking_pool_queue_rechecks_before_callback() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let fixture = owner_admission_fixture();
-            let server = &fixture.server;
-            let route = owner_admission_route(server, "grid", ConcurrencyMode::Parallel).await;
-            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                started_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            });
-            started_rx.await.unwrap();
-            let conn = Connection::new(1);
-            let pending = route.scheduler.reserve_pending(0).unwrap();
-            let mut request = Box::pin(execute_route_request(
-                server.execution_scheduler.clone(),
-                pending,
-                &conn,
-                RequestData::Inline(vec![]),
-                |_| panic!("queued blocking callback must not enter after pause"),
-            ));
-            // This poll acquires both real guards and queues spawn_blocking.
-            assert!(
-                owner_admission_poll_once(request.as_mut())
-                    .await
-                    .is_pending()
-            );
-            assert_eq!(route.scheduler.snapshot().active_workers, 1);
-            assert_eq!(server.execution_scheduler.snapshot().active_workers, 1);
-            assert!(fixture.control.pause());
-            assert!(
-                fixture
-                    .control
-                    .resume(std::time::Instant::now() + Duration::from_secs(5))
-            );
-            release_tx.send(()).unwrap();
-            blocker.await.unwrap();
-            assert!(matches!(
-                tokio::time::timeout(Duration::from_secs(2), request)
-                    .await
-                    .unwrap(),
-                Err(RouteExecutionError::Acquire(
-                    SchedulerAcquireError::Unavailable
-                ))
-            ));
-            assert_eq!(route.scheduler.snapshot().pending, 0);
-            assert_eq!(server.execution_scheduler.snapshot().pending, 0);
-        });
-    }
-
     #[tokio::test]
-    async fn owner_admission_committed_callback_drains_across_pause() {
-        let fixture = owner_admission_fixture();
+    async fn admission_keeps_contract_identity_and_method_error_priority() {
+        let fixture = admission_fixture();
         let server = &fixture.server;
-        let route = owner_admission_route(server, "grid", ConcurrencyMode::Parallel).await;
-        let pending = route.scheduler.reserve_pending(0).unwrap();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let global = server.execution_scheduler.clone();
-        let task = tokio::spawn(async move {
-            execute_route_request(
-                global,
-                pending,
-                &Connection::new(1),
-                RequestData::Inline(vec![]),
-                move |_| {
-                    started_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    Ok(ResponseMeta::Inline(b"done".to_vec()))
-                },
-            )
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), started_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(fixture.control.pause());
-        assert_eq!(route.scheduler.snapshot().active_workers, 1);
-        assert_eq!(server.execution_scheduler.snapshot().active_workers, 1);
-        release_tx.send(()).unwrap();
-        assert!(
-            matches!(task.await.unwrap().unwrap(), ResponseMeta::Inline(bytes) if bytes == b"done")
-        );
-        assert_eq!(route.scheduler.snapshot().pending, 0);
-        assert_eq!(server.execution_scheduler.snapshot().pending, 0);
-        assert!(
-            fixture
-                .control
-                .resume(std::time::Instant::now() + Duration::from_secs(5))
-        );
-    }
-
-    #[tokio::test]
-    async fn owner_admission_resume_cannot_revive_closed_unregistered_or_unpublished_routes() {
-        let fixture = owner_admission_fixture();
-        let server = &fixture.server;
-        let closed = owner_admission_route(server, "closed", ConcurrencyMode::Parallel).await;
-        let removed = owner_admission_route(server, "removed", ConcurrencyMode::Parallel).await;
-        closed.scheduler.close();
-        assert!(server.unregister_route("removed").await);
-        let reservation = server
-            .reserve_route(owner_admission_built_route(
-                server,
-                "reserved",
-                ConcurrencyMode::Parallel,
-            ))
-            .await
-            .unwrap();
-        let final_reservation = server
-            .reserve_route(owner_admission_built_route(
-                server,
-                "final",
-                ConcurrencyMode::Parallel,
-            ))
-            .await
-            .unwrap();
-        let token = server
-            .commit_reserved_route_closed(final_reservation)
-            .await
-            .unwrap();
-        assert!(fixture.control.pause());
-        let fresh = owner_admission_built_route(server, "paused", ConcurrencyMode::Parallel);
-        assert!(server.reserve_route(fresh).await.is_err());
-        assert!(
-            fixture
-                .control
-                .resume(std::time::Instant::now() + Duration::from_secs(5))
-        );
-        assert!(server.commit_reserved_route(reservation).await.is_err());
-        assert!(server.open_route_admission(token).await.is_err());
-        for scheduler in [&closed.scheduler, &removed.scheduler] {
-            assert_eq!(
-                scheduler.blocking_acquire(0).unwrap_err(),
-                SchedulerAcquireError::Closed
-            );
-        }
-        assert!(
-            server
-                .route_scheduler_snapshot("final")
-                .await
-                .unwrap()
-                .closed
-        );
-        assert!(!server.contains_route("reserved").await);
-        assert!(!server.contains_route("removed").await);
-        assert!(server.admission.lock().pending.is_empty());
-    }
-
-    #[tokio::test]
-    async fn owner_admission_resume_checks_deadline_after_waiting_for_commit_lock() {
-        let fixture = owner_admission_fixture();
-        assert!(fixture.control.pause());
-        let locked = fixture.server.admission.lock();
-        std::thread::scope(|scope| {
-            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-            let deadline = std::time::Instant::now() + Duration::from_millis(50);
-            let control = &fixture.control;
-            let waiting = scope.spawn(move || {
-                entered_tx.send(()).unwrap();
-                control.resume(deadline)
-            });
-            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            std::thread::sleep(
-                deadline.saturating_duration_since(std::time::Instant::now())
-                    + Duration::from_millis(1),
-            );
-            drop(locked);
-            assert!(!waiting.join().unwrap());
-        });
-        assert!(fixture.server.business_admission_closed());
-    }
-
-    #[tokio::test]
-    async fn owner_admission_terminal_shutdown_cannot_resume() {
-        let fixture = owner_admission_fixture();
-        let server = &fixture.server;
-        let route = owner_admission_route(server, "grid", ConcurrencyMode::Parallel).await;
-        assert!(fixture.control.pause());
-        server.request_shutdown_signal();
-        assert!(
-            !fixture
-                .control
-                .resume(std::time::Instant::now() + Duration::from_secs(5))
-        );
-        assert!(!fixture.control.pause());
-        assert_eq!(
-            route.scheduler.blocking_acquire(0).unwrap_err(),
-            SchedulerAcquireError::Closed
-        );
-        // Even a following start fence cannot resurrect the old owner authority.
-        server.begin_start_attempt().unwrap();
-        assert!(
-            !fixture
-                .control
-                .resume(std::time::Instant::now() + Duration::from_secs(5))
-        );
-        assert!(route.scheduler.snapshot().closed);
-    }
-
-    #[tokio::test]
-    async fn owner_admission_keeps_contract_identity_and_method_error_priority() {
-        let fixture = owner_admission_fixture();
-        let server = &fixture.server;
-        let route = owner_admission_route(server, "grid", ConcurrencyMode::Parallel).await;
+        let route = admission_route(server, "grid", ConcurrencyMode::Parallel).await;
         let mut identity = call_identity("grid");
         identity.route_uid = route.route_uid.clone();
         identity.observed_route_revision = route.route_revision;
-        assert!(fixture.control.pause());
+        server.request_shutdown_signal();
         assert!(matches!(
             reserve_route_execution(server, &identity, 0).await,
-            Err(RouteAdmissionError::Acquire(
-                SchedulerAcquireError::Unavailable
-            ))
+            Err(RouteAdmissionError::Acquire(SchedulerAcquireError::Closed))
         ));
         assert!(matches!(
             reserve_route_execution(server, &identity, 99).await,
@@ -6154,10 +5614,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_admission_rejects_routes_built_for_another_host() {
-        let first = owner_admission_fixture();
-        let second = owner_admission_fixture();
-        let route = owner_admission_built_route(&first.server, "grid", ConcurrencyMode::Parallel);
+    async fn admission_rejects_routes_built_for_another_host() {
+        let first = admission_fixture();
+        let second = admission_fixture();
+        let route = admission_built_route(&first.server, "grid", ConcurrencyMode::Parallel);
         let err = match second.server.reserve_route(route).await {
             Err(err) => err,
             Ok(_) => panic!("foreign scheduler must not bypass the concrete host gate"),
@@ -6429,7 +5889,7 @@ mod tests {
         runner.await.unwrap().unwrap();
     }
 
-    async fn check_route_open_interrupted_at_dispatcher(owner_missing: bool) {
+    async fn check_route_open_interrupted_at_dispatcher(close_admission: bool) {
         use std::future::{Future, poll_fn};
         use std::task::Poll;
 
@@ -6468,15 +5928,14 @@ mod tests {
         let mut open = Box::pin(server.open_route_admission(token));
         let first_open_poll = poll_fn(|cx| Poll::Ready(open.as_mut().poll(cx))).await;
         let registration_locked = server.route_registration.try_lock().is_err();
-        let mut owner_close =
-            Box::pin(server.close_business_admission(OWNER_MISSING_ADMISSION_REASON));
-        let first_close_poll = if owner_missing {
-            Some(poll_fn(|cx| Poll::Ready(owner_close.as_mut().poll(cx))).await)
+        let mut admission_close = Box::pin(server.close_business_admission("maintenance"));
+        let first_close_poll = if close_admission {
+            Some(poll_fn(|cx| Poll::Ready(admission_close.as_mut().poll(cx))).await)
         } else {
             server.request_shutdown_signal();
             None
         };
-        let interrupted = if owner_missing {
+        let interrupted = if close_admission {
             server.business_admission_closed()
         } else {
             matches!(server.lifecycle_state(), ServerLifecycleState::Stopping)
@@ -6492,9 +5951,9 @@ mod tests {
         let stayed_closed = scheduler.snapshot().closed;
         let catalog = server.route_catalog.read().list(&RouteSelector::All);
         if matches!(first_close_poll, Some(Poll::Pending)) {
-            owner_close.as_mut().await;
+            admission_close.as_mut().await;
         }
-        drop(owner_close);
+        drop(admission_close);
         drop(open);
         server.request_shutdown_signal();
         let stopped = server.wait_until_stopped(Duration::from_secs(2)).await;
@@ -6533,7 +5992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_open_rechecks_owner_closure_after_dispatcher_wait() {
+    async fn route_open_rechecks_admission_closure_after_dispatcher_wait() {
         check_route_open_interrupted_at_dispatcher(true).await;
     }
 
@@ -9156,11 +8615,7 @@ mod tests {
                 chunk_frame_ordering(&server, conn.conn_id(), request_id, FLAG_CHUNKED, &payload)
                     .unwrap(),
             ));
-            assert!(
-                owner_admission_poll_once(dispatch.as_mut())
-                    .await
-                    .is_pending()
-            );
+            assert!(admission_poll_once(dispatch.as_mut()).await.is_pending());
 
             // Refusal already removed the ordering entry; the held writer is
             // the remaining await. Its error reply still owns route capacity.
@@ -9926,20 +9381,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_and_established_connections_reject_handshake_or_owner_role_changes() {
+    async fn metadata_and_established_connections_reject_invalid_handshakes() {
         let metadata = c2_wire::handshake::encode_client_handshake(&[], CAP_CALL_V2, "").unwrap();
         let mut wrong_rid = encode_frame(1, FLAG_HANDSHAKE, &metadata);
         wrong_rid.truncate(16);
         let mut wrong_flags = encode_frame(0, FLAG_HANDSHAKE | FLAG_RESPONSE, &metadata);
         wrong_flags.truncate(16);
-        let owner = encode_frame(1, FLAG_CTRL, &[MsgType::OwnerControl.as_byte()]);
         let hello = encode_version_preamble(VersionPreambleKind::Hello).to_vec();
         for (established, frame) in [
             (false, wrong_rid),
             (false, wrong_flags),
-            (false, owner.clone()),
             (false, hello.clone()),
-            (true, owner),
             (true, hello),
         ] {
             let (server, mut client, stream) = version_fence_connection().await;
@@ -9958,7 +9410,7 @@ mod tests {
             handler.await.unwrap();
             assert!(
                 matches!(read, Ok(Ok(0) | Err(_))),
-                "accepted role change: {read:?}"
+                "accepted invalid handshake: {read:?}"
             );
             assert_eq!(server.active_connection_count(), 0);
         }
@@ -10090,43 +9542,6 @@ mod tests {
                 "unhandshaken RPC must close without a reply: {read:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn signal_connection_cannot_switch_to_owner_control() {
-        let (server, mut client, stream) = version_fence_connection().await;
-        let handler = tokio::spawn(handle_connection(server, stream));
-        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
-            client
-                .write_all(&encode_frame(
-                    0,
-                    FLAG_SIGNAL,
-                    &c2_wire::msg_type::PING_BYTES,
-                ))
-                .await?;
-            let mut pong = [0; 17];
-            client.read_exact(&mut pong).await?;
-            let owner = c2_wire::owner_control::encode_owner_request(
-                &c2_wire::owner_control::OwnerRequest::Hello,
-            )
-            .unwrap();
-            client
-                .write_all(&encode_frame(1, FLAG_CTRL, &owner))
-                .await?;
-            Ok::<_, std::io::Error>((pong, client.read(&mut [0]).await))
-        })
-        .await;
-        drop(client);
-        handler.await.unwrap();
-        let (pong, closed) = outcome.unwrap().unwrap();
-        assert_eq!(
-            pong.as_slice(),
-            encode_frame(0, FLAG_RESPONSE | FLAG_SIGNAL, &PONG_BYTES)
-        );
-        assert!(
-            matches!(closed, Ok(0) | Err(_)),
-            "ordinary role cannot become owner control: {closed:?}"
-        );
     }
 
     /// Retain rejection of the pre-negotiation, single-frame version 12 format.
@@ -11703,7 +11118,7 @@ mod tests {
             let mut send = Box::pin(send_response_meta(
                 &pool, &writer, 7, meta, 1024, 4096, 16384, true,
             ));
-            assert!(owner_admission_poll_once(send.as_mut()).await.is_pending());
+            assert!(admission_poll_once(send.as_mut()).await.is_pending());
             assert_eq!(pool.read().stats().alloc_count, 1);
             drop(send);
             drop(guard);

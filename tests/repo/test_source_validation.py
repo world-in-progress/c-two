@@ -241,7 +241,9 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
     assert "c2-core" in local[0][1] and "c2-http/relay" in local[0][1] and "--lib" not in local[0][1]
     windows_local = runner.gates(sys.executable, Path("evidence"), runner.LOCAL_PLATFORM_SCOPE, target_platform="windows")
     assert [name for name, _, _ in windows_local] == ["local-platform-tests", "windows-pipe-identity-test"]
-    assert windows_local[1][1][-3:] == ["--", "--ignored", "--exact"]
+    assert windows_local[1][1][-4:] == [
+        "foreign_object_owner_rejects_connect_and_listener_join", "--", "--ignored", "--exact",
+    ]
     python = {name for name, _, _ in runner.gates(sys.executable, Path("evidence"), runner.PYTHON_SCOPE)}
     assert {"python-suite", "python-native-test", "python-build", "cli-artifact", "python310-install"} <= python
     assert "core-test" not in python and "python-wheel-build" not in python

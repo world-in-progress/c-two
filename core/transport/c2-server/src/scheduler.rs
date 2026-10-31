@@ -251,12 +251,7 @@ impl Scheduler {
         access_map: HashMap<u16, AccessLevel>,
         limits: SchedulerLimits,
     ) -> Self {
-        Self::with_admission(
-            mode,
-            access_map,
-            limits,
-            Arc::new(AdmissionGate::new(false)),
-        )
+        Self::with_admission(mode, access_map, limits, Arc::new(AdmissionGate::new()))
     }
 
     pub(crate) fn with_admission(
@@ -303,8 +298,7 @@ impl Scheduler {
         admission: &AdmissionState,
         state: &SchedulerState,
     ) -> bool {
-        !self.inner.admission.owner_bound
-            && !admission.is_closed()
+        !admission.is_closed()
             && self.inner.mode == ConcurrencyMode::Parallel
             && self.inner.limits.max_pending.is_none()
             && self.inner.limits.max_workers.is_none()

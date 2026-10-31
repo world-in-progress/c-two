@@ -371,12 +371,12 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
     windows_identity = [cargo(
         "windows-pipe-identity-test", "core/Cargo.toml", "-p", "c2-local",
         "--test", "windows_identity",
-        "foreign_object_owner_rejects_connect_listener_join_and_bootstrap_adoption",
+        "foreign_object_owner_rejects_connect_and_listener_join",
         "--", "--ignored", "--exact",
     )] if target_platform == "windows" else []
 
     if scope == LOCAL_PLATFORM_SCOPE:
-        # Include native integration tests (notably owner-control) and Core
+        # Include native integration tests and Core
         # call-state tests at each implementation stage, without SDK matrices.
         return [cargo("local-platform-tests", "core/Cargo.toml", "--no-fail-fast",
                       "--features", "c2-http/relay",

@@ -13,11 +13,10 @@ mod control;
 pub mod error;
 mod host;
 mod identity;
+mod lifecycle;
 mod lifetime;
 pub mod memory;
 mod outcome;
-mod owner_bound;
-mod owner_control;
 mod session;
 
 pub use c2_config::{ConnectOptions, ConnectTimeoutError};
@@ -29,8 +28,8 @@ pub use client::{
 };
 pub use connect_deadline::{ConnectAttempt, connect_deadline_error};
 pub use control::{
-    DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint,
-    ping_direct_ipc, shutdown_direct_ipc,
+    DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint, ping_direct_ipc,
+    shutdown_direct_ipc,
 };
 pub use error::{
     AdapterFailure, AdapterFailurePhase, Error, ExternalCause, LifecycleError, LocalIoCause,
@@ -62,6 +61,7 @@ pub use call_execution::{CallExecutionObservation, CallExecutionObserver};
 // Blocking waits for the connection-observation surface stay with Core's
 // single runtime authority; SDKs project parameters and results only.
 pub use connection_observation::{ConnectionEventWait, recv_connection_event};
+pub use lifecycle::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot};
 pub use memory::{
     MemoryCellStats, MemoryScopeStats, RetiredMemoryObservation, RetiredScopeReport,
     RetirementHandoff, RuntimeMemoryStats, scope,
@@ -70,23 +70,14 @@ pub use outcome::{
     IpcClientCloseDetail, RegisterFailureOutcome, RegisterOutcome, RelayCleanupError,
     RouteCloseOutcome, ShutdownOutcome, UnregisterOutcome,
 };
-pub use owner_bound::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot};
 pub use session::{
     FailedStartShutdownReceipt, Runtime, RuntimeIdentity, RuntimeOptions, RuntimeShutdownReceipt,
     RuntimeShutdownTarget,
 };
 
-// SDK facades use the canonical Core owner capability types.
 pub use c2_config::{
     CallExecutionLimits, CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources,
     EnvFilePolicy, EnvMap, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
-    MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace,
 };
-pub use c2_local::OwnerBootstrap;
-pub use owner_control::{
-    OwnerControl, OwnerControlError, OwnerControlErrorKind, OwnerPhase, OwnerRecoveryTicket,
-    OwnerStatus, PreparedOwnerTakeover, owner_control_pair,
-};
-
 /// Read-only counters for the Runtime finite-call input retention domain.
 pub use c2_mem::RetentionSnapshot as CallExecutionSnapshot;

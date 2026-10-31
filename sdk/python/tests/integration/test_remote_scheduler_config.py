@@ -9,7 +9,6 @@ import pytest
 
 import c_two as cc
 
-import c_two.owner
 from c_two.config import settings
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from c_two.transport.server.scheduler import ConcurrencyConfig
@@ -22,10 +21,8 @@ def _clean_env_and_registry(monkeypatch):
     settings.relay_anchor_address = None
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     try:
-        # These scheduler tests own a Persistent host, never a prior test's
-        # OwnerBound capability or frozen server configuration.
+        # Start each scheduler test with fresh server configuration.
         assert cc.shutdown()['completed']
-        cc.set_server(lifecycle=cc.owner.LifecycleConfig.persistent())
         yield
     finally:
         try:

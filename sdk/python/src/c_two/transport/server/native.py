@@ -343,7 +343,7 @@ class NativeServerBridge:
         """Whether the Core host is actually running.
 
         Delegates to the native ``Host.is_running()`` projection, so a host
-        that already stopped (explicit shutdown, owner EOF) does not read as
+        that already stopped (explicit shutdown) does not read as
         started even while this bridge object is still alive.
         """
         return bool(self._runtime_session.host_started)
@@ -351,10 +351,8 @@ class NativeServerBridge:
     def lifecycle_snapshot(self) -> LifecycleSnapshot | None:
         """Thin read-only Core lifecycle observation for the bridge.
 
-        Reports the native policy and phase plus the separate listener,
-        drained-work and client-held-lease facts. ``None`` means no host
-        exists, never "stopped". ``owner_missing`` and ``draining`` are not
-        terminal.
+        Reports the native phase plus the separate listener, drained-work
+        and client-held-lease facts. ``None`` means no host exists.
         """
         return self._runtime_session.native_lifecycle_snapshot()
 

@@ -5,14 +5,11 @@ pub mod config;
 pub mod connection;
 mod dispatcher;
 pub mod heartbeat;
-#[doc(hidden)]
-pub mod owner_control;
 pub mod response;
 pub mod runtime;
 mod scheduler;
 pub mod server;
 
-pub use admission::OwnerAdmissionControl;
 pub use c2_local::{
     ConnectionClosed, ConnectionEndReason, ConnectionEvent, ConnectionEventSource,
     ConnectionEvents, ConnectionEventsError, ConnectionObservation,
@@ -30,10 +27,9 @@ pub use scheduler::{
     SchedulerLimits, SchedulerSnapshot,
 };
 pub use server::{
-    DIRECT_IPC_SHUTDOWN_REASON, OWNER_BOUND_SHUTDOWN_REASON, OWNER_MISSING_ADMISSION_REASON,
-    OWNER_WATCHER_ERROR_ADMISSION_REASON, OWNER_WATCHER_ERROR_SHUTDOWN_REASON, Server, ServerError,
-    ServerFailure, ServerIdentity, ServerLifecycleState, ServerMemorySnapshot,
-    ServerRouteCloseOutcome, ServerShutdownCompletion, ServerStartupStage, ServerStartupTimeout,
+    DIRECT_IPC_SHUTDOWN_REASON, Server, ServerError, ServerFailure, ServerIdentity,
+    ServerLifecycleState, ServerMemorySnapshot, ServerRouteCloseOutcome, ServerShutdownCompletion,
+    ServerStartupStage, ServerStartupTimeout,
 };
 
 pub use response::ResponsePool;

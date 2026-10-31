@@ -446,8 +446,6 @@ pub struct HostOptions {
     relay_use_proxy: Option<bool>,
     startup_timeout: Option<Duration>,
     shutdown_timeout: Duration,
-    lifecycle: c2_config::ServerLifecyclePolicy,
-    lifecycle_explicit: bool,
     #[cfg(test)]
     startup_gate: Option<Arc<StartupGateForTest>>,
 }
@@ -469,8 +467,6 @@ impl Default for HostOptions {
             relay_use_proxy: None,
             startup_timeout: None,
             shutdown_timeout: Duration::from_secs(5),
-            lifecycle: c2_config::ServerLifecyclePolicy::Persistent,
-            lifecycle_explicit: false,
             #[cfg(test)]
             startup_gate: None,
         }
@@ -505,28 +501,6 @@ impl HostOptions {
         self.shutdown_timeout = timeout;
         self
     }
-
-    /// Select the validated server lifecycle policy.
-    ///
-    /// `Persistent` (the default) keeps the explicit-shutdown semantics. An
-    /// `OwnerBound` policy additionally requires the native owner control
-    /// capability to be attached to the Runtime before the host starts.
-    pub fn with_lifecycle(mut self, policy: c2_config::ServerLifecyclePolicy) -> Self {
-        self.lifecycle = policy;
-        self.lifecycle_explicit = true;
-        self
-    }
-
-    /// Shorthand for the `OwnerBound` policy with one grace window.
-    pub fn with_owner_bound(self, owner_missing_grace: Duration) -> Self {
-        self.with_lifecycle(c2_config::ServerLifecyclePolicy::OwnerBound {
-            owner_missing_grace,
-        })
-    }
-
-    pub fn lifecycle(&self) -> &c2_config::ServerLifecyclePolicy {
-        &self.lifecycle
-    }
 }
 
 /// Core-owned host for one process server and any number of validated routes.
@@ -555,8 +529,7 @@ struct HostInner {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown_outcome: Mutex<Option<ShutdownOutcome>>,
     shutdown_gate: Mutex<()>,
-    lifecycle: crate::owner_bound::HostLifecycleCell,
-    lifecycle_policy: c2_config::ServerLifecyclePolicy,
+    lifecycle: crate::lifecycle::HostLifecycleCell,
 }
 
 impl HostInner {
@@ -639,14 +612,7 @@ impl HostInner {
         )
     }
 
-    fn finish_owner_shutdown_from_host_thread(&self) {
-        let Some(_gate) = self.shutdown_gate.try_lock() else {
-            return;
-        };
-        self.run_shutdown_transaction(self.shutdown_timeout);
-    }
-
-    fn lifecycle_snapshot(&self) -> crate::owner_bound::HostLifecycleSnapshot {
+    fn lifecycle_snapshot(&self) -> crate::lifecycle::HostLifecycleSnapshot {
         self.refresh_shutdown_outcome();
         let server_state = self.server.lifecycle_state();
         let budget = self.server.memory_budget_snapshot().budget;
@@ -656,8 +622,7 @@ impl HostInner {
                 .iter()
                 .all(|close| close.active_drained)
         });
-        crate::owner_bound::HostLifecycleSnapshot {
-            policy: self.lifecycle_policy,
+        crate::lifecycle::HostLifecycleSnapshot {
             phase: self.lifecycle.phase(),
             listener_closed: matches!(
                 server_state,
@@ -665,7 +630,7 @@ impl HostInner {
                     | c2_server::ServerLifecycleState::Failed(_)
             ),
             work_drained,
-            client_held_leases: crate::owner_bound::HostClientHeldLeases {
+            client_held_leases: crate::lifecycle::HostClientHeldLeases {
                 response_shm_bytes: budget.shm.used_bytes,
                 response_file_bytes: budget.file.used_bytes,
                 reassembly_bytes: budget.reassembly.used_bytes,
@@ -860,9 +825,9 @@ impl Host {
     ///
     /// The snapshot exposes the policy and phase plus the separately
     /// observable listener, drained-work, and client-held lease facts. It
-    /// never exposes OS handles or the owner control capability, and it does
+    /// never exposes OS handles, and it does
     /// not report endpoint (socket/lock) cleanup results.
-    pub fn lifecycle_snapshot(&self) -> crate::owner_bound::HostLifecycleSnapshot {
+    pub fn lifecycle_snapshot(&self) -> crate::lifecycle::HostLifecycleSnapshot {
         self.inner.lifecycle_snapshot()
     }
 }
@@ -933,17 +898,7 @@ impl Runtime {
         options: HostOptions,
         on_failed_start: impl FnOnce(FailedStartShutdownReceipt),
     ) -> Result<Host, Error> {
-        options
-            .lifecycle
-            .validate()
-            .map_err(|message| LifecycleError::Configuration(message))?;
-        let policy = if options.lifecycle_explicit {
-            options.lifecycle
-        } else {
-            self.lifecycle_policy()
-        };
-        let startup_timeout = self.freeze_host_options(policy, options.startup_timeout)?;
-        let options = options.with_lifecycle(policy);
+        let startup_timeout = self.freeze_host_options(options.startup_timeout)?;
         let identity = self.ensure_server()?;
         let config = self.server_ipc_config()?;
         let relay_anchor_address = match options.relay {
@@ -964,60 +919,15 @@ impl Runtime {
             server_id: identity.server_id,
             server_instance_id: identity.server_instance_id,
         };
-        let (server, owner_admission) = if options.lifecycle.is_owner_bound() {
-            let (server, admission) = Server::new_owner_bound_with_identity_and_endpoint(
-                endpoint,
-                config.clone(),
-                server_identity.clone(),
-            )
-            .map_err(LifecycleError::from)?;
-            (server, Some(admission))
-        } else {
-            (
-                Server::new_with_identity_and_endpoint(
-                    endpoint,
-                    config.clone(),
-                    server_identity.clone(),
-                )
-                .map_err(LifecycleError::from)?,
-                None,
-            )
-        };
-        let lifecycle = crate::owner_bound::HostLifecycleCell::new(&options.lifecycle);
-        let owner_supervisor = owner_admission.map(|admission| {
-            Arc::new(crate::owner_bound::OwnerSupervisor::new(
-                lifecycle.clone(),
-                admission,
-                server_identity,
-                identity.ipc_address,
-                options
-                    .lifecycle
-                    .owner_missing_grace()
-                    .expect("owner-bound policy"),
-            ))
-        });
-        let server = server.with_connection_event_source(self.connection_event_source());
-        let server = Arc::new(match &owner_supervisor {
-            Some(owner) => server.with_owner_control_handler(owner.clone()),
-            None => server,
-        });
-        if let Some(owner) = &owner_supervisor {
-            owner.attach_server(&server);
-        }
+        let server =
+            Server::new_with_identity_and_endpoint(endpoint, config.clone(), server_identity)
+                .map_err(LifecycleError::from)?;
+        let lifecycle = crate::lifecycle::HostLifecycleCell::new();
+        let server = Arc::new(server.with_connection_event_source(self.connection_event_source()));
         let server_runtime = ServerRuntimeBuilder::build(&config)
             .map_err(|error| LifecycleError::Server(ServerFailure::new(error.to_string())))?;
         server.begin_start_attempt().map_err(LifecycleError::from)?;
 
-        // Consume the native owner control capability before this host can
-        // publish readiness. Naming the OwnerBound policy alone fails here,
-        // and the capability leaves the Runtime state so it can never be
-        // cloned, reattached, or logged with the options.
-        let owner_receiver = match options.lifecycle {
-            c2_config::ServerLifecyclePolicy::Persistent => None,
-            c2_config::ServerLifecyclePolicy::OwnerBound { .. } => {
-                Some(self.consume_owner_control()?)
-            }
-        };
         let inner = Arc::new(HostInner {
             runtime: self.clone(),
             server: Arc::clone(&server),
@@ -1029,14 +939,8 @@ impl Runtime {
             shutdown_outcome: Mutex::new(None),
             shutdown_gate: Mutex::new(()),
             lifecycle: lifecycle.clone(),
-            lifecycle_policy: options.lifecycle,
         });
-        // The host thread observes the inner state only through a Weak
-        // reference: a live watcher must never keep a dropped Host/Runtime
-        // alive, and the thread always ends within bounded shutdown waits.
-        let weak_inner = Arc::downgrade(&inner);
         let run_server = Arc::clone(&server);
-        let owner_startup_timeout = startup_timeout;
         #[cfg(test)]
         let startup_gate = options.startup_gate.clone();
         #[cfg(test)]
@@ -1050,87 +954,18 @@ impl Runtime {
             Err(std::io::Error::other("injected host thread spawn failure"))
         } else {
             std::thread::Builder::new()
-            .name(format!("c2-host-{}", server.server_id()))
-            .spawn(move || {
-                #[cfg(test)]
-                if let Some(gate) = startup_gate {
-                    let _ = gate.entered.send(Arc::clone(&run_server));
-                    let _ = gate.proceed.lock().recv();
-                }
-                let Some(mut receiver) = owner_receiver else {
-                    // Persistent policy: the accept loop alone decides
-                    // nothing about lifecycle; explicit shutdown does.
+                .name(format!("c2-host-{}", server.server_id()))
+                .spawn(move || {
+                    #[cfg(test)]
+                    if let Some(gate) = startup_gate {
+                        let _ = gate.entered.send(Arc::clone(&run_server));
+                        let _ = gate.proceed.lock().recv();
+                    }
                     let result = server_runtime.block_on(run_server.run());
                     if result.is_err() {
                         run_server.finalize_runtime_stopped();
                     }
-                    return;
-                };
-                enum ThreadOutcome {
-                    ServerFinished(Result<(), c2_server::ServerError>),
-                    PreReadyRefused,
-                }
-                let outcome = server_runtime.block_on(async {
-                    // Arm the owner watcher before the accept loop runs, so
-                    // readiness can only be published behind a live watcher
-                    // and an already-gone capability is refused pre-ready.
-                    let session = match crate::owner_bound::arm_owner_watch_with_fence(crate::owner_bound::arm_owner_watch(&mut receiver), &run_server, owner_startup_timeout).await {
-                        crate::owner_bound::OwnerArmOutcome::Alive(session) => session,
-                        crate::owner_bound::OwnerArmOutcome::Closed => {
-                            receiver.close();
-                            let _ = run_server.reject_start_attempt(ServerFailure::new(
-                                "owner control capability was already closed before the host became ready"
-                                    .to_string(),
-                            ));
-                            return ThreadOutcome::PreReadyRefused;
-                        }
-                        crate::owner_bound::OwnerArmOutcome::IoError(message) => {
-                            receiver.close();
-                            let _ = run_server.reject_start_attempt(ServerFailure::new(format!(
-                                "owner control watcher failed before the host became ready: {message}"
-                            )));
-                            return ThreadOutcome::PreReadyRefused;
-                        }
-                        crate::owner_bound::OwnerArmOutcome::StartupTimeout => {
-                            receiver.close();
-                            let error = c2_server::ServerError::StartupTimeout(crate::ServerStartupTimeout {
-                                stage: crate::ServerStartupStage::OwnerControl,
-                                timeout: owner_startup_timeout,
-                            });
-                            let _ = run_server.reject_start_attempt((&error).into());
-                            return ThreadOutcome::PreReadyRefused;
-                        }
-                    };
-                    let run = run_server.run();
-                    let supervision = owner_supervisor.expect("owner-bound supervisor").supervise(session);
-                    tokio::pin!(run);
-                    tokio::pin!(supervision);
-                    tokio::select! {
-                        result = &mut run => {
-                            supervision.await;
-                            ThreadOutcome::ServerFinished(result)
-                        },
-                        _ = &mut supervision => {
-                            // Owner supervision only initiates drain. Never drop the run future
-                            // after a caller timeout; it owns the route journal and callbacks.
-                            ThreadOutcome::ServerFinished(run.await)
-                        }
-                    }
-
-                });
-                match outcome {
-                    ThreadOutcome::ServerFinished(result) => {
-                        if result.is_err() { run_server.finalize_runtime_stopped(); }
-                        // Reconcile every cause of run termination, including an explicit stop
-                        // winning the select. The watcher/grace has already been cancelled.
-                        if let Some(inner) = weak_inner.upgrade() {
-                            inner.finish_owner_shutdown_from_host_thread();
-                        }
-                    }
-                    ThreadOutcome::PreReadyRefused => {}
-
-                }
-            })
+                })
         };
         let thread = match thread {
             Ok(thread) => thread,
@@ -1744,32 +1579,6 @@ mod lifecycle_tests {
         close_receipt_root(directory);
     }
 
-    #[test]
-    fn live_owner_watcher_does_not_keep_a_dropped_host_alive() {
-        let runtime = Runtime::new(crate::RuntimeOptions {
-            use_process_relay_anchor: false,
-            ..Default::default()
-        })
-        .unwrap();
-        let (_owner, receiver) = crate::owner_control_pair().unwrap();
-        runtime.attach_owner_control(receiver).unwrap();
-        let host = runtime
-            .host(
-                HostOptions::default()
-                    .without_relay()
-                    .with_shutdown_timeout(Duration::from_millis(100))
-                    .with_owner_bound(Duration::from_secs(30)),
-            )
-            .unwrap();
-        let weak = Arc::downgrade(&host.inner);
-        let started = Instant::now();
-        drop(host);
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(
-            weak.upgrade().is_none(),
-            "pending watcher must not own HostInner"
-        );
-    }
     #[test]
     fn real_relay_idle_eviction_does_not_stop_persistent_host() {
         use crate::{Connect, EncodedClient};

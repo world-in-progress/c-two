@@ -7,7 +7,6 @@ mod call;
 mod connect_options;
 mod identity;
 mod ipc;
-mod lifecycle;
 mod local;
 mod memory;
 mod pool;
@@ -27,7 +26,6 @@ pub use ipc::{
     BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig, MAX_EXECUTION_WORKERS,
     MAX_IPC_POOL_SEGMENTS, PoolRoleTuning, SERVER_IPC_OVERRIDE_KEYS, ServerIpcConfig,
 };
-pub use lifecycle::{MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace};
 pub use local::{
     LocalEndpoint, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
     UNIX_NAMESPACE_FORMAT_VERSION,

@@ -46,7 +46,6 @@ from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
 from c_two.crm.meta import _SHUTDOWN_ATTR, get_shutdown_method
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
-from c_two.config.lifecycle import LifecycleConfig
 from c_two.mem import MemoryStats
 from c_two.config.settings import C2Settings, _clean_optional_str, settings
 from c_two.error import (
@@ -61,7 +60,6 @@ from .server.scheduler import ConcurrencyConfig
 from .server.native import NativeServerBridge as Server
 
 if TYPE_CHECKING:
-    from c_two.owner import OwnerBootstrap, OwnedChild
     from .endpoint import EndpointCredential
 
 CRM = TypeVar('CRM')
@@ -334,8 +332,6 @@ class Runtime:
         *,
         server_id: str | None = None,
         ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
-        lifecycle: LifecycleConfig | None = None,
-        owner_control: OwnerBootstrap | None = None,
         startup_timeout: float | None = None,
     ) -> None:
         """Configure IPC server and its native lifecycle. Call before register().
@@ -350,16 +346,6 @@ class Runtime:
             Native startup wait budget in seconds. ``None`` uses Rust's
             five-second default; zero expires immediately. Must be finite
             and non-negative. Cleanup after expiry has its own shutdown budget.
-        lifecycle:
-            Typed :class:`~c_two.config.LifecycleConfig`. Rust validates the
-            policy and its bounded grace window before it is frozen. Naming the
-            ``owner_bound`` policy is never enough on its own: the native owner
-            control capability must also be attached through *owner_control*.
-        owner_control:
-            The controller-held opaque
-            :class:`c_two.owner.OwnerBootstrap`. It is consumed exactly once and
-            is deliberately kept outside the IPC override mapping and every
-            other cloneable configuration path.
         """
         with self._lock:
             if self._server is not None:
@@ -367,10 +353,6 @@ class Runtime:
                     self._runtime_session.set_server_options(
                         server_id, ipc_overrides, startup_timeout,
                     )
-                if lifecycle is not None:
-                    self._runtime_session.set_lifecycle_policy(*lifecycle.native_args())
-                if owner_control is not None:
-                    self._runtime_session.attach_owner_control(owner_control)
                 import warnings
                 warnings.warn(
                     'Server already started, set_server() ignored. '
@@ -380,10 +362,6 @@ class Runtime:
                 )
                 return
             self._runtime_session.set_server_options(server_id, ipc_overrides, startup_timeout)
-            if lifecycle is not None:
-                self._runtime_session.set_lifecycle_policy(*lifecycle.native_args())
-            if owner_control is not None:
-                self._runtime_session.attach_owner_control(owner_control)
 
     def set_client(
         self,
@@ -447,9 +425,6 @@ class Runtime:
         with self._lock:
             return self._runtime_session.connection_events()
 
-    def prepare_owner_takeover(self, ticket):
-        """Prepare takeover in this instance's existing endpoint context."""
-        return self._runtime_session.prepare_owner_takeover(ticket)
 
     def memory_stats(self) -> MemoryStats:
         """Observe C-Two-owned IPC backing and live reassembly charges, not RSS.
@@ -889,7 +864,7 @@ class Runtime:
         if not blocking:
             return
 
-        # The native lifecycle is the truth: an owner-bound host can stop
+        # The native lifecycle is the truth: the host can stop
         # itself when its controller closes, without any signal, so serve()
         # must also watch the native terminal outcome instead of polling
         # only for a stop request.
@@ -897,7 +872,7 @@ class Runtime:
             if self._native_host_terminated():
                 break
 
-        # Graceful shutdown. A host that already drained (owner EOF) or that is
+        # Graceful shutdown. A host that already drained or that is
         # still draining reaches the same consume path, which returns without
         # fabricating a stopped SDK state while the transaction is incomplete;
         # the loop stays alive until the real structured terminal appears.
@@ -911,11 +886,7 @@ class Runtime:
         _print_serve_message(' Resource server stopped.')
 
     def _native_host_terminated(self) -> bool:
-        """Whether the Core host reached its structured terminal outcome.
-
-        ``OwnerMissing`` (bounded grace) and ``Draining`` (in-flight work still
-        finishing) are not terminal and never read as stopped.
-        """
+        """Whether the Core host reached its structured terminal outcome."""
         with self._lock:
             server = self._server
         if server is None:
@@ -965,7 +936,6 @@ class Runtime:
             session.set_relay_anchor_address(
                 self._settings._relay_anchor_address, connect_attempt=connect_attempt,  # noqa: SLF001
             )
-
 
 
 # ------------------------------------------------------------------
@@ -1025,8 +995,6 @@ def set_server(
     *,
     server_id: str | None = None,
     ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
-    lifecycle: LifecycleConfig | None = None,
-    owner_control: OwnerBootstrap | None = None,
     startup_timeout: float | None = None,
 ) -> None:
     """Configure IPC server and its native lifecycle. Call before register().
@@ -1036,50 +1004,8 @@ def set_server(
     _get_default_runtime().set_server(
         server_id=server_id,
         ipc_overrides=ipc_overrides,
-        lifecycle=lifecycle,
-        owner_control=owner_control,
         startup_timeout=startup_timeout,
     )
-
-
-def owner_control_pair():
-    """Create ``(OwnerControl, OwnerBootstrap)`` for explicit inheritance.
-
-    The controller keeps the keepalive private and hands the opaque receiver to
-    exactly one target child through :func:`c_two.owner.spawn_owned_child`. Neither value ever exposes an OS
-    descriptor, handle, endpoint name, or token.
-    """
-    from c_two._native import owner_control_pair as _owner_control_pair
-
-    return _owner_control_pair()
-
-
-def prepare_owner_takeover(ticket):
-    """Prepare one takeover in this runtime's existing endpoint context.
-
-    Save ``successor_ticket`` before committing when recovery after a lost
-    acknowledgement is required. ``inspect`` observes state, not a receipt.
-    """
-    return _get_default_runtime().prepare_owner_takeover(ticket)
-
-
-def spawn_owned_child(receiver, program, args=None, cwd=None) -> OwnedChild:
-    """Start one child and return an opaque :class:`c_two.owner.OwnedChild`.
-
-    ``child.id`` identifies the process; ``poll()`` observes its exit code and
-    ``wait(timeout=30)`` waits with a finite deadline, raising ``TimeoutError``
-    while leaving the handle live. ``kill()`` explicitly terminates the child.
-    ``close()`` and garbage collection release this observer; a shared native
-    reaper retains the OS process until exit without blocking Python or killing
-    the service. The controller must separately retain its owner keepalive.
-
-    The controller must call this for the intended child only. The receiver is
-    consumed by the call, so an unrelated child can never inherit the
-    capability; it never travels through argv, the environment, or a path.
-    """
-    from c_two._native import spawn_owned_child as _spawn_owned_child
-
-    return _spawn_owned_child(receiver, program, args or [], cwd)
 
 
 def set_client(

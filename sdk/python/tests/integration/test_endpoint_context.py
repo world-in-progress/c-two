@@ -1,7 +1,7 @@
 """Real local context isolation and cleanup, with spawned Python participants.
 
 Custom filesystem roots are Unix-only and deliberately short, pre-created
-containers. Common Persistent/OwnerBound lifecycle cases run on both Unix and
+containers. Common Host lifecycle cases run on both Unix and
 Windows. No test changes the pytest process environment or assumes fork.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ from tests.unit.test_endpoint_context import IS_WINDOWS, _isolated_env, _run_iso
 
 CONTRACT = '''
 import c_two as cc
-import c_two.owner
+
 import c_two.endpoint
 import c_two.observe
 
@@ -303,7 +303,7 @@ def test_used_selection_survives_repeated_shutdown_then_refreezes(source: str) -
         import os
         from pathlib import Path
         import c_two as cc
-        import c_two.owner
+
         import c_two.endpoint
         import c_two.observe
         from c_two import _native
@@ -346,7 +346,7 @@ def test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state(ab
         document = ready['credential']
         _run_isolated(f'''
             import c_two as cc
-            import c_two.owner
+
             import c_two.endpoint
             import c_two.observe
             from c_two import _native
@@ -374,7 +374,7 @@ def test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state(ab
             resource.stop()
         _run_isolated(f'''
             import c_two as cc
-            import c_two.owner
+
             import c_two.endpoint
             import c_two.observe
             credential = cc.endpoint.EndpointCredential.from_json({document!r})
@@ -407,7 +407,7 @@ def test_sweep_captures_code_context_once_and_keeps_it_across_env_flip(short_roo
         _run_isolated(f'''
             import os
             import c_two as cc
-            import c_two.owner
+
             import c_two.endpoint
             import c_two.observe
             from c_two import _native
@@ -443,64 +443,11 @@ def test_sweep_captures_code_context_once_and_keeps_it_across_env_flip(short_roo
         resource.close()
 
 
-def test_common_owner_bound_transfer_default_context_and_business_disconnect() -> None:
-    address = f'ipc://owner-context-{uuid.uuid4().hex[:12]}'
-    business = CONTRACT + textwrap.dedent(f'''
-        proxy = cc.connect(Echo, name='same-route', address={address!r})
-        assert proxy.value() == 'owner'
-        cc.close(proxy)
-        assert cc.shutdown()['completed']
-    ''')
-    _run_isolated(CONTRACT + textwrap.dedent(f'''
-        import subprocess
-        import sys
-        import time
-        from c_two.transport.registry import _get_default_runtime
-        keepalive, receiver = cc.owner.owner_control_pair()
-        class Resource:
-            hooks = 0
-            def value(self): return 'owner'
-            def done(self): self.hooks += 1
-        resource = Resource()
-        try:
-            cc.set_server(server_id={address.removeprefix('ipc://')!r},
-                lifecycle=cc.owner.LifecycleConfig.owner_bound(.05), owner_control=receiver)
-            original = _get_default_runtime()._runtime_session
-            context = cc.endpoint.local_endpoint_context()
-            cc.set_transport_policy(shm_threshold=8192)
-            replacement = _get_default_runtime()._runtime_session
-            assert replacement is not original
-            assert replacement.owner_control_attached
-            assert not original.owner_control_attached
-            assert cc.endpoint.local_endpoint_context() == context
-            cc.register(Echo, resource, name='same-route')
-            assert replacement.local_endpoint_frozen
-            result = subprocess.run([sys.executable, '-c', {business!r}],
-                capture_output=True, text=True, timeout=8)
-            assert result.returncode == 0, result.stderr
-            assert cc.observe.lifecycle_snapshot()['phase'] == 'armed'
-            assert cc.observe.shutdown_outcome() is None
-            assert resource.hooks == 0
-            keepalive.close()
-            deadline = time.monotonic() + 5
-            while cc.observe.shutdown_outcome() is None:
-                assert time.monotonic() < deadline, 'owner EOF did not drain'
-                time.sleep(.01)
-            outcome = cc.shutdown(timeout=5)
-            assert outcome['completed'], outcome
-            assert resource.hooks == 1
-            assert cc.endpoint.local_endpoint_context() == context
-        finally:
-            keepalive.close()
-            cc.shutdown(timeout=5)
-    '''))
-
-
 def test_common_active_incomplete_shutdown_retains_session_bindings_and_context() -> None:
     _run_isolated('''
         import threading
         import c_two as cc
-        import c_two.owner
+
         import c_two.endpoint
         import c_two.observe
         from c_two.transport.registry import _get_default_runtime

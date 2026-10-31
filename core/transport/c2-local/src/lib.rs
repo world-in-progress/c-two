@@ -31,37 +31,6 @@ pub use credential::{
     EndpointCredentialErrorKind,
 };
 
-pub mod owner;
-pub use owner::{OwnerBootstrap, OwnerControllerEndpoint, owner_endpoint_pair};
-
-/// An opaque, read-only pin of the native identity of an endpoint context.
-///
-/// Unix pins both directory roles and the verified coordinator inode/nonce. Windows binds the
-/// current TokenUser scope. The digest contains no path; the logical address, server instance and
-/// owner epoch must be bound separately by the control protocol. This pin holds no listener
-/// lease or namespace lock and grants no cleanup or owner-control authority.
-#[derive(Clone)]
-pub struct EndpointContextBinding(platform::ContextBinding);
-
-impl EndpointContextBinding {
-    /// Capture an existing context without creating or repairing any namespace metadata.
-    /// Unix makes one nonblocking gate-lock attempt; contention returns `WouldBlock`.
-    pub fn capture(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        platform::ContextBinding::capture(endpoint).map(Self)
-    }
-
-    pub fn digest(&self) -> [u8; 32] {
-        self.0.digest()
-    }
-
-    /// Validate the current native context against the originally pinned identity.
-    /// Unix also strictly checks both directory paths and the named gate/marker under one
-    /// nonblocking gate-lock attempt. Replacement or missing metadata is never adopted.
-    pub fn validate(&self) -> io::Result<()> {
-        self.0.validate()
-    }
-}
-
 #[cfg(unix)]
 mod unix_common;
 #[cfg(unix)]
@@ -770,12 +739,6 @@ impl LocalListener {
         platform::Listener::bind(endpoint).map(Self)
     }
 
-    /// Bind and pin the context needed by Core's owner-control protocol.
-    /// Ordinary listeners retain their existing handle and validation costs.
-    #[doc(hidden)]
-    pub fn bind_with_context_binding(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        platform::Listener::bind_with_context_binding(endpoint).map(Self)
-    }
     /// Cancelling accept keeps its pending listener instance available.
     pub async fn accept(&mut self) -> io::Result<LocalStream> {
         self.0.accept().await.map(LocalStream::from_inner)
@@ -785,13 +748,6 @@ impl LocalListener {
     /// management by a caller that already owns this listener.
     pub fn credential(&self) -> EndpointCredential {
         self.0.credential()
-    }
-
-    /// Return the context pin captured under this listener's original bind gate.
-    /// This projects the frozen identity without I/O; a later replacement cannot
-    /// become this listener's identity. Call `validate()` before using a grant.
-    pub fn context_binding(&self) -> io::Result<EndpointContextBinding> {
-        self.0.context_binding().map(EndpointContextBinding)
     }
 
     /// Closes the listener and reports the native socket cleanup result.

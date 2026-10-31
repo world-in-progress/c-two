@@ -28,7 +28,6 @@ pub enum MsgType {
     RouteWatchEvent = 0x13,
     RouteAck = 0x14,
     RouteNack = 0x15,
-    OwnerControl = 0x16,
 }
 
 impl MsgType {
@@ -56,7 +55,6 @@ impl MsgType {
             0x13 => Some(Self::RouteWatchEvent),
             0x14 => Some(Self::RouteAck),
             0x15 => Some(Self::RouteNack),
-            0x16 => Some(Self::OwnerControl),
             _ => None,
         }
     }
@@ -123,7 +121,6 @@ mod tests {
             (0x13, MsgType::RouteWatchEvent),
             (0x14, MsgType::RouteAck),
             (0x15, MsgType::RouteNack),
-            (0x16, MsgType::OwnerControl),
         ] {
             let parsed = MsgType::from_byte(byte).unwrap();
             assert_eq!(parsed, expected);
@@ -148,6 +145,5 @@ mod tests {
         assert!(MsgType::DisconnectAck.is_signal());
         assert!(!MsgType::CrmCall.is_signal());
         assert!(!MsgType::CrmReply.is_signal());
-        assert!(!MsgType::OwnerControl.is_signal());
     }
 }

@@ -97,7 +97,7 @@ class CoreError(CCBaseError, RuntimeError):
         'configuration', 'server', 'startup_timeout', 'relay',
         'runtime_retired', 'shutdown_wait_timeout',
     ] | None
-    startup_stage: Literal['readiness', 'responsiveness', 'owner_control'] | None
+    startup_stage: Literal['readiness', 'responsiveness'] | None
     timeout_seconds: float | None
     route_name: str | None
     status_code: int | None
@@ -279,7 +279,7 @@ class ResourceUnavailable(CCError):
         super().__init__(code=ERROR_Code.ERROR_RESOURCE_UNAVAILABLE, message=msg, details=details)
 
 class ResourceAlreadyRegistered(CCError):
-    """Raised when a relay rejects duplicate registration for a resource name."""
+    """Raised when a relay rejects duplicate registration for a route name."""
     ERROR_CODE = 703
 
     def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):

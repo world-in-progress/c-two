@@ -387,15 +387,6 @@ struct RuntimeState {
     use_process_relay_anchor: bool,
     relay_projection: Option<RelayProjection>,
     path_counters: PathCounters,
-    /// Native owner control capability attached by an explicit call. It is
-    /// deliberately not part of [`RuntimeOptions`]: the capability never
-    /// travels through cloneable option data, argv, environment variables,
-    /// or logs.
-    owner_control: Option<c2_local::OwnerBootstrap>,
-    /// Set once an owner-bound host consumed the capability; later attach or
-    /// consume attempts are rejected.
-    owner_control_consumed: bool,
-    lifecycle_policy: c2_config::ServerLifecyclePolicy,
     lifecycle_frozen: bool,
     shutdown_transactions: HashMap<String, Arc<ShutdownTransaction>>,
     retirement: Option<Arc<ShutdownTransaction>>,
@@ -673,9 +664,6 @@ impl Runtime {
                 use_process_relay_anchor: options.use_process_relay_anchor,
                 relay_projection: None,
                 path_counters: PathCounters::default(),
-                owner_control: None,
-                owner_control_consumed: false,
-                lifecycle_policy: Default::default(),
                 lifecycle_frozen: false,
                 shutdown_transactions: HashMap::new(),
                 retirement: None,
@@ -890,19 +878,6 @@ impl Runtime {
 
     pub fn local_endpoint_frozen(&self) -> bool {
         self.state.lock().frozen_local_endpoint.is_some()
-    }
-
-    /// Prepare a single owner takeover in the Runtime's current endpoint context.
-    /// This freezes the existing endpoint configuration without starting a host
-    /// or adopting a root from the ticket.
-    pub fn prepare_owner_takeover(
-        &self,
-        ticket: crate::OwnerRecoveryTicket,
-    ) -> Result<crate::PreparedOwnerTakeover, crate::OwnerControlError> {
-        let context = self.freeze_local_endpoint_context().map_err(|_| {
-            crate::OwnerControlError::new(crate::OwnerControlErrorKind::Unavailable)
-        })?;
-        crate::PreparedOwnerTakeover::prepare(ticket, &context)
     }
 
     pub(crate) fn freeze_local_endpoint_context(
@@ -1340,28 +1315,11 @@ impl Runtime {
             .clone())
     }
 
-    /// Set the native policy before the first Host freezes it.
-    pub fn set_lifecycle_policy(
-        &self,
-        policy: c2_config::ServerLifecyclePolicy,
-    ) -> Result<(), LifecycleError> {
-        policy.validate().map_err(LifecycleError::Configuration)?;
-        let mut state = self.state.lock();
-        if state.lifecycle_frozen {
-            return Err(LifecycleError::Configuration(
-                "server lifecycle policy is frozen".into(),
-            ));
-        }
-        state.lifecycle_policy = policy;
-        Ok(())
-    }
-
     /// Atomically move the unstarted server lifecycle to a prepared Runtime.
     ///
     /// Session replacement is a pre-use configuration transaction. Both sides
-    /// are checked before moving the opaque receiver, so a refused handoff
-    /// leaves the source usable. Lock order is stable even for opposing calls.
-    /// A host-frozen or consumed capability can never be transferred or reused.
+    /// are checked before moving subscriptions, so a refused handoff leaves
+    /// the source usable. Lock order is stable even for opposing calls.
     /// Subscriptions to the future host follow this same pre-use handoff.
     pub fn transfer_unstarted_lifecycle_to(
         &self,
@@ -1375,35 +1333,20 @@ impl Runtime {
         let transfer = |source: &mut RuntimeState, target: &mut RuntimeState| {
             source.ensure_no_pending_teardown()?;
             target.ensure_no_pending_teardown()?;
-            if source.lifecycle_frozen
-                || source.owner_control_consumed
-                || source.frozen_client_config.is_some()
-            {
+            if source.lifecycle_frozen || source.frozen_client_config.is_some() {
                 return Err(LifecycleError::Configuration(
                     "cannot transfer lifecycle after Runtime use".into(),
                 ));
             }
-            if target.lifecycle_frozen
-                || target.owner_control_consumed
-                || target.owner_control.is_some()
-                || target.frozen_client_config.is_some()
-                || target.lifecycle_policy != Default::default()
-            {
+            if target.lifecycle_frozen || target.frozen_client_config.is_some() {
                 return Err(LifecycleError::Configuration(
                     "replacement Runtime already owns a lifecycle".into(),
                 ));
             }
-            target.lifecycle_policy = source.lifecycle_policy;
-            target.owner_control = source.owner_control.take();
             // Pre-use SDK configuration replaces the Runtime, but preserves
             // subscriptions to that same future host. A full shutdown does
             // not use this handoff and ends the old event source normally.
             target.connection_event_source = std::mem::take(&mut source.connection_event_source);
-            // The retired source cannot adopt another capability after moving
-            // its original receiver. Closing it remains a hostless operation.
-            if target.owner_control.is_some() {
-                source.owner_control_consumed = true;
-            }
             Ok(())
         };
         if Arc::as_ptr(&self.state) < Arc::as_ptr(&replacement.state) {
@@ -1421,86 +1364,18 @@ impl Runtime {
         self.state.lock().ensure_no_pending_teardown().is_err()
     }
 
-    pub fn lifecycle_policy(&self) -> c2_config::ServerLifecyclePolicy {
-        self.state.lock().lifecycle_policy
-    }
-
     pub(crate) fn freeze_host_options(
         &self,
-        policy: c2_config::ServerLifecyclePolicy,
         startup_timeout: Option<Duration>,
     ) -> Result<Duration, LifecycleError> {
         let mut state = self.state.lock();
         state.ensure_no_pending_teardown()?;
-        if state.lifecycle_frozen && state.lifecycle_policy != policy {
-            return Err(LifecycleError::Configuration(
-                "server lifecycle policy is frozen".into(),
-            ));
-        }
         let startup_timeout = startup_timeout
             .or(state.server_startup_timeout)
             .unwrap_or(Duration::from_secs(5));
         validate_startup_timeout(Some(startup_timeout))?;
-        state.lifecycle_policy = policy;
         state.lifecycle_frozen = true;
         Ok(startup_timeout)
-    }
-
-    /// Attach one private native capability, outside cloneable configuration data.
-    /// Once a Host consumes it, a new attachment is rejected; recovery uses a ticket.
-    pub fn attach_owner_control(
-        &self,
-        receiver: c2_local::OwnerBootstrap,
-    ) -> Result<(), LifecycleError> {
-        let mut state = self.state.lock();
-        if state.owner_control_consumed {
-            return Err(LifecycleError::Configuration(
-                "owner control capability was already consumed by an owner-bound host; late capability changes are rejected"
-                    .to_string(),
-            ));
-        }
-        if state.owner_control.is_some() {
-            return Err(LifecycleError::Configuration(
-                "owner control capability already attached; a Runtime accepts exactly one owner bootstrap"
-                    .to_string(),
-            ));
-        }
-        state.owner_control = Some(receiver);
-        Ok(())
-    }
-
-    /// Whether an unconsumed native owner control capability is attached.
-    pub fn owner_control_attached(&self) -> bool {
-        let state = self.state.lock();
-        state.owner_control.is_some() && !state.owner_control_consumed
-    }
-
-    /// Read-only one-way consumption state for SDK capability preflight.
-    pub fn owner_control_consumed(&self) -> bool {
-        self.state.lock().owner_control_consumed
-    }
-
-    /// Consume the attached capability for one owner-bound host start.
-    ///
-    /// This is the freeze point: naming the `OwnerBound` policy without an
-    /// attached capability fails here, before the host can publish readiness.
-    /// A second consume attempt also fails, so one Runtime can never run two
-    /// owner-bound hosts from one capability.
-    pub(crate) fn consume_owner_control(&self) -> Result<c2_local::OwnerBootstrap, LifecycleError> {
-        let mut state = self.state.lock();
-        match state.owner_control.take() {
-            Some(receiver) => {
-                state.owner_control_consumed = true;
-                Ok(receiver)
-            }
-            None if state.owner_control_consumed => Err(LifecycleError::Configuration(
-                "owner control capability was already consumed by an owner-bound host".to_string(),
-            )),
-            None => Err(LifecycleError::Configuration(
-                "OwnerBound host policy requires an attached native owner control capability before the host can publish readiness"
-                    .to_string(),
-            )),
-        }
     }
 
     pub fn effective_relay_anchor_address(&self) -> Result<Option<String>, LifecycleError> {

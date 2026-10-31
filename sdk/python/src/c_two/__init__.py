@@ -1,7 +1,7 @@
 """Resource RPC for applications: declare contracts, register resources and connect clients.
 
-Supervisors use ``owner`` for process ownership and ``endpoint`` for local endpoint
-administration; operators use ``observe`` for diagnostics, and authors use
+Supervisors use ``endpoint`` for local endpoint administration; operators use
+``observe`` for diagnostics, and authors use
 ``contract`` for descriptor and code-generation tools.
 """
 from importlib.metadata import version as _version
@@ -19,7 +19,7 @@ from .transport.registry import (
     set_transport_policy, set_call_execution_limits,
 )
 
-from . import owner, endpoint, observe, contract
+from . import endpoint, observe, contract
 
 __all__ = [
     'crm',
@@ -43,7 +43,6 @@ __all__ = [
     'Runtime',
     'ConcurrencyConfig',
     'error',
-    'owner',
     'endpoint',
     'observe',
     'contract',

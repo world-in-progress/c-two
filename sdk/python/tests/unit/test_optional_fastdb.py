@@ -89,7 +89,7 @@ def test_plain_crm_local_calls_and_errors_never_import_fastdb(
     run_isolated(isolated_source, """
         import c_two as cc
 
-        for name in ('owner', 'endpoint', 'observe', 'contract'):
+        for name in ('endpoint', 'observe', 'contract'):
             assert name in cc.__all__
             assert getattr(cc, name).__name__ == f'c_two.{name}'
         assert_no_optional_imports()

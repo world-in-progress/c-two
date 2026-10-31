@@ -79,7 +79,7 @@ def test_public_core_error_annotations_expose_native_literal_values():
         'coordinator-missing', 'coordinator-replaced', 'initialization-incomplete',
         'unsupported-namespace-format',
     ] | None
-    assert hints['startup_stage'] == Literal['readiness', 'responsiveness', 'owner_control'] | None
+    assert hints['startup_stage'] == Literal['readiness', 'responsiveness'] | None
     assert hints['code'] == int | None
     assert hints['local_protocol_version'] == hints['peer_protocol_version'] == int | None
     assert hints['details'] == dict[str, str]

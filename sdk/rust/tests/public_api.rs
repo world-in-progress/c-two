@@ -461,7 +461,7 @@ fn low_level_transports_are_not_importable_and_encoded_client_is_sealed() {
     assert_external_crate_rejected(
         "moved-root-surface",
         r#"
-use c_two::{EndpointCredential, OwnerControl, ConnectionObservation};
+use c_two::{EndpointCredential, ConnectionObservation};
 fn main() {}
 "#,
         "unresolved imports",
@@ -561,33 +561,11 @@ fn assert_external_crate_rejected(name: &str, source: &str, expected_stderr: &st
 }
 
 #[test]
-fn owner_lifecycle_facade_uses_the_exact_core_capability_types() {
-    let pair: fn() -> std::io::Result<(c2_core::OwnerControl, c2_core::OwnerBootstrap)> =
-        c_two::owner::owner_control_pair;
-    assert_eq!(
-        std::any::TypeId::of::<c_two::owner::ServerLifecyclePolicy>(),
-        std::any::TypeId::of::<c2_core::ServerLifecyclePolicy>(),
-    );
+fn native_endpoint_and_admin_probes_are_thin_facade_reexports() {
     assert_eq!(
         std::any::TypeId::of::<c_two::observe::HostLifecycleSnapshot>(),
         std::any::TypeId::of::<c2_core::HostLifecycleSnapshot>(),
     );
-    let (keepalive, receiver) = pair().expect("native capability pair");
-    let runtime = test_runtime(RuntimeOptions::default()).expect("runtime");
-    runtime
-        .set_lifecycle_policy(
-            c_two::owner::ServerLifecyclePolicy::owner_bound(Duration::ZERO).unwrap(),
-        )
-        .expect("Core validates the policy");
-    runtime
-        .attach_owner_control(receiver)
-        .expect("Core takes receiver");
-    assert!(runtime.owner_control_attached());
-    keepalive.close();
-}
-
-#[test]
-fn native_endpoint_and_admin_probes_are_thin_facade_reexports() {
     use c_two::endpoint::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc};
     let address = format!("ipc://{}", unique_name("rust-sdk-native"));
     let endpoint = direct_ipc_endpoint(&address, None).expect("native endpoint");

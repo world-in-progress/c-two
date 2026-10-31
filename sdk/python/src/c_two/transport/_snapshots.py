@@ -54,12 +54,6 @@ class CallExecutionSnapshot(CallExecutionCounters):
     retired: list[RetiredCallExecutionSnapshot]
 
 
-class LifecyclePolicy(TypedDict):
-    policy: Literal['persistent', 'owner_bound']
-    owner_bound: bool
-    owner_missing_grace_seconds: float | None
-
-
 class ClientHeldLeases(TypedDict):
     response_shm_bytes: int
     response_file_bytes: int
@@ -67,11 +61,7 @@ class ClientHeldLeases(TypedDict):
 
 
 class LifecycleSnapshot(TypedDict):
-    policy: LifecyclePolicy
-    phase: Literal[
-        'persistent', 'armed', 'owner_missing', 'draining', 'finished', 'watcher_io_error',
-    ]
-    watcher_error: str | None
+    phase: Literal['persistent', 'finished']
     terminal: bool
     listener_closed: bool
     work_drained: bool

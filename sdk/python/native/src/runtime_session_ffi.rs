@@ -17,8 +17,8 @@ use c2_core::{
     CallExecutionObserver, Connect, FailedStartShutdownReceipt, Host, HostClientHeldLeases,
     HostLifecyclePhase, HostLifecycleSnapshot, HostOptions, MethodDefinition, RegisterOutcome,
     Registration, RetiredMemoryObservation, Runtime, RuntimeOptions, RuntimeShutdownReceipt,
-    RuntimeShutdownTarget, ServerLifecyclePolicy, ServiceConcurrencyMode, ServiceDefinition,
-    ShutdownOutcome, UnregisterOutcome,
+    RuntimeShutdownTarget, ServiceConcurrencyMode, ServiceDefinition, ShutdownOutcome,
+    UnregisterOutcome,
 };
 use c2_mem::{BufferLeaseStats, BufferLeaseTracker};
 
@@ -33,9 +33,6 @@ use crate::core_error_ffi::{
 use crate::core_ffi::{PyCoreClient, PyCoreService};
 use crate::endpoint_ffi::{PyEndpointCredential, PyLocalEndpointContext};
 use crate::lease_ffi::{PyBufferLeaseTracker, lease_stats_dict};
-use crate::owner_ffi::{
-    PyNativeOwnerBootstrap, PyOwnerRecoveryTicket, PyPreparedOwnerTakeover, owner_error,
-};
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 
 pub(crate) fn checked_timeout(seconds: f64) -> Result<Duration, &'static str> {
@@ -396,11 +393,7 @@ impl PyRuntimeSession {
 
     /// Start this session's one Core host.
     ///
-    /// The default [`HostOptions`] inherits the native lifecycle policy the
-    /// Runtime has frozen (or the one `set_lifecycle_policy` pinned), so an
-    /// `OwnerBound` policy consumes the attached owner capability here and a
-    /// `Persistent` one does not. The capability is consumed at most once: a
-    /// second `ensure_host` reuses the live host and never re-consumes.
+    /// Reuse the live Host, or publish a fresh Host after native startup succeeds.
     fn ensure_host(&self) -> PyResult<Host> {
         let mut host_guard = self.host.lock();
         if let Err(error) = self.inner.ensure_active() {
@@ -415,14 +408,6 @@ impl PyRuntimeSession {
                     ));
                 }
                 return Ok(host.clone());
-            }
-            if !matches!(
-                self.inner.lifecycle_policy(),
-                ServerLifecyclePolicy::Persistent
-            ) {
-                return Err(PyRuntimeError::new_err(
-                    "owner-bound host cannot restart with an already consumed owner capability",
-                ));
             }
             if !self.registrations.lock().is_empty() {
                 return Err(PyRuntimeError::new_err(
@@ -1101,7 +1086,7 @@ impl PyRuntimeSession {
     ///
     /// This reports the native `Host.is_running()` observation instead of the
     /// SDK's mere handle presence, so a host that already stopped (explicit
-    /// shutdown, owner EOF, or a failed start attempt) does not read as
+    /// shutdown or a failed start attempt) does not read as
     /// started.
     #[getter]
     fn host_started(&self) -> bool {
@@ -1114,10 +1099,9 @@ impl PyRuntimeSession {
 
     /// Thin read-only lifecycle observation for the bridge.
     ///
-    /// The projection exposes only the native policy/phase and the separate
+    /// The projection exposes only the native phase and the separate
     /// listener, drained-work and client-held-lease facts. `None` means no
-    /// host exists, never "stopped". It never initiates or consumes shutdown
-    /// and never exposes the owner capability.
+    /// host exists. It never initiates or consumes shutdown or endpoint cleanup.
     fn native_lifecycle_snapshot<'py>(
         &self,
         py: Python<'py>,
@@ -1158,73 +1142,6 @@ impl PyRuntimeSession {
             }
             None => Ok(None),
         }
-    }
-
-    /// Whether the native owner capability is attached and not yet consumed.
-    #[getter]
-    fn owner_control_attached(&self) -> bool {
-        self.inner.owner_control_attached()
-    }
-
-    /// Attach one opaque native owner control receiver.
-    ///
-    /// The receiver is consumed exactly once. A duplicate attach, a late
-    /// attach after a host consumed the capability, and a capability that is
-    /// already closed are all rejected by Core before any host can publish
-    /// readiness, so a policy name alone can never create an owner-bound host.
-    fn prepare_owner_takeover(
-        &self,
-        py: Python<'_>,
-        ticket: &PyOwnerRecoveryTicket,
-    ) -> PyResult<PyPreparedOwnerTakeover> {
-        py.detach(|| self.inner.prepare_owner_takeover(ticket.inner.clone()))
-            .map(|inner| PyPreparedOwnerTakeover { inner })
-            .map_err(|error| owner_error(py, error))
-    }
-
-    fn attach_owner_control(&self, receiver: &PyNativeOwnerBootstrap) -> PyResult<()> {
-        let host_guard = self.host.lock();
-        if host_guard.host.is_some() || self.inner.owner_control_consumed() {
-            return Err(PyRuntimeError::new_err(
-                "owner control capability must be attached before the Core host starts",
-            ));
-        }
-        if !matches!(
-            self.inner.lifecycle_policy(),
-            ServerLifecyclePolicy::OwnerBound { .. }
-        ) {
-            return Err(PyValueError::new_err(
-                "owner_control requires the owner_bound lifecycle policy",
-            ));
-        }
-        if self.inner.owner_control_attached() {
-            return Err(PyRuntimeError::new_err(
-                "owner control capability already attached",
-            ));
-        }
-        let receiver = receiver.take_for_attach()?;
-        self.inner
-            .attach_owner_control(receiver)
-            .map_err(runtime_configuration_error_to_py)
-    }
-
-    /// Set the native lifecycle policy before the first host freezes it.
-    #[pyo3(signature = (policy=None, owner_missing_grace_seconds=None))]
-    fn set_lifecycle_policy(
-        &self,
-        policy: Option<&str>,
-        owner_missing_grace_seconds: Option<f64>,
-    ) -> PyResult<()> {
-        let policy = parse_lifecycle_policy(policy, owner_missing_grace_seconds)?;
-        self.inner
-            .set_lifecycle_policy(policy)
-            .map_err(runtime_configuration_error_to_py)
-    }
-
-    /// Read-only projection of the frozen native lifecycle policy.
-    #[getter]
-    fn lifecycle_policy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        lifecycle_policy_to_dict(py, &self.inner.lifecycle_policy())
     }
 
     #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, descriptor_json))]
@@ -1836,67 +1753,10 @@ fn shutdown_outcome_is_incomplete(outcome: &ShutdownOutcome) -> bool {
             .any(|route| !route.active_drained || route.close_error.is_some())
 }
 
-fn lifecycle_policy_to_dict<'py>(
-    py: Python<'py>,
-    policy: &ServerLifecyclePolicy,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    match policy {
-        ServerLifecyclePolicy::Persistent => {
-            dict.set_item("policy", "persistent")?;
-            dict.set_item("owner_bound", false)?;
-            dict.set_item("owner_missing_grace_seconds", py.None())?;
-        }
-        ServerLifecyclePolicy::OwnerBound {
-            owner_missing_grace,
-        } => {
-            dict.set_item("policy", "owner_bound")?;
-            dict.set_item("owner_bound", true)?;
-            dict.set_item(
-                "owner_missing_grace_seconds",
-                owner_missing_grace.as_secs_f64(),
-            )?;
-        }
-    }
-    Ok(dict)
-}
-
-fn parse_lifecycle_policy(
-    policy: Option<&str>,
-    owner_missing_grace_seconds: Option<f64>,
-) -> PyResult<ServerLifecyclePolicy> {
-    match policy {
-        None | Some("persistent") => {
-            if owner_missing_grace_seconds.is_some() {
-                return Err(PyValueError::new_err(
-                    "owner_missing_grace_seconds is only valid with the owner_bound policy",
-                ));
-            }
-            Ok(ServerLifecyclePolicy::Persistent)
-        }
-        Some("owner_bound") => {
-            let seconds = owner_missing_grace_seconds.ok_or_else(|| {
-                PyValueError::new_err(
-                    "owner_bound requires an explicit owner_missing_grace_seconds window",
-                )
-            })?;
-            let grace = checked_timeout(seconds).map_err(PyValueError::new_err)?;
-            ServerLifecyclePolicy::owner_bound(grace).map_err(PyValueError::new_err)
-        }
-        Some(other) => Err(PyValueError::new_err(format!(
-            "invalid lifecycle policy {other:?}; expected \"persistent\" or \"owner_bound\"",
-        ))),
-    }
-}
-
 fn lifecycle_phase_name(phase: &HostLifecyclePhase) -> PyResult<&'static str> {
     Ok(match phase {
         HostLifecyclePhase::Persistent => "persistent",
-        HostLifecyclePhase::Armed => "armed",
-        HostLifecyclePhase::OwnerMissing => "owner_missing",
-        HostLifecyclePhase::Draining => "draining",
         HostLifecyclePhase::Finished => "finished",
-        HostLifecyclePhase::WatcherIoError(_) => "watcher_io_error",
     })
 }
 
@@ -1905,14 +1765,7 @@ fn lifecycle_snapshot_to_dict<'py>(
     snapshot: &HostLifecycleSnapshot,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item("policy", lifecycle_policy_to_dict(py, &snapshot.policy)?)?;
     dict.set_item("phase", lifecycle_phase_name(&snapshot.phase)?)?;
-    match &snapshot.phase {
-        HostLifecyclePhase::WatcherIoError(message) => {
-            dict.set_item("watcher_error", message)?;
-        }
-        _ => dict.set_item("watcher_error", py.None())?,
-    }
     // A finished transaction is terminal; every earlier phase, including a
     // bounded draining transaction, still has native work outstanding.
     dict.set_item("terminal", snapshot.phase == HostLifecyclePhase::Finished)?;
