@@ -56,17 +56,6 @@ _Avoid_: 运行时 or a lowercase runtime for this object (both name C-Two as a 
 The server side of a Runtime: it listens on an IPC endpoint and serves the registered resources.
 _Avoid_: 宿主, server process
 
-**Persistent / OwnerBound**:
-The two Host lifecycle policies. A Persistent Host runs until it is shut down explicitly; an OwnerBound Host follows the owner that started it and pauses when that owner goes missing.
-
-**所有者 / owner**:
-The controller that holds `OwnerControl` for an OwnerBound Host and decides when it ends.
-_Avoid_: 属主, parent, supervisor; 所有者 for any other kind of owner
-
-**接管 / takeover**:
-A new controller adopting an OwnerBound Host with a saved recovery ticket while the Host waits in its owner-missing grace period.
-_Avoid_: recovery (for the whole operation), restart
-
 ### Transport
 
 **直接 IPC / direct IPC**:

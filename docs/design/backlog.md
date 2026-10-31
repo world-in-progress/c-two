@@ -19,6 +19,7 @@
    - 删除所有者子系统（[接口审查](2026-10-31-api-surface-review.md)第六节）：`OwnerBound` 生命周期、所有者监督与缺席宽限、恢复凭证与接管、托管子进程，以及 Python 与 Rust 的公开名字、文档与测试；握手 15 同时去掉所有者控制这种连接角色与 0x16 帧。普通 Host 也在用的关闭、生命周期观测、准入锁与代次和端点凭据保留，不留空的 API 壳。依据：用户 2026-11-01 的标准是"下游看不见、内部机制也不需要，就可以删"；独立评估与 Host 核对都满足（C ABI、CLI、relay、端点维护都不依赖它）。按文件粗算约 3.7 千行生产代码、5.9 千行测试与夹具。
    - 步骤：详细设计（消息格式、借出表、两个方向的发送时机、各条关闭路径的失败场景、端到端基准与验收计划，附流式 RPC 草图）→ 独立审查 → 用户批准，同时确认单一属主的决定 2、3 → 实施。
    - 状态：用户 2026-11-01 批准[详细设计](2026-11-01-protocol-batch-design.md)，包括 D7（按所列条件）与性能门槛；决定记为 [ADR 0001](../decisions/0001-single-owner-release.md) 与 [ADR 0002](../decisions/0002-remove-owner-subsystem.md)。实施在分支 `socu/protocol-batch` 上按设计第七节的顺序进行，P0（删除所有者子系统）进行中。现行的生命周期契约（AGENTS.md、`payload-lifetime.md`、`memory-policy.md`、Python 与 Rust 用法）和术语表里 hold、释放两条，由 Host 在行为改变的那一块合入时同步改。
+   - P6 顺带：P0 删除所有者子系统后，Host 生命周期阶段只剩 `Persistent` 与 `Finished`；`Persistent` 原本相对 `OwnerBound` 而言，现在失去对照，改成表示"运行中"的名字，Python 的投影一并改。
 2. **流式 RPC**（[路线图](roadmap.zh-CN.md)第 7 项，用户确认是必备能力）：排在协议批之后，设计要回答单一属主评估"与流式 RPC 的关系"一节的八个问题，并定下同一连接内调用的顺序契约。现状（2026-11-01 核实，写在[运行时生命周期](../reference/runtime-lifecycle.md)）：非分片的 IPC 调用在接收循环里按帧序预约路由，`exclusive` 与 `read_parallel` 下后到的调用不会先于先到的写执行；`parallel` 与不同路由之间没有顺序；分片请求的首片在另一个任务里才预约，后到的非分片调用可能先执行。旧 Python 服务端的连接级写屏障连跨路由也保证顺序，Rust 里没有。一并设计：分片的结构调整（B2：先缩小重组池锁，再把首片准入搬回接收循环、删排序闸门，分片请求也就按帧序预约了；以及 C03、C04、R14 的剩余）；relay 的 HTTP 响应现在整体物化，改为流式发送；HTTP 载荷的内存预算与消费生命周期（[提案](2026-10-06-http-memory-budget.md)，未实施）。
 3. **按区域的结构调整与重复校验。** 不碰协议，可以与协议批的设计并行；各区先出方案：
    - **Core 与 Python：** E1、E2、E4、E13；C5、C6；G5、G9；R06 回调重入导致自锁的风险。顺带：`c2-core/src/control.rs` 里 `direct_ipc_endpoint`、`ping_direct_ipc`、`shutdown_direct_ipc` 每次克隆上下文，可以直接借用；`register` 的签名写 `Literal['materialized', 'borrowed']`，服务端桥里另有私有别名 `_InputLifetime`，统一成一处。
@@ -64,6 +65,7 @@
 下一批碰到测试运行器时顺带做掉：
 
 - 本地直接跑 pytest 时，TypeScript 测试要先构建 c2-mem-ffi 的 Node 绑定（`core/foundation/c2-mem-ffi/bindings/typescript` 下 `npm ci && npm run build`）。没构建时，有 2 项报错、约 30 项被跳过，看上去像回归。可以让夹具缺这个绑定时直接报出来，或者在开发文档里写明这一步。
+- `tests/repo/test_python_test_runner.py::test_parent_exit_with_live_descendant_is_not_success` 在 2026-11-01 P0 验收的本机全量里失败过一次：期望"进程组仍存活"，实际得到 `[Errno 1] Operation not permitted`，单独重跑通过。进程组退出与发信号之间可能有竞态，碰到运行器时核实。
 - 直接用 pytest 跑 Python 套件时，`test_typescript_persistent_ipc.py` 依赖别的测试先构建好 fastdb4ts；运行顺序不同就会报"尚未构建"。CI 的运行器会预先构建，所以只在本地出现。
 
 ## 下游跟进（由用户决定）

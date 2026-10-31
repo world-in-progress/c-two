@@ -35,7 +35,7 @@ A **CRM contract** declares the callable methods and their namespace/version. A 
 - **Native memory transport:** IPC uses lazy buddy pools, dedicated shared memory, checked chunk transfer and file spill. Budgets and idle reclamation control memory and file usage for large payloads. See [memory policy](docs/reference/memory-policy.md).
 - **Explicit payload lifetimes:** `cc.hold()` retains response leases, while registration can select borrowed input lifetimes. Release invalidates payload owners and checked views before releasing transport storage. See [Python payload usage](docs/reference/python-usage.md).
 - **Connection observations:** `cc.observe.connection_events()` aggregates outgoing and accepted physical IPC connections; one cancellable consumer replaces per-connection blocking waits. Reasons describe transport facts, not proof of process death.
-- **Resource lifecycle management:** Resources use `Persistent` or controller-owned `OwnerBound` lifecycles; native shutdown drains work, and scoped endpoint maintenance cleans up confirmed exits. See [lifecycle integration](docs/reference/local-endpoint-lifecycle.md).
+- **Resource lifecycle management:** Native shutdown drains work, and scoped endpoint maintenance cleans up confirmed exits. See [lifecycle integration](docs/reference/local-endpoint-lifecycle.md).
 - **Shared Rust core:** Python and Rust use the same routing, transport, memory, error and lifecycle mechanisms. The native c3 CLI handles relay, contract tools and endpoint maintenance on Linux, macOS and Windows x64 and ARM64.
 
 ## Install
@@ -54,7 +54,7 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.
 
 On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/reference/windows-native-usage.md#install-python-and-c3).
 
-C3 0.6.0 pairs with C-Two 0.10.x. IPC handshake 14 cannot interoperate with 0.9.x peers (IPC 13), and Unix endpoint namespace format 3 uses new default directories, so upgrade the Python and Rust SDKs, c3 and Node consumers on one host together; stop old services before upgrading and restarting. C/FFI ABI 6, SHM 3 and owner control 1 keep their formats. See the [0.10.0 migration notes](docs/releases/0.10.0.md), the [handshake spec](docs/reference/ipc-handshake.md) and the [endpoint lifecycle guide](docs/reference/local-endpoint-lifecycle.md).
+C3 0.6.0 pairs with C-Two 0.10.x. IPC handshake 14 cannot interoperate with 0.9.x peers (IPC 13), and Unix endpoint namespace format 3 uses new default directories, so upgrade the Python and Rust SDKs, c3 and Node consumers on one host together; stop old services before upgrading and restarting. C/FFI ABI 6 and SHM 3 keep their formats. See the [0.10.0 migration notes](docs/releases/0.10.0.md), the [handshake spec](docs/reference/ipc-handshake.md) and the [endpoint lifecycle guide](docs/reference/local-endpoint-lifecycle.md).
 
 Source builds need Rust 1.95 or newer; for builds and tests, see the [development guide](docs/reference/development.md).
 
@@ -105,7 +105,7 @@ For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_ancho
 | Python contracts, portable payloads and API index | [Python SDK guide](docs/reference/python-usage.md) |
 | Rust SDK and API migration | [Rust SDK guide](sdk/rust/README.md) |
 | Relay and contract tools | [c3 CLI guide](cli/README.md) |
-| Connection, owner and endpoint APIs | [Lifecycle guide](docs/reference/local-endpoint-lifecycle.md) |
+| Connection and endpoint APIs | [Lifecycle guide](docs/reference/local-endpoint-lifecycle.md) |
 | IPC handshake protocol | [Handshake spec](docs/reference/ipc-handshake.md) |
 | Windows | [Build and usage](docs/reference/windows-native-usage.md) |
 | Environment variables | [.env.example](.env.example) |

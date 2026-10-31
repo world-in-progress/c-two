@@ -62,9 +62,9 @@ Typed overrides 为 `BaseIPCOverrides`、`ServerIPCOverrides`、`ClientIPCOverri
 
 在首次注册前用 `cc.set_server(startup_timeout=seconds)` 设置 Core 的启动等待预算。原生 `RuntimeSession` 构造器和 `set_server_options` 接受同名参数。数值必须有限、非负且能由原生时钟表示；零表示立即到期。省略或 `None` 使用原有的 5 秒有限默认值，不表示无限等待。保留默认值是为了约束无人配置时的启动等待，不保证繁忙运行器能在 5 秒内就绪；应用应明确选择自己的部署预算。
 
-Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；空 Host 的 `runtime.start()` 同样是首次启动尝试。启动前通过 `set_transport_policy` 替换 RuntimeSession 时会保留该设置。`cc.shutdown()` 或显式 `runtime.shutdown()` 消费已完成结果后产生的新 session 可以重新配置；返回 pending 后，须再次调用 SDK shutdown 消费结果，后台完成本身不会换代。Rust 的优先级为显式 `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > 5 秒。就绪和后续直连 IPC ping 共用等待预算，所有者启动围栏也使用该配置时长。配置、合同验证发生在等待之前；超时后的原生收尾仍使用独立的 shutdown 预算，因此这不是 `cc.register()` 或 `runtime.start()` 的总墙钟时限。
+Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；空 Host 的 `runtime.start()` 同样是首次启动尝试。启动前通过 `set_transport_policy` 替换 RuntimeSession 时会保留该设置。`cc.shutdown()` 或显式 `runtime.shutdown()` 消费已完成结果后产生的新 session 可以重新配置；返回 pending 后，须再次调用 SDK shutdown 消费结果，后台完成本身不会换代。Rust 的优先级为显式 `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > 5 秒。就绪和后续直连 IPC ping 共用等待预算。配置、合同验证发生在等待之前；超时后的原生收尾仍使用独立的 shutdown 预算，因此这不是 `cc.register()` 或 `runtime.start()` 的总墙钟时限。
 
-启动到期产生公开的 `c_two.error.CoreError`：`category='lifecycle'`、`lifecycle_kind='startup_timeout'`，并携带 `startup_stage`（`readiness`、`responsiveness` 或 `owner_control`）及 `timeout_seconds`。三个本地 I/O 字段 `io_operation`、`io_kind`、`raw_os_error` 均为 `None`。真实 bind 失败保持原结构化系统原因，消息不再添加错误的 `config error` 前缀。这些诊断不提供重试、接管或清理端点的权限。完整类型及取值范围见[公开错误字段表](local-endpoint-lifecycle.md#public-structured-python-errors)。
+启动到期产生公开的 `c_two.error.CoreError`：`category='lifecycle'`、`lifecycle_kind='startup_timeout'`，并携带 `startup_stage`（`readiness` 或 `responsiveness`）及 `timeout_seconds`。三个本地 I/O 字段 `io_operation`、`io_kind`、`raw_os_error` 均为 `None`。真实 bind 失败保持原结构化系统原因，消息不再添加错误的 `config error` 前缀。这些诊断不提供重试或清理端点的权限。完整类型及取值范围见[公开错误字段表](local-endpoint-lifecycle.md#public-structured-python-errors)。
 
 ## IPC 内存、分片与心跳
 
@@ -175,7 +175,7 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 直连 IPC 默认无限等待；HTTP 的预算覆盖一个逻辑调用和其内的路由重取。`timeout=None` 显式无限，`0` 在派发前到期，负数和非有限值在入口拒绝。同进程同步调用只接受继承或无限策略。
 
-截止时间到达后结束调用方等待，已经派发的原生事务仍可能继续完成传输，随后释放其保留的输入。单次调用截止时间到期不会撤销 relay 路由、发起 OwnerBound 关闭，也不会使已经取得的 held 响应的载荷所有者失效。错误区分派发前到期与派发状态不确定；后者不能自动重放调用。
+截止时间到达后结束调用方等待，已经派发的原生事务仍可能继续完成传输，随后释放其保留的输入。单次调用截止时间到期不会撤销 relay 路由，也不会使已经取得的 held 响应的载荷所有者失效。错误区分派发前到期与派发状态不确定；后者不能自动重放调用。
 
 有限调用的数量上限 `0` 拒绝所有新有限调用，字节预算 `0` 只拒绝正数输入；无限调用不受这两项准入限额约束。`cc.observe.call_execution_snapshot()` 查看当前及退休域的真实计费。示例与错误阶段见[调用截止时间指南](../releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
 
@@ -185,7 +185,7 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 服务端 `max_pending_requests` 是所有连接共用的一个信号量，计算等待或使用执行容量的完整远程调用，不随连接数倍增。`max_execution_workers` 单独限制正在执行的远程回调。路由自己的 `max_pending` 和 `max_workers` 也约束同进程调用。机制见[执行准入](runtime-lifecycle.md#execution-admission)。
 
-`cc.owner.LifecycleConfig` 选择默认 `Persistent` 或显式 `OwnerBound`。后者使用控制器预先准备的私有 owner capability。`cc.shutdown(timeout=...)` 在取得 Python 实例锁后，用一个截止时间约束 Native owner/Core/pool 锁等待和本次关闭观察；Python 实例锁等待不计入该截止时间，已启动的原生收尾不会被等待超时取消；监听关闭、工作排空和 held lease 释放分别报告。完整接入方式见[生命周期指南](local-endpoint-lifecycle.md)。
+`cc.shutdown(timeout=...)` 在取得 Python 实例锁后，用一个截止时间约束 Native Host、Core 与 pool 的锁等待和本次关闭观察；Python 实例锁等待不计入该截止时间，已启动的原生收尾不会被等待超时取消；监听关闭、工作排空和 held lease 释放分别报告。完整接入方式见[生命周期指南](local-endpoint-lifecycle.md)。
 
 ## 原生配置权威
 

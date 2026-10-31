@@ -56,7 +56,7 @@ Server lifecycle/readiness belongs to Rust. Python `NativeServerBridge` may expo
 
 ## Shutdown authority
 
-Direct IPC `shutdown("ipc://...")` under `c_two.transport.client.util` is an admin/control-plane helper for high-privilege same-host supervisors of `Persistent` hosts. `OwnerBound` hosts reject ordinary admin shutdown with the existing negative ACK, including pre-handshake and duplicate initiate requests; their current owner uses `OwnerControl.request_shutdown()`. Trusted in-process `Runtime.shutdown()` / `cc.shutdown()` retains its authority. An accepted shutdown ACK proves initiation only, without proving that active callbacks have drained or shutdown hooks are safe to run. Completion and route close outcomes must be observed through `RuntimeSession.shutdown()` / bridge barriers or a future explicit wait helper. Future name-based or HTTP/relay-propagated shutdown must be designed as an explicit authenticated admin control plane with clear route-level vs server-level scope, not as a hidden normal RPC side effect.
+Direct IPC `shutdown("ipc://...")` under `c_two.transport.client.util` is an admin/control-plane helper for high-privilege same-host supervisors. Trusted in-process `Runtime.shutdown()` / `cc.shutdown()` retains its authority. An accepted shutdown ACK proves initiation only, without proving that active callbacks have drained or shutdown hooks are safe to run. Completion and route close outcomes must be observed through `RuntimeSession.shutdown()` / bridge barriers or a future explicit wait helper. Future name-based or HTTP/relay-propagated shutdown must be designed as an explicit authenticated admin control plane with clear route-level vs server-level scope, not as a hidden normal RPC side effect.
 
 ## Session retirement
 

@@ -6,7 +6,7 @@ The preamble-free handshake 13 used by 0.9.x is incompatible. See the [design pl
 
 ## Scope
 
-This specification governs only `HANDSHAKE` version negotiation on ordinary RPC connections: business handshakes initiated by Rust/Python clients and generated TypeScript clients over Unix UDS or Windows Named Pipes. SIGNAL ping/shutdown control, OwnerControl (independent version 1), and private owner bootstrap channels do not use this preamble and do not change with the RPC version. Diagnosability of different IPC versions applies only to RPC connections using this fixed preamble; it does not imply that any local channel or unresponsive process can report a version.
+This specification governs only `HANDSHAKE` version negotiation on ordinary RPC connections: business handshakes initiated by Rust/Python clients and generated TypeScript clients over Unix UDS or Windows Named Pipes. SIGNAL ping/shutdown control does not use this preamble and does not change with the RPC version. Diagnosability of different IPC versions applies only to RPC connections using this fixed preamble; it does not imply that any local channel or unresponsive process can report a version.
 
 ## Permanent fixed preamble (25 bytes)
 
@@ -27,9 +27,7 @@ Each side first reads the fixed 16-byte envelope and checks `total_len=21`, `RID
 
 After the existing OS connection and native identity checks, the client sends only the Hello preamble and waits for a fixed response; it sends no SHM names, route requests, or business data yet. On a version mismatch, the server writes VersionMismatch carrying the server version; on equality, it writes Accepted. Only after receiving Accepted with an equal version does the client send the original capability/SHM metadata. The server then performs the original full validation and produces the identity/route/capability ACK. The one-byte version field in the old metadata is removed; the fixed preamble alone owns the version boundary.
 
-Initial negotiation exclusively reads Hello and metadata in one handshake call stack. Each stage checks RID, direction, and exact flags. It does not return to the ordinary dispatch loop while waiting for metadata and does not add a second persistent state machine. Only after the final metadata ACK is written does the server publish `handshake_done` and `ordinary_protocol`, opening business calls and heartbeats. Before handshake completion, CALL and ordinary CTRL frames other than independent SIGNAL control terminate the connection with `frame_before_handshake`; a second HANDSHAKE on an established connection terminates it with `duplicate_handshake`; switching to an owner role after an ordinary role is established terminates it with `owner_role_change`. No RPC channel bypasses version negotiation.
-
-Once classified, ordinary RPC and owner-control roles cannot mix or change in either direction. An ordinary RPC connection cannot carry or upgrade to OwnerControl; an owner-control connection accepts only its bounded owner protocol and cannot carry business RPC or upgrade to an ordinary RPC connection.
+Initial negotiation exclusively reads Hello and metadata in one handshake call stack. Each stage checks RID, direction, and exact flags. It does not return to the ordinary dispatch loop while waiting for metadata and does not add a second persistent state machine. Only after the final metadata ACK is written does the server publish `handshake_done` and `ordinary_protocol`, opening business calls and heartbeats. Before handshake completion, CALL and ordinary CTRL frames other than independent SIGNAL control terminate the connection with `frame_before_handshake`; a second HANDSHAKE on an established connection terminates it with `duplicate_handshake`. No RPC channel bypasses version negotiation.
 
 ## Malformed records versus VersionMismatch
 
@@ -57,7 +55,7 @@ For relay-selected local routes, Core treats a typed version mismatch as termina
 
 ## Compatibility
 
-RPC handshakes before version 14 lack this format. A new endpoint does not parse an old payload, try an old pipe name, or infer a version from EOF or error code 2. Mixed connections with an old endpoint, including 0.9.x and earlier wheels, remain connection/protocol failures; the old wheel can observe only a generic connection failure, without typed projection. Low-level manual handshake callers must use the new sequence, and the old single-frame RPC handshake entry point is not retained. C/FFI ABI 6, SHM 3, owner control 1, ordinary business frame/call/reply layouts, and CRM hashes do not change because of this version change.
+RPC handshakes before version 14 lack this format. A new endpoint does not parse an old payload, try an old pipe name, or infer a version from EOF or error code 2. Mixed connections with an old endpoint, including 0.9.x and earlier wheels, remain connection/protocol failures; the old wheel can observe only a generic connection failure, without typed projection. Low-level manual handshake callers must use the new sequence, and the old single-frame RPC handshake entry point is not retained. C/FFI ABI 6, SHM 3, ordinary business frame/call/reply layouts, and CRM hashes do not change because of this version change.
 
 ## Fixed Windows naming
 

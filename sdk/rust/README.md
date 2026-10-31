@@ -11,7 +11,7 @@ publish:       false
 
 This source-only package has no crates.io release. It reuses `c2-contract` for release identity and `c2-core` for route, transport, retry, host, and lifetime behavior. It does not expose a second runtime state machine.
 
-This guide describes the current source-only SDK, whose independent version remains 0.1.0. It requires Rust 1.95 or newer and matches Python C-Two 0.10.x / c3 0.6.0; see the [0.10.0 release notes](../../docs/releases/0.10.0.md) for the Rust API changes in that release. Rust `c2-core` owns default `Persistent`, explicit `OwnerBound`, shutdown drain transactions and local endpoint maintenance. SDKs use the one OS endpoint derived by `LocalEndpoint::from_address`; there is no backend selector. See [lifecycle integration](../../docs/reference/local-endpoint-lifecycle.md) and the [owned-child example](examples/owned_child.rs). Use matching builds and local endpoint configuration for clients, hosts and relays.
+This guide describes the current source-only SDK, whose independent version remains 0.1.0. It requires Rust 1.95 or newer and matches Python C-Two 0.10.x / c3 0.6.0; see the [0.10.0 release notes](../../docs/releases/0.10.0.md) for the Rust API changes in that release. Rust `c2-core` owns shutdown drain transactions and local endpoint maintenance. SDKs use the one OS endpoint derived by `LocalEndpoint::from_address`; there is no backend selector. See [lifecycle integration](../../docs/reference/local-endpoint-lifecycle.md). Use matching builds and local endpoint configuration for clients, hosts and relays.
 
 [IPC memory policy](../../docs/reference/memory-policy.md) is also shared Core behavior: lazy buddy allocation, idle decay, finite direction-scoped backing/reassembly budgets and checked transport fallback. Endpoint closure does not release retained payload owners or their budgets.
 
@@ -24,7 +24,6 @@ The crate root contains the Runtime, Host, client, registration and call types, 
 | Module | Audience and contents |
 | --- | --- |
 | `c_two::endpoint` | Supervisors and maintenance tools: endpoint contexts, credentials, inspection, reaping, sweeps, direct IPC ping/shutdown and local I/O causes. |
-| `c_two::owner` | Trusted launchers: owner/bootstrap capabilities, recovery tickets, takeover and lifecycle policy. |
 | `c_two::observe` | Monitoring and diagnostics: connection events, call admission and concurrency snapshots, memory statistics, host lifecycle, paths and routes. |
 | `c_two::contract` | Contract tooling: validation errors, release references and expected route contracts. |
 
@@ -35,8 +34,6 @@ The crate root contains the Runtime, Host, client, registration and call types, 
 | `Client::connection_observation()` / generated client method | Returns the current physical IPC observation. `snapshot()` reads its terminal record; async `wait_closed(Option<Duration>)` waits without retaining the connection. Thread-local and HTTP clients reject this operation. |
 | `Runtime::connection_events()` | Subscribes to future outgoing and accepted IPC connections without starting a host. Values expose `ConnectionSide`; async `recv(&self)` returns `Ok(None)` at end. `close()` wakes this subscriber only; lag or concurrent consumers return `ConnectionEventsError`. |
 | `Host::endpoint_credential()` | Returns `Option<EndpointCredential>` from the existing lifecycle watch. Ready/Stopping retain the listener snapshot; terminal states clear it. No inspect, filesystem I/O or gate lock; a snapshot proves neither liveness nor cleanup authority. |
-| `c_two::owner::owner_control_pair()` | Returns `OwnerControl` and the one-use `OwnerBootstrap` for a trusted launcher. `recovery_ticket(timeout)` issues the current recovery grant; `revoke_recovery(timeout)` revokes it. |
-| `Runtime::prepare_owner_takeover(ticket)` | Freezes the configured endpoint context. Save `successor_ticket().export()` before one `commit(timeout)`; a successful commit returns the new `OwnerControl`. `inspect(timeout)` observes state without proving commit success. |
 | `Error::local_io_cause()` | Returns `Option<LocalIoCause>` for bind/connect failures. `Bind(EndpointBindCause { error, unverified_reason })` preserves OS details or the typed binding refusal; `Connect(EndpointIoError)` keeps its OS cause. `error()` still returns the unchanged `EndpointIoError`. |
 | `Error::ProtocolVersionMismatch { local, peer }` | A complete fixed RPC preamble reported a different nonzero `u32` version. Terminal before metadata or dispatch; no retry or relay fallback. |
 

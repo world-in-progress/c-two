@@ -36,7 +36,7 @@ This page routes each subject to the document that owns it. It states no behavio
 | [Runtime lifecycle](reference/runtime-lifecycle.md) | Registration, startup, execution admission, connection deadlines, shutdown and retirement |
 | [Payload and buffer lifetime](reference/payload-lifetime.md) | Held responses, borrowed inputs, FastDB view invalidation and the dispatch copy path |
 | [Memory policy](reference/memory-policy.md) | Budgets, buddy and dedicated SHM, file spill, fallback, memory pressure and statistics |
-| [Local endpoint lifecycle](reference/local-endpoint-lifecycle.md) | Endpoint namespaces, credentials, inspection and reaping, and owner-bound hosts with takeover |
+| [Local endpoint lifecycle](reference/local-endpoint-lifecycle.md) | Endpoint namespaces, credentials, bind and connect failures, cleanup and sweeps, admin shutdown and connection observation |
 | [IPC handshake](reference/ipc-handshake.md) | The fixed version preamble, negotiation and connection roles |
 | [Errors](reference/errors.md) | Error codes, the wire codec and diagnostic fields |
 | [C ABI](reference/c-abi.md) | The `c2-mem-ffi` ABI and its consumers |

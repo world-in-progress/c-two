@@ -128,7 +128,7 @@ with cc.hold(echo.echo)(source) as held:
 
 ### Python SDK
 
-`c_two` 根模块只容纳日常 API：契约装饰器、`hold` / `HeldResult`、register / connect / close / unregister / serve / shutdown、`server_address`、`with_call_options`、各 setter、`Runtime`、`ConcurrencyConfig` 和 `error`。所有者控制、端点维护、诊断与契约工具分别位于 `c_two.owner`、`c_two.endpoint`、`c_two.observe` 和 `c_two.contract`；Rust SDK 在 `c_two::` 下使用相同的四个模块。不要为这些能力新增根模块名称、别名或第二种拼写；并发模式和输入生命周期等选项值使用字符串字面量。
+`c_two` 根模块只容纳日常 API：契约装饰器、`hold` / `HeldResult`、register / connect / close / unregister / serve / shutdown、`server_address`、`with_call_options`、各 setter、`Runtime`、`ConcurrencyConfig` 和 `error`。端点维护、诊断与契约工具分别位于 `c_two.endpoint`、`c_two.observe` 和 `c_two.contract`；Rust SDK 在 `c_two::` 下使用相同的三个模块。不要为这些能力新增根模块名称、别名或第二种拼写；并发模式和输入生命周期等选项值使用字符串字面量。
 
 应用以 `import c_two as cc` 开始。需要时导入专用模块：
 
@@ -145,14 +145,13 @@ use fastdb::Payload;
 
 生成的 Rust 模块可以使用隐藏的 `c_two::generated` 接缝。普通应用代码不得直接组装 `c2-ipc`、`c2-http`、`c2-server`、`SyncClient` 或路由绑定。
 
-契约导出和所有者能力构造不选择 Runtime。并发模式为 `'parallel'`、`'exclusive'` 和 `'read_parallel'`；注册输入生命周期为 `'materialized'` 和 `'borrowed'`。
+契约导出不选择 Runtime。并发模式为 `'parallel'`、`'exclusive'` 和 `'read_parallel'`；注册输入生命周期为 `'materialized'` 和 `'borrowed'`。
 
 - 编写契约：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`
 - 调用：`cc.with_call_options`（按调用设置截止时间的视图，见[远程连接与截止时间](#远程连接与截止时间)）
-- Runtime：`cc.Runtime`，其实例方法包括 `set_local_endpoint`、`set_server`、`set_client`、`set_transport_policy`、`set_relay_anchor`、`set_call_execution_limits`、`register`、`connect`、`unregister`、`start`、`server_id`、`server_address`、`server_credential`、`local_endpoint_context`、`shutdown`、`connection_events`、`lifecycle_snapshot`、`shutdown_outcome`、`memory_stats`、`call_execution_snapshot` 和 `prepare_owner_takeover`
+- Runtime：`cc.Runtime`，其实例方法包括 `set_local_endpoint`、`set_server`、`set_client`、`set_transport_policy`、`set_relay_anchor`、`set_call_execution_limits`、`register`、`connect`、`unregister`、`start`、`server_id`、`server_address`、`server_credential`、`local_endpoint_context`、`shutdown`、`connection_events`、`lifecycle_snapshot`、`shutdown_outcome`、`memory_stats` 和 `call_execution_snapshot`
 - 默认 Runtime：`cc.register`、`cc.connect`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.endpoint.server_credential`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.set_transport_policy`、`cc.endpoint.set_local_endpoint`；`cc.close(proxy)` 跟随代理自身的连接
 - 契约：`cc.contract.export_descriptor`、`cc.contract.release_ref`、`cc.contract.compile_artifacts`、`cc.contract.diagnostics`
-- 生命周期与所有权：`cc.owner.LifecycleConfig`、`cc.owner.owner_control_pair`、`cc.owner.spawn_owned_child`、`cc.owner.OwnerBootstrap.adopt_owner_stdin`、`cc.owner.OwnerControl`、`cc.owner.OwnerRecoveryTicket`、`cc.owner.prepare_owner_takeover`、`cc.owner.PreparedOwnerTakeover`、`cc.owner.OwnerStatus`、`cc.owner.OwnerControlError`
 - 端点维护：`cc.endpoint.inspect_endpoint`、`cc.endpoint.reap_endpoint`、`cc.endpoint.sweep_endpoints`、`cc.endpoint.EndpointCredential`（不可变的原生值；显式 JSON 导入/导出）
 - 连接观察：`cc.observe.connection_observation`、`cc.observe.connection_events`、`cc.observe.ConnectionObservation`、`cc.observe.ConnectionClosed`、`cc.observe.ConnectionEvent`、`cc.observe.ConnectionEvents`、`cc.observe.ConnectionEventsLagged`
 - 错误：`cc.error.CoreError`（结构化本地/Core 错误）、`cc.error.CCError`（语义错误），共同基类为 `cc.error.CCBaseError`
@@ -164,7 +163,7 @@ use fastdb::Payload;
 
 Runtime 范围内的 IPC 策略、调用准入限制及 relay 设置见[配置指南](configuration.zh-CN.md)。
 
-[生命周期 API 指南](local-endpoint-lifecycle.md)规定观察返回值、超时/结束/滞后行为、所有者票据的签发和撤销、单次提交的接管顺序以及错误结果。其中的[绑定/连接章节](local-endpoint-lifecycle.md#bind-and-connect-failures)记录公共 `cc.error.CoreError` 上的结构化操作系统字段。这些观察不能证明进程退出，也不能授权重放或清理。
+[生命周期 API 指南](local-endpoint-lifecycle.md)规定观察返回值、超时/结束/滞后行为以及错误结果。其中的[绑定/连接章节](local-endpoint-lifecycle.md#bind-and-connect-failures)记录公共 `cc.error.CoreError` 上的结构化操作系统字段。这些观察不能证明进程退出，也不能授权重放或清理。
 
 ### CRM 契约、客户端与名称
 
@@ -233,4 +232,4 @@ cc.shutdown()
 
 传给远程 `connect()` 的截止时间也约束 SDK 最终发布检查。若原截止时间在发布前到期，connect 抛出对应的截止时间错误，仅释放自身的逻辑客户端，且不重试。其他情况下成功的连接继续正常复用其池化客户端。`runtime_retired` 生命周期错误没有 I/O 原因。仅使用 HTTP 不会创建 IPC 池，shutdown 也不保证每个 HTTP keepalive 套接字都已物理关闭。Rust 底层 Host 的关闭/重启生命周期仍独立且可重启；永久退役仅适用于 Python SDK Runtime 作用域。IPC 握手 14、SHM 3 和 C/FFI ABI 6 均未改变。R07 final Drop 仍是独立工作。
 
-完成交接后，已配置的端点选择、传输策略、调用限制和 relay 覆盖值保留现有交接行为，而服务端身份、IPC 覆盖值、启动超时和一次性所有者能力会重置。现有的 `connection_events()` 订阅只观察原会话；新会话需要重新订阅。返回值是正在关闭的会话的结果；已保留的载荷继续遵循自身的生命周期。应用拥有自己创建的任何自定义端点目录；Runtime 不会移除该目录。[预检示例](../../examples/python/independent_runtime.py)在删除新建的私有目录前检查关闭结果。
+完成交接后，已配置的端点选择、传输策略、调用限制和 relay 覆盖值保留现有交接行为，而服务端身份、IPC 覆盖值和启动超时会重置。现有的 `connection_events()` 订阅只观察原会话；新会话需要重新订阅。返回值是正在关闭的会话的结果；已保留的载荷继续遵循自身的生命周期。应用拥有自己创建的任何自定义端点目录；Runtime 不会移除该目录。[预检示例](../../examples/python/independent_runtime.py)在删除新建的私有目录前检查关闭结果。

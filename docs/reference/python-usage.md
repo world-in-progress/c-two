@@ -128,7 +128,7 @@ On the server side, portable inputs are owned by default. Registering with `cc.r
 
 ### Python SDK
 
-The `c_two` root holds only the everyday API: contract decorators, `hold` / `HeldResult`, register / connect / close / unregister / serve / shutdown, `server_address`, `with_call_options`, setters, `Runtime`, `ConcurrencyConfig` and `error`. Owner control, endpoint maintenance, diagnostics and contract tooling live in `c_two.owner`, `c_two.endpoint`, `c_two.observe` and `c_two.contract`; the Rust SDK uses the same four modules under `c_two::`. Do not add root names, aliases or second spellings for these capabilities; option values such as concurrency modes and input lifetimes are string literals.
+The `c_two` root holds only the everyday API: contract decorators, `hold` / `HeldResult`, register / connect / close / unregister / serve / shutdown, `server_address`, `with_call_options`, setters, `Runtime`, `ConcurrencyConfig` and `error`. Endpoint maintenance, diagnostics and contract tooling live in `c_two.endpoint`, `c_two.observe` and `c_two.contract`; the Rust SDK uses the same three modules under `c_two::`. Do not add root names, aliases or second spellings for these capabilities; option values such as concurrency modes and input lifetimes are string literals.
 
 Applications start with `import c_two as cc`. Import the specialized modules when needed:
 
@@ -145,14 +145,13 @@ use fastdb::Payload;
 
 Generated Rust modules may use the hidden `c_two::generated` seam. Ordinary application code must not assemble `c2-ipc`, `c2-http`, `c2-server`, `SyncClient`, or route bindings directly.
 
-Contract export and owner capability construction do not select a Runtime. Concurrency modes are `'parallel'`, `'exclusive'`, and `'read_parallel'`; registration input lifetimes are `'materialized'` and `'borrowed'`.
+Contract export does not select a Runtime. Concurrency modes are `'parallel'`, `'exclusive'`, and `'read_parallel'`; registration input lifetimes are `'materialized'` and `'borrowed'`.
 
 - Authoring: `@cc.crm`, `@cc.read`, `@cc.write`, `@cc.on_shutdown`, `@cc.transfer`, `cc.hold`
 - Calls: `cc.with_call_options` (per-call deadline views, see [remote connections and deadlines](#remote-connections-and-deadlines))
-- Runtime: `cc.Runtime`, whose instance methods include `set_local_endpoint`, `set_server`, `set_client`, `set_transport_policy`, `set_relay_anchor`, `set_call_execution_limits`, `register`, `connect`, `unregister`, `start`, `server_id`, `server_address`, `server_credential`, `local_endpoint_context`, `shutdown`, `connection_events`, `lifecycle_snapshot`, `shutdown_outcome`, `memory_stats`, `call_execution_snapshot` and `prepare_owner_takeover`
+- Runtime: `cc.Runtime`, whose instance methods include `set_local_endpoint`, `set_server`, `set_client`, `set_transport_policy`, `set_relay_anchor`, `set_call_execution_limits`, `register`, `connect`, `unregister`, `start`, `server_id`, `server_address`, `server_credential`, `local_endpoint_context`, `shutdown`, `connection_events`, `lifecycle_snapshot`, `shutdown_outcome`, `memory_stats` and `call_execution_snapshot`
 - Default Runtime: `cc.register`, `cc.connect`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.endpoint.server_credential`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.set_transport_policy`, `cc.endpoint.set_local_endpoint`; `cc.close(proxy)` follows the proxy's own connection
 - Contracts: `cc.contract.export_descriptor`, `cc.contract.release_ref`, `cc.contract.compile_artifacts`, `cc.contract.diagnostics`
-- Lifecycle and ownership: `cc.owner.LifecycleConfig`, `cc.owner.owner_control_pair`, `cc.owner.spawn_owned_child`, `cc.owner.OwnerBootstrap.adopt_owner_stdin`, `cc.owner.OwnerControl`, `cc.owner.OwnerRecoveryTicket`, `cc.owner.prepare_owner_takeover`, `cc.owner.PreparedOwnerTakeover`, `cc.owner.OwnerStatus`, `cc.owner.OwnerControlError`
 - Endpoint maintenance: `cc.endpoint.inspect_endpoint`, `cc.endpoint.reap_endpoint`, `cc.endpoint.sweep_endpoints`, `cc.endpoint.EndpointCredential` (immutable native value; explicit JSON import/export)
 - Connection observations: `cc.observe.connection_observation`, `cc.observe.connection_events`, `cc.observe.ConnectionObservation`, `cc.observe.ConnectionClosed`, `cc.observe.ConnectionEvent`, `cc.observe.ConnectionEvents`, `cc.observe.ConnectionEventsLagged`
 - Errors: `cc.error.CoreError` (structured local/Core errors), `cc.error.CCError` (semantic errors), with common `cc.error.CCBaseError`
@@ -164,7 +163,7 @@ After a listener reaches Ready, `cc.endpoint.server_credential() -> cc.endpoint.
 
 Runtime-scoped IPC policy, call admission limits and relay settings are documented in the [configuration guide](configuration.md).
 
-The [lifecycle API guide](local-endpoint-lifecycle.md) specifies observation return values, timeout/end/lag behavior, owner ticket issuance and revocation, the single-commit takeover sequence and error outcomes. Its [bind/connect section](local-endpoint-lifecycle.md#bind-and-connect-failures) documents the structured OS fields on public `cc.error.CoreError`. These observations do not prove process exit or authorize replay or cleanup.
+The [lifecycle API guide](local-endpoint-lifecycle.md) specifies observation return values, timeout/end/lag behavior and error outcomes. Its [bind/connect section](local-endpoint-lifecycle.md#bind-and-connect-failures) documents the structured OS fields on public `cc.error.CoreError`. These observations do not prove process exit or authorize replay or cleanup.
 
 ### CRM contracts, clients and names
 
@@ -233,4 +232,4 @@ Calling `runtime.shutdown(timeout=...)` starts the Core Runtime's single permane
 
 The deadline passed to remote `connect()` also bounds the SDK's final publication check. If that original deadline expires before publication, connect raises the corresponding deadline error and releases only its own logical client; it does not retry. An otherwise successful connection continues to reuse its pooled client normally. A `runtime_retired` lifecycle error has no I/O cause. HTTP-only use does not create an IPC pool, and shutdown does not promise that every HTTP keepalive socket has physically closed. The Rust low-level Host shutdown/restart lifecycle remains separate and restartable; this permanent retirement applies to the Python SDK Runtime scope. IPC handshake 14, SHM 3 and C/FFI ABI 6 are unchanged. R07 final Drop remains separate work.
 
-After completed handoff, configured endpoint selection, transport policy, call limits and relay override retain their existing handoff behavior, while server identity, IPC overrides, startup timeout and one-use owner capability reset. An existing `connection_events()` subscription observes its original session only; subscribe again for the new session. The return value is the closing session's result, and held payloads retain their own lifetime. An application owns any custom endpoint directory it creates; the Runtime does not remove that directory. The [preflight example](../../examples/python/independent_runtime.py) checks the shutdown outcome before deleting its newly created private directory.
+After completed handoff, configured endpoint selection, transport policy, call limits and relay override retain their existing handoff behavior, while server identity, IPC overrides and startup timeout reset. An existing `connection_events()` subscription observes its original session only; subscribe again for the new session. The return value is the closing session's result, and held payloads retain their own lifetime. An application owns any custom endpoint directory it creates; the Runtime does not remove that directory. The [preflight example](../../examples/python/independent_runtime.py) checks the shutdown outcome before deleting its newly created private directory.

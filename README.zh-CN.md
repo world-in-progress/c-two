@@ -35,7 +35,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 - **原生内存传输**：IPC 使用按需 buddy 池、独占共享内存、检查过的分片传输及文件溢出。通过预算和空闲回收控制大载荷的内存与文件用量。详见[内存策略](docs/reference/memory-policy.md)。
 - **明确的载荷生命周期**：`cc.hold()` 保留响应租约，资源注册可选择借用输入；释放时先使载荷所有者和 checked view 失效，再释放传输存储。详见 [Python 载荷用法](docs/reference/python-usage.zh-CN.md)。
 - **连接观察**：`cc.observe.connection_events()` 汇总客户端和服务端物理 IPC 连接，一个可关闭的消费者替代逐连接阻塞等待；原因只描述连接事实，不证明进程已经退出。
-- **资源生命周期管理**：资源采用 `Persistent` 或控制器持有的 `OwnerBound` 生命周期；原生 shutdown 排空工作，限定范围的端点维护清理已确认退出的端点。详见[生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
+- **资源生命周期管理**：原生 shutdown 排空工作，限定范围的端点维护清理已确认退出的端点。详见[生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
 - **统一 Rust core**：Python 与 Rust 共用路由、传输、内存、错误和生命周期机制。原生 c3 CLI 在 Linux、macOS、Windows x64 / ARM64 上提供 relay、契约工具和端点维护。
 
 ## 安装
@@ -54,7 +54,7 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.
 
 Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/reference/windows-native-usage.zh-CN.md#安装-python-包和-c3)。
 
-C3 0.6.0 配合 C-Two 0.10.x 使用。IPC 握手 14 与 0.9.x（IPC 13）的对端无法互通，Unix 端点命名空间格式 3 使用新的默认目录，因此同一主机上的 Python 与 Rust SDK、c3 和 Node 使用方要一起升级；先停止旧服务，再升级并重启。C/FFI ABI 6、SHM 3 与所有者控制 1 的格式保持不变。见 [0.10.0 迁移说明](docs/releases/0.10.0.md)、[握手规范](docs/reference/ipc-handshake.md)和[端点生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
+C3 0.6.0 配合 C-Two 0.10.x 使用。IPC 握手 14 与 0.9.x（IPC 13）的对端无法互通，Unix 端点命名空间格式 3 使用新的默认目录，因此同一主机上的 Python 与 Rust SDK、c3 和 Node 使用方要一起升级；先停止旧服务，再升级并重启。C/FFI ABI 6 与 SHM 3 的格式保持不变。见 [0.10.0 迁移说明](docs/releases/0.10.0.md)、[握手规范](docs/reference/ipc-handshake.md)和[端点生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
 
 源码构建需要 Rust 1.95 或更新版本；构建与测试见[开发指南](docs/reference/development.md)。
 
@@ -105,7 +105,7 @@ finally:
 | Python 契约、跨语言载荷与 API 索引 | [Python SDK 指南](docs/reference/python-usage.zh-CN.md) |
 | Rust SDK 与 API 迁移 | [Rust SDK 指南](sdk/rust/README.md) |
 | Relay 与契约工具 | [c3 CLI 指南](cli/README.md) |
-| 连接、所有者与端点 API | [生命周期指南](docs/reference/local-endpoint-lifecycle.md) |
+| 连接与端点 API | [生命周期指南](docs/reference/local-endpoint-lifecycle.md) |
 | Windows | [构建与使用](docs/reference/windows-native-usage.zh-CN.md) |
 | 环境变量 | [.env.example](.env.example) |
 | 开发 | [构建与测试](docs/reference/development.md)、[CI 与发行](docs/reference/ci-cd.md)、[贡献指南](CONTRIBUTING.md) |
