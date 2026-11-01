@@ -66,7 +66,7 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 
 启动到期产生公开的 `c_two.error.CoreError`：`category='lifecycle'`、`lifecycle_kind='startup_timeout'`，并携带 `startup_stage`（`readiness` 或 `responsiveness`）及 `timeout_seconds`。三个本地 I/O 字段 `io_operation`、`io_kind`、`raw_os_error` 均为 `None`。真实 bind 失败保持原结构化系统原因，消息不再添加错误的 `config error` 前缀。这些诊断不提供重试或清理端点的权限。完整类型及取值范围见[公开错误字段表](local-endpoint-lifecycle.md#public-structured-python-errors)。
 
-## IPC 内存、分片与心跳
+## IPC 内存与分片
 
 下面的 pool、budget、reassembly 字段通过对应端的 `ipc_overrides` 设置。具体分配、释放和回退语义见[内存策略](memory-policy.md)。
 
@@ -89,10 +89,8 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 | `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 秒 | 未完成分片重组的超时秒数 |
 | `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 秒 | 分片垃圾回收扫描的间隔秒数 |
 | `max_reassembly_bytes` | `C2_IPC_MAX_REASSEMBLY_BYTES` | 8 GiB | 重组缓冲内存的最大字节数 |
-| `heartbeat_interval`（服务端） | `C2_IPC_HEARTBEAT_INTERVAL` | 15 秒 | 心跳间隔秒数；0 关闭心跳 |
-| `heartbeat_timeout`（服务端） | `C2_IPC_HEARTBEAT_TIMEOUT` | 30 秒 | 心跳超时秒数 |
 
-`pool_segment_size` 是池段容量，向上取 2 的幂后须能用 u32 表示，即最大为 2 GiB；`max_payload_size` 是单条消息限额，两者独立。关闭 buddy 池仍允许 dedicated SHM、分片传输和文件溢出。Backing budget 和 live-reassembly budget 的 `0` 拒绝正数预留；`pool_decay_seconds=0` 在下一维护周期回收空闲段；`heartbeat_interval=0` 关闭心跳。
+`pool_segment_size` 是池段容量，向上取 2 的幂后须能用 u32 表示，即最大为 2 GiB；`max_payload_size` 是单条消息限额，两者独立。关闭 buddy 池仍允许 dedicated SHM、分片传输和文件溢出。Backing budget 和 live-reassembly budget 的 `0` 拒绝正数预留；`pool_decay_seconds=0` 在下一维护周期回收空闲段。
 
 `cc.observe.memory_stats()` 查看原生内存域，`cc.observe.memory_stats()["holds"]` 查看 SDK 租约，二者均为只读统计。它们不表示整个进程的 RSS。
 

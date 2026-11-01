@@ -66,7 +66,7 @@ Core owns and freezes server configuration on the first Host start attempt, incl
 
 Startup expiry raises public `c_two.error.CoreError` with `category='lifecycle'`, `lifecycle_kind='startup_timeout'`, `startup_stage` (`readiness` or `responsiveness`) and `timeout_seconds`. Its `io_operation`, `io_kind` and `raw_os_error` are `None`. Local bind failures retain their original structured OS cause and no longer carry the misleading `config error` message prefix. These diagnostics do not authorize retry or endpoint cleanup. See the [public error field table](local-endpoint-lifecycle.md#public-structured-python-errors) for types and value ranges.
 
-## IPC memory, chunks and heartbeat
+## IPC memory and chunks
 
 Set the following fields through the appropriate endpoint's `ipc_overrides`. Allocation, accounting and fallback behavior are described in the [memory policy](memory-policy.md).
 
@@ -89,10 +89,8 @@ Set the following fields through the appropriate endpoint's `ipc_overrides`. All
 | `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 seconds | Incomplete chunk-reassembly timeout in seconds |
 | `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 seconds | Chunk garbage-collection sweep interval in seconds |
 | `max_reassembly_bytes` | `C2_IPC_MAX_REASSEMBLY_BYTES` | 8 GiB | Maximum reassembly buffer memory in bytes |
-| `heartbeat_interval` (server) | `C2_IPC_HEARTBEAT_INTERVAL` | 15 seconds | Heartbeat interval in seconds; 0 disables heartbeat |
-| `heartbeat_timeout` (server) | `C2_IPC_HEARTBEAT_TIMEOUT` | 30 seconds | Heartbeat timeout in seconds |
 
-Pool segment capacity and the per-message payload limit are independent. Rounding `pool_segment_size` up to a power of two must fit in u32, so its maximum is 2 GiB. Disabling the buddy pool still permits dedicated SHM, checked chunk transfer and file spill. A zero backing or reassembly budget rejects positive reservations; `pool_decay_seconds=0` reclaims idle segments on the next maintenance pass; `heartbeat_interval=0` disables heartbeat.
+Pool segment capacity and the per-message payload limit are independent. Rounding `pool_segment_size` up to a power of two must fit in u32, so its maximum is 2 GiB. Disabling the buddy pool still permits dedicated SHM, checked chunk transfer and file spill. A zero backing or reassembly budget rejects positive reservations; `pool_decay_seconds=0` reclaims idle segments on the next maintenance pass.
 
 `cc.observe.memory_stats()` observes native memory domains, and `cc.observe.memory_stats()["holds"]` observes SDK leases. These are accounting snapshots, without measuring total process RSS.
 
