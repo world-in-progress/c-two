@@ -6,6 +6,8 @@ English · [简体中文](configuration.zh-CN.md)
 
 ## Configuration sources and freezing
 
+IPC tuning values follow one rule: every `ipc_overrides` key `name` has the environment variable `C2_IPC_<NAME>` (upper case), resolved by the precedence below. A budget for a single operation is a parameter of that call, such as `connect(timeout=...)` or `shutdown(timeout=...)`.
+
 Precedence is **explicit code or CLI > process environment > `.env` > Rust defaults**. The default environment file is `.env` in the current working directory. Set `C2_ENV_FILE` to another file, or to an empty string to disable file loading. [`.env.example`](../../.env.example) contains the environment reference.
 
 ```bash
@@ -83,7 +85,7 @@ Set the following fields through the appropriate endpoint's `ipc_overrides`. All
 | `live_reassembly_budget_bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | Byte budget for incomplete and retained reassembly capacity |
 | `reassembly_segment_size` | `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | 64 MiB | Reassembly pool segment size in bytes |
 | `reassembly_max_segments` | `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | 4 | Maximum reassembly pool segments, from 1 to 255 |
-| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | Maximum total in-flight chunks across all connections |
+| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | Number of in-flight reassemblies at which an early cleanup sweep runs; it never rejects, and the reassembly budget is the hard bound |
 | `chunk_size` | `C2_IPC_CHUNK_SIZE` | 128 KiB | Individual chunk size in bytes |
 | `chunk_threshold_ratio` | `C2_IPC_CHUNK_THRESHOLD_RATIO` | 0.9 | Configured fraction of maximum frame size; accepted and validated, but not currently used by transport selection |
 | `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 seconds | Incomplete chunk-reassembly timeout in seconds |

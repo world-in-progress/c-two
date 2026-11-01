@@ -63,7 +63,7 @@ These come from the [over-defense review](../design/2026-10-31-over-defense-revi
   - `c3 registry` reports malformed relay responses instead of printing "No routes registered."
 - **Local endpoints.**
   - A custom IPC root that already holds more than 64 unrelated entries initializes normally.
-  - Listeners dropped while another process holds the namespace gate no longer leave sockets and leases behind.
+  - Listeners dropped while another process briefly holds the namespace gate retire their socket and lease in the background; if the gate stays held, the complete record is left for the reaper.
 - **Configuration.** A `pool_segment_size` whose buddy layout would overflow `u32` is rejected when configured, instead of silently disabling buddy shared memory. Explicit `max_execution_workers` values above 64 are accepted; only the default stays capped.
 - **Relay.**
   - Mesh peers must speak the same protocol version; older peers are no longer accepted.

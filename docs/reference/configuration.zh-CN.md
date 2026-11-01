@@ -6,6 +6,8 @@
 
 ## 配置来源与生效时机
 
+IPC 的调优值遵循一条规则：`ipc_overrides` 的每个键 `name` 都有环境变量 `C2_IPC_<NAME>`（大写），按下面的优先级解析。单次操作的预算是这次调用的参数，例如 `connect(timeout=...)`、`shutdown(timeout=...)`。
+
 优先级为 **显式代码或命令行 > 进程环境变量 > `.env` > Rust 默认值**。默认读取当前工作目录的 `.env`。`C2_ENV_FILE` 指定其他文件，空字符串关闭文件读取。[`.env.example`](../../.env.example) 提供环境变量参考。
 
 ```bash
@@ -83,7 +85,7 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 | `live_reassembly_budget_bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | 未完成及仍被保留的重组容量字节预算 |
 | `reassembly_segment_size` | `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | 64 MiB | 重组池每段的字节数 |
 | `reassembly_max_segments` | `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | 4 | 重组池段数上限，范围为 1 到 255 |
-| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | 所有连接中在途分片的总数上限 |
+| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | 在途重组达到这个数目时提前清扫一次；它从不拒绝，硬上限是重组预算 |
 | `chunk_size` | `C2_IPC_CHUNK_SIZE` | 128 KiB | 单个分片的字节数 |
 | `chunk_threshold_ratio` | `C2_IPC_CHUNK_THRESHOLD_RATIO` | 0.9 | 最大 frame 大小的配置比例；接受并校验，但当前传输选择不使用此值 |
 | `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 秒 | 未完成分片重组的超时秒数 |
