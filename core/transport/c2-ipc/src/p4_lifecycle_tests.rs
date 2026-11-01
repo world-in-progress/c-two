@@ -1,5 +1,78 @@
 use super::*;
 
+// Normal closure carries its reason before transport EOF, without an ACK wait.
+#[tokio::test]
+async fn normal_client_close_reports_peer_close_message() {
+    for use_drop in [false, true] {
+        let endpoint = Endpoint::new();
+        let (server, runner) = start(&endpoint, Arc::new(Echo), ServerIpcConfig::default()).await;
+        let events = server.connection_events();
+        let mut client = endpoint.client();
+        client.connect().await.unwrap();
+        let observation = match timeout(WAIT, events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        {
+            c2_local::ConnectionEvent::Opened(observation) => observation,
+            event => panic!("expected accepted connection: {event:?}"),
+        };
+        if !use_drop {
+            assert!(client.close_shared_bounded(WAIT).await);
+        }
+        drop(client);
+        let closed = observation.wait_closed(Some(WAIT)).await.unwrap();
+        assert_eq!(
+            closed.reason(),
+            ConnectionEndReason::PeerCloseMessage,
+            "Drop={use_drop}"
+        );
+        assert_eq!(closed.operation(), "disconnect");
+        assert!(
+            matches!(timeout(WAIT, events.recv()).await.unwrap().unwrap(),
+            Some(c2_local::ConnectionEvent::Closed(record)) if record == closed)
+        );
+        stop(server, runner).await;
+    }
+}
+
+#[tokio::test]
+async fn normal_client_close_does_not_wait_for_frozen_peer_ack() {
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let (frozen, is_frozen) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut stream = accept(&mut listener).await;
+        frozen.send(()).unwrap();
+        // No reads, DISCONNECT handling or ACK can happen before close returns.
+        resumed.await.unwrap();
+        let (header, payload) = read_frame(&mut stream).await;
+        assert_eq!(header.request_id, 0);
+        assert_eq!(header.flags, flags::FLAG_SIGNAL);
+        assert_eq!(payload, c2_wire::msg_type::DISCONNECT_BYTES);
+        assert_eq!(
+            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
+            0
+        );
+        crate::tests::close_listener(listener).await;
+    });
+    let mut client = endpoint.client();
+    client.connect().await.unwrap();
+    is_frozen.await.unwrap();
+    assert!(
+        timeout(
+            Duration::from_secs(1),
+            client.close_shared_bounded(Duration::from_millis(100))
+        )
+        .await
+        .expect("close must retain its existing caller deadline")
+    );
+    resume.send(()).unwrap();
+    peer.await.unwrap();
+}
+
 // An unpolled receive task owns its cleanup fence. B retains the actual stream,
 // while an unproved end must leave L allocated in its original owner pool.
 #[tokio::test]
@@ -169,10 +242,7 @@ async fn bounded_close_is_honest_while_peer_stops_reading_a_started_frame() {
         stream.read_exact(&mut payload).await.unwrap();
         let (_, control_len) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
         assert!(payload[control_len..].iter().all(|byte| *byte == 0x5b));
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0
-        );
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
@@ -264,10 +334,7 @@ async fn published_shm_loan_and_budget_survive_cancellation_close_and_client_dro
                         ))
                         .await
                         .unwrap();
-                    assert_eq!(
-                        timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-                        0
-                    );
+                    expect_disconnect_or_eof(&mut stream).await;
                 }
                 drop(stream);
                 crate::tests::close_listener(listener).await;
@@ -537,12 +604,16 @@ async fn admitted_response_error_never_enters_the_buddy_request_fallback() {
             }
             let (length, body) = frame::decode_total_len(&header).unwrap();
             let (header, _) = frame::decode_frame_body(body, length).unwrap();
+            let mut payload = vec![0; header.payload_len()];
+            stream.read_exact(&mut payload).await.unwrap();
+            if header.is_signal() {
+                expect_disconnect_eof(&mut stream, header, &payload).await;
+                break;
+            }
             assert!(
                 header.is_ctrl(),
                 "response admission error must never replay the call as chunks"
             );
-            let mut payload = vec![0; header.payload_len()];
-            stream.read_exact(&mut payload).await.unwrap();
         }
         crate::tests::close_listener(listener).await;
     });

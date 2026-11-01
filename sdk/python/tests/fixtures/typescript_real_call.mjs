@@ -24,16 +24,13 @@ const payloadApi = config.payloadModule === null
   ? undefined
   : await import(pathToFileURL(config.payloadModule).href);
 const observations = [];
-let responseShmReader;
+let nodeRuntime;
+let nodeRuntimeClosed = false;
 
 function localIpcOptions(responsePayloadAllocator) {
-  const nodeRuntime = createBundledC2MemFfiNodeRuntime();
-  responseShmReader ??= contract.createC2MemFfiNativeResponseShmReader({
-    binding: nodeRuntime.responsePoolFactory,
-  });
+  nodeRuntime ??= createBundledC2MemFfiNodeRuntime();
   return {
     connect: nodeRuntime.connect,
-    responseShmReader,
     requestChunkSize: 64 * 1024,
     responsePayloadAllocator,
   };
@@ -459,7 +456,12 @@ try {
     opaqueAllocator = await proveOpaqueAllocatorRelease();
   }
 } finally {
-  await responseShmReader?.close();
+  if (nodeRuntime !== undefined) {
+    await nodeRuntime.close();
+    await nodeRuntime.close();
+    assert.throws(() => nodeRuntime.resolveEndpoint('ipc://closed-runtime'), /closed/);
+    nodeRuntimeClosed = true;
+  }
 }
 
 const expectedPath = {
@@ -474,7 +476,8 @@ assert.ok(observations.every((observation) => observation.routeUid));
 
 process.stdout.write(`NODE_RECEIPT ${JSON.stringify({
   cleanup: {
-    responseShmReaderClosed: true,
+    nodeRuntimeCreated: nodeRuntime !== undefined,
+    nodeRuntimeClosed,
     transportClosedIdempotently: true,
   },
   lifecycle,

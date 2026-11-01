@@ -41,11 +41,8 @@ impl CompiledTransportProject {
             .ancestors()
             .nth(3)
             .expect("C-Two repository root");
-        let fastdb_typescript = repository
-            .parent()
-            .expect("WorldInProgress root")
-            .join("fastdb/ts/fastdb4ts");
-        let tsc = fastdb_typescript.join("node_modules/typescript/bin/tsc");
+        let tsc = repository
+            .join("core/foundation/c2-mem-ffi/bindings/typescript/node_modules/typescript/bin/tsc");
         assert!(
             tsc.is_file(),
             "Task 9 requires the audited TypeScript compiler at {}",
@@ -77,12 +74,12 @@ const connect: C2IpcConnect = async () => ({
 // @ts-expect-error A connection must be able to terminate pending reads/writes.
 const missingClose: C2IpcConnect = () => ({ write() {}, readExactly(n: number) { return new Uint8Array(n); } });
 createIpcEncodedTransport("ipc://typed-custom", { connect });
-const mismatch = new C2IpcTransportError("version mismatch", { localProtocolVersion: 14, peerProtocolVersion: 15 });
+const mismatch = new C2IpcTransportError("version mismatch", { localProtocolVersion: 15, peerProtocolVersion: 16 });
 const category: "protocol_version_mismatch" | null = mismatch.category;
 const localVersion: number | null = mismatch.localProtocolVersion;
 const peerVersion: number | null = mismatch.peerProtocolVersion;
 // @ts-expect-error Version facts are supplied as one complete pair.
-new C2IpcTransportError("incomplete version facts", { localProtocolVersion: 14 });
+new C2IpcTransportError("incomplete version facts", { localProtocolVersion: 15 });
 // @ts-expect-error Node factories belong to @c-two/c2-mem-ffi.
 import { createNodeIpcConnect } from "./c_two_contract.js";
 // @ts-expect-error Generated modules expose the generic connection contract.
@@ -217,9 +214,7 @@ fn generated_http_calls_are_bound_to_resolved_route_tokens() {
     let source = generated_typescript();
 
     assert!(source.contains("routeUid"));
-    assert!(source.contains("routeRevision"));
     assert!(source.contains("\"x-c2-route-uid\""));
-    assert!(source.contains("\"x-c2-route-revision\""));
     assert!(source.contains("/_probe/"));
     assert!(
         source.contains("requestHeadersForResolvedRoute"),
@@ -289,7 +284,7 @@ const route = {
   name: routeName,
   relay_url: anchor,
   route_uid: "same-path-route-0001",
-  route_revision: 1,
+
   ipc_address: "ipc://same_path_unreachable",
   server_id: "same-path-server",
   server_instance_id: "same-path-instance",
@@ -451,108 +446,6 @@ await uncertainTransport.close();
 }
 
 #[test]
-fn generated_c2_mem_ffi_reader_bootstraps_unadvertised_lazy_segments() {
-    let project = CompiledTransportProject::compile();
-    project.run_node_fixture(
-        "lazy_reader.mjs",
-        r#"import assert from "node:assert/strict";
-import { createC2MemFfiNativeResponseShmReader } from "./dist/typescript/c_two_contract.js";
-
-const bootstrapFloor = 2 * 4096;
-const created = [];
-const reads = [];
-const releases = [];
-const binding = {
-  createResponsePool(options) {
-    created.push(options);
-    return {
-      read(block, destination) {
-        reads.push([options.prefix, block.segmentIndex, block.generation, block.offset, block.byteLength, destination.byteLength]);
-        destination.fill(0x2a);
-      },
-      release(block) {
-        releases.push([options.prefix, block.segmentIndex, block.generation]);
-      },
-    };
-  },
-};
-const reader = createC2MemFfiNativeResponseShmReader({ binding });
-
-// A lazy server pool advertises no segments at handshake; the reader must
-// bootstrap a legal peer pool instead of demanding the server's real geometry.
-const lazyBlock = {
-  prefix: "/lazy_peer",
-  segments: [],
-  segmentIndex: 0,
-  generation: 1,
-  offset: 0,
-  byteLength: 4,
-  allocationId: 1n, dedicated: false,
-};
-const lazyBytes = await reader.read(lazyBlock);
-assert.deepEqual(Array.from(lazyBytes), [0x2a, 0x2a, 0x2a, 0x2a]);
-assert.equal(created.length, 1);
-assert.deepEqual(created[0], {
-  prefix: "/lazy_peer",
-  segmentSize: bootstrapFloor,
-  maxSegments: 16,
-  minBlockSize: 4096,
-});
-assert.deepEqual(reads, [["/lazy_peer", 0, 1, 0, 4, 4]]);
-
-await reader.release(lazyBlock);
-assert.equal(created.length, 1, "one pool per owner prefix");
-assert.deepEqual(releases, [["/lazy_peer", 0, 1]]);
-
-const secondOwner = { ...lazyBlock, prefix: "/second_peer", generation: 3 };
-await reader.read(secondOwner, new Uint8Array(4));
-assert.equal(created.length, 2, "each owner prefix gets its own peer pool");
-assert.equal(created[1].segmentSize, bootstrapFloor);
-
-// The handshake snapshot is descriptive: when present it seeds the bootstrap
-// capacity, and native still validates the real backing.
-const advertisedBlock = {
-  prefix: "/snapshot_peer",
-  segments: [{ name: "/snapshot_segment", size: 1 << 20 }],
-  segmentIndex: 0,
-  generation: 2,
-  offset: 8,
-  byteLength: 4,
-  allocationId: 1n, dedicated: false,
-};
-await reader.read(advertisedBlock, new Uint8Array(4));
-assert.equal(created[2].segmentSize, 1 << 20);
-
-// Dedicated responses have no buddy snapshot and only need a legal bootstrap.
-const dedicatedBlock = {
-  prefix: "/dedicated_peer",
-  segments: [],
-  segmentIndex: 7,
-  generation: 0,
-  offset: 0,
-  byteLength: 4,
-  allocationId: 0n, dedicated: true,
-};
-await reader.read(dedicatedBlock, new Uint8Array(4));
-assert.equal(created[3].segmentSize, bootstrapFloor);
-
-const configured = createC2MemFfiNativeResponseShmReader({
-  binding,
-  segmentSize: 65536,
-  maxSegments: 2,
-  minBlockSize: 4096,
-});
-await configured.read(advertisedBlock, new Uint8Array(4));
-assert.equal(created[4].segmentSize, 65536, "explicit configuration wins");
-assert.equal(created[4].maxSegments, 2);
-
-await reader.close();
-await configured.close();
-"#,
-    );
-}
-
-#[test]
 fn ipc_version_preamble_rejects_before_metadata_and_stays_terminal() {
     let project = CompiledTransportProject::compile();
     project.run_node_fixture(
@@ -563,12 +456,12 @@ import {
   CONTRACT, C2IpcTransportError, createIpcEncodedTransport, createRelayAwareHttpEncodedTransport,
 } from './dist/typescript/c_two_contract.js';
 
-// Handwritten IPC14 records, independent of every production frame/handshake encoder.
+// Handwritten IPC15 records, independent of every production frame/handshake encoder.
 // Each is LE bodylen=21, RID=0, exact direction flags, C2IP, kind, LE u32 version.
-const HELLO14 = Buffer.from('1500000000000000000000000400000043324950010e000000', 'hex');
-const ACCEPTED14 = Buffer.from('1500000000000000000000000600000043324950020e000000', 'hex');
-const MISMATCH15 = Buffer.from('1500000000000000000000000600000043324950030f000000', 'hex');
-const CLIENT_METADATA = Buffer.from('110000000000000000000000040000000000000700', 'hex');
+const HELLO15 = Buffer.from('1500000000000000000000000400000043324950010f000000', 'hex');
+const ACCEPTED15 = Buffer.from('1500000000000000000000000600000043324950020f000000', 'hex');
+const MISMATCH16 = Buffer.from('15000000000000000000000006000000433249500310000000', 'hex');
+const CLIENT_METADATA = Buffer.from('0f000000000000000000000004000000000000', 'hex');
 const ADDRESS = 'ipc://version_preamble';
 
 // This peer only supplies handwritten bytes. It never closes the remote end to
@@ -599,7 +492,7 @@ const captureError = (promise) => promise.then(() => undefined, (error) => error
 function assertMismatch(error, peerVersion) {
   assert.ok(error instanceof C2IpcTransportError, 'keep the existing IPC error class');
   assert.equal(error.category, 'protocol_version_mismatch');
-  assert.equal(error.localProtocolVersion, 14);
+  assert.equal(error.localProtocolVersion, 15);
   assert.equal(error.peerProtocolVersion, peerVersion);
 }
 
@@ -613,17 +506,17 @@ test('ordinary IPC errors initialize null version facts', () => {
 for (const [version, hex] of [
   [1, '15000000000000000000000006000000433249500301000000'],
   [13, '1500000000000000000000000600000043324950030d000000'],
-  [15, '1500000000000000000000000600000043324950030f000000'],
+  [16, '15000000000000000000000006000000433249500310000000'],
   [256, '15000000000000000000000006000000433249500300010000'],
   [4294967295, '150000000000000000000000060000004332495003ffffffff'],
 ]) {
-  test(`fixed rejection reports local 14 and peer ${version} without remote EOF`, {timeout: 1000}, async () => {
+  test(`fixed rejection reports local 15 and peer ${version} without remote EOF`, {timeout: 1000}, async () => {
     const peer = fixedPeer(Buffer.from(hex, 'hex'));
     const transport = createIpcEncodedTransport(ADDRESS, {connect: peer.connect});
     try {
       const error = await captureError(prepare(transport));
       assertMismatch(error, version);
-      assert.deepEqual(peer.writes, [HELLO14]);
+      assert.deepEqual(peer.writes, [HELLO15]);
       assert.deepEqual(peer.reads, [16, 9], 'read the fixed envelope before the fixed body');
       assert.equal(peer.closes, 1, 'reject and close locally after the complete record');
       assert.equal(peer.connects, 1, 'a rejection must not reconnect');
@@ -632,7 +525,7 @@ for (const [version, hex] of [
 }
 
 test('Hello is the only write while acceptance is pending, including with a private SHM pool', {timeout: 1000}, async () => {
-  const peer = fixedPeer(MISMATCH15);
+  const peer = fixedPeer(MISMATCH16);
   const connect = peer.connect;
   let signalRead, releaseReply;
   const reading = new Promise((resolve) => { signalRead = resolve; });
@@ -641,6 +534,7 @@ test('Hello is the only write while acceptance is pending, including with a priv
     const connection = await connect();
     return {
       ...connection,
+      memory: { prefix: '/private_before_acceptance' },
       async readExactly(n) {
         signalRead();
         await replyReady;
@@ -650,17 +544,11 @@ test('Hello is the only write while acceptance is pending, including with a priv
   };
   const transport = createIpcEncodedTransport(ADDRESS, {
     connect: peer.connect,
-    requestShmWriter: {
-      prefix: '/private_before_acceptance',
-      segments: [{name: '/private_before_acceptance_b0000', size: 4096}],
-      async write() { assert.fail('no SHM payload before acceptance'); },
-      async release() { assert.fail('no SHM allocation before acceptance'); },
-    },
   });
   const result = captureError(prepare(transport));
   try {
     await reading;
-    assert.deepEqual(peer.writes, [HELLO14], 'SHM names and variable metadata wait for Accepted14');
+    assert.deepEqual(peer.writes, [HELLO15], 'SHM names and variable metadata wait for Accepted15');
   } finally {
     releaseReply();
     await result;
@@ -669,26 +557,15 @@ test('Hello is the only write while acceptance is pending, including with a priv
 });
 
 test('local metadata encoding errors precede Hello and cannot be hidden by a peer rejection', async () => {
-  const peer = fixedPeer(MISMATCH15);
-  let nameReads = 0;
+  const peer = fixedPeer(MISMATCH16);
+  const connect = peer.connect;
   const transport = createIpcEncodedTransport(ADDRESS, {
-    connect: peer.connect,
-    requestShmWriter: {
-      prefix: '/localpool',
-      segments: [{
-        // Normalization validates the initial value, then snapshots it. The
-        // encoder must still reject an invalid snapshot before sending Hello.
-        get name() { return nameReads++ === 0 ? '/valid_segment' : '/invalid\0segment'; },
-        size: 4096,
-      }],
-      async write() { assert.fail('must not allocate'); },
-      async release() { assert.fail('must not release an unallocated block'); },
-    },
+    connect: async () => ({ ...await connect(), memory: { prefix: '/invalid\0prefix' } }),
   });
   try {
     const error = await captureError(prepare(transport));
     assert.ok(error instanceof C2IpcTransportError);
-    assert.match(error.message, /client SHM segment 0 name cannot contain control characters/);
+    assert.match(error.message, /client SHM prefix cannot contain control characters/);
     assert.equal(error.category, null);
     assert.equal(error.localProtocolVersion, null);
     assert.equal(error.peerProtocolVersion, null);
@@ -704,8 +581,8 @@ for (const [label, hex] of [
   ['missing handshake flag', '0c000000000000000000000002000000'],
   ['extra flags', '0c00000000000000000000000e000000'],
 ]) {
-  test(`Accepted14 releases version-free metadata, then rejects metadata ACK ${label}`, async () => {
-    const peer = fixedPeer(Buffer.concat([ACCEPTED14, Buffer.from(hex, 'hex')]));
+  test(`Accepted15 releases version-free metadata, then rejects metadata ACK ${label}`, async () => {
+    const peer = fixedPeer(Buffer.concat([ACCEPTED15, Buffer.from(hex, 'hex')]));
     const transport = createIpcEncodedTransport(ADDRESS, {connect: peer.connect});
     try {
       const error = await captureError(prepare(transport));
@@ -714,7 +591,7 @@ for (const [label, hex] of [
       assert.equal(error.category, null);
       assert.equal(error.localProtocolVersion, null);
       assert.equal(error.peerProtocolVersion, null);
-      assert.deepEqual(peer.writes, [HELLO14, CLIENT_METADATA]);
+      assert.deepEqual(peer.writes, [HELLO15, CLIENT_METADATA]);
       assert.deepEqual(peer.reads, [16, 9, 16]);
       assert.equal(peer.closes, 1);
     } finally { await transport.close(); }
@@ -723,19 +600,19 @@ for (const [label, hex] of [
 
 for (const [label, hex, expectedReads] of [
   ['short envelope', '150000000000000000000000060000', [16]],
-  ['wrong body length', '1600000000000000000000000600000043324950030f000000', [16]],
-  ['untrusted huge body length', 'ffffffff00000000000000000600000043324950030f000000', [16]],
-  ['nonzero RID', '1500000001000000000000000600000043324950030f000000', [16]],
-  ['request flags', '1500000000000000000000000400000043324950030f000000', [16]],
-  ['missing handshake flag', '1500000000000000000000000200000043324950030f000000', [16]],
-  ['extra flags', '1500000000000000000000000e00000043324950030f000000', [16]],
+  ['wrong body length', '16000000000000000000000006000000433249500310000000', [16]],
+  ['untrusted huge body length', 'ffffffff000000000000000006000000433249500310000000', [16]],
+  ['nonzero RID', '15000000010000000000000006000000433249500310000000', [16]],
+  ['request flags', '15000000000000000000000004000000433249500310000000', [16]],
+  ['missing handshake flag', '15000000000000000000000002000000433249500310000000', [16]],
+  ['extra flags', '1500000000000000000000000e000000433249500310000000', [16]],
   ['short body', '1500000000000000000000000600000043324950030f0000', [16, 9]],
   ['bad magic', '1500000000000000000000000600000043324951030f000000', [16, 9]],
   ['Hello response', '1500000000000000000000000600000043324950010f000000', [16, 9]],
   ['unknown kind', '1500000000000000000000000600000043324950040f000000', [16, 9]],
   ['zero version', '15000000000000000000000006000000433249500300000000', [16, 9]],
-  ['Accepted with different version', '1500000000000000000000000600000043324950020f000000', [16, 9]],
-  ['VersionMismatch with equal version', '1500000000000000000000000600000043324950030e000000', [16, 9]],
+  ['Accepted with different version', '1500000000000000000000000600000043324950020e000000', [16, 9]],
+  ['VersionMismatch with equal version', '1500000000000000000000000600000043324950030f000000', [16, 9]],
 ]) {
   test(`malformed preamble ${label} has no version facts`, async () => {
     const peer = fixedPeer(Buffer.from(hex, 'hex'));
@@ -747,7 +624,7 @@ for (const [label, hex, expectedReads] of [
       assert.equal(error.localProtocolVersion, null);
       assert.equal(error.peerProtocolVersion, null);
       assert.deepEqual(peer.reads, expectedReads, 'invalid envelopes must not drive a body allocation/read');
-      assert.deepEqual(peer.writes, [HELLO14], 'malformed responses cannot admit metadata');
+      assert.deepEqual(peer.writes, [HELLO15], 'malformed responses cannot admit metadata');
       assert.equal(peer.closes, 1);
     } finally { await transport.close(); }
   });
@@ -755,11 +632,11 @@ for (const [label, hex, expectedReads] of [
 
 test('fixed rejection survives a failed handshake close with the cleanup error as cause', async () => {
   const cleanup = new Error('local connection close failed');
-  const peer = fixedPeer(MISMATCH15, cleanup);
+  const peer = fixedPeer(MISMATCH16, cleanup);
   const transport = createIpcEncodedTransport(ADDRESS, {connect: peer.connect});
   try {
     const error = await captureError(prepare(transport));
-    assertMismatch(error, 15);
+    assertMismatch(error, 16);
     assert.equal(error.cause, cleanup);
     assert.equal(peer.closes, 1);
   } finally { await transport.close(); }
@@ -791,11 +668,11 @@ for (const withAlternative of [false, true]) {
   for (const failClose of [false, true]) {
     test(`relay local prepare keeps rejection terminal (alternative=${withAlternative}, close failure=${failClose})`, async () => {
       const cleanup = failClose ? new Error('relay local connection close failed') : undefined;
-      const peer = fixedPeer(MISMATCH15, cleanup);
+      const peer = fixedPeer(MISMATCH16, cleanup);
       const anchor = 'http://127.0.0.1:7357';
       const local = {
         name: 'manager', relay_url: anchor, ipc_address: ADDRESS,
-        route_uid: 'local-route', route_revision: 1, server_id: 'server', server_instance_id: 'instance',
+        route_uid: 'local-route', server_id: 'server', server_instance_id: 'instance',
         crm_ns: CONTRACT.namespace, crm_name: CONTRACT.name, crm_ver: CONTRACT.version,
         abi_hash: CONTRACT.abiHash, signature_hash: CONTRACT.signatureHash, max_payload_size: 1048576,
       };
@@ -825,11 +702,11 @@ for (const withAlternative of [false, true]) {
         const error = await captureError(transport.call('manager', CONTRACT, 'ping', new Uint8Array()));
         assert.deepEqual(http, [], 'no HTTP probe or business fallback, even to a distinct route');
         assert.equal(resolutions, 1, 'do not exclude the local token and resolve/retry');
-        assertMismatch(error, 15);
+        assertMismatch(error, 16);
         assert.equal(error.cause, cleanup, 'relay prepare must preserve handshake cleanup cause');
         assert.equal(peer.connects, 1);
         assert.equal(peer.closes, 1);
-        assert.deepEqual(peer.writes, [HELLO14]);
+        assert.deepEqual(peer.writes, [HELLO15]);
         assert.deepEqual(observations, [], 'no business call completed');
       } finally { await transport.close(); }
     });
@@ -861,23 +738,23 @@ const wireContract = (name) => ({
   crm_ver: CONTRACT.version, abi_hash: CONTRACT.abiHash, signature_hash: CONTRACT.signatureHash,
 });
 const record = (name, overrides = {}) => ({
-  route_name: name, route_uid: `${name}-uid`, route_revision: 1, catalog_revision: 1,
-  owner_server_id: 'server', owner_server_instance_id: 'instance', owner_epoch: 1,
+  route_name: name, route_uid: `${name}-uid`,
+  owner_server_id: 'server', owner_server_instance_id: 'instance',
   contract: wireContract(name), methods: [{name: 'ping', index: 0}],
   max_payload_size: 1048576, state: 'ready', state_reason: 'register_committed',
-  lease_deadline_ms: null, ...overrides,
+  ...overrides,
 });
 const u16 = (n) => { const b = Buffer.alloc(2); b.writeUInt16LE(n); return b; };
 const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
 const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
 const text = (s) => Buffer.concat([Buffer.from([Buffer.byteLength(s)]), Buffer.from(s)]);
 const frame = (id, flags, payload) => Buffer.concat([u32(12 + payload.length), u64(id), u32(flags), payload]);
-const HELLO14 = Buffer.from('1500000000000000000000000400000043324950010e000000', 'hex');
-const ACCEPTED14 = Buffer.from('1500000000000000000000000600000043324950020e000000', 'hex');
-const handshake = (routes, instance, caps = 7) => Buffer.concat([
-  text('/serverpool'), u16(0), u16(caps), text('server'), text(instance), u16(routes.length),
+const HELLO15 = Buffer.from('1500000000000000000000000400000043324950010f000000', 'hex');
+const ACCEPTED15 = Buffer.from('1500000000000000000000000600000043324950020f000000', 'hex');
+const handshake = (routes, instance, caps = 0) => Buffer.concat([
+  text('/serverpool'), u16(caps), text('server'), text(instance), u16(routes.length),
   ...routes.map((r) => Buffer.concat([
-    text(r.route_name), text(r.route_uid), u64(r.route_revision),
+    text(r.route_name), text(r.route_uid),
     text(r.contract.crm_ns), text(r.contract.crm_name), text(r.contract.crm_ver),
     text(r.contract.abi_hash), text(r.contract.signature_hash), u64(r.max_payload_size),
     u16(r.methods.length), ...r.methods.map((m) => Buffer.concat([text(m.name), u16(m.index)])),
@@ -893,7 +770,7 @@ function server() {
   };
   // The ACK models the native session intersection: a direction is
   // acknowledged only when this server enables it and the client offered it.
-  s.serverCaps = () => 7
+  s.serverCaps = () => 0
     | (s.ackShmRequest && (s.clientCaps & 8) !== 0 ? 8 : 0)
     | (s.ackShmResponse && (s.clientCaps & 16) !== 0 ? 16 : 0);
   s.connect = async () => {
@@ -904,6 +781,7 @@ function server() {
     const feed = (bytes) => { buffered = Buffer.concat([buffered, bytes]); wakeRead?.(); };
     const c = {
       closed: 0,
+      memory: s.memory,
       async write(data) {
         if (this.closed) { s.writesAfterClose += 1; throw new Error('write after close'); }
         const b = Buffer.from(data);
@@ -917,14 +795,14 @@ function server() {
         if (flags === 4) {
           assert.equal(id, 0n);
           if (handshakeStage === 0) {
-            assert.deepEqual(b, HELLO14);
+            assert.deepEqual(b, HELLO15);
             s.clientHellos.push(Buffer.from(b));
             handshakeStage = 1;
-            feed(ACCEPTED14);
+            feed(ACCEPTED15);
             return;
           }
           assert.equal(handshakeStage, 1, 'metadata follows exactly one Hello');
-          assert.notDeepEqual(b, HELLO14, 'a repeated Hello is not metadata');
+          assert.notDeepEqual(b, HELLO15, 'a repeated Hello is not metadata');
           s.clientHandshakes.push(Buffer.from(payload));
           s.clientCaps = payload.subarray(payload.length - 2).readUInt16LE(0);
           handshakeStage = 2;
@@ -932,20 +810,23 @@ function server() {
           return;
         }
         assert.equal(handshakeStage, 2, 'business and route control require both handshake stages');
+        if (flags === 16 && payload[0] === 0x17) {
+          if (s.failRelease) throw new Error('release write failed');
+          s.responseReleases ??= [];
+          for (let i = 0; i < payload[1]; i++) s.responseReleases.push(payload.readBigUInt64LE(2 + i * 8));
+          return;
+        }
         if (flags === 16) {
           const request = JSON.parse(payload.subarray(1).toString());
           if (payload[0] === 0x0e) {
-            if (request.selector.expected.route_name === 'manager') assert.equal(payload.toString('hex'), '0e7b2273656c6563746f72223a7b2274797065223a22636f6e7472616374222c226578706563746564223a7b22726f7574655f6e616d65223a226d616e61676572222c2263726d5f6e73223a22746573742e70657273697374656e74222c2263726d5f6e616d65223a2250657273697374656e74222c2263726d5f766572223a22302e312e30222c226162695f68617368223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227369676e61747572655f68617368223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262227d7d2c226d696e5f7265766973696f6e223a6e756c6c7d');
-            assert.deepEqual(request, { selector: {type: 'contract', expected: wireContract(request.selector.expected.route_name)}, min_revision: null });
+            assert.deepEqual(request, { selector: {type: 'contract', expected: wireContract(request.selector.expected.route_name)} });
             s.lists.push(request);
-            reply(0x0f, {catalog_revision: 1, min_watch_revision: 1, routes: [...s.routes.values()].filter((r) => r.route_name === request.selector.expected.route_name)});
+            reply(0x0f, {routes: [...s.routes.values()].filter((r) => r.route_name === request.selector.expected.route_name)});
             return;
           }
           assert.equal(payload[0], 0x10);
-          if (request.expected.route_name === 'manager' && request.observed_route_uid === null) assert.equal(payload.toString('hex'), '107b226578706563746564223a7b22726f7574655f6e616d65223a226d616e61676572222c2263726d5f6e73223a22746573742e70657273697374656e74222c2263726d5f6e616d65223a2250657273697374656e74222c2263726d5f766572223a22302e312e30222c226162695f68617368223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227369676e61747572655f68617368223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262227d2c226f627365727665645f726f7574655f756964223a6e756c6c2c226f627365727665645f726f7574655f7265766973696f6e223a6e756c6c7d');
           assert.deepEqual(request.expected, wireContract(request.expected.route_name));
-          assert.deepEqual(Object.keys(request).sort(), ['expected', 'observed_route_revision', 'observed_route_uid']);
-          assert.equal(request.observed_route_uid === null, request.observed_route_revision === null);
+          assert.deepEqual(Object.keys(request).sort(), ['expected', 'observed_route_uid']);
           s.lookups.push(request);
           if (s.corrupt) {
             feed(s.corrupt(id));
@@ -958,12 +839,13 @@ function server() {
           }
           const current = s.routes.get(request.expected.route_name);
           reply(0x11, current ? {
-            status: request.observed_route_uid !== null && (request.observed_route_uid !== current.route_uid || request.observed_route_revision !== current.route_revision) ? 'stale' : 'ready', current,
+            status: request.observed_route_uid !== null && (request.observed_route_uid !== current.route_uid) ? 'stale' : 'ready', current,
           } : {status: 'not_found', route_name: request.expected.route_name});
         } else {
           assert.ok((flags & 128) !== 0);
           s.callFlags.push(flags);
           s.calls.push(payload);
+          if ((flags & 64) !== 0) feed(frame(0n, 18, Buffer.concat([Buffer.from([0x17, 1]), u64(payload.readBigUInt64LE(15))])));
           if (s.failCall) { s.failCall = false; throw new Error('uncertain write'); }
           if (s.onCall) return await s.onCall({id, flags, feed, block: () => new Promise((resolve, reject) => { finishWrite = s.completeWriteOnClose ? resolve : () => reject(new Error('write interrupted by close')); })});
           if ((flags & 512) !== 0 && (flags & 1024) === 0) return;
@@ -1029,7 +911,7 @@ test('prepare and call reject replacements without poisoning another route', asy
   const s = server(), t = transport(s);
   s.routes.set('builder', record('builder'));
   await call(t, 'builder');
-  s.routes.set('builder', record('builder', {route_uid: 'replacement', route_revision: 2}));
+  s.routes.set('builder', record('builder', {route_uid: 'replacement'}));
   await assert.rejects(() => t.prepare('builder', CONTRACT), /route token mismatch/);
   await assert.rejects(() => call(t, 'builder'), /route token mismatch/);
   await call(t);
@@ -1050,7 +932,7 @@ test('uncertain writes are never replayed; same identity reconnect retains the o
   assert.equal(s.connections[0].closed, 1);
   s.failCall = true;
   await assert.rejects(() => call(t), /uncertain write/);
-  s.routes.set('manager', record('manager', {route_uid: 'replacement', route_revision: 2}));
+  s.routes.set('manager', record('manager', {route_uid: 'replacement'}));
   await assert.rejects(() => call(t), /route token mismatch/);
   assert.equal(s.calls.length, 4);
   await t.close();
@@ -1086,22 +968,9 @@ test('closed/removed/not-found/contract mismatch do not dispatch or close a heal
   await t.close();
 });
 
-test('compacted catalog uses contract-scoped list then lookup with the pinned token', async () => {
-  const s = server(), t = transport(s);
-  await call(t);
-  s.nextControl = {tag: 0x15, body: {nonce: 0, rejected_revision: 1, error: {
-    version: 1, code: 711, name: 'RouteCatalogCompacted', message: 'compacted', details: {},
-  }}};
-  await call(t);
-  assert.equal(s.lists.length, 1);
-  assert.equal(s.lookups.length, 3);
-  assert.equal(s.lookups[2].observed_route_uid, 'manager-uid');
-  await t.close();
-});
-
 test('a future semantic NACK code and name remain a valid error envelope', async () => {
   const s = server(), t = transport(s);
-  s.nextControl = {tag: 0x15, body: {nonce: 0, rejected_revision: 1, error: {
+  s.nextControl = {tag: 0x15, body: {error: {
     version: 1, code: 799, name: 'FutureRouteCondition', message: 'future condition', details: {},
   }}};
   try {
@@ -1120,7 +989,7 @@ test('NACK decoding still rejects malformed error fields', async () => {
     [{version: 1, code: 799, name: 'FutureRouteCondition', message: 'bad details', details: {stage: 42}}, /invalid NACK error details/],
   ]) {
     const s = server(), t = transport(s);
-    s.nextControl = {tag: 0x15, body: {nonce: 0, rejected_revision: 1, error}};
+    s.nextControl = {tag: 0x15, body: {error}};
     try {
       await assert.rejects(() => call(t), expected);
       assert.equal(s.calls.length, 0);
@@ -1149,7 +1018,7 @@ test('corrupt control replies discard the stream without business dispatch', asy
 
 test('resolved relay identity and token remain mandatory in the local acquire path', async () => {
   const s = server();
-  const t = transport(s, {expectedServerIdentity: {serverId: 'server', serverInstanceId: 'instance'}, expectedRouteToken: {routeUid: 'resolved-old', routeRevision: 1}});
+  const t = transport(s, {expectedServerIdentity: {serverId: 'server', serverInstanceId: 'instance'}, expectedRouteToken: {routeUid: 'resolved-old', }});
   await assert.rejects(() => call(t), /route token mismatch/);
   assert.equal(s.calls.length, 0);
   await t.close();
@@ -1159,7 +1028,7 @@ test('resolved relay identity and token remain mandatory in the local acquire pa
       assert.ok(url.includes('/_resolve/'), 'no HTTP business fallback after local prepare');
       return {status: 200, async text() {return JSON.stringify([{
         name: 'manager', relay_url: 'http://127.0.0.1:7357', ipc_address: 'ipc://persistent',
-        route_uid: 'resolved-old', route_revision: 1, server_id: 'server', server_instance_id: 'instance',
+        route_uid: 'resolved-old', server_id: 'server', server_instance_id: 'instance',
         crm_ns: CONTRACT.namespace, crm_name: CONTRACT.name, crm_ver: CONTRACT.version,
         abi_hash: CONTRACT.abiHash, signature_hash: CONTRACT.signatureHash, max_payload_size: 1048576,
       }]);}};
@@ -1176,7 +1045,7 @@ test('resolved relay identity and token remain mandatory in the local acquire pa
       assert.ok(url.includes('/_resolve/'));
       return {status: 200, async text() {return JSON.stringify([{
         name: 'manager', relay_url: 'http://127.0.0.1:7357', ipc_address: 'ipc://persistent',
-        route_uid: 'manager-uid', route_revision: 1, server_id: 'server', server_instance_id: 'instance',
+        route_uid: 'manager-uid', server_id: 'server', server_instance_id: 'instance',
         crm_ns: CONTRACT.namespace, crm_name: CONTRACT.name, crm_ver: CONTRACT.version,
         abi_hash: CONTRACT.abiHash, signature_hash: CONTRACT.signatureHash, max_payload_size: 1048576,
       }]);}};
@@ -1202,7 +1071,7 @@ test('relay prepare cleanup failure keeps the identity error and its local close
       assert.ok(url.includes('/_resolve/'), 'no HTTP fallback on cleanup failure');
       return {status: 200, async text() {return JSON.stringify([{
         name: 'manager', relay_url: 'http://127.0.0.1:7357', ipc_address: 'ipc://persistent',
-        route_uid: 'manager-uid', route_revision: 1, server_id: 'server', server_instance_id: 'different-instance',
+        route_uid: 'manager-uid', server_id: 'server', server_instance_id: 'different-instance',
         crm_ns: CONTRACT.namespace, crm_name: CONTRACT.name, crm_ver: CONTRACT.version,
         abi_hash: CONTRACT.abiHash, signature_hash: CONTRACT.signatureHash, max_payload_size: 1048576,
       }]);}};
@@ -1233,10 +1102,9 @@ test('response read loss never replays a business call or changes the reconnect 
   await assert.rejects(() => call(t), /uncertain read/);
   assert.equal(s.calls.length, 2);
   assert.equal(s.connections[0].closed, 1);
-  s.routes.set('manager', record('manager', {route_revision: 2}));
+  s.routes.set('manager', record('manager', {route_uid: 'replacement'}));
   await assert.rejects(() => call(t), /route token mismatch/);
   assert.equal(s.calls.length, 2);
-  assert.equal(s.lookups.at(-1).observed_route_revision, 1);
   await t.close();
 });
 
@@ -1249,7 +1117,7 @@ test('contract, owner, and non-ready records cannot change a binding', async () 
   for (const overrides of [
     {contract: {...wireContract('manager'), signature_hash: 'c'.repeat(64)}},
     {owner_server_instance_id: 'other-instance'},
-    ...['pending', 'draining', 'closed', 'removed'].map((state) => ({state})),
+    {state: 'closed'},
   ]) {
     s.routes.set('manager', record('manager', overrides));
     await assert.rejects(() => call(t));
@@ -1308,7 +1176,6 @@ for (const failure of ['refusal', 'refusal-with-successful-write', 'wrong-id', '
       await call(t); await call(t);
       assert.equal(s.connections.length, 2, 'only the failed connection is replaced');
       assert.equal(s.lookups.at(-1).observed_route_uid, 'manager-uid');
-      assert.equal(s.lookups.at(-1).observed_route_revision, 1);
     } finally {
       await t.close();
       await result;
@@ -1335,223 +1202,109 @@ test('a refusal after the last chunk discards duplicate replies before the next 
   } finally { await t.close(); }
 });
 
-for (const [generation, allocationId, dedicated] of [[1, 7n, false], [0, 0n, true], [1, 0n, false]]) {
-  test(`a received SHM reply is released exactly when authorized after a write failure (${generation}/${allocationId})`, async () => {
-    const s = server(), releases = [];
-    s.ackShmResponse = true;
-    let allocated = 0;
-    const t = transport(s, {
-      requestChunkSize: 2,
-      responsePayloadAllocator() { allocated += 1; throw new Error('must not allocate after failed send'); },
-      responseShmReader: {
-        read() { throw new Error('must not copy an undelivered reply'); },
-        release(block) { releases.push(block); },
-      },
-    });
-    s.onCall = ({id, flags, feed}) => {
-      if (!(flags & 1024)) return;
-      const buddy = Buffer.concat([u16(0), u32(generation), u32(0), u32(3), Buffer.from([Number(dedicated)]), u64(allocationId)]);
-      feed(frame(id, 2 | 256 | 64, Buffer.concat([buddy, Buffer.from([0])])));
-      return new Promise((_, reject) => setImmediate(() => reject(new Error('write acknowledgement lost'))));
-    };
-    try {
-      await assert.rejects(t.call('manager', CONTRACT, 'ping', new Uint8Array(8)),
-        !dedicated && allocationId === 0n ? /allocationId/ : /write acknowledgement lost/);
-      assert.equal(allocated, 0);
-      assert.deepEqual(releases.map(({prefix, generation, allocationId, dedicated}) => ({prefix, generation, allocationId, dedicated})),
-        !dedicated && allocationId === 0n ? [] : [{prefix: '/serverpool', generation, allocationId, dedicated}]);
-      assert.equal(s.connections[0].closed, 1);
-    } finally { await t.close(); }
-  });
+function memory(s, events = []) {
+  let releases = [];
+  return {
+    prefix: '/requestpool',
+    finishHandshake(prefix) { events.push(['handshake', prefix]); },
+    prepareRequest(payload) { events.push(['prepare', payload.byteLength]); return { block: {segmentIndex: 0, generation: 1, offset: 0, byteLength: payload.byteLength, loanId: 0xffffffffffffffffn, dedicated: false} }; },
+    discardRequest() { events.push(['cancel']); },
+    admitResponse(block) { events.push(['admit', block.loanId]); return block; },
+    consumeResponse(block, dst) { events.push(['consume', block.loanId]); dst.set(s.responseData); releases.push(block.loanId); },
+    discardResponse(block) { events.push(['discard', block.loanId]); releases.push(block.loanId); },
+    beginWrite(kind) {
+      const prefix = releases.length ? frame(0n, 16, Buffer.concat([Buffer.from([0x17, releases.length]), ...releases.map(u64)])) : Buffer.alloc(0);
+      releases = [];
+      return kind === 2 && prefix.length === 0 ? undefined : { prefix, start() {}, complete() {} };
+    },
+    receiveRelease(bytes) { events.push(['release', Buffer.from(bytes).readBigUInt64LE(18)]); },
+    deactivate() {}, tryClose() { return true; },
+  };
 }
 
-test('IPC14 client metadata offers each shared-memory direction separately after Hello', async () => {
-  const writerShape = {
-    prefix: '/requestpool', segments: [{name: '/requestpool_b0000', size: 1048576}],
-    async write() { throw new Error('must not write without the request ACK'); },
-    async release() {},
-  };
-  const readerShape = { read() {}, release() {} };
-
+test('IPC15 metadata uses directional flags and no segment list', async () => {
   const s = server(), t = transport(s);
   await call(t);
-  assert.equal(s.clientHandshakes.length, 1);
-  assert.deepEqual(s.clientHellos, [HELLO14]);
-  assert.equal(s.clientHandshakes[0].subarray(-2).readUInt16LE(0), 7);
-  assert.equal(s.clientHandshakes[0][0], 0, 'no pool advertisement without a writer');
+  assert.equal(s.clientHandshakes[0].toString('hex'), '000000');
   await t.close();
-
-  const readerOnly = server();
-  const rt = transport(readerOnly, { responseShmReader: readerShape });
-  await call(rt);
-  assert.deepEqual(readerOnly.clientHellos, [HELLO14]);
-  assert.equal(readerOnly.clientHandshakes[0].subarray(-2).readUInt16LE(0), 7 | 16);
-  assert.equal(readerOnly.clientHandshakes[0][0], 0);
-  await rt.close();
-
-  const writerOnly = server();
-  const wt = transport(writerOnly, { requestShmThreshold: 0, requestShmWriter: writerShape });
-  await call(wt);
-  const offer = writerOnly.clientHandshakes[0];
-  assert.deepEqual(writerOnly.clientHellos, [HELLO14]);
-  assert.equal(offer.subarray(-2).readUInt16LE(0), 7 | 8);
-  assert.equal(offer.subarray(1, 1 + '/requestpool'.length).toString(), '/requestpool');
-  await wt.close();
-
-  const both = server();
-  const bt = transport(both, { requestShmThreshold: 0, requestShmWriter: writerShape, responseShmReader: readerShape });
-  await call(bt);
-  assert.deepEqual(both.clientHellos, [HELLO14]);
-  assert.equal(both.clientHandshakes[0].subarray(-2).readUInt16LE(0), 7 | 8 | 16);
-  await bt.close();
+  const n = server(); n.memory = memory(n);
+  const native = transport(n);
+  await call(native);
+  assert.equal(n.clientHandshakes[0].subarray(-2).readUInt16LE(), 24);
+  assert.equal(n.clientHandshakes[0].length, 1 + '/requestpool'.length + 2);
+  await native.close();
 });
 
-test('unacknowledged request shared memory stays on the owned inline path', async () => {
-  const s = server();
-  const events = [];
-  const writer = {
-    prefix: '/requestpool', segments: [{name: '/requestpool_b0000', size: 1048576}],
-    async write(payload) {
-      events.push(['write', payload.byteLength]);
-      return {segmentIndex: 0, generation: 1, offset: 0, byteLength: payload.byteLength, allocationId: 1n, dedicated: false};
-    },
-    async markConsumed() { events.push(['consumed']); },
-    async release() { events.push(['request-release']); },
-  };
-  const refused = transport(s, { requestShmThreshold: 0, requestShmWriter: writer });
-  await refused.call('manager', CONTRACT, 'ping', new Uint8Array(5));
-  assert.deepEqual(events, [], 'an unacknowledged direction never touches the writer');
-  assert.equal((s.callFlags.at(-1) & 64) === 0, true, 'requests stay on owned inline frames');
-  await refused.close();
-
-  s.ackShmRequest = true;
-  const accepted = transport(s, { requestShmThreshold: 0, requestShmWriter: writer });
-  await accepted.call('manager', CONTRACT, 'ping', new Uint8Array(5));
-  assert.deepEqual(events, [['write', 5], ['consumed']]);
-  assert.equal((s.callFlags.at(-1) & 64) !== 0, true, 'the ACK enables request shared memory');
-  await accepted.close();
+test('request SHM requires the ACK and preserves a full u64 loan ID', async () => {
+  const s = server(), events = []; s.memory = memory(s, events);
+  const t = transport(s, {requestShmThreshold: 0});
+  await t.call('manager', CONTRACT, 'ping', new Uint8Array(7));
+  assert.equal(s.callFlags.at(-1) & 64, 0);
+  assert.equal(events.some(([event]) => event === 'prepare'), false);
+  s.ackShmRequest = true; await t.close();
+  await t.call('manager', CONTRACT, 'ping', new Uint8Array(7));
+  assert.equal(s.callFlags.at(-1), 128 | 64);
+  assert.equal(s.calls.at(-1).subarray(0, 23).toString('hex'), '000001000000000000000700000000ffffffffffffffff');
+  assert.deepEqual(events.filter(([event]) => event === 'release'), [['release', 0xffffffffffffffffn]]);
+  await t.close();
 });
 
-test('SHM replies without the response ACK are rejected before any reader work', async () => {
-  const s = server();
-  const readerEvents = [];
-  let allocated = 0;
-  const allocator = (size) => {
-    allocated += 1;
-    const view = new Uint8Array(size);
-    return {payload: {byteLength: size, view}, view};
-  };
-  const t = transport(s, {
-    responsePayloadAllocator: allocator,
-    responseShmReader: {
-      read() { readerEvents.push('read'); },
-      release() { readerEvents.push('release'); },
-    },
-  });
-  s.shmReply = true;
-  s.responseData = Buffer.from([42]);
-  await assert.rejects(() => call(t), /without the acknowledged SHM response capability/);
-  assert.deepEqual(readerEvents, [], 'no mapper, read, or release may run');
-  assert.equal(allocated, 0, 'no response allocation may run');
-  assert.equal(s.connections[0].closed, 1, 'the protocol violation discards the connection');
-
-  s.ackShmResponse = true;
-  const control = transport(s, {
-    responsePayloadAllocator: allocator,
-    responseShmReader: {
-      read(block, destination) { readerEvents.push('read'); destination.set(Buffer.from([42])); },
-      release() { readerEvents.push('release'); },
-    },
-  });
-  assert.deepEqual(Array.from((await call(control)).view), [42]);
-  assert.deepEqual(readerEvents, ['read', 'release']);
-  await control.close();
-});
-
-test('provider allocator, SHM release and chunk framing remain on the same shared stream', async () => {
-  const s = server();
+test('response copy sends release before the next call and keeps provider memory local', async () => {
+  const s = server(), events = []; s.memory = memory(s, events);
+  s.ackShmResponse = true; s.shmReply = true; s.responseAllocationId = 9007199254740993n;
   s.responseData = Buffer.from([42, 43, 44]);
-  s.ackShmRequest = true;
-  s.ackShmResponse = true;
-  const allocations = [], shmEvents = [];
-  const t = transport(s, {
-    requestChunkSize: 2,
-    responsePayloadAllocator(size) {
-      const view = new Uint8Array(size);
-      const payload = {byteLength: size, view};
-      allocations.push(payload);
-      return {payload, view};
-    },
-    responseShmReader: {
-      async read(block, destination) {
-        assert.equal(block.prefix, '/serverpool');
-        assert.equal(block.generation, 1);
-        assert.equal(block.allocationId, 9007199254740993n);
-        shmEvents.push('read');
-        destination.set(s.responseData);
-      },
-      async release(block) {
-        assert.equal(block.allocationId, 9007199254740993n);
-        shmEvents.push('response-release');
-      },
-    },
-  });
+  const t = transport(s, {responsePayloadAllocator(size) { const view = new Uint8Array(size); return {payload: {byteLength: size, view}, view}; }});
+  const value = await call(t);
+  assert.deepEqual(Array.from(value.view), [42, 43, 44]);
+  assert.deepEqual(events.filter(([event]) => ['admit', 'consume'].includes(event)), [['admit', 9007199254740993n], ['consume', 9007199254740993n]]);
+  assert.deepEqual(s.responseReleases, [9007199254740993n]);
+  await t.close();
+});
+
+test('SHM replies without the response ACK never reach memory or the allocator', async () => {
+  const s = server(), events = []; s.memory = memory(s, events); s.shmReply = true; s.responseData = Buffer.from([42]);
+  const t = transport(s, {responsePayloadAllocator() { assert.fail('unacknowledged response allocated'); }});
+  await assert.rejects(() => call(t), /without the acknowledged SHM response capability/);
+  assert.equal(events.some(([event]) => event === 'admit'), false);
+  assert.equal(s.connections[0].closed, 1);
+  await t.close();
+});
+test('provider allocator handles inline and chunked responses on the shared stream', async () => {
+  const s = server(); s.responseData = Buffer.from([42, 43, 44]);
+  const allocations = [];
+  const t = transport(s, {requestChunkSize: 2, responsePayloadAllocator(size) {
+    const view = new Uint8Array(size), payload = {byteLength: size, view};
+    allocations.push(payload); return {payload, view};
+  }});
   assert.deepEqual(Array.from((await call(t)).view), [42, 43, 44]);
   s.chunkedReply = true;
   assert.deepEqual(Array.from((await t.call('manager', CONTRACT, 'ping', new Uint8Array(7))).view), [42, 43, 44]);
-  assert.equal(s.callFlags.filter((flags) => flags & 512).length, 4);
-  assert.equal(s.callFlags.at(-1), 128 | 512 | 1024);
-  s.chunkedReply = false; s.shmReply = true; s.responseAllocationId = 9007199254740993n;
-  assert.deepEqual(Array.from((await call(t)).view), [42, 43, 44]);
-  assert.deepEqual(shmEvents, ['read', 'response-release']);
-  assert.deepEqual(allocations.map((p) => p.byteLength), [3, 3, 3]);
-  assert.equal(s.connections.length, 1);
+  assert.equal(s.callFlags.filter(flags => flags & 512).length, 4);
+  assert.deepEqual(allocations.map(p => p.byteLength), [3, 3]);
+  assert.equal(s.connections.length, 1); await t.close();
+});
+for (const dedicated of [false, true]) {
+  test(`failed chunked write discards an admitted response once (${dedicated})`, async () => {
+    const s = server(), events = []; s.memory = memory(s, events); s.ackShmResponse = true;
+    const t = transport(s, {requestChunkSize: 2, responsePayloadAllocator() { assert.fail('failed exchange allocated'); }});
+    s.onCall = ({id, flags, feed}) => {
+      if (!(flags & 1024)) return;
+      const buddy = Buffer.concat([u16(0), u32(1), u32(0), u32(3), Buffer.from([Number(dedicated)]), u64(0xfffffffffffffff1n)]);
+      feed(frame(id, 2 | 256 | 64, Buffer.concat([buddy, Buffer.from([0])])));
+      return new Promise((_, reject) => setImmediate(() => reject(new Error('write acknowledgement lost'))));
+    };
+    await assert.rejects(() => t.call('manager', CONTRACT, 'ping', new Uint8Array(8)), /write acknowledgement lost/);
+    assert.deepEqual(events.filter(([event]) => ['admit', 'consume', 'discard'].includes(event)), [['admit', 0xfffffffffffffff1n], ['discard', 0xfffffffffffffff1n]]);
+    await t.close();
+  });
+}
+test('failed response release write preserves the result and closes the original stream', async () => {
+  const s = server(); s.memory = memory(s); s.ackShmResponse = true; s.shmReply = true;
+  s.responseData = Buffer.from([42]); s.failRelease = true;
+  const t = transport(s);
+  assert.deepEqual(Array.from(await call(t)), [42]);
+  assert.equal(s.connections[0].closed, 1);
   await t.close();
-
-  const requestEvents = [];
-  const request = transport(s, {
-    requestShmThreshold: 0,
-    requestShmWriter: {
-      prefix: '/requestpool', segments: [{name: '/requestpool_b0000', size: 1048576}],
-      async write(payload) {
-        requestEvents.push('write');
-        return {segmentIndex: 0, generation: 1, offset: 0, byteLength: payload.byteLength, allocationId: 0xffffffffffffffffn, dedicated: false};
-      },
-      async markConsumed() {requestEvents.push('consumed');},
-      async release() {requestEvents.push('request-release');},
-    },
-  });
-  s.shmReply = false;
-  await request.call('manager', CONTRACT, 'ping', new Uint8Array(7));
-  assert.equal(s.callFlags.at(-1), 128 | 64);
-  assert.equal(s.calls.at(-1).subarray(0, 23).toString('hex'), '000001000000000000000700000000ffffffffffffffff');
-  assert.deepEqual(requestEvents, ['write', 'consumed']);
-  await request.close();
-
-  for (const allocationId of [undefined, 0n, -1n, 1, 0x1_0000_0000_0000_0000n]) {
-    const invalidWriter = transport(s, {
-      requestShmThreshold: 0,
-      requestShmWriter: {
-        prefix: '/requestpool', segments: [{name: '/requestpool_b0000', size: 1048576}],
-        write(payload) {
-          return {segmentIndex: 0, generation: 1, offset: 0, byteLength: payload.byteLength, allocationId, dedicated: false};
-        },
-        release() {},
-      },
-    });
-    await assert.rejects(() => invalidWriter.call('manager', CONTRACT, 'ping', new Uint8Array(7)), /allocationId/);
-    await invalidWriter.close();
-  }
-
-  s.shmReply = true; s.responseAllocationId = 0n;
-  const invalidResponse = transport(s, {
-    responseShmReader: {
-      read() { throw new Error('invalid ID reached reader'); },
-      release() { throw new Error('invalid ID reached release'); },
-    },
-  });
-  await assert.rejects(() => call(invalidResponse), /allocationId/);
-  await invalidResponse.close();
 });
 "#,
     );

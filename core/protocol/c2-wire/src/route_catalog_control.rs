@@ -20,23 +20,17 @@ pub struct RouteContractWire {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteStateWire {
-    Pending,
     Ready,
-    Draining,
     Closed,
-    Removed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteStateReasonWire {
-    RegisterPrepared,
     RegisterCommitted,
     ExplicitUnregister,
     Shutdown,
-    ContractMismatch,
-    ProtocolViolation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +51,7 @@ pub struct RouteRecordWire {
     pub methods: Vec<RouteMethodWire>,
     pub max_payload_size: u64,
     pub state: RouteStateWire,
-    pub state_reason: Option<RouteStateReasonWire>,
+    pub state_reason: RouteStateReasonWire,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,4 +352,33 @@ fn validate_error_envelope(error: &C2ErrorEnvelope) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    #[test]
+    fn route_states_and_reasons_only_accept_produced_values() {
+        for state in ["ready", "closed"] {
+            assert!(serde_json::from_value::<RouteStateWire>(serde_json::json!(state)).is_ok());
+        }
+        for state in ["pending", "draining", "removed"] {
+            assert!(serde_json::from_value::<RouteStateWire>(serde_json::json!(state)).is_err());
+        }
+        for reason in ["register_committed", "explicit_unregister", "shutdown"] {
+            assert!(
+                serde_json::from_value::<RouteStateReasonWire>(serde_json::json!(reason)).is_ok()
+            );
+        }
+        for reason in [
+            "register_prepared",
+            "contract_mismatch",
+            "protocol_violation",
+        ] {
+            assert!(
+                serde_json::from_value::<RouteStateReasonWire>(serde_json::json!(reason)).is_err()
+            );
+        }
+        assert!(serde_json::from_value::<RouteStateReasonWire>(serde_json::Value::Null).is_err());
+    }
 }

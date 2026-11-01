@@ -76,32 +76,26 @@ static void *open_library(const char *path, char *error, size_t error_size) {
 #endif
 }
 
-typedef C2MemFfiStatus (*request_pool_new_fn)(
-    const char *,
-    uint32_t,
-    uint16_t,
-    uint32_t,
-    C2MemFfiRequestPool **);
-typedef void (*request_pool_destroy_fn)(C2MemFfiRequestPool *);
-typedef C2MemFfiStatus (*request_pool_prefix_len_fn)(const C2MemFfiRequestPool *, size_t *);
-typedef C2MemFfiStatus (*request_pool_prefix_copy_fn)(const C2MemFfiRequestPool *, char *, size_t, size_t *);
-typedef C2MemFfiStatus (*request_pool_segment_count_fn)(const C2MemFfiRequestPool *, size_t *);
-typedef C2MemFfiStatus (*request_pool_segment_name_len_fn)(const C2MemFfiRequestPool *, size_t, size_t *);
-typedef C2MemFfiStatus (*request_pool_segment_name_copy_fn)(const C2MemFfiRequestPool *, size_t, char *, size_t, size_t *);
-typedef C2MemFfiStatus (*request_pool_segment_data_size_fn)(const C2MemFfiRequestPool *, size_t, uint32_t *);
-typedef C2MemFfiStatus (*request_pool_write_fn)(C2MemFfiRequestPool *, const uint8_t *, size_t, C2MemFfiRequestBlock *);
-typedef C2MemFfiStatus (*request_pool_read_local_fn)(const C2MemFfiRequestPool *, C2MemFfiRequestBlock, uint8_t *, size_t, size_t *);
-typedef C2MemFfiStatus (*request_pool_release_fn)(C2MemFfiRequestPool *, C2MemFfiRequestBlock);
-typedef C2MemFfiStatus (*request_pool_forget_consumed_fn)(C2MemFfiRequestPool *, C2MemFfiRequestBlock);
-typedef C2MemFfiStatus (*response_pool_new_fn)(
-    const char *,
-    uint32_t,
-    uint16_t,
-    uint32_t,
-    C2MemFfiResponsePool **);
-typedef void (*response_pool_destroy_fn)(C2MemFfiResponsePool *);
-typedef C2MemFfiStatus (*response_pool_read_fn)(C2MemFfiResponsePool *, C2MemFfiResponseBlock, uint8_t *, size_t, size_t *);
-typedef C2MemFfiStatus (*response_pool_release_fn)(C2MemFfiResponsePool *, C2MemFfiResponseBlock);
+typedef C2MemFfiStatus (*memory_context_new_fn)(uintptr_t connection, uintptr_t process, C2MemFfiMemoryContext **out);
+typedef void (*memory_context_free_fn)(C2MemFfiMemoryContext *context);
+typedef C2MemFfiStatus (*memory_context_prefix_len_fn)(const C2MemFfiMemoryContext *context, size_t *out);
+typedef C2MemFfiStatus (*memory_context_prefix_copy_fn)(const C2MemFfiMemoryContext *context, char *dst, size_t len, size_t *out);
+typedef C2MemFfiStatus (*memory_context_finish_handshake_fn)(const C2MemFfiMemoryContext *context, const char *prefix);
+typedef C2MemFfiStatus (*request_prepare_fn)(const C2MemFfiMemoryContext *context, const uint8_t *data, size_t len, C2MemFfiRequest **out, C2MemFfiBlock *block);
+typedef void (*request_discard_fn)(C2MemFfiRequest *request);
+typedef C2MemFfiStatus (*response_admit_fn)(const C2MemFfiMemoryContext *context, C2MemFfiBlock block, C2MemFfiResponse **out);
+typedef C2MemFfiStatus (*response_consume_fn)(C2MemFfiResponse *response, uint8_t *dst, size_t len, size_t *out);
+typedef void (*response_discard_fn)(C2MemFfiResponse *response);
+typedef C2MemFfiStatus (*memory_context_receive_release_fn)(const C2MemFfiMemoryContext *context, const uint8_t *bytes, size_t len);
+typedef C2MemFfiStatus (*write_begin_fn)(const C2MemFfiMemoryContext *context, C2MemFfiRequest *request, uint8_t kind, C2MemFfiWrite **out);
+typedef C2MemFfiStatus (*write_prefix_len_fn)(const C2MemFfiWrite *write, size_t *out);
+typedef C2MemFfiStatus (*write_prefix_copy_fn)(const C2MemFfiWrite *write, uint8_t *dst, size_t len);
+typedef C2MemFfiStatus (*write_start_fn)(C2MemFfiWrite *write);
+typedef C2MemFfiStatus (*write_complete_fn)(C2MemFfiWrite *write, uint8_t success);
+typedef void (*write_discard_fn)(C2MemFfiWrite *write);
+typedef C2MemFfiStatus (*memory_context_deactivate_fn)(const C2MemFfiMemoryContext *context);
+typedef C2MemFfiStatus (*memory_context_peer_end_fn)(const C2MemFfiMemoryContext *context);
+typedef C2MemFfiStatus (*memory_context_try_close_fn)(const C2MemFfiMemoryContext *context, uint8_t *out);
 typedef uint32_t (*abi_version_fn)(void);
 typedef C2MemFfiStatus (*endpoint_context_capture_fn)(const char *, C2MemFfiLocalEndpointContext **);
 typedef void (*endpoint_context_free_fn)(C2MemFfiLocalEndpointContext *);
@@ -123,34 +117,27 @@ typedef struct C2MemFfiNodeSymbols {
     endpoint_context_namespace_id_copy_fn endpoint_context_namespace_id_copy;
     endpoint_context_connect_unix_fn endpoint_context_connect_unix;
     endpoint_context_connect_windows_fn endpoint_context_connect_windows;
-    request_pool_new_fn request_pool_new;
-    request_pool_destroy_fn request_pool_destroy;
-    request_pool_prefix_len_fn request_pool_prefix_len;
-    request_pool_prefix_copy_fn request_pool_prefix_copy;
-    request_pool_segment_count_fn request_pool_segment_count;
-    request_pool_segment_name_len_fn request_pool_segment_name_len;
-    request_pool_segment_name_copy_fn request_pool_segment_name_copy;
-    request_pool_segment_data_size_fn request_pool_segment_data_size;
-    request_pool_write_fn request_pool_write;
-    request_pool_read_local_fn request_pool_read_local;
-    request_pool_release_fn request_pool_release;
-    request_pool_forget_consumed_fn request_pool_forget_consumed;
-    response_pool_new_fn response_pool_new;
-    response_pool_destroy_fn response_pool_destroy;
-    response_pool_read_fn response_pool_read;
-    response_pool_release_fn response_pool_release;
+    memory_context_new_fn memory_context_new;
+    memory_context_free_fn memory_context_free;
+    memory_context_prefix_len_fn memory_context_prefix_len;
+    memory_context_prefix_copy_fn memory_context_prefix_copy;
+    memory_context_finish_handshake_fn memory_context_finish_handshake;
+    request_prepare_fn request_prepare;
+    request_discard_fn request_discard;
+    response_admit_fn response_admit;
+    response_consume_fn response_consume;
+    response_discard_fn response_discard;
+    memory_context_receive_release_fn memory_context_receive_release;
+    write_begin_fn write_begin;
+    write_prefix_len_fn write_prefix_len;
+    write_prefix_copy_fn write_prefix_copy;
+    write_start_fn write_start;
+    write_complete_fn write_complete;
+    write_discard_fn write_discard;
+    memory_context_deactivate_fn memory_context_deactivate;
+    memory_context_peer_end_fn memory_context_peer_end;
+    memory_context_try_close_fn memory_context_try_close;
 } C2MemFfiNodeSymbols;
-
-typedef enum C2MemFfiNodePoolKind {
-    C2_MEM_FFI_NODE_REQUEST_POOL = 1,
-    C2_MEM_FFI_NODE_RESPONSE_POOL = 2,
-} C2MemFfiNodePoolKind;
-
-typedef struct C2MemFfiNodePoolHandle {
-    C2MemFfiNodeSymbols *symbols;
-    C2MemFfiNodePoolKind kind;
-    void *ptr;
-} C2MemFfiNodePoolHandle;
 
 typedef struct C2MemFfiNodeEndpointContext {
     C2MemFfiNodeSymbols *symbols;
@@ -161,10 +148,10 @@ typedef struct C2MemFfiNodeEndpointContext {
 } C2MemFfiNodeEndpointContext;
 
 /* Only wrapped objects created by this addon can carry a context owner.
- * ABI 6 rotated this tag from the ABI 5 constant: a stale ABI 5 addon's
+ * ABI 7 rotates the tag: a stale addon's
  * endpoint contexts must fail the tag check instead of being unwrapped. */
 static const napi_type_tag endpoint_context_tag = {
-    UINT64_C(0x5a71e0c3f28b94d6), UINT64_C(0xd6340f81b9e57c2a)
+    UINT64_C(0x5a71e0c3f28b94d7), UINT64_C(0xd6340f81b9e57c2a)
 };
 
 static napi_value throw_error(napi_env env, const char *message) {
@@ -278,73 +265,6 @@ static bool read_uint32_arg(napi_env env, napi_value value, const char *label, u
     return true;
 }
 
-static bool get_external_handle(
-    napi_env env,
-    napi_value value,
-    C2MemFfiNodePoolKind expected_kind,
-    C2MemFfiNodePoolHandle **out_handle) {
-    void *raw = NULL;
-    if (!check_napi(napi_get_value_external(env, value, &raw)) || raw == NULL) {
-        throw_type_error(env, "Expected a c2-mem-ffi native pool handle.");
-        return false;
-    }
-    C2MemFfiNodePoolHandle *handle = (C2MemFfiNodePoolHandle *)raw;
-    if (handle->kind != expected_kind) {
-        throw_type_error(env, "c2-mem-ffi native pool handle kind mismatch.");
-        return false;
-    }
-    if (handle->ptr == NULL) {
-        throw_type_error(env, "c2-mem-ffi native pool handle is closed.");
-        return false;
-    }
-    *out_handle = handle;
-    return true;
-}
-
-static napi_value make_pool_external(
-    napi_env env,
-    C2MemFfiNodeSymbols *symbols,
-    C2MemFfiNodePoolKind kind,
-    void *ptr);
-
-static void pool_external_finalize(napi_env env, void *data, void *hint) {
-    (void)env;
-    (void)hint;
-    C2MemFfiNodePoolHandle *handle = (C2MemFfiNodePoolHandle *)data;
-    if (handle == NULL) {
-        return;
-    }
-    if (handle->ptr != NULL) {
-        if (handle->kind == C2_MEM_FFI_NODE_REQUEST_POOL) {
-            handle->symbols->request_pool_destroy((C2MemFfiRequestPool *)handle->ptr);
-        } else if (handle->kind == C2_MEM_FFI_NODE_RESPONSE_POOL) {
-            handle->symbols->response_pool_destroy((C2MemFfiResponsePool *)handle->ptr);
-        }
-        handle->ptr = NULL;
-    }
-    free(handle);
-}
-
-static napi_value make_pool_external(
-    napi_env env,
-    C2MemFfiNodeSymbols *symbols,
-    C2MemFfiNodePoolKind kind,
-    void *ptr) {
-    C2MemFfiNodePoolHandle *handle = (C2MemFfiNodePoolHandle *)calloc(1, sizeof(C2MemFfiNodePoolHandle));
-    if (handle == NULL) {
-        return throw_error(env, "Out of memory.");
-    }
-    handle->symbols = symbols;
-    handle->kind = kind;
-    handle->ptr = ptr;
-    napi_value external;
-    if (!check_napi(napi_create_external(env, handle, pool_external_finalize, NULL, &external))) {
-        free(handle);
-        return NULL;
-    }
-    return external;
-}
-
 static bool get_named_property(napi_env env, napi_value object, const char *name, napi_value *out) {
     if (!check_napi(napi_get_named_property(env, object, name, out))) {
         char message[160];
@@ -363,7 +283,7 @@ static bool read_block_common(
     uint32_t *generation,
     uint32_t *offset,
     uint32_t *byte_length,
-    uint64_t *allocation_id) {
+    uint64_t *loan_id) {
     napi_value property;
     uint32_t temp_u32 = 0;
     bool temp_bool = false;
@@ -395,73 +315,50 @@ static bool read_block_common(
         return false;
     }
     bool lossless = false;
-    if (!get_named_property(env, value, "allocationId", &property) ||
-        !check_napi(napi_get_value_bigint_uint64(env, property, allocation_id, &lossless)) ||
+    if (!get_named_property(env, value, "loanId", &property) ||
+        !check_napi(napi_get_value_bigint_uint64(env, property, loan_id, &lossless)) ||
         !lossless) {
-        throw_type_error(env, "block.allocationId must be a lossless u64 bigint.");
-        return false;
-    }
-    if ((*is_dedicated == 0 && *allocation_id == 0) ||
-        (*is_dedicated != 0 && *allocation_id != 0)) {
-        throw_type_error(env, "block.allocationId must be nonzero for buddy memory and zero for dedicated memory.");
+        throw_type_error(env, "block.loanId must be a lossless u64 bigint.");
         return false;
     }
     return true;
 }
 
-static bool read_request_block(napi_env env, napi_value value, C2MemFfiRequestBlock *block) {
-    uint16_t segment_index = 0;
-    uint8_t is_dedicated = 0;
-    uint32_t generation = 0;
-    uint32_t offset = 0;
-    uint32_t byte_length = 0;
-    uint64_t allocation_id = 0;
-    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length, &allocation_id)) {
-        return false;
+static bool read_block(napi_env env, napi_value value, C2MemFfiBlock *block) {
+    memset(block, 0, sizeof(*block));
+    const char *fields[] = { "segmentIndex", "generation", "offset", "byteLength", "loanId", "dedicated" };
+    napi_value keys;
+    uint32_t length = 0;
+    if (!check_napi(napi_get_all_property_names(env, value, napi_key_own_only,
+            napi_key_all_properties, napi_key_numbers_to_strings, &keys)) ||
+        !check_napi(napi_get_array_length(env, keys, &length))) return false;
+    for (uint32_t i = 0; i < length; i++) {
+        napi_value key;
+        napi_valuetype type;
+        char name[32];
+        size_t written = 0;
+        bool known = false;
+        if (!check_napi(napi_get_element(env, keys, i, &key)) ||
+            !check_napi(napi_typeof(env, key, &type))) return false;
+        if (type == napi_string && check_napi(napi_get_value_string_utf8(env, key, name, sizeof(name), &written))) {
+            for (size_t j = 0; j < sizeof(fields) / sizeof(fields[0]); j++) {
+                if (written == strlen(fields[j]) && memcmp(name, fields[j], written) == 0) { known = true; break; }
+            }
+        }
+        if (!known) { throw_type_error(env, "Unknown block fields."); return false; }
     }
-    block->segment_index = segment_index;
-    block->is_dedicated = is_dedicated;
-    block->reserved = 0;
-    block->generation = generation;
-    block->offset = offset;
-    block->byte_length = byte_length;
-    block->allocation_id = allocation_id;
-    return true;
+    return read_block_common(env, value, &block->segment_index, &block->is_dedicated,
+        &block->generation, &block->offset, &block->byte_length, &block->loan_id);
 }
-
-static bool read_response_block(napi_env env, napi_value value, C2MemFfiResponseBlock *block) {
-    uint16_t segment_index = 0;
-    uint8_t is_dedicated = 0;
-    uint32_t generation = 0;
-    uint32_t offset = 0;
-    uint32_t byte_length = 0;
-    uint64_t allocation_id = 0;
-    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length, &allocation_id)) {
-        return false;
-    }
-    block->segment_index = segment_index;
-    block->is_dedicated = is_dedicated;
-    block->reserved = 0;
-    block->generation = generation;
-    block->offset = offset;
-    block->byte_length = byte_length;
-    block->allocation_id = allocation_id;
-    return true;
-}
-
-static napi_value make_request_block(napi_env env, C2MemFfiRequestBlock block) {
+static napi_value make_block(napi_env env, C2MemFfiBlock block) {
     napi_value object;
-    if (!check_napi(napi_create_object(env, &object))) {
-        return NULL;
-    }
-    if (!set_named_uint32(env, object, "segmentIndex", block.segment_index) ||
+    if (!check_napi(napi_create_object(env, &object)) ||
+        !set_named_uint32(env, object, "segmentIndex", block.segment_index) ||
         !set_named_uint32(env, object, "generation", block.generation) ||
         !set_named_uint32(env, object, "offset", block.offset) ||
         !set_named_uint32(env, object, "byteLength", block.byte_length) ||
-        !set_named_uint64_bigint(env, object, "allocationId", block.allocation_id) ||
-        !set_named_bool(env, object, "dedicated", block.is_dedicated != 0)) {
-        return NULL;
-    }
+        !set_named_uint64_bigint(env, object, "loanId", block.loan_id) ||
+        !set_named_bool(env, object, "dedicated", block.is_dedicated != 0)) return NULL;
     return object;
 }
 
@@ -483,7 +380,7 @@ static bool get_uint8_array(
     size_t byte_offset = 0;
     if (!check_napi(napi_get_typedarray_info(env, value, &type, &length, &data, &arraybuffer, &byte_offset)) ||
         type != napi_uint8_array ||
-        data == NULL) {
+        (data == NULL && length != 0)) {
         throw_type_error(env, label);
         return false;
     }
@@ -492,345 +389,229 @@ static bool get_uint8_array(
     return true;
 }
 
-static napi_value request_pool_new(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value args[4];
-    C2MemFfiNodeSymbols *symbols = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols)) || argc < 4) {
-        return throw_type_error(env, "c2_mem_ffi_request_pool_new expects prefix, segmentSize, maxSegments, and minBlockSize.");
-    }
-    char *prefix = read_string_arg(env, args[0], "prefix must be a string.");
-    if (prefix == NULL) {
-        return NULL;
-    }
-    uint32_t segment_size = 0;
-    uint32_t max_segments_u32 = 0;
-    uint32_t min_block_size = 0;
-    if (!read_uint32_arg(env, args[1], "segmentSize must be a u32 integer.", &segment_size) ||
-        !read_uint32_arg(env, args[2], "maxSegments must be a u32 integer.", &max_segments_u32) ||
-        !read_uint32_arg(env, args[3], "minBlockSize must be a u32 integer.", &min_block_size)) {
-        free(prefix);
-        return NULL;
-    }
-    if (max_segments_u32 > UINT16_MAX) {
-        free(prefix);
-        return throw_type_error(env, "maxSegments must fit in u16.");
-    }
-    C2MemFfiRequestPool *pool = NULL;
-    C2MemFfiStatus status = symbols->request_pool_new(prefix, segment_size, (uint16_t)max_segments_u32, min_block_size, &pool);
-    free(prefix);
-    napi_value external = NULL;
-    if (status == C2_MEM_FFI_STATUS_OK) {
-        external = make_pool_external(env, symbols, C2_MEM_FFI_NODE_REQUEST_POOL, pool);
-        if (external == NULL) {
-            symbols->request_pool_destroy(pool);
-            return NULL;
-        }
-    }
-    return make_status_result(env, status, external);
-}
-
 static napi_value abi_version_callback(napi_env env, napi_callback_info info) {
-    size_t argc = 0;
     C2MemFfiNodeSymbols *symbols = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, NULL, NULL, (void **)&symbols))) {
-        return throw_type_error(env, "c2_mem_ffi_abi_version could not read callback context.");
-    }
+    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, NULL, (void **)&symbols))) return NULL;
     napi_value value;
-    if (!check_napi(napi_create_uint32(env, symbols->abi_version(), &value))) {
-        return NULL;
-    }
+    if (!check_napi(napi_create_uint32(env, symbols->abi_version(), &value))) return NULL;
     return value;
 }
 
-static napi_value request_pool_destroy(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 1) {
-        return throw_type_error(env, "c2_mem_ffi_request_pool_destroy expects a pool handle.");
+enum MemoryKind { MEMORY_CONTEXT, MEMORY_REQUEST, MEMORY_RESPONSE, MEMORY_WRITE };
+typedef struct MemoryOwner {
+    C2MemFfiNodeSymbols *symbols;
+    enum MemoryKind kind;
+    void *ptr;
+} MemoryOwner;
+static const napi_type_tag memory_tag = { UINT64_C(0xb178382913ac77af), UINT64_C(0x17d088f27bcb0700) };
+static void memory_release(MemoryOwner *owner) {
+    if (owner->ptr == NULL) return;
+    switch (owner->kind) {
+    case MEMORY_CONTEXT: owner->symbols->memory_context_free(owner->ptr); break;
+    case MEMORY_REQUEST: owner->symbols->request_discard(owner->ptr); break;
+    case MEMORY_RESPONSE: owner->symbols->response_discard(owner->ptr); break;
+    case MEMORY_WRITE: owner->symbols->write_discard(owner->ptr); break;
     }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_REQUEST_POOL, &handle)) {
-        return NULL;
-    }
-    handle->symbols->request_pool_destroy((C2MemFfiRequestPool *)handle->ptr);
-    handle->ptr = NULL;
-    napi_value undefined;
-    napi_get_undefined(env, &undefined);
-    return undefined;
+    owner->ptr = NULL;
 }
-
-static napi_value request_pool_string(
-    napi_env env,
-    C2MemFfiRequestPool *pool,
-    C2MemFfiStatus (*len_fn)(const C2MemFfiRequestPool *, size_t *),
-    C2MemFfiStatus (*copy_fn)(const C2MemFfiRequestPool *, char *, size_t, size_t *)) {
-    size_t length = 0;
-    C2MemFfiStatus status = len_fn(pool, &length);
-    if (status != C2_MEM_FFI_STATUS_OK) {
-        return make_status_result(env, status, NULL);
+static void memory_finalize(napi_env env, void *data, void *hint) {
+    (void)env; (void)hint;
+    MemoryOwner *owner = data;
+    memory_release(owner);
+    free(owner);
+}
+static MemoryOwner *memory_owner(napi_env env, napi_value value, enum MemoryKind kind, bool live) {
+    bool tagged = false;
+    void *raw = NULL;
+    if (!check_napi(napi_check_object_type_tag(env, value, &memory_tag, &tagged)) || !tagged ||
+        !check_napi(napi_unwrap(env, value, &raw)) || raw == NULL) {
+        throw_type_error(env, "Expected an opaque ABI 7 memory owner."); return NULL;
     }
-    char *buffer = (char *)malloc(length + 1);
-    if (buffer == NULL) {
+    MemoryOwner *owner = raw;
+    if (owner->kind != kind || (live && owner->ptr == NULL)) {
+        throw_type_error(env, "ABI 7 memory owner is consumed or has a different kind."); return NULL;
+    }
+    return owner;
+}
+static napi_value memory_wrap(napi_env env, C2MemFfiNodeSymbols *symbols, enum MemoryKind kind, void *ptr) {
+    MemoryOwner *owner = malloc(sizeof(*owner));
+    if (owner == NULL) {
+        MemoryOwner temporary = { symbols, kind, ptr }; memory_release(&temporary);
         return throw_error(env, "Out of memory.");
     }
-    size_t written = 0;
-    status = copy_fn(pool, buffer, length + 1, &written);
+    *owner = (MemoryOwner){ symbols, kind, ptr };
+    napi_value object;
+    if (!check_napi(napi_create_object(env, &object)) || !check_napi(napi_type_tag_object(env, object, &memory_tag)) ||
+        !check_napi(napi_wrap(env, object, owner, memory_finalize, NULL, NULL))) {
+        memory_finalize(env, owner, NULL); return NULL;
+    }
+    return object;
+}
+static napi_value memory_bytes(napi_env env, size_t len, uint8_t **data) {
+    napi_value buffer, view;
+    if (!check_napi(napi_create_arraybuffer(env, len, (void **)data, &buffer)) ||
+        !check_napi(napi_create_typedarray(env, napi_uint8_array, len, buffer, 0, &view))) return NULL;
+    return view;
+}
+enum MemoryOp { M_PREFIX, M_HANDSHAKE, M_PREPARE, M_ADMIT, M_CONSUME, M_DISCARD_RESPONSE,
+    M_BEGIN, M_START, M_COMPLETE, M_RECEIVE, M_DEACTIVATE, M_PEER_END, M_TRY_CLOSE, M_CLOSE, M_DISCARD_REQUEST, M_DISCARD_WRITE };
+static napi_value memory_call(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2], receiver;
+    void *operation = NULL;
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, &operation))) return NULL;
+    enum MemoryOp op = (enum MemoryOp)(uintptr_t)operation;
+    bool needs_context = op != M_CLOSE && op != M_CONSUME && op != M_DISCARD_RESPONSE &&
+        op != M_DISCARD_REQUEST && op != M_COMPLETE && op != M_DISCARD_WRITE;
+    MemoryOwner *owner = memory_owner(env, receiver, MEMORY_CONTEXT, needs_context);
+    if (owner == NULL) return NULL;
+    C2MemFfiNodeSymbols *s = owner->symbols;
+    C2MemFfiMemoryContext *ctx = owner->ptr;
+    C2MemFfiStatus status = C2_MEM_FFI_STATUS_OK;
     napi_value value = NULL;
-    if (status == C2_MEM_FFI_STATUS_OK) {
-        if (!check_napi(napi_create_string_utf8(env, buffer, written, &value))) {
-            free(buffer);
+    MemoryOwner *created = NULL;
+    switch (op) {
+    case M_PREFIX: {
+        size_t len = 0, written = 0;
+        status = s->memory_context_prefix_len(ctx, &len);
+        if (status != C2_MEM_FFI_STATUS_OK) break;
+        char *buffer = malloc(len + 1);
+        if (buffer == NULL) return throw_error(env, "Out of memory.");
+        status = s->memory_context_prefix_copy(ctx, buffer, len + 1, &written);
+        if (status == C2_MEM_FFI_STATUS_OK && !check_napi(napi_create_string_utf8(env, buffer, written, &value))) value = NULL;
+        free(buffer); break;
+    }
+    case M_HANDSHAKE: {
+        if (argc != 1) return throw_type_error(env, "finishHandshake expects a prefix or null.");
+        napi_valuetype type;
+        if (!check_napi(napi_typeof(env, args[0], &type))) return NULL;
+        char *prefix = type == napi_null ? NULL : read_string_arg(env, args[0], "Expected response prefix.");
+        if (type != napi_null && prefix == NULL) return NULL;
+        status = s->memory_context_finish_handshake(ctx, prefix);
+        free(prefix); break;
+    }
+    case M_PREPARE: {
+        uint8_t *data = NULL; size_t len = 0; C2MemFfiRequest *request = NULL; C2MemFfiBlock block;
+        if (argc != 1 || !get_uint8_array(env, args[0], "Expected request bytes.", &data, &len)) return NULL;
+        status = s->request_prepare(ctx, data, len, &request, &block);
+        if (status == C2_MEM_FFI_STATUS_OK) {
+            value = memory_wrap(env, s, MEMORY_REQUEST, request);
+            if (value == NULL) return NULL;
+            created = memory_owner(env, value, MEMORY_REQUEST, true);
+            napi_value descriptor = make_block(env, block);
+            if (descriptor == NULL || !set_named_value(env, value, "block", descriptor)) { memory_release(created); return NULL; }
+        }
+        break;
+    }
+    case M_ADMIT: {
+        C2MemFfiBlock block; C2MemFfiResponse *response = NULL;
+        if (argc != 1 || !read_block(env, args[0], &block)) {
+            s->memory_context_deactivate(ctx);
             return NULL;
         }
+        status = s->response_admit(ctx, block, &response);
+        if (status == C2_MEM_FFI_STATUS_OK) {
+            value = memory_wrap(env, s, MEMORY_RESPONSE, response);
+            if (value == NULL) return NULL;
+            created = memory_owner(env, value, MEMORY_RESPONSE, true);
+        }
+        break;
     }
-    free(buffer);
-    return make_status_result(env, status, value);
-}
-
-static napi_value request_pool_prefix(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 1) {
-        return throw_type_error(env, "c2_mem_ffi_request_pool_prefix expects a pool handle.");
-    }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_REQUEST_POOL, &handle)) {
-        return NULL;
-    }
-    return request_pool_string(
-        env,
-        (C2MemFfiRequestPool *)handle->ptr,
-        handle->symbols->request_pool_prefix_len,
-        handle->symbols->request_pool_prefix_copy);
-}
-
-static napi_value request_pool_segment_name(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 2) {
-        return throw_type_error(env, "c2_mem_ffi_request_pool_segment_name expects a pool handle and segment index.");
-    }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    uint32_t index = 0;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_REQUEST_POOL, &handle) ||
-        !read_uint32_arg(env, args[1], "segmentIndex must be a u32 integer.", &index)) {
-        return NULL;
-    }
-    size_t length = 0;
-    C2MemFfiStatus status = handle->symbols->request_pool_segment_name_len((C2MemFfiRequestPool *)handle->ptr, index, &length);
-    if (status != C2_MEM_FFI_STATUS_OK) {
-        return make_status_result(env, status, NULL);
-    }
-    char *buffer = (char *)malloc(length + 1);
-    if (buffer == NULL) {
-        return throw_error(env, "Out of memory.");
-    }
-    size_t written = 0;
-    status = handle->symbols->request_pool_segment_name_copy((C2MemFfiRequestPool *)handle->ptr, index, buffer, length + 1, &written);
-    napi_value value = NULL;
-    if (status == C2_MEM_FFI_STATUS_OK) {
-        if (!check_napi(napi_create_string_utf8(env, buffer, written, &value))) {
-            free(buffer);
+    case M_CONSUME: {
+        if (argc != 2) return throw_type_error(env, "Expected owner and destination.");
+        MemoryOwner *item = memory_owner(env, args[0], MEMORY_RESPONSE, true);
+        if (item == NULL || item->symbols != s) return NULL;
+        uint8_t *dst = NULL; size_t len = 0, written = 0;
+        if (!get_uint8_array(env, args[1], "Expected destination bytes.", &dst, &len)) {
+            memory_release(item);
             return NULL;
         }
+        C2MemFfiResponse *response = item->ptr; item->ptr = NULL;
+        status = s->response_consume(response, dst, len, &written);
+        return make_status_number_result(env, status, (double)written);
     }
-    free(buffer);
-    return make_status_result(env, status, value);
-}
-
-static napi_value request_pool_segment_count(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 1) {
-        return throw_type_error(env, "c2_mem_ffi_request_pool_segment_count expects a pool handle.");
+    case M_DISCARD_RESPONSE: case M_DISCARD_REQUEST: case M_DISCARD_WRITE: {
+        if (argc != 1) return throw_type_error(env, "Expected memory owner.");
+        MemoryOwner *item = memory_owner(env, args[0], op == M_DISCARD_RESPONSE ? MEMORY_RESPONSE : op == M_DISCARD_WRITE ? MEMORY_WRITE : MEMORY_REQUEST, false);
+        if (item == NULL || item->symbols != s) return NULL;
+        memory_release(item); break;
     }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_REQUEST_POOL, &handle)) {
-        return NULL;
-    }
-    size_t count = 0;
-    C2MemFfiStatus status = handle->symbols->request_pool_segment_count((C2MemFfiRequestPool *)handle->ptr, &count);
-    return make_status_number_result(env, status, (double)count);
-}
-
-static napi_value request_pool_segment_data_size(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 2) {
-        return throw_type_error(env, "c2_mem_ffi_request_pool_segment_data_size expects a pool handle and segment index.");
-    }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    uint32_t index = 0;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_REQUEST_POOL, &handle) ||
-        !read_uint32_arg(env, args[1], "segmentIndex must be a u32 integer.", &index)) {
-        return NULL;
-    }
-    uint32_t size = 0;
-    C2MemFfiStatus status = handle->symbols->request_pool_segment_data_size((C2MemFfiRequestPool *)handle->ptr, index, &size);
-    return make_status_number_result(env, status, (double)size);
-}
-
-static napi_value request_pool_write(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 2) {
-        return throw_type_error(env, "c2_mem_ffi_request_pool_write expects a pool handle and Uint8Array payload.");
-    }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    uint8_t *data = NULL;
-    size_t data_len = 0;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_REQUEST_POOL, &handle) ||
-        !get_uint8_array(env, args[1], "payload must be a Uint8Array.", &data, &data_len)) {
-        return NULL;
-    }
-    C2MemFfiRequestBlock block;
-    memset(&block, 0, sizeof(block));
-    C2MemFfiStatus status = handle->symbols->request_pool_write((C2MemFfiRequestPool *)handle->ptr, data, data_len, &block);
-    napi_value value = NULL;
-    if (status == C2_MEM_FFI_STATUS_OK) {
-        value = make_request_block(env, block);
-        if (value == NULL) {
-            return NULL;
+    case M_BEGIN: {
+        if (argc < 1) return throw_type_error(env, "beginWrite expects kind and optional request.");
+        uint32_t kind = 0;
+        if (!read_uint32_arg(env, args[0], "Expected write kind.", &kind) || kind > 2) return NULL;
+        C2MemFfiRequest *request = NULL;
+        if (argc == 2) {
+            MemoryOwner *item = memory_owner(env, args[1], MEMORY_REQUEST, true);
+            if (item == NULL || item->symbols != s) return NULL;
+            request = item->ptr; item->ptr = NULL;
         }
-    }
-    return make_status_result(env, status, value);
-}
-
-static napi_value request_pool_read_local(napi_env env, napi_callback_info info) {
-    size_t argc = 3;
-    napi_value args[3];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 3) {
-        return throw_type_error(env, "c2_mem_ffi_request_pool_read_local expects a pool handle, block, and Uint8Array destination.");
-    }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    C2MemFfiRequestBlock block;
-    uint8_t *destination = NULL;
-    size_t destination_len = 0;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_REQUEST_POOL, &handle) ||
-        !read_request_block(env, args[1], &block) ||
-        !get_uint8_array(env, args[2], "destination must be a Uint8Array.", &destination, &destination_len)) {
-        return NULL;
-    }
-    size_t out_read = 0;
-    C2MemFfiStatus status = handle->symbols->request_pool_read_local((C2MemFfiRequestPool *)handle->ptr, block, destination, destination_len, &out_read);
-    return make_status_number_result(env, status, (double)out_read);
-}
-
-static napi_value request_pool_release_like(napi_env env, napi_callback_info info, bool forget_consumed) {
-    size_t argc = 2;
-    napi_value args[2];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 2) {
-        return throw_type_error(env, "c2_mem_ffi request pool ownership call expects a pool handle and block.");
-    }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    C2MemFfiRequestBlock block;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_REQUEST_POOL, &handle) ||
-        !read_request_block(env, args[1], &block)) {
-        return NULL;
-    }
-    C2MemFfiStatus status = forget_consumed
-        ? handle->symbols->request_pool_forget_consumed((C2MemFfiRequestPool *)handle->ptr, block)
-        : handle->symbols->request_pool_release((C2MemFfiRequestPool *)handle->ptr, block);
-    return make_status_result(env, status, NULL);
-}
-
-static napi_value request_pool_release(napi_env env, napi_callback_info info) {
-    return request_pool_release_like(env, info, false);
-}
-
-static napi_value request_pool_forget_consumed(napi_env env, napi_callback_info info) {
-    return request_pool_release_like(env, info, true);
-}
-
-static napi_value response_pool_new(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value args[4];
-    C2MemFfiNodeSymbols *symbols = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols)) || argc < 4) {
-        return throw_type_error(env, "c2_mem_ffi_response_pool_new expects prefix, segmentSize, maxSegments, and minBlockSize.");
-    }
-    char *prefix = read_string_arg(env, args[0], "prefix must be a string.");
-    if (prefix == NULL) {
-        return NULL;
-    }
-    uint32_t segment_size = 0;
-    uint32_t max_segments_u32 = 0;
-    uint32_t min_block_size = 0;
-    if (!read_uint32_arg(env, args[1], "segmentSize must be a u32 integer.", &segment_size) ||
-        !read_uint32_arg(env, args[2], "maxSegments must be a u32 integer.", &max_segments_u32) ||
-        !read_uint32_arg(env, args[3], "minBlockSize must be a u32 integer.", &min_block_size)) {
-        free(prefix);
-        return NULL;
-    }
-    if (max_segments_u32 > UINT16_MAX) {
-        free(prefix);
-        return throw_type_error(env, "maxSegments must fit in u16.");
-    }
-    C2MemFfiResponsePool *pool = NULL;
-    C2MemFfiStatus status = symbols->response_pool_new(prefix, segment_size, (uint16_t)max_segments_u32, min_block_size, &pool);
-    free(prefix);
-    napi_value external = NULL;
-    if (status == C2_MEM_FFI_STATUS_OK) {
-        external = make_pool_external(env, symbols, C2_MEM_FFI_NODE_RESPONSE_POOL, pool);
-        if (external == NULL) {
-            symbols->response_pool_destroy(pool);
-            return NULL;
+        C2MemFfiWrite *write = NULL;
+        status = s->write_begin(ctx, request, (uint8_t)kind, &write);
+        if (status == C2_MEM_FFI_STATUS_OK && write != NULL) {
+            value = memory_wrap(env, s, MEMORY_WRITE, write);
+            if (value == NULL) return NULL;
+            created = memory_owner(env, value, MEMORY_WRITE, true);
+            size_t len = 0; uint8_t *data = NULL;
+            status = s->write_prefix_len(write, &len);
+            napi_value prefix = status == C2_MEM_FFI_STATUS_OK ? memory_bytes(env, len, &data) : NULL;
+            if (prefix == NULL) { memory_release(created); return NULL; }
+            status = s->write_prefix_copy(write, data, len);
+            if (!set_named_value(env, value, "prefix", prefix)) { memory_release(created); return NULL; }
         }
+        break;
     }
-    return make_status_result(env, status, external);
+    case M_START: case M_COMPLETE: {
+        if (argc < 1) return throw_type_error(env, "Expected write owner.");
+        MemoryOwner *item = memory_owner(env, args[0], MEMORY_WRITE, true);
+        if (item == NULL || item->symbols != s) return NULL;
+        if (op == M_START) status = s->write_start(item->ptr);
+        else {
+            bool success = false;
+            if (argc != 2 || !check_napi(napi_get_value_bool(env, args[1], &success))) return throw_type_error(env, "Expected write outcome.");
+            C2MemFfiWrite *write = item->ptr; item->ptr = NULL;
+            status = s->write_complete(write, success ? 1 : 0);
+        }
+        break;
+    }
+    case M_RECEIVE: {
+        uint8_t *data = NULL; size_t len = 0;
+        if (argc != 1 || !get_uint8_array(env, args[0], "Expected release frame.", &data, &len)) return NULL;
+        status = s->memory_context_receive_release(ctx, data, len); break;
+    }
+    case M_DEACTIVATE: status = s->memory_context_deactivate(ctx); break;
+    case M_PEER_END: status = s->memory_context_peer_end(ctx); break;
+    case M_TRY_CLOSE: {
+        uint8_t closed = 0;
+        status = s->memory_context_try_close(ctx, &closed);
+        if (!check_napi(napi_get_boolean(env, closed != 0, &value))) return NULL;
+        break;
+    }
+    case M_CLOSE: memory_release(owner); break;
+    }
+    napi_value result = make_status_result(env, status, value);
+    if (created != NULL && (result == NULL || status != C2_MEM_FFI_STATUS_OK)) memory_release(created);
+    return result;
 }
-
-static napi_value response_pool_destroy(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 1) {
-        return throw_type_error(env, "c2_mem_ffi_response_pool_destroy expects a pool handle.");
+static napi_value make_memory(napi_env env, C2MemFfiNodeSymbols *symbols, uintptr_t connection, uintptr_t process) {
+    C2MemFfiMemoryContext *ctx = NULL;
+    C2MemFfiStatus status = symbols->memory_context_new(connection, process, &ctx);
+    if (status != C2_MEM_FFI_STATUS_OK) return throw_error(env, "Failed to bind memory to the verified connection.");
+    napi_value object = memory_wrap(env, symbols, MEMORY_CONTEXT, ctx);
+    if (object == NULL) return NULL;
+#define METHOD(name, op) { name, NULL, memory_call, NULL, NULL, NULL, napi_default, (void *)(uintptr_t)op }
+    napi_property_descriptor methods[] = {
+        METHOD("prefix", M_PREFIX), METHOD("finishHandshake", M_HANDSHAKE), METHOD("prepareRequest", M_PREPARE),
+        METHOD("admitResponse", M_ADMIT), METHOD("consumeResponse", M_CONSUME), METHOD("discardResponse", M_DISCARD_RESPONSE),
+        METHOD("beginWrite", M_BEGIN), METHOD("startWrite", M_START), METHOD("completeWrite", M_COMPLETE),
+        METHOD("receiveRelease", M_RECEIVE), METHOD("deactivate", M_DEACTIVATE), METHOD("peerEnd", M_PEER_END),
+        METHOD("tryClose", M_TRY_CLOSE), METHOD("close", M_CLOSE), METHOD("discardRequest", M_DISCARD_REQUEST), METHOD("discardWrite", M_DISCARD_WRITE),
+    };
+#undef METHOD
+    if (!check_napi(napi_define_properties(env, object, sizeof(methods) / sizeof(methods[0]), methods))) {
+        memory_release(memory_owner(env, object, MEMORY_CONTEXT, true)); return NULL;
     }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_RESPONSE_POOL, &handle)) {
-        return NULL;
-    }
-    handle->symbols->response_pool_destroy((C2MemFfiResponsePool *)handle->ptr);
-    handle->ptr = NULL;
-    napi_value undefined;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static napi_value response_pool_read(napi_env env, napi_callback_info info) {
-    size_t argc = 3;
-    napi_value args[3];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 3) {
-        return throw_type_error(env, "c2_mem_ffi_response_pool_read expects a pool handle, block, and Uint8Array destination.");
-    }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    C2MemFfiResponseBlock block;
-    uint8_t *destination = NULL;
-    size_t destination_len = 0;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_RESPONSE_POOL, &handle) ||
-        !read_response_block(env, args[1], &block) ||
-        !get_uint8_array(env, args[2], "destination must be a Uint8Array.", &destination, &destination_len)) {
-        return NULL;
-    }
-    size_t out_read = 0;
-    C2MemFfiStatus status = handle->symbols->response_pool_read((C2MemFfiResponsePool *)handle->ptr, block, destination, destination_len, &out_read);
-    return make_status_number_result(env, status, (double)out_read);
-}
-
-static napi_value response_pool_release(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 2) {
-        return throw_type_error(env, "c2_mem_ffi_response_pool_release expects a pool handle and block.");
-    }
-    C2MemFfiNodePoolHandle *handle = NULL;
-    C2MemFfiResponseBlock block;
-    if (!get_external_handle(env, args[0], C2_MEM_FFI_NODE_RESPONSE_POOL, &handle) ||
-        !read_response_block(env, args[1], &block)) {
-        return NULL;
-    }
-    C2MemFfiStatus status = handle->symbols->response_pool_release((C2MemFfiResponsePool *)handle->ptr, block);
-    return make_status_result(env, status, NULL);
+    return object;
 }
 
 /* A null address selects the namespace id query on the same captured context. */
@@ -974,9 +755,9 @@ static napi_value endpoint_context_close(napi_env env, napi_callback_info info) 
 
 /* A descriptor remains owned until explicitly taken by Node's Socket. An
  * ignored async result is closed by GC; every failed handoff closes it here. */
-typedef struct NativeSocketFd { int32_t fd; } NativeSocketFd;
+typedef struct NativeSocketFd { int32_t fd; C2MemFfiNodeSymbols *symbols; bool memory_taken; } NativeSocketFd;
 static const napi_type_tag socket_fd_tag = {
-    UINT64_C(0xb82cd6be1d234b99), UINT64_C(0x9b4e465211132206)
+    UINT64_C(0xb82cd6be1d234b9a), UINT64_C(0x9b4e465211132206)
 };
 
 #ifdef _WIN32
@@ -1063,6 +844,15 @@ static NativeSocketFd *socket_fd_receiver(napi_env env, napi_callback_info info)
     return (NativeSocketFd *)raw;
 }
 
+static napi_value socket_fd_take_memory(napi_env env, napi_callback_info info) {
+    NativeSocketFd *owner = socket_fd_receiver(env, info);
+    if (owner == NULL) return NULL;
+    if (owner->fd < 0 || owner->memory_taken) return throw_type_error(env, "Native memory context was already transferred or socket closed.");
+    napi_value memory = make_memory(env, owner->symbols, (uintptr_t)owner->fd, 0);
+    if (memory != NULL) owner->memory_taken = true;
+    return memory;
+}
+
 static napi_value socket_fd_take(napi_env env, napi_callback_info info) {
     NativeSocketFd *owner = socket_fd_receiver(env, info);
     if (owner == NULL) return NULL;
@@ -1083,17 +873,20 @@ static napi_value socket_fd_close(napi_env env, napi_callback_info info) {
     return value;
 }
 
-static napi_value socket_fd_object(napi_env env, int32_t fd, NativeSocketFd **out_owner) {
+static napi_value socket_fd_object(napi_env env, C2MemFfiNodeSymbols *symbols, int32_t fd, NativeSocketFd **out_owner) {
     NativeSocketFd *owner = (NativeSocketFd *)malloc(sizeof(*owner));
     if (owner == NULL) { close_socket_fd(fd); return throw_error(env, "Out of memory."); }
     owner->fd = fd;
+    owner->symbols = symbols;
+    owner->memory_taken = false;
     napi_value object;
     napi_property_descriptor methods[] = {
+        { "takeMemory", NULL, socket_fd_take_memory, NULL, NULL, NULL, napi_default, NULL },
         { "takeFd", NULL, socket_fd_take, NULL, NULL, NULL, napi_default, NULL },
         { "close", NULL, socket_fd_close, NULL, NULL, NULL, napi_default, NULL },
     };
     if (!check_napi(napi_create_object(env, &object)) ||
-        !check_napi(napi_define_properties(env, object, 2, methods)) ||
+        !check_napi(napi_define_properties(env, object, 3, methods)) ||
         !check_napi(napi_type_tag_object(env, object, &socket_fd_tag)) ||
         !check_napi(napi_wrap(env, object, owner, socket_fd_finalize, NULL, NULL))) {
         socket_fd_finalize(env, owner, NULL);
@@ -1139,7 +932,7 @@ static void endpoint_connect_complete(napi_env env, napi_status status, void *da
     if (work->status == C2_MEM_FFI_STATUS_OK) {
         int32_t fd = work->fd;
         work->fd = -1;
-        value = socket_fd_object(env, fd, &owner);
+        value = socket_fd_object(env, work->context->symbols, fd, &owner);
     }
     napi_value result = make_status_result(env, work->status, value);
     if (result == NULL || !check_napi(napi_resolve_deferred(env, work->deferred, result))) {
@@ -1183,9 +976,12 @@ static napi_value endpoint_context_connect(napi_env env, napi_callback_info info
 typedef struct NativeWindowsSocket {
     int32_t fd;        /* -1 once transferred to Node or closed */
     uintptr_t process; /* server process pin; 0 once released */
+    uintptr_t pipe; /* borrowed from fd, only before transfer */
+    C2MemFfiNodeSymbols *symbols;
+    bool memory_taken;
 } NativeWindowsSocket;
 static const napi_type_tag windows_socket_tag = {
-    UINT64_C(0x2f6b97d84c0a51e3), UINT64_C(0x6a1c40fe93b7d208)
+    UINT64_C(0x2f6b97d84c0a51e3), UINT64_C(0x6a1c40fe93b7d209)
 };
 
 static void windows_socket_release(NativeWindowsSocket *owner) {
@@ -1223,6 +1019,15 @@ static NativeWindowsSocket *windows_socket_receiver(napi_env env, napi_callback_
     return (NativeWindowsSocket *)raw;
 }
 
+static napi_value windows_socket_take_memory(napi_env env, napi_callback_info info) {
+    NativeWindowsSocket *owner = windows_socket_receiver(env, info);
+    if (owner == NULL) return NULL;
+    if (owner->fd < 0 || owner->memory_taken) return throw_type_error(env, "Native memory context was already transferred or pipe closed.");
+    napi_value memory = make_memory(env, owner->symbols, owner->pipe, owner->process);
+    if (memory != NULL) owner->memory_taken = true;
+    return memory;
+}
+
 static napi_value windows_socket_take(napi_env env, napi_callback_info info) {
     NativeWindowsSocket *owner = windows_socket_receiver(env, info);
     if (owner == NULL) return NULL;
@@ -1242,7 +1047,7 @@ static napi_value windows_socket_close(napi_env env, napi_callback_info info) {
     return value;
 }
 
-static napi_value windows_socket_object(napi_env env, int32_t fd, uintptr_t process, NativeWindowsSocket **out_owner) {
+static napi_value windows_socket_object(napi_env env, C2MemFfiNodeSymbols *symbols, uintptr_t pipe, int32_t fd, uintptr_t process, NativeWindowsSocket **out_owner) {
     NativeWindowsSocket *owner = (NativeWindowsSocket *)malloc(sizeof(*owner));
     if (owner == NULL) {
         close_socket_fd(fd);
@@ -1253,13 +1058,17 @@ static napi_value windows_socket_object(napi_env env, int32_t fd, uintptr_t proc
     }
     owner->fd = fd;
     owner->process = process;
+    owner->pipe = pipe;
+    owner->symbols = symbols;
+    owner->memory_taken = false;
     napi_value object;
     napi_property_descriptor methods[] = {
+        { "takeMemory", NULL, windows_socket_take_memory, NULL, NULL, NULL, napi_default, NULL },
         { "takeFd", NULL, windows_socket_take, NULL, NULL, NULL, napi_default, NULL },
         { "close", NULL, windows_socket_close, NULL, NULL, NULL, napi_default, NULL },
     };
     if (!check_napi(napi_create_object(env, &object)) ||
-        !check_napi(napi_define_properties(env, object, 2, methods)) ||
+        !check_napi(napi_define_properties(env, object, 3, methods)) ||
         !check_napi(napi_type_tag_object(env, object, &windows_socket_tag)) ||
         !check_napi(napi_wrap(env, object, owner, windows_socket_finalize, NULL, NULL))) {
         windows_socket_finalize(env, owner, NULL);
@@ -1330,6 +1139,7 @@ static void windows_connect_complete(napi_env env, napi_status status, void *dat
         windows_connect_discard_handles(work);
     }
     NativeWindowsSocket *owner = NULL;
+    uintptr_t verified_pipe = 0;
     napi_value value = NULL;
     if (work->status == C2_MEM_FFI_STATUS_OK) {
         int32_t fd = -1;
@@ -1359,6 +1169,7 @@ static void windows_connect_complete(napi_env env, napi_status status, void *dat
         /* Ownership handoff: only after a successful conversion does the CRT
          * descriptor own the pipe handle; the work entry keeps the process
          * pin until the socket owner below takes it over. */
+        verified_pipe = work->pipe;
         work->pipe = 0;
         /* Node PlatformInit occupies stdio slots; Windows libuv never closes
          * them. A native embedder that bypasses that initialization is outside
@@ -1372,7 +1183,7 @@ static void windows_connect_complete(napi_env env, napi_status status, void *dat
         if (work->status == C2_MEM_FFI_STATUS_OK) {
             uintptr_t process = work->process;
             work->process = 0; /* The socket owner now pins the server process. */
-            value = windows_socket_object(env, fd, process, &owner);
+            value = windows_socket_object(env, work->context->symbols, verified_pipe, fd, process, &owner);
             if (value == NULL) {
                 /* windows_socket_object released the descriptor and process pin. */
                 windows_connect_dispose(env, work);
@@ -1542,22 +1353,26 @@ static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
     LOAD_REQUIRED(endpoint_context_namespace_id_copy, "c2_mem_ffi_local_endpoint_context_namespace_id_copy");
     LOAD_REQUIRED(endpoint_context_connect_unix, "c2_mem_ffi_local_endpoint_context_connect_unix");
     LOAD_REQUIRED(endpoint_context_connect_windows, "c2_mem_ffi_local_endpoint_context_connect_windows");
-    LOAD_REQUIRED(request_pool_new, "c2_mem_ffi_request_pool_new");
-    LOAD_REQUIRED(request_pool_destroy, "c2_mem_ffi_request_pool_destroy");
-    LOAD_REQUIRED(request_pool_prefix_len, "c2_mem_ffi_request_pool_prefix_len");
-    LOAD_REQUIRED(request_pool_prefix_copy, "c2_mem_ffi_request_pool_prefix_copy");
-    LOAD_REQUIRED(request_pool_segment_count, "c2_mem_ffi_request_pool_segment_count");
-    LOAD_REQUIRED(request_pool_segment_name_len, "c2_mem_ffi_request_pool_segment_name_len");
-    LOAD_REQUIRED(request_pool_segment_name_copy, "c2_mem_ffi_request_pool_segment_name_copy");
-    LOAD_REQUIRED(request_pool_segment_data_size, "c2_mem_ffi_request_pool_segment_data_size");
-    LOAD_REQUIRED(request_pool_write, "c2_mem_ffi_request_pool_write");
-    LOAD_REQUIRED(request_pool_read_local, "c2_mem_ffi_request_pool_read_local");
-    LOAD_REQUIRED(request_pool_release, "c2_mem_ffi_request_pool_release");
-    LOAD_REQUIRED(request_pool_forget_consumed, "c2_mem_ffi_request_pool_forget_consumed");
-    LOAD_REQUIRED(response_pool_new, "c2_mem_ffi_response_pool_new");
-    LOAD_REQUIRED(response_pool_destroy, "c2_mem_ffi_response_pool_destroy");
-    LOAD_REQUIRED(response_pool_read, "c2_mem_ffi_response_pool_read");
-    LOAD_REQUIRED(response_pool_release, "c2_mem_ffi_response_pool_release");
+    LOAD_REQUIRED(memory_context_new, "c2_mem_ffi_memory_context_new");
+    LOAD_REQUIRED(memory_context_free, "c2_mem_ffi_memory_context_free");
+    LOAD_REQUIRED(memory_context_prefix_len, "c2_mem_ffi_memory_context_prefix_len");
+    LOAD_REQUIRED(memory_context_prefix_copy, "c2_mem_ffi_memory_context_prefix_copy");
+    LOAD_REQUIRED(memory_context_finish_handshake, "c2_mem_ffi_memory_context_finish_handshake");
+    LOAD_REQUIRED(request_prepare, "c2_mem_ffi_request_prepare");
+    LOAD_REQUIRED(request_discard, "c2_mem_ffi_request_discard");
+    LOAD_REQUIRED(response_admit, "c2_mem_ffi_response_admit");
+    LOAD_REQUIRED(response_consume, "c2_mem_ffi_response_consume");
+    LOAD_REQUIRED(response_discard, "c2_mem_ffi_response_discard");
+    LOAD_REQUIRED(memory_context_receive_release, "c2_mem_ffi_memory_context_receive_release");
+    LOAD_REQUIRED(write_begin, "c2_mem_ffi_write_begin");
+    LOAD_REQUIRED(write_prefix_len, "c2_mem_ffi_write_prefix_len");
+    LOAD_REQUIRED(write_prefix_copy, "c2_mem_ffi_write_prefix_copy");
+    LOAD_REQUIRED(write_start, "c2_mem_ffi_write_start");
+    LOAD_REQUIRED(write_complete, "c2_mem_ffi_write_complete");
+    LOAD_REQUIRED(write_discard, "c2_mem_ffi_write_discard");
+    LOAD_REQUIRED(memory_context_deactivate, "c2_mem_ffi_memory_context_deactivate");
+    LOAD_REQUIRED(memory_context_peer_end, "c2_mem_ffi_memory_context_peer_end");
+    LOAD_REQUIRED(memory_context_try_close, "c2_mem_ffi_memory_context_try_close");
 #undef LOAD_REQUIRED
     return true;
 }
@@ -1606,24 +1421,10 @@ static napi_value load(napi_env env, napi_callback_info info) {
         free(symbols);
         return NULL;
     }
-    if (!set_function(env, object, "c2_mem_ffi_request_pool_new", request_pool_new, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_abi_version", abi_version_callback, symbols) ||
+    if (!set_function(env, object, "c2_mem_ffi_abi_version", abi_version_callback, symbols) ||
         !set_function(env, object, "c2_mem_ffi_local_endpoint", local_endpoint, symbols) ||
         !set_function(env, object, "c2_mem_ffi_local_endpoint_context_capture", endpoint_context_capture, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_endpoint_context_connect_windows", endpoint_context_connect_windows_verified, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_request_pool_destroy", request_pool_destroy, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_request_pool_prefix", request_pool_prefix, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_request_pool_segment_count", request_pool_segment_count, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_request_pool_segment_name", request_pool_segment_name, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_request_pool_segment_data_size", request_pool_segment_data_size, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_request_pool_write", request_pool_write, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_request_pool_read_local", request_pool_read_local, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_request_pool_release", request_pool_release, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_request_pool_forget_consumed", request_pool_forget_consumed, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_response_pool_new", response_pool_new, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_response_pool_destroy", response_pool_destroy, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_response_pool_read", response_pool_read, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_response_pool_release", response_pool_release, symbols)) {
+        !set_function(env, object, "c2_mem_ffi_endpoint_context_connect_windows", endpoint_context_connect_windows_verified, symbols)) {
         close_library(library);
         free(symbols);
         return NULL;

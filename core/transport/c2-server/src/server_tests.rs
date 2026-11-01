@@ -3298,6 +3298,52 @@ async fn established_raw_disconnect_receives_ack() {
         .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_disconnect_before_eof_preserves_peer_close_message_as_first_cause() {
+    let server = Arc::new(
+        test_server_new(
+            &unique_readiness_address("disconnect_first_cause"),
+            ServerIpcConfig::default(),
+        )
+        .unwrap(),
+    );
+    for _ in 0..16 {
+        let events = server.connection_events();
+        let (mut client, stream) = isolated_pair().await;
+        let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+        handshake_test_client(&mut client).await;
+        let observation = match tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        {
+            c2_local::ConnectionEvent::Opened(observation) => observation,
+            event => panic!("expected accepted connection: {event:?}"),
+        };
+        client
+            .write_all(&encode_frame(
+                0,
+                FLAG_SIGNAL,
+                &c2_wire::msg_type::DISCONNECT_BYTES,
+            ))
+            .await
+            .unwrap();
+        // The ordinary closer does not consume the ACK before dropping its OS stream.
+        drop(client);
+        let closed = observation
+            .wait_closed(Some(Duration::from_secs(2)))
+            .await
+            .unwrap();
+        assert_eq!(closed.reason(), ConnectionEndReason::PeerCloseMessage);
+        assert_eq!(closed.operation(), "disconnect");
+        tokio::time::timeout(Duration::from_secs(2), handler)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn established_raw_shutdown_receives_single_byte_ack() {
     let server = Arc::new(
@@ -5929,7 +5975,7 @@ async fn committed_route_waiting_for_admission_projects_closed_register_committe
     assert_eq!(record.state, RouteStateWire::Closed);
     assert_eq!(
         record.state_reason,
-        Some(RouteStateReasonWire::RegisterCommitted)
+        RouteStateReasonWire::RegisterCommitted
     );
     assert!(scheduler.snapshot().closed);
     assert_eq!(
@@ -5942,7 +5988,7 @@ async fn committed_route_waiting_for_admission_projects_closed_register_committe
     assert_eq!(record.state, RouteStateWire::Ready);
     assert_eq!(
         record.state_reason,
-        Some(RouteStateReasonWire::RegisterCommitted)
+        RouteStateReasonWire::RegisterCommitted
     );
     drop(scheduler.try_acquire(0).unwrap());
     let route = server.dispatcher.read().await.resolve("grid").unwrap();
@@ -5951,7 +5997,7 @@ async fn committed_route_waiting_for_admission_projects_closed_register_committe
     assert_eq!(record.state, RouteStateWire::Closed);
     assert_eq!(
         record.state_reason,
-        Some(RouteStateReasonWire::ExplicitUnregister)
+        RouteStateReasonWire::ExplicitUnregister
     );
     assert!(scheduler.snapshot().closed);
     assert!(!scheduler.open_admission_for_registration());
@@ -5973,7 +6019,7 @@ async fn host_close_retires_committed_route_before_admission() {
     assert_eq!(server.close_business_admission("maintenance").await, 1);
     let record = route_records(&server).await.pop().unwrap();
     assert_eq!(record.state, RouteStateWire::Closed);
-    assert_eq!(record.state_reason, Some(RouteStateReasonWire::Shutdown));
+    assert_eq!(record.state_reason, RouteStateReasonWire::Shutdown);
     assert!(server.open_route_admission(token).await.is_err());
     assert!(scheduler.snapshot().closed);
     assert_eq!(server.close_business_admission("maintenance").await, 0);
@@ -6006,4 +6052,281 @@ async fn aborted_and_dropped_reservations_terminally_close_their_schedulers() {
         );
         assert!(!server.contains_route("grid").await);
     }
+}
+
+struct ShutdownReplyFixture {
+    server: Arc<Server>,
+    peer: LocalStream,
+    conn: Arc<Connection>,
+    runner: Option<tokio::task::JoinHandle<Result<(), ServerError>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+impl ShutdownReplyFixture {
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+    async fn start(response: Vec<u8>) -> Self {
+        Self::start_with_request(response, false).await
+    }
+    async fn start_with_request(response: Vec<u8>, chunked: bool) -> Self {
+        Self::start_with_outcome(response, chunked, false).await
+    }
+    async fn start_with_outcome(response: Vec<u8>, chunked: bool, fail: bool) -> Self {
+        struct Callback {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+            completed: Arc<std::sync::atomic::AtomicBool>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            response: Vec<u8>,
+            fail: bool,
+        }
+        impl CrmCallback for Callback {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                _: Vec<u8>,
+                _: Arc<crate::ResponsePool>,
+            ) -> Result<ResponseMeta, CrmError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut released = self.release.0.lock().unwrap();
+                while !*released {
+                    released = self.release.1.wait(released).unwrap();
+                }
+                self.completed.store(true, Ordering::SeqCst);
+                if self.fail {
+                    Err(CrmError::InternalError("expected callback failure".into()))
+                } else {
+                    Ok(ResponseMeta::Inline(self.response.clone()))
+                }
+            }
+        }
+        let server = Arc::new(
+            test_server_new(
+                &unique_readiness_address("shutdown_reply"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut route = make_host_route(&server, "grid");
+        route.callback = Arc::new(Callback {
+            calls: calls.clone(),
+            completed: completed.clone(),
+            release: release.clone(),
+            response,
+            fail,
+        });
+        server.register_route(route).await.unwrap();
+        let running = server.clone();
+        let runner = tokio::spawn(async move { running.run().await });
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let events = server.connection_events();
+        let mut peer = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        handshake_test_client(&mut peer).await;
+        let observation = match events.recv().await.unwrap().unwrap() {
+            c2_local::ConnectionEvent::Opened(observation) => observation,
+            event => panic!("expected Opened: {event:?}"),
+        };
+        let conn = server
+            .active_connection(observation.connection_id())
+            .unwrap();
+        let mut fixture = Self {
+            server,
+            peer,
+            conn,
+            runner: Some(runner),
+            calls,
+            completed,
+            release,
+        };
+        let payload = c2_wire::control::encode_call_control(&call_identity("grid"), 0);
+        if chunked {
+            for index in 0..2 {
+                fixture
+                    .peer
+                    .write_all(&chunked_call_frame(1, index, 2, &[7, 8], "grid"))
+                    .await
+                    .unwrap();
+            }
+        } else {
+            fixture
+                .peer
+                .write_all(&encode_frame(1, c2_wire::flags::FLAG_CALL_V2, &payload))
+                .await
+                .unwrap();
+        }
+        wait_until("callback entered before shutdown", || {
+            fixture.calls.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        fixture
+    }
+}
+impl Drop for ShutdownReplyFixture {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_preserves_active_reply_refuses_new_calls_and_fences_lifecycle_hook() {
+    for (same_connection, chunked_request) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let mut f =
+            ShutdownReplyFixture::start_with_request(b"done".to_vec(), chunked_request).await;
+        let hook_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = {
+            let server = f.server.clone();
+            let completed = f.completed.clone();
+            let hook_called = hook_called.clone();
+            tokio::spawn(async move {
+                server.wait_until_terminal().await.unwrap();
+                assert!(
+                    completed.load(Ordering::SeqCst),
+                    "shutdown hook cannot precede the active callback"
+                );
+                hook_called.store(true, Ordering::SeqCst);
+            })
+        };
+        let shutdown = encode_frame(
+            99,
+            FLAG_SIGNAL,
+            &c2_wire::shutdown_control::encode_shutdown_initiate(),
+        );
+        if same_connection {
+            f.peer.write_all(&shutdown).await.unwrap();
+            assert_eq!(read_reply_frame(&mut f.peer).await.0, 99);
+        } else {
+            let mut admin =
+                LocalStream::connect(f.server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
+                    .await
+                    .unwrap();
+            admin.write_all(&shutdown).await.unwrap();
+            assert_eq!(read_reply_frame(&mut admin).await.0, 99);
+        }
+        assert!(
+            !f.conn.is_cancelled(),
+            "active response must retain business write admission"
+        );
+        let payload = c2_wire::control::encode_call_control(&call_identity("grid"), 0);
+        f.peer
+            .write_all(&encode_frame(2, c2_wire::flags::FLAG_CALL_V2, &payload))
+            .await
+            .unwrap();
+        let (id, _, reply) = read_reply_frame(&mut f.peer).await;
+        assert_eq!(id, 2);
+        assert!(matches!(
+            c2_wire::control::decode_reply_control(&reply, 0).unwrap().0,
+            ReplyControl::Error(_)
+        ));
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            1,
+            "shutdown admission must reject the new callback"
+        );
+        assert!(
+            f.server
+                .wait_until_stopped(Duration::from_millis(30))
+                .await
+                .is_err()
+        );
+        assert!(!hook_called.load(Ordering::SeqCst));
+        f.release();
+        let (id, _, reply) = read_reply_frame(&mut f.peer).await;
+        assert_eq!(id, 1);
+        let (control, consumed) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+        assert!(matches!(control, ReplyControl::Success));
+        assert_eq!(&reply[consumed..], b"done");
+        f.runner.take().unwrap().await.unwrap().unwrap();
+        hook.await.unwrap();
+        assert!(hook_called.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_keeps_response_flight_until_chunked_reply_flushes() {
+    const SIZE: usize = 4 * 1024 * 1024;
+    let mut f = ShutdownReplyFixture::start(vec![0x5b; SIZE]).await;
+    f.server.request_shutdown_signal();
+    f.release();
+    wait_until("callback completed before blocked response drain", || {
+        f.completed.load(Ordering::SeqCst)
+    })
+    .await;
+    // The peer deliberately withholds reads. The response exceeds the native
+    // stream buffer, so callback completion cannot be mistaken for reply flush.
+    assert!(
+        f.server
+            .wait_until_stopped(Duration::from_millis(50))
+            .await
+            .is_err()
+    );
+    assert_eq!(f.conn.inflight_count(), 1);
+    let mut received = 0;
+    let mut index = 0;
+    loop {
+        let (id, flags, payload) = read_reply_frame(&mut f.peer).await;
+        assert_eq!(id, 1);
+        assert!(c2_wire::flags::is_chunked(flags));
+        let (size, total, chunk, meta) =
+            c2_wire::chunk::header::decode_reply_chunk_meta(&payload, 0).unwrap();
+        assert_eq!(size as usize, SIZE);
+        assert!(total > 1);
+        assert_eq!(chunk, index);
+        let data = &payload[meta..];
+        assert!(data.iter().all(|byte| *byte == 0x5b));
+        received += data.len();
+        index += 1;
+        if c2_wire::flags::is_chunk_last(flags) {
+            break;
+        }
+    }
+    assert_eq!(received, SIZE);
+    f.runner.take().unwrap().await.unwrap().unwrap();
+    assert_eq!(f.conn.inflight_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_deadline_deactivates_a_connection_with_an_unfinished_call() {
+    let mut f = ShutdownReplyFixture::start(b"done".to_vec()).await;
+    assert!(
+        f.server
+            .shutdown_and_wait(Duration::from_millis(30))
+            .await
+            .is_err()
+    );
+    assert!(
+        f.conn.is_cancelled(),
+        "the expired shutdown deadline must still deactivate"
+    );
+    assert!(!f.completed.load(Ordering::SeqCst));
+    f.release();
+    f.runner.take().unwrap().await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_flushes_the_active_call_error_before_deactivation() {
+    let mut f = ShutdownReplyFixture::start_with_outcome(Vec::new(), false, true).await;
+    f.server.request_shutdown_signal();
+    f.release();
+    let (id, _, reply) = read_reply_frame(&mut f.peer).await;
+    assert_eq!(id, 1);
+    match c2_wire::control::decode_reply_control(&reply, 0).unwrap().0 {
+        ReplyControl::Error(error) => {
+            assert!(String::from_utf8_lossy(&error).contains("expected callback failure"))
+        }
+        other => panic!("expected completed callback error, got {other:?}"),
+    }
+    f.runner.take().unwrap().await.unwrap().unwrap();
 }

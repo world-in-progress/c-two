@@ -62,6 +62,7 @@ if (process.platform === 'win32') {
 const cc = process.env.CC || 'cc';
 const args = [
   '-std=c11',
+  '-Werror=incompatible-pointer-types',
   '-O2',
   '-fPIC',
   '-shared',

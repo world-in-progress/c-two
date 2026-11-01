@@ -98,19 +98,21 @@ impl Drop for PhysicalRetirement {
 }
 
 /// RAII guard that increments flight count on creation and decrements on drop.
-/// Ensures [`Connection::wait_idle`] blocks until all guarded tasks complete.
-pub(crate) struct FlightGuard<'a> {
-    conn: &'a Connection,
+/// Owns the reservation before task submission, through the response flush.
+pub(crate) struct FlightGuard {
+    conn: Arc<Connection>,
 }
 
-impl<'a> FlightGuard<'a> {
-    pub fn new(conn: &'a Connection) -> Self {
+impl FlightGuard {
+    pub fn new(conn: &Arc<Connection>) -> Self {
         conn.flight_inc();
-        Self { conn }
+        Self {
+            conn: Arc::clone(conn),
+        }
     }
 }
 
-impl Drop for FlightGuard<'_> {
+impl Drop for FlightGuard {
     fn drop(&mut self) {
         self.conn.flight_dec();
     }
@@ -156,6 +158,8 @@ pub struct Connection {
 
     /// Number of requests currently being processed.
     inflight: AtomicI32,
+    /// Route admission is closed; accepted calls retain response write access.
+    shutdown_requested: AtomicBool,
 
     /// Notified whenever `inflight` drops to zero.
     idle_notify: Notify,
@@ -203,6 +207,7 @@ impl Connection {
             first_end: Arc::new(Mutex::new(None)),
             read_stopped: AtomicBool::new(false),
             inflight: AtomicI32::new(0),
+            shutdown_requested: AtomicBool::new(false),
             idle_notify: Notify::new(),
             publisher,
         }
@@ -227,6 +232,21 @@ impl Connection {
     pub(crate) fn end(&self, reason: ConnectionEndReason, operation: &'static str) {
         self.record_end(PendingEnd::Explicit { reason, operation });
         drop(self.core.deactivate());
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.record_end(PendingEnd::Explicit {
+            reason: ConnectionEndReason::LocalClose,
+            operation: "server_shutdown",
+        });
+        self.shutdown_requested.store(true, Ordering::Release);
+        if self.inflight.load(Ordering::Acquire) == 0 {
+            drop(self.core.deactivate());
+        }
+    }
+
+    pub(crate) fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
     }
 
     pub(crate) fn end_read(&self, operation: &'static str, error: &std::io::Error) {
@@ -402,6 +422,9 @@ impl Connection {
     pub(crate) fn flight_dec(&self) {
         let prev = self.inflight.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
+            if self.shutdown_requested() {
+                drop(self.core.deactivate());
+            }
             // Counter went 1 → 0: connection is idle.
             self.idle_notify.notify_waiters();
         }
@@ -443,6 +466,8 @@ impl Connection {
         // Slow path: wait for notification from `flight_dec`.
         loop {
             let notified = self.idle_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             // Re-check after registering the future to avoid missed wakeups.
             if self.inflight.load(Ordering::Acquire) == 0 {
                 return;
@@ -548,5 +573,34 @@ mod tests {
             .await
             .expect("timed out waiting for wait_idle")
             .expect("task panicked");
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use c2_wire::connection::WriteRequest;
+
+    #[test]
+    fn unpolled_response_task_keeps_shutdown_writable_and_cancellation_retires_its_flight() {
+        let conn = Arc::new(Connection::new(1));
+        conn.set_handshake_done(true).unwrap();
+        let flight = FlightGuard::new(&conn);
+        let task = async move {
+            let _flight = flight;
+            std::future::pending::<()>().await;
+        };
+        conn.begin_shutdown();
+        assert_eq!(conn.inflight_count(), 1);
+        assert!(!conn.is_cancelled());
+        drop(
+            conn.core
+                .begin_write(WriteRequest::Business(Vec::new()))
+                .unwrap(),
+        );
+        drop(task);
+        assert_eq!(conn.inflight_count(), 0);
+        assert!(conn.is_cancelled());
+        assert!(conn.try_close());
     }
 }

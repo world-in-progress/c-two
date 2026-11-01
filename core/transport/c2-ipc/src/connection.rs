@@ -9,7 +9,12 @@ use c2_local::{
 use c2_mem::MemPool;
 use c2_wire::{
     chunk::ChunkRegistry,
-    connection::{ConnectionCore, ConnectionError, ConnectionSide, WriteBatch, WriteRequest},
+    connection::{
+        ConnectionCore, ConnectionError, ConnectionSide, ControlFrame, WriteBatch, WriteRequest,
+    },
+    flags::FLAG_SIGNAL,
+    frame::encode_frame,
+    msg_type::DISCONNECT_BYTES,
 };
 use parking_lot::{Mutex, RwLock};
 use std::io;
@@ -137,12 +142,22 @@ struct WriteDriver {
     stream: Option<LocalWriteHalf>,
     _retirement: Arc<PhysicalRetirement>,
     stop_gc: watch::Sender<bool>,
+    disconnect: Arc<Mutex<Disconnect>>,
+    disconnect_bytes: Option<Vec<u8>>,
 }
 impl Drop for WriteDriver {
     fn drop(&mut self) {
+        // Cancel an unsubmitted control reservation when the driver ends.
+        *self.disconnect.lock() = Disconnect::Finished;
         self.stop_gc.send_replace(true);
         drop(self.stream.take());
     }
+}
+
+enum Disconnect {
+    NotRequested,
+    Pending(ControlFrame),
+    Finished,
 }
 
 pub(crate) struct ClientConnection {
@@ -156,6 +171,7 @@ pub(crate) struct ClientConnection {
     read_stopped: AtomicBool,
     deactivated: watch::Sender<bool>,
     gc_stop: watch::Sender<bool>,
+    disconnect: Arc<Mutex<Disconnect>>,
     runtime: tokio::runtime::Handle,
     #[cfg(any(test, feature = "test-support"))]
     pub pause: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
@@ -175,6 +191,7 @@ impl ClientConnection {
         });
         core.finish_handshake().expect("a fresh connection core");
         let (queue, receiver) = mpsc::channel(64);
+        let disconnect = Arc::new(Mutex::new(Disconnect::NotRequested));
         let conn = Arc::new(Self {
             core,
             wake,
@@ -186,6 +203,7 @@ impl ClientConnection {
             read_stopped: AtomicBool::new(false),
             deactivated: watch::channel(false).0,
             gc_stop: watch::channel(false).0,
+            disconnect: disconnect.clone(),
             runtime: tokio::runtime::Handle::current(),
             #[cfg(any(test, feature = "test-support"))]
             pause: Mutex::new(None),
@@ -194,6 +212,8 @@ impl ClientConnection {
             stream: Some(stream),
             _retirement: retirement,
             stop_gc: conn.gc_stop.clone(),
+            disconnect,
+            disconnect_bytes: Some(encode_frame(0, FLAG_SIGNAL, &DISCONNECT_BYTES)),
         };
         tokio::spawn(run(driver, conn.clone(), receiver));
         conn
@@ -201,6 +221,37 @@ impl ClientConnection {
     fn stop_admission(&self) {
         drop(self.core.deactivate());
         self.deactivated.send_replace(true);
+    }
+    pub fn close(&self) {
+        {
+            let mut disconnect = self.disconnect.lock();
+            // Reserve before deactivation so the writer cannot seal B=L=0 in
+            // between. Only the already-deactivated driver can submit it.
+            let control = if matches!(*disconnect, Disconnect::NotRequested) {
+                self.core.prepare_control_frame().ok()
+            } else {
+                None
+            };
+            self.end
+                .record(ConnectionEndReason::LocalClose, "client_close");
+            self.stop_admission();
+            if matches!(*disconnect, Disconnect::NotRequested) {
+                *disconnect = control.map_or(Disconnect::Finished, Disconnect::Pending);
+            }
+        }
+        self.fail_pending();
+        self.wake.notify_waiters();
+        self.wake.notify_one();
+    }
+    fn take_disconnect(&self) -> Option<ControlFrame> {
+        let mut disconnect = self.disconnect.lock();
+        match std::mem::replace(&mut *disconnect, Disconnect::Finished) {
+            Disconnect::Pending(control) => Some(control),
+            previous => {
+                *disconnect = previous;
+                None
+            }
+        }
     }
     pub fn end(&self, reason: ConnectionEndReason, operation: &'static str) {
         self.end.record(reason, operation);
@@ -342,6 +393,18 @@ async fn run(
     loop {
         if conn.close_ready() || conn.read_stopped.load(Ordering::Acquire) {
             break;
+        }
+        if let Some(control) = conn.take_disconnect() {
+            if let Ok(Some(batch)) = conn.core.begin_write(WriteRequest::Control(control)) {
+                let frame = driver
+                    .disconnect_bytes
+                    .take()
+                    .expect("one DISCONNECT per connection");
+                if let Ok(batch) = prepare(batch, frame, &conn) {
+                    let _ = write_batch(stream, &conn, batch, &mut None).await;
+                }
+            }
+            continue;
         }
         if let Ok(submission) = receiver.try_recv() {
             process(stream, &conn, submission).await;

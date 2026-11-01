@@ -49,10 +49,7 @@ async fn rejected_reply_discards_only_its_declared_chunks_and_preserves_other_ca
                 .write_all(&reply_chunk(rejected.request_id, count, 1, &data))
                 .await
                 .unwrap();
-            assert_eq!(
-                timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-                0
-            );
+            expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
         let mut cfg = config();
@@ -197,11 +194,7 @@ async fn deactivation_distinguishes_unpublished_calls_from_started_dispatch() {
             assert!(!request.is_buddy());
             let (_, consumed) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
             assert_eq!(&payload[consumed..], b"first");
-            assert_eq!(
-                timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-                0,
-                "a queued call must not reach the peer"
-            );
+            expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
         let mut cfg = config();
@@ -260,10 +253,7 @@ async fn deactivation_before_shm_dispatch_reports_pre_dispatch_and_releases_its_
         let peer = tokio::spawn(async move {
             let mut stream = accept(&mut listener).await;
             let _ = read_frame(&mut stream).await;
-            assert_eq!(
-                timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-                0
-            );
+            expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
         let mut cfg = config();
@@ -589,11 +579,7 @@ async fn queued_control_and_business_cancellation_remove_only_their_waiters() {
         let mut stream = accept(&mut listener).await;
         let (first, _) = read_frame(&mut stream).await;
         reply(&mut stream, first.request_id, b"first").await;
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0,
-            "cancelled queued control and business writes must publish no frame"
-        );
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
@@ -650,10 +636,7 @@ async fn repeated_response_wait_cancellation_never_accumulates_pending_entries()
         }
         let (healthy, _) = read_frame(&mut stream).await;
         reply(&mut stream, healthy.request_id, b"healthy").await;
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0
-        );
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
@@ -703,10 +686,7 @@ async fn started_control_send_survives_caller_cancellation_and_keeps_connection(
             .unwrap();
         let (business, _) = read_frame(&mut stream).await;
         reply(&mut stream, business.request_id, b"business").await;
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0
-        );
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();

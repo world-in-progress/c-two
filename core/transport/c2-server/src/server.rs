@@ -1562,7 +1562,12 @@ impl Server {
         timeout: Duration,
     ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
         self.request_shutdown_signal();
-        self.wait_until_stopped(timeout).await?;
+        if let Err(error) = self.wait_until_stopped(timeout).await {
+            for conn in self.active_connections.lock().values() {
+                conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
+            }
+            return Err(error);
+        }
         self.completed_shutdown_outcomes()
     }
 
@@ -1650,10 +1655,10 @@ impl Server {
         }
         let shutdown_already_requested = *self.shutdown_tx.borrow();
         if !shutdown_already_requested {
-            // Publish before route/callback drain can start. Courtesy control
-            // acknowledgements still use their existing I/O and deadlines.
+            // Retain the first close reason while accepted calls flush their
+            // responses. Closed route admission rejects any new business.
             for conn in self.active_connections.lock().values() {
-                conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
+                conn.begin_shutdown();
                 self.cleanup_chunk_requests_for_connection(conn.conn_id());
             }
             self.shutdown_tx.send_replace(true);
@@ -1905,8 +1910,8 @@ async fn read_connection_exact(
         tokio::select! {
             result = &mut read => return result.map(|_| true),
             _ = changed => {},
-            _ = wait_for_shutdown(shutdown), if !conn.is_cancelled() => {
-                conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
+            _ = wait_for_shutdown(shutdown), if !conn.shutdown_requested() => {
+                conn.begin_shutdown();
             }
         }
     }
@@ -2133,7 +2138,11 @@ fn handle_connection(
                     Some(MsgType::ShutdownClient)
                 ) {
                     handle_shutdown_signal(&server, payload, request_id, &writer).await;
-                    conn.end(ConnectionEndReason::LocalClose, "shutdown_control_close");
+                    if *server.shutdown_tx.borrow() {
+                        conn.begin_shutdown();
+                    } else {
+                        conn.end(ConnectionEndReason::LocalClose, "shutdown_control_close");
+                    }
                     server.cleanup_chunk_requests_for_connection(conn_id);
                     continue;
                 }
@@ -2152,6 +2161,9 @@ fn handle_connection(
                     handle_ctrl(&srv, &payload, request_id, &wr).await;
                 });
             } else if header.is_call_v2() {
+                // Reserve before any admission await or task submission so a
+                // concurrent shutdown cannot miss an already accepted call.
+                let flight = crate::connection::FlightGuard::new(&conn);
                 // Un-negotiated buddy coordinates must be refused before any
                 // admission, lazy-open, or late-discard cleanup could touch a
                 // mapping this connection was never promised. The rejection
@@ -2320,6 +2332,7 @@ fn handle_connection(
                     let route_pending_permit = route_admission.pending_permit;
                     let method_idx = ctrl.method_idx;
                     tokio::spawn(async move {
+                        let _flight = flight;
                         dispatch_admitted_buddy_call(AdmittedBuddyCall {
                             server: &srv,
                             conn: &cn,
@@ -2370,6 +2383,7 @@ fn handle_connection(
                 let route_pending_permit = route_admission.pending_permit;
                 let method_idx = ctrl.method_idx;
                 tokio::spawn(async move {
+                    let _flight = flight;
                     dispatch_admitted_call(AdmittedCall {
                         server: &srv,
                         conn: &cn,
@@ -2716,7 +2730,7 @@ fn route_record(server: &Server, route: &CrmRoute) -> RouteRecordWire {
                 RouteStateWire::Closed
             }
         },
-        state_reason: Some(match admission {
+        state_reason: match admission {
             RouteAdmissionState::Opened | RouteAdmissionState::CommittedPending => {
                 RouteStateReasonWire::RegisterCommitted
             }
@@ -2724,7 +2738,7 @@ fn route_record(server: &Server, route: &CrmRoute) -> RouteRecordWire {
                 RouteStateReasonWire::Shutdown
             }
             RouteAdmissionState::Closed => RouteStateReasonWire::ExplicitUnregister,
-        }),
+        },
     }
 }
 
@@ -2800,9 +2814,7 @@ async fn route_lookup_payload(server: &Server, payload: &[u8]) -> Vec<u8> {
             RouteLookupResponse::Closed {
                 route_name: current.route_name,
                 route_uid: current.route_uid,
-                reason: current
-                    .state_reason
-                    .unwrap_or(RouteStateReasonWire::ProtocolViolation),
+                reason: current.state_reason,
             }
         } else {
             RouteLookupResponse::Ready { current }
@@ -3221,7 +3233,6 @@ async fn dispatch_admitted_call(call: AdmittedCall<'_>) {
         _pending_permit,
         route_pending_permit,
     } = call;
-    let _flight = crate::connection::FlightGuard::new(conn);
 
     let callback = Arc::clone(&route.callback);
     let name = route.name.clone();
@@ -3239,7 +3250,6 @@ async fn dispatch_admitted_call(call: AdmittedCall<'_>) {
     )
     .await;
 
-    drop(_flight);
     drop(_pending_permit);
     send_route_execution_result(server, conn, writer, request_id, result).await;
 }
@@ -3304,7 +3314,6 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
         _pending_permit,
         route_pending_permit,
     } = call;
-    let _flight = crate::connection::FlightGuard::new(conn.as_ref());
 
     // 3. Check for extra inline args appended after control header.
     let inline_start = BUDDY_PAYLOAD_SIZE + ctrl_consumed;
@@ -3333,7 +3342,6 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
     )
     .await;
 
-    drop(_flight);
     drop(_pending_permit);
     send_route_execution_result(server, conn, writer, request_id, result).await;
 }
@@ -3380,7 +3388,9 @@ fn spawn_chunked_call(
     let cn = Arc::clone(conn);
     let wr = Arc::clone(writer);
     let pl = payload.to_vec();
+    let flight = crate::connection::FlightGuard::new(conn);
     tokio::spawn(async move {
+        let _flight = flight;
         dispatch_chunked_call(
             &srv,
             &cn,
@@ -3867,9 +3877,6 @@ async fn dispatch_chunked_call(
         drop(chunk_processing_permit);
         let method_idx = chunk_admission.method_idx;
 
-        // FlightGuard: increments on create, decrements on drop.
-        let _flight = crate::connection::FlightGuard::new(conn);
-
         let callback = Arc::clone(&chunk_admission.route.callback);
         let name = chunk_admission.route.name.clone();
         let resp_pool = Arc::clone(&server.response_pool);
@@ -3883,7 +3890,6 @@ async fn dispatch_chunked_call(
         )
         .await;
 
-        drop(_flight);
         drop(_pending_permit);
         send_route_execution_result(server, conn, writer, request_id, result).await;
     }

@@ -581,7 +581,8 @@ def test_generated_typescript_calls_real_hosts(
     assert calls == expected_calls
     assert receipt["logicalResultSha256"] == logical_result_sha256(payload)
     assert receipt["cleanup"] == {
-        "responseShmReaderClosed": True,
+        "nodeRuntimeCreated": mode in {"direct-ipc", "relay-aware-local-ipc"},
+        "nodeRuntimeClosed": mode in {"direct-ipc", "relay-aware-local-ipc"},
         "transportClosedIdempotently": True,
     }
     observations = receipt["observations"]

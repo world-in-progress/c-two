@@ -125,6 +125,47 @@ impl Drop for Serving {
 }
 
 #[test]
+fn eviction_reports_peer_close_message_through_the_client_connection_driver() {
+    let mut serving = Serving::new();
+    let address = serving.start("eviction_disconnect");
+    serving.runtime.block_on(async {
+        tokio::time::timeout(WAIT, async {
+            while serving.servers[0].active_connection_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    });
+    let events = serving.servers[0].connection_events();
+    let pool = serving.pool(Duration::ZERO);
+    let client = pool.acquire(&address, None).unwrap();
+    let observation = serving.runtime.block_on(async {
+        match tokio::time::timeout(WAIT, events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        {
+            c2_local::ConnectionEvent::Opened(observation) => observation,
+            event => panic!("expected accepted connection: {event:?}"),
+        }
+    });
+    assert!(pool.release_if_same(&address, &client));
+    pool.sweep_expired();
+    let closed = serving
+        .runtime
+        .block_on(observation.wait_closed(Some(WAIT)))
+        .unwrap();
+    assert_eq!(closed.reason(), ConnectionEndReason::PeerCloseMessage);
+    assert_eq!(closed.operation(), "disconnect");
+    assert_eq!(
+        serving.closed(&client).reason(),
+        ConnectionEndReason::LocalClose
+    );
+}
+
+#[test]
 fn seal_guard_is_reversible_and_deadline_waits_are_bounded() {
     let pool = ClientPool::new(WAIT);
     let before = pool.state.lock().epoch;

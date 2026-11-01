@@ -8,6 +8,7 @@
       "msvs_settings": {
         "VCCLCompilerTool": {
           "AdditionalOptions!": ["-std:c++20", "/std:c++20"],
+          "AdditionalOptions": ["/we4133"],
           "LanguageStandard": "stdcpp20",
           "LanguageStandard_C": "stdc11"
         }

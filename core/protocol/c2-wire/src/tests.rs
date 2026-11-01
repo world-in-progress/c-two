@@ -517,7 +517,7 @@ mod ipc15_tests {
             }],
             max_payload_size: 1024,
             state: RouteStateWire::Ready,
-            state_reason: None,
+            state_reason: RouteStateReasonWire::RegisterCommitted,
         }
     }
 

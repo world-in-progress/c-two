@@ -690,10 +690,7 @@ impl RouteDirectory {
                 self.routes
                     .insert(record.route_name.clone(), MethodTable::from_record(&record));
             }
-            RouteStateWire::Pending
-            | RouteStateWire::Draining
-            | RouteStateWire::Closed
-            | RouteStateWire::Removed => {
+            RouteStateWire::Closed => {
                 self.routes.remove(&record.route_name);
             }
         }
@@ -2493,23 +2490,14 @@ impl IpcClient {
         match record.state {
             RouteStateWire::Ready => Ok(RouteBinding::from_table(table)),
             RouteStateWire::Closed
-                if record.state_reason == Some(RouteStateReasonWire::RegisterCommitted) =>
+                if record.state_reason == RouteStateReasonWire::RegisterCommitted =>
             {
                 Ok(RouteBinding::from_table(table))
             }
-            RouteStateWire::Removed => Err(IpcError::RouteRemoved {
-                route_name: record.route_name,
-                route_uid: Some(record.route_uid),
-            }),
             state => Err(IpcError::RouteClosed {
                 route_name: record.route_name,
                 route_uid: record.route_uid,
-                reason: format!(
-                    "{state:?}:{:?}",
-                    record
-                        .state_reason
-                        .unwrap_or(RouteStateReasonWire::ProtocolViolation)
-                ),
+                reason: format!("{state:?}:{:?}", record.state_reason),
             }),
         }
     }
@@ -2694,7 +2682,7 @@ impl IpcClient {
 
     pub(crate) fn deactivate(&self) {
         if let Some(conn) = self.driver.read().as_ref() {
-            conn.end(ConnectionEndReason::LocalClose, "client_close");
+            conn.close();
         }
     }
 

@@ -94,6 +94,48 @@ async fn read_frame(stream: &mut LocalStream) -> (FrameHeader, Vec<u8>) {
         .unwrap();
     (header, payload)
 }
+// Closing may add one DISCONNECT after already-started work. Reject any
+// additional business/control payload, preserving cancellation's no-replay proof.
+async fn expect_disconnect_or_eof(stream: &mut LocalStream) {
+    let mut header = [0; HEADER_SIZE];
+    if timeout(WAIT, stream.read(&mut header[..1]))
+        .await
+        .unwrap()
+        .unwrap()
+        == 0
+    {
+        return;
+    }
+    timeout(WAIT, stream.read_exact(&mut header[1..]))
+        .await
+        .unwrap()
+        .unwrap();
+    let (len, body) = frame::decode_total_len(&header).unwrap();
+    let (header, _) = frame::decode_frame_body(body, len).unwrap();
+    assert_eq!(header.payload_len(), 1);
+    let mut payload = [0];
+    timeout(WAIT, stream.read_exact(&mut payload))
+        .await
+        .unwrap()
+        .unwrap();
+    expect_disconnect_eof(stream, header, &payload).await;
+}
+
+async fn expect_disconnect_eof(stream: &mut LocalStream, header: FrameHeader, payload: &[u8]) {
+    assert_eq!(header.request_id, 0);
+    assert_eq!(
+        header.flags,
+        flags::FLAG_SIGNAL,
+        "only the normal close signal may follow"
+    );
+    assert_eq!(payload, c2_wire::msg_type::DISCONNECT_BYTES);
+    assert_eq!(
+        timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
+        0,
+        "no second DISCONNECT, replay or other frame may follow"
+    );
+}
+
 async fn accept(listener: &mut LocalListener) -> LocalStream {
     let mut stream = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
     crate::tests::accept_version_preamble(&mut stream).await;
@@ -195,7 +237,7 @@ async fn high_request_bits_are_preserved_through_pending_and_delivery() {
         assert_eq!(high.request_id, (1 << 32) | 7);
         reply(&mut stream, high.request_id, b"high").await;
         reply(&mut stream, low.request_id, b"low").await;
-        let _ = stream.read(&mut [0]).await;
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
@@ -274,10 +316,7 @@ async fn cancellation_before_writer_publication_releases_ordinary_and_stream_pre
             let mut stream = accept(&mut listener).await;
             let (hdr, _) = read_frame(&mut stream).await;
             reply(&mut stream, hdr.request_id, b"first").await;
-            assert_eq!(
-                timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-                0
-            );
+            expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
         let mut client = endpoint.client();
@@ -539,11 +578,9 @@ async fn cancelling_a_started_shm_write_keeps_the_driver_and_never_replays() {
             true,
         );
         stream.write_all(&release).await.unwrap();
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0,
-            "exactly one complete request was written"
-        );
+        // The helper permits only the normal close signal after this one
+        // complete request; a replay or second request still fails.
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
@@ -1057,10 +1094,7 @@ async fn started_inline_cancellation_finishes_the_original_frame_once() {
         assert!(header.is_call_v2());
         let (_, consumed) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
         assert_eq!(&payload[consumed..], b"one side effect");
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0
-        );
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
@@ -1134,10 +1168,7 @@ async fn unnegotiated_shm_reply_is_rejected_before_mapping_or_loan_admission() {
             ))
             .await
             .unwrap();
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0
-        );
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
@@ -1192,10 +1223,7 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
         }
         reply(&mut stream, first.request_id, b"cancelled result").await;
         complete.send(()).unwrap();
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0
-        );
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
@@ -1400,12 +1428,16 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
                         stream.read_exact(&mut header[1..]).await.unwrap();
                         let (len, body) = frame::decode_total_len(&header).unwrap();
                         let (header, _) = frame::decode_frame_body(body, len).unwrap();
+                        let mut payload = vec![0; header.payload_len()];
+                        stream.read_exact(&mut payload).await.unwrap();
+                        if header.is_signal() {
+                            expect_disconnect_eof(&mut stream, header, &payload).await;
+                            break;
+                        }
                         assert!(
                             header.is_ctrl(),
                             "response failure must not replay a business call"
                         );
-                        let mut payload = vec![0; header.payload_len()];
-                        stream.read_exact(&mut payload).await.unwrap();
                     }
                 }
             }
@@ -1451,10 +1483,7 @@ async fn materialization_failure_is_uncertain_and_refunds_local_backing_once() {
     let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0
-        );
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
@@ -1499,10 +1528,7 @@ async fn client_gc_expires_a_stalled_reply_and_stops_with_the_driver() {
             .write_all(&reply_chunk(request.request_id, 2, 0, &[1; 4096]))
             .await
             .unwrap();
-        assert_eq!(
-            timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-            0
-        );
+        expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut cfg = config();

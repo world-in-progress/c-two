@@ -11,7 +11,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::connection::{Connection, PhysicalRetirement};
+use crate::connection::{Connection, FlightGuard, PhysicalRetirement};
 
 const QUEUE_CAPACITY: usize = 64;
 
@@ -33,6 +33,8 @@ struct Submission {
     bytes: Vec<u8>,
     request: WriteRequest,
     reply: Option<oneshot::Sender<io::Result<()>>>,
+    // Nonblocking replies retain drain ownership after their dispatcher returns.
+    _flight: Option<FlightGuard>,
 }
 
 /// Submit complete frames to the connection's sole write task. Dropping a
@@ -94,6 +96,7 @@ impl ConnectionWriter {
                 bytes,
                 request,
                 reply: Some(reply),
+                _flight: None,
             })
             .await
             .map_err(|_| broken_pipe())?;
@@ -103,20 +106,30 @@ impl ConnectionWriter {
     /// The receive loop only enqueues; it never waits for a blocked OS write.
     pub(crate) fn try_write_control(&self, bytes: Vec<u8>) -> io::Result<()> {
         let control = self.conn.core.prepare_control_frame().map_err(core_error)?;
-        self.try_submit(bytes, WriteRequest::Control(control))
+        self.try_submit(bytes, WriteRequest::Control(control), None)
     }
 
     pub(crate) fn try_write_reply(&self, bytes: Vec<u8>) -> io::Result<()> {
-        self.try_submit(bytes, WriteRequest::Business(Vec::new()))
+        self.try_submit(
+            bytes,
+            WriteRequest::Business(Vec::new()),
+            Some(FlightGuard::new(&self.conn)),
+        )
     }
 
-    fn try_submit(&self, bytes: Vec<u8>, request: WriteRequest) -> io::Result<()> {
+    fn try_submit(
+        &self,
+        bytes: Vec<u8>,
+        request: WriteRequest,
+        flight: Option<FlightGuard>,
+    ) -> io::Result<()> {
         let result = self
             .queue
             .try_send(Submission {
                 bytes,
                 request,
                 reply: None,
+                _flight: flight,
             })
             .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.to_string()));
         if result.is_err() {

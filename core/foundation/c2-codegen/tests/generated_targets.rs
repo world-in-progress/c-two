@@ -83,8 +83,7 @@ fn every_target_contains_a_c_two_owned_contract_module() {
                 "createIpcEncodedTransport",
                 "createHttpRelayEncodedTransport",
                 "createRelayAwareHttpEncodedTransport",
-                "createNativeRequestShmWriter",
-                "createNativeResponseShmReader",
+                "C2IpcMemoryContext",
             ] {
                 assert!(
                     source.contains(transport_symbol),
@@ -261,7 +260,7 @@ parking_lot = "0.13"
         r##"use std::sync::Arc;
 use c_two_generated_contract_check::contract;
 use c_two::generated::{AdapterFailurePhase, HeldResponse, fastdb_adapter_error};
-use c2_ipc::{ResponseData, ResponseLease};
+use c2_ipc::ResponseData;
 use c2_mem::{MemPool, PoolConfig};
 use c2_wire::chunk::backing::ReassemblyBacking;
 use fastdb::{BuildPolicy, Builder, CompiledSpec};
@@ -285,18 +284,15 @@ fn main() {
     let budget = pool.read().budget().unwrap().clone();
     let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len()).unwrap();
     backing.write_at(0, &bytes).unwrap();
-    let response = HeldResponse::from_response_lease(ResponseLease::new(ResponseData::Handle(backing))).unwrap();
-    let original = std::mem::replace(&mut *pool.write(), MemPool::new(PoolConfig::default()).unwrap());
+    let response = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();
     let error = contract::decode_method_1_echo_output_held(response).unwrap_err();
     match error {
         c_two::Error::Semantic(error) => assert_eq!(error, expected),
         error => panic!("primary semantic error was replaced: {error}"),
     }
-    assert_eq!(budget.snapshot().abandoned_releases, 1);
-    assert_eq!(budget.snapshot().reassembly.used_bytes, bytes.len() as u64);
-    *pool.write() = original;
-    assert_eq!(pool.read().stats().alloc_count, 1);
-    pool.write().destroy();
+    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(pool.read().stats().alloc_count, 0);
+    drop(pool);
 }
 "##,
     )
@@ -318,26 +314,6 @@ fn main() {
         "generated Rust project failed to compile:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.lines().any(|line| {
-            line.starts_with("Warning: held payload decode cleanup failed:")
-                && line.contains("pool owner incarnation mismatch")
-        }),
-        "generated held cleanup discarded its failure reason:\n{stderr}",
-    );
-    assert_eq!(
-        stderr
-            .matches("held payload decode cleanup failed:")
-            .count(),
-        1
-    );
-    assert_eq!(
-        stderr
-            .matches("final Rust held value release failed:")
-            .count(),
-        1
     );
 }
 

@@ -96,7 +96,7 @@ fn ready_reply() -> RouteLookupResponse {
             }],
             max_payload_size: 1024,
             state: RouteStateWire::Ready,
-            state_reason: None,
+            state_reason: c2_wire::route_catalog_control::RouteStateReasonWire::RegisterCommitted,
         },
     }
 }

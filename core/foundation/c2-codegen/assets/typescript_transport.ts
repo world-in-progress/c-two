@@ -29,7 +29,6 @@ export type C2ObservedPath =
 
 export interface C2RouteToken {
   readonly routeUid: string;
-  readonly routeRevision: number;
 }
 
 export interface C2ServerIdentity {
@@ -43,9 +42,9 @@ export interface C2TransportObservation extends C2RouteToken {
   readonly requests: number;
   readonly responses: number;
   readonly relayUrl?: string;
-  readonly ipcAddress?: string;
-  readonly serverId?: string;
-  readonly serverInstanceId?: string;
+  readonly ipcAddress?: string | undefined;
+  readonly serverId?: string | undefined;
+  readonly serverInstanceId?: string | undefined;
 }
 
 export type C2TransportObserver = (observation: C2TransportObservation) => void;
@@ -64,6 +63,7 @@ export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayl
 }
 
 export interface C2IpcConnection {
+  readonly memory?: C2IpcMemoryContext | undefined;
   write(data: C2ByteArray): void | Promise<void>;
   readExactly(byteLength: number): C2ByteArray | Promise<C2ByteArray>;
   close(): void | Promise<void>;
@@ -71,129 +71,45 @@ export interface C2IpcConnection {
 
 export type C2IpcConnect = (address: string) => C2IpcConnection | Promise<C2IpcConnection>;
 
-export interface C2IpcShmSegment {
-  readonly name: string;
-  readonly size: number;
-}
-
-export interface C2IpcResponseShmBlock {
-  readonly prefix: string;
-  readonly segments: readonly C2IpcShmSegment[];
+export interface C2IpcShmBlock {
   readonly segmentIndex: number;
   readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
-  readonly allocationId: bigint;
+  readonly loanId: bigint;
   readonly dedicated: boolean;
 }
-
-export interface C2IpcResponseShmReader {
-  read(
-    block: C2IpcResponseShmBlock,
-    destination?: C2ByteArray,
-  ): C2ByteArray | ArrayBufferLike | void | Promise<C2ByteArray | ArrayBufferLike | void>;
-  release(block: C2IpcResponseShmBlock): void | Promise<void>;
+export interface C2IpcPreparedRequest { readonly block: C2IpcShmBlock; }
+export interface C2IpcMemoryWrite {
+  readonly prefix: C2ByteArray;
+  start(): void;
+  complete(success: boolean): void;
+  discard(): void;
 }
-
-export interface C2IpcRequestShmBlock {
-  readonly segmentIndex: number;
-  readonly generation: number;
-  readonly offset: number;
-  readonly byteLength: number;
-  readonly allocationId: bigint;
-  readonly dedicated: boolean;
-}
-
-export interface C2IpcRequestShmWriter {
+/** One native ConnectionCore, bound to this connector's verified OS stream. */
+export interface C2IpcMemoryContext {
   readonly prefix: string;
-  readonly segments: readonly C2IpcShmSegment[];
-  write(payload: Uint8Array): C2IpcRequestShmBlock | Promise<C2IpcRequestShmBlock>;
-  release(block: C2IpcRequestShmBlock): void | Promise<void>;
-  markConsumed?(block: C2IpcRequestShmBlock): void | Promise<void>;
-}
-
-export interface C2NativeResponseShmBackend {
-  readResponse(block: C2IpcResponseShmBlock, destination: Uint8Array): void | Promise<void>;
-  releaseResponse(block: C2IpcResponseShmBlock): void | Promise<void>;
-}
-
-export interface C2NativeRequestShmBackend {
-  readonly prefix: string;
-  readonly segments: readonly C2IpcShmSegment[];
-  writeRequest(payload: Uint8Array): C2IpcRequestShmBlock | Promise<C2IpcRequestShmBlock>;
-  releaseRequest(block: C2IpcRequestShmBlock): void | Promise<void>;
-  markRequestConsumed?(block: C2IpcRequestShmBlock): void | Promise<void>;
-}
-
-export interface C2Closable {
-  close(): void | Promise<void>;
-}
-
-export type C2ClosableIpcResponseShmReader = C2IpcResponseShmReader & C2Closable;
-export type C2ClosableIpcRequestShmWriter = C2IpcRequestShmWriter & C2Closable;
-
-export interface C2MemFfiResponsePoolOptions {
-  readonly prefix: string;
-  readonly segmentSize: number;
-  readonly maxSegments: number;
-  readonly minBlockSize: number;
-}
-
-export interface C2MemFfiResponsePoolBinding {
-  read(block: C2IpcResponseShmBlock, destination: Uint8Array): void | Promise<void>;
-  release(block: C2IpcResponseShmBlock): void | Promise<void>;
-  close?(): void | Promise<void>;
-}
-
-export interface C2MemFfiResponsePoolFactory {
-  createResponsePool(options: C2MemFfiResponsePoolOptions): C2MemFfiResponsePoolBinding | Promise<C2MemFfiResponsePoolBinding>;
-}
-
-export interface C2MemFfiRequestPoolBinding {
-  readonly prefix: string;
-  readonly segments: readonly C2IpcShmSegment[];
-  write(payload: Uint8Array): C2IpcRequestShmBlock | Promise<C2IpcRequestShmBlock>;
-  release(block: C2IpcRequestShmBlock): void | Promise<void>;
-  forgetConsumed(block: C2IpcRequestShmBlock): void | Promise<void>;
-  close?(): void | Promise<void>;
-}
-
-export interface C2NativeResponseShmReaderOptions {
-  readonly backend: C2NativeResponseShmBackend;
-}
-
-export interface C2NativeRequestShmWriterOptions {
-  readonly backend: C2NativeRequestShmBackend;
-}
-
-export interface C2MemFfiNativeResponseShmReaderOptions {
-  readonly binding: C2MemFfiResponsePoolFactory;
-  /**
-   * Explicit peer response pool capacity. This is a bootstrap geometry for
-   * opening the server's backings, never a replacement for the geometry the
-   * mapped backing actually carries: c2-mem validates capacity, byte range,
-   * and generation when the pooled reader opens prefix/index/generation.
-   */
-  readonly segmentSize?: number;
-  readonly maxSegments?: number;
-  readonly minBlockSize?: number;
-}
-
-export interface C2MemFfiNativeRequestShmWriterOptions {
-  readonly pool: C2MemFfiRequestPoolBinding;
+  finishHandshake(prefix: string | null): void;
+  prepareRequest(payload: C2ByteArray): C2IpcPreparedRequest;
+  discardRequest(request: C2IpcPreparedRequest): void;
+  admitResponse(block: C2IpcShmBlock): unknown;
+  consumeResponse(response: unknown, destination: C2ByteArray): void;
+  discardResponse(response: unknown): void;
+  beginWrite(kind: 0 | 1 | 2, request?: C2IpcPreparedRequest): C2IpcMemoryWrite | undefined;
+  receiveRelease(frame: C2ByteArray): void;
+  deactivate(): void;
+  tryClose(): boolean;
 }
 
 export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> {
   readonly connect: C2IpcConnect;
   readonly responsePayloadAllocator?: C2ResponsePayloadAllocator<Payload>;
-  readonly responseShmReader?: C2IpcResponseShmReader;
-  readonly requestShmWriter?: C2IpcRequestShmWriter;
   readonly requestShmThreshold?: number;
   readonly requestChunkSize?: number;
   readonly expectedServerIdentity?: C2ServerIdentity;
   readonly expectedRouteToken?: C2RouteToken;
   readonly observationPath?: "DirectIpc" | "RelayAwareLocalIpc";
-  readonly observe?: C2TransportObserver;
+  readonly observe?: C2TransportObserver | undefined;
 }
 
 export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2EncodedClientTransport {
@@ -250,7 +166,7 @@ export type C2Fetch = (
     readonly method: "GET" | "POST";
     readonly headers: Readonly<Record<string, string>>;
     readonly body?: C2ByteArray;
-    readonly signal?: C2AbortSignal;
+    readonly signal?: C2AbortSignal | undefined;
   },
 ) => Promise<C2FetchResponse>;
 
@@ -262,7 +178,7 @@ export interface C2HttpRelayTransportOptions<Payload extends C2ResponsePayload =
   readonly responsePayloadAllocator?: C2ResponsePayloadAllocator<Payload>;
   readonly responsePayloadUnknownLengthStrategy?: C2ResponsePayloadUnknownLengthStrategy;
   readonly responsePayloadUnknownLengthMaxBytes?: number;
-  readonly observe?: C2TransportObserver;
+  readonly observe?: C2TransportObserver | undefined;
 }
 
 export interface C2RelayAwareHttpTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> extends C2HttpRelayTransportOptions<Payload> {
@@ -275,10 +191,9 @@ interface C2RelayRouteInfo {
   readonly name: string;
   readonly relayUrl: string;
   readonly routeUid: string;
-  readonly routeRevision: number;
-  readonly ipcAddress?: string;
-  readonly serverId?: string;
-  readonly serverInstanceId?: string;
+  readonly ipcAddress?: string | undefined;
+  readonly serverId?: string | undefined;
+  readonly serverInstanceId?: string | undefined;
   readonly crmNs: string;
   readonly crmName: string;
   readonly crmVer: string;
@@ -301,7 +216,6 @@ interface C2IpcMethodInfo {
 interface C2IpcRouteInfo {
   readonly name: string;
   readonly routeUid: string;
-  readonly routeRevision: number;
   readonly crmNs: string;
   readonly crmName: string;
   readonly crmVer: string;
@@ -313,7 +227,6 @@ interface C2IpcRouteInfo {
 
 interface C2IpcHandshake {
   readonly shmPrefix: string;
-  readonly shmSegments: readonly C2IpcShmSegment[];
   readonly capabilityFlags: number;
   readonly serverIdentity: C2ServerIdentity;
 }
@@ -321,6 +234,10 @@ interface C2IpcHandshake {
 interface C2IpcOpenConnection {
   readonly connection: C2IpcConnection;
   readonly handshake: C2IpcHandshake;
+  writeChain: Promise<void>;
+  closing: boolean;
+  discarded?: boolean;
+  reading: Promise<void> | undefined;
 }
 
 interface C2IpcFrame {
@@ -336,18 +253,9 @@ interface C2IpcReplyChunk {
   readonly data: Uint8Array;
 }
 
-interface C2IpcBuddyPayload {
-  readonly segmentIndex: number;
-  readonly generation: number;
-  readonly offset: number;
-  readonly byteLength: number;
-  readonly allocationId: bigint;
-  readonly dedicated: boolean;
-}
-
 type C2IpcCallResponse =
   | { readonly kind: "inline"; readonly payload: Uint8Array }
-  | { readonly kind: "shm"; readonly block: C2IpcResponseShmBlock };
+  | { readonly kind: "shm"; readonly block: C2IpcShmBlock; readonly response: unknown };
 
 type C2IpcReplyControl =
   | { readonly kind: "success"; readonly payload: Uint8Array }
@@ -415,8 +323,6 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   validateIpcAddress(address);
   const connect = normalizeIpcConnect(options, "C-Two IPC transport options");
   const responsePayloadAllocator = normalizeResponsePayloadAllocator(options.responsePayloadAllocator, "C-Two IPC responsePayloadAllocator");
-  const responseShmReader = normalizeIpcResponseShmReader(options.responseShmReader, "C-Two IPC responseShmReader");
-  const requestShmWriter = normalizeIpcRequestShmWriter(options.requestShmWriter, "C-Two IPC requestShmWriter");
   const requestShmThreshold = normalizeIpcRequestShmThreshold(options.requestShmThreshold, "C-Two IPC requestShmThreshold");
   const requestChunkSize = normalizeIpcRequestChunkSize(options.requestChunkSize, "C-Two IPC requestChunkSize");
   const expectedServerIdentity = normalizeExpectedServerIdentity(options.expectedServerIdentity, "C-Two IPC expectedServerIdentity");
@@ -428,14 +334,14 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   // restore this transport, but cannot redirect its already acquired routes.
   let boundServerIdentity: C2ServerIdentity | undefined;
   const boundRoutes = new Map<string, C2IpcRouteInfo>();
-  let nextRequestId = 1;
+  let nextRequestId = 1n;
   let callChain: Promise<void> = Promise.resolve();
   let requests = 0;
   let responses = 0;
 
   const openConnection = (): Promise<C2IpcOpenConnection> => {
     if (connectionPromise === undefined) {
-      connectionPromise = connectAndHandshakeIpc(address, connect, requestShmWriter, responseShmReader).catch((error) => {
+      connectionPromise = connectAndHandshakeIpc(address, connect).catch((error) => {
         connectionPromise = undefined;
         throw error;
       });
@@ -445,18 +351,30 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
 
   const allocateRequestId = (): bigint => {
     const requestId = nextRequestId;
-    nextRequestId = nextRequestId === Number.MAX_SAFE_INTEGER ? 1 : nextRequestId + 1;
-    return BigInt(requestId);
+    if (requestId > 0xffffffffffffffffn) {
+      void connectionPromise?.then(open => { open.connection.memory?.deactivate(); return discardConnection(open); });
+      throw new C2IpcTransportError("C-Two IPC request ID space exhausted.");
+    }
+    nextRequestId += 1n;
+    return requestId;
   };
 
   const discardConnection = async (open: C2IpcOpenConnection): Promise<void> => {
     connectionPromise = undefined;
+    if (open.discarded) return;
+    open.discarded = true;
     try {
+      open.connection.memory?.deactivate();
       await open.connection.close();
     } catch (cleanupError) {
       // Preserve the primary stream failure, including uncertain writes.
       console.warn("Warning: IPC connection cleanup failed:", cleanupError);
     }
+  };
+
+  const flushReleases = async (open: C2IpcOpenConnection): Promise<void> => {
+    try { await writeIpcFrame(open); }
+    catch (error) { await discardConnection(open); throw error; }
   };
 
   const control = async (
@@ -467,9 +385,11 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   ): Promise<C2IpcCatalogReply> => {
     const requestId = allocateRequestId();
     try {
-      await open.connection.write(encodeIpcFrame(requestId, C2_IPC_FLAG_CTRL,
+      if (open.closing) throw new C2IpcTransportError("C-Two IPC connection is closing.");
+      // New route queries require business admission, even with CTRL on wire.
+      await writeIpcFrame(open, encodeIpcFrame(requestId, C2_IPC_FLAG_CTRL,
         concatUint8Arrays([new Uint8Array([tag]), C2_TEXT_ENCODER.encode(JSON.stringify(request))])));
-      const frame = await readIpcFrame(open.connection);
+      const frame = await readIpcResponseFrame(open);
       if (frame.requestId !== requestId || frame.flags !== (C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_CTRL)) {
         throw new C2IpcTransportError("C-Two IPC route control reply has invalid request id or flags.");
       }
@@ -508,25 +428,11 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
     const request = {
       expected,
       observed_route_uid: token?.routeUid ?? null,
-      observed_route_revision: token?.routeRevision ?? null,
     };
     // The handshake route list is a snapshot, never an acquire authority.
-    let reply = await control(open, C2_IPC_ROUTE_LOOKUP, request, C2_IPC_ROUTE_LOOKUP_ACK);
-    if (reply.kind === "nack" && (reply.code === 711 || reply.code === 712)) {
-      // Match Rust's bounded catalog recovery without installing a watcher or
-      // changing an already bound token. Only contract-scoped lists are used.
-      const list = await control(open, C2_IPC_ROUTE_LIST,
-        { selector: { type: "contract", expected }, min_revision: null }, C2_IPC_ROUTE_LIST_ACK);
-      if (list.kind === "nack") {
-        throw new C2IpcTransportError(`C-Two IPC route catalog NACK ${list.code}: ${list.message}`);
-      }
-      reply = await control(open, C2_IPC_ROUTE_LOOKUP, request, C2_IPC_ROUTE_LOOKUP_ACK);
-    }
+    const reply = await control(open, C2_IPC_ROUTE_LOOKUP, request, C2_IPC_ROUTE_LOOKUP_ACK);
     if (reply.kind === "nack") {
       throw new C2IpcTransportError(`C-Two IPC route catalog NACK ${reply.code}: ${reply.message}`);
-    }
-    if (reply.kind !== "lookup") {
-      throw new C2IpcTransportError("C-Two IPC expected route lookup reply.");
     }
     if (reply.routeName !== routeName) {
       await discardConnection(open);
@@ -583,14 +489,12 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         }
         const methodInfo = findIpcMethod(route, method);
         const requestId = allocateRequestId();
-        let requestShmBlock: C2IpcRequestShmBlock | undefined;
         let responseError: unknown;
         let responseValue: Payload | undefined;
-        let requestShmServerConsumed = false;
         // The server's handshake ACK gates every outgoing shared-memory
         // request. Without CAP_SHM_REQUEST the call automatically stays on the
         // existing owned inline/chunked paths, never touching the writer.
-        const useShm = requestShmWriter !== undefined
+        const useShm = open.connection.memory !== undefined
           && (open.handshake.capabilityFlags & C2_IPC_CAP_SHM_REQUEST) !== 0
           && requestPayload.byteLength > requestShmThreshold
           && requestPayload.byteLength <= 0xffffffff;
@@ -599,7 +503,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           let frame: C2IpcFrame;
           try {
             try {
-              frame = await readIpcFrame(open.connection);
+              frame = await readIpcResponseFrame(open);
             } catch (error) {
               throw new C2IpcTransportError(`C-Two IPC call response read failed: ${String(error)}`);
             }
@@ -613,42 +517,55 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
             if (!chunked) await discardConnection(open);
             throw error;
           }
-          requestShmServerConsumed = true;
-          let buddy: C2IpcBuddyPayload | undefined;
+          let buddy: C2IpcShmBlock | undefined;
           if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
-            if ((open.handshake.capabilityFlags & C2_IPC_CAP_SHM_RESPONSE) === 0) {
-              // Reject before any block mapping, reading, or release cleanup:
-              // an SHM reply the server never acknowledged is a protocol
-              // violation, and the connection state is no longer trustworthy.
+            try {
+              if ((open.handshake.capabilityFlags & C2_IPC_CAP_SHM_RESPONSE) === 0) {
+                throw new C2IpcTransportError("C-Two IPC server sent an SHM reply without the acknowledged SHM response capability.");
+              }
+              if (open.connection.memory === undefined) throw new C2IpcTransportError("C-Two IPC SHM response has no native memory context.");
+              if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
+                throw new C2IpcTransportError("C-Two IPC chunked SHM responses are not supported by this generated transport yet.");
+              }
+              buddy = decodeIpcBuddyPayload(frame.payload);
+            } catch (error) {
               await discardConnection(open);
-              throw new C2IpcTransportError("C-Two IPC server sent an SHM reply without the acknowledged SHM response capability.");
+              throw error;
             }
-            if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
-              throw new C2IpcTransportError("C-Two IPC chunked SHM responses are not supported by this generated transport yet.");
-            }
-            buddy = decodeIpcBuddyPayload(frame.payload);
           } else if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
             try {
-              return { kind: "inline", payload: await readIpcChunkedSuccessPayload(open.connection, frame, requestId) };
+              return { kind: "inline", payload: await readIpcChunkedSuccessPayload(open, frame, requestId) };
             } catch (error) {
               if (!chunked) await discardConnection(open);
               if (error instanceof C2IpcTransportError) throw error;
               throw new C2IpcTransportError(`C-Two IPC chunked response read failed: ${String(error)}`);
             }
           }
-          const reply = decodeIpcReplyControl(frame.payload.subarray(buddy === undefined ? 0 : C2_IPC_BUDDY_PAYLOAD_BYTES));
-          if (reply.kind === "error") throw new C2CrmMethodError(reply.payload);
-          if (reply.kind === "route-not-found") throw new C2IpcRouteNotFoundError(reply.routeName);
-          if (buddy !== undefined) {
-            if (reply.payload.byteLength !== 0) {
-              throw new C2IpcTransportError("C-Two IPC SHM success reply control contains unexpected inline payload bytes.");
+          const memory = open.connection.memory;
+          let response: unknown;
+          let admitted = false;
+          let delivered = false;
+          try {
+            if (buddy !== undefined && memory !== undefined) {
+              try { response = memory.admitResponse(buddy); }
+              catch (error) { await discardConnection(open); throw error; }
+              admitted = true;
             }
-            if (responseShmReader === undefined) {
-              throw new C2IpcTransportError("C-Two IPC responseShmReader is required for SHM replies.");
+            const reply = decodeIpcReplyControl(frame.payload.subarray(buddy === undefined ? 0 : C2_IPC_BUDDY_PAYLOAD_BYTES));
+            if (reply.kind === "error") throw new C2CrmMethodError(reply.payload);
+            if (reply.kind === "route-not-found") throw new C2IpcRouteNotFoundError(reply.routeName);
+            if (buddy !== undefined) {
+              if (reply.payload.byteLength !== 0 || memory === undefined) throw new C2IpcTransportError("Invalid SHM response control or native memory context.");
+              delivered = true;
+              return { kind: "shm", block: buddy, response };
             }
-            return { kind: "shm", block: buildIpcResponseShmBlock(open.handshake, buddy) };
+            return { kind: "inline", payload: reply.payload };
+          } finally {
+            if (admitted && !delivered) {
+              memory!.discardResponse(response);
+              await flushReleases(open);
+            }
           }
-          return { kind: "inline", payload: reply.payload };
         };
         const observeResponse = (value: Payload): Payload => {
           responses += 1;
@@ -656,7 +573,6 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
             path: observationPath,
             routeName,
             routeUid: route.routeUid,
-            routeRevision: route.routeRevision,
             ipcAddress: address,
             serverId: open.handshake.serverIdentity.serverId,
             serverInstanceId: open.handshake.serverIdentity.serverInstanceId,
@@ -670,9 +586,6 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           try {
             callControl = encodeIpcCallControl(route, methodInfo.index);
             if (chunked) {
-              if ((open.handshake.capabilityFlags & C2_IPC_CAP_CHUNKED) === 0) {
-                throw new C2IpcTransportError("C-Two IPC server does not support chunked request calls.");
-              }
               if (totalChunks <= 0 || totalChunks > 0xffff) {
                 throw new C2IpcTransportError(`C-Two IPC request chunk count ${totalChunks} is outside the u16 chunk header range.`);
               }
@@ -685,7 +598,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           const writing = (async (): Promise<void> => {
             try {
               if (useShm) {
-                requestShmBlock = await writeIpcBuddyCallRequestFrame(open.connection, requestId, callControl, requestPayload, requestShmWriter!);
+                await writeIpcBuddyCallRequestFrame(open, requestId, callControl, requestPayload);
               } else if (chunked) {
                 for (let index = 0; index < totalChunks; index += 1) {
                   // close/discard clears this before closing the stream;
@@ -700,10 +613,10 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
                   const body = index === 0
                     ? concatUint8Arrays([encodeIpcRequestChunkHeader(index, totalChunks), callControl, chunk])
                     : concatUint8Arrays([encodeIpcRequestChunkHeader(index, totalChunks), chunk]);
-                  await open.connection.write(encodeIpcFrame(requestId, flags, body));
+                  await writeIpcFrame(open, encodeIpcFrame(requestId, flags, body));
                 }
               } else {
-                await open.connection.write(encodeIpcFrame(requestId, C2_IPC_FLAG_CALL_V2, concatUint8Arrays([callControl, requestPayload])));
+                await writeIpcFrame(open, encodeIpcFrame(requestId, C2_IPC_FLAG_CALL_V2, concatUint8Arrays([callControl, requestPayload])));
               }
               requests += 1;
             } catch (error) {
@@ -721,8 +634,10 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
               await discardConnection(open);
               const [, received] = await Promise.allSettled([writing, receiving]);
               if (received.status === "fulfilled" && received.value.kind === "shm") {
-                await releaseIpcShmResponseBlockAfterRead(responseShmReader!, received.value.block, error);
+                open.connection.memory!.discardResponse(received.value.response);
+                try { await writeIpcFrame(open); } catch { /* preserve the original failed exchange */ }
               }
+              await discardConnection(open);
               throw error;
             }
           } else {
@@ -735,7 +650,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
             reply = await receive();
           }
           if (reply.kind === "shm") {
-            responseValue = await readIpcShmSuccessPayload(reply.block, responsePayloadAllocator, responseShmReader!);
+            responseValue = await readIpcShmSuccessPayload(reply.response, reply.block.byteLength, responsePayloadAllocator, open.connection.memory!, () => flushReleases(open));
             return observeResponse(responseValue);
           }
           try {
@@ -746,11 +661,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           }
         } catch (error) {
           responseError = error;
-          if (chunked) await discardConnection(open);
-        } finally {
-          if (requestShmServerConsumed && requestShmBlock !== undefined && requestShmWriter !== undefined) {
-            await releaseIpcRequestShmBlockAfterCall(requestShmWriter, requestShmBlock, responseError);
-          }
+          if (chunked || error instanceof C2IpcTransportError) await discardConnection(open);
         }
         if (responseError !== undefined) {
           throw responseError;
@@ -768,9 +679,29 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
       }
       const open = await current.catch(() => undefined);
       if (open !== undefined) {
+        let closeAttempted = false;
         try {
+          if (open.connection.memory !== undefined) {
+            open.closing = true;
+            open.connection.memory.deactivate();
+            await open.writeChain;
+            await writeIpcFrame(open);
+            if (!open.connection.memory.tryClose()) {
+              await writeIpcFrame(open, encodeIpcFrame(0n, C2_IPC_FLAG_SIGNAL, new Uint8Array([0x08])), undefined, true);
+              if (open.reading !== undefined) await open.reading;
+              else {
+                try { await readIpcResponseFrame(open); } catch (error) {
+                  if (!open.connection.memory.tryClose()) throw error;
+                }
+              }
+            }
+          }
+          closeAttempted = true;
           await open.connection.close();
         } catch (error) {
+          if (!closeAttempted) {
+            try { await open.connection.close(); } catch { /* preserve the settlement failure */ }
+          }
           const closeError = new C2IpcTransportError(`C-Two IPC close failed: ${String(error)}`);
           closeError.cause = error;
           throw closeError;
@@ -869,7 +800,6 @@ export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayloa
         path: "ExplicitRelay",
         routeName,
         routeUid: route.routeUid,
-        routeRevision: route.routeRevision,
         relayUrl: route.relayUrl,
         requests,
         responses,
@@ -954,7 +884,6 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
               },
               expectedRouteToken: {
                 routeUid: localRoute.routeUid,
-                routeRevision: localRoute.routeRevision,
               },
               observationPath: "RelayAwareLocalIpc",
               observe,
@@ -1045,7 +974,6 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
               path: "RelayAwareHttp",
               routeName,
               routeUid: route.routeUid,
-              routeRevision: route.routeRevision,
               relayUrl,
               requests,
               responses,
@@ -1082,7 +1010,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
   };
 }
 
-const C2_IPC_HANDSHAKE_VERSION = 14;
+const C2_IPC_HANDSHAKE_VERSION = 15;
 const C2_IPC_FRAME_BODY_HEADER_BYTES = 12;
 const C2_IPC_FRAME_HEADER_BYTES = 16;
 const C2_IPC_BUDDY_PAYLOAD_BYTES = 23;
@@ -1091,21 +1019,9 @@ const C2_IPC_REPLY_CHUNK_META_BYTES = 16;
 const C2_IPC_REQUEST_CHUNK_HEADER_BYTES = 4;
 const C2_IPC_DEFAULT_REQUEST_SHM_THRESHOLD = 4096;
 const C2_IPC_DEFAULT_REQUEST_CHUNK_SIZE = 131_072;
-const C2_IPC_MAX_SHM_PREFIX_BYTES = 255;
-const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
-const C2_MEM_FFI_DEFAULT_MAX_SEGMENTS = 16;
-const C2_MEM_FFI_DEFAULT_MIN_BLOCK_SIZE = 4096;
-const C2_IPC_CAP_CALL_V2 = 1 << 0;
-const C2_IPC_CAP_METHOD_IDX = 1 << 1;
-const C2_IPC_CAP_CHUNKED = 1 << 2;
-// IPC 13 splits shared memory by client-relative direction. A client offers
-// CAP_SHM_REQUEST when it owns a request writer and CAP_SHM_RESPONSE when it
-// owns a response reader; the server ACK carries the intersection with its
-// real native session. Pool enablement is never a capability, and no session
-// switch exists: an unacknowledged direction silently stays on the existing
-// owned inline/chunked paths, including across SHM session boundaries.
 const C2_IPC_CAP_SHM_REQUEST = 1 << 3;
 const C2_IPC_CAP_SHM_RESPONSE = 1 << 4;
+const C2_IPC_FLAG_SIGNAL = 1 << 11;
 const C2_IPC_FLAG_RESPONSE = 1 << 1;
 const C2_IPC_FLAG_HANDSHAKE = 1 << 2;
 const C2_IPC_FLAG_CTRL = 1 << 4;
@@ -1115,8 +1031,7 @@ const C2_IPC_FLAG_REPLY_V2 = 1 << 8;
 const C2_IPC_FLAG_CHUNKED = 1 << 9;
 const C2_IPC_FLAG_CHUNK_LAST = 1 << 10;
 // Canonical c2-wire route catalog MsgType discriminants.
-const C2_IPC_ROUTE_LIST = 0x0e;
-const C2_IPC_ROUTE_LIST_ACK = 0x0f;
+const C2_IPC_RELEASE = 0x17;
 const C2_IPC_ROUTE_LOOKUP = 0x10;
 const C2_IPC_ROUTE_LOOKUP_ACK = 0x11;
 const C2_IPC_ROUTE_NACK = 0x15;
@@ -1157,84 +1072,6 @@ function normalizeIpcConnect<Payload extends C2ResponsePayload>(value: C2IpcTran
   return value.connect;
 }
 
-function normalizeIpcResponseShmReader(value: C2IpcResponseShmReader | undefined, label: string): C2IpcResponseShmReader | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (typeof value !== "object" || value === null) {
-    throw new C2IpcTransportError(`${label} must be an object.`);
-  }
-  if (typeof value.read !== "function") {
-    throw new C2IpcTransportError("C-Two IPC responseShmReader read must be a function.");
-  }
-  if (typeof value.release !== "function") {
-    throw new C2IpcTransportError("C-Two IPC responseShmReader release must be a function.");
-  }
-  return value;
-}
-
-function normalizeIpcRequestShmWriter(value: C2IpcRequestShmWriter | undefined, label: string): C2IpcRequestShmWriter | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (typeof value !== "object" || value === null) {
-    throw new C2IpcTransportError(`${label} must be an object.`);
-  }
-  if (typeof value.prefix !== "string" || value.prefix.length === 0) {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter prefix must be a non-empty string.");
-  }
-  requireIpcHandshakeText(value.prefix, "requestShmWriter prefix");
-  if (utf8ByteLength(value.prefix) > C2_IPC_MAX_SHM_PREFIX_BYTES) {
-    throw new C2IpcTransportError(`C-Two IPC requestShmWriter prefix cannot exceed ${C2_IPC_MAX_SHM_PREFIX_BYTES} bytes.`);
-  }
-  if (!Array.isArray(value.segments)) {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter segments must be an array.");
-  }
-  if (value.segments.length > 0xffff) {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter segments length exceeds u16 range.");
-  }
-  for (let index = 0; index < value.segments.length; index += 1) {
-    const segment = value.segments[index] as Partial<C2IpcShmSegment>;
-    if (typeof segment !== "object" || segment === null) {
-      throw new C2IpcTransportError(`C-Two IPC requestShmWriter segment ${index} must be an object.`);
-    }
-    const name = segment.name;
-    const size = segment.size;
-    if (typeof name !== "string" || name.length === 0) {
-      throw new C2IpcTransportError(`C-Two IPC requestShmWriter segment ${index} name must be a non-empty string.`);
-    }
-    requireIpcHandshakeText(name, `requestShmWriter segment ${index} name`);
-    if (typeof size !== "number" || !Number.isSafeInteger(size) || size <= 0 || size > 0xffffffff) {
-      throw new C2IpcTransportError(`C-Two IPC requestShmWriter segment ${index} size must be a positive u32 integer.`);
-    }
-  }
-  if (typeof value.write !== "function") {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter write must be a function.");
-  }
-  if (typeof value.release !== "function") {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter release must be a function.");
-  }
-  if (value.markConsumed !== undefined && typeof value.markConsumed !== "function") {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter markConsumed must be a function when provided.");
-  }
-  const writer = value;
-  const prefix = value.prefix;
-  const segments = value.segments.map((segment) => ({ name: segment.name, size: segment.size }));
-  return {
-    prefix,
-    segments,
-    write(payload: Uint8Array): C2IpcRequestShmBlock | Promise<C2IpcRequestShmBlock> {
-      return writer.write(payload);
-    },
-    release(block: C2IpcRequestShmBlock): void | Promise<void> {
-      return writer.release(block);
-    },
-    markConsumed(block: C2IpcRequestShmBlock): void | Promise<void> {
-      return writer.markConsumed?.(block);
-    },
-  };
-}
-
 function normalizeIpcRequestShmThreshold(value: number | undefined, label: string): number {
   if (value === undefined) {
     return C2_IPC_DEFAULT_REQUEST_SHM_THRESHOLD;
@@ -1254,391 +1091,6 @@ function normalizeIpcRequestChunkSize(value: number | undefined, label: string):
     throw new C2IpcTransportError(`${label} must be a positive safe integer no greater than ${maxRequestChunkSize}.`);
   }
   return value;
-}
-
-export function createNativeResponseShmReader(options: C2NativeResponseShmReaderOptions): C2IpcResponseShmReader {
-  const backend = normalizeNativeResponseBackend(options, "C-Two native response SHM reader options");
-  return {
-    async read(block: C2IpcResponseShmBlock, destination?: Uint8Array): Promise<Uint8Array | void> {
-      requireNativeResponseShmBlock(block, "reader");
-      const target = destination ?? new Uint8Array(block.byteLength);
-      if (target.byteLength !== block.byteLength) {
-        throw new C2IpcTransportError(`C-Two native SHM reader destination length ${target.byteLength} does not match block byteLength ${block.byteLength}.`);
-      }
-      const result = (await backend.readResponse(block, target)) as C2ByteArray | ArrayBufferLike | void;
-      let postReadError: unknown;
-      try {
-        if (result !== undefined) {
-          const bytes = requireIpcShmReaderBytes(result);
-          if (bytes.byteLength !== block.byteLength) {
-            throw new C2IpcTransportError(`C-Two native SHM reader returned ${bytes.byteLength} bytes, expected ${block.byteLength}.`);
-          }
-          if (bytes !== target) {
-            target.set(bytes);
-          }
-        }
-      } catch (error) {
-        postReadError = error;
-      }
-      if (postReadError !== undefined) {
-        try {
-          await backend.releaseResponse(block);
-        } catch (releaseError) {
-          throw new C2IpcTransportError(`C-Two native SHM reader post-read validation failed and release failed: validation=${String(postReadError)} release=${String(releaseError)}`);
-        }
-        if (postReadError instanceof C2IpcTransportError) {
-          throw postReadError;
-        }
-        throw new C2IpcTransportError(`C-Two native SHM reader post-read validation failed: ${String(postReadError)}`);
-      }
-      return destination === undefined ? target : undefined;
-    },
-    async release(block: C2IpcResponseShmBlock): Promise<void> {
-      requireNativeResponseShmBlock(block, "release");
-      await backend.releaseResponse(block);
-    },
-  };
-}
-
-export function createNativeRequestShmWriter(options: C2NativeRequestShmWriterOptions): C2IpcRequestShmWriter {
-  const backend = normalizeNativeRequestBackend(options, "C-Two native request SHM writer options");
-  return {
-    prefix: backend.prefix,
-    segments: backend.segments,
-    async write(payload: Uint8Array): Promise<C2IpcRequestShmBlock> {
-      const block = await backend.writeRequest(requireUint8Array(payload, "payload"));
-      return block;
-    },
-    release(block: C2IpcRequestShmBlock): void | Promise<void> {
-      return backend.releaseRequest(block);
-    },
-    markConsumed(block: C2IpcRequestShmBlock): void | Promise<void> {
-      return backend.markRequestConsumed?.(block);
-    },
-  };
-}
-
-export function createC2MemFfiNativeResponseShmReader(options: C2MemFfiNativeResponseShmReaderOptions): C2ClosableIpcResponseShmReader {
-  const normalized = normalizeC2MemFfiResponsePoolFactory(options, "C-Two c2-mem-ffi response SHM reader options");
-  const pools = new Map<string, Promise<C2MemFfiResponsePoolBinding>>();
-  let closed = false;
-  const poolForBlock = async (block: C2IpcResponseShmBlock): Promise<C2MemFfiResponsePoolBinding> => {
-    ensureC2MemFfiFacadeOpen(closed, "response SHM reader");
-    requireC2MemFfiResponsePrefix(block.prefix);
-    const prefix = block.prefix;
-    let pool = pools.get(prefix);
-    if (pool === undefined) {
-      const segmentSize = resolveC2MemFfiResponseBootstrapSegmentSize(block, normalized.segmentSize, normalized.minBlockSize);
-      pool = Promise.resolve(normalized.binding.createResponsePool({
-        prefix,
-        segmentSize,
-        maxSegments: normalized.maxSegments,
-        minBlockSize: normalized.minBlockSize,
-      })).then((created) => normalizeC2MemFfiResponsePoolBinding(created, `C-Two c2-mem-ffi response pool for ${prefix}`)).catch((error) => {
-        pools.delete(prefix);
-        throw error;
-      });
-      pools.set(prefix, pool);
-    }
-    return await pool;
-  };
-  const backend: C2NativeResponseShmBackend = {
-    async readResponse(block: C2IpcResponseShmBlock, destination: Uint8Array): Promise<void> {
-      const pool = await poolForBlock(block);
-      await pool.read(block, destination);
-    },
-    async releaseResponse(block: C2IpcResponseShmBlock): Promise<void> {
-      const pool = await poolForBlock(block);
-      await pool.release(block);
-    },
-  };
-  const reader = createNativeResponseShmReader({ backend });
-  return Object.assign(reader, {
-    async close(): Promise<void> {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      const pendingPools = Array.from(pools.values());
-      pools.clear();
-      let firstError: unknown;
-      for (const pool of pendingPools) {
-        try {
-          await (await pool).close?.();
-        } catch (error) {
-          firstError ??= error;
-        }
-      }
-      if (firstError !== undefined) {
-        throw new C2IpcTransportError(`C-Two c2-mem-ffi response SHM reader close failed: ${String(firstError)}`);
-      }
-    },
-  });
-}
-
-export function createC2MemFfiNativeRequestShmWriter(options: C2MemFfiNativeRequestShmWriterOptions): C2ClosableIpcRequestShmWriter {
-  const pool = normalizeC2MemFfiRequestPool(options, "C-Two c2-mem-ffi request SHM writer options");
-  let closed = false;
-  const writer = createNativeRequestShmWriter({
-    backend: {
-      prefix: pool.prefix,
-      segments: pool.segments,
-      writeRequest(payload: Uint8Array): C2IpcRequestShmBlock | Promise<C2IpcRequestShmBlock> {
-        ensureC2MemFfiFacadeOpen(closed, "request SHM writer");
-        return pool.write(payload);
-      },
-      releaseRequest(block: C2IpcRequestShmBlock): void | Promise<void> {
-        ensureC2MemFfiFacadeOpen(closed, "request SHM writer");
-        return pool.release(block);
-      },
-      markRequestConsumed(block: C2IpcRequestShmBlock): void | Promise<void> {
-        ensureC2MemFfiFacadeOpen(closed, "request SHM writer");
-        return pool.forgetConsumed(block);
-      },
-    },
-  });
-  return Object.assign(writer, {
-    close(): void | Promise<void> {
-      if (closed) {
-        return undefined;
-      }
-      closed = true;
-      return pool.close?.();
-    },
-  });
-}
-
-function normalizeNativeResponseBackend(options: C2NativeResponseShmReaderOptions, label: string): C2NativeResponseShmBackend {
-  if (typeof options !== "object" || options === null) {
-    throw new C2IpcTransportError(`${label} must be an object.`);
-  }
-  const backend = options.backend;
-  if (typeof backend !== "object" || backend === null) {
-    throw new C2IpcTransportError(`${label} backend must be a native/FFI c2-mem-compatible backend object.`);
-  }
-  if (typeof backend.readResponse !== "function") {
-    throw new C2IpcTransportError(`${label} backend.readResponse must be a function.`);
-  }
-  if (typeof backend.releaseResponse !== "function") {
-    throw new C2IpcTransportError(`${label} backend.releaseResponse must be a function.`);
-  }
-  return backend;
-}
-
-function normalizeNativeRequestBackend(
-  options: C2NativeRequestShmWriterOptions,
-  label: string,
-): C2NativeRequestShmBackend {
-  if (typeof options !== "object" || options === null) {
-    throw new C2IpcTransportError(`${label} must be an object.`);
-  }
-  const backend = options.backend;
-  if (typeof backend !== "object" || backend === null) {
-    throw new C2IpcTransportError(`${label} backend must be a native/FFI c2-mem-compatible backend object.`);
-  }
-  const prefix = backend.prefix;
-  if (typeof prefix !== "string" || prefix.length === 0) {
-    throw new C2IpcTransportError(`${label} backend.prefix must be a non-empty shared-memory identity prefix.`);
-  }
-  requireIpcHandshakeText(prefix, "native request SHM prefix");
-  requireShmIdentity(prefix, "native request SHM prefix");
-  if (utf8ByteLength(prefix) > C2_IPC_MAX_SHM_PREFIX_BYTES) {
-    throw new C2IpcTransportError(`C-Two native request SHM prefix cannot exceed ${C2_IPC_MAX_SHM_PREFIX_BYTES} bytes.`);
-  }
-  if (!Array.isArray(backend.segments)) {
-    throw new C2IpcTransportError(`${label} backend.segments must be an array.`);
-  }
-  if (backend.segments.length > 0xffff) {
-    throw new C2IpcTransportError(`${label} backend.segments length exceeds u16 range.`);
-  }
-  const segments = backend.segments.map((segment, index) => {
-    if (typeof segment !== "object" || segment === null) {
-      throw new C2IpcTransportError(`${label} backend segment ${index} must be an object.`);
-    }
-    const name = segment.name;
-    const size = segment.size;
-    if (typeof name !== "string" || name.length === 0) {
-      throw new C2IpcTransportError(`${label} backend segment ${index} name must be a non-empty shared-memory identity name.`);
-    }
-    requireIpcHandshakeText(name, `native request SHM segment ${index} name`);
-    requireShmIdentity(name, `native request SHM segment ${index} name`);
-    if (typeof size !== "number" || !Number.isSafeInteger(size) || size <= 0 || size > 0xffffffff) {
-      throw new C2IpcTransportError(`${label} backend segment ${index} size must be a positive u32 integer.`);
-    }
-    return { name, size };
-  });
-  if (typeof backend.writeRequest !== "function") {
-    throw new C2IpcTransportError(`${label} backend.writeRequest must be a function.`);
-  }
-  if (typeof backend.releaseRequest !== "function") {
-    throw new C2IpcTransportError(`${label} backend.releaseRequest must be a function.`);
-  }
-  if (backend.markRequestConsumed !== undefined && typeof backend.markRequestConsumed !== "function") {
-    throw new C2IpcTransportError(`${label} backend.markRequestConsumed must be a function when provided.`);
-  }
-  return {
-    prefix,
-    segments,
-    writeRequest(payload: Uint8Array): C2IpcRequestShmBlock | Promise<C2IpcRequestShmBlock> {
-      return backend.writeRequest(payload);
-    },
-    releaseRequest(block: C2IpcRequestShmBlock): void | Promise<void> {
-      return backend.releaseRequest(block);
-    },
-    markRequestConsumed(block: C2IpcRequestShmBlock): void | Promise<void> {
-      return backend.markRequestConsumed?.(block);
-    },
-  };
-}
-
-function normalizeC2MemFfiResponsePoolFactory(
-  options: C2MemFfiNativeResponseShmReaderOptions,
-  label: string,
-): { readonly binding: C2MemFfiResponsePoolFactory; readonly segmentSize: number | undefined; readonly maxSegments: number; readonly minBlockSize: number } {
-  if (typeof options !== "object" || options === null) {
-    throw new C2IpcTransportError(`${label} must be an object.`);
-  }
-  const binding = options.binding;
-  if (typeof binding !== "object" || binding === null) {
-    throw new C2IpcTransportError(`${label} binding must be a c2-mem-ffi response pool factory object.`);
-  }
-  if (typeof binding.createResponsePool !== "function") {
-    throw new C2IpcTransportError(`${label} binding.createResponsePool must be a function.`);
-  }
-  return {
-    binding,
-    segmentSize: options.segmentSize === undefined ? undefined : normalizeC2MemFfiPositiveU32(options.segmentSize, `${label} segmentSize`),
-    maxSegments: normalizeC2MemFfiMaxSegments(options.maxSegments, `${label} maxSegments`),
-    minBlockSize: options.minBlockSize === undefined ? C2_MEM_FFI_DEFAULT_MIN_BLOCK_SIZE : normalizeC2MemFfiPositiveU32(options.minBlockSize, `${label} minBlockSize`),
-  };
-}
-
-function normalizeC2MemFfiResponsePoolBinding(value: unknown, label: string): C2MemFfiResponsePoolBinding {
-  if (typeof value !== "object" || value === null) {
-    throw new C2IpcTransportError(`${label} must be an object.`);
-  }
-  const pool = value as Partial<C2MemFfiResponsePoolBinding>;
-  if (typeof pool.read !== "function") {
-    throw new C2IpcTransportError(`${label}.read must be a function.`);
-  }
-  if (typeof pool.release !== "function") {
-    throw new C2IpcTransportError(`${label}.release must be a function.`);
-  }
-  if (pool.close !== undefined && typeof pool.close !== "function") {
-    throw new C2IpcTransportError(`${label}.close must be a function when provided.`);
-  }
-  return pool as C2MemFfiResponsePoolBinding;
-}
-
-function normalizeC2MemFfiRequestPool(
-  options: C2MemFfiNativeRequestShmWriterOptions,
-  label: string,
-): C2MemFfiRequestPoolBinding {
-  if (typeof options !== "object" || options === null) {
-    throw new C2IpcTransportError(`${label} must be an object.`);
-  }
-  const pool = options.pool;
-  if (typeof pool !== "object" || pool === null) {
-    throw new C2IpcTransportError(`${label} pool must be a c2-mem-ffi request pool object.`);
-  }
-  if (typeof pool.write !== "function") {
-    throw new C2IpcTransportError(`${label} pool.write must be a function.`);
-  }
-  if (typeof pool.release !== "function") {
-    throw new C2IpcTransportError(`${label} pool.release must be a function.`);
-  }
-  if (typeof pool.forgetConsumed !== "function") {
-    throw new C2IpcTransportError(`${label} pool.forgetConsumed must be a function.`);
-  }
-  if (pool.close !== undefined && typeof pool.close !== "function") {
-    throw new C2IpcTransportError(`${label} pool.close must be a function when provided.`);
-  }
-  return pool;
-}
-
-/**
- * Smallest `PoolConfig.segment_size` that buddy-pool validation accepts for a
- * `min_block_size` (`segment_size >= 2 * min_block_size`).
- */
-function minimumC2MemFfiPeerSegmentSize(minBlockSize: number): number {
-  return normalizeC2MemFfiPositiveU32(minBlockSize * 2, "C-Two c2-mem-ffi response SHM minimum peer segment size");
-}
-
-/**
- * Resolve the bootstrap capacity used to open a peer response pool.
- *
- * The pool factory only needs a legal bootstrap geometry: c2-mem resolves the
- * actual backing by prefix/index/generation and stays authoritative for
- * capacity, byte range, and generation checks. A handshake segment list is a
- * descriptive snapshot of the segments that happened to exist when the
- * connection was opened, so a lazy server pool legitimately advertises none
- * and publishes later backings only through response frames. Prefer the
- * explicit configuration, then the advertised snapshot, and otherwise use the
- * minimum legal peer-pool geometry as an open-side floor — never a fabricated
- * claim about the server's real segment size.
- */
-function resolveC2MemFfiResponseBootstrapSegmentSize(block: C2IpcResponseShmBlock, configuredSegmentSize: number | undefined, minBlockSize: number): number {
-  if (configuredSegmentSize !== undefined) {
-    return configuredSegmentSize;
-  }
-  const advertisedSegment = block.segments[block.dedicated ? 0 : block.segmentIndex];
-  if (advertisedSegment !== undefined) {
-    return normalizeC2MemFfiPositiveU32(advertisedSegment.size, `C-Two c2-mem-ffi response SHM segment ${block.segmentIndex} advertised size`);
-  }
-  return minimumC2MemFfiPeerSegmentSize(minBlockSize);
-}
-
-function requireC2MemFfiResponsePrefix(prefix: string): void {
-  if (typeof prefix !== "string" || prefix.length === 0) {
-    throw new C2IpcTransportError("C-Two c2-mem-ffi response SHM prefix must be a non-empty shared-memory identity prefix.");
-  }
-  requireIpcHandshakeText(prefix, "c2-mem-ffi response SHM prefix");
-  requireShmIdentity(prefix, "c2-mem-ffi response SHM prefix");
-  if (utf8ByteLength(prefix) > C2_IPC_MAX_SHM_PREFIX_BYTES) {
-    throw new C2IpcTransportError(`C-Two c2-mem-ffi response SHM prefix cannot exceed ${C2_IPC_MAX_SHM_PREFIX_BYTES} bytes.`);
-  }
-}
-
-function ensureC2MemFfiFacadeOpen(closed: boolean, label: string): void {
-  if (closed) {
-    throw new C2IpcTransportError(`C-Two c2-mem-ffi ${label} is closed.`);
-  }
-}
-
-function normalizeC2MemFfiMaxSegments(value: number | undefined, label: string): number {
-  if (value === undefined) {
-    return C2_MEM_FFI_DEFAULT_MAX_SEGMENTS;
-  }
-  if (!Number.isSafeInteger(value) || value < 1 || value > C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS) {
-    throw new C2IpcTransportError(`${label} must be a positive safe integer no greater than ${C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS}.`);
-  }
-  return value;
-}
-
-function normalizeC2MemFfiPositiveU32(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value <= 0 || value > 0xffffffff) {
-    throw new C2IpcTransportError(`${label} must be a positive u32 integer.`);
-  }
-  return value;
-}
-
-function requireNativeResponseShmBlock(block: C2IpcResponseShmBlock, action: string): void {
-  if (releasableIpcRequestShmBlock(block) === undefined || (block.dedicated && block.offset !== 0)) {
-    throw new C2IpcTransportError(`C-Two native SHM ${action} received invalid coordinates.`);
-  }
-}
-
-function requireShmIdentity(name: string, label: string): void {
-  if (typeof name !== "string" || name.length < 2 || !name.startsWith("/")) {
-    throw new C2IpcTransportError(`C-Two Node/shared-memory identity ${label} must start with "/" and contain a name.`);
-  }
-  const body = name.slice(1);
-  if (body === "." || body === ".." || body.includes("/") || body.includes("\\")) {
-    throw new C2IpcTransportError(`C-Two Node/shared-memory identity ${label} cannot contain path separators.`);
-  }
-  if (/[\u0000-\u001F\u007F-\u009F]/.test(name)) {
-    throw new C2IpcTransportError(`C-Two Node/shared-memory identity ${label} cannot contain control characters.`);
-  }
 }
 
 function requireIpcConnection(value: unknown): C2IpcConnection {
@@ -1661,8 +1113,6 @@ function requireIpcConnection(value: unknown): C2IpcConnection {
 async function connectAndHandshakeIpc(
   address: string,
   connect: C2IpcConnect,
-  requestShmWriter: C2IpcRequestShmWriter | undefined,
-  responseShmReader: C2IpcResponseShmReader | undefined,
 ): Promise<C2IpcOpenConnection> {
   let connection: C2IpcConnection;
   try {
@@ -1675,7 +1125,7 @@ async function connectAndHandshakeIpc(
   }
   try {
     // Preserve local metadata validation before any bytes reach the peer.
-    const metadata = encodeIpcFrame(0n, C2_IPC_FLAG_HANDSHAKE, encodeClientIpcHandshake(requestShmWriter, responseShmReader));
+    const metadata = encodeIpcFrame(0n, C2_IPC_FLAG_HANDSHAKE, encodeClientIpcHandshake(connection.memory));
     await connection.write(encodeClientIpcHello());
     await acceptServerIpcVersion(connection);
     await connection.write(metadata);
@@ -1684,13 +1134,8 @@ async function connectAndHandshakeIpc(
       throw new C2IpcTransportError("C-Two IPC server metadata response has invalid request id or flags.");
     }
     const handshake = decodeServerIpcHandshake(frame.payload);
-    if ((handshake.capabilityFlags & C2_IPC_CAP_CALL_V2) === 0) {
-      throw new C2IpcTransportError("C-Two IPC server does not support v2 call frames.");
-    }
-    if ((handshake.capabilityFlags & C2_IPC_CAP_METHOD_IDX) === 0) {
-      throw new C2IpcTransportError("C-Two IPC server does not support method indexes.");
-    }
-    return { connection, handshake };
+    connection.memory?.finishHandshake((handshake.capabilityFlags & C2_IPC_CAP_SHM_RESPONSE) !== 0 ? handshake.shmPrefix : null);
+    return { connection, handshake, writeChain: Promise.resolve(), closing: false, reading: undefined };
   } catch (error) {
     const primaryError = error instanceof C2IpcTransportError ? error : new C2IpcTransportError(
       `C-Two IPC handshake failed: ${String(error)}`,
@@ -1778,27 +1223,9 @@ function validateIpcRegionId(region: string): void {
   }
 }
 
-function encodeClientIpcHandshake(
-  requestShmWriter: C2IpcRequestShmWriter | undefined,
-  responseShmReader: C2IpcResponseShmReader | undefined,
-): Uint8Array {
-  // The request-pool advertisement is present exactly when the client offers
-  // the request direction; the response direction is offered through its own
-  // capability bit because the server owns that pool's advertisement.
-  const prefix = requestShmWriter?.prefix ?? "";
-  const segments = requestShmWriter?.segments ?? [];
-  let capabilityFlags = C2_IPC_CAP_CALL_V2 | C2_IPC_CAP_METHOD_IDX | C2_IPC_CAP_CHUNKED;
-  if (requestShmWriter !== undefined) capabilityFlags |= C2_IPC_CAP_SHM_REQUEST;
-  if (responseShmReader !== undefined) capabilityFlags |= C2_IPC_CAP_SHM_RESPONSE;
-  return concatUint8Arrays([
-    encodeIpcHandshakeText(prefix, "client SHM prefix"),
-    writeU16LE(segments.length),
-    ...segments.map((segment, index) => concatUint8Arrays([
-      writeU32LE(segment.size),
-      encodeIpcHandshakeText(segment.name, `client SHM segment ${index} name`),
-    ])),
-    writeU16LE(capabilityFlags),
-  ]);
+function encodeClientIpcHandshake(memory: C2IpcMemoryContext | undefined): Uint8Array {
+  const capabilities = memory === undefined ? 0 : C2_IPC_CAP_SHM_REQUEST | C2_IPC_CAP_SHM_RESPONSE;
+  return concatUint8Arrays([encodeIpcHandshakeText(memory?.prefix ?? "", "client SHM prefix"), writeU16LE(capabilities)]);
 }
 
 function encodeIpcHandshakeText(value: string, field: string): Uint8Array {
@@ -1837,7 +1264,6 @@ function encodeIpcCallControl(route: C2IpcRouteInfo, methodIndex: number): Uint8
     new Uint8Array([routeBytes.byteLength]),
     routeBytes,
     routeUidBytes,
-    writeU64LE(route.routeRevision, "route_revision"),
     crmNsBytes,
     crmNameBytes,
     crmVerBytes,
@@ -1847,211 +1273,84 @@ function encodeIpcCallControl(route: C2IpcRouteInfo, methodIndex: number): Uint8
   ]);
 }
 
-async function writeIpcBuddyCallRequestFrame(
-  connection: C2IpcConnection,
-  requestId: bigint,
-  callControl: Uint8Array,
-  requestPayload: Uint8Array,
-  requestShmWriter: C2IpcRequestShmWriter,
-): Promise<C2IpcRequestShmBlock> {
-  let block: C2IpcRequestShmBlock | undefined;
-  let frameWriteAttempted = false;
+async function writeIpcBuddyCallRequestFrame(open: C2IpcOpenConnection, requestId: bigint, control: C2ByteArray, payload: C2ByteArray): Promise<void> {
+  const memory = open.connection.memory!;
+  const request = memory.prepareRequest(payload);
+  let handedOff = false;
   try {
-    const rawBlock = await requestShmWriter.write(requestPayload);
-    try {
-      block = requireIpcRequestShmBlock(rawBlock, requestPayload.byteLength, requestShmWriter);
-    } catch (error) {
-      const releasableBlock = releasableIpcRequestShmBlock(rawBlock);
-      if (releasableBlock !== undefined) {
-        await tryReleaseIpcRequestShmBlock(requestShmWriter, releasableBlock);
-      }
-      throw error;
-    }
-    const payload = concatUint8Arrays([encodeIpcBuddyPayload(block), callControl]);
-    frameWriteAttempted = true;
-    await connection.write(encodeIpcFrame(requestId, C2_IPC_FLAG_CALL_V2 | C2_IPC_FLAG_BUDDY, payload));
-    return block;
-  } catch (error) {
-    if (block !== undefined) {
-      await tryReleaseIpcRequestShmBlock(requestShmWriter, block);
-    }
-    if (frameWriteAttempted) {
-      await closeIpcConnectionAfterWriteFailure(connection);
-    }
-    if (error instanceof C2IpcTransportError) {
-      throw error;
-    }
-    throw new C2IpcTransportError(`C-Two IPC requestShmWriter failed: ${String(error)}`);
+    const frame = encodeIpcFrame(requestId, C2_IPC_FLAG_CALL_V2 | C2_IPC_FLAG_BUDDY,
+      concatUint8Arrays([encodeIpcBuddyPayload(request.block), control]));
+    handedOff = true;
+    await writeIpcFrame(open, frame, request);
+  } finally {
+    if (!handedOff) memory.discardRequest(request);
   }
 }
 
-function requireIpcRequestShmBlock(value: unknown, expectedByteLength: number, requestShmWriter: C2IpcRequestShmWriter): C2IpcRequestShmBlock {
-  if (typeof value !== "object" || value === null) {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter write must return a request SHM block object.");
-  }
-  const block = value as Partial<C2IpcRequestShmBlock>;
-  const segmentIndex = block.segmentIndex;
-  const generation = block.generation;
-  const offset = block.offset;
-  const byteLength = block.byteLength;
-  const allocationId = block.allocationId;
-  const dedicated = block.dedicated;
-  if (typeof segmentIndex !== "number" || !Number.isSafeInteger(segmentIndex) || segmentIndex < 0 || segmentIndex > 0xffff) {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter block segmentIndex must be a u16 integer.");
-  }
-  if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0 || generation > 0xffffffff || (dedicated ? generation !== 0 : generation === 0)) {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter block generation must be a positive u32 for buddy memory or 0 for dedicated memory.");
-  }
-  if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 || offset > 0xffffffff) {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter block offset must be a u32 integer.");
-  }
-  if (byteLength !== expectedByteLength) {
-    throw new C2IpcTransportError(`C-Two IPC requestShmWriter block byteLength ${String(byteLength)} does not match request payload length ${expectedByteLength}.`);
-  }
-  if (typeof byteLength !== "number" || !Number.isSafeInteger(byteLength) || byteLength <= 0 || byteLength > 0xffffffff) {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter block byteLength must be a positive u32 integer.");
-  }
-  if (typeof dedicated !== "boolean") {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter block dedicated must be a boolean.");
-  }
-  if (dedicated && offset !== 0) {
-    throw new C2IpcTransportError("C-Two IPC requestShmWriter dedicated block offset must be 0.");
-  }
-  requireIpcAllocationId(allocationId, dedicated, "requestShmWriter block");
-  if (!dedicated) {
-    const segment = requestShmWriter.segments[segmentIndex];
-    if (segment === undefined) {
-      throw new C2IpcTransportError(`C-Two IPC requestShmWriter block segmentIndex ${segmentIndex} is not advertised in the client handshake.`);
-    }
-    const segmentSize = segment.size;
-    if (offset + byteLength > segmentSize) {
-      throw new C2IpcTransportError(`C-Two IPC requestShmWriter block range ${offset}+${byteLength} exceeds segment ${segmentIndex} size ${segmentSize}.`);
-    }
-  }
-  return { segmentIndex, generation, offset, byteLength, allocationId, dedicated };
-}
-
-function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | undefined {
-  if (typeof value !== "object" || value === null) {
-    return undefined;
-  }
-  const block = value as Partial<C2IpcRequestShmBlock>;
-  const segmentIndex = block.segmentIndex;
-  const generation = block.generation;
-  const offset = block.offset;
-  const byteLength = block.byteLength;
-  const allocationId = block.allocationId;
-  const dedicated = block.dedicated;
-  if (
-    typeof segmentIndex !== "number" ||
-    !Number.isSafeInteger(segmentIndex) ||
-    segmentIndex < 0 ||
-    segmentIndex > 0xffff ||
-    typeof generation !== "number" ||
-    !Number.isSafeInteger(generation) ||
-    generation < 0 ||
-    generation > 0xffffffff ||
-    (dedicated ? generation !== 0 : generation === 0) ||
-    typeof offset !== "number" ||
-    !Number.isSafeInteger(offset) ||
-    offset < 0 ||
-    offset > 0xffffffff ||
-    typeof byteLength !== "number" ||
-    !Number.isSafeInteger(byteLength) ||
-    byteLength <= 0 ||
-    byteLength > 0xffffffff ||
-    typeof dedicated !== "boolean" ||
-    !isIpcAllocationId(allocationId, dedicated)
-  ) {
-    return undefined;
-  }
-  return { segmentIndex, generation, offset, byteLength, allocationId: allocationId as bigint, dedicated };
-}
-
-function isIpcAllocationId(value: unknown, dedicated: boolean): value is bigint {
-  return typeof value === "bigint" && value >= 0n && value <= 0xffffffffffffffffn && (dedicated ? value === 0n : value !== 0n);
-}
-
-function requireIpcAllocationId(value: unknown, dedicated: boolean, label: string): asserts value is bigint {
-  if (!isIpcAllocationId(value, dedicated)) {
-    throw new C2IpcTransportError(`C-Two IPC ${label} allocationId must be a nonzero u64 bigint for buddy memory or 0n for dedicated memory.`);
+function requireIpcLoanId(value: unknown): asserts value is bigint {
+  if (typeof value !== "bigint" || value <= 0n || value > 0xffffffffffffffffn) {
+    throw new C2IpcTransportError("C-Two IPC loanId must be a nonzero u64 bigint.");
   }
 }
-
-function encodeIpcBuddyPayload(block: C2IpcRequestShmBlock): Uint8Array {
+function encodeIpcBuddyPayload(block: C2IpcShmBlock): Uint8Array {
+  requireIpcLoanId(block.loanId);
   return concatUint8Arrays([
-    writeU16LE(block.segmentIndex),
-    writeU32LE(block.generation),
-    writeU32LE(block.offset),
-    writeU32LE(block.byteLength),
-    new Uint8Array([block.dedicated ? C2_IPC_BUDDY_FLAG_DEDICATED : 0]),
-    writeU64LEBigInt(block.allocationId, "allocation_id"),
+    writeU16LE(block.segmentIndex), writeU32LE(block.generation), writeU32LE(block.offset), writeU32LE(block.byteLength),
+    new Uint8Array([block.dedicated ? C2_IPC_BUDDY_FLAG_DEDICATED : 0]), writeU64LEBigInt(block.loanId, "loan_id"),
   ]);
 }
 
-async function closeIpcConnectionAfterWriteFailure(connection: C2IpcConnection): Promise<void> {
-  try {
-    await connection.close();
-  } catch (cleanupError) {
-    console.warn("Warning: IPC write failure cleanup failed:", cleanupError);
-  }
-}
-
-async function releaseIpcRequestShmBlockAfterCall(writer: C2IpcRequestShmWriter, block: C2IpcRequestShmBlock, priorError: unknown): Promise<void> {
-  if (!block.dedicated) {
-    let markConsumedError: unknown;
+/** Serializes all post-handshake writes, including immediate response releases. */
+async function writeIpcFrame(open: C2IpcOpenConnection, frame?: C2ByteArray, request?: C2IpcPreparedRequest, control = false): Promise<void> {
+  const write = open.writeChain.then(async () => {
+    const memory = open.connection.memory;
+    let batch: C2IpcMemoryWrite | undefined;
+    let started = false;
     try {
-      await markIpcRequestShmBlockConsumed(writer, block);
-    } catch (error) {
-      markConsumedError = error;
+      batch = memory?.beginWrite(frame === undefined ? 2 : control ? 1 : 0, request);
+      if (frame === undefined && batch === undefined) return;
+      const bytes = batch === undefined ? frame! : concatUint8Arrays([batch.prefix, frame ?? new Uint8Array()]);
+      batch?.start();
+      started = true;
+      try { await open.connection.write(bytes); }
+      catch (error) { batch?.complete(false); throw error; }
+      batch?.complete(true);
+    } finally {
+      if (!started) {
+        batch?.discard();
+        if (batch === undefined && request !== undefined) memory?.discardRequest(request);
+      }
     }
-    if (markConsumedError !== undefined) {
-      throw markConsumedError;
-    }
-    if (priorError !== undefined) {
-      throw priorError;
-    }
-    return;
-  }
-  let releaseError: unknown;
-  try {
-    await releaseIpcRequestShmBlock(writer, block);
-  } catch (error) {
-    releaseError = error;
-  }
-  if (releaseError !== undefined) {
-    throw releaseError;
-  }
-  if (priorError !== undefined) {
-    throw priorError;
-  }
+  });
+  open.writeChain = write.then(() => undefined, () => undefined);
+  return await write;
 }
 
-async function markIpcRequestShmBlockConsumed(writer: C2IpcRequestShmWriter, block: C2IpcRequestShmBlock): Promise<void> {
-  if (writer.markConsumed === undefined) {
-    return;
-  }
+async function readIpcResponseFrame(open: C2IpcOpenConnection): Promise<C2IpcFrame> {
+  let finish!: () => void;
+  open.reading = new Promise<void>(resolve => { finish = resolve; });
   try {
-    await writer.markConsumed(block);
-  } catch (error) {
-    throw new C2IpcTransportError(`C-Two IPC requestShmWriter markConsumed failed: ${String(error)}`);
-  }
-}
-
-async function releaseIpcRequestShmBlock(writer: C2IpcRequestShmWriter, block: C2IpcRequestShmBlock): Promise<void> {
-  try {
-    await writer.release(block);
-  } catch (error) {
-    throw new C2IpcTransportError(`C-Two IPC requestShmWriter release failed: ${String(error)}`);
-  }
-}
-
-async function tryReleaseIpcRequestShmBlock(writer: C2IpcRequestShmWriter, block: C2IpcRequestShmBlock): Promise<void> {
-  try {
-    await releaseIpcRequestShmBlock(writer, block);
-  } catch (cleanupError) {
-    console.warn("Warning: IPC request SHM cleanup failed:", cleanupError);
-  }
+    for (;;) {
+      const memory = open.connection.memory;
+      if (open.closing && memory?.tryClose()) {
+        await open.connection.close();
+        throw new C2IpcTransportError("C-Two IPC connection is closed.");
+      }
+      const frame = await readIpcFrame(open.connection);
+      if (frame.payload[0] === C2_IPC_RELEASE && (frame.flags & C2_IPC_FLAG_CTRL) !== 0) {
+        if (memory === undefined) throw new C2IpcTransportError("Release on a connection without native memory.");
+        memory.receiveRelease(encodeIpcFrame(frame.requestId, frame.flags, frame.payload));
+        continue;
+      }
+      if (!open.closing) return frame;
+      if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
+        if (memory === undefined || (open.handshake.capabilityFlags & C2_IPC_CAP_SHM_RESPONSE) === 0) throw new C2IpcTransportError("Unacknowledged SHM while closing.");
+        const response = memory.admitResponse(decodeIpcBuddyPayload(frame.payload));
+        memory.discardResponse(response);
+        await writeIpcFrame(open);
+      }
+    }
+  } finally { open.reading = undefined; finish(); }
 }
 
 function encodeIpcRequestChunkHeader(chunkIndex: number, totalChunks: number): Uint8Array {
@@ -2124,14 +1423,6 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     offset += 2;
     return value;
   };
-  const readU32 = (field: string): number => {
-    if (offset + 4 > payload.byteLength) {
-      throw new C2IpcTransportError(`C-Two IPC handshake truncated at ${field}.`);
-    }
-    const value = readU32LE(payload, offset);
-    offset += 4;
-    return value;
-  };
   const readU64 = (field: string): number => {
     if (offset + 8 > payload.byteLength) {
       throw new C2IpcTransportError(`C-Two IPC handshake truncated at ${field}.`);
@@ -2151,20 +1442,8 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
   };
 
   const shmPrefix = readText("prefix");
-  const segmentCount = readU16("segment count");
-  const shmSegments: C2IpcShmSegment[] = [];
-  for (let index = 0; index < segmentCount; index += 1) {
-    const size = readU32(`segment ${index} size`);
-    const name = readText(`segment ${index} name`);
-    if (size <= 0) {
-      throw new C2IpcTransportError(`C-Two IPC handshake segment ${index} size must be positive.`);
-    }
-    shmSegments.push({ name, size });
-  }
-  // Server ACK flags: CALL_V2/METHOD_IDX are mandatory; CAP_SHM_REQUEST and
-  // CAP_SHM_RESPONSE carry the native session's intersection with this
-  // client's directional offer and gate both shared-memory directions.
   const capabilityFlags = readU16("capability flags");
+  if ((capabilityFlags & ~(C2_IPC_CAP_SHM_REQUEST | C2_IPC_CAP_SHM_RESPONSE)) !== 0) throw new C2IpcTransportError("Unknown IPC capability bits.");
   const serverId = readText("server_id");
   const serverInstanceId = readText("server_instance_id");
   if (serverId.length === 0 || serverInstanceId.length === 0) {
@@ -2174,7 +1453,6 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
   for (let routeIndex = 0; routeIndex < routeCount; routeIndex += 1) {
     const name = readText(`route ${routeIndex} name`);
     const routeUid = readText(`route ${routeIndex} route_uid`);
-    readU64(`route ${routeIndex} route_revision`);
     const crmNs = readText(`route ${routeIndex} crm_ns`);
     const crmName = readText(`route ${routeIndex} crm_name`);
     const crmVer = readText(`route ${routeIndex} crm_ver`);
@@ -2207,7 +1485,6 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
   }
   return {
     shmPrefix,
-    shmSegments,
     capabilityFlags,
     serverIdentity: { serverId, serverInstanceId },
   };
@@ -2216,13 +1493,11 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
 interface C2IpcCatalogRecord {
   readonly route: C2IpcRouteInfo;
   readonly serverIdentity: C2ServerIdentity;
-  readonly catalogRevision: number;
   readonly state: string;
 }
 
 type C2IpcCatalogReply =
   | { readonly kind: "nack"; readonly code: number; readonly message: string }
-  | { readonly kind: "list" }
   | { readonly kind: "lookup"; readonly status: "ready" | "stale" | "contract_mismatch"; readonly routeName: string; readonly current: C2IpcCatalogRecord }
   | { readonly kind: "lookup"; readonly status: "not_found" | "removed" | "closed"; readonly routeName: string };
 
@@ -2259,11 +1534,13 @@ function ipcCatalogUid(value: unknown): string {
   return uid;
 }
 
+function ipcCatalogFields(item: Record<string, unknown>, fields: readonly string[]): void {
+  if (Object.keys(item).some(key => !fields.includes(key))) throw new C2IpcTransportError("C-Two IPC route catalog unknown fields.");
+}
+
 function ipcCatalogReason(value: unknown): void {
   if (typeof value !== "string" || ![
-    "register_prepared", "register_committed", "explicit_unregister", "shutdown",
-    "owner_lease_expired", "owner_watch_disconnected", "owner_route_missing",
-    "owner_identity_mismatch", "contract_mismatch", "catalog_compacted", "protocol_violation",
+    "register_committed", "explicit_unregister", "shutdown",
   ].includes(value)) {
     throw new C2IpcTransportError("C-Two IPC route catalog invalid state reason.");
   }
@@ -2275,6 +1552,7 @@ function decodeIpcCatalogRecord(value: unknown): C2IpcCatalogRecord {
   requireRouteNamePathValue(name);
   const routeUid = ipcCatalogUid(item.route_uid);
   const contract = ipcCatalogObject(item.contract);
+  ipcCatalogFields(contract, ["route_name", "crm_ns", "crm_name", "crm_ver", "abi_hash", "signature_hash"]);
   if (contract.route_name !== name) {
     throw new C2IpcTransportError("C-Two IPC route catalog contract route_name mismatch.");
   }
@@ -2293,15 +1571,10 @@ function decodeIpcCatalogRecord(value: unknown): C2IpcCatalogRecord {
   };
   validateIpcRegionId(serverIdentity.serverId);
   validateIpcRegionId(serverIdentity.serverInstanceId);
-  ipcCatalogInteger(item.owner_epoch, "owner_epoch");
-  if (item.lease_deadline_ms !== null && item.lease_deadline_ms !== undefined) {
-    ipcCatalogInteger(item.lease_deadline_ms, "lease_deadline_ms");
-  }
-  if (item.state_reason !== null && item.state_reason !== undefined) {
-    ipcCatalogReason(item.state_reason);
-  }
+  ipcCatalogFields(item, ["route_name", "route_uid", "owner_server_id", "owner_server_instance_id", "contract", "methods", "max_payload_size", "state", "state_reason"]);
+  ipcCatalogReason(item.state_reason);
   const state = ipcCatalogText(item.state, "state");
-  if (!["pending", "ready", "draining", "closed", "removed"].includes(state)) {
+  if (!["ready", "closed"].includes(state)) {
     throw new C2IpcTransportError("C-Two IPC route catalog invalid state.");
   }
   if (!Array.isArray(item.methods) || item.methods.length > 256) {
@@ -2311,6 +1584,7 @@ function decodeIpcCatalogRecord(value: unknown): C2IpcCatalogRecord {
   const indexes = new Set<number>();
   const methods = item.methods.map((value): C2IpcMethodInfo => {
     const method = ipcCatalogObject(value);
+    ipcCatalogFields(method, ["name", "index"]);
     const name = ipcCatalogText(method.name, "method name");
     requireMethodPathValue(name);
     const index = ipcCatalogInteger(method.index, "method index");
@@ -2324,13 +1598,11 @@ function decodeIpcCatalogRecord(value: unknown): C2IpcCatalogRecord {
   return {
     route: {
       name, routeUid,
-      routeRevision: ipcCatalogInteger(item.route_revision, "route_revision"),
       crmNs: identity.namespace, crmName: identity.name, crmVer: identity.version,
       abiHash: identity.abiHash, signatureHash: identity.signatureHash,
       maxPayloadSize: ipcCatalogInteger(item.max_payload_size, "max_payload_size", 1), methods,
     },
     serverIdentity,
-    catalogRevision: ipcCatalogInteger(item.catalog_revision, "catalog_revision"),
     state,
   };
 }
@@ -2341,8 +1613,7 @@ function decodeIpcCatalogReply(payload: Uint8Array, responseTag: number): C2IpcC
   }
   const item = ipcCatalogObject(JSON.parse(utf8Decode(payload.subarray(1), "route catalog")));
   if (payload[0] === C2_IPC_ROUTE_NACK) {
-    ipcCatalogInteger(item.nonce, "nonce");
-    ipcCatalogInteger(item.rejected_revision, "rejected_revision");
+    ipcCatalogFields(item, ["error"]);
     const error = ipcCatalogObject(item.error);
     const code = ipcCatalogInteger(error.code, "error code");
     ipcCatalogText(error.name, "error name");
@@ -2355,29 +1626,14 @@ function decodeIpcCatalogReply(payload: Uint8Array, responseTag: number): C2IpcC
     }
     return { kind: "nack", code, message: error.message };
   }
-  if (responseTag === C2_IPC_ROUTE_LIST_ACK) {
-    const revision = ipcCatalogInteger(item.catalog_revision, "catalog_revision");
-    if (ipcCatalogInteger(item.min_watch_revision, "min_watch_revision") > revision + 1 || !Array.isArray(item.routes)) {
-      throw new C2IpcTransportError("C-Two IPC route catalog invalid list response.");
-    }
-    const names = new Set<string>();
-    const uids = new Set<string>();
-    for (const value of item.routes) {
-      const record = decodeIpcCatalogRecord(value);
-      if (record.catalogRevision > revision || names.has(record.route.name) || uids.has(record.route.routeUid)) {
-        throw new C2IpcTransportError("C-Two IPC route catalog invalid or duplicate list record.");
-      }
-      names.add(record.route.name);
-      uids.add(record.route.routeUid);
-    }
-    return { kind: "list" };
-  }
   const status = item.status;
   if (status === "ready" || status === "stale" || status === "contract_mismatch") {
+    ipcCatalogFields(item, ["status", "current"]);
     const current = decodeIpcCatalogRecord(item.current);
     return { kind: "lookup", status, routeName: current.route.name, current };
   }
   if (status === "not_found" || status === "removed" || status === "closed") {
+    ipcCatalogFields(item, status === "not_found" ? ["status", "route_name"] : status === "removed" ? ["status", "route_name", "route_uid"] : ["status", "route_name", "route_uid", "reason"]);
     const routeName = ipcCatalogText(item.route_name, "route_name");
     requireRouteNamePathValue(routeName);
     if (status === "closed") {
@@ -2412,7 +1668,7 @@ function findIpcMethod(route: C2IpcRouteInfo, method: string): C2IpcMethodInfo {
   return methodInfo;
 }
 
-function decodeIpcBuddyPayload(payload: Uint8Array): C2IpcBuddyPayload {
+function decodeIpcBuddyPayload(payload: Uint8Array): C2IpcShmBlock {
   if (payload.byteLength < C2_IPC_BUDDY_PAYLOAD_BYTES) {
     throw new C2IpcTransportError("C-Two IPC buddy payload is truncated.");
   }
@@ -2429,163 +1685,48 @@ function decodeIpcBuddyPayload(payload: Uint8Array): C2IpcBuddyPayload {
   }
   const generation = readU32LE(payload, 2);
   const dedicated = (flags & C2_IPC_BUDDY_FLAG_DEDICATED) !== 0;
-  if (dedicated ? generation !== 0 : generation === 0) {
-    throw new C2IpcTransportError("C-Two IPC buddy generation must be positive; dedicated generation must be 0.");
+  if (generation === 0 || (dedicated && readU32LE(payload, 6) !== 0)) {
+    throw new C2IpcTransportError("C-Two IPC SHM generation must be positive and dedicated offset must be 0.");
   }
-  const allocationId = readU64LEBigInt(payload, 15);
-  requireIpcAllocationId(allocationId, dedicated, "buddy payload");
+  const loanId = readU64LEBigInt(payload, 15);
+  requireIpcLoanId(loanId);
   return {
     segmentIndex: readU16LE(payload, 0),
     generation,
     offset: readU32LE(payload, 6),
     byteLength,
-    allocationId,
+    loanId,
     dedicated,
   };
 }
 
-function buildIpcResponseShmBlock(handshake: C2IpcHandshake, buddy: C2IpcBuddyPayload): C2IpcResponseShmBlock {
-  if (buddy.dedicated && buddy.offset !== 0) {
-    throw new C2IpcTransportError("C-Two IPC dedicated SHM response offset must be 0.");
-  }
-  if (handshake.shmPrefix.length === 0) {
-    throw new C2IpcTransportError("C-Two IPC server handshake did not advertise an SHM prefix for an SHM response.");
-  }
-  const advertisedSegment = handshake.shmSegments[buddy.segmentIndex];
-  if (!buddy.dedicated && advertisedSegment !== undefined && buddy.offset + buddy.byteLength > advertisedSegment.size) {
-    throw new C2IpcTransportError(`C-Two IPC SHM response range ${buddy.offset}+${buddy.byteLength} exceeds segment ${buddy.segmentIndex} size ${advertisedSegment.size}.`);
-  }
-  return {
-    prefix: handshake.shmPrefix,
-    segments: handshake.shmSegments,
-    segmentIndex: buddy.segmentIndex,
-    generation: buddy.generation,
-    offset: buddy.offset,
-    byteLength: buddy.byteLength,
-    allocationId: buddy.allocationId,
-    dedicated: buddy.dedicated,
-  };
-}
-
 async function readIpcShmSuccessPayload<Payload extends C2ResponsePayload>(
-  block: C2IpcResponseShmBlock,
+  response: unknown,
+  byteLength: number,
   allocator: C2ResponsePayloadAllocator<Payload> | undefined,
-  reader: C2IpcResponseShmReader,
+  memory: C2IpcMemoryContext,
+  flush: () => Promise<void>,
 ): Promise<Payload> {
-  if (allocator !== undefined) {
-    let allocated: C2AllocatedResponsePayload<Payload>;
-    try {
-      allocated = requireAllocatedResponsePayload<Payload>(allocator(block.byteLength), block.byteLength);
-    } catch (error) {
-      return await releaseIpcShmResponseBlockAfterAllocatorFailure(reader, block, error);
-    }
-    let result: C2ByteArray | ArrayBufferLike | void;
-    try {
-      result = await reader.read(block, allocated.view);
-    } catch (error) {
-      tryReleaseAllocatedResponsePayload(allocated);
-      throw new C2IpcTransportError(`C-Two IPC responseShmReader failed: ${String(error)}`);
-    }
-    let responseError: unknown;
-    try {
-      if (result !== undefined) {
-        const bytes = requireIpcShmReaderBytes(result);
-        if (bytes.byteLength !== block.byteLength) {
-          throw new C2IpcTransportError(`C-Two IPC responseShmReader returned ${bytes.byteLength} bytes, expected ${block.byteLength}.`);
-        }
-        if (bytes !== allocated.view) {
-          allocated.view.set(bytes);
-        }
-      }
-    } catch (error) {
-      responseError = error;
-    }
-    try {
-      await releaseIpcShmResponseBlockAfterRead(reader, block, responseError);
-    } catch (error) {
-      tryReleaseAllocatedResponsePayload(allocated);
-      if (error instanceof C2IpcTransportError) {
-        throw error;
-      }
-      throw new C2IpcTransportError(`C-Two IPC responseShmReader failed: ${String(error)}`);
-    }
-    return allocated.payload;
-  }
-  const destination = new Uint8Array(block.byteLength);
-  let result: C2ByteArray | ArrayBufferLike | void;
+  let consumed = false;
+  let allocated: C2AllocatedResponsePayload<Payload> | undefined;
   try {
-    result = await reader.read(block, destination);
+    if (allocator !== undefined) allocated = requireAllocatedResponsePayload(allocator(byteLength), byteLength);
+    const destination = allocated?.view ?? new Uint8Array(byteLength);
+    consumed = true;
+    memory.consumeResponse(response, destination);
+    return allocated?.payload ?? destination as Payload;
   } catch (error) {
-    throw new C2IpcTransportError(`C-Two IPC responseShmReader failed: ${String(error)}`);
-  }
-  let responseError: unknown;
-  try {
-    if (result !== undefined) {
-      const bytes = requireIpcShmReaderBytes(result);
-      if (bytes.byteLength !== block.byteLength) {
-        throw new C2IpcTransportError(`C-Two IPC responseShmReader returned ${bytes.byteLength} bytes, expected ${block.byteLength}.`);
-      }
-      if (bytes !== destination) {
-        destination.set(bytes);
-      }
-    }
-  } catch (error) {
-    responseError = error;
-  }
-  await releaseIpcShmResponseBlockAfterRead(reader, block, responseError);
-  return destination as Payload;
-}
-
-async function releaseIpcShmResponseBlockAfterRead(reader: C2IpcResponseShmReader, block: C2IpcResponseShmBlock, priorError: unknown): Promise<void> {
-  let releaseError: unknown;
-  try {
-    await releaseIpcShmResponseBlock(reader, block);
-  } catch (error) {
-    releaseError = error;
-  }
-  if (priorError !== undefined) {
-    if (priorError instanceof C2IpcTransportError) {
-      throw priorError;
-    }
-    throw new C2IpcTransportError(`C-Two IPC responseShmReader failed: ${String(priorError)}`);
-  }
-  if (releaseError !== undefined) {
-    throw releaseError;
+    if (allocated !== undefined) tryReleaseAllocatedResponsePayload(allocated);
+    throw new C2IpcTransportError(`C-Two IPC response copy failed: ${String(error)}`);
+  } finally {
+    if (!consumed) memory.discardResponse(response);
+    // The flush callback deactivates and discards a failed stream. A copied
+    // result and a copy failure each retain their own terminal outcome.
+    try { await flush(); } catch { /* peer end settles releases not delivered */ }
   }
 }
 
-async function releaseIpcShmResponseBlockAfterAllocatorFailure(reader: C2IpcResponseShmReader, block: C2IpcResponseShmBlock, allocatorError: unknown): Promise<never> {
-  let releaseError: unknown;
-  try {
-    await releaseIpcShmResponseBlock(reader, block);
-  } catch (error) {
-    releaseError = error;
-  }
-  if (releaseError !== undefined) {
-    throw new C2IpcTransportError(`C-Two IPC responsePayloadAllocator failed and responseShmReader release failed: allocator=${String(allocatorError)} release=${String(releaseError)}`);
-  }
-  throw new C2IpcTransportError(`C-Two IPC responsePayloadAllocator failed: ${String(allocatorError)}`);
-}
-
-async function releaseIpcShmResponseBlock(reader: C2IpcResponseShmReader, block: C2IpcResponseShmBlock): Promise<void> {
-  try {
-    await reader.release(block);
-  } catch (error) {
-    throw new C2IpcTransportError(`C-Two IPC responseShmReader release failed: ${String(error)}`);
-  }
-}
-
-function requireIpcShmReaderBytes(value: C2ByteArray | ArrayBufferLike): Uint8Array {
-  if (value instanceof Uint8Array) {
-    return value;
-  }
-  if (isArrayBufferLike(value)) {
-    return new Uint8Array(value);
-  }
-  throw new C2IpcTransportError("C-Two IPC responseShmReader must return a Uint8Array, ArrayBuffer, or undefined.");
-}
-
-async function readIpcChunkedSuccessPayload(connection: C2IpcConnection, firstFrame: C2IpcFrame, requestId: bigint): Promise<Uint8Array> {
+async function readIpcChunkedSuccessPayload(open: C2IpcOpenConnection, firstFrame: C2IpcFrame, requestId: bigint): Promise<Uint8Array> {
   const firstChunk = validateIpcChunkedReplyFrame(firstFrame, requestId);
   if (firstChunk.chunkIndex !== 0) {
     throw new C2IpcTransportError(`C-Two IPC first chunked response frame has chunk_idx ${firstChunk.chunkIndex}, expected 0.`);
@@ -2659,7 +1800,7 @@ async function readIpcChunkedSuccessPayload(connection: C2IpcConnection, firstFr
 
   feed(firstFrame);
   while (received.size < firstChunk.totalChunks) {
-    feed(await readIpcFrame(connection));
+    feed(await readIpcResponseFrame(open));
   }
   if (writtenEnd !== firstChunk.totalSize) {
     throw new C2IpcTransportError("C-Two IPC chunked response final chunk did not complete total_size.");
@@ -2754,15 +1895,6 @@ function readU16LE(value: Uint8Array, offset: number): number {
 function writeU32LE(value: number): Uint8Array {
   const out = new Uint8Array(4);
   new DataView(out.buffer).setUint32(0, value, true);
-  return out;
-}
-
-function writeU64LE(value: number, field: string): Uint8Array {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new C2IpcTransportError(`C-Two IPC ${field} must be a non-negative safe integer.`);
-  }
-  const out = new Uint8Array(8);
-  new DataView(out.buffer).setBigUint64(0, BigInt(value), true);
   return out;
 }
 
@@ -3175,7 +2307,6 @@ const C2_RESERVED_HTTP_HEADER_NAMES = new Set([
   "x-c2-expected-abi-hash",
   "x-c2-expected-signature-hash",
   "x-c2-route-uid",
-  "x-c2-route-revision",
 ]);
 const C2_MAX_RESPONSE_PAYLOAD_BYTES = 2_147_483_647;
 const C2_MAX_WIRE_TEXT_BYTES = 255;
@@ -3284,7 +2415,6 @@ function requestHeadersForResolvedRoute(
     ...requestHeadersForRouteContract(customHeaders, routeContract),
   } as Record<string, string>;
   headers["x-c2-route-uid"] = route.routeUid;
-  headers["x-c2-route-revision"] = route.routeRevision.toString();
   return headers;
 }
 
@@ -3470,10 +2600,8 @@ function normalizeExpectedRouteToken(
     throw new Error(`${label} must be an object.`);
   }
   const routeUid = requireNonEmptyText(value.routeUid, `${label}.routeUid`);
-  if (!Number.isSafeInteger(value.routeRevision) || value.routeRevision <= 0) {
-    throw new Error(`${label}.routeRevision must be a positive safe integer.`);
-  }
-  return Object.freeze({ routeUid, routeRevision: value.routeRevision });
+  if ("routeRevision" in value) throw new Error(`${label} contains unknown fields.`);
+  return Object.freeze({ routeUid });
 }
 
 function normalizeIpcObservationPath(
@@ -3535,12 +2663,11 @@ function requireExpectedRouteToken(
   if (
     expected !== undefined &&
     (
-      actual.routeUid !== expected.routeUid ||
-      actual.routeRevision !== expected.routeRevision
+      actual.routeUid !== expected.routeUid
     )
   ) {
     throw new C2IpcTransportError(
-      `C-Two IPC route token mismatch: expected ${expected.routeUid}/${expected.routeRevision}, got ${actual.routeUid}/${actual.routeRevision}.`,
+      `C-Two IPC route token mismatch: expected ${expected.routeUid}, got ${actual.routeUid}.`,
     );
   }
 }
@@ -3581,7 +2708,7 @@ function relayAnchorAllowsLocalIpc(anchorUrl: string): boolean {
 }
 
 function routeTokenKey(route: C2RouteToken): string {
-  return JSON.stringify([route.routeUid, route.routeRevision]);
+  return JSON.stringify([route.routeUid]);
 }
 
 function samePathFallbackDeniedError(
@@ -3597,7 +2724,6 @@ function samePathFallbackDeniedError(
       details: {
         route: routeName,
         route_uid: route.routeUid,
-        route_revision: route.routeRevision.toString(),
       },
     }),
   );
@@ -3838,6 +2964,7 @@ function normalizeRelayRouteInfo(route: unknown, index: number): C2RelayRouteInf
     throw new Error(`C-Two relay resolve route ${index} is not an object.`);
   }
   const item = route as Record<string, unknown>;
+  if ("route_revision" in item) throw new Error(`C-Two relay resolve route ${index} contains unknown fields.`);
   const ipcAddress = optionalStringField(item, "ipc_address", index);
   const serverId = optionalStringField(item, "server_id", index);
   const serverInstanceId = optionalStringField(item, "server_instance_id", index);
@@ -3856,7 +2983,6 @@ function normalizeRelayRouteInfo(route: unknown, index: number): C2RelayRouteInf
       `C-Two relay resolve route ${index} relay_url`,
     ),
     routeUid: stringField(item, "route_uid", index),
-    routeRevision: numberField(item, "route_revision", index),
     ipcAddress,
     serverId,
     serverInstanceId,
