@@ -131,20 +131,30 @@ IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh protocol 7 replace 14, 3, 6 
 - A low-level Host shutdown no longer seals the Runtime's call domain or outgoing clients; only an explicit `Runtime.shutdown()` / `cc.shutdown()` retires them. A low-level shutdown with no Host completes immediately.
 - Request IDs are 64-bit end to end instead of being truncated to 32 bits inside the client, and generated TypeScript carries them and loan IDs as `bigint`.
 - `max_frame_size` must be at least 526 bytes, the size of a full release frame.
-- A peer that stops while it still holds loans keeps shutdown at `completed=False`, returned when the shutdown budget ends, until the peer releases them or its connection ends. 0.10.1 aborted such a connection at once, because the shared allocator let the server free the blocks itself.
+- A peer that stops while it still holds loans keeps shutdown at `completed=False`, returned when the shutdown budget ends, until the peer releases them or its connection ends. 0.10.1 aborted such a connection at once, because the shared allocator let the server free the blocks itself. A server also closes its listener only after accepted calls and their replies drain, so a client that stops reading keeps the address bound until it reads again or its connection ends.
+- Deactivating a connection, after a release-channel violation, local bookkeeping exhaustion or a write timeout, stops new calls on it; calls already sent still receive their replies. Only a broken frame boundary fails the other calls in flight. A well-framed bad reply or chunk, or a local failure such as opening the peer's mapping, fails only its own call, as in 0.10.1.
+- Replacing, discarding or evicting a cached client, in the SDK's IPC pool or in the relay, no longer aborts calls already sent on it: the old connection closes after their replies.
+- A server whose client reads slowly makes replies wait for writer queue space instead of ending the connection. Replies sent from the receive loop count toward `max_pending_requests`, and a call keeps its pending slot until its reply is written; when that budget is exhausted the server ends the connection with reason `local_close`.
+
+### Added
+
+- `ipc_overrides` keys `write_timeout`, `max_dedicated_segments` and `spill_threshold`, with `C2_IPC_WRITE_TIMEOUT`, `C2_IPC_MAX_DEDICATED_SEGMENTS` and `C2_IPC_SPILL_THRESHOLD` ([configuration](../reference/configuration.md)).
+- `cc.connect(timeout=...)` also bounds the OS connection, the namespace gate or listener-lease wait and the handshake, which 0.10.1 limited to fixed five-second guards; without a timeout those guards remain. Generated TypeScript accepts `connectTimeoutMs` for the same attempt, and the ABI 7 connect entries take a nullable `timeout_millis` ([C ABI](../reference/c-abi.md)).
+- `cc.serve(shutdown_timeout=30.0)` validates the budget on entry, calls `shutdown` once with it after a signal and returns the outcome; 0.10.1 looped until shutdown completed. A pending outcome prints a line saying cleanup continues.
 
 ### Removed
 
 | Removed | Instead |
 | --- | --- |
 | The automatic IPC heartbeat: `heartbeat_interval`, `heartbeat_timeout`, `C2_IPC_HEARTBEAT_INTERVAL`, `C2_IPC_HEARTBEAT_TIMEOUT`, and the `heartbeat_timeout` end reason | Connections end on OS facts and calls on their own deadlines; manual ping remains |
-| `abandoned_releases` in every `memory_stats()` scope, `holds.by_storage`, and `storage` in hold sweeps | `holds` counts local copies with `active_holds`, `total_held_bytes`, `oldest_hold_seconds` and `by_direction` |
+| `abandoned_releases` in every `memory_stats()` scope and `holds.by_storage` | `holds` counts local copies with `active_holds`, `total_held_bytes`, `oldest_hold_seconds` and `by_direction` |
+| The warning logged for a resource input retained over 60 seconds, `NativeServerBridge(hold_warn_seconds=...)`, `LocalCopyTracker.sweep_retained` and `RuntimeSession.sweep_local_copies` | `cc.observe.memory_stats()['holds']['oldest_hold_seconds']` |
 | Python `MemPool.data_addr`, `seg_data_info`, `open_peer`, `ensure_peer_segment`, `read_at`, `free_at`, `destroy`, and `PoolConfig(dedicated_crash_timeout_secs=...)` | The local allocation APIs; a pool is freed with its last owner |
 | Lifecycle snapshot `phase`, `terminal` and `client_held_leases` (Python `ClientHeldLeases`; Rust `HostLifecyclePhase`, `HostClientHeldLeases`) | `finished`, `listener_closed` and `work_drained` |
 | The dictionary returned by direct IPC `shutdown()` (`acknowledged`, `shutdown_started`, `server_stopped`, route outcomes); Rust `DirectIpcShutdownRouteOutcome` | `'initiated'`, `'absent'` or `'unconfirmed'`; Rust `DirectIpcShutdownOutcome::{Initiated, Absent, Unconfirmed}` |
 | Route revisions in route bindings, call tokens, relay resolution, HTTP headers and the mesh; IPC `RouteWatch` and route-contract queries | Route UID, server instance and contract identify a route |
 | C/FFI ABI 6 request and response pools, including `request_pool_read_local`, `request_pool_forget_consumed` and `response_pool_release`; TypeScript `createC2MemFfiNativeResponseShmReader`, the `responseShmReader` and `requestShmWriter` options, and block `allocationId` | One ABI 7 memory context per verified connection; blocks carry `loanId: bigint` ([C ABI](../reference/c-abi.md)) |
-| Rust Core `HeldResponse` leases and pins, `has_pending_release`, `abandon`, `RequestLease` and `ResponseLease` | `Held` and `HeldResponse` own a local copy |
+| Rust Core `HeldResponse` leases and pins, `has_pending_release`, `abandon`, `RequestLease` and `ResponseLease`, and `c2_ipc::ResponseLease` with `SyncClient::lease_response` | `Held` and `HeldResponse` own a local copy |
 
 ### Further changes
 
@@ -161,7 +171,8 @@ Found by the strict comparison against 0.10.1 and not listed above:
   - The close notification is published when the physical stream retires, not when the end is first recorded.
   - A write timeout deactivates the connection instead of aborting the stream.
   - Calls not yet written when a connection deactivates, or before it connects, fail as pre-dispatch and are retry-safe; 0.10.1 reported them as dispatch-uncertain.
-  - A chunked reply larger than `max_reassembly_bytes` fails with a capacity error, like a request.
+  - A chunked reply larger than `max_reassembly_bytes` fails with a capacity error, like a request. Reassembly charges also count one byte per chunk for arrival tracking.
+  - An early reply to a chunked request stops the upload at a frame boundary and keeps the connection; generated TypeScript previously reopened its connection.
   - A malformed shutdown frame closes the connection instead of receiving a negative acknowledgement.
 - Shutdown and errors:
   - Repeating a low-level Rust `Runtime::shutdown` returns the complete journal instead of an empty one.

@@ -86,7 +86,7 @@ finally:
     source.close()
 ```
 
-连接的 `timeout` 是以秒为单位的单一预算，覆盖连接池等待、操作系统连接、握手、当前路由查找和 relay 获取。省略或传入 `None` 不设置调用方截止时间；零会立即过期。负数和非有限值会被拒绝。过期时抛出 `CallDeadlineExceeded`，包含 `operation=connect`、`transport_phase=pre_dispatch` 及失败的 `stage`；资源方法尚未执行。
+连接的 `timeout` 是以秒为单位的单一预算，覆盖连接池等待、操作系统连接、握手、当前路由查找和 relay 获取。省略或传入 `None` 不设置调用方截止时间；零会立即过期。给了 `timeout` 时，它取代操作系统连接与握手各自固定的 5 秒守卫，命名空间门锁或命名管道的等待也以它为限；不给时保留这些守卫。负数和非有限值会被拒绝。过期时抛出 `CallDeadlineExceeded`，包含 `operation=connect`、`transport_phase=pre_dispatch` 及失败的 `stage`；资源方法尚未执行。
 
 业务调用的等待独立于连接等待。`cc.with_call_options` 返回现有连接的视图；其超时不会成为资源方法参数。调用截止时间可能在分派后结束调用方等待，此时原生任务仍持有输入直到完成。它不会取消正在运行的资源方法，也不允许重放。直接 IPC 默认无限等待；HTTP 使用已配置的逻辑调用预算。同进程同步调用接受继承的等待上限或无限等待。默认值和有限调用准入限制见[配置](configuration.zh-CN.md#调用等待与准入)。
 
@@ -229,6 +229,8 @@ cc.shutdown()
 `runtime.start()` 启动未注册 CRM 的 Host，并等待原生就绪及现有 IPC PING/PONG。随后 `runtime.register()` 使用该 Host。没有显式地址时，`runtime.connect()` 仅搜索该实例的本地路由；跨实例 IPC 调用应使用 `address=other.server_address()`，并采用相同的 Unix 端点上下文。`cc.close(proxy)`、代理的上下文管理器、`cc.hold()` 和 `cc.with_call_options()` 均跟随创建该代理的 Runtime。显式实例没有 `serve()` 方法，也没有自动信号或 atexit 清理；`cc.serve()` 处理模块级默认 Runtime。
 
 调用 `runtime.shutdown(timeout=...)` 会为该 SDK 会话启动 Core Runtime 唯一且永久的退役作用域；模块级 `cc.shutdown()` 对默认 Runtime 执行相同操作。该作用域封闭 Core 客户端池，并停止接受新的注册、启动和远程连接任务。待定观察保留旧会话及其槽位；Core 此后自行完成也不会替换它们。应再次调用 SDK shutdown，消费已完成的回执并进行会话交接。零或较短的等待预算只限制当前调用方的观察，不取消驱动任务。如果交接退役之前截止时间到期，shutdown 抛出 `CoreError`，包含 `lifecycle_kind='shutdown_wait_timeout'`、`details.stage` 和 `timeout_seconds`；这不是待定回执。Python 的数值转换在取得 SDK 实例锁前发生。等待取得该锁不计入 shutdown 截止时间；取得锁后，Native Host、Core 与连接池等待共用一个绝对截止时间。关闭错误投影和关闭回调在 Python 绑定锁外运行。回调在会话替换后运行；如果构造替换会话失败，原始槽位及日志仍可用。
+
+`cc.serve(shutdown_timeout=30.0)` 在开始服务之前就拒绝无效的预算，之后阻塞到收到 SIGINT 或 SIGTERM，再以 `shutdown(timeout=shutdown_timeout)` 调用一次关闭并返回其结果。结果为待定时，清理在后台继续，之后再调用 `cc.shutdown()` 可以观察到它完成。
 
 传给远程 `connect()` 的截止时间也约束 SDK 最终发布检查。若原截止时间在发布前到期，connect 抛出对应的截止时间错误，仅释放自身的逻辑客户端，且不重试。其他情况下成功的连接继续正常复用其池化客户端。`runtime_retired` 生命周期错误没有 I/O 原因。仅使用 HTTP 不会创建 IPC 池，shutdown 也不保证每个 HTTP keepalive 套接字都已物理关闭。Rust 底层 Host 的关闭/重启生命周期仍独立且可重启；永久退役仅适用于 Python SDK Runtime 作用域。IPC 握手 14、SHM 3 和 C/FFI ABI 6 均未改变。R07 final Drop 仍是独立工作。
 

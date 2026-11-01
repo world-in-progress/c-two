@@ -95,7 +95,7 @@ The internal state machine of one physical connection, holding its write queue, 
 _Avoid_: 负责方, coordinator, owner (for this object)
 
 **停用 / deactivation**:
-A physical connection refusing new calls while it stays open to settle its loans.
+A physical connection refusing new calls and loans while it stays open until the calls already sent and its loans have settled.
 _Avoid_: close, shutdown (for this state)
 
 **对端结束 / peer end**:
