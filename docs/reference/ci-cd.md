@@ -35,6 +35,14 @@ Manual source qualification and daily checks use separate concurrency groups; a 
 
 Validation commands share one 45-minute aggregate budget. Each child command is bounded by the lesser of its phase limit and the remaining budget. A timeout first interrupts the driver and allows up to 40 seconds for its existing child cleanup before forcing the owned process group to stop. The validation step has a 50-minute limit; the job has a 90-minute limit to include native prerequisites, cleanup and evidence upload. A failure retains its real exit code and full log. Cargo panics and Python assertions are shown in the console and step summary even when later successful commands would otherwise push them out of the log tail.
 
+## Paired IPC benchmark
+
+`.github/workflows/ipc-memory-paired.yml` runs only on manual dispatch and never in daily checks. On Linux, macOS, Windows x64 and Windows ARM64 it builds the baseline (default `b861f994`, the protocol batch's implementation baseline) and the candidate in separate checkouts and environments, then runs `tools/benchmarks/ipc_paired.py`: the nine `ipc_memory.py` matrix rows and the eleven anomaly scenarios, each with the normal client alone and beside the abnormal client, in alternating baseline/candidate order for at least five pairs. Per-call samples, summaries, source commits and native hashes are uploaded for 30 days. The run fails only on correctness failures; P50, P99 and throughput ratios against the batch thresholds are reported, not enforced. Loans in flight, release backlog and release settlement time are not measured, because this batch adds no internal probes.
+
+```bash
+gh workflow run ipc-memory-paired.yml --ref <branch> -f baseline_ref=<commit>
+```
+
 ## Build one release candidate
 
 Dispatch immediately after merging the release commit; packaging does not wait for Source Validation:
