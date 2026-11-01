@@ -91,6 +91,9 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 | `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 秒 | 未完成分片重组的超时秒数 |
 | `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 秒 | 分片垃圾回收扫描的间隔秒数 |
 | `max_reassembly_bytes` | `C2_IPC_MAX_REASSEMBLY_BYTES` | 8 GiB | 重组缓冲内存的最大字节数 |
+| `write_timeout` | `C2_IPC_WRITE_TIMEOUT` | 30 秒 | 写一帧允许的秒数，超时就停用这条连接 |
+| `max_dedicated_segments` | `C2_IPC_MAX_DEDICATED_SEGMENTS` | 4 | 一个池同时保有的独立 SHM 段数，最多 65536 |
+| `spill_threshold` | `C2_IPC_SPILL_THRESHOLD` | 0.8 | 新建 SHM backing 可占到的可用内存比例，取 0 到 1；1 表示不检查 |
 
 `pool_segment_size` 是池段容量，向上取 2 的幂后须能用 u32 表示，即最大为 2 GiB；`max_payload_size` 是单条消息限额，两者独立。关闭 buddy 池仍允许 dedicated SHM、分片传输和文件溢出。Backing budget 和 live-reassembly budget 的 `0` 拒绝正数预留；`pool_decay_seconds=0` 在下一维护周期回收空闲段。
 
