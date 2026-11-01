@@ -806,7 +806,9 @@ class Runtime:
 
     _serve_stop: threading.Event | None = None
 
-    def _serve(self, blocking: bool = True) -> None:
+    def _serve(
+        self, blocking: bool = True, *, shutdown_timeout: float = 30.0,
+    ) -> ShutdownOutcome | None:
         """Keep the process alive as a CRM resource server.
 
         Transitions the process from a computation script into a
@@ -825,7 +827,11 @@ class Runtime:
             termination signal is received.  If ``False``, install
             signal handlers and print the banner but return immediately
             — the caller is responsible for keeping the process alive.
+        shutdown_timeout:
+            Maximum seconds this caller waits for shutdown after a signal.
+            The native cleanup continues when the budget expires.
         """
+        self._runtime_session.validate_shutdown_timeout(shutdown_timeout)
         if self._serve_stop is not None:
             return  # idempotent
 
@@ -873,18 +879,19 @@ class Runtime:
             if self._native_host_terminated():
                 break
 
-        # Graceful shutdown. A host that already drained or that is
-        # still draining reaches the same consume path, which returns without
-        # fabricating a stopped SDK state while the transaction is incomplete;
-        # the loop stays alive until the real structured terminal appears.
+        # One caller budget bounds shutdown observation. A pending result
+        # leaves the native retirement driver running for a later shutdown
+        # call to consume.
         _print_serve_message('\n Shutting down...')
-        while True:
-            outcome = self.shutdown(timeout=0.1)
-            if outcome['completed']:
-                break
-            threading.Event().wait(0.05)
-        self._serve_stop = None
-        _print_serve_message(' Resource server stopped.')
+        try:
+            outcome = self.shutdown(timeout=shutdown_timeout)
+        finally:
+            self._serve_stop = None
+        if outcome['completed']:
+            _print_serve_message(' Resource server stopped.')
+        else:
+            _print_serve_message(' Resource server shutdown is still in progress.')
+        return outcome
 
     def _native_host_terminated(self) -> bool:
         """Whether the Core host reached its structured terminal outcome."""
@@ -1120,16 +1127,23 @@ def shutdown_outcome() -> ShutdownOutcome | None:
     return _get_default_runtime().shutdown_outcome()
 
 
-def serve(blocking: bool = True) -> None:
+def serve(
+    blocking: bool = True, *, shutdown_timeout: float = 30.0,
+) -> ShutdownOutcome | None:
     """Keep the process alive as a CRM resource server.
 
     Transitions the calling process from a computation script into a
     long-running resource service.  Blocks until ``SIGINT`` or
-    ``SIGTERM``, then calls :func:`shutdown` for graceful cleanup.
+    ``SIGTERM``, then calls :func:`shutdown` with ``shutdown_timeout``.
+    Returns the shutdown outcome, including ``completed=False`` if the caller's
+    wait budget expires while native cleanup continues. Nonblocking calls
+    return ``None``.
 
     Explicit Runtime instances use ``start`` and let their application own signals.
     """
-    _get_default_runtime()._serve(blocking=blocking)
+    return _get_default_runtime()._serve(
+        blocking=blocking, shutdown_timeout=shutdown_timeout,
+    )
 
 
 def set_call_execution_limits(

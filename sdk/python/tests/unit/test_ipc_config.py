@@ -94,6 +94,9 @@ def test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields(
     client = get_type_hints(config.ClientIPCOverrides)
 
     assert base['pool_enabled'] is bool
+    assert base['write_timeout'] is float
+    assert base['max_dedicated_segments'] is int
+    assert base['spill_threshold'] is float
     assert base['pool_segment_size'] is int
     assert base['pool_prewarm_segments'] is int
     assert base['pool_min_retained_segments'] is int
@@ -368,6 +371,35 @@ def test_client_session_projects_memory_budget_overrides():
     client_config = registry._runtime_session.client_ipc_config  # noqa: SLF001
     assert client_config['shm_backing_budget_bytes'] == 2 * GIB
     assert client_config['file_backing_budget_bytes'] == 16 * GIB
+
+
+@pytest.mark.parametrize('side', ('server', 'client'))
+def test_ipc_write_and_pool_policy_roundtrip_from_env_through_typed_override(
+    monkeypatch, side,
+):
+    monkeypatch.setenv('C2_IPC_WRITE_TIMEOUT', '41.5')
+    monkeypatch.setenv('C2_IPC_MAX_DEDICATED_SEGMENTS', '9')
+    monkeypatch.setenv('C2_IPC_SPILL_THRESHOLD', '0.65')
+    resolved = getattr(_native, f'resolve_{side}_ipc_config')
+    assert {key: resolved(None, None)[key] for key in (
+        'write_timeout', 'max_dedicated_segments', 'spill_threshold',
+    )} == {
+        'write_timeout': 41.5,
+        'max_dedicated_segments': 9,
+        'spill_threshold': 0.65,
+    }
+
+    overrides: config.ServerIPCOverrides | config.ClientIPCOverrides = {
+        'write_timeout': 2.5,
+        'max_dedicated_segments': 0,
+        'spill_threshold': 0.0,
+    }
+    session = _native.RuntimeSession(**{f'{side}_ipc_overrides': overrides})
+    assert getattr(session, f'{side}_ipc_overrides') == overrides
+    effective = (
+        resolved(overrides, None) if side == 'server' else session.client_ipc_config
+    )
+    assert {key: effective[key] for key in overrides} == overrides
 
 
 def test_server_config_projects_memory_budget_env(monkeypatch):

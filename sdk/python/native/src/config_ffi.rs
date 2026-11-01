@@ -163,6 +163,9 @@ fn parse_server_ipc_overrides_dict(dict: &Bound<'_, PyDict>) -> PyResult<ServerI
     reject_forbidden_ipc_fields(dict)?;
     reject_unknown_ipc_fields(dict, c2_config::SERVER_IPC_OVERRIDE_KEYS)?;
     Ok(ServerIpcConfigOverrides {
+        write_timeout_secs: get_opt(dict, "write_timeout")?,
+        max_dedicated_segments: get_opt(dict, "max_dedicated_segments")?,
+        spill_threshold: get_opt(dict, "spill_threshold")?,
         pool_enabled: get_opt(dict, "pool_enabled")?,
         pool_segment_size: get_opt(dict, "pool_segment_size")?,
         max_pool_segments: get_opt(dict, "max_pool_segments")?,
@@ -199,6 +202,15 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     overrides: &ServerIpcConfigOverrides,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
+    if let Some(value) = overrides.write_timeout_secs {
+        dict.set_item("write_timeout", value)?;
+    }
+    if let Some(value) = overrides.max_dedicated_segments {
+        dict.set_item("max_dedicated_segments", value)?;
+    }
+    if let Some(value) = overrides.spill_threshold {
+        dict.set_item("spill_threshold", value)?;
+    }
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -270,6 +282,15 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     overrides: &ClientIpcConfigOverrides,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
+    if let Some(value) = overrides.write_timeout_secs {
+        dict.set_item("write_timeout", value)?;
+    }
+    if let Some(value) = overrides.max_dedicated_segments {
+        dict.set_item("max_dedicated_segments", value)?;
+    }
+    if let Some(value) = overrides.spill_threshold {
+        dict.set_item("spill_threshold", value)?;
+    }
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -349,6 +370,9 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
     reject_forbidden_ipc_fields(&dict)?;
     reject_unknown_ipc_fields(&dict, c2_config::CLIENT_IPC_OVERRIDE_KEYS)?;
     Ok(ClientIpcConfigOverrides {
+        write_timeout_secs: get_opt(&dict, "write_timeout")?,
+        max_dedicated_segments: get_opt(&dict, "max_dedicated_segments")?,
+        spill_threshold: get_opt(&dict, "spill_threshold")?,
         pool_enabled: get_opt(&dict, "pool_enabled")?,
         pool_segment_size: get_opt(&dict, "pool_segment_size")?,
         max_pool_segments: get_opt(&dict, "max_pool_segments")?,
@@ -435,6 +459,9 @@ fn base_ipc_to_dict<'py>(
     cfg: &c2_config::BaseIpcConfig,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
+    dict.set_item("write_timeout", cfg.write_timeout_secs)?;
+    dict.set_item("max_dedicated_segments", cfg.max_dedicated_segments)?;
+    dict.set_item("spill_threshold", cfg.spill_threshold)?;
     dict.set_item("pool_enabled", cfg.pool_enabled)?;
     dict.set_item("pool_segment_size", cfg.pool_segment_size)?;
     dict.set_item("max_pool_segments", cfg.max_pool_segments)?;

@@ -891,6 +891,7 @@ impl Runtime {
         on_failed_start: impl FnOnce(FailedStartShutdownReceipt),
     ) -> Result<Host, Error> {
         let startup_timeout = self.freeze_host_options(options.startup_timeout)?;
+        let startup_deadline = Instant::now() + startup_timeout;
         let identity = self.ensure_server()?;
         let config = self.server_ipc_config()?;
         let relay_anchor_address = match options.relay {
@@ -953,7 +954,9 @@ impl Runtime {
                         let _ = gate.entered.send(Arc::clone(&run_server));
                         let _ = gate.proceed.lock().recv();
                     }
-                    let result = server_runtime.block_on(run_server.run());
+                    let result = server_runtime.block_on(
+                        run_server.run_with_startup_deadline(startup_deadline, startup_timeout),
+                    );
                     if result.is_err() {
                         run_server.finalize_runtime_stopped();
                     }
@@ -1009,7 +1012,13 @@ impl Runtime {
                 return Err(error.into());
             }
         };
-        if let Err(error) = wait_runtime.block_on(server.wait_until_responsive(startup_timeout)) {
+        if let Err(mut error) = wait_runtime.block_on(
+            server
+                .wait_until_responsive(startup_deadline.saturating_duration_since(Instant::now())),
+        ) {
+            if let c2_server::ServerError::StartupTimeout(ref mut expired) = error {
+                expired.timeout = startup_timeout;
+            }
             if let Some(thread) = inner.thread.lock().take() {
                 if thread.is_finished() {
                     let _ = thread.join();
@@ -1292,7 +1301,7 @@ mod lifecycle_tests {
                 abi_hash: expected.abi_hash,
                 signature_hash: expected.signature_hash,
             };
-            let mut call = c2_wire::control::encode_call_control(&identity, 1);
+            let mut call = c2_wire::control::encode_call_control(&identity, 1).unwrap();
             call.extend_from_slice(&vec![0x5a; 32 * 1024]);
             peer.write_all(&encode_frame(1, FLAG_CALL_V2, &call))
                 .await

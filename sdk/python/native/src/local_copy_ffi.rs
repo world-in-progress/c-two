@@ -1,10 +1,9 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use c2_core::memory::{LocalCopyDirection, LocalCopyGuard, LocalCopyMeta, LocalCopyTracker};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyDict;
 
 #[pyclass(name = "LocalCopyTracker", frozen, skip_from_py_object)]
 #[derive(Clone)]
@@ -40,44 +39,6 @@ impl PyLocalCopyTracker {
     pub(crate) fn stats_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         local_copy_stats_dict(py, &self.inner.stats())
     }
-
-    pub(crate) fn sweep_retained_list<'py>(
-        &self,
-        py: Python<'py>,
-        threshold_seconds: f64,
-    ) -> PyResult<Bound<'py, PyList>> {
-        if !threshold_seconds.is_finite() || threshold_seconds < 0.0 {
-            return Err(PyValueError::new_err(
-                "threshold_seconds must be a non-negative finite number",
-            ));
-        }
-
-        let threshold = Duration::from_secs_f64(threshold_seconds);
-        let list = PyList::empty(py);
-        for snapshot in self.inner.sweep_retained(threshold) {
-            list.append(local_copy_snapshot_dict(py, &snapshot)?)?;
-        }
-        Ok(list)
-    }
-}
-
-/// Build the Python shape of one local-copy snapshot.
-///
-/// Shared by a single tracker and by the retired-observation sweeps, so the
-/// projection can report retired local-copy metadata from snapshot values without
-/// ever handing the retired trackers themselves to Python.
-pub(crate) fn local_copy_snapshot_dict<'py>(
-    py: Python<'py>,
-    snapshot: &c2_core::memory::LocalCopySnapshot,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("id", snapshot.id)?;
-    dict.set_item("route_name", &snapshot.route_name)?;
-    dict.set_item("method_name", &snapshot.method_name)?;
-    dict.set_item("direction", snapshot.direction.as_str())?;
-    dict.set_item("bytes", snapshot.bytes)?;
-    dict.set_item("age_seconds", snapshot.age_seconds)?;
-    Ok(dict)
 }
 
 /// Build the Python shape of one composed local-copy stats view.
@@ -155,14 +116,6 @@ impl PyLocalCopyTracker {
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         self.stats_dict(py)
-    }
-
-    fn sweep_retained<'py>(
-        &self,
-        py: Python<'py>,
-        threshold_seconds: f64,
-    ) -> PyResult<Bound<'py, PyList>> {
-        self.sweep_retained_list(py, threshold_seconds)
     }
 }
 

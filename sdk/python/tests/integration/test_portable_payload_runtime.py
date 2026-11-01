@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 
 import pytest
@@ -77,6 +79,56 @@ class EchoResource:
         return payload
 
 
+@cc.crm(namespace='test.portable-runtime-retirement', version='0.1.0')
+class RetiringEcho:
+    @cc.transfer(input=SPEC)
+    def consume(self, payload: Payload) -> None: ...
+
+    @cc.transfer(input=SPEC, output=SPEC)
+    def echo(self, payload: Payload) -> Payload: ...
+
+    @cc.on_shutdown
+    def stopped(self) -> None: ...
+
+
+class RetiringEchoResource:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.verify_after_pending = threading.Event()
+        self.verified_after_pending = threading.Event()
+        self.proceed = threading.Event()
+        self.finished = threading.Event()
+        self.saved_input: Payload | None = None
+        self.value_while_pending: int | None = None
+        self.value_after_pending_shutdown: int | None = None
+        self.events: list[str] = []
+
+    def consume(self, payload: Payload) -> None:
+        self.saved_input = payload
+        self.entered.set()
+        try:
+            if not self.verify_after_pending.wait(timeout=10):
+                raise RuntimeError('borrowed input was not verified after shutdown began')
+            self.value_while_pending = read_value(payload)
+            self.verified_after_pending.set()
+            if not self.proceed.wait(timeout=10):
+                raise RuntimeError('borrowed callback was not released')
+            self.value_after_pending_shutdown = read_value(payload)
+        finally:
+            self.events.append('callback_finished')
+            self.finished.set()
+
+    def echo(self, payload: Payload) -> Payload:
+        return payload
+
+    def stopped(self) -> None:
+        assert self.saved_input is not None
+        with pytest.raises(PayloadError) as borrowed_error:
+            self.saved_input.entry_view(0)
+        assert borrowed_error.value.symbol == 'VIEW_INVALIDATED'
+        self.events.append('shutdown_hook')
+
+
 @pytest.fixture(autouse=True)
 def cleanup_runtime():
     yield
@@ -107,6 +159,92 @@ def read_value(payload: Payload) -> int:
     with payload.entry_view(0) as values:
         with values.at(0) as value:
             return value.get_u8()
+
+
+@pytest.mark.timeout(30)
+def test_runtime_retirement_preserves_borrowed_callback_and_obtained_hold(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
+    server = cc.Runtime()
+    client = cc.Runtime()
+    if os.name != 'nt':
+        server.set_local_endpoint(root=str(tmp_path))
+        client.set_local_endpoint(root=str(tmp_path))
+    resource = RetiringEchoResource()
+    source = build_payload()
+    proxy = None
+    held = None
+    retained = None
+    call_thread = None
+    call_result: dict[str, object] = {}
+    try:
+        server.register(
+            RetiringEcho, resource, name='retiring-echo',
+            input_lifetime={'consume': 'borrowed'},
+        )
+        proxy = client.connect(
+            RetiringEcho, name='retiring-echo', address=server.server_address(),
+        )
+        held = cc.hold(proxy.echo)(source)
+        retained = held.value
+        assert read_value(retained) == 7
+
+        def call_borrowed() -> None:
+            try:
+                call_result['value'] = proxy.consume(source)
+            except BaseException as exc:
+                call_result['error'] = exc
+
+        call_thread = threading.Thread(target=call_borrowed, daemon=True)
+        call_thread.start()
+        assert resource.entered.wait(timeout=5), 'borrowed callback did not start'
+        assert resource.saved_input is not None
+
+        pending = server.shutdown(timeout=0.05)
+        assert pending['completed'] is False, pending
+        assert resource.events == []
+        resource.verify_after_pending.set()
+        assert resource.verified_after_pending.wait(timeout=5)
+        assert resource.value_while_pending == 7
+        assert resource.events == []
+        assert read_value(retained) == 7
+
+        resource.proceed.set()
+        call_thread.join(timeout=5)
+        assert not call_thread.is_alive(), 'borrowed call did not finish'
+        assert resource.finished.wait(timeout=5), 'borrowed callback did not finish'
+        assert call_result == {'value': None}, call_result
+        assert resource.value_after_pending_shutdown == 7
+        assert resource.events == ['callback_finished']
+        with pytest.raises(PayloadError) as borrowed_error:
+            resource.saved_input.entry_view(0)
+        assert borrowed_error.value.symbol == 'VIEW_INVALIDATED'
+
+        retired_client = client.shutdown(timeout=5)
+        assert retired_client['completed'] is True, retired_client
+        assert read_value(retained) == 7
+
+        completed = server.shutdown(timeout=5)
+        assert completed['completed'] is True, completed
+        assert resource.events == ['callback_finished', 'shutdown_hook']
+        assert read_value(retained) == 7
+        held.release()
+        with pytest.raises(PayloadError) as held_error:
+            retained.entry_view(0)
+        assert held_error.value.symbol == 'VIEW_INVALIDATED'
+    finally:
+        resource.verify_after_pending.set()
+        resource.proceed.set()
+        if call_thread is not None and call_thread.ident is not None:
+            call_thread.join(timeout=5)
+        if held is not None:
+            held.release()
+        if proxy is not None:
+            cc.close(proxy)
+        client.shutdown(timeout=5)
+        server.shutdown(timeout=5)
+        source.close()
 
 
 @pytest.mark.timeout(30)

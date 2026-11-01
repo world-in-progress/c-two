@@ -864,6 +864,9 @@ def test_native_transport_dependencies_reject_production_tables(crate, table, re
 
 def test_python_native_server_start_wait_uses_core_responsive_fence():
     root = Path(__file__).resolve().parents[4]
+    python_server = (
+        root / "sdk" / "python" / "src" / "c_two" / "transport" / "server" / "native.py"
+    ).read_text(encoding="utf-8")
     core_host = (
         root / "core" / "runtime" / "c2-core" / "src" / "host.rs"
     ).read_text(encoding="utf-8")
@@ -871,7 +874,12 @@ def test_python_native_server_start_wait_uses_core_responsive_fence():
         root / "core" / "transport" / "c2-server" / "src" / "server.rs"
     ).read_text(encoding="utf-8")
 
-    assert "wait_until_responsive(startup_timeout)" in core_host
+    assert "self._runtime_session.ensure_host_started()" in python_server
+    assert "os.path.exists" not in python_server
+    assert "time.sleep" not in python_server
+    assert "letstartup_deadline=Instant::now()+startup_timeout;" in _rust_compact(core_host)
+    assert "run_server.run_with_startup_deadline(startup_deadline,startup_timeout)" in _rust_compact(core_host)
+    assert "wait_until_responsive(startup_deadline.saturating_duration_since(Instant::now()))" in _rust_compact(core_host)
     assert "wait_until_ready(startup_timeout)" not in core_host
     assert "pub async fn wait_until_responsive(&self, timeout: Duration)" in core_server
 

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use c2_mem::{MemHandle, MemPool};
+use c2_mem::{MemHandle, MemPool, PeerMappingCache, PeerRead};
 use c2_wire::buddy::BuddyPayload;
 use c2_wire::chunk::ReassemblyBacking;
-use c2_wire::connection::{ConnectionCore, PreparedLoan, RemoteLoan};
+use c2_wire::connection::{ConnectionCore, ConnectionError, PreparedLoan, RemoteLoan};
 use c2_wire::handshake::MAX_METHODS;
 
 use crate::server::ServerError;
@@ -124,10 +124,12 @@ impl PreparedShmResponse {
         }
     }
 
-    pub(crate) fn into_loan(mut self, core: &ConnectionCore) -> Result<PreparedLoan, String> {
+    pub(crate) fn into_loan(
+        mut self,
+        core: &ConnectionCore,
+    ) -> Result<PreparedLoan, ConnectionError> {
         let handle = self.handle.take().expect("live prepared owner");
         core.prepare_loan(Arc::clone(&self.pool), handle)
-            .map_err(|error| error.to_string())
     }
 }
 
@@ -142,16 +144,15 @@ impl Drop for PreparedShmResponse {
 /// Minted only at this crate's frame-admission path from a decoded descriptor,
 /// its original peer mapping, and a read interval on that physical connection.
 pub(crate) struct PeerShmRequest {
-    pool: Arc<parking_lot::RwLock<MemPool>>,
-    payload: BuddyPayload,
+    // Field order also ends the mapping read before loan release on discard.
+    read: PeerRead,
     loan: RemoteLoan,
 }
 
 impl std::fmt::Debug for PeerShmRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerShmRequest")
-            .field("pool", &Arc::as_ptr(&self.pool))
-            .field("payload", &self.payload)
+            .field("len", &self.read.len())
             .finish()
     }
 }
@@ -160,61 +161,31 @@ impl PeerShmRequest {
     /// The loan is admitted before mapping, so even a mapping failure ends
     /// the remote read interval and queues its release.
     pub(crate) fn admit(
-        pool: Arc<parking_lot::RwLock<MemPool>>,
+        cache: Arc<PeerMappingCache>,
         payload: BuddyPayload,
         loan: RemoteLoan,
     ) -> Result<Self, String> {
-        let end = (payload.offset as usize)
-            .checked_add(payload.data_size as usize)
-            .ok_or_else(|| "request SHM span overflow".to_string())?;
-        {
-            let mut mapped = pool.write();
-            if payload.is_dedicated {
-                mapped.ensure_peer_dedicated(
-                    u32::from(payload.seg_idx),
-                    payload.generation,
-                    end,
-                )?;
-            } else {
-                mapped.ensure_peer_segment(u32::from(payload.seg_idx), payload.generation, end)?;
-            }
-            mapped.validate_data_at(
-                u32::from(payload.seg_idx),
+        let read = cache
+            .admit(
+                payload.seg_idx,
                 payload.generation,
                 payload.offset,
                 payload.data_size,
                 payload.is_dedicated,
-            )?;
-        }
-        Ok(Self {
-            pool,
-            payload,
-            loan,
-        })
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(Self { read, loan })
     }
 
     /// Copy the request bytes out of the peer's published block.
     fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
-        // Frame admission established the mapping before dispatch. The live
-        // carrier keeps it in the original peer cache until release.
-        let pool = self.pool.read();
-        // SAFETY: these coordinates were admitted from a frame received on
-        // this exact connection pool; the writing peer completed and
-        // published the block (write-then-publish protocol) and the carrier
-        // is the only local authority for it, so no conflicting access or
-        // release can race this copy.
-        let copied = unsafe {
-            pool.copy_data_at(
-                u32::from(self.payload.seg_idx),
-                self.payload.generation,
-                self.payload.offset,
-                self.payload.data_size,
-                self.payload.is_dedicated,
-            )
-        }
-        .map_err(|error| format!("request SHM copy failed: {error}"));
-        drop(pool);
-        self.loan.finish();
+        let Self { read, loan } = self;
+        // SAFETY: frame admission pinned this exact span; its original
+        // connection loan keeps the published bytes immutable through copy.
+        let copied =
+            unsafe { read.copy() }.map_err(|error| format!("request SHM copy failed: {error}"));
+        drop(read);
+        loan.finish();
         copied
     }
 }
@@ -623,9 +594,9 @@ mod tests {
             .handle_slice_mut(&mut handle)
             .copy_from_slice(&payload);
         let allocation = handle.shm_allocation().unwrap();
-        let peer = Arc::new(parking_lot::RwLock::new(
-            MemPool::open_peer(request_pool_config(), owner.prefix().to_owned()).unwrap(),
-        ));
+        let peer = Arc::new(
+            PeerMappingCache::new(request_pool_config(), owner.prefix().to_owned()).unwrap(),
+        );
         let core = server_core();
         let loan = core.admit_remote_loan(7, Box::new(())).unwrap();
         let descriptor = BuddyPayload {
@@ -658,9 +629,9 @@ mod tests {
         let mut owner = request_test_pool();
         let handle = owner.alloc_shm_handle(4096).unwrap();
         let allocation = handle.shm_allocation().unwrap();
-        let peer = Arc::new(parking_lot::RwLock::new(
-            MemPool::open_peer(request_pool_config(), owner.prefix().to_owned()).unwrap(),
-        ));
+        let peer = Arc::new(
+            PeerMappingCache::new(request_pool_config(), owner.prefix().to_owned()).unwrap(),
+        );
         let core = server_core();
         let loan = core.admit_remote_loan(9, Box::new(())).unwrap();
         let descriptor = BuddyPayload {
@@ -681,6 +652,76 @@ mod tests {
                 .is_empty()
         );
         owner.release_handle(handle);
+    }
+
+    #[test]
+    fn peer_request_views_retire_after_the_last_carrier() {
+        for len in [4096, 65537] {
+            for consume in [false, true] {
+                let mut owner = request_test_pool();
+                let mut handle = owner.alloc_shm_handle(len).unwrap();
+                owner.handle_slice_mut(&mut handle).fill(0x37);
+                let allocation = handle.shm_allocation().unwrap();
+                assert_eq!(allocation.is_dedicated, len > 65536);
+                let mut config = request_pool_config();
+                config.buddy_idle_decay_secs = 0.03;
+                let peer = Arc::new(PeerMappingCache::new(config, owner.prefix().into()).unwrap());
+                let core = server_core();
+                let mut carriers = Vec::new();
+                for id in [11, 12] {
+                    let descriptor = BuddyPayload {
+                        seg_idx: allocation.seg_idx as u16,
+                        generation: allocation.generation,
+                        offset: allocation.offset,
+                        data_size: len as u32,
+                        is_dedicated: allocation.is_dedicated,
+                        loan_id: id,
+                    };
+                    carriers.push(
+                        PeerShmRequest::admit(
+                            peer.clone(),
+                            descriptor,
+                            core.admit_remote_loan(id, Box::new(())).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
+                assert_eq!(peer.mapped_segments(), 1);
+                drop(carriers.pop());
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                assert_eq!(
+                    peer.gc_idle(),
+                    0,
+                    "an admitted read still pins the original view"
+                );
+                let carrier = carriers.pop().unwrap();
+                if consume {
+                    assert_eq!(
+                        RequestData::Shm(carrier).into_owned_bytes().unwrap(),
+                        vec![0x37; len]
+                    );
+                } else {
+                    drop(carrier);
+                }
+                if allocation.is_dedicated {
+                    assert_eq!(
+                        peer.mapped_segments(),
+                        0,
+                        "dedicated view closes without a GC tick"
+                    );
+                } else {
+                    assert_eq!(
+                        peer.gc_idle(),
+                        0,
+                        "buddy decay starts at the final read's end"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    assert_eq!(peer.gc_idle(), 1);
+                    assert_eq!(peer.mapped_segments(), 0);
+                }
+                owner.release_handle(handle);
+            }
+        }
     }
 
     #[test]

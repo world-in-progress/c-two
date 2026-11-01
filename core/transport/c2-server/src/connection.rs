@@ -2,14 +2,14 @@
 //!
 //! Tracks one physical IPC peer and projects its shared connection core.
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 use c2_config::MAX_IPC_POOL_SEGMENTS;
 use c2_local::{ConnectionEndReason, ConnectionObservation, ConnectionPublisher, RemoteReadGuard};
-use c2_mem::MemPool;
+use c2_mem::PeerMappingCache;
 use c2_mem::config::PoolConfig;
 use c2_wire::connection::{ConnectionCore, ConnectionError, ConnectionSide};
 
@@ -17,18 +17,17 @@ use c2_wire::connection::{ConnectionCore, ConnectionError, ConnectionSide};
 // Peer SHM state (set once during handshake, read concurrently)
 // ---------------------------------------------------------------------------
 
-/// Valid initialization geometry only; mapped backing headers supply the
-/// peer's actual geometry. This does not allocate or size a peer mapping.
+/// Valid initialization geometry only; the OS mapping supplies the actual
+/// span. This does not allocate or size a peer mapping.
 const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
 
 struct PeerShmState {
-    /// MemPool opened over the client's SHM segments for data access.
-    pool: Option<Arc<RwLock<MemPool>>>,
+    cache: Option<Arc<PeerMappingCache>>,
 }
 
 impl PeerShmState {
     fn new() -> Self {
-        Self { pool: None }
+        Self { cache: None }
     }
 }
 
@@ -118,9 +117,33 @@ impl Drop for FlightGuard {
     }
 }
 
+/// A submitted write outlives its waiter's timeout. Keep business drain open
+/// until the driver completes or discards the original submission.
+pub(crate) struct WriteGuard {
+    conn: Arc<Connection>,
+}
+
+impl WriteGuard {
+    pub(crate) fn new(conn: &Arc<Connection>) -> Self {
+        conn.pending_writes.fetch_add(1, Ordering::AcqRel);
+        Self { conn: conn.clone() }
+    }
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        if self.conn.pending_writes.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.conn.notify_idle();
+        }
+    }
+}
+
 /// Per-client connection state.
 pub struct Connection {
     pub(crate) core: ConnectionCore,
+    /// Serialize response-loan publication with local deactivation. The writer
+    /// holds this only through preparation and begin_io, never through I/O.
+    pub(crate) publication_gate: Mutex<()>,
     pub(crate) writer_wake: Arc<Notify>,
     conn_id: u64,
     ordinary_protocol: AtomicBool,
@@ -155,9 +178,11 @@ pub struct Connection {
     first_end: Arc<Mutex<Option<PendingEnd>>>,
     /// The receive driver cannot obtain any more release or peer-end facts.
     read_stopped: AtomicBool,
+    peer_ended: AtomicBool,
 
     /// Number of requests currently being processed.
     inflight: AtomicI32,
+    pending_writes: AtomicUsize,
     /// Route admission is closed; accepted calls retain response write access.
     shutdown_requested: AtomicBool,
 
@@ -193,6 +218,7 @@ impl Connection {
                 notify.notify_waiters();
                 notify.notify_one();
             }),
+            publication_gate: Mutex::new(()),
             writer_wake,
             conn_id,
             ordinary_protocol: AtomicBool::new(false),
@@ -206,7 +232,9 @@ impl Connection {
             remote_read_guard_installed: AtomicBool::new(false),
             first_end: Arc::new(Mutex::new(None)),
             read_stopped: AtomicBool::new(false),
+            peer_ended: AtomicBool::new(false),
             inflight: AtomicI32::new(0),
+            pending_writes: AtomicUsize::new(0),
             shutdown_requested: AtomicBool::new(false),
             idle_notify: Notify::new(),
             publisher,
@@ -230,17 +258,19 @@ impl Connection {
     }
 
     pub(crate) fn end(&self, reason: ConnectionEndReason, operation: &'static str) {
+        let _publication = self.publication_gate.lock();
         self.record_end(PendingEnd::Explicit { reason, operation });
         drop(self.core.deactivate());
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        let _publication = self.publication_gate.lock();
         self.record_end(PendingEnd::Explicit {
             reason: ConnectionEndReason::LocalClose,
             operation: "server_shutdown",
         });
         self.shutdown_requested.store(true, Ordering::Release);
-        if self.inflight.load(Ordering::Acquire) == 0 {
+        if self.is_idle() {
             drop(self.core.deactivate());
         }
     }
@@ -250,6 +280,7 @@ impl Connection {
     }
 
     pub(crate) fn end_read(&self, operation: &'static str, error: &std::io::Error) {
+        let _publication = self.publication_gate.lock();
         self.record_end(PendingEnd::Read {
             operation,
             kind: error.kind(),
@@ -259,6 +290,7 @@ impl Connection {
     }
 
     pub(crate) fn end_io(&self, operation: &'static str, error: &std::io::Error) {
+        let _publication = self.publication_gate.lock();
         self.record_end(PendingEnd::Io {
             operation,
             kind: error.kind(),
@@ -318,7 +350,15 @@ impl Connection {
     }
 
     pub(crate) fn try_close(&self) -> bool {
+        if !self.is_idle() && !self.reading_stopped() && !self.peer_ended.load(Ordering::Acquire) {
+            return false;
+        }
         self.core.try_close()
+    }
+
+    pub(crate) fn peer_end(&self) {
+        self.peer_ended.store(true, Ordering::Release);
+        drop(self.core.peer_end());
     }
 
     pub fn handshake_done(&self) -> bool {
@@ -376,39 +416,31 @@ impl Connection {
 
     // -- peer SHM accessors -------------------------------------------------
 
-    /// Get a shared reference to the peer's MemPool.
+    /// Get the read-only mapping cache for the peer's pool incarnation.
     /// Returns None if handshake hasn't completed yet.
-    pub(crate) fn peer_pool_arc(&self) -> Option<Arc<RwLock<MemPool>>> {
+    pub(crate) fn peer_mappings(&self) -> Option<Arc<PeerMappingCache>> {
         let state = self.peer_shm.lock();
-        state.pool.clone()
+        state.cache.clone()
     }
 
     /// Initialise the peer SHM cache from its handshake pool incarnation.
     ///
-    /// Always creates a `MemPool` with the peer's prefix so that later
-    /// admitted request carriers can lazy-open segments by
-    /// resolving names through MemPool's prefix, index, and generation authority.
-    pub fn init_peer_shm(&self, prefix: String) -> Result<(), String> {
-        // Receive-side cache: `buddy_enabled` is irrelevant (peer pools never
-        // allocate) and `min_retained_segments` is 0 so cached views retire as
-        // soon as their peer frees — matching MemPool's peer-cache behavior.
-        // The segment bound is the canonical IPC buddy segment bound, so any
-        // index a legitimately configured peer may reference (config caps
-        // `max_pool_segments` at the same constant) is accepted here while
-        // arbitrary counts stay rejected by `ensure_peer_segment`.
+    /// Dedicated views retire at the last admitted read; buddy views start
+    /// their configured idle window then and retire in the maintenance task.
+    pub(crate) fn init_peer_shm(&self, prefix: String, decay_seconds: f64) -> Result<(), String> {
         let cfg = PoolConfig {
             segment_size: MIN_BUDDY_SEGMENT_SIZE,
             min_block_size: 4096,
             max_segments: MAX_IPC_POOL_SEGMENTS as usize,
-            max_dedicated_segments: MAX_IPC_POOL_SEGMENTS as usize,
-            buddy_idle_decay_secs: 60.0,
+            max_dedicated_segments: usize::from(u16::MAX) + 1,
+            buddy_idle_decay_secs: decay_seconds,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c_two_request_cache"),
             buddy_enabled: true,
             min_retained_segments: 0,
         };
-        let pool = MemPool::open_peer(cfg, prefix)?;
-        self.peer_shm.lock().pool = Some(Arc::new(RwLock::new(pool)));
+        let cache = PeerMappingCache::new(cfg, prefix)?;
+        self.peer_shm.lock().cache = Some(Arc::new(cache));
         Ok(())
     }
 
@@ -422,11 +454,23 @@ impl Connection {
     pub(crate) fn flight_dec(&self) {
         let prev = self.inflight.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
+            self.notify_idle();
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.inflight.load(Ordering::Acquire) == 0
+            && self.pending_writes.load(Ordering::Acquire) == 0
+    }
+
+    fn notify_idle(&self) {
+        if self.is_idle() {
             if self.shutdown_requested() {
+                let _publication = self.publication_gate.lock();
                 drop(self.core.deactivate());
             }
-            // Counter went 1 → 0: connection is idle.
             self.idle_notify.notify_waiters();
+            self.writer_wake.notify_one();
         }
     }
 
@@ -455,12 +499,12 @@ impl Connection {
         self.inflight.load(Ordering::Relaxed)
     }
 
-    /// Wait until all in-flight requests have completed (counter == 0).
+    /// Wait until requests and their original queued writes have completed.
     ///
     /// Returns immediately if already idle.
     pub async fn wait_idle(&self) {
         // Fast path: already idle.
-        if self.inflight.load(Ordering::Acquire) == 0 {
+        if self.is_idle() {
             return;
         }
         // Slow path: wait for notification from `flight_dec`.
@@ -469,11 +513,11 @@ impl Connection {
             tokio::pin!(notified);
             notified.as_mut().enable();
             // Re-check after registering the future to avoid missed wakeups.
-            if self.inflight.load(Ordering::Acquire) == 0 {
+            if self.is_idle() {
                 return;
             }
             notified.await;
-            if self.inflight.load(Ordering::Acquire) == 0 {
+            if self.is_idle() {
                 return;
             }
         }
@@ -500,16 +544,15 @@ mod tests {
         assert!(!conn.native_shm_reachable());
         assert!(!conn.shm_request_capable());
         assert!(!conn.shm_response_capable());
-        assert!(conn.peer_pool_arc().is_none());
+        assert!(conn.peer_mappings().is_none());
         assert_eq!(conn.inflight_count(), 0);
     }
 
     #[test]
-    fn init_peer_shm_initializes_unmapped_peer_pool() {
+    fn init_peer_shm_initializes_unmapped_peer_cache() {
         let conn = Connection::new(1);
-        conn.init_peer_shm("prefix".into()).unwrap();
-        assert_eq!(conn.peer_pool_arc().unwrap().read().prefix(), "prefix");
-        assert_eq!(conn.peer_pool_arc().unwrap().read().segment_count(), 0);
+        conn.init_peer_shm("prefix".into(), 7.5).unwrap();
+        assert_eq!(conn.peer_mappings().unwrap().mapped_segments(), 0);
     }
 
     #[test]

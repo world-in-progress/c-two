@@ -43,6 +43,14 @@ pub(crate) fn checked_timeout(seconds: f64) -> Result<Duration, &'static str> {
     Duration::try_from_secs_f64(seconds).map_err(|_| INVALID)
 }
 
+fn checked_shutdown_deadline(timeout_seconds: f64) -> PyResult<(Duration, Instant)> {
+    let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        PyValueError::new_err("timeout_seconds cannot be represented as a shutdown deadline")
+    })?;
+    Ok((timeout, deadline))
+}
+
 #[cfg(test)]
 mod shutdown_timeout_tests {
     use super::checked_timeout;
@@ -526,6 +534,12 @@ impl PyRuntimeSession {
 
 #[pymethods]
 impl PyRuntimeSession {
+    /// Validate the exact native shutdown budget before serve installs signals
+    /// or prints its banner, without starting retirement or waiting.
+    fn validate_shutdown_timeout(&self, timeout_seconds: f64) -> PyResult<()> {
+        checked_shutdown_deadline(timeout_seconds).map(|_| ())
+    }
+
     fn connection_events(&self) -> crate::connection_ffi::PyConnectionEvents {
         crate::connection_ffi::PyConnectionEvents {
             inner: self.inner.connection_events(),
@@ -850,37 +864,6 @@ impl PyRuntimeSession {
                 execution.push(observer.clone());
             }
         }
-    }
-
-    fn sweep_local_copies<'py>(
-        &self,
-        py: Python<'py>,
-        threshold_seconds: f64,
-    ) -> PyResult<Bound<'py, PyList>> {
-        if !threshold_seconds.is_finite() || threshold_seconds < 0.0 {
-            return Err(PyValueError::new_err(
-                "threshold_seconds must be a non-negative finite number",
-            ));
-        }
-        // Compose the live tracker with every retired bundle's snapshots so
-        // retired local-copy metadata does not disappear while a real owner keeps
-        // it alive. The retired trackers themselves stay inside the
-        // observation bundles; only their snapshot values reach Python.
-        let threshold = Duration::from_secs_f64(threshold_seconds);
-        let retired = self.live_retired_observations();
-        let mut snapshots = self.local_copy_tracker.sweep_retained(threshold);
-        snapshots.extend(RetiredMemoryObservation::compose_sweep_snapshots(
-            &retired, threshold,
-        ));
-        snapshots.sort_by_key(|snapshot| snapshot.id);
-        let list = PyList::new(
-            py,
-            snapshots
-                .iter()
-                .map(|snapshot| crate::local_copy_ffi::local_copy_snapshot_dict(py, snapshot))
-                .collect::<PyResult<Vec<_>>>()?,
-        )?;
-        Ok(list)
     }
 
     fn ensure_server<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -1243,10 +1226,7 @@ impl PyRuntimeSession {
         py: Python<'_>,
         timeout_seconds: f64,
     ) -> PyResult<PyRuntimeShutdownWait> {
-        let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            PyValueError::new_err("timeout_seconds cannot be represented as a shutdown deadline")
-        })?;
+        let (_, deadline) = checked_shutdown_deadline(timeout_seconds)?;
         let receipt = {
             let borrowed = slf.borrow(py);
             let session: &PyRuntimeSession = &borrowed;
@@ -1275,10 +1255,7 @@ impl PyRuntimeSession {
     #[pyo3(signature = (timeout_seconds=5.0))]
     fn shutdown<'py>(&self, py: Python<'py>, timeout_seconds: f64) -> PyResult<Bound<'py, PyDict>> {
         // Validate before taking the Host or changing any session state.
-        let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            PyValueError::new_err("timeout_seconds cannot be represented as a shutdown deadline")
-        })?;
+        let (timeout, deadline) = checked_shutdown_deadline(timeout_seconds)?;
         let receipt = py
             .detach(|| self.inner.retirement_receipt(deadline))
             .map_err(|error| shutdown_error_to_py(py, error, timeout_seconds))?;

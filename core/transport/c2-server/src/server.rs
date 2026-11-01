@@ -31,17 +31,15 @@ use c2_error::{C2Error, ErrorCode};
 #[cfg(test)]
 use c2_mem::config::PoolConfig;
 use c2_mem::{MemPool, MemoryBudget};
-use c2_wire::buddy::{
-    BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
-};
+use c2_wire::buddy::{BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload};
 use c2_wire::chunk::ChunkAdmissionError;
 use c2_wire::chunk::header::{REPLY_CHUNK_META_SIZE, decode_chunk_header, encode_reply_chunk_meta};
 use c2_wire::control::{
     ReplyControl, RouteCallIdentity, decode_call_control, encode_reply_control,
 };
 use c2_wire::flags::{
-    FLAG_BUDDY, FLAG_CHUNK_LAST, FLAG_CHUNKED, FLAG_CTRL, FLAG_HANDSHAKE, FLAG_REPLY_V2,
-    FLAG_RESPONSE, FLAG_SIGNAL,
+    FLAG_CHUNK_LAST, FLAG_CHUNKED, FLAG_CTRL, FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE,
+    FLAG_SIGNAL,
 };
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
@@ -315,6 +313,7 @@ pub struct Server {
     memory_budget: MemoryBudget,
     admission: Arc<AdmissionGate>,
     pending_requests: Arc<Semaphore>,
+    control_reply_budget: Arc<Semaphore>,
     chunk_processing_permits: Arc<Semaphore>,
     /// Bounded per-request first-chunk admission ordering (see
     /// [`crate::chunk_ordering`]). Created at frame dispatch and resolved by the
@@ -563,6 +562,9 @@ impl Server {
             credential: None,
         });
         let pending_requests = Arc::new(Semaphore::new(config.max_pending_requests as usize));
+        // Even a zero business budget must leave one control reply slot.
+        let control_reply_budget =
+            Arc::new(Semaphore::new(config.max_pending_requests.max(1) as usize));
         let chunk_processing_permits = Arc::new(Semaphore::new(config.max_total_chunks as usize));
         let execution_scheduler = Scheduler::with_admission(
             crate::scheduler::ConcurrencyMode::Parallel,
@@ -585,6 +587,7 @@ impl Server {
             memory_budget,
             admission,
             pending_requests,
+            control_reply_budget,
             chunk_processing_permits,
             chunk_admission_gate,
             active_connections: parking_lot::Mutex::new(HashMap::new()),
@@ -1036,8 +1039,10 @@ impl Server {
                 .is_some_and(|current| Arc::ptr_eq(&current, &route))
             {
                 dispatcher.unregister(name);
+                true
+            } else {
+                false
             }
-            true
         } else {
             false
         }
@@ -1396,12 +1401,53 @@ impl Server {
 
     /// Run the accept loop.  Blocks until [`shutdown`](Self::shutdown) is called.
     pub async fn run(self: &Arc<Self>) -> Result<(), ServerError> {
+        self.run_inner(None).await
+    }
+
+    /// Run with the Host's original startup deadline, including the native
+    /// listener ownership wait. It does not bound the serving lifetime.
+    pub async fn run_with_startup_deadline(
+        self: &Arc<Self>,
+        startup_deadline: std::time::Instant,
+        startup_timeout: Duration,
+    ) -> Result<(), ServerError> {
+        self.run_inner(Some((startup_deadline, startup_timeout)))
+            .await
+    }
+
+    async fn run_inner(
+        self: &Arc<Self>,
+        startup_budget: Option<(std::time::Instant, Duration)>,
+    ) -> Result<(), ServerError> {
         if !matches!(self.lifecycle_state(), ServerLifecycleState::Starting) {
             self.begin_start_attempt()?;
         }
 
         self.run_entered.store(true, Ordering::Release);
-        let startup = LocalListener::bind(&self.endpoint).map_err(ServerError::Bind);
+        let endpoint = self.endpoint.clone();
+        let startup = tokio::task::spawn_blocking(move || {
+            LocalListener::bind_until(&endpoint, startup_budget.map(|(deadline, _)| deadline))
+        })
+        .await
+        .map_err(|error| ServerError::Config(format!("listener startup task failed: {error}")))
+        .and_then(|result| {
+            result.map_err(|error| {
+                if let Some((deadline, timeout)) = startup_budget
+                    && std::time::Instant::now() >= deadline
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    )
+                {
+                    ServerError::StartupTimeout(ServerStartupTimeout {
+                        stage: ServerStartupStage::Readiness,
+                        timeout,
+                    })
+                } else {
+                    ServerError::Bind(error)
+                }
+            })
+        });
 
         let listener = match startup {
             Ok(listener) => listener,
@@ -1424,7 +1470,14 @@ impl Server {
         let gc_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(gc_interval);
             interval.tick().await; // skip first immediate tick
+            let mut stopping = false;
             loop {
+                let connections_changed = gc_server.active_connections_notify.notified();
+                tokio::pin!(connections_changed);
+                connections_changed.as_mut().enable();
+                if stopping && gc_server.active_connections.lock().is_empty() {
+                    break;
+                }
                 tokio::select! {
                     _ = interval.tick() => {
                         let stats = gc_server.chunk_registry.gc_sweep();
@@ -1436,6 +1489,13 @@ impl Server {
                             let mut reassembly_pool = gc_server.chunk_registry.pool().write();
                             reassembly_pool.gc_buddy();
                         }
+                        let connections = gc_server.active_connections.lock()
+                            .values().cloned().collect::<Vec<_>>();
+                        for conn in connections {
+                            if let Some(cache) = conn.peer_mappings() {
+                                cache.gc_idle();
+                            }
+                        }
                         if stats.expired > 0 {
                             info!(
                                 expired = stats.expired,
@@ -1445,7 +1505,8 @@ impl Server {
                             );
                         }
                     }
-                    _ = wait_for_shutdown(&mut gc_shutdown_rx) => break,
+                    _ = wait_for_shutdown(&mut gc_shutdown_rx), if !stopping => stopping = true,
+                    _ = &mut connections_changed, if stopping => {},
                 }
             }
         });
@@ -1454,7 +1515,6 @@ impl Server {
         let (shutdown_done_tx, mut shutdown_done_rx) = mpsc::unbounded_channel();
         let mut shutdown_close_started = false;
         let mut listener = Some(listener);
-        let mut listener_result = Ok(());
         loop {
             tokio::select! {
                 result = async {
@@ -1475,7 +1535,6 @@ impl Server {
                     info!("server shutting down");
                     self.set_lifecycle_state(ServerLifecycleState::Stopping);
                     shutdown_close_started = true;
-                    listener_result = self.close_listener_for_shutdown(listener.take().expect("open listener")).await;
                     let server = Arc::clone(self);
                     let done_tx = shutdown_done_tx.clone();
                     let close_reason = *server.shutdown_close_reason.lock();
@@ -1492,12 +1551,20 @@ impl Server {
                     // by the peer. Their drivers stay on this same executor.
                     let connections = self.active_connections.lock().values().cloned().collect::<Vec<_>>();
                     for conn in connections { conn.wait_idle().await; }
+                    let listener_result = self.close_listener_for_shutdown(listener.take().expect("open listener")).await;
                     if !shutdown_route_outcomes.is_empty() {
                         self.shutdown_route_outcomes
                             .lock()
                             .extend(shutdown_route_outcomes);
                     }
-                    let _ = gc_handle.await;
+                    if self.active_connections.lock().is_empty() {
+                        let _ = gc_handle.await;
+                    } else {
+                        // Retained connections still need idle mapping GC.
+                        // The existing maintenance task ends at their drain;
+                        // business shutdown does not wait for their loans.
+                        drop(gc_handle);
+                    }
                     match listener_result {
                         Ok(()) => self.set_lifecycle_state(ServerLifecycleState::Stopped),
                         Err(error) => {
@@ -1988,7 +2055,12 @@ fn handle_connection(
         conn.install_remote_read_guard(stream.retain_for_remote_read());
         let abort = stream.abort_handle();
         let (mut reader, write_half) = stream.into_split();
-        let (writer, writer_task) = ConnectionWriter::spawn(write_half, Arc::clone(&conn));
+        let (writer, writer_task) = ConnectionWriter::spawn(
+            write_half,
+            Arc::clone(&conn),
+            server.config.write_timeout(),
+            server.control_reply_budget.clone(),
+        );
         registration.writer_task = Some(writer_task);
 
         debug!(conn_id, "connection accepted");
@@ -2110,7 +2182,10 @@ fn handle_connection(
             let request_id = header.request_id;
 
             if header.is_ctrl() && payload.first() == Some(&MsgType::Release.as_byte()) {
-                let outcome = conn.core.receive_release(&header, payload);
+                let outcome = {
+                    let _publication = conn.publication_gate.lock();
+                    conn.core.receive_release(&header, payload)
+                };
                 drop(outcome.reclaims);
                 if let Some(error) = outcome.error {
                     warn!(conn_id, %error, "invalid release record");
@@ -2154,12 +2229,13 @@ fn handle_connection(
                     }
                 }
             } else if header.is_ctrl() {
-                let srv = Arc::clone(&server);
-                let wr = Arc::clone(&writer);
-                let payload = payload.to_vec();
-                tokio::spawn(async move {
-                    handle_ctrl(&srv, &payload, request_id, &wr).await;
-                });
+                if let Ok(reply) = writer.reserve_control() {
+                    let srv = Arc::clone(&server);
+                    let payload = payload.to_vec();
+                    tokio::spawn(async move {
+                        handle_ctrl(&srv, &payload, request_id, reply).await;
+                    });
+                }
             } else if header.is_call_v2() {
                 // Reserve before any admission await or task submission so a
                 // concurrent shutdown cannot miss an already accepted call.
@@ -2182,7 +2258,7 @@ fn handle_connection(
                         // (no mappings involved), then correlate the caller.
                         server.abort_chunk_request(conn.conn_id(), request_id);
                     }
-                    write_reply(
+                    queue_reply(
                         &writer,
                         request_id,
                         &ReplyControl::Error(error_wire(
@@ -2210,7 +2286,7 @@ fn handle_connection(
                             // admission wakes and rolls back; it can never
                             // publish after this terminal outcome.
                             server.abort_chunk_request(conn.conn_id(), request_id);
-                            write_chunk_processing_capacity_error(&writer, request_id, limit).await;
+                            queue_chunk_processing_capacity_error(&writer, request_id, limit).await;
                             continue;
                         }
                     };
@@ -2242,7 +2318,7 @@ fn handle_connection(
                             // also tears down an already-published assembly
                             // and frees its stored route admission.
                             server.abort_chunk_request(conn.conn_id(), request_id);
-                            write_reply(
+                            queue_reply(
                                 &writer,
                                 request_id,
                                 &ReplyControl::Error(error_wire(
@@ -2292,7 +2368,7 @@ fn handle_connection(
                     let request = match admit_peer_request(&conn, buddy, &server.memory_budget) {
                         Ok(request) => request,
                         Err(error) => {
-                            write_reply(
+                            queue_reply(
                                 &writer,
                                 request_id,
                                 &ReplyControl::Error(error_wire(
@@ -2311,7 +2387,7 @@ fn handle_connection(
                             Ok(admission) => admission,
                             Err(err) => {
                                 drop(request);
-                                write_route_admission_error(&writer, request_id, err).await;
+                                queue_route_admission_error(&writer, request_id, err).await;
                                 continue;
                             }
                         };
@@ -2320,7 +2396,7 @@ fn handle_connection(
                         Err(limit) => {
                             drop(route_admission.pending_permit);
                             drop(request);
-                            write_server_pending_capacity_error(&writer, request_id, limit).await;
+                            queue_server_pending_capacity_error(&writer, request_id, limit).await;
                             continue;
                         }
                     };
@@ -2363,7 +2439,7 @@ fn handle_connection(
                     match reserve_route_execution(&server, &ctrl.identity, ctrl.method_idx).await {
                         Ok(admission) => admission,
                         Err(err) => {
-                            write_route_admission_error(&writer, request_id, err).await;
+                            queue_route_admission_error(&writer, request_id, err).await;
                             continue;
                         }
                     };
@@ -2371,7 +2447,7 @@ fn handle_connection(
                     Ok(permit) => permit,
                     Err(limit) => {
                         drop(route_admission.pending_permit);
-                        write_server_pending_capacity_error(&writer, request_id, limit).await;
+                        queue_server_pending_capacity_error(&writer, request_id, limit).await;
                         continue;
                     }
                 };
@@ -2406,7 +2482,7 @@ fn handle_connection(
         conn.cancel_queued_work();
         server.cleanup_chunk_requests_for_connection(conn_id);
         if reader.peer_ended() {
-            drop(conn.core.peer_end());
+            conn.peer_end();
         }
         // Invalid framing has no recoverable next boundary. Read only into a
         // fixed discard buffer until peer end; a write error is no end proof.
@@ -2431,11 +2507,11 @@ fn handle_connection(
             }
             tokio::select! {
                 result = reader.read(&mut discard) => match result {
-                    Ok(0) => { conn.end(ConnectionEndReason::PeerEof, "discard_eof"); drop(conn.core.peer_end()); },
+                    Ok(0) => { conn.end(ConnectionEndReason::PeerEof, "discard_eof"); conn.peer_end(); },
                     Ok(_) => {},
                     Err(error) => {
                         record_read_error(&conn, &abort, "discard_read", &error);
-                        if reader.peer_ended() { drop(conn.core.peer_end()); }
+                        if reader.peer_ended() { conn.peer_end(); }
                         else {
                             // An unrecoverable read without end proof cannot
                             // grant permission to reuse published storage.
@@ -2564,7 +2640,7 @@ async fn handle_handshake(
         .map_err(|e| ServerError::Protocol(format!("handshake decode: {e:?}")))?;
 
     // Frames identify peer backings by pool incarnation, index and generation.
-    conn.init_peer_shm(client_hs.prefix)
+    conn.init_peer_shm(client_hs.prefix, server.config.pool_decay_seconds)
         .map_err(ServerError::Protocol)?;
 
     conn.set_chunked_capable(true);
@@ -2645,7 +2721,7 @@ async fn handle_shutdown_signal(
     );
     // Enqueue the courtesy ACK before closing admission. Completion is observed
     // through the server shutdown transaction, independently of this write.
-    let _ = writer.try_write_control(frame);
+    let _ = writer.queue_control(frame);
     server.request_shutdown_signal();
 }
 
@@ -2666,7 +2742,7 @@ async fn handle_signal(
     };
 
     let frame = encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, reply);
-    let _ = writer.try_write_control(frame);
+    let _ = writer.queue_control(frame);
     action
 }
 
@@ -2674,7 +2750,7 @@ async fn handle_ctrl(
     server: &Server,
     payload: &[u8],
     request_id: u64,
-    writer: &Arc<ConnectionWriter>,
+    reply: crate::writer::ControlReplyPermit,
 ) {
     let Some(msg_type) = payload.first().and_then(|&b| MsgType::from_byte(b)) else {
         return;
@@ -2685,7 +2761,11 @@ async fn handle_ctrl(
         MsgType::RouteLookup => route_lookup_payload(server, payload).await,
         _ => return,
     };
-    write_ctrl_response(writer, request_id, &response).await;
+    reply.send(encode_frame(
+        request_id,
+        FLAG_RESPONSE | FLAG_CTRL,
+        &response,
+    ));
 }
 
 async fn route_records(server: &Server) -> Vec<RouteRecordWire> {
@@ -3045,6 +3125,17 @@ async fn send_route_execution_result(
                         )
                         .await;
                     }
+                    ResponseSendError::Capacity(message) => {
+                        write_reply(
+                            writer,
+                            request_id,
+                            &ReplyControl::Error(error_wire(
+                                ErrorCode::ResourceUnavailable,
+                                message,
+                            )),
+                        )
+                        .await;
+                    }
                     ResponseSendError::Transport(message) => {
                         warn!(request_id, error = %message, "response send failed");
                     }
@@ -3101,111 +3192,70 @@ async fn send_route_execution_result(
     }
 }
 
+fn route_admission_reply(err: RouteAdmissionError) -> ReplyControl {
+    let (code, message) = match err {
+        RouteAdmissionError::RouteNotFound(name) => return ReplyControl::RouteNotFound(name),
+        RouteAdmissionError::RouteRemoved {
+            route_name,
+            route_uid,
+        } => (
+            ErrorCode::ResourceRemoved,
+            match route_uid {
+                Some(uid) => format!("route {route_name} was removed: route_uid {uid}"),
+                None => format!("route {route_name} was removed"),
+            },
+        ),
+        RouteAdmissionError::RouteStale {
+            route_name,
+            expected_uid,
+            actual_uid,
+        } => (
+            ErrorCode::RouteStale,
+            format!(
+                "stale route token for {route_name}: expected route_uid {expected_uid}, current route_uid {actual_uid}"
+            ),
+        ),
+        RouteAdmissionError::ContractMismatch { route_name, reason } => (
+            ErrorCode::ContractMismatch,
+            format!("contract mismatch for route {route_name}: {reason}"),
+        ),
+        RouteAdmissionError::UnknownMethod {
+            route_name,
+            method_idx,
+        } => (
+            ErrorCode::ResourceFunctionExecuting,
+            format!("unknown method index {method_idx} for route {route_name}"),
+        ),
+        RouteAdmissionError::Acquire(SchedulerAcquireError::Closed) => {
+            (ErrorCode::ResourceClosed, "route closed".into())
+        }
+        RouteAdmissionError::Acquire(SchedulerAcquireError::Unavailable) => (
+            ErrorCode::ResourceUnavailable,
+            "host admission unavailable".into(),
+        ),
+        RouteAdmissionError::Acquire(SchedulerAcquireError::Capacity { field, limit }) => (
+            ErrorCode::ResourceUnavailable,
+            format!("route concurrency capacity exceeded: {field}={limit}"),
+        ),
+    };
+    ReplyControl::Error(error_wire(code, message))
+}
+
 async fn write_route_admission_error(
     writer: &Arc<ConnectionWriter>,
     request_id: u64,
     err: RouteAdmissionError,
 ) {
-    match err {
-        RouteAdmissionError::RouteNotFound(route_name) => {
-            write_reply(writer, request_id, &ReplyControl::RouteNotFound(route_name)).await;
-        }
-        RouteAdmissionError::RouteRemoved {
-            route_name,
-            route_uid,
-        } => {
-            let message = match route_uid {
-                Some(route_uid) => {
-                    format!("route {route_name} was removed: route_uid {route_uid}")
-                }
-                None => format!("route {route_name} was removed"),
-            };
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::Error(error_wire(ErrorCode::ResourceRemoved, message)),
-            )
-            .await;
-        }
-        RouteAdmissionError::RouteStale {
-            route_name,
-            expected_uid,
-            actual_uid,
-        } => {
-            let message = format!(
-                "stale route token for {route_name}: expected route_uid {expected_uid}, current route_uid {actual_uid}"
-            );
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::Error(error_wire(ErrorCode::RouteStale, message)),
-            )
-            .await;
-        }
-        RouteAdmissionError::ContractMismatch { route_name, reason } => {
-            let message = format!("contract mismatch for route {route_name}: {reason}");
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::Error(error_wire(ErrorCode::ContractMismatch, message)),
-            )
-            .await;
-        }
-        RouteAdmissionError::UnknownMethod {
-            route_name,
-            method_idx,
-        } => {
-            write_unknown_method_index(writer, request_id, &route_name, method_idx).await;
-        }
-        RouteAdmissionError::Acquire(SchedulerAcquireError::Closed) => {
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::Error(error_wire(ErrorCode::ResourceClosed, "route closed")),
-            )
-            .await;
-        }
-        RouteAdmissionError::Acquire(SchedulerAcquireError::Unavailable) => {
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::Error(error_wire(
-                    ErrorCode::ResourceUnavailable,
-                    "host admission unavailable",
-                )),
-            )
-            .await;
-        }
-        RouteAdmissionError::Acquire(SchedulerAcquireError::Capacity { field, limit }) => {
-            let msg = format!("route concurrency capacity exceeded: {field}={limit}");
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, msg)),
-            )
-            .await;
-        }
-    }
+    write_reply(writer, request_id, &route_admission_reply(err)).await;
 }
 
-async fn write_unknown_method_index(
+async fn queue_route_admission_error(
     writer: &Arc<ConnectionWriter>,
     request_id: u64,
-    route_name: &str,
-    method_idx: u16,
+    err: RouteAdmissionError,
 ) {
-    let message = format!("unknown method index {method_idx} for route {route_name}");
-    write_reply(
-        writer,
-        request_id,
-        &ReplyControl::Error(error_wire(ErrorCode::ResourceFunctionExecuting, message)),
-    )
-    .await;
+    queue_reply(writer, request_id, &route_admission_reply(err)).await;
 }
-
-// ---------------------------------------------------------------------------
-// CRM call dispatch (inline, non-buddy, non-chunked)
-// ---------------------------------------------------------------------------
 
 struct AdmittedCall<'a> {
     server: &'a Server,
@@ -3250,8 +3300,8 @@ async fn dispatch_admitted_call(call: AdmittedCall<'_>) {
     )
     .await;
 
-    drop(_pending_permit);
     send_route_execution_result(server, conn, writer, request_id, result).await;
+    drop(_pending_permit);
 }
 
 // CRM call dispatch — buddy SHM
@@ -3261,19 +3311,21 @@ fn admit_peer_request(
     bp: BuddyPayload,
     _budget: &MemoryBudget,
 ) -> Result<RequestData, String> {
-    let pool = conn
-        .peer_pool_arc()
+    let cache = conn
+        .peer_mappings()
         .ok_or_else(|| "peer pool not initialised".to_string())?;
     // Bind the original OS stream and mapping before the first fallible map.
     // Even failed copies/admission end this node and queue a release record.
-    let loan = conn
-        .core
-        .admit_remote_loan(
-            bp.loan_id,
-            Box::new((conn.remote_read_guard(), Arc::clone(&pool))),
-        )
-        .map_err(|error| error.to_string())?;
-    PeerShmRequest::admit(pool, bp, loan).map(RequestData::Shm)
+    let loan = {
+        let _publication = conn.publication_gate.lock();
+        conn.core
+            .admit_remote_loan(
+                bp.loan_id,
+                Box::new((conn.remote_read_guard(), Arc::clone(&cache))),
+            )
+            .map_err(|error| error.to_string())?
+    };
+    PeerShmRequest::admit(cache, bp, loan).map(RequestData::Shm)
 }
 
 fn cleanup_buddy_request_block(conn: &Arc<Connection>, payload: &[u8], budget: &MemoryBudget) {
@@ -3342,8 +3394,8 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
     )
     .await;
 
-    drop(_pending_permit);
     send_route_execution_result(server, conn, writer, request_id, result).await;
+    drop(_pending_permit);
 }
 
 // ---------------------------------------------------------------------------
@@ -3890,8 +3942,8 @@ async fn dispatch_chunked_call(
         )
         .await;
 
-        drop(_pending_permit);
         send_route_execution_result(server, conn, writer, request_id, result).await;
+        drop(_pending_permit);
     }
 }
 
@@ -3950,14 +4002,26 @@ fn ensure_response_meta_len(
 #[derive(Debug)]
 enum ResponseSendError {
     UserVisible(String),
+    Capacity(String),
     Transport(String),
 }
 
 impl std::fmt::Display for ResponseSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UserVisible(message) | Self::Transport(message) => f.write_str(message),
+            Self::UserVisible(message) | Self::Capacity(message) | Self::Transport(message) => {
+                f.write_str(message)
+            }
         }
+    }
+}
+
+fn response_write_error(context: &str, error: std::io::Error) -> ResponseSendError {
+    let message = format!("{context}: {error}");
+    if error.kind() == std::io::ErrorKind::OutOfMemory {
+        ResponseSendError::Capacity(message)
+    } else {
+        ResponseSendError::Transport(message)
     }
 }
 
@@ -3974,14 +4038,27 @@ async fn write_server_pending_capacity_error(
     )
     .await;
 }
+async fn queue_server_pending_capacity_error(
+    writer: &Arc<ConnectionWriter>,
+    request_id: u64,
+    limit: u32,
+) {
+    let msg = format!("server execution capacity exceeded: max_pending_requests={limit}");
+    queue_reply(
+        writer,
+        request_id,
+        &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, msg)),
+    )
+    .await;
+}
 
-async fn write_chunk_processing_capacity_error(
+async fn queue_chunk_processing_capacity_error(
     writer: &Arc<ConnectionWriter>,
     request_id: u64,
     limit: u32,
 ) {
     let msg = format!("server chunk processing capacity exceeded: max_total_chunks={limit}");
-    write_reply(
+    queue_reply(
         writer,
         request_id,
         &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, msg)),
@@ -3992,15 +4069,15 @@ async fn write_chunk_processing_capacity_error(
 async fn write_reply(writer: &Arc<ConnectionWriter>, request_id: u64, ctrl: &ReplyControl) {
     let payload = encode_reply_control(ctrl);
     let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
-    if let Err(err) = writer.try_write_reply(frame) {
+    if let Err(err) = writer.write_all(&frame).await {
         warn!(request_id, error = %err, "failed to queue reply frame");
     }
 }
-
-async fn write_ctrl_response(writer: &Arc<ConnectionWriter>, request_id: u64, payload: &[u8]) {
-    let frame = encode_frame(request_id, FLAG_RESPONSE | FLAG_CTRL, payload);
-    if let Err(err) = writer.try_write_control(frame) {
-        warn!(request_id, error = %err, "failed to queue ctrl response frame");
+async fn queue_reply(writer: &Arc<ConnectionWriter>, request_id: u64, ctrl: &ReplyControl) {
+    let payload = encode_reply_control(ctrl);
+    let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
+    if let Err(err) = writer.queue_control(frame) {
+        warn!(request_id, error = %err, "failed to queue reply frame");
     }
 }
 
@@ -4032,14 +4109,14 @@ async fn write_reply_with_data(
         writer
             .write_all(&buf[..off])
             .await
-            .map_err(|e| ResponseSendError::Transport(format!("inline reply write failed: {e}")))?;
+            .map_err(|error| response_write_error("inline reply write failed", error))?;
     } else {
         // Large response: heap Vec (existing path)
         let frame = frame::encode_frame_parts(request_id, REPLY_FLAGS, &[&ctrl_bytes, data]);
         writer
             .write_all(&frame)
             .await
-            .map_err(|e| ResponseSendError::Transport(format!("inline reply write failed: {e}")))?;
+            .map_err(|error| response_write_error("inline reply write failed", error))?;
     }
     Ok(())
 }
@@ -4049,29 +4126,24 @@ async fn send_prepared_shm_response(
     writer: &Arc<ConnectionWriter>,
     request_id: u64,
     prepared: PreparedShmResponse,
+    chunk_size: usize,
 ) -> Result<(), ResponseSendError> {
-    let data_size = prepared.data_size();
-    let allocation = prepared.shm_allocation().expect("prepared SHM owner");
-    let loan = prepared
-        .into_loan(writer.connection_core())
-        .map_err(ResponseSendError::Transport)?;
-    let descriptor = BuddyPayload {
-        seg_idx: allocation.seg_idx as u16,
-        generation: allocation.generation,
-        offset: allocation.offset,
-        data_size,
-        is_dedicated: allocation.is_dedicated,
-        loan_id: loan.id(),
-    };
-    let buddy = encode_buddy_payload(&descriptor);
-    let frame = frame::encode_frame_parts(
-        request_id,
-        REPLY_FLAGS | FLAG_BUDDY,
-        &[&buddy, &SUCCESS_REPLY],
-    );
-    writer.write_loan(frame, loan).await.map_err(|error| {
-        ResponseSendError::Transport(format!("prepared SHM reply write failed: {error}"))
-    })
+    if let Some(prepared) = writer
+        .write_prepared(request_id, prepared)
+        .await
+        .map_err(|error| response_write_error("prepared SHM reply write failed", error))?
+    {
+        let bytes = prepared
+            .copy_logical_bytes()
+            .map_err(ResponseSendError::UserVisible)?;
+        drop(prepared);
+        if bytes.len() > chunk_size || inline_reply_total_len(bytes.len()).is_err() {
+            write_chunked_reply(writer, request_id, &bytes, chunk_size).await?;
+        } else {
+            write_reply_with_data(writer, request_id, &bytes).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Write a success reply via chunked transfer: split data into chunks,
@@ -4111,9 +4183,10 @@ async fn write_chunked_reply(
         frame.extend_from_slice(&meta);
         frame.extend_from_slice(chunk);
 
-        writer.write_all(&frame).await.map_err(|e| {
-            ResponseSendError::Transport(format!("chunked reply write failed: {e}"))
-        })?;
+        writer
+            .write_all(&frame)
+            .await
+            .map_err(|error| response_write_error("chunked reply write failed", error))?;
     }
     Ok(())
 }
@@ -4169,7 +4242,7 @@ async fn send_response_meta(
                 )
                 .await;
             }
-            send_prepared_shm_response(writer, request_id, prepared).await?;
+            send_prepared_shm_response(writer, request_id, prepared, chunk_size).await?;
         }
     }
     Ok(())
@@ -4192,7 +4265,8 @@ async fn smart_reply_with_data(
                 Ok(())
             }) {
                 Ok(Some(prepared)) => {
-                    return send_prepared_shm_response(writer, request_id, prepared).await;
+                    return send_prepared_shm_response(writer, request_id, prepared, chunk_size)
+                        .await;
                 }
                 // Preserve pre-write fallback. Once prepared, a write error returns above.
                 Ok(None) => {}

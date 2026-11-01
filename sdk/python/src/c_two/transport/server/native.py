@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -140,7 +139,6 @@ class NativeServerBridge:
         self,
         runtime_session: object,
         *,
-        hold_warn_seconds: float = 60.0,
         local_copy_tracker: object | None = None,
     ) -> None:
         # Keep config failures at bridge construction, before CRM binding work.
@@ -153,15 +151,6 @@ class NativeServerBridge:
             from c_two._native import LocalCopyTracker
             local_copy_tracker = LocalCopyTracker()
         self._local_copy_tracker = local_copy_tracker
-        self._hold_warn_seconds = float(hold_warn_seconds)
-        if (
-            not math.isfinite(self._hold_warn_seconds)
-            or self._hold_warn_seconds < 0.0
-        ):
-            raise ValueError(
-                'hold_warn_seconds must be a non-negative finite number',
-            )
-        self._hold_sweep_interval = 10
 
         self._runtime_session = runtime_session
 
@@ -458,9 +447,6 @@ class NativeServerBridge:
         dispatch_table = slot._dispatch_table
 
         local_copy_tracker = self._local_copy_tracker
-        hold_warn_seconds = self._hold_warn_seconds
-        hold_sweep_interval = self._hold_sweep_interval
-        hold_dispatch_count = 0
 
         def dispatch(
             _route_name: str, method_idx: int,
@@ -522,26 +508,6 @@ class NativeServerBridge:
                     raise
                 if buffer_mode == 'borrowed' and not released:
                     release_fn()
-
-                nonlocal hold_dispatch_count
-                hold_dispatch_count += 1
-                should_sweep_holds = (
-                    local_copy_tracker is not None
-                    and hold_dispatch_count % hold_sweep_interval == 0
-                )
-                if should_sweep_holds:
-                    for stale in local_copy_tracker.sweep_retained(hold_warn_seconds):
-                        if stale.get('direction') != 'resource_input':
-                            continue
-                        logger.warning(
-                            "Resource input local copy retained for %.1fs — "
-                            "route=%s method=%s size=%d bytes. "
-                            "Resource may be storing buffer-backed views.",
-                            stale['age_seconds'],
-                            stale['route_name'],
-                            stale['method_name'],
-                            stale['bytes'],
-                        )
 
             # 3. Unpack result
             res_part, err_part = unpack_resource_result(result)

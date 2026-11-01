@@ -7,6 +7,8 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 import uuid
 
 import pytest
@@ -161,6 +163,122 @@ def test_two_runtime_names_connections_and_shutdown_are_independent(runtimes):
     assert registry._default_runtime is None
     assert second.shutdown()['completed']
     assert resources[1].stopped == 1
+
+
+def test_serve_shutdown_timeout_returns_pending_and_cleanup_continues(capsys) -> None:
+    import inspect
+
+    assert (
+        inspect.signature(cc.serve).parameters['shutdown_timeout'].default
+        == inspect.signature(cc.shutdown).parameters['timeout'].default
+    )
+
+    class BlockingResource:
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.proceed = threading.Event()
+            self.finished = threading.Event()
+            self.stopped = 0
+
+        def echo(self, value: str) -> str:
+            self.entered.set()
+            try:
+                if not self.proceed.wait(timeout=10):
+                    raise RuntimeError('callback was not released')
+                return value
+            finally:
+                self.finished.set()
+
+        def stop(self) -> None:
+            assert self.finished.is_set()
+            self.stopped += 1
+
+    resource = BlockingResource()
+    cc.register(Echo, resource, name='serve-timeout')
+    client = cc.Runtime()
+    proxy = client.connect(Echo, name='serve-timeout', address=cc.server_address())
+    call_result: dict[str, object] = {}
+    serve_result: dict[str, object] = {}
+
+    def call() -> None:
+        try:
+            call_result['value'] = proxy.echo('alive')
+        except BaseException as exc:
+            call_result['error'] = exc
+
+    def run_serve() -> None:
+        try:
+            serve_result['outcome'] = cc.serve(shutdown_timeout=0.05)
+        except BaseException as exc:
+            serve_result['error'] = exc
+
+    call_thread = threading.Thread(target=call, daemon=True)
+    serve_thread = threading.Thread(target=run_serve, daemon=True)
+    try:
+        call_thread.start()
+        assert resource.entered.wait(timeout=5), 'remote callback did not start'
+        serve_thread.start()
+        deadline = time.monotonic() + 5
+        runtime = registry._get_default_runtime()
+        while runtime._serve_stop is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert runtime._serve_stop is not None, 'serve did not install its stop event'
+        runtime._serve_stop.set()  # The signal handler sets this same event.
+        serve_thread.join(timeout=5)
+        assert not serve_thread.is_alive(), 'serve exceeded its shutdown wait budget'
+        assert 'error' not in serve_result, serve_result
+        assert serve_result['outcome']['completed'] is False
+        output = capsys.readouterr().out
+        assert 'Shutting down...' in output
+        assert 'Resource server shutdown is still in progress.' in output
+        assert 'Resource server stopped.' not in output
+        assert resource.stopped == 0
+        assert not resource.proceed.is_set()
+
+        resource.proceed.set()
+        call_thread.join(timeout=5)
+        assert not call_thread.is_alive(), 'callback client did not finish'
+        assert call_result == {'value': 'alive'}, call_result
+        assert resource.finished.wait(timeout=5), 'resource callback did not finish'
+        completed = cc.shutdown(timeout=5)
+        assert completed['completed'] is True, completed
+        assert resource.stopped == 1
+    finally:
+        resource.proceed.set()
+        if call_thread.ident is not None:
+            call_thread.join(timeout=5)
+        if serve_thread.ident is not None:
+            serve_thread.join(timeout=5)
+        cc.close(proxy)
+        client.shutdown(timeout=5)
+        cc.shutdown(timeout=5)
+
+
+@pytest.mark.parametrize('timeout', [
+    -1.0, float('nan'), float('inf'), 1e19, 1e300, '0.5', None,
+])
+def test_serve_rejects_invalid_shutdown_timeout_before_side_effects(
+    monkeypatch, timeout,
+) -> None:
+    runtime = registry._get_default_runtime()
+    session = runtime._runtime_session
+    with pytest.raises((TypeError, ValueError)) as shutdown_error:
+        runtime.shutdown(timeout=timeout)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError('invalid serve timeout caused a side effect')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(registry.signal, 'signal', unexpected)
+        patch.setattr(registry, '_print_serve_message', unexpected)
+        patch.setattr(runtime, 'shutdown', unexpected)
+        with pytest.raises(type(shutdown_error.value)) as serve_error:
+            cc.serve(blocking=False, shutdown_timeout=timeout)
+
+    assert str(serve_error.value) == str(shutdown_error.value)
+    assert runtime._serve_stop is None
+    assert runtime._runtime_session is session
+    session.check_active()
 
 
 def test_explicit_instances_communicate_through_real_ipc(runtimes):

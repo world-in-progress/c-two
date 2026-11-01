@@ -619,6 +619,7 @@ mod native_boundary_tests {
     fn response_admission_keeps_capacity_code_and_dispatch_uncertainty() {
         // Exercise encoded reply metadata, actual registry/allocator admission,
         // IPC mapping, and Core normalization, rather than inventing a variant.
+        let total_size = 128;
         for (file_limit, live_limit) in [(1024, 0), (0, 1024)] {
             for (chunks, data_len) in [(2, 64), (1, 128)] {
                 for supplied_phase in [
@@ -626,7 +627,7 @@ mod native_boundary_tests {
                     TransportPhase::DispatchUncertain,
                 ] {
                     let (source, budget) =
-                        wire_admission_error(128, chunks, data_len, file_limit, live_limit);
+                        wire_admission_error(total_size, chunks, data_len, file_limit, live_limit);
                     assert!(matches!(source, IpcError::Chunk(ChunkError::Capacity(_))));
                     let error = normalize_ipc_error(source, supplied_phase);
                     let Error::Transport(transport) = error else {
@@ -650,7 +651,8 @@ mod native_boundary_tests {
                     assert_eq!(snapshot.file.used_bytes, 0);
                     assert_eq!(snapshot.shm.used_bytes, 0);
                     if live_limit > 0 {
-                        assert_eq!(snapshot.reassembly.peak_bytes, 128);
+                        let tracking_bytes = u64::from(chunks) * std::mem::size_of::<bool>() as u64;
+                        assert_eq!(snapshot.reassembly.peak_bytes, total_size + tracking_bytes);
                     }
                 }
             }

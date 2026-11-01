@@ -125,6 +125,9 @@ def test_native_runtime_session_projects_ipc_overrides_copy(side: str) -> None:
     from c_two._native import RuntimeSession
 
     expected = {
+        'write_timeout': 12.5,
+        'max_dedicated_segments': 2,
+        'spill_threshold': 0.5,
         'pool_enabled': False,
         'pool_segment_size': 2 * 1024 * 1024,
         'max_pool_segments': 3,

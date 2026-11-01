@@ -178,7 +178,6 @@ def test_retired_observation_surface_has_no_track_or_reserve_escape() -> None:
         'close_confirmed',
         'scope_reports',
         'local_copy_stats',
-        'sweep_retained_snapshots',
     ):
         assert forbidden not in surface, f'observation must not expose {forbidden!r}'
 
@@ -211,14 +210,11 @@ def test_native_retirement_keeps_retained_local_copy_metadata_across_sessions() 
     assert replacement.memory_stats()["holds"]['active_holds'] == 1
     assert replacement.memory_stats()['holds']['active_holds'] == 1
     assert replacement.memory_stats()['holds']['total_held_bytes'] == 64
-    sweeps = replacement.sweep_local_copies(0.0)
-    assert [item['route_name'] for item in sweeps] == ['grid']
 
     # A hold is a real owner: releasing it does not detach the record while
     # the retired session's own tracker handle still exists.
     local_copy.release()
     assert replacement.memory_stats()["holds"]['active_holds'] == 0
-    assert replacement.sweep_local_copies(0.0) == []
 
     # The last owner goes away (the retired session wrapper drops, exactly
     # like the end of a public shutdown); the record detaches.
@@ -319,7 +315,6 @@ def test_old_proxy_tracker_publishes_a_hold_after_public_shutdown() -> None:
     # The proxy itself goes away; the observation record detaches with it.
     del proxy_tracker
     assert replacement.memory_stats()['retired'] == []
-    assert replacement.sweep_local_copies(0.0) == []
 
 
 def test_failed_session_replacement_preserves_previous_and_own_observations() -> None:

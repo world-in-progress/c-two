@@ -18,7 +18,7 @@ use std::sync::{
     Arc, Weak,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -88,16 +88,6 @@ impl LocalCopyStats {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct LocalCopySnapshot {
-    pub id: u64,
-    pub route_name: String,
-    pub method_name: String,
-    pub direction: LocalCopyDirection,
-    pub bytes: usize,
-    pub age_seconds: f64,
-}
-
 #[derive(Debug)]
 struct LocalCopyTrackerInner {
     next_id: AtomicU64,
@@ -137,11 +127,6 @@ impl LocalCopyObserver {
 
     pub fn stats(&self) -> Option<LocalCopyStats> {
         self.upgrade().map(|tracker| tracker.stats())
-    }
-
-    pub fn sweep_retained(&self, threshold: Duration) -> Option<Vec<LocalCopySnapshot>> {
-        self.upgrade()
-            .map(|tracker| tracker.sweep_retained(threshold))
     }
 }
 
@@ -200,26 +185,6 @@ impl LocalCopyTracker {
             );
         }
         stats
-    }
-
-    pub fn sweep_retained(&self, threshold: Duration) -> Vec<LocalCopySnapshot> {
-        let now = Instant::now();
-        let mut snapshots = Vec::new();
-        for (id, entry) in self.inner.entries.lock().iter() {
-            let age = now.saturating_duration_since(entry.created_at);
-            if age >= threshold {
-                snapshots.push(LocalCopySnapshot {
-                    id: *id,
-                    route_name: entry.meta.route_name.clone(),
-                    method_name: entry.meta.method_name.clone(),
-                    direction: entry.meta.direction,
-                    bytes: entry.meta.bytes,
-                    age_seconds: age.as_secs_f64(),
-                });
-            }
-        }
-        snapshots.sort_by_key(|snapshot| snapshot.id);
-        snapshots
     }
 }
 
@@ -441,22 +406,6 @@ impl RetiredMemoryObservation {
         stats
     }
 
-    /// Local-buffer snapshots older than `threshold`, composed across every
-    /// still-owned tracker in this bundle without exposing the trackers.
-    pub fn sweep_retained_snapshots(
-        &self,
-        threshold: std::time::Duration,
-    ) -> Vec<LocalCopySnapshot> {
-        let mut snapshots = Vec::new();
-        for observer in self.state.trackers.lock().iter() {
-            if let Some(retained) = observer.sweep_retained(threshold) {
-                snapshots.extend(retained);
-            }
-        }
-        snapshots.sort_by_key(|snapshot| snapshot.id);
-        snapshots
-    }
-
     /// Drop records whose last real owner is gone, and de-duplicate the rest.
     ///
     /// Records with zero counters are deliberately kept: zero is not
@@ -552,32 +501,6 @@ impl RetiredMemoryObservation {
             }
         }
         stats
-    }
-
-    /// Local-buffer snapshots older than `threshold` across several
-    /// bundles, de-duplicated by tracker identity.
-    pub fn compose_sweep_snapshots(
-        bundles: &[Arc<RetiredMemoryObservation>],
-        threshold: std::time::Duration,
-    ) -> Vec<LocalCopySnapshot> {
-        let mut snapshots = Vec::new();
-        let mut seen: Vec<LocalCopyObserver> = Vec::new();
-        for bundle in bundles {
-            for observer in bundle.state.trackers.lock().iter() {
-                if !observer.is_alive() {
-                    continue;
-                }
-                if seen.iter().any(|existing| existing.ptr_eq(observer)) {
-                    continue;
-                }
-                if let Some(retained) = observer.sweep_retained(threshold) {
-                    seen.push(observer.clone());
-                    snapshots.extend(retained);
-                }
-            }
-        }
-        snapshots.sort_by_key(|snapshot| snapshot.id);
-        snapshots
     }
 }
 
@@ -680,15 +603,10 @@ mod tests {
             stats.by_direction[&LocalCopyDirection::ResourceInput].total_held_bytes,
             31
         );
-        let snapshots = tracker.sweep_retained(Duration::ZERO);
-        assert_eq!(snapshots.len(), 2);
-        assert_eq!(snapshots[0].route_name, "grid");
-        assert_eq!(snapshots[0].method_name, "echo");
         assert!(stats.oldest_hold_seconds >= 0.0);
         drop((response, input));
         assert_eq!(tracker.stats().active_holds, 0);
         assert_eq!(tracker.stats().total_held_bytes, 0);
-        assert!(tracker.sweep_retained(Duration::ZERO).is_empty());
     }
 
     #[test]
@@ -803,30 +721,6 @@ mod tests {
     }
 
     #[test]
-    fn sweep_snapshots_are_composed_without_exposing_trackers() {
-        let tracker = Arc::new(LocalCopyTracker::new());
-        let _hold = tracker.track(retained_meta(16));
-
-        let observation = RetiredMemoryObservation::new();
-        observation.push_tracker(Arc::clone(&tracker));
-        observation.push_tracker(Arc::clone(&tracker));
-
-        let snapshots = observation.sweep_retained_snapshots(std::time::Duration::ZERO);
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].route_name, "grid");
-        assert_eq!(snapshots[0].bytes, 16);
-
-        drop(_hold);
-        drop(tracker);
-        observation.prune_detached();
-        assert!(
-            observation
-                .sweep_retained_snapshots(std::time::Duration::ZERO)
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn repeated_session_swaps_keep_one_live_hold_without_growing_records() {
         // One long-lived hold outlives repeated session swaps. Each swap's
         // own records detach when that session's handles drop, so only the
@@ -934,11 +828,6 @@ mod tests {
         let reports = RetiredMemoryObservation::compose_scope_reports(&replacement);
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].role, scope::RUNTIME_OUTGOING);
-        let sweeps = RetiredMemoryObservation::compose_sweep_snapshots(
-            &replacement,
-            std::time::Duration::ZERO,
-        );
-        assert_eq!(sweeps.len(), 1);
 
         drop(hold);
         drop(tracker);

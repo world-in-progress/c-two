@@ -3781,6 +3781,46 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_unregister_of_the_same_route_has_one_winner() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let route_name = unique_route_name("concurrent-unregister");
+        let server = test_server("concurrent-unregister-server");
+        let route = dummy_route(&server, &route_name);
+        let handle = route.route_handle();
+        let rt = Runtime::server_runtime().expect("runtime");
+        let reservation = rt
+            .block_on(server.reserve_route(route))
+            .expect("reserve route");
+        rt.block_on(server.commit_reserved_route(reservation))
+            .expect("register route");
+
+        // Keep both removals suspended after they have each reached the same
+        // registered route. This fixes the interleaving without a sleep or a
+        // scheduler-dependent race between two OS threads.
+        let active = handle.blocking_acquire(0).expect("active route guard");
+        let mut first = std::pin::pin!(server.unregister_route(&route_name));
+        let mut second = std::pin::pin!(server.unregister_route(&route_name));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
+        let second_initial = second.as_mut().poll(&mut context);
+        assert!(!matches!(second_initial, Poll::Ready(true)));
+        assert!(handle.snapshot().closed);
+
+        drop(active);
+        let (first_removed, second_removed) = match second_initial {
+            Poll::Ready(removed) => (rt.block_on(first), removed),
+            Poll::Pending => rt.block_on(async { tokio::join!(first, second) }),
+        };
+        assert_eq!(
+            (first_removed, second_removed),
+            (true, false),
+            "the first removal must succeed and the second must report MissingRoute"
+        );
+    }
+
+    #[test]
     fn unregister_without_relay_does_not_publish_lazy_identity() {
         let route_name = unique_route_name("no-relay-unregister");
         let session = Runtime::new(RuntimeOptions {
