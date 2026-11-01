@@ -113,7 +113,7 @@ _Avoid_: 组装, 拼装, assembly
 ### Memory and lifetime
 
 **租约 / lease**:
-The transport's claim on a buffer from the moment a call delivers it until it is released.
+The transport's claim on a buffer from the moment a call delivers it until it is released; a call releases it as soon as it has copied the bytes out.
 _Avoid_: 句柄 (for the claim), lock
 
 **借出 / loan**:
@@ -125,8 +125,12 @@ A pool owner's per-connection record of the loans it has made and not yet seen r
 _Avoid_: pending table
 
 **hold**:
-Keeping a response's lease after the call returns, with `cc.hold(...)` and `HeldResult`, until it is released.
+Keeping a response's local copy after the call returns, with `cc.hold(...)` and `HeldResult`, until it is released. A hold keeps no transport storage and no connection.
 _Avoid_: 持有 (for the API; 保留 is the verb in Chinese text), pin, cache
+
+**本地副本 / local copy**:
+The bytes a call copies out of transport storage before it releases the lease. Holds and borrowed inputs keep only local copies.
+_Avoid_: lease (for a local copy), snapshot
 
 **借用输入 / borrowed input**:
 A server-side input that is valid only while the resource method runs, selected at registration with `input_lifetime`.
@@ -157,13 +161,13 @@ A finite allowance of bytes or time that one scope may consume, such as the SHM 
 _Avoid_: quota; limit (for a budget)
 
 **释放 / release**:
-Returning a lease or an allocation to its owner; a failed release stays with its holder.
-_Avoid_: free (for a lease), close
+Ending a lease, an allocation or a hold. Across processes it travels as a release record on the physical connection; a local release does not mean the pool owner has reclaimed the allocation.
+_Avoid_: free (for a lease), close, 归还
 
 **截止时间 / deadline**:
 The absolute end of one bounded operation, such as a connect, a call, a Host start or a shutdown; every wait inside the operation shares it.
 _Avoid_: 期限
 
 **超时 / timeout**:
-A configured or caller-passed duration after which something expires, such as `timeout=`, `startup_timeout` or `C2_IPC_HEARTBEAT_TIMEOUT`; a bounded operation computes its deadline from it.
+A configured or caller-passed duration after which something expires, such as `timeout=`, `startup_timeout` or `C2_RELAY_CALL_TIMEOUT`; a bounded operation computes its deadline from it.
 _Avoid_: 期限

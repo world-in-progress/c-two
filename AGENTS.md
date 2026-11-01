@@ -125,7 +125,7 @@ The language-neutral Cargo workspace is `core/`; the Python SDK owns its PyO3/ma
 - Direct IPC remains a complete standalone mode when relay is unset or unavailable.
 - Route acquisition and dispatch validate the route name, complete CRM identity, ABI hash and signature hash in Rust.
 - Core owns deadlines, readiness, registration and lifecycle transactions; Python projects the native authority without retaining a second state machine.
-- Core retains each request transport lease through invocation and moves its owned snapshot into PyO3 without a second copy; response carriers retain their lease ordering.
+- Each direction copies a transport payload into a local `Vec` and releases its lease before handing the bytes on: a request is released before the resource method runs, a response before decoding or delivering a hold; PyO3 moves that same `Vec` into its buffer projection without a second copy.
 - `c2-core` does not depend on FastDB; Rust users name `fastdb::Payload`, and Rust and Python expose the same portable capabilities.
 - Same-process calls pass Python objects directly and skip serialization.
 - Python imports `c_two as cc`; Rust applications import the `c_two` facade and leave hidden `c_two::generated` seams to generated code.
@@ -203,7 +203,7 @@ Requires Python 3.10 or newer, including downstream Taichi stacks pinned to 3.10
 - Use Rust core crates for cross-language behavior so later SDKs do not have to reimplement mechanisms independently.
 - Do not treat the Python SDK as the reference implementation for generic runtime behavior. If behavior is language-neutral, prefer a Rust-core owner with thin SDK facades.
 - Preserve direct IPC as relay-independent. If touching registration, client routing, or runtime session code, include checks for explicit `ipc://` connections with relay unset or unavailable.
-- Preserve the Core request snapshot and transport lease ordering. If touching wire, SHM, scheduler, or native callback code, check that PyO3 moves the owned request `Vec` into its buffer projection without a second copy and exposes a Python `memoryview`.
+- Preserve the copy, release, move ordering. If touching wire, SHM, scheduler, or native callback code, check that the transport lease ends right after the copy, before the resource method or a hold, and that PyO3 moves the owned request `Vec` into its buffer projection without a second copy and exposes a Python `memoryview`.
 - Do not turn a transport-level SHM proof into a FastDB direct-backing claim. The current portable receive adapters are copy-backed; stronger wording requires resource-time construction into the final C-Two backing, truthful FastDB direct/staged reports, and Rust/Python proof.
 - Keep local-candidate truth separate from official release truth. Reused version metadata identifies an artifact only together with its source commit and SHA-256; do not substitute registry packages for the retained candidate or call documentation-only commits package inputs.
 - For bug fixes and behavior changes, add or update focused tests first when feasible, then implement the correct production-grade code change needed to satisfy the verified behavior; do not use phase boundaries to justify temporary shims or lower-quality shortcuts.
