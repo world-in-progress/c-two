@@ -30,8 +30,8 @@ pub use client::{
     ServerPoolState,
 };
 pub use control::{
-    local_endpoint_from_ipc_address, ping, ping_with_context, ping_with_endpoint, shutdown,
-    shutdown_with_context, shutdown_with_endpoint,
+    DirectIpcShutdownOutcome, local_endpoint_from_ipc_address, ping, ping_with_context,
+    ping_with_endpoint, shutdown, shutdown_with_context, shutdown_with_endpoint,
 };
 pub use pool::{ClientCacheMemorySnapshot, ClientPool};
 pub use response::{ResponseData, ResponseLease, ServerShmResponse};

@@ -2,13 +2,13 @@ use std::fmt;
 
 use c2_core::{Error, HeldResponse};
 
-/// A retained SDK value paired with its still-live C-Two response lease.
+/// A retained SDK value paired with its local response copy.
 ///
 /// The current portable receive path is copy-backed. Retention is a lifetime
 /// contract, not a zero-copy claim.
 #[must_use = "held values must remain owned or be explicitly released"]
 pub struct Held<T> {
-    // Response first preserves native cleanup before value drop on unwind.
+    // The response owns only local bytes; transport storage is already released.
     owners: Option<(HeldResponse, T)>,
     invalidate: fn(&T) -> Result<(), String>,
 }
@@ -38,31 +38,21 @@ impl<T> Held<T> {
             .is_none_or(|(response, _)| response.is_released())
     }
 
-    /// Invalidate the retained value owner before releasing transport storage.
+    /// Invalidate the retained value owner before dropping the local bytes.
     ///
-    /// Invalidation runs once. A failed native release retains the response
-    /// for another explicit cleanup attempt, while the value stays inaccessible.
+    /// Invalidation runs once, including when it fails or unwinds. The original
+    /// invalidation error is preserved and subsequent releases are no-ops.
     pub fn release(&mut self) -> Result<(), Error> {
-        let Some((response, value)) = self.owners.as_mut() else {
+        let Some((mut response, value)) = self.owners.take() else {
             return Ok(());
         };
-        let result = response.invalidate_then_release(|| (self.invalidate)(&value));
-        if !response.has_pending_release() {
-            let (response, value) = self.owners.take().expect("held owners still present");
-            if std::thread::panicking() {
-                drop(response);
-                drop(value);
-            } else {
-                drop(value);
-                drop(response);
-            }
-        }
-        result.map_err(Error::from)
+        response
+            .invalidate_then_release(|| (self.invalidate)(&value))
+            .map_err(Error::from)
     }
 }
 
 /// Report failed cleanup while the caller preserves its primary decode error.
-/// A pending response remains owned by `held` for its final Drop attempt.
 pub fn release_held_after_error<T>(held: &mut Held<T>) {
     if let Err(cleanup_error) = held.release() {
         eprintln!("Warning: held payload decode cleanup failed: {cleanup_error}");
@@ -83,19 +73,13 @@ impl<T> Drop for Held<T> {
         if let Err(error) = self.release() {
             eprintln!("Warning: final Rust held value release failed: {error}");
         }
-        if let Some((response, value)) = self.owners.take() {
-            // The final native attempt failed. End its obligation once; a
-            // nested response Drop must not retry it.
-            response.abandon();
-            drop(value);
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_ipc::{ResponseData, ResponseLease};
+    use c2_ipc::ResponseData;
     use c2_mem::{MemPool, PoolConfig};
     use c2_wire::chunk::backing::ReassemblyBacking;
     use parking_lot::RwLock;
@@ -121,9 +105,7 @@ mod tests {
         let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
         let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, 512).unwrap();
         backing.write_at(0, &[7; 512]).unwrap();
-        let response =
-            HeldResponse::from_response_lease(ResponseLease::new(ResponseData::Handle(backing)))
-                .unwrap();
+        let response = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();
         let observed = Arc::new(AtomicBool::new(false));
         let panic = catch_unwind(AssertUnwindSafe({
             let pool = Arc::clone(&pool);
@@ -137,48 +119,70 @@ mod tests {
         }));
         assert!(panic.is_err());
         assert!(observed.load(Ordering::SeqCst));
-        pool.write().destroy();
+        drop(pool);
     }
 
     #[test]
-    fn failed_native_release_retains_response_and_never_reinvalidates() {
-        let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
-        let budget = pool.read().budget().unwrap().clone();
-        let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, 512).unwrap();
-        backing.write_at(0, &[7; 512]).unwrap();
-        let response =
-            HeldResponse::from_response_lease(ResponseLease::new(ResponseData::Handle(backing)))
+    fn decode_cleanup_preserves_primary_error_and_invalidates_once() {
+        const CHILD: &str = "C2_TEST_RUST_HELD_INVALIDATION_ERROR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "held::tests::decode_cleanup_preserves_primary_error_and_invalidates_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
                 .unwrap();
-        let calls = Cell::new(0);
-        let mut held = Held::new(&calls, response, |calls| {
-            calls.set(calls.get() + 1);
-            Ok(())
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "child failed: {stderr}");
+            assert!(stderr.lines().any(|line| {
+                line.starts_with("Warning: held payload decode cleanup failed:")
+                    && line.contains("invalidation failed")
+            }));
+            assert_eq!(stderr.matches("Warning:").count(), 1);
+            return;
+        }
+
+        let invalidations = Cell::new(0);
+        let mut held = Held::new(
+            &invalidations,
+            HeldResponse::from_owned_bytes(vec![7]),
+            |calls| {
+                calls.set(calls.get() + 1);
+                Err("invalidation failed".into())
+            },
+        );
+        let primary = Err::<(), _>("original decode error").inspect_err(|_| {
+            release_held_after_error(&mut held);
         });
-        let original = std::mem::replace(
-            &mut *pool.write(),
-            MemPool::new(PoolConfig::default()).unwrap(),
-        );
-
-        let first = held
-            .release()
-            .expect_err("foreign pool must reject release");
-        assert!(
-            first
-                .to_string()
-                .contains("pool owner incarnation mismatch")
-        );
-        assert!(held.is_released());
+        assert_eq!(primary, Err("original decode error"));
         assert!(held.value().is_none());
-        assert_eq!(calls.get(), 1);
-        assert_eq!(budget.snapshot().abandoned_releases, 0);
-
-        *pool.write() = original;
         held.release().unwrap();
-        assert_eq!(calls.get(), 1);
-        assert_eq!(pool.read().stats().alloc_count, 0);
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
-        assert_eq!(budget.snapshot().abandoned_releases, 0);
-        pool.write().destroy();
+        drop(held);
+        assert_eq!(invalidations.get(), 1);
+    }
+
+    #[test]
+    fn drop_during_unwind_preserves_primary_panic_and_invalidates_once() {
+        let invalidations = Cell::new(0);
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _held = Held::new(
+                &invalidations,
+                HeldResponse::from_owned_bytes(vec![7]),
+                |calls| {
+                    calls.set(calls.get() + 1);
+                    Err("invalidation failed during unwind".into())
+                },
+            );
+            panic!("original business panic");
+        }));
+        assert_eq!(
+            panic.unwrap_err().downcast_ref::<&str>(),
+            Some(&"original business panic")
+        );
+        assert_eq!(invalidations.get(), 1);
     }
 
     #[test]
@@ -196,8 +200,12 @@ mod tests {
             );
             let result = catch_unwind(AssertUnwindSafe(|| held.release()));
             assert_eq!(result.is_err(), panics);
-            if let Ok(result) = result {
-                assert!(result.is_err());
+            match result {
+                Ok(Err(Error::Lifecycle(c2_core::LifecycleError::HeldResponseRelease {
+                    invalidation_error,
+                }))) => assert_eq!(invalidation_error, "invalidation failed"),
+                Err(panic) => assert_eq!(panic.downcast_ref::<&str>(), Some(&"invalidation panic")),
+                other => panic!("unexpected invalidation result: {other:?}"),
             }
             assert!(held.is_released());
             assert!(held.value().is_none());

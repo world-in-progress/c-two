@@ -11,6 +11,20 @@ use c2_wire::frame::{self, HEADER_SIZE};
 use c2_wire::msg_type::{PING_BYTES, PONG_BYTES};
 use c2_wire::shutdown_control::{decode_shutdown_ack, encode_shutdown_initiate};
 
+/// Result of a direct IPC shutdown probe.
+/// Only an acknowledged request establishes initiation; completion is observed
+/// through the original Host shutdown receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectIpcShutdownOutcome {
+    /// A valid shutdown acknowledgement was received.
+    Initiated,
+    /// The operating system reported that this endpoint has no listener.
+    Absent,
+    /// No request was sent within the deadline, the reply was not an
+    /// acknowledgement, or a possibly delivered request was not confirmed.
+    Unconfirmed,
+}
+
 /// Derive the automatic platform native endpoint for a logical IPC address.
 pub fn local_endpoint_from_ipc_address(address: &str) -> Result<LocalEndpoint, IpcError> {
     LocalEndpoint::from_address(address).map_err(endpoint_error)
@@ -263,9 +277,9 @@ pub fn ping_with_endpoint(endpoint: &LocalEndpoint, timeout: Duration) -> Result
     })
 }
 
-/// Initiate shutdown at exactly this endpoint. True means initiation was
-/// acknowledged or the endpoint is absent; completion uses the Host receipt.
-pub fn shutdown(address: &str, timeout: Duration) -> Result<bool, IpcError> {
+/// Initiate shutdown at exactly this endpoint, distinguishing acknowledgement,
+/// endpoint absence and an unconfirmed request. Completion uses the Host receipt.
+pub fn shutdown(address: &str, timeout: Duration) -> Result<DirectIpcShutdownOutcome, IpcError> {
     shutdown_with_endpoint(&local_endpoint_from_ipc_address(address)?, timeout)
 }
 
@@ -274,7 +288,7 @@ pub fn shutdown_with_context(
     address: &str,
     context: &LocalEndpointContext,
     timeout: Duration,
-) -> Result<bool, IpcError> {
+) -> Result<DirectIpcShutdownOutcome, IpcError> {
     shutdown_with_endpoint(&context.endpoint(address).map_err(endpoint_error)?, timeout)
 }
 
@@ -285,7 +299,7 @@ pub fn shutdown_with_context(
 pub fn shutdown_with_endpoint(
     endpoint: &LocalEndpoint,
     timeout: Duration,
-) -> Result<bool, IpcError> {
+) -> Result<DirectIpcShutdownOutcome, IpcError> {
     let endpoint = endpoint.clone();
     blocking(async move {
         let started = Instant::now();
@@ -302,23 +316,23 @@ pub fn shutdown_with_endpoint(
             .await?
             {
                 Exchange::Absent => {
-                    return Ok(true);
+                    return Ok(DirectIpcShutdownOutcome::Absent);
                 }
                 Exchange::Reply(flags, payload) => {
                     if flags & FLAG_SIGNAL == 0 || flags & FLAG_RESPONSE == 0 {
-                        return Ok(false);
+                        return Ok(DirectIpcShutdownOutcome::Unconfirmed);
                     }
                     return decode_shutdown_ack(&payload)
-                        .map(|()| true)
+                        .map(|()| DirectIpcShutdownOutcome::Initiated)
                         .map_err(IpcError::Protocol);
                 }
-                Exchange::DispatchUncertain => return Ok(false),
+                Exchange::DispatchUncertain => return Ok(DirectIpcShutdownOutcome::Unconfirmed),
                 Exchange::NotSent => {
                     tokio::time::sleep(remaining.min(Duration::from_millis(10))).await
                 }
             }
         }
-        Ok(false)
+        Ok(DirectIpcShutdownOutcome::Unconfirmed)
     })
 }
 
@@ -491,11 +505,11 @@ mod tests {
     }
 
     #[test]
-    fn absent_endpoint_has_no_ping_and_is_already_stopped() {
+    fn absent_endpoint_has_no_ping_and_reports_absent() {
         let address = address("absent");
         assert!(!ping(&address, Duration::from_millis(20)).unwrap());
         let result = shutdown(&address, Duration::from_millis(20)).unwrap();
-        assert!(result);
+        assert_eq!(result, DirectIpcShutdownOutcome::Absent);
     }
 
     #[cfg(unix)]
@@ -511,7 +525,7 @@ mod tests {
         let result = shutdown(&address, Duration::from_millis(20));
         std::fs::remove_file(path).unwrap();
         let result = result.unwrap();
-        assert!(!result);
+        assert_eq!(result, DirectIpcShutdownOutcome::Unconfirmed);
     }
 
     /// Drives one probe through the absent-to-ready sequence and returns its
@@ -597,12 +611,14 @@ mod tests {
             let result = shutdown(&address, PROBE_BUDGET).unwrap();
             responder.stop();
             assert!(!test_seam::take_connect_refusal(&address));
-            assert!(result);
+            assert_eq!(result, DirectIpcShutdownOutcome::Initiated);
         }
     }
 
-    #[tokio::test]
-    async fn malformed_shutdown_ack_is_protocol_error() {
+    async fn shutdown_reply(
+        flags: u32,
+        reply: &[u8],
+    ) -> Result<DirectIpcShutdownOutcome, IpcError> {
         #[cfg(unix)]
         let root = tempfile::Builder::new()
             .prefix("c2m2")
@@ -616,7 +632,7 @@ mod tests {
         };
         #[cfg(windows)]
         let context = LocalEndpointContext::default_for_platform().unwrap();
-        let endpoint = context.endpoint(&address("malformed-ack")).unwrap();
+        let endpoint = context.endpoint(&address("shutdown-reply")).unwrap();
         let mut listener = LocalListener::bind(&endpoint).unwrap();
         let shutdown =
             tokio::task::spawn_blocking(move || shutdown_with_endpoint(&endpoint, PROBE_BUDGET));
@@ -624,19 +640,43 @@ mod tests {
         let (_, request) = read_reply(&mut stream).await.unwrap();
         assert_eq!(request, encode_shutdown_initiate());
         stream
-            .write_all(&frame::encode_frame(
-                0,
-                FLAG_SIGNAL | FLAG_RESPONSE,
-                b"malformed shutdown acknowledgement",
-            ))
+            .write_all(&frame::encode_frame(0, flags, reply))
             .await
             .unwrap();
         drop(stream);
         let result = shutdown.await.unwrap();
         crate::tests::close_listener(listener).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn malformed_shutdown_ack_is_protocol_error() {
+        let result = shutdown_reply(
+            FLAG_SIGNAL | FLAG_RESPONSE,
+            b"malformed shutdown acknowledgement",
+        )
+        .await;
         assert!(
             matches!(result, Err(IpcError::Protocol(_))),
             "malformed shutdown ACK must fail parsing: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_acknowledgement_reply_is_unconfirmed() {
+        for flags in [FLAG_SIGNAL, FLAG_RESPONSE] {
+            assert_eq!(
+                shutdown_reply(flags, &encode_shutdown_ack()).await.unwrap(),
+                DirectIpcShutdownOutcome::Unconfirmed,
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_without_budget_is_unconfirmed() {
+        assert_eq!(
+            shutdown(&address("zero-budget"), Duration::ZERO).unwrap(),
+            DirectIpcShutdownOutcome::Unconfirmed,
         );
     }
 
@@ -691,7 +731,7 @@ mod tests {
             "a replacement listener received the shutdown replay"
         );
         let result = result.unwrap();
-        assert!(!result);
+        assert_eq!(result, DirectIpcShutdownOutcome::Unconfirmed);
     }
 
     #[tokio::test]

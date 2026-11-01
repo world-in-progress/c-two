@@ -20,6 +20,7 @@ mod outcome;
 mod session;
 
 pub use c2_config::{ConnectOptions, ConnectTimeoutError};
+pub use c2_ipc::DirectIpcShutdownOutcome;
 pub use c2_server::{ServerFailure, ServerStartupStage, ServerStartupTimeout};
 pub use call_scope::{CallScope, CallScopeError, CallState};
 pub use client::{
@@ -27,9 +28,7 @@ pub use client::{
     PathCounters, PreparedCall,
 };
 pub use connect_deadline::{ConnectAttempt, connect_deadline_error};
-pub use control::{
-    DirectIpcShutdownOutcome, direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc,
-};
+pub use control::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc};
 pub use error::{
     AdapterFailure, AdapterFailurePhase, Error, ExternalCause, LifecycleError, LocalIoCause,
     TransportError, TransportKind, TransportPhase, external_cause_details,

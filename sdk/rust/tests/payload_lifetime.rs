@@ -1,12 +1,11 @@
 use c_two::generated::{
     HeldResponse, open_borrowed, open_held, open_owned, release_held_after_error,
 };
-use c2_ipc::{ResponseData, ResponseLease};
+use c2_ipc::ResponseData;
 use c2_mem::{MemPool, PoolConfig};
 use c2_wire::chunk::backing::ReassemblyBacking;
 use fastdb::{BuildPolicy, Builder, CompiledSpec, Payload};
 use parking_lot::RwLock;
-use std::process::Command;
 use std::sync::Arc;
 
 const VALUE_SPEC: &[u8] = br#"{
@@ -117,27 +116,7 @@ fn held_drop_runs_the_same_invalidation_path() {
 }
 
 #[test]
-fn held_open_failure_keeps_payload_error_and_abandons_failed_cleanup_once() {
-    const CHILD: &str = "C2_TEST_HELD_OPEN_FAILURE_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "held_open_failure_keeps_payload_error_and_abandons_failed_cleanup_once",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "child failed: {stderr}");
-        assert!(stderr.lines().any(|line| {
-            line.starts_with("Warning: held payload open cleanup failed:")
-                && line.contains("pool owner incarnation mismatch")
-        }));
-        assert_eq!(stderr.matches("Warning:").count(), 1);
-        return;
-    }
+fn held_open_failure_preserves_original_payload_error_after_transport_release() {
     let spec = CompiledSpec::compile(VALUE_SPEC).expect("compile value spec");
     let invalid_bytes = [0xa5; 512];
     let expected = open_owned(&spec, &invalid_bytes).expect_err("invalid payload");
@@ -145,70 +124,77 @@ fn held_open_failure_keeps_payload_error_and_abandons_failed_cleanup_once() {
     let budget = pool.read().budget().unwrap().clone();
     let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, invalid_bytes.len()).unwrap();
     backing.write_at(0, &invalid_bytes).unwrap();
-    let response =
-        HeldResponse::from_response_lease(ResponseLease::new(ResponseData::Handle(backing)))
-            .unwrap();
-    let original = std::mem::replace(
-        &mut *pool.write(),
-        MemPool::new(PoolConfig::default()).unwrap(),
-    );
+    let response = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();
+    assert_eq!(pool.read().stats().alloc_count, 0);
+    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
 
     let error = open_held(&spec, response).err().expect("invalid payload");
     assert_eq!(error.symbol(), expected.symbol());
     assert_eq!(error.message(), expected.message());
-    assert_eq!(budget.snapshot().abandoned_releases, 1);
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
-    *pool.write() = original;
-    assert_eq!(pool.read().stats().alloc_count, 1);
-    pool.write().destroy();
+    drop(pool);
 }
 
 #[test]
-fn generated_decode_cleanup_reports_failure_and_preserves_drop_retry() {
-    const CHILD: &str = "C2_TEST_HELD_DECODE_CLEANUP_CHILD";
-    let Some(mode) = std::env::var_os(CHILD) else {
-        for mode in ["success", "failed"] {
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "generated_decode_cleanup_reports_failure_and_preserves_drop_retry",
-                    "--nocapture",
-                ])
-                .env(CHILD, mode)
-                .output()
-                .unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(output.status.success(), "{mode} child failed: {stderr}");
-            if mode == "failed" {
-                assert!(stderr.lines().any(|line| {
-                    line.starts_with("Warning: held payload decode cleanup failed:")
-                        && line.contains("pool owner incarnation mismatch")
-                }));
-                assert_eq!(stderr.matches("Warning:").count(), 1);
-            } else {
-                assert!(!stderr.contains("Warning:"), "{stderr}");
-            }
-        }
-        return;
-    };
+fn held_local_value_survives_reassembly_storage_reuse_and_pool_destruction() {
+    check_held_local_copy_after_reassembly_release(true);
+}
+
+#[test]
+fn held_local_value_survives_file_spill_release_and_pool_drop() {
+    check_held_local_copy_after_reassembly_release(false);
+}
+
+fn check_held_local_copy_after_reassembly_release(buddy: bool) {
     let (spec, source) = value_payload(19);
     let bytes = source.binary_bytes().unwrap();
-    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
+    let mut pool = MemPool::new(PoolConfig {
+        segment_size: 64 * 1024,
+        spill_threshold: if buddy { 1.0 } else { 0.0 },
+        ..PoolConfig::default()
+    })
+    .unwrap();
+    if buddy {
+        // Warm a real SHM slot without fallback, so an unavailable mapping is
+        // reported with its original cause rather than passing as file spill.
+        let seed = pool
+            .alloc_shm_handle(bytes.len())
+            .expect("buddy SHM required");
+        pool.release_handle(seed);
+    }
+    let pool = Arc::new(RwLock::new(pool));
+    let weak_pool = Arc::downgrade(&pool);
     let budget = pool.read().budget().unwrap().clone();
     let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len()).unwrap();
+    assert_eq!(backing.is_buddy(), buddy);
+    assert_eq!(backing.is_file_spill(), !buddy);
+    let spill_path = backing.file_spill_path();
     backing.write_at(0, &bytes).unwrap();
-    let response =
-        HeldResponse::from_response_lease(ResponseLease::new(ResponseData::Handle(backing)))
-            .unwrap();
+    assert_eq!(pool.read().stats().alloc_count, u32::from(buddy));
+    let response = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();
+    assert_eq!(pool.read().stats().alloc_count, 0);
+    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    if let Some(path) = spill_path {
+        assert!(
+            !path.exists(),
+            "copied file backing must already be removed"
+        );
+    }
+    assert_eq!(response.bytes(), bytes);
     let mut held = open_held(&spec, response).unwrap();
     let clone = held.value().unwrap().clone();
     let view = clone.entry_view(0).unwrap().at(0).unwrap();
-    let original = (mode == "failed").then(|| {
-        std::mem::replace(
-            &mut *pool.write(),
-            MemPool::new(PoolConfig::default()).unwrap(),
-        )
-    });
+
+    let mut replacement = ReassemblyBacking::admit(Arc::clone(&pool), 2, bytes.len()).unwrap();
+    replacement.write_at(0, &vec![0xa5; bytes.len()]).unwrap();
+    assert_eq!(view.get_u8().unwrap(), 19);
+    drop(replacement);
+    drop(pool);
+    assert!(
+        weak_pool.upgrade().is_none(),
+        "hold must not retain the pool"
+    );
+    assert_eq!(payload_value(held.value().unwrap()), 19);
+    assert_eq!(view.get_u8().unwrap(), 19);
 
     release_held_after_error(&mut held);
 
@@ -219,18 +205,7 @@ fn generated_decode_cleanup_reports_failure_and_preserves_drop_retry() {
         clone.entry_view(0).unwrap_err().symbol(),
         "VIEW_INVALIDATED"
     );
-    assert_eq!(budget.snapshot().abandoned_releases, 0);
-    if let Some(original) = original {
-        assert_eq!(budget.snapshot().reassembly.used_bytes, bytes.len() as u64);
-        *pool.write() = original;
-        assert_eq!(pool.read().stats().alloc_count, 1);
-    }
-    // A repaired owner lets Held's final attempt release the original charge.
-    drop(held);
-    assert_eq!(pool.read().stats().alloc_count, 0);
     assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
-    assert_eq!(budget.snapshot().abandoned_releases, 0);
-    pool.write().destroy();
 }
 
 #[test]

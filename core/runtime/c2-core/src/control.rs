@@ -3,14 +3,7 @@ use c2_config::{
 };
 use std::time::Duration;
 
-use crate::{LifecycleError, Runtime};
-
-/// Initiation-only acknowledgement of a direct IPC shutdown request.
-/// Completion is observed through the original Host shutdown receipt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirectIpcShutdownOutcome {
-    pub shutdown_started: bool,
-}
+use crate::{DirectIpcShutdownOutcome, LifecycleError, Runtime};
 
 /// Capture process configuration once for an independent admin operation.
 fn process_context() -> Result<LocalEndpointContext, LifecycleError> {
@@ -73,7 +66,6 @@ pub fn shutdown_direct_ipc(
         }
     };
     c2_ipc::shutdown_with_context(address, context, timeout)
-        .map(DirectIpcShutdownOutcome::from)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
@@ -103,12 +95,6 @@ impl Runtime {
             Some(&self.freeze_local_endpoint_context()?),
             timeout,
         )
-    }
-}
-
-impl From<bool> for DirectIpcShutdownOutcome {
-    fn from(shutdown_started: bool) -> Self {
-        Self { shutdown_started }
     }
 }
 
@@ -208,6 +194,6 @@ mod tests {
         assert!(!ping_direct_ipc("ipc://capacity", Some(&context), Duration::ZERO).unwrap());
         let outcome =
             shutdown_direct_ipc("ipc://capacity", Some(&context), Duration::ZERO).unwrap();
-        assert!(!outcome.shutdown_started);
+        assert_eq!(outcome, DirectIpcShutdownOutcome::Unconfirmed);
     }
 }

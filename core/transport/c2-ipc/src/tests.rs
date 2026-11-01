@@ -438,8 +438,8 @@ mod endpoint_context_tests {
 #[cfg(all(test, unix))]
 mod endpoint_context_transport_tests {
     use crate::{
-        ClientPool, SyncClient, ping_with_context, ping_with_endpoint, shutdown_with_context,
-        shutdown_with_endpoint,
+        ClientPool, DirectIpcShutdownOutcome, SyncClient, ping_with_context, ping_with_endpoint,
+        shutdown_with_context, shutdown_with_endpoint,
     };
     use c2_config::LocalEndpointContext;
     use c2_server::{
@@ -623,7 +623,7 @@ mod endpoint_context_transport_tests {
             "{report:?}"
         );
         let ack_a = shutdown_with_context(ADDRESS, &a, WAIT).unwrap();
-        assert!(ack_a);
+        assert_eq!(ack_a, DirectIpcShutdownOutcome::Initiated);
         rt.block_on(async {
             server_a.wait_until_stopped(WAIT).await.unwrap();
             run_a.await.unwrap().unwrap();
@@ -632,7 +632,7 @@ mod endpoint_context_transport_tests {
         assert!(ping_with_endpoint(&endpoint_b, WAIT).unwrap());
         check_tag(&cached_b, b'B');
         let absent_a = shutdown_with_endpoint(&endpoint_a, WAIT).unwrap();
-        assert!(absent_a);
+        assert_eq!(absent_a, DirectIpcShutdownOutcome::Absent);
         // Fence restart before readiness waiters, using the same Server endpoint.
         server_a.begin_start_attempt().unwrap();
         let restarted_a = rt.block_on(async {
@@ -653,7 +653,7 @@ mod endpoint_context_transport_tests {
         assert!(restarted_client.close_shared(WAIT));
         check_tag(&cached_b, b'B');
         let ack_a = shutdown_with_endpoint(&endpoint_a, WAIT).unwrap();
-        assert!(ack_a);
+        assert_eq!(ack_a, DirectIpcShutdownOutcome::Initiated);
         rt.block_on(async {
             server_a.wait_until_stopped(WAIT).await.unwrap();
             restarted_a.await.unwrap().unwrap();
@@ -664,7 +664,7 @@ mod endpoint_context_transport_tests {
             "{report:?}"
         );
         let ack_b = shutdown_with_endpoint(&endpoint_b, WAIT).unwrap();
-        assert!(ack_b);
+        assert_eq!(ack_b, DirectIpcShutdownOutcome::Initiated);
         rt.block_on(async {
             server_b.wait_until_stopped(WAIT).await.unwrap();
             run_b.await.unwrap().unwrap();

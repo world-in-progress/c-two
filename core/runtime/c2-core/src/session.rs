@@ -4539,7 +4539,7 @@ mod tests {
             .expect("server ready");
         let ack = c2_ipc::shutdown(server.local_endpoint().address(), Duration::from_secs(2))
             .expect("direct IPC shutdown should be acknowledged");
-        assert!(ack);
+        assert_eq!(ack, c2_ipc::DirectIpcShutdownOutcome::Initiated);
         rt.block_on(server.wait_until_stopped(Duration::from_secs(2)))
             .expect("server stopped");
 
@@ -4636,7 +4636,7 @@ mod tests {
         let active = handle.blocking_acquire(0).expect("active route guard");
         let ack = c2_ipc::shutdown_with_endpoint(server.local_endpoint(), Duration::from_secs(2))
             .expect("direct shutdown must be acknowledged");
-        assert!(ack);
+        assert_eq!(ack, c2_ipc::DirectIpcShutdownOutcome::Initiated);
         // Damage only this test's pinned lease record, then let actual active
         // work drain before listener retirement detects the failure.
         lease.write_all_at(b"invalid", 0).unwrap();

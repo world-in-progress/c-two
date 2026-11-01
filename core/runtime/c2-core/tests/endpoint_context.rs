@@ -593,7 +593,7 @@ mod unix {
         let ack = runtime_a
             .shutdown_direct_ipc("ipc://same-server", TIMEOUT)
             .unwrap();
-        assert!(ack.shutdown_started);
+        assert_eq!(ack, c2_core::DirectIpcShutdownOutcome::Initiated);
         assert!(
             runtime_b
                 .ping_direct_ipc("ipc://same-server", TIMEOUT)

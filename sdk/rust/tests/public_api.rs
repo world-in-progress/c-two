@@ -280,7 +280,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         .register(definition(&route_name))
         .expect("route registration");
     let registered_route_uid = registration.outcome().route_uid.clone();
-    let registered_route_revision = registration.outcome().route_revision;
     let expected = release()
         .expected_route(&route_name)
         .expect("expected route");
@@ -295,10 +294,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         .expect("direct IPC client");
     accepts_client(&direct);
     assert_eq!(direct.observed_route().route_uid, registered_route_uid);
-    assert_eq!(
-        direct.observed_route().route_revision,
-        registered_route_revision
-    );
     assert_eq!(
         direct.call_owned("echo", b"direct").expect("direct call"),
         b"direct"
@@ -315,10 +310,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
     accepts_client(&explicit);
     assert_eq!(explicit.observed_route().route_uid, registered_route_uid);
     assert_eq!(
-        explicit.observed_route().route_revision,
-        registered_route_revision
-    );
-    assert_eq!(
         explicit
             .call_owned("echo", b"explicit")
             .expect("explicit relay call"),
@@ -330,10 +321,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         .expect("relay-aware client");
     accepts_client(&relay_aware);
     assert_eq!(relay_aware.observed_route().route_uid, registered_route_uid);
-    assert_eq!(
-        relay_aware.observed_route().route_revision,
-        registered_route_revision
-    );
     assert_eq!(
         relay_aware
             .call_owned("echo", b"aware")
@@ -563,6 +550,11 @@ fn assert_external_crate_rejected(name: &str, source: &str, expected_stderr: &st
 #[test]
 fn native_endpoint_and_admin_probes_are_thin_facade_reexports() {
     assert_eq!(
+        std::any::TypeId::of::<c_two::endpoint::DirectIpcShutdownOutcome>(),
+        std::any::TypeId::of::<c2_ipc::DirectIpcShutdownOutcome>(),
+    );
+
+    assert_eq!(
         std::any::TypeId::of::<c_two::observe::HostLifecycleSnapshot>(),
         std::any::TypeId::of::<c2_core::HostLifecycleSnapshot>(),
     );
@@ -584,8 +576,49 @@ fn native_endpoint_and_admin_probes_are_thin_facade_reexports() {
     assert!(!ping_direct_ipc(&address, Some(test_context()), Duration::from_millis(20)).unwrap());
     let outcome =
         shutdown_direct_ipc(&address, Some(test_context()), Duration::from_millis(20)).unwrap();
-    assert!(outcome.server_stopped && !outcome.shutdown_started);
-    assert!(outcome.route_outcomes.is_empty());
+    assert_eq!(outcome, c_two::endpoint::DirectIpcShutdownOutcome::Absent);
+}
+
+#[test]
+fn direct_shutdown_receipt_finishes_while_held_checked_view_stays_live() {
+    use c_two::generated::open_held;
+
+    let (runtime, host, _registration, client, _calls) = preparation_fixture(1, 4096);
+    let spec = CompiledSpec::compile(FASTDB_RECORD_U8_SPEC).unwrap();
+    let mut builder = Builder::create(&spec).unwrap();
+    builder.entry_begin(0, 1).unwrap().value_u8(23).unwrap();
+    let payload = builder
+        .freeze()
+        .unwrap()
+        .execute(BuildPolicy::AllowStaging)
+        .unwrap()
+        .payload;
+    let bytes = payload.binary_bytes().unwrap();
+    let response = client.call_held("echo", &bytes).unwrap();
+    let mut held = open_held(&spec, response).unwrap();
+    let view = held.value().unwrap().entry_view(0).unwrap().at(0).unwrap();
+    assert_eq!(view.get_u8().unwrap(), 23);
+    assert!(!host.lifecycle_snapshot().finished);
+
+    let acknowledgement = runtime
+        .shutdown_direct_ipc(&runtime.server_address().unwrap(), Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        acknowledgement,
+        c_two::endpoint::DirectIpcShutdownOutcome::Initiated
+    );
+    let receipt = host.shutdown();
+    assert!(receipt.runtime_barrier_error.is_none(), "{receipt:?}");
+    assert!(receipt.route_close_error.is_none(), "{receipt:?}");
+    assert_eq!(host.shutdown_outcome().unwrap(), receipt);
+    let snapshot = host.lifecycle_snapshot();
+    assert!(snapshot.finished);
+    assert!(snapshot.listener_closed);
+    assert_eq!(snapshot.work_drained, Some(true));
+    assert_eq!(view.get_u8().unwrap(), 23);
+
+    held.release().unwrap();
+    assert_eq!(view.kind().unwrap_err().symbol(), "VIEW_INVALIDATED");
 }
 
 #[test]
@@ -686,7 +719,10 @@ fn runtime_roots_and_admin_contexts_share_the_core_freeze_authority() {
     assert!(!ping_direct_ipc(&address, Some(&first_context), Duration::ZERO).unwrap());
     let stopped = shutdown_direct_ipc(&address, Some(&first_context), Duration::ZERO).unwrap();
     // A zero observation budget makes no exchange and cannot establish absence.
-    assert!(!stopped.acknowledged && !stopped.server_stopped && !stopped.shutdown_started);
+    assert_eq!(
+        stopped,
+        c_two::endpoint::DirectIpcShutdownOutcome::Unconfirmed
+    );
     assert!(!first.local_endpoint_frozen());
     assert!(!first.ping_direct_ipc(&address, Duration::ZERO).unwrap());
     assert!(first.local_endpoint_frozen());
