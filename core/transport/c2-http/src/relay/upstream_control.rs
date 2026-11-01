@@ -185,7 +185,7 @@ async fn remove_owner_routes(state: &Arc<RelayState>, key: &UpstreamOwnerKey, re
 }
 
 async fn remove_route(state: &Arc<RelayState>, route: &RouteEntry, reason: &str) {
-    let Some((entry, removed_at, removed_revision, client)) =
+    let Some((entry, removed_at, client)) =
         state.remove_unreachable_local_upstream_if_matches(route)
     else {
         return;
@@ -194,15 +194,14 @@ async fn remove_route(state: &Arc<RelayState>, route: &RouteEntry, reason: &str)
         state.clients.close(&client);
     }
     eprintln!(
-        "[relay] Upstream control watch removed route: name={} server_id={} server_instance_id={} address={} removed_at={} removed_revision={} reason={reason}",
+        "[relay] Upstream control watch removed route: name={} server_id={} server_instance_id={} address={} removed_at={} reason={reason}",
         entry.name,
         entry.server_id.as_deref().unwrap_or(""),
         entry.server_instance_id.as_deref().unwrap_or(""),
         entry.ipc_address.as_deref().unwrap_or(""),
         removed_at,
-        removed_revision
     );
-    broadcast_route_withdraw(state, &entry, removed_at, removed_revision);
+    broadcast_route_withdraw(state, &entry, removed_at);
 }
 
 fn expected_contract_for_route(route: &RouteEntry) -> c2_contract::ExpectedRouteContract {
@@ -226,12 +225,7 @@ mod tests {
     const STEP: Duration = Duration::from_secs(2);
     const ROUTE_NAME: &str = "proxy/bypass/test";
 
-    fn route_entry(
-        server_id: &str,
-        address: &str,
-        route_uid: String,
-        route_revision: u64,
-    ) -> RouteEntry {
+    fn route_entry(server_id: &str, address: &str, route_uid: String) -> RouteEntry {
         RouteEntry {
             name: ROUTE_NAME.into(),
             relay_id: "test-relay".into(),
@@ -246,7 +240,6 @@ mod tests {
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: c2_server::ServerIpcConfig::default().max_payload_size,
             route_uid,
-            route_revision,
             locality: Locality::Local,
             registered_at: 0.0,
         }
@@ -291,8 +284,8 @@ mod tests {
             .commit_reserved_route_closed(reservation)
             .await
             .unwrap();
-        let (route_uid, route_revision) = server.registered_route_identity(ROUTE_NAME).unwrap();
-        let route = route_entry(&id, &address, route_uid, route_revision);
+        let route_uid = server.registered_route_identity(ROUTE_NAME).await.unwrap();
+        let route = route_entry(&id, &address, route_uid);
         let expected = expected_contract_for_route(&route);
         let run_server = server.clone();
         let mut server_task = tokio::spawn(async move { run_server.run().await });
@@ -323,12 +316,33 @@ mod tests {
                     .await
                     .is_ok()
             );
+            let attested = crate::relay::authority::attest_ipc_route_contract(
+                &client,
+                crate::relay::authority::ClaimedRouteContract {
+                    expected: &expected,
+                    max_payload_size: route.max_payload_size,
+                },
+            )
+            .await
+            .expect("relay registration accepts a committed route before admission opens");
+            assert_eq!(attested.route_uid, route.route_uid);
+            client.rebuild_route_catalog().await.unwrap();
+            // Operator registration without a claimed contract only adopts routes already opened and exported by their owner.
+            assert_eq!(
+                crate::relay::authority::read_ipc_route_contract(&client, ROUTE_NAME).await,
+                Err(crate::relay::authority::RouteAttestationError::NotFound)
+            );
             assert!(
                 !route_is_semantically_gone(&client, &route).await,
                 "watch must preserve Closed(RegisterCommitted) until publication completes"
             );
 
             server.open_route_admission(admission).await.unwrap();
+            client.rebuild_route_catalog().await.unwrap();
+            let discovered = crate::relay::authority::read_ipc_route_contract(&client, ROUTE_NAME)
+                .await
+                .expect("CLI registration accepts an opened and exported route");
+            assert_eq!(discovered, attested);
             client.acquire_route(&expected).await.unwrap();
             assert!(!route_is_semantically_gone(&client, &route).await);
 
@@ -413,7 +427,7 @@ mod tests {
         let address = "ipc://relay_watch_unconnected";
         let client =
             IpcClient::with_config(address, c2_config::ClientIpcConfig::default()).unwrap();
-        let route = route_entry("unconnected", address, "unconnected-route".into(), 1);
+        let route = route_entry("unconnected", address, "unconnected-route".into());
         assert!(matches!(
             client
                 .attest_route_for_registration(&expected_contract_for_route(&route))
@@ -479,8 +493,8 @@ mod tests {
                 .unwrap(),
             );
             crate::relay::test_support::register_echo_route(&server, ROUTE_NAME).await;
-            let (uid, revision) = server.registered_route_identity(ROUTE_NAME).unwrap();
-            let entry = route_entry(&id, &address, uid, revision);
+            let uid = server.registered_route_identity(ROUTE_NAME).await.unwrap();
+            let entry = route_entry(&id, &address, uid);
             assert!(matches!(
                 test_commit_registration!(
                     &state,
@@ -495,7 +509,6 @@ mod tests {
                     entry.signature_hash.clone(),
                     entry.max_payload_size,
                     entry.route_uid.clone(),
-                    entry.route_revision,
                     None
                 ),
                 crate::relay::state::RegisterCommitResult::Registered { .. }
@@ -637,13 +650,12 @@ mod tests {
             .unwrap()
             .unwrap_or_else(|_| panic!("live acquire must succeed"));
             assert_eq!(binding.route_uid(), fixture.entry.route_uid);
-            assert_eq!(binding.route_revision(), fixture.entry.route_revision);
             let reply =
                 tokio::time::timeout(STEP, lease.client().call_bound(&binding, "ping", &[]))
                     .await
                     .unwrap()
                     .unwrap();
-            assert_eq!(reply.into_bytes().unwrap(), b"echo");
+            assert_eq!(reply.into_owned_bytes().unwrap(), b"echo");
             assert!(
                 fixture
                     .state

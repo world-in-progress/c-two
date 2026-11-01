@@ -684,6 +684,70 @@ async fn real_lazy_startup_sends_one_byte_without_mapping_buddy_backing() {
 async fn exhausted_reassembly_budget_returns_correlated_error_and_keeps_controls_usable() {
     let endpoint = Endpoint::new();
     let mut server_config = ServerIpcConfig::default();
+    server_config.base.shm_backing_budget_bytes = 0;
+    server_config.base.chunk_size = 4096;
+    server_config.shm_threshold = 1;
+    let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
+    let mut cfg = config();
+    cfg.base.shm_backing_budget_bytes = 0;
+    cfg.base.live_reassembly_budget_bytes = 0;
+    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    client.connect().await.unwrap();
+    let binding = client.acquire_route(&contract()).await.unwrap();
+    let connection = client.driver.read().clone().unwrap();
+    let identity = binding.table.call_identity();
+    let (rejected, other) = timeout(WAIT, async {
+        tokio::join!(
+            client.call_chunked(&identity, 0, &[3; 8193], None),
+            client.call_bound(&binding, "echo", b"other")
+        )
+    })
+    .await
+    .unwrap();
+    let error = rejected.unwrap_err();
+    assert!(
+        matches!(error.source_error(),
+            IpcError::ResponseFailure(source) if matches!(source.as_ref(), IpcError::Chunk(ChunkError::Capacity(_)))
+        ),
+        "expected correlated response capacity error: {error:?}"
+    );
+    assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
+    assert_eq!(other.unwrap().into_owned_bytes().unwrap(), b"other");
+    assert_eq!(client.pending_len_for_test(), 0);
+    assert!(client.is_connected());
+    assert!(Arc::ptr_eq(
+        client.driver.read().as_ref().unwrap(),
+        &connection
+    ));
+    assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
+    client.acquire_route(&contract()).await.unwrap();
+    assert_eq!(
+        client
+            .call_bound(&binding, "echo", b"x")
+            .await
+            .unwrap()
+            .into_owned_bytes()
+            .unwrap(),
+        b"x"
+    );
+    let ping_endpoint = endpoint.endpoint.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || crate::control::ping_with_endpoint(
+            &ping_endpoint,
+            WAIT
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+    );
+    assert!(client.close_shared_bounded(WAIT).await);
+    stop(server, runner).await;
+}
+
+#[tokio::test]
+async fn exhausted_request_reassembly_budget_returns_correlated_error_and_keeps_controls_usable() {
+    let endpoint = Endpoint::new();
+    let mut server_config = ServerIpcConfig::default();
     server_config.base.live_reassembly_budget_bytes = 0;
     let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
     let mut cfg = config();

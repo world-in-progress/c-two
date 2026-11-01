@@ -40,7 +40,6 @@ const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
 const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
 const ROUTE_UID_HEADER: &str = "x-c2-route-uid";
-const ROUTE_REVISION_HEADER: &str = "x-c2-route-revision";
 const UNKNOWN_LENGTH_BODY_LIMIT_BYTES: u64 = 64 * 1024;
 const REJECTED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -63,7 +62,6 @@ enum RequestClient {
 
 struct ExpectedRouteToken {
     route_uid: String,
-    route_revision: u64,
 }
 
 struct ResponseFailure(Box<Response>);
@@ -417,44 +415,15 @@ fn route_token_from_headers(
     route_name: &str,
     headers: &HeaderMap,
 ) -> ResponseResult<ExpectedRouteToken> {
-    let route_uid = single_route_token_header(route_name, headers, ROUTE_UID_HEADER)?;
-    let route_revision = single_route_token_header(route_name, headers, ROUTE_REVISION_HEADER)?;
-
-    match (route_uid, route_revision) {
-        (Some(route_uid), Some(route_revision)) => {
-            c2_contract::validate_call_route_key("route_uid", &route_uid).map_err(|err| {
-                protocol_violation_response(
-                    route_name,
-                    format!("invalid route token header {ROUTE_UID_HEADER}: {err}"),
-                )
-            })?;
-            let route_revision = route_revision.parse::<u64>().map_err(|_| {
-                protocol_violation_response(
-                    route_name,
-                    format!("invalid route token header {ROUTE_REVISION_HEADER}: must be u64"),
-                )
-            })?;
-            if route_revision == 0 {
-                return Err(protocol_violation_response(
-                    route_name,
-                    format!("invalid route token header {ROUTE_REVISION_HEADER}: must be > 0"),
-                )
-                .into());
-            }
-            Ok(ExpectedRouteToken {
-                route_uid,
-                route_revision,
-            })
-        }
-        (None, None) => {
-            Err(protocol_violation_response(route_name, "route token headers are required").into())
-        }
-        _ => Err(protocol_violation_response(
+    let route_uid = single_route_token_header(route_name, headers, ROUTE_UID_HEADER)?
+        .ok_or_else(|| protocol_violation_response(route_name, "route token header is required"))?;
+    c2_contract::validate_call_route_key("route_uid", &route_uid).map_err(|err| {
+        protocol_violation_response(
             route_name,
-            "route token headers must be supplied together",
+            format!("invalid route token header {ROUTE_UID_HEADER}: {err}"),
         )
-        .into()),
-    }
+    })?;
+    Ok(ExpectedRouteToken { route_uid })
 }
 
 fn single_route_token_header(
@@ -482,7 +451,7 @@ fn validate_route_token_for_route(
     route: &RouteEntry,
     expected: &ExpectedRouteToken,
 ) -> ResponseResult<()> {
-    if route.route_uid == expected.route_uid && route.route_revision == expected.route_revision {
+    if route.route_uid == expected.route_uid {
         Ok(())
     } else {
         Err(route_stale_response(route).into())
@@ -703,7 +672,7 @@ async fn handle_register(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "LocalEndpointNamespaceRequired",
-                    "message": "custom relay endpoint context requires the resource namespace",
+                    "message": "custom relay endpoint context requires the resource's local endpoint namespace",
                 })),
             )
                 .into_response();
@@ -1187,14 +1156,13 @@ async fn handle_unregister(
         Ok(RegistrationWithdrawal::Removed {
             entry,
             removed_at,
-            removed_revision,
             client,
         }) => {
             state.stop_upstream_control_if_owner_idle_for_route(&entry);
             if let Some(client) = client {
                 close_arc_client(&state, client);
             }
-            broadcast_route_withdraw(&state, &entry, removed_at, removed_revision);
+            broadcast_route_withdraw(&state, &entry, removed_at);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"status": "removed"})),
@@ -1245,7 +1213,6 @@ async fn handle_admin_unregister(
         crate::relay::state::UnregisterResult::Removed {
             entry,
             removed_at,
-            removed_revision,
             client,
         } => {
             // Close old client asynchronously
@@ -1253,9 +1220,9 @@ async fn handle_admin_unregister(
                 close_arc_client(&state, arc_client);
             }
 
-            broadcast_route_withdraw(&state, &entry, removed_at, removed_revision);
+            broadcast_route_withdraw(&state, &entry, removed_at);
             eprintln!(
-                "[relay] Unregister removed: name={} server_id={} removed_at={removed_at} removed_revision={removed_revision}",
+                "[relay] Unregister removed: name={} server_id={} removed_at={removed_at}",
                 entry.name,
                 entry.server_id.as_deref().unwrap_or("")
             );
@@ -1740,7 +1707,7 @@ async fn forward_call(
     match call_result {
         Ok(result) => materialized_response_or_error(
             &route_name,
-            result.into_bytes(),
+            result.into_owned_bytes(),
             state.config().remote_payload_chunk_size,
         ),
         Err(error) => {
@@ -1781,8 +1748,12 @@ async fn forward_call(
                     }
                     ipc_route_error_response(&route_name, &error)
                 }
-                error @ c2_ipc::IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_))
-                    if matches!(phase, c2_ipc::TransportPhase::DispatchUncertain) =>
+                error
+                    if matches!(
+                        &error,
+                        c2_ipc::IpcError::ResponseFailure(source)
+                            if matches!(source.as_ref(), c2_ipc::IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_)))
+                    ) && matches!(phase, c2_ipc::TransportPhase::DispatchUncertain) =>
                 {
                     // Reply admission rejects only this RID; the receiver
                     // keeps serving other calls on the healthy connection.
@@ -1890,13 +1861,12 @@ fn route_stale_response(route: &RouteEntry) -> Response {
         StatusCode::CONFLICT,
         c2_error::ErrorCode::RouteStale,
         format!(
-            "stale relay route token for {} uid={} revision={}",
-            route.name, route.route_uid, route.route_revision
+            "stale relay route token for {} uid={}",
+            route.name, route.route_uid
         ),
         [
             ("route", route.name.clone()),
             ("route_uid", route.route_uid.clone()),
-            ("route_revision", route.route_revision.to_string()),
         ],
     )
 }
@@ -1952,7 +1922,6 @@ fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Respo
         c2_ipc::IpcError::RouteStale {
             route_name,
             current_route_uid,
-            current_route_revision,
         } => semantic_error_response(
             StatusCode::CONFLICT,
             C2Error::new(
@@ -1960,10 +1929,6 @@ fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Respo
                 format!("route token is stale: {route_name}"),
             )
             .with_details(BTreeMap::from([
-                (
-                    "current_route_revision".to_string(),
-                    current_route_revision.to_string(),
-                ),
                 ("current_route_uid".to_string(), current_route_uid.clone()),
                 ("route".to_string(), route_name.clone()),
             ])),
@@ -2065,6 +2030,7 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::Closed => "closed",
         c2_ipc::IpcError::Pool(_) => "pool",
         c2_ipc::IpcError::PoolRetired => "pool-retired",
+        c2_ipc::IpcError::ResponseFailure(_) => "response-failure",
     }
 }
 
@@ -2112,7 +2078,7 @@ fn remove_unreachable_owner_endpoint_routes(
 }
 
 fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry, reason: &'static str) {
-    if let Some((entry, removed_at, removed_revision, client)) =
+    if let Some((entry, removed_at, client)) =
         state.remove_unreachable_local_upstream_if_matches(route)
     {
         state.stop_upstream_control_if_owner_idle_for_route(&entry);
@@ -2121,26 +2087,24 @@ fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry, reason:
         }
         eprintln!(
             "{}",
-            unreachable_route_removal_log_line(&entry, removed_at, removed_revision, reason)
+            unreachable_route_removal_log_line(&entry, removed_at, reason)
         );
-        broadcast_route_withdraw(state, &entry, removed_at, removed_revision);
+        broadcast_route_withdraw(state, &entry, removed_at);
     }
 }
 
 fn unreachable_route_removal_log_line(
     entry: &RouteEntry,
     removed_at: f64,
-    removed_revision: u64,
     reason: &'static str,
 ) -> String {
     format!(
-        "[relay] Removed unreachable route: name={} server_id={} server_instance_id={} address={} removed_at={} removed_revision={} reason={reason}",
+        "[relay] Removed unreachable route: name={} server_id={} server_instance_id={} address={} removed_at={} reason={reason}",
         entry.name,
         entry.server_id.as_deref().unwrap_or(""),
         entry.server_instance_id.as_deref().unwrap_or(""),
         entry.ipc_address.as_deref().unwrap_or(""),
         removed_at,
-        removed_revision
     )
 }
 
@@ -2159,13 +2123,29 @@ async fn echo_handler(body: Bytes) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_token_uses_uid_and_ignores_unknown_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ROUTE_UID_HEADER, "route-uid-0001".parse().unwrap());
+        let token = route_token_from_headers("grid", &headers)
+            .unwrap_or_else(|_| panic!("UID is a complete route token"));
+        assert_eq!(token.route_uid, "route-uid-0001");
+        headers.append("x-c2-route-revision", "invalid".parse().unwrap());
+        headers.append("x-c2-route-revision", "0".parse().unwrap());
+        headers.append("x-another-unknown-header", "ignored".parse().unwrap());
+        let token = route_token_from_headers("grid", &headers)
+            .unwrap_or_else(|_| panic!("unknown headers must be ignored"));
+        assert_eq!(token.route_uid, "route-uid-0001");
+    }
+
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
     use c2_ipc::ClientIpcConfig;
     use c2_server::{
-        ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
-        SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
+        ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits,
+        Server, ServerIdentity, ServerIpcConfig,
     };
     use futures::StreamExt;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2331,7 +2311,6 @@ mod tests {
             semantic_withdrawal_reason(&c2_ipc::IpcError::RouteStale {
                 route_name: "grid".into(),
                 current_route_uid: "new-grid-uid".into(),
-                current_route_revision: 2,
             }),
             None
         );
@@ -2368,7 +2347,6 @@ mod tests {
                 c2_ipc::IpcError::RouteStale {
                     route_name: "grid".into(),
                     current_route_uid: "grid-uid-v2".into(),
-                    current_route_revision: 2,
                 },
                 StatusCode::CONFLICT,
                 ErrorCode::RouteStale,
@@ -2457,12 +2435,11 @@ mod tests {
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
             route_uid: "grid-uid".into(),
-            route_revision: 3,
             locality: Locality::Local,
             registered_at: 1.0,
         };
 
-        let line = unreachable_route_removal_log_line(&entry, 2.0, 4, "route-missing");
+        let line = unreachable_route_removal_log_line(&entry, 2.0, "route-missing");
 
         assert!(line.contains("[relay] Removed unreachable route:"));
         assert!(line.contains("name=grid"));
@@ -2470,7 +2447,6 @@ mod tests {
         assert!(line.contains("server_instance_id=server-grid-instance"));
         assert!(line.contains("address=ipc://grid"));
         assert!(line.contains("removed_at=2"));
-        assert!(line.contains("removed_revision=4"));
         assert!(line.contains("reason=route-missing"));
     }
 
@@ -2492,7 +2468,6 @@ mod tests {
                 TEST_SIGNATURE_HASH.into(),
                 1024,
                 format!("{route_name}-uid"),
-                1,
                 None,
             ) {
                 RegisterCommitResult::Registered { .. } => {}
@@ -2512,7 +2487,6 @@ mod tests {
             TEST_SIGNATURE_HASH.into(),
             1024,
             "other-endpoint-uid".into(),
-            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -2556,18 +2530,10 @@ mod tests {
             &self,
             _route_name: &str,
             _method_idx: u16,
-            request: RequestData,
+            request: Vec<u8>,
             _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
-            let marker = match &request {
-                RequestData::Inline(_) => "inline",
-                RequestData::Shm(_) => "shm",
-                RequestData::Handle(_) => "handle",
-            };
-            c2_server::RequestLease::new(request)
-                .release()
-                .map_err(CrmError::InternalError)?;
-            Ok(ResponseMeta::Inline(marker.as_bytes().to_vec()))
+            Ok(ResponseMeta::Inline(request))
         }
     }
 
@@ -2622,7 +2588,7 @@ mod tests {
             &self,
             _route_name: &str,
             _method_idx: u16,
-            _request: RequestData,
+            _request: Vec<u8>,
             _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(self.marker.to_vec()))
@@ -2719,7 +2685,6 @@ mod tests {
                 TEST_SIGNATURE_HASH.into(),
                 1024,
                 "grid-uid".into(),
-                1,
                 None,
             ),
             RegisterCommitResult::Registered { .. }
@@ -3072,12 +3037,12 @@ mod tests {
                 Some(candidate.server_instance_id.as_str())
             );
             let binding = ipc
-                .acquire_route_token(&expected, &candidate.route_uid, candidate.route_revision)
+                .acquire_route_token(&expected, &candidate.route_uid)
                 .await
                 .unwrap();
             let response = ipc.call_bound(&binding, "ping", b"").await.unwrap();
             assert_eq!(
-                response.into_bytes().unwrap(),
+                response.into_owned_bytes().unwrap(),
                 if index == 0 {
                     b"root-a".to_vec()
                 } else {
@@ -3169,7 +3134,6 @@ mod tests {
         wait_for_local_route_removed(&relay_states[0], "grid").await;
         let root_b_after = relay_states[1].local_route("grid").unwrap();
         assert_eq!(root_b_after.route_uid, root_b_before.route_uid);
-        assert_eq!(root_b_after.route_revision, root_b_before.route_revision);
         assert_eq!(
             root_b_after.server_instance_id,
             root_b_before.server_instance_id
@@ -3555,9 +3519,7 @@ mod tests {
         route: Option<&RouteEntry>,
     ) -> axum::http::request::Builder {
         match route {
-            Some(route) => builder
-                .header("x-c2-route-uid", route.route_uid.as_str())
-                .header("x-c2-route-revision", route.route_revision.to_string()),
+            Some(route) => builder.header("x-c2-route-uid", route.route_uid.as_str()),
             None => builder,
         }
     }
@@ -3979,8 +3941,7 @@ mod tests {
                     Request::builder()
                         .method("GET")
                         .uri("/_probe/grid")
-                        .header("x-c2-route-uid", "stale-grid-route-uid")
-                        .header("x-c2-route-revision", "1"),
+                        .header("x-c2-route-uid", "stale-grid-route-uid"),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -3996,10 +3957,6 @@ mod tests {
         assert_eq!(body["name"], "RouteStale");
         assert_eq!(body["details"]["route"], "grid");
         assert_eq!(body["details"]["route_uid"], current_route.route_uid);
-        assert_eq!(
-            body["details"]["route_revision"],
-            current_route.route_revision.to_string()
-        );
 
         shutdown_live_server(&server).await;
     }
@@ -4027,11 +3984,7 @@ mod tests {
                         .method("GET")
                         .uri("/_probe/grid")
                         .header("x-c2-route-uid", current_route.route_uid.as_str())
-                        .header("x-c2-route-uid", current_route.route_uid.as_str())
-                        .header(
-                            "x-c2-route-revision",
-                            current_route.route_revision.to_string(),
-                        ),
+                        .header("x-c2-route-uid", current_route.route_uid.as_str()),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -4120,7 +4073,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         );
 
@@ -4135,7 +4087,6 @@ mod tests {
         assert_eq!(routes[0].server_id.as_deref(), Some("server-grid"));
         assert_eq!(routes[0].server_instance_id.as_deref(), Some("inst-grid"));
         assert_eq!(routes[0].route_uid, "grid-server-grid-uid");
-        assert_eq!(routes[0].route_revision, 1);
 
         let (status, routes) = get_resolve_routes_from(
             state,
@@ -4148,7 +4099,6 @@ mod tests {
         assert_eq!(routes[0].server_id, None);
         assert_eq!(routes[0].server_instance_id, None);
         assert_eq!(routes[0].route_uid, "grid-server-grid-uid");
-        assert_eq!(routes[0].route_revision, 1);
     }
 
     #[tokio::test]
@@ -4509,7 +4459,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -4574,7 +4523,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-missing-server-grid-uid".into(),
-            1,
             None,
         );
 
@@ -4632,7 +4580,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-route-missing-server-grid-uid".into(),
-            1,
             None,
         );
 
@@ -4737,7 +4684,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 4,
                 route_uid: "grid-oversized-uid".into(),
-                route_revision: 1,
                 locality: crate::relay::types::Locality::Local,
                 registered_at: 1000.0,
             }));
@@ -4794,7 +4740,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-duplicate-content-length-uid".into(),
-                route_revision: 1,
                 locality: crate::relay::types::Locality::Local,
                 registered_at: 1000.0,
             }));
@@ -4895,7 +4840,7 @@ mod tests {
         let payload = vec![b'x'; ClientIpcConfig::default().chunk_size as usize + 1];
         let content_length = payload.len().to_string();
         let route = state.local_route("grid");
-        let app = build_router(state);
+        let app = build_router(state.clone());
         let response = app
             .oneshot(
                 add_route_token_headers(
@@ -4908,7 +4853,7 @@ mod tests {
                     ),
                     route.as_ref(),
                 )
-                .body(Body::from(payload))
+                .body(Body::from(payload.clone()))
                 .unwrap(),
             )
             .await
@@ -4916,7 +4861,17 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&body[..], b"shm");
+        assert_eq!(&body[..], payload.as_slice());
+        let (lease, _) = state
+            .acquire_upstream_for_route(route.as_ref().unwrap())
+            .await
+            .unwrap_or_else(|_| panic!("route remains acquirable"));
+        let pool = unsafe { lease.client().request_pool_for_test() }.unwrap();
+        assert!(
+            pool.read().segment_count() > 0,
+            "large request used the real SHM pool"
+        );
+        drop(lease);
 
         shutdown_live_server(&server).await;
     }
@@ -4937,14 +4892,12 @@ mod tests {
                 &self,
                 _route_name: &str,
                 method_idx: u16,
-                request: RequestData,
+                request: Vec<u8>,
                 _response_pool: Arc<c2_server::ResponsePool>,
             ) -> Result<ResponseMeta, CrmError> {
                 // Consume through the real owner even when the HTTP request
                 // reached us as SHM. No transport coordinates are discarded.
-                let bytes = c2_server::RequestLease::new(request)
-                    .into_owned_bytes()
-                    .map_err(CrmError::InternalError)?;
+                let bytes = request;
                 if bytes != [7; 32] {
                     return Err(CrmError::InternalError("unexpected request".into()));
                 }
@@ -5091,7 +5044,6 @@ mod tests {
                     .header(EXPECTED_ABI_HASH_HEADER, TEST_ABI_HASH)
                     .header(EXPECTED_SIGNATURE_HASH_HEADER, TEST_SIGNATURE_HASH)
                     .header(ROUTE_UID_HEADER, &route.route_uid)
-                    .header(ROUTE_REVISION_HEADER, route.route_revision)
                     .body(vec![7; 32])
             };
             let blocked = request("blocked").send();
@@ -5129,7 +5081,6 @@ mod tests {
             assert!(Arc::ptr_eq(&client, &lease.client()), "capacity must not evict the shared client");
             assert!(client.is_connected());
             assert_eq!(current_route.route_uid, route.route_uid);
-            assert_eq!(current_route.route_revision, route.route_revision);
             assert_eq!(UpstreamEndpointKey::from_route(&current_route), UpstreamEndpointKey::from_route(&route));
             assert!(route_matches_expected_crm(&current_route, &c2_contract::ExpectedRouteContract {
                 route_name: route.name.clone(),
@@ -5156,7 +5107,6 @@ mod tests {
             assert!(Arc::ptr_eq(&client, &lease.client()));
             assert!(client.is_connected());
             assert_eq!(final_route.route_uid, route.route_uid);
-            assert_eq!(final_route.route_revision, route.route_revision);
             drop(lease);
             assert_eq!(callback.calls.each_ref().map(|n| n.load(Ordering::SeqCst)), [1, 1, 1],
                 "capacity rejection must not replay either dispatched call");
@@ -5298,7 +5248,6 @@ mod tests {
                 TEST_SIGNATURE_HASH.to_string(),
                 1024,
                 format!("{route_for_hook}-server-new-uid"),
-                1,
                 None,
             ) {
                 RegisterCommitResult::Registered { .. }
@@ -5688,7 +5637,6 @@ mod tests {
             TEST_SIGNATURE_HASH.into(),
             1024,
             "grid-never-served-uid".into(),
-            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -5735,7 +5683,6 @@ mod tests {
             .expect("attestation client connects");
         let table = attested.route_table("grid").expect("server exports grid");
         let route_uid = table.route_uid().to_string();
-        let route_revision = table.route_revision();
         let max_payload_size = table.max_payload_size();
         attested.close().await;
 
@@ -5758,7 +5705,6 @@ mod tests {
             TEST_SIGNATURE_HASH.into(),
             max_payload_size,
             route_uid.clone(),
-            route_revision,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -5889,7 +5835,6 @@ mod tests {
             .expect("attestation client connects");
         let table = attested.route_table("grid").expect("server exports grid");
         let route_uid = table.route_uid().to_string();
-        let route_revision = table.route_revision();
         let max_payload_size = table.max_payload_size();
         attested.close().await;
 
@@ -5912,7 +5857,6 @@ mod tests {
             TEST_SIGNATURE_HASH.into(),
             max_payload_size,
             route_uid.clone(),
-            route_revision,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -6144,7 +6088,6 @@ mod tests {
             TEST_SIGNATURE_HASH.into(),
             ServerIpcConfig::default().max_payload_size,
             "builder-server-grid-uid".into(),
-            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -6250,7 +6193,6 @@ mod tests {
             TEST_SIGNATURE_HASH.into(),
             table.max_payload_size(),
             table.route_uid().to_string(),
-            table.route_revision(),
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -6275,7 +6217,6 @@ mod tests {
             .await
             .expect("stale data-plane client connects");
         stale_data_client.close().await;
-        stale_data_client.force_connected(true);
         state.reconnect("grid", stale_data_client.into_shared());
 
         let route = state.local_route("grid").expect("relay route registered");
@@ -6471,7 +6412,6 @@ mod tests {
             server_id: entry.server_id.clone().unwrap(),
             server_instance_id: entry.server_instance_id.clone().unwrap(),
             route_uid: entry.route_uid.clone(),
-            route_revision: entry.route_revision,
         }
     }
 
@@ -6509,12 +6449,6 @@ mod tests {
                 .unwrap()
                 .route_uid,
             new.route_uid
-        );
-        let mut wrong_revision = new.clone();
-        wrong_revision.route_revision += 1;
-        assert_eq!(
-            post_registration_withdrawal(state.clone(), &wrong_revision).await,
-            StatusCode::ACCEPTED
         );
         let mut wrong_instance = new.clone();
         wrong_instance.server_instance_id.push_str("-old");

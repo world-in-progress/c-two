@@ -1,5 +1,106 @@
 use super::*;
 
+#[tokio::test]
+async fn rejected_reply_discards_only_its_declared_chunks_and_preserves_other_calls() {
+    for count in [1, 2] {
+        let endpoint = Endpoint::new();
+        let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+        let (first_seen, first_received) = oneshot::channel();
+        let (send_unknown, unknown_requested) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut stream = accept(&mut listener).await;
+            let (rejected, _) = read_frame(&mut stream).await;
+            first_seen.send(()).unwrap();
+            let (other, _) = read_frame(&mut stream).await;
+            let data = vec![7; 8192 / count as usize];
+            stream
+                .write_all(&reply_chunk(rejected.request_id, count, 0, &data))
+                .await
+                .unwrap();
+            let mut reply = encode_reply_control(&ReplyControl::Success);
+            reply.extend_from_slice(b"other");
+            stream
+                .write_all(&frame::encode_frame(
+                    other.request_id,
+                    flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
+                    &reply,
+                ))
+                .await
+                .unwrap();
+            for index in 1..count {
+                stream
+                    .write_all(&reply_chunk(rejected.request_id, count, index, &data))
+                    .await
+                    .unwrap();
+            }
+            let (after, _) = read_frame(&mut stream).await;
+            let mut reply = encode_reply_control(&ReplyControl::Success);
+            reply.extend_from_slice(b"after");
+            stream
+                .write_all(&frame::encode_frame(
+                    after.request_id,
+                    flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
+                    &reply,
+                ))
+                .await
+                .unwrap();
+            unknown_requested.await.unwrap();
+            stream
+                .write_all(&reply_chunk(rejected.request_id, count, 1, &data))
+                .await
+                .unwrap();
+            assert_eq!(
+                timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
+                0
+            );
+            crate::tests::close_listener(listener).await;
+        });
+        let mut cfg = config();
+        cfg.base.live_reassembly_budget_bytes = 0;
+        let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+        client.connect().await.unwrap();
+        let connection = client.driver.read().clone().unwrap();
+        let client = Arc::new(client);
+        let rejected = tokio::spawn({
+            let client = client.clone();
+            async move { client.call_inline(&identity(), 0, b"reject").await }
+        });
+        first_received.await.unwrap();
+        let other_identity = identity();
+        let other = client.call_inline(&other_identity, 0, b"other");
+        let (rejected, other) = timeout(WAIT, async { tokio::join!(rejected, other) })
+            .await
+            .unwrap();
+        let error = rejected.unwrap().unwrap_err();
+        assert!(
+            matches!(error.source_error(), IpcError::ResponseFailure(source)
+            if matches!(source.as_ref(), IpcError::Chunk(ChunkError::Capacity(_))))
+        );
+        assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
+        assert_eq!(other.unwrap().into_owned_bytes().unwrap(), b"other");
+        assert!(client.is_connected());
+        assert!(Arc::ptr_eq(
+            client.driver.read().as_ref().unwrap(),
+            &connection
+        ));
+        assert_eq!(
+            client
+                .call_inline(&identity(), 0, b"after")
+                .await
+                .unwrap()
+                .into_owned_bytes()
+                .unwrap(),
+            b"after"
+        );
+        assert_eq!(client.pending_len_for_test(), 0);
+        assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
+        send_unknown.send(()).unwrap();
+        eventually(|| !client.is_connected()).await;
+        assert!(client.close_shared_bounded(WAIT).await);
+        timeout(WAIT, peer).await.unwrap().unwrap();
+    }
+}
+
 fn cached_binding(client: &IpcClient) -> RouteBinding {
     client.route_directory.write().insert_table(
         "grid".into(),

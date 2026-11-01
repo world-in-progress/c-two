@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use c2_config::RelayConfig;
 use c2_server::{
-    ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
-    SchedulerLimits, Server, ServerIpcConfig,
+    ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,
+    ServerIpcConfig,
 };
 
 use crate::relay::disseminator::Disseminator;
@@ -35,7 +35,7 @@ impl CrmCallback for Echo {
         &self,
         _route_name: &str,
         _method_idx: u16,
-        _request: RequestData,
+        _request: Vec<u8>,
         _response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         Ok(ResponseMeta::Inline(b"echo".to_vec()))

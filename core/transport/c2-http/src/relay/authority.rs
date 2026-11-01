@@ -39,7 +39,6 @@ pub(crate) enum RouteAttestationError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttestedRouteContract {
     pub route_uid: String,
-    pub route_revision: u64,
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
@@ -135,7 +134,6 @@ pub(crate) async fn read_ipc_route_contract(
         .map_err(|err| attestation_error_from_ipc(route_name, err))?;
     Ok(AttestedRouteContract {
         route_uid: binding.route_uid().to_string(),
-        route_revision: binding.route_revision(),
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
@@ -172,7 +170,6 @@ pub(crate) async fn attest_ipc_route_contract(
     }
     Ok(AttestedRouteContract {
         route_uid: binding.route_uid().to_string(),
-        route_revision: binding.route_revision(),
         crm_ns: claimed.expected.crm_ns.clone(),
         crm_name: claimed.expected.crm_name.clone(),
         crm_ver: claimed.expected.crm_ver.clone(),
@@ -233,7 +230,6 @@ pub(crate) async fn attest_ipc_pending_route_contract(
     }
     Ok(AttestedRouteContract {
         route_uid: binding.route_uid().to_string(),
-        route_revision: binding.route_revision(),
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
@@ -275,7 +271,6 @@ pub(crate) struct OwnerReplacement {
     signature_hash: String,
     max_payload_size: u64,
     route_uid: String,
-    route_revision: u64,
     token: OwnerToken,
     evidence: OwnerReplacementEvidence,
 }
@@ -294,7 +289,6 @@ pub(crate) struct OwnerReplacementCandidate {
     signature_hash: String,
     max_payload_size: u64,
     route_uid: String,
-    route_revision: u64,
     token: OwnerToken,
 }
 
@@ -313,7 +307,6 @@ impl OwnerReplacementCandidate {
             signature_hash: self.signature_hash,
             max_payload_size: self.max_payload_size,
             route_uid: self.route_uid,
-            route_revision: self.route_revision,
             token: self.token,
             evidence,
         }
@@ -329,7 +322,6 @@ pub(crate) enum UnregisterLocalResult {
     Unregistered {
         entry: RouteEntry,
         removed_at: f64,
-        removed_revision: u64,
         client: Option<Arc<IpcClient>>,
     },
     AlreadyUnregistered,
@@ -339,7 +331,6 @@ pub(crate) enum RegistrationWithdrawal {
     Removed {
         entry: RouteEntry,
         removed_at: f64,
-        removed_revision: u64,
         client: Option<Arc<IpcClient>>,
     },
     AlreadyRemoved,
@@ -577,7 +568,6 @@ impl<'a> RouteAuthority<'a> {
             contract:
                 AttestedRouteContract {
                     route_uid,
-                    route_revision,
                     crm_ns,
                     crm_name,
                     crm_ver,
@@ -612,11 +602,6 @@ impl<'a> RouteAuthority<'a> {
                 reason: err.to_string(),
             }
         })?;
-        if route_revision == 0 {
-            return Err(ControlError::ContractMismatch {
-                reason: "route_revision must be > 0".to_string(),
-            });
-        }
 
         let mut route_table = self.state.route_table_write();
         let mut required_replacement_address = None;
@@ -648,9 +633,7 @@ impl<'a> RouteAuthority<'a> {
                         ) {
                             return Err(ControlError::ContractMismatch { reason });
                         }
-                        if existing.route_uid == route_uid
-                            && existing.route_revision == route_revision
-                        {
+                        if existing.route_uid == route_uid {
                             if let Some(token) =
                                 self.state.owner_token_for_endpoint(&existing_endpoint)
                             {
@@ -679,7 +662,6 @@ impl<'a> RouteAuthority<'a> {
                             || token.signature_hash != existing.signature_hash
                             || token.max_payload_size != existing.max_payload_size
                             || token.route_uid != existing.route_uid
-                            || token.route_revision != existing.route_revision
                         {
                             return Err(ControlError::DuplicateRoute { existing_address });
                         }
@@ -705,7 +687,6 @@ impl<'a> RouteAuthority<'a> {
             signature_hash,
             max_payload_size,
             route_uid,
-            route_revision,
             locality: Locality::Local,
             registered_at: route_table.next_local_timestamp(),
         };
@@ -785,7 +766,6 @@ impl<'a> RouteAuthority<'a> {
                     signature_hash: existing.signature_hash.clone(),
                     max_payload_size: existing.max_payload_size,
                     route_uid: existing.route_uid.clone(),
-                    route_revision: existing.route_revision,
                     token,
                 })
             }
@@ -801,13 +781,12 @@ impl<'a> RouteAuthority<'a> {
         self.validate_server_id(&scope.server_id)?;
         validate_server_instance_id_value(&scope.server_instance_id)
             .map_err(|reason| ControlError::InvalidServerInstanceId { reason })?;
-        if !valid_route_name(&scope.route_uid) || scope.route_revision == 0 {
+        if !valid_route_name(&scope.route_uid) {
             return Err(ControlError::ContractMismatch {
-                reason: "registration must include a bounded route_uid and nonzero route_revision"
-                    .into(),
+                reason: "registration must include a bounded route_uid".into(),
             });
         }
-        let (entry, removed_at, removed_revision, client) = {
+        let (entry, removed_at, client) = {
             let mut table = self.state.route_table_write();
             let Some(existing) = table.local_route(&scope.name) else {
                 return Ok(if table.registration_already_withdrawn(scope) {
@@ -819,13 +798,11 @@ impl<'a> RouteAuthority<'a> {
             if existing.server_id.as_deref() != Some(scope.server_id.as_str())
                 || existing.server_instance_id.as_deref() != Some(scope.server_instance_id.as_str())
                 || existing.route_uid != scope.route_uid
-                || existing.route_revision != scope.route_revision
             {
                 return Ok(RegistrationWithdrawal::Superseded);
             }
             let expected = existing.clone();
-            let (entry, removed_at, removed_revision) =
-                table.unregister_local_route_if_matches(&expected);
+            let (entry, removed_at) = table.unregister_local_route_if_matches(&expected);
             let Some(entry) = entry else {
                 return Ok(RegistrationWithdrawal::Superseded);
             };
@@ -837,12 +814,11 @@ impl<'a> RouteAuthority<'a> {
                     self.state.remove_connection_for_withdraw(&key)
                 }
             });
-            (entry, removed_at, removed_revision, client)
+            (entry, removed_at, client)
         };
         Ok(RegistrationWithdrawal::Removed {
             entry,
             removed_at,
-            removed_revision,
             client,
         })
     }
@@ -855,7 +831,7 @@ impl<'a> RouteAuthority<'a> {
         self.validate_route_name(&name)?;
         self.validate_server_id(&server_id)?;
 
-        let (entry, removed_at, removed_revision) = {
+        let (entry, removed_at) = {
             let mut route_table = self.state.route_table_write();
             let Some(existing) = route_table.local_route(&name) else {
                 if route_table.local_tombstone_matches_server(&name, &server_id) {
@@ -866,9 +842,9 @@ impl<'a> RouteAuthority<'a> {
             if existing.server_id.as_deref() != Some(server_id.as_str()) {
                 return Err(ControlError::OwnerMismatch);
             }
-            let (entry, removed_at, removed_revision) =
+            let (entry, removed_at) =
                 route_table.unregister_local_route_with_tombstone(&name, &server_id);
-            (entry, removed_at, removed_revision)
+            (entry, removed_at)
         };
         let Some(entry) = entry else {
             return Err(ControlError::NotFound);
@@ -879,7 +855,6 @@ impl<'a> RouteAuthority<'a> {
         Ok(UnregisterLocalResult::Unregistered {
             entry,
             removed_at,
-            removed_revision,
             client,
         })
     }
@@ -897,14 +872,7 @@ impl<'a> RouteAuthority<'a> {
                 name,
                 relay_id,
                 removed_at,
-                removed_revision,
-            } => self.withdraw_peer(
-                sender_relay_id.to_string(),
-                name,
-                relay_id,
-                removed_at,
-                removed_revision,
-            ),
+            } => self.withdraw_peer(sender_relay_id.to_string(), name, relay_id, removed_at),
         }
     }
 
@@ -958,7 +926,6 @@ impl<'a> RouteAuthority<'a> {
         name: String,
         relay_id: String,
         removed_at: f64,
-        removed_revision: u64,
     ) -> Result<(), ControlError> {
         self.validate_route_name(&name)?;
         self.validate_relay_id(&sender_relay_id)?;
@@ -971,7 +938,7 @@ impl<'a> RouteAuthority<'a> {
         }
         self.state
             .route_table_write()
-            .unregister_route_with_tombstone(&name, &relay_id, removed_at, removed_revision);
+            .unregister_route_with_tombstone(&name, &relay_id, removed_at);
         Ok(())
     }
 
@@ -1209,7 +1176,6 @@ mod tests {
                 .into(),
             max_payload_size: 1024,
             route_uid: format!("{name}-{relay_id}-uid"),
-            route_revision: 1,
             locality: Locality::Peer,
             registered_at: 1000.0,
         }

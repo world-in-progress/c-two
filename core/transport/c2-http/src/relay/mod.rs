@@ -20,7 +20,6 @@ macro_rules! test_commit_registration {
         $signature_hash:expr,
         $max_payload_size:expr,
         $route_uid:expr,
-        $route_revision:expr,
         $replacement:expr $(,)?
     ) => {{
         ($state).commit_register_upstream($crate::relay::authority::LocalRegistration {
@@ -38,7 +37,6 @@ macro_rules! test_commit_registration {
                 signature_hash: $signature_hash,
                 max_payload_size: $max_payload_size,
                 route_uid: $route_uid,
-                route_revision: $route_revision,
             },
             replacement: $replacement,
         })

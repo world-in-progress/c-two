@@ -92,7 +92,6 @@ pub struct RelayLocalIpcCandidate {
     pub server_id: String,
     pub server_instance_id: String,
     pub route_uid: String,
-    pub route_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +102,6 @@ pub enum RelayResolvedTarget {
     Http {
         relay_url: String,
         route_uid: String,
-        route_revision: u64,
     },
 }
 
@@ -392,7 +390,6 @@ impl RelayAwareHttpClient {
                         return Ok(RelayResolvedTarget::Http {
                             relay_url,
                             route_uid: route.route_uid,
-                            route_revision: route.route_revision,
                         });
                     }
                     Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
@@ -758,10 +755,6 @@ fn fallback_denied_body(route_name: &str, failed_candidates: &[RelayLocalIpcCand
             json!(candidate.server_instance_id),
         );
         details.insert("route_uid".to_string(), json!(candidate.route_uid));
-        details.insert(
-            "route_revision".to_string(),
-            json!(candidate.route_revision.to_string()),
-        );
     }
     json!({
         "version": c2_error::ERROR_WIRE_VERSION,
@@ -815,7 +808,6 @@ fn select_local_ipc_candidate(
             server_id: route.server_id.clone()?,
             server_instance_id: route.server_instance_id.clone()?,
             route_uid: route.route_uid.clone(),
-            route_revision: route.route_revision,
         })
     })
 }
@@ -1128,7 +1120,6 @@ mod tests {
             name,
             relay_url,
             route_uid: "grid-route-uid-0001".to_string(),
-            route_revision: 1,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -1371,7 +1362,6 @@ mod tests {
         headers
             .get("x-c2-route-uid")
             .is_some_and(|v| v == "grid-route-uid-0001")
-            && headers.get("x-c2-route-revision").is_some_and(|v| v == "1")
     }
 
     async fn probe_requires_expected_crm_headers(headers: HeaderMap) -> Response {
@@ -1754,7 +1744,6 @@ mod tests {
             server_id: "local-grid".to_string(),
             server_instance_id: "inst-local-grid".to_string(),
             route_uid: "grid-route-uid-0001".to_string(),
-            route_revision: 1,
         };
 
         let target = client
@@ -1772,7 +1761,6 @@ mod tests {
             RelayResolvedTarget::Http {
                 relay_url: live_url,
                 route_uid: "grid-route-uid-0001".to_string(),
-                route_revision: 1,
             }
         );
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
@@ -1813,7 +1801,6 @@ mod tests {
             server_id: "local-grid".to_string(),
             server_instance_id: "inst-local-grid".to_string(),
             route_uid: "grid-route-uid-0001".to_string(),
-            route_revision: 1,
         };
 
         let err = client
@@ -1840,14 +1827,12 @@ mod tests {
             server_id: "local-grid".to_string(),
             server_instance_id: "inst-local-grid".to_string(),
             route_uid: "grid-route-uid-0001".to_string(),
-            route_revision: 1,
         };
         let refreshed_same_endpoint = RelayRouteInfo {
             ipc_address: Some("ipc://local-grid".to_string()),
             server_id: Some("local-grid".to_string()),
             server_instance_id: Some("inst-local-grid".to_string()),
             route_uid: "grid-route-uid-0002".to_string(),
-            route_revision: 2,
             ..route_info("grid".to_string(), "http://127.0.0.1:8080".to_string())
         };
 
@@ -2047,7 +2032,6 @@ mod tests {
                 server_id: "grid-server".to_string(),
                 server_instance_id: "inst-a".to_string(),
                 route_uid: "grid-route-uid-0001".to_string(),
-                route_revision: 1,
             }),
         );
     }
@@ -2067,7 +2051,6 @@ mod tests {
         assert_eq!(candidate.server_id, "grid-server");
         assert_eq!(candidate.server_instance_id, "inst-a");
         assert_eq!(candidate.route_uid, "grid-route-uid-0001");
-        assert_eq!(candidate.route_revision, 1);
     }
 
     #[test]

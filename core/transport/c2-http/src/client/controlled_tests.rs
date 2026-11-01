@@ -43,7 +43,6 @@ fn route(url: &str) -> RelayRouteInfo {
         name: contract.route_name,
         relay_url: url.into(),
         route_uid: "controlled-grid-route".into(),
-        route_revision: 7,
         ipc_address: None,
         server_id: None,
         server_instance_id: None,
@@ -568,7 +567,6 @@ fn assert_headers(headers: &HeaderMap, len: usize) {
         ("x-c2-expected-abi-hash", ABI_HASH),
         ("x-c2-expected-signature-hash", SIGNATURE_HASH),
         ("x-c2-route-uid", "controlled-grid-route"),
-        ("x-c2-route-revision", "7"),
         ("content-type", "application/octet-stream"),
     ] {
         assert_eq!(headers[key], expected, "header {key}");

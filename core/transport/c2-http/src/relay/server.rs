@@ -745,18 +745,17 @@ impl RelayServer {
                         UnregisterResult::Removed {
                             entry,
                             removed_at,
-                            removed_revision,
                             client,
                         } => {
                             if let Some(arc_client) = client {
                                 state.clients.close(&arc_client);
                             }
                             eprintln!(
-                                "[relay] Unregister command removed: name={} server_id={} removed_at={removed_at} removed_revision={removed_revision}",
+                                "[relay] Unregister command removed: name={} server_id={} removed_at={removed_at}",
                                 entry.name,
                                 entry.server_id.as_deref().unwrap_or("")
                             );
-                            broadcast_route_withdraw(&state, &entry, removed_at, removed_revision);
+                            broadcast_route_withdraw(&state, &entry, removed_at);
                             let _ = reply.send(Ok(()));
                         }
                         UnregisterResult::AlreadyRemoved => {
@@ -1322,7 +1321,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -1527,12 +1525,10 @@ mod tests {
                 &self,
                 _route_name: &str,
                 _method_idx: u16,
-                request: c2_server::RequestData,
+                request: Vec<u8>,
                 _response_pool: Arc<c2_server::ResponsePool>,
             ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
-                let mut request = c2_server::RequestLease::new(request);
-                assert!(request.copy_bytes().unwrap().is_empty());
-                request.release().unwrap();
+                assert!(request.is_empty());
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(c2_server::ResponseMeta::Inline(b"ok".to_vec()))
             }
@@ -1649,7 +1645,6 @@ mod tests {
                 TEST_SIGNATURE_HASH.to_string(),
                 manager_binding.max_payload_size(),
                 manager_binding.route_uid().to_string(),
-                manager_binding.route_revision(),
                 None,
             ) {
                 RegisterCommitResult::Registered { entry } => entry,
@@ -1709,7 +1704,6 @@ mod tests {
                 TEST_SIGNATURE_HASH.to_string(),
                 builder_binding.max_payload_size(),
                 builder_binding.route_uid().to_string(),
-                builder_binding.route_revision(),
                 None,
             ) {
                 RegisterCommitResult::Registered { entry } => entry,
@@ -1787,7 +1781,6 @@ mod tests {
                     Some(instance_id.as_str())
                 );
                 assert_eq!(retained.route_uid, route.route_uid);
-                assert_eq!(retained.route_revision, route.route_revision);
                 assert_eq!(retained.crm_ns, "test.echo");
                 assert_eq!(retained.crm_name, "Echo");
                 assert_eq!(retained.crm_ver, "0.1.0");

@@ -2715,6 +2715,21 @@ impl IpcClient {
     pub fn pending_len_for_test(&self) -> usize {
         self.pending.lock().len()
     }
+
+    /// Pause the next prepared write after `begin_io`, before its first byte.
+    /// The existing one-shot pause is consumed by the writer; clearing it only
+    /// removes a pause that has not yet been consumed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_write_pause_for_test(
+        &self,
+        pause: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    ) {
+        let driver = self.driver.read();
+        let conn = driver
+            .as_ref()
+            .expect("test write pause requires an established connection");
+        *conn.pause.lock() = pause;
+    }
 }
 
 impl Drop for IpcClient {
@@ -2795,6 +2810,7 @@ pub(crate) fn recv_loop(
         let reader = task.driver.stream.as_mut().unwrap();
         let mut header = [0u8; HEADER_SIZE];
         let mut payload = Vec::with_capacity(4096);
+        let mut rejected_reply_chunks = HashMap::new();
         let mut malformed = false;
         'frames: loop {
             if let Err(error) = reader.read_exact(&mut header).await {
@@ -2864,10 +2880,19 @@ pub(crate) fn recv_loop(
                     registry.abort(conn_id, rid);
                     continue;
                 }
-                let result = receive_chunk(&hdr, &payload, &registry, conn_id);
+                let result = receive_chunk(
+                    &hdr,
+                    &payload,
+                    &registry,
+                    conn_id,
+                    &mut rejected_reply_chunks,
+                );
                 match result {
                     Ok(Some(response)) => complete_pending(&pending, rid, Ok(response)),
                     Ok(None) => {}
+                    Err(error @ IpcError::Chunk(ChunkError::Capacity(_))) => {
+                        complete_pending(&pending, rid, Err(error.response_failure()));
+                    }
                     Err(error) => {
                         registry.abort(conn_id, rid);
                         conn.response_failed(rid, error);
@@ -2917,6 +2942,7 @@ fn receive_chunk(
     payload: &[u8],
     registry: &ChunkRegistry<()>,
     conn_id: u64,
+    rejected_reply_chunks: &mut HashMap<u64, u32>,
 ) -> Result<Option<ResponseData>, IpcError> {
     let (total_size, total_chunks, index, consumed) =
         c2_wire::chunk::header::decode_reply_chunk_meta(payload, 0).map_err(|error| {
@@ -2925,11 +2951,23 @@ fn receive_chunk(
             )))
         })?;
     let rid = hdr.request_id;
+    if let Some(remaining) = rejected_reply_chunks.get_mut(&rid) {
+        *remaining -= 1;
+        if *remaining == 0 {
+            rejected_reply_chunks.remove(&rid);
+        }
+        return Ok(None);
+    }
     let data = &payload[consumed..];
     if index == 0 {
-        registry
-            .insert_reply(conn_id, rid, total_size, total_chunks as usize, data.len())
-            .map_err(|error| IpcError::Chunk(error.into()))?;
+        if let Err(error) =
+            registry.insert_reply(conn_id, rid, total_size, total_chunks as usize, data.len())
+        {
+            if matches!(&error, ChunkAdmissionError::Capacity(_)) && total_chunks > 1 {
+                rejected_reply_chunks.insert(rid, total_chunks - 1);
+            }
+            return Err(IpcError::Chunk(error.into()));
+        }
     }
     if !registry
         .feed(conn_id, rid, index as usize, data)

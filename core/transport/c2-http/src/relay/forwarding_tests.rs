@@ -13,8 +13,8 @@ use axum::http::StatusCode;
 use c2_config::{CallExecutionLimits, ClientIpcConfig, LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, RouteBinding};
 use c2_server::{
-    ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
-    RouteBuildSpec, SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
+    ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,
+    ServerIdentity, ServerIpcConfig,
 };
 use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -104,7 +104,6 @@ struct Probe {
     calls: [AtomicUsize; 3],
     entered: [Notify; 2],
     release: [parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>; 2],
-    input_kind: AtomicUsize,
     response_kind: AtomicUsize,
     response_pool: parking_lot::Mutex<Option<Arc<c2_server::ResponsePool>>>,
 }
@@ -114,23 +113,12 @@ impl CrmCallback for Probe {
         &self,
         _: &str,
         method: u16,
-        input: RequestData,
+        input: Vec<u8>,
         response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
-        let kind = match &input {
-            RequestData::Inline(_) => 1,
-            RequestData::Shm(shm) if !shm.is_dedicated() => 2,
-            RequestData::Shm(_) => 3,
-            RequestData::Handle(_) => 4,
-        };
-        let mut owner = RequestLease::new(input);
-        let bytes = owner.copy_bytes().map_err(CrmError::InternalError)?;
-        assert_eq!(bytes, vec![7; self.input_len]);
+        assert_eq!(input, vec![7; self.input_len]);
         self.calls[method as usize].fetch_add(1, Ordering::SeqCst);
         if method < 2 {
-            if method == 1 {
-                self.input_kind.store(kind, Ordering::SeqCst);
-            }
             self.entered[method as usize].notify_one();
             if let Some(release) = self.release[method as usize].lock().take() {
                 release
@@ -138,9 +126,6 @@ impl CrmCallback for Probe {
                     .map_err(|e| CrmError::InternalError(e.to_string()))?;
             }
         }
-        // Keep the actual server request owner until the controlled callback
-        // exits. No observation or HTTP waiter departure refunds this owner.
-        owner.release().map_err(CrmError::InternalError)?;
         if method != 1 || matches!(self.carrier, Carrier::Inline | Carrier::Chunked) {
             return Ok(ResponseMeta::Inline(vec![method as u8; 32]));
         }
@@ -334,8 +319,8 @@ fn request_head(
     framing: &str,
 ) -> String {
     format!(
-        "POST /grid/{method} HTTP/1.1\r\nHost: {socket}\r\n{framing}\r\nConnection: close\r\nx-c2-expected-crm-ns: test.echo\r\nx-c2-expected-crm-name: Echo\r\nx-c2-expected-crm-ver: 0.1.0\r\nx-c2-expected-abi-hash: {TEST_ABI_HASH}\r\nx-c2-expected-signature-hash: {TEST_SIGNATURE_HASH}\r\nx-c2-route-uid: {}\r\nx-c2-route-revision: {}\r\n\r\n",
-        entry.route_uid, entry.route_revision
+        "POST /grid/{method} HTTP/1.1\r\nHost: {socket}\r\n{framing}\r\nConnection: close\r\nx-c2-expected-crm-ns: test.echo\r\nx-c2-expected-crm-name: Echo\r\nx-c2-expected-crm-ver: 0.1.0\r\nx-c2-expected-abi-hash: {TEST_ABI_HASH}\r\nx-c2-expected-signature-hash: {TEST_SIGNATURE_HASH}\r\nx-c2-route-uid: {}\r\n\r\n",
+        entry.route_uid
     )
 }
 
@@ -458,7 +443,6 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: input_len as u64,
             route_uid: "capacity-route".into(),
-            route_revision: 1,
             locality: super::types::Locality::Local,
             registered_at: 1000.0,
         };
@@ -878,7 +862,6 @@ impl Fixture {
                 parking_lot::Mutex::new(Some(other_rx)),
                 parking_lot::Mutex::new(Some(target_rx)),
             ],
-            input_kind: AtomicUsize::new(0),
             response_kind: AtomicUsize::new(0),
             response_pool: parking_lot::Mutex::new(None),
         });
@@ -1130,23 +1113,21 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
         let other_result = bounded(&mut other).await;
         other_joined = true;
         let other_reply = other_result.unwrap().unwrap();
-        assert_eq!(other_reply.into_bytes().unwrap(), vec![0; 32], "already-in-flight other RID must succeed on same IPC client");
+        assert_eq!(other_reply.into_owned_bytes().unwrap(), vec![0; 32], "already-in-flight other RID must succeed on same IPC client");
         assert!(fixture.client.is_connected());
         let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; INPUT_LEN])).await.unwrap();
-        assert_eq!(ping.into_bytes().unwrap(), vec![2; 32], "same client ping must succeed without reconnect");
+        assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32], "same client ping must succeed without reconnect");
         let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled client acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "liveness cannot be masked by reconnecting");
         drop(lease);
         assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (0, 0));
         assert_eq!(fixture.probe.calls.each_ref().map(|c| c.load(Ordering::SeqCst)), [1, 1, 1]);
-        let expected_input = match carrier { Carrier::Inline => 1, Carrier::Buddy => 2, Carrier::Dedicated => 3, Carrier::File | Carrier::Chunked => 4 };
-        assert_eq!(fixture.probe.input_kind.load(Ordering::SeqCst), expected_input, "real request carrier for {carrier:?}");
         if matches!(carrier, Carrier::Buddy | Carrier::Dedicated) {
-            assert_eq!(fixture.probe.response_kind.load(Ordering::SeqCst), expected_input);
+            assert_eq!(fixture.probe.response_kind.load(Ordering::SeqCst), if carrier == Carrier::Buddy { 2 } else { 3 });
             let pool = fixture.probe.response_pool.lock().as_ref().unwrap().clone();
             eventually(|| pool.read().stats().alloc_count == 0).await;
             if carrier == Carrier::Dedicated {
-                eventually(|| { unsafe { pool.write() }.gc_dedicated(); fixture.server.memory_budget_snapshot().budget.shm.used_bytes == 0 }).await;
+                eventually(|| fixture.server.memory_budget_snapshot().budget.shm.used_bytes == 0).await;
             }
         }
         let memory = fixture.state.upstream_memory_snapshot();
@@ -1284,7 +1265,7 @@ async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal()
         ))
         .await
         .unwrap();
-        assert_eq!(ping.into_bytes().unwrap(), vec![2; 32]);
+        assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32]);
         eprintln!(
             "[relay-forwarding] known and unknown HTTP source faults: retention={:?}",
             fixture.state.forwarding.snapshot()
@@ -1390,12 +1371,11 @@ async fn h1_chunked_upstream_source_fault_is_dispatch_uncertain_and_reclaims_act
     }
 }
 
-// The partial writer is an explicit per-client test feature. It uses the
-// shared LocalStream writer on every supported platform, including Windows.
+// The existing IPC writer pause follows begin_io and precedes the first byte.
 // The HTTP input is complete before its socket leaves; missing source bytes
 // cannot be mistaken for a cancelled waiter in this regression.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() {
+async fn h1_disconnect_after_ipc_write_begins_before_first_byte_preserves_same_client() {
     const LEN: usize = 32;
     let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, LEN as u64, LEN).await;
     let client = fixture.client.clone();
@@ -1403,31 +1383,35 @@ async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() 
     let mut other =
         tokio::spawn(async move { client.call_bound_phased(&binding, "other", &[7; LEN]).await });
     let mut other_joined = false;
-    let (prefix_tx, prefix_rx) = oneshot::channel();
+    let (acquired_tx, acquired_rx) = oneshot::channel();
+    let (acquire_resume_tx, acquire_resume_rx) = oneshot::channel();
+    let mut acquire_release = Some(acquire_resume_tx);
+    let (write_started_tx, write_started_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let mut write_release = Some(release_tx);
     let result = AssertUnwindSafe(async {
         // This other RID has already been dispatched and entered its actual
         // callback on the same connection before the target writer parks.
         bounded(fixture.probe.entered[0].notified()).await;
-        fixture.client.set_frame_write_seam_for_test(Some(c2_ipc::client::FrameWriteSeam {
-            prefix_bytes: 8,
-            prefix_written: prefix_tx,
-            release: release_rx,
-        }));
+        fixture.state.set_acquire_recheck_seam_for_test(acquired_tx, acquire_resume_rx);
         let mut upload = bounded(tokio::net::TcpStream::connect(fixture.socket)).await.unwrap();
         bounded(upload.write_all(fixture.head("target", "Content-Length: 32").as_bytes())).await.unwrap();
         bounded(upload.write_all(&[7; LEN])).await.unwrap();
-        bounded(prefix_rx).await.expect("the real IPC writer must write eight bytes before parking");
+        // Finish the live route-token lookup before arming the writer pause,
+        // so the pause observes the target business frame rather than lookup.
+        bounded(acquired_rx).await.expect("target route-token lookup must finish");
+        fixture.client.set_write_pause_for_test(Some((write_started_tx, release_rx)));
+        acquire_release.take().unwrap().send(()).unwrap();
+        bounded(write_started_rx).await.expect("the real IPC writer must begin_io before parking without writing a byte");
         assert_eq!(fixture.client.pending_len_for_test(), 2, "target and previously dispatched other RID share one client");
-        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0, "eight real frame bytes cannot invoke the target callback");
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0, "no frame bytes have reached the target callback");
         let before = fixture.state.forwarding.detached_waiters();
         drop(upload);
         eventually(|| fixture.state.forwarding.detached_waiters() > before).await;
         let held = fixture.state.forwarding.snapshot();
         assert_eq!((held.used_operations, held.used_retained_bytes), (1, LEN as u64), "native task still owns full input while real writer is parked");
         assert_eq!(fixture.client.pending_len_for_test(), 2);
-        assert!(fixture.client.is_connected(), "waiter departure must not trigger SendGuard's partial-frame abort");
+        assert!(fixture.client.is_connected(), "waiter departure must preserve the started IPC write");
         let rejected = fixture.request_capacity_rejection(LEN).await;
         assert!(rejected.starts_with(b"HTTP/1.1 502 "));
         assert!(String::from_utf8_lossy(&rejected).contains("pre_dispatch"));
@@ -1435,34 +1419,36 @@ async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() 
         fixture.release(0);
         let other_result = bounded(&mut other).await;
         other_joined = true;
-        assert_eq!(other_result.unwrap().unwrap().into_bytes().unwrap(), vec![0; 32], "already-dispatched RID must finish before the target writer resumes");
+        assert_eq!(other_result.unwrap().unwrap().into_owned_bytes().unwrap(), vec![0; 32], "already-dispatched RID must finish before the target writer resumes");
         assert!(fixture.client.is_connected());
         assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (1, LEN as u64));
         write_release.take().unwrap().send(()).unwrap();
         bounded(fixture.probe.entered[1].notified()).await;
-        assert_eq!(fixture.probe.input_kind.load(Ordering::SeqCst), 1, "complete input reaches real upstream callback only after remaining frame bytes are written");
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1, "complete input reaches real upstream callback once after the writer resumes");
         fixture.release(1);
         eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
         eventually(|| fixture.client.pending_len_for_test() == 0).await;
         assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
         let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; LEN])).await.unwrap();
-        assert_eq!(ping.into_bytes().unwrap(), vec![2; 32]);
+        assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32]);
         let current = fixture.state.local_route("grid").expect("HTTP disconnect must not withdraw route");
         assert_eq!(current.route_uid, fixture.entry.route_uid);
-        assert_eq!(current.route_revision, fixture.entry.route_revision);
         let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled IPC acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "same-client ping cannot be concealed by reconnecting");
         drop(lease);
         assert_eq!(fixture.probe.calls.each_ref().map(|calls| calls.load(Ordering::SeqCst)), [1, 1, 1]);
         assert_eq!(fixture.state.upstream_memory_snapshot().reassembly.used_bytes, 0);
-        eprintln!("[relay-forwarding] real H1 full_input=32 partial_ipc_prefix=8 same_client=true pending={} retention={:?}", fixture.client.pending_len_for_test(), fixture.state.forwarding.snapshot());
+        eprintln!("[relay-forwarding] real H1 full_input=32 write_started=true bytes_written_before_pause=0 same_client=true pending={} retention={:?}", fixture.client.pending_len_for_test(), fixture.state.forwarding.snapshot());
     }).catch_unwind().await;
     // Release the one-shot writer even after assertion failure, then release
     // bounded callback waits and confirm both actual listener tasks exit.
+    if let Some(release) = acquire_release.take() {
+        let _ = release.send(());
+    }
     if let Some(release) = write_release.take() {
         let _ = release.send(());
     }
-    fixture.client.set_frame_write_seam_for_test(None);
+    fixture.client.set_write_pause_for_test(None);
     fixture.release(0);
     fixture.release(1);
     if !other_joined {
@@ -1544,7 +1530,7 @@ async fn h1_admitted_unknown_upload_growth_after_close_is_pre_dispatch_capacity_
         ))
         .await
         .unwrap();
-        assert_eq!(ping.into_bytes().unwrap(), vec![2; 32]);
+        assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32]);
     })
     .catch_unwind()
     .await;

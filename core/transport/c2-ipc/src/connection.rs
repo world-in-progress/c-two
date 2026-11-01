@@ -157,7 +157,7 @@ pub(crate) struct ClientConnection {
     deactivated: watch::Sender<bool>,
     gc_stop: watch::Sender<bool>,
     runtime: tokio::runtime::Handle,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub pause: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 impl ClientConnection {
@@ -187,7 +187,7 @@ impl ClientConnection {
             deactivated: watch::channel(false).0,
             gc_stop: watch::channel(false).0,
             runtime: tokio::runtime::Handle::current(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pause: Mutex::new(None),
         });
         let driver = WriteDriver {
@@ -399,7 +399,7 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
             }
         }
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if prepared.is_ok() {
         let pause = conn.pause.lock().take();
         if let Some((entered, resume)) = pause {
