@@ -18,6 +18,15 @@ The core abstraction is resources, not services.
 - Resource: the stateful object implementing a CRM contract. It is a plain Python class, not decorated. Name it by domain semantics.
 - Client: any code that calls `cc.connect(...)` to consume a resource. There is no separate "Component" abstraction.
 
+## Stateful RPC for scientific computation
+
+C-Two resources hold state, and their calls are often non-idempotent and ordered by the caller, which awaits one call before issuing the next. Several choices that are safe for stateless RPC such as gRPC are therefore wrong here:
+
+- Never turn a completed call into an unknown outcome. A failure fails only the call it belongs to; a connection is deactivated, and its other in-flight calls fail, only when its framing can no longer be trusted.
+- Only pre-dispatch failures are retry-safe. A dispatch-uncertain call is never retried, replayed or hedged automatically; the caller decides.
+- Lifecycle reports are truthful. `completed` means the real terminal state; a caller's budget bounds only its own wait and never cancels cleanup. A stopped or stuck peer keeps its loans until it releases them or its connection ends, and no block is reused without that proof.
+- Do not size waits, payloads or budgets for the "usual" case. Durations and sizes that grow with a workload are exposed through the existing per-call or configuration path rather than fixed.
+
 ## Build, Test, And Run
 
 Package manager: `uv`, not direct `pip`. Build backend: `maturin`, which compiles the Rust native extension through PyO3. Source builds require Rust 1.95 or newer; every user-facing Rust package declares that `rust-version`.
