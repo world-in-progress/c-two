@@ -21,7 +21,7 @@ EXPECTED_ROW_IDS = tuple(
     for transport in TRANSPORTS
 )
 
-RECEIPT_SCHEMA = "c-two.portable-matrix-receipt.v1"
+RECEIPT_SCHEMA = "c-two.portable-matrix-receipt.v2"
 RELEASE_REF_SCHEMA = "c-two.contract-release-ref.v1"
 CONTRACT_SCHEMA = "c-two.contract.v2"
 
@@ -49,7 +49,7 @@ _RELEASE_REF_FIELDS = frozenset(
     ("schema", "contract_schema", "descriptor_sha256", "crm")
 )
 _CRM_FIELDS = frozenset(("namespace", "name", "version"))
-_ROUTE_FIELDS = frozenset(("uid", "revision"))
+_ROUTE_FIELDS = frozenset(("uid",))
 _PACKAGE_FIELDS = frozenset(("client_sha256", "host_sha256"))
 _PATH_COUNTER_FIELDS = frozenset(("requests", "responses"))
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -204,7 +204,6 @@ def _validate_row(value: object, expected_id: str, index: int) -> None:
     route = _require_object(row["route"], route_path)
     _reject_unknown_fields(route, _ROUTE_FIELDS, route_path)
     _require_string(route["uid"], f"{route_path}.uid")
-    _require_positive_integer(route["revision"], f"{route_path}.revision")
 
     _require_sha256(
         row["logical_result_sha256"],

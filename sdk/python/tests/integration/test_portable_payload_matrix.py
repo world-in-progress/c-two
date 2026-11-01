@@ -336,10 +336,10 @@ def test_portable_payload_matrix_writes_complete_receipt(
         Path(configured_path)
         if configured_path
         else REPOSITORY
-        / "target/local-rc/portable-matrix-receipt.v1.json"
+        / "target/local-rc/portable-matrix-receipt.v2.json"
     )
     receipt = {
-        "schema": "c-two.portable-matrix-receipt.v1",
+        "schema": "c-two.portable-matrix-receipt.v2",
         "evidence_stage": evidence_stage,
         "rows": [_MATRIX_ROWS[row_id] for row_id in EXPECTED_ROW_IDS],
     }

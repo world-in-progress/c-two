@@ -688,10 +688,10 @@ def test_typescript_real_calls_write_strict_development_receipt(
         Path(configured)
         if configured
         else REPOSITORY
-        / "target/local-rc/typescript-real-call-receipt.v1.json"
+        / "target/local-rc/typescript-real-call-receipt.v2.json"
     )
     receipt = {
-        "schema": "c-two.typescript-real-call-receipt.v1",
+        "schema": "c-two.typescript-real-call-receipt.v2",
         "evidence_stage": evidence_stage,
         "runtime": {
             "node_version": typescript_artifacts.node_version,
@@ -710,7 +710,6 @@ def test_typescript_real_calls_write_strict_development_receipt(
             "host_processes_stopped": True,
             "relay_processes_stopped": True,
             "node_processes_stopped": True,
-            "response_readers_closed": True,
         },
     }
     write_receipt(

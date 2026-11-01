@@ -19,7 +19,7 @@ EXPECTED_ROW_IDS = tuple(
 )
 DIGEST_ROW_ID = "record-v1__direct-ipc"
 OPAQUE_ROW_ID = "object-graph-v1__relay-aware-http"
-RECEIPT_SCHEMA = "c-two.typescript-real-call-receipt.v1"
+RECEIPT_SCHEMA = "c-two.typescript-real-call-receipt.v2"
 FROZEN_FASTDB_DIGEST_MISMATCH_CAUSE = {
     "cause_owner": "fastdb",
     "fastdb_code": "3006",
@@ -71,7 +71,7 @@ _RELEASE_REF_FIELDS = frozenset(
     ("schema", "contract_schema", "descriptor_sha256", "crm")
 )
 _CRM_FIELDS = frozenset(("namespace", "name", "version"))
-_ROUTE_FIELDS = frozenset(("uid", "revision"))
+_ROUTE_FIELDS = frozenset(("uid",))
 _COUNTER_FIELDS = frozenset(("requests", "responses"))
 _LIFETIME_FIELDS = frozenset(
     ("close_idempotent", "checked_view_invalidated", "materialized_survived")
@@ -94,7 +94,6 @@ _CLEANUP_FIELDS = frozenset(
         "host_processes_stopped",
         "relay_processes_stopped",
         "node_processes_stopped",
-        "response_readers_closed",
     )
 )
 _OBSERVED_PATH = {
@@ -147,12 +146,6 @@ def _string(value: object, path: str) -> str:
 def _sha256(value: object, path: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         _fail(path, "must be a lowercase SHA-256 digest")
-    return value
-
-
-def _positive(value: object, path: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        _fail(path, "must be a positive integer")
     return value
 
 
@@ -231,7 +224,6 @@ def _validate_row(value: object, row_id: str, index: int) -> None:
     route = _object(row["route"], f"{path}.route")
     _fields(route, _ROUTE_FIELDS, f"{path}.route")
     _string(route["uid"], f"{path}.route.uid")
-    _positive(route["revision"], f"{path}.route.revision")
     _sha256(row["logical_result_sha256"], f"{path}.logical_result_sha256")
     counters = _object(row["path_counters"], f"{path}.path_counters")
     _fields(counters, _COUNTER_FIELDS, f"{path}.path_counters")

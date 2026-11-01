@@ -21,6 +21,7 @@ from tools.local_rc.artifact_manifest import (  # noqa: E402
     MANIFEST_FILENAME,
     MANIFEST_SCHEMA,
     CandidateError,
+    _validate_candidate_file_set,
     artifact_descriptor,
     archive_inventory,
     canonical_json_bytes,
@@ -527,6 +528,30 @@ def _candidate(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
         enforce_candidate_set=False,
     )
     return root, manifest
+
+
+@pytest.mark.parametrize("filename", [
+    "portable-matrix-receipt.v2.json",
+    "typescript-real-call-receipt.v2.json",
+    "package-consumer-receipt.v1.json",
+])
+def test_manifest_accepts_current_receipt_files(tmp_path: Path, filename: str) -> None:
+    root, manifest = _candidate(tmp_path)
+    (root / filename).write_text("{}\n", encoding="utf-8")
+    write_manifest(root / MANIFEST_FILENAME, manifest, candidate_root=root, enforce_candidate_set=False)
+    _validate_candidate_file_set(root, manifest["artifacts"])
+
+
+@pytest.mark.parametrize("filename", [
+    "portable-matrix-receipt.v1.json",
+    "typescript-real-call-receipt.v1.json",
+])
+def test_manifest_rejects_noncurrent_receipt_files(tmp_path: Path, filename: str) -> None:
+    root, manifest = _candidate(tmp_path)
+    (root / filename).write_text("{}\n", encoding="utf-8")
+    write_manifest(root / MANIFEST_FILENAME, manifest, candidate_root=root, enforce_candidate_set=False)
+    with pytest.raises(CandidateError, match="unexpected"):
+        _validate_candidate_file_set(root, manifest["artifacts"])
 
 
 def test_manifest_is_canonical_and_byte_stable(tmp_path: Path) -> None:
