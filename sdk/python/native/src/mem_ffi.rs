@@ -7,12 +7,12 @@
 //! - PoolStats: statistics dataclass
 
 use c2_mem::{MemPool, PoolAllocation, PoolConfig};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// Python-visible pool configuration.
 #[pyclass(name = "PoolConfig", frozen, skip_from_py_object)]
@@ -146,6 +146,8 @@ pub struct PyPoolAlloc {
     pub level: u16,
     #[pyo3(get)]
     pub is_dedicated: bool,
+    owner: Weak<RwLock<MemPool>>,
+    released: Arc<Mutex<bool>>,
 }
 
 #[pymethods]
@@ -163,8 +165,20 @@ impl PyPoolAlloc {
     }
 }
 
-impl From<PoolAllocation> for PyPoolAlloc {
-    fn from(a: PoolAllocation) -> Self {
+impl PyPoolAlloc {
+    fn validate_for(&self, owner: &Arc<RwLock<MemPool>>) -> PyResult<()> {
+        if !Weak::ptr_eq(&self.owner, &Arc::downgrade(owner)) {
+            return Err(PyRuntimeError::new_err(
+                "allocation belongs to a different memory pool",
+            ));
+        }
+        if *self.released.lock() {
+            return Err(PyRuntimeError::new_err("allocation already released"));
+        }
+        Ok(())
+    }
+
+    fn from_allocation(a: PoolAllocation, owner: &Arc<RwLock<MemPool>>) -> Self {
         Self {
             seg_idx: a.seg_idx,
             generation: a.generation,
@@ -172,6 +186,8 @@ impl From<PoolAllocation> for PyPoolAlloc {
             actual_size: a.actual_size,
             level: a.level,
             is_dedicated: a.is_dedicated,
+            owner: Arc::downgrade(owner),
+            released: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -269,7 +285,10 @@ impl PyMemPool {
         let mut pool = self.pool.write();
         let alloc = pool.alloc(size).map_err(PyRuntimeError::new_err)?;
         let ptr = pool.data_ptr(&alloc).map_err(PyRuntimeError::new_err)?;
-        Ok((PyPoolAlloc::from(alloc), ptr as usize))
+        Ok((
+            PyPoolAlloc::from_allocation(alloc, &self.pool),
+            ptr as usize,
+        ))
     }
 
     /// Allocate `size` bytes from the pool.
@@ -277,13 +296,14 @@ impl PyMemPool {
     fn alloc(&self, size: usize) -> PyResult<PyPoolAlloc> {
         let mut pool = self.pool.write();
         pool.alloc(size)
-            .map(PyPoolAlloc::from)
+            .map(|alloc| PyPoolAlloc::from_allocation(alloc, &self.pool))
             .map_err(PyRuntimeError::new_err)
     }
 
     /// Free a previously allocated block.
     fn free(&self, alloc: &PyPoolAlloc) -> PyResult<()> {
         let mut pool = self.pool.write();
+        alloc.validate_for(&self.pool)?;
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             generation: alloc.generation,
@@ -293,12 +313,14 @@ impl PyMemPool {
             is_dedicated: alloc.is_dedicated,
         };
         unsafe { pool.free(&pa) }.map_err(PyRuntimeError::new_err)?;
+        *alloc.released.lock() = true;
         Ok(())
     }
 
     /// Write data into an allocated block.
     fn write(&self, alloc: &PyPoolAlloc, data: &[u8]) -> PyResult<()> {
         let pool = self.pool.read();
+        alloc.validate_for(&self.pool)?;
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             generation: alloc.generation,
@@ -325,6 +347,7 @@ impl PyMemPool {
         size: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let pool = self.pool.read();
+        alloc.validate_for(&self.pool)?;
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             generation: alloc.generation,
@@ -350,6 +373,7 @@ impl PyMemPool {
         alloc: &PyPoolAlloc,
     ) -> PyResult<()> {
         let pool = self.pool.read();
+        alloc.validate_for(&self.pool)?;
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             generation: alloc.generation,

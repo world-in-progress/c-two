@@ -238,6 +238,7 @@ interface C2IpcOpenConnection {
   closing: boolean;
   discarded?: boolean;
   reading: Promise<void> | undefined;
+  readonly discardingChunkReplyIds: Set<bigint>;
 }
 
 interface C2IpcFrame {
@@ -319,6 +320,14 @@ export class C2IpcRouteNotFoundError extends Error {
   }
 }
 
+/** Framing, write commitment, or release authority cannot be trusted. */
+class C2IpcConnectionFailure extends C2IpcTransportError {
+  constructor(message: string) {
+    super(message);
+    Object.setPrototypeOf(this, C2IpcConnectionFailure.prototype);
+  }
+}
+
 export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(address: string, options: C2IpcTransportOptions<Payload>): C2IpcEncodedTransport<Payload> {
   validateIpcAddress(address);
   const connect = normalizeIpcConnect(options, "C-Two IPC transport options");
@@ -374,7 +383,10 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
 
   const flushReleases = async (open: C2IpcOpenConnection): Promise<void> => {
     try { await writeIpcFrame(open); }
-    catch (error) { await discardConnection(open); throw error; }
+    catch (error) {
+      if (error instanceof C2IpcConnectionFailure) await discardConnection(open);
+      throw error;
+    }
   };
 
   const control = async (
@@ -384,23 +396,30 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
     responseTag: number,
   ): Promise<C2IpcCatalogReply> => {
     const requestId = allocateRequestId();
+    if (open.closing) throw new C2IpcTransportError("C-Two IPC connection is closing.");
+    // New route queries require business admission, even with CTRL on wire.
     try {
-      if (open.closing) throw new C2IpcTransportError("C-Two IPC connection is closing.");
-      // New route queries require business admission, even with CTRL on wire.
       await writeIpcFrame(open, encodeIpcFrame(requestId, C2_IPC_FLAG_CTRL,
         concatUint8Arrays([new Uint8Array([tag]), C2_TEXT_ENCODER.encode(JSON.stringify(request))])));
-      const frame = await readIpcResponseFrame(open);
-      if (frame.requestId !== requestId || frame.flags !== (C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_CTRL)) {
-        throw new C2IpcTransportError("C-Two IPC route control reply has invalid request id or flags.");
-      }
-      return decodeIpcCatalogReply(frame.payload, responseTag);
     } catch (error) {
-      await discardConnection(open);
+      if (error instanceof C2IpcConnectionFailure) await discardConnection(open);
       if (error instanceof C2IpcTransportError) {
         throw error;
       }
-      throw new C2IpcTransportError(`C-Two IPC route control failed: ${String(error)}`);
+      throw new C2IpcTransportError(`C-Two IPC route control write failed: ${String(error)}`);
     }
+    let frame: C2IpcFrame;
+    try {
+      frame = await readIpcResponseFrame(open, requestId);
+      if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) await discardIpcShmFrame(open, frame);
+    } catch (error) {
+      if (error instanceof C2IpcConnectionFailure) await discardConnection(open);
+      throw error;
+    }
+    if (frame.requestId !== requestId || frame.flags !== (C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_CTRL)) {
+      throw new C2IpcTransportError("C-Two IPC route control reply has invalid request id or flags.");
+    }
+    return decodeIpcCatalogReply(frame.payload, responseTag);
   };
 
   const prepareRoute = async (
@@ -435,7 +454,6 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
       throw new C2IpcTransportError(`C-Two IPC route catalog NACK ${reply.code}: ${reply.message}`);
     }
     if (reply.routeName !== routeName) {
-      await discardConnection(open);
       throw new C2IpcTransportError("C-Two IPC route lookup reply names a different route.");
     }
     if (reply.status === "not_found") {
@@ -502,10 +520,27 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         const receive = async (): Promise<C2IpcCallResponse> => {
           let frame: C2IpcFrame;
           try {
-            try {
-              frame = await readIpcResponseFrame(open);
-            } catch (error) {
-              throw new C2IpcTransportError(`C-Two IPC call response read failed: ${String(error)}`);
+            frame = await readIpcResponseFrame(open, requestId);
+          } catch (error) {
+            if (error instanceof C2IpcConnectionFailure) await discardConnection(open);
+            throw error instanceof C2IpcTransportError ? error
+              : new C2IpcTransportError(`C-Two IPC call response read failed: ${String(error)}`);
+          }
+          const memory = open.connection.memory;
+          let buddy: C2IpcShmBlock | undefined;
+          let response: unknown;
+          let admissionAttempted = false;
+          let admitted = false;
+          let chunkReaderStarted = false;
+          try {
+            if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
+              buddy = decodeIpcBuddyPayload(frame.payload);
+              if (memory === undefined) throw new C2IpcTransportError("C-Two IPC SHM response has no native memory context.");
+              admissionAttempted = true;
+              // Native admission owns the release obligation even when mapping
+              // or span validation fails. Never submit the descriptor twice.
+              response = memory.admitResponse(buddy);
+              admitted = true;
             }
             if (frame.requestId !== requestId) {
               throw new C2IpcTransportError(`C-Two IPC response request id ${frame.requestId} did not match request id ${requestId}.`);
@@ -513,58 +548,44 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
             if ((frame.flags & C2_IPC_FLAG_RESPONSE) === 0 || (frame.flags & C2_IPC_FLAG_REPLY_V2) === 0) {
               throw new C2IpcTransportError("C-Two IPC response is not a v2 reply frame.");
             }
-          } catch (error) {
-            if (!chunked) await discardConnection(open);
-            throw error;
-          }
-          let buddy: C2IpcShmBlock | undefined;
-          if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
-            try {
+            if (buddy !== undefined) {
+              if ((frame.payload[14] & ~C2_IPC_BUDDY_FLAG_DEDICATED) !== 0) {
+                throw new C2IpcTransportError(`C-Two IPC buddy payload flags ${frame.payload[14]} are invalid.`);
+              }
+              if (buddy.byteLength > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
+                throw new C2IpcTransportError(`C-Two IPC SHM response data_size ${buddy.byteLength} must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES}.`);
+              }
               if ((open.handshake.capabilityFlags & C2_IPC_CAP_SHM_RESPONSE) === 0) {
                 throw new C2IpcTransportError("C-Two IPC server sent an SHM reply without the acknowledged SHM response capability.");
               }
-              if (open.connection.memory === undefined) throw new C2IpcTransportError("C-Two IPC SHM response has no native memory context.");
               if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
                 throw new C2IpcTransportError("C-Two IPC chunked SHM responses are not supported by this generated transport yet.");
               }
-              buddy = decodeIpcBuddyPayload(frame.payload);
-            } catch (error) {
-              await discardConnection(open);
-              throw error;
             }
-          } else if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
-            try {
+            if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
+              chunkReaderStarted = true;
               return { kind: "inline", payload: await readIpcChunkedSuccessPayload(open, frame, requestId) };
-            } catch (error) {
-              if (!chunked) await discardConnection(open);
-              if (error instanceof C2IpcTransportError) throw error;
-              throw new C2IpcTransportError(`C-Two IPC chunked response read failed: ${String(error)}`);
-            }
-          }
-          const memory = open.connection.memory;
-          let response: unknown;
-          let admitted = false;
-          let delivered = false;
-          try {
-            if (buddy !== undefined && memory !== undefined) {
-              try { response = memory.admitResponse(buddy); }
-              catch (error) { await discardConnection(open); throw error; }
-              admitted = true;
             }
             const reply = decodeIpcReplyControl(frame.payload.subarray(buddy === undefined ? 0 : C2_IPC_BUDDY_PAYLOAD_BYTES));
             if (reply.kind === "error") throw new C2CrmMethodError(reply.payload);
             if (reply.kind === "route-not-found") throw new C2IpcRouteNotFoundError(reply.routeName);
             if (buddy !== undefined) {
               if (reply.payload.byteLength !== 0 || memory === undefined) throw new C2IpcTransportError("Invalid SHM response control or native memory context.");
-              delivered = true;
               return { kind: "shm", block: buddy, response };
             }
             return { kind: "inline", payload: reply.payload };
-          } finally {
-            if (admitted && !delivered) {
-              memory!.discardResponse(response);
-              await flushReleases(open);
+          } catch (error) {
+            if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0 && !chunkReaderStarted && (frame.flags & C2_IPC_FLAG_CHUNK_LAST) === 0) {
+              open.discardingChunkReplyIds.add(frame.requestId);
             }
+            if (admissionAttempted) {
+              if (admitted) memory!.discardResponse(response);
+              // A failed native admission has already queued its own release.
+              // A write failure deactivates this stream but does not change the
+              // outcome of the complete response frame.
+              try { await flushReleases(open); } catch { /* preserve the response failure */ }
+            }
+            throw error;
           }
         };
         const observeResponse = (value: Payload): Payload => {
@@ -591,7 +612,6 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
               }
             }
           } catch (error) {
-            await discardConnection(open);
             if (error instanceof C2IpcTransportError) throw error;
             throw new C2IpcTransportError(`C-Two IPC call write failed: ${String(error)}`);
           }
@@ -627,24 +647,28 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           let reply: C2IpcCallResponse;
           if (chunked) {
             const receiving = receive();
-            try {
-              [, reply] = await Promise.all([writing, receiving]);
-            } catch (error) {
-              // Preserve the first failure before close wakes the other side.
+            const finishingWrite = writing.catch(async error => {
+              // A partial request chunk sequence leaves the peer's request
+              // assembly incomplete and the concurrent read must be woken.
               await discardConnection(open);
-              const [, received] = await Promise.allSettled([writing, receiving]);
+              throw error;
+            });
+            const [written, received] = await Promise.allSettled([finishingWrite, receiving]);
+            if (written.status === "rejected") {
               if (received.status === "fulfilled" && received.value.kind === "shm") {
                 open.connection.memory!.discardResponse(received.value.response);
                 try { await writeIpcFrame(open); } catch { /* preserve the original failed exchange */ }
               }
-              await discardConnection(open);
-              throw error;
+              if (received.status === "rejected" && received.reason instanceof C2IpcConnectionFailure) throw received.reason;
+              throw written.reason;
             }
+            if (received.status === "rejected") throw received.reason;
+            reply = received.value;
           } else {
             try {
               await writing;
             } catch (error) {
-              await discardConnection(open);
+              if (error instanceof C2IpcConnectionFailure) await discardConnection(open);
               throw error;
             }
             reply = await receive();
@@ -661,7 +685,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           }
         } catch (error) {
           responseError = error;
-          if (chunked || error instanceof C2IpcTransportError) await discardConnection(open);
+          if (error instanceof C2IpcConnectionFailure) await discardConnection(open);
         }
         if (responseError !== undefined) {
           throw responseError;
@@ -1135,7 +1159,7 @@ async function connectAndHandshakeIpc(
     }
     const handshake = decodeServerIpcHandshake(frame.payload);
     connection.memory?.finishHandshake((handshake.capabilityFlags & C2_IPC_CAP_SHM_RESPONSE) !== 0 ? handshake.shmPrefix : null);
-    return { connection, handshake, writeChain: Promise.resolve(), closing: false, reading: undefined };
+    return { connection, handshake, writeChain: Promise.resolve(), closing: false, reading: undefined, discardingChunkReplyIds: new Set() };
   } catch (error) {
     const primaryError = error instanceof C2IpcTransportError ? error : new C2IpcTransportError(
       `C-Two IPC handshake failed: ${String(error)}`,
@@ -1313,8 +1337,12 @@ async function writeIpcFrame(open: C2IpcOpenConnection, frame?: C2ByteArray, req
       batch?.start();
       started = true;
       try { await open.connection.write(bytes); }
-      catch (error) { batch?.complete(false); throw error; }
-      batch?.complete(true);
+      catch (error) {
+        try { batch?.complete(false); } catch { /* the stream is already uncertain */ }
+        throw new C2IpcConnectionFailure(`C-Two IPC frame write failed: ${String(error)}`);
+      }
+      try { batch?.complete(true); }
+      catch (error) { throw new C2IpcConnectionFailure(`C-Two IPC frame write completion failed: ${String(error)}`); }
     } finally {
       if (!started) {
         batch?.discard();
@@ -1326,7 +1354,7 @@ async function writeIpcFrame(open: C2IpcOpenConnection, frame?: C2ByteArray, req
   return await write;
 }
 
-async function readIpcResponseFrame(open: C2IpcOpenConnection): Promise<C2IpcFrame> {
+async function readIpcResponseFrame(open: C2IpcOpenConnection, expectedRequestId?: bigint): Promise<C2IpcFrame> {
   let finish!: () => void;
   open.reading = new Promise<void>(resolve => { finish = resolve; });
   try {
@@ -1338,19 +1366,41 @@ async function readIpcResponseFrame(open: C2IpcOpenConnection): Promise<C2IpcFra
       }
       const frame = await readIpcFrame(open.connection);
       if (frame.payload[0] === C2_IPC_RELEASE && (frame.flags & C2_IPC_FLAG_CTRL) !== 0) {
-        if (memory === undefined) throw new C2IpcTransportError("Release on a connection without native memory.");
-        memory.receiveRelease(encodeIpcFrame(frame.requestId, frame.flags, frame.payload));
+        if (memory === undefined) throw new C2IpcConnectionFailure("Release on a connection without native memory.");
+        try { memory.receiveRelease(encodeIpcFrame(frame.requestId, frame.flags, frame.payload)); }
+        catch (error) { throw new C2IpcConnectionFailure(`C-Two IPC release frame rejected: ${String(error)}`); }
+        continue;
+      }
+      if (open.discardingChunkReplyIds.has(frame.requestId)) {
+        if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) await discardIpcShmFrame(open, frame);
+        if ((frame.flags & C2_IPC_FLAG_CHUNK_LAST) !== 0) open.discardingChunkReplyIds.delete(frame.requestId);
+        continue;
+      }
+      if (expectedRequestId !== undefined && frame.requestId !== 0n && frame.requestId < expectedRequestId) {
+        // A completed older call may have sent a duplicate whole reply. It
+        // cannot be the answer to this monotonic request ID.
+        if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) await discardIpcShmFrame(open, frame);
         continue;
       }
       if (!open.closing) return frame;
       if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
-        if (memory === undefined || (open.handshake.capabilityFlags & C2_IPC_CAP_SHM_RESPONSE) === 0) throw new C2IpcTransportError("Unacknowledged SHM while closing.");
-        const response = memory.admitResponse(decodeIpcBuddyPayload(frame.payload));
-        memory.discardResponse(response);
-        await writeIpcFrame(open);
+        await discardIpcShmFrame(open, frame);
       }
     }
   } finally { open.reading = undefined; finish(); }
+}
+
+async function discardIpcShmFrame(open: C2IpcOpenConnection, frame: C2IpcFrame): Promise<void> {
+  const memory = open.connection.memory;
+  if (memory === undefined) return;
+  let block: C2IpcShmBlock;
+  try { block = decodeIpcBuddyPayload(frame.payload); }
+  catch { return; } // A truncated descriptor contains no usable loan identity.
+  let response: unknown;
+  try { response = memory.admitResponse(block); }
+  catch { await writeIpcFrame(open); return; } // Native admission queued its release.
+  memory.discardResponse(response);
+  await writeIpcFrame(open);
 }
 
 function encodeIpcRequestChunkHeader(chunkIndex: number, totalChunks: number): Uint8Array {
@@ -1381,30 +1431,34 @@ function encodeIpcFrame(requestId: bigint, flags: number, payload: Uint8Array): 
 }
 
 async function readIpcFrame(connection: C2IpcConnection): Promise<C2IpcFrame> {
-  const header = requireUint8Array(await connection.readExactly(C2_IPC_FRAME_HEADER_BYTES), "C-Two IPC frame header");
-  if (header.byteLength !== C2_IPC_FRAME_HEADER_BYTES) {
-    throw new C2IpcTransportError(`C-Two IPC frame header read returned ${header.byteLength} bytes.`);
+  try {
+    const header = requireUint8Array(await connection.readExactly(C2_IPC_FRAME_HEADER_BYTES), "C-Two IPC frame header");
+    if (header.byteLength !== C2_IPC_FRAME_HEADER_BYTES) {
+      throw new C2IpcTransportError(`C-Two IPC frame header read returned ${header.byteLength} bytes.`);
+    }
+    const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+    const totalLen = view.getUint32(0, true);
+    if (totalLen < C2_IPC_FRAME_BODY_HEADER_BYTES) {
+      throw new C2IpcTransportError(`C-Two IPC frame total_len ${totalLen} is smaller than the fixed body header.`);
+    }
+    const payloadLen = totalLen - C2_IPC_FRAME_BODY_HEADER_BYTES;
+    if (payloadLen > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
+      throw new C2IpcTransportError(`C-Two IPC frame payload length ${payloadLen} must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES}.`);
+    }
+    const payload = payloadLen === 0
+      ? new Uint8Array()
+      : requireUint8Array(await connection.readExactly(payloadLen), "C-Two IPC frame payload");
+    if (payload.byteLength !== payloadLen) {
+      throw new C2IpcTransportError(`C-Two IPC frame payload read returned ${payload.byteLength} bytes, expected ${payloadLen}.`);
+    }
+    return {
+      requestId: view.getBigUint64(4, true),
+      flags: view.getUint32(12, true),
+      payload,
+    };
+  } catch (error) {
+    throw new C2IpcConnectionFailure(`C-Two IPC frame read failed: ${String(error)}`);
   }
-  const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
-  const totalLen = view.getUint32(0, true);
-  if (totalLen < C2_IPC_FRAME_BODY_HEADER_BYTES) {
-    throw new C2IpcTransportError(`C-Two IPC frame total_len ${totalLen} is smaller than the fixed body header.`);
-  }
-  const payloadLen = totalLen - C2_IPC_FRAME_BODY_HEADER_BYTES;
-  if (payloadLen > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
-    throw new C2IpcTransportError(`C-Two IPC frame payload length ${payloadLen} must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES}.`);
-  }
-  const payload = payloadLen === 0
-    ? new Uint8Array()
-    : requireUint8Array(await connection.readExactly(payloadLen), "C-Two IPC frame payload");
-  if (payload.byteLength !== payloadLen) {
-    throw new C2IpcTransportError(`C-Two IPC frame payload read returned ${payload.byteLength} bytes, expected ${payloadLen}.`);
-  }
-  return {
-    requestId: view.getBigUint64(4, true),
-    flags: view.getUint32(12, true),
-    payload,
-  };
 }
 
 function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
@@ -1673,23 +1727,10 @@ function decodeIpcBuddyPayload(payload: Uint8Array): C2IpcShmBlock {
     throw new C2IpcTransportError("C-Two IPC buddy payload is truncated.");
   }
   const flags = payload[14];
-  if ((flags & ~C2_IPC_BUDDY_FLAG_DEDICATED) !== 0) {
-    throw new C2IpcTransportError(`C-Two IPC buddy payload flags ${flags} are invalid.`);
-  }
   const byteLength = readU32LE(payload, 10);
-  if (byteLength <= 0) {
-    throw new C2IpcTransportError("C-Two IPC SHM response data_size must be positive.");
-  }
-  if (byteLength > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
-    throw new C2IpcTransportError(`C-Two IPC SHM response data_size ${byteLength} must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES}.`);
-  }
   const generation = readU32LE(payload, 2);
   const dedicated = (flags & C2_IPC_BUDDY_FLAG_DEDICATED) !== 0;
-  if (generation === 0 || (dedicated && readU32LE(payload, 6) !== 0)) {
-    throw new C2IpcTransportError("C-Two IPC SHM generation must be positive and dedicated offset must be 0.");
-  }
   const loanId = readU64LEBigInt(payload, 15);
-  requireIpcLoanId(loanId);
   return {
     segmentIndex: readU16LE(payload, 0),
     generation,
@@ -1727,85 +1768,103 @@ async function readIpcShmSuccessPayload<Payload extends C2ResponsePayload>(
 }
 
 async function readIpcChunkedSuccessPayload(open: C2IpcOpenConnection, firstFrame: C2IpcFrame, requestId: bigint): Promise<Uint8Array> {
-  const firstChunk = validateIpcChunkedReplyFrame(firstFrame, requestId);
-  if (firstChunk.chunkIndex !== 0) {
-    throw new C2IpcTransportError(`C-Two IPC first chunked response frame has chunk_idx ${firstChunk.chunkIndex}, expected 0.`);
-  }
-  if (firstChunk.totalSize <= 0) {
-    throw new C2IpcTransportError("C-Two IPC chunked response total_size must be positive.");
-  }
-  if (firstChunk.totalSize > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
-    throw new C2IpcTransportError(`C-Two IPC chunked response total_size ${firstChunk.totalSize} must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES}.`);
-  }
-  if (firstChunk.totalChunks <= 0) {
-    throw new C2IpcTransportError("C-Two IPC chunked response total_chunks must be positive.");
-  }
-  if (firstChunk.totalChunks > firstChunk.totalSize) {
-    throw new C2IpcTransportError("C-Two IPC chunked response total_chunks cannot exceed total_size.");
-  }
-  const chunkSize = firstChunk.totalChunks === 1 ? firstChunk.totalSize : firstChunk.data.byteLength;
-  if (chunkSize <= 0) {
-    throw new C2IpcTransportError("C-Two IPC chunked response chunk_size must be positive.");
-  }
-  let expectedFinalChunkSize = firstChunk.totalSize;
-  if (firstChunk.totalChunks > 1) {
-    const maxNonFinalChunkSize = Math.floor((firstChunk.totalSize - 1) / (firstChunk.totalChunks - 1));
-    if (chunkSize > maxNonFinalChunkSize) {
-      throw new C2IpcTransportError("C-Two IPC chunked response chunk layout cannot fit total_size.");
+  let lastFrame = firstFrame;
+  try {
+    const firstChunk = validateIpcChunkedReplyFrame(firstFrame, requestId);
+    if (firstChunk.chunkIndex !== 0) {
+      throw new C2IpcTransportError(`C-Two IPC first chunked response frame has chunk_idx ${firstChunk.chunkIndex}, expected 0.`);
     }
-    expectedFinalChunkSize = firstChunk.totalSize - (firstChunk.totalChunks - 1) * chunkSize;
-  }
-  const assembled = new Uint8Array(firstChunk.totalSize);
-  const received = new Set<number>();
-  let writtenEnd = 0;
-  const feed = (frame: C2IpcFrame): void => {
-    const chunk = validateIpcChunkedReplyFrame(frame, requestId);
-    if (chunk.totalSize !== firstChunk.totalSize || chunk.totalChunks !== firstChunk.totalChunks) {
-      throw new C2IpcTransportError("C-Two IPC chunked response metadata changed between chunks.");
+    if (firstChunk.totalSize <= 0) {
+      throw new C2IpcTransportError("C-Two IPC chunked response total_size must be positive.");
     }
-    if (chunk.chunkIndex >= firstChunk.totalChunks) {
-      throw new C2IpcTransportError(`C-Two IPC chunked response chunk_idx ${chunk.chunkIndex} is outside total_chunks ${firstChunk.totalChunks}.`);
+    if (firstChunk.totalSize > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
+      throw new C2IpcTransportError(`C-Two IPC chunked response total_size ${firstChunk.totalSize} must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES}.`);
     }
-    if (received.has(chunk.chunkIndex)) {
-      throw new C2IpcTransportError(`C-Two IPC chunked response duplicate chunk_idx ${chunk.chunkIndex}.`);
+    if (firstChunk.totalChunks <= 0) {
+      throw new C2IpcTransportError("C-Two IPC chunked response total_chunks must be positive.");
     }
-    const isLastChunk = chunk.chunkIndex === firstChunk.totalChunks - 1;
-    const frameSaysLast = (frame.flags & C2_IPC_FLAG_CHUNK_LAST) !== 0;
-    if (isLastChunk !== frameSaysLast) {
-      throw new C2IpcTransportError("C-Two IPC chunked response CHUNK_LAST flag does not match chunk index.");
+    if (firstChunk.totalChunks > firstChunk.totalSize) {
+      throw new C2IpcTransportError("C-Two IPC chunked response total_chunks cannot exceed total_size.");
     }
-    if (!isLastChunk && chunk.data.byteLength !== chunkSize) {
-      throw new C2IpcTransportError("C-Two IPC chunked response non-final chunk length does not match chunk_size.");
+    const chunkSize = firstChunk.totalChunks === 1 ? firstChunk.totalSize : firstChunk.data.byteLength;
+    if (chunkSize <= 0) {
+      throw new C2IpcTransportError("C-Two IPC chunked response chunk_size must be positive.");
     }
-    if (isLastChunk && chunk.data.byteLength === 0) {
-      throw new C2IpcTransportError("C-Two IPC chunked response final chunk must not be empty.");
+    let expectedFinalChunkSize = firstChunk.totalSize;
+    if (firstChunk.totalChunks > 1) {
+      const maxNonFinalChunkSize = Math.floor((firstChunk.totalSize - 1) / (firstChunk.totalChunks - 1));
+      if (chunkSize > maxNonFinalChunkSize) {
+        throw new C2IpcTransportError("C-Two IPC chunked response chunk layout cannot fit total_size.");
+      }
+      expectedFinalChunkSize = firstChunk.totalSize - (firstChunk.totalChunks - 1) * chunkSize;
     }
-    if (isLastChunk && chunk.data.byteLength > chunkSize) {
-      throw new C2IpcTransportError("C-Two IPC chunked response final chunk exceeds chunk_size.");
+    const assembled = new Uint8Array(firstChunk.totalSize);
+    const received = new Set<number>();
+    let writtenEnd = 0;
+    const feed = (frame: C2IpcFrame): void => {
+      const chunk = validateIpcChunkedReplyFrame(frame, requestId);
+      if (chunk.totalSize !== firstChunk.totalSize || chunk.totalChunks !== firstChunk.totalChunks) {
+        throw new C2IpcTransportError("C-Two IPC chunked response metadata changed between chunks.");
+      }
+      if (chunk.chunkIndex >= firstChunk.totalChunks) {
+        throw new C2IpcTransportError(`C-Two IPC chunked response chunk_idx ${chunk.chunkIndex} is outside total_chunks ${firstChunk.totalChunks}.`);
+      }
+      if (received.has(chunk.chunkIndex)) {
+        throw new C2IpcTransportError(`C-Two IPC chunked response duplicate chunk_idx ${chunk.chunkIndex}.`);
+      }
+      const isLastChunk = chunk.chunkIndex === firstChunk.totalChunks - 1;
+      const frameSaysLast = (frame.flags & C2_IPC_FLAG_CHUNK_LAST) !== 0;
+      if (isLastChunk !== frameSaysLast) {
+        throw new C2IpcTransportError("C-Two IPC chunked response CHUNK_LAST flag does not match chunk index.");
+      }
+      if (!isLastChunk && chunk.data.byteLength !== chunkSize) {
+        throw new C2IpcTransportError("C-Two IPC chunked response non-final chunk length does not match chunk_size.");
+      }
+      if (isLastChunk && chunk.data.byteLength === 0) {
+        throw new C2IpcTransportError("C-Two IPC chunked response final chunk must not be empty.");
+      }
+      if (isLastChunk && chunk.data.byteLength > chunkSize) {
+        throw new C2IpcTransportError("C-Two IPC chunked response final chunk exceeds chunk_size.");
+      }
+      if (isLastChunk && chunk.data.byteLength !== expectedFinalChunkSize) {
+        throw new C2IpcTransportError("C-Two IPC chunked response final chunk did not complete total_size.");
+      }
+      const offset = chunk.chunkIndex * chunkSize;
+      const end = offset + chunk.data.byteLength;
+      if (end > firstChunk.totalSize) {
+        throw new C2IpcTransportError("C-Two IPC chunked response chunk data exceeds total_size.");
+      }
+      assembled.set(chunk.data, offset);
+      if (end > writtenEnd) {
+        writtenEnd = end;
+      }
+      received.add(chunk.chunkIndex);
+    };
+
+    feed(firstFrame);
+    while (received.size < firstChunk.totalChunks) {
+      lastFrame = await readIpcResponseFrame(open, requestId);
+      feed(lastFrame);
     }
-    if (isLastChunk && chunk.data.byteLength !== expectedFinalChunkSize) {
+    if (writtenEnd !== firstChunk.totalSize) {
       throw new C2IpcTransportError("C-Two IPC chunked response final chunk did not complete total_size.");
     }
-    const offset = chunk.chunkIndex * chunkSize;
-    const end = offset + chunk.data.byteLength;
-    if (end > firstChunk.totalSize) {
-      throw new C2IpcTransportError("C-Two IPC chunked response chunk data exceeds total_size.");
+    return assembled;
+  } catch (error) {
+    if (!(error instanceof C2IpcConnectionFailure)) {
+      if ((lastFrame.flags & C2_IPC_FLAG_CHUNK_LAST) === 0) open.discardingChunkReplyIds.add(requestId);
+      if (lastFrame !== firstFrame && (lastFrame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
+        try { await discardIpcShmFrame(open, lastFrame); }
+        catch (cleanupError) {
+          if (cleanupError instanceof C2IpcConnectionFailure) {
+            throw new C2IpcConnectionFailure(`C-Two IPC chunked response failed: ${String(error)}; release write also failed: ${String(cleanupError)}`);
+          }
+          // Preserve the malformed chunk when local release cleanup fails.
+        }
+      }
     }
-    assembled.set(chunk.data, offset);
-    if (end > writtenEnd) {
-      writtenEnd = end;
-    }
-    received.add(chunk.chunkIndex);
-  };
-
-  feed(firstFrame);
-  while (received.size < firstChunk.totalChunks) {
-    feed(await readIpcResponseFrame(open));
+    throw error;
   }
-  if (writtenEnd !== firstChunk.totalSize) {
-    throw new C2IpcTransportError("C-Two IPC chunked response final chunk did not complete total_size.");
-  }
-  return assembled;
 }
 
 function validateIpcChunkedReplyFrame(frame: C2IpcFrame, requestId: bigint): C2IpcReplyChunk {

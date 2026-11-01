@@ -483,32 +483,97 @@ class TestBuddyPanicSafety:
 
 
 class TestDoubleFreeSafety:
-    """Test that pool handles double-free and invalid-free gracefully."""
+    """A Python allocation can be released only once by its owner pool."""
 
-
-    def test_alloc_after_double_free_still_works(self):
-        """Pool must remain usable after a double-free attempt."""
+    def test_double_free_rejected_without_releasing_reused_block(self):
         pool = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=1,
         ))
-        try:
-            alloc = pool.alloc(4096)
+        first = pool.alloc(4096)
+        pool.free(first)
+        reused = pool.alloc(4096)
+        assert (reused.seg_idx, reused.offset) == (first.seg_idx, first.offset)
+        before = pool.stats().alloc_count
+
+        with pytest.raises(RuntimeError, match='already released'):
+            pool.free(first)
+        assert pool.stats().alloc_count == before
+
+        next_alloc = pool.alloc(4096)
+        assert (next_alloc.seg_idx, next_alloc.offset) != (reused.seg_idx, reused.offset)
+        pool.write(reused, b'reused')
+        pool.write(next_alloc, b'next')
+        assert pool.read(reused, 6) == b'reused'
+        assert pool.read(next_alloc, 4) == b'next'
+        pool.free(reused)
+        pool.free(next_alloc)
+        assert pool.stats().alloc_count == 0
+
+    def test_cross_pool_free_rejected_without_consuming_allocation(self):
+        config = PoolConfig(
+            segment_size=64 * 1024,
+            min_block_size=4096,
+            max_segments=1,
+        )
+        owner = MemPool(config)
+        other = MemPool(config)
+        alloc, _ = owner.alloc_ptr(4096)
+        other_alloc = other.alloc(4096)
+        assert (
+            alloc.seg_idx, alloc.generation, alloc.offset, alloc.level, alloc.is_dedicated
+        ) == (
+            other_alloc.seg_idx, other_alloc.generation, other_alloc.offset,
+            other_alloc.level, other_alloc.is_dedicated
+        )
+        owner_count = owner.stats().alloc_count
+        other_count = other.stats().alloc_count
+
+        with pytest.raises(RuntimeError, match='different memory pool'):
+            other.free(alloc)
+        assert owner.stats().alloc_count == owner_count
+        assert other.stats().alloc_count == other_count
+
+        next_alloc = other.alloc(4096)
+        assert (next_alloc.seg_idx, next_alloc.offset) != (
+            other_alloc.seg_idx, other_alloc.offset
+        )
+        other.write(other_alloc, b'other')
+        other.write(next_alloc, b'next')
+        assert other.read(other_alloc, 5) == b'other'
+        assert other.read(next_alloc, 4) == b'next'
+        owner.free(alloc)
+        other.free(other_alloc)
+        other.free(next_alloc)
+        assert owner.stats().alloc_count == 0
+        assert other.stats().alloc_count == 0
+
+    @pytest.mark.parametrize('operation', ['read', 'write', 'write_from_buffer'])
+    @pytest.mark.parametrize('invalid', ['released', 'foreign'])
+    def test_invalid_allocation_access_preserves_live_block(self, operation, invalid):
+        config = PoolConfig(segment_size=64 * 1024, max_segments=1)
+        pool = MemPool(config)
+        owner = pool if invalid == 'released' else MemPool(config)
+        alloc = owner.alloc(4096)
+        if invalid == 'released':
             pool.free(alloc)
-            try:
-                pool.free(alloc)
-            except RuntimeError:
-                pass
-            # Pool must still be functional
-            alloc2 = pool.alloc(4096)
-            data = b'after-double-free'
-            pool.write(alloc2, data)
-            result = pool.read(alloc2, len(data))
-            assert result == data
-            pool.free(alloc2)
-        finally:
-            del pool
+        live = pool.alloc(4096)
+        pool.write(live, b'unchanged')
+        before = pool.stats().alloc_count
+        message = 'already released' if invalid == 'released' else 'different memory pool'
+        with pytest.raises(RuntimeError, match=message):
+            if operation == 'read':
+                pool.read(alloc, 9)
+            elif operation == 'write':
+                pool.write(alloc, b'corrupted')
+            else:
+                pool.write_from_buffer(b'corrupted', alloc)
+        assert pool.stats().alloc_count == before
+        assert pool.read(live, 9) == b'unchanged'
+        pool.free(live)
+        if invalid == 'foreign':
+            owner.free(alloc)
 
 
 class TestSegmentExhaustion:

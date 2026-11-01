@@ -1183,7 +1183,7 @@ impl PoolAllocation {
     }
 }
 
-fn check_span(span: usize, start: usize, len: usize) -> Result<(), String> {
+pub(crate) fn check_span(span: usize, start: usize, len: usize) -> Result<(), String> {
     if len == 0 {
         return Err("shared-memory copy span must not be empty".into());
     }

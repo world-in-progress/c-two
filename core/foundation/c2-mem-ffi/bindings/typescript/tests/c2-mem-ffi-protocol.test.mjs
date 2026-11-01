@@ -118,7 +118,7 @@ test('native memory byte arguments reject a malformed release without allocating
   });
 });
 
-test('native block integer fields reject fractional negative and overflowing values', {timeout: 150_000}, async () => {
+test('native block integer fields reject invalid values without deactivating', {timeout: 150_000}, async () => {
   await withServer(async ({transport, connection}) => {
     await transport.prepare('echo', contract);
     const memory = connection().memory;
@@ -128,15 +128,17 @@ test('native block integer fields reject fractional negative and overflowing val
         assert.throws(() => memory.admitResponse({...block, [field]: value}), /u32 integer|fit in u16/);
       }
     }
-    assert.throws(() => memory.beginWrite(0), /INVALID_ARGUMENT/, 'rejected admission must deactivate');
+    memory.beginWrite(0).discard();
   });
 });
-test('native dedicated offset is rejected before mapping and deactivates admission', {timeout: 150_000}, async () => {
+test('native dedicated offset fails admission without deactivating the connection', {timeout: 150_000}, async () => {
   await withServer(async ({transport, connection}) => {
     await transport.prepare('echo', contract);
     const memory = connection().memory;
     assert.throws(() => memory.admitResponse({segmentIndex: 0, generation: 1, offset: 1, byteLength: 8, loanId: 1n, dedicated: true}), /INVALID_ARGUMENT/);
-    assert.throws(() => memory.beginWrite(0), /INVALID_ARGUMENT/);
+    memory.beginWrite(0).discard();
+    connection().close();
+    return false; // The synthetic loan ID was never issued by this server.
   });
 });
 test('Node close rejects native operations but still discards live request response and write owners', {timeout: 150_000}, async () => {

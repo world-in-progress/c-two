@@ -2,6 +2,13 @@ import { createRequire } from "node:module";
 import { createConnection, Socket } from "node:net";
 import { closeSync } from "node:fs";
 
+interface C2NodeTimer { unref(): void; }
+const { setTimeout, clearTimeout, setImmediate } = createRequire(import.meta.url)("node:timers") as {
+  setTimeout(callback: () => void, delayMillis: number): C2NodeTimer;
+  clearTimeout(timer: C2NodeTimer): void;
+  setImmediate(callback: () => void): void;
+};
+
 export const C2_MEM_FFI_STATUS_OK = 0;
 export const C2_MEM_FFI_STATUS_NULL_POINTER = 1;
 export const C2_MEM_FFI_STATUS_INVALID_ARGUMENT = 2;
@@ -56,6 +63,7 @@ export interface C2MemFfiMemoryContext {
   discardResponse(response: unknown): void;
   beginWrite(kind: 0 | 1 | 2, request?: C2MemFfiPreparedRequest): C2MemFfiWrite | undefined;
   receiveRelease(frame: Uint8Array): void;
+  gc(): number;
   deactivate(): void;
   peerEnd(): void;
   tryClose(): boolean;
@@ -74,6 +82,7 @@ export interface C2MemFfiNativeMemoryContext {
   completeWrite(write: unknown, success: boolean): C2MemFfiCallResult;
   discardWrite(write: unknown): C2MemFfiCallResult;
   receiveRelease(frame: Uint8Array): C2MemFfiCallResult;
+  gc(): C2MemFfiCallResult<number>;
   deactivate(): C2MemFfiCallResult;
   peerEnd(): C2MemFfiCallResult;
   tryClose(): C2MemFfiCallResult<boolean>;
@@ -709,6 +718,7 @@ function memoryFromNative(native: C2MemFfiNativeMemoryContext): C2MemFfiMemoryCo
       };
     },
     receiveRelease(frame) { requireOk(native.receiveRelease(frame), "receive release"); },
+    gc() { return requireOkValue(native.gc(), "memory GC"); },
     deactivate() { requireOk(native.deactivate(), "deactivate"); },
     peerEnd() { requireOk(native.peerEnd(), "peer end"); },
     tryClose() { return requireOkValue(native.tryClose(), "try close"); },
@@ -722,6 +732,10 @@ class NodeIpcConnection implements C2NodeIpcConnection {
   private readonly waiters: Array<() => void> = [];
   private terminalError: C2NodeIpcConnectionError | undefined;
   private closed = false;
+  private peerReadEnded = false;
+  private peerEndReported = false;
+  private peerEndScheduled = false;
+  private gcTimer: C2NodeTimer | undefined;
   constructor(private readonly socket: C2NodeIpcSocket, readonly memory?: C2MemFfiMemoryContext) {
     socket.pause();
     socket.on("data", (chunk: Uint8Array): void => {
@@ -735,16 +749,17 @@ class NodeIpcConnection implements C2NodeIpcConnection {
     });
     socket.on("error", (error: Error): void => {
       const failure = error as Error & { code?: string; syscall?: string };
-      if (!this.closed && process.platform !== "win32" && failure.code === "ECONNRESET" && failure.syscall === "read") this.memory?.peerEnd();
+      if (!this.closed && process.platform !== "win32" && failure.code === "ECONNRESET" && failure.syscall === "read") this.markPeerEnd();
       this.fail(nodeIpcError("C-Two Node IPC socket error", error));
     });
     socket.on("end", (): void => {
-      if (!this.closed) this.memory?.peerEnd();
+      if (!this.closed) this.markPeerEnd();
       this.fail(new C2NodeIpcConnectionError("C-Two Node IPC socket ended."));
     });
     socket.on("close", (): void => {
       this.fail(new C2NodeIpcConnectionError("C-Two Node IPC socket closed."));
     });
+    if (this.memory !== undefined) this.scheduleGc();
   }
 
   async write(data: Uint8Array): Promise<void> {
@@ -795,6 +810,9 @@ class NodeIpcConnection implements C2NodeIpcConnection {
     }
     while (this.bufferedBytes < requested) {
       if (this.terminalError !== undefined) {
+        // A short terminal read cannot contain the complete frame requested
+        // by the caller. Its remaining bytes will not settle a release.
+        this.reportPeerEnd();
         throw this.terminalError;
       }
       await new Promise<void>((resolve) => {
@@ -802,7 +820,9 @@ class NodeIpcConnection implements C2NodeIpcConnection {
         this.socket.resume();
       });
     }
-    return this.take(requested);
+    const bytes = this.take(requested);
+    this.schedulePeerEnd();
+    return bytes;
   }
 
   close(): void {
@@ -810,13 +830,49 @@ class NodeIpcConnection implements C2NodeIpcConnection {
       return;
     }
     this.closed = true;
+    if (this.gcTimer !== undefined) clearTimeout(this.gcTimer);
+    this.gcTimer = undefined;
     this.fail(new C2NodeIpcConnectionError("C-Two Node IPC connection closed."));
     // Native remote reads retain a duplicate OS reference. SHUT_WR on this
     // socket would expose EOF to the peer before the last such read ends.
     if (this.memory === undefined) this.socket.end();
     this.socket.destroy();
+    if (this.peerReadEnded) this.reportPeerEnd();
     this.memory?.deactivate();
     this.memory?.close();
+  }
+
+  private markPeerEnd(): void {
+    this.peerReadEnded = true;
+    this.schedulePeerEnd();
+  }
+
+  private scheduleGc(): void {
+    if (this.closed || this.memory === undefined) return;
+    const delayMillis = this.memory.gc();
+    this.gcTimer = setTimeout(() => {
+      this.gcTimer = undefined;
+      if (!this.closed) this.scheduleGc();
+    }, delayMillis);
+    this.gcTimer.unref();
+  }
+
+  private schedulePeerEnd(): void {
+    if (!this.peerReadEnded || this.peerEndReported || this.peerEndScheduled || this.bufferedBytes !== 0) return;
+    this.peerEndScheduled = true;
+    // The consumer parses the final buffered frame and delivers its release
+    // record in microtasks following readExactly(). Settle remaining loans only
+    // after that parser has run.
+    setImmediate(() => {
+      this.peerEndScheduled = false;
+      if (this.bufferedBytes === 0) this.reportPeerEnd();
+    });
+  }
+
+  private reportPeerEnd(): void {
+    if (!this.peerReadEnded || this.peerEndReported) return;
+    this.peerEndReported = true;
+    this.memory?.peerEnd();
   }
 
   private take(byteLength: number): Uint8Array {

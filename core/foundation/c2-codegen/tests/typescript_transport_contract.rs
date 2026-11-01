@@ -997,7 +997,7 @@ test('NACK decoding still rejects malformed error fields', async () => {
   }
 });
 
-test('corrupt control replies discard the stream without business dispatch', async () => {
+test('invalid complete control replies fail lookup and preserve the stream', async () => {
   for (const corrupt of [
     (id) => frame(id + 1n, 18, Buffer.from([0x11, 123, 125])),
     (id) => frame(id, 2, Buffer.from([0x11, 123, 125])),
@@ -1009,9 +1009,9 @@ test('corrupt control replies discard the stream without business dispatch', asy
     s.corrupt = corrupt;
     await assert.rejects(() => call(t));
     assert.equal(s.calls.length, 0);
-    assert.equal(s.connections[0].closed, 1);
+    assert.equal(s.connections[0].closed, 0);
     await call(t);
-    assert.equal(s.connections.length, 2);
+    assert.equal(s.connections.length, 1);
     await t.close();
   }
 });
@@ -1145,36 +1145,37 @@ const refusal = (id) => frame(id, 2 | 256, Buffer.concat([Buffer.from([1]), u32(
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
 
 for (const failure of ['refusal', 'refusal-with-successful-write', 'wrong-id', 'bad-flags', 'read-loss']) {
-  test(`chunked ${failure} ends the currently blocked write and joins before the next call`, async () => {
+  test(`chunked ${failure} settles its write before the next call`, async () => {
     const s = server(), t = transport(s, {requestChunkSize: 2});
-    s.completeWriteOnClose = failure === 'refusal-with-successful-write';
+    let sentFailure = false;
     s.onCall = ({id, feed, block}) => {
-      const pending = block();
+      if (sentFailure) return;
+      sentFailure = true;
       if (failure === 'read-loss') {
         s.readFailure = new Error('independent read failure');
         feed(Buffer.alloc(0));
+        return block();
       } else {
         feed(failure.startsWith('refusal') ? refusal(id) : failure === 'wrong-id'
           ? refusal(id + 1n) : frame(id, 0, Buffer.from([0])));
       }
-      return pending;
+      return failure === 'refusal-with-successful-write' ? nextTurn() : undefined;
     };
     const result = t.call('manager', CONTRACT, 'ping', new Uint8Array(8)).catch((error) => error);
     try {
-      await nextTurn();
-      assert.equal(s.connections[0].closed, 1, 'terminal receive must interrupt this write');
       const error = await result;
+      assert.equal(s.connections[0].closed, failure === 'read-loss' ? 1 : 0);
       if (failure.startsWith('refusal')) {
         assert.equal(error.name, 'C2CrmMethodError');
         assert.deepEqual(Buffer.from(error.payload), refusalPayload);
       } else {
         assert.match(error.message, failure === 'wrong-id' ? /did not match/ : failure === 'bad-flags' ? /v2 reply/ : /independent read failure/);
       }
-      assert.equal(s.calls.length, 1, 'unsent chunks must not be sent or replayed');
-      assert.equal(s.writesAfterClose, 0, 'a successful write callback must not resume a closed exchange');
+      assert.equal(s.calls.length, failure === 'read-loss' ? 1 : 4, 'completed frames are not replayed');
+      assert.equal(s.writesAfterClose, 0);
       s.onCall = undefined;
       await call(t); await call(t);
-      assert.equal(s.connections.length, 2, 'only the failed connection is replaced');
+      assert.equal(s.connections.length, failure === 'read-loss' ? 2 : 1);
       assert.equal(s.lookups.at(-1).observed_route_uid, 'manager-uid');
     } finally {
       await t.close();
@@ -1183,7 +1184,7 @@ for (const failure of ['refusal', 'refusal-with-successful-write', 'wrong-id', '
   });
 }
 
-test('a refusal after the last chunk discards duplicate replies before the next call', async () => {
+test('a refusal after the last chunk skips duplicate older replies on the same stream', async () => {
   const s = server(), t = transport(s, {requestChunkSize: 2});
   s.onCall = ({id, flags, feed}) => {
     if (flags & 1024) feed(Buffer.concat([refusal(id), refusal(id)]));
@@ -1194,11 +1195,11 @@ test('a refusal after the last chunk discards duplicate replies before the next 
       assert.deepEqual(Buffer.from(error.payload), refusalPayload);
       return true;
     });
-    assert.equal(s.connections[0].closed, 1);
+    assert.equal(s.connections[0].closed, 0);
     assert.equal(s.calls.length, 4);
     s.onCall = undefined;
     await call(t); await call(t);
-    assert.equal(s.connections.length, 2);
+    assert.equal(s.connections.length, 1);
   } finally { await t.close(); }
 });
 
@@ -1218,6 +1219,7 @@ function memory(s, events = []) {
       return kind === 2 && prefix.length === 0 ? undefined : { prefix, start() {}, complete() {} };
     },
     receiveRelease(bytes) { events.push(['release', Buffer.from(bytes).readBigUInt64LE(18)]); },
+    gc() { return 1000; },
     deactivate() {}, tryClose() { return true; },
   };
 }
@@ -1261,12 +1263,19 @@ test('response copy sends release before the next call and keeps provider memory
   await t.close();
 });
 
-test('SHM replies without the response ACK never reach memory or the allocator', async () => {
+test('SHM replies without the response ACK settle the loan and keep the stream', async () => {
   const s = server(), events = []; s.memory = memory(s, events); s.shmReply = true; s.responseData = Buffer.from([42]);
-  const t = transport(s, {responsePayloadAllocator() { assert.fail('unacknowledged response allocated'); }});
+  const t = transport(s, {responsePayloadAllocator(size) {
+    if (s.shmReply) assert.fail('unacknowledged response allocated');
+    const view = new Uint8Array(size); return {payload: view, view};
+  }});
   await assert.rejects(() => call(t), /without the acknowledged SHM response capability/);
-  assert.equal(events.some(([event]) => event === 'admit'), false);
-  assert.equal(s.connections[0].closed, 1);
+  assert.deepEqual(events.filter(([event]) => ['admit', 'discard'].includes(event)), [['admit', 1n], ['discard', 1n]]);
+  assert.deepEqual(s.responseReleases, [1n]);
+  assert.equal(s.connections[0].closed, 0);
+  s.shmReply = false;
+  assert.deepEqual(Array.from(await call(t)), [42]);
+  assert.equal(s.connections.length, 1);
   await t.close();
 });
 test('provider allocator handles inline and chunked responses on the shared stream', async () => {

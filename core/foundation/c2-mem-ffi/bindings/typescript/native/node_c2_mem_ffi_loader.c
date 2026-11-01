@@ -78,6 +78,7 @@ static void *open_library(const char *path, char *error, size_t error_size) {
 
 typedef C2MemFfiStatus (*memory_context_new_fn)(uintptr_t connection, uintptr_t process, C2MemFfiMemoryContext **out);
 typedef void (*memory_context_free_fn)(C2MemFfiMemoryContext *context);
+typedef C2MemFfiStatus (*memory_context_gc_fn)(const C2MemFfiMemoryContext *context, uint32_t *out_delay_millis);
 typedef C2MemFfiStatus (*memory_context_prefix_len_fn)(const C2MemFfiMemoryContext *context, size_t *out);
 typedef C2MemFfiStatus (*memory_context_prefix_copy_fn)(const C2MemFfiMemoryContext *context, char *dst, size_t len, size_t *out);
 typedef C2MemFfiStatus (*memory_context_finish_handshake_fn)(const C2MemFfiMemoryContext *context, const char *prefix);
@@ -119,6 +120,7 @@ typedef struct C2MemFfiNodeSymbols {
     endpoint_context_connect_windows_fn endpoint_context_connect_windows;
     memory_context_new_fn memory_context_new;
     memory_context_free_fn memory_context_free;
+    memory_context_gc_fn memory_context_gc;
     memory_context_prefix_len_fn memory_context_prefix_len;
     memory_context_prefix_copy_fn memory_context_prefix_copy;
     memory_context_finish_handshake_fn memory_context_finish_handshake;
@@ -454,7 +456,7 @@ static napi_value memory_bytes(napi_env env, size_t len, uint8_t **data) {
     return view;
 }
 enum MemoryOp { M_PREFIX, M_HANDSHAKE, M_PREPARE, M_ADMIT, M_CONSUME, M_DISCARD_RESPONSE,
-    M_BEGIN, M_START, M_COMPLETE, M_RECEIVE, M_DEACTIVATE, M_PEER_END, M_TRY_CLOSE, M_CLOSE, M_DISCARD_REQUEST, M_DISCARD_WRITE };
+    M_GC, M_BEGIN, M_START, M_COMPLETE, M_RECEIVE, M_DEACTIVATE, M_PEER_END, M_TRY_CLOSE, M_CLOSE, M_DISCARD_REQUEST, M_DISCARD_WRITE };
 static napi_value memory_call(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value args[2], receiver;
@@ -506,7 +508,6 @@ static napi_value memory_call(napi_env env, napi_callback_info info) {
     case M_ADMIT: {
         C2MemFfiBlock block; C2MemFfiResponse *response = NULL;
         if (argc != 1 || !read_block(env, args[0], &block)) {
-            s->memory_context_deactivate(ctx);
             return NULL;
         }
         status = s->response_admit(ctx, block, &response);
@@ -579,6 +580,12 @@ static napi_value memory_call(napi_env env, napi_callback_info info) {
         if (argc != 1 || !get_uint8_array(env, args[0], "Expected release frame.", &data, &len)) return NULL;
         status = s->memory_context_receive_release(ctx, data, len); break;
     }
+    case M_GC: {
+        uint32_t delay = 0;
+        status = s->memory_context_gc(ctx, &delay);
+        if (!check_napi(napi_create_uint32(env, delay, &value))) return NULL;
+        break;
+    }
     case M_DEACTIVATE: status = s->memory_context_deactivate(ctx); break;
     case M_PEER_END: status = s->memory_context_peer_end(ctx); break;
     case M_TRY_CLOSE: {
@@ -601,7 +608,7 @@ static napi_value make_memory(napi_env env, C2MemFfiNodeSymbols *symbols, uintpt
     if (object == NULL) return NULL;
 #define METHOD(name, op) { name, NULL, memory_call, NULL, NULL, NULL, napi_default, (void *)(uintptr_t)op }
     napi_property_descriptor methods[] = {
-        METHOD("prefix", M_PREFIX), METHOD("finishHandshake", M_HANDSHAKE), METHOD("prepareRequest", M_PREPARE),
+        METHOD("gc", M_GC), METHOD("prefix", M_PREFIX), METHOD("finishHandshake", M_HANDSHAKE), METHOD("prepareRequest", M_PREPARE),
         METHOD("admitResponse", M_ADMIT), METHOD("consumeResponse", M_CONSUME), METHOD("discardResponse", M_DISCARD_RESPONSE),
         METHOD("beginWrite", M_BEGIN), METHOD("startWrite", M_START), METHOD("completeWrite", M_COMPLETE),
         METHOD("receiveRelease", M_RECEIVE), METHOD("deactivate", M_DEACTIVATE), METHOD("peerEnd", M_PEER_END),
@@ -1355,6 +1362,7 @@ static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
     LOAD_REQUIRED(endpoint_context_connect_windows, "c2_mem_ffi_local_endpoint_context_connect_windows");
     LOAD_REQUIRED(memory_context_new, "c2_mem_ffi_memory_context_new");
     LOAD_REQUIRED(memory_context_free, "c2_mem_ffi_memory_context_free");
+    LOAD_REQUIRED(memory_context_gc, "c2_mem_ffi_memory_context_gc");
     LOAD_REQUIRED(memory_context_prefix_len, "c2_mem_ffi_memory_context_prefix_len");
     LOAD_REQUIRED(memory_context_prefix_copy, "c2_mem_ffi_memory_context_prefix_copy");
     LOAD_REQUIRED(memory_context_finish_handshake, "c2_mem_ffi_memory_context_finish_handshake");

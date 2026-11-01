@@ -1,6 +1,7 @@
 //! ABI 7: one memory context for one verified physical connection. No I/O loop.
 use super::*;
-use c2_mem::{MemPool, PoolConfig};
+use c2_config::{ClientIpcConfig, ConfigResolver, ConfigSources};
+use c2_mem::{MemPool, MemoryBudget, PeerMappingCache, PeerMappingError, PeerRead, PoolConfig};
 use c2_wire::connection::{
     ConnectionCore, ConnectionSide, PreparedLoan, RemoteLoan, WriteBatch, WriteRequest,
 };
@@ -31,7 +32,8 @@ struct ConnectionHandle {
 pub struct C2MemFfiMemoryContext {
     core: ConnectionCore,
     pool: Arc<RwLock<MemPool>>,
-    peer: RwLock<Option<PeerMappings>>,
+    peer: RwLock<Option<PeerMappingCache>>,
+    config: ClientIpcConfig,
     connection: Arc<ConnectionHandle>,
 }
 
@@ -43,13 +45,6 @@ impl Drop for C2MemFfiMemoryContext {
     }
 }
 
-struct PeerMappings {
-    prefix: String,
-    // Each mapping owner is immutable after admission. A new generation may
-    // replace the cache entry, but cannot unmap an outstanding read's backing.
-    slots: std::collections::HashMap<(u16, bool), (u32, Arc<MemPool>)>,
-}
-
 /// Unpublished allocation authority. Coordinates alone cannot cancel a loan.
 pub struct C2MemFfiRequest {
     loan: PreparedLoan,
@@ -57,10 +52,8 @@ pub struct C2MemFfiRequest {
 
 /// Admitted remote read. Consuming or discarding it settles the same node.
 pub struct C2MemFfiResponse {
-    _mapping: Arc<MemPool>,
+    mapping: PeerRead,
     _loan: RemoteLoan,
-    pointer: usize,
-    len: usize,
 }
 
 pub struct C2MemFfiWrite {
@@ -74,6 +67,57 @@ fn context<'a>(
         return Err(C2MemFfiStatus::NullPointer);
     }
     Ok(unsafe { &*value })
+}
+
+fn resolve_memory_policy(
+    sources: ConfigSources,
+) -> Result<(ClientIpcConfig, MemPool), C2MemFfiStatus> {
+    let config =
+        ConfigResolver::resolve_client_ipc(Default::default(), Default::default(), sources)
+            .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+    let budget = MemoryBudget::from_limits(&config.memory_budget_limits());
+    let mut pool = MemPool::new_with_prefix_and_budget(
+        config.primary_pool_config(&config.pool_tuning()),
+        format!("/cc3b{:08x}", std::process::id()),
+        budget,
+    )
+    .map_err(|_| C2MemFfiStatus::PoolError)?;
+    if config.pool_prewarm_segments != 0 {
+        pool.ensure_buddy_segments(config.pool_prewarm_segments as usize)
+            .map_err(|_| C2MemFfiStatus::PoolError)?;
+    }
+    Ok((config, pool))
+}
+
+/// # Safety
+/// Context is live; out_delay_millis is writable. Call throughout the idle
+/// connection period as well as during traffic. The next maintenance delay
+/// uses the same resolved decay/GC settings as the Rust IPC client.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_memory_context_gc(
+    value: *const C2MemFfiMemoryContext,
+    out_delay_millis: *mut u32,
+) -> C2MemFfiStatus {
+    guard_status(|| {
+        if out_delay_millis.is_null() {
+            return Err(C2MemFfiStatus::NullPointer);
+        }
+        let value = context(value)?;
+        value.pool.write().gc_buddy();
+        if let Some(peer) = value.peer.read().as_ref() {
+            peer.gc_idle();
+        }
+        let seconds = value
+            .config
+            .chunk_gc_interval_secs
+            .min(value.config.pool_decay_seconds.max(0.005));
+        // Node's timers accept signed 32-bit milliseconds. A shorter tick
+        // merely checks eligibility; it never changes the configured decay.
+        unsafe {
+            *out_delay_millis = (seconds * 1000.0).ceil().clamp(1.0, i32::MAX as f64) as u32;
+        }
+        Ok(())
+    })
 }
 
 /// # Safety
@@ -123,13 +167,12 @@ pub unsafe extern "C" fn c2_mem_ffi_memory_context_new(
             })
         };
         let connection = connection.map_err(|_| C2MemFfiStatus::IoError)?;
-        let config = c2_config::ClientIpcConfig::default()
-            .primary_pool_config(&c2_config::PoolRoleTuning::default());
-        let pool = MemPool::new(config).map_err(|_| C2MemFfiStatus::PoolError)?;
+        let (config, pool) = resolve_memory_policy(ConfigSources::from_process())?;
         let value = C2MemFfiMemoryContext {
             core: ConnectionCore::new(ConnectionSide::Client, || {}),
             pool: Arc::new(RwLock::new(pool)),
             peer: RwLock::new(None),
+            config,
             connection: Arc::new(connection),
         };
         unsafe {
@@ -184,10 +227,14 @@ pub unsafe extern "C" fn c2_mem_ffi_memory_context_finish_handshake(
             None
         } else {
             let prefix = parse_prefix(prefix)?;
-            Some(PeerMappings {
-                prefix,
-                slots: Default::default(),
-            })
+            let config = PoolConfig {
+                segment_size: 8192,
+                max_segments: c2_config::MAX_IPC_POOL_SEGMENTS as usize,
+                max_dedicated_segments: c2_config::MAX_IPC_POOL_SEGMENTS as usize,
+                buddy_idle_decay_secs: value.config.pool_decay_seconds,
+                ..PoolConfig::default()
+            };
+            Some(PeerMappingCache::new(config, prefix).map_err(|_| C2MemFfiStatus::PoolError)?)
         };
         value
             .core
@@ -281,80 +328,40 @@ pub unsafe extern "C" fn c2_mem_ffi_response_admit(
             *out = ptr::null_mut();
         }
         let value = context(value)?;
-        let result = (|| {
-            if block.reserved != 0
-                || block.is_dedicated > 1
-                || block.generation == 0
-                || block.byte_length == 0
-                || block.loan_id == 0
-                || (block.is_dedicated != 0 && block.offset != 0)
-            {
-                return Err(C2MemFfiStatus::InvalidArgument);
-            }
-            let mut peers = value.peer.write();
-            let peer = peers.as_mut().ok_or(C2MemFfiStatus::InvalidArgument)?;
-            // Admission owns the connection and process pin even if mapping fails.
-            let loan = value
-                .core
-                .admit_remote_loan(block.loan_id, Box::new(value.connection.clone()))
-                .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
-            let key = (block.segment_index, block.is_dedicated != 0);
-            if peer
-                .slots
-                .get(&key)
-                .is_none_or(|(generation, _)| *generation != block.generation)
-            {
-                let config = PoolConfig {
-                    segment_size: 8192,
-                    max_segments: c2_config::MAX_IPC_POOL_SEGMENTS as usize,
-                    ..PoolConfig::default()
-                };
-                let mut pool = MemPool::open_peer(config, peer.prefix.clone())
-                    .map_err(|_| C2MemFfiStatus::PoolError)?;
-                if block.is_dedicated != 0 {
-                    pool.ensure_peer_dedicated(
-                        block.segment_index.into(),
-                        block.generation,
-                        block.byte_length as usize,
-                    )
-                } else {
-                    pool.ensure_peer_segment(block.segment_index.into(), block.generation, 1)
-                }
-                .map_err(|_| C2MemFfiStatus::PoolError)?;
-                peer.slots.insert(key, (block.generation, Arc::new(pool)));
-            }
-            let pool = peer.slots[&key].1.clone();
-            pool.validate_data_at(
-                block.segment_index.into(),
+        // A decodable loan ID can be settled even when the descriptor's
+        // remaining content or our local mapping/copy fails. Zero carries no
+        // releasable loan; do not send it into ConnectionCore's protocol path.
+        if block.loan_id == 0 {
+            return Err(C2MemFfiStatus::InvalidArgument);
+        }
+        let loan = value
+            .core
+            .admit_remote_loan(block.loan_id, Box::new(value.connection.clone()))
+            .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+        if block.reserved != 0 || block.is_dedicated > 1 {
+            return Err(C2MemFfiStatus::InvalidArgument);
+        }
+        let peers = value.peer.read();
+        let peer = peers.as_ref().ok_or(C2MemFfiStatus::InvalidArgument)?;
+        let mapping = peer
+            .admit(
+                block.segment_index,
                 block.generation,
                 block.offset,
                 block.byte_length,
                 block.is_dedicated != 0,
             )
-            .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
-            let pointer = pool
-                .data_ptr_at(
-                    block.segment_index.into(),
-                    block.generation,
-                    block.offset,
-                    block.is_dedicated != 0,
-                )
-                .expect("admitted span");
-            drop(peers);
-            unsafe {
-                *out = Box::into_raw(Box::new(C2MemFfiResponse {
-                    _mapping: pool,
-                    _loan: loan,
-                    pointer: pointer as usize,
-                    len: block.byte_length as usize,
-                }));
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            drop(value.core.deactivate());
+            .map_err(|error| match error {
+                PeerMappingError::Open(_) => C2MemFfiStatus::PoolError,
+                PeerMappingError::InvalidDescriptor(_) => C2MemFfiStatus::InvalidArgument,
+            })?;
+        unsafe {
+            *out = Box::into_raw(Box::new(C2MemFfiResponse {
+                mapping,
+                _loan: loan,
+            }));
         }
-        result
+        Ok(())
     })
 }
 
@@ -379,15 +386,21 @@ pub unsafe extern "C" fn c2_mem_ffi_response_consume(
         unsafe {
             *out = 0;
         }
-        if len < response.len {
+        if len < response.mapping.len() {
             return Err(C2MemFfiStatus::InsufficientBuffer);
         }
         if dst.is_null() {
             return Err(C2MemFfiStatus::NullPointer);
         }
         unsafe {
-            ptr::copy_nonoverlapping(response.pointer as *const u8, dst, response.len);
-            *out = response.len;
+            let destination = std::slice::from_raw_parts_mut(dst, response.mapping.len());
+            // SAFETY: admission pins the OS mapping and the remote loan stays
+            // alive until this response drops, after the copy has finished.
+            response
+                .mapping
+                .copy_into(destination)
+                .map_err(|_| C2MemFfiStatus::PoolError)?;
+            *out = response.mapping.len();
         }
         drop(response);
         Ok(())
@@ -606,6 +619,119 @@ pub unsafe extern "C" fn c2_mem_ffi_memory_context_try_close(
     })
 }
 
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use c2_config::{EnvFilePolicy, EnvMap};
+
+    fn environment(values: &[(&str, &str)]) -> ConfigSources {
+        ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: values
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn node_memory_policy_uses_canonical_defaults_without_mapping() {
+        let (config, pool) = resolve_memory_policy(ConfigSources::empty()).unwrap();
+        assert_eq!(config, ClientIpcConfig::default());
+        assert_eq!(
+            pool.config().segment_size,
+            config.pool_segment_size as usize
+        );
+        assert_eq!(
+            pool.config().buddy_idle_decay_secs,
+            config.pool_decay_seconds
+        );
+        assert_eq!(
+            pool.budget().unwrap().snapshot().shm.limit_bytes,
+            config.shm_backing_budget_bytes
+        );
+        assert_eq!(pool.stats().total_segments, 0);
+    }
+
+    #[test]
+    fn node_memory_policy_projects_environment_decay_switch_and_budgets() {
+        let (config, mut pool) = resolve_memory_policy(environment(&[
+            ("C2_IPC_POOL_ENABLED", "false"),
+            ("C2_IPC_POOL_SEGMENT_SIZE", "16384"),
+            ("C2_IPC_MAX_POOL_SEGMENTS", "2"),
+            ("C2_IPC_POOL_DECAY_SECONDS", "0.025"),
+            ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "0"),
+            ("C2_IPC_FILE_BACKING_BUDGET_BYTES", "8192"),
+            ("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES", "4096"),
+        ]))
+        .unwrap();
+        assert!(!pool.config().buddy_enabled);
+        assert_eq!(pool.config().segment_size, 16384);
+        assert_eq!(pool.config().max_segments, 2);
+        assert_eq!(pool.config().buddy_idle_decay_secs, 0.025);
+        assert_eq!(config.pool_decay_seconds, 0.025);
+        assert_eq!(pool.budget().unwrap().snapshot().file.limit_bytes, 8192);
+        assert_eq!(
+            pool.budget().unwrap().snapshot().reassembly.limit_bytes,
+            4096
+        );
+        assert!(
+            pool.alloc_shm_handle(8192)
+                .unwrap_err()
+                .contains("memory budget cell 'shm'")
+        );
+        assert_eq!(pool.stats().dedicated_segments, 0);
+    }
+
+    #[test]
+    fn node_memory_policy_reads_dotenv_with_process_precedence() {
+        let path = std::env::temp_dir().join(format!(
+            "c2-f1-policy-{}-{}.env",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "C2_IPC_POOL_SEGMENT_SIZE=32768\nC2_IPC_MAX_POOL_SEGMENTS=3\nC2_IPC_POOL_DECAY_SECONDS=2.5\nC2_IPC_SHM_BACKING_BUDGET_BYTES=4096\n").unwrap();
+        let result = resolve_memory_policy(ConfigSources {
+            env_file: EnvFilePolicy::Path(path.clone()),
+            process_env: EnvMap::from([("C2_IPC_POOL_DECAY_SECONDS".into(), "1.25".into())]),
+        });
+        std::fs::remove_file(path).unwrap();
+        let (config, pool) = result.unwrap();
+        assert_eq!(config.pool_decay_seconds, 1.25);
+        assert_eq!(pool.config().segment_size, 32768);
+        assert_eq!(pool.config().max_segments, 3);
+        assert_eq!(pool.budget().unwrap().snapshot().shm.limit_bytes, 4096);
+    }
+
+    #[test]
+    fn node_memory_policy_rejects_invalid_values_before_allocating() {
+        for (key, value) in [
+            ("C2_IPC_POOL_ENABLED", "neither"),
+            ("C2_IPC_POOL_DECAY_SECONDS", "-1"),
+            ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "-1"),
+        ] {
+            assert!(matches!(
+                resolve_memory_policy(environment(&[(key, value)])),
+                Err(C2MemFfiStatus::InvalidArgument)
+            ));
+        }
+    }
+
+    #[test]
+    fn node_memory_policy_honors_prewarm_budget() {
+        assert!(matches!(
+            resolve_memory_policy(environment(&[
+                ("C2_IPC_POOL_PREWARM_SEGMENTS", "1"),
+                ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "0"),
+            ])),
+            Err(C2MemFfiStatus::PoolError)
+        ));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -718,7 +844,16 @@ mod tests {
         context: &Context,
         len: usize,
     ) -> (Arc<RwLock<MemPool>>, c2_mem::MemHandle, C2MemFfiBlock) {
-        let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new(PoolConfig {
+                segment_size: 8192,
+                min_retained_segments: 0,
+                buddy_idle_decay_secs: 0.0,
+                spill_threshold: 1.0,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        ));
         context.handshake(Some(pool.read().prefix()));
         let mut handle = pool.write().alloc_shm_handle(len).unwrap();
         pool.read().handle_slice_mut(&mut handle).fill(42);
@@ -741,6 +876,123 @@ mod tests {
             C2MemFfiStatus::Ok
         );
         owner
+    }
+
+    #[test]
+    fn invalid_descriptor_fields_preserve_connection_and_settle_available_id() {
+        for (generation, len, loan_id) in [(0, 8, 81), (1, 0, 82), (1, 8, 0)] {
+            let context = Context::new();
+            context.handshake(Some("/f1_not_opened"));
+            let mut response = ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    c2_mem_ffi_response_admit(
+                        context.0,
+                        C2MemFfiBlock {
+                            generation,
+                            byte_length: len,
+                            loan_id,
+                            ..Default::default()
+                        },
+                        &mut response,
+                    )
+                },
+                C2MemFfiStatus::InvalidArgument
+            );
+            assert!(response.is_null());
+            assert!(!context.value().core.is_deactivated());
+            let releases = prefix_ids(&context.write(ptr::null_mut(), 2, true));
+            assert_eq!(releases, if loan_id == 0 { vec![] } else { vec![loan_id] });
+            context.write(ptr::null_mut(), 0, true);
+        }
+    }
+
+    #[test]
+    fn ffi_large_dedicated_consume_unmaps_before_release_write() {
+        let context = Context::new();
+        let (pool, handle, block) = response(&context, 1024 * 1024);
+        assert_eq!(block.is_dedicated, 1);
+        let owner = admit(&context, block);
+        assert_eq!(
+            context
+                .value()
+                .peer
+                .read()
+                .as_ref()
+                .unwrap()
+                .mapped_segments(),
+            1
+        );
+        let mut bytes = vec![0; 1024 * 1024];
+        let mut len = 0;
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_response_consume(owner, bytes.as_mut_ptr(), bytes.len(), &mut len)
+            },
+            C2MemFfiStatus::Ok
+        );
+        assert_eq!(len, bytes.len());
+        assert!(bytes.iter().all(|byte| *byte == 42));
+        assert_eq!(
+            context
+                .value()
+                .peer
+                .read()
+                .as_ref()
+                .unwrap()
+                .mapped_segments(),
+            0
+        );
+        assert_eq!(
+            prefix_ids(&context.write(ptr::null_mut(), 2, true)),
+            [block.loan_id]
+        );
+        pool.write().release_handle(handle);
+    }
+
+    #[test]
+    fn ffi_idle_gc_keeps_carrier_then_retires_buddy_after_owner() {
+        let context = Context::new();
+        unsafe {
+            (*context.0).config.pool_decay_seconds = 0.0;
+        }
+        let (pool, handle, block) = response(&context, 4096);
+        let owner = admit(&context, block);
+        let mut delay = 0;
+        assert_eq!(
+            unsafe { c2_mem_ffi_memory_context_gc(context.0, &mut delay) },
+            C2MemFfiStatus::Ok
+        );
+        assert_eq!(delay, 5);
+        assert_eq!(
+            context
+                .value()
+                .peer
+                .read()
+                .as_ref()
+                .unwrap()
+                .mapped_segments(),
+            1
+        );
+        unsafe {
+            c2_mem_ffi_response_discard(owner);
+        }
+        pool.write().release_handle(handle);
+        assert_eq!(pool.write().gc_buddy(), 1);
+        assert_eq!(
+            unsafe { c2_mem_ffi_memory_context_gc(context.0, &mut delay) },
+            C2MemFfiStatus::Ok
+        );
+        assert_eq!(
+            context
+                .value()
+                .peer
+                .read()
+                .as_ref()
+                .unwrap()
+                .mapped_segments(),
+            0
+        );
     }
 
     #[test]
@@ -768,7 +1020,7 @@ mod tests {
         }
     }
     #[test]
-    fn malformed_dedicated_coordinates_deactivate_without_mapping_or_release() {
+    fn malformed_dedicated_coordinates_fail_only_call_and_release() {
         for (dedicated, offset, reserved) in [(1, 1, 0), (2, 0, 0), (1, 0, 1)] {
             let context = Context::new();
             context.handshake(Some("/p8a_unopened"));
@@ -787,7 +1039,7 @@ mod tests {
                 C2MemFfiStatus::InvalidArgument
             );
             assert!(owner.is_null());
-            assert!(context.value().core.is_deactivated());
+            assert!(!context.value().core.is_deactivated());
             assert!(
                 context
                     .value()
@@ -795,14 +1047,14 @@ mod tests {
                     .read()
                     .as_ref()
                     .unwrap()
-                    .slots
-                    .is_empty()
+                    .mapped_segments()
+                    == 0
             );
-            assert!(context.write(ptr::null_mut(), 2, true).is_empty());
+            assert_eq!(prefix_ids(&context.write(ptr::null_mut(), 2, true)), [41]);
         }
     }
     #[test]
-    fn missing_mapping_deactivates_and_queues_release_once() {
+    fn missing_mapping_fails_only_call_and_queues_release_once() {
         let context = Context::new();
         context.handshake(Some(&format!("/p8a_absent_{}", std::process::id())));
         let block = C2MemFfiBlock {
@@ -817,12 +1069,12 @@ mod tests {
             C2MemFfiStatus::PoolError
         );
         assert!(owner.is_null());
-        assert!(context.value().core.is_deactivated());
+        assert!(!context.value().core.is_deactivated());
         assert_eq!(prefix_ids(&context.write(ptr::null_mut(), 2, true)), [41]);
         assert!(context.write(ptr::null_mut(), 2, true).is_empty());
     }
     #[test]
-    fn mapped_out_of_bounds_span_deactivates_without_reading_and_releases_once() {
+    fn mapped_out_of_bounds_span_fails_only_call_and_releases_once() {
         let context = Context::new();
         let (pool, handle, mut block) = response(&context, 8);
         block.offset = u32::MAX;
@@ -839,11 +1091,11 @@ mod tests {
                 .read()
                 .as_ref()
                 .unwrap()
-                .slots
-                .contains_key(&(block.segment_index, false)),
+                .mapped_segments()
+                == 1,
             "the real mapping must succeed before the span fails"
         );
-        assert!(context.value().core.is_deactivated());
+        assert!(!context.value().core.is_deactivated());
         assert_eq!(
             prefix_ids(&context.write(ptr::null_mut(), 2, true)),
             [block.loan_id]
@@ -957,7 +1209,7 @@ mod tests {
             C2MemFfiStatus::PoolError
         );
         assert!(owner.is_null());
-        assert!(context.value().core.is_deactivated());
+        assert!(!context.value().core.is_deactivated());
         assert_eq!(
             prefix_ids(&context.write(ptr::null_mut(), 2, true)),
             vec![block.loan_id]
@@ -1036,28 +1288,11 @@ mod tests {
     }
 
     #[test]
-    fn consuming_copy_boundary_settles_success_failure_and_discard_without_shm() {
-        // Exercise the actual C consume/discard functions with an owned test
-        // backing. Native SHM mapping is covered separately, never substituted.
+    fn consuming_copy_boundary_settles_success_failure_and_discard() {
         for mode in 0..4 {
             let context = Context::new();
-            context.handshake(None);
-            let bytes = Arc::new(vec![11u8; 8]);
-            let pointer = bytes.as_ptr() as usize;
-            let loan = context
-                .value()
-                .core
-                .admit_remote_loan(
-                    0xfffffffffffffff1,
-                    Box::new((bytes, context.value().connection.clone())),
-                )
-                .unwrap();
-            let response = Box::into_raw(Box::new(C2MemFfiResponse {
-                _mapping: Arc::new(MemPool::new(PoolConfig::default()).unwrap()),
-                _loan: loan,
-                pointer,
-                len: 8,
-            }));
+            let (pool, handle, block) = response(&context, 8);
+            let response = admit(&context, block);
             let mut dst = [0; 8];
             let mut read = 99;
             let status = match mode {
@@ -1087,14 +1322,15 @@ mod tests {
                 ][mode]
             );
             if mode == 0 {
-                assert_eq!(dst, [11; 8]);
+                assert_eq!(dst, [42; 8]);
                 assert_eq!(read, 8);
             }
             assert_eq!(
                 prefix_ids(&context.write(ptr::null_mut(), 2, true)),
-                [0xfffffffffffffff1]
+                [block.loan_id]
             );
             assert!(context.write(ptr::null_mut(), 2, true).is_empty());
+            pool.write().release_handle(handle);
         }
     }
 

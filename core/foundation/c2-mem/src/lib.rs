@@ -13,6 +13,7 @@ pub mod budget;
 pub mod config;
 pub mod dedicated;
 pub mod handle;
+pub mod peer;
 pub mod pool;
 mod pressure;
 pub mod retention;
@@ -28,6 +29,7 @@ pub use budget::{
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
 pub use handle::MemHandle;
+pub use peer::{PeerMappingCache, PeerMappingError, PeerRead};
 pub use pool::MemPool;
 pub use retention::{
     RetentionBudget, RetentionError, RetentionPermit, RetentionRejectReason, RetentionSnapshot,

@@ -137,13 +137,18 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_context_connect_windows(
  * The driver alone reads and writes; this API performs no transport I/O. */
 C2MemFfiStatus c2_mem_ffi_memory_context_new(uintptr_t connection, uintptr_t process, C2MemFfiMemoryContext **out);
 void c2_mem_ffi_memory_context_free(C2MemFfiMemoryContext *context);
+/* Sweep idle local/peer buddy mappings throughout the connection, including
+ * idle periods. Returns the next delay in Node-compatible milliseconds. */
+C2MemFfiStatus c2_mem_ffi_memory_context_gc(const C2MemFfiMemoryContext *context, uint32_t *out_delay_millis);
 C2MemFfiStatus c2_mem_ffi_memory_context_prefix_len(const C2MemFfiMemoryContext *context, size_t *out);
 C2MemFfiStatus c2_mem_ffi_memory_context_prefix_copy(const C2MemFfiMemoryContext *context, char *dst, size_t len, size_t *out);
 /* Only after metadata ACK; NULL prefix disables response SHM. */
 C2MemFfiStatus c2_mem_ffi_memory_context_finish_handshake(const C2MemFfiMemoryContext *context, const char *prefix);
 C2MemFfiStatus c2_mem_ffi_request_prepare(const C2MemFfiMemoryContext *context, const uint8_t *data, size_t len, C2MemFfiRequest **out, C2MemFfiBlock *block);
 void c2_mem_ffi_request_discard(C2MemFfiRequest *request);
-/* Admit each received descriptor once. Mapping failure also queues release. */
+/* Admit each received descriptor once. A decodable nonzero loan ID queues
+ * release even on invalid descriptor or mapping failure; these errors do not
+ * deactivate the connection. No release can be sent for a zero/absent ID. */
 C2MemFfiStatus c2_mem_ffi_response_admit(const C2MemFfiMemoryContext *context, C2MemFfiBlock block, C2MemFfiResponse **out);
 /* Consumes response even on NULL/short dst or out. Copy -> end read -> release. */
 C2MemFfiStatus c2_mem_ffi_response_consume(C2MemFfiResponse *response, uint8_t *dst, size_t len, size_t *out);
