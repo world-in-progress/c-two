@@ -1,0 +1,131 @@
+name: IPC Memory Paired Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Baseline source ref
+        type: string
+        default: b861f994e9f7294c0f3d4efc096c14f0d7f5c121
+      candidate_ref:
+        description: Candidate source ref (empty uses dispatch commit)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipc-memory-paired-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  C2_ENV_FILE: ""
+  C2_RELAY_ANCHOR_ADDRESS: ""
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  FASTDB_PAYLOAD_LINK_MODE: system
+  PYTHONUTF8: "1"
+
+jobs:
+  paired:
+    name: paired (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: baseline/c-two
+          ref: ${{ inputs.baseline_ref }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate/c-two
+          ref: ${{ inputs.candidate_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: world-in-progress/fastdb
+          ref: f82fa13adeae2b87a295bf984821c85c44b55a3d
+          path: baseline/fastdb
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: world-in-progress/fastdb
+          ref: f82fa13adeae2b87a295bf984821c85c44b55a3d
+          path: candidate/fastdb
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ runner.os == 'Windows' && runner.arch == 'ARM64' && 'stable-aarch64-pc-windows-msvc' || 'stable' }}
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Prepare official FastDB CoreSDK
+        working-directory: candidate/c-two
+        run: python .github/scripts/prepare_fastdb_sdk.py --output "${{ runner.temp }}/fastdb-core-sdk" --emit-github
+      - name: Build separate baseline and candidate environments
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          for label in ('baseline', 'candidate'):
+              root = workspace / label / 'c-two'
+              env = dict(os.environ, CARGO_TARGET_DIR=str(root / 'core' / 'target'),
+                         FASTDB_PAYLOAD_LINK_MODE='system')
+              subprocess.run(['uv', 'sync', '--python', '3.12', '--reinstall-package', 'c-two'],
+                             cwd=root, env=env, check=True)
+              import shutil
+              shutil.rmtree(root / 'core' / 'target', ignore_errors=True)
+      - name: Run exact paired matrix and anomaly controls
+        shell: python
+        run: |
+          import os, pathlib, subprocess, sys
+          workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          candidate = workspace / 'candidate' / 'c-two'
+          baseline = workspace / 'baseline' / 'c-two'
+          def interpreter(root):
+              return root / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ipc-paired'
+          command = [sys.executable, str(candidate / 'tools' / 'benchmarks' / 'ipc_paired.py'),
+                     '--baseline-root', str(baseline), '--candidate-root', str(candidate),
+                     '--baseline-commit', subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+                         cwd=baseline, text=True).strip(),
+                     '--baseline-ref', os.environ['BASELINE_REF'],
+                     '--candidate-ref', os.environ['CANDIDATE_REF'],
+                     '--baseline-python', str(interpreter(baseline)),
+                     '--candidate-python', str(interpreter(candidate)),
+                     '--output-dir', str(output), '--pairs', '5']
+          subprocess.run(command, cwd=candidate, check=True)
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref || github.sha }}
+      - name: Remove rebuildable build and environment artifacts
+        if: always()
+        shell: python
+        run: |
+          import os, pathlib, shutil
+          workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          for label in ('baseline', 'candidate'):
+              root = workspace / label / 'c-two'
+              for path in (root / 'core' / 'target', root / '.venv'):
+                  shutil.rmtree(path, ignore_errors=True)
+      - name: Retain all paired raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipc-memory-paired-${{ matrix.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/ipc-paired/
+          if-no-files-found: warn
+          retention-days: 30
