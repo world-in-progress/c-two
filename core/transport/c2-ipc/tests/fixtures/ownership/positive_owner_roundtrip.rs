@@ -1,7 +1,7 @@
 //! Legal owner round-trip: must compile before and after the R02 migration.
 #![forbid(unsafe_code)]
 
-use c2_mem::{MemPool, PoolConfig};
+use c2_mem::{MemPool, PeerMappingCache, PoolConfig};
 
 fn main() {
     let mut pool = MemPool::new(PoolConfig::default()).unwrap();
@@ -14,6 +14,20 @@ fn main() {
     first[0] = 0xCD;
     second[0] = first[0];
     assert_eq!(pool.handle_slice(&other)[0], 0xCD);
+    let raw = handle.shm_allocation().expect("SHM owner");
+    let cache = PeerMappingCache::new(PoolConfig::default(), pool.prefix().into()).unwrap();
+    let read = cache
+        .admit(
+            raw.seg_idx as u16,
+            raw.generation,
+            raw.offset,
+            handle.len() as u32,
+            raw.is_dedicated,
+        )
+        .unwrap();
+    assert_eq!(read.len(), handle.len());
+    assert!(!read.is_empty());
+    drop(read);
     let _ = pool.release_handle(other);
     let _ = pool.release_handle(handle);
     assert_eq!(pool.stats().alloc_count, 0);

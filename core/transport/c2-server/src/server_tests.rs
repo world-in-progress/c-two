@@ -3839,25 +3839,18 @@ async fn raw_response_loan_settlement(release_frame: bool, shutdown_before_relea
     let (control, _) = decode_reply_control(&payload, consumed).unwrap();
     assert!(matches!(control, ReplyControl::Success));
 
-    let mut peer = MemPool::open_peer(PoolConfig::default(), ack.prefix).unwrap();
-    let end = descriptor.offset as usize + descriptor.data_size as usize;
-    if descriptor.is_dedicated {
-        peer.ensure_peer_dedicated(descriptor.seg_idx as u32, descriptor.generation, end)
-            .unwrap();
-    } else {
-        peer.ensure_peer_segment(descriptor.seg_idx as u32, descriptor.generation, end)
-            .unwrap();
-    }
-    let copied = unsafe {
-        peer.copy_data_at(
-            descriptor.seg_idx as u32,
+    let peer = c2_mem::PeerMappingCache::new(PoolConfig::default(), ack.prefix).unwrap();
+    let read = peer
+        .admit(
+            descriptor.seg_idx,
             descriptor.generation,
             descriptor.offset,
             descriptor.data_size,
             descriptor.is_dedicated,
         )
-        .unwrap()
-    };
+        .unwrap();
+    let copied = unsafe { read.copy() }.unwrap();
+    drop(read);
     assert_eq!(copied, expected);
     assert_eq!(server.response_pool.read().stats().alloc_count, 1);
 

@@ -1,14 +1,13 @@
-//! R02 unique-write-ownership compile gate: each fixture under
+//! Unique-write-ownership compile gate: each fixture under
 //! `tests/fixtures/ownership/` becomes the source of one external consumer
 //! crate (real `c2-mem`/`c2-ipc`/`c2-server`) and is compiled, never
 //! executed. `Compiles` is the legal owner round-trip and proves the
 //! consumer's dependencies resolve, so a rejection can never hide behind a
 //! missing crate or unresolved import. `Fails(&codes)` requires rejection
-//! with only the listed rustc error codes: the controls are rejected by
-//! today's borrow/move rules, while each `vuln_*` names the codes the
-//! approved R02 migration is expected to produce; on the unmodified
-//! baseline the `vuln_*` fixtures still compile, so the test stays red
-//! until the migration lands.
+//! with only the listed rustc error codes. Controls exercise borrow/move
+//! rules; `vuln_*` fixtures exercise privacy, ownership and unsafe
+//! boundaries. Peer reads expose neither their mapping nor owner writes,
+//! and copying requires the caller's explicit unsafe read contract.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,9 +35,10 @@ const CASES: &[(&str, Probe)] = &[
         "vuln_same_pool_duplicate_handle_read_write",
         Probe::Fails(&["E0616", "E0451"]),
     ),
+    ("vuln_peer_read_raw_mapping", Probe::Fails(&["E0616"])),
     (
-        "vuln_second_mapping_double_write",
-        Probe::Fails(&["E0616", "E0451"]),
+        "vuln_peer_read_write_during_borrow",
+        Probe::Fails(&["E0308"]),
     ),
     (
         "vuln_shared_allocator_free_during_borrow",
@@ -49,7 +49,7 @@ const CASES: &[(&str, Probe)] = &[
         Probe::Fails(&["E0133"]),
     ),
     (
-        "vuln_raw_coordinate_copy_during_borrow",
+        "vuln_peer_read_copy_during_borrow",
         Probe::Fails(&["E0133"]),
     ),
     (
@@ -72,7 +72,6 @@ const CASES: &[(&str, Probe)] = &[
         "vuln_connection_pool_replacement",
         Probe::Fails(&["E0599", "E0624"]),
     ),
-    ("vuln_dedicated_mapping_adoption", Probe::Fails(&["E0133"])),
     (
         "vuln_server_response_pool_replacement",
         Probe::Fails(&["E0133"]),
@@ -187,8 +186,7 @@ fn r02_unique_write_ownership_boundary_gate() {
     assert!(
         failures.is_empty(),
         "R02 ownership gate failures: {failures:?}\n\
-         On the unmodified baseline the vuln_* probes still compile, which is the\n\
-         recorded red baseline; the controls must already fail with their listed\n\
-         rustc error codes, and the positive round-trip must always compile."
+         Rejections must use only the listed rustc error codes; the positive\n\
+         owner round-trip and peer admission must always compile."
     );
 }

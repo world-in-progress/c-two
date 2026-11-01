@@ -625,38 +625,6 @@ mod tests {
     }
 
     #[test]
-    fn peer_with_same_incarnation_cannot_replace_owner_authority() {
-        let pool = make_pool("peer");
-        let budget = pool.read().budget().unwrap().clone();
-        let mut backing = ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
-        backing.write_at(0, &[0x11; 512]).unwrap();
-        let prefix = pool.read().prefix().to_owned();
-        let mut peer = MemPool::open_peer(PoolConfig::default(), prefix.clone()).unwrap();
-        let (seg, generation, _) = coordinates(&backing.live_state().unwrap().handle);
-        peer.ensure_peer_segment(u32::from(seg), generation, 512)
-            .unwrap();
-        // The peer has the same mapped bytes and valid coordinates, but it
-        // cannot take the owner carrier's release authority.
-        assert!(
-            peer.validate_handle(&backing.live_state().unwrap().handle)
-                .is_err()
-        );
-        let owner = std::mem::replace(&mut *pool.write(), peer);
-        assert_eq!(pool.read().prefix(), prefix);
-        assert!(backing.copy_bytes().is_err());
-        assert!(backing.with_slice(|_| panic!("unexpected access")).is_err());
-        assert!(backing.write_at(0, &[0x33]).is_err());
-        assert!(!backing.is_released());
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
-        assert_eq!(owner.stats().alloc_count, 1);
-        *pool.write() = owner;
-        assert_eq!(backing.copy_bytes().unwrap(), vec![0x11; 512]);
-        backing.release();
-        assert_eq!(pool.read().stats().alloc_count, 0);
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
-    }
-
-    #[test]
     fn self_owned_file_survives_pool_replacement_and_releases_its_charge() {
         // Pure file path: no SHM seam is attempted, including under sandboxing.
         let budget = c2_mem::MemoryBudget::new(0, 4096, 4096);

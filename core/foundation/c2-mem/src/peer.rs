@@ -398,12 +398,26 @@ mod tests {
             let mut owner = MemPool::new(config()).unwrap();
             let cache = PeerMappingCache::new(config(), owner.prefix().into()).unwrap();
             let (old_handle, old) = payload(&mut owner, len, 21);
+            let prefix = owner.prefix().to_owned();
+            let old_name = if old.is_dedicated {
+                owner.dedicated_name(old.seg_idx).unwrap()
+            } else {
+                owner.segment_name(old.seg_idx as usize).unwrap()
+            }
+            .to_owned();
             let old_read = admit(&cache, old, len as u32);
             owner.release_handle(old_handle);
             owner.gc_buddy();
             let (new_handle, new) = payload(&mut owner, len, 42);
             assert_eq!(old.seg_idx, new.seg_idx);
             assert!(new.generation > old.generation);
+            assert_eq!(owner.prefix(), prefix);
+            let new_name = if new.is_dedicated {
+                owner.dedicated_name(new.seg_idx).unwrap()
+            } else {
+                owner.segment_name(new.seg_idx as usize).unwrap()
+            };
+            assert_ne!(new_name, old_name);
             let new_read = admit(&cache, new, len as u32);
             assert_eq!(unsafe { old_read.copy() }.unwrap(), vec![21; len]);
             drop(old_read);
@@ -446,6 +460,58 @@ mod tests {
         ));
         assert_eq!(cache.mapped_segments(), 0);
         owner.release_handle(handle);
+    }
+
+    #[test]
+    fn admission_rejects_invalid_identity_and_spans() {
+        let mut owner = MemPool::new(config()).unwrap();
+        let cache = PeerMappingCache::new(config(), owner.prefix().into()).unwrap();
+        for len in [4096, 16384] {
+            let (handle, allocation) = payload(&mut owner, len, 7);
+            let slot = allocation.seg_idx as u16;
+            let generation = allocation.generation;
+            let dedicated = allocation.is_dedicated;
+            let read = admit(&cache, allocation, len as u32);
+            let span = read.mapping.size() as u32;
+            let mut invalid = vec![
+                (slot, 0, 0, 1, dedicated),
+                (2, generation, 0, 1, dedicated),
+                (slot, generation, 0, 0, dedicated),
+                (slot, generation, 0, u32::MAX, dedicated),
+            ];
+            if dedicated {
+                invalid.push((slot, generation, 1, 1, true));
+            } else {
+                invalid.push((slot, generation, span - 1, 2, false));
+            }
+            for (slot, generation, offset, len, dedicated) in invalid {
+                assert!(matches!(
+                    cache.admit(slot, generation, offset, len, dedicated),
+                    Err(PeerMappingError::InvalidDescriptor(_))
+                ));
+            }
+            assert_eq!(unsafe { read.copy() }.unwrap(), vec![7; len]);
+            drop(read);
+            owner.release_handle(handle);
+        }
+    }
+
+    #[test]
+    fn opening_lower_slot_keeps_higher_peer_mapping() {
+        let mut owner = MemPool::new(config()).unwrap();
+        let cache = PeerMappingCache::new(config(), owner.prefix().into()).unwrap();
+        let (low_handle, low) = payload(&mut owner, 8192, 0x12);
+        let (high_handle, high) = payload(&mut owner, 8192, 0x56);
+        assert!(low.seg_idx < high.seg_idx);
+        let high_read = admit(&cache, high, 8192);
+        let low_read = admit(&cache, low, 8192);
+        assert_eq!(unsafe { high_read.copy() }.unwrap(), vec![0x56; 8192]);
+        assert_eq!(unsafe { low_read.copy() }.unwrap(), vec![0x12; 8192]);
+        assert_eq!(cache.mapped_segments(), 2);
+        assert_eq!(owner.stats().alloc_count, 2);
+        drop((high_read, low_read));
+        owner.release_handle(high_handle);
+        owner.release_handle(low_handle);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use c2_mem::{MemHandle, MemPool, PoolAllocation, PoolConfig};
+use c2_mem::{MemHandle, MemPool, PeerMappingCache, PeerMappingError, PoolAllocation, PoolConfig};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -79,115 +79,31 @@ fn moved_loan_retains_its_original_pool_until_local_release() {
 }
 
 #[test]
-fn buddy_slot_reuse_preserves_old_peer_mapping_and_pool_prefix() {
-    let mut owner = owner(config());
-    let original_prefix = owner.prefix().to_owned();
-    let mut old = owner.alloc_shm_handle(SEGMENT_SIZE).unwrap();
-    owner.handle_slice_mut(&mut old).fill(0x3a);
-    let first = allocation(&old);
-    assert_eq!(first.seg_idx, 0);
-    assert_ne!(first.generation, 0);
-    let first_name = owner.segment_name(0).unwrap().to_owned();
-
-    let mut old_peer = MemPool::open_peer(config(), original_prefix.clone()).unwrap();
-    old_peer
-        .ensure_peer_segment(first.seg_idx, first.generation, SEGMENT_SIZE)
-        .unwrap();
-    owner.release_handle(old);
-    assert_eq!(owner.gc_buddy(), 1);
-
-    let mut fresh = owner.alloc_shm_handle(SEGMENT_SIZE).unwrap();
-    owner.handle_slice_mut(&mut fresh).fill(0x9b);
-    let second = allocation(&fresh);
-    assert_eq!(second.seg_idx, first.seg_idx);
-    assert!(second.generation > first.generation);
-    assert_eq!(owner.prefix(), original_prefix);
-    assert_ne!(owner.segment_name(0).unwrap(), first_name);
-    assert_eq!(
-        unsafe { old_peer.copy_data_at(first.seg_idx, first.generation, 0, 1, false) }.unwrap(),
-        [0x3a]
-    );
-    let mut new_peer = MemPool::open_peer(config(), original_prefix).unwrap();
-    new_peer
-        .ensure_peer_segment(second.seg_idx, second.generation, SEGMENT_SIZE)
-        .unwrap();
-    assert!(
-        new_peer
-            .ensure_peer_segment(first.seg_idx, first.generation, SEGMENT_SIZE)
-            .is_err()
-    );
-    assert!(
-        old_peer
-            .validate_data_at(first.seg_idx, second.generation, 0, 1, false)
-            .is_err()
-    );
-    assert_eq!(
-        unsafe { new_peer.copy_data_at(second.seg_idx, second.generation, 0, 1, false) }.unwrap(),
-        [0x9b]
-    );
-    owner.release_handle(fresh);
-}
-
-#[test]
-fn dedicated_slot_reuse_preserves_retained_old_peer_view() {
+fn dedicated_reads_use_actual_os_span() {
     let mut owner_config = config();
     owner_config.max_segments = 0;
-    let mut owner = owner(owner_config.clone());
-    let original_prefix = owner.prefix().to_owned();
-    let mut old = owner.alloc_shm_handle(5000).unwrap();
-    owner.handle_slice_mut(&mut old)[0] = 0x31;
-    let first = allocation(&old);
-    assert!(first.is_dedicated);
-    assert_eq!(first.seg_idx, 0);
-    assert_ne!(first.generation, 0);
-    let first_name = owner.dedicated_name(0).unwrap().to_owned();
+    let mut owner = owner(owner_config);
+    let mut handle = owner.alloc_shm_handle(5000).unwrap();
+    owner.handle_slice_mut(&mut handle).fill(0x31);
+    let allocation = allocation(&handle);
+    assert!(allocation.is_dedicated);
 
-    let mut peer_config = owner_config.clone();
+    let mut peer_config = config();
     peer_config.segment_size = 8 * 1024;
-    let mut old_peer = MemPool::open_peer(peer_config.clone(), original_prefix.clone()).unwrap();
-    old_peer
-        .ensure_peer_dedicated(first.seg_idx, first.generation, 5000)
-        .unwrap();
+    let peer = PeerMappingCache::new(peer_config, owner.prefix().to_owned()).unwrap();
     let span = c2_mem::DedicatedSegment::required_shm_size(5000).unwrap() as u32;
-    assert_eq!(first.actual_size, span);
-    assert!(
-        old_peer
-            .validate_data_at(first.seg_idx, first.generation, 0, span, true)
-            .is_ok()
-    );
-    assert!(
-        old_peer
-            .validate_data_at(first.seg_idx, first.generation, 0, span + 1, true)
-            .is_err()
-    );
-    owner.release_handle(old);
-
-    let mut fresh = owner.alloc_shm_handle(5000).unwrap();
-    owner.handle_slice_mut(&mut fresh)[0] = 0xa4;
-    let second = allocation(&fresh);
-    assert_eq!(second.seg_idx, first.seg_idx);
-    assert!(second.generation > first.generation);
-    assert_eq!(owner.prefix(), original_prefix);
-    assert_ne!(owner.dedicated_name(0).unwrap(), first_name);
-    assert_eq!(
-        unsafe { old_peer.copy_data_at(first.seg_idx, first.generation, 0, 1, true) }.unwrap(),
-        [0x31]
-    );
-
-    let mut new_peer = MemPool::open_peer(peer_config, original_prefix).unwrap();
-    new_peer
-        .ensure_peer_dedicated(second.seg_idx, second.generation, 5000)
-        .unwrap();
-    assert_eq!(
-        unsafe { new_peer.copy_data_at(second.seg_idx, second.generation, 0, 1, true) }.unwrap(),
-        [0xa4]
-    );
-    assert!(
-        new_peer
-            .validate_data_at(first.seg_idx, first.generation, 0, 1, true)
-            .is_err()
-    );
-    owner.release_handle(fresh);
+    assert_eq!(allocation.actual_size, span);
+    let full = peer.admit(0, allocation.generation, 0, span, true).unwrap();
+    assert_eq!(full.len(), span as usize);
+    assert!(matches!(
+        peer.admit(0, allocation.generation, 0, span + 1, true),
+        Err(PeerMappingError::InvalidDescriptor(_))
+    ));
+    drop(full);
+    let read = peer.admit(0, allocation.generation, 0, 5000, true).unwrap();
+    assert_eq!(unsafe { read.copy() }.unwrap(), vec![0x31; 5000]);
+    drop(read);
+    owner.release_handle(handle);
 }
 
 #[test]
@@ -198,55 +114,29 @@ fn peer_reads_use_actual_os_span_and_reject_wrong_identity_or_kind() {
     let mut buddy = owner.alloc_shm_handle(64 * 1024).unwrap();
     owner.handle_slice_mut(&mut buddy)[64 * 1024 - 1] = 0x5e;
     let identity = allocation(&buddy);
+    let slot = identity.seg_idx as u16;
 
     let mut peer_config = config();
     peer_config.segment_size = 8 * 1024;
-    let mut peer = MemPool::open_peer(peer_config, owner.prefix().to_owned()).unwrap();
-    peer.ensure_peer_segment(identity.seg_idx, identity.generation, 64 * 1024)
+    let peer = PeerMappingCache::new(peer_config, owner.prefix().to_owned()).unwrap();
+    let read = peer
+        .admit(slot, identity.generation, 64 * 1024 - 1, 1, false)
         .unwrap();
-    assert_eq!(peer.segment(0).unwrap().size(), 64 * 1024);
-    assert_eq!(
-        unsafe {
-            peer.copy_data_at(
-                identity.seg_idx,
-                identity.generation,
-                64 * 1024 - 1,
-                1,
-                false,
-            )
-        }
-        .unwrap(),
-        [0x5e]
-    );
-    assert!(
-        peer.validate_data_at(identity.seg_idx, identity.generation, 64 * 1024, 1, false)
-            .is_err()
-    );
-    assert!(
-        peer.validate_data_at(identity.seg_idx, identity.generation + 1, 0, 1, false)
-            .is_err()
-    );
-    assert!(
-        peer.validate_data_at(identity.seg_idx, identity.generation, 0, 1, true)
-            .is_err()
-    );
-    assert!(
-        peer.ensure_peer_dedicated(identity.seg_idx, identity.generation, 1)
-            .is_err()
-    );
-    assert!(
-        unsafe {
-            peer.free_at(
-                identity.seg_idx,
-                identity.generation,
-                identity.offset,
-                identity.level,
-                false,
-            )
-        }
-        .is_err()
-    );
+    assert_eq!(unsafe { read.copy() }.unwrap(), [0x5e]);
+    assert!(matches!(
+        peer.admit(slot, identity.generation, 64 * 1024, 1, false),
+        Err(PeerMappingError::InvalidDescriptor(_))
+    ));
+    assert!(matches!(
+        peer.admit(slot, identity.generation + 1, 0, 1, false),
+        Err(PeerMappingError::Open(_))
+    ));
+    assert!(matches!(
+        peer.admit(slot, identity.generation, 0, 1, true),
+        Err(PeerMappingError::Open(_))
+    ));
     assert_eq!(owner.stats().alloc_count, 1);
+    drop(read);
     owner.release_handle(buddy);
 }
 

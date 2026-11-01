@@ -63,7 +63,7 @@ pub struct MemPool {
     config: PoolConfig,
     /// Buddy-managed segments.
     segments: Vec<Option<BuddySegment>>,
-    /// Never truncated when an owner slot is reclaimed or a peer view closes.
+    /// Never truncated when an owner slot is reclaimed.
     generations: Vec<u32>,
     is_peer: bool,
     /// Dedicated segments for oversized allocations. Key is segment index.
@@ -133,10 +133,10 @@ impl MemPool {
         Self::with_identity(config, name_prefix, false, Some(budget))
     }
 
-    /// Receive-side cache for one producer's advertised pool incarnation.
+    /// Validate one producer's advertised pool identity without owning storage.
     ///
-    /// Peer pools open existing peer backings and never charge the
-    /// owner-creation budget; they carry no budget context.
+    /// This pool cannot allocate or open backings and carries no budget.
+    /// Use [`crate::PeerMappingCache`] to admit reads from peer backings.
     pub fn open_peer(config: PoolConfig, name_prefix: String) -> Result<Self, String> {
         Self::with_identity(config, name_prefix, true, None)
     }
@@ -349,35 +349,24 @@ impl MemPool {
         }
     }
 
-    /// Observe this pool's mapped backing. Peer views expose capacities,
-    /// not the owner's local allocation counters.
+    /// Observe this pool's locally owned backing and allocation counters.
     pub fn stats(&self) -> PoolStats {
         let mut buddy_data = 0u64;
         let mut buddy_idle = 0u64;
         let mut alloc_count = 0u32;
         for segment in self.segments.iter().flatten() {
             buddy_data += segment.size() as u64;
-            if !self.is_peer {
-                buddy_idle += segment.allocator().free_bytes();
-                alloc_count += segment.allocator().alloc_count();
-            }
+            buddy_idle += segment.allocator().free_bytes();
+            alloc_count += segment.allocator().alloc_count();
         }
         let dedicated_mapped: u64 = self
             .dedicated
             .values()
             .map(|e| e.segment.size() as u64)
             .sum();
-        let dedicated_active_count = if self.is_peer {
-            0
-        } else {
-            self.dedicated.len()
-        };
+        let dedicated_active_count = self.dedicated.len();
         alloc_count += dedicated_active_count as u32;
-        let buddy_occupied = if self.is_peer {
-            0
-        } else {
-            buddy_data - buddy_idle
-        };
+        let buddy_occupied = buddy_data - buddy_idle;
         PoolStats {
             total_segments: self.segment_count(),
             dedicated_segments: self.dedicated.len(),
@@ -387,7 +376,7 @@ impl MemPool {
             buddy_idle_bytes: buddy_idle,
             dedicated_mapped_bytes: dedicated_mapped,
             dedicated_active_count,
-            dedicated_active_bytes: if self.is_peer { 0 } else { dedicated_mapped },
+            dedicated_active_bytes: dedicated_mapped,
             buddy_reused_allocs: self.counters.buddy_reused_allocs,
             buddy_expanded_allocs: self.counters.buddy_expanded_allocs,
             dedicated_allocs: self.counters.dedicated_allocs,
@@ -403,12 +392,8 @@ impl MemPool {
 
     /// Reclaim trailing idle owner backings down to the retained minimum.
     /// Allocation handles retained by a loan book keep the local count live.
-    /// Slot generations are never truncated or reset. Peer caches have no
-    /// allocator state to inspect and are released by their mapping owner.
+    /// Slot generations are never truncated or reset.
     pub fn gc_buddy(&mut self) -> usize {
-        if self.is_peer {
-            return 0;
-        }
         let delay = if self.config.buddy_idle_decay_secs < 0.0 {
             Duration::ZERO
         } else {
@@ -535,56 +520,6 @@ impl MemPool {
         )
     }
 
-    /// Open exactly the advertised buddy generation, read-only and without
-    /// attaching an allocator. `min_size` bounds the admitted descriptor's end.
-    pub fn ensure_peer_segment(
-        &mut self,
-        seg_idx: u32,
-        generation: u32,
-        min_size: usize,
-    ) -> Result<(), String> {
-        self.check_peer_identity(seg_idx, generation, self.config.max_segments)?;
-        let idx = seg_idx as usize;
-        let known = self.generations.get(idx).copied().unwrap_or(0);
-        if generation < known {
-            return Err("stale shared-memory backing generation".into());
-        }
-        if generation == known
-            && let Some(segment) = self.segment(idx)
-        {
-            return check_span(segment.size(), 0, min_size).map(|_| ());
-        }
-        let name = Self::buddy_segment_name(&self.name_prefix, seg_idx, generation);
-        let segment = BuddySegment::open(&name, min_size)?;
-        if self.generations.len() <= idx {
-            self.generations.resize(idx + 1, 0);
-        }
-        self.generations[idx] = generation;
-        self.install_segment(idx, segment);
-        Ok(())
-    }
-
-    pub fn ensure_peer_dedicated(
-        &mut self,
-        seg_idx: u32,
-        generation: u32,
-        min_size: usize,
-    ) -> Result<(), String> {
-        let name = Self::dedicated_segment_name(&self.name_prefix, seg_idx, generation);
-        // SAFETY: the name was derived from this peer pool's identity.
-        unsafe { self.open_dedicated_at(seg_idx, generation, &name, min_size) }
-    }
-
-    fn check_peer_identity(&self, slot: u32, generation: u32, limit: usize) -> Result<(), String> {
-        if !self.is_peer {
-            return Err("cannot open peer backings in an owner pool".into());
-        }
-        if generation == 0 || slot > u16::MAX as u32 || slot as usize >= limit {
-            return Err("invalid peer backing identity".into());
-        }
-        Ok(())
-    }
-
     fn validate_generation(
         &self,
         seg_idx: u32,
@@ -599,46 +534,6 @@ impl MemPool {
         if seg_idx > u16::MAX as u32 || generation == 0 || current != Some(generation) {
             return Err("stale or unavailable shared-memory backing generation".into());
         }
-        Ok(())
-    }
-
-    /// Raw peer entry retained for the Python boundary until its removal.
-    ///
-    /// # Safety
-    /// `name` must identify this peer pool's exact kind, slot and generation.
-    /// No read may outlive the cached mapping when it is replaced or dropped.
-    pub unsafe fn open_dedicated_at(
-        &mut self,
-        idx: u32,
-        generation: u32,
-        name: &str,
-        min_size: usize,
-    ) -> Result<(), String> {
-        self.check_peer_identity(idx, generation, self.config.max_dedicated_segments)?;
-        let known = self
-            .dedicated_generations
-            .get(idx as usize)
-            .copied()
-            .unwrap_or(0);
-        if generation < known {
-            return Err("stale shared-memory backing generation".into());
-        }
-        if generation == known
-            && let Some(entry) = self.dedicated.get(&idx)
-        {
-            return check_span(entry.segment.size(), 0, min_size).map(|_| ());
-        }
-        let segment = DedicatedSegment::open(name, min_size)?;
-        self.dedicated_generations
-            .resize(self.dedicated_generations.len().max(idx as usize + 1), 0);
-        self.dedicated_generations[idx as usize] = generation;
-        self.dedicated.insert(
-            idx,
-            DedicatedEntry {
-                segment,
-                generation,
-            },
-        );
         Ok(())
     }
 
@@ -666,101 +561,6 @@ impl MemPool {
                 is_dedicated,
             })
         }
-    }
-
-    /// Get a raw pointer to data at a specific (seg_idx, offset) without a PoolAllocation.
-    ///
-    /// Used by the remote side of a connection to read from SHM blocks allocated
-    /// by the peer.
-    pub fn data_ptr_at(
-        &self,
-        seg_idx: u32,
-        generation: u32,
-        offset: u32,
-        is_dedicated: bool,
-    ) -> Result<*mut u8, String> {
-        self.validate_generation(seg_idx, generation, is_dedicated)?;
-        if is_dedicated {
-            let entry = self
-                .dedicated
-                .get(&seg_idx)
-                .ok_or("invalid dedicated segment index")?;
-            Ok(entry.segment.data_ptr())
-        } else {
-            let seg = self
-                .segments
-                .get(seg_idx as usize)
-                .and_then(Option::as_ref)
-                .ok_or("invalid segment index")?;
-            Ok(seg.base_ptr().wrapping_add(offset as usize))
-        }
-    }
-
-    /// Copy bytes from mapped shared-memory coordinates after validating that
-    /// the complete span belongs to the selected segment's data region.
-    /// # Safety
-    /// The span belongs to a live published allocation. No writer or release may race the copy through any mapping.
-    pub unsafe fn copy_data_at(
-        &self,
-        seg_idx: u32,
-        generation: u32,
-        offset: u32,
-        data_size: u32,
-        is_dedicated: bool,
-    ) -> Result<Vec<u8>, String> {
-        let (pointer, len) =
-            self.checked_data_pointer(seg_idx, generation, offset, data_size, is_dedicated)?;
-
-        // SAFETY: `checked_data_pointer` proves that the non-empty span is
-        // entirely inside the mapped data region and no longer than
-        // `isize::MAX`.
-        Ok(unsafe { std::slice::from_raw_parts(pointer, len) }.to_vec())
-    }
-
-    /// Validate shared-memory coordinates without copying their contents.
-    ///
-    /// Raw descriptor admission checks the actual OS view, without allocator geometry.
-    pub fn validate_data_at(
-        &self,
-        seg_idx: u32,
-        generation: u32,
-        offset: u32,
-        data_size: u32,
-        is_dedicated: bool,
-    ) -> Result<(), String> {
-        self.checked_data_pointer(seg_idx, generation, offset, data_size, is_dedicated)
-            .map(|_| ())
-    }
-
-    fn checked_data_pointer(
-        &self,
-        seg_idx: u32,
-        generation: u32,
-        offset: u32,
-        data_size: u32,
-        dedicated: bool,
-    ) -> Result<(*mut u8, usize), String> {
-        self.validate_generation(seg_idx, generation, dedicated)?;
-        let (base, span) = if dedicated {
-            if offset != 0 {
-                return Err("dedicated shared-memory offset must be zero".into());
-            }
-            let segment = &self
-                .dedicated
-                .get(&seg_idx)
-                .expect("validated generation")
-                .segment;
-            (segment.data_ptr(), segment.size())
-        } else {
-            let segment = self
-                .segment(seg_idx as usize)
-                .expect("validated generation");
-            (segment.base_ptr(), segment.size())
-        };
-        let start = offset as usize;
-        let len = data_size as usize;
-        check_span(span, start, len)?;
-        Ok((base.wrapping_add(start), len))
     }
 
     // ── MemHandle API ──────────────────────────────────────────────
@@ -1104,9 +904,6 @@ impl MemPool {
     }
 
     fn create_segment(&mut self) -> Result<(usize, BuddySegment), BackingError> {
-        if self.is_peer {
-            return Err(BackingError::Other("cannot create peer backing".into()));
-        }
         let (idx, generation) = (0..self.config.max_segments)
             .find_map(|idx| {
                 if self.segment(idx).is_some() {
@@ -1350,90 +1147,6 @@ mod tests {
             assert_eq!(*ptr.add(99), 0xAB);
         }
         unsafe { pool.free(&a) }.unwrap();
-    }
-
-    #[test]
-    fn test_copy_data_at_reads_buddy_and_dedicated_allocations() {
-        let mut pool = test_pool(small_config());
-        for payload in [b"buddy".repeat(32), b"dedicated".repeat(20_000)] {
-            let allocation = pool.alloc(payload.len()).unwrap();
-            let ptr = pool.data_ptr(&allocation).unwrap();
-            unsafe {
-                std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, payload.len());
-            }
-
-            assert_eq!(
-                unsafe {
-                    pool.copy_data_at(
-                        allocation.seg_idx,
-                        allocation.generation,
-                        allocation.offset,
-                        u32::try_from(payload.len()).unwrap(),
-                        allocation.is_dedicated,
-                    )
-                }
-                .unwrap(),
-                payload,
-            );
-            unsafe { pool.free(&allocation) }.unwrap();
-        }
-    }
-
-    #[test]
-    fn test_copy_data_at_rejects_spans_outside_mapped_data() {
-        let mut pool = test_pool(small_config());
-        let buddy = pool.alloc(4096).unwrap();
-        let buddy_capacity = pool
-            .segment(buddy.seg_idx as usize)
-            .unwrap()
-            .allocator()
-            .data_size();
-        assert!(
-            unsafe {
-                pool.copy_data_at(
-                    buddy.seg_idx,
-                    buddy.generation,
-                    u32::try_from(buddy_capacity - 1).unwrap(),
-                    2,
-                    false,
-                )
-            }
-            .unwrap_err()
-            .contains("outside mapped segment")
-        );
-        assert!(
-            pool.validate_data_at(
-                buddy.seg_idx,
-                buddy.generation,
-                u32::try_from(buddy_capacity - 1).unwrap(),
-                2,
-                false,
-            )
-            .unwrap_err()
-            .contains("outside mapped segment")
-        );
-        assert!(
-            unsafe { pool.copy_data_at(buddy.seg_idx, buddy.generation, buddy.offset, 0, false) }
-                .unwrap_err()
-                .contains("must not be empty")
-        );
-        unsafe { pool.free(&buddy) }.unwrap();
-
-        let dedicated = pool.alloc(128 * 1024).unwrap();
-        assert!(dedicated.is_dedicated);
-        assert!(
-            unsafe { pool.copy_data_at(dedicated.seg_idx, dedicated.generation, 1, 1, true) }
-                .unwrap_err()
-                .contains("offset must be zero")
-        );
-        assert!(
-            unsafe {
-                pool.copy_data_at(dedicated.seg_idx, dedicated.generation, 0, u32::MAX, true)
-            }
-            .unwrap_err()
-            .contains("outside mapped segment")
-        );
-        unsafe { pool.free(&dedicated) }.unwrap();
     }
 
     #[test]
@@ -1823,34 +1536,6 @@ mod tests {
         second.ensure_buddy_segments(1).unwrap();
         assert_ne!(first.prefix(), second.prefix());
         assert_ne!(first.segment_name(0), second.segment_name(0));
-    }
-
-    #[test]
-    fn opening_lower_slot_keeps_higher_peer_mapping() {
-        let config = test_config();
-        let mut owner = test_pool(config.clone());
-        let low = owner.alloc(config.segment_size).unwrap();
-        let high = owner.alloc(config.segment_size).unwrap();
-        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned()).unwrap();
-        peer.ensure_peer_segment(high.seg_idx, high.generation, 1)
-            .unwrap();
-        let pointer = peer
-            .data_ptr_at(high.seg_idx, high.generation, 0, false)
-            .unwrap();
-        unsafe {
-            *owner.data_ptr(&high).unwrap() = 0x56;
-        }
-        peer.ensure_peer_segment(low.seg_idx, low.generation, 1)
-            .unwrap();
-        assert_eq!(unsafe { *pointer }, 0x56);
-        assert_eq!(peer.stats().total_segments, 2);
-        assert_eq!(peer.stats().alloc_count, 0);
-        assert!(
-            unsafe { peer.free_at(low.seg_idx, low.generation, low.offset, low.level, false) }
-                .is_err()
-        );
-        unsafe { owner.free(&low) }.unwrap();
-        unsafe { owner.free(&high) }.unwrap();
     }
 
     #[test]
