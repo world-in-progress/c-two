@@ -9,9 +9,9 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -382,21 +382,26 @@ pub async fn connect_windows_pipe(
     endpoint: &LocalEndpoint,
     timeout: Duration,
 ) -> io::Result<WindowsPipeConnection> {
-    tokio::time::timeout(timeout, platform::connect_raw(endpoint))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local connection deadline expired"))?
+    connect_windows_pipe_until(endpoint, Some(Instant::now() + timeout)).await
 }
 
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Native pipe connection under the caller's absolute connection deadline.
+/// Omission selects the default phase guard; a supplied deadline replaces it.
+#[cfg(windows)]
+pub async fn connect_windows_pipe_until(
+    endpoint: &LocalEndpoint,
+    deadline: Option<Instant>,
+) -> io::Result<WindowsPipeConnection> {
+    within_connect_deadline(deadline, platform::connect_raw(endpoint)).await
+}
 
 struct AbortState {
     closed: AtomicBool,
     peer_ended: AtomicBool,
     reader: AtomicWaker,
     writer: AtomicWaker,
-    connection: OnceLock<ConnectionPublisher>,
-    end: Mutex<Option<observation::ConnectionEnd>>,
 }
 
 /// Stop pending local I/O without closing a stream retained by a remote reader.
@@ -411,19 +416,12 @@ impl AbortHandle {
             peer_ended: AtomicBool::new(false),
             reader: AtomicWaker::new(),
             writer: AtomicWaker::new(),
-            connection: OnceLock::new(),
-            end: Mutex::new(None),
         }))
     }
 
     /// Wake local I/O waiters with ConnectionAborted. The OS stream closes
     /// only when its I/O owners and all remote read guards have been dropped.
     pub fn abort(&self) {
-        self.record_end(observation::ConnectionEnd::new(
-            ConnectionEndReason::LocalClose,
-            "local_abort",
-            None,
-        ));
         self.0.closed.store(true, Ordering::Release);
         self.0.reader.wake();
         self.0.writer.wake();
@@ -432,50 +430,16 @@ impl AbortHandle {
     pub fn is_aborted(&self) -> bool {
         self.0.closed.load(Ordering::Acquire)
     }
-
-    fn close_io(&self, operation: &'static str, error: &io::Error) {
-        self.record_end(observation::ConnectionEnd::io(operation, error));
-    }
-
-    fn record_end(&self, end: observation::ConnectionEnd) {
-        if end.is_peer_end() {
-            self.0.peer_ended.store(true, Ordering::Release);
-        }
-        self.0
-            .end
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get_or_insert(end);
-    }
 }
 
 struct StreamOwner {
-    // Rust drops fields in declaration order: close the OS stream before
-    // publishing its physical close, even if an observer runs immediately.
     stream: Mutex<platform::Stream>,
     abort: AbortHandle,
-    _retirement: StreamRetirement,
 }
 
 impl Drop for StreamOwner {
     fn drop(&mut self) {
         self.abort.abort();
-    }
-}
-
-struct StreamRetirement(AbortHandle);
-
-impl Drop for StreamRetirement {
-    fn drop(&mut self) {
-        if let Some(connection) = self.0.0.connection.get() {
-            let end = self
-                .0
-                .0
-                .end
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            connection.close_end(end.expect("stream retirement records its end"));
-        }
     }
 }
 
@@ -499,13 +463,25 @@ pub struct LocalStream {
     owner: Arc<StreamOwner>,
 }
 
-async fn connect_native(
-    endpoint: &LocalEndpoint,
-    timeout: Duration,
-) -> io::Result<platform::Stream> {
-    tokio::time::timeout(timeout, platform::connect(endpoint))
+async fn within_connect_deadline<T>(
+    deadline: Option<Instant>,
+    connect: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    let deadline = deadline
+        .map(tokio::time::Instant::from_std)
+        .unwrap_or_else(|| tokio::time::Instant::now() + DEFAULT_CONNECT_TIMEOUT);
+    let expired = || io::Error::new(io::ErrorKind::TimedOut, "local connection deadline expired");
+    if tokio::time::Instant::now() >= deadline {
+        return Err(expired());
+    }
+    let connected = tokio::time::timeout_at(deadline, connect)
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local connection deadline expired"))?
+        .map_err(|_| expired())??;
+    // Native identity and directory validation can complete synchronously.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(expired());
+    }
+    Ok(connected)
 }
 
 /// Connect using the native directory authority, then transfer an owned Unix
@@ -516,7 +492,17 @@ pub async fn connect_unix_stream(
     endpoint: &LocalEndpoint,
     timeout: Duration,
 ) -> io::Result<std::os::unix::net::UnixStream> {
-    connect_native(endpoint, timeout).await?.into_std()
+    connect_unix_stream_until(endpoint, Some(Instant::now() + timeout)).await
+}
+
+#[cfg(unix)]
+pub async fn connect_unix_stream_until(
+    endpoint: &LocalEndpoint,
+    deadline: Option<Instant>,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    within_connect_deadline(deadline, platform::connect(endpoint))
+        .await?
+        .into_std()
 }
 
 impl LocalStream {
@@ -525,14 +511,22 @@ impl LocalStream {
         Self {
             owner: Arc::new(StreamOwner {
                 stream: Mutex::new(inner),
-                _retirement: StreamRetirement(abort.clone()),
                 abort,
             }),
         }
     }
 
     pub async fn connect(endpoint: &LocalEndpoint, timeout: Duration) -> io::Result<Self> {
-        let stream = connect_native(endpoint, timeout).await?;
+        Self::connect_until(endpoint, Some(Instant::now() + timeout)).await
+    }
+
+    /// Establish the stream under one caller-owned deadline on both platforms.
+    /// With no deadline, retain the finite default connection phase guard.
+    pub async fn connect_until(
+        endpoint: &LocalEndpoint,
+        deadline: Option<Instant>,
+    ) -> io::Result<Self> {
+        let stream = within_connect_deadline(deadline, platform::connect(endpoint)).await?;
         Ok(Self::from_inner(stream))
     }
 
@@ -570,19 +564,6 @@ impl LocalStream {
         self.owner.abort.0.peer_ended.load(Ordering::Acquire)
     }
 
-    /// Bind this physical stream to its transport's existing terminal record
-    /// before sharing or splitting it. Abort handles retain only the same
-    /// metadata publisher; observers never gain stream cancellation authority.
-    pub fn with_connection_publisher(self, publisher: ConnectionPublisher) -> Self {
-        self.owner
-            .abort
-            .0
-            .connection
-            .set(publisher)
-            .expect("local stream already has a connection publisher");
-        self
-    }
-
     pub fn into_split(self) -> (LocalReadHalf, LocalWriteHalf) {
         let abort = self.abort_handle();
         let writer = Self {
@@ -598,7 +579,7 @@ impl LocalStream {
     }
 
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.write_all_with_timeout(bytes, DEFAULT_WRITE_TIMEOUT)
+        self.write_all_with_timeout(bytes, c2_config::BaseIpcConfig::default().write_timeout())
             .await
     }
 
@@ -608,7 +589,7 @@ impl LocalStream {
         timeout: Duration,
     ) -> io::Result<()> {
         let abort = self.abort_handle();
-        write_complete(self, abort, bytes, timeout, &mut false).await
+        write_complete(self, abort, bytes, timeout).await
     }
 
     /// A connected pair for local-transport tests, using the real OS backend.
@@ -662,16 +643,12 @@ impl AsyncRead for LocalStream {
         let result = Pin::new(&mut *stream).poll_read(cx, buf);
         match &result {
             Poll::Ready(Ok(())) if had_capacity && buf.filled().len() == before => {
-                this.owner.abort.record_end(observation::ConnectionEnd::new(
-                    ConnectionEndReason::PeerEof,
-                    "read",
-                    None,
-                ));
+                this.owner.abort.0.peer_ended.store(true, Ordering::Release);
             }
             Poll::Ready(Err(error)) => {
-                this.owner
-                    .abort
-                    .record_end(observation::ConnectionEnd::read_error("read", error));
+                if observation::ConnectionEnd::read_error("read", error).is_peer_end() {
+                    this.owner.abort.0.peer_ended.store(true, Ordering::Release);
+                }
             }
             _ => {}
         }
@@ -744,17 +721,8 @@ impl LocalWriteHalf {
         self.abort.clone()
     }
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.write_all_with_timeout(bytes, DEFAULT_WRITE_TIMEOUT)
+        self.write_all_with_timeout(bytes, c2_config::BaseIpcConfig::default().write_timeout())
             .await
-    }
-    /// Record full-frame admission before flush; cancellation keeps this fact visible.
-    pub async fn write_all_with_progress(
-        &mut self,
-        bytes: &[u8],
-        frame_written: &mut bool,
-    ) -> io::Result<()> {
-        let abort = self.abort_handle();
-        write_complete(self, abort, bytes, DEFAULT_WRITE_TIMEOUT, frame_written).await
     }
 
     pub async fn write_all_with_timeout(
@@ -763,7 +731,7 @@ impl LocalWriteHalf {
         timeout: Duration,
     ) -> io::Result<()> {
         let abort = self.abort_handle();
-        write_complete(self, abort, bytes, timeout, &mut false).await
+        write_complete(self, abort, bytes, timeout).await
     }
 }
 impl AsyncWrite for LocalWriteHalf {
@@ -787,20 +755,11 @@ async fn write_complete<W: AsyncWrite + Unpin>(
     abort: AbortHandle,
     bytes: &[u8],
     timeout: Duration,
-    frame_written: &mut bool,
 ) -> io::Result<()> {
-    *frame_written = false;
     let mut guard = AbortOnDrop(Some(abort.clone()));
     let result = tokio::time::timeout(timeout, async {
-        // Record the native failure before local cancellation can win the
-        // final stream owner's end cause.
-        AsyncWriteExt::write_all(writer, bytes)
-            .await
-            .inspect_err(|error| abort.close_io("write", error))?;
-        *frame_written = true;
-        AsyncWriteExt::flush(writer)
-            .await
-            .inspect_err(|error| abort.close_io("flush", error))
+        AsyncWriteExt::write_all(writer, bytes).await?;
+        AsyncWriteExt::flush(writer).await
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local write deadline expired"))?;
@@ -813,7 +772,13 @@ async fn write_complete<W: AsyncWrite + Unpin>(
 pub struct LocalListener(platform::Listener);
 impl LocalListener {
     pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        platform::Listener::bind(endpoint).map(Self)
+        Self::bind_until(endpoint, None)
+    }
+
+    /// Wait for listener ownership within the caller's startup deadline.
+    /// With no deadline, use the existing bounded coordinator wait.
+    pub fn bind_until(endpoint: &LocalEndpoint, deadline: Option<Instant>) -> io::Result<Self> {
+        platform::Listener::bind_until(endpoint, deadline).map(Self)
     }
 
     /// Cancelling accept keeps its pending listener instance available.
@@ -857,104 +822,7 @@ mod credential_tests;
 mod tests;
 
 #[cfg(test)]
-mod write_observation_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn native_write_error_is_retained_until_physical_close_without_a_reader_task() {
-        let (_fixture, stream, peer) = crate::tests::isolated_pair().await;
-        let publisher = ConnectionPublisher::new(ConnectionSide::Client);
-        let observation = publisher.observation();
-        let stream = stream.with_connection_publisher(publisher);
-        let abort = stream.abort_handle();
-        let (reader, mut writer) = stream.into_split();
-        // Closing without shutdown can still admit a small write on macOS.
-        // Make the peer's read direction unavailable before testing a native
-        // write failure; this does not manufacture read-side peer-end proof.
-        {
-            let native = peer.owner.stream.lock().unwrap();
-            #[cfg(unix)]
-            socket2::SockRef::from(&*native)
-                .shutdown(std::net::Shutdown::Read)
-                .unwrap();
-            #[cfg(windows)]
-            assert_ne!(
-                unsafe {
-                    windows_sys::Win32::System::Pipes::DisconnectNamedPipe(platform::raw_handle(
-                        &native,
-                    )
-                        as windows_sys::Win32::Foundation::HANDLE)
-                },
-                0
-            );
-        }
-        drop(peer);
-
-        let error = writer
-            .write_all_with_timeout(b"native send failure", Duration::from_secs(2))
-            .await
-            .expect_err("closed native peer must reject the write or its flush");
-        assert_ne!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(abort.is_aborted());
-        assert!(observation.snapshot().is_none());
-        drop(writer);
-        assert!(observation.snapshot().is_none());
-        drop(reader);
-        let closed = observation
-            .snapshot()
-            .expect("physical close retains the native error");
-        assert!(matches!(
-            closed.reason(),
-            ConnectionEndReason::IoError | ConnectionEndReason::ConnectionReset
-        ));
-        assert!(matches!(closed.operation(), "write" | "flush"));
-        assert_eq!(closed.os_error(), error.raw_os_error());
-        assert!(!closed.is_peer_end());
-        abort.abort();
-        assert_eq!(observation.snapshot(), Some(closed));
-    }
-
-    #[tokio::test]
-    async fn native_stream_drop_publishes_once_before_peer_read() {
-        use tokio::io::AsyncReadExt;
-
-        let source = ConnectionEventSource::new();
-        let events = source.subscribe();
-        let publisher = source.open_connection(ConnectionSide::Server);
-        let observation = publisher.observation();
-        let (_fixture, stream, mut peer) = crate::tests::isolated_pair().await;
-        let stream = stream.with_connection_publisher(publisher);
-        let abort = stream.abort_handle();
-        drop(stream);
-
-        let closed = observation
-            .snapshot()
-            .expect("stream Drop publishes synchronously");
-        assert_eq!(closed.reason(), ConnectionEndReason::LocalClose);
-        abort.abort();
-        assert_eq!(observation.snapshot(), Some(closed));
-        let mut byte = [0];
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
-                .await
-                .unwrap()
-                .unwrap(),
-            0
-        );
-        drop(source);
-        assert!(matches!(
-            events.recv().await.unwrap(),
-            Some(ConnectionEvent::Opened(_))
-        ));
-        assert!(
-            matches!(events.recv().await.unwrap(), Some(ConnectionEvent::Closed(record)) if record == closed)
-        );
-        assert!(events.recv().await.unwrap().is_none());
-    }
-}
-
-#[cfg(test)]
-mod frame_progress_tests {
+mod write_completion_tests {
     use super::*;
 
     struct FaultWriter {
@@ -999,7 +867,7 @@ mod frame_progress_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn full_frame_progress_survives_flush_error_and_original_deadline() {
+    async fn complete_write_aborts_on_flush_error_and_configured_timeout() {
         for fault in [1, 2] {
             let mut writer = FaultWriter {
                 bytes: Vec::new(),
@@ -1007,19 +875,16 @@ mod frame_progress_tests {
                 flush: fault,
             };
             let abort = abort();
-            let mut frame_written = false;
             let start = tokio::time::Instant::now();
             let error = write_complete(
                 &mut writer,
                 abort.clone(),
                 b"complete frame",
-                DEFAULT_WRITE_TIMEOUT,
-                &mut frame_written,
+                Duration::from_millis(175),
             )
             .await
             .unwrap_err();
             assert_eq!(writer.bytes, b"complete frame");
-            assert!(frame_written);
             assert!(abort.is_aborted());
             assert_eq!(
                 error.kind(),
@@ -1030,31 +895,28 @@ mod frame_progress_tests {
                 }
             );
             if fault == 2 {
-                assert_eq!(start.elapsed(), DEFAULT_WRITE_TIMEOUT);
+                assert_eq!(start.elapsed(), Duration::from_millis(175));
             }
         }
     }
 
     #[tokio::test]
-    async fn incomplete_frame_does_not_transfer_release_authority() {
+    async fn partial_write_error_aborts_local_io() {
         let mut writer = FaultWriter {
             bytes: Vec::new(),
             limit: 3,
             flush: 0,
         };
         let abort = abort();
-        let mut frame_written = true;
         write_complete(
             &mut writer,
             abort.clone(),
             b"complete frame",
-            DEFAULT_WRITE_TIMEOUT,
-            &mut frame_written,
+            c2_config::BaseIpcConfig::default().write_timeout(),
         )
         .await
         .unwrap_err();
         assert_eq!(writer.bytes, b"com");
-        assert!(!frame_written);
         assert!(abort.is_aborted());
     }
 }

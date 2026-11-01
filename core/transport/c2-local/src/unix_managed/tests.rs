@@ -76,7 +76,7 @@ fn bound_guard_keeps_live_device_identity_after_persistent_identity_drops_it() {
     let fixture = TestNamespace::new();
     let root = fixture.path();
     let endpoint = managed_endpoint_at(root, "guard-device");
-    let namespace = open_root_bounded(root, true).unwrap();
+    let namespace = open_root_bounded(root, true, None).unwrap();
     let names = managed_names(&endpoint).unwrap();
     let lease = namespace
         .directories
@@ -2104,8 +2104,7 @@ fn managed_bind_does_not_change_cwd_in_an_independent_subprocess() {
 }
 
 /// A held coordinator must never make `bind_managed_at` wait unboundedly: server
-/// startup reaches it, so a foreign gate holder becomes a bounded `WouldBlock`
-/// that the upper start layer can retry with its own timeout.
+/// startup without an explicit deadline retains the default `WouldBlock` guard.
 #[tokio::test]
 async fn managed_bind_is_bounded_when_the_gate_is_held() {
     let namespace = TestNamespace::new();
@@ -3315,7 +3314,7 @@ async fn before_listen_checkpoint_rejects_an_already_listening_socket() {
     let root = fixture.path();
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
     let endpoint = managed_endpoint_at(root, "pre-listen-negative-control");
-    let namespace = open_root_bounded(root, true).unwrap();
+    let namespace = open_root_bounded(root, true, None).unwrap();
     let names = managed_names(&endpoint).unwrap();
     let lease = namespace
         .directories
@@ -3373,7 +3372,7 @@ fn failed_bind_after_lock_releases_lease_with_live_duplicate() {
         let lease_path = lease_path_at(root, &endpoint);
         let old_identity = original.map(|bytes| {
             // Initialize the namespace, then place an old, incomplete lease.
-            drop(open_root_bounded(root, true).unwrap());
+            drop(open_root_bounded(root, true, None).unwrap());
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -4150,4 +4149,47 @@ async fn final_lease_stat_rollback_keeps_initialization_error() {
             .to_string()
             .contains("injected socket permission failure before rollback stat")
     );
+}
+
+#[tokio::test]
+async fn managed_bind_gate_wait_uses_the_callers_deadline() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let seed = bind_managed_at(&managed_endpoint_at(root, "deadline-seed"), root).unwrap();
+    seed.abandon_for_test();
+    let held_root = root.to_owned();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let gate = ManagedNamespace::open_root(&held_root, false, true).unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        drop(gate);
+    });
+    ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let endpoint = managed_endpoint_at(root, "deadline-bind");
+    let started = std::time::Instant::now();
+    let error =
+        crate::LocalListener::bind_until(&endpoint, Some(started + Duration::from_millis(15)))
+            .err()
+            .expect("a held gate must expire within the caller budget");
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(started.elapsed() >= Duration::from_millis(15));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
+
+    // Hold beyond the old 50 x 2 ms guard, within the explicit startup budget.
+    let started = std::time::Instant::now();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(175));
+        release_tx.send(()).unwrap();
+    });
+    let listener =
+        crate::LocalListener::bind_until(&endpoint, Some(started + Duration::from_secs(3)))
+            .expect("the caller budget must replace the default gate guard");
+    assert!(started.elapsed() >= Duration::from_millis(175));
+    release.join().unwrap();
+    holder.join().unwrap();
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
 }

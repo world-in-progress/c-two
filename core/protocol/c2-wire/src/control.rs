@@ -119,26 +119,39 @@ pub fn encoded_call_control_len<S: AsRef<str>>(identity: &RouteCallIdentity<S>) 
             .sum::<usize>()
 }
 
-/// Encode a route and contract identity validated at its authoring boundary.
+const CALL_TEXT_FIELDS: [&str; 7] = [
+    "route_name",
+    "route_uid",
+    "crm_ns",
+    "crm_name",
+    "crm_ver",
+    "abi_hash",
+    "signature_hash",
+];
+
+/// Encode an identity, rejecting text that cannot fit its wire length byte.
 pub fn encode_call_control<S: AsRef<str>>(
     identity: &RouteCallIdentity<S>,
     method_idx: u16,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, EncodeError> {
     let mut buf = Vec::with_capacity(encoded_call_control_len(identity));
-    for value in identity_fields(identity) {
-        push_text(&mut buf, value);
+    for (field, value) in CALL_TEXT_FIELDS.into_iter().zip(identity_fields(identity)) {
+        push_text(&mut buf, field, value)?;
     }
     buf.extend_from_slice(&method_idx.to_le_bytes());
-    buf
+    Ok(buf)
 }
 
-/// Encode into caller storage, checking only that output boundary.
+/// Check text lengths and output capacity before changing caller storage.
 pub fn encode_call_control_into<S: AsRef<str>>(
     buf: &mut [u8],
     offset: usize,
     identity: &RouteCallIdentity<S>,
     method_idx: u16,
 ) -> Result<usize, EncodeError> {
+    for (field, value) in CALL_TEXT_FIELDS.into_iter().zip(identity_fields(identity)) {
+        text_length(field, value)?;
+    }
     let len = encoded_call_control_len(identity);
     check_write_capacity(buf, offset, len, "call_control")?;
     let mut cursor = offset;
@@ -245,10 +258,18 @@ fn validate_route_uid(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Callers supply text validated at the route/contract boundary.
-fn push_text(buf: &mut Vec<u8>, value: &str) {
-    buf.push(value.len() as u8);
+fn text_length(field: &'static str, value: &str) -> Result<u8, EncodeError> {
+    u8::try_from(value.len()).map_err(|_| EncodeError::FieldTooLong {
+        field,
+        max: u8::MAX as usize,
+        actual: value.len(),
+    })
+}
+
+fn push_text(buf: &mut Vec<u8>, field: &'static str, value: &str) -> Result<(), EncodeError> {
+    buf.push(text_length(field, value)?);
     buf.extend_from_slice(value.as_bytes());
+    Ok(())
 }
 
 // The caller validates every field and the complete output range first.

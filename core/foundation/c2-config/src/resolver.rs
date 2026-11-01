@@ -85,6 +85,9 @@ impl EnvCatalog {
 
 #[derive(Debug, Clone, Default)]
 pub struct ServerIpcConfigOverrides {
+    pub write_timeout_secs: Option<f64>,
+    pub max_dedicated_segments: Option<u32>,
+    pub spill_threshold: Option<f64>,
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
@@ -110,6 +113,9 @@ pub struct ServerIpcConfigOverrides {
 
 #[derive(Debug, Clone, Default)]
 pub struct ClientIpcConfigOverrides {
+    pub write_timeout_secs: Option<f64>,
+    pub max_dedicated_segments: Option<u32>,
+    pub spill_threshold: Option<f64>,
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
@@ -503,6 +509,9 @@ fn resolve_relay_server_config(
 macro_rules! resolve_ipc_fields {
     (base, $cfg:expr, $overrides:expr, $catalog:expr) => {
         resolve_ipc_fields!($cfg, $overrides, $catalog;
+            write_timeout_secs: optional_f64("C2_IPC_WRITE_TIMEOUT"),
+            max_dedicated_segments: optional_u32("C2_IPC_MAX_DEDICATED_SEGMENTS"),
+            spill_threshold: optional_f64("C2_IPC_SPILL_THRESHOLD"),
             pool_enabled: optional_bool("C2_IPC_POOL_ENABLED"),
             pool_segment_size: optional_u64("C2_IPC_POOL_SEGMENT_SIZE"),
             max_pool_segments: optional_u32("C2_IPC_MAX_POOL_SEGMENTS"),
@@ -725,6 +734,208 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn shared_write_and_spill_policy_resolves_for_both_roles() {
+        let process_env = env(&[
+            ("C2_IPC_WRITE_TIMEOUT", "42.5"),
+            ("C2_IPC_MAX_DEDICATED_SEGMENTS", "9"),
+            ("C2_IPC_SPILL_THRESHOLD", "0.65"),
+        ]);
+        let server = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            Default::default(),
+            ConfigSources {
+                process_env: process_env.clone(),
+                ..ConfigSources::empty()
+            },
+        )
+        .unwrap();
+        let client = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            Default::default(),
+            ConfigSources {
+                process_env: process_env.clone(),
+                ..ConfigSources::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(server.base, client.base);
+        assert_eq!(client.write_timeout_secs, 42.5);
+        assert_eq!(client.max_dedicated_segments, 9);
+        assert_eq!(client.spill_threshold, 0.65);
+
+        let server = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides {
+                write_timeout_secs: Some(60.0),
+                max_dedicated_segments: Some(0),
+                spill_threshold: Some(0.0),
+                ..Default::default()
+            },
+            Default::default(),
+            ConfigSources {
+                process_env: process_env.clone(),
+                ..ConfigSources::empty()
+            },
+        )
+        .unwrap();
+        let client = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides {
+                write_timeout_secs: Some(60.0),
+                max_dedicated_segments: Some(0),
+                spill_threshold: Some(0.0),
+                ..Default::default()
+            },
+            Default::default(),
+            ConfigSources {
+                process_env: process_env.clone(),
+                ..ConfigSources::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(server.base, client.base);
+        assert_eq!(client.write_timeout_secs, 60.0);
+        for pool in [
+            client.primary_pool_config(&client.pool_tuning()),
+            client.reassembly_pool_config(&client.pool_tuning()),
+            server.primary_pool_config(&server.response_pool_tuning()),
+            server.reassembly_pool_config(&server.reassembly_pool_tuning()),
+        ] {
+            assert_eq!(pool.max_dedicated_segments, 0);
+            assert_eq!(pool.spill_threshold, 0.0);
+        }
+    }
+
+    #[test]
+    fn shared_write_and_spill_policy_rejects_invalid_environment() {
+        for (key, value) in [
+            ("C2_IPC_WRITE_TIMEOUT", "0"),
+            ("C2_IPC_WRITE_TIMEOUT", "-1"),
+            ("C2_IPC_WRITE_TIMEOUT", "NaN"),
+            ("C2_IPC_WRITE_TIMEOUT", "1e100"),
+            ("C2_IPC_MAX_DEDICATED_SEGMENTS", "-1"),
+            ("C2_IPC_MAX_DEDICATED_SEGMENTS", "65537"),
+            ("C2_IPC_MAX_DEDICATED_SEGMENTS", "4294967296"),
+            ("C2_IPC_SPILL_THRESHOLD", "-0.1"),
+            ("C2_IPC_SPILL_THRESHOLD", "1.1"),
+            ("C2_IPC_SPILL_THRESHOLD", "inf"),
+        ] {
+            let process_env = env(&[(key, value)]);
+            assert!(
+                ConfigResolver::resolve_server_ipc(
+                    Default::default(),
+                    Default::default(),
+                    ConfigSources {
+                        process_env: process_env.clone(),
+                        ..ConfigSources::empty()
+                    },
+                )
+                .is_err(),
+                "server accepted {key}={value}"
+            );
+            assert!(
+                ConfigResolver::resolve_client_ipc(
+                    Default::default(),
+                    Default::default(),
+                    ConfigSources {
+                        process_env: process_env.clone(),
+                        ..ConfigSources::empty()
+                    },
+                )
+                .is_err(),
+                "client accepted {key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_write_and_spill_policy_rejects_invalid_overrides() {
+        for (write_timeout_secs, spill_threshold) in [
+            (Some(0.0), None),
+            (Some(-1.0), None),
+            (Some(f64::INFINITY), None),
+            (Some(1e100), None),
+            (None, Some(-0.1)),
+            (None, Some(1.1)),
+            (None, Some(f64::NAN)),
+        ] {
+            assert!(
+                ConfigResolver::resolve_server_ipc(
+                    ServerIpcConfigOverrides {
+                        write_timeout_secs,
+                        spill_threshold,
+                        ..Default::default()
+                    },
+                    Default::default(),
+                    ConfigSources::empty(),
+                )
+                .is_err()
+            );
+            assert!(
+                ConfigResolver::resolve_client_ipc(
+                    ClientIpcConfigOverrides {
+                        write_timeout_secs,
+                        spill_threshold,
+                        ..Default::default()
+                    },
+                    Default::default(),
+                    ConfigSources::empty(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn dedicated_segment_limit_matches_the_wire_slot_range() {
+        for max_dedicated_segments in [0, 65536, 65537, u32::MAX] {
+            let valid = max_dedicated_segments <= u32::from(u16::MAX) + 1;
+            let process_env = env(&[(
+                "C2_IPC_MAX_DEDICATED_SEGMENTS",
+                &max_dedicated_segments.to_string(),
+            )]);
+            let sources = ConfigSources {
+                process_env,
+                ..ConfigSources::empty()
+            };
+            assert_eq!(
+                ConfigResolver::resolve_server_ipc(
+                    Default::default(),
+                    Default::default(),
+                    sources.clone(),
+                )
+                .is_ok(),
+                valid
+            );
+            assert_eq!(ConfigResolver::resolve_client_ipc(
+                Default::default(), Default::default(), sources,
+            ).is_ok(), valid);
+            assert_eq!(
+                ConfigResolver::resolve_server_ipc(
+                    ServerIpcConfigOverrides {
+                        max_dedicated_segments: Some(max_dedicated_segments),
+                        ..Default::default()
+                    },
+                    Default::default(),
+                    ConfigSources::empty(),
+                )
+                .is_ok(),
+                valid
+            );
+            assert_eq!(
+                ConfigResolver::resolve_client_ipc(
+                    ClientIpcConfigOverrides {
+                        max_dedicated_segments: Some(max_dedicated_segments),
+                        ..Default::default()
+                    },
+                    Default::default(),
+                    ConfigSources::empty(),
+                )
+                .is_ok(),
+                valid
+            );
+        }
     }
 
     #[test]

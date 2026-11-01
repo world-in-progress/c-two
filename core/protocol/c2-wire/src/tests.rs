@@ -246,7 +246,7 @@ mod ipc15_tests {
 
     #[test]
     fn borrowed_call_identity_encodes_without_revision() {
-        let bytes = encode_call_control(&identity("grid"), 7);
+        let bytes = encode_call_control(&identity("grid"), 7).unwrap();
         assert_eq!(bytes, call_golden());
         let (decoded, consumed) = decode_call_control(&call_golden(), 0).unwrap();
         assert_eq!(consumed, bytes.len());
@@ -278,6 +278,60 @@ mod ipc15_tests {
     }
 
     #[test]
+    fn call_control_rejects_overlong_text_fields_before_writing_output() {
+        let long = "é".repeat(128); // 256 UTF-8 bytes
+        for field in [
+            "route_name",
+            "route_uid",
+            "crm_ns",
+            "crm_name",
+            "crm_ver",
+            "abi_hash",
+            "signature_hash",
+        ] {
+            let mut value = identity("grid");
+            match field {
+                "route_name" => value.route_name = &long,
+                "route_uid" => value.route_uid = &long,
+                "crm_ns" => value.crm_ns = &long,
+                "crm_name" => value.crm_name = &long,
+                "crm_ver" => value.crm_ver = &long,
+                "abi_hash" => value.abi_hash = &long,
+                _ => value.signature_hash = &long,
+            }
+            let expected = EncodeError::FieldTooLong {
+                field,
+                max: 255,
+                actual: 256,
+            };
+            assert_eq!(encode_call_control(&value, 7).unwrap_err(), expected);
+            let mut output = vec![0xaa; encoded_call_control_len(&value)];
+            assert_eq!(
+                encode_call_control_into(&mut output, 0, &value, 7),
+                Err(expected)
+            );
+            assert!(output.iter().all(|byte| *byte == 0xaa));
+        }
+    }
+
+    #[test]
+    fn call_control_roundtrips_a_255_byte_route_name() {
+        let route = "r".repeat(255);
+        let value = identity(&route);
+        let encoded = encode_call_control(&value, 19).unwrap();
+        let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
+        assert_eq!(decoded.identity.route_name, route);
+        assert_eq!(decoded.method_idx, 19);
+        assert_eq!(consumed, encoded.len());
+        let mut output = vec![0; encoded.len()];
+        assert_eq!(
+            encode_call_control_into(&mut output, 0, &value, 19).unwrap(),
+            encoded.len()
+        );
+        assert_eq!(output, encoded);
+    }
+
+    #[test]
     fn call_boundary_rejects_truncation_bad_contract_and_legacy_revision() {
         let bytes = call_golden();
         for len in 0..bytes.len() {
@@ -298,7 +352,7 @@ mod ipc15_tests {
                 _ => value.abi_hash = text,
             }
             assert!(
-                decode_call_control(&encode_call_control(&value, 7), 0).is_err(),
+                decode_call_control(&encode_call_control(&value, 7).unwrap(), 0).is_err(),
                 "{field}"
             );
         }
@@ -567,6 +621,18 @@ mod ipc15_tests {
         assert_eq!(
             decode_route_nack(&encode_route_nack(&nack).unwrap()).unwrap(),
             nack
+        );
+    }
+
+    #[test]
+    fn nack_decoder_rejects_a_mismatched_error_code_and_name() {
+        // Handwritten peer bytes deliberately bypass encode_route_nack.
+        let payload = br#"{"error":{"version":1,"code":713,"name":"ResourceNotFound","message":"bad","details":{}}}"#;
+        let mut frame = vec![crate::msg_type::MsgType::RouteNack as u8];
+        frame.extend_from_slice(payload);
+        assert_eq!(
+            decode_route_nack(&frame).unwrap_err(),
+            "C2 error envelope name mismatch for code 713: expected ProtocolViolation, got ResourceNotFound",
         );
     }
 

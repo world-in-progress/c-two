@@ -841,31 +841,35 @@ fn verified_socket_stat(
     Ok(stat)
 }
 
-/// Opens the coordinator gate with a short, bounded retry instead of an
-/// unbounded wait.
-///
-/// A blocked bind is reachable from server startup, so waiting forever on a
-/// coordinator another process holds would stall `Server::start`. The bounded
-/// wait lets a transient same-address race resolve (the existing
-/// winner/loser semantics), while a persistently held or otherwise busy gate
-/// degrades to `Busy` and surfaces as `WouldBlock`. Retrying the whole start
-/// attempt, with the caller's own timeout, is left to the layer above.
-fn open_root_bounded(root: &Path, create: bool) -> Result<ManagedNamespace, NamespaceError> {
+/// Wait under the caller's deadline, or retain the default 50-attempt guard
+/// for cleanup and callers without a startup budget.
+fn open_root_bounded(
+    root: &Path,
+    create: bool,
+    deadline: Option<std::time::Instant>,
+) -> Result<ManagedNamespace, NamespaceError> {
     const ATTEMPTS: usize = 50;
-    let mut last = NamespaceError::Busy;
-    for attempt in 0..ATTEMPTS {
+    let pause = std::time::Duration::from_millis(2);
+    let mut attempts = 0;
+    loop {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(NamespaceError::Busy);
+        }
         match ManagedNamespace::open_root(root, create, false) {
             Ok(namespace) => return Ok(namespace),
-            Err(error @ NamespaceError::Busy) => {
-                last = error;
-                if attempt + 1 < ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
+            Err(NamespaceError::Busy) => {}
             Err(error) => return Err(error),
         }
+        attempts += 1;
+        let wait = match deadline {
+            Some(deadline) => {
+                pause.min(deadline.saturating_duration_since(std::time::Instant::now()))
+            }
+            None if attempts == ATTEMPTS => return Err(NamespaceError::Busy),
+            None => pause,
+        };
+        std::thread::sleep(wait);
     }
-    Err(last)
 }
 
 /// Binds the managed socket inside the exact verified directory.
@@ -1081,7 +1085,7 @@ impl DropRetirement {
             observer.started.send(()).unwrap();
             observer.resume.recv().unwrap();
         }
-        if let Ok(namespace) = open_root_bounded(&self.root, false) {
+        if let Ok(namespace) = open_root_bounded(&self.root, false, None) {
             let _ = retire_listener_with_namespace(
                 &namespace,
                 self.directories_pin.as_ref(),
@@ -1154,8 +1158,11 @@ pub(crate) struct ManagedListener {
 }
 
 impl ManagedListener {
-    pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        bind_managed(endpoint)
+    pub fn bind_until(
+        endpoint: &LocalEndpoint,
+        deadline: Option<std::time::Instant>,
+    ) -> io::Result<Self> {
+        bind_managed(endpoint, deadline)
     }
     pub(crate) fn credential(&self) -> EndpointCredential {
         EndpointCredential::unix_managed(
@@ -1187,7 +1194,7 @@ impl ManagedListener {
     pub(crate) fn close(mut self) -> EndpointReapResult {
         self.cleaned = true;
         self.inner.take();
-        let namespace = match open_root_bounded(&self.root, false) {
+        let namespace = match open_root_bounded(&self.root, false, None) {
             Ok(namespace) => namespace,
             Err(error) => {
                 // Even when the gate cannot be taken, this listener's ownership
@@ -1291,14 +1298,17 @@ impl Drop for ManagedListener {
 }
 
 /// Binds a managed-v2 endpoint under the fixed coordinator gate.
-fn bind_managed(endpoint: &LocalEndpoint) -> io::Result<ManagedListener> {
+fn bind_managed(
+    endpoint: &LocalEndpoint,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<ManagedListener> {
     let root = Path::new(endpoint.os_name()).parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "endpoint has no namespace directory",
         )
     })?;
-    bind_at(endpoint, root)
+    bind_at(endpoint, root, deadline)
 }
 
 #[cfg(test)]
@@ -1306,17 +1316,21 @@ pub(crate) fn bind_managed_at(
     endpoint: &LocalEndpoint,
     root: &Path,
 ) -> io::Result<ManagedListener> {
-    bind_at(endpoint, root)
+    bind_at(endpoint, root, None)
 }
 
-fn bind_at(endpoint: &LocalEndpoint, root: &Path) -> io::Result<ManagedListener> {
+fn bind_at(
+    endpoint: &LocalEndpoint,
+    root: &Path,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<ManagedListener> {
     if Path::new(endpoint.os_name()).parent() != Some(root) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "endpoint context does not match namespace",
         ));
     }
-    let namespace = open_root_bounded(root, true).map_err(namespace_bind_error)?;
+    let namespace = open_root_bounded(root, true, deadline).map_err(namespace_bind_error)?;
     let gate_pin = namespace.gate.try_clone()?;
     let names = managed_names(endpoint)?;
     let (file, created) = match namespace.directories.records.open_file(

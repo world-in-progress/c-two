@@ -7,8 +7,9 @@
 //!   the release authority for buddy/dedicated backing,
 //! - the allocated [`MemHandle`] (file-spill mappings are self-owned by the
 //!   handle value), and
-//! - the [`BudgetReservation`] that charges the pool's canonical reassembly
-//!   budget cell for the full allocated capacity.
+//! - chunk receipt flags, when the backing belongs to an assembler;
+//! - the [`BudgetReservation`] charging payload and flags to the pool's
+//!   canonical reassembly budget cell.
 //!
 //! The reservation is taken **before** the pool allocates, and is refunded
 //! only **after** the pool authority accepted the storage release (or the
@@ -46,6 +47,7 @@ pub fn checked_capacity(total_chunks: usize, chunk_size: usize) -> Result<usize,
 /// Kept together so every release path drops storage before the charge; the
 /// pair is never handed out separately.
 struct BackingState {
+    received_flags: Vec<bool>,
     handle: MemHandle,
     reservation: BudgetReservation,
 }
@@ -91,7 +93,7 @@ impl ReassemblyBacking {
         // Keep standalone invalid geometry rejection ahead of lock waiting.
         checked_capacity(total_chunks, chunk_size)?;
         let guard = pool.write();
-        Self::admit_with_guard(Arc::clone(&pool), guard, total_chunks, chunk_size)
+        Self::admit_with_guard(Arc::clone(&pool), guard, total_chunks, chunk_size, 0)
     }
 
     /// Admission with an already acquired write guard from this exact pool.
@@ -102,25 +104,39 @@ impl ReassemblyBacking {
         mut guard: RwLockWriteGuard<'_, MemPool>,
         total_chunks: usize,
         chunk_size: usize,
+        tracked_chunks: usize,
     ) -> Result<Self, String> {
         if !std::ptr::eq(Arc::as_ptr(&pool), RwLockWriteGuard::rwlock(&guard)) {
             return Err("reassembly admission guard belongs to a different pool".to_string());
         }
         let capacity = checked_capacity(total_chunks, chunk_size)?;
-        let capacity_bytes = u64::try_from(capacity).map_err(|_| {
-            format!("reassembly capacity {capacity} bytes exceeds the budget accounting range")
+        let metadata_bytes = tracked_chunks * std::mem::size_of::<bool>();
+        let charged_capacity = capacity.checked_add(metadata_bytes).ok_or_else(|| {
+            "reassembly capacity including metadata exceeds the addressable range".to_string()
+        })?;
+        let capacity_bytes = u64::try_from(charged_capacity).map_err(|_| {
+            format!(
+                "reassembly capacity {charged_capacity} bytes exceeds the budget accounting range"
+            )
         })?;
         // One pool write critical section covers charge and allocation so no
         // other allocator can consume the admitted bytes in between.
-        let (handle, reservation) = {
+        let (received_flags, handle, reservation) = {
             let budget = guard
                 .budget()
                 .ok_or_else(|| "reassembly pool carries no owner budget context".to_string())?;
             let reservation = budget
                 .reserve(BudgetKind::Reassembly, capacity_bytes)
                 .map_err(|e| e.to_string())?;
+            // Make tracking allocation fallible before creating a pool handle
+            // that requires an explicit release through its owner.
+            let mut received_flags = Vec::new();
+            received_flags
+                .try_reserve_exact(tracked_chunks)
+                .map_err(|error| format!("reassembly chunk tracking allocation failed: {error}"))?;
+            received_flags.resize(tracked_chunks, false);
             match guard.alloc_handle(capacity) {
-                Ok(handle) => (handle, reservation),
+                Ok(handle) => (received_flags, handle, reservation),
                 // The reservation guard drops with this error return and
                 // refunds the charge; no backing was created.
                 Err(e) => return Err(e),
@@ -130,6 +146,7 @@ impl ReassemblyBacking {
         Ok(Self {
             pool,
             state: Some(BackingState {
+                received_flags,
                 handle,
                 reservation,
             }),
@@ -146,6 +163,15 @@ impl ReassemblyBacking {
         self.state
             .as_mut()
             .ok_or_else(|| "reassembly backing already released".to_string())
+    }
+
+    pub(crate) fn chunk_received(&self, index: usize) -> Result<bool, String> {
+        Ok(self.live_state()?.received_flags[index])
+    }
+
+    pub(crate) fn mark_chunk_received(&mut self, index: usize) -> Result<(), String> {
+        self.live_state_mut()?.received_flags[index] = true;
+        Ok(())
     }
 
     /// Logical data length (may be trimmed below allocated capacity).
@@ -178,7 +204,7 @@ impl ReassemblyBacking {
             .unwrap_or(false)
     }
 
-    /// The charged allocation capacity in bytes (never the trimmed length).
+    /// Charged payload and tracking capacity in bytes (never the trimmed length).
     ///
     /// Returns the reserved capacity while the backing is live and zero after
     /// release.
@@ -299,6 +325,7 @@ impl ReassemblyBacking {
 
     fn release_storage_with_pool(&mut self, pool: &mut MemPool) {
         if let Some(state) = self.state.take() {
+            drop(state.received_flags);
             pool.release_handle(state.handle);
             drop(state.reservation);
         }
@@ -459,8 +486,8 @@ mod tests {
         };
         let (owner, owner_budget) = make();
         let (other, other_budget) = make();
-        let error =
-            ReassemblyBacking::admit_with_guard(owner.clone(), other.write(), 1, 128).unwrap_err();
+        let error = ReassemblyBacking::admit_with_guard(owner.clone(), other.write(), 1, 128, 0)
+            .unwrap_err();
         assert!(error.contains("different pool"));
         for (pool, budget) in [(owner, owner_budget), (other, other_budget)] {
             let snapshot = budget.snapshot();

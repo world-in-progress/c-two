@@ -30,7 +30,6 @@ pub struct ChunkAssembler {
     /// High-water mark: one past the last byte written.
     written_end: usize,
     backing: ReassemblyBacking,
-    received_flags: Vec<bool>,
 }
 
 /// Checked immutable geometry. Only the canonical checks can create this token.
@@ -96,15 +95,23 @@ impl ChunkAssembler {
             total_chunks,
             chunk_size,
         } = geometry;
-        let backing = ReassemblyBacking::admit_with_guard(pool, guard, total_chunks, chunk_size)
-            .map_err(ChunkAdmissionError::Capacity)?;
+        // Vec<bool> stores one byte per flag. Reserve those bytes together with
+        // the payload before allocating either storage, using the same owner
+        // reservation throughout the backing's lifetime.
+        let backing = ReassemblyBacking::admit_with_guard(
+            pool,
+            guard,
+            total_chunks,
+            chunk_size,
+            total_chunks,
+        )
+        .map_err(ChunkAdmissionError::Capacity)?;
         Ok(Self {
             total_chunks,
             chunk_size,
             received: 0,
             written_end: 0,
             backing,
-            received_flags: vec![false; total_chunks],
         })
     }
 
@@ -118,7 +125,7 @@ impl ChunkAssembler {
                 self.total_chunks
             ));
         }
-        if self.received_flags[chunk_idx] {
+        if self.backing.chunk_received(chunk_idx)? {
             return Err(format!("duplicate chunk_idx {chunk_idx}"));
         }
         if data.len() > self.chunk_size {
@@ -130,7 +137,7 @@ impl ChunkAssembler {
         }
         let offset = chunk_idx * self.chunk_size;
         self.backing.write_at(offset, data)?;
-        self.received_flags[chunk_idx] = true;
+        self.backing.mark_chunk_received(chunk_idx)?;
         self.received += 1;
         let end = offset + data.len();
         if end > self.written_end {
@@ -149,7 +156,7 @@ impl ChunkAssembler {
         self.received
     }
 
-    /// The allocated (and budget-charged) capacity in bytes.
+    /// The allocated payload and chunk-tracking capacity charged to the budget.
     pub fn capacity_bytes(&self) -> u64 {
         self.backing.capacity_bytes()
     }
@@ -158,8 +165,8 @@ impl ChunkAssembler {
     ///
     /// The returned backing's logical length is trimmed to `written_end` (one
     /// past the last byte written), which may be less than the allocated and
-    /// charged `total_chunks × chunk_size` capacity if the last chunk was
-    /// short. The trim never changes the charge.
+    /// charged payload capacity if the last chunk was short. The backing also
+    /// retains its chunk flags and their charge; trimming never refunds storage.
     ///
     /// On an incomplete assembly this returns `Err`; the assembler value
     /// drops on that return, releasing the backing storage through the pool
@@ -247,7 +254,7 @@ mod tests {
 
     #[test]
     fn try_release_file_keeps_partial_assembly_for_retry() {
-        let budget = MemoryBudget::new(0, 8192, 8192);
+        let budget = MemoryBudget::new(0, 8192, 8194);
         let pool = Arc::new(RwLock::new(
             MemPool::new_with_prefix_and_budget(
                 PoolConfig {
@@ -267,9 +274,9 @@ mod tests {
             assert!(!asm.try_release());
             assert_eq!(asm.received(), 1);
             assert_eq!(asm.written_end(), 4096);
-            assert_eq!(asm.capacity_bytes(), 8192);
+            assert_eq!(asm.capacity_bytes(), 8194);
             assert_eq!(budget.snapshot().file.used_bytes, 8192);
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 8192);
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
         }
         // Failed cleanup left data and chunk geometry intact, rather than
         // consuming the assembler or silently refunding an unfinished owner.
@@ -312,7 +319,7 @@ mod tests {
         assert_eq!(&slice[8..16], b"bbbbbbbb");
         assert_eq!(&slice[16..18], b"cc");
         // Trim happened but the full capacity stays charged until release.
-        assert_eq!(backing.capacity_bytes(), 24);
+        assert_eq!(backing.capacity_bytes(), 27);
         backing.release();
     }
 
@@ -367,7 +374,10 @@ mod tests {
             let mut backing = asm.finish().unwrap();
             assert_eq!(backing.len(), (total_chunks - 1) * chunk_size + last_size);
             assert_eq!(backing.copy_bytes().unwrap(), chunks.concat());
-            assert_eq!(backing.capacity_bytes(), (total_chunks * chunk_size) as u64);
+            assert_eq!(
+                backing.capacity_bytes(),
+                (total_chunks * (chunk_size + 1)) as u64
+            );
             backing.release();
         }
     }
@@ -414,10 +424,10 @@ mod tests {
         assert!(!asm.feed_chunk(0, &[7; 200]).unwrap());
         assert_eq!(asm.received(), 1);
         assert_eq!(asm.written_end(), 200);
-        assert_eq!(asm.capacity_bytes(), 4 * 4096);
+        assert_eq!(asm.capacity_bytes(), 4 * (4096 + 1));
         assert_eq!(
             budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            4 * 4096
+            4 * (4096 + 1)
         );
         asm.abort();
         assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
@@ -447,7 +457,7 @@ mod tests {
         asm.feed_chunk(0, b"data").unwrap();
         assert_eq!(
             budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            24
+            27
         );
         let err = asm.finish().unwrap_err();
         assert!(err.contains("incomplete"));
@@ -501,7 +511,7 @@ mod tests {
             err.contains("'reassembly'"),
             "error must name the cell: {err}"
         );
-        assert!(err.contains("128"), "error must name the size: {err}");
+        assert!(err.contains("130"), "error must name the size: {err}");
         assert!(err.contains("100"), "error must name the limit: {err}");
 
         // The rejection happened before any mapping: no buddy or dedicated
@@ -512,7 +522,7 @@ mod tests {
         let snap = budget.snapshot();
         assert_eq!(snap.reassembly.used_bytes, 0);
         assert_eq!(snap.reassembly.rejected_allocations, 1);
-        assert_eq!(snap.reassembly.rejected_bytes, 128);
+        assert_eq!(snap.reassembly.rejected_bytes, 130);
     }
 
     #[test]
@@ -531,7 +541,7 @@ mod tests {
         drop(registry_view);
         assert_eq!(
             budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            16
+            18
         );
         assert_eq!(backing.copy_bytes().unwrap(), b"firsttttsec");
         // Idempotent release refunds exactly once.

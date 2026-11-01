@@ -240,11 +240,26 @@ pub struct Listener {
 }
 
 impl Listener {
-    pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
+    pub fn bind_until(
+        endpoint: &LocalEndpoint,
+        deadline: Option<std::time::Instant>,
+    ) -> io::Result<Self> {
+        let check_deadline = || {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "local listener deadline expired",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        check_deadline()?;
         let mut security = LocalSecurityAttributes::new()?;
         let ownership = claim_listener(endpoint, &mut security)?;
         grant_server_identity_query_access()?;
         let pending = create_instance(endpoint, &mut security)?;
+        check_deadline()?;
         Ok(Self {
             pending,
             endpoint: endpoint.clone(),
@@ -423,7 +438,7 @@ mod tests {
         use windows_sys::Win32::System::Threading::OpenMutexW;
 
         let endpoint = endpoint(&format!("global-lease-{}", uuid::Uuid::new_v4().simple()));
-        let listener = Listener::bind(&endpoint).unwrap();
+        let listener = Listener::bind_until(&endpoint, None).unwrap();
         let name = listener_lease_name(endpoint.os_name());
         let wide: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
         let raw = unsafe { OpenMutexW(READ_CONTROL, 0, wide.as_ptr()) };
@@ -464,7 +479,7 @@ mod tests {
         unsafe { LocalFree(descriptor) };
         assert_ne!(same_owner, 0);
         assert_eq!(
-            Listener::bind(&endpoint).err().unwrap().kind(),
+            Listener::bind_until(&endpoint, None).err().unwrap().kind(),
             io::ErrorKind::AddrInUse
         );
         drop(lease);

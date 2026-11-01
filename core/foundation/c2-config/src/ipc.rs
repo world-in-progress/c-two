@@ -30,6 +30,9 @@ pub const MAX_IPC_POOL_SEGMENTS: u32 = 255;
 
 /// Code-level IPC override fields accepted for server config resolution.
 pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
+    "write_timeout",
+    "max_dedicated_segments",
+    "spill_threshold",
     "pool_enabled",
     "pool_segment_size",
     "max_pool_segments",
@@ -55,6 +58,9 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
 
 /// Code-level IPC override fields accepted for client config resolution.
 pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
+    "write_timeout",
+    "max_dedicated_segments",
+    "spill_threshold",
     "pool_enabled",
     "pool_segment_size",
     "max_pool_segments",
@@ -85,6 +91,8 @@ pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
 /// than mutating a shared value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BaseIpcConfig {
+    /// Total budget for one local write, including flush, in seconds.
+    pub write_timeout_secs: f64,
     // ── Pool SHM settings ────────────────────────────────────────────────
     /// Buddy-pool policy switch. Disabling it skips only the buddy tiers
     /// (reuse and expansion); dedicated SHM, chunked transfer, inline frames,
@@ -92,6 +100,8 @@ pub struct BaseIpcConfig {
     pub pool_enabled: bool,
     pub pool_segment_size: u64,
     pub max_pool_segments: u32,
+    pub max_dedicated_segments: u32,
+    pub spill_threshold: f64,
     /// Buddy segments to map eagerly at connect/register (default 0 = fully
     /// lazy). Prewarming is an explicit transport action: without it, no buddy
     /// memory is mapped until the first allocation that needs it.
@@ -161,9 +171,12 @@ impl Default for BaseIpcConfig {
     fn default() -> Self {
         let budget_limits = crate::MemoryBudgetLimits::default();
         Self {
+            write_timeout_secs: 30.0,
             pool_enabled: true,
             pool_segment_size: 268_435_456, // 256 MB
             max_pool_segments: 4,
+            max_dedicated_segments: 4,
+            spill_threshold: 0.8,
             pool_prewarm_segments: 0,
             pool_min_retained_segments: 0,
 
@@ -237,8 +250,6 @@ impl Deref for ClientIpcConfig {
 pub struct PoolRoleTuning {
     /// Idle window before a fully idle buddy segment may be retired.
     pub buddy_idle_decay_secs: f64,
-    /// Maximum simultaneously active dedicated segments.
-    pub max_dedicated_segments: usize,
     /// File-spill directory for allocations that cannot stay in SHM.
     pub spill_dir: std::path::PathBuf,
 }
@@ -247,13 +258,17 @@ impl Default for PoolRoleTuning {
     fn default() -> Self {
         Self {
             buddy_idle_decay_secs: 60.0,
-            max_dedicated_segments: 4,
             spill_dir: crate::default_spill_dir(),
         }
     }
 }
 
 impl BaseIpcConfig {
+    /// Local-write duration after boundary validation by the resolver.
+    pub fn write_timeout(&self) -> Duration {
+        Duration::from_secs_f64(self.write_timeout_secs)
+    }
+
     /// Project this config's buddy policy onto an owner pool config for the
     /// primary request/response pool role (`pool_segment_size` /
     /// `max_pool_segments`). Disabling `pool_enabled` disables only the buddy
@@ -263,9 +278,9 @@ impl BaseIpcConfig {
             segment_size: self.pool_segment_size as usize,
             min_block_size: 4096,
             max_segments: self.max_pool_segments as usize,
-            max_dedicated_segments: tuning.max_dedicated_segments,
+            max_dedicated_segments: self.max_dedicated_segments as usize,
             buddy_idle_decay_secs: tuning.buddy_idle_decay_secs,
-            spill_threshold: 0.8,
+            spill_threshold: self.spill_threshold,
             spill_dir: tuning.spill_dir.clone(),
             buddy_enabled: self.pool_enabled,
             min_retained_segments: self.pool_min_retained_segments as usize,
@@ -282,9 +297,9 @@ impl BaseIpcConfig {
             segment_size: self.reassembly_segment_size as usize,
             min_block_size: 4096,
             max_segments: self.reassembly_max_segments as usize,
-            max_dedicated_segments: tuning.max_dedicated_segments,
+            max_dedicated_segments: self.max_dedicated_segments as usize,
             buddy_idle_decay_secs: tuning.buddy_idle_decay_secs,
-            spill_threshold: 0.8,
+            spill_threshold: self.spill_threshold,
             spill_dir: tuning.spill_dir.clone(),
             buddy_enabled: self.pool_enabled,
             min_retained_segments: self.pool_min_retained_segments as usize,
@@ -297,7 +312,6 @@ impl ServerIpcConfig {
     pub fn response_pool_tuning(&self) -> PoolRoleTuning {
         PoolRoleTuning {
             buddy_idle_decay_secs: self.pool_decay_seconds,
-            max_dedicated_segments: 4,
             spill_dir: std::path::PathBuf::from("/tmp/c_two_response_spill"),
         }
     }
@@ -306,7 +320,6 @@ impl ServerIpcConfig {
     pub fn reassembly_pool_tuning(&self) -> PoolRoleTuning {
         PoolRoleTuning {
             buddy_idle_decay_secs: self.pool_decay_seconds,
-            max_dedicated_segments: 4,
             spill_dir: std::path::PathBuf::from("/tmp/c_two_reassembly"),
         }
     }
@@ -330,6 +343,16 @@ impl BaseIpcConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if !self.write_timeout_secs.is_finite() || self.write_timeout_secs <= 0.0 {
+            return Err("write_timeout_secs must be finite and > 0".into());
+        }
+        validate_duration_secs("write_timeout_secs", self.write_timeout_secs)?;
+        if !self.spill_threshold.is_finite() || !(0.0..=1.0).contains(&self.spill_threshold) {
+            return Err("spill_threshold must be finite and in [0, 1]".into());
+        }
+        if self.max_dedicated_segments > u32::from(u16::MAX) + 1 {
+            return Err("max_dedicated_segments exceeds the wire segment-index range".into());
+        }
         if self.pool_segment_size == 0 {
             return Err("pool_segment_size must be > 0".into());
         }
@@ -908,10 +931,11 @@ mod tests {
         cfg.max_pool_segments = 3;
         cfg.pool_enabled = false;
         cfg.pool_min_retained_segments = 2;
+        cfg.max_dedicated_segments = 7;
+        cfg.spill_threshold = 0.6;
 
         let tuning = PoolRoleTuning {
             buddy_idle_decay_secs: 12.0,
-            max_dedicated_segments: 7,
             spill_dir: std::path::PathBuf::from("/tmp/projection_test"),
         };
         let pool = cfg.primary_pool_config(&tuning);
@@ -922,6 +946,7 @@ mod tests {
         assert_eq!(pool.min_retained_segments, 2);
         assert_eq!(pool.buddy_idle_decay_secs, 12.0);
         assert_eq!(pool.max_dedicated_segments, 7);
+        assert_eq!(pool.spill_threshold, 0.6);
         assert_eq!(
             pool.spill_dir,
             std::path::PathBuf::from("/tmp/projection_test")
@@ -1018,11 +1043,7 @@ mod tests {
         cfg.pool_decay_seconds = 2.5;
         let tuning = cfg.pool_tuning();
         assert_eq!(tuning.buddy_idle_decay_secs, 2.5);
-        // Role defaults for the non-decay fields stay intact.
-        assert_eq!(
-            tuning.max_dedicated_segments,
-            PoolRoleTuning::default().max_dedicated_segments
-        );
+        assert_eq!(tuning.spill_dir, PoolRoleTuning::default().spill_dir);
     }
 
     // ── Complete resolved-config equality ────────────────────────────────
@@ -1040,6 +1061,18 @@ mod tests {
         assert_eq!(pristine, pristine.clone());
 
         let base_mutations = [
+            BaseIpcConfig {
+                write_timeout_secs: base.write_timeout_secs + 1.0,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                max_dedicated_segments: base.max_dedicated_segments + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                spill_threshold: base.spill_threshold - 0.1,
+                ..base.clone()
+            },
             BaseIpcConfig {
                 pool_enabled: !base.pool_enabled,
                 ..base.clone()

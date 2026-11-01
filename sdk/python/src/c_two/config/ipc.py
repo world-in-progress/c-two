@@ -13,6 +13,10 @@ __all__ = [
 class BaseIPCOverrides(TypedDict, total=False):
     """Shared IPC code-level overrides for server and client resolution."""
 
+    write_timeout: float
+    max_dedicated_segments: int
+    spill_threshold: float
+
     # Buddy-pool policy switch. Disabling it skips only the buddy tiers;
     # dedicated SHM, chunked transfer, and file spill stay available.
     pool_enabled: bool

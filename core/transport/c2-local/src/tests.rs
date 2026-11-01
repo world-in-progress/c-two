@@ -53,9 +53,7 @@ pub(super) async fn isolated_pair() -> (TestEndpoint, LocalStream, LocalStream) 
 #[tokio::test]
 async fn peer_close_with_unread_data_records_the_native_read_end() {
     let (local, peer) = tokio::net::UnixStream::pair().unwrap();
-    let publisher = ConnectionPublisher::new(ConnectionSide::Client);
-    let observation = publisher.observation();
-    let mut local = LocalStream::from_inner(local).with_connection_publisher(publisher);
+    let mut local = LocalStream::from_inner(local);
     let mut peer = LocalStream::from_inner(peer);
     // The closing peer leaves its receive queue nonempty. Drain its outgoing
     // bytes first so the following read observes the OS-specific end result.
@@ -71,20 +69,6 @@ async fn peer_close_with_unread_data_records_the_native_read_end() {
     #[cfg(target_os = "macos")]
     assert_eq!(result.unwrap(), 0);
     assert!(local.peer_ended());
-    assert!(
-        observation.snapshot().is_none(),
-        "the local stream is still open"
-    );
-    drop(local);
-    let closed = observation.snapshot().unwrap();
-    assert!(closed.is_peer_end());
-    #[cfg(target_os = "linux")]
-    {
-        assert_eq!(closed.reason(), ConnectionEndReason::ConnectionReset);
-        assert_eq!(closed.os_error(), Some(libc::ECONNRESET));
-    }
-    #[cfg(target_os = "macos")]
-    assert_eq!(closed.reason(), ConnectionEndReason::PeerEof);
 }
 
 pub(super) fn close_listener(listener: LocalListener) {
@@ -98,6 +82,82 @@ pub(super) fn close_listener(listener: LocalListener) {
         ),
         "listener cleanup failed: {outcome:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_connect_deadline_replaces_the_default_phase_guard() {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let started = tokio::time::Instant::now();
+    within_connect_deadline(Some(deadline.into_std()), async {
+        tokio::time::sleep(DEFAULT_CONNECT_TIMEOUT + Duration::from_secs(1)).await;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        started.elapsed(),
+        DEFAULT_CONNECT_TIMEOUT + Duration::from_secs(1)
+    );
+
+    let started = tokio::time::Instant::now();
+    let error = within_connect_deadline(None, std::future::pending::<io::Result<()>>())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(started.elapsed(), DEFAULT_CONNECT_TIMEOUT);
+}
+
+#[tokio::test]
+async fn expired_connection_and_bind_deadlines_create_no_connection_or_listener() {
+    let fixture = isolated_endpoint("expired-deadline");
+    let deadline = Some(Instant::now());
+    assert_eq!(
+        LocalStream::connect_until(&fixture.endpoint, deadline)
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::TimedOut,
+    );
+    assert_eq!(
+        LocalListener::bind_until(&fixture.endpoint, deadline)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::WouldBlock,
+    );
+    close_listener(LocalListener::bind_until(&fixture.endpoint, None).unwrap());
+}
+
+#[tokio::test]
+async fn native_write_failure_aborts_without_peer_end() {
+    let (_fixture, stream, peer) = isolated_pair().await;
+    let abort = stream.abort_handle();
+    let (reader, mut writer) = stream.into_split();
+    {
+        let native = peer.owner.stream.lock().unwrap();
+        #[cfg(unix)]
+        socket2::SockRef::from(&*native)
+            .shutdown(std::net::Shutdown::Read)
+            .unwrap();
+        #[cfg(windows)]
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::System::Pipes::DisconnectNamedPipe(
+                    platform::raw_handle(&native) as windows_sys::Win32::Foundation::HANDLE,
+                )
+            },
+            0
+        );
+    }
+    drop(peer);
+    let error = writer
+        .write_all_with_timeout(b"native failure", Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(abort.is_aborted());
+    assert!(!reader.peer_ended());
 }
 
 #[tokio::test]
@@ -127,9 +187,6 @@ async fn remote_read_guards_retain_the_os_stream_after_abort_and_io_owners_drop(
             ConnectionSide::Client => (client, server),
             ConnectionSide::Server => (server, client),
         };
-        let publisher = ConnectionPublisher::new(side);
-        let observation = publisher.observation();
-        let stream = stream.with_connection_publisher(publisher);
         let abort = stream.abort_handle();
         let first = stream.retain_for_remote_read();
         let (mut reader, writer) = stream.into_split();
@@ -143,17 +200,10 @@ async fn remote_read_guards_retain_the_os_stream_after_abort_and_io_owners_drop(
         drop(reader);
         drop(writer);
         assert_eq!(Arc::strong_count(&last._owner), 2);
-        assert!(observation.snapshot().is_none());
         assert!(futures_util::poll!(std::pin::pin!(peer.read(&mut [0]))).is_pending());
         drop(first);
-        assert!(observation.snapshot().is_none());
         assert!(futures_util::poll!(std::pin::pin!(peer.read(&mut [0]))).is_pending());
         drop(last);
-        let closed = observation
-            .snapshot()
-            .expect("last guard retires the stream");
-        assert_eq!(closed.reason(), ConnectionEndReason::LocalClose);
-        assert!(!closed.is_peer_end());
         // Retaining the abort handle must not retain the OS connection.
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), peer.read(&mut [0]))
@@ -163,7 +213,6 @@ async fn remote_read_guards_retain_the_os_stream_after_abort_and_io_owners_drop(
             0
         );
         abort.abort();
-        assert_eq!(observation.snapshot(), Some(closed));
     }
 }
 
@@ -179,22 +228,17 @@ fn remote_read_guard_retains_the_os_stream_after_executor_shutdown() {
         .enable_all()
         .build()
         .unwrap();
-    let publisher = ConnectionPublisher::new(ConnectionSide::Client);
-    let observation = publisher.observation();
     let guard = {
         let _entered = runtime.enter();
-        let stream = LocalStream::from_inner(tokio::net::UnixStream::from_std(local).unwrap())
-            .with_connection_publisher(publisher);
+        let stream = LocalStream::from_inner(tokio::net::UnixStream::from_std(local).unwrap());
         stream.retain_for_remote_read()
     };
     drop(runtime);
-    assert!(observation.snapshot().is_none());
     assert_eq!(
         peer.read(&mut [0]).unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
     drop(guard);
-    assert!(observation.snapshot().is_some());
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
 }
 
@@ -213,9 +257,6 @@ fn remote_read_guard_retains_native_pipe_handles_after_executor_shutdown() {
             ConnectionSide::Client => (client, server),
             ConnectionSide::Server => (server, client),
         };
-        let publisher = ConnectionPublisher::new(side);
-        let observation = publisher.observation();
-        let stream = stream.with_connection_publisher(publisher);
         let raw = platform::raw_handle(&stream.owner.stream.lock().unwrap());
         let guard = stream.retain_for_remote_read();
         let owner = Arc::downgrade(&guard._owner);
@@ -226,10 +267,8 @@ fn remote_read_guard_retains_native_pipe_handles_after_executor_shutdown() {
             unsafe { GetHandleInformation(raw as HANDLE, &mut flags) },
             0
         );
-        assert!(observation.snapshot().is_none());
         drop(guard);
         assert!(owner.upgrade().is_none());
-        assert!(observation.snapshot().is_some());
         drop(peer);
     }
 }
