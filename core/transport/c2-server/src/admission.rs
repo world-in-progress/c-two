@@ -9,6 +9,7 @@ use crate::server::PendingRouteInfo;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmissionPhase {
     Open,
+    Draining,
     Terminal,
 }
 
@@ -31,8 +32,27 @@ impl AdmissionState {
             Err(SchedulerAcquireError::Closed)
         } else if self.generation != generation {
             Err(SchedulerAcquireError::Unavailable)
+        } else if self.phase == AdmissionPhase::Draining {
+            Err(SchedulerAcquireError::Closed)
         } else {
             Ok(())
+        }
+    }
+
+    /// Continue work admitted in this host generation while shutdown drains it.
+    pub(crate) fn check_accepted(&self, generation: u64) -> Result<(), SchedulerAcquireError> {
+        if self.phase == AdmissionPhase::Terminal {
+            Err(SchedulerAcquireError::Closed)
+        } else if self.generation != generation {
+            Err(SchedulerAcquireError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn begin_drain(&mut self) {
+        if self.phase == AdmissionPhase::Open {
+            self.phase = AdmissionPhase::Draining;
         }
     }
 

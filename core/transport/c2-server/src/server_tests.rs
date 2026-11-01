@@ -1068,7 +1068,7 @@ async fn admission_dispatcher_waiter_keeps_original_generation() {
     let mut identity = call_identity("grid");
     identity.route_uid = route.route_uid.clone();
     let dispatcher = server.dispatcher.write().await;
-    let mut request = Box::pin(reserve_route_execution(server, &identity, 0));
+    let mut request = Box::pin(reserve_accepted_route_execution(server, &identity, 0));
     assert!(admission_poll_once(request.as_mut()).await.is_pending());
     {
         let mut admission = server.admission.lock();
@@ -1146,25 +1146,25 @@ async fn admission_keeps_contract_identity_and_method_error_priority() {
     let route = admission_route(server, "grid", ConcurrencyMode::Parallel).await;
     let mut identity = call_identity("grid");
     identity.route_uid = route.route_uid.clone();
-    server.request_shutdown_signal();
+    server.close_business_admission("test").await;
     assert!(matches!(
-        reserve_route_execution(server, &identity, 0).await,
+        reserve_accepted_route_execution(server, &identity, 0).await,
         Err(RouteAdmissionError::Acquire(SchedulerAcquireError::Closed))
     ));
     assert!(matches!(
-        reserve_route_execution(server, &identity, 99).await,
+        reserve_accepted_route_execution(server, &identity, 99).await,
         Err(RouteAdmissionError::UnknownMethod { .. })
     ));
     let mut wrong = identity.clone();
     wrong.route_uid.push_str("-stale");
     assert!(matches!(
-        reserve_route_execution(server, &wrong, 99).await,
+        reserve_accepted_route_execution(server, &wrong, 99).await,
         Err(RouteAdmissionError::RouteStale { .. })
     ));
     wrong = identity;
     wrong.abi_hash = "0".repeat(64);
     assert!(matches!(
-        reserve_route_execution(server, &wrong, 99).await,
+        reserve_accepted_route_execution(server, &wrong, 99).await,
         Err(RouteAdmissionError::ContractMismatch { .. })
     ));
 }
@@ -2106,6 +2106,7 @@ async fn shutdown_signal_closes_all_route_admissions_before_waiting_for_drain() 
     let guard_b = scheduler_b
         .blocking_acquire(0)
         .expect("route B guard should enter");
+    server.request_shutdown_signal();
     let close_task = {
         let server = Arc::clone(&server);
         tokio::spawn(async move {
@@ -2489,7 +2490,7 @@ async fn connection_close_cancels_request_waiting_for_server_execution_slot() {
             }
             _ => unreachable!(),
         }
-        wait_until("connection deactivated", || conn.is_cancelled()).await;
+        wait_until("connection deactivated", || conn.is_deactivated()).await;
         assert!(
             !handler.is_finished(),
             "active work keeps the connection handler alive"
@@ -3983,97 +3984,164 @@ async fn call_over_connection(
     reply
 }
 
-async fn assert_malformed_call_disconnects(flags: u32, payload: &[u8]) {
-    let server = ordering_test_server("ipc://malformed_call", 8);
+async fn assert_bad_call_isolated(flags: u32, payload: &[u8], deactivates: bool) {
+    let config = ServerIpcConfig {
+        max_execution_workers: 1,
+        ..Default::default()
+    };
+    let server = Arc::new(test_server_new("ipc://malformed_call", config).unwrap());
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut route = make_host_route(&server, "grid");
     route.callback = Arc::new(EchoRequestBytes {
-        calls: Arc::clone(&calls),
+        calls: calls.clone(),
     });
     server.register_route(route).await.unwrap();
-    let events = server.connection_events();
+    let execution = server.execution_scheduler.try_acquire(0).unwrap();
     let (mut client, stream) = isolated_pair().await;
-    let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
-    let observation = match events.recv().await.unwrap().unwrap() {
-        c2_local::ConnectionEvent::Opened(observation) => observation,
-        _ => panic!("expected opened connection"),
-    };
-    negotiate_test_version(&mut client).await;
-    let metadata =
-        c2_wire::handshake::encode_client_handshake(CAP_SHM_REQUEST, "malformed-call-peer")
-            .unwrap();
+    let handler = tokio::spawn(handle_connection(server.clone(), stream));
+    let ack = handshake_test_client_with(&mut client, CAP_SHM_REQUEST, "malformed-call-peer").await;
+    assert_ne!(ack.capability_flags & CAP_SHM_REQUEST, 0);
+    let conn = server
+        .active_connection(server.active_connection_ids()[0])
+        .unwrap();
+    let mut good = c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap();
+    good.extend_from_slice(b"accepted");
     client
-        .write_all(&encode_frame(0, FLAG_HANDSHAKE, &metadata))
+        .write_all(&encode_frame(41, c2_wire::flags::FLAG_CALL_V2, &good))
         .await
         .unwrap();
-    let (_, _, ack) = read_reply_frame(&mut client).await;
-    assert_ne!(
-        decode_handshake(&ack, true).unwrap().capability_flags & CAP_SHM_REQUEST,
-        0
-    );
+    wait_until("valid call waits for execution capacity", || {
+        conn.inflight_count() == 1
+    })
+    .await;
     client
         .write_all(&encode_frame(42, flags, payload))
         .await
         .unwrap();
-    let closed = observation
-        .wait_closed(Some(Duration::from_millis(250)))
-        .await;
-    let mut byte = [0];
-    let eof = tokio::time::timeout(Duration::from_millis(250), client.read(&mut byte)).await;
-    client.abort_handle().abort();
+    let mut releases = Vec::new();
+    let reply = loop {
+        let (id, flags, body) = read_reply_frame(&mut client).await;
+        if flags == FLAG_CTRL | FLAG_RESPONSE {
+            let frame = encode_frame(id, flags, &body);
+            let (header, payload) = c2_wire::frame::decode_frame(&frame).unwrap();
+            let release =
+                c2_wire::release::decode_release_frame(&header, payload, true, true).unwrap();
+            releases.extend_from_slice(release.ids());
+        } else {
+            assert_eq!(id, 42, "only the malformed call fails");
+            break body;
+        }
+    };
+    assert_eq!(
+        reply_error_code(&reply),
+        ErrorCode::ResourceInputDeserializing
+    );
+    assert_eq!(conn.core.is_deactivated(), deactivates);
+    assert_eq!(conn.inflight_count(), 1, "accepted call remains queued");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    if c2_wire::flags::is_buddy(flags) && !deactivates {
+        assert_eq!(
+            releases,
+            vec![1],
+            "failed local open still returns the known loan"
+        );
+    }
+    // A new call after deactivation is explicitly rejected before execution.
+    client
+        .write_all(&encode_frame(43, c2_wire::flags::FLAG_CALL_V2, &good))
+        .await
+        .unwrap();
+    if deactivates {
+        let (id, _, reply) = read_reply_frame(&mut client).await;
+        assert_eq!(id, 43);
+        assert_eq!(reply_error_code(&reply), ErrorCode::ResourceClosed);
+        assert!(reply_error_message(&reply).contains("not executed"));
+    }
+    drop(execution);
+    let (id, _, reply) = read_reply_frame(&mut client).await;
+    assert_eq!(id, 41);
+    let (control, consumed) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+    assert!(matches!(control, ReplyControl::Success));
+    assert_eq!(&reply[consumed..], b"accepted");
+    if !deactivates {
+        let (id, _, reply) = read_reply_frame(&mut client).await;
+        assert_eq!(id, 43);
+        assert!(matches!(
+            c2_wire::control::decode_reply_control(&reply, 0).unwrap().0,
+            ReplyControl::Success
+        ));
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        if deactivates { 1 } else { 2 }
+    );
+    drop(client);
     tokio::time::timeout(Duration::from_secs(2), handler)
         .await
-        .expect("connection handler terminates")
+        .unwrap()
         .unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(
-        matches!(eof, Ok(Ok(0))),
-        "malformed call must close the stream: {eof:?}"
-    );
-    assert_eq!(
-        closed
-            .expect("malformed call must close immediately")
-            .reason(),
-        ConnectionEndReason::ProtocolError
-    );
 }
 
-#[tokio::test]
-async fn malformed_inline_call_control_disconnects_immediately() {
-    assert_malformed_call_disconnects(c2_wire::flags::FLAG_CALL_V2, &[0xff]).await;
+fn reply_error_code(payload: &[u8]) -> ErrorCode {
+    let ReplyControl::Error(error) = c2_wire::control::decode_reply_control(payload, 0)
+        .unwrap()
+        .0
+    else {
+        panic!("expected a correlated error reply");
+    };
+    C2Error::from_wire_bytes(&error).unwrap().unwrap().code
 }
 
-#[tokio::test]
-async fn malformed_buddy_call_control_disconnects_immediately() {
-    let mut payload = encode_buddy_payload(&BuddyPayload {
+fn bad_call_buddy_payload(loan_id: u64) -> Vec<u8> {
+    encode_buddy_payload(&BuddyPayload {
         seg_idx: 0,
         generation: 1,
         offset: 4096,
         data_size: 16,
         is_dedicated: false,
-        loan_id: 1,
+        loan_id,
     })
-    .to_vec();
+    .to_vec()
+}
+
+#[tokio::test]
+async fn malformed_inline_call_control_only_fails_its_call() {
+    assert_bad_call_isolated(c2_wire::flags::FLAG_CALL_V2, &[0xff], false).await;
+}
+
+#[tokio::test]
+async fn malformed_buddy_call_control_only_fails_its_call() {
+    let mut payload = bad_call_buddy_payload(1);
     payload.push(0xff);
-    assert_malformed_call_disconnects(c2_wire::flags::FLAG_CALL_V2 | FLAG_BUDDY, &payload).await;
+    assert_bad_call_isolated(c2_wire::flags::FLAG_CALL_V2 | FLAG_BUDDY, &payload, false).await;
 }
 
 #[tokio::test]
-async fn malformed_buddy_payload_disconnects_before_dispatch() {
-    let mut payload = encode_buddy_payload(&BuddyPayload {
-        seg_idx: 0,
-        generation: 1,
-        offset: 4096,
-        data_size: 16,
-        is_dedicated: false,
-        loan_id: 1,
-    })
-    .to_vec();
+async fn malformed_buddy_payload_deactivates_but_preserves_accepted_call() {
+    let mut payload = bad_call_buddy_payload(1);
     payload[14] = 0x80;
     payload.extend_from_slice(
         &c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap(),
     );
-    assert_malformed_call_disconnects(c2_wire::flags::FLAG_CALL_V2 | FLAG_BUDDY, &payload).await;
+    assert_bad_call_isolated(c2_wire::flags::FLAG_CALL_V2 | FLAG_BUDDY, &payload, true).await;
+}
+
+#[tokio::test]
+async fn zero_buddy_loan_deactivates_but_preserves_accepted_call() {
+    let mut payload = bad_call_buddy_payload(0);
+    payload.extend_from_slice(
+        &c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap(),
+    );
+    assert_bad_call_isolated(c2_wire::flags::FLAG_CALL_V2 | FLAG_BUDDY, &payload, true).await;
+}
+
+#[tokio::test]
+async fn buddy_mapping_open_failure_only_fails_its_call() {
+    let mut payload = bad_call_buddy_payload(1);
+    payload.extend_from_slice(
+        &c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap(),
+    );
+    assert_bad_call_isolated(c2_wire::flags::FLAG_CALL_V2 | FLAG_BUDDY, &payload, false).await;
 }
 
 async fn wait_until(label: &str, mut check: impl FnMut() -> bool) {
@@ -5610,7 +5678,7 @@ async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
     // Observe the two release orders while the real pool prevents backing
     // release. Run synchronous teardown off the Tokio worker.
     for rollback in [false, true] {
-        let admission = reserve_route_execution(&server, &call_identity("grid"), 0)
+        let admission = reserve_accepted_route_execution(&server, &call_identity("grid"), 0)
             .await
             .ok()
             .expect("route admission for release-order probe");
@@ -5625,6 +5693,7 @@ async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
                     route: admission.route,
                     method_idx: 0,
                     pending_permit: admission.pending_permit,
+                    _flight: crate::connection::FlightGuard::new(&conn),
                 },
             )
             .unwrap_or_else(|(error, _)| panic!("{error}"));
@@ -6242,7 +6311,7 @@ async fn shutdown_preserves_active_reply_refuses_new_calls_and_fences_lifecycle_
             assert_eq!(read_reply_frame(&mut admin).await.0, 99);
         }
         assert!(
-            !f.conn.is_cancelled(),
+            !f.conn.is_deactivated(),
             "active response must retain business write admission"
         );
         let payload = c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap();
@@ -6324,7 +6393,7 @@ async fn shutdown_keeps_response_flight_until_chunked_reply_flushes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_deadline_deactivates_a_connection_with_an_unfinished_call() {
+async fn shutdown_deadline_preserves_the_unfinished_call_and_its_reply() {
     let mut f = ShutdownReplyFixture::start(b"done".to_vec()).await;
     assert!(
         f.server
@@ -6332,12 +6401,18 @@ async fn shutdown_deadline_deactivates_a_connection_with_an_unfinished_call() {
             .await
             .is_err()
     );
+    assert!(f.conn.shutdown_requested());
     assert!(
-        f.conn.is_cancelled(),
-        "the expired shutdown deadline must still deactivate"
+        !f.conn.is_deactivated(),
+        "the caller budget only bounds observation"
     );
     assert!(!f.completed.load(Ordering::SeqCst));
     f.release();
+    let (id, _, reply) = read_reply_frame(&mut f.peer).await;
+    assert_eq!(id, 1);
+    let (control, used) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+    assert!(matches!(control, ReplyControl::Success));
+    assert_eq!(&reply[used..], b"done");
     f.runner.take().unwrap().await.unwrap().unwrap();
 }
 
@@ -6590,7 +6665,7 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
         || calls.load(Ordering::SeqCst) == CALLS as usize + 1,
     )
     .await;
-    assert!(!conn.is_cancelled());
+    assert!(!conn.is_deactivated());
     let mut received = std::collections::HashSet::new();
     for _ in 0..CALLS + 3 {
         let (id, flags, payload) = read_reply_frame(&mut peer).await;
@@ -6617,7 +6692,7 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
         }
     }
     assert!(
-        !conn.is_cancelled(),
+        !conn.is_deactivated(),
         "queue backpressure must preserve the physical connection"
     );
     peer.write_all(&encode_frame(
@@ -6648,7 +6723,7 @@ async fn invalid_release_deactivates_new_work_but_preserves_active_owned_replies
             .await
             .unwrap();
         wait_until("invalid release deactivates business admission", || {
-            f.conn.is_cancelled()
+            f.conn.is_deactivated()
         })
         .await;
         assert!(!f.completed.load(Ordering::SeqCst));
@@ -6903,7 +6978,7 @@ async fn shutdown_keeps_listener_until_timed_out_response_writer_finishes() {
     f.server.request_shutdown_signal();
     f.release();
     wait_until("configured response write timeout elapsed", || {
-        f.conn.is_cancelled()
+        f.conn.is_deactivated()
     })
     .await;
     assert!(
@@ -7128,8 +7203,352 @@ async fn zero_business_pending_budget_keeps_control_and_capacity_replies() {
         .find(|conn| conn.handshake_done())
         .unwrap()
         .clone();
-    assert!(!conn.is_cancelled());
+    assert!(!conn.is_deactivated());
     drop(peer);
     server.request_shutdown_signal();
     runner.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn deactivation_keeps_calls_waiting_for_route_or_global_execution() {
+    for route_wait in [true, false] {
+        let config = ServerIpcConfig {
+            max_execution_workers: 1,
+            ..Default::default()
+        };
+        let server = Arc::new(test_server_new("ipc://deactivation_waiter", config).unwrap());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut route = make_host_route(&server, "grid");
+        route.scheduler = Arc::new(Scheduler::with_admission(
+            ConcurrencyMode::Exclusive,
+            HashMap::new(),
+            SchedulerLimits::try_from_usize(None, Some(1)).unwrap(),
+            server.admission.clone(),
+        ));
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: calls.clone(),
+        });
+        let scheduler = route.scheduler.clone();
+        server.register_route(route).await.unwrap();
+        let capacity = if route_wait {
+            scheduler.try_acquire(0).unwrap()
+        } else {
+            server.execution_scheduler.try_acquire(0).unwrap()
+        };
+        let (mut peer, stream) = isolated_pair().await;
+        let handler = tokio::spawn(handle_connection(server.clone(), stream));
+        handshake_test_client(&mut peer).await;
+        let conn = server
+            .active_connection(server.active_connection_ids()[0])
+            .unwrap();
+        let mut payload = c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap();
+        payload.extend_from_slice(b"queued");
+        peer.write_all(&encode_frame(1, c2_wire::flags::FLAG_CALL_V2, &payload))
+            .await
+            .unwrap();
+        wait_until("accepted call queued", || {
+            conn.inflight_count() == 1
+                && scheduler.snapshot().pending == if route_wait { 2 } else { 1 }
+        })
+        .await;
+        conn.end(ConnectionEndReason::LocalClose, "test_deactivation");
+        peer.write_all(&encode_frame(2, c2_wire::flags::FLAG_CALL_V2, &payload))
+            .await
+            .unwrap();
+        let (id, _, reply) = read_reply_frame(&mut peer).await;
+        assert_eq!(id, 2, "the accepted call has no premature error");
+        assert_eq!(reply_error_code(&reply), ErrorCode::ResourceClosed);
+        assert!(reply_error_message(&reply).contains("not executed"));
+        assert_eq!(conn.inflight_count(), 1);
+        drop(capacity);
+        let (id, _, reply) = read_reply_frame(&mut peer).await;
+        assert_eq!(id, 1);
+        let (control, used) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+        assert!(matches!(control, ReplyControl::Success));
+        assert_eq!(&reply[used..], b"queued");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(peer);
+        handler.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn deactivation_and_shutdown_preserve_started_chunked_calls() {
+    for shutdown in [false, true] {
+        for parked_admission in [false, true] {
+            let server = ordering_test_server("ipc://deactivated_chunks", 8);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut route = make_host_route(&server, "grid");
+            route.callback = Arc::new(EchoRequestBytes {
+                calls: calls.clone(),
+            });
+            server.register_route(route).await.unwrap();
+            let (mut peer, stream) = isolated_pair().await;
+            let handler = tokio::spawn(handle_connection(server.clone(), stream));
+            handshake_test_client(&mut peer).await;
+            let conn = server
+                .active_connection(server.active_connection_ids()[0])
+                .unwrap();
+            let gate = if parked_admission {
+                Some(server.dispatcher.write().await)
+            } else {
+                None
+            };
+            peer.write_all(&chunked_call_frame(1, 0, 2, b"abcd", "grid"))
+                .await
+                .unwrap();
+            wait_until("first chunk accepted", || {
+                if parked_admission {
+                    server.chunk_admission_gate.len() == 1
+                } else {
+                    server.chunk_registry.contains(conn.conn_id(), 1)
+                }
+            })
+            .await;
+            if shutdown {
+                server.request_shutdown_signal();
+            } else {
+                conn.end(ConnectionEndReason::ProtocolError, "test_deactivation");
+            }
+            let inline = c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap();
+            peer.write_all(&encode_frame(2, c2_wire::flags::FLAG_CALL_V2, &inline))
+                .await
+                .unwrap();
+            peer.write_all(&chunked_call_frame(3, 0, 2, b"new!", "grid"))
+                .await
+                .unwrap();
+            let mut refused = HashSet::new();
+            for _ in 0..2 {
+                let (id, _, reply) = read_reply_frame(&mut peer).await;
+                assert!([2, 3].contains(&id));
+                assert!(refused.insert(id));
+                assert_eq!(reply_error_code(&reply), ErrorCode::ResourceClosed);
+                assert!(reply_error_message(&reply).contains("not executed"));
+            }
+            peer.write_all(&chunked_call_frame(1, 1, 2, b"EFGH", "grid"))
+                .await
+                .unwrap();
+            drop(gate);
+            let (id, _, reply) = read_reply_frame(&mut peer).await;
+            assert_eq!(id, 1);
+            let (control, used) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+            assert!(matches!(control, ReplyControl::Success), "{control:?}");
+            assert_eq!(&reply[used..], b"abcdEFGH");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(server.chunk_registry.active_count(), 0);
+            drop(peer);
+            handler.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn shutdown_preserves_accepted_calls_behind_dispatcher_route_and_global_gates() {
+    for stage in ["dispatcher", "route", "global"] {
+        let config = ServerIpcConfig {
+            max_execution_workers: 1,
+            ..Default::default()
+        };
+        let server = Arc::new(
+            test_server_new(&unique_readiness_address("shutdown_waiter"), config).unwrap(),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut route = make_host_route(&server, "grid");
+        route.scheduler = Arc::new(Scheduler::with_admission(
+            ConcurrencyMode::Exclusive,
+            HashMap::new(),
+            SchedulerLimits::try_from_usize(None, Some(1)).unwrap(),
+            server.admission.clone(),
+        ));
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: calls.clone(),
+        });
+        let scheduler = route.scheduler.clone();
+        server.register_route(route).await.unwrap();
+        let running = server.clone();
+        let runner = tokio::spawn(async move { running.run().await });
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut peer = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        handshake_test_client(&mut peer).await;
+        let conn = server
+            .active_connection(server.active_connection_ids()[0])
+            .unwrap();
+        let dispatcher = if stage == "dispatcher" {
+            Some(server.dispatcher.write().await)
+        } else {
+            None
+        };
+        let capacity = match stage {
+            "route" => Some(scheduler.try_acquire(0).unwrap()),
+            "global" => Some(server.execution_scheduler.try_acquire(0).unwrap()),
+            _ => None,
+        };
+        let payload = c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap();
+        peer.write_all(&encode_frame(1, c2_wire::flags::FLAG_CALL_V2, &payload))
+            .await
+            .unwrap();
+        wait_until("accepted call parks before execution", || {
+            conn.inflight_count() == 1
+                && (stage == "dispatcher"
+                    || scheduler.snapshot().pending == if stage == "route" { 2 } else { 1 })
+        })
+        .await;
+        assert!(
+            server
+                .shutdown_and_wait(Duration::from_millis(30))
+                .await
+                .is_err()
+        );
+        assert!(!runner.is_finished());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            endpoint_connects(server.local_endpoint()).await,
+            "listener stays until accepted work drains"
+        );
+        drop(dispatcher);
+        drop(capacity);
+        let (id, _, reply) = read_reply_frame(&mut peer).await;
+        assert_eq!(id, 1);
+        assert!(matches!(
+            c2_wire::control::decode_reply_control(&reply, 0).unwrap().0,
+            ReplyControl::Success
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        runner.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+    }
+}
+
+#[tokio::test]
+async fn response_write_buffer_capacity_failure_reports_executed_output_error() {
+    let mut f = ShutdownReplyFixture::start(b"executed".to_vec()).await;
+    f.conn
+        .fail_next_write_allocation
+        .store(true, Ordering::Release);
+    f.release();
+    let (id, _, reply) = read_reply_frame(&mut f.peer).await;
+    assert_eq!(id, 1);
+    assert!(f.completed.load(Ordering::SeqCst));
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reply_error_code(&reply),
+        ErrorCode::ResourceOutputSerializing
+    );
+    assert!(reply_error_message(&reply).contains("write buffer allocation failure"));
+    f.server.request_shutdown_signal();
+    f.runner.take().unwrap().await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn buddy_chunk_continuations_survive_deactivation_and_shutdown() {
+    for shutdown in [false, true] {
+        for parked_admission in [false, true] {
+            let server = ordering_test_server("ipc://deactivated_buddy_chunks", 8);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut route = make_host_route(&server, "grid");
+            route.callback = Arc::new(EchoRequestBytes {
+                calls: calls.clone(),
+            });
+            server.register_route(route).await.unwrap();
+            let mut pool = MemPool::new_with_prefix(
+                PoolConfig {
+                    segment_size: 64 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 1,
+                    ..Default::default()
+                },
+                unique_response_pool_prefix("drainingchunks"),
+            )
+            .unwrap();
+            let (mut peer, stream) = isolated_pair().await;
+            let handler = tokio::spawn(handle_connection(server.clone(), stream));
+            let ack = handshake_test_client_with(&mut peer, CAP_SHM_REQUEST, pool.prefix()).await;
+            assert_ne!(ack.capability_flags & CAP_SHM_REQUEST, 0);
+            let conn = server
+                .active_connection(server.active_connection_ids()[0])
+                .unwrap();
+            let gate = if parked_admission {
+                Some(server.dispatcher.write().await)
+            } else {
+                None
+            };
+            let mut gate = gate;
+            for (index, bytes) in [b"abcd", b"EFGH"].into_iter().enumerate() {
+                let mut handle = pool.alloc_shm_handle(bytes.len()).unwrap();
+                pool.handle_slice_mut(&mut handle).copy_from_slice(bytes);
+                let allocation = handle.shm_allocation().unwrap();
+                let loan_id = 101 + index as u64;
+                let mut payload = encode_buddy_payload(&BuddyPayload {
+                    seg_idx: allocation.seg_idx as u16,
+                    generation: allocation.generation,
+                    offset: allocation.offset,
+                    data_size: bytes.len() as u32,
+                    is_dedicated: allocation.is_dedicated,
+                    loan_id,
+                })
+                .to_vec();
+                payload.extend_from_slice(&c2_wire::chunk::header::encode_chunk_header(
+                    index as u16,
+                    2,
+                ));
+                if index == 0 {
+                    payload.extend_from_slice(
+                        &c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap(),
+                    );
+                }
+                let flags = c2_wire::flags::FLAG_CALL_V2
+                    | FLAG_CHUNKED
+                    | FLAG_BUDDY
+                    | if index == 1 { FLAG_CHUNK_LAST } else { 0 };
+                peer.write_all(&encode_frame(1, flags, &payload))
+                    .await
+                    .unwrap();
+                if index == 1 {
+                    drop(gate.take());
+                }
+                assert_eq!(read_release_id(&mut peer).await, loan_id);
+                pool.release_handle(handle);
+                assert_eq!(pool.stats().alloc_count, 0);
+                if index == 0 {
+                    wait_until("buddy first chunk accepted", || {
+                        if parked_admission {
+                            server.chunk_admission_gate.len() == 1
+                        } else {
+                            server.chunk_registry.contains(conn.conn_id(), 1)
+                        }
+                    })
+                    .await;
+                    if shutdown {
+                        server.request_shutdown_signal();
+                    } else {
+                        conn.end(
+                            ConnectionEndReason::ProtocolError,
+                            "test_buddy_deactivation",
+                        );
+                    }
+                    let new_call =
+                        c2_wire::control::encode_call_control(&call_identity("grid"), 0).unwrap();
+                    peer.write_all(&encode_frame(2, c2_wire::flags::FLAG_CALL_V2, &new_call))
+                        .await
+                        .unwrap();
+                    let (id, _, reply) = read_reply_frame(&mut peer).await;
+                    assert_eq!(id, 2);
+                    assert_eq!(reply_error_code(&reply), ErrorCode::ResourceClosed);
+                }
+            }
+            let (id, _, reply) = read_reply_frame(&mut peer).await;
+            assert_eq!(id, 1);
+            let (control, used) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+            assert!(matches!(control, ReplyControl::Success), "{control:?}");
+            assert_eq!(&reply[used..], b"abcdEFGH");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            drop(peer);
+            handler.await.unwrap();
+        }
+    }
 }

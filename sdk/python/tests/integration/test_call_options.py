@@ -173,7 +173,10 @@ def http_connection(start_c3_relay):
     max_payload_size = resolve_server_ipc_config(
         registry._runtime_session.server_ipc_overrides,  # noqa: SLF001
     )['max_payload_size']
-    with httpx.Client(trust_env=False, timeout=5) as http:
+    with httpx.Client(
+        trust_env=False, timeout=5,
+        headers={'x-c2-local-namespace': registry.local_endpoint_context().namespace_id},
+    ) as http:
         response = http.post(f'{relay.url}/_register', json={
             'name': name,
             'server_id': identity['server_id'],
@@ -319,10 +322,10 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
         assert retired['used_operations'] == 1
         assert retired['used_retained_bytes'] == nbytes
 
-        outcome = session.begin_shutdown().observe()
-        assert outcome['completed']
-        assert outcome['ipc_clients_drained']
         if owner_kind == 'prepared':
+            outcome = session.begin_shutdown().observe()
+            assert outcome['completed']
+            assert outcome['ipc_clients_drained']
             snapshot = replacement.call_execution_snapshot()
             assert len(snapshot['retired']) == 1
             retired = snapshot['retired'][0]
@@ -333,20 +336,21 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
             assert resource.calls == 0
             owner.close()
         else:
+            outcome = session.begin_shutdown(timeout_seconds=0.05).observe()
+            assert outcome['completed'] is False, outcome
+            assert outcome['ipc_clients_drained'] is False, outcome
             assert not resource.finished.is_set()
-            # Explicit shutdown may finish the client future while server work
-            # remains alive. Observe the actual metadata refund, never infer it
-            # from server completion or assert that shutdown must stay pending.
-            deadline = time.monotonic() + 2
+            # The caller's deadline ended only its wait. Retirement keeps the
+            # dispatched call and its charge until the resource finishes.
             actual = session.call_execution_snapshot()
-            while actual['used_operations'] != 0:
-                assert actual['closed']
-                assert actual['used_operations'] == 1
-                assert actual['used_retained_bytes'] == nbytes
-                assert time.monotonic() < deadline, actual
-                actual = session.call_execution_snapshot()
+            assert actual['closed']
+            assert actual['used_operations'] == 1
+            assert actual['used_retained_bytes'] == nbytes
             release_resource.set()
             assert resource.finished.wait(2)
+            outcome = session.begin_shutdown(timeout_seconds=2).observe()
+            assert outcome['completed'], outcome
+            assert outcome['ipc_clients_drained'], outcome
             assert resource.completed == ['active']
 
         actual = session.call_execution_snapshot()

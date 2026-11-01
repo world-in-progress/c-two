@@ -179,6 +179,10 @@ pub struct Connection {
     /// The receive driver cannot obtain any more release or peer-end facts.
     read_stopped: AtomicBool,
     peer_ended: AtomicBool,
+    /// The reader lost the peer or a trustworthy next frame boundary.
+    work_cancelled: AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_next_write_allocation: AtomicBool,
 
     /// Number of requests currently being processed.
     inflight: AtomicI32,
@@ -233,6 +237,9 @@ impl Connection {
             first_end: Arc::new(Mutex::new(None)),
             read_stopped: AtomicBool::new(false),
             peer_ended: AtomicBool::new(false),
+            work_cancelled: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_write_allocation: AtomicBool::new(false),
             inflight: AtomicI32::new(0),
             pending_writes: AtomicUsize::new(0),
             shutdown_requested: AtomicBool::new(false),
@@ -475,19 +482,24 @@ impl Connection {
     }
 
     pub(crate) fn cancel_queued_work(&self) {
+        self.work_cancelled.store(true, Ordering::Release);
         self.end(ConnectionEndReason::LocalClose, "connection_cancel");
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_deactivated(&self) -> bool {
         self.core.is_deactivated()
     }
 
-    pub(crate) async fn wait_cancelled(&self) {
+    pub(crate) fn is_work_cancelled(&self) -> bool {
+        self.work_cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_work_cancelled(&self) {
         loop {
             let notified = self.writer_wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.is_cancelled() {
+            if self.is_work_cancelled() {
                 return;
             }
             notified.await;
@@ -635,7 +647,7 @@ mod shutdown_tests {
         };
         conn.begin_shutdown();
         assert_eq!(conn.inflight_count(), 1);
-        assert!(!conn.is_cancelled());
+        assert!(!conn.is_deactivated());
         drop(
             conn.core
                 .begin_write(WriteRequest::Business(Vec::new()))
@@ -643,7 +655,7 @@ mod shutdown_tests {
         );
         drop(task);
         assert_eq!(conn.inflight_count(), 0);
-        assert!(conn.is_cancelled());
+        assert!(conn.is_deactivated());
         assert!(conn.try_close());
     }
 }

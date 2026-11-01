@@ -182,7 +182,7 @@ impl SchedulerInner {
         self.admission.notify.notify_waiters();
     }
 
-    fn check_admission(
+    fn check_accepted_admission(
         &self,
         admission: &AdmissionState,
         state: &SchedulerState,
@@ -191,7 +191,7 @@ impl SchedulerInner {
         if state.route_admission != RouteAdmissionState::Opened {
             return Err(SchedulerAcquireError::Closed);
         }
-        admission.check(generation)
+        admission.check_accepted(generation)
     }
 
     fn worker_slots_available(&self, state: &SchedulerState) -> usize {
@@ -381,11 +381,15 @@ impl Scheduler {
         self.reserve_pending(method_idx)?.blocking_activate()
     }
 
-    pub(crate) async fn async_acquire(
+    /// Acquire server-wide capacity for a call already admitted by a route.
+    pub(crate) async fn async_acquire_accepted(
         &self,
         method_idx: u16,
+        generation: u64,
     ) -> Result<SchedulerGuard, SchedulerAcquireError> {
-        self.reserve_pending(method_idx)?.async_activate().await
+        self.reserve_pending_in_generation(method_idx, generation)?
+            .async_activate()
+            .await
     }
 
     pub(crate) fn reserve_pending(
@@ -411,11 +415,15 @@ impl Scheduler {
         let access = self.held_access(method_idx);
         let admission = self.inner.admission.lock();
         let mut state = self.inner.state.lock().unwrap();
-        self.inner.check_admission(
-            &admission,
-            &state,
-            generation.unwrap_or(admission.generation),
-        )?;
+        if let Some(generation) = generation {
+            self.inner
+                .check_accepted_admission(&admission, &state, generation)?;
+        } else {
+            if state.route_admission != RouteAdmissionState::Opened {
+                return Err(SchedulerAcquireError::Closed);
+            }
+            admission.check(admission.generation)?;
+        }
         if let Some(limit) = self.inner.limits.max_pending
             && state.pending >= limit.get()
         {
@@ -537,7 +545,7 @@ impl SchedulerPendingPermit {
         let admission = self.inner.admission.lock();
         let mut state = self.inner.state.lock().unwrap();
         self.inner
-            .check_admission(&admission, &state, self.admission_generation)?;
+            .check_accepted_admission(&admission, &state, self.admission_generation)?;
         if !self.inner.can_activate(&state, self.ticket, self.access) {
             return Ok(None);
         }
@@ -573,6 +581,10 @@ impl Drop for SchedulerPendingPermit {
 }
 
 impl SchedulerGuard {
+    pub(crate) fn admission_generation(&self) -> u64 {
+        self.admission_generation
+    }
+
     /// Commit immediately before the resource callback, after all queue waits.
     /// This serializes with host pause and route close. Once committed, work
     /// retains the original guard/drain accounting even if the host pauses.
@@ -583,7 +595,7 @@ impl SchedulerGuard {
         let admission = self.inner.admission.lock();
         let state = self.inner.state.lock().unwrap();
         self.inner
-            .check_admission(&admission, &state, self.admission_generation)?;
+            .check_accepted_admission(&admission, &state, self.admission_generation)?;
         self.committed = true;
         Ok(())
     }
@@ -592,7 +604,7 @@ impl SchedulerGuard {
         let admission = self.inner.admission.lock();
         let state = self.inner.state.lock().unwrap();
         self.inner
-            .check_admission(&admission, &state, self.admission_generation)
+            .check_accepted_admission(&admission, &state, self.admission_generation)
     }
 
     pub(crate) async fn wait_rejected(&self) -> SchedulerAcquireError {
@@ -667,6 +679,150 @@ mod tests {
             sched.try_acquire(0).unwrap_err(),
             SchedulerAcquireError::Closed
         );
+    }
+
+    #[tokio::test]
+    async fn draining_keeps_queued_route_call_and_rejects_new_admission() {
+        let admission = Arc::new(AdmissionGate::new());
+        let scheduler = Scheduler::with_admission(
+            ConcurrencyMode::Exclusive,
+            empty_map(),
+            SchedulerLimits::default(),
+            Arc::clone(&admission),
+        );
+        let first = scheduler.try_acquire(0).expect("first call enters");
+        let generation = admission.lock().generation;
+        let queued = scheduler
+            .reserve_pending_in_generation(0, generation)
+            .expect("second call was admitted before drain");
+
+        admission.lock().begin_drain();
+        assert!(scheduler.snapshot().closed);
+        assert_eq!(
+            scheduler.reserve_pending(0).unwrap_err(),
+            SchedulerAcquireError::Closed
+        );
+        assert!(admission.lock().check_accepted(generation).is_ok());
+
+        drop(first);
+        let mut second = queued.async_activate().await.expect("queued call enters");
+        second.commit().expect("accepted call commits during drain");
+        drop(second);
+        scheduler.wait_drained_async().await;
+        assert_eq!(scheduler.snapshot().pending, 0);
+    }
+
+    #[tokio::test]
+    async fn draining_keeps_accepted_call_waiting_for_global_capacity() {
+        use tokio::time::{Duration, timeout};
+
+        let admission = Arc::new(AdmissionGate::new());
+        let route = Scheduler::with_admission(
+            ConcurrencyMode::Parallel,
+            empty_map(),
+            SchedulerLimits::default(),
+            Arc::clone(&admission),
+        );
+        let global = Scheduler::with_admission(
+            ConcurrencyMode::Parallel,
+            empty_map(),
+            SchedulerLimits {
+                max_pending: None,
+                max_workers: Some(NonZeroUsize::new(1).unwrap()),
+            },
+            Arc::clone(&admission),
+        );
+        let occupied = global.try_acquire(0).expect("global capacity occupied");
+        let generation = admission.lock().generation;
+        let route_guard = route
+            .reserve_pending_in_generation(0, generation)
+            .expect("route call admitted")
+            .async_activate()
+            .await
+            .expect("route capacity acquired");
+
+        admission.lock().begin_drain();
+        assert_eq!(route_guard.admission_generation(), generation);
+        assert_eq!(
+            global.reserve_pending(0).unwrap_err(),
+            SchedulerAcquireError::Closed
+        );
+        let mut waiting = tokio::spawn({
+            let global = global.clone();
+            async move { global.async_acquire_accepted(0, generation).await }
+        });
+        assert!(
+            timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert!(route_guard.check_admission().is_ok());
+
+        drop(occupied);
+        let global_guard = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("global capacity should release")
+            .expect("waiter should not panic")
+            .expect("accepted call should acquire global capacity");
+        let mut route_guard = route_guard;
+        route_guard.commit().expect("route callback may start");
+        drop(global_guard);
+        drop(route_guard);
+        global.wait_drained_async().await;
+        route.wait_drained_async().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_and_new_start_fence_accepted_pending_calls() {
+        let admission = Arc::new(AdmissionGate::new());
+        let scheduler = Scheduler::with_admission(
+            ConcurrencyMode::Parallel,
+            empty_map(),
+            SchedulerLimits::default(),
+            Arc::clone(&admission),
+        );
+        let generation = admission.lock().generation;
+        let pending = scheduler
+            .reserve_pending_in_generation(0, generation)
+            .expect("call admitted");
+        admission.lock().begin_drain();
+        admission.lock().terminate();
+        assert_eq!(
+            pending.async_activate().await.unwrap_err(),
+            SchedulerAcquireError::Closed
+        );
+        admission.lock().begin_start();
+        assert_eq!(
+            scheduler
+                .reserve_pending_in_generation(0, generation)
+                .unwrap_err(),
+            SchedulerAcquireError::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_route_close_still_rejects_pending_call_during_drain() {
+        let admission = Arc::new(AdmissionGate::new());
+        let scheduler = Scheduler::with_admission(
+            ConcurrencyMode::Exclusive,
+            empty_map(),
+            SchedulerLimits::default(),
+            Arc::clone(&admission),
+        );
+        let first = scheduler.try_acquire(0).expect("first call enters");
+        let generation = admission.lock().generation;
+        let pending = scheduler
+            .reserve_pending_in_generation(0, generation)
+            .expect("second call admitted");
+
+        admission.lock().begin_drain();
+        scheduler.close();
+        drop(first);
+        assert_eq!(
+            pending.async_activate().await.unwrap_err(),
+            SchedulerAcquireError::Closed
+        );
+        scheduler.wait_drained_async().await;
     }
 
     #[test]

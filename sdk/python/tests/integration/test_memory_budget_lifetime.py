@@ -14,7 +14,6 @@ import pytest
 import c_two as cc
 
 import c_two.observe
-from c_two.error import ClientCallResource
 from c_two.transport.client.util import ping
 from c_two.transport.registry import _get_default_runtime
 from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec, Payload, PayloadError
@@ -396,13 +395,22 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         assert route in _get_default_runtime().names
         assert hooks == []
         assert not proceed.is_set()
-        # The caller's wait expiry does not expire Core's cleanup budget. Keep
-        # the callback blocked until the actual client close wakes this call.
+        # Shutdown's short observation budget does not end the dispatched
+        # call or its response wait. The resource is still blocked here.
+        assert call_thread.is_alive()
+        assert call_outcome == {}
+        proceed.set()
         call_thread.join(timeout=10)
         assert not call_thread.is_alive()
-        assert isinstance(call_outcome.get('error'), ClientCallResource), call_outcome
-        assert 'held' not in call_outcome
-        proceed.set()
+        assert 'error' not in call_outcome, call_outcome
+        extra_held = call_outcome['held']
+        with extra_held.value.entry_view(0) as sequence:
+            extra_checked = sequence.at(0)
+        with extra_checked.acquire() as access:
+            assert access.bytes() == BLOB
+        extra_checked.close()
+        extra_held.release()
+        call_outcome.pop('held')
         completed = cc.shutdown(timeout=10)
         assert completed['completed'] is True, completed
         assert hooks == ['stopped']
@@ -454,6 +462,10 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         observer.shutdown(timeout_seconds=5)
         if payload is not None:
             payload.close()
+        # A failed assertion retains this frame in pytest's report. Release
+        # real producers too, so one failure cannot pin another test's domain.
+        call_outcome.clear()
+        call_thread = proxy = old_session = bridge = held = checked = extra_held = None
 
 
 @pytest.mark.timeout(60)

@@ -1927,7 +1927,7 @@ impl Runtime {
     fn drive_shutdown_transaction(
         &self,
         transaction: Arc<ShutdownTransaction>,
-        mut work: ShutdownWork,
+        work: ShutdownWork,
         historical: Option<ShutdownOutcome>,
     ) {
         let (pool, mut execution) = {
@@ -1939,27 +1939,36 @@ impl Runtime {
         };
         let mut observation = pool.as_ref().map(|pool| pool.observe_closes());
         if let Some(execution) = execution.as_mut() {
-            work.shutdown_timeout = execution.shutdown_timeout;
             if let (Some(observer), Some(seed)) = (observation.as_mut(), execution.seed.take()) {
                 observer.merge_seed(seed);
             }
         }
+        // Start client deactivation without waiting for its physical close.
+        // A slow peer must not hold up the selected Host's own drain.
+        let early_client_close = if execution.is_some() {
+            observation
+                .as_mut()
+                .map(|observer| observer.close_all(Duration::ZERO))
+        } else {
+            None
+        };
         let needs_final_drain = execution.is_none() || historical.is_some();
         let mut outcome = if let Some(historical) = historical {
             // The original journal is immutable and may already have been delivered.
             // Only the new sealed client scope and any still-live Server remain.
             historical
         } else {
-            let outcome = self.execute_shutdown(
-                &work,
-                execution.as_ref().map(|e| &e.executor),
-                observation.as_mut(),
-            );
+            let outcome = self.execute_shutdown(&work, execution.as_ref().map(|e| &e.executor));
             if let Some(server) = &work.server {
                 self.retire_registration_scopes(server, &work.scopes);
             }
             outcome
         };
+        if let Some(mut report) = early_client_close {
+            outcome
+                .ipc_client_close_details
+                .append(&mut report.abnormal);
+        }
         #[cfg(test)]
         {
             let gate = self.state.lock().shutdown_publication_gate.take();
@@ -1993,25 +2002,6 @@ impl Runtime {
             None
         };
         let mut late_observation = late_pool.as_ref().map(|pool| pool.observe_closes());
-        let observer = observation.as_mut().or(late_observation.as_mut());
-        if let Some(observer) = observer {
-            if let Some(seed) = execution.seed.take() {
-                observer.merge_seed(seed);
-            }
-            // A newly sealed scope already drained these same entries and
-            // records in execute_shutdown. Only an upgraded/old journal needs
-            // a further pass; admission cannot reopen the sealed pool.
-            if needs_final_drain || !outcome.ipc_clients_drained {
-                Self::drain_ipc_clients(
-                    &mut outcome,
-                    Some(observer),
-                    execution.shutdown_timeout,
-                    true,
-                );
-            }
-        } else {
-            outcome.ipc_clients_drained = true;
-        }
         if let Some(server) = &work.server {
             // A prior error is not a stopped Server. Finish its existing native
             // lifecycle without replaying route unregister or relay withdrawal.
@@ -2025,7 +2015,6 @@ impl Runtime {
             while needs_completion {
                 let completion = execution.executor.block_on(async {
                     if server.lifecycle_state().is_running() {
-                        server.close_business_admission("shutdown").await;
                         server.request_shutdown_signal_with_reason("shutdown");
                     }
                     server.observe_shutdown_completion_unbounded().await
@@ -2062,6 +2051,24 @@ impl Runtime {
                 needs_completion = server.lifecycle_state().is_running();
             }
         }
+        let observer = observation.as_mut().or(late_observation.as_mut());
+        if let Some(observer) = observer {
+            if let Some(seed) = execution.seed.take() {
+                observer.merge_seed(seed);
+            }
+            // Host completion and outgoing-client closure have separate owners.
+            // Retain this transaction while the sealed pool's connections settle.
+            if needs_final_drain || !outcome.ipc_clients_drained {
+                Self::drain_ipc_clients(
+                    &mut outcome,
+                    Some(observer),
+                    execution.shutdown_timeout,
+                    true,
+                );
+            }
+        } else {
+            outcome.ipc_clients_drained = true;
+        }
         {
             let _state = self.state.lock();
             transaction.outcome.lock().outcome = Some(outcome);
@@ -2090,7 +2097,7 @@ impl Runtime {
             shutdown_timeout,
             scopes,
         };
-        self.execute_shutdown(&work, None, None)
+        self.execute_shutdown(&work, None)
     }
 
     fn with_shutdown_executor<T>(
@@ -2107,14 +2114,12 @@ impl Runtime {
         &self,
         work: &ShutdownWork,
         executor: Option<&tokio::runtime::Runtime>,
-        observation: Option<&mut c2_ipc::pool::ClientCloseObservation<'_>>,
     ) -> ShutdownOutcome {
         let server = work.server.as_ref();
         let route_names = &work.route_names;
         let relay_anchor_address = work.relay_anchor_address.as_deref();
         let relay_use_proxy = work.relay_use_proxy;
         let scopes = &work.scopes;
-        let shutdown_timeout = work.shutdown_timeout;
         let (mut effective_relay_anchor_address, mut relay_config_errors) =
             match self.effective_relay_anchor_address_arg(relay_anchor_address) {
                 Ok(address) => (address, Vec::new()),
@@ -2141,14 +2146,15 @@ impl Runtime {
 
         if let Some(server) = server {
             // A running Server owns the only drain and route journal. Request its close
-            // immediately so explicit shutdown cancels owner observation/grace while callbacks
-            // continue in the run loop. Never race a separate unregister future against it.
+            // immediately; its admission fence preserves accepted queue waits and
+            // callbacks in the run loop. Never race a separate unregister against it.
             if matches!(
                 server.lifecycle_state(),
                 ServerLifecycleState::Starting | ServerLifecycleState::Ready
             ) {
-                match Self::with_shutdown_executor(executor, |rt| {
-                    rt.block_on(server.close_business_admission("shutdown"));
+                // Establish the observer executor before starting an otherwise
+                // irreversible close; creation failure leaves the live Host alone.
+                match Self::with_shutdown_executor(executor, |_rt| {
                     server.request_shutdown_signal_with_reason("shutdown");
                 }) {
                     Ok(()) => {}
@@ -2165,12 +2171,6 @@ impl Runtime {
                     }
                 }
             }
-        }
-
-        // Only explicit Runtime retirement supplies a client observation.
-        // Ordinary Host closure has no authority over outgoing calls.
-        if executor.is_some() {
-            Self::drain_ipc_clients(&mut outcome, observation, shutdown_timeout, true);
         }
 
         if let Some(server) = server {

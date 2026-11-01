@@ -689,21 +689,32 @@ impl Server {
         &self,
         closed_reason: &str,
     ) -> Vec<ServerRouteCloseOutcome> {
+        // A complete frame (or an admitted first chunk) may still be waiting
+        // for route lookup. Keep those routes available until its original
+        // response has drained; shutdown already refuses new frame admission.
+        let connections = self
+            .active_connections
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for conn in connections {
+            conn.wait_idle().await;
+        }
         let routes = {
             let _guard = self.route_registration.lock().await;
             let dispatcher = self.dispatcher.read().await;
-            let routes = dispatcher.routes_snapshot();
-            for route in &routes {
-                route.scheduler.close();
-            }
-            routes
+            dispatcher.routes_snapshot()
         };
-        let outcomes = Self::wait_closed_routes_drained(routes, closed_reason).await;
+        let outcomes = Self::wait_routes_drained(routes.clone(), closed_reason).await;
+        for route in routes {
+            route.scheduler.close();
+        }
         self.dispatcher.write().await.take_all();
         outcomes
     }
 
-    async fn wait_closed_routes_drained(
+    async fn wait_routes_drained(
         routes: Vec<Arc<CrmRoute>>,
         closed_reason: &str,
     ) -> Vec<ServerRouteCloseOutcome> {
@@ -1065,7 +1076,7 @@ impl Server {
                 .inspect(|route| route.scheduler.close())
                 .collect::<Vec<_>>()
         };
-        let outcomes = Self::wait_closed_routes_drained(routes.clone(), closed_reason).await;
+        let outcomes = Self::wait_routes_drained(routes.clone(), closed_reason).await;
         let mut dispatcher = self.dispatcher.write().await;
         for route in routes {
             if dispatcher
@@ -1629,12 +1640,7 @@ impl Server {
         timeout: Duration,
     ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
         self.request_shutdown_signal();
-        if let Err(error) = self.wait_until_stopped(timeout).await {
-            for conn in self.active_connections.lock().values() {
-                conn.end(ConnectionEndReason::LocalClose, "server_shutdown");
-            }
-            return Err(error);
-        }
+        self.wait_until_stopped(timeout).await?;
         self.completed_shutdown_outcomes()
     }
 
@@ -1706,7 +1712,7 @@ impl Server {
 
     fn request_shutdown_signal(&self) {
         let mut registration = self.admission.lock();
-        registration.terminate();
+        registration.begin_drain();
         self.admission.notify.notify_waiters();
         match self.lifecycle_state() {
             ServerLifecycleState::Starting | ServerLifecycleState::Ready => {
@@ -1726,7 +1732,6 @@ impl Server {
             // responses. Closed route admission rejects any new business.
             for conn in self.active_connections.lock().values() {
                 conn.begin_shutdown();
-                self.cleanup_chunk_requests_for_connection(conn.conn_id());
             }
             self.shutdown_tx.send_replace(true);
         }
@@ -1943,6 +1948,7 @@ impl Drop for RegisteredConnection {
     fn drop(&mut self) {
         self.conn
             .end(ConnectionEndReason::LocalClose, "connection_task_drop");
+        self.conn.cancel_queued_work();
         self.conn.stop_reading();
         if let Some(task) = self.writer_task.take() {
             task.abort();
@@ -2069,9 +2075,6 @@ fn handle_connection(
         let mut read_failed = false;
 
         loop {
-            if conn.is_cancelled() {
-                server.cleanup_chunk_requests_for_connection(conn_id);
-            }
             let mut len_buf = [0u8; 4];
             match read_connection_exact(&mut reader, &mut len_buf, &conn, &mut shutdown_rx).await {
                 Ok(true) => {}
@@ -2190,16 +2193,6 @@ fn handle_connection(
                 if let Some(error) = outcome.error {
                     warn!(conn_id, %error, "invalid release record");
                     conn.end(ConnectionEndReason::ProtocolError, "release");
-                    server.cleanup_chunk_requests_for_connection(conn_id);
-                }
-                continue;
-            }
-            if conn.is_cancelled() && !header.is_signal() && !header.is_ctrl() {
-                if header.is_call_v2()
-                    && c2_wire::flags::is_buddy(flags)
-                    && conn.shm_request_capable()
-                {
-                    cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
                 }
                 continue;
             }
@@ -2218,14 +2211,12 @@ fn handle_connection(
                     } else {
                         conn.end(ConnectionEndReason::LocalClose, "shutdown_control_close");
                     }
-                    server.cleanup_chunk_requests_for_connection(conn_id);
                     continue;
                 }
                 match handle_signal(payload, request_id, &writer).await {
                     SignalAction::Continue => {}
                     SignalAction::Disconnect => {
                         conn.end(ConnectionEndReason::PeerCloseMessage, "disconnect");
-                        server.cleanup_chunk_requests_for_connection(conn_id);
                     }
                 }
             } else if header.is_ctrl() {
@@ -2240,6 +2231,23 @@ fn handle_connection(
                 // Reserve before any admission await or task submission so a
                 // concurrent shutdown cannot miss an already accepted call.
                 let flight = crate::connection::FlightGuard::new(&conn);
+                if (conn.is_deactivated() || conn.shutdown_requested())
+                    && !accepted_chunk_continuation(&server, conn_id, request_id, flags, payload)
+                {
+                    if c2_wire::flags::is_buddy(flags) && conn.shm_request_capable() {
+                        cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
+                    }
+                    queue_reply(
+                        &writer,
+                        request_id,
+                        &ReplyControl::Error(error_wire(
+                            ErrorCode::ResourceClosed,
+                            "connection admission is closed; request was not executed",
+                        )),
+                    )
+                    .await;
+                    continue;
+                }
                 // Un-negotiated buddy coordinates must be refused before any
                 // admission, lazy-open, or late-discard cleanup could touch a
                 // mapping this connection was never promised. The rejection
@@ -2343,12 +2351,12 @@ fn handle_connection(
                     continue;
                 }
                 if c2_wire::flags::is_buddy(flags) {
-                    let (buddy, _) = match decode_buddy_payload(payload) {
+                    let buddy = match decode_request_buddy(&conn, payload) {
                         Ok(value) => value,
                         Err(error) => {
                             warn!(conn_id, request_id, %error, "buddy payload decode error");
-                            conn.end(ConnectionEndReason::ProtocolError, "buddy_payload");
-                            break;
+                            queue_input_error(&writer, request_id, error).await;
+                            continue;
                         }
                     };
                     let (ctrl, ctrl_consumed) =
@@ -2360,9 +2368,9 @@ fn handle_connection(
                                     ?e,
                                     "buddy call control decode error"
                                 );
-                                cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
-                                conn.end(ConnectionEndReason::ProtocolError, "call_control");
-                                break;
+                                drop(admit_peer_request(&conn, buddy, &server.memory_budget));
+                                queue_input_error(&writer, request_id, e.to_string()).await;
+                                continue;
                             }
                         };
                     let request = match admit_peer_request(&conn, buddy, &server.memory_budget) {
@@ -2380,17 +2388,20 @@ fn handle_connection(
                             continue;
                         }
                     };
-                    let route_admission =
-                        match reserve_route_execution(&server, &ctrl.identity, ctrl.method_idx)
-                            .await
-                        {
-                            Ok(admission) => admission,
-                            Err(err) => {
-                                drop(request);
-                                queue_route_admission_error(&writer, request_id, err).await;
-                                continue;
-                            }
-                        };
+                    let route_admission = match reserve_accepted_route_execution(
+                        &server,
+                        &ctrl.identity,
+                        ctrl.method_idx,
+                    )
+                    .await
+                    {
+                        Ok(admission) => admission,
+                        Err(err) => {
+                            drop(request);
+                            queue_route_admission_error(&writer, request_id, err).await;
+                            continue;
+                        }
+                    };
                     let pending_permit = match server.try_acquire_pending_request() {
                         Ok(permit) => permit,
                         Err(limit) => {
@@ -2431,18 +2442,23 @@ fn handle_connection(
                     Ok(v) => v,
                     Err(e) => {
                         warn!(conn_id = conn.conn_id(), ?e, "call control decode error");
-                        conn.end(ConnectionEndReason::ProtocolError, "call_control");
-                        break;
+                        queue_input_error(&writer, request_id, e.to_string()).await;
+                        continue;
                     }
                 };
-                let route_admission =
-                    match reserve_route_execution(&server, &ctrl.identity, ctrl.method_idx).await {
-                        Ok(admission) => admission,
-                        Err(err) => {
-                            queue_route_admission_error(&writer, request_id, err).await;
-                            continue;
-                        }
-                    };
+                let route_admission = match reserve_accepted_route_execution(
+                    &server,
+                    &ctrl.identity,
+                    ctrl.method_idx,
+                )
+                .await
+                {
+                    Ok(admission) => admission,
+                    Err(err) => {
+                        queue_route_admission_error(&writer, request_id, err).await;
+                        continue;
+                    }
+                };
                 let pending_permit = match server.try_acquire_pending_request() {
                     Ok(permit) => permit,
                     Err(limit) => {
@@ -2928,6 +2944,8 @@ struct ChunkRouteAdmission {
     route: Arc<CrmRoute>,
     method_idx: u16,
     pending_permit: SchedulerPendingPermit,
+    // A partially received request keeps the connection open between chunks.
+    _flight: crate::connection::FlightGuard,
 }
 
 enum RouteAdmissionError {
@@ -2970,13 +2988,13 @@ where
                 return Err(RouteExecutionError::Acquire(err));
             }
         },
-        _ = conn.wait_cancelled() => {
+        _ = conn.wait_work_cancelled() => {
             drop(request);
             return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
         }
     };
     let execution_guard = tokio::select! {
-        result = execution_scheduler.async_acquire(0) => match result {
+        result = execution_scheduler.async_acquire_accepted(0, route_guard.admission_generation()) => match result {
             Ok(guard) => guard,
             Err(err) => {
                 drop(request);
@@ -2987,7 +3005,7 @@ where
             drop(request);
             return Err(RouteExecutionError::Acquire(err));
         },
-        _ = conn.wait_cancelled() => {
+        _ = conn.wait_work_cancelled() => {
             drop(request);
             return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
         }
@@ -2996,19 +3014,14 @@ where
         drop(request);
         return Err(RouteExecutionError::Acquire(err));
     }
-    if conn.is_cancelled() {
+    if conn.is_work_cancelled() {
         drop(request);
         return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
     }
 
-    let connection_core = conn.core.clone();
     tokio::task::spawn_blocking(move || {
         let mut route_guard = route_guard;
         let _execution_guard = execution_guard;
-        if connection_core.is_deactivated() {
-            drop(request);
-            return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
-        }
         if let Err(err) = route_guard.commit() {
             drop(request);
             return Err(RouteExecutionError::Acquire(err));
@@ -3022,7 +3035,7 @@ where
     .expect("route execution task panicked")
 }
 
-async fn reserve_route_execution(
+async fn reserve_accepted_route_execution(
     server: &Server,
     identity: &RouteCallIdentity,
     method_idx: u16,
@@ -3114,23 +3127,13 @@ async fn send_route_execution_result(
             .await
             {
                 match err {
-                    ResponseSendError::UserVisible(message) => {
+                    ResponseSendError::UserVisible(message)
+                    | ResponseSendError::Capacity(message) => {
                         write_reply(
                             writer,
                             request_id,
                             &ReplyControl::Error(error_wire(
                                 ErrorCode::ResourceOutputSerializing,
-                                message,
-                            )),
-                        )
-                        .await;
-                    }
-                    ResponseSendError::Capacity(message) => {
-                        write_reply(
-                            writer,
-                            request_id,
-                            &ReplyControl::Error(error_wire(
-                                ErrorCode::ResourceUnavailable,
                                 message,
                             )),
                         )
@@ -3329,13 +3332,22 @@ fn admit_peer_request(
 }
 
 fn cleanup_buddy_request_block(conn: &Arc<Connection>, payload: &[u8], budget: &MemoryBudget) {
-    let result = decode_buddy_payload(payload)
-        .map_err(|error| error.to_string())
-        .and_then(|(bp, _)| admit_peer_request(conn, bp, budget));
+    let result =
+        decode_request_buddy(conn, payload).and_then(|bp| admit_peer_request(conn, bp, budget));
     if let Err(error) = result {
         warn!(conn_id = conn.conn_id(), %error, "request discard failed");
-        conn.end(ConnectionEndReason::ProtocolError, "request_discard");
     }
+}
+
+fn decode_request_buddy(conn: &Connection, payload: &[u8]) -> Result<BuddyPayload, String> {
+    decode_buddy_payload(payload)
+        .map(|(buddy, _)| buddy)
+        .map_err(|error| {
+            // No decoded descriptor means there is no trustworthy loan ID to
+            // release. Seal admission, but keep the next frame boundary.
+            conn.end(ConnectionEndReason::ProtocolError, "buddy_payload");
+            error.to_string()
+        })
 }
 
 struct AdmittedBuddyCall<'a> {
@@ -3429,9 +3441,8 @@ fn spawn_chunked_call(
 ) {
     let peer_request = if c2_wire::flags::is_buddy(flags) {
         Some(
-            decode_buddy_payload(payload)
-                .map_err(|error| error.to_string())
-                .and_then(|(bp, _)| admit_peer_request(conn, bp, &server.memory_budget)),
+            decode_request_buddy(conn, payload)
+                .and_then(|bp| admit_peer_request(conn, bp, &server.memory_budget)),
         )
     } else {
         None
@@ -3491,6 +3502,27 @@ fn chunk_frame_ordering(
             None => ChunkFrameOrdering::Direct,
         })
     }
+}
+
+/// Only a continuation of a request accepted before deactivation may join it.
+fn accepted_chunk_continuation(
+    server: &Server,
+    conn_id: u64,
+    request_id: u64,
+    flags: u32,
+    payload: &[u8],
+) -> bool {
+    if !c2_wire::flags::is_chunked(flags) {
+        return false;
+    }
+    let offset = if c2_wire::flags::is_buddy(flags) {
+        BUDDY_PAYLOAD_SIZE
+    } else {
+        0
+    };
+    matches!(decode_chunk_header(payload, offset), Ok((index, _, _)) if index > 0)
+        && (server.chunk_registry.contains(conn_id, request_id)
+            || server.chunk_admission_waiter(conn_id, request_id).is_some())
 }
 
 /// Fail one chunked request: publish the terminal admission outcome first (so a
@@ -3606,23 +3638,7 @@ async fn dispatch_chunked_call(
     // is applied only to the final assembled result (RequestData::Handle above).
     let shm_data: Option<Vec<u8>>;
     if is_buddy {
-        let (_, bp_consumed) = match decode_buddy_payload(payload) {
-            Ok(v) => v,
-            Err(e) => {
-                fail_chunked_request(
-                    server,
-                    conn,
-                    writer,
-                    request_id,
-                    admission_owner.take(),
-                    ErrorCode::ResourceInputDeserializing,
-                    format!("chunked call buddy payload decode failed: {e:?}"),
-                )
-                .await;
-                return;
-            }
-        };
-        offset = bp_consumed;
+        offset = BUDDY_PAYLOAD_SIZE;
         match peer_request
             .expect("buddy frame admitted before spawn")
             .and_then(RequestData::into_owned_bytes)
@@ -3687,7 +3703,7 @@ async fn dispatch_chunked_call(
         };
         let route_admission = {
             // The route/dispatcher gate can stall (a route transaction holds
-            // the dispatcher write lock). A disconnect must not leave this
+            // the dispatcher write lock). A peer end must not leave this
             // task, its chunk permit, or its ordering entry alive behind that
             // gate, so the wait is cancellable by the connection's teardown.
             //
@@ -3715,11 +3731,11 @@ async fn dispatch_chunked_call(
             let waited = tokio::select! {
                 biased;
                 admission =
-                    reserve_route_execution(server, &ctrl.identity, ctrl.method_idx) => {
+                    reserve_accepted_route_execution(server, &ctrl.identity, ctrl.method_idx) => {
                     AdmissionWait::Ready(admission)
                 }
                 _ = terminal => AdmissionWait::Terminal,
-                _ = conn.wait_cancelled() => AdmissionWait::Cancelled,
+                _ = conn.wait_work_cancelled() => AdmissionWait::Cancelled,
             };
             match waited {
                 AdmissionWait::Ready(Ok(admission)) => admission,
@@ -3785,6 +3801,7 @@ async fn dispatch_chunked_call(
                 route: route_admission.route,
                 method_idx: ctrl.method_idx,
                 pending_permit: route_admission.pending_permit,
+                _flight: crate::connection::FlightGuard::new(conn),
             },
         ) {
             Ok(assembly) => assembly,
@@ -3953,6 +3970,15 @@ async fn dispatch_chunked_call(
 
 const REPLY_FLAGS: u32 = FLAG_RESPONSE | FLAG_REPLY_V2;
 const SUCCESS_REPLY: [u8; 1] = [c2_wire::control::STATUS_SUCCESS];
+
+async fn queue_input_error(writer: &Arc<ConnectionWriter>, request_id: u64, error: String) {
+    queue_reply(
+        writer,
+        request_id,
+        &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, error)),
+    )
+    .await;
+}
 
 fn checked_frame_total_len(payload_len: usize, context: &str) -> Result<u32, String> {
     let total_len = 12usize

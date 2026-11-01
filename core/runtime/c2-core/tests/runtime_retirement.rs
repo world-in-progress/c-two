@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use c2_contract::{ContractRelease, MethodAccess};
@@ -20,6 +20,24 @@ impl EncodedService for Echo {
     }
 }
 
+struct GatedEcho {
+    entered: mpsc::SyncSender<()>,
+    released: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl EncodedService for GatedEcho {
+    fn invoke(&self, _: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+        self.entered.send(()).unwrap();
+        let (lock, changed) = &*self.released;
+        let released = lock.lock().unwrap();
+        let (released, wait) = changed
+            .wait_timeout_while(released, WAIT, |released| !*released)
+            .unwrap();
+        assert!(*released && !wait.timed_out(), "callback was not released");
+        Ok(request)
+    }
+}
+
 struct Fixture {
     runtime: Runtime,
     _root: Option<tempfile::TempDir>,
@@ -37,7 +55,7 @@ impl Fixture {
         let root = {
             let root = tempfile::Builder::new()
                 .prefix("c2-retire-")
-                .tempdir_in("/tmp")
+                .tempdir_in(std::env::temp_dir())
                 .unwrap();
             runtime
                 .set_local_endpoint_with_sources(
@@ -89,6 +107,32 @@ fn definition() -> ServiceDefinition {
             },
         ],
         Arc::new(Echo),
+    )
+    .unwrap()
+}
+
+fn gated_definition(
+    entered: mpsc::SyncSender<()>,
+    released: Arc<(Mutex<bool>, Condvar)>,
+) -> ServiceDefinition {
+    let release = release();
+    ServiceDefinition::new(
+        &release,
+        release.reference(),
+        "echo",
+        [
+            MethodDefinition {
+                index: 0,
+                name: "ping".into(),
+                access: MethodAccess::Read,
+            },
+            MethodDefinition {
+                index: 1,
+                name: "echo".into(),
+                access: MethodAccess::Write,
+            },
+        ],
+        Arc::new(GatedEcho { entered, released }),
     )
     .unwrap()
 }
@@ -241,6 +285,11 @@ fn hosted_zero_budget_retirement_keeps_draining_and_rejects_new_work() {
         .begin_session_retirement(RuntimeShutdownTarget::ClientsOnly, Instant::now())
         .unwrap();
     assert!(!repeated.observe_until(Instant::now()).1);
+    let wait_deadline = Instant::now() + Duration::from_millis(50);
+    assert!(
+        !repeated.observe_until(wait_deadline).1,
+        "a later caller's deadline must not complete blocked Host work"
+    );
     drop(receipt); // The caller and its receipt do not own driver cancellation.
     drop(active);
     let outcome = completed(&repeated);
@@ -250,6 +299,77 @@ fn hosted_zero_budget_retirement_keeps_draining_and_rejects_new_work() {
     assert_eq!(outcome.removed_routes, ["echo"]);
     assert!(outcome.route_outcomes[0].active_drained);
     assert!(runtime.ensure_active().is_err());
+}
+
+#[test]
+fn retirement_observation_expires_while_host_closes_and_outgoing_call_finishes_later() {
+    let owner = Fixture::new();
+    let host = owner
+        .runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    let _registration = host.register(definition()).unwrap();
+    let peer = Fixture::new();
+    peer.runtime
+        .inherit_local_endpoint_selection(&owner.runtime)
+        .unwrap();
+    let peer_host = peer
+        .runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    let (entered, callback_entered) = mpsc::sync_channel(1);
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let _peer_registration = peer_host
+        .register(gated_definition(entered, released.clone()))
+        .unwrap();
+    let client = owner
+        .runtime
+        .connect(
+            release().expected_route("echo").unwrap(),
+            Connect::DirectIpc {
+                address: peer_host.local_endpoint().address().into(),
+            },
+        )
+        .unwrap()
+        .with_call_options(c2_core::CallOptions::with_timeout(
+            c2_core::CallTimeout::Unlimited,
+        ));
+    let call = std::thread::spawn(move || client.call_owned("echo", b"in flight"));
+    callback_entered.recv_timeout(WAIT).unwrap();
+
+    let deadline = Instant::now() + Duration::from_millis(40);
+    let receipt = owner
+        .runtime
+        .begin_session_retirement(RuntimeShutdownTarget::Host(&host), deadline)
+        .unwrap();
+    let observed = receipt.observe_until(deadline);
+    let host_close_deadline = Instant::now() + Duration::from_secs(2);
+    while !host.lifecycle_snapshot().listener_closed && Instant::now() < host_close_deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let host_closed_before_call = host.lifecycle_snapshot().listener_closed;
+    let still_pending = receipt.terminal_outcome().is_none();
+
+    let (lock, changed) = &*released;
+    *lock.lock().unwrap() = true;
+    changed.notify_all();
+    let call_result = call.join().unwrap();
+    let outcome = completed(&receipt);
+    assert!(
+        !observed.1,
+        "caller deadline must end observation: {observed:?}"
+    );
+    assert!(
+        host_closed_before_call,
+        "Host listener waited for outgoing client"
+    );
+    assert!(
+        still_pending,
+        "client drain must remain pending until the call ends"
+    );
+    assert_eq!(call_result.unwrap(), b"in flight");
+    assert!(outcome.route_outcomes[0].active_drained);
+    assert!(peer_host.shutdown().runtime_barrier_error.is_none());
 }
 
 #[test]
@@ -545,4 +665,67 @@ fn client_scope_cannot_report_completion_for_an_undeclared_host() {
     // Rejection borrows the supplied Host; its owner remains available.
     assert!(host.is_running());
     assert!(host.shutdown().runtime_barrier_error.is_none());
+}
+
+#[test]
+fn retirement_preserves_host_calls_already_waiting_for_route_execution() {
+    let owner = Fixture::new();
+    let host = owner
+        .runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    let (entered, callback_entered) = mpsc::sync_channel(2);
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let registration = host
+        .register(
+            gated_definition(entered, released.clone())
+                .with_concurrency(c2_core::ServiceConcurrencyMode::Exclusive, Some(4), Some(1))
+                .unwrap(),
+        )
+        .unwrap();
+    let peer = Fixture::new();
+    peer.runtime
+        .inherit_local_endpoint_selection(&owner.runtime)
+        .unwrap();
+    let client = peer
+        .runtime
+        .connect(
+            release().expected_route("echo").unwrap(),
+            Connect::DirectIpc {
+                address: host.local_endpoint().address().into(),
+            },
+        )
+        .unwrap();
+    let second_client = client.clone();
+    let first = std::thread::spawn(move || client.call_owned("echo", b"first"));
+    callback_entered.recv_timeout(WAIT).unwrap();
+    let second = std::thread::spawn(move || second_client.call_owned("echo", b"second"));
+    let admitted_by = Instant::now() + WAIT;
+    while registration.route_concurrency().snapshot().pending != 2 {
+        assert!(Instant::now() < admitted_by, "second call was not admitted");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let deadline = Instant::now() + Duration::from_millis(40);
+    let receipt = owner
+        .runtime
+        .begin_session_retirement(RuntimeShutdownTarget::Host(&host), deadline)
+        .unwrap();
+    let observed = receipt.observe_until(deadline);
+    let listener_retained = !host.lifecycle_snapshot().listener_closed;
+    let pending_before_release = registration.route_concurrency().snapshot().pending;
+    *released.0.lock().unwrap() = true;
+    released.1.notify_all();
+    let first_result = first.join().unwrap();
+    let second_result = second.join().unwrap();
+    let outcome = completed(&receipt);
+    assert!(!observed.1, "the caller only bounds its observation");
+    assert!(listener_retained);
+    assert_eq!(
+        pending_before_release, 2,
+        "shutdown preserves both accepted calls"
+    );
+    assert_eq!(first_result.unwrap(), b"first");
+    assert_eq!(second_result.unwrap(), b"second");
+    assert!(outcome.route_outcomes[0].active_drained);
+    assert!(host.lifecycle_snapshot().finished);
 }

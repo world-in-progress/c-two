@@ -325,7 +325,21 @@ enum PreparedResponseWrite {
     Published(PendingWrite),
 }
 
-fn assemble_write(batch: WriteBatch, frame: Option<&[u8]>) -> io::Result<PendingWrite> {
+fn assemble_write(
+    _conn: &Connection,
+    batch: WriteBatch,
+    frame: Option<&[u8]>,
+) -> io::Result<PendingWrite> {
+    #[cfg(test)]
+    if _conn
+        .fail_next_write_allocation
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "injected write buffer allocation failure",
+        ));
+    }
     let prefix = batch.release_bytes();
     let frame_bytes = frame.unwrap_or(&[]);
     let total_len = prefix
@@ -398,7 +412,7 @@ fn prepare_response_write(
         .begin_write(WriteRequest::Business(vec![loan]))
         .map_err(core_error)?
         .expect("response frame");
-    let mut write = assemble_write(batch, Some(&frame))?;
+    let mut write = assemble_write(conn, batch, Some(&frame))?;
     write.batch.begin_io().map_err(core_error)?;
     Ok(PreparedResponseWrite::Published(write))
 }
@@ -410,8 +424,8 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     mut frame: Option<(&[u8], &mut WriteReceipt)>,
     write_timeout: Duration,
 ) -> io::Result<()> {
-    let mut write =
-        assemble_write(batch, frame.as_ref().map(|(bytes, _)| *bytes)).inspect_err(|_| {
+    let mut write = assemble_write(conn, batch, frame.as_ref().map(|(bytes, _)| *bytes))
+        .inspect_err(|_| {
             conn.end(
                 c2_local::ConnectionEndReason::LocalClose,
                 "write_batch_capacity",
