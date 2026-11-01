@@ -156,7 +156,7 @@ fn native_host_serves_calls_and_admin_shutdown_initiates_draining() {
         c2_config::LocalEndpoint::from_address(&address).unwrap()
     );
     let shutdown = shutdown_direct_ipc(&address, None, Duration::from_millis(500)).unwrap();
-    assert!(shutdown.acknowledged && shutdown.shutdown_started && !shutdown.server_stopped);
+    assert!(shutdown.shutdown_started);
     let completed = host.shutdown();
     assert!(completed.runtime_barrier_error.is_none(), "{completed:?}");
     drop(runtime);

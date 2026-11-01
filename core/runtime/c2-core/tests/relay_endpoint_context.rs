@@ -180,7 +180,6 @@ impl HttpFixture {
                 name: expected.route_name,
                 relay_url: url.clone(),
                 route_uid: "route-uid".into(),
-                route_revision: 1,
                 ipc_address: Some("ipc://same-owner".into()),
                 server_id: Some("same-owner".into()),
                 server_instance_id: Some("candidate-instance".into()),

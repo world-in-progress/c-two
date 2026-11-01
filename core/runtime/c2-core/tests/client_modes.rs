@@ -449,7 +449,6 @@ fn local_candidate(
         name: expected.route_name.clone(),
         relay_url: "http://127.0.0.1:9".to_string(),
         route_uid: "route-uid-1".to_string(),
-        route_revision: 1,
         ipc_address: Some(address),
         server_id: Some(server_id),
         server_instance_id: Some(server_instance_id),
@@ -500,7 +499,6 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         .register(definition(&route_name))
         .expect("route registration");
     let registered_route_uid = registration.outcome().route_uid.clone();
-    let registered_route_revision = registration.outcome().route_revision;
     let expected = release()
         .expected_route(&route_name)
         .expect("expected route");
@@ -517,10 +515,6 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
     accepts_client(&direct);
     assert_eq!(direct.observed_path(), ObservedPath::DirectIpc);
     assert_eq!(direct.observed_route().route_uid, registered_route_uid);
-    assert_eq!(
-        direct.observed_route().route_revision,
-        registered_route_revision
-    );
     assert_eq!(direct.expected_route(), &expected);
     assert_eq!(
         direct.call_owned("echo", b"direct").expect("direct call"),
@@ -539,10 +533,6 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
     assert_eq!(explicit.observed_path(), ObservedPath::ExplicitRelay);
     assert_eq!(explicit.observed_route().route_uid, registered_route_uid);
     assert_eq!(
-        explicit.observed_route().route_revision,
-        registered_route_revision
-    );
-    assert_eq!(
         explicit
             .call_owned("echo", b"explicit")
             .expect("explicit relay call"),
@@ -558,10 +548,6 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         ObservedPath::RelayAwareLocalIpc
     );
     assert_eq!(relay_aware.observed_route().route_uid, registered_route_uid);
-    assert_eq!(
-        relay_aware.observed_route().route_revision,
-        registered_route_revision
-    );
     assert_eq!(
         relay_aware
             .call_owned("echo", b"aware")
@@ -692,7 +678,6 @@ fn route_state_and_terminal_identity_errors_use_the_canonical_registry() {
             IpcError::RouteStale {
                 route_name: "route".to_string(),
                 current_route_uid: "uid".to_string(),
-                current_route_revision: 2,
             },
             ErrorCode::RouteStale,
         ),
@@ -734,7 +719,6 @@ fn retained_release_identity_is_unchanged_by_route_failures() {
         IpcError::RouteStale {
             route_name: "route".to_string(),
             current_route_uid: "uid".to_string(),
-            current_route_revision: 9,
         },
         c2_core::TransportPhase::PreDispatch,
     );
@@ -862,8 +846,7 @@ fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
     let address = runtime.server_address().expect("server address");
     // Inspect the server's local route token through a standalone throwaway
     // client pool. Runtime-owned caches stay private (no public escape
-    // hatch), and a plain ClientPool::acquire/release pair serves the
-    // inspection without any lifecycle coupling.
+    // hatch). The inspection releases exactly the acquired client by identity.
     let inspector_pool = c2_ipc::ClientPool::with_endpoint_context(
         Duration::from_secs(60),
         runtime.local_endpoint_context().unwrap(),
@@ -885,12 +868,11 @@ fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
         identity.server_instance_id,
     );
     candidate.route_uid = binding.route_uid().to_string();
-    candidate.route_revision = binding.route_revision();
     let registry = registry_server(candidate, resolve_count.clone());
     runtime.set_relay_anchor_address(Some(registry.url.clone()));
 
     let result = runtime.connect(claimed_expected, Connect::RelayAware);
-    inspector_pool.release(&address);
+    assert!(inspector_pool.release_if_same(&address, &inspector));
     let Error::Semantic(error) = result.expect_err("contract mismatch must be terminal") else {
         panic!("contract mismatch must be semantic");
     };
@@ -956,7 +938,6 @@ fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists()
             name: expected.route_name.clone(),
             relay_url: data_plane.url.clone(),
             route_uid: "route-uid-http".to_string(),
-            route_revision: 1,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -1004,7 +985,6 @@ fn a_cached_stale_route_is_refreshed_once_and_a_second_stale_result_is_terminal(
             name: expected.route_name.clone(),
             relay_url: data_plane.url.clone(),
             route_uid: "route-uid-stale".to_string(),
-            route_revision: 1,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -1109,12 +1089,12 @@ fn service_error_is_not_replayed() {
 }
 
 #[test]
-fn hostless_shutdown_closes_own_clients_and_isolates_sibling_runtimes_and_held_leases() {
+fn hostless_retirement_closes_own_clients_and_isolates_sibling_runtimes_and_local_holds() {
     // One hosting Runtime publishes the echo route; two distinct client-only
     // (hostless) Runtimes connect over direct IPC. Each hostless Runtime owns
     // its own outgoing IPC client cache: shutting down A must close only A's
-    // clients, leave B callable, and keep B's already-held response lease
-    // valid until it is explicitly released — even across B's own shutdown.
+    // clients, leave B callable, and keep B's local response copy
+    // valid until it is explicitly released, even across B's own retirement.
     // Runtime construction and client-config resolution read the process
     // environment, so this test joins the file-wide env isolation guard.
     let _environment = relay_env_lock();
@@ -1159,9 +1139,7 @@ fn hostless_shutdown_closes_own_clients_and_isolates_sibling_runtimes_and_held_l
         b"b-before"
     );
 
-    // Held SHM-backed response on B: the payload is far above the default
-    // 4096-byte SHM threshold, so the held lease retains pool ownership
-    // after the call returns.
+    // A large response arrives through IPC. Its hold keeps only local bytes.
     let big: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
     let mut held = client_b.call_held("echo", &big).expect("held response");
     assert_eq!(held.bytes(), big.as_slice());
@@ -1186,8 +1164,7 @@ fn hostless_shutdown_closes_own_clients_and_isolates_sibling_runtimes_and_held_l
     );
     assert_eq!(held.bytes(), big.as_slice());
 
-    // B's own hostless shutdown closes B's connection; the already-held
-    // lease and its pool Arcs must stay valid until explicitly released.
+    // B's retirement closes its connection; its local copy remains readable.
     let outcome_b = runtime_b.shutdown_without_host(Duration::from_secs(5));
     assert!(
         outcome_b.ipc_clients_drained,
@@ -1200,7 +1177,7 @@ fn hostless_shutdown_closes_own_clients_and_isolates_sibling_runtimes_and_held_l
     );
     assert_eq!(held.bytes(), big.as_slice());
     held.invalidate_then_release(|| Ok(()))
-        .expect("held lease must release cleanly after its connection closed");
+        .expect("local hold must release cleanly after its connection closed");
 
     drop(client_a);
     drop(client_b);

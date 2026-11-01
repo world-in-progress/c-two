@@ -558,10 +558,14 @@ mod unix {
         let payload = vec![42; 32 * 1024];
         let mut held = client_a.call_held("echo", &payload).unwrap();
         assert_eq!(held.bytes(), [&[b'A'], payload.as_slice()].concat());
-        let retained = outgoing_a.snapshot().reassembly.used_bytes;
+        let copied = outgoing_a.snapshot().reassembly;
         assert!(
-            retained > 0,
-            "chunked response retains its outgoing-domain charge"
+            copied.peak_bytes >= payload.len() as u64,
+            "the response must use outgoing-domain reassembly"
+        );
+        assert_eq!(
+            copied.used_bytes, 0,
+            "the local hold must not retain reassembly"
         );
         assert!(!outgoing_a.downgrade().ptr_eq(&outgoing_b.downgrade()));
         let endpoint = host_a.local_endpoint().clone();
@@ -589,7 +593,7 @@ mod unix {
         let ack = runtime_a
             .shutdown_direct_ipc("ipc://same-server", TIMEOUT)
             .unwrap();
-        assert!(ack.acknowledged && ack.shutdown_started);
+        assert!(ack.shutdown_started);
         assert!(
             runtime_b
                 .ping_direct_ipc("ipc://same-server", TIMEOUT)
@@ -597,7 +601,7 @@ mod unix {
         );
         let outcome = host_a.shutdown();
         assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
-        assert_eq!(outgoing_a.snapshot().reassembly.used_bytes, retained);
+        assert_eq!(outgoing_a.snapshot().reassembly.used_bytes, 0);
         assert!(outgoing_a.snapshot().shm.used_bytes > 0);
         runtime_a.clear_server_identity().unwrap();
         let restarted = runtime_a
@@ -624,8 +628,10 @@ mod unix {
                 .downgrade()
                 .ptr_eq(&runtime_b.outgoing_memory_observer().unwrap().downgrade())
         );
-        assert_eq!(outgoing_a.snapshot().reassembly.used_bytes, retained);
+        assert_eq!(outgoing_a.snapshot().reassembly.used_bytes, 0);
+        assert_eq!(held.bytes(), [&[b'A'], payload.as_slice()].concat());
         held.invalidate_then_release(|| Ok(())).unwrap();
+        assert!(held.bytes().is_empty());
         assert_eq!(outgoing_a.snapshot().reassembly.used_bytes, 0);
         assert!(restarted.shutdown().runtime_barrier_error.is_none());
         assert!(host_b.shutdown().runtime_barrier_error.is_none());

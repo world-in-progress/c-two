@@ -288,6 +288,111 @@ fn ordinary_host_shutdown_preserves_runtime_restart_and_reacquire() {
 }
 
 #[test]
+fn host_shutdown_preserves_outgoing_finite_calls_until_explicit_retirement() {
+    let fixture = Fixture::new();
+    let runtime = &fixture.runtime;
+    let host = runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    let _registration = host.register(definition()).unwrap();
+    let peer = Fixture::new();
+    peer.runtime
+        .inherit_local_endpoint_selection(runtime)
+        .unwrap();
+    let peer_host = peer
+        .runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    let _peer_registration = peer_host.register(definition()).unwrap();
+    let outgoing = runtime
+        .connect(
+            release().expected_route("echo").unwrap(),
+            Connect::DirectIpc {
+                address: peer_host.local_endpoint().address().into(),
+            },
+        )
+        .unwrap()
+        .with_call_options(c2_core::CallOptions::with_timeout(
+            c2_core::CallTimeout::After(WAIT),
+        ));
+    let payload = vec![0x6b; 256 * 1024];
+    let mut held = outgoing.call_held("echo", &payload).unwrap();
+    let observation = outgoing.connection_observation().unwrap();
+    let calls = runtime.call_execution_observer();
+    assert!(calls.snapshot().initialized);
+    assert!(!calls.snapshot().closed);
+
+    let original = host.shutdown();
+    assert!(original.runtime_barrier_error.is_none(), "{original:?}");
+    assert!(host.lifecycle_snapshot().finished);
+    assert!(
+        !original.ipc_clients_drained,
+        "Host closure has no outgoing drain scope"
+    );
+    assert!(!calls.snapshot().closed);
+    assert!(observation.snapshot().is_none());
+    assert_eq!(
+        outgoing.call_owned("echo", b"after-host").unwrap(),
+        b"after-host"
+    );
+    assert_eq!(held.bytes(), payload);
+
+    runtime.clear_server_identity().unwrap();
+    let restarted = runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    let _new_registration = restarted.register(definition()).unwrap();
+    assert_eq!(
+        outgoing.call_owned("echo", b"after-restart").unwrap(),
+        b"after-restart"
+    );
+    assert_eq!(host.shutdown_outcome(), Some(original.clone()));
+    let receipt = runtime
+        .begin_session_retirement(
+            RuntimeShutdownTarget::Host(&restarted),
+            Instant::now() + WAIT,
+        )
+        .unwrap();
+    completed(&receipt);
+    assert!(calls.snapshot().closed);
+    let Error::Semantic(error) = outgoing
+        .call_owned("echo", b"after-retirement")
+        .unwrap_err()
+    else {
+        panic!("the original finite-call admission must remain closed");
+    };
+    assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
+    assert_eq!(error.details["admission_reason"], "Closed");
+    assert_eq!(error.details["transport_phase"], "pre_dispatch");
+    assert!(matches!(
+        runtime.ensure_active(),
+        Err(LifecycleError::RuntimeRetired)
+    ));
+    assert_eq!(held.bytes(), payload);
+    assert_eq!(host.shutdown_outcome(), Some(original));
+
+    let replacement = Fixture::new();
+    replacement.runtime.ensure_active().unwrap();
+    assert!(
+        replacement
+            .runtime
+            .retirement_receipt(Instant::now())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        replacement
+            .runtime
+            .memory_stats()
+            .runtime_outgoing
+            .is_none()
+    );
+    held.invalidate_then_release(|| Ok(())).unwrap();
+    assert!(held.bytes().is_empty());
+    assert!(peer_host.shutdown().runtime_barrier_error.is_none());
+}
+
+#[test]
 fn terminal_host_journal_survives_retirement_of_late_clients() {
     let fixture = Fixture::new();
     let runtime = &fixture.runtime;

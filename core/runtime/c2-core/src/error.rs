@@ -16,9 +16,7 @@ use crate::RegisterFailureOutcome;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleError {
     RuntimeRetired,
-    ShutdownWaitTimeout {
-        stage: &'static str,
-    },
+    ShutdownWaitTimeout { stage: &'static str },
     InvalidServerId(String),
     ClientConfigFrozen,
     ConfigFrozen,
@@ -26,14 +24,7 @@ pub enum LifecycleError {
     MissingRoute(String),
     MissingRelayAddress,
     RegisterFailure(Box<RegisterFailureOutcome>),
-    HeldResponseCopy {
-        copy_error: String,
-        transport_error: Option<String>,
-    },
-    HeldResponseRelease {
-        invalidation_error: Option<String>,
-        transport_error: Option<String>,
-    },
+    HeldResponseRelease { invalidation_error: String },
     ResponseCopy(String),
     Configuration(String),
     Server(ServerFailure),
@@ -59,31 +50,11 @@ impl fmt::Display for LifecycleError {
                 "registration failed at {}: {}",
                 outcome.failure_source, outcome.error_message
             ),
-            Self::HeldResponseCopy {
-                copy_error,
-                transport_error,
-            } => {
-                write!(formatter, "held response copy failed: {copy_error}")?;
-                if let Some(transport_error) = transport_error {
-                    write!(
-                        formatter,
-                        "; response transport cleanup also failed: {transport_error}"
-                    )?;
-                }
-                Ok(())
-            }
-            Self::HeldResponseRelease {
-                invalidation_error,
-                transport_error,
-            } => {
-                formatter.write_str("held response release failed")?;
-                if let Some(invalidation_error) = invalidation_error {
-                    write!(formatter, "; invalidation: {invalidation_error}")?;
-                }
-                if let Some(transport_error) = transport_error {
-                    write!(formatter, "; transport cleanup: {transport_error}")?;
-                }
-                Ok(())
+            Self::HeldResponseRelease { invalidation_error } => {
+                write!(
+                    formatter,
+                    "held response invalidation failed: {invalidation_error}"
+                )
             }
             Self::ResponseCopy(message) => write!(formatter, "response copy failed: {message}"),
             Self::Configuration(message) => {
@@ -309,25 +280,30 @@ impl From<LifecycleError> for Error {
 /// Normalize an IPC error without flattening its transport source.
 pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
     match error {
+        IpcError::ResponseFailure(source) => {
+            // Materialization failed after delivery. Neither admission nor
+            // lookup classifications may make this failure replayable.
+            let semantic_error = match source.as_ref() {
+                IpcError::Chunk(ChunkError::Capacity(message)) => {
+                    Some(response_capacity_error(message))
+                }
+                _ => None,
+            };
+            let mut transport = TransportError::new(
+                TransportPhase::DispatchUncertain,
+                TransportKind::Ipc,
+                IpcError::ResponseFailure(source),
+            );
+            transport.semantic_error = semantic_error;
+            Error::Transport(transport)
+        }
         IpcError::PoolRetired => LifecycleError::RuntimeRetired.into(),
         IpcError::ProtocolVersionMismatch { local, peer } => {
             Error::ProtocolVersionMismatch { local, peer }
         }
         IpcError::LocalCallRejected(error) => Error::Semantic(error),
         IpcError::Chunk(ChunkError::Capacity(message)) => {
-            let semantic = C2Error::new(ErrorCode::ResourceUnavailable, message.clone())
-                .with_details(BTreeMap::from([
-                    ("transport".to_string(), "ipc".to_string()),
-                    (
-                        "stage".to_string(),
-                        "response_reassembly_admission".to_string(),
-                    ),
-                    (
-                        "transport_phase".to_string(),
-                        "dispatch_uncertain".to_string(),
-                    ),
-                    ("fallback_eligible".to_string(), "false".to_string()),
-                ]));
+            let semantic = response_capacity_error(&message);
             let mut transport = TransportError::new(
                 TransportPhase::DispatchUncertain,
                 TransportKind::Ipc,
@@ -374,14 +350,12 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
         IpcError::RouteStale {
             route_name,
             current_route_uid,
-            current_route_revision,
         } => semantic_route_error(
             ErrorCode::RouteStale,
             format!("route token is stale: {route_name}"),
             [
                 ("route", route_name),
                 ("current_route_uid", current_route_uid),
-                ("current_route_revision", current_route_revision.to_string()),
             ],
         ),
         IpcError::ContractMismatch(message) => Error::Semantic(
@@ -426,6 +400,15 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
         ),
         transport => Error::Transport(TransportError::new(phase, TransportKind::Ipc, transport)),
     }
+}
+
+fn response_capacity_error(message: &str) -> C2Error {
+    C2Error::new(ErrorCode::ResourceUnavailable, message).with_details(BTreeMap::from([
+        ("transport".into(), "ipc".into()),
+        ("stage".into(), "response_reassembly_admission".into()),
+        ("transport_phase".into(), "dispatch_uncertain".into()),
+        ("fallback_eligible".into(), "false".into()),
+    ]))
 }
 
 fn semantic_route_error<const N: usize>(
@@ -715,6 +698,36 @@ mod native_boundary_tests {
         assert_eq!(snapshot.reassembly.used_bytes, 0);
         assert_eq!(snapshot.file.used_bytes, 0);
         assert_eq!(snapshot.shm.used_bytes, 0);
+    }
+
+    #[test]
+    fn response_failure_never_becomes_a_pre_dispatch_error() {
+        for source in [
+            IpcError::Protocol("malformed response".into()),
+            IpcError::Shm("response admission failed".into()),
+            IpcError::Chunk(ChunkError::Capacity("response budget full".into())),
+        ] {
+            let is_capacity = matches!(&source, IpcError::Chunk(ChunkError::Capacity(_)));
+            let error = normalize_ipc_error(
+                IpcError::ResponseFailure(Box::new(source)),
+                TransportPhase::PreDispatch,
+            );
+            let Error::Transport(transport) = error else {
+                panic!("response failure must retain its transport phase");
+            };
+            assert_eq!(transport.phase(), TransportPhase::DispatchUncertain);
+            assert!(!transport.is_fallback_eligible());
+            assert!(matches!(
+                transport.source().unwrap().downcast_ref::<IpcError>(),
+                Some(IpcError::ResponseFailure(_))
+            ));
+            if is_capacity {
+                assert_eq!(
+                    transport.semantic_error().unwrap().code,
+                    ErrorCode::ResourceUnavailable
+                );
+            }
+        }
     }
 
     #[test]

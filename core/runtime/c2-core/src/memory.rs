@@ -9,27 +9,231 @@
 //! Every accessor here is observation-only. Looking at a snapshot never
 //! connects, maps memory, freezes a configuration, or resets accounting.
 //!
-//! Retired observations follow one lifecycle rule: **the owner decides**. A
-//! retired record stores only weak handles to budget accounting and lease
-//! metadata, never the accounting itself, so a record stays reportable
-//! exactly while a real owner — a retired session's still-live Runtime/client
-//! pool, an old proxy's native client or tracker handle, an in-flight
-//! response, or an outstanding lease or reservation guard — keeps that
-//! metadata alive. A late held result published through any such owner stays
-//! visible; once the last owner is gone the record detaches and is pruned on
-//! the next observation. There is deliberately no close-confirmation fence:
-//! transport close outcomes cannot prove that no supported SDK producer will
-//! publish later (an old proxy remains legitimately usable after a public
-//! shutdown), so observable lifetime is bound to producer lifetime instead.
+//! Retired observations retain weak metadata only. Transport budgets and local
+//! buffer accounting have independent lifetimes: a hold never retains a pool,
+//! connection, mapping, or an otherwise ownerless backing domain.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use c2_config::MemoryBudgetLimits;
-use c2_mem::{
-    BudgetCellSnapshot, BudgetObserver, BudgetObserverWeak, BudgetSnapshot, BufferLeaseObserver,
-    BufferLeaseStats, BufferLeaseTracker,
-};
+use c2_mem::{BudgetCellSnapshot, BudgetObserver, BudgetObserverWeak, BudgetSnapshot};
 use c2_server::ServerMemorySnapshot;
+
+/// The SDK scope retaining one local buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LocalCopyDirection {
+    ClientResponse,
+    ResourceInput,
+}
+
+impl LocalCopyDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientResponse => "client_response",
+            Self::ResourceInput => "resource_input",
+        }
+    }
+}
+
+/// Metadata for a local SDK buffer, independent of its transport origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalCopyMeta {
+    pub route_name: String,
+    pub method_name: String,
+    pub direction: LocalCopyDirection,
+    /// Logical buffer length, not allocation capacity or RSS.
+    pub bytes: usize,
+}
+
+#[derive(Debug)]
+struct LocalCopyEntry {
+    meta: LocalCopyMeta,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalCopyBucketStats {
+    pub active_holds: usize,
+    pub total_held_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LocalCopyStats {
+    pub active_holds: usize,
+    pub total_held_bytes: usize,
+    pub oldest_hold_seconds: f64,
+    pub by_direction: BTreeMap<LocalCopyDirection, LocalCopyBucketStats>,
+}
+
+impl LocalCopyStats {
+    /// Compose counters from disjoint trackers.
+    pub fn merge(&mut self, other: &Self) {
+        self.active_holds = self.active_holds.saturating_add(other.active_holds);
+        self.total_held_bytes = self.total_held_bytes.saturating_add(other.total_held_bytes);
+        self.oldest_hold_seconds = self.oldest_hold_seconds.max(other.oldest_hold_seconds);
+        for (direction, stats) in &other.by_direction {
+            let bucket = self.by_direction.entry(*direction).or_default();
+            bucket.active_holds = bucket.active_holds.saturating_add(stats.active_holds);
+            bucket.total_held_bytes = bucket
+                .total_held_bytes
+                .saturating_add(stats.total_held_bytes);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalCopySnapshot {
+    pub id: u64,
+    pub route_name: String,
+    pub method_name: String,
+    pub direction: LocalCopyDirection,
+    pub bytes: usize,
+    pub age_seconds: f64,
+}
+
+#[derive(Debug)]
+struct LocalCopyTrackerInner {
+    next_id: AtomicU64,
+    entries: Mutex<HashMap<u64, LocalCopyEntry>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalCopyTracker {
+    inner: Arc<LocalCopyTrackerInner>,
+}
+
+/// Weak observation cannot recover producer authority or retain a buffer.
+///
+/// ```compile_fail
+/// use c2_core::memory::LocalCopyObserver;
+/// fn recover_producer(observer: &LocalCopyObserver) {
+///     let _producer = observer.upgrade();
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct LocalCopyObserver {
+    inner: Weak<LocalCopyTrackerInner>,
+}
+
+impl LocalCopyObserver {
+    pub fn is_alive(&self) -> bool {
+        self.inner.strong_count() > 0
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn upgrade(&self) -> Option<LocalCopyTracker> {
+        self.inner.upgrade().map(|inner| LocalCopyTracker { inner })
+    }
+
+    pub fn stats(&self) -> Option<LocalCopyStats> {
+        self.upgrade().map(|tracker| tracker.stats())
+    }
+
+    pub fn sweep_retained(&self, threshold: Duration) -> Option<Vec<LocalCopySnapshot>> {
+        self.upgrade()
+            .map(|tracker| tracker.sweep_retained(threshold))
+    }
+}
+
+/// The local buffer owner keeps only its metadata alive. Drop this guard after
+/// invalidating checked views, ending exports, and dropping the buffer.
+#[derive(Debug)]
+pub struct LocalCopyGuard {
+    id: u64,
+    tracker: Arc<LocalCopyTrackerInner>,
+}
+
+impl LocalCopyTracker {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(LocalCopyTrackerInner {
+                next_id: AtomicU64::new(1),
+                entries: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    pub fn observer(&self) -> LocalCopyObserver {
+        LocalCopyObserver {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub fn track(&self, meta: LocalCopyMeta) -> LocalCopyGuard {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        self.inner.entries.lock().insert(
+            id,
+            LocalCopyEntry {
+                meta,
+                created_at: Instant::now(),
+            },
+        );
+        LocalCopyGuard {
+            id,
+            tracker: Arc::clone(&self.inner),
+        }
+    }
+
+    pub fn stats(&self) -> LocalCopyStats {
+        let now = Instant::now();
+        let mut stats = LocalCopyStats::default();
+        for entry in self.inner.entries.lock().values() {
+            stats.active_holds = stats.active_holds.saturating_add(1);
+            stats.total_held_bytes = stats.total_held_bytes.saturating_add(entry.meta.bytes);
+            let direction = stats.by_direction.entry(entry.meta.direction).or_default();
+            direction.active_holds = direction.active_holds.saturating_add(1);
+            direction.total_held_bytes =
+                direction.total_held_bytes.saturating_add(entry.meta.bytes);
+            stats.oldest_hold_seconds = stats.oldest_hold_seconds.max(
+                now.saturating_duration_since(entry.created_at)
+                    .as_secs_f64(),
+            );
+        }
+        stats
+    }
+
+    pub fn sweep_retained(&self, threshold: Duration) -> Vec<LocalCopySnapshot> {
+        let now = Instant::now();
+        let mut snapshots = Vec::new();
+        for (id, entry) in self.inner.entries.lock().iter() {
+            let age = now.saturating_duration_since(entry.created_at);
+            if age >= threshold {
+                snapshots.push(LocalCopySnapshot {
+                    id: *id,
+                    route_name: entry.meta.route_name.clone(),
+                    method_name: entry.meta.method_name.clone(),
+                    direction: entry.meta.direction,
+                    bytes: entry.meta.bytes,
+                    age_seconds: age.as_secs_f64(),
+                });
+            }
+        }
+        snapshots.sort_by_key(|snapshot| snapshot.id);
+        snapshots
+    }
+}
+
+impl Default for LocalCopyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LocalCopyGuard {
+    fn drop(&mut self) {
+        self.tracker.entries.lock().remove(&self.id);
+    }
+}
 
 /// Scope labels used when reporting C-Two memory budgets.
 pub mod scope {
@@ -75,8 +279,6 @@ impl MemoryCellStats {
 pub struct MemoryScopeStats {
     /// Resolved limits the scope's budget enforces.
     pub limits: MemoryBudgetLimits,
-    /// Release obligations this process conservatively abandoned.
-    pub abandoned_releases: u64,
     /// Owner-created buddy/dedicated mapped backing, including headers.
     pub shm: MemoryCellStats,
     /// Owner-created file-spill backing length.
@@ -91,7 +293,6 @@ impl MemoryScopeStats {
     pub const fn from_budget(limits: MemoryBudgetLimits, budget: BudgetSnapshot) -> Self {
         Self {
             limits,
-            abandoned_releases: budget.abandoned_releases,
             shm: MemoryCellStats::from_cell(budget.shm),
             file: MemoryCellStats::from_cell(budget.file),
             reassembly: MemoryCellStats::from_cell(budget.reassembly),
@@ -135,7 +336,7 @@ impl RetiredScope {
     fn stats(&self) -> Option<MemoryScopeStats> {
         self.observer
             .upgrade()
-            .map(|observer| MemoryScopeStats::from_budget(*observer.limits(), observer.snapshot()))
+            .map(|observer| MemoryScopeStats::from_budget(observer.limits(), observer.snapshot()))
     }
 }
 
@@ -155,20 +356,19 @@ pub struct RetiredScopeReport {
 #[derive(Debug, Default)]
 struct RetiredMemoryObservationState {
     scopes: parking_lot::Mutex<Vec<RetiredScope>>,
-    trackers: parking_lot::Mutex<Vec<BufferLeaseObserver>>,
+    trackers: parking_lot::Mutex<Vec<LocalCopyObserver>>,
 }
 
 /// Read-only observation bundle for the memory domains of one retired session.
 ///
 /// Built before the owning session shuts down and adopted by its replacement,
-/// this keeps retired budget usage and retained-lease metadata observable for
+/// this keeps retired budget usage and local-buffer metadata observable for
 /// exactly as long as real owners keep them alive. It stores only weak
-/// handles to budget accounting and lease metadata — never a Runtime, cache,
+/// handles to budget accounting and local-buffer metadata — never a Runtime, cache,
 /// pool, connection, callback, payload, or the accounting/tracker `Arc`s
 /// themselves — so observation can never extend a producer's lifetime, and a
-/// producer that can still publish (a live old proxy, an in-flight response,
-/// an outstanding hold) automatically keeps its record observable through its
-/// own ownership. Observation never connects, maps, freezes configuration,
+/// producer that can still publish (an in-flight response or an outstanding
+/// hold) keeps its record observable through its own ownership. Observation never connects, maps, freezes configuration,
 /// instantiates a host, or resets accounting.
 ///
 /// ## Lifecycle rule: the owner decides
@@ -178,8 +378,8 @@ struct RetiredMemoryObservationState {
 /// for having zero counters. A record is dropped only when its weak handle
 /// detaches — the moment no real owner can publish into or use it anymore.
 /// That is why there is no close-confirmation fence: a confirmed transport
-/// close does not prove future publication is impossible (old proxies stay
-/// legitimately usable after a public shutdown), while owner lifetime does.
+/// close does not prove future publication is impossible: local copies can
+/// outlive their Runtime, while owner lifetime still bounds observation.
 #[derive(Debug, Clone, Default)]
 pub struct RetiredMemoryObservation {
     state: Arc<RetiredMemoryObservationState>,
@@ -202,9 +402,9 @@ impl RetiredMemoryObservation {
         });
     }
 
-    /// Register one Rust-owned retained-lease tracker; duplicates by identity
+    /// Register one Rust-owned local-buffer tracker; duplicates by identity
     /// are skipped so one tracker can never be observed twice.
-    pub fn push_tracker(&self, tracker: Arc<BufferLeaseTracker>) {
+    pub fn push_tracker(&self, tracker: Arc<LocalCopyTracker>) {
         let observer = tracker.observer();
         let mut trackers = self.state.trackers.lock();
         if !trackers.iter().any(|existing| existing.ptr_eq(&observer)) {
@@ -229,10 +429,10 @@ impl RetiredMemoryObservation {
             .collect()
     }
 
-    /// Retained-lease counters composed across every still-owned tracker in
+    /// Local-buffer counters composed across every still-owned tracker in
     /// this bundle. Detached trackers contribute nothing.
-    pub fn lease_stats(&self) -> BufferLeaseStats {
-        let mut stats = BufferLeaseStats::default();
+    pub fn local_copy_stats(&self) -> LocalCopyStats {
+        let mut stats = LocalCopyStats::default();
         for observer in self.state.trackers.lock().iter() {
             if let Some(snapshot) = observer.stats() {
                 stats.merge(&snapshot);
@@ -241,12 +441,12 @@ impl RetiredMemoryObservation {
         stats
     }
 
-    /// Retained-lease snapshots older than `threshold`, composed across every
+    /// Local-buffer snapshots older than `threshold`, composed across every
     /// still-owned tracker in this bundle without exposing the trackers.
     pub fn sweep_retained_snapshots(
         &self,
         threshold: std::time::Duration,
-    ) -> Vec<c2_mem::BufferLeaseSnapshot> {
+    ) -> Vec<LocalCopySnapshot> {
         let mut snapshots = Vec::new();
         for observer in self.state.trackers.lock().iter() {
             if let Some(retained) = observer.sweep_retained(threshold) {
@@ -270,7 +470,7 @@ impl RetiredMemoryObservation {
             .retain(|scope| scope.observer.is_alive());
         let mut trackers = self.state.trackers.lock();
         trackers.retain(|observer| observer.is_alive());
-        let mut deduped: Vec<BufferLeaseObserver> = Vec::with_capacity(trackers.len());
+        let mut deduped: Vec<LocalCopyObserver> = Vec::with_capacity(trackers.len());
         for observer in trackers.iter() {
             if !deduped.iter().any(|existing| existing.ptr_eq(observer)) {
                 deduped.push(observer.clone());
@@ -321,7 +521,7 @@ impl RetiredMemoryObservation {
                     reports.push(RetiredScopeReport {
                         role: scope.role,
                         stats: MemoryScopeStats::from_budget(
-                            *observer.limits(),
+                            observer.limits(),
                             observer.snapshot(),
                         ),
                     });
@@ -331,12 +531,12 @@ impl RetiredMemoryObservation {
         reports
     }
 
-    /// Retained-lease counters across several bundles, de-duplicated by
+    /// Local-buffer counters across several bundles, de-duplicated by
     /// tracker identity so one tracker observed through two bundles is
     /// counted once.
-    pub fn compose_lease_stats(bundles: &[Arc<RetiredMemoryObservation>]) -> BufferLeaseStats {
-        let mut stats = BufferLeaseStats::default();
-        let mut seen: Vec<BufferLeaseObserver> = Vec::new();
+    pub fn compose_local_copy_stats(bundles: &[Arc<RetiredMemoryObservation>]) -> LocalCopyStats {
+        let mut stats = LocalCopyStats::default();
+        let mut seen: Vec<LocalCopyObserver> = Vec::new();
         for bundle in bundles {
             for observer in bundle.state.trackers.lock().iter() {
                 if !observer.is_alive() {
@@ -354,14 +554,14 @@ impl RetiredMemoryObservation {
         stats
     }
 
-    /// Retained-lease snapshots older than `threshold` across several
+    /// Local-buffer snapshots older than `threshold` across several
     /// bundles, de-duplicated by tracker identity.
     pub fn compose_sweep_snapshots(
         bundles: &[Arc<RetiredMemoryObservation>],
         threshold: std::time::Duration,
-    ) -> Vec<c2_mem::BufferLeaseSnapshot> {
+    ) -> Vec<LocalCopySnapshot> {
         let mut snapshots = Vec::new();
-        let mut seen: Vec<BufferLeaseObserver> = Vec::new();
+        let mut seen: Vec<LocalCopyObserver> = Vec::new();
         for bundle in bundles {
             for observer in bundle.state.trackers.lock().iter() {
                 if !observer.is_alive() {
@@ -441,7 +641,7 @@ impl RetirementHandoff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_mem::{BudgetKind, BufferLeaseMeta, BufferStorage, LeaseDirection, MemoryBudget};
+    use c2_mem::{BudgetKind, MemoryBudget};
 
     fn limits() -> MemoryBudgetLimits {
         MemoryBudgetLimits {
@@ -451,14 +651,61 @@ mod tests {
         }
     }
 
-    fn retained_meta(bytes: usize) -> BufferLeaseMeta {
-        BufferLeaseMeta {
+    fn retained_meta(bytes: usize) -> LocalCopyMeta {
+        LocalCopyMeta {
             route_name: "grid".to_string(),
             method_name: "echo".to_string(),
-            direction: LeaseDirection::ClientResponse,
-            storage: BufferStorage::Shm,
+            direction: LocalCopyDirection::ClientResponse,
             bytes,
         }
+    }
+
+    #[test]
+    fn local_buffers_count_logical_bytes_by_direction_until_release() {
+        let tracker = LocalCopyTracker::new();
+        let response = tracker.track(retained_meta(17));
+        let input = tracker.track(LocalCopyMeta {
+            direction: LocalCopyDirection::ResourceInput,
+            bytes: 31,
+            ..retained_meta(0)
+        });
+        let stats = tracker.stats();
+        assert_eq!(stats.active_holds, 2);
+        assert_eq!(stats.total_held_bytes, 48);
+        assert_eq!(
+            stats.by_direction[&LocalCopyDirection::ClientResponse].total_held_bytes,
+            17
+        );
+        assert_eq!(
+            stats.by_direction[&LocalCopyDirection::ResourceInput].total_held_bytes,
+            31
+        );
+        let snapshots = tracker.sweep_retained(Duration::ZERO);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].route_name, "grid");
+        assert_eq!(snapshots[0].method_name, "echo");
+        assert!(stats.oldest_hold_seconds >= 0.0);
+        drop((response, input));
+        assert_eq!(tracker.stats().active_holds, 0);
+        assert_eq!(tracker.stats().total_held_bytes, 0);
+        assert!(tracker.sweep_retained(Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn local_hold_does_not_keep_an_ownerless_retired_backing_domain() {
+        let budget = MemoryBudget::from_limits(&limits());
+        let tracker = Arc::new(LocalCopyTracker::new());
+        let hold = tracker.track(retained_meta(128));
+        let observation = RetiredMemoryObservation::new();
+        observation.push_scope(scope::SERVER, BudgetObserver::new(budget.clone()));
+        observation.push_tracker(tracker.clone());
+        drop((budget, tracker));
+        observation.prune_detached();
+        assert!(observation.scope_reports().is_empty());
+        assert_eq!(observation.local_copy_stats().total_held_bytes, 128);
+        drop(hold);
+        observation.prune_detached();
+        assert!(observation.is_empty());
     }
 
     #[test]
@@ -466,14 +713,11 @@ mod tests {
         let limits = limits();
         let budget = MemoryBudget::from_limits(&limits);
         let reservation = budget.reserve(BudgetKind::Shm, 1024).expect("reserve");
-        let tracker = Arc::new(BufferLeaseTracker::new());
+        let tracker = Arc::new(LocalCopyTracker::new());
         let hold = tracker.track(retained_meta(64));
 
         let observation = RetiredMemoryObservation::new();
-        observation.push_scope(
-            scope::RUNTIME_OUTGOING,
-            BudgetObserver::new(limits, budget.clone()),
-        );
+        observation.push_scope(scope::RUNTIME_OUTGOING, BudgetObserver::new(budget.clone()));
         observation.push_tracker(Arc::clone(&tracker));
         // Simulate the failed-capture path registering the same tracker twice.
         observation.push_tracker(Arc::clone(&tracker));
@@ -484,8 +728,8 @@ mod tests {
         assert_eq!(retired.stats.limits, limits);
         assert_eq!(retired.stats.shm.used_bytes, 1024);
         assert_eq!(retired.stats.shm.limit_bytes, 4096);
-        assert_eq!(observation.lease_stats().active_holds, 1);
-        assert_eq!(observation.lease_stats().total_held_bytes, 64);
+        assert_eq!(observation.local_copy_stats().active_holds, 1);
+        assert_eq!(observation.local_copy_stats().total_held_bytes, 64);
 
         // The owning session drops its own handles, exactly like a session
         // swap releasing the retired RuntimeSession. The outstanding charge
@@ -495,7 +739,7 @@ mod tests {
         drop(tracker);
         observation.prune_detached();
         assert_eq!(observation.scope_reports()[0].stats.shm.used_bytes, 1024);
-        assert_eq!(observation.lease_stats().active_holds, 1);
+        assert_eq!(observation.local_copy_stats().active_holds, 1);
 
         // The last owners finish: records detach and the bundle empties.
         drop(reservation);
@@ -513,13 +757,10 @@ mod tests {
         // zero record must stay observable.
         let limits = limits();
         let budget = MemoryBudget::from_limits(&limits);
-        let tracker = Arc::new(BufferLeaseTracker::new());
+        let tracker = Arc::new(LocalCopyTracker::new());
 
         let observation = RetiredMemoryObservation::new();
-        observation.push_scope(
-            scope::RUNTIME_OUTGOING,
-            BudgetObserver::new(limits, budget.clone()),
-        );
+        observation.push_scope(scope::RUNTIME_OUTGOING, BudgetObserver::new(budget.clone()));
         observation.push_tracker(Arc::clone(&tracker));
 
         observation.prune_detached();
@@ -543,20 +784,17 @@ mod tests {
         // observable through the same record.
         let limits = limits();
         let budget = MemoryBudget::from_limits(&limits);
-        let session_tracker = Arc::new(BufferLeaseTracker::new());
+        let session_tracker = Arc::new(LocalCopyTracker::new());
         let producer_handle = session_tracker.clone();
 
         let observation = RetiredMemoryObservation::new();
-        observation.push_scope(
-            scope::RUNTIME_OUTGOING,
-            BudgetObserver::new(limits, budget.clone()),
-        );
+        observation.push_scope(scope::RUNTIME_OUTGOING, BudgetObserver::new(budget.clone()));
         observation.push_tracker(Arc::clone(&session_tracker));
         drop((budget, session_tracker));
 
         let late_charge = producer_handle.track(retained_meta(48));
-        assert_eq!(observation.lease_stats().active_holds, 1);
-        assert_eq!(observation.lease_stats().total_held_bytes, 48);
+        assert_eq!(observation.local_copy_stats().active_holds, 1);
+        assert_eq!(observation.local_copy_stats().total_held_bytes, 48);
 
         drop(late_charge);
         drop(producer_handle);
@@ -566,7 +804,7 @@ mod tests {
 
     #[test]
     fn sweep_snapshots_are_composed_without_exposing_trackers() {
-        let tracker = Arc::new(BufferLeaseTracker::new());
+        let tracker = Arc::new(LocalCopyTracker::new());
         let _hold = tracker.track(retained_meta(16));
 
         let observation = RetiredMemoryObservation::new();
@@ -597,7 +835,7 @@ mod tests {
         let limits = limits();
         let charged = MemoryBudget::from_limits(&limits);
         let reservation = charged.reserve(BudgetKind::Shm, 2048).expect("reserve");
-        let held_tracker = Arc::new(BufferLeaseTracker::new());
+        let held_tracker = Arc::new(LocalCopyTracker::new());
         let hold = held_tracker.track(retained_meta(96));
 
         let mut current: Vec<Arc<RetiredMemoryObservation>> = Vec::new();
@@ -607,14 +845,14 @@ mod tests {
                 // The first session owns the outstanding charge and hold.
                 pending.push_scope(
                     scope::RUNTIME_OUTGOING,
-                    BudgetObserver::new(limits, charged.clone()),
+                    BudgetObserver::new(charged.clone()),
                 );
                 pending.push_tracker(Arc::clone(&held_tracker));
             } else {
                 // Later sessions are empty: fresh tracker, no scopes. Their
                 // session handles drop with the swap, so their records
                 // detach.
-                pending.push_tracker(Arc::new(BufferLeaseTracker::new()));
+                pending.push_tracker(Arc::new(LocalCopyTracker::new()));
             }
             let handoff = RetirementHandoff::new(pending, current.clone());
             let mut replacement = Vec::new();
@@ -627,9 +865,9 @@ mod tests {
                 1,
                 "swap {swap}: only the bundle with live owners may survive"
             );
-            let mut stats = BufferLeaseStats::default();
+            let mut stats = LocalCopyStats::default();
             for bundle in &current {
-                stats.merge(&bundle.lease_stats());
+                stats.merge(&bundle.local_copy_stats());
             }
             assert_eq!(stats.active_holds, 1);
             assert_eq!(stats.total_held_bytes, 96);
@@ -657,7 +895,7 @@ mod tests {
         // same tracker/domain observed through two adopted bundles.
         let limits = limits();
         let budget = MemoryBudget::from_limits(&limits);
-        let tracker = Arc::new(BufferLeaseTracker::new());
+        let tracker = Arc::new(LocalCopyTracker::new());
         let hold = tracker.track(retained_meta(64));
 
         // First retirement succeeded earlier and was adopted.
@@ -674,10 +912,7 @@ mod tests {
         // The session's own outgoing domain is created only after the failed
         // attempt; the retry's fresh capture must include it.
         let retry = Arc::new(RetiredMemoryObservation::new());
-        retry.push_scope(
-            scope::RUNTIME_OUTGOING,
-            BudgetObserver::new(limits, budget.clone()),
-        );
+        retry.push_scope(scope::RUNTIME_OUTGOING, BudgetObserver::new(budget.clone()));
         retry.push_tracker(Arc::clone(&tracker));
         let handoff = RetirementHandoff::new(retry, adopted.clone());
         let mut replacement = Vec::new();
@@ -690,8 +925,10 @@ mod tests {
         );
 
         // The same tracker lives in both bundles; composition counts it once.
-        let mut stats = BufferLeaseStats::default();
-        stats.merge(&RetiredMemoryObservation::compose_lease_stats(&replacement));
+        let mut stats = LocalCopyStats::default();
+        stats.merge(&RetiredMemoryObservation::compose_local_copy_stats(
+            &replacement,
+        ));
         assert_eq!(stats.active_holds, 1);
         assert_eq!(stats.total_held_bytes, 64);
         let reports = RetiredMemoryObservation::compose_scope_reports(&replacement);
