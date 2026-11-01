@@ -24,8 +24,8 @@ const MIN_IPC_FRAME_SIZE: u64 = 8 + 4 + 1 + 1 + 8 * IPC_RELEASE_BATCH_CAPACITY a
 /// supported IPC segment-index space, not an arbitrary limit: both peers size
 /// their receive-side peer caches to this bound so every segment index a
 /// legitimately configured peer can reference is accepted, while indices
-/// beyond it stay rejected (`MemPool::ensure_peer_segment` bounds checks
-/// against the peer-cache `max_segments`).
+/// beyond it stay rejected (`PeerMappingCache::admit` refuses an index at or
+/// above the peer cache's `max_segments`).
 pub const MAX_IPC_POOL_SEGMENTS: u32 = 255;
 
 /// Code-level IPC override fields accepted for server config resolution.
