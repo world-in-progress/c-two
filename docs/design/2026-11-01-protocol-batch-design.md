@@ -93,7 +93,7 @@ peer end 包括读 0 和 Unix 本地流读端 ECONNRESET；保留 reason=connect
 
 本地 cancel/超时/一般 io_error/DISCONNECT 不清 L。畸形帧不猜边界，停用后固定缓冲丢弃到 peer end；解析健康时继续收释放、立即释放迟到 SHM。不可恢复读错却无结束证明，错误原样上报，L 留原池 teardown，不偷偷复用/重试；连接结束不撤销违规 raw mapping（`docs/reference/local-endpoint-lifecycle.md:189`）。
 
-物理 close 需停用、B=0、L=0，锁内封新租约/借出，未发布写撤销。此时释放队列未发完也可关，对端会据 peer end 结清；peer end 先清 L，本地映射留到 B=0。不依赖 half-close 或双方都等 EOF 才关的新 ACK。
+物理 close 需停用、B=0、L=0，锁内封新租约/借出，未发布写撤销。读端已不可恢复（没有结束证明的读错、接收任务结束）时，B=0 即可关闭物理流，剩余 L 留在原池直到池销毁，绝不在没有证明时提前释放；两端用同一规则，关闭事件只发布连接最先记下的首因（Host 2026-11-01 在 P4 验收中定）。已经开始写的调用被取消时不停用连接：写端写完这次请求剩下的帧（分片也一样），调用方得到取消，分相为 DispatchUncertain，其他调用不受影响。此时释放队列未发完也可关，对端会据 peer end 结清；peer end 先清 L，本地映射留到 B=0。不依赖 half-close 或双方都等 EOF 才关的新 ACK。
 
 调用方按原截止时间返回，writer 仍拥有已开始帧，超时只停用 / 记原因，实际 I/O 失败不重发。local 用引用计数 owner 持有实际流，未结束的远端读区间强引用它；任务 / 执行器结束不能越过这个区间关句柄 / SHUT_RDWR，旧 abort 的 take 操作删除。复制完成后本地副本不再持此引用，hold 不延长关闭；释放队列由连接驱动方独立排空。已发布借出不随任务析构 free，无结算任务时留原池占用（`c2-local/src/lib.rs:423-452,739-764`）。
 
