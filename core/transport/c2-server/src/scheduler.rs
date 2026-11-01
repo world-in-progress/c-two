@@ -101,13 +101,21 @@ enum HeldAccess {
 
 #[derive(Debug, Default)]
 struct SchedulerState {
-    closed: bool,
+    route_admission: RouteAdmissionState,
     pending: usize,
     active_workers: usize,
     active_readers: usize,
     writer_active: bool,
     next_ticket: u64,
     queue: VecDeque<QueuedPermit>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RouteAdmissionState {
+    CommittedPending,
+    #[default]
+    Opened,
+    Closed,
 }
 
 struct SchedulerInner {
@@ -180,7 +188,7 @@ impl SchedulerInner {
         state: &SchedulerState,
         generation: u64,
     ) -> Result<(), SchedulerAcquireError> {
-        if state.closed {
+        if state.route_admission != RouteAdmissionState::Opened {
             return Err(SchedulerAcquireError::Closed);
         }
         admission.check(generation)
@@ -199,7 +207,7 @@ impl SchedulerInner {
     }
 
     fn can_activate(&self, state: &SchedulerState, ticket: u64, access: HeldAccess) -> bool {
-        if state.closed {
+        if state.route_admission != RouteAdmissionState::Opened {
             return false;
         }
         let worker_slots = self.worker_slots_available(state);
@@ -280,7 +288,7 @@ impl Scheduler {
             max_workers: self.inner.limits.max_workers.map(NonZeroUsize::get),
             pending: state.pending,
             active_workers: state.active_workers,
-            closed: state.closed || admission.is_closed(),
+            closed: state.route_admission != RouteAdmissionState::Opened || admission.is_closed(),
             is_unconstrained: self.is_unconstrained_with_state(&admission, &state),
         }
     }
@@ -302,12 +310,12 @@ impl Scheduler {
             && self.inner.mode == ConcurrencyMode::Parallel
             && self.inner.limits.max_pending.is_none()
             && self.inner.limits.max_workers.is_none()
-            && !state.closed
+            && state.route_admission == RouteAdmissionState::Opened
     }
 
     pub fn close(&self) {
         let mut state = self.inner.state.lock().unwrap();
-        state.closed = true;
+        state.route_admission = RouteAdmissionState::Closed;
         self.inner.notify_all();
     }
 
@@ -327,8 +335,8 @@ impl Scheduler {
         Arc::ptr_eq(&self.inner.admission, admission)
     }
 
-    pub(crate) fn route_closed(&self) -> bool {
-        self.inner.state.lock().unwrap().closed
+    pub(crate) fn route_admission_state(&self) -> RouteAdmissionState {
+        self.inner.state.lock().unwrap().route_admission
     }
 
     fn is_drained(&self) -> bool {
@@ -336,10 +344,26 @@ impl Scheduler {
         state.pending == 0 && state.active_workers == 0
     }
 
-    pub(crate) fn open_admission_for_registration(&self) {
+    pub(crate) fn commit_awaiting_admission(&self) -> bool {
         let mut state = self.inner.state.lock().unwrap();
-        state.closed = false;
-        self.inner.notify_all();
+        if state.route_admission == RouteAdmissionState::Opened {
+            state.route_admission = RouteAdmissionState::CommittedPending;
+            self.inner.notify_all();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn open_admission_for_registration(&self) -> bool {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.route_admission == RouteAdmissionState::CommittedPending {
+            state.route_admission = RouteAdmissionState::Opened;
+            self.inner.notify_all();
+            true
+        } else {
+            false
+        }
     }
 
     #[cfg(test)]
@@ -643,6 +667,42 @@ mod tests {
             sched.try_acquire(0).unwrap_err(),
             SchedulerAcquireError::Closed
         );
+    }
+
+    #[test]
+    fn committed_pending_opens_once_and_terminal_close_cannot_reopen() {
+        let sched = Scheduler::new(ConcurrencyMode::Parallel, empty_map());
+        assert!(sched.commit_awaiting_admission());
+        assert_eq!(
+            sched.route_admission_state(),
+            RouteAdmissionState::CommittedPending
+        );
+        assert!(sched.snapshot().closed);
+        assert_eq!(
+            sched.try_acquire(0).unwrap_err(),
+            SchedulerAcquireError::Closed
+        );
+
+        assert!(sched.open_admission_for_registration());
+        assert_eq!(sched.route_admission_state(), RouteAdmissionState::Opened);
+        assert!(!sched.open_admission_for_registration());
+        drop(sched.try_acquire(0).unwrap());
+
+        sched.close();
+        assert_eq!(sched.route_admission_state(), RouteAdmissionState::Closed);
+        assert!(!sched.open_admission_for_registration());
+        assert_eq!(sched.route_admission_state(), RouteAdmissionState::Closed);
+        assert_eq!(
+            sched.try_acquire(0).unwrap_err(),
+            SchedulerAcquireError::Closed
+        );
+
+        let pending = Scheduler::new(ConcurrencyMode::Parallel, empty_map());
+        assert!(pending.commit_awaiting_admission());
+        pending.close();
+        assert_eq!(pending.route_admission_state(), RouteAdmissionState::Closed);
+        assert!(!pending.open_admission_for_registration());
+        assert_eq!(pending.route_admission_state(), RouteAdmissionState::Closed);
     }
 
     #[test]

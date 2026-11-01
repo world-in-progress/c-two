@@ -57,6 +57,46 @@ fn restore_error(kind: std::io::ErrorKind, os_error: Option<i32>) -> std::io::Er
     }
 }
 
+fn publish_end(publisher: &ConnectionPublisher, first_end: &Mutex<Option<PendingEnd>>) {
+    let end = *first_end.lock();
+    match end {
+        Some(PendingEnd::Explicit { reason, operation }) => {
+            publisher.close(reason, operation, None);
+        }
+        Some(PendingEnd::Read {
+            operation,
+            kind,
+            os_error,
+        }) => {
+            publisher.close_read_error(operation, &restore_error(kind, os_error));
+        }
+        Some(PendingEnd::Io {
+            operation,
+            kind,
+            os_error,
+        }) => {
+            publisher.close_io(operation, &restore_error(kind, os_error));
+        }
+        None => {
+            publisher.close(ConnectionEndReason::LocalClose, "stream_retired", None);
+        }
+    }
+}
+
+/// Publishes only after the last driver or remote reader drops this owner.
+pub(crate) struct PhysicalRetirement {
+    guard: Option<RemoteReadGuard>,
+    publisher: ConnectionPublisher,
+    first_end: Arc<Mutex<Option<PendingEnd>>>,
+}
+
+impl Drop for PhysicalRetirement {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        publish_end(&self.publisher, &self.first_end);
+    }
+}
+
 /// RAII guard that increments flight count on creation and decrements on drop.
 /// Ensures [`Connection::wait_idle`] blocks until all guarded tasks complete.
 pub(crate) struct FlightGuard<'a> {
@@ -106,9 +146,13 @@ pub struct Connection {
     peer_shm: Mutex<PeerShmState>,
 
     /// Retain the accepted OS stream until the last admitted remote read ends.
-    remote_read_guard: Mutex<Option<Arc<RemoteReadGuard>>>,
+    remote_read_guard: Mutex<Option<Arc<PhysicalRetirement>>>,
+    /// Once installed, only PhysicalRetirement may publish the physical close.
+    remote_read_guard_installed: AtomicBool,
     /// The first requested end is retained until the physical stream retires.
-    first_end: Mutex<Option<PendingEnd>>,
+    first_end: Arc<Mutex<Option<PendingEnd>>>,
+    /// The receive driver cannot obtain any more release or peer-end facts.
+    read_stopped: AtomicBool,
 
     /// Number of requests currently being processed.
     inflight: AtomicI32,
@@ -155,7 +199,9 @@ impl Connection {
             shm_response_capable: AtomicBool::new(false),
             peer_shm: Mutex::new(PeerShmState::new()),
             remote_read_guard: Mutex::new(None),
-            first_end: Mutex::new(None),
+            remote_read_guard_installed: AtomicBool::new(false),
+            first_end: Arc::new(Mutex::new(None)),
+            read_stopped: AtomicBool::new(false),
             inflight: AtomicI32::new(0),
             idle_notify: Notify::new(),
             publisher,
@@ -205,43 +251,33 @@ impl Connection {
         self.first_end.lock().get_or_insert(end);
     }
 
-    /// Publish the final retained reason at the close-ready boundary.
-    /// The caller has joined the writer and is about to drop the final stream
-    /// owners; this wins over c2-local's fallback retirement reason.
+    /// Publish for a connection that ended before a retirement guard was made.
+    /// The caller must already have dropped its unsplit stream.
     pub(crate) fn publish_physical_close(&self) {
-        let end = *self.first_end.lock();
-        match end {
-            Some(PendingEnd::Explicit { reason, operation }) => {
-                self.publisher.close(reason, operation, None);
-            }
-            Some(PendingEnd::Read {
-                operation,
-                kind,
-                os_error,
-            }) => {
-                self.publisher
-                    .close_read_error(operation, &restore_error(kind, os_error));
-            }
-            Some(PendingEnd::Io {
-                operation,
-                kind,
-                os_error,
-            }) => {
-                self.publisher
-                    .close_io(operation, &restore_error(kind, os_error));
-            }
-            None => {
-                self.publisher
-                    .close(ConnectionEndReason::LocalClose, "stream_retired", None);
-            }
-        }
+        publish_end(&self.publisher, &self.first_end);
+    }
+
+    pub(crate) fn stop_reading(&self) {
+        self.read_stopped.store(true, Ordering::Release);
+        self.writer_wake.notify_waiters();
+        self.writer_wake.notify_one();
+    }
+
+    pub(crate) fn reading_stopped(&self) -> bool {
+        self.read_stopped.load(Ordering::Acquire)
     }
 
     pub(crate) fn install_remote_read_guard(&self, guard: RemoteReadGuard) {
-        *self.remote_read_guard.lock() = Some(Arc::new(guard));
+        *self.remote_read_guard.lock() = Some(Arc::new(PhysicalRetirement {
+            guard: Some(guard),
+            publisher: self.publisher.clone(),
+            first_end: Arc::clone(&self.first_end),
+        }));
+        self.remote_read_guard_installed
+            .store(true, Ordering::Release);
     }
 
-    pub(crate) fn remote_read_guard(&self) -> Arc<RemoteReadGuard> {
+    pub(crate) fn remote_read_guard(&self) -> Arc<PhysicalRetirement> {
         self.remote_read_guard
             .lock()
             .as_ref()
@@ -249,12 +285,20 @@ impl Connection {
             .clone()
     }
 
-    pub(crate) fn try_close(&self) -> bool {
-        self.core.try_close()
+    pub(crate) fn has_ever_installed_remote_read_guard(&self) -> bool {
+        self.remote_read_guard_installed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn has_remote_read_guard(&self) -> bool {
+        self.remote_read_guard.lock().is_some()
     }
 
     pub(crate) fn clear_remote_read_guard(&self) {
         self.remote_read_guard.lock().take();
+    }
+
+    pub(crate) fn try_close(&self) -> bool {
+        self.core.try_close()
     }
 
     pub fn handshake_done(&self) -> bool {

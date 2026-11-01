@@ -3367,6 +3367,176 @@ async fn deactivated_readable_connection_still_answers_manual_ping() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn first_server_end_is_published_after_last_remote_read_on_task_drop() {
+    let server = Arc::new(
+        test_server_new(
+            &unique_readiness_address("first_end_remote_read"),
+            ServerIpcConfig::default(),
+        )
+        .unwrap(),
+    );
+    let events = server.connection_events();
+    let (mut peer, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+    handshake_test_client(&mut peer).await;
+    let observation = match events.recv().await.unwrap().unwrap() {
+        c2_local::ConnectionEvent::Opened(observation) => observation,
+        _ => panic!("expected Opened"),
+    };
+    let conn = server
+        .active_connection(observation.connection_id())
+        .unwrap();
+    let remote = conn
+        .core
+        .admit_remote_loan(71, Box::new(conn.remote_read_guard()))
+        .unwrap();
+    conn.end(ConnectionEndReason::ProtocolError, "first_end");
+    handler.abort();
+    assert!(handler.await.unwrap_err().is_cancelled());
+    assert!(observation.snapshot().is_none());
+    let mut byte = [0];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), peer.read(&mut byte))
+            .await
+            .is_err(),
+        "the remote read guard retains the accepted OS stream"
+    );
+    remote.finish();
+    let closed = observation
+        .wait_closed(Some(Duration::from_secs(2)))
+        .await
+        .expect("last remote read retires the stream");
+    assert_eq!(closed.reason(), ConnectionEndReason::ProtocolError);
+    assert_eq!(closed.operation(), "first_end");
+    assert!(matches!(events.recv().await.unwrap(),
+        Some(c2_local::ConnectionEvent::Closed(record)) if record == closed));
+}
+
+#[tokio::test]
+async fn unrecoverable_read_waits_for_remote_reader_before_publishing_close() {
+    let server = Arc::new(
+        test_server_new(
+            &unique_readiness_address("unrecoverable_read_remote_guard"),
+            ServerIpcConfig::default(),
+        )
+        .unwrap(),
+    );
+    let events = server.connection_events();
+    let (mut peer, stream) = isolated_pair().await;
+    let abort = stream.abort_handle();
+    let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+    handshake_test_client(&mut peer).await;
+    let observation = match events.recv().await.unwrap().unwrap() {
+        c2_local::ConnectionEvent::Opened(observation) => observation,
+        _ => panic!("expected Opened"),
+    };
+    let conn = server
+        .active_connection(observation.connection_id())
+        .unwrap();
+    let remote = conn
+        .core
+        .admit_remote_loan(72, Box::new(conn.remote_read_guard()))
+        .unwrap();
+    conn.end(ConnectionEndReason::ProtocolError, "first_end_before_abort");
+    abort.abort();
+    tokio::time::timeout(Duration::from_secs(2), handler)
+        .await
+        .expect("unrecoverable read completes its handler")
+        .unwrap();
+    assert!(observation.snapshot().is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), events.recv())
+            .await
+            .is_err(),
+        "Closed must wait for the last remote reader"
+    );
+    remote.finish();
+    let closed = observation
+        .wait_closed(Some(Duration::from_secs(2)))
+        .await
+        .expect("last remote reader publishes Closed");
+    assert_eq!(closed.reason(), ConnectionEndReason::ProtocolError);
+    assert_eq!(closed.operation(), "first_end_before_abort");
+    assert!(matches!(events.recv().await.unwrap(),
+        Some(c2_local::ConnectionEvent::Closed(record)) if record == closed));
+}
+
+#[tokio::test]
+async fn unrecoverable_server_read_closes_with_published_loan_in_original_pool() {
+    use c2_wire::connection::WriteRequest;
+
+    let server = Arc::new(
+        test_server_new(
+            &unique_readiness_address("read_error_published_loan"),
+            ServerIpcConfig::default(),
+        )
+        .unwrap(),
+    );
+    let events = server.connection_events();
+    let (mut peer, stream) = isolated_pair().await;
+    let abort = stream.abort_handle();
+    let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+    handshake_test_client(&mut peer).await;
+    let observation = match events.recv().await.unwrap().unwrap() {
+        c2_local::ConnectionEvent::Opened(observation) => observation,
+        _ => panic!("expected Opened"),
+    };
+    let conn = server
+        .active_connection(observation.connection_id())
+        .unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let pool = Arc::new(parking_lot::RwLock::new(
+        MemPool::new_with_prefix(
+            PoolConfig {
+                max_segments: 0,
+                max_dedicated_segments: 0,
+                min_retained_segments: 0,
+                buddy_enabled: false,
+                spill_dir: directory.path().to_path_buf(),
+                ..PoolConfig::default()
+            },
+            unique_response_pool_prefix("unread_loan"),
+        )
+        .unwrap(),
+    ));
+    let handle = pool.write().alloc_handle(4096).unwrap();
+    assert!(handle.is_file_spill());
+    let loan = conn.core.prepare_loan(Arc::clone(&pool), handle).unwrap();
+    let mut batch = conn
+        .core
+        .begin_write(WriteRequest::Business(vec![loan]))
+        .unwrap()
+        .unwrap();
+    batch.begin_io().unwrap();
+    batch.frame_completed();
+    batch.flush_completed();
+    assert_eq!(
+        pool.read().budget().unwrap().snapshot().file.used_bytes,
+        4096
+    );
+
+    abort.abort();
+    tokio::time::timeout(Duration::from_secs(2), handler)
+        .await
+        .expect("unrecoverable read must not wait for an unknowable release")
+        .unwrap();
+    let closed = observation.snapshot().expect("physical stream retired");
+    assert_eq!(closed.reason(), ConnectionEndReason::LocalClose);
+    assert_eq!(closed.operation(), "local_abort");
+    assert!(
+        !conn.core.try_close(),
+        "the published loan is still recorded"
+    );
+    assert_eq!(
+        pool.read().budget().unwrap().snapshot().file.used_bytes,
+        4096
+    );
+    drop(conn);
+    drop(server);
+}
+
 async fn read_release_id(client: &mut LocalStream) -> u64 {
     let (request_id, flags, payload) = read_reply_frame(client).await;
     assert_eq!(request_id, 0);
@@ -5740,4 +5910,100 @@ fn handshake_extracts_client_info() {
     let decoded = decode_handshake(&hs_bytes, false).unwrap();
     assert_eq!(decoded.prefix, "/cc3b_test");
     assert_eq!(decoded.capability_flags, CAP_SHM_REQUEST);
+}
+
+#[tokio::test]
+async fn committed_route_waiting_for_admission_projects_closed_register_committed() {
+    use c2_wire::route_catalog_control::{RouteStateReasonWire, RouteStateWire};
+
+    let server = test_server_new(
+        &unique_readiness_address("route_committed_pending"),
+        ServerIpcConfig::default(),
+    )
+    .unwrap();
+    let route = make_host_route(&server, "grid");
+    let scheduler = Arc::clone(&route.scheduler);
+    let token = commit_closed_test_route(&server, route).await;
+
+    let record = route_records(&server).await.pop().unwrap();
+    assert_eq!(record.state, RouteStateWire::Closed);
+    assert_eq!(
+        record.state_reason,
+        Some(RouteStateReasonWire::RegisterCommitted)
+    );
+    assert!(scheduler.snapshot().closed);
+    assert_eq!(
+        scheduler.try_acquire(0).unwrap_err(),
+        crate::scheduler::SchedulerAcquireError::Closed,
+    );
+
+    server.open_route_admission(token).await.unwrap();
+    let record = route_records(&server).await.pop().unwrap();
+    assert_eq!(record.state, RouteStateWire::Ready);
+    assert_eq!(
+        record.state_reason,
+        Some(RouteStateReasonWire::RegisterCommitted)
+    );
+    drop(scheduler.try_acquire(0).unwrap());
+    let route = server.dispatcher.read().await.resolve("grid").unwrap();
+    assert!(server.unregister_route("grid").await);
+    let record = route_record(&server, &route);
+    assert_eq!(record.state, RouteStateWire::Closed);
+    assert_eq!(
+        record.state_reason,
+        Some(RouteStateReasonWire::ExplicitUnregister)
+    );
+    assert!(scheduler.snapshot().closed);
+    assert!(!scheduler.open_admission_for_registration());
+}
+
+#[tokio::test]
+async fn host_close_retires_committed_route_before_admission() {
+    use c2_wire::route_catalog_control::{RouteStateReasonWire, RouteStateWire};
+
+    let server = test_server_new(
+        &unique_readiness_address("route_pending_host_close"),
+        ServerIpcConfig::default(),
+    )
+    .unwrap();
+    let route = make_host_route(&server, "grid");
+    let scheduler = Arc::clone(&route.scheduler);
+    let token = commit_closed_test_route(&server, route).await;
+
+    assert_eq!(server.close_business_admission("maintenance").await, 1);
+    let record = route_records(&server).await.pop().unwrap();
+    assert_eq!(record.state, RouteStateWire::Closed);
+    assert_eq!(record.state_reason, Some(RouteStateReasonWire::Shutdown));
+    assert!(server.open_route_admission(token).await.is_err());
+    assert!(scheduler.snapshot().closed);
+    assert_eq!(server.close_business_admission("maintenance").await, 0);
+}
+
+#[tokio::test]
+async fn aborted_and_dropped_reservations_terminally_close_their_schedulers() {
+    let server = test_server_new(
+        &unique_readiness_address("route_reservation_abort"),
+        ServerIpcConfig::default(),
+    )
+    .unwrap();
+
+    for explicit_abort in [true, false] {
+        let route = make_host_route(&server, "grid");
+        let scheduler = Arc::clone(&route.scheduler);
+        let reservation = server
+            .reserve_route(BuiltRoute::new(route).unwrap())
+            .await
+            .unwrap();
+        if explicit_abort {
+            server.abort_reserved_route(reservation).await;
+        } else {
+            drop(reservation);
+        }
+        assert!(scheduler.snapshot().closed);
+        assert_eq!(
+            scheduler.try_acquire(0).unwrap_err(),
+            crate::scheduler::SchedulerAcquireError::Closed,
+        );
+        assert!(!server.contains_route("grid").await);
+    }
 }

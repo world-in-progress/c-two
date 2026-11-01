@@ -78,7 +78,8 @@ use crate::dispatcher::{
 };
 use crate::response::try_prepare_shm_response;
 use crate::scheduler::{
-    Scheduler, SchedulerAcquireError, SchedulerLimits, SchedulerPendingPermit, SchedulerSnapshot,
+    RouteAdmissionState, Scheduler, SchedulerAcquireError, SchedulerLimits, SchedulerPendingPermit,
+    SchedulerSnapshot,
 };
 use crate::writer::ConnectionWriter;
 
@@ -402,6 +403,9 @@ impl PendingRouteReservation {
 
 impl Drop for PendingRouteReservation {
     fn drop(&mut self) {
+        if !self.resolved {
+            self.close_scheduler_for_abort();
+        }
         self.resolve();
     }
 }
@@ -913,7 +917,18 @@ impl Server {
             )));
         }
         if !admission_open {
-            reservation.close_scheduler_for_abort();
+            let pending = reservation
+                .route
+                .as_ref()
+                .expect("pending route reservation must still own the route")
+                .scheduler
+                .commit_awaiting_admission();
+            if !pending {
+                return Err(ServerError::Protocol(format!(
+                    "route admission already closed; cannot commit route {}",
+                    reservation.route_name()
+                )));
+            }
         }
         state.pending.remove(reservation.route_name());
         reservation.resolved = true;
@@ -963,7 +978,11 @@ impl Server {
                 "route admission token does not match current route: {name}"
             )));
         }
-        route.scheduler.open_admission_for_registration();
+        if !route.scheduler.open_admission_for_registration() {
+            return Err(ServerError::Protocol(format!(
+                "route is no longer awaiting admission: {name}"
+            )));
+        }
         Ok(())
     }
 
@@ -1577,11 +1596,12 @@ impl Server {
         };
         let mut closed = 0usize;
         for route in &routes {
-            let scheduler_closed = !route.scheduler.route_closed();
-            if scheduler_closed {
+            let newly_closed =
+                route.scheduler.route_admission_state() != RouteAdmissionState::Closed;
+            if newly_closed {
                 route.scheduler.close();
             }
-            if scheduler_closed {
+            if newly_closed {
                 closed += 1;
             }
         }
@@ -1844,18 +1864,24 @@ struct RegisteredConnection {
     server: Arc<Server>,
     conn: Arc<Connection>,
     stream: Option<LocalStream>,
+    writer_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for RegisteredConnection {
     fn drop(&mut self) {
         self.conn
             .end(ConnectionEndReason::LocalClose, "connection_task_drop");
-        if self.conn.try_close() {
-            self.conn.publish_physical_close();
+        self.conn.stop_reading();
+        if let Some(task) = self.writer_task.take() {
+            task.abort();
         }
-        self.conn.clear_remote_read_guard();
         // Also close an accepted stream if its future was never polled.
         drop(self.stream.take());
+        let had_guard = self.conn.has_ever_installed_remote_read_guard();
+        self.conn.clear_remote_read_guard();
+        if !had_guard {
+            self.conn.publish_physical_close();
+        }
         self.server
             .unregister_active_connection(self.conn.conn_id());
     }
@@ -1906,7 +1932,6 @@ fn handle_connection(
     let publisher = server
         .connection_event_source
         .open_connection(c2_local::ConnectionSide::Server);
-    let stream = stream.with_connection_publisher(publisher.clone());
     let conn = Arc::new(Connection::observed(publisher));
     let conn_id = conn.conn_id();
     server.register_active_connection(Arc::clone(&conn));
@@ -1914,6 +1939,7 @@ fn handle_connection(
         server,
         conn,
         stream: Some(stream),
+        writer_task: None,
     };
     async move {
         let mut registration = registration;
@@ -1949,9 +1975,6 @@ fn handle_connection(
                     "native shared-memory reachability indeterminate; terminating connection"
                 );
                 conn.end_io("shm_reachability", &error);
-                if conn.try_close() {
-                    conn.publish_physical_close();
-                }
                 return;
             }
         };
@@ -1961,6 +1984,7 @@ fn handle_connection(
         let abort = stream.abort_handle();
         let (mut reader, write_half) = stream.into_split();
         let (writer, writer_task) = ConnectionWriter::spawn(write_half, Arc::clone(&conn));
+        registration.writer_task = Some(writer_task);
 
         debug!(conn_id, "connection accepted");
 
@@ -2373,7 +2397,10 @@ fn handle_connection(
         // Invalid framing has no recoverable next boundary. Read only into a
         // fixed discard buffer until peer end; a write error is no end proof.
         let mut discard = [0u8; 8192];
-        if read_failed || reader.peer_ended() {
+        if read_failed && !reader.peer_ended() {
+            conn.stop_reading();
+        }
+        if reader.peer_ended() {
             loop {
                 let changed = conn.writer_wake.notified();
                 if conn.try_close() {
@@ -2382,7 +2409,7 @@ fn handle_connection(
                 changed.await;
             }
         }
-        while !conn.try_close() {
+        while !conn.reading_stopped() && !conn.try_close() {
             let changed = conn.writer_wake.notified();
             if reader.peer_ended() {
                 changed.await;
@@ -2398,18 +2425,24 @@ fn handle_connection(
                         else {
                             // An unrecoverable read without end proof cannot
                             // grant permission to reuse published storage.
-                            while !conn.try_close() { conn.writer_wake.notified().await; }
+                            conn.stop_reading();
                         }
                     }
                 },
                 _ = changed => {},
             }
         }
+        if conn.reading_stopped() {
+            // No more release facts can be read. Wake any blocked writer I/O;
+            // retirement guards still retain the native stream until B=0,
+            // and the original loan book keeps every unproved published loan.
+            abort.abort();
+        }
         drop(writer);
-        let _ = writer_task.await;
-        conn.publish_physical_close();
-        conn.clear_remote_read_guard();
+        let _ = registration.writer_task.as_mut().unwrap().await;
+        registration.writer_task.take();
         drop(reader);
+        conn.clear_remote_read_guard();
         conn.wait_idle().await;
         debug!(conn_id, "connection physically closed");
     }
@@ -2538,7 +2571,7 @@ async fn handle_handshake(
     let route_owners = server.dispatcher.read().await.routes_snapshot();
     let routes = route_owners
         .iter()
-        .filter(|route| !route.scheduler.route_closed())
+        .filter(|route| route.scheduler.route_admission_state() == RouteAdmissionState::Opened)
         .map(|route| RouteInfo {
             name: route.name.as_str(),
             route_uid: route.route_uid.as_str(),
@@ -2653,7 +2686,7 @@ async fn route_records(server: &Server) -> Vec<RouteRecordWire> {
 }
 
 fn route_record(server: &Server, route: &CrmRoute) -> RouteRecordWire {
-    let closed = route.scheduler.route_closed();
+    let admission = route.scheduler.route_admission_state();
     RouteRecordWire {
         route_name: route.name.clone(),
         route_uid: route.route_uid.clone(),
@@ -2677,19 +2710,20 @@ fn route_record(server: &Server, route: &CrmRoute) -> RouteRecordWire {
             })
             .collect(),
         max_payload_size: server.config.max_payload_size,
-        state: if closed {
-            RouteStateWire::Closed
-        } else {
-            RouteStateWire::Ready
-        },
-        state_reason: Some(if closed {
-            if server.business_admission_closed() {
-                RouteStateReasonWire::Shutdown
-            } else {
-                RouteStateReasonWire::ExplicitUnregister
+        state: match admission {
+            RouteAdmissionState::Opened => RouteStateWire::Ready,
+            RouteAdmissionState::CommittedPending | RouteAdmissionState::Closed => {
+                RouteStateWire::Closed
             }
-        } else {
-            RouteStateReasonWire::RegisterCommitted
+        },
+        state_reason: Some(match admission {
+            RouteAdmissionState::Opened | RouteAdmissionState::CommittedPending => {
+                RouteStateReasonWire::RegisterCommitted
+            }
+            RouteAdmissionState::Closed if server.business_admission_closed() => {
+                RouteStateReasonWire::Shutdown
+            }
+            RouteAdmissionState::Closed => RouteStateReasonWire::ExplicitUnregister,
         }),
     }
 }

@@ -15,6 +15,7 @@
 //! ```
 
 pub mod client;
+mod connection;
 pub mod control;
 pub mod pool;
 pub mod response;
@@ -24,7 +25,6 @@ pub mod sync_client;
 mod tests;
 
 pub use c2_local::{ConnectionClosed, ConnectionEndReason, ConnectionObservation};
-pub use c2_wire::shutdown_control::{DirectShutdownAck, ShutdownControlRouteOutcome};
 pub use client::{
     ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding,
     ServerPoolState,

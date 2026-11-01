@@ -53,10 +53,6 @@ const CASES: &[(&str, Probe)] = &[
         Probe::Fails(&["E0133"]),
     ),
     (
-        "vuln_request_data_shm_bare_coordinates",
-        Probe::Fails(&["E0624"]),
-    ),
-    (
         "vuln_response_data_shm_bare_coordinates",
         Probe::Fails(&["E0624"]),
     ),
@@ -76,10 +72,7 @@ const CASES: &[(&str, Probe)] = &[
         "vuln_connection_pool_replacement",
         Probe::Fails(&["E0599", "E0624"]),
     ),
-    (
-        "vuln_dedicated_rebind_after_destroy",
-        Probe::Fails(&["E0133"]),
-    ),
+    ("vuln_dedicated_mapping_adoption", Probe::Fails(&["E0133"])),
     (
         "vuln_server_response_pool_replacement",
         Probe::Fails(&["E0133"]),

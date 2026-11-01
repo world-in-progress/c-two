@@ -11,9 +11,23 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, PhysicalRetirement};
 
 const QUEUE_CAPACITY: usize = 64;
+
+struct WriterDriver {
+    stream: Option<LocalWriteHalf>,
+    retirement: Option<Arc<PhysicalRetirement>>,
+}
+
+impl Drop for WriterDriver {
+    fn drop(&mut self) {
+        // Cancellation can drop the task at any await point. The OS writer
+        // reference must go before this driver's retirement reference.
+        drop(self.stream.take());
+        drop(self.retirement.take());
+    }
+}
 
 struct Submission {
     bytes: Vec<u8>,
@@ -38,7 +52,19 @@ impl ConnectionWriter {
             queue,
             conn: conn.clone(),
         });
-        let task = tokio::spawn(run(write_half, conn, receiver));
+        // Keep the physical retirement owner until the write half has gone.
+        // Standalone writer tests construct connections without an accepted
+        // stream guard, so only live server connections have one.
+        let retirement = conn
+            .has_remote_read_guard()
+            .then(|| conn.remote_read_guard());
+        let mut driver = WriterDriver {
+            stream: Some(write_half),
+            retirement,
+        };
+        let task = tokio::spawn(async move {
+            run(driver.stream.as_mut().unwrap(), conn, receiver).await;
+        });
         (writer, task)
     }
 
@@ -104,16 +130,19 @@ impl ConnectionWriter {
 }
 
 async fn run(
-    mut stream: LocalWriteHalf,
+    stream: &mut LocalWriteHalf,
     conn: Arc<Connection>,
     mut receiver: mpsc::Receiver<Submission>,
 ) {
     let mut queue_closed = false;
     loop {
+        if conn.reading_stopped() {
+            break;
+        }
         if !queue_closed {
             match receiver.try_recv() {
                 Ok(submission) => {
-                    process_submission(&mut stream, &conn, submission).await;
+                    process_submission(stream, &conn, submission).await;
                     continue;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => queue_closed = true,
@@ -124,7 +153,7 @@ async fn run(
         if conn.handshake_done() {
             match conn.core.begin_write(WriteRequest::Releases) {
                 Ok(Some(batch)) => {
-                    if write_batch(&mut stream, &conn, batch, None).await.is_err() {
+                    if write_batch(stream, &conn, batch, None).await.is_err() {
                         break;
                     }
                     continue;
@@ -149,7 +178,7 @@ async fn run(
             _ = conn.writer_wake.notified() => {}
             next = receiver.recv(), if !queue_closed => {
                 match next {
-                    Some(submission) => process_submission(&mut stream, &conn, submission).await,
+                    Some(submission) => process_submission(stream, &conn, submission).await,
                     None => queue_closed = true,
                 }
             }

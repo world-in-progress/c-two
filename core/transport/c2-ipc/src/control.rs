@@ -9,7 +9,7 @@ use c2_local::{LocalEndpoint, LocalStream};
 use c2_wire::flags::{FLAG_RESPONSE, FLAG_SIGNAL};
 use c2_wire::frame::{self, HEADER_SIZE};
 use c2_wire::msg_type::{PING_BYTES, PONG_BYTES};
-use c2_wire::shutdown_control::{DirectShutdownAck, decode_shutdown_ack, encode_shutdown_initiate};
+use c2_wire::shutdown_control::{decode_shutdown_ack, encode_shutdown_initiate};
 
 /// Derive the automatic platform native endpoint for a logical IPC address.
 pub fn local_endpoint_from_ipc_address(address: &str) -> Result<LocalEndpoint, IpcError> {
@@ -263,38 +263,9 @@ pub fn ping_with_endpoint(endpoint: &LocalEndpoint, timeout: Duration) -> Result
     })
 }
 
-fn unacknowledged() -> DirectShutdownAck {
-    DirectShutdownAck {
-        acknowledged: false,
-        shutdown_started: false,
-        server_stopped: false,
-        route_outcomes: Vec::new(),
-    }
-}
-
-/// The one endpoint this probe was addressed to owns no listener.
-///
-/// This is the only absence-shaped success: it is scoped to the single OS
-/// native endpoint named by the address, so it is not a cross-namespace probe result.
-fn already_stopped() -> DirectShutdownAck {
-    DirectShutdownAck {
-        acknowledged: true,
-        shutdown_started: false,
-        server_stopped: true,
-        route_outcomes: Vec::new(),
-    }
-}
-
-/// Initiate shutdown through the platform native endpoint.
-///
-/// An absent endpoint is reported as already stopped: this address names one
-/// platform native endpoint, no listener owns it, and a
-/// later server on that same endpoint would be a new incarnation rather than
-/// the one this probe was addressed to. The reply `server_stopped: false` is
-/// *not* re-derivable from absence — only a live server's acknowledgement
-/// carries route outcomes — so absence is answered here instead of being
-/// confused with a probe that reached the wrong namespace.
-pub fn shutdown(address: &str, timeout: Duration) -> Result<DirectShutdownAck, IpcError> {
+/// Initiate shutdown at exactly this endpoint. True means initiation was
+/// acknowledged or the endpoint is absent; completion uses the Host receipt.
+pub fn shutdown(address: &str, timeout: Duration) -> Result<bool, IpcError> {
     shutdown_with_endpoint(&local_endpoint_from_ipc_address(address)?, timeout)
 }
 
@@ -303,7 +274,7 @@ pub fn shutdown_with_context(
     address: &str,
     context: &LocalEndpointContext,
     timeout: Duration,
-) -> Result<DirectShutdownAck, IpcError> {
+) -> Result<bool, IpcError> {
     shutdown_with_endpoint(&context.endpoint(address).map_err(endpoint_error)?, timeout)
 }
 
@@ -314,7 +285,7 @@ pub fn shutdown_with_context(
 pub fn shutdown_with_endpoint(
     endpoint: &LocalEndpoint,
     timeout: Duration,
-) -> Result<DirectShutdownAck, IpcError> {
+) -> Result<bool, IpcError> {
     let endpoint = endpoint.clone();
     blocking(async move {
         let started = Instant::now();
@@ -331,21 +302,23 @@ pub fn shutdown_with_endpoint(
             .await?
             {
                 Exchange::Absent => {
-                    return Ok(already_stopped());
+                    return Ok(true);
                 }
                 Exchange::Reply(flags, payload) => {
                     if flags & FLAG_SIGNAL == 0 || flags & FLAG_RESPONSE == 0 {
-                        return Ok(unacknowledged());
+                        return Ok(false);
                     }
-                    return decode_shutdown_ack(&payload).map_err(IpcError::Protocol);
+                    return decode_shutdown_ack(&payload)
+                        .map(|()| true)
+                        .map_err(IpcError::Protocol);
                 }
-                Exchange::DispatchUncertain => return Ok(unacknowledged()),
+                Exchange::DispatchUncertain => return Ok(false),
                 Exchange::NotSent => {
                     tokio::time::sleep(remaining.min(Duration::from_millis(10))).await
                 }
             }
         }
-        Ok(unacknowledged())
+        Ok(false)
     })
 }
 
@@ -522,8 +495,7 @@ mod tests {
         let address = address("absent");
         assert!(!ping(&address, Duration::from_millis(20)).unwrap());
         let result = shutdown(&address, Duration::from_millis(20)).unwrap();
-        assert!(result.acknowledged && result.server_stopped && !result.shutdown_started);
-        assert!(result.route_outcomes.is_empty());
+        assert!(result);
     }
 
     #[cfg(unix)]
@@ -539,8 +511,7 @@ mod tests {
         let result = shutdown(&address, Duration::from_millis(20));
         std::fs::remove_file(path).unwrap();
         let result = result.unwrap();
-        assert!(!result.acknowledged);
-        assert!(!result.server_stopped);
+        assert!(!result);
     }
 
     /// Drives one probe through the absent-to-ready sequence and returns its
@@ -615,25 +586,18 @@ mod tests {
             if refuse_first {
                 test_seam::refuse_connect_once(&address);
             }
-            let expected = DirectShutdownAck {
-                acknowledged: true,
-                shutdown_started: true,
-                server_stopped: false,
-                route_outcomes: Vec::new(),
-            };
             let responder = responder(
                 address.clone(),
                 false,
                 encode_shutdown_initiate().to_vec(),
-                encode_shutdown_ack(&expected).unwrap(),
+                encode_shutdown_ack().to_vec(),
             );
             responder.wait_ready();
             responder.bind();
             let result = shutdown(&address, PROBE_BUDGET).unwrap();
             responder.stop();
             assert!(!test_seam::take_connect_refusal(&address));
-            assert!(result.acknowledged && result.shutdown_started && !result.server_stopped);
-            assert!(result.route_outcomes.is_empty());
+            assert!(result);
         }
     }
 
@@ -714,14 +678,8 @@ mod tests {
             accepted = replacement.accept() => {
                 let mut stream = accepted.unwrap();
                 assert_eq!(read_reply(&mut stream).await.unwrap().1, encode_shutdown_initiate());
-                let ack = DirectShutdownAck {
-                    acknowledged: true,
-                    shutdown_started: true,
-                    server_stopped: false,
-                    route_outcomes: Vec::new(),
-                };
                 stream.write_all(&frame::encode_frame(0, FLAG_SIGNAL | FLAG_RESPONSE,
-                    &encode_shutdown_ack(&ack).unwrap())).await.unwrap();
+                    &encode_shutdown_ack())).await.unwrap();
                 (true, probe.await.unwrap())
             }
             result = &mut probe => (false, result.unwrap()),
@@ -733,8 +691,7 @@ mod tests {
             "a replacement listener received the shutdown replay"
         );
         let result = result.unwrap();
-        assert!(!result.acknowledged && !result.shutdown_started && !result.server_stopped);
-        assert!(result.route_outcomes.is_empty());
+        assert!(!result);
     }
 
     #[tokio::test]

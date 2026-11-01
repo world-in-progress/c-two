@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use c2_mem::{MemPool, PoolConfig};
-use c2_server::{CrmCallback, CrmError, PreparedShmResponse, RequestData, ResponseMeta};
+use c2_server::{CrmCallback, CrmError, PreparedShmResponse, ResponseMeta};
 
 struct ForgedPublisher;
 
@@ -14,7 +14,7 @@ impl CrmCallback for ForgedPublisher {
         &self,
         _route_name: &str,
         _method_idx: u16,
-        _request: RequestData,
+        _request: Vec<u8>,
         _response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         let mut other_pool = MemPool::new(PoolConfig::default()).unwrap();

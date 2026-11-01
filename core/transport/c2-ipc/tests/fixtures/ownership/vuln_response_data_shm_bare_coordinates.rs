@@ -1,25 +1,6 @@
-//! R02 baseline: ResponseData::Shm hand-built from bare coordinates is
-//! accepted by the public ResponseLease. Compiled only, never run.
+//! Only frame admission may mint a server response carrier.
 #![forbid(unsafe_code)]
-
-use std::sync::Arc;
-
-use c2_ipc::{ResponseData, ResponseLease, ServerPoolState, ServerShmResponse};
-use parking_lot::Mutex;
-
-fn from_coordinates(server_pool: Arc<Mutex<ServerPoolState>>) {
-    let mut lease = ResponseLease::new(ResponseData::Shm(ServerShmResponse::admit(
-        server_pool,
-        0,
-        1,
-        0,
-        4096,
-        false,
-        7,
-        c2_mem::MemoryBudget::new(0, 0, 0),
-    )));
-    let _ = lease.copy_bytes();
-    let _ = lease.release();
+use c2_ipc::ServerShmResponse;
+fn main() {
+    let _ = ServerShmResponse::admit;
 }
-
-fn main() {}

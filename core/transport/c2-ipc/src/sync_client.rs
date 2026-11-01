@@ -3,7 +3,7 @@
 //! Wraps [`IpcClient`] for blocking calls from SDK bindings.
 //! Multiple `SyncClient` instances share a single tokio runtime.
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::sync::{Arc, OnceLock};
 
 use c2_mem::MemPool;
@@ -85,7 +85,8 @@ pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
         | IpcError::Shm(_)
         | IpcError::Pool(_)
         | IpcError::PoolRetired => TransportPhase::PreDispatch,
-        IpcError::Io(_)
+        IpcError::ResponseFailure(_)
+        | IpcError::Io(_)
         | IpcError::Connect(_)
         | IpcError::Decode(_)
         | IpcError::Chunk(_)
@@ -141,12 +142,6 @@ fn initialize_runtime<'a>(
         .expect("executor was published by its coordinator"))
 }
 
-pub(crate) fn ensure_runtime_with_deadline(
-    deadline: c2_config::ConnectDeadline,
-) -> Result<(), IpcError> {
-    initialize_runtime(&GLOBAL_RUNTIME, &RUNTIME_INIT, deadline).map(|_| ())
-}
-
 /// Core's dedicated owner-control streams use the existing client I/O executor.
 #[doc(hidden)]
 pub fn shared_io_handle(
@@ -191,27 +186,6 @@ const _: () = {
 };
 
 impl SyncClient {
-    /// Test-only connect that arms a probe before the receive task is spawned.
-    #[cfg(test)]
-    pub(crate) fn connect_with_partial_header_probe_for_test(
-        address: &str,
-        config: ClientIpcConfig,
-        ready: std::sync::mpsc::Sender<()>,
-        receiver_drop_gate: Option<crate::client::ReceiverDropGateForTest>,
-    ) -> Result<Self, IpcError> {
-        let rt = get_or_create_runtime();
-        let mut client = IpcClient::with_config(address, config)?;
-        client.set_partial_header_pending_for_test(ready);
-        if let Some(gate) = receiver_drop_gate {
-            client.set_receiver_drop_gate_for_test(gate);
-        }
-        rt.block_on(client.connect())?;
-        Ok(Self {
-            inner: client,
-            rt: rt.handle().clone(),
-        })
-    }
-
     /// Connect with a transport-internal pool (pooled-client acquire path).
     ///
     /// The pool was built from `config` by the caller inside this crate and is
@@ -220,7 +194,7 @@ impl SyncClient {
     /// charges the same context.
     pub(crate) fn connect_transport_pool_attempt_with_deadline(
         endpoint: c2_config::LocalEndpoint,
-        pool: Arc<Mutex<MemPool>>,
+        pool: Arc<RwLock<MemPool>>,
         config: ClientIpcConfig,
         budget: c2_mem::MemoryBudget,
         deadline: c2_config::ConnectDeadline,
@@ -320,11 +294,6 @@ impl SyncClient {
             .await
     }
 
-    #[cfg(test)]
-    pub(crate) fn request_pool(&self) -> Option<Arc<Mutex<MemPool>>> {
-        self.inner.request_pool()
-    }
-
     /// The complete resolved client configuration this connection was created
     /// from. Used by the owning cache to reject a same-address hit whose
     /// requested policy differs from the cached connection's policy.
@@ -332,10 +301,8 @@ impl SyncClient {
         self.inner.config()
     }
 
-    /// Bind a response to the exact transport pool that owns its backing.
-    ///
-    /// Reassembled handles carry their own pool and budget charge inside the
-    /// [`c2_wire::chunk::ReassemblyBacking`] carrier.
+    /// Consume response storage into owned bytes. Normal IPC calls have
+    /// already materialized their response and released transport storage.
     pub fn lease_response(&self, response: ResponseData) -> ResponseLease {
         ResponseLease::new(response)
     }
@@ -348,20 +315,16 @@ impl SyncClient {
     /// Synchronous shared-ownership close with a bounded close barrier.
     ///
     /// Usable through `Arc<SyncClient>` when unique ownership cannot be
-    /// proven. Returns `true` when maintenance and receive tasks finished,
-    /// the writer cleared, pending requests settled, and owner pool
-    /// slots detached within `timeout`. Live RequestBlocks, held carriers and
-    /// dedicated-retire jobs retain their exact pools and budget charges.
-    /// IPC-owned cleanup-lock contention returns `false` with the cleanup
-    /// owners reachable for a later close.
-    /// Busy connection cleanup stays owned for retry. This is not a hard
-    /// real-time bound on OS scheduling or mapping destruction.
+    /// proven. The connection's driver owns outstanding frames and loans;
+    /// copied responses retain no physical connection.
+    /// False leaves the original driver settling its loans. A later observer
+    /// sees that same physical close; no cleanup worker is started.
     pub fn close_shared(&self, timeout: std::time::Duration) -> bool {
         self.rt.block_on(self.inner.close_shared_bounded(timeout))
     }
 
-    pub(crate) fn abnormal_close_reason(&self) -> Option<&'static str> {
-        self.inner.abnormal_close_reason()
+    pub(crate) fn deactivate(&self) {
+        self.inner.deactivate();
     }
 
     /// Whether the client is connected.
@@ -405,12 +368,9 @@ impl SyncClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
         route_uid: &str,
-        route_revision: u64,
     ) -> Result<RouteBinding, IpcError> {
-        self.rt.block_on(
-            self.inner
-                .acquire_route_token(expected, route_uid, route_revision),
-        )
+        self.rt
+            .block_on(self.inner.acquire_route_token(expected, route_uid))
     }
 
     /// Acquire under the caller's unchanged absolute connection deadline.
@@ -427,16 +387,12 @@ impl SyncClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
         route_uid: &str,
-        route_revision: u64,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RouteBinding, IpcError> {
-        self.rt
-            .block_on(self.inner.acquire_route_token_with_deadline(
-                expected,
-                route_uid,
-                route_revision,
-                deadline,
-            ))
+        self.rt.block_on(
+            self.inner
+                .acquire_route_token_with_deadline(expected, route_uid, deadline),
+        )
     }
 
     /// CRM tag advertised by a route, if present.
@@ -481,26 +437,6 @@ impl SyncClient {
             inner,
             rt: rt.handle().clone(),
         }
-    }
-
-    /// Deterministically occupy the writer slot exactly like a bulk write
-    /// stuck on a non-reading peer would, signalling `acquired` once the
-    /// slot is held and releasing it when `release` resolves.
-    ///
-    /// This replaces timing-dependent blocked-pipe fixtures: the close
-    /// barrier's writer phase observes an unavailable writer slot without
-    /// any 32 MiB stack buffers or kernel pipe-buffer pressure.
-    pub(crate) fn hold_writer_slot_for_test(
-        &self,
-        acquired: tokio::sync::oneshot::Sender<()>,
-        release: tokio::sync::oneshot::Receiver<()>,
-    ) {
-        let writer = self.inner.writer_slot_for_test();
-        self.rt.spawn(async move {
-            let _guard = writer.lock().await;
-            let _ = acquired.send(());
-            let _ = release.await;
-        });
     }
 }
 
