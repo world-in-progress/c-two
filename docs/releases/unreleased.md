@@ -131,6 +131,7 @@ IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh protocol 7 replace 14, 3, 6 
 - A low-level Host shutdown no longer seals the Runtime's call domain or outgoing clients; only an explicit `Runtime.shutdown()` / `cc.shutdown()` retires them. A low-level shutdown with no Host completes immediately.
 - Request IDs are 64-bit end to end instead of being truncated to 32 bits inside the client, and generated TypeScript carries them and loan IDs as `bigint`.
 - `max_frame_size` must be at least 526 bytes, the size of a full release frame.
+- A peer that stops while it still holds loans keeps shutdown at `completed=False`, returned when the shutdown budget ends, until the peer releases them or its connection ends. 0.10.1 aborted such a connection at once, because the shared allocator let the server free the blocks itself.
 
 ### Removed
 
@@ -144,6 +145,29 @@ IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh protocol 7 replace 14, 3, 6 
 | Route revisions in route bindings, call tokens, relay resolution, HTTP headers and the mesh; IPC `RouteWatch` and route-contract queries | Route UID, server instance and contract identify a route |
 | C/FFI ABI 6 request and response pools, including `request_pool_read_local`, `request_pool_forget_consumed` and `response_pool_release`; TypeScript `createC2MemFfiNativeResponseShmReader`, the `responseShmReader` and `requestShmWriter` options, and block `allocationId` | One ABI 7 memory context per verified connection; blocks carry `loanId: bigint` ([C ABI](../reference/c-abi.md)) |
 | Rust Core `HeldResponse` leases and pins, `has_pending_release`, `abandon`, `RequestLease` and `ResponseLease` | `Held` and `HeldResponse` own a local copy |
+
+### Further changes
+
+Found by the strict comparison against 0.10.1 and not listed above:
+
+- Python:
+  - `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverrides` live in `c_two.config`; `InputLifetimeLike`, `CoreError.body` and `Server.get_slot_info` are removed, and a proxy's tracker is `local_copy_tracker` (was `lease_tracker`).
+  - `c_two.mem`: `PoolAlloc.allocation_id` and `PoolStats.dedicated_pending_free_bytes` are removed; `max_dedicated_segments` above 65536 raises `ValueError`; a dedicated segment no longer reserves a 64-byte header (0.10.1 could write 64 bytes past it).
+- Rust: `Held::release` consumes the value even when invalidation fails or panics, and a later call returns `Ok`. The Core crate `c2-mem` changes its low-level API: `free_at` takes the level, `ensure_peer_dedicated` takes the generation, `release_handle` panics on a handle from another pool, `BuddySegment::allocator()` panics on a peer segment, and `destroy`, `gc_dedicated`, `SegmentHeader` and `ShmSpinlock` are removed.
+- TypeScript: options accept an explicit `undefined` for `ipcAddress`, `serverId`, `serverInstanceId`, the two `observe` callbacks and `C2Fetch.signal`.
+- Wire: `RouteAck` (0x14), `RouteRecord.owner_epoch` and `lease_deadline_ms`, `RouteNack.nonce`, `DigestDiffEntry.hash` and the `FLAG_SHM`, `FLAG_POOL` and `FLAG_DISK_SPILL` flags are removed. A route's state is `ready` or `closed`, its reason is one of `register_committed`, `explicit_unregister` or `shutdown` and is always present, and the route directory and the mesh reject unknown fields.
+- Connections:
+  - Aborting or dropping a local stream no longer forces an OS disconnect: the handle closes when its last holder releases it, so a forked child that inherited the descriptor keeps the peer from seeing the end.
+  - The close notification is published when the physical stream retires, not when the end is first recorded.
+  - A write timeout deactivates the connection instead of aborting the stream.
+  - Calls not yet written when a connection deactivates, or before it connects, fail as pre-dispatch and are retry-safe; 0.10.1 reported them as dispatch-uncertain.
+  - A chunked reply larger than `max_reassembly_bytes` fails with a capacity error, like a request.
+  - A malformed shutdown frame closes the connection instead of receiving a negative acknowledgement.
+- Shutdown and errors:
+  - Repeating a low-level Rust `Runtime::shutdown` returns the complete journal instead of an empty one.
+  - `ipc_client_close_details` lists only connections whose first end was not a local close, with the operation as the reason.
+  - A failed request materialization reports `ResourceInputDeserializing` instead of `ProtocolViolation`.
+  - Unregistering the same route twice concurrently returns `True` both times.
 
 ### Validation
 
