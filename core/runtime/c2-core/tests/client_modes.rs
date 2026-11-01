@@ -1144,9 +1144,17 @@ fn hostless_retirement_closes_own_clients_and_isolates_sibling_runtimes_and_loca
     let mut held = client_b.call_held("echo", &big).expect("held response");
     assert_eq!(held.bytes(), big.as_slice());
 
-    // Hostless shutdown of A closes A's cache through the same bounded
-    // barrier the native RuntimeSession hostless branch projects.
-    let outcome_a = runtime_a.shutdown_without_host(Duration::from_secs(5));
+    // Explicit client-only retirement closes A's outgoing scope; low-level
+    // Host shutdown does not select this scope.
+    let retirement_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (outcome_a, retirement_completed) = runtime_a
+        .begin_session_retirement(
+            c2_core::RuntimeShutdownTarget::ClientsOnly,
+            retirement_deadline,
+        )
+        .expect("begin client-only retirement")
+        .observe_until(retirement_deadline);
+    assert!(retirement_completed, "{outcome_a:?}");
     assert!(
         outcome_a.ipc_clients_drained,
         "A drain must confirm: {:?}",
@@ -1154,7 +1162,7 @@ fn hostless_retirement_closes_own_clients_and_isolates_sibling_runtimes_and_loca
     );
     assert!(
         client_a.call_owned("echo", b"a-after").is_err(),
-        "A's client must be closed by its own hostless shutdown"
+        "A's client must be closed by its own explicit retirement"
     );
     assert_eq!(
         client_b
@@ -1165,7 +1173,15 @@ fn hostless_retirement_closes_own_clients_and_isolates_sibling_runtimes_and_loca
     assert_eq!(held.bytes(), big.as_slice());
 
     // B's retirement closes its connection; its local copy remains readable.
-    let outcome_b = runtime_b.shutdown_without_host(Duration::from_secs(5));
+    let retirement_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (outcome_b, retirement_completed) = runtime_b
+        .begin_session_retirement(
+            c2_core::RuntimeShutdownTarget::ClientsOnly,
+            retirement_deadline,
+        )
+        .expect("begin client-only retirement")
+        .observe_until(retirement_deadline);
+    assert!(retirement_completed, "{outcome_b:?}");
     assert!(
         outcome_b.ipc_clients_drained,
         "B drain must confirm: {:?}",
@@ -1173,7 +1189,7 @@ fn hostless_retirement_closes_own_clients_and_isolates_sibling_runtimes_and_loca
     );
     assert!(
         client_b.call_owned("echo", b"b-closed").is_err(),
-        "B's client must be closed by its own hostless shutdown"
+        "B's client must be closed by its own explicit retirement"
     );
     assert_eq!(held.bytes(), big.as_slice());
     held.invalidate_then_release(|| Ok(()))

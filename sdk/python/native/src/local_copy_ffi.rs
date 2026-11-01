@@ -1,26 +1,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use c2_mem::{
-    BufferLeaseGuard, BufferLeaseMeta, BufferLeaseTracker, BufferStorage, LeaseDirection,
-};
+use c2_core::memory::{LocalCopyDirection, LocalCopyGuard, LocalCopyMeta, LocalCopyTracker};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-#[pyclass(name = "BufferLeaseTracker", frozen, skip_from_py_object)]
+#[pyclass(name = "LocalCopyTracker", frozen, skip_from_py_object)]
 #[derive(Clone)]
-pub struct PyBufferLeaseTracker {
-    pub(crate) inner: Arc<BufferLeaseTracker>,
+pub struct PyLocalCopyTracker {
+    pub(crate) inner: Arc<LocalCopyTracker>,
 }
 
-#[pyclass(name = "BufferLease", frozen)]
-pub struct PyBufferLease {
-    guard: parking_lot::Mutex<Option<BufferLeaseGuard>>,
+#[pyclass(name = "LocalCopyGuard", frozen)]
+pub struct PyLocalCopyGuard {
+    guard: parking_lot::Mutex<Option<LocalCopyGuard>>,
 }
 
-impl PyBufferLeaseTracker {
-    pub(crate) fn from_arc(inner: Arc<BufferLeaseTracker>) -> Self {
+impl PyLocalCopyTracker {
+    pub(crate) fn from_arc(inner: Arc<LocalCopyTracker>) -> Self {
         Self { inner }
     }
 
@@ -29,20 +27,18 @@ impl PyBufferLeaseTracker {
         route_name: &str,
         method_name: &str,
         direction: &str,
-        storage: &str,
         bytes: usize,
-    ) -> PyResult<BufferLeaseGuard> {
-        Ok(self.inner.track(BufferLeaseMeta {
+    ) -> PyResult<LocalCopyGuard> {
+        Ok(self.inner.track(LocalCopyMeta {
             route_name: route_name.to_string(),
             method_name: method_name.to_string(),
             direction: parse_direction(direction)?,
-            storage: parse_storage(storage)?,
             bytes,
         }))
     }
 
     pub(crate) fn stats_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        lease_stats_dict(py, &self.inner.stats())
+        local_copy_stats_dict(py, &self.inner.stats())
     }
 
     pub(crate) fn sweep_retained_list<'py>(
@@ -59,62 +55,49 @@ impl PyBufferLeaseTracker {
         let threshold = Duration::from_secs_f64(threshold_seconds);
         let list = PyList::empty(py);
         for snapshot in self.inner.sweep_retained(threshold) {
-            list.append(lease_snapshot_dict(py, &snapshot)?)?;
+            list.append(local_copy_snapshot_dict(py, &snapshot)?)?;
         }
         Ok(list)
     }
 }
 
-/// Build the Python shape of one retained-lease snapshot.
+/// Build the Python shape of one local-copy snapshot.
 ///
 /// Shared by a single tracker and by the retired-observation sweeps, so the
-/// projection can report retired lease metadata from snapshot values without
+/// projection can report retired local-copy metadata from snapshot values without
 /// ever handing the retired trackers themselves to Python.
-pub(crate) fn lease_snapshot_dict<'py>(
+pub(crate) fn local_copy_snapshot_dict<'py>(
     py: Python<'py>,
-    snapshot: &c2_mem::BufferLeaseSnapshot,
+    snapshot: &c2_core::memory::LocalCopySnapshot,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("id", snapshot.id)?;
     dict.set_item("route_name", &snapshot.route_name)?;
     dict.set_item("method_name", &snapshot.method_name)?;
     dict.set_item("direction", snapshot.direction.as_str())?;
-    dict.set_item("storage", snapshot.storage.as_str())?;
     dict.set_item("bytes", snapshot.bytes)?;
     dict.set_item("age_seconds", snapshot.age_seconds)?;
     Ok(dict)
 }
 
-/// Build the Python shape of one composed lease-stats view.
+/// Build the Python shape of one composed local-copy stats view.
 ///
 /// Shared by a single tracker and by the runtime session's merged view
 /// (live tracker plus trackers retained for retired sessions), so the public
 /// shape stays identical whether or not a retired domain is still reporting.
-pub(crate) fn lease_stats_dict<'py>(
+pub(crate) fn local_copy_stats_dict<'py>(
     py: Python<'py>,
-    stats: &c2_mem::BufferLeaseStats,
+    stats: &c2_core::memory::LocalCopyStats,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("active_holds", stats.active_holds)?;
     dict.set_item("total_held_bytes", stats.total_held_bytes)?;
     dict.set_item("oldest_hold_seconds", stats.oldest_hold_seconds)?;
 
-    let by_storage = PyDict::new(py);
-    for storage in [
-        BufferStorage::Inline,
-        BufferStorage::Shm,
-        BufferStorage::Handle,
-        BufferStorage::FileSpill,
-    ] {
-        let value = stats.by_storage.get(&storage).cloned().unwrap_or_default();
-        by_storage.set_item(storage.as_str(), hold_bucket_stats_dict(py, &value)?)?;
-    }
-    dict.set_item("by_storage", by_storage)?;
-
     let by_direction = PyDict::new(py);
     for direction in [
-        LeaseDirection::ClientResponse,
-        LeaseDirection::ResourceInput,
+        LocalCopyDirection::ClientResponse,
+        LocalCopyDirection::ResourceInput,
     ] {
         let value = stats
             .by_direction
@@ -127,31 +110,19 @@ pub(crate) fn lease_stats_dict<'py>(
     Ok(dict)
 }
 
-fn parse_storage(storage: &str) -> PyResult<BufferStorage> {
-    match storage {
-        "inline" => Ok(BufferStorage::Inline),
-        "shm" => Ok(BufferStorage::Shm),
-        "handle" => Ok(BufferStorage::Handle),
-        "file_spill" => Ok(BufferStorage::FileSpill),
-        other => Err(PyValueError::new_err(format!(
-            "invalid buffer storage {other:?}"
-        ))),
-    }
-}
-
-fn parse_direction(direction: &str) -> PyResult<LeaseDirection> {
+fn parse_direction(direction: &str) -> PyResult<LocalCopyDirection> {
     match direction {
-        "client_response" => Ok(LeaseDirection::ClientResponse),
-        "resource_input" => Ok(LeaseDirection::ResourceInput),
+        "client_response" => Ok(LocalCopyDirection::ClientResponse),
+        "resource_input" => Ok(LocalCopyDirection::ResourceInput),
         other => Err(PyValueError::new_err(format!(
-            "invalid lease direction {other:?}"
+            "invalid local copy direction {other:?}"
         ))),
     }
 }
 
 fn hold_bucket_stats_dict<'py>(
     py: Python<'py>,
-    stats: &c2_mem::HoldBucketStats,
+    stats: &c2_core::memory::LocalCopyBucketStats,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("active_holds", stats.active_holds)?;
@@ -160,26 +131,24 @@ fn hold_bucket_stats_dict<'py>(
 }
 
 #[pymethods]
-impl PyBufferLeaseTracker {
+impl PyLocalCopyTracker {
     #[new]
     fn new() -> Self {
         Self {
-            inner: Arc::new(BufferLeaseTracker::new()),
+            inner: Arc::new(LocalCopyTracker::new()),
         }
     }
 
-    #[pyo3(signature = (route_name, method_name, direction, storage, bytes))]
+    #[pyo3(signature = (route_name, method_name, direction, bytes))]
     fn track_retained(
         &self,
         route_name: &str,
         method_name: &str,
         direction: &str,
-        storage: &str,
         bytes: usize,
-    ) -> PyResult<PyBufferLease> {
-        let guard =
-            self.track_retained_guard(route_name, method_name, direction, storage, bytes)?;
-        Ok(PyBufferLease {
+    ) -> PyResult<PyLocalCopyGuard> {
+        let guard = self.track_retained_guard(route_name, method_name, direction, bytes)?;
+        Ok(PyLocalCopyGuard {
             guard: parking_lot::Mutex::new(Some(guard)),
         })
     }
@@ -198,14 +167,14 @@ impl PyBufferLeaseTracker {
 }
 
 #[pymethods]
-impl PyBufferLease {
+impl PyLocalCopyGuard {
     fn release(&self) {
         self.guard.lock().take();
     }
 
     fn __enter__<'py>(slf: PyRef<'py, Self>) -> PyResult<PyRef<'py, Self>> {
         if slf.guard.lock().is_none() {
-            return Err(PyRuntimeError::new_err("buffer lease already released"));
+            return Err(PyRuntimeError::new_err("local copy already released"));
         }
         Ok(slf)
     }
@@ -221,14 +190,14 @@ impl PyBufferLease {
     }
 }
 
-impl Drop for PyBufferLease {
+impl Drop for PyLocalCopyGuard {
     fn drop(&mut self) {
         self.guard.lock().take();
     }
 }
 
 pub(crate) fn register_module(parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    parent.add_class::<PyBufferLeaseTracker>()?;
-    parent.add_class::<PyBufferLease>()?;
+    parent.add_class::<PyLocalCopyTracker>()?;
+    parent.add_class::<PyLocalCopyGuard>()?;
     Ok(())
 }

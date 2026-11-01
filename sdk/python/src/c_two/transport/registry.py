@@ -40,7 +40,7 @@ import threading
 from inspect import getattr_static
 from collections.abc import Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Literal, TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
@@ -54,6 +54,7 @@ from c_two.error import (
     ResourceUnavailable,
     RegistryUnavailable,
 )
+from .input_lifetime import _InputLifetime
 from .client.proxy import CRMProxy
 from ._snapshots import CallExecutionSnapshot, LifecycleSnapshot, ShutdownOutcome
 from .server.scheduler import ConcurrencyConfig
@@ -263,7 +264,7 @@ class Runtime:
         # The retirement observation needs no fence: it observes through weak
         # handles, so its records stay reportable exactly while real owners
         # (old proxies, in-flight responses, outstanding holds) keep the old
-        # session's accounting and lease metadata alive.
+        # session's accounting and local-copy metadata alive.
         self._close_replaced_session(old_session)
 
     def _swap_runtime_session(self, *, preserve_server_identity: bool):
@@ -281,7 +282,7 @@ class Runtime:
         publishes it, so the public session never shows a window in which
         retired charges silently disappeared. Observation lifetime needs no
         fence here: records stay reportable exactly while real owners keep
-        the old session's accounting and lease metadata alive.
+        the old session's accounting and local-copy metadata alive.
         """
         runtime_session = self._runtime_session
         retired_observation = runtime_session.retire_memory_observation()
@@ -444,7 +445,7 @@ class Runtime:
         *,
         name: str,
         concurrency: ConcurrencyConfig | None = None,
-        input_lifetime: Mapping[str, Literal['materialized', 'borrowed']] | None = None,
+        input_lifetime: Mapping[str, _InputLifetime] | None = None,
     ) -> str:
         """Register a CRM, making it available via :func:`connect`.
 
@@ -593,7 +594,7 @@ class Runtime:
                 if address is None and server is not None
                 else None
             )
-            lease_tracker = runtime_session.lease_tracker()
+            local_copy_tracker = runtime_session.local_copy_tracker()
 
             remote = address is not None or local is None
 
@@ -609,7 +610,7 @@ class Runtime:
                 crm_instance,
                 name=name,
                 scheduler=scheduler,
-                lease_tracker=lease_tracker,
+                local_copy_tracker=local_copy_tracker,
             )
         elif address is not None and address.startswith(('http://', 'https://')):
             # HTTP mode — cross-node via relay server.
@@ -633,7 +634,7 @@ class Runtime:
                 client,
                 name,
                 on_terminate=client.close,
-                lease_tracker=lease_tracker,
+                local_copy_tracker=local_copy_tracker,
             )
         elif address is not None:
             # Remote IPC via pooled RustClient.
@@ -652,7 +653,7 @@ class Runtime:
                 client,
                 name,
                 on_terminate=client.close,
-                lease_tracker=lease_tracker,
+                local_copy_tracker=local_copy_tracker,
             )
         else:
             try:
@@ -683,14 +684,14 @@ class Runtime:
                     client,
                     name,
                     on_terminate=lambda: client.close(),
-                    lease_tracker=lease_tracker,
+                    local_copy_tracker=local_copy_tracker,
                 )
             elif mode == 'http':
                 proxy = CRMProxy.http(
                     client,
                     name,
                     on_terminate=lambda: client.close(),
-                    lease_tracker=lease_tracker,
+                    local_copy_tracker=local_copy_tracker,
                 )
             else:
                 raise RegistryUnavailable(f"Unsupported relay target mode: {mode!r}")
@@ -1027,7 +1028,7 @@ def register(
     *,
     name: str,
     concurrency: ConcurrencyConfig | None = None,
-    input_lifetime: Mapping[str, Literal['materialized', 'borrowed']] | None = None,
+    input_lifetime: Mapping[str, _InputLifetime] | None = None,
 ) -> str:
     """Register a CRM in the current process.
 
@@ -1181,19 +1182,15 @@ def memory_stats() -> MemoryStats:
     ``reassembly`` cells with ``limit_bytes``, ``used_bytes``,
     ``peak_bytes``, ``rejected_allocations`` and ``rejected_bytes``.
 
-    ``retired`` lists scope-labelled domains from earlier sessions whose
-    accounting or lease metadata is still kept alive by a real owner — an old
-    proxy's native client, an in-flight response, or outstanding ``cc.hold()``
-    data. Retired entries carry ``state="retired"``; records detach
-    individually once their last owner is gone, so repeated empty session
-    swaps never accumulate, and a late held result published through an old
-    proxy stays visible. Observing them never retains the retired Runtime,
-    cache, pools, callbacks, or payloads.
+    ``retired`` lists backing domains from earlier sessions while an old
+    native client, in-flight call or backing charge still owns the accounting.
+    Entries carry ``state="retired"`` and detach after their last owner drops.
+    Observation retains no Runtime, cache, pool, callback or payload.
 
-    ``holds`` carries Rust-owned retained-buffer counters, composed across
-    the live and retired lease trackers.
-    These are C-Two-owned IPC backing and live reassembly charges; not process RSS.
-    Never sum or present the three cells as RAM usage.
+    ``holds`` reports local-copy logical bytes and counts by direction,
+    composed across live and retired local-copy trackers. A hold keeps no
+    transport backing domain alive. These counters are not process RSS;
+    never sum the independent backing and reassembly cells as RAM usage.
     """
     return _get_default_runtime().memory_stats()
 

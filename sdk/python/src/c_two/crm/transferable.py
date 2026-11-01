@@ -22,7 +22,7 @@ P = ParamSpec("P")
 
 
 class HeldResult(Generic[R]):
-    """A result whose C-Two lease must be released explicitly."""
+    """A result whose local response copy must be released explicitly."""
 
     __slots__ = (
         "_value", "_release_cb", "_invalidate_cb", "_released", "_buffer",
@@ -47,13 +47,13 @@ class HeldResult(Generic[R]):
     @property
     def value(self) -> R:
         if self._released:
-            raise RuntimeError("SHM released — value no longer accessible")
+            raise RuntimeError("Local copy released — value no longer accessible")
         return self._value
 
     @property
     def unsafe_buffer(self) -> memoryview:
         if self._released:
-            raise RuntimeError("SHM released — buffer no longer accessible")
+            raise RuntimeError("Local copy released — buffer no longer accessible")
         if self._buffer is None:
             raise RuntimeError("HeldResult has no retained buffer")
         return self._buffer
@@ -122,8 +122,7 @@ class HeldResult(Generic[R]):
                 self._value = None  # type: ignore[assignment]
                 self._invalidate_cb = None
                 self._buffer = None
-                if not response.has_pending_release:
-                    self._native_response = None
+                self._native_response = None
 
         if first_error is not None:
             raise first_error
@@ -151,10 +150,8 @@ class HeldResult(Generic[R]):
             if not getattr(self, "_release_attempted", False):
                 message = (
                     "HeldResult was garbage-collected without release() — "
-                    "potential SHM leak. Use 'with cc.hold(...)' or call .release()."
+                    "retained local copy. Use 'with cc.hold(...)' or call .release()."
                 )
-            elif getattr(self, "_released", False) and response is not None:
-                message = "HeldResult has pending native cleanup after release() failed"
             else:
                 message = "HeldResult release() did not complete before garbage collection"
             _warn(
@@ -165,10 +162,6 @@ class HeldResult(Generic[R]):
         try:
             self.release()
         except BaseException as cleanup_error:
-            response = self._native_response
-            if response is not None:
-                response._abandon_after_failed_release()
-                self._native_response = None
             if not _is_finalizing():
                 _warn(
                     f"HeldResult final release failed: {cleanup_error}",
@@ -179,7 +172,7 @@ class HeldResult(Generic[R]):
 
 
 def hold(method: Callable[P, R]) -> Callable[P, HeldResult[R]]:
-    """Retain one remote response lease until the returned owner is released."""
+    """Retain one local response copy until the returned owner is released."""
 
     if not callable(method):
         raise TypeError(
@@ -305,7 +298,7 @@ def _build_transfer_wrapper(
                         result = output_decoder(view)
                         result_ready = True
                         if hasattr(response, "track_retained"):
-                            tracker = getattr(client, "lease_tracker", None)
+                            tracker = getattr(client, "local_copy_tracker", None)
                             if tracker is not None:
                                 response.track_retained(
                                     tracker,
@@ -664,11 +657,7 @@ def _resolved_hints(func: Callable[..., object]) -> dict[str, Any]:
 def _release_response(response: object) -> None:
     release = getattr(response, "release", None)
     if callable(release):
-        try:
-            release()
-        except BaseException:
-            response._abandon_after_failed_release()
-            raise
+        release()
 
 
 def _release_view_and_response(view: memoryview, response: object) -> None:
@@ -705,7 +694,6 @@ def _invalidate_and_release_held_response(
         try:
             core_release(invalidator, value)
         except BaseException as exc:
-            response._abandon_after_failed_release()
             if first_error is None:
                 first_error = exc
             else:

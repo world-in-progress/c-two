@@ -5,7 +5,7 @@ snapshot and must never keep its own counters. The three budget cells are
 C-Two-owned IPC backing/live-reassembly accounting, not process RSS.
 
 The retirement tests here prove the owner-lifetime observation contract: a
-retirement record stores only weak views of budget accounting and lease
+retirement record stores only weak views of budget accounting and local-copy
 metadata, so it stays reportable exactly while a real owner — an old proxy's
 native client or tracker handle, an in-flight response, an outstanding hold
 or charge guard — keeps that metadata alive. Zero counters never prune a
@@ -85,12 +85,11 @@ def _build_payload(value: int = 7):
         spec.close()
 
 
-def _track_retained_lease(session, *, bytes_: int = 64):
-    return session.lease_tracker().track_retained(
+def _track_retained_local_copy(session, *, bytes_: int = 64):
+    return session.local_copy_tracker().track_retained(
         route_name='grid',
         method_name='echo',
         direction='client_response',
-        storage='inline',
         bytes=bytes_,
     )
 
@@ -110,13 +109,13 @@ def test_memory_stats_is_observable_without_freezing_an_unused_runtime() -> None
     # always an explicit list with scope labels.
     assert isinstance(first['retired'], list)
     assert all(
-        {'role', 'state', 'abandoned_releases', 'limits', 'cells'} <= set(scope)
+        {'role', 'state', 'limits', 'cells'} <= set(scope)
         for scope in first['retired']
     )
     # The retained-buffer counters stay Rust-owned and are composed, not
     # duplicated, into the snapshot.
     assert set(first['holds']) == {
-        'active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_storage', 'by_direction'
+        'active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_direction'
     }
     assert 'not process RSS' in ' '.join(cc.observe.memory_stats.__doc__.split())
 
@@ -139,7 +138,7 @@ def test_memory_stats_typed_shape_is_declared_for_the_public_facade() -> None:
         'rejected_allocations',
         'rejected_bytes',
     }
-    scope_fields = {'role', 'state', 'abandoned_releases', 'limits', 'cells'}
+    scope_fields = {'role', 'state', 'limits', 'cells'}
     assert set(MemoryScopeStats.__annotations__) == scope_fields
     assert set(RetiredScopeStats.__annotations__) == scope_fields
     assert set(MemoryStats.__annotations__) == {
@@ -178,7 +177,7 @@ def test_retired_observation_surface_has_no_track_or_reserve_escape() -> None:
         'mark_close_confirmed',
         'close_confirmed',
         'scope_reports',
-        'lease_stats',
+        'local_copy_stats',
         'sweep_retained_snapshots',
     ):
         assert forbidden not in surface, f'observation must not expose {forbidden!r}'
@@ -191,11 +190,11 @@ def test_retired_observation_surface_has_no_track_or_reserve_escape() -> None:
     assert not hasattr(_native, 'BudgetObserver')
 
 
-def test_native_retirement_keeps_retained_lease_metadata_across_sessions() -> None:
-    """The session handoff keeps Rust-owned lease metadata observable.
+def test_native_retirement_keeps_retained_local_copy_metadata_across_sessions() -> None:
+    """The session handoff keeps Rust-owned local-copy metadata observable.
 
     This is the deterministic native-level half of the public proof: the
-    replacement session reports a retained lease that belongs to the retired
+    replacement session reports a retained local copy that belongs to the retired
     session for exactly as long as a real owner holds it, and the record
     detaches once the last owner (the hold guard and the retired session
     itself) is gone.
@@ -203,7 +202,7 @@ def test_native_retirement_keeps_retained_lease_metadata_across_sessions() -> No
     from c_two import _native
 
     first = _native.RuntimeSession()
-    lease = _track_retained_lease(first)
+    local_copy = _track_retained_local_copy(first)
     observation = first.retire_memory_observation()
 
     replacement = _native.RuntimeSession()
@@ -212,14 +211,14 @@ def test_native_retirement_keeps_retained_lease_metadata_across_sessions() -> No
     assert replacement.memory_stats()["holds"]['active_holds'] == 1
     assert replacement.memory_stats()['holds']['active_holds'] == 1
     assert replacement.memory_stats()['holds']['total_held_bytes'] == 64
-    sweeps = replacement.sweep_hold_leases(0.0)
+    sweeps = replacement.sweep_local_copies(0.0)
     assert [item['route_name'] for item in sweeps] == ['grid']
 
     # A hold is a real owner: releasing it does not detach the record while
     # the retired session's own tracker handle still exists.
-    lease.release()
+    local_copy.release()
     assert replacement.memory_stats()["holds"]['active_holds'] == 0
-    assert replacement.sweep_hold_leases(0.0) == []
+    assert replacement.sweep_local_copies(0.0) == []
 
     # The last owner goes away (the retired session wrapper drops, exactly
     # like the end of a public shutdown); the record detaches.
@@ -236,14 +235,14 @@ def test_zero_retirement_keeps_a_late_hold_visible_while_a_producer_owns_the_tra
     an in-flight response has not published its held result yet. The old
     session itself goes away — exactly like a public shutdown dropping the
     retired session — but the producer handle it handed out (what an old
-    proxy's ``lease_tracker`` or an in-flight response holds) keeps the
+    proxy's ``local_copy_tracker`` or an in-flight response holds) keeps the
     tracker alive, so the late hold must remain visible through the
     replacement once it lands, without relying on timing.
     """
     from c_two import _native
 
     first = _native.RuntimeSession()
-    producer_tracker = first.lease_tracker()
+    producer_tracker = first.local_copy_tracker()
     # Counters are zero and no hold exists at capture time.
     observation = first.retire_memory_observation()
 
@@ -260,11 +259,10 @@ def test_zero_retirement_keeps_a_late_hold_visible_while_a_producer_owns_the_tra
 
     # The in-flight response / old proxy publishes its held result after all
     # of that, through the same native tracker handle production code uses.
-    lease = producer_tracker.track_retained(
+    local_copy = producer_tracker.track_retained(
         route_name='grid',
         method_name='echo',
         direction='client_response',
-        storage='inline',
         bytes=128,
     )
     assert replacement.memory_stats()["holds"]['active_holds'] == 1, (
@@ -273,7 +271,7 @@ def test_zero_retirement_keeps_a_late_hold_visible_while_a_producer_owns_the_tra
     )
     assert replacement.memory_stats()['holds']['total_held_bytes'] == 128
 
-    lease.release()
+    local_copy.release()
     assert replacement.memory_stats()["holds"]['active_holds'] == 0
     del producer_tracker
     assert replacement.memory_stats()['retired'] == []
@@ -282,17 +280,16 @@ def test_zero_retirement_keeps_a_late_hold_visible_while_a_producer_owns_the_tra
 def test_old_proxy_tracker_publishes_a_hold_after_public_shutdown() -> None:
     """An old proxy remains a supported producer after ``cc.shutdown()``.
 
-    Old HTTP and thread-local proxies legitimately stay usable after a public
-    shutdown; their held results publish through the native tracker handle
-    they hold (``proxy.lease_tracker`` → ``response.track_retained``). This
-    reproduces that exact producer chain deterministically at the native
-    level: the session goes away, the producer handle publishes, and public
-    statistics must see it.
+    Old HTTP and thread-local proxies legitimately stay usable after public
+    shutdown; new held calls publish through the native local-copy tracker
+    they captured (``proxy.local_copy_tracker`` -> ``response.track_retained``).
+    This reproduces that producer chain deterministically at the native level:
+    the session goes away, the producer publishes, and statistics must see it.
     """
     from c_two import _native
 
     session = _native.RuntimeSession()
-    proxy_tracker = session.lease_tracker()
+    proxy_tracker = session.local_copy_tracker()
     observation = session.retire_memory_observation()
 
     # Public shutdown: the registry swaps in a replacement that adopts the
@@ -305,25 +302,24 @@ def test_old_proxy_tracker_publishes_a_hold_after_public_shutdown() -> None:
         stats = replacement.memory_stats()
         assert stats['holds']['active_holds'] == 0
 
-    # The old proxy makes a new held call; its response tracks the retained
-    # lease on the tracker the proxy holds, after shutdown and snapshots.
-    lease = proxy_tracker.track_retained(
+    # The old proxy makes a new held call and tracks its retained local copy
+    # through the captured tracker, after shutdown and repeated snapshots.
+    local_copy = proxy_tracker.track_retained(
         route_name='grid',
         method_name='echo',
         direction='client_response',
-        storage='inline',
         bytes=64,
     )
     assert replacement.memory_stats()["holds"]['active_holds'] == 1
     assert replacement.memory_stats()['holds']['active_holds'] == 1
     assert replacement.memory_stats()['holds']['total_held_bytes'] == 64
 
-    lease.release()
+    local_copy.release()
     assert replacement.memory_stats()["holds"]['active_holds'] == 0
     # The proxy itself goes away; the observation record detaches with it.
     del proxy_tracker
     assert replacement.memory_stats()['retired'] == []
-    assert replacement.sweep_hold_leases(0.0) == []
+    assert replacement.sweep_local_copies(0.0) == []
 
 
 def test_failed_session_replacement_preserves_previous_and_own_observations() -> None:
@@ -338,7 +334,7 @@ def test_failed_session_replacement_preserves_previous_and_own_observations() ->
     from c_two import _native
 
     first = _native.RuntimeSession()
-    lease = _track_retained_lease(first)
+    local_copy = _track_retained_local_copy(first)
     handoff = first.retire_memory_observation()
     second = _native.RuntimeSession()
     second.adopt_retired_memory_observation(handoff)
@@ -355,7 +351,7 @@ def test_failed_session_replacement_preserves_previous_and_own_observations() ->
 
     # The session continues working and publishes another hold after the
     # failed attempt; the retry's fresh capture must include it.
-    own_lease = _track_retained_lease(second, bytes_=96)
+    own_local_copy = _track_retained_local_copy(second, bytes_=96)
     retry_handoff = second.retire_memory_observation()
     third = _native.RuntimeSession()
     third.adopt_retired_memory_observation(retry_handoff)
@@ -365,8 +361,8 @@ def test_failed_session_replacement_preserves_previous_and_own_observations() ->
     )
     assert third.memory_stats()['holds']['total_held_bytes'] == 64 + 96
 
-    lease.release()
-    own_lease.release()
+    local_copy.release()
+    own_local_copy.release()
     assert third.memory_stats()["holds"]['active_holds'] == 0
 
     # The registry-level ordering: a session class whose next construction
@@ -434,7 +430,7 @@ def test_failed_native_replacement_retry_carries_own_holds_through_the_registry(
     from c_two.transport import registry as registry_module
 
     first = _native.RuntimeSession()
-    lease = _track_retained_lease(first)
+    local_copy = _track_retained_local_copy(first)
 
     registry = Runtime()
     registry._runtime_session = first  # noqa: SLF001
@@ -473,7 +469,7 @@ def test_failed_native_replacement_retry_carries_own_holds_through_the_registry(
     finally:
         settings.shm_threshold = None
         registry._runtime_session.shutdown()  # noqa: SLF001
-        lease.release()
+        local_copy.release()
         _reset_default_runtime()
 
 
@@ -483,7 +479,7 @@ def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records(scope
     """One long-lived hold spans repeated ``api.shutdown()`` session swaps.
 
     The live old proxy keeps the retired session's Runtime, budget domain,
-    and lease tracker alive, so its retired record stays observable — with
+    and local-copy tracker alive, so its retired record stays observable — with
     the hold visible — through every swap. Each later empty session's own
     records detach when that session drops, so ``retired`` stays bounded at
     the one owner-backed row instead of accumulating, and once the hold, the

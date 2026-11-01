@@ -408,7 +408,6 @@ publish = false
         raise AssertionError(f"unknown SDK language: {language}")
 
 
-
 def _parse_key_values(line: str, prefix: str) -> dict[str, str]:
     if not line.startswith(prefix):
         raise AssertionError(f"expected {prefix!r} line, got {line!r}")
@@ -459,7 +458,6 @@ class RustHost:
                     f"Rust matrix host address mismatch: {ready!r}"
                 )
             self.route_uid = ready["route_uid"]
-            self.route_revision = int(ready["route_revision"])
         except BaseException:
             self._kill_and_collect()
             raise
@@ -659,7 +657,7 @@ def wait_for_contract_resolution(
                         raise AssertionError(
                             f"relay resolution {route_key} mismatch: {route!r}"
                         )
-                if not route.get("route_uid") or route.get("route_revision", 0) <= 0:
+                if not route.get("route_uid"):
                     raise AssertionError(
                         f"relay resolution omitted route token: {route!r}"
                     )
@@ -683,7 +681,6 @@ def wait_for_contract_resolution(
                             "signature_hash"
                         ],
                         "x-c2-route-uid": route["route_uid"],
-                        "x-c2-route-revision": str(route["route_revision"]),
                     },
                 )
                 with opener.open(probe, timeout=1) as response:

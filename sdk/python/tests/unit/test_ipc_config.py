@@ -101,7 +101,6 @@ def test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields(
     assert base['shm_backing_budget_bytes'] is int
     assert base['file_backing_budget_bytes'] is int
     assert base['live_reassembly_budget_bytes'] is int
-    assert server['heartbeat_interval'] is float
     assert server['max_pending_requests'] is int
     assert server['max_execution_workers'] is int
     assert server['pool_decay_seconds'] is float
@@ -285,8 +284,6 @@ _SERVER_IPC_FIELDS = (
     ('max_payload_size', 'C2_IPC_MAX_PAYLOAD_SIZE', 1048576, 2097152),
     ('max_pending_requests', 'C2_IPC_MAX_PENDING_REQUESTS', 7, 11),
     ('max_execution_workers', 'C2_IPC_MAX_EXECUTION_WORKERS', 9, 7),
-    ('heartbeat_interval', 'C2_IPC_HEARTBEAT_INTERVAL', 3.0, 0.0),
-    ('heartbeat_timeout', 'C2_IPC_HEARTBEAT_TIMEOUT', 20.0, 45.0),
 )
 
 
@@ -583,8 +580,6 @@ def test_ipc_override_mapping_is_snapshotted_by_native():
     }  # noqa: SLF001
 
 
-
-
 def test_server_id_override_drives_auto_address():
     cc.set_server(server_id='unit-server')
     cc.register(IUnitConfigCRM, UnitConfigCRM(), name='unit-route')
@@ -689,7 +684,7 @@ class _FakeRuntimeSession:
         self.relay_anchor_address_override = relay_address
         self.connect_attempt = connect_attempt
 
-    def lease_tracker(self):
+    def local_copy_tracker(self):
         return None
 
 

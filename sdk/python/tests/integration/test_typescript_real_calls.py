@@ -61,73 +61,6 @@ pytestmark = pytest.mark.timeout(600)
 _ROWS: dict[str, dict[str, Any]] = {}
 _NEGATIVE_EVIDENCE: dict[str, Any] = {}
 
-_LAZY_HANDSHAKE_SCRIPT = dedent(
-    """\
-    import assert from 'node:assert/strict';
-    import { pathToFileURL } from 'node:url';
-
-    import {
-      createC2MemFfiRequestPoolFromSymbols,
-      createC2MemFfiResponsePoolFromSymbols,
-      loadBundledC2MemFfiNodeNativeSymbols,
-    } from '@c-two/c2-mem-ffi';
-
-    const [contractModulePath] = process.argv.slice(2);
-    const contract = await import(pathToFileURL(contractModulePath).href);
-    const { requestSymbols, responseSymbols } =
-      loadBundledC2MemFfiNodeNativeSymbols();
-
-    const owner = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
-      prefix: `/c2tsreader${process.pid}`,
-      segmentSize: 1024 * 1024,
-      maxSegments: 1,
-      minBlockSize: 4096,
-    });
-    const poolOptions = [];
-    const reader = contract.createC2MemFfiNativeResponseShmReader({
-      binding: {
-        createResponsePool(options) {
-          poolOptions.push(options);
-          return createC2MemFfiResponsePoolFromSymbols(responseSymbols, options);
-        },
-      },
-    });
-
-    const payload = new Uint8Array(1024).fill(0x5a);
-    const block = await owner.write(payload);
-    await owner.forgetConsumed(block);
-    const ownerSegmentSize = owner.segments[0].size;
-
-    // A lazy server pool advertises no segments at handshake time and creates
-    // its backing only for the reply. The generated reader must open the real
-    // backing by prefix/index/generation instead of demanding a server size.
-    const emptySnapshot = {
-      prefix: owner.prefix,
-      segments: [],
-      segmentIndex: block.segmentIndex,
-      generation: block.generation,
-      offset: block.offset,
-      byteLength: block.byteLength,
-      allocationId: block.allocationId,
-      dedicated: block.dedicated,
-    };
-    const bytes = await reader.read(emptySnapshot);
-    assert.deepEqual(Array.from(bytes), Array.from(payload));
-    assert.equal(poolOptions.length, 1);
-    assert.equal(poolOptions[0].segmentSize, 2 * 4096);
-    await reader.release(emptySnapshot);
-    await reader.close();
-    await owner.close();
-
-    console.log(JSON.stringify({
-      ownerSegmentSize,
-      bootstrapSegmentSize: poolOptions[0].segmentSize,
-      byteLength: bytes.byteLength,
-    }));
-    """
-)
-
-
 def _tree_sha256(root: Path) -> str:
     digest = hashlib.sha256()
     files = sorted(path for path in root.rglob("*") if path.is_file())
@@ -654,14 +587,9 @@ def test_generated_typescript_calls_real_hosts(
     observations = receipt["observations"]
     assert len(observations) == expected_calls
     route_uids = {observation["routeUid"] for observation in observations}
-    route_revisions = {
-        observation["routeRevision"] for observation in observations
-    }
     observed_paths = {observation["path"] for observation in observations}
     assert len(route_uids) == 1
-    assert len(route_revisions) == 1
     assert len(observed_paths) == 1
-    assert next(iter(route_revisions)) > 0
 
     if row_id == DIGEST_ROW_ID:
         _NEGATIVE_EVIDENCE["digest_mismatch"] = {
@@ -689,7 +617,6 @@ def test_generated_typescript_calls_real_hosts(
         "fastdb_spec_sha256": facts.fastdb_spec_sha256,
         "route": {
             "uid": next(iter(route_uids)),
-            "revision": next(iter(route_revisions)),
         },
         "logical_result_sha256": receipt["logicalResultSha256"],
         "path_counters": {
@@ -707,35 +634,6 @@ def test_generated_typescript_calls_real_hosts(
         },
         "status": "passed",
     }
-
-
-def test_generated_typescript_reader_opens_lazy_empty_handshake(
-    typescript_artifacts: TypeScriptArtifacts,
-) -> None:
-    """Pin the empty-handshake lazy open against the generated artifact.
-
-    The matrix exercises this over real IPC: a Python host retires its idle
-    response segment, so the next handshake advertises none and the response
-    backing only appears after the call. This test drives the transport the c3
-    binary actually generated together with the packaged native binding, so a
-    stale generated transport cannot pass by inheriting the previous receipt;
-    the packaged native binding is exercised against a real owner backing.
-    """
-    script = typescript_artifacts.node_root / "lazy_handshake.mjs"
-    script.write_text(_LAZY_HANDSHAKE_SCRIPT, encoding="utf-8")
-    completed = _run_checked(
-        [
-            typescript_artifacts.node_binary,
-            str(script),
-            str(typescript_artifacts.contract_modules["record-v1"]),
-        ],
-        cwd=typescript_artifacts.node_root,
-        timeout=120,
-    )
-    receipt = json.loads(completed.stdout.strip().splitlines()[-1])
-    assert receipt["bootstrapSegmentSize"] == 2 * 4096
-    assert receipt["ownerSegmentSize"] >= 1024 * 1024
-    assert receipt["byteLength"] == 1024
 
 
 def test_typescript_real_connector_version_mismatch(
@@ -757,14 +655,14 @@ def test_typescript_real_connector_version_mismatch(
           await assert.rejects(transport.prepare('version', contract.CONTRACT), (error) => {
             assert.ok(error instanceof contract.C2IpcTransportError);
             assert.equal(error.category, 'protocol_version_mismatch');
-            assert.equal(error.localProtocolVersion, 14);
-            assert.equal(error.peerProtocolVersion, 15);
+            assert.equal(error.localProtocolVersion, 15);
+            assert.equal(error.peerProtocolVersion, 16);
             return true;
           });
           assert.equal(connects, 1);
         } finally { await transport.close(); await runtime.close(); }
         """), encoding="utf-8")
-    with running_version_peer(ipc_version_peer_binary, "mismatch15") as (address, context):
+    with running_version_peer(ipc_version_peer_binary, "mismatch16") as (address, context):
         _run_checked(
             [typescript_artifacts.node_binary, str(script),
              str(typescript_artifacts.contract_modules["no-payload"]), address, context.root or ""],

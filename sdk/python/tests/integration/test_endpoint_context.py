@@ -226,8 +226,7 @@ def test_same_logical_address_registers_connects_and_stays_isolated(short_roots)
             assert proxy.value() == 'b'
             cc.close(proxy)
             ack = util.shutdown({address!r})
-            assert ack['acknowledged'] and ack['shutdown_started'], ack
-            assert not ack['server_stopped'], ack
+            assert ack == 'initiated', ack
             assert cc.shutdown()['completed']
         '''))
         b.stop()
@@ -269,8 +268,7 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
             assert not util.ping({address!r}, timeout=.01)
         else:
             stopped = util.shutdown({address!r}, timeout=.01)
-            assert stopped['acknowledged'] and stopped['server_stopped'], stopped
-            assert not stopped['shutdown_started'], stopped
+            assert stopped == 'absent', stopped
         assert session.local_endpoint_frozen
         assert not Path({missing!r}).exists()
         os.environ['C2_IPC_ROOT'] = {changed!r}

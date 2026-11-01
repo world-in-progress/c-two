@@ -698,7 +698,15 @@ fn retirement_seals_calls_without_refunding_the_prepared_owner() {
         .with_call_options(finite());
     let mut prepared = client.begin_call("echo").unwrap();
     prepared.charge_input(8).unwrap();
-    runtime.shutdown_without_host(EVENT_WAIT);
+    let retirement_deadline = std::time::Instant::now() + EVENT_WAIT;
+    let (retirement_outcome, retirement_completed) = runtime
+        .begin_session_retirement(
+            c2_core::RuntimeShutdownTarget::ClientsOnly,
+            retirement_deadline,
+        )
+        .expect("begin client-only retirement")
+        .observe_until(retirement_deadline);
+    assert!(retirement_completed, "{retirement_outcome:?}");
     let observed = runtime.clone().call_execution_snapshot().unwrap();
     assert!(observed.closed);
     assert_eq!(observed.used_operations, 1);

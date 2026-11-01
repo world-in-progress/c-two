@@ -13,7 +13,6 @@ pub mod budget;
 pub mod config;
 pub mod dedicated;
 pub mod handle;
-pub mod lease;
 pub mod pool;
 mod pressure;
 pub mod retention;
@@ -29,10 +28,6 @@ pub use budget::{
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
 pub use handle::MemHandle;
-pub use lease::{
-    BufferLeaseGuard, BufferLeaseMeta, BufferLeaseObserver, BufferLeaseSnapshot, BufferLeaseStats,
-    BufferLeaseTracker, BufferStorage, HoldBucketStats, LeaseDirection,
-};
 pub use pool::MemPool;
 pub use retention::{
     RetentionBudget, RetentionError, RetentionPermit, RetentionRejectReason, RetentionSnapshot,

@@ -91,7 +91,7 @@ def _registration_scope(base_url: str, name: str) -> dict[str, object]:
     # projection (remote entries deliberately omit local server identity).
     route = _http_get_json(_resolve_url(base_url, name))[0]
     return {key: route[key] for key in (
-        'name', 'server_id', 'server_instance_id', 'route_uid', 'route_revision',
+        'name', 'server_id', 'server_instance_id', 'route_uid',
     )}
 
 

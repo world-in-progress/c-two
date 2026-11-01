@@ -67,10 +67,6 @@ class ServerIPCOverrides(BaseIPCOverrides, total=False):
     max_execution_workers: int
     # Seconds before unused server-side pool resources may decay.
     pool_decay_seconds: float
-    # Seconds between heartbeat probes; zero disables heartbeat probes.
-    heartbeat_interval: float
-    # Seconds to wait for a heartbeat response before treating a peer as dead.
-    heartbeat_timeout: float
 
 
 class ClientIPCOverrides(BaseIPCOverrides, total=False):

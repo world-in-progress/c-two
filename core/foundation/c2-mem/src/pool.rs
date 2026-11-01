@@ -668,21 +668,6 @@ impl MemPool {
         }
     }
 
-    /// Get the data region base address and size for a buddy segment.
-    ///
-    /// Returns (data_base_addr, data_region_size) where data_base_addr is the
-    /// raw pointer to offset 0 within the data region.  Useful for creating
-    /// a persistent memoryview covering the whole data region.
-    pub fn seg_data_info(&self, seg_idx: u32, generation: u32) -> Result<(*mut u8, usize), String> {
-        self.validate_generation(seg_idx, generation, false)?;
-        let seg = self
-            .segments
-            .get(seg_idx as usize)
-            .and_then(Option::as_ref)
-            .ok_or("invalid segment index")?;
-        Ok((seg.base_ptr(), seg.size()))
-    }
-
     /// Get a raw pointer to data at a specific (seg_idx, offset) without a PoolAllocation.
     ///
     /// Used by the remote side of a connection to read from SHM blocks allocated

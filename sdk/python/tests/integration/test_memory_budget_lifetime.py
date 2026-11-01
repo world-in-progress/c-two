@@ -121,8 +121,8 @@ def _retired_outgoing_cells(stats: dict) -> dict:
 
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize('tier', ['file', 'buddy'])
-def test_held_portable_reassembly_budget_survives_public_shutdown(tier: str) -> None:
-    """A held checked owner keeps full reassembly capacity until release."""
+def test_local_hold_outlives_reassembly_backing_and_public_shutdown(tier: str) -> None:
+    """Reassembly is released before a local hold; checked views follow the hold."""
     cc.shutdown()
     route = f'memory-budget-{tier}-{uuid.uuid4().hex[:12]}'
     server_overrides = {
@@ -178,40 +178,61 @@ def test_held_portable_reassembly_budget_survives_public_shutdown(tier: str) -> 
         with checked.acquire() as access:
             assert access.bytes() == BLOB
 
-        # The response is chunked because the server cannot allocate SHM.
-        # The first reply chunk sets the reassembly capacity; a short final
-        # chunk trims only logical length, never the reservation.
+        # The response was reassembled, then copied and released before SDK decode.
         logical_len = len(held.unsafe_buffer)
         assert logical_len > CHUNK_SIZE
         assert logical_len % CHUNK_SIZE != 0
         capacity = math.ceil(logical_len / CHUNK_SIZE) * CHUNK_SIZE
-        active = _outgoing_cells(cc.observe.memory_stats())
-        assert active['reassembly']['used_bytes'] - baseline_reassembly == capacity
+        active_stats = cc.observe.memory_stats()
+        active = _outgoing_cells(active_stats)
+        assert active['reassembly']['used_bytes'] == baseline_reassembly
+        assert active['reassembly']['peak_bytes'] >= capacity
+        assert active['file']['used_bytes'] == baseline_file
         if tier == 'file':
-            assert active['file']['used_bytes'] - baseline_file == capacity
+            assert active['file']['peak_bytes'] >= capacity
             assert active['shm']['used_bytes'] == baseline_shm
         else:
-            # A 1 MiB reassembly segment distinguishes buddy backing from a
-            # dedicated mapping sized only for this roughly 200 KiB payload.
-            assert active['shm']['used_bytes'] - baseline_shm >= REASSEMBLY_SEGMENT_SIZE
-            assert active['file']['used_bytes'] == baseline_file
+            assert active['shm']['peak_bytes'] >= REASSEMBLY_SEGMENT_SIZE
+        assert set(active_stats['holds']) == {
+            'active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_direction',
+        }
+        assert active_stats['holds']['active_holds'] == 1
+        assert active_stats['holds']['total_held_bytes'] == logical_len
+        original = bytes(held.unsafe_buffer)
+        # Reuse the transport storage while the first local copy stays alive.
+        next_value = proxy.produce()
+        next_value.close()
+        assert bytes(held.unsafe_buffer) == original
 
         cc.shutdown()
         retired = _retired_outgoing_cells(cc.observe.memory_stats())
-        assert retired['reassembly']['used_bytes'] - baseline_reassembly == capacity
-        if tier == 'file':
-            assert retired['file']['used_bytes'] - baseline_file == capacity
-            assert retired['shm']['used_bytes'] == baseline_shm
-        else:
-            assert retired['shm']['used_bytes'] - baseline_shm >= REASSEMBLY_SEGMENT_SIZE
-            assert retired['file']['used_bytes'] == baseline_file
-        assert cc.observe.memory_stats()["holds"]['active_holds'] >= 1
-        assert cc.observe.memory_stats()['holds']['active_holds'] >= 1
-        # Keep the proxy/client alive while the held FastDB checked view is
-        # read after shutdown; its owner and transport backing must still live.
+        assert retired['reassembly']['used_bytes'] == baseline_reassembly
+        assert retired['file']['used_bytes'] == baseline_file
         with checked.acquire() as access:
             assert access.bytes() == BLOB
+        cc.close(proxy)
+        proxy = None
+        deadline = time.monotonic() + 5.0
+        while True:
+            stats = cc.observe.memory_stats()
+            if not stats['retired'] or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        assert stats['retired'] == [], stats
+        assert stats['holds']['active_holds'] == 1
+        assert stats['holds']['total_held_bytes'] == logical_len
+        assert bytes(held.unsafe_buffer) == original
 
+        exported = memoryview(held.unsafe_buffer)
+        try:
+            with pytest.raises(BufferError):
+                held.release()
+            assert held.value is retained
+            with checked.acquire() as access:
+                assert access.bytes() == BLOB
+            assert cc.observe.memory_stats()['holds']['total_held_bytes'] == logical_len
+        finally:
+            exported.release()
         held.release()
         with pytest.raises(PayloadError) as invalidated:
             checked.kind()
@@ -243,8 +264,6 @@ def test_held_portable_reassembly_budget_survives_public_shutdown(tier: str) -> 
             time.sleep(0.02)
         assert drained, after_release
         assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
-        # All assertions above occur before cc.close(proxy).
-        assert proxy is not None
     finally:
         if held is not None:
             with suppress(Exception):
@@ -334,7 +353,7 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         assert entered.wait(timeout=5), 'real resource callback never started'
         observation = old_session.retire_memory_observation()
         observer.adopt_retired_memory_observation(observation)
-        # Re-adoption must not double-count the same domains or lease tracker.
+        # Re-adoption must not double-count the same domains or local-copy tracker.
         observer.adopt_retired_memory_observation(observation)
         del observation
         for _ in range(3):
@@ -353,15 +372,14 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
             checked = sequence.at(0)
         with checked.acquire() as access:
             assert access.bytes() == BLOB
-        capacity = math.ceil(len(held.unsafe_buffer) / CHUNK_SIZE) * CHUNK_SIZE
         late = observer.memory_stats()
         retired = _retired_outgoing_cells(late)
         current = _outgoing_cells(cc.observe.memory_stats())
         for kind in ('shm', 'file', 'reassembly'):
             assert retired[kind] == current[kind]
         assert retired['shm']['used_bytes'] == 0
-        assert retired['file']['used_bytes'] == capacity
-        assert retired['reassembly']['used_bytes'] == capacity
+        assert retired['file']['used_bytes'] == 0
+        assert retired['reassembly']['used_bytes'] == 0
         assert late['holds']['active_holds'] == cc.observe.memory_stats()["holds"]['active_holds'] == 1
 
         # A second real callback blocks drain while the first held owner lives.
@@ -393,8 +411,8 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
             assert access.bytes() == BLOB
         after_shutdown = observer.memory_stats()
         retired = _retired_outgoing_cells(after_shutdown)
-        assert retired['file']['used_bytes'] == capacity
-        assert retired['reassembly']['used_bytes'] == capacity
+        assert retired['file']['used_bytes'] == 0
+        assert retired['reassembly']['used_bytes'] == 0
         assert after_shutdown['holds']['active_holds'] == 1
 
         held.release()
@@ -444,7 +462,7 @@ def test_delivered_response_tracks_hold_after_confirmed_shutdown(monkeypatch) ->
 
     Block the real FastDB output decoder, which runs after the native call has
     delivered its response but before ``response.track_retained``. Repeated
-    public snapshots after confirmed shutdown must not discard the old lease
+    public snapshots after confirmed shutdown must not discard the old local-copy
     tracker while this SDK call can still publish a held result.
     """
     cc.shutdown()
@@ -509,8 +527,8 @@ def test_delivered_response_tracks_hold_after_confirmed_shutdown(monkeypatch) ->
         call_thread.start()
         assert decode_entered.wait(timeout=10), 'real response never reached FastDB decoder'
         delivered = _outgoing_cells(cc.observe.memory_stats())
-        assert delivered['file']['used_bytes'] > baseline['file']['used_bytes']
-        assert delivered['reassembly']['used_bytes'] > baseline['reassembly']['used_bytes']
+        assert delivered['file']['used_bytes'] == baseline['file']['used_bytes']
+        assert delivered['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
         assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
 
         shutdown_thread = threading.Thread(target=shut_down, daemon=True)
@@ -524,8 +542,8 @@ def test_delivered_response_tracks_hold_after_confirmed_shutdown(monkeypatch) ->
         for _ in range(3):
             stats = cc.observe.memory_stats()
             retired = _retired_outgoing_cells(stats)
-            assert retired['file']['used_bytes'] > baseline['file']['used_bytes']
-            assert retired['reassembly']['used_bytes'] > baseline['reassembly']['used_bytes']
+            assert retired['file']['used_bytes'] == baseline['file']['used_bytes']
+            assert retired['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
             assert stats['holds']['active_holds'] == 0
             assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
 
@@ -571,10 +589,10 @@ def test_delivered_response_tracks_hold_after_confirmed_shutdown(monkeypatch) ->
 
 
 @pytest.mark.timeout(60)
-def test_failed_public_shutdown_retry_keeps_its_own_held_budget(monkeypatch) -> None:
+def test_failed_public_shutdown_retry_keeps_its_own_local_hold(monkeypatch) -> None:
     """A failed replacement cannot consume the current session's observer.
 
-    This uses a real file-backed FastDB held response from the current native
+    This uses a local FastDB held response received through file reassembly from the current native
     session. Only the next native RuntimeSession construction is refused; the
     same installed session then retries public shutdown successfully.
     """
@@ -609,10 +627,8 @@ def test_failed_public_shutdown_retry_keeps_its_own_held_budget(monkeypatch) -> 
         with checked.acquire() as access:
             assert access.bytes() == BLOB
         live = _outgoing_cells(cc.observe.memory_stats())
-        logical_len = len(held.unsafe_buffer)
-        capacity = math.ceil(logical_len / CHUNK_SIZE) * CHUNK_SIZE
-        assert live['reassembly']['used_bytes'] - baseline['reassembly']['used_bytes'] == capacity
-        assert live['file']['used_bytes'] - baseline['file']['used_bytes'] == capacity
+        assert live['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
+        assert live['file']['used_bytes'] == baseline['file']['used_bytes']
         assert cc.observe.memory_stats()["holds"]['active_holds'] >= 1
 
         old_session = _get_default_runtime()._runtime_session  # noqa: SLF001
@@ -629,16 +645,16 @@ def test_failed_public_shutdown_retry_keeps_its_own_held_budget(monkeypatch) -> 
 
         assert _get_default_runtime()._runtime_session is old_session  # noqa: SLF001
         failed = _outgoing_cells(cc.observe.memory_stats())
-        assert failed['reassembly']['used_bytes'] - baseline['reassembly']['used_bytes'] == capacity
-        assert failed['file']['used_bytes'] - baseline['file']['used_bytes'] == capacity
+        assert failed['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
+        assert failed['file']['used_bytes'] == baseline['file']['used_bytes']
         assert cc.observe.memory_stats()["holds"]['active_holds'] >= 1
         with checked.acquire() as access:
             assert access.bytes() == BLOB
 
         cc.shutdown()
         retried = _retired_outgoing_cells(cc.observe.memory_stats())
-        assert retried['reassembly']['used_bytes'] - baseline['reassembly']['used_bytes'] == capacity
-        assert retried['file']['used_bytes'] - baseline['file']['used_bytes'] == capacity
+        assert retried['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
+        assert retried['file']['used_bytes'] == baseline['file']['used_bytes']
         assert cc.observe.memory_stats()["holds"]['active_holds'] >= 1
         assert cc.observe.memory_stats()['holds']['active_holds'] >= 1
         # Both the proxy and its held checked owner remain referenced here.

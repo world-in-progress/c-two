@@ -150,7 +150,7 @@ class TestBuddyReply:
         rust_client = proxy.client._client
         data = os.urandom(size)
         response = rust_client.call('echo', pickle.dumps(data))
-        tracker = _native.BufferLeaseTracker()
+        tracker = _native.LocalCopyTracker()
         response.track_retained(tracker, 'echo', 'echo')
         assert tracker.stats()['total_held_bytes'] == len(response)
         mv = memoryview(response)
@@ -159,16 +159,16 @@ class TestBuddyReply:
         with pytest.raises(BufferError, match='currently exported'):
             response.release()
         assert not response.is_released
-        assert tracker.stats()['by_storage']['inline']['active_holds'] == 1
+        assert tracker.stats()['by_direction']['client_response']['active_holds'] == 1
         mv.release()
         response.release()
-        assert tracker.stats()['by_storage']['inline']['active_holds'] == 0
+        assert tracker.stats()['by_direction']['client_response']['active_holds'] == 0
         assert tracker.stats()['total_held_bytes'] == 0
         response.release()
         cc.close(proxy)
 
     def test_response_buffer_auto_release(self):
-        """ResponseBuffer auto-releases SHM on garbage collection."""
+        """ResponseBuffer drops its local copy on garbage collection."""
         import pickle
         proxy = self._setup_ipc()
         rust_client = proxy.client._client

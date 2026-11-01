@@ -5,7 +5,7 @@ transport, scheduling, and lifecycle to ``c2-core`` through PyO3.
 
 CRM domain logic (CRM instance creation, method discovery, dispatch tables,
 shutdown callbacks) remains in Python.  The native local accept loop,
-frame parsing, heartbeat, and concurrency scheduling move to Rust.
+frame parsing and concurrency scheduling move to Rust.
 """
 from __future__ import annotations
 
@@ -141,7 +141,7 @@ class NativeServerBridge:
         runtime_session: object,
         *,
         hold_warn_seconds: float = 60.0,
-        lease_tracker: object | None = None,
+        local_copy_tracker: object | None = None,
     ) -> None:
         # Keep config failures at bridge construction, before CRM binding work.
         runtime_session._preflight_server_config()
@@ -149,10 +149,10 @@ class NativeServerBridge:
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
 
-        if lease_tracker is None:
-            from c_two._native import BufferLeaseTracker
-            lease_tracker = BufferLeaseTracker()
-        self._lease_tracker = lease_tracker
+        if local_copy_tracker is None:
+            from c_two._native import LocalCopyTracker
+            local_copy_tracker = LocalCopyTracker()
+        self._local_copy_tracker = local_copy_tracker
         self._hold_warn_seconds = float(hold_warn_seconds)
         if (
             not math.isfinite(self._hold_warn_seconds)
@@ -351,8 +351,8 @@ class NativeServerBridge:
     def lifecycle_snapshot(self) -> LifecycleSnapshot | None:
         """Thin read-only Core lifecycle observation for the bridge.
 
-        Reports the native phase plus the separate listener, drained-work
-        and client-held-lease facts. ``None`` means no host exists.
+        Reports whether shutdown finished, whether the listener closed
+        and whether work drained. ``None`` means no host exists.
         """
         return self._runtime_session.native_lifecycle_snapshot()
 
@@ -449,7 +449,7 @@ class NativeServerBridge:
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
         held.  Signature: ``(route_name, method_idx, request_buf)``.
-        It reads the owned request snapshot via ``memoryview(request_buf)``, resolves the
+        It reads the owned local request copy via ``memoryview(request_buf)``, resolves the
         method, calls the resource, and returns serialized result data (or
         *None* for empty responses). Rust native code owns the response
         allocation choice for inline, SHM, or chunked transport.
@@ -457,7 +457,7 @@ class NativeServerBridge:
         idx_to_name = slot.method_table._idx_to_name
         dispatch_table = slot._dispatch_table
 
-        lease_tracker = self._lease_tracker
+        local_copy_tracker = self._local_copy_tracker
         hold_warn_seconds = self._hold_warn_seconds
         hold_sweep_interval = self._hold_sweep_interval
         hold_dispatch_count = 0
@@ -504,9 +504,9 @@ class NativeServerBridge:
                         release_fn()
             else:  # borrowed
                 try:
-                    if lease_tracker is not None and hasattr(request_buf, 'track_retained'):
+                    if local_copy_tracker is not None and hasattr(request_buf, 'track_retained'):
                         request_buf.track_retained(
-                            lease_tracker,
+                            local_copy_tracker,
                             route_name,
                             method_name,
                             'resource_input',
@@ -526,21 +526,20 @@ class NativeServerBridge:
                 nonlocal hold_dispatch_count
                 hold_dispatch_count += 1
                 should_sweep_holds = (
-                    lease_tracker is not None
+                    local_copy_tracker is not None
                     and hold_dispatch_count % hold_sweep_interval == 0
                 )
                 if should_sweep_holds:
-                    for stale in lease_tracker.sweep_retained(hold_warn_seconds):
+                    for stale in local_copy_tracker.sweep_retained(hold_warn_seconds):
                         if stale.get('direction') != 'resource_input':
                             continue
                         logger.warning(
-                            "Retained resource input buffer pinned for %.1fs — "
-                            "route=%s method=%s storage=%s size=%d bytes. "
+                            "Resource input local copy retained for %.1fs — "
+                            "route=%s method=%s size=%d bytes. "
                             "Resource may be storing buffer-backed views.",
                             stale['age_seconds'],
                             stale['route_name'],
                             stale['method_name'],
-                            stale['storage'],
                             stale['bytes'],
                         )
 

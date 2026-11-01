@@ -68,7 +68,7 @@ class CRMProxy:
     __slots__ = (
         '_mode', '_crm', '_client', '_name',
         '_closed', '_close_lock', '_on_terminate',
-        '_scheduler', '_lease_tracker', '_call_options',
+        '_scheduler', '_local_copy_tracker', '_call_options',
     )
 
     # ------------------------------------------------------------------
@@ -83,7 +83,7 @@ class CRMProxy:
         name: str | None = None,
         scheduler: Scheduler | None = None,
         on_terminate: Callable[[], None] | None = None,
-        lease_tracker: Any = None,
+        local_copy_tracker: Any = None,
     ) -> CRMProxy:
         """Create a thread-local proxy (same process, no serialization).
 
@@ -110,7 +110,7 @@ class CRMProxy:
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = scheduler
-        proxy._lease_tracker = lease_tracker
+        proxy._local_copy_tracker = local_copy_tracker
         proxy._call_options = None
         return proxy
 
@@ -121,7 +121,7 @@ class CRMProxy:
         name: str,
         *,
         on_terminate: Callable[[], None] | None = None,
-        lease_tracker: Any = None,
+        local_copy_tracker: Any = None,
     ) -> CRMProxy:
         """Create an IPC proxy (cross-process via Rust IPC client).
 
@@ -139,7 +139,7 @@ class CRMProxy:
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
-        proxy._lease_tracker = lease_tracker
+        proxy._local_copy_tracker = local_copy_tracker
         proxy._call_options = None
         return proxy
 
@@ -150,7 +150,7 @@ class CRMProxy:
         name: str,
         *,
         on_terminate: Callable[[], None] | None = None,
-        lease_tracker: Any = None,
+        local_copy_tracker: Any = None,
     ) -> CRMProxy:
         """Create an HTTP proxy (cross-node via Rust HTTP client + relay).
 
@@ -166,7 +166,7 @@ class CRMProxy:
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
-        proxy._lease_tracker = lease_tracker
+        proxy._local_copy_tracker = local_copy_tracker
         proxy._call_options = None
         return proxy
 
@@ -204,16 +204,9 @@ class CRMProxy:
         return self._client.route_uid
 
     @property
-    def route_revision(self) -> int:
-        """Route revision observed when this remote proxy connected."""
-        if self._mode == 'thread':
-            raise RuntimeError('thread-local proxy has no remote route token')
-        return self._client.route_revision
-
-    @property
-    def lease_tracker(self) -> Any:
-        """Native retained-buffer lease tracker for this process session."""
-        return self._lease_tracker
+    def local_copy_tracker(self) -> Any:
+        """Native local-copy tracker for this process session."""
+        return self._local_copy_tracker
 
     def with_call_options(self, *, timeout=...) -> CRMProxy:
         """Create an independent connection view with Core-owned call options."""

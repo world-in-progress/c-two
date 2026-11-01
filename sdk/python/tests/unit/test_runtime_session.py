@@ -24,17 +24,29 @@ def test_native_shutdown_rejects_invalid_timeout_without_changing_identity(timeo
     assert session.server_address is None
     # A rejected call leaves the session usable for an ordinary shutdown.
     outcome = dict(session.shutdown(timeout_seconds=0.0))
-    assert outcome['ipc_clients_drained'] is True
+    assert outcome['completed'] is True
+    assert outcome['ipc_clients_drained'] is False
     assert outcome['runtime_barrier_error'] is None
+    assert not session.retired
+    session.check_active()
+    session.clear_server_identity()
 
 
 @pytest.mark.parametrize('timeout', [0.0, -0.0, 0.125, 5.0])
 def test_native_shutdown_accepts_zero_and_normal_timeout(timeout: float) -> None:
     from c_two._native import RuntimeSession
 
-    outcome = dict(RuntimeSession().shutdown(timeout_seconds=timeout))
-    assert outcome['ipc_clients_drained'] is True
+    session = RuntimeSession()
+    before = session.call_execution_snapshot()
+    assert before['closed'] is False
+    outcome = dict(session.shutdown(timeout_seconds=timeout))
+    assert outcome['completed'] is True
+    assert outcome['ipc_clients_drained'] is False
     assert outcome['runtime_barrier_error'] is None
+    assert not session.retired
+    session.check_active()
+    session.clear_server_identity()
+    assert session.call_execution_snapshot() == before
 
 
 def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -> None:

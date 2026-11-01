@@ -98,12 +98,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn response_failure_projection_is_dispatch_uncertain() {
+        Python::initialize();
+        Python::attach(|py| {
+            for source in [
+                c2_ipc::IpcError::Protocol("malformed response".into()),
+                c2_ipc::IpcError::Shm("response admission failed".into()),
+            ] {
+                let error = core_error_to_py(c2_core::normalize_ipc_error(
+                    c2_ipc::IpcError::ResponseFailure(Box::new(source)),
+                    TransportPhase::PreDispatch,
+                ));
+                let value = error.value(py);
+                assert_eq!(
+                    value
+                        .getattr("category")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "transport"
+                );
+                assert_eq!(
+                    value
+                        .getattr("transport_phase")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "dispatch_uncertain"
+                );
+                assert!(
+                    !value
+                        .getattr("fallback_eligible")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap()
+                );
+            }
+        });
+    }
+
+    #[test]
     fn protocol_version_error_uses_public_class_and_typed_fields() {
         Python::initialize();
         Python::attach(|py| {
             let error = core_error_to_py(Error::ProtocolVersionMismatch {
-                local: 14,
-                peer: 15,
+                local: 15,
+                peer: 14,
             });
             let value = error.value(py);
             let class = py
@@ -123,8 +163,8 @@ mod tests {
                 );
             }
             for (name, expected) in [
-                ("local_protocol_version", 14_u32),
-                ("peer_protocol_version", 15),
+                ("local_protocol_version", 15_u32),
+                ("peer_protocol_version", 14),
             ] {
                 assert_eq!(
                     value.getattr(name).unwrap().extract::<u32>().unwrap(),
@@ -217,9 +257,6 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
                         set_attr(value, "relay_duplicate", true);
                     }
                 }
-            }
-            LifecycleError::HeldResponseCopy { .. } => {
-                set_attr(value, "lifecycle_kind", "held_response_copy");
             }
             LifecycleError::HeldResponseRelease { .. } => {
                 set_attr(value, "lifecycle_kind", "held_response_release");

@@ -109,12 +109,8 @@ def test_client_shutdown_with_live_proxy(monkeypatch, freeze: bool, hosted: bool
                 assert outcome['removed_routes'] == (['local-echo'] if hosted else []), outcome
                 assert all(route['active_drained'] for route in outcome['route_outcomes']), outcome
                 abnormal = outcome['ipc_client_close_details']
-                if freeze:
-                    assert abnormal == [{
-                        'address': address, 'reason': 'disconnect_ack_timeout',
-                    }], outcome
-                else:
-                    assert abnormal == [], outcome
+                assert abnormal == [], outcome
+
             finally:
                 # Resume before any further cleanup, even after a failing
                 # assertion. OS wait must precede credential-based reap.

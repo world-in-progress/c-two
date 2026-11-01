@@ -288,7 +288,7 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
                 assert resumed["chunkWrites"] == stopped_at
                 assert resumed["businessWrites"] == rejected["businessWrites"] + calls - 1
                 assert resumed["activeWrites"] == 0 and resumed["writesAfterClose"] == 0
-                for key in ("serverId", "serverInstanceId", "routeName", "routeUid", "routeRevision"):
+                for key in ("serverId", "serverInstanceId", "routeName", "routeUid"):
                     assert resumed["observations"][-1][key] == bound[key], resumed
         finally:
             try:
@@ -335,7 +335,6 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
         resumed = _ok(node.request("call", "builder"))
         assert builder.calls == 3 and resumed["connects"] == 2
         assert resumed["observations"][-1]["routeUid"] == bound["routeUid"]
-        assert resumed["observations"][-1]["routeRevision"] == bound["routeRevision"]
         _ok(node.request("prepare", "builder"))
 
         removed = server.unregister_crm("builder")

@@ -50,7 +50,15 @@ fn default_query_preserves_native_name_and_does_not_freeze_any_domain() {
     assert!(!runtime.client_config_frozen());
     assert!(runtime.outgoing_memory_stats().is_none());
     assert!(runtime.outgoing_memory_observer().is_none());
-    runtime.shutdown_without_host(TIMEOUT);
+    let retirement_deadline = std::time::Instant::now() + TIMEOUT;
+    let (retirement_outcome, retirement_completed) = runtime
+        .begin_session_retirement(
+            c2_core::RuntimeShutdownTarget::ClientsOnly,
+            retirement_deadline,
+        )
+        .expect("begin client-only retirement")
+        .observe_until(retirement_deadline);
+    assert!(retirement_completed, "{retirement_outcome:?}");
     assert!(!runtime.local_endpoint_frozen());
     assert!(runtime.outgoing_memory_stats().is_none());
 }
@@ -292,7 +300,15 @@ mod unix {
             runtime.set_client_ipc_overrides(None),
             Err(LifecycleError::ClientConfigFrozen)
         ));
-        runtime.shutdown_without_host(TIMEOUT);
+        let retirement_deadline = std::time::Instant::now() + TIMEOUT;
+        let (retirement_outcome, retirement_completed) = runtime
+            .begin_session_retirement(
+                c2_core::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{retirement_outcome:?}");
         assert!(connect().is_err());
         assert!(
             observer

@@ -2341,20 +2341,6 @@ impl Runtime {
         }
     }
 
-    /// Explicitly retire a client-only Runtime and observe its original receipt.
-    /// The caller timeout bounds observation; the retirement driver continues.
-    /// Independently owned Hosts are outside this selected scope.
-    pub fn shutdown_without_host(&self, shutdown_timeout: Duration) -> ShutdownOutcome {
-        let deadline = Instant::now() + shutdown_timeout;
-        match self.begin_session_retirement(RuntimeShutdownTarget::ClientsOnly, deadline) {
-            Ok(receipt) => receipt.observe_until(deadline).0,
-            Err(error) => ShutdownOutcome {
-                runtime_barrier_error: Some(error.to_string()),
-                ..Default::default()
-            },
-        }
-    }
-
     pub(crate) fn resolve_relay_connection_with_deadline(
         &self,
         relay_anchor_address: &str,
@@ -2950,7 +2936,15 @@ mod tests {
                 })
             };
             barrier.wait();
-            runtime.shutdown_without_host(Duration::from_secs(1));
+            let retirement_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let (retirement_outcome, retirement_completed) = runtime
+                .begin_session_retirement(
+                    crate::RuntimeShutdownTarget::ClientsOnly,
+                    retirement_deadline,
+                )
+                .expect("begin client-only retirement")
+                .observe_until(retirement_deadline);
+            assert!(retirement_completed, "{retirement_outcome:?}");
             let context = initializing.join().unwrap();
             assert!(context.snapshot().closed);
             let observed = observer.snapshot();
@@ -3444,7 +3438,15 @@ mod tests {
             )
             .unwrap();
         call.charge_input(32).unwrap();
-        runtime.shutdown_without_host(Duration::from_secs(1));
+        let retirement_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let (retirement_outcome, retirement_completed) = runtime
+            .begin_session_retirement(
+                crate::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{retirement_outcome:?}");
         let snapshot = runtime.call_execution_snapshot().unwrap();
         assert!(snapshot.closed);
         assert_eq!(
@@ -4834,7 +4836,15 @@ mod tests {
             .expect("runtime a observer");
 
         // Shutting one Runtime must not reset or change the other's domain.
-        let outcome = runtime_a.shutdown_without_host(Duration::from_secs(2));
+        let retirement_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let (outcome, retirement_completed) = runtime_a
+            .begin_session_retirement(
+                crate::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{outcome:?}");
         assert!(outcome.ipc_clients_drained);
         assert_eq!(retired_a.limits(), a.limits);
         assert_eq!(retired_a.used_bytes(), 0);

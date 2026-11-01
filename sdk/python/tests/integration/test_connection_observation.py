@@ -42,8 +42,6 @@ def isolated_runtime(tmp_path, monkeypatch):
         root.mkdir(mode=0o700)
         monkeypatch.setenv('C2_IPC_ROOT', str(root))
         cc.endpoint.set_local_endpoint(root=str(root))
-    # A dead peer must be observable without heartbeat or business calls.
-    cc.set_server(ipc_overrides={'heartbeat_interval': 0.0})
     context = cc.endpoint.local_endpoint_context()
     yield
     address = cc.server_address()
@@ -62,7 +60,6 @@ import c_two.observe
 from tests.integration.test_connection_observation import ObservationPeer, PeerResource
 role, address = sys.argv[1:]
 if role == 'server':
-    cc.set_server(ipc_overrides={'heartbeat_interval': 0.0})
     cc.register(ObservationPeer, PeerResource(), name='peer')
     address = cc.server_address()
     credential = cc.endpoint.inspect_endpoint(address)['credential']

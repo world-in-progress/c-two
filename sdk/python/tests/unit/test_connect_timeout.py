@@ -174,7 +174,7 @@ def test_registry_projects_budget_with_full_expected_contract(timeout, address, 
         pass
 
     class Session:
-        def lease_tracker(self):
+        def local_copy_tracker(self):
             return None
 
         def set_relay_anchor_address(self, address, *, connect_attempt=None):
@@ -204,7 +204,7 @@ def test_relay_connect_preserves_unmapped_native_exception(monkeypatch):
     registry = Runtime()
 
     class Session:
-        def lease_tracker(self):
+        def local_copy_tracker(self):
             return None
 
         def set_relay_anchor_address(self, address, *, connect_attempt=None):
@@ -345,7 +345,7 @@ def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
             raise AssertionError(f'connect reread replaced session: {name}')
 
     class CapturedSession:
-        def lease_tracker(self):
+        def local_copy_tracker(self):
             registry._runtime_session = ReplacedSession()
             return None
 
@@ -381,9 +381,9 @@ def test_python_preparation_and_native_entry_keep_original_attempt_budget(monkey
     observed = []
 
     class Session:
-        def lease_tracker(self):
+        def local_copy_tracker(self):
             time.sleep(0.06)
-            return native_session.lease_tracker()
+            return native_session.local_copy_tracker()
 
         def acquire_ipc_client(self, *args, connect_attempt=None):
             observed.append(connect_attempt)
@@ -413,7 +413,6 @@ def test_native_unlimited_attempt_keeps_python_lock_behavior():
         lock.release()
 
 
-
 def test_expiry_after_python_lock_acquisition_releases_only_new_acquisition():
     lock = threading.Lock()
     released = []
@@ -436,12 +435,11 @@ def test_expiry_after_python_lock_acquisition_releases_only_new_acquisition():
     assert not lock.locked()
 
 
-
 def test_relay_override_deadline_keeps_canonical_error_before_registry_wrapping():
     registry = Runtime()
 
     class Session:
-        def lease_tracker(self):
+        def local_copy_tracker(self):
             return None
 
         def set_relay_anchor_address(self, address, *, connect_attempt=None):

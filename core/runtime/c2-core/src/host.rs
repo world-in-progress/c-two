@@ -1230,7 +1230,15 @@ mod lifecycle_tests {
         assert_eq!(held.bytes(), first);
         held.invalidate_then_release(|| Ok(())).unwrap();
         assert!(held.bytes().is_empty());
-        runtime.shutdown_without_host(Duration::from_secs(5));
+        let retirement_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (retirement_outcome, retirement_completed) = runtime
+            .begin_session_retirement(
+                crate::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{retirement_outcome:?}");
         drop((held, client, runtime));
         close_receipt_root(root);
     }

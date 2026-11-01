@@ -54,15 +54,7 @@ class CallExecutionSnapshot(CallExecutionCounters):
     retired: list[RetiredCallExecutionSnapshot]
 
 
-class ClientHeldLeases(TypedDict):
-    response_shm_bytes: int
-    response_file_bytes: int
-    reassembly_bytes: int
-
-
 class LifecycleSnapshot(TypedDict):
-    phase: Literal['persistent', 'finished']
-    terminal: bool
+    finished: bool
     listener_closed: bool
     work_drained: bool
-    client_held_leases: ClientHeldLeases

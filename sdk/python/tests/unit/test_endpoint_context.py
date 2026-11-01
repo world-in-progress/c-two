@@ -196,7 +196,7 @@ def test_admin_probes_accept_long_directory_and_report_missing_endpoint(probe: s
         if {probe!r} == 'ping':
             assert result is False, result
         else:
-            assert result == {{'acknowledged': True, 'shutdown_started': False, 'server_stopped': True, 'route_outcomes': []}}, result
+            assert result == 'absent', result
     ''')
 
 
@@ -231,7 +231,7 @@ def test_admin_probes_accept_long_directory_in_all_contexts(
         if {probe!r} == 'ping':
             assert result is False, result
         else:
-            assert result == {{'acknowledged': True, 'shutdown_started': False, 'server_stopped': True, 'route_outcomes': []}}, result
+            assert result == 'absent', result
         session = _get_default_runtime()._runtime_session
         assert session.local_endpoint_frozen == ({selection!r} != 'context')
         assert not session.client_config_frozen
@@ -300,10 +300,7 @@ def test_admin_runtime_configuration_precedence_and_freeze(probe: str) -> None:
         session = _get_default_runtime()._runtime_session
         assert not session.local_endpoint_frozen
         address = 'ipc://admin-freeze-' + uuid.uuid4().hex
-        expected = False if {probe!r} == 'ping' else {{
-            'acknowledged': True, 'shutdown_started': False,
-            'server_stopped': True, 'route_outcomes': [],
-        }}
+        expected = False if {probe!r} == 'ping' else 'absent'
         assert getattr(util, {probe!r})(address, 0.01) == expected
         assert session.local_endpoint_frozen
         assert not session.client_config_frozen
@@ -578,9 +575,9 @@ def test_public_replacement_preserves_root_and_native_retirement_observations() 
         from c_two.transport.registry import _get_default_runtime
         cc.endpoint.set_local_endpoint(root={root!r})
         old = _get_default_runtime()._runtime_session
-        tracker = old.lease_tracker()
+        tracker = old.local_copy_tracker()
         lease = tracker.track_retained(route_name='endpoint-retirement', method_name='echo',
-            direction='client_response', storage='inline', bytes=64)
+            direction='client_response', bytes=64)
         captured = cc.endpoint.local_endpoint_context()
         for _ in range(3):
             assert cc.shutdown()['completed']
@@ -591,7 +588,7 @@ def test_public_replacement_preserves_root_and_native_retirement_observations() 
         assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
         # An old producer remains observable after the endpoint handoff.
         late = tracker.track_retained(route_name='endpoint-retirement', method_name='echo',
-            direction='client_response', storage='inline', bytes=96)
+            direction='client_response', bytes=96)
         assert cc.observe.memory_stats()["holds"]['active_holds'] == 1
         assert cc.observe.memory_stats()['holds']['total_held_bytes'] == 96
         late.release()
@@ -708,4 +705,33 @@ def test_windows_root_override_is_explicitly_unsupported_and_preserves_default()
         assert not session.local_endpoint_frozen
         assert cc.shutdown()['completed']
         assert cc.endpoint.local_endpoint_context() == context
+    ''')
+
+
+@pytest.mark.parametrize('surface', ['native', 'session', 'public_runtime', 'public_context'])
+def test_shutdown_without_confirmation_returns_unconfirmed(surface, tmp_path) -> None:
+    """A deadline before any exchange cannot claim initiation or absence."""
+    _run_isolated(f'''
+        import os
+        import uuid
+        import c_two.endpoint
+        from c_two import _native
+        from c_two.transport.client import util
+
+        session = _native.RuntimeSession(use_process_relay_anchor=False)
+        if os.name != 'nt':
+            session.set_local_endpoint(root={str(tmp_path)!r})
+            c_two.endpoint.set_local_endpoint(root={str(tmp_path)!r})
+        context = session.local_endpoint_context()
+        address = 'ipc://no-confirmation-' + uuid.uuid4().hex
+        if {surface!r} == 'native':
+            result = _native.ipc_shutdown(address, 0.0, context=context)
+        elif {surface!r} == 'session':
+            result = session.shutdown_direct_ipc(address, 0.0)
+        elif {surface!r} == 'public_context':
+            result = util.shutdown(address, 0.0, context=context)
+        else:
+            result = util.shutdown(address, 0.0)
+        assert type(result) is str, result
+        assert result == 'unconfirmed', result
     ''')

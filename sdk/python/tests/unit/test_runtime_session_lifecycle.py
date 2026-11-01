@@ -20,8 +20,8 @@ def test_host_started_reports_the_real_native_running_state(tmp_path) -> None:
     assert type(credential) is cc.endpoint.EndpointCredential  # No route was registered.
     assert credential.address == session.server_address
     snapshot = session.native_lifecycle_snapshot()
-    assert snapshot['phase'] == 'persistent'
-    assert snapshot['terminal'] is False
+    assert set(snapshot) == {'finished', 'listener_closed', 'work_drained'}
+    assert snapshot['finished'] is False
     assert snapshot['listener_closed'] is False
     # Observing the terminal state never initiates or consumes shutdown.
     assert session.native_terminal_outcome() is None
@@ -29,5 +29,5 @@ def test_host_started_reports_the_real_native_running_state(tmp_path) -> None:
     # A completed shutdown releases the session's host handle.
     assert session.host_started is False
     assert session.server_credential is None
-    assert session.native_lifecycle_snapshot()['terminal'] is True
+    assert session.native_lifecycle_snapshot()['finished'] is True
     assert session.native_terminal_outcome() == session.shutdown(timeout_seconds=0)

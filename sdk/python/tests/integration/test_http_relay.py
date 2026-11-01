@@ -72,7 +72,7 @@ def _registration_scope(http: httpx.Client, relay_url: str, name: str) -> dict:
     assert response.status_code == 200, response.text
     route = response.json()[0]
     return {key: route[key] for key in (
-        'name', 'server_id', 'server_instance_id', 'route_uid', 'route_revision',
+        'name', 'server_id', 'server_instance_id', 'route_uid',
     )}
 
 
@@ -643,12 +643,11 @@ class TestRelayControlPlane:
             )
             assert registered.status_code == 201, registered.text
             scope = _registration_scope(http, relay_url, 'hello')
-            # A stale incarnation, UID, owner or revision cannot remove this route.
+            # A stale incarnation, UID or owner cannot remove this route.
             for key, value in (
                 ('server_id', 'other-server'),
                 ('server_instance_id', 'stale-instance'),
                 ('route_uid', 'stale-route'),
-                ('route_revision', scope['route_revision'] + 1),
             ):
                 rejected = http.post(
                     f'{relay_url}/_unregister', json={**scope, key: value},
@@ -692,7 +691,7 @@ class TestRelayControlPlane:
                 json={
                     'name': 'nonexistent', 'server_id': 'missing-server',
                     'server_instance_id': 'missing-instance',
-                    'route_uid': 'missing-route', 'route_revision': 1,
+                    'route_uid': 'missing-route',
                 },
             )
             assert resp.status_code == 404

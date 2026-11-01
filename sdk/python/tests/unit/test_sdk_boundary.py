@@ -156,7 +156,6 @@ def test_top_level_exposes_register_concurrency_facade():
     assert cfg.mode == 'parallel'
 
 
-
 def test_contract_module_exposes_projection_tools():
     import c_two as cc
     import c_two.contract
@@ -317,7 +316,6 @@ def test_registry_does_not_own_generic_relay_or_route_authority():
         "resolve_matching",
         "resolve_routes",
         "route_uid",
-        "route_revision",
         "FallbackDenied(",
     ]
     offenders = [needle for needle in forbidden if needle in source]
@@ -947,8 +945,8 @@ def test_route_table_direct_mutations_validate_tombstones_and_private_identity()
         assert 'if!self.apply_tombstone(tombstone)' in mutation
     apply = _rust_compact(_rust_function(source, 'apply_tombstone'))
     assert apply.index('if!self.valid_tombstone(&tombstone)') < apply.index(
-        'self.advance_catalog_revision()',
-    ) < apply.index('self.routes.remove(&key)')
+        'self.routes.remove(&key)',
+    ) < apply.index('self.tombstones.insert(key,tombstone)')
     identity = _rust_compact(_rust_function(source, 'valid_server_id'))
     assert 'c2_config::validate_server_id(server_id).is_ok()' in identity
     assert 'server_id.len()<=MAX_WIRE_TEXT_BYTES' in identity
@@ -1032,7 +1030,7 @@ def test_relay_router_does_not_silence_response_materialization_errors():
     call_handler = production[production.index("async fn call_handler"):]
     call_handler = call_handler[:call_handler.index("async fn acquire_request_client")]
 
-    assert "result.into_bytes()" in call_handler
+    assert "result.into_owned_bytes()" in call_handler
     materialization = call_handler[call_handler.index("fn materialized_response_or_error"):]
     assert "resource_unavailable_response_with_phase" in materialization
     assert '"dispatch_uncertain"' in materialization

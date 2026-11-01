@@ -319,7 +319,7 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
         assert retired['used_operations'] == 1
         assert retired['used_retained_bytes'] == nbytes
 
-        outcome = session.shutdown()
+        outcome = session.begin_shutdown().observe()
         assert outcome['completed']
         assert outcome['ipc_clients_drained']
         if owner_kind == 'prepared':
@@ -483,7 +483,7 @@ def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
     def route(index):
         return {
             'name': route_name, 'relay_url': f'http://127.0.0.1:{servers[index].server_port}',
-            'route_uid': f'deadline-retry-{index}', 'route_revision': 1,
+            'route_uid': f'deadline-retry-{index}',
             'ipc_address': None, 'server_id': None, 'server_instance_id': None,
             'crm_ns': expected.crm_ns, 'crm_name': expected.crm_name,
             'crm_ver': expected.crm_ver, 'abi_hash': expected.abi_hash,

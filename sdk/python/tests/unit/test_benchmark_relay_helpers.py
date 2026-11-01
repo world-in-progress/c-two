@@ -6,7 +6,9 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from queue import SimpleQueue
 from types import ModuleType
 
 import pytest
@@ -60,7 +62,7 @@ def test_relay_qps_hey_args_include_contract_and_route_identity():
     module = _load_benchmark('relay_qps_benchmark.py')
     expected = crm_contract(module.Hello)
 
-    args = module._route_hey_args(expected, 'registered-route-uid', 7)
+    args = module._route_hey_args(expected, 'registered-route-uid')
 
     assert args == [
         '-H',
@@ -75,9 +77,54 @@ def test_relay_qps_hey_args_include_contract_and_route_identity():
         f'x-c2-expected-signature-hash: {expected.signature_hash}',
         '-H',
         'x-c2-route-uid: registered-route-uid',
-        '-H',
-        'x-c2-route-revision: 7',
     ]
+
+
+def test_relay_qps_headers_form_a_valid_hey_request(monkeypatch, tmp_path):
+    """Exercise hey's real argument parser and the headers sent over HTTP."""
+    module = _load_benchmark('relay_qps_benchmark.py')
+    expected = crm_contract(module.Hello)
+    received = SimpleQueue()
+    payload = tmp_path / 'payload.bin'
+    payload.write_bytes(b'benchmark payload')
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.put((
+                self.path,
+                {key.lower(): value for key, value in self.headers.items()},
+                self.rfile.read(int(self.headers['Content-Length'])),
+            ))
+            self.send_response(200)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    monkeypatch.setenv('NO_PROXY', '127.0.0.1')
+    try:
+        result = module._run_hey('header-regression', [
+            'hey', '-n', '1', '-c', '1', '-t', '2', '-m', 'POST',
+            '-D', str(payload), '-T', 'application/octet-stream',
+            *module._route_hey_args(expected, 'registered-route-uid'),
+            f'http://127.0.0.1:{server.server_port}/echo/greeting',
+        ])
+        assert result.returncode == 0
+        path, headers, body = received.get_nowait()
+        assert path == '/echo/greeting'
+        assert body == payload.read_bytes()
+        assert headers['x-c2-route-uid'] == 'registered-route-uid'
+        assert headers['x-c2-expected-abi-hash'] == expected.abi_hash
+        assert headers['x-c2-expected-signature-hash'] == expected.signature_hash
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
 
 
 @pytest.mark.parametrize('script', ['relay_qps_benchmark.py', 'three_mode_benchmark.py'])

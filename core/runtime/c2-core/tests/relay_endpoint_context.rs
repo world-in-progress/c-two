@@ -519,8 +519,24 @@ mod unix {
             b"Aafter-mismatch"
         );
         drop((ipc, http, explicit, local_b, after_mismatch));
-        client_a.shutdown_without_host(WAIT);
-        client_b.shutdown_without_host(WAIT);
+        let retirement_deadline = std::time::Instant::now() + WAIT;
+        let (retirement_outcome, retirement_completed) = client_a
+            .begin_session_retirement(
+                c2_core::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{retirement_outcome:?}");
+        let retirement_deadline = std::time::Instant::now() + WAIT;
+        let (retirement_outcome, retirement_completed) = client_b
+            .begin_session_retirement(
+                c2_core::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{retirement_outcome:?}");
         assert!(host_a.shutdown().relay_errors.is_empty());
         assert!(host_b.shutdown().runtime_barrier_error.is_none());
         relay.stop().unwrap();
@@ -638,7 +654,15 @@ mod unix {
             checker.local_endpoint_context().unwrap(),
             *host.local_endpoint_context()
         );
-        checker.shutdown_without_host(WAIT);
+        let retirement_deadline = std::time::Instant::now() + WAIT;
+        let (retirement_outcome, retirement_completed) = checker
+            .begin_session_retirement(
+                c2_core::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{retirement_outcome:?}");
         let mut wrong = expected();
         wrong.signature_hash = "0".repeat(64);
         assert!(
@@ -659,7 +683,15 @@ mod unix {
         );
         assert_http_call(&client, &fixture);
         drop(local);
-        runtime.shutdown_without_host(WAIT);
+        let retirement_deadline = std::time::Instant::now() + WAIT;
+        let (retirement_outcome, retirement_completed) = runtime
+            .begin_session_retirement(
+                c2_core::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{retirement_outcome:?}");
         assert!(host.shutdown().runtime_barrier_error.is_none());
     }
 
@@ -754,7 +786,15 @@ mod unix {
                 )
                 .is_err()
         );
-        runtime.shutdown_without_host(WAIT);
+        let retirement_deadline = std::time::Instant::now() + WAIT;
+        let (retirement_outcome, retirement_completed) = runtime
+            .begin_session_retirement(
+                c2_core::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{retirement_outcome:?}");
     }
 
     #[test]

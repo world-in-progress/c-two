@@ -83,12 +83,7 @@ def test_client_util_keeps_the_historical_call_shapes():
     exercisable without ever touching a live server.
     """
     assert util.ping(_absent_address(), 0.01) is False
-    assert util.shutdown(_absent_address(), 0.01) == {
-        'acknowledged': True,
-        'shutdown_started': False,
-        'server_stopped': True,
-        'route_outcomes': [],
-    }
+    assert util.shutdown(_absent_address(), 0.01) == 'absent'
 
 
 def test_ping_invalid_address_raises():
@@ -111,3 +106,32 @@ def test_ping_rejects_invalid_timeout(timeout):
 def test_shutdown_rejects_invalid_timeout(timeout):
     with pytest.raises(ValueError, match='timeout'):
         util.shutdown(_absent_address(), timeout=timeout)
+
+
+@pytest.mark.parametrize('outcome', ['initiated', 'absent', 'unconfirmed'])
+@pytest.mark.parametrize('selection', ['runtime', 'context'])
+def test_shutdown_preserves_native_string_outcomes(monkeypatch, outcome, selection):
+    from typing import Literal, get_type_hints
+    from c_two import _native
+
+    address = _absent_address()
+    context = _native.resolve_local_endpoint_context()
+    calls = []
+
+    class Session:
+        def shutdown_direct_ipc(self, target, timeout):
+            calls.append((target, timeout, None))
+            return outcome
+
+    def native_shutdown(target, timeout, *, context):
+        calls.append((target, timeout, context))
+        return outcome
+
+    monkeypatch.setattr(util, '_session', Session)
+    monkeypatch.setattr(_native, 'ipc_shutdown', native_shutdown)
+    kwargs = {'context': context} if selection == 'context' else {}
+    result = util.shutdown(address, 0.25, **kwargs)
+    assert type(result) is str
+    assert result == outcome
+    assert calls == [(address, 0.25, context if selection == 'context' else None)]
+    assert get_type_hints(util.shutdown)['return'] == Literal['initiated', 'absent', 'unconfirmed']

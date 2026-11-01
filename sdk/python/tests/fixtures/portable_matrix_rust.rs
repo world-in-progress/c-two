@@ -330,8 +330,8 @@ fn run_host(
         return Err(format!("expected host address {address:?}, got {actual_address:?}").into());
     }
     println!(
-        "READY address={} route_uid={} route_revision={}",
-        actual_address, outcome.route_uid, outcome.route_revision
+        "READY address={} route_uid={}",
+        actual_address, outcome.route_uid
     );
     std::io::stdout().flush()?;
 
@@ -372,7 +372,6 @@ fn run_client(
     let core_client = runtime.connect(expected, connect)?;
     let observed_path = core_client.observed_path();
     let route_uid = core_client.observed_route().route_uid.clone();
-    let route_revision = core_client.observed_route().route_revision;
 
     match payload {
         "no-payload" => {
@@ -405,7 +404,7 @@ fn run_client(
         return Err(format!("expected one selected path observation, got {selected}").into());
     }
     println!(
-        "CLIENT_RECEIPT observed_path={observed_path:?} route_uid={route_uid} route_revision={route_revision} requests=1 responses=1"
+        "CLIENT_RECEIPT observed_path={observed_path:?} route_uid={route_uid} requests=1 responses=1"
     );
     Ok(())
 }

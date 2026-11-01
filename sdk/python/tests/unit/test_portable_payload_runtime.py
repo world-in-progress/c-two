@@ -241,14 +241,10 @@ class _FailingReleaseResponse(bytearray):
     def __init__(self, source: bytes) -> None:
         super().__init__(source)
         self.release_calls = 0
-        self.abandon_calls = 0
 
     def release(self) -> None:
         self.release_calls += 1
-        raise RuntimeError("transport release failed")
-
-    def _abandon_after_failed_release(self) -> None:
-        self.abandon_calls += 1
+        raise BufferError("local buffer export is active")
 
 
 def _fake_fastdb_binding(
@@ -310,85 +306,60 @@ def test_decode_error_remains_primary_when_response_cleanup_also_fails(
         wrapped(Contract(), **kwargs)
 
     assert "decode failed" in raised.value.message
-    assert "transport release failed" not in raised.value.message
-    assert "transport release failed" in str(raised.value.__cause__.__context__)
+    assert "local buffer export is active" not in raised.value.message
+    assert "local buffer export is active" in str(raised.value.__cause__.__context__)
     assert response.release_calls == 1
-    assert response.abandon_calls == 1
 
 
-@pytest.mark.parametrize("reject_before_invalidation", [False, True])
-def test_native_held_retries_response_without_repeating_invalidation(
-    reject_before_invalidation: bool,
-) -> None:
+def test_native_held_export_rejection_allows_later_local_release() -> None:
     owner = object()
-    invalidated: list[object] = []
+    invalidated = []
 
     class Response(bytearray):
         is_released = False
-        has_pending_release = False
-        release_calls = 0
+        export_active = True
         invalidate_calls = 0
 
-        def invalidate_then_release(self, callback, value) -> None:
-            if reject_before_invalidation and not self.release_calls:
-                self.release_calls += 1
+        def invalidate_then_release(self, callback, value):
+            if self.export_active:
                 raise BufferError("another export is active")
             self.is_released = True
             self.invalidate_calls += 1
             callback(value)
-            self.release()
 
-        def release(self) -> None:
-            self.release_calls += 1
-            if self.release_calls == (2 if reject_before_invalidation else 1):
-                self.has_pending_release = True
-                raise RuntimeError("native release blocked")
-            self.has_pending_release = False
+        def release(self):
+            self.is_released = True
 
     response = Response(b"payload")
 
     class Client:
         supports_direct_call = False
-
-        def call(self, method_name: str, payload: object) -> object:
+        def call(self, method_name, payload):
             return response
 
     class Contract:
         direction = "->"
         client = Client()
 
-    def fetch(self) -> object:
-        ...
+    def fetch(self) -> object: ...
 
     wrapped = _build_transfer_wrapper(
-        fetch,
-        input=no_payload_binding(),
-        output=_fake_fastdb_binding(
-            deserialize=lambda source: owner,
-            invalidate=invalidated.append,
-        ),
+        fetch, input=no_payload_binding(),
+        output=_fake_fastdb_binding(deserialize=lambda source: owner, invalidate=invalidated.append),
     )
     held = wrapped(Contract(), _c2_buffer="hold")
-
-    with pytest.raises(BufferError if reject_before_invalidation else RuntimeError):
+    with pytest.raises(BufferError, match="another export"):
         held.release()
-    if reject_before_invalidation:
-        assert held.value is owner
-        with pytest.raises(RuntimeError, match="no retained buffer"):
-            _ = held.unsafe_buffer
-        with pytest.raises(RuntimeError, match="native release blocked"):
-            held.release()
-    else:
-        with pytest.raises(RuntimeError, match="no longer accessible"):
-            _ = held.value
-
-    assert response.has_pending_release
-    assert response.invalidate_calls == 1
+    assert held.value is owner
+    assert invalidated == []
+    response.export_active = False
     held.release()
     held.release()
     assert invalidated == [owner]
-    assert response.release_calls == (3 if reject_before_invalidation else 2)
-    assert not response.has_pending_release
+    assert response.invalidate_calls == 1
+    assert held._native_response is None
+    with pytest.raises(RuntimeError, match="no longer accessible"):
+        _ = held.value
 
 
 def test_post_decode_release_failure_invalidates_unreturned_owner() -> None:
@@ -418,12 +389,11 @@ def test_post_decode_release_failure_invalidates_unreturned_owner() -> None:
         ),
     )
 
-    with pytest.raises(error.ClientDeserializeOutput, match="transport release failed"):
+    with pytest.raises(error.ClientDeserializeOutput, match="local buffer export is active"):
         wrapped(Contract())
 
     assert invalidated == [owner]
     assert response.release_calls == 1
-    assert response.abandon_calls == 1
 
 
 def test_retained_tracking_failure_invalidates_owner_then_releases_response() -> None:
@@ -442,7 +412,7 @@ def test_retained_tracking_failure_invalidates_owner_then_releases_response() ->
 
     class Client:
         supports_direct_call = False
-        lease_tracker = object()
+        local_copy_tracker = object()
         route_name = "route"
 
         def call(self, method_name: str, payload: object) -> object:
@@ -605,3 +575,56 @@ def test_non_fastdb_error_fields_are_not_misattributed_to_fastdb() -> None:
         wrapped(Contract(), object())
 
     assert raised.value.details == {}
+
+
+@pytest.mark.parametrize('fail_resource', [False, True])
+def test_borrowed_checked_owner_invalidates_before_local_request_release(fail_resource):
+    from c_two.crm.payload_plan import fastdb_payload_binding
+
+    retained = {}
+    events = []
+
+    class Resource:
+        def consume(self, value):
+            assert payload_value(value) == 7
+            retained['owner'] = value
+            with value.entry_view(0) as sequence:
+                retained['checked'] = sequence.at(0)
+            events.append('resource')
+            if fail_resource:
+                raise ValueError('resource failed')
+
+    class Contract:
+        direction = '<-'
+        resource = Resource()
+
+    def consume(self, value: Payload) -> None: ...
+
+    wrapped = _build_transfer_wrapper(
+        consume,
+        input=fastdb_payload_binding(RECORD_SPEC, label='test.borrowed'),
+        output=no_payload_binding(),
+    )
+    source = build_payload(RECORD_SPEC)
+    request = memoryview(source.binary_bytes())
+
+    def release_request():
+        with pytest.raises(PayloadError) as invalidated:
+            retained['checked'].kind()
+        assert invalidated.value.symbol == 'VIEW_INVALIDATED'
+        events.append('release_local_request')
+        request.release()
+
+    try:
+        error_bytes, _output = wrapped(
+            Contract(), request, _release_fn=release_request,
+            _c2_input_buffer_mode='borrowed',
+        )
+        assert bool(error_bytes) is fail_resource
+        assert events == ['resource', 'release_local_request']
+        assert payload_value(source) == 7
+    finally:
+        request.release()
+        for value in retained.values():
+            value.close()
+        source.close()
