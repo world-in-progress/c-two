@@ -1,10 +1,10 @@
 //! The I/O drivers of one physical client connection. ConnectionCore alone
 //! owns publication, release ordering and the normal close decision.
 
-use crate::client::{IpcCallControl, IpcError, PendingMap};
+use crate::client::{IpcCallControl, IpcError, PendingMap, ServerPoolState};
 use c2_local::{
-    AbortHandle, ConnectionEndReason, ConnectionPublisher, DEFAULT_WRITE_TIMEOUT, LocalReadHalf,
-    LocalWriteHalf, RemoteReadGuard,
+    AbortHandle, ConnectionEndReason, ConnectionPublisher, LocalReadHalf, LocalWriteHalf,
+    RemoteReadGuard,
 };
 use c2_mem::MemPool;
 use c2_wire::{
@@ -173,8 +173,11 @@ pub(crate) struct ClientConnection {
     gc_stop: watch::Sender<bool>,
     disconnect: Arc<Mutex<Disconnect>>,
     runtime: tokio::runtime::Handle,
+    write_timeout: Duration,
     #[cfg(any(test, feature = "test-support"))]
     pub pause: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub prefix_pause: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 impl ClientConnection {
     pub fn spawn(
@@ -182,6 +185,7 @@ impl ClientConnection {
         pending: Arc<Mutex<PendingMap>>,
         abort: AbortHandle,
         retirement: Arc<PhysicalRetirement>,
+        write_timeout: Duration,
     ) -> Arc<Self> {
         let wake = Arc::new(Notify::new());
         let notify = wake.clone();
@@ -205,8 +209,11 @@ impl ClientConnection {
             gc_stop: watch::channel(false).0,
             disconnect: disconnect.clone(),
             runtime: tokio::runtime::Handle::current(),
+            write_timeout,
             #[cfg(any(test, feature = "test-support"))]
             pause: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            prefix_pause: Mutex::new(None),
         });
         let driver = WriteDriver {
             stream: Some(stream),
@@ -220,7 +227,29 @@ impl ClientConnection {
     }
     fn stop_admission(&self) {
         drop(self.core.deactivate());
+        // A queued future need not be polled again to stop retaining a pending
+        // entry. Sent waiters remain until their own reply or a framing failure.
+        let mut pending = self.pending.lock();
+        for (_, entry) in pending.extract_if(|_, entry| {
+            // The writer holds this lock while publication linearizes. It
+            // may itself report a preparation failure here, so never wait on
+            // that lock; its own receipt resolves the in-progress submission.
+            entry.state.try_lock().is_some_and(|state| !state.started())
+        }) {
+            entry.complete(Err(IpcError::Closed));
+        }
+        drop(pending);
         self.deactivated.send_replace(true);
+    }
+    /// Retire a cache incarnation while preserving replies for requests that
+    /// already reached the writer. The ordinary close barrier seals the stream
+    /// after those replies and its remaining loans settle.
+    pub fn retire(&self) {
+        self.end
+            .record(ConnectionEndReason::LocalClose, "client_retire");
+        self.stop_admission();
+        self.wake.notify_waiters();
+        self.wake.notify_one();
     }
     pub fn close(&self) {
         {
@@ -256,30 +285,28 @@ impl ClientConnection {
     pub fn end(&self, reason: ConnectionEndReason, operation: &'static str) {
         self.end.record(reason, operation);
         self.stop_admission();
-        self.fail_pending();
     }
     pub fn end_io(&self, operation: &'static str, error: &io::Error, read: bool) {
         self.end.record_io(operation, error, read);
         self.stop_admission();
-        self.fail_pending();
     }
-    /// Stop admission before waking the affected waiter. Its response failure
-    /// remains DispatchUncertain even when deactivation also wakes its sender.
+    /// Readable framing preserves every other call's outcome, including while
+    /// admission is stopped for a release violation or local bookkeeping error.
     pub fn response_failed(&self, rid: u64, error: IpcError) {
         let target = self.pending.lock().remove(&rid);
-        self.end
-            .record(ConnectionEndReason::ProtocolError, "response_decode");
-        drop(self.core.deactivate());
         if let Some(entry) = target {
-            let _ = entry.tx.send(Err(error.response_failure()));
+            entry.complete(Err(error.response_failure()));
         }
-        self.deactivated.send_replace(true);
+        self.wake.notify_one();
+    }
+    pub fn framing_failed(&self, operation: &'static str) {
+        self.end(ConnectionEndReason::ProtocolError, operation);
         self.fail_pending();
     }
     pub fn fail_pending(&self) {
         let pending = std::mem::take(&mut *self.pending.lock());
         for (_, entry) in pending {
-            let _ = entry.tx.send(Err(IpcError::Closed));
+            entry.complete(Err(IpcError::Closed));
         }
     }
     pub fn read_stopped(&self, peer_end: bool) {
@@ -295,6 +322,11 @@ impl ClientConnection {
         self.wake.notify_one();
     }
     fn close_ready(&self) -> bool {
+        // ConnectionCore accounts for loans and real remote reads; the client
+        // also has sent calls whose replies still have trustworthy framing.
+        if !self.pending.lock().is_empty() {
+            return false;
+        }
         if !self.core.try_close() {
             return false;
         }
@@ -312,6 +344,7 @@ impl ClientConnection {
     pub fn start_gc(
         &self,
         pool: Arc<RwLock<MemPool>>,
+        peer: Arc<RwLock<ServerPoolState>>,
         registry: Arc<ChunkRegistry<()>>,
         decay_seconds: f64,
     ) {
@@ -319,7 +352,8 @@ impl ClientConnection {
         let period = registry
             .config()
             .gc_interval
-            .min(Duration::from_secs_f64(decay_seconds.max(0.005)));
+            .min(Duration::from_secs_f64(decay_seconds))
+            .max(Duration::from_millis(5));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(period);
             tick.tick().await;
@@ -334,6 +368,7 @@ impl ClientConnection {
                         registry.try_gc_sweep();
                         if let Some(mut pool) = pool.try_write() { pool.gc_buddy(); }
                         if let Some(mut pool) = registry.pool().try_write() { pool.gc_buddy(); }
+                        if let Some(peer) = peer.try_read() { peer.cache.gc_idle(); }
                     }
                 }
             }
@@ -356,7 +391,7 @@ impl ClientConnection {
             .send(Submission {
                 bytes,
                 request,
-                state,
+                state: state.clone(),
                 policy,
                 reply: Some(reply),
             })
@@ -364,10 +399,21 @@ impl ClientConnection {
             .map_err(|_| IpcError::Closed)?;
         let mut stopped = self.deactivated.subscribe();
         let is_stopped = *stopped.borrow();
-        let result = if is_stopped {
-            receipt.try_recv().unwrap_or(Err(IpcError::Closed))
+        let result = if is_stopped && !state.lock().started() {
+            Err(IpcError::Closed)
         } else {
-            tokio::select! { biased; result = receipt => result.map_err(|_| IpcError::Closed)?, _ = stopped.changed() => Err(IpcError::Closed), }
+            tokio::select! {
+                biased;
+                result = &mut receipt => result.map_err(|_| IpcError::Closed)?,
+                _ = stopped.changed(), if !is_stopped => {
+                    let started = state.lock().started();
+                    if started {
+                        receipt.await.map_err(|_| IpcError::Closed)?
+                    } else {
+                        Err(IpcError::Closed)
+                    }
+                }
+            }
         };
         cancellation.finished = true;
         result
@@ -471,7 +517,15 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
         }
     }
     let result = match prepared {
-        Ok(batch) => write_batch(stream, conn, batch, &mut submission.reply).await,
+        Ok(batch) => {
+            #[cfg(any(test, feature = "test-support"))]
+            let batch = {
+                let mut batch = batch;
+                batch.prefix_pause = conn.prefix_pause.lock().take();
+                batch
+            };
+            write_batch(stream, conn, batch, &mut submission.reply).await
+        }
         Err(error) => Err(error),
     };
     if let Some(reply) = submission.reply {
@@ -482,6 +536,10 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
 struct PreparedWrite {
     batch: WriteBatch,
     bytes: Vec<u8>,
+    #[cfg(any(test, feature = "test-support"))]
+    frame_start: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    prefix_pause: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 fn prepare(
@@ -490,6 +548,8 @@ fn prepare(
     conn: &ClientConnection,
 ) -> Result<PreparedWrite, IpcError> {
     let prefix = batch.release_bytes();
+    #[cfg(any(test, feature = "test-support"))]
+    let frame_start = prefix.len();
     let bytes = if prefix.is_empty() {
         frame
     } else {
@@ -507,7 +567,14 @@ fn prepare(
         bytes
     };
     batch.begin_io().map_err(core_error)?;
-    Ok(PreparedWrite { batch, bytes })
+    Ok(PreparedWrite {
+        batch,
+        bytes,
+        #[cfg(any(test, feature = "test-support"))]
+        frame_start,
+        #[cfg(any(test, feature = "test-support"))]
+        prefix_pause: None,
+    })
 }
 
 async fn write_batch<W: AsyncWrite + Unpin>(
@@ -516,12 +583,19 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     mut write: PreparedWrite,
     receipt: &mut Option<Receipt>,
 ) -> Result<(), IpcError> {
-    let deadline = tokio::time::Instant::now() + DEFAULT_WRITE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + conn.write_timeout;
     let mut timed_out = false;
     let mut written = 0;
     let mut boundary = 4 + u32::from_le_bytes(write.bytes[..4].try_into().unwrap()) as usize;
     while written < write.bytes.len() {
-        let mut operation = Box::pin(AsyncWriteExt::write(stream, &write.bytes[written..]));
+        let limit = write.bytes.len();
+        #[cfg(any(test, feature = "test-support"))]
+        let limit = if write.prefix_pause.is_some() {
+            write.frame_start + 8
+        } else {
+            limit
+        };
+        let mut operation = Box::pin(AsyncWriteExt::write(stream, &write.bytes[written..limit]));
         let result = if timed_out {
             operation.await
         } else {
@@ -555,6 +629,13 @@ async fn write_batch<W: AsyncWrite + Unpin>(
             boundary +=
                 4 + u32::from_le_bytes(write.bytes[boundary..boundary + 4].try_into().unwrap())
                     as usize;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if written == write.frame_start + 8 {
+            if let Some((entered, resume)) = write.prefix_pause.take() {
+                let _ = entered.send(());
+                let _ = resume.await;
+            }
         }
     }
     let mut operation = Box::pin(AsyncWriteExt::flush(stream));

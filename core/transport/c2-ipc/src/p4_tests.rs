@@ -1185,8 +1185,8 @@ async fn unnegotiated_shm_reply_is_rejected_before_mapping_or_loan_admission() {
             .as_ref()
             .unwrap()
             .read()
-            .pool
-            .segment_count(),
+            .cache
+            .mapped_segments(),
         0
     );
     assert!(client.close_shared_bounded(WAIT).await);
@@ -1269,7 +1269,6 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
 
 #[derive(Clone, Copy, Debug)]
 enum FramedFault {
-    Signal,
     Direction,
     ReplyControl,
     UnnegotiatedShm,
@@ -1321,13 +1320,13 @@ fn reply_chunk(rid: u64, count: u32, index: u32, data: &[u8]) -> Vec<u8> {
     )
 }
 
-// Group: complete-frame protocol faults stop admission while the reader still
-// settles the original loan book. No SHM allocation is claimed by this proof:
+// Group: correlated frame-content faults preserve admission while the reader
+// still settles the original loan book. A zero loan ID stops admission.
+// No SHM allocation is claimed by this proof:
 // the file handle isolates the driver's control/read and error-phase wiring.
 #[tokio::test]
 async fn framed_response_faults_remain_uncertain_and_still_settle_release_records() {
     for fault in [
-        FramedFault::Signal,
         FramedFault::Direction,
         FramedFault::ReplyControl,
         FramedFault::UnnegotiatedShm,
@@ -1369,7 +1368,6 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
                 .unwrap();
             let (request, _) = read_frame(&mut stream).await;
             let bad = match fault {
-                FramedFault::Signal => frame::encode_frame(0, flags::FLAG_SIGNAL, &[0xfe]),
                 FramedFault::Direction => {
                     frame::encode_frame(request.request_id, flags::FLAG_CALL_V2, &[0])
                 }
@@ -1458,7 +1456,10 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
             crate::TransportPhase::DispatchUncertain,
             "{fault:?}: {error}"
         );
-        assert!(!client.is_connected());
+        assert_eq!(
+            client.is_connected(),
+            !matches!(fault, FramedFault::ZeroLoan)
+        );
         assert!(budget.snapshot().file.used_bytes > 0);
         loan_sent.send(loan).unwrap();
         eventually(|| budget.snapshot().file.used_bytes == 0).await;
@@ -1471,7 +1472,11 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
                 .snapshot()
                 .unwrap()
                 .reason(),
-            ConnectionEndReason::ProtocolError
+            if matches!(fault, FramedFault::ZeroLoan) {
+                ConnectionEndReason::ProtocolError
+            } else {
+                ConnectionEndReason::LocalClose
+            }
         );
         peer.await.unwrap();
     }
@@ -1481,13 +1486,25 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
 async fn materialization_failure_is_uncertain_and_refunds_local_backing_once() {
     let endpoint = Endpoint::new();
     let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let (sent, request_sent) = oneshot::channel();
+    let (finish, finish_requested) = oneshot::channel();
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
+        let (other, _) = read_frame(&mut stream).await;
+        sent.send(()).unwrap();
+        finish_requested.await.unwrap();
+        reply(&mut stream, other.request_id, b"other").await;
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
     client.connect().await.unwrap();
+    let client = Arc::new(client);
+    let other = tokio::spawn({
+        let client = client.clone();
+        async move { client.call_inline(&identity(), 0, b"other").await }
+    });
+    request_sent.await.unwrap();
     let budget = c2_mem::MemoryBudget::new(0, 1024 * 1024, 1024 * 1024);
     let pool = Arc::new(RwLock::new(
         MemPool::new_with_prefix_and_budget(
@@ -1502,8 +1519,7 @@ async fn materialization_failure_is_uncertain_and_refunds_local_backing_once() {
     ));
     let mut backing = c2_wire::chunk::ReassemblyBacking::admit(pool, 1, 4096).unwrap();
     backing.release();
-    let conn = client.driver.read().clone().unwrap();
-    let error = owned_response(Ok(ResponseData::Handle(backing)), &conn).unwrap_err();
+    let error = owned_response(Ok(ResponseData::Handle(backing))).unwrap_err();
     assert!(matches!(error, IpcError::ResponseFailure(_)));
     assert_eq!(
         crate::sync_client::call_error_phase(&error),
@@ -1511,6 +1527,20 @@ async fn materialization_failure_is_uncertain_and_refunds_local_backing_once() {
     );
     assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert!(client.is_connected());
+    assert_eq!(client.pending_len_for_test(), 1);
+    assert!(!other.is_finished());
+    finish.send(()).unwrap();
+    assert_eq!(
+        timeout(WAIT, other)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_owned_bytes()
+            .unwrap(),
+        b"other"
+    );
     assert!(client.close_shared_bounded(WAIT).await);
     peer.await.unwrap();
 }
@@ -1562,3 +1592,6 @@ mod continuation;
 
 #[path = "p4_lifecycle_tests.rs"]
 mod lifecycle;
+
+#[path = "f2_tests.rs"]
+mod fixes;

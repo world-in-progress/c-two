@@ -2,7 +2,7 @@
 
 This focused fixture does not build or modify sibling repositories. It consumes
 already built packages (or the same three supplied tarballs as the TS matrix),
-uses current native codegen, and retains command/Node logs under /tmp.
+uses current native codegen, and retains command/Node logs under the platform temporary directory.
 """
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ def _run(command: list[str], root: Path, label: str) -> None:
 
 @pytest.fixture(scope="module")
 def persistent_node_project() -> Iterator[tuple[Path, str]]:
-    log_root = tempfile.gettempdir() if os.name == "nt" else "/tmp"
+    log_root = tempfile.gettempdir()
     root = Path(tempfile.mkdtemp(prefix="c2-t3-persistent-", dir=log_root))
     node = shutil.which("node")
     assert node is not None, "real persistent IPC regression requires Node"
@@ -228,11 +228,11 @@ def _reject(result: dict[str, Any], text: str | None = None) -> None:
         assert text in result["error"]["message"], result
 
 
-def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
+def test_generated_node_early_chunk_rejection_stops_upload_and_reuses_connection(
     persistent_node_project: tuple[Path, str], unique_ipc_address: str,
 ) -> None:
     with tempfile.TemporaryDirectory(
-        prefix="c2-r16-", dir=tempfile.gettempdir() if os.name == "nt" else "/tmp",
+        prefix="c2-r16-", dir=tempfile.gettempdir(),
     ) as directory:
         ipc_root = directory if os.name != "nt" else None
         server = local_server(unique_ipc_address, ipc_overrides={
@@ -277,15 +277,17 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
             assert manager.calls == 1 and rejected["chunkRequests"] == 1
             stopped_at = rejected["chunkWrites"]
             assert 0 < stopped_at < 64 * 1024 * 1024 // 4096, rejected
+            assert rejected["completedChunkWrites"] == stopped_at, rejected
             assert rejected["activeWrites"] == 0 and rejected["writesAfterClose"] == 0
-            assert rejected["connects"] == 1 and rejected["closes"] == 1
+            assert rejected["connects"] == 1 and rejected["closes"] == 0
             assert rejected["observations"] == first["observations"]
 
             for calls in (2, 3):
                 resumed = _ok(node.request("call"))
-                assert resumed["connects"] == 2 and resumed["closes"] == 1
+                assert resumed["connects"] == 1 and resumed["closes"] == 0
                 assert manager.calls == calls and resumed["chunkRequests"] == 1
                 assert resumed["chunkWrites"] == stopped_at
+                assert resumed["completedChunkWrites"] == stopped_at
                 assert resumed["businessWrites"] == rejected["businessWrites"] + calls - 1
                 assert resumed["activeWrites"] == 0 and resumed["writesAfterClose"] == 0
                 for key in ("serverId", "serverInstanceId", "routeName", "routeUid"):
@@ -305,6 +307,40 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
                     if entry.is_socket() or entry.name.endswith(".lease")
                 ]
                 assert not residue, f"private endpoint socket/lease residue: {residue}"
+
+
+def test_generated_node_connection_deadline_covers_slow_connect_and_prevents_dispatch(
+    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
+) -> None:
+    # The existing Windows TypeScript integration gate runs this same Node path.
+    server = local_server(unique_ipc_address)
+    manager = CountingResource()
+    node: PersistentNode | None = None
+    try:
+        server.register_crm(Manager, manager, name="manager")
+        server.start()
+        node = PersistentNode(persistent_node_project, unique_ipc_address)
+
+        slow = _ok(node.request(
+            "call", transport="slow", connectDelayMs=5100, connectTimeoutMs=7000,
+        ))
+        assert slow["connects"] == 1 and slow["closes"] == 0
+        assert manager.calls == 1
+
+        expired = node.request(
+            "call", transport="expired", connectDelayMs=100, connectTimeoutMs=25,
+        )
+        _reject(expired, "connection deadline expired")
+        assert manager.calls == 1 and expired["businessWrites"] == 0
+        settled = _ok(node.request("wait", transport="expired", ms=200))
+        assert settled["connects"] == 1 and settled["closes"] == 1
+        assert settled["businessWrites"] == 0 and manager.calls == 1
+    finally:
+        try:
+            if node is not None:
+                node.stop()
+        finally:
+            assert server.shutdown()["completed"]
 
 
 def test_generated_node_persistent_dynamic_acquire_and_identity_fences(

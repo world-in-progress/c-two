@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 use c2_ipc::ServerPoolState;
 fn raw(state: &ServerPoolState) {
-    let _ = ServerPoolState::copy_response;
-    let _ = &state.pool;
+    let _ = ServerPoolState::admit;
+    let _ = &state.cache;
 }
 fn main() {}

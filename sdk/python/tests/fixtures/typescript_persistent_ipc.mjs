@@ -12,17 +12,21 @@ const builder = await import(pathToFileURL(config.builderModule).href);
 const runtime = createBundledC2MemFfiNodeRuntime({ipcRoot: config.ipcRoot ?? undefined});
 const transports = new Map();
 
-function stateFor(id) {
+function stateFor(id, command) {
   let state = transports.get(id);
   if (state !== undefined) return state;
   state = {
     connects: 0, businessWrites: 0, observations: [], loseReply: false,
-    chunkWrites: 0, chunkRequests: 0, activeWrites: 0, writesAfterClose: 0, closes: 0,
+    chunkWrites: 0, completedChunkWrites: 0, chunkRequests: 0, activeWrites: 0, writesAfterClose: 0, closes: 0,
   };
   const transport = manager.createIpcEncodedTransport(config.address, {
     requestChunkSize: 4096,
-    async connect(address) {
-      const connection = await runtime.connect(address);
+    connectTimeoutMs: command.connectTimeoutMs,
+    async connect(address, timeoutMs) {
+      if (command.connectDelayMs !== undefined) {
+        await new Promise(resolve => setTimeout(resolve, command.connectDelayMs));
+      }
+      const connection = await runtime.connect(address, timeoutMs);
       state.connects += 1;
       let loseBusinessReply = false;
       let closed = false;
@@ -43,6 +47,7 @@ function stateFor(id) {
           state.activeWrites += 1;
           try {
             await connection.write(bytes);
+            if ((flags & (1 << 7)) !== 0 && (flags & (1 << 9)) !== 0) state.completedChunkWrites += 1;
           } finally {
             state.activeWrites -= 1;
           }
@@ -86,12 +91,14 @@ try {
       reply({ok: true});
       break;
     }
-    const state = stateFor(command.transport ?? 'original');
+    const state = stateFor(command.transport ?? 'original', command);
     let error;
     try {
       if (command.op === 'close') {
         await state.transport.close();
         await state.transport.close();
+      } else if (command.op === 'wait') {
+        await new Promise(resolve => setTimeout(resolve, command.ms));
       } else if (command.op === 'prepare') {
         const contract = command.route === 'manager' ? manager.CONTRACT : builder.CONTRACT;
         await state.transport.prepare(command.route, contract);
@@ -113,7 +120,7 @@ try {
     reply({
       ok: error === undefined, error,
       connects: state.connects, businessWrites: state.businessWrites,
-      chunkWrites: state.chunkWrites, chunkRequests: state.chunkRequests,
+      chunkWrites: state.chunkWrites, completedChunkWrites: state.completedChunkWrites, chunkRequests: state.chunkRequests,
       activeWrites: state.activeWrites, writesAfterClose: state.writesAfterClose, closes: state.closes,
       observations: state.observations,
     });

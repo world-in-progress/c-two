@@ -34,7 +34,7 @@ pub use control::{
     ping_with_endpoint, shutdown, shutdown_with_context, shutdown_with_endpoint,
 };
 pub use pool::{ClientCacheMemorySnapshot, ClientPool};
-pub use response::{ResponseData, ResponseLease, ServerShmResponse};
+pub use response::{ResponseData, ServerShmResponse};
 #[doc(hidden)]
 pub use sync_client::shared_io_handle;
 pub use sync_client::{IpcCallError, SyncClient, TransportPhase};

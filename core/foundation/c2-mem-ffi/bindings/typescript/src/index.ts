@@ -111,8 +111,8 @@ export interface C2MemFfiNativeWindowsSocket {
 export interface C2MemFfiNativeLocalEndpointContext {
   endpointName(address: string): C2MemFfiCallResult<string>;
   namespaceId(): C2MemFfiCallResult<string>;
-  connectUnix?(address: string): Promise<C2MemFfiCallResult<C2MemFfiNativeUnixSocket>>;
-  connectWindows?(address: string): Promise<C2MemFfiCallResult<C2MemFfiNativeWindowsSocket>>;
+  connectUnix?(address: string, timeoutMs?: number): Promise<C2MemFfiCallResult<C2MemFfiNativeUnixSocket>>;
+  connectWindows?(address: string, timeoutMs?: number): Promise<C2MemFfiCallResult<C2MemFfiNativeWindowsSocket>>;
   close(): void;
 }
 
@@ -131,6 +131,7 @@ export interface C2MemFfiLocalEndpointSymbols {
   c2_mem_ffi_endpoint_context_connect_windows?(
     context: C2MemFfiNativeLocalEndpointContext,
     address: string,
+    timeoutMs?: number,
   ): Promise<C2MemFfiCallResult<C2MemFfiNativeWindowsSocket>>;
 }
 
@@ -179,7 +180,7 @@ export interface C2NodeIpcConnection {
   close(): MaybePromise<void>;
 }
 
-export type C2NodeIpcConnect = (address: string) => MaybePromise<C2NodeIpcConnection>;
+export type C2NodeIpcConnect = (address: string, timeoutMs?: number) => MaybePromise<C2NodeIpcConnection>;
 
 /** First connect attempt freezes native configuration, including failed attempts. */
 export type C2NodeIpcConnector = C2NodeIpcConnect & {
@@ -519,7 +520,7 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
     }
     return requireNativeEndpointString(symbols.c2_mem_ffi_local_endpoint(address), "endpoint resolution");
   };
-  const connect = async (address: string): Promise<C2NodeIpcConnection> => {
+  const connect = async (address: string, timeoutMs?: number): Promise<C2NodeIpcConnection> => {
     let socket: C2NodeIpcSocket | undefined;
     try {
       freeze();
@@ -536,7 +537,7 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
         let owner: C2MemFfiNativeWindowsSocket | undefined;
         try {
           const native = nativeEndpointContext(active);
-          const result = await verifiedConnect(native, address);
+          const result = await verifiedConnect(native, address, timeoutMs);
           owner = result?.value;
           if (result?.status !== C2_MEM_FFI_STATUS_OK || owner === undefined
             || typeof owner.takeFd !== "function" || typeof owner.close !== "function") {
@@ -569,7 +570,7 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
         const active = leaseEndpointContext(snapshot.owner.state);
         let owner: C2MemFfiNativeUnixSocket | undefined;
         try {
-          const result = await nativeEndpointContext(active).connectUnix!(address);
+          const result = await nativeEndpointContext(active).connectUnix!(address, timeoutMs);
           owner = result?.value;
           if (result?.status !== C2_MEM_FFI_STATUS_OK || owner === undefined
             || typeof owner.takeFd !== "function" || typeof owner.close !== "function") {

@@ -11,7 +11,7 @@ use c2_mem::MemPool;
 use crate::client::{
     ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding,
 };
-use crate::response::{ResponseData, ResponseLease};
+use crate::response::ResponseData;
 
 /// Whether an IPC call failure is proven to precede CRM dispatch.
 ///
@@ -142,7 +142,7 @@ fn initialize_runtime<'a>(
         .expect("executor was published by its coordinator"))
 }
 
-/// Core's dedicated owner-control streams use the existing client I/O executor.
+/// Share the client I/O executor with Core's native connection operations.
 #[doc(hidden)]
 pub fn shared_io_handle(
     deadline: c2_config::ConnectDeadline,
@@ -301,12 +301,6 @@ impl SyncClient {
         self.inner.config()
     }
 
-    /// Consume response storage into owned bytes. Normal IPC calls have
-    /// already materialized their response and released transport storage.
-    pub fn lease_response(&self, response: ResponseData) -> ResponseLease {
-        ResponseLease::new(response)
-    }
-
     /// Synchronous close.
     pub fn close(&mut self) {
         self.rt.block_on(self.inner.close_shared());
@@ -325,6 +319,10 @@ impl SyncClient {
 
     pub(crate) fn deactivate(&self) {
         self.inner.deactivate();
+    }
+
+    pub(crate) fn retire(&self) {
+        self.inner.retire();
     }
 
     /// Whether the client is connected.

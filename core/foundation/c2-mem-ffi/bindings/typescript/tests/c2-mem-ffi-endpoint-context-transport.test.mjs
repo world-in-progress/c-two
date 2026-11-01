@@ -158,7 +158,7 @@ async function runWindowsScenario(server) {
 
     const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
     raw = symbols.c2_mem_ffi_local_endpoint_context_capture(null).value;
-    const owned = await raw.connectWindows(address);
+    const owned = await raw.connectWindows(address, 6000);
     assert.equal(owned.status, 0);
     owned.value.close(); owned.value.close();
     assert.throws(() => owned.value.takeFd(), /closed or transferred/);
@@ -305,7 +305,7 @@ async function runScenario(server, container) {
     await fdFixture.ready;
     const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
     const raw = symbols.c2_mem_ffi_local_endpoint_context_capture(rootA).value;
-    const owned = await raw.connectUnix(fdAddress);
+    const owned = await raw.connectUnix(fdAddress, 6000);
     assert.equal(owned.status, 0);
     owned.value.close(); owned.value.close();
     assert.throws(() => owned.value.takeFd(), /closed or transferred/);
@@ -343,11 +343,38 @@ if (process.argv[2] === '--endpoint-context-child') {
     process.exitCode = 1;
   }
 } else {
+  // Keep native pipe-instance contention in the existing Windows transport
+  // branch, so platform skip accounting remains owned by that same gate.
+  async function runWindowsConnectDeadlineScenario() {
+    const address = `ipc://node-deadline-${process.pid}-${randomBytes(6).toString('hex')}`;
+    const fixture = startServer(buildServer(), '-', address, 0x7c, 3, 'delayed-accept');
+    const connect = createNodeIpcConnect({});
+    let first, second, third;
+    try {
+      await fixture.ready;
+      first = await connect(address);
+      await exchange(first, 0x7c);
+      // accept() keeps one pending instance. Occupy it while the fixture
+      // delays its next accept, then time the third native connection.
+      second = await connect(address);
+      const started = performance.now();
+      third = await connect(address, 7000);
+      assert.ok(performance.now() - started > 5000, 'the third native pipe instance is delayed beyond the default guard');
+      await exchange(second, 0x7c); await exchange(third, 0x7c);
+      await first.close(); await second.close(); await third.close();
+      const result = await fixture.closed;
+      assert.equal(result.code, 0, `${JSON.stringify(result.messages)} ${result.stderr}`);
+    } finally {
+      await first?.close(); await second?.close(); await third?.close(); connect.close(); await stopServer(fixture);
+    }
+  }
+
   test('Native endpoint contexts retain verified streams and close pending connections', {
     timeout: 120_000,
   }, async (t) => {
     if (process.platform === 'win32') {
       await runWindowsScenario(buildServer());
+      await runWindowsConnectDeadlineScenario();
       return;
     }
     const explicitContainer = process.env.C2_ENDPOINT_CONTEXT_TEST_ROOT;

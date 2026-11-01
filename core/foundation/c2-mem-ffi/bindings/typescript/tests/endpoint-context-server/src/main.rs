@@ -77,7 +77,7 @@ async fn run() -> Result<(), Failure> {
         emit(metadata("probe"));
         return Ok(());
     }
-    if !matches!(arguments[0].as_str(), "serve" | "buffering") || arguments.len() != 5 {
+    if !matches!(arguments[0].as_str(), "serve" | "buffering" | "delayed-accept") || arguments.len() != 5 {
         return Err(Failure {
             phase: "arguments",
             message: "unknown fixture mode or missing serve arguments".into(),
@@ -100,7 +100,10 @@ async fn run() -> Result<(), Failure> {
 
     let mut tasks = tokio::task::JoinSet::new();
     let buffering = arguments[0] == "buffering";
-    for _ in 0..connections {
+    for index in 0..connections {
+        if arguments[0] == "delayed-accept" && index == 1 {
+            tokio::time::sleep(Duration::from_millis(5_500)).await;
+        }
         let mut stream = tokio::time::timeout(Duration::from_secs(15), listener.accept())
             .await
             .map_err(|error| Failure {

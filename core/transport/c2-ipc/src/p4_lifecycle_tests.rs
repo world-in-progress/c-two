@@ -94,7 +94,13 @@ async fn dropped_receive_task_preserves_first_cause_and_waits_only_for_remote_re
     let abort = stream.abort_handle();
     let (reader, writer) = stream.into_split();
     let pending = Arc::new(StdMutex::new(HashMap::new()));
-    let conn = ClientConnection::spawn(writer, pending.clone(), abort, retirement.clone());
+    let conn = ClientConnection::spawn(
+        writer,
+        pending.clone(),
+        abort,
+        retirement.clone(),
+        config().write_timeout(),
+    );
     let (_loan, pool, budget) = publish_file_loan(&conn, endpoint._root.path());
     let remote = conn
         .core

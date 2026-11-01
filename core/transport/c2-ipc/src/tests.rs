@@ -62,7 +62,7 @@ mod client_tests {
     fn encode_v2_inline_call() {
         // Verify that an inline v2 call frame has the expected layout:
         // [16B header (flags=FLAG_CALL_V2)] [call_control] [data]
-        let ctrl = encode_call_control(&call_identity("grid"), 0);
+        let ctrl = encode_call_control(&call_identity("grid"), 0).unwrap();
         let data = b"hello";
         let mut payload = Vec::new();
         payload.extend_from_slice(&ctrl);
@@ -145,7 +145,7 @@ mod client_tests {
         let buddy_bytes = encode_buddy_payload(&bp);
         assert_eq!(buddy_bytes.len(), BUDDY_PAYLOAD_SIZE);
 
-        let ctrl = encode_call_control(&call_identity("grid"), 3);
+        let ctrl = encode_call_control(&call_identity("grid"), 3).unwrap();
         let mut payload = Vec::new();
         payload.extend_from_slice(&buddy_bytes);
         payload.extend_from_slice(&ctrl);
@@ -190,7 +190,7 @@ mod client_tests {
         };
         let buddy_bytes = encode_buddy_payload(&bp);
 
-        let ctrl = encode_call_control(&call_identity("net"), 1);
+        let ctrl = encode_call_control(&call_identity("net"), 1).unwrap();
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&buddy_bytes);
@@ -211,7 +211,7 @@ mod client_tests {
     fn test_chunked_frame_encoding() {
         use c2_wire::chunk::header::encode_chunk_header;
 
-        let ctrl = encode_call_control(&call_identity("grid"), 2);
+        let ctrl = encode_call_control(&call_identity("grid"), 2).unwrap();
         let data = [0xABu8; 128];
         for (idx, count, last) in [(0, 1, true), (0, 3, false), (1, 3, false), (2, 3, true)] {
             let chunk_header = encode_chunk_header(idx, count);
@@ -531,10 +531,7 @@ mod endpoint_context_transport_tests {
     fn check_tag(client: &SyncClient, expected: u8) {
         let binding = client.acquire_route(&contract()).unwrap();
         let response = client.call_bound(&binding, "tag", &[]).unwrap();
-        assert_eq!(
-            client.lease_response(response).into_owned_bytes().unwrap(),
-            vec![expected]
-        );
+        assert_eq!(response.into_owned_bytes().unwrap(), vec![expected]);
     }
 
     #[test]

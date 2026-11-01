@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn rejected_reply_discards_only_its_declared_chunks_and_preserves_other_calls() {
+async fn rejected_reply_discards_late_chunks_and_preserves_other_calls() {
     for count in [1, 2] {
         let endpoint = Endpoint::new();
         let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
@@ -17,13 +17,13 @@ async fn rejected_reply_discards_only_its_declared_chunks_and_preserves_other_ca
                 .write_all(&reply_chunk(rejected.request_id, count, 0, &data))
                 .await
                 .unwrap();
-            let mut reply = encode_reply_control(&ReplyControl::Success);
-            reply.extend_from_slice(b"other");
+            let mut reply_bytes = encode_reply_control(&ReplyControl::Success);
+            reply_bytes.extend_from_slice(b"other");
             stream
                 .write_all(&frame::encode_frame(
                     other.request_id,
                     flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
-                    &reply,
+                    &reply_bytes,
                 ))
                 .await
                 .unwrap();
@@ -34,13 +34,13 @@ async fn rejected_reply_discards_only_its_declared_chunks_and_preserves_other_ca
                     .unwrap();
             }
             let (after, _) = read_frame(&mut stream).await;
-            let mut reply = encode_reply_control(&ReplyControl::Success);
-            reply.extend_from_slice(b"after");
+            let mut reply_bytes = encode_reply_control(&ReplyControl::Success);
+            reply_bytes.extend_from_slice(b"after");
             stream
                 .write_all(&frame::encode_frame(
                     after.request_id,
                     flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
-                    &reply,
+                    &reply_bytes,
                 ))
                 .await
                 .unwrap();
@@ -49,6 +49,8 @@ async fn rejected_reply_discards_only_its_declared_chunks_and_preserves_other_ca
                 .write_all(&reply_chunk(rejected.request_id, count, 1, &data))
                 .await
                 .unwrap();
+            let (tail, _) = read_frame(&mut stream).await;
+            reply(&mut stream, tail.request_id, b"tail").await;
             expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
@@ -92,7 +94,16 @@ async fn rejected_reply_discards_only_its_declared_chunks_and_preserves_other_ca
         assert_eq!(client.pending_len_for_test(), 0);
         assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
         send_unknown.send(()).unwrap();
-        eventually(|| !client.is_connected()).await;
+        assert_eq!(
+            client
+                .call_inline(&identity(), 0, b"tail")
+                .await
+                .unwrap()
+                .into_owned_bytes()
+                .unwrap(),
+            b"tail"
+        );
+        assert!(client.is_connected());
         assert!(client.close_shared_bounded(WAIT).await);
         timeout(WAIT, peer).await.unwrap().unwrap();
     }
@@ -194,6 +205,7 @@ async fn deactivation_distinguishes_unpublished_calls_from_started_dispatch() {
             assert!(!request.is_buddy());
             let (_, consumed) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
             assert_eq!(&payload[consumed..], b"first");
+            reply(&mut stream, request.request_id, b"first").await;
             expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
@@ -230,17 +242,28 @@ async fn deactivation_distinguishes_unpublished_calls_from_started_dispatch() {
             ConnectionEndReason::LocalClose,
             "test_deactivate_before_dispatch",
         );
+        assert_eq!(
+            client.pending_len_for_test(),
+            1,
+            "unpolled queued waiter is removed on deactivation"
+        );
         let queued_error = queued.await.unwrap_err();
-        let started_error = first.await.unwrap().unwrap_err();
+        assert!(!first.is_finished());
         resume.send(()).unwrap();
+        assert_eq!(
+            timeout(WAIT, first)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_owned_bytes()
+                .unwrap(),
+            b"first"
+        );
         assert!(client.close_shared_bounded(WAIT).await);
         peer.await.unwrap();
         assert!(matches!(queued_error.source_error(), IpcError::Closed));
         assert_eq!(queued_error.phase(), crate::TransportPhase::PreDispatch);
-        assert_eq!(
-            started_error.phase(),
-            crate::TransportPhase::DispatchUncertain
-        );
         assert_eq!(client.pending_len_for_test(), 0);
     }
 }
@@ -252,7 +275,8 @@ async fn deactivation_before_shm_dispatch_reports_pre_dispatch_and_releases_its_
         let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
         let peer = tokio::spawn(async move {
             let mut stream = accept(&mut listener).await;
-            let _ = read_frame(&mut stream).await;
+            let (first, _) = read_frame(&mut stream).await;
+            reply(&mut stream, first.request_id, b"first").await;
             expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
@@ -291,8 +315,18 @@ async fn deactivation_before_shm_dispatch_reports_pre_dispatch_and_releases_its_
         );
         let error = queued.await.unwrap_err();
         assert_eq!(pool.read().stats().alloc_count, 0);
-        assert!(first.await.unwrap().is_err());
+        assert!(!first.is_finished());
         resume.send(()).unwrap();
+        assert_eq!(
+            timeout(WAIT, first)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_owned_bytes()
+                .unwrap(),
+            b"first"
+        );
         assert!(client.close_shared_bounded(WAIT).await);
         peer.await.unwrap();
         assert!(matches!(error.source_error(), IpcError::Closed));

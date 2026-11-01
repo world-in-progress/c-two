@@ -893,6 +893,72 @@ function server() {
 const transport = (s, extra = {}) => createIpcEncodedTransport('ipc://persistent', {connect: s.connect, ...extra});
 const call = (t, name = 'manager') => t.call(name, CONTRACT, 'ping', new Uint8Array());
 
+test('Node IPC connection deadline accepts only positive safe milliseconds', () => {
+  const s = server();
+  for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => transport(s, {connectTimeoutMs: value}), /connectTimeoutMs must be a positive safe integer/);
+  }
+});
+
+// This generated Node test also runs on Windows in the existing codegen CI gate.
+test('Node IPC explicit connection budget can exceed the native five-second guard', {timeout: 8000}, async () => {
+  const s = server();
+  let passedBudget;
+  const t = transport(s, {
+    connectTimeoutMs: 6500,
+    async connect(address, timeoutMs) {
+      assert.equal(address, 'ipc://persistent');
+      passedBudget = timeoutMs;
+      await new Promise(resolve => setTimeout(resolve, 5100));
+      return s.connect();
+    },
+  });
+  try {
+    await call(t);
+    assert.ok(passedBudget > 5000 && passedBudget <= 6500);
+    assert.equal(s.calls.length, 1);
+  } finally { await t.close(); }
+});
+
+test('Node IPC connect expiry closes a late connection without business dispatch', {timeout: 1000}, async () => {
+  const s = server();
+  const t = transport(s, {
+    connectTimeoutMs: 25,
+    async connect() {
+      await new Promise(resolve => setTimeout(resolve, 75));
+      return s.connect();
+    },
+  });
+  try {
+    await assert.rejects(() => call(t), /connection deadline expired/);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(s.connections.length, 1);
+    assert.equal(s.connections[0].closed, 1);
+    assert.equal(s.calls.length, 0);
+  } finally { await t.close(); }
+});
+
+test('Node IPC metadata handshake shares the connection deadline', {timeout: 1000}, async () => {
+  const s = server();
+  const t = transport(s, {
+    connectTimeoutMs: 25,
+    async connect() {
+      const connection = await s.connect();
+      return {
+        ...connection,
+        async readExactly() { return await new Promise(() => {}); },
+        close() { return connection.close(); },
+      };
+    },
+  });
+  try {
+    await assert.rejects(() => call(t), /connection deadline expired/);
+    assert.equal(s.connections.length, 1);
+    assert.equal(s.connections[0].closed, 1);
+    assert.equal(s.calls.length, 0);
+  } finally { await t.close(); }
+});
+
 test('authoritative late route, shared serial prepare/calls, and independent tokens', async () => {
   const s = server(), t = transport(s);
   await call(t);
@@ -1144,6 +1210,25 @@ const refusalPayload = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 70
 const refusal = (id) => frame(id, 2 | 256, Buffer.concat([Buffer.from([1]), u32(refusalPayload.length), refusalPayload]));
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
 
+test('an early complete success ends chunk upload after a whole frame and keeps the stream', async () => {
+  const s = server(), t = transport(s, {requestChunkSize: 2});
+  let replied = false;
+  s.onCall = ({id, feed}) => {
+    if (!replied) {
+      replied = true;
+      feed(frame(id, 2 | 256, Buffer.from([0])));
+    }
+  };
+  try {
+    await t.call('manager', CONTRACT, 'ping', new Uint8Array(8));
+    assert.ok(s.calls.length > 0 && s.calls.length < 4);
+    assert.equal(s.connections[0].closed, 0);
+    s.onCall = undefined;
+    await call(t);
+    assert.equal(s.connections.length, 1);
+  } finally { await t.close(); }
+});
+
 for (const failure of ['refusal', 'refusal-with-successful-write', 'wrong-id', 'bad-flags', 'read-loss']) {
   test(`chunked ${failure} settles its write before the next call`, async () => {
     const s = server(), t = transport(s, {requestChunkSize: 2});
@@ -1171,7 +1256,11 @@ for (const failure of ['refusal', 'refusal-with-successful-write', 'wrong-id', '
       } else {
         assert.match(error.message, failure === 'wrong-id' ? /did not match/ : failure === 'bad-flags' ? /v2 reply/ : /independent read failure/);
       }
-      assert.equal(s.calls.length, failure === 'read-loss' ? 1 : 4, 'completed frames are not replayed');
+      if (failure.startsWith('refusal')) {
+        assert.ok(s.calls.length > 0 && s.calls.length < 4, 'a complete service refusal stops later chunks');
+      } else {
+        assert.equal(s.calls.length, failure === 'read-loss' ? 1 : 4, 'completed frames are not replayed');
+      }
       assert.equal(s.writesAfterClose, 0);
       s.onCall = undefined;
       await call(t); await call(t);

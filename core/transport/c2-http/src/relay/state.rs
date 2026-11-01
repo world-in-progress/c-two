@@ -537,11 +537,17 @@ impl RelayState {
         }
     }
 
-    // Mark the exact registered owner before awaiting native disconnect initiation.
+    // Mark the exact registered owner before awaiting native retirement.
     // A false confirmation leaves that owner with the bounded lifecycle observer.
     async fn close_failed_acquire_client(&self, client: &Arc<IpcClient>) {
         self.clients.close(client);
-        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        let confirmed = match client.connection_observation() {
+            Some(observation) => observation
+                .wait_closed(Some(Duration::from_millis(50)))
+                .await
+                .is_some(),
+            None => true,
+        };
         if !confirmed {
             tracing::debug!("relay acquire cleanup remains owned by lifecycle observer");
         }

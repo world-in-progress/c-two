@@ -41,12 +41,12 @@ function compileContextFixture(directory, omittedSymbol, connectStatus = 1) {
     // socket. The reference-count tests do not need an injected JS connector.
     if (name === 'c2_mem_ffi_local_endpoint_context_connect_unix') return `
       #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
-        _ctx: *const Context, _address: *const u8, fd: *mut i32, os: *mut i32) -> u32 {
+        _ctx: *const Context, _address: *const u8, _timeout: *const u64, fd: *mut i32, os: *mut i32) -> u32 {
         unsafe { *fd = -1; *os = 0; } ${connectStatus}
       }`;
     if (name === 'c2_mem_ffi_local_endpoint_context_connect_windows') return `
       #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
-        _ctx: *const Context, _address: *const u8, pipe: *mut usize, process: *mut usize, os: *mut i32) -> u32 {
+        _ctx: *const Context, _address: *const u8, _timeout: *const u64, pipe: *mut usize, process: *mut usize, os: *mut i32) -> u32 {
         unsafe { *pipe = 0; *process = 0; *os = 0; } ${connectStatus}
       }`;
     return `#[unsafe(no_mangle)] pub extern "C" fn ${name}() { std::process::abort(); }`;

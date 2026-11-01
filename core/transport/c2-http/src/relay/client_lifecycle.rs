@@ -123,16 +123,21 @@ impl ClientLifecycle {
 
     pub(crate) fn close(&self, client: &Arc<IpcClient>) {
         let mut inner = self.inner.lock();
-        for entry in inner.entries.iter_mut().flatten() {
-            if entry
+        let found = inner.entries.iter_mut().flatten().any(|entry| {
+            let matched = entry
                 .client
                 .as_ref()
-                .is_some_and(|owned| Arc::ptr_eq(owned, client))
-            {
+                .is_some_and(|owned| Arc::ptr_eq(owned, client));
+            if matched {
                 entry.closing = true;
-                self.changed.notify_one();
-                return;
             }
+            matched
+        });
+        if found {
+            drop(inner);
+            client.retire();
+            self.changed.notify_one();
+            return;
         }
         // Production clients are always registered before connection I/O.
         // Test-only manually inserted clients have no native runtime work.
@@ -158,12 +163,24 @@ impl ClientLifecycle {
                         let entry = entry.as_ref()?;
                         let client = entry.client.as_ref()?;
                         (entry.closing || !client.is_connected() || Arc::strong_count(client) == 1)
-                            .then(|| (slot, client.clone()))
+                            .then(|| (slot, client.clone(), inner.closed))
                     })
                     .collect::<Vec<_>>()
             };
-            for (slot, client) in work {
-                if client.close_shared_bounded(Duration::from_millis(50)).await {
+            for (slot, client, force) in work {
+                let confirmed = if force {
+                    client.close_shared_bounded(Duration::from_millis(50)).await
+                } else {
+                    client.retire();
+                    match client.connection_observation() {
+                        Some(observation) => observation
+                            .wait_closed(Some(Duration::from_millis(50)))
+                            .await
+                            .is_some(),
+                        None => true,
+                    }
+                };
+                if confirmed {
                     self.inner.lock().entries[slot] = None;
                     self.drained.notify_waiters();
                 }

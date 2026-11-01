@@ -988,6 +988,88 @@ impl Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_upstream_preserves_forwarded_reply_and_reconnects_new_request() {
+    let mut fixture = Fixture::start(Carrier::Inline, 2, (2 * INPUT_LEN) as u64).await;
+    let result = AssertUnwindSafe(async {
+        let socket = fixture.socket;
+        let old_head = fixture.head("target", &format!("Content-Length: {INPUT_LEN}"));
+        let old_request = tokio::spawn(async move {
+            let mut stream = bounded(tokio::net::TcpStream::connect(socket))
+                .await
+                .unwrap();
+            bounded(stream.write_all(old_head.as_bytes()))
+                .await
+                .unwrap();
+            bounded(stream.write_all(&vec![7; INPUT_LEN]))
+                .await
+                .unwrap();
+            bounded(read_framed_reply(&mut stream)).await.unwrap()
+        });
+        bounded(fixture.probe.entered[1].notified()).await;
+        fixture.state.clients.close(&fixture.client);
+        assert!(!fixture.client.is_connected());
+
+        let (replacement_lease, _) =
+            bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+                .await
+                .unwrap_or_else(|_| panic!("retired route must acquire a fresh upstream"));
+        assert!(!Arc::ptr_eq(&replacement_lease.client(), &fixture.client));
+        let replacement = replacement_lease.client();
+        drop(replacement_lease);
+        assert!(replacement.is_connected());
+
+        let mut new_stream = bounded(tokio::net::TcpStream::connect(fixture.socket))
+            .await
+            .unwrap();
+        bounded(
+            new_stream.write_all(
+                fixture
+                    .head("ping", &format!("Content-Length: {INPUT_LEN}"))
+                    .as_bytes(),
+            ),
+        )
+        .await
+        .unwrap();
+        bounded(new_stream.write_all(&vec![7; INPUT_LEN]))
+            .await
+            .unwrap();
+        let new_reply = bounded(read_framed_reply(&mut new_stream)).await.unwrap();
+        assert!(
+            new_reply.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&new_reply)
+        );
+        assert_eq!(fixture.probe.calls[2].load(Ordering::SeqCst), 1);
+        assert!(!old_request.is_finished());
+
+        fixture.release(1);
+        let old_reply = bounded(old_request).await.unwrap();
+        assert!(
+            old_reply.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&old_reply)
+        );
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1);
+        eventually(|| {
+            fixture
+                .client
+                .connection_observation()
+                .unwrap()
+                .snapshot()
+                .is_some()
+        })
+        .await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.release(1);
+    fixture.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
     let mut fixture = Fixture::start(Carrier::Inline, 1, INPUT_LEN as u64).await;
     let result = AssertUnwindSafe(async {
@@ -1347,7 +1429,7 @@ async fn h1_chunked_upstream_source_fault_is_dispatch_uncertain_and_reclaims_act
         bounded(upload.write_all(&[7; INPUT_LEN / 2])).await.unwrap();
         // This charge belongs to the real server ChunkRegistry. It can only
         // exist after the first actual IPC chunk reaches the upstream reader.
-        eventually(|| fixture.server.memory_budget_snapshot().budget.reassembly.used_bytes == INPUT_LEN as u64).await;
+        eventually(|| fixture.server.memory_budget_snapshot().budget.reassembly.used_bytes == INPUT_LEN as u64 + 2).await;
         assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0);
         assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (1, INPUT_LEN as u64));
         bounded(upload.shutdown()).await.unwrap();
@@ -1371,11 +1453,15 @@ async fn h1_chunked_upstream_source_fault_is_dispatch_uncertain_and_reclaims_act
     }
 }
 
-// The existing IPC writer pause follows begin_io and precedes the first byte.
+#[derive(Clone, Copy)]
+enum WriterPausePoint {
+    BeforeFirstByte,
+    AfterEightBytePrefix,
+}
+
 // The HTTP input is complete before its socket leaves; missing source bytes
-// cannot be mistaken for a cancelled waiter in this regression.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn h1_disconnect_after_ipc_write_begins_before_first_byte_preserves_same_client() {
+// cannot be mistaken for a cancelled waiter in either regression.
+async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPausePoint) {
     const LEN: usize = 32;
     let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, LEN as u64, LEN).await;
     let client = fixture.client.clone();
@@ -1400,11 +1486,18 @@ async fn h1_disconnect_after_ipc_write_begins_before_first_byte_preserves_same_c
         // Finish the live route-token lookup before arming the writer pause,
         // so the pause observes the target business frame rather than lookup.
         bounded(acquired_rx).await.expect("target route-token lookup must finish");
-        fixture.client.set_write_pause_for_test(Some((write_started_tx, release_rx)));
+        match pause_point {
+            WriterPausePoint::BeforeFirstByte => fixture
+                .client
+                .set_write_pause_for_test(Some((write_started_tx, release_rx))),
+            WriterPausePoint::AfterEightBytePrefix => fixture
+                .client
+                .set_write_prefix_pause_for_test(Some((write_started_tx, release_rx))),
+        }
         acquire_release.take().unwrap().send(()).unwrap();
-        bounded(write_started_rx).await.expect("the real IPC writer must begin_io before parking without writing a byte");
+        bounded(write_started_rx).await.expect("the real IPC writer must reach the selected pause point");
         assert_eq!(fixture.client.pending_len_for_test(), 2, "target and previously dispatched other RID share one client");
-        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0, "no frame bytes have reached the target callback");
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0, "the incomplete frame has not reached the target callback");
         let before = fixture.state.forwarding.detached_waiters();
         drop(upload);
         eventually(|| fixture.state.forwarding.detached_waiters() > before).await;
@@ -1438,7 +1531,11 @@ async fn h1_disconnect_after_ipc_write_begins_before_first_byte_preserves_same_c
         drop(lease);
         assert_eq!(fixture.probe.calls.each_ref().map(|calls| calls.load(Ordering::SeqCst)), [1, 1, 1]);
         assert_eq!(fixture.state.upstream_memory_snapshot().reassembly.used_bytes, 0);
-        eprintln!("[relay-forwarding] real H1 full_input=32 write_started=true bytes_written_before_pause=0 same_client=true pending={} retention={:?}", fixture.client.pending_len_for_test(), fixture.state.forwarding.snapshot());
+        let bytes_written_before_pause = match pause_point {
+            WriterPausePoint::BeforeFirstByte => 0,
+            WriterPausePoint::AfterEightBytePrefix => 8,
+        };
+        eprintln!("[relay-forwarding] real H1 full_input=32 write_started=true bytes_written_before_pause={bytes_written_before_pause} same_client=true pending={} retention={:?}", fixture.client.pending_len_for_test(), fixture.state.forwarding.snapshot());
     }).catch_unwind().await;
     // Release the one-shot writer even after assertion failure, then release
     // bounded callback waits and confirm both actual listener tasks exit.
@@ -1449,6 +1546,7 @@ async fn h1_disconnect_after_ipc_write_begins_before_first_byte_preserves_same_c
         let _ = release.send(());
     }
     fixture.client.set_write_pause_for_test(None);
+    fixture.client.set_write_prefix_pause_for_test(None);
     fixture.release(0);
     fixture.release(1);
     if !other_joined {
@@ -1458,6 +1556,18 @@ async fn h1_disconnect_after_ipc_write_begins_before_first_byte_preserves_same_c
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+// The first pause follows begin_io but precedes the first frame byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h1_disconnect_after_ipc_write_begins_before_first_byte_preserves_same_client() {
+    disconnect_during_ipc_write_preserves_same_client(WriterPausePoint::BeforeFirstByte).await;
+}
+
+// The second pause follows an actual write of the first eight frame bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() {
+    disconnect_during_ipc_write_preserves_same_client(WriterPausePoint::AfterEightBytePrefix).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -38,6 +38,7 @@ use super::types::RouteEntry;
 
 const PAYLOAD_LEN: usize = 8192;
 const CHUNK_SIZE: u64 = 4096;
+const REASSEMBLY_CHARGE: u64 = PAYLOAD_LEN as u64 + (PAYLOAD_LEN as u64).div_ceil(CHUNK_SIZE);
 const DEADLINE: Duration = Duration::from_secs(10);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -401,7 +402,7 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() {
     let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64;
-    let state = state(policy(charge, PAYLOAD_LEN as u64, PAYLOAD_LEN as u64));
+    let state = state(policy(charge, PAYLOAD_LEN as u64, REASSEMBLY_CHARGE));
     let a = Upstream::start(&state, "request", 23, false).await;
     let b = Upstream::start(&state, "reply", 181, true).await;
     // Each role individually succeeds with real dedicated SHM storage.
@@ -476,7 +477,7 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() 
     );
     assert_eq!(overlap.shm.rejected_bytes, held.shm.rejected_bytes + charge);
     assert_eq!(overlap.file.peak_bytes, PAYLOAD_LEN as u64);
-    assert_eq!(overlap.reassembly.peak_bytes, PAYLOAD_LEN as u64);
+    assert_eq!(overlap.reassembly.peak_bytes, REASSEMBLY_CHARGE);
     assert_eq!(
         (overlap.file.used_bytes, overlap.reassembly.used_bytes),
         (0, 0),
@@ -547,11 +548,12 @@ async fn shared_response_capacity(file_is_tighter: bool) {
             };
             if admits {
                 assert_eq!(current.file.peak_bytes, one);
-                assert_eq!(current.reassembly.peak_bytes, one);
+                assert_eq!(current.reassembly.peak_bytes, REASSEMBLY_CHARGE);
                 assert_eq!(cell.rejected_allocations, old_cell.rejected_allocations);
             } else {
                 assert_eq!(cell.rejected_allocations, old_cell.rejected_allocations + 1);
-                assert_eq!(cell.rejected_bytes, old_cell.rejected_bytes + one);
+                let charge = if file_is_tighter { one } else { REASSEMBLY_CHARGE };
+                assert_eq!(cell.rejected_bytes, old_cell.rejected_bytes + charge);
                 assert_eq!(
                     expect_inline(call(client, binding, upstream).await),
                     b"ok",
@@ -598,7 +600,7 @@ async fn zero_response_budgets_reject_real_allocation_without_charge_or_replay()
         let state = state(policy(
             0,
             if file_zero { 0 } else { one },
-            if file_zero { one } else { 0 },
+            if file_zero { REASSEMBLY_CHARGE } else { 0 },
         ));
         let upstream = Upstream::start(&state, "zero", 67, true).await;
         let (lease, client, binding) = upstream.acquire(&state).await;
@@ -624,7 +626,8 @@ async fn zero_response_budgets_reject_real_allocation_without_charge_or_replay()
             after_cell.rejected_allocations,
             before_cell.rejected_allocations + 1
         );
-        assert_eq!(after_cell.rejected_bytes, before_cell.rejected_bytes + one);
+        let charge = if file_zero { one } else { REASSEMBLY_CHARGE };
+        assert_eq!(after_cell.rejected_bytes, before_cell.rejected_bytes + charge);
         assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 1);
         assert!(client.is_connected());
         drop(lease);
@@ -829,7 +832,7 @@ async fn exercise_http_upload(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_http_incomplete_upload_and_completed_call_refund_after_idle_close() {
     let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64;
-    let state = state(policy(charge, PAYLOAD_LEN as u64, PAYLOAD_LEN as u64));
+    let state = state(policy(charge, PAYLOAD_LEN as u64, REASSEMBLY_CHARGE));
     let upstream = Upstream::start(&state, "http", 113, true).await;
     // Keep the original acquired client so an unnoticed eviction/replacement
     // cannot masquerade as survival of the HTTP upload's connection.

@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use c2_mem::{PeerMappingError, PeerRead};
 use c2_wire::{buddy::BuddyPayload, chunk::ReassemblyBacking, connection::RemoteLoan};
 use parking_lot::RwLock;
 
@@ -18,9 +19,10 @@ pub enum ResponseData {
 /// An admitted remote read, bound to its original mapping and physical stream.
 /// Dropping an unread carrier also queues exactly one release record.
 pub struct ServerShmResponse {
-    pool: Arc<RwLock<ServerPoolState>>,
+    // Fields drop in order: end the mapped read before queueing its release.
+    read: PeerRead,
     payload: BuddyPayload,
-    loan: RemoteLoan,
+    _loan: RemoteLoan,
 }
 
 impl std::fmt::Debug for ServerShmResponse {
@@ -36,14 +38,14 @@ impl ServerShmResponse {
         pool: Arc<RwLock<ServerPoolState>>,
         payload: BuddyPayload,
         loan: RemoteLoan,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, PeerMappingError> {
         // The loan is already admitted: mapping/validation failure ends its
         // read interval and queues release via Drop, just like a copy failure.
-        pool.write().admit(&payload)?;
+        let read = pool.write().admit(&payload)?;
         Ok(Self {
-            pool,
+            read,
             payload,
-            loan,
+            _loan: loan,
         })
     }
 
@@ -58,8 +60,10 @@ impl ServerShmResponse {
     }
 
     fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
-        let result = self.pool.read().copy_response(&self.payload);
-        self.loan.finish();
+        // SAFETY: the admitted move-only read pins the original mapping, and
+        // its remote loan keeps the peer's span immutable through this copy.
+        let result = unsafe { self.read.copy() };
+        drop(self);
         result
     }
 }
@@ -89,17 +93,5 @@ impl ResponseData {
                 copied
             }
         }
-    }
-}
-
-/// Consuming transport boundary: no public copy-then-retain/retry operation.
-pub struct ResponseLease(ResponseData);
-
-impl ResponseLease {
-    pub fn new(response: ResponseData) -> Self {
-        Self(response)
-    }
-    pub fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
-        self.0.into_owned_bytes()
     }
 }

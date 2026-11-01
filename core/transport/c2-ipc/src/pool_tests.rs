@@ -125,7 +125,7 @@ impl Drop for Serving {
 }
 
 #[test]
-fn eviction_reports_peer_close_message_through_the_client_connection_driver() {
+fn eviction_retires_physical_connection_after_pending_work() {
     let mut serving = Serving::new();
     let address = serving.start("eviction_disconnect");
     serving.runtime.block_on(async {
@@ -157,8 +157,7 @@ fn eviction_reports_peer_close_message_through_the_client_connection_driver() {
         .runtime
         .block_on(observation.wait_closed(Some(WAIT)))
         .unwrap();
-    assert_eq!(closed.reason(), ConnectionEndReason::PeerCloseMessage);
-    assert_eq!(closed.operation(), "disconnect");
+    assert_eq!(closed.reason(), ConnectionEndReason::PeerEof);
     assert_eq!(
         serving.closed(&client).reason(),
         ConnectionEndReason::LocalClose
@@ -266,7 +265,10 @@ fn original_native_abnormal_end_survives_timeout_and_late_seed_merge() {
         let mut state = pool.state.lock();
         state.entries.remove(&address).unwrap();
         let record = state.record(&address);
-        *record.state.lock() = CloseState::Closing(Some(native));
+        *record.state.lock() = CloseState::Closing {
+            observation: Some(native),
+            client: None,
+        };
     }
     let seed = pool.prepare_seal(Instant::now() + WAIT).unwrap().commit();
     let duplicate_seed = ClientCloseSeed {
@@ -485,7 +487,10 @@ fn concurrent_drains_serialize_and_reject_acquires_with_aggregate_deadline() {
         let mut state = pool.state.lock();
         state.entries.remove(address).unwrap();
         let record = state.record(address);
-        *record.state.lock() = CloseState::Closing(Some(native));
+        *record.state.lock() = CloseState::Closing {
+            observation: Some(native),
+            client: None,
+        };
         retained.push(client);
     }
     let draining_pool = Arc::clone(&pool);
@@ -795,4 +800,155 @@ fn registration_attestation_accepts_committed_closed_route() {
         server.open_route_admission(admission).await.unwrap();
         client.close().await;
     });
+}
+
+struct PausedEcho {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl CrmCallback for PausedEcho {
+    fn invoke(
+        &self,
+        _: &str,
+        _: u16,
+        input: Vec<u8>,
+        _: Arc<c2_server::ResponsePool>,
+    ) -> Result<ResponseMeta, CrmError> {
+        if input == b"old" {
+            self.entered.send(()).unwrap();
+            self.resume.lock().recv_timeout(WAIT).unwrap();
+        }
+        Ok(ResponseMeta::Inline(input))
+    }
+}
+
+fn retired_pool_client_preserves_sent_reply(discard: bool, force_close: bool) {
+    let mut serving = Serving::new();
+    let address = if force_close {
+        "ipc://pool_close_retired_sent_reply"
+    } else if discard {
+        "ipc://pool_discard_sent_reply"
+    } else {
+        "ipc://pool_retirement_sent_reply"
+    };
+    let expected = c2_contract::ExpectedRouteContract {
+        route_name: "grid".into(),
+        crm_ns: "test.pool".into(),
+        crm_name: "Grid".into(),
+        crm_ver: "0.1.0".into(),
+        abi_hash: "01".repeat(32),
+        signature_hash: "02".repeat(32),
+    };
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let endpoint = serving.context.endpoint(address).unwrap();
+    let server = Arc::new(Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap());
+    let built = server
+        .build_route(
+            RouteBuildSpec {
+                name: expected.route_name.clone(),
+                crm_ns: expected.crm_ns.clone(),
+                crm_name: expected.crm_name.clone(),
+                crm_ver: expected.crm_ver.clone(),
+                abi_hash: expected.abi_hash.clone(),
+                signature_hash: expected.signature_hash.clone(),
+                method_names: vec!["ping".into()],
+                access_map: HashMap::new(),
+                concurrency_mode: ConcurrencyMode::Parallel,
+                limits: SchedulerLimits::default(),
+            },
+            Arc::new(PausedEcho {
+                entered: entered_tx,
+                resume: parking_lot::Mutex::new(resume_rx),
+            }),
+        )
+        .unwrap();
+    serving.runtime.block_on(async {
+        let reservation = server.reserve_route(built).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+    });
+    let runner = server.clone();
+    serving
+        .runtime
+        .spawn(async move { runner.run().await.unwrap() });
+    serving
+        .runtime
+        .block_on(server.wait_until_responsive(WAIT))
+        .unwrap();
+    serving.servers.push(server);
+
+    let pool = serving.pool(WAIT);
+    let old = pool.acquire(address, None).unwrap();
+    let old_binding = old.acquire_route(&expected).unwrap();
+    let old_observation = old.connection_observation().unwrap();
+    let old_call = {
+        let old = old.clone();
+        thread::spawn(move || old.call_bound_phased(&old_binding, "ping", b"old"))
+    };
+    entered_rx.recv_timeout(WAIT).unwrap();
+    if discard {
+        assert!(pool.discard_if_same(address, &old));
+    } else {
+        old.retire();
+    }
+    assert!(!old.is_connected());
+    let replacement = pool.acquire(address, None).unwrap();
+    assert!(!Arc::ptr_eq(&old, &replacement));
+    let new_binding = replacement.acquire_route(&expected).unwrap();
+    assert_eq!(
+        replacement
+            .call_bound(&new_binding, "ping", b"new")
+            .unwrap()
+            .into_owned_bytes()
+            .unwrap(),
+        b"new"
+    );
+    assert!(old_observation.snapshot().is_none());
+    if force_close {
+        let report = pool.close_all(WAIT);
+        assert!(
+            report.error.is_none() && report.unconfirmed.is_empty(),
+            "{report:?}"
+        );
+        let error = old_call.join().unwrap().unwrap_err();
+        assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
+        assert!(matches!(error.source_error(), IpcError::Closed));
+        let _ = resume_tx.send(());
+    } else {
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            old_call
+                .join()
+                .unwrap()
+                .unwrap()
+                .into_owned_bytes()
+                .unwrap(),
+            b"old"
+        );
+    }
+    assert!(
+        serving
+            .runtime
+            .block_on(old_observation.wait_closed(Some(WAIT)))
+            .is_some()
+    );
+    if !force_close {
+        assert!(pool.close_all(WAIT).unconfirmed.is_empty());
+    }
+}
+
+#[test]
+fn replacement_after_retirement_preserves_sent_reply_on_old_connection() {
+    retired_pool_client_preserves_sent_reply(false, false);
+}
+
+#[test]
+fn discard_preserves_sent_reply_on_old_connection() {
+    retired_pool_client_preserves_sent_reply(true, false);
+}
+
+#[test]
+fn close_all_aborts_sent_calls_on_previously_retired_clients() {
+    retired_pool_client_preserves_sent_reply(false, true);
 }

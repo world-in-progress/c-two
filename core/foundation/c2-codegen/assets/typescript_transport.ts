@@ -69,7 +69,7 @@ export interface C2IpcConnection {
   close(): void | Promise<void>;
 }
 
-export type C2IpcConnect = (address: string) => C2IpcConnection | Promise<C2IpcConnection>;
+export type C2IpcConnect = (address: string, timeoutMs?: number) => C2IpcConnection | Promise<C2IpcConnection>;
 
 export interface C2IpcShmBlock {
   readonly segmentIndex: number;
@@ -103,6 +103,8 @@ export interface C2IpcMemoryContext {
 
 export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> {
   readonly connect: C2IpcConnect;
+  /** One deadline from native connection through the IPC metadata handshake. */
+  readonly connectTimeoutMs?: number;
   readonly responsePayloadAllocator?: C2ResponsePayloadAllocator<Payload>;
   readonly requestShmThreshold?: number;
   readonly requestChunkSize?: number;
@@ -331,6 +333,7 @@ class C2IpcConnectionFailure extends C2IpcTransportError {
 export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(address: string, options: C2IpcTransportOptions<Payload>): C2IpcEncodedTransport<Payload> {
   validateIpcAddress(address);
   const connect = normalizeIpcConnect(options, "C-Two IPC transport options");
+  const connectTimeoutMs = normalizeIpcConnectTimeoutMs(options.connectTimeoutMs);
   const responsePayloadAllocator = normalizeResponsePayloadAllocator(options.responsePayloadAllocator, "C-Two IPC responsePayloadAllocator");
   const requestShmThreshold = normalizeIpcRequestShmThreshold(options.requestShmThreshold, "C-Two IPC requestShmThreshold");
   const requestChunkSize = normalizeIpcRequestChunkSize(options.requestChunkSize, "C-Two IPC requestChunkSize");
@@ -350,7 +353,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
 
   const openConnection = (): Promise<C2IpcOpenConnection> => {
     if (connectionPromise === undefined) {
-      connectionPromise = connectAndHandshakeIpc(address, connect).catch((error) => {
+      connectionPromise = connectAndHandshakeIpc(address, connect, connectTimeoutMs).catch((error) => {
         connectionPromise = undefined;
         throw error;
       });
@@ -517,6 +520,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           && requestPayload.byteLength > requestShmThreshold
           && requestPayload.byteLength <= 0xffffffff;
         const chunked = !useShm && requestPayload.byteLength > requestChunkSize;
+        let stopChunkUpload = false;
         const receive = async (): Promise<C2IpcCallResponse> => {
           let frame: C2IpcFrame;
           try {
@@ -533,6 +537,10 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           let admitted = false;
           let chunkReaderStarted = false;
           try {
+            if (frame.requestId === requestId && (frame.flags & C2_IPC_FLAG_RESPONSE) !== 0
+              && (frame.flags & C2_IPC_FLAG_CHUNKED) === 0) {
+              stopChunkUpload = true;
+            }
             if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
               buddy = decodeIpcBuddyPayload(frame.payload);
               if (memory === undefined) throw new C2IpcTransportError("C-Two IPC SHM response has no native memory context.");
@@ -564,7 +572,9 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
             }
             if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0) {
               chunkReaderStarted = true;
-              return { kind: "inline", payload: await readIpcChunkedSuccessPayload(open, frame, requestId) };
+              const payload = await readIpcChunkedSuccessPayload(open, frame, requestId);
+              stopChunkUpload = true;
+              return { kind: "inline", payload };
             }
             const reply = decodeIpcReplyControl(frame.payload.subarray(buddy === undefined ? 0 : C2_IPC_BUDDY_PAYLOAD_BYTES));
             if (reply.kind === "error") throw new C2CrmMethodError(reply.payload);
@@ -621,6 +631,9 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
                 await writeIpcBuddyCallRequestFrame(open, requestId, callControl, requestPayload);
               } else if (chunked) {
                 for (let index = 0; index < totalChunks; index += 1) {
+                  // A received service refusal stops after the preceding
+                  // complete frame; the stream remains usable for the next call.
+                  if (stopChunkUpload) break;
                   // close/discard clears this before closing the stream;
                   // callChain prevents a replacement until this exchange ends.
                   if (connectionPromise === undefined) {
@@ -1096,6 +1109,70 @@ function normalizeIpcConnect<Payload extends C2ResponsePayload>(value: C2IpcTran
   return value.connect;
 }
 
+function normalizeIpcConnectTimeoutMs(value: number | undefined): number | undefined {
+  if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
+    throw new C2IpcTransportError("C-Two IPC connectTimeoutMs must be a positive safe integer.");
+  }
+  return value;
+}
+
+function ipcConnectDeadlineError(): C2IpcTransportError {
+  return new C2IpcTransportError("C-Two IPC connection deadline expired.");
+}
+
+interface C2IpcConnectDeadline {
+  readonly startedAt: number;
+  readonly timeoutMs: number;
+}
+
+function remainingIpcConnectMs(deadline: C2IpcConnectDeadline | undefined): number | undefined {
+  if (deadline === undefined) return undefined;
+  const remaining = deadline.timeoutMs - (performance.now() - deadline.startedAt);
+  if (remaining <= 0) throw ipcConnectDeadlineError();
+  return Math.max(1, Math.ceil(remaining));
+}
+
+async function withinIpcConnectDeadline<T>(
+  deadline: C2IpcConnectDeadline | undefined,
+  operation: () => T | Promise<T>,
+  disposeLate?: (value: T) => void | Promise<void>,
+): Promise<T> {
+  if (deadline === undefined) return await operation();
+  remainingIpcConnectMs(deadline);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let expired = false;
+  const pending = Promise.resolve().then(operation);
+  pending.then(value => {
+    if (expired && disposeLate !== undefined) void Promise.resolve().then(() => disposeLate(value)).catch(() => undefined);
+  }, () => undefined);
+  const timeout = new Promise<never>((_, reject) => {
+    const schedule = (): void => {
+      const remaining = deadline.timeoutMs - (performance.now() - deadline.startedAt);
+      if (remaining <= 0) {
+        expired = true;
+        reject(ipcConnectDeadlineError());
+      } else {
+        timer = setTimeout(schedule, Math.min(Math.ceil(remaining), 2_147_483_647));
+      }
+    };
+    schedule();
+  });
+  try {
+    const value = await Promise.race([pending, timeout]);
+    if (deadline.timeoutMs - (performance.now() - deadline.startedAt) <= 0) {
+      expired = true;
+      if (disposeLate !== undefined) void Promise.resolve().then(() => disposeLate(value)).catch(() => undefined);
+      throw ipcConnectDeadlineError();
+    }
+    return value;
+  } catch (error) {
+    if (expired || deadline.timeoutMs - (performance.now() - deadline.startedAt) <= 0) throw ipcConnectDeadlineError();
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function normalizeIpcRequestShmThreshold(value: number | undefined, label: string): number {
   if (value === undefined) {
     return C2_IPC_DEFAULT_REQUEST_SHM_THRESHOLD;
@@ -1137,10 +1214,16 @@ function requireIpcConnection(value: unknown): C2IpcConnection {
 async function connectAndHandshakeIpc(
   address: string,
   connect: C2IpcConnect,
+  connectTimeoutMs: number | undefined,
 ): Promise<C2IpcOpenConnection> {
+  const deadline = connectTimeoutMs === undefined ? undefined : { startedAt: performance.now(), timeoutMs: connectTimeoutMs };
   let connection: C2IpcConnection;
   try {
-    connection = requireIpcConnection(await connect(address));
+    connection = requireIpcConnection(await withinIpcConnectDeadline(
+      deadline,
+      () => connect(address, remainingIpcConnectMs(deadline)),
+      value => { if (typeof (value as C2IpcConnection)?.close === "function") return (value as C2IpcConnection).close(); },
+    ));
   } catch (error) {
     if (error instanceof C2IpcTransportError) {
       throw error;
@@ -1150,15 +1233,16 @@ async function connectAndHandshakeIpc(
   try {
     // Preserve local metadata validation before any bytes reach the peer.
     const metadata = encodeIpcFrame(0n, C2_IPC_FLAG_HANDSHAKE, encodeClientIpcHandshake(connection.memory));
-    await connection.write(encodeClientIpcHello());
-    await acceptServerIpcVersion(connection);
-    await connection.write(metadata);
-    const frame = await readIpcFrame(connection);
+    await withinIpcConnectDeadline(deadline, () => connection.write(encodeClientIpcHello()));
+    await acceptServerIpcVersion(connection, deadline);
+    await withinIpcConnectDeadline(deadline, () => connection.write(metadata));
+    const frame = await withinIpcConnectDeadline(deadline, () => readIpcFrame(connection));
     if (frame.requestId !== 0n || frame.flags !== (C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_HANDSHAKE)) {
       throw new C2IpcTransportError("C-Two IPC server metadata response has invalid request id or flags.");
     }
     const handshake = decodeServerIpcHandshake(frame.payload);
     connection.memory?.finishHandshake((handshake.capabilityFlags & C2_IPC_CAP_SHM_RESPONSE) !== 0 ? handshake.shmPrefix : null);
+    remainingIpcConnectMs(deadline);
     return { connection, handshake, writeChain: Promise.resolve(), closing: false, reading: undefined, discardingChunkReplyIds: new Set() };
   } catch (error) {
     const primaryError = error instanceof C2IpcTransportError ? error : new C2IpcTransportError(
@@ -1185,9 +1269,9 @@ function encodeClientIpcHello(): Uint8Array {
   return record;
 }
 
-async function acceptServerIpcVersion(connection: C2IpcConnection): Promise<void> {
+async function acceptServerIpcVersion(connection: C2IpcConnection, deadline?: C2IpcConnectDeadline): Promise<void> {
   // Never let an unnegotiated length select a read or payload allocation.
-  const header = requireUint8Array(await connection.readExactly(16), "C-Two IPC version preamble header");
+  const header = requireUint8Array(await withinIpcConnectDeadline(deadline, () => connection.readExactly(16)), "C-Two IPC version preamble header");
   if (header.byteLength !== 16) {
     throw new C2IpcTransportError("C-Two IPC version preamble header is truncated.");
   }
@@ -1195,7 +1279,7 @@ async function acceptServerIpcVersion(connection: C2IpcConnection): Promise<void
   if (envelope.getUint32(0, true) !== 21 || envelope.getBigUint64(4, true) !== 0n || envelope.getUint32(12, true) !== 0x06) {
     throw new C2IpcTransportError("C-Two IPC version preamble has invalid length, request id or flags.");
   }
-  const body = requireUint8Array(await connection.readExactly(9), "C-Two IPC version preamble body");
+  const body = requireUint8Array(await withinIpcConnectDeadline(deadline, () => connection.readExactly(9)), "C-Two IPC version preamble body");
   if (body.byteLength !== 9) {
     throw new C2IpcTransportError("C-Two IPC version preamble body is truncated.");
   }

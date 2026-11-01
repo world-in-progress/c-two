@@ -101,33 +101,39 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_context_namespace_id_copy(
 
 /*
  * Connect through c2-local's verified directory addressing. Unix only.
- * Call on a worker: connection completion is bounded by the native default
- * deadline. context/address must remain live throughout the call; output
+ * Call on a worker. NULL timeout_millis selects the native five-second phase
+ * guard; a non-NULL value supplies the remaining budget for this connection
+ * attempt, including directory gate and identity verification. The caller
+ * accounts for time spent queued before this call. context/address and a
+ * non-NULL timeout_millis must remain live throughout the call; output
  * storage must not overlap. On success out_fd is an owned nonblocking,
  * close-on-exec descriptor to adopt or close exactly once. On failure it is
  * -1 and out_os_error is zero or native errno. Windows returns INVALID_ARGUMENT;
  * its Node connector uses the native Named Pipe API. Endpoint identity
- * verification refusals return PERMISSION_DENIED; other IO failures IO_ERROR.
+ * verification refusals return IDENTITY_MISMATCH; other IO failures IO_ERROR.
  */
 C2MemFfiStatus c2_mem_ffi_local_endpoint_context_connect_unix(
     const C2MemFfiLocalEndpointContext *context, const char *address,
+    const uint64_t *timeout_millis,
     int32_t *out_fd, int32_t *out_os_error);
 
 /*
  * Connect through c2-local's verified TokenUser-scoped Named Pipe addressing
  * and transfer the pipe plus its pinned server process. Windows only; other
  * platforms return INVALID_ARGUMENT. Call on a worker: completion is bounded
- * by the same native default deadline as the Unix bridge. The returned pipe
+ * by the same default or supplied remaining budget as the Unix bridge.
+ * NULL timeout_millis selects the native five-second phase guard. The returned pipe
  * handle is overlapped-capable and not registered with any IOCP or foreign
  * event loop; adopt it before any registration. context/address must remain
  * live throughout the call; output storage must not overlap. On success
  * out_pipe and out_process hold raw HANDLE values to close or adopt exactly
  * once each. On failure both are 0 and out_os_error is zero or the native OS
  * error. Server identity verification happens before the first byte and
- * fails with PERMISSION_DENIED; other IO failures return IO_ERROR.
+ * fails with IDENTITY_MISMATCH; other IO failures return IO_ERROR.
  */
 C2MemFfiStatus c2_mem_ffi_local_endpoint_context_connect_windows(
     const C2MemFfiLocalEndpointContext *context, const char *address,
+    const uint64_t *timeout_millis,
     uintptr_t *out_pipe, uintptr_t *out_process, int32_t *out_os_error);
 
 /* Borrow a c2-local-verified OS socket/pipe, duplicating its reference.

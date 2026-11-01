@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "c2_mem_ffi.h"
 
@@ -104,8 +105,8 @@ typedef C2MemFfiStatus (*endpoint_context_name_len_fn)(const C2MemFfiLocalEndpoi
 typedef C2MemFfiStatus (*endpoint_context_name_copy_fn)(const C2MemFfiLocalEndpointContext *, const char *, char *, size_t, size_t *);
 typedef C2MemFfiStatus (*endpoint_context_namespace_id_len_fn)(const C2MemFfiLocalEndpointContext *, size_t *);
 typedef C2MemFfiStatus (*endpoint_context_namespace_id_copy_fn)(const C2MemFfiLocalEndpointContext *, char *, size_t, size_t *);
-typedef C2MemFfiStatus (*endpoint_context_connect_unix_fn)(const C2MemFfiLocalEndpointContext *, const char *, int32_t *, int32_t *);
-typedef C2MemFfiStatus (*endpoint_context_connect_windows_fn)(const C2MemFfiLocalEndpointContext *, const char *, uintptr_t *, uintptr_t *, int32_t *);
+typedef C2MemFfiStatus (*endpoint_context_connect_unix_fn)(const C2MemFfiLocalEndpointContext *, const char *, const uint64_t *, int32_t *, int32_t *);
+typedef C2MemFfiStatus (*endpoint_context_connect_windows_fn)(const C2MemFfiLocalEndpointContext *, const char *, const uint64_t *, uintptr_t *, uintptr_t *, int32_t *);
 
 typedef struct C2MemFfiNodeSymbols {
     void *library;
@@ -912,13 +913,68 @@ typedef struct EndpointConnectWork {
     C2MemFfiStatus status;
     int32_t fd;
     int32_t os_error;
+    bool has_deadline;
+    uint64_t deadline_millis;
 } EndpointConnectWork;
+
+/* Capture a native monotonic deadline before queueing N-API work. The worker
+ * passes only its remaining duration to Rust, so queue time is not lost. */
+static bool monotonic_millis(uint64_t *out) {
+#ifdef _WIN32
+    LARGE_INTEGER frequency, now;
+    if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&now) || frequency.QuadPart <= 0) return false;
+    uint64_t ticks = (uint64_t)now.QuadPart;
+    uint64_t rate = (uint64_t)frequency.QuadPart;
+    *out = (ticks / rate) * 1000 + ((ticks % rate) * 1000) / rate;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
+    *out = (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+#endif
+    return true;
+}
+
+static bool read_connect_deadline(napi_env env, napi_value value, bool *has_deadline, uint64_t *deadline_millis) {
+    napi_valuetype type;
+    if (!check_napi(napi_typeof(env, value, &type))) return false;
+    if (type == napi_null || type == napi_undefined) {
+        *has_deadline = false;
+        return true;
+    }
+    double number;
+    if (type != napi_number || !check_napi(napi_get_value_double(env, value, &number)) ||
+        !(number > 0 && number <= 9007199254740991.0) || (double)(uint64_t)number != number) {
+        throw_type_error(env, "connect timeout must be a positive safe integer in milliseconds or null.");
+        return false;
+    }
+    uint64_t now;
+    if (!monotonic_millis(&now) || UINT64_MAX - now < (uint64_t)number) {
+        throw_error(env, "Cannot establish a native monotonic connection deadline.");
+        return false;
+    }
+    *has_deadline = true;
+    *deadline_millis = now + (uint64_t)number;
+    return true;
+}
+
+static bool remaining_connect_millis(bool has_deadline, uint64_t deadline_millis, uint64_t *remaining) {
+    if (!has_deadline) return true;
+    uint64_t now;
+    if (!monotonic_millis(&now)) return false;
+    *remaining = deadline_millis > now ? deadline_millis - now : 0;
+    return true;
+}
 
 static void endpoint_connect_execute(napi_env env, void *data) {
     (void)env;
     EndpointConnectWork *work = (EndpointConnectWork *)data;
+    uint64_t remaining = 0;
+    if (!remaining_connect_millis(work->has_deadline, work->deadline_millis, &remaining)) {
+        work->status = C2_MEM_FFI_STATUS_IO_ERROR;
+        return;
+    }
     work->status = work->context->symbols->endpoint_context_connect_unix(
-        work->context->ptr, work->address, &work->fd, &work->os_error);
+        work->context->ptr, work->address, work->has_deadline ? &remaining : NULL, &work->fd, &work->os_error);
 }
 
 static void endpoint_connect_dispose(napi_env env, EndpointConnectWork *work) {
@@ -949,20 +1005,28 @@ static void endpoint_connect_complete(napi_env env, napi_status status, void *da
 }
 
 static napi_value endpoint_context_connect(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1], receiver;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc != 1) {
-        return throw_type_error(env, "connectUnix expects an ipc:// address.");
+    size_t argc = 2;
+    napi_value args[2], receiver;
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc < 1) {
+        return throw_type_error(env, "connectUnix expects an ipc:// address and optional timeout.");
     }
     C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
     if (context == NULL) return NULL;
     char *address = read_string_arg(env, args[0], "IPC address must be a string.");
     if (address == NULL) return NULL;
+    bool has_deadline = false;
+    uint64_t deadline_millis = 0;
+    if (argc > 1 && !read_connect_deadline(env, args[1], &has_deadline, &deadline_millis)) {
+        free(address);
+        return NULL;
+    }
     EndpointConnectWork *work = (EndpointConnectWork *)calloc(1, sizeof(*work));
     if (work == NULL) { free(address); return throw_error(env, "Out of memory."); }
     work->context = context;
     work->address = address;
     work->fd = -1;
+    work->has_deadline = has_deadline;
+    work->deadline_millis = deadline_millis;
     context->active_connects += 1;
     napi_value promise, name;
     if (!check_napi(napi_create_promise(env, &work->deferred, &promise)) ||
@@ -1095,13 +1159,21 @@ typedef struct WindowsConnectWork {
     int32_t os_error;
     uintptr_t pipe;
     uintptr_t process;
+    bool has_deadline;
+    uint64_t deadline_millis;
 } WindowsConnectWork;
 
 static void windows_connect_execute(napi_env env, void *data) {
     (void)env;
     WindowsConnectWork *work = (WindowsConnectWork *)data;
+    uint64_t remaining = 0;
+    if (!remaining_connect_millis(work->has_deadline, work->deadline_millis, &remaining)) {
+        work->status = C2_MEM_FFI_STATUS_IO_ERROR;
+        return;
+    }
     work->status = work->context->symbols->endpoint_context_connect_windows(
-        work->context->ptr, work->address, &work->pipe, &work->process, &work->os_error);
+        work->context->ptr, work->address, work->has_deadline ? &remaining : NULL,
+        &work->pipe, &work->process, &work->os_error);
 }
 
 static void windows_connect_discard_handles(WindowsConnectWork *work) {
@@ -1205,7 +1277,7 @@ static void windows_connect_complete(napi_env env, napi_status status, void *dat
     windows_connect_dispose(env, work);
 }
 
-static napi_value queue_windows_connect(napi_env env, C2MemFfiNodeEndpointContext *context, napi_value receiver, char *address) {
+static napi_value queue_windows_connect(napi_env env, C2MemFfiNodeEndpointContext *context, napi_value receiver, char *address, bool has_deadline, uint64_t deadline_millis) {
     WindowsConnectWork *work = (WindowsConnectWork *)calloc(1, sizeof(*work));
     if (work == NULL) {
         free(address);
@@ -1213,6 +1285,8 @@ static napi_value queue_windows_connect(napi_env env, C2MemFfiNodeEndpointContex
     }
     work->context = context;
     work->address = address;
+    work->has_deadline = has_deadline;
+    work->deadline_millis = deadline_millis;
     context->active_connects += 1;
     napi_value promise, name;
     if (!check_napi(napi_create_promise(env, &work->deferred, &promise)) ||
@@ -1228,16 +1302,22 @@ static napi_value queue_windows_connect(napi_env env, C2MemFfiNodeEndpointContex
 }
 
 static napi_value endpoint_context_connect_windows_method(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1], receiver;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc != 1) {
-        return throw_type_error(env, "connectWindows expects an ipc:// address.");
+    size_t argc = 2;
+    napi_value args[2], receiver;
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc < 1) {
+        return throw_type_error(env, "connectWindows expects an ipc:// address and optional timeout.");
     }
     C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
     if (context == NULL) return NULL;
     char *address = read_string_arg(env, args[0], "IPC address must be a string.");
     if (address == NULL) return NULL;
-    return queue_windows_connect(env, context, receiver, address);
+    bool has_deadline = false;
+    uint64_t deadline_millis = 0;
+    if (argc > 1 && !read_connect_deadline(env, args[1], &has_deadline, &deadline_millis)) {
+        free(address);
+        return NULL;
+    }
+    return queue_windows_connect(env, context, receiver, address, has_deadline, deadline_millis);
 }
 
 /* Module-level verified Windows connect: the receiver argument must be a real
@@ -1245,17 +1325,23 @@ static napi_value endpoint_context_connect_windows_method(napi_env env, napi_cal
  * connectUnix/connectWindows functions cannot pass the native type-tag check
  * performed here, so unverified sockets cannot enter official Windows flows. */
 static napi_value endpoint_context_connect_windows_verified(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2];
+    size_t argc = 3;
+    napi_value args[3];
     C2MemFfiNodeSymbols *symbols = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols)) || argc != 2) {
-        return throw_type_error(env, "verified Windows connect expects a context object and an ipc:// address.");
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols)) || argc < 2) {
+        return throw_type_error(env, "verified Windows connect expects a context object, an ipc:// address and optional timeout.");
     }
     C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, args[0], true);
     if (context == NULL) return NULL;
     char *address = read_string_arg(env, args[1], "IPC address must be a string.");
     if (address == NULL) return NULL;
-    return queue_windows_connect(env, context, args[0], address);
+    bool has_deadline = false;
+    uint64_t deadline_millis = 0;
+    if (argc > 2 && !read_connect_deadline(env, args[2], &has_deadline, &deadline_millis)) {
+        free(address);
+        return NULL;
+    }
+    return queue_windows_connect(env, context, args[0], address, has_deadline, deadline_millis);
 }
 
 static napi_value endpoint_context_capture(napi_env env, napi_callback_info info) {

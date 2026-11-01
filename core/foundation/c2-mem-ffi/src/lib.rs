@@ -6,6 +6,7 @@ use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 const MAX_SHM_PREFIX_LEN: usize = 255;
 const C2_MEM_FFI_ABI_VERSION: u32 = 7;
@@ -315,14 +316,16 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_namespace_id_copy(
 /// failures as `PermissionDenied`, and other IO failures as `IoError`.
 ///
 /// # Safety
-/// `context` and the NUL-terminated `address` must remain live throughout the
-/// call. Both output pointers must be writable and non-overlapping. On success
+/// `context`, the NUL-terminated `address`, and a non-null `timeout_millis`
+/// must remain live throughout the call. Both output pointers must be writable
+/// and non-overlapping. On success
 /// the caller owns `out_fd` and must close or adopt it exactly once. On failure
 /// `out_fd` is -1; `out_os_error` is zero or the native errno.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_unix(
     context: *const C2MemFfiLocalEndpointContext,
     address: *const c_char,
+    timeout_millis: *const u64,
     out_fd: *mut i32,
     out_os_error: *mut i32,
 ) -> C2MemFfiStatus {
@@ -337,6 +340,7 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_unix(
         if context.is_null() {
             return Err(C2MemFfiStatus::NullPointer);
         }
+        let deadline = connect_deadline(timeout_millis)?;
         let address = parse_utf8_c_string(address)?;
         let endpoint = unsafe { (*context).inner.endpoint(&address) }
             .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
@@ -347,10 +351,7 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_unix(
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
-                    .block_on(c2_local::connect_unix_stream(
-                        &endpoint,
-                        c2_local::DEFAULT_CONNECT_TIMEOUT,
-                    ))
+                    .block_on(c2_local::connect_unix_stream_until(&endpoint, deadline))
             };
             let stream = connect().map_err(|error| {
                 unsafe {
@@ -365,10 +366,23 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_unix(
         }
         #[cfg(not(unix))]
         {
-            let _ = endpoint;
+            let _ = (endpoint, deadline);
             Err(C2MemFfiStatus::InvalidArgument)
         }
     })
+}
+
+/// A null pointer explicitly selects the native phase guard. A supplied zero
+/// budget is already expired, including when a Node worker waited in its queue.
+fn connect_deadline(timeout_millis: *const u64) -> Result<Option<Instant>, C2MemFfiStatus> {
+    if timeout_millis.is_null() {
+        return Ok(None);
+    }
+    let millis = unsafe { *timeout_millis };
+    Instant::now()
+        .checked_add(Duration::from_millis(millis))
+        .map(Some)
+        .ok_or(C2MemFfiStatus::InvalidArgument)
 }
 
 /// Endpoint identity verification happens before the first byte in c2-local;
@@ -387,13 +401,14 @@ fn connect_failure_status(error: &std::io::Error) -> C2MemFfiStatus {
 
 /// Transfer one verified Windows Named Pipe connection, plus its pinned server
 /// process, to a foreign runtime. Both handles are overlapped-capable,
-/// IOCP-unregistered, and owned by the caller exactly once. The connect runs
-/// on the same current-thread runtime and `DEFAULT_CONNECT_TIMEOUT` budget as
-/// the Unix bridge. Windows only; other platforms return `InvalidArgument`.
+/// IOCP-unregistered, and owned by the caller exactly once. The connect uses
+/// the same optional caller deadline as the Unix bridge. Windows only; other
+/// platforms return `InvalidArgument`.
 ///
 /// # Safety
-/// `context` and the NUL-terminated `address` must remain live throughout the
-/// call. All output pointers must be writable and non-overlapping. On success
+/// `context`, the NUL-terminated `address`, and a non-null `timeout_millis`
+/// must remain live throughout the call. All output pointers must be writable
+/// and non-overlapping. On success
 /// `out_pipe` and `out_process` hold raw HANDLE values the caller must close
 /// or adopt exactly once. On failure both are 0; `out_os_error` is zero or the
 /// native OS error.
@@ -401,6 +416,7 @@ fn connect_failure_status(error: &std::io::Error) -> C2MemFfiStatus {
 pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_windows(
     context: *const C2MemFfiLocalEndpointContext,
     address: *const c_char,
+    timeout_millis: *const u64,
     out_pipe: *mut usize,
     out_process: *mut usize,
     out_os_error: *mut i32,
@@ -417,6 +433,7 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_windows(
         if context.is_null() {
             return Err(C2MemFfiStatus::NullPointer);
         }
+        let deadline = connect_deadline(timeout_millis)?;
         let address = parse_utf8_c_string(address)?;
         let endpoint = unsafe { (*context).inner.endpoint(&address) }
             .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
@@ -427,10 +444,7 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_windows(
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
-                    .block_on(c2_local::connect_windows_pipe(
-                        &endpoint,
-                        c2_local::DEFAULT_CONNECT_TIMEOUT,
-                    ))
+                    .block_on(c2_local::connect_windows_pipe_until(&endpoint, deadline))
             };
             let connection = connect().map_err(|error| {
                 unsafe {
@@ -447,7 +461,7 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_windows(
         }
         #[cfg(not(windows))]
         {
-            let _ = endpoint;
+            let _ = (endpoint, deadline);
             Err(C2MemFfiStatus::InvalidArgument)
         }
     })
@@ -1033,6 +1047,7 @@ mod tests {
                 c2_mem_ffi_local_endpoint_context_connect_windows(
                     ptr::null(),
                     ptr::null(),
+                    ptr::null(),
                     &mut pipe,
                     &mut process,
                     &mut os_error,
@@ -1046,6 +1061,7 @@ mod tests {
                 c2_mem_ffi_local_endpoint_context_connect_windows(
                     ptr::null(),
                     ptr::null(),
+                    ptr::null(),
                     ptr::null_mut(),
                     &mut process,
                     &mut os_error,
@@ -1058,6 +1074,7 @@ mod tests {
                 c2_mem_ffi_local_endpoint_context_connect_windows(
                     ptr::null(),
                     ptr::null(),
+                    ptr::null(),
                     &mut pipe,
                     ptr::null_mut(),
                     &mut os_error,
@@ -1068,6 +1085,7 @@ mod tests {
         assert_eq!(
             unsafe {
                 c2_mem_ffi_local_endpoint_context_connect_windows(
+                    ptr::null(),
                     ptr::null(),
                     ptr::null(),
                     &mut pipe,
@@ -1087,6 +1105,7 @@ mod tests {
                 c2_mem_ffi_local_endpoint_context_connect_windows(
                     &context,
                     address.as_ptr(),
+                    ptr::null(),
                     &mut pipe,
                     &mut process,
                     &mut os_error,
@@ -1105,6 +1124,7 @@ mod tests {
                     c2_mem_ffi_local_endpoint_context_connect_windows(
                         &context,
                         address.as_ptr(),
+                        ptr::null(),
                         &mut pipe,
                         &mut process,
                         &mut os_error,
@@ -1125,6 +1145,7 @@ mod tests {
                 c2_mem_ffi_local_endpoint_context_connect_unix(
                     ptr::null(),
                     ptr::null(),
+                    ptr::null(),
                     &mut fd,
                     &mut os_error,
                 )
@@ -1141,6 +1162,7 @@ mod tests {
                 c2_mem_ffi_local_endpoint_context_connect_unix(
                     &context,
                     address.as_ptr(),
+                    ptr::null(),
                     &mut fd,
                     &mut os_error,
                 )
@@ -1156,6 +1178,7 @@ mod tests {
                     c2_mem_ffi_local_endpoint_context_connect_unix(
                         &context,
                         address.as_ptr(),
+                        ptr::null(),
                         &mut fd,
                         &mut os_error,
                     )
