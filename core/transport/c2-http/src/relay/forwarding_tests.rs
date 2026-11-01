@@ -988,7 +988,7 @@ impl Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn retired_upstream_preserves_forwarded_reply_and_reconnects_new_request() {
+async fn evicted_upstream_preserves_forwarded_reply_and_reconnects_new_request() {
     let mut fixture = Fixture::start(Carrier::Inline, 2, (2 * INPUT_LEN) as u64).await;
     let result = AssertUnwindSafe(async {
         let socket = fixture.socket;
@@ -1006,7 +1006,9 @@ async fn retired_upstream_preserves_forwarded_reply_and_reconnects_new_request()
             bounded(read_framed_reply(&mut stream)).await.unwrap()
         });
         bounded(fixture.probe.entered[1].notified()).await;
-        fixture.state.clients.close(&fixture.client);
+        let evicted = fixture.state.evict_connection("grid").unwrap();
+        assert!(Arc::ptr_eq(&evicted, &fixture.client));
+        fixture.state.clients.close(&evicted);
         assert!(!fixture.client.is_connected());
 
         let (replacement_lease, _) =
@@ -1050,6 +1052,68 @@ async fn retired_upstream_preserves_forwarded_reply_and_reconnects_new_request()
             String::from_utf8_lossy(&old_reply)
         );
         assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1);
+        eventually(|| {
+            fixture
+                .client
+                .connection_observation()
+                .unwrap()
+                .snapshot()
+                .is_some()
+        })
+        .await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.release(1);
+    fixture.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forced_native_cleanup_preserves_forwarded_http_reply() {
+    let mut fixture = Fixture::start(Carrier::Inline, 1, INPUT_LEN as u64).await;
+    let result = AssertUnwindSafe(async {
+        let socket = fixture.socket;
+        let head = fixture.head("target", &format!("Content-Length: {INPUT_LEN}"));
+        let request = tokio::spawn(async move {
+            let mut stream = bounded(tokio::net::TcpStream::connect(socket))
+                .await
+                .unwrap();
+            bounded(stream.write_all(head.as_bytes())).await.unwrap();
+            bounded(stream.write_all(&vec![7; INPUT_LEN]))
+                .await
+                .unwrap();
+            bounded(read_framed_reply(&mut stream)).await.unwrap()
+        });
+        bounded(fixture.probe.entered[1].notified()).await;
+        fixture.state.forwarding.close();
+        bounded(fixture.state.stop_upstream_controls()).await;
+        let cleanup = {
+            let state = fixture.state.clone();
+            tokio::spawn(async move { state.clients.shutdown().await })
+        };
+        eventually(|| !fixture.client.is_connected()).await;
+        assert!(!cleanup.is_finished());
+        assert!(!request.is_finished());
+        assert!(
+            fixture
+                .client
+                .connection_observation()
+                .unwrap()
+                .snapshot()
+                .is_none()
+        );
+        fixture.release(1);
+        let reply = bounded(request).await.unwrap();
+        assert!(
+            reply.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1);
+        bounded(cleanup).await.unwrap();
         eventually(|| {
             fixture
                 .client
@@ -1568,6 +1632,109 @@ async fn h1_disconnect_after_ipc_write_begins_before_first_byte_preserves_same_c
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() {
     disconnect_during_ipc_write_preserves_same_client(WriterPausePoint::AfterEightBytePrefix).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eviction_during_ipc_frame_write_finishes_old_http_reply_and_reconnects() {
+    const LEN: usize = 32;
+    let mut fixture =
+        Fixture::start_with_input_len(Carrier::Inline, 2, (2 * LEN) as u64, LEN).await;
+    let (acquired_tx, acquired_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let mut resume = Some(resume_tx);
+    let (write_started_tx, write_started_rx) = oneshot::channel();
+    let (write_release_tx, write_release_rx) = oneshot::channel();
+    let mut write_release = Some(write_release_tx);
+    let result = AssertUnwindSafe(async {
+        fixture
+            .state
+            .set_acquire_recheck_seam_for_test(acquired_tx, resume_rx);
+        let socket = fixture.socket;
+        let head = fixture.head("target", "Content-Length: 32");
+        let old_request = tokio::spawn(async move {
+            let mut stream = bounded(tokio::net::TcpStream::connect(socket))
+                .await
+                .unwrap();
+            bounded(stream.write_all(head.as_bytes())).await.unwrap();
+            bounded(stream.write_all(&[7; LEN])).await.unwrap();
+            bounded(read_framed_reply(&mut stream)).await.unwrap()
+        });
+        bounded(acquired_rx)
+            .await
+            .expect("route-token lookup must complete");
+        fixture
+            .client
+            .set_write_prefix_pause_for_test(Some((write_started_tx, write_release_rx)));
+        resume.take().unwrap().send(()).unwrap();
+        bounded(write_started_rx)
+            .await
+            .expect("eight real frame bytes must be written");
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0);
+        let old = fixture.state.evict_connection("grid").unwrap();
+        assert!(Arc::ptr_eq(&old, &fixture.client));
+        fixture.state.clients.close(&old);
+        assert!(!old.is_connected(), "deactivation must reject new calls");
+        assert!(
+            old.connection_observation().unwrap().snapshot().is_none(),
+            "the started frame still owns the old connection"
+        );
+        assert!(
+            bounded(old.call_bound_phased(&fixture.binding, "ping", &[7; LEN]))
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.probe.calls[2].load(Ordering::SeqCst), 0);
+        assert!(
+            !old_request.is_finished(),
+            "started write must remain owned"
+        );
+
+        let mut new_stream = bounded(tokio::net::TcpStream::connect(fixture.socket))
+            .await
+            .unwrap();
+        bounded(new_stream.write_all(fixture.head("ping", "Content-Length: 32").as_bytes()))
+            .await
+            .unwrap();
+        bounded(new_stream.write_all(&[7; LEN])).await.unwrap();
+        let new_reply = bounded(read_framed_reply(&mut new_stream)).await.unwrap();
+        assert!(
+            new_reply.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&new_reply)
+        );
+        assert_eq!(fixture.probe.calls[2].load(Ordering::SeqCst), 1);
+        let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+            .await
+            .unwrap_or_else(|_| panic!("new request must acquire a replacement upstream"));
+        assert!(!Arc::ptr_eq(&lease.client(), &old));
+        drop(lease);
+
+        write_release.take().unwrap().send(()).unwrap();
+        bounded(fixture.probe.entered[1].notified()).await;
+        fixture.release(1);
+        let old_reply = bounded(old_request).await.unwrap();
+        assert!(
+            old_reply.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&old_reply)
+        );
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1);
+        eventually(|| old.connection_observation().unwrap().snapshot().is_some()).await;
+    })
+    .catch_unwind()
+    .await;
+    if let Some(resume) = resume.take() {
+        let _ = resume.send(());
+    }
+    if let Some(write_release) = write_release.take() {
+        let _ = write_release.send(());
+    }
+    fixture.client.set_write_prefix_pause_for_test(None);
+    fixture.release(1);
+    fixture.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -187,6 +187,8 @@ async function runWindowsScenario(server) {
 }
 
 async function runScenario(server, container) {
+  const previousWriteTimeout = process.env.C2_IPC_WRITE_TIMEOUT;
+  process.env.C2_IPC_WRITE_TIMEOUT = '1.25';
   const ownedRoot = mkdtempSync(resolve(container, 't'));
   const segments = Array(4).fill('目录 with spaces ' + 'x'.repeat(100));
   const rootA = resolve(ownedRoot, 'a', ...segments);
@@ -249,6 +251,7 @@ async function runScenario(server, container) {
     const explicit = createNodeIpcConnect({ ipcRoot: rootA });
     owners.push(typed, explicit);
     const fromSnapshot = await connect(typed);
+    assert.equal(fromSnapshot.memory.writeTimeoutMillis, 1250);
     const typedOther = await connect(typed, otherAddress);
     await exchange(fromSnapshot, 0xa1);
     await fromSnapshot.close(); await fromSnapshot.close();
@@ -326,6 +329,8 @@ async function runScenario(server, container) {
     return { kind: 'passed', connections: 15, listeners: 4,
       evidence: 'Real Node→c2-local streams: success-first and failure-first Runtime A survive env flip to B; new Runtime B, explicit roots, shared typed context, multiple addresses/connections, reconnect and factory disposal preserve stream bytes. No RPC/SHM/matrix assertion.' };
   } finally {
+    if (previousWriteTimeout === undefined) delete process.env.C2_IPC_WRITE_TIMEOUT;
+    else process.env.C2_IPC_WRITE_TIMEOUT = previousWriteTimeout;
     for (const connection of connections) await connection.close();
     for (const owner of owners) owner.close();
     for (const fixture of fixtures) await stopServer(fixture);

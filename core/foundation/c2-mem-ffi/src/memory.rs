@@ -121,6 +121,23 @@ pub unsafe extern "C" fn c2_mem_ffi_memory_context_gc(
 }
 
 /// # Safety
+/// Context is live and `out_seconds` points to writable storage. This is the
+/// same resolved write budget used by Rust IPC clients.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_memory_context_write_timeout(
+    value: *const C2MemFfiMemoryContext,
+    out_seconds: *mut f64,
+) -> C2MemFfiStatus {
+    guard_status(|| {
+        if out_seconds.is_null() {
+            return Err(C2MemFfiStatus::NullPointer);
+        }
+        unsafe { *out_seconds = context(value)?.config.write_timeout_secs };
+        Ok(())
+    })
+}
+
+/// # Safety
 /// `connection` is a live OS socket/pipe already verified by c2-local, borrowed
 /// throughout this call. On Windows it is a HANDLE, never a foreign CRT fd;
 /// `process` is its verified server process pin. Unix requires process=0.
@@ -230,7 +247,7 @@ pub unsafe extern "C" fn c2_mem_ffi_memory_context_finish_handshake(
             let config = PoolConfig {
                 segment_size: 8192,
                 max_segments: c2_config::MAX_IPC_POOL_SEGMENTS as usize,
-                max_dedicated_segments: c2_config::MAX_IPC_POOL_SEGMENTS as usize,
+                max_dedicated_segments: usize::from(u16::MAX) + 1,
                 buddy_idle_decay_secs: value.config.pool_decay_seconds,
                 ..PoolConfig::default()
             };
@@ -330,8 +347,10 @@ pub unsafe extern "C" fn c2_mem_ffi_response_admit(
         let value = context(value)?;
         // A decodable loan ID can be settled even when the descriptor's
         // remaining content or our local mapping/copy fails. Zero carries no
-        // releasable loan; do not send it into ConnectionCore's protocol path.
+        // releasable loan. The descriptor violates the connection protocol,
+        // so refuse new work while leaving previously sent calls to settle.
         if block.loan_id == 0 {
+            drop(value.core.deactivate());
             return Err(C2MemFfiStatus::InvalidArgument);
         }
         let loan = value
@@ -670,6 +689,7 @@ mod policy_tests {
         assert_eq!(pool.config().max_segments, 2);
         assert_eq!(pool.config().buddy_idle_decay_secs, 0.025);
         assert_eq!(config.pool_decay_seconds, 0.025);
+        assert_eq!(config.write_timeout_secs, 30.0);
         assert_eq!(pool.budget().unwrap().snapshot().file.limit_bytes, 8192);
         assert_eq!(
             pool.budget().unwrap().snapshot().reassembly.limit_bytes,
@@ -704,6 +724,13 @@ mod policy_tests {
         assert_eq!(pool.config().segment_size, 32768);
         assert_eq!(pool.config().max_segments, 3);
         assert_eq!(pool.budget().unwrap().snapshot().shm.limit_bytes, 4096);
+    }
+
+    #[test]
+    fn node_write_timeout_uses_resolved_environment_setting() {
+        let (config, _) =
+            resolve_memory_policy(environment(&[("C2_IPC_WRITE_TIMEOUT", "0.0125")])).unwrap();
+        assert_eq!(config.write_timeout_secs, 0.0125);
     }
 
     #[test]
@@ -745,6 +772,9 @@ mod tests {
     struct Context(*mut C2MemFfiMemoryContext, UnixStream);
     impl Context {
         fn new() -> Self {
+            // Capture a coherent environment and finish socketpair's CLOEXEC
+            // setup before a parallel test may spawn a child process.
+            let _process = crate::tests::PROCESS_STATE_LOCK.lock().unwrap();
             let (stream, peer) = UnixStream::pair().unwrap();
             let mut context = ptr::null_mut();
             assert_eq!(
@@ -900,11 +930,103 @@ mod tests {
                 C2MemFfiStatus::InvalidArgument
             );
             assert!(response.is_null());
-            assert!(!context.value().core.is_deactivated());
-            let releases = prefix_ids(&context.write(ptr::null_mut(), 2, true));
-            assert_eq!(releases, if loan_id == 0 { vec![] } else { vec![loan_id] });
-            context.write(ptr::null_mut(), 0, true);
+            assert_eq!(context.value().core.is_deactivated(), loan_id == 0);
+            if loan_id == 0 {
+                assert!(context.value().core.try_close());
+                let mut write = ptr::null_mut();
+                assert_eq!(
+                    unsafe { c2_mem_ffi_write_begin(context.0, ptr::null_mut(), 0, &mut write) },
+                    C2MemFfiStatus::InvalidArgument
+                );
+                assert!(write.is_null());
+            } else {
+                assert_eq!(
+                    prefix_ids(&context.write(ptr::null_mut(), 2, true)),
+                    vec![loan_id]
+                );
+                context.write(ptr::null_mut(), 0, true);
+            }
         }
+    }
+
+    #[test]
+    fn ffi_write_timeout_projects_the_resolved_connection_policy() {
+        let context = Context::new();
+        let mut seconds = 0.0;
+        assert_eq!(
+            unsafe { c2_mem_ffi_memory_context_write_timeout(context.0, &mut seconds) },
+            C2MemFfiStatus::Ok
+        );
+        assert_eq!(seconds, context.value().config.write_timeout_secs);
+        assert_eq!(
+            unsafe { c2_mem_ffi_memory_context_write_timeout(context.0, ptr::null_mut()) },
+            C2MemFfiStatus::NullPointer
+        );
+    }
+
+    #[test]
+    fn zero_response_loan_deactivates_without_losing_existing_sent_loan() {
+        let context = Context::new();
+        context.handshake(None);
+        let (request, sent) = context.prepare(&[7; 8]);
+        context.write(request, 0, true);
+        let mut response = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_response_admit(
+                    context.0,
+                    C2MemFfiBlock {
+                        loan_id: 0,
+                        ..Default::default()
+                    },
+                    &mut response,
+                )
+            },
+            C2MemFfiStatus::InvalidArgument
+        );
+        assert!(response.is_null());
+        assert!(context.value().core.is_deactivated());
+        assert!(!context.value().core.try_close());
+        assert_eq!(
+            context.receive(&release_frame(sent.loan_id, true)),
+            C2MemFfiStatus::Ok
+        );
+        assert_eq!(context.value().pool.read().stats().alloc_count, 0);
+        assert!(context.value().core.try_close());
+    }
+
+    #[test]
+    fn peer_dedicated_mapping_accepts_wire_index_above_buddy_limit() {
+        let context = Context::new();
+        let mut owner = MemPool::new(PoolConfig {
+            buddy_enabled: false,
+            max_dedicated_segments: 257,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        context.handshake(Some(owner.prefix()));
+        let mut handles = Vec::new();
+        for _ in 0..257 {
+            handles.push(owner.alloc_shm_handle(8).unwrap());
+        }
+        let allocation = handles.last().unwrap().shm_allocation().unwrap();
+        assert_eq!(allocation.seg_idx, 256);
+        let response = admit(
+            &context,
+            C2MemFfiBlock {
+                segment_index: 256,
+                generation: allocation.generation,
+                byte_length: 8,
+                is_dedicated: 1,
+                loan_id: 88,
+                ..Default::default()
+            },
+        );
+        unsafe { c2_mem_ffi_response_discard(response) };
+        assert_eq!(
+            prefix_ids(&context.write(ptr::null_mut(), 2, true)),
+            vec![88]
+        );
     }
 
     #[test]
@@ -1221,6 +1343,10 @@ mod tests {
     fn remote_read_keeps_original_os_connection_after_context_drop() {
         use std::io::{ErrorKind, Read};
         let context = Context::new();
+        // A concurrent spawn may temporarily copy even CLOEXEC descriptors
+        // before exec closes them. Observe this connection's final reference
+        // without an unrelated child borrowing the process's descriptor table.
+        let _process = crate::tests::PROCESS_STATE_LOCK.lock().unwrap();
         let (pool, handle, block) = response(&context, 9);
         let response = admit(&context, block);
         let mut peer = context.1.try_clone().unwrap();
@@ -1354,18 +1480,76 @@ mod tests {
         assert!(context.value().core.try_close());
     }
 
+    fn c_compiler(arguments: &[&str]) -> std::process::Child {
+        // Pair creation, environment capture/mutation and spawn must use the
+        // same process boundary. The compiler itself still runs concurrently.
+        let _process = crate::tests::PROCESS_STATE_LOCK.lock().unwrap();
+        std::process::Command::new("cc")
+            .args(arguments)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn remote_read_connection_is_not_retained_by_a_live_compiler_child() {
+        use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+        let context = Context::new();
+        let (pool, handle, block) = response(&context, 9);
+        let response = admit(&context, block);
+        let mut peer = context.1.try_clone().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        drop(context);
+        // The version diagnostic proves exec has completed; an unexeced child
+        // can still temporarily hold its parent's CLOEXEC descriptor table.
+        // Keep stdin open so the compiler remains alive during the assertion.
+        let mut compiler = c_compiler(&["-v", "-std=c11", "-x", "c", "-fsyntax-only", "-"]);
+        let mut input = compiler.stdin.take().unwrap();
+        let mut diagnostics = BufReader::new(compiler.stderr.take().unwrap());
+        let mut ready = String::new();
+        assert_ne!(diagnostics.read_line(&mut ready).unwrap(), 0);
+        assert!(compiler.try_wait().unwrap().is_none());
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        let eof = {
+            let _process = crate::tests::PROCESS_STATE_LOCK.lock().unwrap();
+            unsafe { c2_mem_ffi_response_discard(response) };
+            peer.read(&mut [0])
+        };
+        input.write_all(b"int c2_ffi_probe;\n").unwrap();
+        drop(input);
+        let mut remainder = String::new();
+        diagnostics.read_to_string(&mut remainder).unwrap();
+        let status = compiler.wait().unwrap();
+        assert!(status.success(), "{ready}{remainder}");
+        assert_eq!(
+            eof.unwrap(),
+            0,
+            "the live compiler must not own the native connection"
+        );
+        pool.write().release_handle(handle);
+    }
+
     #[test]
     fn c_header_matches_abi7_block_layout_and_compiles() {
-        use std::process::Command;
+        use std::io::Write;
         assert_eq!(std::mem::size_of::<C2MemFfiBlock>(), 24);
         let header = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include");
-        let output = Command::new("cc").args(["-std=c11", "-x", "c", "-fsyntax-only", "-I"])
-            .arg(header).arg("-").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
-            .spawn().map(|mut child| {
-                use std::io::Write;
-                child.stdin.take().unwrap().write_all(b"#include <c2_mem_ffi.h>\n_Static_assert(C2_MEM_FFI_ABI_VERSION == 7, \"ABI\");\n_Static_assert(sizeof(C2MemFfiBlock) == 24, \"layout\");\n_Static_assert(offsetof(C2MemFfiBlock, loan_id) == 16, \"loan\");\n").unwrap();
-                child.wait_with_output().unwrap()
-            }).unwrap();
+        let mut compiler = c_compiler(&[
+            "-std=c11",
+            "-x",
+            "c",
+            "-fsyntax-only",
+            "-I",
+            header.to_str().unwrap(),
+            "-",
+        ]);
+        compiler.stdin.take().unwrap().write_all(b"#include <c2_mem_ffi.h>\n_Static_assert(C2_MEM_FFI_ABI_VERSION == 7, \"ABI\");\n_Static_assert(sizeof(C2MemFfiBlock) == 24, \"layout\");\n_Static_assert(offsetof(C2MemFfiBlock, loan_id) == 16, \"loan\");\n").unwrap();
+        let output = compiler.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "{}",

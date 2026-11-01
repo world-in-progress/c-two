@@ -477,7 +477,10 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_ID: AtomicU32 = AtomicU32::new(0);
-    static ENDPOINT_ENV_LOCK: Mutex<()> = Mutex::new(());
+    // These tests share process environment and create native handles while
+    // other tests launch a compiler. Serialize those boundaries, including
+    // socketpair's non-atomic CLOEXEC setup on macOS.
+    pub(super) static PROCESS_STATE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     #[cfg(any(unix, windows))]
@@ -516,7 +519,7 @@ mod tests {
         }
 
         fn set_root(root: Option<&str>) {
-            // Endpoint tests hold ENDPOINT_ENV_LOCK across every configuration
+            // Endpoint tests hold PROCESS_STATE_LOCK across every configuration
             // capture/read as well as mutation of these test-owned variables.
             unsafe {
                 match root {
@@ -617,7 +620,7 @@ mod tests {
 
     #[test]
     fn c_endpoint_projection_uses_the_same_platform_authority() {
-        let _lock = ENDPOINT_ENV_LOCK.lock().unwrap();
+        let _lock = PROCESS_STATE_LOCK.lock().unwrap();
         let address = CString::new("ipc://c-ffi-endpoint").unwrap();
         let context = ConfigResolver::resolve_local_endpoint(
             LocalEndpointOptions::default(),
@@ -664,7 +667,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn endpoint_context_freezes_sources_and_keeps_resolution_pure() {
-        let _lock = ENDPOINT_ENV_LOCK.lock().unwrap();
+        let _lock = PROCESS_STATE_LOCK.lock().unwrap();
         let _saved_env = SavedEndpointEnv::new();
         unsafe {
             std::env::set_var("C2_ENV_FILE", "");
@@ -842,7 +845,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn endpoint_context_uses_current_sid_and_rejects_root_overrides() {
-        let _lock = ENDPOINT_ENV_LOCK.lock().unwrap();
+        let _lock = PROCESS_STATE_LOCK.lock().unwrap();
         let _saved_env = SavedEndpointEnv::new();
         unsafe {
             std::env::set_var("C2_ENV_FILE", "");
@@ -880,7 +883,7 @@ mod tests {
 
     #[test]
     fn endpoint_context_query_failures_reset_outputs_and_preserve_buffers() {
-        let _lock = ENDPOINT_ENV_LOCK.lock().unwrap();
+        let _lock = PROCESS_STATE_LOCK.lock().unwrap();
         // Explicit Unix options remain independent of ambient C2_IPC_ROOT;
         // Windows uses its native SID-only default.
         let inner = LocalEndpointContext::default_for_platform().unwrap();

@@ -115,9 +115,12 @@ impl ClientLifecycle {
         let mut inner = self.inner.lock();
         let closed = inner.closed;
         let entry = inner.entries[slot].as_mut().expect("reserved native owner");
-        entry.client = Some(client);
+        entry.client = Some(client.clone());
         entry.closing = closing || closed;
         drop(inner);
+        if closing || closed {
+            client.deactivate();
+        }
         self.changed.notify_one();
     }
 
@@ -135,7 +138,7 @@ impl ClientLifecycle {
         });
         if found {
             drop(inner);
-            client.retire();
+            client.deactivate();
             self.changed.notify_one();
             return;
         }
@@ -163,23 +166,14 @@ impl ClientLifecycle {
                         let entry = entry.as_ref()?;
                         let client = entry.client.as_ref()?;
                         (entry.closing || !client.is_connected() || Arc::strong_count(client) == 1)
-                            .then(|| (slot, client.clone(), inner.closed))
+                            .then(|| (slot, client.clone()))
                     })
                     .collect::<Vec<_>>()
             };
-            for (slot, client, force) in work {
-                let confirmed = if force {
-                    client.close_shared_bounded(Duration::from_millis(50)).await
-                } else {
-                    client.retire();
-                    match client.connection_observation() {
-                        Some(observation) => observation
-                            .wait_closed(Some(Duration::from_millis(50)))
-                            .await
-                            .is_some(),
-                        None => true,
-                    }
-                };
+            for (slot, client) in work {
+                // A closing owner stops new work immediately. Existing writes,
+                // replies and loans retain the connection until they settle.
+                let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
                 if confirmed {
                     self.inner.lock().entries[slot] = None;
                     self.drained.notify_waiters();
@@ -194,12 +188,20 @@ impl ClientLifecycle {
     }
 
     pub(crate) async fn shutdown(&self) {
-        {
+        let clients = {
             let mut inner = self.inner.lock();
             inner.closed = true;
+            let mut clients = Vec::new();
             for entry in inner.entries.iter_mut().flatten() {
                 entry.closing = true;
+                if let Some(client) = &entry.client {
+                    clients.push(client.clone());
+                }
             }
+            clients
+        };
+        for client in clients {
+            client.deactivate();
         }
         self.changed.notify_one();
         loop {

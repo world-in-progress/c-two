@@ -112,17 +112,27 @@ impl EndState {
 pub(crate) struct PhysicalRetirement {
     guard: Option<RemoteReadGuard>,
     pub end: Arc<EndState>,
+    peer: Mutex<Option<Arc<RwLock<ServerPoolState>>>>,
 }
 impl PhysicalRetirement {
     pub fn new(guard: RemoteReadGuard, end: Arc<EndState>) -> Arc<Self> {
         Arc::new(Self {
             guard: Some(guard),
             end,
+            peer: Mutex::new(None),
         })
+    }
+    pub fn set_peer(&self, peer: Arc<RwLock<ServerPoolState>>) {
+        *self.peer.lock() = Some(peer);
     }
 }
 impl Drop for PhysicalRetirement {
     fn drop(&mut self) {
+        // Both I/O drivers and every admitted remote read have ended. Cache
+        // metadata retained by an evicted client must not retain OS mappings.
+        if let Some(peer) = self.peer.get_mut().take() {
+            peer.write().cache.take();
+        }
         drop(self.guard.take());
         self.end.publish();
     }
@@ -241,17 +251,8 @@ impl ClientConnection {
         drop(pending);
         self.deactivated.send_replace(true);
     }
-    /// Retire a cache incarnation while preserving replies for requests that
-    /// already reached the writer. The ordinary close barrier seals the stream
-    /// after those replies and its remaining loans settle.
-    pub fn retire(&self) {
-        self.end
-            .record(ConnectionEndReason::LocalClose, "client_retire");
-        self.stop_admission();
-        self.wake.notify_waiters();
-        self.wake.notify_one();
-    }
-    pub fn close(&self) {
+    /// Stop admission and drain sent calls and loans before physical close.
+    pub fn deactivate(&self) {
         {
             let mut disconnect = self.disconnect.lock();
             // Reserve before deactivation so the writer cannot seal B=L=0 in
@@ -262,17 +263,21 @@ impl ClientConnection {
                 None
             };
             self.end
-                .record(ConnectionEndReason::LocalClose, "client_close");
+                .record(ConnectionEndReason::LocalClose, "client_deactivate");
             self.stop_admission();
             if matches!(*disconnect, Disconnect::NotRequested) {
                 *disconnect = control.map_or(Disconnect::Finished, Disconnect::Pending);
             }
         }
-        self.fail_pending();
         self.wake.notify_waiters();
         self.wake.notify_one();
     }
     fn take_disconnect(&self) -> Option<ControlFrame> {
+        // DISCONNECT stops the peer's admission too. Send it only after every
+        // dispatched request (including its continuation frames) has replied.
+        if !self.pending.lock().is_empty() {
+            return None;
+        }
         let mut disconnect = self.disconnect.lock();
         match std::mem::replace(&mut *disconnect, Disconnect::Finished) {
             Disconnect::Pending(control) => Some(control),
@@ -303,7 +308,7 @@ impl ClientConnection {
         self.end(ConnectionEndReason::ProtocolError, operation);
         self.fail_pending();
     }
-    pub fn fail_pending(&self) {
+    fn fail_pending(&self) {
         let pending = std::mem::take(&mut *self.pending.lock());
         for (_, entry) in pending {
             entry.complete(Err(IpcError::Closed));
@@ -341,6 +346,11 @@ impl ClientConnection {
         self.runtime.spawn(future)
     }
 
+    #[cfg(test)]
+    pub fn queue_capacity_for_test(&self) -> usize {
+        self.queue.capacity()
+    }
+
     pub fn start_gc(
         &self,
         pool: Arc<RwLock<MemPool>>,
@@ -368,7 +378,9 @@ impl ClientConnection {
                         registry.try_gc_sweep();
                         if let Some(mut pool) = pool.try_write() { pool.gc_buddy(); }
                         if let Some(mut pool) = registry.pool().try_write() { pool.gc_buddy(); }
-                        if let Some(peer) = peer.try_read() { peer.cache.gc_idle(); }
+                        if let Some(peer) = peer.try_read() {
+                            if let Some(cache) = &peer.cache { cache.gc_idle(); }
+                        }
                     }
                 }
             }
@@ -381,23 +393,34 @@ impl ClientConnection {
         state: Arc<Mutex<SendState>>,
         policy: Option<IpcCallControl>,
     ) -> Result<(), IpcError> {
+        // Subscribe before waiting for queue capacity. Deactivation must wake
+        // unpublished calls even while the writer and all 64 queue slots stall.
+        let mut stopped = self.deactivated.subscribe();
+        let started = state.lock().started();
+        if *stopped.borrow() && !started {
+            return Err(IpcError::Closed);
+        }
         let request = Arc::new(Mutex::new(Some(request)));
         let mut cancellation = QueuedWrite {
             request: request.clone(),
             finished: false,
         };
         let (reply, mut receipt) = oneshot::channel();
-        self.queue
-            .send(Submission {
-                bytes,
-                request,
-                state: state.clone(),
-                policy,
-                reply: Some(reply),
-            })
-            .await
-            .map_err(|_| IpcError::Closed)?;
-        let mut stopped = self.deactivated.subscribe();
+        let permit = tokio::select! {
+            biased;
+            _ = stopped.changed(), if !started => return Err(IpcError::Closed),
+            permit = self.queue.reserve() => permit.map_err(|_| IpcError::Closed)?,
+        };
+        if *stopped.borrow() && !state.lock().started() {
+            return Err(IpcError::Closed);
+        }
+        permit.send(Submission {
+            bytes,
+            request,
+            state: state.clone(),
+            policy,
+            reply: Some(reply),
+        });
         let is_stopped = *stopped.borrow();
         let result = if is_stopped && !state.lock().started() {
             Err(IpcError::Closed)
@@ -415,7 +438,7 @@ impl ClientConnection {
                 }
             }
         };
-        cancellation.finished = true;
+        cancellation.finished = state.lock().started();
         result
     }
 }
@@ -492,7 +515,7 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
                 }
                 (|| {
                     let mut state = submission.state.lock();
-                    if state.cancelled && !state.started {
+                    if !state.started && (state.cancelled || conn.core.is_deactivated()) {
                         return Err(IpcError::Closed);
                     }
                     IpcCallControl::begin_dispatch(submission.policy.as_ref())?;
@@ -602,7 +625,7 @@ async fn write_batch<W: AsyncWrite + Unpin>(
             tokio::select! {
                 result = &mut operation => result,
                 _ = tokio::time::sleep_until(deadline) => {
-                    timeout(conn, receipt, "write_timeout"); timed_out = true; operation.await
+                    timeout(conn, "write_timeout"); timed_out = true; operation.await
                 }
             }
         };
@@ -644,7 +667,7 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     } else {
         tokio::select! {
             result = &mut operation => result,
-            _ = tokio::time::sleep_until(deadline) => { timeout(conn, receipt, "flush_timeout"); operation.await }
+            _ = tokio::time::sleep_until(deadline) => { timeout(conn, "flush_timeout"); operation.await }
         }
     };
     match result {
@@ -678,9 +701,11 @@ fn report_io(
     conn.end_io(operation, error, false);
 }
 
-fn timeout(conn: &ClientConnection, receipt: &mut Option<Receipt>, operation: &'static str) {
+fn timeout(conn: &ClientConnection, operation: &'static str) {
     let error = io::Error::new(io::ErrorKind::TimedOut, "local write deadline expired");
-    report_io(conn, receipt, operation, &error);
+    // The timeout stops new work; it cannot cancel an already-started write
+    // or turn that call's eventual readable reply into an unknown outcome.
+    conn.end_io(operation, &error, false);
 }
 
 pub(crate) fn core_error(error: ConnectionError) -> IpcError {

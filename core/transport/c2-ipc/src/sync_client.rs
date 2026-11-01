@@ -321,10 +321,6 @@ impl SyncClient {
         self.inner.deactivate();
     }
 
-    pub(crate) fn retire(&self) {
-        self.inner.retire();
-    }
-
     /// Whether the client is connected.
     pub fn is_connected(&self) -> bool {
         self.inner.is_connected()

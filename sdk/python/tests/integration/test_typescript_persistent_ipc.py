@@ -343,6 +343,52 @@ def test_generated_node_connection_deadline_covers_slow_connect_and_prevents_dis
             assert server.shutdown()["completed"]
 
 
+def test_generated_node_close_during_chunk_upload_preserves_dispatched_outcome(
+    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
+) -> None:
+    server = local_server(unique_ipc_address, ipc_overrides={"pool_enabled": False})
+    manager = CountingResource()
+    node: PersistentNode | None = None
+    try:
+        server.register_crm(Manager, manager, name="manager")
+        server.start()
+        node = PersistentNode(persistent_node_project, unique_ipc_address)
+        result = _ok(node.request("closeDuringUpload"))
+        assert result["chunkRequests"] == 1, result
+        assert result["completedChunkWrites"] > 0, result
+        assert result["activeWrites"] == 0 and result["writesAfterClose"] == 0, result
+        assert result["closes"] == 1, result
+        _reject(node.request("call"), "deactivated")
+    finally:
+        try:
+            if node is not None:
+                node.stop()
+        finally:
+            assert server.shutdown()["completed"]
+
+
+def test_generated_node_local_response_copy_failure_preserves_persistent_stream(
+    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
+) -> None:
+    server = local_server(unique_ipc_address)
+    manager = CountingResource()
+    node: PersistentNode | None = None
+    try:
+        server.register_crm(Manager, manager, name="manager")
+        server.start()
+        node = PersistentNode(persistent_node_project, unique_ipc_address)
+        failed = _ok(node.request("copyFail"))
+        assert manager.calls == 1 and failed["closes"] == 0, failed
+        resumed = _ok(node.request("call"))
+        assert manager.calls == 2 and resumed["connects"] == 1, resumed
+    finally:
+        try:
+            if node is not None:
+                node.stop()
+        finally:
+            assert server.shutdown()["completed"]
+
+
 def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
     persistent_node_project: tuple[Path, str], unique_ipc_address: str,
 ) -> None:
@@ -389,11 +435,10 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
         fresh = _ok(node.request("call", "builder", transport="fresh"))
         assert replacement.calls == 1
         assert fresh["observations"][-1]["routeUid"] != bound["routeUid"]
-        _ok(node.request("close"))
         _reject(node.request("call", "builder"), "route token mismatch")
         assert replacement.calls == 1
         healthy = _ok(node.request("call"))
-        assert healthy["connects"] == 3 and manager.calls == 3
+        assert healthy["connects"] == 2 and manager.calls == 3
 
         _ok(node.request("close"))
         _ok(node.request("close", transport="fresh"))
@@ -406,8 +451,8 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
         new_identity = dict(server._runtime_session.ensure_server())
         assert new_identity["server_id"] == native_identity["server_id"]
         assert new_identity["server_instance_id"] != native_identity["server_instance_id"]
-        _reject(node.request("call"), "server identity mismatch")
-        _reject(node.request("prepare", "builder", transport="fresh"), "server identity mismatch")
+        _reject(node.request("call"), "deactivated")
+        _reject(node.request("prepare", "builder", transport="fresh"), "deactivated")
         assert restarted_manager.calls == 0 and restarted_builder.calls == 0
         restarted = _ok(node.request("call", "builder", transport="restarted"))
         assert restarted_builder.calls == 1

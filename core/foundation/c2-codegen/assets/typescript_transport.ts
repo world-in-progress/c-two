@@ -64,6 +64,9 @@ export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayl
 
 export interface C2IpcConnection {
   readonly memory?: C2IpcMemoryContext | undefined;
+  /** Native write timeout can seal new admission while dispatched I/O finishes. */
+  readonly deactivated?: boolean;
+  readonly deactivation?: Promise<void>;
   write(data: C2ByteArray): void | Promise<void>;
   readExactly(byteLength: number): C2ByteArray | Promise<C2ByteArray>;
   close(): void | Promise<void>;
@@ -234,6 +237,7 @@ interface C2IpcHandshake {
 }
 
 interface C2IpcOpenConnection {
+  onDeactivated?: () => void;
   readonly connection: C2IpcConnection;
   readonly handshake: C2IpcHandshake;
   writeChain: Promise<void>;
@@ -330,6 +334,14 @@ class C2IpcConnectionFailure extends C2IpcTransportError {
   }
 }
 
+/** The native reader consumed one whole frame payload but could not allocate its local copy. */
+class C2IpcLocalPayloadFailure extends C2IpcTransportError {
+  constructor(readonly requestId: bigint, readonly flags: number, cause: unknown, readonly prefix?: Uint8Array) {
+    super(`C-Two IPC local response payload allocation failed: ${String(cause)}`);
+    Object.setPrototypeOf(this, C2IpcLocalPayloadFailure.prototype);
+  }
+}
+
 export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(address: string, options: C2IpcTransportOptions<Payload>): C2IpcEncodedTransport<Payload> {
   validateIpcAddress(address);
   const connect = normalizeIpcConnect(options, "C-Two IPC transport options");
@@ -342,8 +354,16 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   const observationPath = normalizeIpcObservationPath(options.observationPath);
   const observe = normalizeTransportObserver(options.observe, "C-Two IPC observe");
   let connectionPromise: Promise<C2IpcOpenConnection> | undefined;
-  // Bindings survive stream loss and explicit close. A new connection may
-  // restore this transport, but cannot redirect its already acquired routes.
+  let deactivated = false;
+  const queuedCalls = new Set<(error: C2IpcTransportError) => void>();
+  const deactivateAdmission = (): void => {
+    deactivated = true;
+    for (const reject of queuedCalls) reject(new C2IpcTransportError("C-Two IPC transport is deactivated."));
+    queuedCalls.clear();
+  };
+  let closePromise: Promise<void> | undefined;
+  // Bindings survive stream loss and reconnect without redirecting acquired routes.
+  // Explicit close seals this transport.
   let boundServerIdentity: C2ServerIdentity | undefined;
   const boundRoutes = new Map<string, C2IpcRouteInfo>();
   let nextRequestId = 1n;
@@ -352,11 +372,22 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   let responses = 0;
 
   const openConnection = (): Promise<C2IpcOpenConnection> => {
+    if (deactivated) throw new C2IpcTransportError("C-Two IPC transport is deactivated.");
     if (connectionPromise === undefined) {
-      connectionPromise = connectAndHandshakeIpc(address, connect, connectTimeoutMs).catch((error) => {
-        connectionPromise = undefined;
+      const pending = connectAndHandshakeIpc(address, connect, connectTimeoutMs).then(open => {
+        open.onDeactivated = () => {
+          // Closing a discarded stream must not seal a newer incarnation.
+          if (connectionPromise !== pending) return;
+          deactivateAdmission();
+          void closeTransport().catch(error => console.warn("Warning: IPC connection retirement failed:", error));
+        };
+        void open.connection.deactivation?.then(open.onDeactivated);
+        return open;
+      }).catch((error) => {
+        if (connectionPromise === pending) connectionPromise = undefined;
         throw error;
       });
+      connectionPromise = pending;
     }
     return connectionPromise;
   };
@@ -372,7 +403,10 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   };
 
   const discardConnection = async (open: C2IpcOpenConnection): Promise<void> => {
-    connectionPromise = undefined;
+    if (connectionPromise !== undefined) {
+      const current = await connectionPromise.catch(() => undefined);
+      if (current === open) connectionPromise = undefined;
+    }
     if (open.discarded) return;
     open.discarded = true;
     try {
@@ -436,6 +470,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
       requireMatchingIpcRoute(boundRoute, routeName, routeContract);
     }
     const open = await openConnection();
+    if (deactivated || open.connection.deactivated) throw new C2IpcTransportError("C-Two IPC transport is deactivated.");
     requireExpectedServerIdentity(open.handshake.serverIdentity, expectedServerIdentity);
     requireExpectedServerIdentity(open.handshake.serverIdentity, boundServerIdentity);
     const expected = {
@@ -490,21 +525,74 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   };
 
   const enqueue = <T>(run: () => Promise<T>): Promise<T> => {
-    const result = callChain.then(run, run);
-    callChain = result.then(() => undefined, () => undefined);
-    return result;
+    if (deactivated) return Promise.reject(new C2IpcTransportError("C-Two IPC transport is deactivated."));
+    let rejectQueued!: (error: C2IpcTransportError) => void;
+    const stopped = new Promise<T>((_, reject) => { rejectQueued = reject; });
+    queuedCalls.add(rejectQueued);
+    const begin = (): Promise<T> => {
+      queuedCalls.delete(rejectQueued);
+      if (deactivated) throw new C2IpcTransportError("C-Two IPC transport is deactivated.");
+      return run();
+    };
+    const execution = callChain.then(begin, begin);
+    callChain = execution.then(() => undefined, () => undefined);
+    return Promise.race([execution, stopped]).finally(() => { queuedCalls.delete(rejectQueued); });
+  };
+
+  const closeTransport = async (): Promise<void> => {
+    if (closePromise !== undefined) return await closePromise;
+    deactivateAdmission();
+    const pendingCalls = callChain;
+    closePromise = (async () => {
+      await pendingCalls;
+      const current = connectionPromise;
+      if (current === undefined) return;
+      const open = await current.catch(() => undefined);
+      if (open === undefined || open.discarded) return;
+      let closeAttempted = false;
+      try {
+        open.closing = true;
+        if (open.connection.memory !== undefined) {
+          open.connection.memory.deactivate();
+          await open.writeChain;
+          await writeIpcFrame(open);
+          if (!open.connection.memory.tryClose()) {
+            await writeIpcFrame(open, encodeIpcFrame(0n, C2_IPC_FLAG_SIGNAL, new Uint8Array([0x08])), undefined, true);
+            if (open.reading !== undefined) await open.reading;
+            else {
+              try { await readIpcResponseFrame(open); } catch (error) {
+                if (!open.connection.memory.tryClose()) throw error;
+              }
+            }
+          }
+        }
+        closeAttempted = true;
+        await open.connection.close();
+      } catch (error) {
+        if (!closeAttempted) {
+          try { await open.connection.close(); } catch { /* preserve the settlement failure */ }
+        }
+        const closeError = new C2IpcTransportError(`C-Two IPC close failed: ${String(error)}`);
+        closeError.cause = error;
+        throw closeError;
+      }
+    })();
+    return await closePromise;
   };
 
   return {
     async prepare(routeName: string, contract: C2ContractIdentity): Promise<void> {
+      if (deactivated) throw new C2IpcTransportError("C-Two IPC transport is deactivated.");
       await enqueue(async () => { await prepareRoute(routeName, contract); });
     },
 
     async call(routeName: string, contract: C2ContractIdentity, method: string, payload: Uint8Array): Promise<Payload> {
       const run = async (): Promise<Payload> => {
+        if (deactivated) throw new C2IpcTransportError("C-Two IPC transport is deactivated.");
         requireMethodPathValue(method);
         const requestPayload = requireUint8Array(payload, "payload");
         const { open, route } = await prepareRoute(routeName, contract);
+        if (deactivated || open.connection.deactivated) throw new C2IpcTransportError("C-Two IPC transport is deactivated.");
         if (requestPayload.byteLength > route.maxPayloadSize) {
           throw new C2IpcTransportError(`C-Two IPC route ${routeName} payload ${requestPayload.byteLength} exceeds max_payload_size ${route.maxPayloadSize}.`);
         }
@@ -634,11 +722,6 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
                   // A received service refusal stops after the preceding
                   // complete frame; the stream remains usable for the next call.
                   if (stopChunkUpload) break;
-                  // close/discard clears this before closing the stream;
-                  // callChain prevents a replacement until this exchange ends.
-                  if (connectionPromise === undefined) {
-                    throw new C2IpcTransportError("C-Two IPC connection is closed.");
-                  }
                   const start = index * requestChunkSize;
                   const chunk = requestPayload.subarray(start, Math.min(start + requestChunkSize, requestPayload.byteLength));
                   let flags = C2_IPC_FLAG_CALL_V2 | C2_IPC_FLAG_CHUNKED;
@@ -646,7 +729,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
                   const body = index === 0
                     ? concatUint8Arrays([encodeIpcRequestChunkHeader(index, totalChunks), callControl, chunk])
                     : concatUint8Arrays([encodeIpcRequestChunkHeader(index, totalChunks), chunk]);
-                  await writeIpcFrame(open, encodeIpcFrame(requestId, flags, body));
+                  await writeIpcFrame(open, encodeIpcFrame(requestId, flags, body), undefined, index !== 0);
                 }
               } else {
                 await writeIpcFrame(open, encodeIpcFrame(requestId, C2_IPC_FLAG_CALL_V2, concatUint8Arrays([callControl, requestPayload])));
@@ -705,45 +788,18 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         }
         return responseValue as Payload;
       };
-      return await enqueue(run);
+      if (deactivated) throw new C2IpcTransportError("C-Two IPC transport is deactivated.");
+      try { return await enqueue(run); }
+      finally {
+        const open = await connectionPromise?.catch(() => undefined);
+        if (open?.connection.deactivated && !deactivated) {
+          void closeTransport().catch(error => console.warn("Warning: IPC connection retirement failed:", error));
+        }
+      }
     },
 
     async close(): Promise<void> {
-      const current = connectionPromise;
-      connectionPromise = undefined;
-      if (current === undefined) {
-        return;
-      }
-      const open = await current.catch(() => undefined);
-      if (open !== undefined) {
-        let closeAttempted = false;
-        try {
-          if (open.connection.memory !== undefined) {
-            open.closing = true;
-            open.connection.memory.deactivate();
-            await open.writeChain;
-            await writeIpcFrame(open);
-            if (!open.connection.memory.tryClose()) {
-              await writeIpcFrame(open, encodeIpcFrame(0n, C2_IPC_FLAG_SIGNAL, new Uint8Array([0x08])), undefined, true);
-              if (open.reading !== undefined) await open.reading;
-              else {
-                try { await readIpcResponseFrame(open); } catch (error) {
-                  if (!open.connection.memory.tryClose()) throw error;
-                }
-              }
-            }
-          }
-          closeAttempted = true;
-          await open.connection.close();
-        } catch (error) {
-          if (!closeAttempted) {
-            try { await open.connection.close(); } catch { /* preserve the settlement failure */ }
-          }
-          const closeError = new C2IpcTransportError(`C-Two IPC close failed: ${String(error)}`);
-          closeError.cause = error;
-          throw closeError;
-        }
-      }
+      return await closeTransport();
     },
   };
 }
@@ -1448,11 +1504,31 @@ async function readIpcResponseFrame(open: C2IpcOpenConnection, expectedRequestId
         await open.connection.close();
         throw new C2IpcTransportError("C-Two IPC connection is closed.");
       }
-      const frame = await readIpcFrame(open.connection);
+      let frame: C2IpcFrame;
+      try { frame = await readIpcFrame(open.connection); }
+      catch (error) {
+        if (error instanceof C2IpcLocalPayloadFailure) {
+          if ((error.flags & C2_IPC_FLAG_BUDDY) !== 0 && error.prefix !== undefined) {
+            await discardIpcShmFrame(open, {requestId: error.requestId, flags: error.flags, payload: error.prefix});
+          }
+          if (open.discardingChunkReplyIds.has(error.requestId)) {
+            if ((error.flags & C2_IPC_FLAG_CHUNK_LAST) !== 0) open.discardingChunkReplyIds.delete(error.requestId);
+            continue;
+          }
+          if ((error.flags & C2_IPC_FLAG_CHUNKED) !== 0 && (error.flags & C2_IPC_FLAG_CHUNK_LAST) === 0) {
+            open.discardingChunkReplyIds.add(error.requestId);
+          }
+          throw error;
+        }
+        throw error;
+      }
       if (frame.payload[0] === C2_IPC_RELEASE && (frame.flags & C2_IPC_FLAG_CTRL) !== 0) {
         if (memory === undefined) throw new C2IpcConnectionFailure("Release on a connection without native memory.");
         try { memory.receiveRelease(encodeIpcFrame(frame.requestId, frame.flags, frame.payload)); }
-        catch (error) { throw new C2IpcConnectionFailure(`C-Two IPC release frame rejected: ${String(error)}`); }
+        catch {
+          memory.deactivate();
+          open.onDeactivated?.();
+        }
         continue;
       }
       if (open.discardingChunkReplyIds.has(frame.requestId)) {
@@ -1479,7 +1555,10 @@ async function discardIpcShmFrame(open: C2IpcOpenConnection, frame: C2IpcFrame):
   if (memory === undefined) return;
   let block: C2IpcShmBlock;
   try { block = decodeIpcBuddyPayload(frame.payload); }
-  catch { return; } // A truncated descriptor contains no usable loan identity.
+  catch (error) {
+    if (error instanceof C2IpcConnectionFailure) throw error;
+    return; // A truncated descriptor contains no usable loan identity.
+  }
   let response: unknown;
   try { response = memory.admitResponse(block); }
   catch { await writeIpcFrame(open); return; } // Native admission queued its release.
@@ -1516,12 +1595,20 @@ function encodeIpcFrame(requestId: bigint, flags: number, payload: Uint8Array): 
 
 async function readIpcFrame(connection: C2IpcConnection): Promise<C2IpcFrame> {
   try {
-    const header = requireUint8Array(await connection.readExactly(C2_IPC_FRAME_HEADER_BYTES), "C-Two IPC frame header");
+    let header: Uint8Array;
+    try { header = requireUint8Array(await connection.readExactly(C2_IPC_FRAME_HEADER_BYTES), "C-Two IPC frame header"); }
+    catch (error) {
+      const failure = error as { c2LocalAllocationFailure?: unknown; c2ReadPrefix?: Uint8Array };
+      if (failure?.c2LocalAllocationFailure !== true || failure.c2ReadPrefix?.byteLength !== C2_IPC_FRAME_HEADER_BYTES) throw error;
+      header = failure.c2ReadPrefix;
+    }
     if (header.byteLength !== C2_IPC_FRAME_HEADER_BYTES) {
       throw new C2IpcTransportError(`C-Two IPC frame header read returned ${header.byteLength} bytes.`);
     }
     const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
     const totalLen = view.getUint32(0, true);
+    const requestId = view.getBigUint64(4, true);
+    const flags = view.getUint32(12, true);
     if (totalLen < C2_IPC_FRAME_BODY_HEADER_BYTES) {
       throw new C2IpcTransportError(`C-Two IPC frame total_len ${totalLen} is smaller than the fixed body header.`);
     }
@@ -1529,18 +1616,33 @@ async function readIpcFrame(connection: C2IpcConnection): Promise<C2IpcFrame> {
     if (payloadLen > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
       throw new C2IpcTransportError(`C-Two IPC frame payload length ${payloadLen} must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES}.`);
     }
-    const payload = payloadLen === 0
-      ? new Uint8Array()
-      : requireUint8Array(await connection.readExactly(payloadLen), "C-Two IPC frame payload");
+    let payload: Uint8Array;
+    try {
+      payload = payloadLen === 0
+        ? new Uint8Array()
+        : requireUint8Array(await connection.readExactly(payloadLen), "C-Two IPC frame payload");
+    } catch (error) {
+      const failure = error as { c2LocalAllocationFailure?: unknown; c2ReadPrefix?: Uint8Array };
+      if (failure?.c2LocalAllocationFailure === true && (flags & C2_IPC_FLAG_CTRL) !== 0
+        && failure.c2ReadPrefix?.byteLength === payloadLen) {
+        // The reserved metadata contains this whole control payload. Process
+        // its release records normally before reading the dispatched reply.
+        payload = failure.c2ReadPrefix;
+      } else if (failure?.c2LocalAllocationFailure === true && (flags & C2_IPC_FLAG_RESPONSE) !== 0) {
+        throw new C2IpcLocalPayloadFailure(requestId, flags, error,
+          failure.c2ReadPrefix);
+      } else throw error;
+    }
     if (payload.byteLength !== payloadLen) {
       throw new C2IpcTransportError(`C-Two IPC frame payload read returned ${payload.byteLength} bytes, expected ${payloadLen}.`);
     }
     return {
-      requestId: view.getBigUint64(4, true),
-      flags: view.getUint32(12, true),
+      requestId,
+      flags,
       payload,
     };
   } catch (error) {
+    if (error instanceof C2IpcLocalPayloadFailure) throw error;
     throw new C2IpcConnectionFailure(`C-Two IPC frame read failed: ${String(error)}`);
   }
 }
@@ -1815,6 +1917,7 @@ function decodeIpcBuddyPayload(payload: Uint8Array): C2IpcShmBlock {
   const generation = readU32LE(payload, 2);
   const dedicated = (flags & C2_IPC_BUDDY_FLAG_DEDICATED) !== 0;
   const loanId = readU64LEBigInt(payload, 15);
+  if (loanId === 0n) throw new C2IpcConnectionFailure("C-Two IPC response loan ID is zero.");
   return {
     segmentIndex: readU16LE(payload, 0),
     generation,

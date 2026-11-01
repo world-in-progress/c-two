@@ -248,6 +248,7 @@ async fn bounded_close_is_honest_while_peer_stops_reading_a_started_frame() {
         stream.read_exact(&mut payload).await.unwrap();
         let (_, control_len) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
         assert!(payload[control_len..].iter().all(|byte| *byte == 0x5b));
+        reply(&mut stream, header.request_id, b"finished").await;
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
@@ -271,9 +272,18 @@ async fn bounded_close_is_honest_while_peer_stops_reading_a_started_frame() {
             .snapshot()
             .is_none()
     );
-    let error = caller.await.unwrap().unwrap_err();
-    assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
+    assert!(!caller.is_finished());
     resume.send(()).unwrap();
+    assert_eq!(
+        timeout(WAIT, caller)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_owned_bytes()
+            .unwrap(),
+        b"finished"
+    );
     assert!(client.close_shared_bounded(WAIT).await);
     peer.await.unwrap();
 }

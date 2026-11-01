@@ -438,9 +438,9 @@ fn next_owner_generation(inner: &mut PoolInner) -> u64 {
 
 #[cfg(test)]
 fn close_replaced_client(client: Arc<IpcClient>) {
+    client.deactivate();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
-            client.retire();
             if let Some(observation) = client.connection_observation() {
                 observation.wait_closed(None).await;
             }
@@ -560,7 +560,7 @@ impl UpstreamSlot {
                             // domain before returning it here. An unconfirmed close
                             // leaves that owner intact and is_connected=false makes
                             // its existing observer retry until confirmed cleanup.
-                            client.retire();
+                            client.deactivate();
                             let cleanup_confirmed = match client.connection_observation() {
                                 Some(observation) => observation
                                     .wait_closed(Some(Duration::from_millis(50)))

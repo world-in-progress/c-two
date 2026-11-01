@@ -174,7 +174,6 @@ test('release write failure delivers the successful call and discards only its c
 for (const [label, payload, flags, expectedAdmissions, expectedReleases] of [
   ['truncated descriptor', new Uint8Array(22), 322, 0, 0],
   ['empty span', Buffer.concat([blockBytes({byteLength: 0}), Buffer.from([0])]), 322, 1, 1],
-  ['zero loan ID', Buffer.concat([blockBytes({loanId: 0n}), Buffer.from([0])]), 322, 1, 0],
   ['invalid generation', Buffer.concat([blockBytes({generation: 0}), Buffer.from([0])]), 322, 1, 1],
   ['dedicated offset', Buffer.concat([blockBytes({dedicated: true, offset: 1}), Buffer.from([0])]), 322, 1, 1],
   ['chunked SHM', Buffer.concat([blockBytes(), Buffer.from([0])]), 322 | 512, 1, 1],
@@ -349,6 +348,200 @@ test('local response allocation failure preserves a complete inline connection',
   await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /allocation failed/);
   assert.equal(p.closed.length, 0);
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
+  await transport.close();
+});
+test('local frame payload copy allocation failure fails only its call after the frame is consumed', async () => {
+  const {createIpcEncodedTransport} = await transportModule();
+  const p = peer();
+  const read = p.connection.readExactly.bind(p.connection);
+  let failNextReplyPayload = true;
+  let afterBusinessWrite = false;
+  const write = p.connection.write.bind(p.connection);
+  p.connection.write = bytes => {
+    const flags = Buffer.from(bytes).readUInt32LE(12);
+    if ((flags & 128) !== 0) afterBusinessWrite = true;
+    write(bytes);
+  };
+  p.connection.readExactly = length => {
+    const bytes = read(length);
+    if (afterBusinessWrite && length === 2 && failNextReplyPayload) {
+      failNextReplyPayload = false;
+      const failure = new Error('injected local copy target allocation failure');
+      failure.c2LocalAllocationFailure = true;
+      throw failure;
+    }
+    return bytes;
+  };
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
+  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /local response payload allocation failed/);
+  assert.equal(p.closed.length, 0);
+  assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
+  assert.equal(p.calls.length, 2);
+  await transport.close();
+});
+test('local SHM descriptor copy allocation failure settles its loan and preserves the stream', async () => {
+  const {createIpcEncodedTransport} = await transportModule();
+  const memory = memoryPeer();
+  const p = peer({memory, reply: [{flags: 322, payload: Buffer.concat([blockBytes(), Buffer.from([0])])}, undefined]});
+  const read = p.connection.readExactly.bind(p.connection);
+  let failed = false;
+  p.connection.readExactly = length => {
+    const bytes = read(length);
+    if (p.calls.length === 1 && length === 24 && !failed) {
+      failed = true;
+      throw Object.assign(new Error('injected descriptor copy allocation failure'), {
+        c2LocalAllocationFailure: true, c2ReadPrefix: bytes.subarray(0, 23),
+      });
+    }
+    return bytes;
+  };
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
+  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /local response payload allocation failed/);
+  assert.equal(failed, true);
+  assert.equal(memory.discards, 1);
+  assert.equal(p.releaseFrames.length, 1);
+  assert.equal(p.closed.length, 0);
+  assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
+  await transport.close();
+});
+test('a recoverable header copy allocation failure keeps the response frame readable', async () => {
+  const {createIpcEncodedTransport} = await transportModule();
+  const p = peer();
+  const read = p.connection.readExactly.bind(p.connection);
+  let failed = false;
+  p.connection.readExactly = length => {
+    const bytes = read(length);
+    if (p.calls.length === 1 && length === 16 && !failed) {
+      failed = true;
+      throw Object.assign(new Error('injected header copy allocation failure'), {c2LocalAllocationFailure: true, c2ReadPrefix: bytes});
+    }
+    return bytes;
+  };
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
+  assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
+  assert.equal(failed, true);
+  assert.equal(p.closed.length, 0);
+  await transport.close();
+});
+for (const invalidRelease of [false, true]) {
+test(invalidRelease ? 'release channel violation seals new work and preserves the dispatched reply' : 'local release batch copy allocation failure settles all 64 loans before the reply', async () => {
+  const {createIpcEncodedTransport} = await transportModule();
+  const memory = memoryPeer();
+  const released = [];
+  memory.receiveRelease = bytes => {
+    if (invalidRelease) throw new Error('release channel violation');
+    for (let offset = 18; offset < bytes.byteLength; offset += 8) released.push(new DataView(bytes.buffer, bytes.byteOffset + offset, 8).getBigUint64(0, true));
+  };
+  const ids = Array.from({length: 64}, (_, index) => BigInt(index + 1));
+  const p = peer({memory, reply: [{frames: [
+    {flags: 18, payload: Buffer.concat([Buffer.from([0x17, 64]), ...ids.map(u64)])},
+    {flags: 258, payload: Buffer.from([0, 42])},
+  ]}, undefined]});
+  const read = p.connection.readExactly.bind(p.connection);
+  let failed = false;
+  p.connection.readExactly = length => {
+    const bytes = read(length);
+    if (!invalidRelease && length === 514 && !failed) {
+      failed = true;
+      throw Object.assign(new Error('injected release target allocation failure'), {c2LocalAllocationFailure: true, c2ReadPrefix: bytes});
+    }
+    return bytes;
+  };
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
+  assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
+  if (invalidRelease) {
+    assert.equal(memory.deactivated, true);
+    await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /deactivated/);
+  } else {
+    assert.equal(failed, true);
+    assert.deepEqual(released, ids);
+    assert.equal(p.closed.length, 0);
+    assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
+  }
+  await transport.close();
+});
+}
+for (const nativeTimeout of [false, true]) {
+test(nativeTimeout ? 'native write timeout wakes queued calls before the dispatched upload finishes' : 'closing during a dispatched chunk upload preserves its reply and rejects queued work', async () => {
+  const {createIpcEncodedTransport} = await transportModule();
+  const memory = memoryPeer();
+  const p = peer({memory});
+  let notifyDeactivation;
+  p.connection.deactivation = new Promise(resolve => { notifyDeactivation = resolve; });
+  Object.defineProperty(p.connection, 'deactivated', {get: () => memory.deactivated});
+  const original = p.connection.write.bind(p.connection);
+  const read = p.connection.readExactly.bind(p.connection);
+  p.connection.readExactly = async length => {
+    for (;;) {
+      try { return read(length); }
+      catch (error) {
+        if (error.code !== 'ERR_ASSERTION') throw error;
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    }
+  };
+  let releaseFirstChunk;
+  let firstChunkSeen;
+  const chunkIndices = [];
+  const firstChunk = new Promise(resolve => { firstChunkSeen = resolve; });
+  p.connection.write = async bytes => {
+    const data = Buffer.from(bytes);
+    if ((data.readUInt32LE(12) & 512) !== 0) {
+      const index = data.readUInt16LE(16);
+      chunkIndices.push(index);
+      if (index === 0) {
+        firstChunkSeen();
+        await new Promise(resolve => { releaseFirstChunk = resolve; });
+      }
+      if ((data.readUInt32LE(12) & 1024) === 0) return;
+    }
+    original(bytes);
+  };
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection, requestChunkSize: 4});
+  const running = transport.call('echo', contract, 'echo', new Uint8Array(12));
+  await firstChunk;
+  const queued = transport.call('echo', contract, 'echo', new Uint8Array());
+  const queuedResult = assert.rejects(queued, /deactivated/);
+  let closing;
+  if (nativeTimeout) { memory.deactivate(); notifyDeactivation(); }
+  else closing = transport.close();
+  assert.equal(p.closed.length, 0);
+  await queuedResult;
+  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /deactivated/);
+  // The same native deactivation happens when Node's write_timeout expires.
+  memory.deactivate();
+  releaseFirstChunk();
+  assert.deepEqual(Array.from(await running), [42]);
+  assert.deepEqual(chunkIndices, [0, 1, 2]);
+  await queuedResult;
+  await (closing ?? transport.close());
+  assert.equal(p.closed.length, 1);
+  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /deactivated/);
+});
+}
+test('close during connection initialization prevents a route query', async () => {
+  const {createIpcEncodedTransport} = await transportModule();
+  const p = peer();
+  let finishConnect;
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => new Promise(resolve => { finishConnect = () => resolve(p.connection); })});
+  const pending = transport.prepare('echo', contract);
+  await new Promise(resolve => setImmediate(resolve));
+  const closing = transport.close();
+  finishConnect();
+  await assert.rejects(pending, /deactivated/);
+  await closing;
+  assert.deepEqual(p.ids, []);
+  assert.equal(p.closed.length, 1);
+});
+test('zero loan ID deactivates connection without changing an earlier call result', async () => {
+  const {createIpcEncodedTransport} = await transportModule();
+  const memory = memoryPeer();
+  const p = peer({memory, reply: [undefined, {flags: 322, payload: Buffer.concat([blockBytes({loanId: 0n}), Buffer.from([0])])}]});
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
+  assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
+  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /loan ID/);
+  assert.equal(p.closed.length, 1);
+  assert.equal(memory.deactivated, true);
   await transport.close();
 });
 test('incomplete frame discards its connection before a new call', async () => {

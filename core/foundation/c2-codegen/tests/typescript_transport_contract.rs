@@ -1007,12 +1007,13 @@ test('uncertain writes are never replayed; same identity reconnect retains the o
 test('server incarnation is shared and pinned even for a newly acquired route', async () => {
   const s = server(), t = transport(s);
   await call(t);
-  await t.close();
+  s.failCall = true;
+  await assert.rejects(() => call(t), /uncertain write/);
   s.instance = 'new-instance';
   s.routes.set('builder', record('builder', {owner_server_instance_id: s.instance}));
   await assert.rejects(() => t.prepare('builder', CONTRACT), /server identity mismatch/);
   await assert.rejects(() => call(t), /server identity mismatch/);
-  assert.equal(s.calls.length, 1);
+  assert.equal(s.calls.length, 2, 'the one failed write attempt is never replayed');
   await t.close();
 });
 
@@ -1198,7 +1199,8 @@ test('contract, owner, and non-ready records cannot change a binding', async () 
 test('failed initial acquisition leaves server binding unset until successful acquire', async () => {
   const s = server(), t = transport(s);
   await assert.rejects(() => t.prepare('builder', CONTRACT));
-  await t.close();
+  s.connections.at(-1).readExactly = async () => { throw new Error('uncertain read before any route binding'); };
+  await assert.rejects(() => t.prepare('builder', CONTRACT), /uncertain read/);
   s.instance = 'new-instance';
   s.routes.set('builder', record('builder', {owner_server_instance_id: 'new-instance'}));
   await call(t, 'builder');
@@ -1333,11 +1335,12 @@ test('request SHM requires the ACK and preserves a full u64 loan ID', async () =
   assert.equal(s.callFlags.at(-1) & 64, 0);
   assert.equal(events.some(([event]) => event === 'prepare'), false);
   s.ackShmRequest = true; await t.close();
-  await t.call('manager', CONTRACT, 'ping', new Uint8Array(7));
+  const acknowledged = transport(s, {requestShmThreshold: 0});
+  await acknowledged.call('manager', CONTRACT, 'ping', new Uint8Array(7));
   assert.equal(s.callFlags.at(-1), 128 | 64);
   assert.equal(s.calls.at(-1).subarray(0, 23).toString('hex'), '000001000000000000000700000000ffffffffffffffff');
   assert.deepEqual(events.filter(([event]) => event === 'release'), [['release', 0xffffffffffffffffn]]);
-  await t.close();
+  await acknowledged.close();
 });
 
 test('response copy sends release before the next call and keeps provider memory local', async () => {

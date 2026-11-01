@@ -410,10 +410,20 @@ async fn peer_views_retire_after_the_last_carrier_and_idle_gc() {
             "real SHM response required: {stats:?}"
         );
         assert_eq!(
-            peer.read().cache.mapped_segments(),
+            peer.read()
+                .cache
+                .as_ref()
+                .map_or(0, |cache| cache.mapped_segments()),
             if dedicated { 0 } else { 1 }
         );
-        eventually(|| peer.read().cache.mapped_segments() == 0).await;
+        eventually(|| {
+            peer.read()
+                .cache
+                .as_ref()
+                .map_or(0, |cache| cache.mapped_segments())
+                == 0
+        })
+        .await;
         assert!(client.is_connected());
         assert_eq!(held, vec![9; 8193]);
         assert_eq!(
@@ -524,6 +534,7 @@ async fn configured_write_timeout_preserves_a_sent_calls_readable_reply() {
         stream.read_exact(&mut payload).await.unwrap();
         let (_, consumed) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
         assert_eq!(&payload[consumed..], vec![7; 8 * 1024 * 1024]);
+        reply(&mut stream, header.request_id, b"timed out write completes").await;
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
@@ -546,17 +557,22 @@ async fn configured_write_timeout_preserves_a_sent_calls_readable_reply() {
         }
     });
     prefix_written.await.unwrap();
-    let error = timeout(Duration::from_secs(2), target)
-        .await
-        .expect("configured 50ms write timeout, not the 30s default")
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
-    assert!(
-        matches!(error.source_error(), IpcError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
+    timeout(
+        Duration::from_secs(2),
+        eventually(|| !client.is_connected()),
+    )
+    .await
+    .expect("configured 50ms write timeout, not the 30s default");
+    assert!(!target.is_finished());
+    assert_eq!(client.pending_len_for_test(), 2);
+    assert_eq!(
+        client
+            .call_inline(&identity(), 0, b"new")
+            .await
+            .unwrap_err()
+            .phase(),
+        crate::TransportPhase::PreDispatch
     );
-    assert!(!client.is_connected());
-    assert_eq!(client.pending_len_for_test(), 1);
     assert!(!other.is_finished());
     other_reply.send(()).unwrap();
     assert_eq!(
@@ -570,6 +586,16 @@ async fn configured_write_timeout_preserves_a_sent_calls_readable_reply() {
         b"other survives"
     );
     drain.send(()).unwrap();
+    assert_eq!(
+        timeout(WAIT, target)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_owned_bytes()
+            .unwrap(),
+        b"timed out write completes"
+    );
     assert!(client.close_shared_bounded(WAIT).await);
     timeout(WAIT, peer).await.unwrap().unwrap();
 }

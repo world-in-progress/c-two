@@ -18,6 +18,7 @@ function stateFor(id, command) {
   state = {
     connects: 0, businessWrites: 0, observations: [], loseReply: false,
     chunkWrites: 0, completedChunkWrites: 0, chunkRequests: 0, activeWrites: 0, writesAfterClose: 0, closes: 0,
+    pauseFirstChunk: undefined,
   };
   const transport = manager.createIpcEncodedTransport(config.address, {
     requestChunkSize: 4096,
@@ -31,6 +32,8 @@ function stateFor(id, command) {
       let loseBusinessReply = false;
       let closed = false;
       return {
+        get deactivated() { return connection.deactivated; },
+        deactivation: connection.deactivation,
         async write(bytes) {
           const header = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
           const flags = header.getUint32(12, true);
@@ -47,6 +50,12 @@ function stateFor(id, command) {
           state.activeWrites += 1;
           try {
             await connection.write(bytes);
+            if ((flags & (1 << 7)) !== 0 && (flags & (1 << 9)) !== 0
+                && header.getUint16(16, true) === 0 && state.pauseFirstChunk !== undefined) {
+              state.pauseFirstChunk.written();
+              await state.pauseFirstChunk.resume;
+              state.pauseFirstChunk = undefined;
+            }
             if ((flags & (1 << 7)) !== 0 && (flags & (1 << 9)) !== 0) state.completedChunkWrites += 1;
           } finally {
             state.activeWrites -= 1;
@@ -106,6 +115,49 @@ try {
         // Reach native chunk admission with the existing no-input method;
         // this payload must be refused before Python dispatch/deserialization.
         await state.transport.call('manager', manager.CONTRACT, 'ping', new Uint8Array(64 * 1024 * 1024));
+      } else if (command.op === 'closeDuringUpload') {
+        let written;
+        let resume;
+        const firstChunk = new Promise(resolve => { written = resolve; });
+        const continueUpload = new Promise(resolve => { resume = resolve; });
+        state.pauseFirstChunk = {written, resume: continueUpload};
+        const dispatched = state.transport.call('manager', manager.CONTRACT, 'ping', new Uint8Array(8192));
+        await firstChunk;
+        const closing = state.transport.close();
+        const rejected = state.transport.call('manager', manager.CONTRACT, 'ping', new Uint8Array());
+        try {
+          await assert.rejects(rejected, /deactivated/);
+        } finally {
+          resume();
+        }
+        try {
+          await dispatched;
+        } catch (caught) {
+          // A complete service refusal still belongs to the dispatched call.
+          assert.equal(caught.name, 'C2CrmMethodError');
+        }
+        await closing;
+        assert.equal(state.writesAfterClose, 0);
+      } else if (command.op === 'copyFail') {
+        const original = globalThis.Uint8Array;
+        let injected = false;
+        globalThis.Uint8Array = new Proxy(original, {
+          construct(target, argumentsList, newTarget) {
+            if (!injected && state.businessWrites > 0 && Number.isInteger(argumentsList[0])
+                && argumentsList[0] > 0 && argumentsList[0] !== 16
+                && new Error().stack?.includes('NodeIpcConnection.take')) {
+              injected = true;
+              throw new Error('injected Node local response copy allocation failure');
+            }
+            return Reflect.construct(target, argumentsList, newTarget);
+          },
+        });
+        try {
+          await assert.rejects(state.clients.manager.method_0_ping(), /local response payload allocation failed/);
+          assert.equal(injected, true, 'Node take() local allocation failure was not reached');
+        } finally {
+          globalThis.Uint8Array = original;
+        }
       } else {
         assert.equal(command.op, 'call');
         state.loseReply = command.uncertain === true;

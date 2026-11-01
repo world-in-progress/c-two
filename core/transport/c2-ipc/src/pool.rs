@@ -8,7 +8,7 @@ use c2_mem::{MemPool, PoolConfig};
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn pool_config_from_client_config(cfg: &ClientIpcConfig) -> PoolConfig {
@@ -223,21 +223,19 @@ struct PoolEntry {
     references: Arc<PoolReferences>,
 }
 
-// Keep the detached business client until its original physical close is
-// observed; dropping IpcClient earlier would turn retirement into active close.
+// Keep detached client metadata until its original physical close is observed.
 // Preparing records fence connects across cache drains/seal.
 enum CloseState {
     Preparing,
     Closing {
         observation: Option<ConnectionObservation>,
-        client: Option<Arc<SyncClient>>,
+        _client: Option<Arc<SyncClient>>,
     },
     Finished,
 }
 struct CloseRecord {
     address: String,
     state: Mutex<CloseState>,
-    force_requested: AtomicBool,
     changed: Condvar,
 }
 impl CloseRecord {
@@ -245,7 +243,6 @@ impl CloseRecord {
         Self {
             address: address.into(),
             state: Mutex::new(CloseState::Preparing),
-            force_requested: AtomicBool::new(false),
             changed: Condvar::new(),
         }
     }
@@ -253,35 +250,15 @@ impl CloseRecord {
         *self.state.lock() = CloseState::Finished;
         self.changed.notify_all();
     }
-    fn start(&self, client: Arc<SyncClient>, retire: bool) {
+    fn deactivate(&self, client: Arc<SyncClient>) {
         // Install the observation and retain the business Arc before changing
         // admission. Native tasks still own the stream and loan book.
         *self.state.lock() = CloseState::Closing {
             observation: client.connection_observation(),
-            client: Some(client.clone()),
+            _client: Some(client.clone()),
         };
-        if retire && !self.force_requested.load(Ordering::Acquire) {
-            client.retire();
-        } else {
-            client.deactivate();
-        }
+        client.deactivate();
         self.changed.notify_all();
-    }
-    fn retire(&self, client: Arc<SyncClient>) {
-        self.start(client, true);
-    }
-    fn close(&self, client: Arc<SyncClient>) {
-        self.start(client, false);
-    }
-    fn force_close(&self) {
-        self.force_requested.store(true, Ordering::Release);
-        let client = match &*self.state.lock() {
-            CloseState::Closing { client, .. } => client.clone(),
-            _ => None,
-        };
-        if let Some(client) = client {
-            client.deactivate();
-        }
     }
     fn complete(&self) -> bool {
         match &*self.state.lock() {
@@ -362,7 +339,7 @@ impl Drop for FreshClient {
         if self.published {
             self.record.finish();
         } else if let Some(client) = self.client.take() {
-            self.record.close(client);
+            self.record.deactivate(client);
         } else {
             self.record.finish();
         }
@@ -616,7 +593,7 @@ impl ClientPool {
             };
         }
         for (record, client) in detached {
-            record.retire(client);
+            record.deactivate(client);
         }
         let endpoint = self
             .endpoint_context()?
@@ -704,7 +681,7 @@ impl ClientPool {
         fresh.record.finish();
         drop(state);
         if let Some((record, client)) = replacement {
-            record.retire(client);
+            record.deactivate(client);
         }
         Ok(ClientLease {
             client,
@@ -741,7 +718,7 @@ impl ClientPool {
             let entry = state.entries.remove(address).unwrap();
             (state.record(address), entry.client)
         };
-        detached.0.retire(detached.1);
+        detached.0.deactivate(detached.1);
         Ok(true)
     }
     pub fn sweep_expired(&self) {
@@ -763,7 +740,7 @@ impl ClientPool {
                 .collect::<Vec<_>>()
         };
         for (record, client) in detached {
-            record.retire(client);
+            record.deactivate(client);
         }
     }
     pub fn prepare_seal(&self, deadline: Instant) -> Option<ClientPoolSeal<'_>> {
@@ -801,7 +778,7 @@ impl ClientPool {
             report.error = Some("timed out waiting for a concurrent cache drain".into());
             return report;
         };
-        let (detached, prior_records, sealed) = {
+        let (detached, sealed) = {
             let mut state = self.state.lock();
             state.draining = true;
             let entries = std::mem::take(&mut state.entries);
@@ -815,17 +792,10 @@ impl ClientPool {
                     observed.entry(*id).or_insert_with(|| Some(record.clone()));
                 }
             }
-            (
-                detached,
-                state.records.values().cloned().collect::<Vec<_>>(),
-                state.epoch.is_none(),
-            )
+            (detached, state.epoch.is_none())
         };
-        for record in prior_records {
-            record.force_close();
-        }
         for (record, client) in detached {
-            record.close(client);
+            record.deactivate(client);
         }
         for record in observed.values_mut() {
             let Some(original) = record.as_ref() else {

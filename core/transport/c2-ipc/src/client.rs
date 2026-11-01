@@ -146,7 +146,7 @@ const ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200]
 
 // Peer mappings are a read-only cache for this physical connection.
 pub struct ServerPoolState {
-    pub(crate) cache: PeerMappingCache,
+    pub(crate) cache: Option<PeerMappingCache>,
     #[cfg(test)]
     open_failure: Option<String>,
 }
@@ -154,7 +154,9 @@ pub struct ServerPoolState {
 impl ServerPoolState {
     pub(crate) fn from_pool_for_test(pool: MemPool) -> Self {
         Self {
-            cache: PeerMappingCache::new(pool.config().clone(), pool.prefix().into()).unwrap(),
+            cache: Some(
+                PeerMappingCache::new(pool.config().clone(), pool.prefix().into()).unwrap(),
+            ),
             open_failure: None,
         }
     }
@@ -165,13 +167,16 @@ impl ServerPoolState {
         if let Some(error) = self.open_failure.take() {
             return Err(PeerMappingError::Open(error));
         }
-        self.cache.admit(
-            payload.seg_idx,
-            payload.generation,
-            payload.offset,
-            payload.data_size,
-            payload.is_dedicated,
-        )
+        self.cache
+            .as_ref()
+            .expect("live connection peer cache")
+            .admit(
+                payload.seg_idx,
+                payload.generation,
+                payload.offset,
+                payload.data_size,
+                payload.is_dedicated,
+            )
     }
 }
 
@@ -1295,6 +1300,7 @@ impl IpcClient {
         connect_directory_write(&self.route_directory)?.seed_from_handshake(&hs.routes);
         self.server_identity = hs.server_identity;
         *self.server_pool.get_mut() = Some(server_pool.clone());
+        retirement.set_peer(server_pool.clone());
         let conn = ClientConnection::spawn(
             writer,
             self.pending.clone(),
@@ -1476,7 +1482,7 @@ impl IpcClient {
         Ok((
             hs,
             Arc::new(RwLock::new(ServerPoolState {
-                cache,
+                cache: Some(cache),
                 #[cfg(test)]
                 open_failure: None,
             })),
@@ -2255,13 +2261,12 @@ impl IpcClient {
         let header = encode_chunk_header(chunk_idx as u16, total_chunks as u16);
         let bytes =
             frame::encode_frame_parts(rid, flags, &[&header, ctrl.unwrap_or(&[]), chunk_data]);
-        conn.submit(
-            bytes,
-            WriteRequest::Business(Vec::new()),
-            state.clone(),
-            policy,
-        )
-        .await
+        let request = if chunk_idx == 0 {
+            WriteRequest::Business(Vec::new())
+        } else {
+            WriteRequest::Control(conn.core.prepare_control_frame().map_err(core_error)?)
+        };
+        conn.submit(bytes, request, state.clone(), policy).await
     }
 
     fn validate_method_table_contract(
@@ -2740,17 +2745,10 @@ impl IpcClient {
         closed
     }
 
-    /// Retire a cached client without cancelling calls already sent on its
-    /// original physical connection. Explicit close retains its abort policy.
-    pub fn retire(&self) {
+    /// Stop new calls and loans while sent calls finish on this connection.
+    pub fn deactivate(&self) {
         if let Some(conn) = self.driver.read().as_ref() {
-            conn.retire();
-        }
-    }
-
-    pub(crate) fn deactivate(&self) {
-        if let Some(conn) = self.driver.read().as_ref() {
-            conn.close();
+            conn.deactivate();
         }
     }
 

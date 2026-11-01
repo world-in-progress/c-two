@@ -8,6 +8,7 @@ const { setTimeout, clearTimeout, setImmediate } = createRequire(import.meta.url
   clearTimeout(timer: C2NodeTimer): void;
   setImmediate(callback: () => void): void;
 };
+const { performance } = createRequire(import.meta.url)("node:perf_hooks") as { performance: { now(): number } };
 
 export const C2_MEM_FFI_STATUS_OK = 0;
 export const C2_MEM_FFI_STATUS_NULL_POINTER = 1;
@@ -55,6 +56,7 @@ export interface C2MemFfiWrite {
 }
 export interface C2MemFfiMemoryContext {
   readonly prefix: string;
+  readonly writeTimeoutMillis: number;
   finishHandshake(prefix: string | null): void;
   prepareRequest(payload: Uint8Array): C2MemFfiPreparedRequest;
   discardRequest(request: C2MemFfiPreparedRequest): void;
@@ -83,6 +85,7 @@ export interface C2MemFfiNativeMemoryContext {
   discardWrite(write: unknown): C2MemFfiCallResult;
   receiveRelease(frame: Uint8Array): C2MemFfiCallResult;
   gc(): C2MemFfiCallResult<number>;
+  writeTimeout(): C2MemFfiCallResult<number>;
   deactivate(): C2MemFfiCallResult;
   peerEnd(): C2MemFfiCallResult;
   tryClose(): C2MemFfiCallResult<boolean>;
@@ -175,6 +178,9 @@ export interface C2MemFfiNodeRuntime {
 
 export interface C2NodeIpcConnection {
   readonly memory?: C2MemFfiMemoryContext | undefined;
+  readonly deactivated?: boolean;
+  readonly deactivation?: Promise<void>;
+  deactivate?(): void;
   write(data: Uint8Array): MaybePromise<void>;
   readExactly(byteLength: number): MaybePromise<Uint8Array>;
   close(): MaybePromise<void>;
@@ -695,11 +701,15 @@ function bundledC2MemFfiNodeNativeLibraryName(): string {
 }
 
 function memoryFromNative(native: C2MemFfiNativeMemoryContext): C2MemFfiMemoryContext {
-  let prefix: string;
-  try { prefix = requireOkValue(native.prefix(), "memory prefix"); }
+  let prefix: string, writeTimeoutMillis: number;
+  try {
+    prefix = requireOkValue(native.prefix(), "memory prefix");
+    writeTimeoutMillis = Math.max(1, Math.ceil(requireOkValue(native.writeTimeout(), "write timeout") * 1000));
+  }
   catch (error) { native.close(); throw error; }
   return {
     prefix,
+    writeTimeoutMillis,
     finishHandshake(prefix) { requireOk(native.finishHandshake(prefix), "finish handshake"); },
     prepareRequest(payload) { return requireOkValue(native.prepareRequest(payload), "prepare request"); },
     discardRequest(request) { requireOk(native.discardRequest(request), "discard request"); },
@@ -729,10 +739,17 @@ function memoryFromNative(native: C2MemFfiNativeMemoryContext): C2MemFfiMemoryCo
 
 class NodeIpcConnection implements C2NodeIpcConnection {
   private readonly chunks: Uint8Array[] = [];
+  // IPC 15 release batches contain at most 64 u64 IDs plus tag/count. This
+  // reserve also holds a frame header or SHM response descriptor, preserving
+  // loan settlement if the complete local read target cannot be allocated.
+  private readonly readFailurePrefix = new Uint8Array(2 + 64 * 8);
   private bufferedBytes = 0;
   private readonly waiters: Array<() => void> = [];
   private terminalError: C2NodeIpcConnectionError | undefined;
   private closed = false;
+  private inactive = false;
+  private notifyDeactivation!: () => void;
+  readonly deactivation = new Promise<void>(resolve => { this.notifyDeactivation = resolve; });
   private peerReadEnded = false;
   private peerEndReported = false;
   private peerEndScheduled = false;
@@ -776,7 +793,9 @@ class NodeIpcConnection implements C2NodeIpcConnection {
     }
     await new Promise<void>((resolve, reject) => {
       let settled = false;
+      let timeout: C2NodeTimer | undefined;
       const cleanup = (): void => {
+        if (timeout !== undefined) clearTimeout(timeout);
         this.socket.off("error", onError);
         this.socket.off("close", onClose);
       };
@@ -796,12 +815,35 @@ class NodeIpcConnection implements C2NodeIpcConnection {
       const onClose = (): void => finish(this.terminalError ?? new C2NodeIpcConnectionError("C-Two Node IPC socket closed before write completed."));
       this.socket.once("error", onError);
       this.socket.once("close", onClose);
+      if (this.memory !== undefined) {
+        const deadline = performance.now() + this.memory.writeTimeoutMillis;
+        const checkTimeout = (): void => {
+          if (settled) return;
+          const remaining = deadline - performance.now();
+          if (remaining <= 0) this.deactivate();
+          else {
+            timeout = setTimeout(checkTimeout, Math.min(Math.ceil(remaining), 0x7fffffff));
+            timeout.unref();
+          }
+        };
+        timeout = setTimeout(checkTimeout, Math.min(this.memory.writeTimeoutMillis, 0x7fffffff));
+        timeout.unref();
+      }
       try {
         this.socket.write(bytes, (error) => finish(error ?? undefined));
       } catch (error) {
         finish(error);
       }
     });
+  }
+
+  get deactivated(): boolean { return this.inactive; }
+
+  deactivate(): void {
+    if (this.inactive) return;
+    this.inactive = true;
+    this.memory?.deactivate();
+    this.notifyDeactivation();
   }
 
   async readExactly(byteLength: number): Promise<Uint8Array> {
@@ -831,6 +873,7 @@ class NodeIpcConnection implements C2NodeIpcConnection {
       return;
     }
     this.closed = true;
+    this.deactivate();
     if (this.gcTimer !== undefined) clearTimeout(this.gcTimer);
     this.gcTimer = undefined;
     this.fail(new C2NodeIpcConnectionError("C-Two Node IPC connection closed."));
@@ -839,7 +882,6 @@ class NodeIpcConnection implements C2NodeIpcConnection {
     if (this.memory === undefined) this.socket.end();
     this.socket.destroy();
     if (this.peerReadEnded) this.reportPeerEnd();
-    this.memory?.deactivate();
     this.memory?.close();
   }
 
@@ -880,7 +922,26 @@ class NodeIpcConnection implements C2NodeIpcConnection {
     if (byteLength === 0) {
       return new Uint8Array();
     }
-    const output = new Uint8Array(byteLength);
+    let output: Uint8Array;
+    try { output = new Uint8Array(byteLength); }
+    catch (error) {
+      const prefixLength = Math.min(byteLength, this.readFailurePrefix.byteLength);
+      let copied = 0;
+      for (const chunk of this.chunks) {
+        const count = Math.min(chunk.byteLength, prefixLength - copied);
+        for (let index = 0; index < count; index++) this.readFailurePrefix[copied + index] = chunk[index];
+        copied += count;
+        if (copied === prefixLength) break;
+      }
+      this.skip(byteLength);
+      this.schedulePeerEnd();
+      const failure = new C2NodeIpcConnectionError(`C-Two Node IPC local read allocation failed: ${String(error)}`) as C2NodeIpcConnectionError & { c2LocalAllocationFailure: boolean; c2ReadPrefix: Uint8Array };
+      failure.c2LocalAllocationFailure = true;
+      // The serialized reader consumes this reserved prefix before another
+      // failed read can overwrite it; no payload or mapping owner is retained.
+      failure.c2ReadPrefix = this.readFailurePrefix.subarray(0, prefixLength);
+      throw failure;
+    }
     let outputOffset = 0;
     while (outputOffset < byteLength) {
       const chunk = this.chunks[0];
@@ -898,6 +959,19 @@ class NodeIpcConnection implements C2NodeIpcConnection {
     }
     this.bufferedBytes -= byteLength;
     return output;
+  }
+
+  private skip(byteLength: number): void {
+    let remaining = byteLength;
+    while (remaining > 0) {
+      const chunk = this.chunks[0];
+      if (chunk === undefined) throw new C2NodeIpcConnectionError("C-Two Node IPC internal buffer underflow.");
+      const length = Math.min(chunk.byteLength, remaining);
+      if (length === chunk.byteLength) this.chunks.shift();
+      else this.chunks[0] = chunk.subarray(length);
+      remaining -= length;
+    }
+    this.bufferedBytes -= byteLength;
   }
 
   private fail(error: C2NodeIpcConnectionError): void {

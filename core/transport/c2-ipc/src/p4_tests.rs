@@ -1186,6 +1186,8 @@ async fn unnegotiated_shm_reply_is_rejected_before_mapping_or_loan_admission() {
             .unwrap()
             .read()
             .cache
+            .as_ref()
+            .unwrap()
             .mapped_segments(),
         0
     );
@@ -1595,3 +1597,6 @@ mod lifecycle;
 
 #[path = "f2_tests.rs"]
 mod fixes;
+
+#[path = "g1_tests.rs"]
+mod g1;

@@ -125,7 +125,7 @@ impl Drop for Serving {
 }
 
 #[test]
-fn eviction_retires_physical_connection_after_pending_work() {
+fn eviction_deactivates_physical_connection_after_pending_work() {
     let mut serving = Serving::new();
     let address = serving.start("eviction_disconnect");
     serving.runtime.block_on(async {
@@ -157,7 +157,7 @@ fn eviction_retires_physical_connection_after_pending_work() {
         .runtime
         .block_on(observation.wait_closed(Some(WAIT)))
         .unwrap();
-    assert_eq!(closed.reason(), ConnectionEndReason::PeerEof);
+    assert_eq!(closed.reason(), ConnectionEndReason::PeerCloseMessage);
     assert_eq!(
         serving.closed(&client).reason(),
         ConnectionEndReason::LocalClose
@@ -267,7 +267,7 @@ fn original_native_abnormal_end_survives_timeout_and_late_seed_merge() {
         let record = state.record(&address);
         *record.state.lock() = CloseState::Closing {
             observation: Some(native),
-            client: None,
+            _client: None,
         };
     }
     let seed = pool.prepare_seal(Instant::now() + WAIT).unwrap().commit();
@@ -489,7 +489,7 @@ fn concurrent_drains_serialize_and_reject_acquires_with_aggregate_deadline() {
         let record = state.record(address);
         *record.state.lock() = CloseState::Closing {
             observation: Some(native),
-            client: None,
+            _client: None,
         };
         retained.push(client);
     }
@@ -890,7 +890,7 @@ fn retired_pool_client_preserves_sent_reply(discard: bool, force_close: bool) {
     if discard {
         assert!(pool.discard_if_same(address, &old));
     } else {
-        old.retire();
+        old.deactivate();
     }
     assert!(!old.is_connected());
     let replacement = pool.acquire(address, None).unwrap();
@@ -906,36 +906,29 @@ fn retired_pool_client_preserves_sent_reply(discard: bool, force_close: bool) {
     );
     assert!(old_observation.snapshot().is_none());
     if force_close {
-        let report = pool.close_all(WAIT);
-        assert!(
-            report.error.is_none() && report.unconfirmed.is_empty(),
-            "{report:?}"
-        );
-        let error = old_call.join().unwrap().unwrap_err();
-        assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
-        assert!(matches!(error.source_error(), IpcError::Closed));
-        let _ = resume_tx.send(());
-    } else {
-        resume_tx.send(()).unwrap();
-        assert_eq!(
-            old_call
-                .join()
-                .unwrap()
-                .unwrap()
-                .into_owned_bytes()
-                .unwrap(),
-            b"old"
-        );
+        let report = pool.close_all(Duration::from_millis(20));
+        assert!(report.error.is_none(), "{report:?}");
+        assert_eq!(report.unconfirmed, vec![address.to_string()]);
+        assert!(!old_call.is_finished());
+        assert!(old_observation.snapshot().is_none());
     }
+    resume_tx.send(()).unwrap();
+    assert_eq!(
+        old_call
+            .join()
+            .unwrap()
+            .unwrap()
+            .into_owned_bytes()
+            .unwrap(),
+        b"old"
+    );
     assert!(
         serving
             .runtime
             .block_on(old_observation.wait_closed(Some(WAIT)))
             .is_some()
     );
-    if !force_close {
-        assert!(pool.close_all(WAIT).unconfirmed.is_empty());
-    }
+    assert!(pool.close_all(WAIT).unconfirmed.is_empty());
 }
 
 #[test]
@@ -949,6 +942,6 @@ fn discard_preserves_sent_reply_on_old_connection() {
 }
 
 #[test]
-fn close_all_aborts_sent_calls_on_previously_retired_clients() {
+fn close_all_preserves_sent_calls_on_previously_deactivated_clients() {
     retired_pool_client_preserves_sent_reply(false, true);
 }
