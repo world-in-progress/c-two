@@ -22,7 +22,7 @@ The core abstraction is resources, not services.
 
 C-Two resources hold state, and their calls are often non-idempotent and ordered by the caller, which awaits one call before issuing the next. Several choices that are safe for stateless RPC such as gRPC are therefore wrong here:
 
-- Never turn a completed call into an unknown outcome. A failure fails only the call it belongs to; a connection is deactivated, and its other in-flight calls fail, only when its framing can no longer be trusted.
+- Never turn a completed call into an unknown outcome. A failure fails only the call it belongs to. Deactivating a connection stops new calls and loans on it while calls already sent still finish; its other in-flight calls fail only when its framing can no longer be trusted.
 - Only pre-dispatch failures are retry-safe. A dispatch-uncertain call is never retried, replayed or hedged automatically; the caller decides.
 - Lifecycle reports are truthful. `completed` means the real terminal state; a caller's budget bounds only its own wait and never cancels cleanup. A stopped or stuck peer keeps its loans until it releases them or its connection ends, and no block is reused without that proof.
 - Do not size waits, payloads or budgets for the "usual" case. Durations and sizes that grow with a workload are exposed through the existing per-call or configuration path rather than fixed.
