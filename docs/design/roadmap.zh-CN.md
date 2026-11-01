@@ -40,7 +40,7 @@ Portable-payload 架构与历史本地候选参考为：
 | Artifact composition | Rust `c2-codegen` 委托 nested specification、保留 structured FastDB error、校验 identity/hash、确定性组合 C-Two 与 FastDB artifacts，并在不存在的 destination 原子发布完整 regular-file tree。 |
 | Language projection | 用户面 Rust SDK 为 `c-two` / `c_two`，与 Python 复用 `c2-core` runtime；generated Rust/Python artifact 已 compile/import 并完成双向调用。生成的 TypeScript 已执行严格 12 行 Node direct/relay 互操作；浏览器 runtime 仍未闭环。 |
 | Runtime payload proof | Record、object-graph 与 no-payload method 已通过 Rust client → Python resource、Python client → Rust resource、Rust client → Rust resource。覆盖 scalar/`str`/`wstr`/bytes/list/null、sharing/cycle、materialize、structured mismatch error 与 checked invalidation。 |
-| 本地端点与生命周期 | 唯一 OS 派生、Persistent/OwnerBound、物理连接通知、显式一次性所有者恢复及结构化 bind/connect 原因在 Linux、macOS 和 Windows x64/ARM64 共用 Core；精确/scoped 原生维护保留身份校验。发行门禁与证据见发布说明。 |
+| 本地端点与生命周期 | 唯一 OS 派生、物理连接通知及结构化 bind/connect 原因在 Linux、macOS 和 Windows x64/ARM64 共用 Core；精确/scoped 原生维护保留身份校验。发行门禁与证据见发布说明。 |
 | IPC 内存策略 | lazy buddy、idle decay 与三个有限方向预算已实现；HTTP 缓冲治理、更广的取消/队列遥测仍未闭环。 |
 | 真实 backing 边界 | 已证明的 Rust/Python receive adapter 是 copy-backed。`cc.hold()` 与 borrowed-input policy 负责 owner/lease invalidation，不代表已直接构造到最终 response shared memory。 |
 | Python-only prototype | 没有 portable binding 的普通 Python method 仍可在本地使用 pickle；portable descriptor export/codegen 会诊断并拒绝它们。 |

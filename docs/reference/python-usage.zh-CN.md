@@ -67,9 +67,9 @@ finally:
 
 可移植方法在每个方向携带零个或一个 `Payload` 封套；C-Two 将每个嵌套规格作为不透明 JSON 值嵌入，且不重新解释它。没有明确绑定的方法仍可使用普通 Python 值进行仅限 Python 的原型开发，但可移植描述符导出与代码生成会诊断并拒绝这些方法。
 
-`cc.hold(echo.echo)(source)` 将响应保留为 `HeldResult`。显式 `release()` 先尝试让载荷所有者失效一次，再释放原生存储。原生清理失败时，结果保留原始响应，供再次调用 `release()`；失效操作不会重放，且该值仍不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(...) as held`，需要超出作用域存活的值应实体化。
+`cc.hold(echo.echo)(source)` 将响应保留为 `HeldResult`，它持有一份本地副本：复制完成后传输内存就已释放，所以 hold 不会占住服务端的共享内存。显式 `release()` 让载荷所有者失效一次，再释放本地副本；失效操作不会重放，此后该值不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(...) as held`，需要超出作用域存活的值应实体化。
 
-`cc.observe.memory_stats()` 在每个原生内存作用域中包含 `abandoned_releases`。最终的消耗式清理失败会保留未返还的占用，并计入一次放弃的释放义务；原生载体返回或记录该错误。没有后台恢复。计数器也包含已发布、可能由对端稍后释放的 SHM 不确定结果。同用户的异常 SHM 对端可以声称无效、重放或过期的分配坐标；无法释放的这些引用也会计数，因此该计数可能超过实际未释放分配数。核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
+`cc.observe.memory_stats()['holds']` 统计这些本地副本：`active_holds`、`total_held_bytes`（逻辑字节，不是 SHM 容量）、`oldest_hold_seconds` 与 `by_direction`。backing 与重组预算的各项及其核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
 
 ## 远程连接与截止时间
 

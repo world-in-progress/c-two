@@ -55,11 +55,11 @@ The relay rejects a different process claiming a live local route name with HTTP
 
 Different relays may advertise the same name. Contract-scoped resolution returns matching local routes first, followed by live peer routes ordered by `(registered_at, relay_id)`. The timestamp uses wall-clock time, so clock skew can affect which peer comes first. A peer message's `sender_relay_id` is a claim, not authentication. The relay checks known membership, claimed owner consistency, and protection of its local routes; peer snapshots omit local-only server identity and IPC address. Deployments must protect the internal `/_peer/*` control endpoints with their own network and node identity controls. An IP allowlist alone does not identify a relay, and this protocol has no HMAC peer authentication.
 
-### Route bindings, catalog, and fallback
+### Route bindings, lookup, and fallback
 
-An endpoint connection is a carrier for calls to multiple routes on one server instance. A route-bound client retains its observed `route_uid`, `route_revision`, complete expected contract, and server identity. Acquisition uses server `RouteLookup` authority rather than handshake or watch cache alone; calls carry `RouteCallIdentity`, which the server checks before invoking resource code. A new route registration gets a new route UID, while existing clients keep their binding until closed.
+An endpoint connection is a carrier for calls to multiple routes on one server instance. A route-bound client retains its observed `route_uid`, complete expected contract, and server identity. Acquisition uses server `RouteLookup` authority rather than handshake data alone; calls carry `RouteCallIdentity`, which the server checks before invoking resource code. A new route registration gets a new route UID, while existing clients keep their binding until closed.
 
-The server owns a revisioned route catalog with `RouteList`, exact `RouteLookup`, and `RouteWatch` history. Current `RouteWatch` returns a batch of retained events, optionally followed by a heartbeat; clients poll again for later changes. A compacted history returns `Compacted`, requiring a fresh list before incremental observation resumes. List and watch improve visibility and cache freshness; lookup and call-time token checks decide correctness. Route removal does not change an immutable `ContractReleaseRef` retained by a caller.
+The server's dispatcher is the single route authority, projected by `RouteList` and exact `RouteLookup`. List improves visibility; lookup and call-time identity checks decide correctness. Route removal does not change an immutable `ContractReleaseRef` retained by a caller.
 
 | Runtime route condition | Semantic result |
 | --- | --- |
@@ -67,7 +67,7 @@ The server owns a revisioned route catalog with `RouteList`, exact `RouteLookup`
 | A known resource is temporarily unreachable | `ResourceUnavailable` |
 | An observed route was removed | `ResourceRemoved` |
 | A route exists but rejects new calls | `ResourceClosed` |
-| A bound route UID or revision is stale | `RouteStale` |
+| A bound route UID is stale | `RouteStale` |
 
 Only a failure proven to occur before dispatch can trigger transport fallback or replay. A failed verified local IPC acquisition may select an independent relay path; returning to the same failed local endpoint is denied. Contract, identity, and protocol mismatches are terminal. A stale cached route can cause one fresh resolution before dispatch. A service error or a connection loss after possible dispatch is terminal for automatic replay because C-Two has no call deduplication identity. Transport I/O failures affect the endpoint connection and do not, by themselves, withdraw route authority.
 

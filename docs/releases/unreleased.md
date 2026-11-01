@@ -115,3 +115,36 @@ The documentation is organized by role, so links into the old tree no longer res
 ### Validation
 
 The full fork CI run [41218012397](https://github.com/Dsssyc/c-two/actions/runs/41218012397) on `08b8c65c` passed on Linux, macOS, Windows x64 and Windows ARM64.
+
+## Single-owner shared-memory release (breaking)
+
+Each shared-memory block now has one owner ([ADR 0001](../decisions/0001-single-owner-release.md), [design](../design/2026-11-01-protocol-batch-design.md)). The owner lends the block; the receiver copies it into a local buffer and returns the loan in a release frame right after the copy. Requests are released before the resource method runs and responses before decoding or delivering a hold, so a slow resource method or a long `cc.hold` no longer keeps the peer's shared memory.
+
+### Upgrade together
+
+IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh protocol 7 replace 14, 3, 6 and 6. A 0.10.x peer receives a typed version mismatch through the unchanged fixed preamble. Upgrade the Python and Rust SDKs, c3 and Node consumers on one host together, and stop old services before restarting.
+
+### Behavior
+
+- `cc.hold` and borrowed inputs keep local copies. `HeldResult` usage is unchanged: `release()` invalidates the FastDB owner once and frees the copy, and it no longer fails or retries because of transport memory.
+- A peer that has not copied a block, for example a stopped process or one that does not read its connection, keeps that loan until it releases it or its connection ends (read EOF, or a read-side ECONNRESET on Unix). Nothing reclaims a loan after a wait or timeout.
+- A low-level Host shutdown no longer seals the Runtime's call domain or outgoing clients; only an explicit `Runtime.shutdown()` / `cc.shutdown()` retires them. A low-level shutdown with no Host completes immediately.
+- Request IDs are 64-bit end to end instead of being truncated to 32 bits inside the client, and generated TypeScript carries them and loan IDs as `bigint`.
+- `max_frame_size` must be at least 526 bytes, the size of a full release frame.
+
+### Removed
+
+| Removed | Instead |
+| --- | --- |
+| The automatic IPC heartbeat: `heartbeat_interval`, `heartbeat_timeout`, `C2_IPC_HEARTBEAT_INTERVAL`, `C2_IPC_HEARTBEAT_TIMEOUT`, and the `heartbeat_timeout` end reason | Connections end on OS facts and calls on their own deadlines; manual ping remains |
+| `abandoned_releases` in every `memory_stats()` scope, `holds.by_storage`, and `storage` in hold sweeps | `holds` counts local copies with `active_holds`, `total_held_bytes`, `oldest_hold_seconds` and `by_direction` |
+| Python `MemPool.data_addr`, `seg_data_info`, `open_peer`, `ensure_peer_segment`, `read_at`, `free_at`, `destroy`, and `PoolConfig(dedicated_crash_timeout_secs=...)` | The local allocation APIs; a pool is freed with its last owner |
+| Lifecycle snapshot `phase`, `terminal` and `client_held_leases` (Python `ClientHeldLeases`; Rust `HostLifecyclePhase`, `HostClientHeldLeases`) | `finished`, `listener_closed` and `work_drained` |
+| The dictionary returned by direct IPC `shutdown()` (`acknowledged`, `shutdown_started`, `server_stopped`, route outcomes); Rust `DirectIpcShutdownRouteOutcome` | `'initiated'`, `'absent'` or `'unconfirmed'`; Rust `DirectIpcShutdownOutcome::{Initiated, Absent, Unconfirmed}` |
+| Route revisions in route bindings, call tokens, relay resolution, HTTP headers and the mesh; IPC `RouteWatch` and route-contract queries | Route UID, server instance and contract identify a route |
+| C/FFI ABI 6 request and response pools, including `request_pool_read_local`, `request_pool_forget_consumed` and `response_pool_release`; TypeScript `createC2MemFfiNativeResponseShmReader`, the `responseShmReader` and `requestShmWriter` options, and block `allocationId` | One ABI 7 memory context per verified connection; blocks carry `loanId: bigint` ([C ABI](../reference/c-abi.md)) |
+| Rust Core `HeldResponse` leases and pins, `has_pending_release`, `abandon`, `RequestLease` and `ResponseLease` | `Held` and `HeldResponse` own a local copy |
+
+### Validation
+
+Pending: host checks of each block are recorded in the [backlog](../design/backlog.md); the exact-candidate CI run and the paired benchmarks follow the last block.
