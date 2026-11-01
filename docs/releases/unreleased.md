@@ -167,7 +167,6 @@ Found by the strict comparison against 0.10.1 and not listed above:
   - Repeating a low-level Rust `Runtime::shutdown` returns the complete journal instead of an empty one.
   - `ipc_client_close_details` lists only connections whose first end was not a local close, with the operation as the reason.
   - A failed request materialization reports `ResourceInputDeserializing` instead of `ProtocolViolation`.
-  - Unregistering the same route twice concurrently returns `True` both times.
 
 ### Validation
 
