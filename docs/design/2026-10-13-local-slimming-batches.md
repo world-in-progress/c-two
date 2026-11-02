@@ -31,7 +31,7 @@
 | R12、R28 剩余 | 已完成可证明的同值重验删除、登记事实与 validated relay 表示收敛；跨 await 的 authority、owner/locality、代际、peer 活性和错误接纳继续保留。新增删除需另证局部不变量。 |
 | R13 剩余 | 请求所有权移动、IPC 拼帧、SHM prepare/send 合并及 [inline 响应所有权移交](../acceptance/2026-10-24-r13-inline-response-ownership-acceptance.md)均已验收。inline 子项复用已有 owned 构造器，省去 Core held 路径的一次 Vec 克隆及重复副本；API/ABI/协议不变，生产与测试实际净增 37 行，作为运行时成本优化单列，不记作代码净减。服务端 Python 初始快照仍有数据寿命职责。写锁前取消保留未发布分配的问题已随协议批 P4 修正，取消即释放未发布的准备分配（`c2-ipc` 的 `cancellation_before_writer_publication_releases_ordinary_and_stream_preparation`），R13 至此没有剩余。 |
 | R15 | 完整 GC 下界复用已独立验收，无公开 API/ABI/协议变化。该边界内的重复压力扫描优化已完成；不承诺合并同时开始的扫描，也不扩大低于原压力阈值时的预算回收保证。上述扩展没有作为本项未交付承诺，若需要须另立设计。 |
-| R14 其他、C03、C04 | C03 的 chunk assembly/pending permit 单一所有权子项已完成，代际与准入围栏保留。bitmap 锁证明、其他 GC admission 进度改造及轮询改通知仍暂缓。不为精简删除跨进程锁、回收进度、预算与唤醒保护。 |
+| R14 其他、C03、C04 | C03 的 chunk assembly/pending permit 单一所有权子项已完成。准入终态与拆除围栏保留；重组代际（`ChunkAssemblyId`）与准入门按身份的核对已于 2026-11-03 随分片拒绝修复删除：它们只防同一连接上复用 request id，而 Rust 与 TypeScript 客户端都单调分配、不复用，独立审查也没有找到正确客户端下需要它们的路径。bitmap 锁证明、其他 GC admission 进度改造及轮询改通知仍暂缓。不为精简删除跨进程锁、回收进度、预算与唤醒保护。 |
 | R16 | 已按[修订方案](../acceptance/2026-10-23-r16-node-backpressure.md)验收：分片上传同步推进接收，失败关闭并汇合，成功保持连接复用，空闲读取使用原生背压；低层 TS close/pause/resume 契约已同步，不留兼容。生产净减 25、测试净增 219，属于正确性修复。完整 Node→Core 投影迁移需另立方案，不作为本批交付内容。 |
 | R18 | 已按正确性修复验收并随 c3 0.4.1 发布：容量拒绝复用原 retry，永久关闭才退出；status 与任务共锁、按原 token 更新，保留不可用记录的独立寿命、1024 owner 上限、代际及释放顺序。生产 +49、测试 +345，不计作瘦身收益。见[验收记录](../acceptance/2026-10-23-082-client-observation-release-acceptance.md)。 |
 | R19、R20 | R19 已随缺陷批修复（复审的 H10：`c3 registry` 按类型反序列化，格式错误即报错）。R20 已核销：示例的文件加载与保存已随 `eee0fe57` 删除。 |
