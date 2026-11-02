@@ -184,3 +184,36 @@ def test_native_prepare_has_dependency_stage(tmp_path):
     assert [s.name for s in steps] == ['native-dependencies', 'python-sync']
     assert steps[0].link_mode == 'source'
     assert steps[0].command == ['cargo', 'fetch', '--locked', '--manifest-path', 'sdk/python/native/Cargo.toml']
+
+
+@pytest.mark.parametrize('suite', ['node', 'typescript', 'python', 'all'])
+@pytest.mark.parametrize('prebuilt', [False, True])
+def test_prepare_fetches_node_fixture_lock_for_every_consumer(tmp_path, monkeypatch, suite, prebuilt):
+    runner = local()
+    monkeypatch.setattr(runner, 'probe', lambda command, env, *args: '' if 'status' in command else runner.strict.FASTDB_SHA)
+    node = tmp_path / 'node'
+    cli = tmp_path / 'node_modules/npm/bin/npm-cli.js'
+    cli.parent.mkdir(parents=True)
+    cli.touch()
+    monkeypatch.setattr(runner, 'find_tool', lambda name, env: str(node))
+    # The all-suite plan validates the sibling before preparing its npm tree.
+    monkeypatch.setattr(runner, 'core_fastdb_identity', lambda *args: {})
+    monkeypatch.setattr(runner, 'validate_core_fastdb', lambda *args: None)
+    sibling = tmp_path / 'fastdb/ts/fastdb4ts'
+    sibling.mkdir(parents=True)
+    for name in ('package.json', 'package-lock.json'):
+        (sibling / name).touch()
+    monkeypatch.setattr(runner, 'ROOT', tmp_path / 'checkout')
+    args = ['prepare', '--suite', suite, '--output', str(tmp_path / 'logs'),
+            '--emsdk', str(tmp_path / 'emsdk')]
+    if prebuilt:
+        for name in ('fastdb', 'c2-mem', 'typescript'):
+            args += [f'--{name}-package', str(tmp_path / f'{name}.tgz')]
+    options = runner.parser().parse_args(args)
+    steps = runner.preparation_steps(options, tmp_path / 'inputs')
+    fetches = [step for step in steps if step.command[:2] == ['cargo', 'fetch']
+               and step.command[-1] == 'core/Cargo.toml']
+    assert len(fetches) == 1
+    assert fetches[0].command == ['cargo', 'fetch', '--locked', '--manifest-path', 'core/Cargo.toml']
+    names = [step.name for step in steps]
+    assert names.index(fetches[0].name) < names.index('c2-mem-npm') < names.index('c2-mem-build')

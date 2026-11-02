@@ -58,8 +58,9 @@ def test_invalid_row_spec_fails_before_any_spawn(harness, monkeypatch, key, valu
     ('nonobject', 0, 1),
     ('server_hash_mismatch', 0, 1),
 ])
+@pytest.mark.parametrize('use_job', [False, True])
 def test_matrix_requires_successful_process_and_complete_identity(
-    harness, monkeypatch, tmp_path, case, returncode, expected_exit,
+    harness, monkeypatch, tmp_path, case, returncode, expected_exit, use_job,
 ):
     identity = {'native_path': 'fixture-native.so', 'native_sha256': 'a' * 64}
     record = {
@@ -75,6 +76,8 @@ def test_matrix_requires_successful_process_and_complete_identity(
         pid = 999999  # No actual process is created by this fixture.
 
         def __init__(self, *args, **kwargs):
+            assert kwargs['start_new_session'] is (not use_job)
+            assert kwargs['creationflags'] == (4 if use_job else 0)
             self.returncode = returncode
 
         def communicate(self, timeout=None):
@@ -86,6 +89,13 @@ def test_matrix_requires_successful_process_and_complete_identity(
         def kill(self):
             pytest.fail('a completed row must not be signalled')
 
+    job_events = []
+    job = SimpleNamespace(
+        assign_and_resume=lambda proc: job_events.append(('assigned', proc)),
+        alive=lambda: False,
+        close=lambda: job_events.append(('closed', None)),
+    )
+    monkeypatch.setattr(harness, 'row_job', lambda: job if use_job else None)
     monkeypatch.setattr(harness.subprocess, 'Popen', CompletedRow)
     monkeypatch.setattr(harness, 'source_commit', lambda: 'fixture')
     args = SimpleNamespace(
@@ -97,6 +107,11 @@ def test_matrix_requires_successful_process_and_complete_identity(
     result = json.loads((tmp_path / 'matrix.json').read_text())
     assert result['complete'] is False
     assert result['rows'][0]['exit_code'] == returncode
+    if use_job:
+        assert len(job_events) == 2
+        assert job_events[0][0] == 'assigned'
+        assert isinstance(job_events[0][1], CompletedRow)
+        assert job_events[1] == ('closed', None)
     if returncode != 0:
         assert result['totals']['passed'] == 0
         assert result['totals']['failed'] == 1

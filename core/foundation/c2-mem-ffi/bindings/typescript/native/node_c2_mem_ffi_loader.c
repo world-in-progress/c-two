@@ -16,7 +16,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "c2_mem_ffi.h"
 
@@ -928,17 +927,19 @@ typedef struct EndpointConnectWork {
 /* Capture a native monotonic deadline before queueing N-API work. The worker
  * passes only its remaining duration to Rust, so queue time is not lost. */
 static bool monotonic_millis(uint64_t *out) {
+    /* Use Node's nanosecond clock on every platform. Resolve it as the other
+     * bundled libuv APIs are resolved on Windows; Unix needs no uv.h (whose
+     * pthread types also depend on POSIX feature macros under strict C11). */
+    typedef uint64_t (*hrtime_fn)(void);
 #ifdef _WIN32
-    LARGE_INTEGER frequency, now;
-    if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&now) || frequency.QuadPart <= 0) return false;
-    uint64_t ticks = (uint64_t)now.QuadPart;
-    uint64_t rate = (uint64_t)frequency.QuadPart;
-    *out = (ticks / rate) * 1000 + ((ticks % rate) * 1000) / rate;
+    HMODULE process_module = GetModuleHandleW(NULL);
+    hrtime_fn hrtime = process_module == NULL ? NULL :
+        (hrtime_fn)(void *)GetProcAddress(process_module, "uv_hrtime");
 #else
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
-    *out = (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+    hrtime_fn hrtime = (hrtime_fn)dlsym(RTLD_DEFAULT, "uv_hrtime");
 #endif
+    if (hrtime == NULL) return false;
+    *out = hrtime() / UINT64_C(1000000);
     return true;
 }
 

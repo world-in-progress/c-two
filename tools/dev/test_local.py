@@ -485,8 +485,11 @@ def preparation_steps(options, staging: Path) -> list[Step]:
             raise LocalError(f'Core tests require the FastDB sibling locked npm project: {sibling}')
         node = Path(find_tool('node', env))
         result.append(Step('core-typescript-dependencies', npm_command(node, 'ci', '--ignore-scripts', '--prefix', str(sibling))))
+    # Node's offline test/consumer peers copy core/Cargo.lock, including when
+    # only TypeScript is selected or the npm tarballs were supplied prebuilt.
+    core_dependencies = any(s in selected for s in ('core', 'node', 'python', 'typescript'))
     for suite, manifest in (('core', 'core/Cargo.toml'), ('rust-sdk', 'sdk/rust/Cargo.toml'), ('native', 'sdk/python/native/Cargo.toml')):
-        if suite in selected:
+        if suite in selected or (suite == 'core' and core_dependencies):
             result.append(Step(f'{suite}-dependencies', ['cargo', 'fetch', '--locked', '--manifest-path', manifest],
                                'source' if suite == 'native' else 'system'))
     if any(s in selected for s in ('cli', 'python', 'typescript')):

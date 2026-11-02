@@ -249,6 +249,22 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
     assert "core-test" not in python and "python-wheel-build" not in python
 
 
+@pytest.mark.parametrize("target_platform", ["linux", "macos", "windows"])
+@pytest.mark.parametrize("scope", ["full", "python"])
+def test_node_fixtures_fetch_core_lock_before_offline_builds(target_platform, scope):
+    runner = _runner()
+    gates = runner.gates(sys.executable, Path("evidence"), scope, target_platform=target_platform)
+    names = [name for name, _, _ in gates]
+    commands = {name: command for name, command, _ in gates}
+    dependencies = {name: set(required) for name, _, required in gates}
+    assert commands["core-dependencies"] == [
+        "cargo", "fetch", "--locked", "--manifest-path", "core/Cargo.toml",
+    ]
+    assert "core-dependencies" in dependencies["c2-mem-build"]
+    for gate in ("c2-mem-build", "c2-mem-node-tests", "c2-mem-node-package"):
+        assert names.index("core-dependencies") < names.index(gate)
+
+
 def test_ipc_memory_matrix_gate_runs_full_required_stats_bounded_matrix():
     runner = _runner()
     gate_list = runner.gates(sys.executable, Path("evidence"), runner.FULL_SCOPE)

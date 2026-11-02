@@ -397,7 +397,10 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
         ("fastdb-wasm-build", [python, str(ROOT / "tools/ci/source_prerequisites.py"), "wasm"], ()),
         ("fastdb-npm-build", [python, str(ROOT / "tools/ci/source_prerequisites.py"), "fastdb"], ("fastdb-npm-install", "fastdb-wasm-build")),
         ("c2-mem-npm-install", npm_command("ci", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", c2_mem_typescript), ()),
-        ("c2-mem-build", ["node", f"{c2_mem_typescript}/scripts/build-runtime.mjs"], ("c2-mem-npm-install",)),
+        # Node's standalone peers reuse core/Cargo.lock and build offline.
+        # Building c2-mem-ffi alone does not fetch the server's dependencies.
+        ("core-dependencies", ["cargo", "fetch", "--locked", "--manifest-path", "core/Cargo.toml"], ()),
+        ("c2-mem-build", ["node", f"{c2_mem_typescript}/scripts/build-runtime.mjs"], ("c2-mem-npm-install", "core-dependencies")),
         ("c2-mem-node-tests", npm_command("test", "--ignore-scripts", "--prefix", c2_mem_typescript), ("c2-mem-build",)),
         ("c2-mem-node-package", npm_command("run", "pack:check", "--prefix", c2_mem_typescript, "--", "--prepared"), ("c2-mem-build",)),
         cargo("fastdb-rust-test", "../fastdb/bindings/rust/Cargo.toml", "--workspace", "--all-features"),
