@@ -3157,6 +3157,7 @@ async fn first_chunked_chunk_holds_route_pending_until_feed_error_aborts() {
         &writer,
         chunk_permit,
         chunk_frame_ordering(&server, conn.conn_id(), 42, FLAG_CHUNKED, &first_payload).unwrap(),
+        server.chunk_registry.begin_frame(conn.conn_id(), 42, false),
         None,
     )
     .await;
@@ -3190,6 +3191,7 @@ async fn first_chunked_chunk_holds_route_pending_until_feed_error_aborts() {
             &bad_second_payload,
         )
         .unwrap(),
+        server.chunk_registry.begin_frame(conn.conn_id(), 42, false),
         None,
     )
     .await;
@@ -3245,6 +3247,7 @@ async fn chunked_connection_cleanup_releases_route_pending_capacity() {
         &writer,
         chunk_permit,
         chunk_frame_ordering(&server, conn.conn_id(), 9, FLAG_CHUNKED, &payload).unwrap(),
+        server.chunk_registry.begin_frame(conn.conn_id(), 9, false),
         None,
     )
     .await;
@@ -4413,6 +4416,311 @@ fn ordering_test_server(address: &str, max_total_chunks: u32) -> Arc<Server> {
     let mut config = ServerIpcConfig::default();
     config.base.max_total_chunks = max_total_chunks;
     Arc::new(test_server_new(address, config).unwrap())
+}
+
+async fn assert_early_chunk_refusal_preserves_connection(processing_capacity: bool) {
+    use std::sync::atomic::AtomicUsize;
+
+    let mut config = ServerIpcConfig::default();
+    config.base.max_total_chunks = 2;
+    config.base.max_reassembly_bytes = 64;
+    config.max_pending_requests = 1;
+    let server = Arc::new(test_server_new("ipc://early_chunk_refusal", config).unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut route = make_host_route(&server, "grid");
+    route.callback = Arc::new(EchoRequestBytes {
+        calls: calls.clone(),
+    });
+    server.register_route(route).await.unwrap();
+    let mut pool = MemPool::new_with_prefix(
+        PoolConfig {
+            segment_size: 64 * 1024,
+            min_block_size: 4096,
+            max_segments: 1,
+            ..Default::default()
+        },
+        unique_response_pool_prefix("refused-chunks"),
+    )
+    .unwrap();
+    let (mut client, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(server.clone(), stream));
+    let ack = handshake_test_client_with(&mut client, CAP_SHM_REQUEST, pool.prefix()).await;
+    assert_ne!(ack.capability_flags & CAP_SHM_REQUEST, 0);
+    let conn = server
+        .active_connection(server.active_connection_ids()[0])
+        .unwrap();
+
+    // Holding every processing permit makes the first refusal deterministic.
+    // Otherwise only the first frame arrives, so reassembly geometry rejects it.
+    let occupied = processing_capacity.then(|| {
+        server
+            .chunk_processing_permits
+            .clone()
+            .try_acquire_many_owned(2)
+            .unwrap()
+    });
+    client
+        .write_all(&chunked_call_frame(61, 0, 6, &[0x11; 32], "grid"))
+        .await
+        .unwrap();
+    let (id, _, reply) = read_reply_frame(&mut client).await;
+    assert_eq!(id, 61);
+    assert!(server.chunk_registry.is_settled(conn.conn_id(), 61));
+    assert_eq!(reply_error_code(&reply), ErrorCode::ResourceUnavailable);
+    let error = reply_error_message(&reply);
+    assert!(
+        error.contains(if processing_capacity {
+            "server chunk processing capacity exceeded: max_total_chunks=2"
+        } else {
+            "reassembly size 192 exceeds limit 64"
+        }),
+        "{error}"
+    );
+    drop(occupied);
+    wait_until("initial refusal released its task", || {
+        server.chunk_processing_permits.available_permits() == 2
+    })
+    .await;
+
+    // With processing permits available, an orphan continuation must also be
+    // discarded without a second ("no assembly") reply. PING is a wire-order
+    // barrier for the receive loop, independent of the resource scheduler.
+    let mut late = chunked_call_frame(61, 1, 6, &[0x22; 32], "grid");
+    late.extend(encode_frame(
+        60,
+        FLAG_SIGNAL,
+        &c2_wire::msg_type::PING_BYTES,
+    ));
+    client.write_all(&late).await.unwrap();
+    let (id, _, reply) = read_reply_frame(&mut client).await;
+    assert_eq!(id, 60, "a refused request must have only one reply");
+    assert_eq!(reply, PONG_BYTES);
+
+    // A stopped uploader can still have complete continuation frames in flight.
+    // Pin processing capacity and batch them so duplicate refusals would fill
+    // the one-slot reply budget before the writer can drain it. No final chunk
+    // follows: the real Node uploader stops as soon as it reads the refusal.
+    let occupied = server
+        .chunk_processing_permits
+        .clone()
+        .try_acquire_many_owned(2)
+        .unwrap();
+    // Discarding a late SHM continuation must still return its loan, even
+    // while processing permits are exhausted.
+    let handle = pool.alloc_shm_handle(32).unwrap();
+    let allocation = handle.shm_allocation().unwrap();
+    let mut payload = encode_buddy_payload(&BuddyPayload {
+        seg_idx: allocation.seg_idx as u16,
+        generation: allocation.generation,
+        offset: allocation.offset,
+        data_size: 32,
+        is_dedicated: allocation.is_dedicated,
+        loan_id: 77,
+    })
+    .to_vec();
+    payload.extend_from_slice(&c2_wire::chunk::header::encode_chunk_header(2, 6));
+    client
+        .write_all(&encode_frame(
+            61,
+            c2_wire::flags::FLAG_CALL_V2 | FLAG_CHUNKED | FLAG_BUDDY,
+            &payload,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_release_id(&mut client).await, 77);
+    pool.release_handle(handle);
+    assert_eq!(pool.stats().alloc_count, 0);
+
+    let mut frames = chunked_call_frame(61, 3, 6, &[0x33; 32], "grid");
+    frames.extend(chunked_call_frame(61, 4, 6, &[0x44; 32], "grid"));
+    frames.extend(inline_call_frame(62, "grid", b"next"));
+    client.write_all(&frames).await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut header = [0; 16];
+        client.read_exact(&mut header).await?;
+        let size = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        let id = u64::from_le_bytes(header[4..12].try_into().unwrap());
+        let mut reply = vec![0; size - 12];
+        client.read_exact(&mut reply).await?;
+        assert_eq!(id, 62, "a refused request must have only one reply");
+        Ok::<_, std::io::Error>(reply)
+    })
+    .await;
+    assert!(
+        !conn.is_deactivated(),
+        "late chunks deactivated the connection; end={:?}; next={outcome:?}",
+        conn.connection_observation().snapshot()
+    );
+    let reply = outcome
+        .expect("next call must receive a reply")
+        .expect("next call transport");
+    let (control, consumed) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+    assert!(
+        matches!(control, ReplyControl::Success),
+        "next call failed: {control:?}"
+    );
+    assert_eq!(&reply[consumed..], b"next");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(server.chunk_registry.active_count(), 0);
+    assert_eq!(server.chunk_admission_gate.len(), 0);
+    assert!(server.chunk_registry.is_settled(conn.conn_id(), 61));
+    let mut last = chunked_call_frame(61, 5, 6, &[0x55; 32], "grid");
+    last.extend(inline_call_frame(63, "grid", b"after-last"));
+    client.write_all(&last).await.unwrap();
+    let (id, _, reply) = read_reply_frame(&mut client).await;
+    assert_eq!(id, 63, "discarding the last chunk sends no second error");
+    assert!(matches!(
+        c2_wire::control::decode_reply_control(&reply, 0).unwrap().0,
+        ReplyControl::Success
+    ));
+    assert!(!server.chunk_registry.is_settled(conn.conn_id(), 61));
+    assert!(!conn.is_deactivated());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    drop(occupied);
+    drop(client);
+    handler.await.unwrap();
+}
+
+#[tokio::test]
+async fn reassembly_size_refusal_discards_late_chunks_and_preserves_connection() {
+    assert_early_chunk_refusal_preserves_connection(false).await;
+}
+
+#[tokio::test]
+async fn chunk_processing_refusal_discards_late_chunks_and_preserves_connection() {
+    assert_early_chunk_refusal_preserves_connection(true).await;
+}
+
+#[tokio::test]
+async fn first_chunk_and_processing_refusals_compete_for_one_reply() {
+    for capacity_first in [false, true] {
+        let server = ordering_test_server("ipc://chunk_reply_race", 2);
+        let conn = Arc::new(Connection::new(77));
+        conn.set_handshake_done(true).unwrap();
+        let (mut peer, stream) = isolated_pair().await;
+        let (reader, half) = stream.into_split();
+        let (writer, driver) = ConnectionWriter::spawn(
+            half,
+            conn.clone(),
+            Duration::from_secs(5),
+            Arc::new(Semaphore::new(1)),
+        );
+        let first = server.chunk_registry.begin_frame(77, 61, false);
+        let later = server.chunk_registry.begin_frame(77, 61, false);
+        let owner = server.begin_chunk_admission(77, 61).unwrap();
+        let size = fail_chunked_request(
+            &server,
+            &conn,
+            &writer,
+            61,
+            &first,
+            Some(owner),
+            ErrorCode::ResourceUnavailable,
+            "reassembly size exceeds limit".into(),
+        );
+        let capacity = queue_chunk_processing_capacity_error(&server, 77, &writer, 61, &later, 2);
+        if capacity_first {
+            tokio::join!(capacity, size);
+        } else {
+            tokio::join!(size, capacity);
+        }
+        // A following complete frame must follow exactly one error reply.
+        writer
+            .write_all(&encode_frame(62, REPLY_FLAGS, &SUCCESS_REPLY))
+            .await
+            .unwrap();
+        let (id, _, payload) = read_reply_frame(&mut peer).await;
+        assert_eq!(id, 61);
+        let error = reply_error_message(&payload);
+        assert!(
+            error.contains(if capacity_first {
+                "max_total_chunks=2"
+            } else {
+                "reassembly size exceeds limit"
+            }),
+            "{error}"
+        );
+        assert_eq!(read_reply_frame(&mut peer).await.0, 62);
+        assert!(server.chunk_registry.is_settled(77, 61));
+        assert_eq!(server.chunk_admission_gate.len(), 0);
+        assert!(!conn.is_deactivated());
+        conn.end(ConnectionEndReason::LocalClose, "test_done");
+        drop((reader, writer, peer));
+        driver.await.unwrap();
+    }
+}
+
+async fn assert_missing_chunk_state_settles_once(expired: bool) {
+    let mut config = ServerIpcConfig::default();
+    config.base.chunk_assembler_timeout_secs = 0.01;
+    let server = Arc::new(test_server_new("ipc://gc_late_call_probe", config).unwrap());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut route = make_host_route(&server, "grid");
+    route.callback = Arc::new(EchoRequestBytes {
+        calls: calls.clone(),
+    });
+    server.register_route(route).await.unwrap();
+    let (mut client, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(server.clone(), stream));
+    handshake_test_client(&mut client).await;
+    let conn_id = server.active_connection_ids()[0];
+    if expired {
+        client
+            .write_all(&chunked_call_frame(61, 0, 4, &[7; 32], "grid"))
+            .await
+            .unwrap();
+        wait_until("first chunk registered", || {
+            server.chunk_registry.active_count() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(server.chunk_registry.gc_sweep().expired, 1);
+    }
+    let mut frames = chunked_call_frame(61, 1, 4, &[8; 32], "grid");
+    frames.extend(chunked_call_frame(61, 2, 4, &[9; 32], "grid"));
+    frames.extend(inline_call_frame(62, "grid", b"next"));
+    client.write_all(&frames).await.unwrap();
+    let outcomes = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut replies = HashMap::new();
+        for _ in 0..2 {
+            let (id, _, payload) = read_reply_frame(&mut client).await;
+            replies.insert(id, payload);
+        }
+        replies
+    })
+    .await;
+    assert!(
+        outcomes.is_ok(),
+        "GC call 61 never received a terminal reply: {outcomes:?}"
+    );
+    let outcomes = outcomes.unwrap();
+    assert!(reply_error_message(&outcomes[&61]).contains("no assembly"));
+    assert!(matches!(
+        c2_wire::control::decode_reply_control(&outcomes[&62], 0)
+            .unwrap()
+            .0,
+        ReplyControl::Success
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(server.chunk_registry.is_settled(conn_id, 61));
+    let mut last = chunked_call_frame(61, 3, 4, &[10; 32], "grid");
+    last.extend(inline_call_frame(63, "grid", b"after-last"));
+    client.write_all(&last).await.unwrap();
+    assert_eq!(read_reply_frame(&mut client).await.0, 63);
+    assert!(!server.chunk_registry.is_settled(conn_id, 61));
+    assert!(!server.active_connection(conn_id).unwrap().is_deactivated());
+    drop(client);
+    handler.await.unwrap();
+}
+
+#[tokio::test]
+async fn gc_late_chunk_still_reports_to_the_waiting_call() {
+    assert_missing_chunk_state_settles_once(true).await;
+}
+
+#[tokio::test]
+async fn never_admitted_continuations_fail_once_then_discard() {
+    assert_missing_chunk_state_settles_once(false).await;
 }
 
 #[tokio::test]
@@ -5873,7 +6181,11 @@ async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
     // capacity/feed/malformed refusal then tore the request down while the
     // owning task was still waiting for route admission.
     let owner = server.begin_chunk_admission(conn.conn_id(), 31).unwrap();
-    server.abort_chunk_request(conn.conn_id(), 31);
+    drop(
+        server
+            .chunk_admission_gate
+            .terminate_key((conn.conn_id(), 31), ChunkAdmissionOutcome::Aborted),
+    );
 
     let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
     dispatch_chunked_call(
@@ -5885,6 +6197,7 @@ async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
         &writer,
         chunk_permit,
         ChunkFrameOrdering::First(owner),
+        server.chunk_registry.begin_frame(conn.conn_id(), 31, false),
         None,
     )
     .await;
@@ -5909,16 +6222,19 @@ async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
 
     // Observe the two release orders while the real pool prevents backing
     // release. Run synchronous teardown off the Tokio worker.
-    for rollback in [false, true] {
+    for (request_id, rollback) in [(32, false), (33, true)] {
         let admission = reserve_accepted_route_execution(&server, &call_identity("grid"), 0)
             .await
             .ok()
             .expect("route admission for release-order probe");
-        let assembly = server
+        let request = server
+            .chunk_registry
+            .begin_frame(conn.conn_id(), request_id, false);
+        server
             .chunk_registry
             .insert(
                 conn.conn_id(),
-                31,
+                request_id,
                 TOTAL_CHUNKS,
                 CHUNK_SIZE,
                 ChunkRouteAdmission {
@@ -5932,14 +6248,15 @@ async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
         let pool_guard = reassembly_pool.try_write().expect("idle reassembly pool");
         let cleanup = {
             let server = Arc::clone(&server);
+            let conn = Arc::clone(&conn);
             tokio::task::spawn_blocking(move || {
                 if rollback {
                     drop(ChunkPublicationGuard {
                         server: &server,
-                        assembly: Some(assembly),
+                        assembly: Some((conn.conn_id(), request_id)),
                     });
                 } else {
-                    server.abort_chunk_request(assembly.conn_id(), 31);
+                    assert!(server.settle_chunk_request(conn.conn_id(), request_id, &request));
                 }
             })
         };

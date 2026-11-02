@@ -32,8 +32,8 @@ use c2_error::{C2Error, ErrorCode};
 use c2_mem::config::PoolConfig;
 use c2_mem::{MemPool, MemoryBudget};
 use c2_wire::buddy::{BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload};
-use c2_wire::chunk::ChunkAdmissionError;
 use c2_wire::chunk::header::{REPLY_CHUNK_META_SIZE, decode_chunk_header, encode_reply_chunk_meta};
+use c2_wire::chunk::{ChunkAdmissionError, ChunkRequest};
 use c2_wire::control::{
     ReplyControl, RouteCallIdentity, decode_call_control, encode_reply_control,
 };
@@ -624,20 +624,13 @@ impl Server {
             .map_err(|_| self.config.max_total_chunks)
     }
 
-    /// Tear down a failed/aborted chunk request.
-    ///
-    /// Order is the correctness argument:
-    /// 1. Publish the terminal ordering outcome and take a gate fence. A
-    ///    first-chunk task still parked in route admission wakes here and can
-    ///    no longer win the admission commit; the fence keeps the gate entry in
-    ///    place so a same-key successor generation cannot begin mid-teardown.
-    /// 2. Remove the assembly and admission together, releasing the backing
-    ///    before the pending permit outside the registry lock.
-    /// 3. Drop the fence, allowing a successor generation to begin.
-    fn abort_chunk_request(&self, conn_id: u64, request_id: u64) {
-        let reclaim = self.chunk_admission_gate.abort_key((conn_id, request_id));
-        self.chunk_registry.abort(conn_id, request_id);
-        drop(reclaim);
+    /// Fence pending admission and claim the request's one error reply. The
+    /// registry releases any assembly and retains only its settled marker.
+    fn settle_chunk_request(&self, conn_id: u64, request_id: u64, request: &ChunkRequest) -> bool {
+        self.chunk_registry.settle(request, || {
+            self.chunk_admission_gate
+                .terminate_key((conn_id, request_id), ChunkAdmissionOutcome::Refused)
+        })
     }
 
     /// Claim first-chunk admission ordering for an incoming chunked request.
@@ -2271,11 +2264,29 @@ fn handle_connection(
                 // Reserve before any admission await or task submission so a
                 // concurrent shutdown cannot miss an already accepted call.
                 let flight = crate::connection::FlightGuard::new(&conn);
+                let chunk_request = c2_wire::flags::is_chunked(flags).then(|| {
+                    server.chunk_registry.begin_frame(
+                        conn_id,
+                        request_id,
+                        c2_wire::flags::is_chunk_last(flags),
+                    )
+                });
+                if chunk_request.as_ref().is_some_and(ChunkRequest::is_settled) {
+                    if c2_wire::flags::is_buddy(flags) && conn.shm_request_capable() {
+                        cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
+                    }
+                    continue;
+                }
                 if (conn.is_deactivated() || conn.shutdown_requested())
                     && !accepted_chunk_continuation(&server, conn_id, request_id, flags, payload)
                 {
                     if c2_wire::flags::is_buddy(flags) && conn.shm_request_capable() {
                         cleanup_buddy_request_block(&conn, payload, &server.memory_budget);
+                    }
+                    if chunk_request.as_ref().is_some_and(|request| {
+                        !server.settle_chunk_request(conn_id, request_id, request)
+                    }) {
+                        continue;
                     }
                     queue_reply(
                         &writer,
@@ -2304,7 +2315,13 @@ fn handle_connection(
                         // inline chunks were admitted; tear that admission
                         // down terminal-first exactly like a capacity refusal
                         // (no mappings involved), then correlate the caller.
-                        server.abort_chunk_request(conn.conn_id(), request_id);
+                        if !server.settle_chunk_request(
+                            conn_id,
+                            request_id,
+                            chunk_request.as_ref().unwrap(),
+                        ) {
+                            continue;
+                        }
                     }
                     queue_reply(
                         &writer,
@@ -2333,8 +2350,15 @@ fn handle_connection(
                             // A first-chunk task still parked in route
                             // admission wakes and rolls back; it can never
                             // publish after this terminal outcome.
-                            server.abort_chunk_request(conn.conn_id(), request_id);
-                            queue_chunk_processing_capacity_error(&writer, request_id, limit).await;
+                            queue_chunk_processing_capacity_error(
+                                &server,
+                                conn_id,
+                                &writer,
+                                request_id,
+                                chunk_request.as_ref().unwrap(),
+                                limit,
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -2365,7 +2389,13 @@ fn handle_connection(
                             // chunk-processing capacity refusal above, which
                             // also tears down an already-published assembly
                             // and frees its stored route admission.
-                            server.abort_chunk_request(conn.conn_id(), request_id);
+                            if !server.settle_chunk_request(
+                                conn_id,
+                                request_id,
+                                chunk_request.as_ref().unwrap(),
+                            ) {
+                                continue;
+                            }
                             queue_reply(
                                 &writer,
                                 request_id,
@@ -2387,6 +2417,7 @@ fn handle_connection(
                         &writer,
                         chunk_processing_permit,
                         ordering,
+                        chunk_request.unwrap(),
                     );
                     continue;
                 }
@@ -3501,6 +3532,7 @@ fn spawn_chunked_call(
     writer: &Arc<ConnectionWriter>,
     chunk_processing_permit: OwnedSemaphorePermit,
     ordering: ChunkFrameOrdering,
+    chunk_request: ChunkRequest,
 ) {
     let peer_request = if c2_wire::flags::is_buddy(flags) {
         Some(
@@ -3526,6 +3558,7 @@ fn spawn_chunked_call(
             &wr,
             chunk_processing_permit,
             ordering,
+            chunk_request,
             peer_request,
         )
         .await;
@@ -3584,8 +3617,10 @@ fn accepted_chunk_continuation(
         0
     };
     matches!(decode_chunk_header(payload, offset), Ok((index, _, _)) if index > 0)
-        && (server.chunk_registry.contains(conn_id, request_id)
-            || server.chunk_admission_waiter(conn_id, request_id).is_some())
+        // Publication inserts the assembly before releasing pending admission.
+        // Observe admission first so that transition cannot look like no state.
+        && (server.chunk_admission_waiter(conn_id, request_id).is_some()
+            || server.chunk_registry.contains(conn_id, request_id))
 }
 
 /// Fail one chunked request: publish the terminal admission outcome first (so a
@@ -3599,6 +3634,7 @@ async fn fail_chunked_request(
     conn: &Arc<Connection>,
     writer: &Arc<ConnectionWriter>,
     request_id: u64,
+    chunk_request: &ChunkRequest,
     mut admission_owner: Option<ChunkAdmissionOwner>,
     code: ErrorCode,
     message: String,
@@ -3607,15 +3643,14 @@ async fn fail_chunked_request(
         conn_id = conn.conn_id(),
         request_id, %message, "chunked call failed"
     );
-    // Terminal outcome first: waiters stop, and the owner's late commit loses
-    // the atomic admission transition. The owner keeps the gate entry as a
-    // teardown fence until its release below.
-    if let Some(owner) = admission_owner.as_mut() {
-        owner.refuse();
-    }
-    server.abort_chunk_request(conn.conn_id(), request_id);
+    // Claim the registry outcome before waking admission waiters. Publishing
+    // refusal earlier would let a continuation race ahead with "no assembly".
+    let won = server.settle_chunk_request(conn.conn_id(), request_id, chunk_request);
     if let Some(owner) = admission_owner.as_mut() {
         owner.release();
+    }
+    if !won {
+        return;
     }
     write_reply(
         writer,
@@ -3625,18 +3660,18 @@ async fn fail_chunked_request(
     .await;
 }
 
-/// Roll back an uncommitted first chunk by its exact assembly generation.
+/// Roll back an uncommitted first chunk by its request key.
 /// The admission gate still fences publication; rollback releases the pending
 /// permit before the backing, including cancellation and a losing commit.
 struct ChunkPublicationGuard<'a> {
     server: &'a Server,
-    assembly: Option<c2_wire::chunk::ChunkAssemblyId>,
+    assembly: Option<(u64, u64)>,
 }
 
 impl Drop for ChunkPublicationGuard<'_> {
     fn drop(&mut self) {
-        if let Some(assembly) = self.assembly.take()
-            && let Some((assembler, admission)) = self.server.chunk_registry.take_id(assembly)
+        if let Some((conn_id, request_id)) = self.assembly.take()
+            && let Ok((assembler, admission)) = self.server.chunk_registry.take(conn_id, request_id)
         {
             drop(admission);
             drop(assembler);
@@ -3654,6 +3689,7 @@ async fn dispatch_chunked_call(
     writer: &Arc<ConnectionWriter>,
     chunk_processing_permit: OwnedSemaphorePermit,
     ordering: ChunkFrameOrdering,
+    chunk_request: ChunkRequest,
     peer_request: Option<Result<RequestData, String>>,
 ) {
     // Ordering: a later chunk waits for its request's first-chunk admission
@@ -3693,6 +3729,10 @@ async fn dispatch_chunked_call(
         ChunkFrameOrdering::Direct => None,
     };
 
+    if chunk_request.is_settled() {
+        drop(peer_request);
+        return;
+    }
     let is_buddy = c2_wire::flags::is_buddy(flags);
     let mut offset: usize = 0;
 
@@ -3715,6 +3755,7 @@ async fn dispatch_chunked_call(
                     conn,
                     writer,
                     request_id,
+                    &chunk_request,
                     admission_owner.take(),
                     ErrorCode::ResourceInputDeserializing,
                     format!("chunked call SHM read failed: {e}"),
@@ -3736,6 +3777,7 @@ async fn dispatch_chunked_call(
                 conn,
                 writer,
                 request_id,
+                &chunk_request,
                 admission_owner.take(),
                 ErrorCode::ResourceInputDeserializing,
                 format!("chunked call chunk header decode failed: {e:?}"),
@@ -3756,6 +3798,7 @@ async fn dispatch_chunked_call(
                     conn,
                     writer,
                     request_id,
+                    &chunk_request,
                     admission_owner.take(),
                     ErrorCode::ResourceInputDeserializing,
                     format!("chunked call control decode failed: {e:?}"),
@@ -3803,14 +3846,11 @@ async fn dispatch_chunked_call(
             match waited {
                 AdmissionWait::Ready(Ok(admission)) => admission,
                 AdmissionWait::Ready(Err(err)) => {
-                    let owner_was_pending = admission_owner
-                        .as_mut()
-                        .map(|owner| {
-                            let refused = owner.refuse();
-                            owner.release();
-                            refused
-                        })
-                        .unwrap_or(true);
+                    let owner_was_pending =
+                        server.settle_chunk_request(conn.conn_id(), request_id, &chunk_request);
+                    if let Some(owner) = admission_owner.as_mut() {
+                        owner.release();
+                    }
                     if !owner_was_pending {
                         // A concurrent terminal outcome already owns the
                         // correlated reply; do not write a second one for the
@@ -3845,6 +3885,7 @@ async fn dispatch_chunked_call(
                 conn,
                 writer,
                 request_id,
+                &chunk_request,
                 admission_owner.take(),
                 ErrorCode::ProtocolViolation,
                 "chunked call rejected: first chunk carries no data".to_string(),
@@ -3855,9 +3896,8 @@ async fn dispatch_chunked_call(
 
         // Assembly and route admission publish together. A rejected insert
         // returns the permit, which stays live through the error reply await.
-        let assembly = match server.chunk_registry.insert(
-            conn.conn_id(),
-            request_id,
+        match server.chunk_registry.insert_request(
+            &chunk_request,
             total_chunks as usize,
             chunk_size,
             ChunkRouteAdmission {
@@ -3867,7 +3907,7 @@ async fn dispatch_chunked_call(
                 _flight: crate::connection::FlightGuard::new(conn),
             },
         ) {
-            Ok(assembly) => assembly,
+            Ok(()) => {}
             Err((e, _admission)) => {
                 // Correlate the admission failure back to the pending caller
                 // instead of logging and leaving it waiting. The message
@@ -3884,6 +3924,7 @@ async fn dispatch_chunked_call(
                     conn,
                     writer,
                     request_id,
+                    &chunk_request,
                     admission_owner.take(),
                     code,
                     format!("chunked call reassembly admission failed: {e}"),
@@ -3894,11 +3935,11 @@ async fn dispatch_chunked_call(
         };
         let mut publication = ChunkPublicationGuard {
             server,
-            assembly: Some(assembly),
+            assembly: Some((conn.conn_id(), request_id)),
         };
         // Admission commit: the atomic Pending → Admitted transition is the
         // linearization point. Losing it means a terminal outcome was published
-        // concurrently; the guard rolls this generation's publications back and
+        // concurrently; the guard rolls this request's publications back and
         // the terminal publisher owns the caller's correlated error reply.
         let admitted = admission_owner
             .as_mut()
@@ -3931,6 +3972,7 @@ async fn dispatch_chunked_call(
                     conn,
                     writer,
                     request_id,
+                    &chunk_request,
                     admission_owner.take(),
                     ErrorCode::ResourceUnavailable,
                     format!("chunked call chunk feed failed: {e}"),
@@ -3951,6 +3993,7 @@ async fn dispatch_chunked_call(
                         conn,
                         writer,
                         request_id,
+                        &chunk_request,
                         admission_owner.take(),
                         ErrorCode::ResourceUnavailable,
                         "chunked call missing route admission".to_string(),
@@ -3968,6 +4011,7 @@ async fn dispatch_chunked_call(
                 conn,
                 writer,
                 request_id,
+                &chunk_request,
                 admission_owner.take(),
                 ErrorCode::ResourceUnavailable,
                 format!(
@@ -3986,6 +4030,7 @@ async fn dispatch_chunked_call(
                     conn,
                     writer,
                     request_id,
+                    &chunk_request,
                     admission_owner.take(),
                     ErrorCode::ResourceUnavailable,
                     format!("chunked call reassembly finish failed: {e}"),
@@ -4142,10 +4187,16 @@ async fn queue_server_pending_capacity_error(
 }
 
 async fn queue_chunk_processing_capacity_error(
+    server: &Server,
+    conn_id: u64,
     writer: &Arc<ConnectionWriter>,
     request_id: u64,
+    request: &ChunkRequest,
     limit: u32,
 ) {
+    if !server.settle_chunk_request(conn_id, request_id, request) {
+        return;
+    }
     let msg = format!("server chunk processing capacity exceeded: max_total_chunks={limit}");
     queue_reply(
         writer,

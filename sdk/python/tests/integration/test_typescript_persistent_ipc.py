@@ -218,7 +218,7 @@ class PersistentNode:
 
 
 def _ok(result: dict[str, Any]) -> dict[str, Any]:
-    assert result["ok"], result
+    assert result["ok"], json.dumps(result, ensure_ascii=False)
     return result
 
 
