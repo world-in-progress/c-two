@@ -75,7 +75,6 @@
 - c2-wire 里给已接纳调用的回复也走 `WriteRequest::Control`（F3 以此保证停用后仍可回复），名字与"控制帧"的本义不符；结构调整时考虑分出"已接纳调用的帧"。
 - 直接用 pytest 跑 Python 套件时，`test_typescript_persistent_ipc.py` 依赖别的测试先构建好 fastdb4ts；运行顺序不同就会报"尚未构建"。CI 的运行器会预先构建，所以只在本地出现。
 - c2-server 在构造时预热响应池，启动时（包括重启）又预热一次；启动时那一次已经够用，构造时的可以删掉。
-- 配对基准工作流改用 source 模式构建之后，"Prepare official FastDB CoreSDK" 一步已不再需要，它还会往后续步骤写入 `system` 模式的环境变量。
 - rustc 1.99 把 `AtomicU64::fetch_update` 标为弃用（改名 `try_update`），c2-mem 与 c2-local 的干净构建各出一条警告；改用 `try_update` 之前先确认它在最低支持的 Rust 1.95 上可用。
 
 ## 下游跟进（由用户决定）
