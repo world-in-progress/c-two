@@ -25,7 +25,7 @@ env:
   CARGO_BUILD_JOBS: "2"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  FASTDB_PAYLOAD_LINK_MODE: system
+  FASTDB_PAYLOAD_LINK_MODE: source
   PYTHONUTF8: "1"
 
 jobs:
@@ -78,14 +78,22 @@ jobs:
       - name: Build separate baseline and candidate environments
         shell: python
         run: |
-          import os, pathlib, subprocess
+          import os, pathlib, subprocess, sys
           workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          sys.path.insert(0, str(workspace / 'candidate' / 'c-two' / 'tools' / 'ci'))
+          from source_validation import source_mode_environment
           for label in ('baseline', 'candidate'):
               root = workspace / label / 'c-two'
-              env = dict(os.environ, CARGO_TARGET_DIR=str(root / 'core' / 'target'),
-                         FASTDB_PAYLOAD_LINK_MODE='system')
-              subprocess.run(['uv', 'sync', '--python', '3.12', '--reinstall-package', 'c-two'],
-                             cwd=root, env=env, check=True)
+              env = source_mode_environment(dict(os.environ,
+                  CARGO_TARGET_DIR=str(root / 'core' / 'target')))
+              try:
+                  subprocess.run(['uv', 'sync', '--python', '3.12', '--reinstall-package', 'c-two'],
+                                 cwd=root, env=env, check=True)
+                  python = root / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+                  subprocess.run([str(python), '-c', 'import c_two; from c_two import _native'],
+                                 cwd=root, env=env, check=True)
+              except (OSError, subprocess.SubprocessError) as exc:
+                  raise RuntimeError(f'[{label}:tool_failure] source build/import failed: {exc}') from exc
               import shutil
               shutil.rmtree(root / 'core' / 'target', ignore_errors=True)
       - name: Run exact paired matrix and anomaly controls

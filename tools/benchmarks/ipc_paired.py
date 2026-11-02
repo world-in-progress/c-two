@@ -2,7 +2,8 @@
 
 The candidate checkout supplies this harness to both interpreters. Every child
 runs with its own source cwd and C2_BENCH_SOURCE_ROOT. Ratios are report-only;
-correctness and missing evidence fail the run. Raw child artifacts are retained.
+candidate correctness and either side's tool failures fail the run. Baseline
+workload failures and all raw child artifacts remain in the receipt.
 """
 from __future__ import annotations
 
@@ -19,7 +20,10 @@ import time
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ipc_evidence import run_owned
+from ipc_evidence import (
+    BenchmarkError, CORRECTNESS_FAILURE, Failures, TOOL_FAILURE, failure_message,
+    failure_parts, run_owned,
+)
 
 BASELINE_HEAD = 'b861f994e9f7294c0f3d4efc096c14f0d7f5c121'
 NORMAL_ROWS = (
@@ -38,13 +42,20 @@ ANOMALIES = (
 )
 
 
-class EvidenceError(ValueError):
+class EvidenceError(BenchmarkError):
     pass
 
 
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise EvidenceError(message)
+
+
+def correctness(condition: bool, message: str, failures: Failures | None) -> None:
+    if not condition:
+        if failures is None:
+            raise EvidenceError(message, CORRECTNESS_FAILURE)
+        failures.append(message)
 
 
 def git_head(root: Path) -> str:
@@ -84,7 +95,8 @@ def read_json(path: Path) -> dict:
     return value
 
 
-def sample_outcomes(path: Path, worker: dict, expected_config: dict | None) -> dict:
+def sample_outcomes(path: Path, worker: dict, expected_config: dict | None,
+                    failures: Failures | None = None) -> dict:
     require(path.is_file(), f'missing samples {path}')
     counts = {'attempts': 0, 'successes': 0, 'failures': 0, 'timeouts': 0}
     metadata = []
@@ -113,10 +125,10 @@ def sample_outcomes(path: Path, worker: dict, expected_config: dict | None) -> d
                             f'invalid sample timing in {path}')
                     require(record.get('status') in ('success', 'error', 'timeout'),
                             f'invalid sample status in {path}')
-                    require(record.get('integrity_ok') is not False,
-                            f'payload integrity failure in {path}')
+                    correctness(record.get('integrity_ok') is not False,
+                                f'payload integrity failure in {path}', failures)
                     if record['status'] == 'success':
-                        require(record.get('integrity_ok') is True,
+                        require(type(record.get('integrity_ok')) is bool,
                                 f'success without confirmed payload integrity in {path}')
                 if record.get('kind') == 'sample' and record.get('measurement') is True:
                     counts['attempts'] += 1
@@ -139,7 +151,7 @@ def sample_outcomes(path: Path, worker: dict, expected_config: dict | None) -> d
 
 def check_worker(worker: dict, base: Path, normal: bool,
                  expected_commit: str | None = None, expected_attempts: int | None = None,
-                 expected_config: dict | None = None) -> dict:
+                 expected_config: dict | None = None, failures: Failures | None = None) -> dict:
     require(isinstance(worker, dict), 'invalid worker record')
     summary = worker.get('summary')
     require(isinstance(summary, dict), 'missing worker summary')
@@ -162,7 +174,7 @@ def check_worker(worker: dict, base: Path, normal: bool,
     require(events.is_file(), f'missing events {events}')
     attempts = summary.get('attempts')
     require(type(attempts) is int and attempts > 0, 'invalid attempts')
-    outcomes = sample_outcomes(samples, worker, expected_config)
+    outcomes = sample_outcomes(samples, worker, expected_config, failures)
     require(outcomes['attempts'] == attempts, f'sample count differs from attempts: {samples}')
     if expected_attempts is not None:
         require(attempts == expected_attempts, f'incomplete attempt count: {samples}')
@@ -183,20 +195,21 @@ def check_worker(worker: dict, base: Path, normal: bool,
             and summary.get('throughput_calls_per_s') == throughput,
             f'summary throughput differs from raw samples: {samples}')
     if normal:
-        require(summary.get('successes') == attempts and summary.get('failures') == 0
+        correctness(summary.get('successes') == attempts and summary.get('failures') == 0
                 and summary.get('timeouts') == 0 and summary.get('unsuccessful', 0) == 0,
-                'normal row contains unsuccessful calls')
+                f'normal row contains unsuccessful calls: {samples}', failures)
         for metric in ('p50_ns', 'p99_ns', 'throughput_calls_per_s'):
             value = summary.get(metric)
-            require(type(value) in (int, float) and math.isfinite(value) and value > 0,
-                    f'missing or invalid {metric}')
+            correctness(type(value) in (int, float) and math.isfinite(value) and value > 0,
+                        f'missing or invalid {metric}: {samples}', failures)
     return summary
 
 
 def check_matrix(directory: Path, expected: set[str],
                  expected_commit: str | None = None) -> dict[str, list[dict]]:
     matrix = read_json(directory / 'matrix.json')
-    require(not matrix.get('failures'), 'matrix reports failures')
+    failures = Failures()
+    failures.extend(matrix.get('failures', []))
     if expected_commit is not None:
         require(matrix.get('source_commit') == expected_commit,
                 'matrix source commit differs from checkout')
@@ -208,15 +221,17 @@ def check_matrix(directory: Path, expected: set[str],
     result = {}
     specs = {}
     hashes = set()
+    outcomes = {}
     for item in rows:
         name = item['name']
-        require(item.get('ok') is True and item.get('exit_code') == 0, f'row failed: {name}')
         record = read_json(artifact_path(directory, item.get('result_file')))
-        require(record.get('ok') is True and record.get('row', {}).get('name') == name,
+        require(record.get('row', {}).get('name') == name,
                 f'invalid row record: {name}')
         benchmark = record.get('benchmark')
-        require(isinstance(benchmark, dict) and benchmark.get('ok') is True,
-                f'benchmark failed: {name}')
+        require(isinstance(benchmark, dict), f'missing benchmark: {name}')
+        row_failures = Failures()
+        row_failures.extend(record.get('failures', []))
+        row_failures.extend(benchmark.get('failures', []))
         workers = benchmark.get('workers')
         spec = record.get('spec')
         require(isinstance(spec, dict), f'missing row config: {name}')
@@ -229,14 +244,23 @@ def check_matrix(directory: Path, expected: set[str],
                        'call_timeout')
         worker_config = {key: spec[key] for key in config_keys}
         result[name] = [check_worker(worker, directory, name in NORMAL_ROWS,
-                                     expected_commit, spec['calls'], worker_config)
+                                     expected_commit, spec['calls'], worker_config, row_failures)
                         for worker in workers]
+        for worker in workers:
+            row_failures.extend(worker.get('failures', []))
+        row_failures = list(dict.fromkeys(row_failures))
+        claimed_ok = item.get('ok') is True and item.get('exit_code') == 0 and record.get('ok') is True and benchmark.get('ok') is True
+        require(claimed_ok or row_failures, f'row failed without a classified reason: {name}')
+        outcomes[name] = {'ok': claimed_ok and not row_failures, 'failures': row_failures}
+        failures.extend(row_failures)
         hashes.add(item.get('native_sha256'))
     require(None not in hashes and len(hashes) == 1, 'matrix native hashes disagree or missing')
     require(matrix.get('native', {}).get('single_installed_hash') in hashes,
             'matrix native hash does not match row hash')
     result['__specs__'] = specs
     result['__native_sha256__'] = next(iter(hashes))
+    result['__outcomes__'] = outcomes
+    result['__failures__'] = list(dict.fromkeys(failures))
     return result
 
 
@@ -288,20 +312,31 @@ def run_harness(args, label: str, group: int, kind: str, scenario: str | None = 
                     '--calls', str(args.anomaly_calls), '--warmup', str(args.warmup),
                     '--pause-seconds', str(args.pause_seconds),
                     '--abnormal-calls', str(args.abnormal_calls)]
-    env = dict(os.environ, C2_BENCH_SOURCE_ROOT=str(root), C2_RELAY_ANCHOR_ADDRESS='')
+    env = dict(os.environ, C2_BENCH_SOURCE_ROOT=str(root), C2_BENCH_SIDE=label,
+               C2_RELAY_ANCHOR_ADDRESS='')
     with (output / 'process.log').open('w') as log:
         proc = run_owned(command, cwd=root, env=env, stdout=log,
                          timeout=args.timeout_seconds)
-    require(proc.returncode == 0, f'{label} {suffix} exited {proc.returncode}; see {output / "process.log"}')
+    (output / 'invocation.json').write_text(json.dumps({'exit_code': proc.returncode,
+        'source': label, 'command': command}) + '\n', encoding='utf-8')
+    report_path = output / ('matrix.json' if kind == 'matrix' else 'anomaly.json')
+    require(report_path.is_file(), f'{label} {suffix} exited {proc.returncode} without {report_path.name}; '
+            f'see {output / "process.log"}: {(output / "process.log").read_text(encoding="utf-8")[-2000:]}')
+    report = read_json(report_path)
+    ok = (not report.get('failures') and all(row.get('ok') is True for row in report.get('rows', []))) if kind == 'matrix' else report.get('ok') is True
+    require(proc.returncode == (0 if ok else 1),
+            f'{label} {suffix} exit {proc.returncode} disagrees with report status; see {output / "process.log"}')
     return output
 
 
 def check_anomaly(directory: Path, scenario: str, control: str,
                   expected_commit: str | None = None) -> dict:
     report = read_json(directory / 'anomaly.json')
-    require(report.get('ok') is True and report.get('scenario') == scenario
-            and report.get('control') == control, f'anomaly failed: {scenario}/{control}')
-    require(not report.get('failures'), f'anomaly failures: {scenario}/{control}')
+    require(report.get('scenario') == scenario and report.get('control') == control,
+            f'anomaly scenario/control mismatch: {scenario}/{control}')
+    failures = Failures()
+    failures.extend(report.get('failures', []))
+    require(report.get('ok') is True or failures, f'anomaly failed without a classified reason: {scenario}/{control}')
     if expected_commit is not None:
         require(report.get('source_commit') == expected_commit,
                 'anomaly source commit differs from checkout')
@@ -318,10 +353,35 @@ def check_anomaly(directory: Path, scenario: str, control: str,
     normal = [worker for worker in workers if worker.get('role') == 'normal'
               or worker.get('identity', {}).get('role') == 'normal']
     require(normal, 'missing normal anomaly worker')
+    summaries = [check_worker(worker, directory, False, expected_commit,
+                             3 * config['calls'], config, failures) for worker in normal]
     return {'config': config, 'native_sha256': server['native_sha256'],
-            'normal_summaries': [check_worker(worker, directory, False, expected_commit,
-                                               3 * config['calls'], config)
-                                 for worker in normal]}
+            'normal_summaries': summaries,
+            'normal_by_phase': [worker.get('by_phase', {}) for worker in normal],
+            'ok': report.get('ok') is True and not failures,
+            'failures': list(dict.fromkeys(failures))}
+
+
+def record_failures(receipt: dict, messages: list[str], source: str, context: str) -> list[str]:
+    result = []
+    for value in messages:
+        recorded_source, category, message = failure_parts(value)
+        require(recorded_source in (source, 'standalone'), 'failure source differs from environment')
+        value = failure_message(f'{context}: {message}', category, source)
+        receipt['failures'].append(value)
+        result.append(value)
+        if source == 'candidate' or category == TOOL_FAILURE:
+            receipt['blocking_failures'].append(value)
+    return result
+
+
+def count_scenario(receipt: dict, source: str, name: str, ok: bool, failures: list[str]) -> None:
+    counts = receipt['scenario_counts'][source].setdefault(name, {
+        'passed': 0, 'failed': 0, 'failure_categories': {}})
+    counts['passed' if ok else 'failed'] += 1
+    for category in {failure_parts(value)[1] for value in failures}:
+        categories = counts['failure_categories']
+        categories[category] = categories.get(category, 0) + 1
 
 
 def run(args) -> dict:
@@ -348,7 +408,7 @@ def run(args) -> dict:
     require(selected <= set(NORMAL_ROWS + BUDGET_ROWS), 'unknown matrix row selector')
     require(not args.only or len(selected) == len(args.only), 'duplicate row selector')
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    receipt = {'schema': 'c-two.ipc-paired.v1', 'machine': platform.uname()._asdict(),
+    receipt = {'schema': 'c-two.ipc-paired.v2', 'machine': platform.uname()._asdict(),
                'baseline_commit': baseline_head, 'candidate_commit': candidate_head,
                'baseline_ref_requested': args.baseline_ref,
                'candidate_ref_requested': args.candidate_ref,
@@ -356,7 +416,8 @@ def run(args) -> dict:
                'baseline_root': str(args.baseline_root), 'candidate_root': str(args.candidate_root),
                'baseline_python': str(args.baseline_python), 'candidate_python': str(args.candidate_python),
                'python_identity': baseline_identity, 'selected_rows': sorted(selected),
-               'pairs_requested': args.pairs, 'groups': [], 'anomalies': [], 'failures': []}
+               'pairs_requested': args.pairs, 'groups': [], 'anomalies': [], 'failures': [],
+               'blocking_failures': [], 'scenario_counts': {'baseline': {}, 'candidate': {}}}
     for index in range(args.pairs):
         group = {'index': index + 1, 'order': list(paired_order(index))}
         anomaly_configs: dict[tuple[str, str], dict] = {}
@@ -366,8 +427,15 @@ def run(args) -> dict:
             try:
                 directory = run_harness(args, label, index, 'matrix')
                 group[label] = check_matrix(directory, selected, head)
-            except (EvidenceError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
-                receipt['failures'].append(f'group {index + 1} {label} matrix: {exc}')
+                record_failures(receipt, group[label].get('__failures__', []), label,
+                                f'group {index + 1} matrix')
+                for name in sorted(selected):
+                    outcome = group[label].get('__outcomes__', {}).get(name, {'ok': True, 'failures': []})
+                    count_scenario(receipt, label, 'matrix/' + name, outcome['ok'], outcome['failures'])
+            except (BenchmarkError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
+                values = record_failures(receipt, [failure_message(str(exc),
+                    getattr(exc, 'category', TOOL_FAILURE), label)], label, f'group {index + 1} matrix')
+                count_scenario(receipt, label, 'matrix', False, values)
         if not args.skip_anomalies:
             for scenario in ANOMALIES:
                 for control in ('alone', 'parallel'):
@@ -387,25 +455,34 @@ def run(args) -> dict:
                                 anomaly_configs[config_key] = anomaly_result['config']
                             entry.update({'native_sha256': anomaly_result['native_sha256'],
                                           'normal_summaries': anomaly_result['normal_summaries'],
-                                          'ok': True})
-                        except (EvidenceError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
-                            entry.update({'ok': False, 'failure': str(exc)})
-                            receipt['failures'].append(f'group {index + 1} {label} {scenario}/{control}: {exc}')
+                                          'normal_by_phase': anomaly_result['normal_by_phase'],
+                                          'config': anomaly_result['config'],
+                                          'ok': anomaly_result['ok']})
+                            entry['failures'] = record_failures(receipt, anomaly_result['failures'], label,
+                                f'group {index + 1} {scenario}/{control}')
+                        except (BenchmarkError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
+                            entry.update({'ok': False, 'failures': record_failures(receipt,
+                                [failure_message(str(exc), getattr(exc, 'category', TOOL_FAILURE), label)],
+                                label, f'group {index + 1} {scenario}/{control}')})
+                        count_scenario(receipt, label, scenario + '/' + control, entry['ok'], entry['failures'])
                         receipt['anomalies'].append(entry)
         if 'baseline' in group and 'candidate' in group:
             try:
                 require(group['baseline'].get('__specs__') == group['candidate'].get('__specs__'),
                         f'baseline/candidate matrix config mismatch in group {index + 1}')
             except EvidenceError as exc:
-                receipt['failures'].append(str(exc))
+                value = failure_message(str(exc), TOOL_FAILURE, 'pair')
+                receipt['failures'].append(value)
+                receipt['blocking_failures'].append(value)
         receipt['groups'].append(group)
         (args.output_dir / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
-    if not receipt['failures']:
+    receipt['ratios'], receipt['ratios_unavailable'] = {}, {}
+    for name in sorted(selected & set(NORMAL_ROWS)):
         try:
-            receipt['ratios'] = ratio_report(receipt['groups'], selected)
-        except EvidenceError as exc:
-            receipt['failures'].append(str(exc))
-    receipt['ok'] = not receipt['failures'] and len(receipt['groups']) >= 5
+            receipt['ratios'].update(ratio_report(receipt['groups'], {name}))
+        except (EvidenceError, KeyError, TypeError) as exc:
+            receipt['ratios_unavailable'][name] = f'five valid metric pairs unavailable: {exc}; see groups and failures'
+    receipt['ok'] = not receipt['blocking_failures'] and len(receipt['groups']) >= 5
     (args.output_dir / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     return receipt
 
@@ -435,8 +512,13 @@ def main() -> None:
         parser.error('--pause-seconds must be finite and positive')
     if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
         parser.error('--timeout-seconds must be finite and positive')
-    result = run(args)
-    print(json.dumps({'ok': result['ok'], 'failures': result['failures'],
+    try:
+        result = run(args)
+    except (BenchmarkError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
+        print(json.dumps({'ok': False, 'failure': failure_message(str(exc), TOOL_FAILURE, 'pair')}))
+        raise SystemExit(1)
+    print(json.dumps({'ok': result['ok'], 'failure_count': len(result['failures']),
+                      'blocking_failure_count': len(result['blocking_failures']),
                       'receipt': str(args.output_dir / 'receipt.json')}))
     raise SystemExit(0 if result['ok'] else 1)
 

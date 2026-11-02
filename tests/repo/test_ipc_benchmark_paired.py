@@ -4,6 +4,9 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -115,6 +118,12 @@ def test_anomaly_checks_normal_raw_evidence_and_native_identity(paired, tmp_path
     (tmp_path / 'anomaly.json').write_text(json.dumps(report))
     result = paired.check_anomaly(tmp_path, 'hold', 'alone', 'fixture')
     assert result['normal_summaries'] == [normal['summary']]
+    report.update(ok=False, failures=['[baseline:scenario_not_established] fallback not reached'])
+    (tmp_path / 'anomaly.json').write_text(json.dumps(report))
+    failed = paired.check_anomaly(tmp_path, 'hold', 'alone', 'fixture')
+    assert failed['ok'] is False
+    assert failed['normal_summaries'] == result['normal_summaries']
+    assert failed['failures'] == report['failures']
     report['benchmark']['server']['native_sha256'] = 'b' * 64
     (tmp_path / 'anomaly.json').write_text(json.dumps(report))
     with pytest.raises(paired.EvidenceError, match='hashes disagree'):
@@ -236,7 +245,7 @@ def test_workflow_keeps_manual_separate_source_environments():
                          Loader=yaml.BaseLoader)
     assert set(workflow['on']) == {'workflow_dispatch'}
     assert set(workflow['on']['workflow_dispatch']['inputs']) == {'baseline_ref', 'candidate_ref'}
-    assert workflow['env']['FASTDB_PAYLOAD_LINK_MODE'] == 'system'
+    assert workflow['env']['FASTDB_PAYLOAD_LINK_MODE'] == 'source'
     assert set(workflow['jobs']['paired']['strategy']['matrix']['os']) == {
         'ubuntu-24.04', 'macos-15', 'windows-2025', 'windows-11-arm'}
     steps = workflow['jobs']['paired']['steps']
@@ -244,5 +253,114 @@ def test_workflow_keeps_manual_separate_source_environments():
                  step['with'].get('path') in {'baseline/c-two', 'candidate/c-two'}]
     assert checkouts == ['baseline/c-two', 'candidate/c-two']
     assert any('prepare_fastdb_sdk.py' in step.get('run', '') for step in steps)
+    build = next(step['run'] for step in steps if step.get('name', '').startswith('Build separate'))
+    assert 'source_mode_environment' in build
+    assert "import c_two; from c_two import _native" in build
     assert any(step.get('if') == 'always()' and step.get('uses') == 'actions/upload-artifact@v4'
                for step in steps)
+
+
+@pytest.mark.parametrize('side,category,blocking', [
+    ('baseline', 'scenario_not_established', False),
+    ('baseline', 'correctness_failure', False),
+    ('baseline', 'tool_failure', True),
+    ('candidate', 'scenario_not_established', True),
+    ('candidate', 'correctness_failure', True),
+    ('candidate', 'tool_failure', True),
+])
+def test_failure_policy_retains_every_result_and_available_ratios(
+    paired, monkeypatch, tmp_path, side, category, blocking,
+):
+    options = args(tmp_path, paired)
+    name = paired.NORMAL_ROWS[0]
+    options.only = [name]
+    monkeypatch.setattr(paired, 'git_head', lambda root: 'b861f994' if root == options.baseline_root else 'candidate')
+    monkeypatch.setattr(paired, 'python_identity', lambda *args: {'dependencies': {}})
+    monkeypatch.setattr(paired, 'run_harness', lambda _args, label, *_: tmp_path / label)
+
+    def matrix(directory, *_args):
+        failures = [f'[{side}:{category}] original failure'] if directory.name == side else []
+        return {name: [summary()], '__specs__': {name: {}},
+                '__failures__': failures, '__outcomes__': {name: {
+                    'ok': not failures, 'failures': failures}}}
+
+    monkeypatch.setattr(paired, 'check_matrix', matrix)
+    result = paired.run(options)
+    assert result['ok'] is (not blocking)
+    assert len(result['failures']) == 5
+    assert len(result['blocking_failures']) == (5 if blocking else 0)
+    assert len(result['groups']) == 5
+    assert result['scenario_counts'][side]['matrix/' + name]['failed'] == 5
+    assert result['groups'][0][side][name] == [summary()]
+    assert name in result['ratios']
+
+
+def test_nonzero_harness_exit_keeps_report_for_classification(paired, monkeypatch, tmp_path):
+    options = args(tmp_path, paired)
+    options.timeout_seconds = 1
+    options.only = None
+    def failed_report(_command, **kwargs):
+        output = Path(kwargs['stdout'].name).parent
+        (output / 'matrix.json').write_text(json.dumps({'rows': [{'ok': False}]}))
+        return SimpleNamespace(returncode=1)
+    monkeypatch.setattr(paired, 'run_owned', failed_report)
+    directory = paired.run_harness(options, 'baseline', 0, 'matrix')
+    assert json.loads((directory / 'invocation.json').read_text())['exit_code'] == 1
+
+
+def test_import_failure_is_a_tool_failure_with_original_log(paired, monkeypatch, tmp_path):
+    options = args(tmp_path, paired)
+    options.timeout_seconds = 1
+    options.only = None
+    def import_failure(_command, **kwargs):
+        kwargs['stdout'].write('ImportError: DLL load failed while importing _native\n')
+        kwargs['stdout'].flush()
+        return SimpleNamespace(returncode=1)
+    monkeypatch.setattr(paired, 'run_owned', import_failure)
+    with pytest.raises(paired.EvidenceError, match='baseline.*DLL load failed') as error:
+        paired.run_harness(options, 'baseline', 0, 'matrix')
+    assert error.value.category == 'tool_failure'
+
+
+@pytest.mark.parametrize('failed_side', [None, 'baseline', 'candidate'])
+def test_workflow_build_drops_system_overrides_and_probes_each_import(monkeypatch, tmp_path, failed_side):
+    workflow = yaml.load((ROOT / '.github/workflows/ipc-memory-paired.yml').read_text(), Loader=yaml.BaseLoader)
+    code = next(step['run'] for step in workflow['jobs']['paired']['steps']
+                if step.get('name', '').startswith('Build separate'))
+    spec = importlib.util.spec_from_file_location('source_validation', ROOT / 'tools/ci/source_validation.py')
+    source = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(source)
+    monkeypatch.setitem(sys.modules, 'source_validation', source)
+    monkeypatch.setenv('GITHUB_WORKSPACE', str(tmp_path))
+    monkeypatch.setenv('FASTDB_PAYLOAD_LINK_MODE', 'system')
+    monkeypatch.setenv('FASTDB_PAYLOAD_SYSTEM_LIB_DIR', '/stale/system/sdk')
+    calls, removed = [], []
+    def command(argv, *, cwd, env, check):
+        side = cwd.parent.name
+        calls.append((side, argv))
+        assert env['FASTDB_PAYLOAD_LINK_MODE'] == 'source'
+        assert 'FASTDB_PAYLOAD_SYSTEM_LIB_DIR' not in env
+        assert env['CARGO_TARGET_DIR'] == str(cwd / 'core' / 'target')
+        assert check
+        if argv[0] == 'uv' and side == failed_side:
+            raise subprocess.CalledProcessError(1, argv)
+    monkeypatch.setattr(subprocess, 'run', command)
+    monkeypatch.setattr(shutil, 'rmtree', lambda path, **kwargs: removed.append(path))
+    if failed_side:
+        with pytest.raises(RuntimeError, match=rf'\[{failed_side}:tool_failure\] source build/import failed'):
+            exec(compile(code, '<paired-workflow-build>', 'exec'), {})
+    else:
+        exec(compile(code, '<paired-workflow-build>', 'exec'), {})
+        assert len(calls) == 4
+        assert len(removed) == 2
+        assert [side for side, argv in calls if argv[-1] == 'import c_two; from c_two import _native'] == ['baseline', 'candidate']
+
+
+def test_source_build_environment_selects_windows_ninja_without_system_dlls():
+    spec = importlib.util.spec_from_file_location('_paired_source_environment', ROOT / 'tools/ci/source_validation.py')
+    source = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(source)
+    source.os = SimpleNamespace(name='nt')
+    env = source.source_mode_environment({'FASTDB_PAYLOAD_LINK_MODE': 'system',
+                                         'FASTDB_PAYLOAD_SYSTEM_LIB_DIR': 'C:/sdk/lib'})
+    assert env == {'FASTDB_PAYLOAD_LINK_MODE': 'source', 'CMAKE_GENERATOR': 'Ninja'}

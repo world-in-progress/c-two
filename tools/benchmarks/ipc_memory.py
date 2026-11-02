@@ -86,7 +86,8 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ipc_evidence import (
-    INTERNAL_PROBES, SampleLog, platform_process_support, process_snapshot, summarize_samples,
+    INTERNAL_PROBES, CORRECTNESS_FAILURE, Failures, SampleLog,
+    TOOL_FAILURE, failure_message, platform_process_support, process_snapshot, summarize_samples,
 )
 
 
@@ -350,7 +351,7 @@ def require_snapshot(
             '--allow-unavailable-stats-after-shutdown; not a fabricated snapshot'
         )
         return
-    failures.append(f'memory stats required but unavailable at {point}')
+    failures.append(failure_message(f'memory stats required but unavailable at {point}', TOOL_FAILURE))
 
 
 def measure(args: argparse.Namespace) -> dict:
@@ -359,7 +360,7 @@ def measure(args: argparse.Namespace) -> dict:
     import c_two as cc
     from c_two import _native
 
-    failures: list[str] = []
+    failures = Failures()
     cleanup: dict[str, object] = {}
     Echo, EchoResource = echo_types(cc)
     overrides = configure(cc, args)
@@ -407,7 +408,7 @@ def measure(args: argparse.Namespace) -> dict:
             _, sample = call_sample(log, request_id, proxy.echo, payload)
             request_id += 1
             if expected_error is not None and sample['status'] == 'success':
-                failures.append(f"request {sample['request_id']}: expected capacity error but call succeeded")
+                failures.setup(f"request {sample['request_id']}: expected capacity error but call succeeded")
             if sample['status'] != 'success':
                 if expected_error is None:
                     failures.append(f"request {sample['request_id']}: {sample['error_type']}: {sample['error_message']}")
@@ -422,9 +423,9 @@ def measure(args: argparse.Namespace) -> dict:
                         failures.append(f'wrong capacity error: {observed}')
         if expected_error is not None:
             if not expected_error['raised']:
-                failures.append('expected native capacity error was not raised; the call succeeded')
+                failures.setup('expected native capacity error was not raised; the call succeeded')
             if expected_error['stage'] != 'call':
-                failures.append('expected capacity failure at call stage')
+                failures.setup('expected capacity failure at call stage')
             from c_two.transport.client import util
             expected_error['control_ping_ok'] = bool(util.ping(address, timeout=2.0))
             if not expected_error['control_ping_ok']:
@@ -450,7 +451,8 @@ def measure(args: argparse.Namespace) -> dict:
             memory_stats['after_calls'] = snapshot_memory_stats()
         os_stats['after_calls'] = process_snapshot()
     except Exception as exc:
-        failures.append(f'{type(exc).__name__}: {exc}')
+        failures.append(f'{type(exc).__name__}: {exc}', getattr(exc, 'category',
+            TOOL_FAILURE if isinstance(exc, TimeoutError) else CORRECTNESS_FAILURE))
         log.event('worker_error', error_type=type(exc).__name__, error_message=str(exc))
     finally:
         if client is not None:
@@ -482,9 +484,9 @@ def measure(args: argparse.Namespace) -> dict:
         log.close()
     summary = summarize_samples(log.samples)
     if summary['attempts'] != args.calls:
-        failures.append(f"sample count mismatch: expected {args.calls}, measured {summary['attempts']}")
+        failures.tool(f"sample count mismatch: expected {args.calls}, measured {summary['attempts']}")
     if not provenance['module_path'] or not provenance['sha256'] or not provenance['source_commit']:
-        failures.append('native path/hash or source commit missing')
+        failures.tool('native path/hash or source commit missing')
     return {
         'pid': os.getpid(), 'role': 'normal', 'worker_index': args.worker_index,
         'python_executable': sys.executable, 'version': distribution_version('c-two'),
@@ -519,7 +521,7 @@ def run_worker(args: argparse.Namespace) -> dict:
             'error_type': type(exc).__name__,
             'error_message': str(exc),
             'traceback_tail': traceback.format_exc()[-2000:],
-            'failures': [f'{type(exc).__name__}: {exc}'],
+            'failures': [failure_message(f'{type(exc).__name__}: {exc}', TOOL_FAILURE)],
         }
 
 
@@ -597,7 +599,7 @@ def run_controller(args: argparse.Namespace) -> dict:
     results = []
     child_processes: list[dict] = []
     terminated: list[int] = []
-    failures: list[str] = []
+    failures = Failures()
     cleanup: dict[str, object] = {}
     server_cc = None
     server_stats = None
@@ -646,12 +648,12 @@ def run_controller(args: argparse.Namespace) -> dict:
                     'pid': child.pid, 'exit_code': child.returncode,
                     'forced_termination': True, 'drain': drain_note or 'ok',
                 })
-                failures.append(
+                failures.tool(
                     f'benchmark child {child.pid} exceeded the {args.child_timeout}s join timeout '
                     'and was terminated; termination is reported as a failure'
                 )
                 if drain_note:
-                    failures.append(f'benchmark child {child.pid} post-kill drain failed: {drain_note}')
+                    failures.tool(f'benchmark child {child.pid} post-kill drain failed: {drain_note}')
                 continue
             child_processes.append({'pid': child.pid, 'exit_code': child.returncode, 'forced_termination': False})
             (args.output_dir / f'child-{child.pid}.stdout.json').write_text(stdout, encoding='utf-8')
@@ -668,17 +670,19 @@ def run_controller(args: argparse.Namespace) -> dict:
                     detail = '; '.join(worker_result.get('failures') or [])
                 if not detail:
                     detail = (stderr or '').strip()[-2000:]
-                failures.append(
-                    f'benchmark child {child.pid} failed with exit code {child.returncode}: {detail}'
-                )
+                if isinstance(worker_result, dict) and worker_result.get('failures'):
+                    failures.extend(worker_result['failures'])
+                else:
+                    failures.tool(f'benchmark child {child.pid} failed with exit code {child.returncode}: {detail}')
                 if isinstance(worker_result, dict):
                     results.append(worker_result)
                 continue
             if not isinstance(worker_result, dict):
-                failures.append(f'benchmark child {child.pid} produced no JSON result')
+                failures.tool(f'benchmark child {child.pid} produced no JSON result')
                 continue
             if not worker_result.get('ok'):
-                failures.append(f'benchmark child {child.pid} reported validation failures')
+                failures.extend(worker_result.get('failures') or [failure_message(
+                    f'benchmark child {child.pid} reported failure without a reason', TOOL_FAILURE)])
             results.append(worker_result)
         if server_stats is not None:
             server_stats['rss_after_calls_high_water_bytes'] = peak_rss_bytes()
@@ -688,7 +692,7 @@ def run_controller(args: argparse.Namespace) -> dict:
                 if args.require_memory_stats:
                     require_snapshot(server_memory_stats['after_workers'], 'after_workers (server)', failures)
     except Exception as exc:
-        failures.append(f'controller: {type(exc).__name__}: {exc}')
+        failures.append(f'controller: {type(exc).__name__}: {exc}', getattr(exc, 'category', TOOL_FAILURE))
         controller_log.event('controller_error', error_type=type(exc).__name__, error_message=str(exc))
     finally:
         for child in children:
@@ -700,11 +704,11 @@ def run_controller(args: argparse.Namespace) -> dict:
                 })
                 if child.pid not in terminated:
                     terminated.append(child.pid)
-                    failures.append(
+                    failures.tool(
                         f'benchmark child {child.pid} was still running during cleanup and was terminated'
                     )
                 if drain_note:
-                    failures.append(f'benchmark child {child.pid} post-kill drain failed: {drain_note}')
+                    failures.tool(f'benchmark child {child.pid} post-kill drain failed: {drain_note}')
             elif not any(record['pid'] == child.pid for record in child_processes):
                 # A worker can fail before readiness. Retain its original
                 # failure report instead of losing it behind a barrier error.
@@ -713,7 +717,7 @@ def run_controller(args: argparse.Namespace) -> dict:
                 except subprocess.TimeoutExpired:
                     note = drain_killed_child(child)
                     stdout, stderr = '', note or 'worker pipes stayed open after exit'
-                    failures.append(f'worker {child.pid} failure-report drain timed out: {stderr}')
+                    failures.tool(f'worker {child.pid} failure-report drain timed out: {stderr}')
                 (args.output_dir / f'child-{child.pid}.stdout.json').write_text(stdout, encoding='utf-8')
                 (args.output_dir / f'child-{child.pid}.stderr.log').write_text(stderr, encoding='utf-8')
                 child_processes.append({'pid': child.pid, 'exit_code': child.returncode, 'forced_termination': False})
@@ -722,7 +726,7 @@ def run_controller(args: argparse.Namespace) -> dict:
                     if isinstance(failed_worker, dict):
                         results.append(failed_worker)
                 except json.JSONDecodeError:
-                    failures.append(f'worker {child.pid} exited without a JSON failure record')
+                    failures.tool(f'worker {child.pid} exited without a JSON failure record')
         if server_cc is not None:
             try:
                 shutdown = server_cc.shutdown(timeout=args.child_timeout)
@@ -748,11 +752,11 @@ def run_controller(args: argparse.Namespace) -> dict:
     from ipc_paired import check_worker
     for worker in results:
         try:
-            check_worker(worker, args.output_dir, False, source_commit(), args.calls, vars_for_config(args))
+            check_worker(worker, args.output_dir, False, source_commit(), args.calls, vars_for_config(args), failures)
         except (ValueError, OSError, KeyError, TypeError) as exc:
-            failures.append(f"worker {worker.get('pid')} raw evidence: {exc}")
+            failures.append(f"worker {worker.get('pid')} raw evidence: {exc}", getattr(exc, 'category', TOOL_FAILURE))
         if not worker.get('native_path') or not worker.get('native_sha256'):
-            failures.append(
+            failures.tool(
                 f"benchmark child {worker.get('pid')} reported no native path/hash; "
                 'provenance must be present instead of an empty-set hash agreement'
             )
@@ -760,17 +764,17 @@ def run_controller(args: argparse.Namespace) -> dict:
         native_hashes.add(worker['native_sha256'])
     if server_stats is not None:
         if not server_stats.get('native_path') or not server_stats.get('native_sha256'):
-            failures.append('controller server reported no native path/hash; provenance failure')
+            failures.tool('controller server reported no native path/hash; provenance failure')
         else:
             native_hashes.add(server_stats['native_sha256'])
     if len(native_hashes) > 1:
-        failures.append(f'processes disagree on the imported native hash: {sorted(native_hashes)}')
+        failures.tool(f'processes disagree on the imported native hash: {sorted(native_hashes)}')
     for record in child_processes:
         if record['exit_code'] is None:
-            failures.append(f"benchmark child {record['pid']} was never reaped (exit code is None)")
+            failures.tool(f"benchmark child {record['pid']} was never reaped (exit code is None)")
     recorded_pids = {record['pid'] for record in child_processes}
     if len(recorded_pids) != args.workers or len(child_processes) != args.workers:
-        failures.append(
+        failures.tool(
             f'worker bookkeeping mismatch: --workers {args.workers}, spawned {len(children)}, '
             f'child records {len(child_processes)} ({len(recorded_pids)} distinct pids)'
         )
@@ -1081,7 +1085,7 @@ def run_matrix(args: argparse.Namespace) -> int:
         # is never mistaken for the full matrix.
         'complete': False,
         'rows': [],
-        'failures': [],
+        'failures': Failures(),
     }
     all_ok = True
     native_hashes: dict[str, str | None] = {}
@@ -1143,11 +1147,11 @@ def run_matrix(args: argparse.Namespace) -> int:
                 'row': {'name': spec['name'], 'workload': spec['workload'], 'config': spec['config']},
                 'spec': spec,
                 'ok': False,
-                'failures': [
+                'failures': [failure_message(
                     f'row controller exceeded the {args.row_timeout}s join timeout; the row session '
                     'it led was terminated by the matrix. Forced termination is reported as a failure, '
-                    'not clean shutdown.'
-                ] + ([f'pipe drain: {drain_failure}'] if drain_failure else []),
+                    'not clean shutdown.', TOOL_FAILURE)
+                ] + ([failure_message(f'pipe drain: {drain_failure}', TOOL_FAILURE)] if drain_failure else []),
             }
         elif not isinstance(row_record, dict):
             row_record = {
@@ -1155,14 +1159,16 @@ def run_matrix(args: argparse.Namespace) -> int:
                 'row': {'name': spec['name'], 'workload': spec['workload'], 'config': spec['config']},
                 'spec': spec,
                 'ok': False,
-                'failures': [f'row controller exited with code {proc.returncode} without JSON output'],
+                'failures': [failure_message(f'row controller exited with code {proc.returncode} without JSON output; '
+                             f'stderr={(stderr or "").strip()[-2000:]}', TOOL_FAILURE)],
                 'stderr_tail': (stderr or '').strip()[-2000:],
             }
-        row_failures = row_record.get('failures', [])
+        row_failures = row_record.get('failures', row_record.get('benchmark', {}).get('failures', []))
         if not isinstance(row_failures, list):
-            row_failures = ['row controller emitted an invalid failures field']
-        if proc.returncode != 0 and not terminated:
-            row_failures.append(f'row controller exited with nonzero status {proc.returncode}')
+            row_failures = [failure_message('row controller emitted an invalid failures field', TOOL_FAILURE)]
+        if proc.returncode != 0 and not terminated and not row_failures:
+            row_failures.append(failure_message(f'row controller exited with nonzero status {proc.returncode} '
+                                               'without classified failures', TOOL_FAILURE))
         row_record['failures'] = row_failures
         row_record['ok'] = row_record.get('ok') is True and proc.returncode == 0 and not terminated and not row_failures
         row_record['terminated_by_matrix'] = terminated
@@ -1206,12 +1212,12 @@ def run_matrix(args: argparse.Namespace) -> int:
             all_ok = False
 
     if missing_provenance_rows:
-        matrix['failures'].append(
+        matrix['failures'].tool(
             f'rows with missing process native path/hash: {sorted(missing_provenance_rows)}; '
             'missing provenance is a failure, not an empty-set agreement'
         )
     if inconsistent_provenance_rows:
-        matrix['failures'].append(
+        matrix['failures'].tool(
             f'rows whose processes disagree on the native hash: {sorted(inconsistent_provenance_rows)}'
         )
     distinct = sorted({value for value in native_hashes.values() if value and not value.startswith('inconsistent:')})

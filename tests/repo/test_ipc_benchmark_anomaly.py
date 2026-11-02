@@ -78,6 +78,31 @@ def test_convergence_fails_on_backing_or_os_leak(anomaly):
     assert anomaly.convergence(baseline, memory_snapshot())['converged'] is True
 
 
+def test_linux_convergence_checks_shared_mappings_and_retains_total_vmas(anomaly):
+    before, after = memory_snapshot(), memory_snapshot(fd=6)
+    before['os']['mapping_count'] = {'value': 251, 'shared_value': 1}
+    after['os']['mapping_count'] = {'value': 339, 'shared_value': 1}
+    receipt = anomaly.convergence(before, after)
+    assert receipt['converged'] is True
+    assert receipt['os']['mapping_count']['before_total'] == 251
+    assert receipt['os']['mapping_count']['after_total'] == 339
+    after['os']['mapping_count']['shared_value'] = 2
+    assert anomaly.convergence(before, after)['converged'] is False
+
+
+def test_linux_mapping_counts_include_deleted_shm_and_file_backings(anomaly):
+    import ipc_evidence
+    counts = ipc_evidence.linux_mapping_counts('''\
+1000-2000 rw-p 00000000 00:00 0
+2000-3000 ---p 00000000 00:00 0
+3000-4000 rw-s 00000000 00:1a 1 /dev/shm/c2-backing (deleted)
+4000-5000 rw-s 00000000 00:1b 2 /tmp/c2-spill (deleted)
+5000-6000 r--p 00000000 00:1c 3 /lib/python.so
+''')
+    assert counts['value'] == 5
+    assert counts['shared_value'] == 2
+
+
 def install_fake_cc(monkeypatch, anomaly):
     cc = ModuleType('c_two')
     cc._native = SimpleNamespace()
@@ -215,7 +240,8 @@ def test_controller_rejects_missing_normal_attempts(anomaly, monkeypatch, tmp_pa
     monkeypatch.setattr(anomaly.subprocess, 'Popen', Child)
     report = anomaly.run_anomaly(options(tmp_path, scenario='hold', control='alone'))
     assert report['ok'] is False
-    assert 'normal client has missing raw attempts' in report['failures']
+    assert any('[standalone:tool_failure] normal client has missing raw attempts' == failure
+               for failure in report['failures'])
     assert json.loads((tmp_path / 'anomaly.json').read_text())['ok'] is False
 
 
@@ -258,6 +284,8 @@ def test_expected_capacity_failure_is_call_stage_and_parallel_only(
     assert result['cleanup']['shutdown']['completed'] is True
     if not expected_ok:
         assert result['failures']
+        category = 'scenario_not_established' if during_status == 'success' else 'correctness_failure'
+        assert all(f'[standalone:{category}]' in failure for failure in result['failures'])
 
 
 SCENARIOS = (

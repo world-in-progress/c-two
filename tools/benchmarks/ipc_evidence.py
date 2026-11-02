@@ -29,6 +29,60 @@ INTERNAL_PROBES = {
 _QUANTILE_METHOD = 'nearest-rank: sorted[ceil(p*n)-1]'
 _QUANTILE_POPULATION = 'all measurement attempts, including errors and timeouts'
 
+TOOL_FAILURE = 'tool_failure'
+SCENARIO_NOT_ESTABLISHED = 'scenario_not_established'
+CORRECTNESS_FAILURE = 'correctness_failure'
+FAILURE_CATEGORIES = {TOOL_FAILURE, SCENARIO_NOT_ESTABLISHED, CORRECTNESS_FAILURE}
+
+
+class BenchmarkError(ValueError):
+    def __init__(self, message: str, category: str = TOOL_FAILURE):
+        super().__init__(message)
+        self.category = category
+
+
+def failure_parts(value: str) -> tuple[str, str, str]:
+    """The failure prefix is part of the evidence format, never inferred from prose."""
+    if not isinstance(value, str):
+        raise BenchmarkError(f'failure is not text: {value!r}')
+    prefix, separator, message = value.partition('] ')
+    source, colon, category = prefix.removeprefix('[').partition(':')
+    if not value.startswith('[') or not separator or not colon or category not in FAILURE_CATEGORIES:
+        raise BenchmarkError(f'unclassified failure: {value}')
+    if source not in ('baseline', 'candidate', 'standalone', 'pair'):
+        raise BenchmarkError(f'unknown failure source: {source}')
+    return source, category, message
+
+
+def failure_message(message: str, category: str = CORRECTNESS_FAILURE,
+                    source: str | None = None) -> str:
+    if category not in FAILURE_CATEGORIES:
+        raise ValueError(f'unknown failure category: {category}')
+    source = source or os.environ.get('C2_BENCH_SIDE', 'standalone')
+    return f'[{source}:{category}] {message}'
+
+
+class Failures(list):
+    """Human-readable, explicitly classified failures survive child process exits."""
+    def append(self, message: str, category: str = CORRECTNESS_FAILURE) -> None:
+        if message.startswith('['):
+            failure_parts(message)
+            super().append(message)
+        else:
+            super().append(failure_message(message, category))
+
+    def extend(self, messages) -> None:
+        # Already classified child failures must retain their original category.
+        for message in messages:
+            failure_parts(message)
+            super().append(message)
+
+    def tool(self, message: str) -> None:
+        self.append(message, TOOL_FAILURE)
+
+    def setup(self, message: str) -> None:
+        self.append(message, SCENARIO_NOT_ESTABLISHED)
+
 
 def _write_json_line(stream, record: dict) -> None:
     stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + '\n')
@@ -172,11 +226,25 @@ def _linux_process_snapshot(pid: int) -> dict:
     except OSError as exc:
         result['fd_count'] = _unavailable(f'/proc fd unavailable: {type(exc).__name__}')
     try:
-        with (proc / 'maps').open(encoding='utf-8') as stream:
-            result['mapping_count'] = _available(sum(1 for _ in stream))
-    except OSError as exc:
+        result['mapping_count'] = linux_mapping_counts((proc / 'maps').read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
         result['mapping_count'] = _unavailable(f'/proc maps unavailable: {type(exc).__name__}')
     return result
+
+
+def linux_mapping_counts(maps: str) -> dict:
+    """Keep total VMAs, and count MAP_SHARED backings separately from stacks/arenas.
+
+    Both C-Two SHM and file spill use shared mappings. Private stacks and malloc
+    arenas may be retained after a concurrent workload; their VMA count is not
+    proof that a transport backing is still mapped. Deleted backings still count.
+    """
+    lines = [line.split(maxsplit=5) for line in maps.splitlines() if line.strip()]
+    if any(len(fields) < 5 or len(fields[1]) != 4 for fields in lines):
+        raise ValueError('invalid /proc maps record')
+    return dict(_available(len(lines)), shared_value=sum(fields[1][3] == 's' for fields in lines),
+                shared_mappings=[' '.join(fields) for fields in lines if fields[1][3] == 's'],
+                scope='total VMAs; shared_value counts all MAP_SHARED mappings including deleted backings')
 
 
 def _macos_process_snapshot(pid: int) -> dict:
