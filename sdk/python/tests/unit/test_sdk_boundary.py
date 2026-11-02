@@ -877,7 +877,7 @@ def test_python_native_server_start_wait_uses_core_responsive_fence():
     assert "self._runtime_session.ensure_host_started()" in python_server
     assert "os.path.exists" not in python_server
     assert "time.sleep" not in python_server
-    assert "letstartup_deadline=Instant::now()+startup_timeout;" in _rust_compact(core_host)
+    assert "letstartup_deadline=c2_config::deadline_after(Instant::now(),startup_timeout)" in _rust_compact(core_host)
     assert "run_server.run_with_startup_deadline(startup_deadline,startup_timeout)" in _rust_compact(core_host)
     assert "wait_until_responsive(startup_deadline.saturating_duration_since(Instant::now()))" in _rust_compact(core_host)
     assert "wait_until_ready(startup_timeout)" not in core_host

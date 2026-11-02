@@ -548,7 +548,10 @@ impl HostInner {
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> ShutdownOutcome {
-        let deadline = Instant::now() + timeout;
+        let deadline = match c2_config::deadline_after(Instant::now(), timeout) {
+            Ok(deadline) => deadline,
+            Err(error) => return ShutdownOutcome::invalid_timeout(error),
+        };
         self.refresh_shutdown_outcome();
         if let Some(outcome) = self.shutdown_outcome.lock().clone() {
             return outcome;
@@ -890,8 +893,11 @@ impl Runtime {
         options: HostOptions,
         on_failed_start: impl FnOnce(FailedStartShutdownReceipt),
     ) -> Result<Host, Error> {
+        c2_config::deadline_after(Instant::now(), options.shutdown_timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
         let startup_timeout = self.freeze_host_options(options.startup_timeout)?;
-        let startup_deadline = Instant::now() + startup_timeout;
+        let startup_deadline = c2_config::deadline_after(Instant::now(), startup_timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
         let identity = self.ensure_server()?;
         let config = self.server_ipc_config()?;
         let relay_anchor_address = match options.relay {
@@ -1426,6 +1432,38 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn unportable_shutdown_budget_rejects_before_start_or_stop() {
+        let (runtime, directory) = receipt_test_runtime();
+        let timeout = Duration::from_secs(10_000_000_000_000_000_000);
+        let result = runtime.host(HostOptions::default().with_shutdown_timeout(timeout));
+        assert!(matches!(
+            result,
+            Err(Error::Lifecycle(LifecycleError::Configuration(_)))
+        ));
+        assert!(runtime.server_id().is_none());
+        runtime
+            .set_server_options(None, None, Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let host = runtime
+            .host(HostOptions::default().without_relay())
+            .unwrap();
+        let rejected = host.shutdown_with_timeout(timeout);
+        assert!(
+            rejected
+                .runtime_barrier_error
+                .unwrap()
+                .contains("portable monotonic clock range")
+        );
+        assert!(host.is_running());
+        assert!(host.shutdown_outcome().is_none());
+        assert!(host.shutdown().runtime_barrier_error.is_none());
+        drop(host);
+        drop(runtime);
+        close_receipt_root(directory);
+    }
+
+    #[test]
     fn host_startup_deadline_is_configurable_and_not_a_configuration_error() {
         let mut observed_errors = Vec::new();
         for (stored, configured, timeout) in [
@@ -1747,6 +1785,17 @@ mod lifecycle_tests {
         let (runtime, directory) = receipt_test_runtime();
         let attempt = failed_attempt(launch_failed_attempt(&runtime));
         assert!(runtime.shutdown_pending(&attempt.server));
+        let (invalid, completed) = attempt
+            .receipt
+            .observe_with_timeout(Duration::from_secs(10_000_000_000_000_000_000));
+        assert!(!completed);
+        assert!(
+            invalid
+                .runtime_barrier_error
+                .unwrap()
+                .contains("portable monotonic clock range")
+        );
+        assert!(attempt.receipt.terminal_outcome().is_none());
         let (pending, completed) = attempt.receipt.observe_with_timeout(Duration::ZERO);
         assert!(!completed);
         assert!(pending.runtime_barrier_error.is_some());

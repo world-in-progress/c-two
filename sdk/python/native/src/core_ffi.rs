@@ -68,11 +68,7 @@ fn call_options(py: Python<'_>, timeout: &Py<PyAny>) -> PyResult<CallOptions> {
         CallTimeout::try_after_seconds(timeout.extract::<f64>()?)
             .map_err(|error| PyValueError::new_err(error.to_string()))?
     };
-    // Validate the monotonic clock range through Core as well as Duration.
-    let options = CallOptions::with_timeout(timeout);
-    c2_core::CallScope::new(options, None)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    Ok(options)
+    Ok(CallOptions::with_timeout(timeout))
 }
 
 #[pymethods]

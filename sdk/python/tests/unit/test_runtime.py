@@ -281,6 +281,29 @@ def test_serve_rejects_invalid_shutdown_timeout_before_side_effects(
     session.check_active()
 
 
+@pytest.mark.parametrize('timeout', [1e19, float(2**63)])
+def test_call_connect_and_lifecycle_share_portable_timeout_range(timeout):
+    from c_two._native import ConnectAttempt, NativeCallOptions
+
+    for construct in (
+        lambda: NativeCallOptions(timeout=timeout),
+        lambda: ConnectAttempt(timeout_seconds=timeout),
+        lambda: RuntimeSession(startup_timeout=timeout),
+    ):
+        with pytest.raises(ValueError):
+            construct()
+
+    session = RuntimeSession(use_process_relay_anchor=False)
+    try:
+        with pytest.raises(ValueError):
+            session.validate_shutdown_timeout(timeout)
+        with pytest.raises(ValueError):
+            session.shutdown(timeout_seconds=timeout)
+        session.check_active()
+    finally:
+        assert session.shutdown()['completed']
+
+
 def test_explicit_instances_communicate_through_real_ipc(runtimes):
     server, client = runtimes
     context = server.local_endpoint_context()

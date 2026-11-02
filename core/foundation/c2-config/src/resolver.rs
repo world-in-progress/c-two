@@ -700,15 +700,7 @@ fn parse_optional_bool(env: &EnvMap, key: &str) -> Option<Result<bool, ConfigErr
 }
 
 fn duration_from_secs(name: &str, secs: f64) -> Result<Duration, ConfigError> {
-    let secs = validate_finite(name, secs)?;
-    if secs < 0.0 {
-        return Err(ConfigError::new(format!("{name} must be >= 0")));
-    }
-    Duration::try_from_secs_f64(secs).map_err(|_| {
-        ConfigError::new(format!(
-            "{name} must be a representable duration in seconds"
-        ))
-    })
+    crate::timeout_from_seconds(secs).map_err(|error| ConfigError::new(format!("{name}: {error}")))
 }
 
 fn validate_millis_timeout(name: &str, secs: u64) -> Result<u64, ConfigError> {
@@ -949,7 +941,7 @@ mod tests {
             .expect_err("oversized relay duration should fail without panicking");
 
         assert!(err.to_string().contains("C2_RELAY_ANTI_ENTROPY_INTERVAL"));
-        assert!(err.to_string().contains("representable duration"));
+        assert!(err.to_string().contains("portable monotonic clock range"));
     }
 
     #[test]

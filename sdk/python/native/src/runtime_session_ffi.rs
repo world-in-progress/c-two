@@ -34,50 +34,12 @@ use crate::endpoint_ffi::{PyEndpointCredential, PyLocalEndpointContext};
 use crate::local_copy_ffi::{PyLocalCopyTracker, local_copy_stats_dict};
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 
-pub(crate) fn checked_timeout(seconds: f64) -> Result<Duration, &'static str> {
-    const INVALID: &str =
-        "timeout_seconds must be finite, non-negative, and representable as a Duration";
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err(INVALID);
-    }
-    Duration::try_from_secs_f64(seconds).map_err(|_| INVALID)
-}
-
 fn checked_shutdown_deadline(timeout_seconds: f64) -> PyResult<(Duration, Instant)> {
-    let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
-    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-        PyValueError::new_err("timeout_seconds cannot be represented as a shutdown deadline")
-    })?;
+    let timeout = c2_config::timeout_from_seconds(timeout_seconds)
+        .map_err(|error| PyValueError::new_err(format!("timeout_seconds: {error}")))?;
+    let deadline = c2_config::deadline_after(Instant::now(), timeout)
+        .map_err(|error| PyValueError::new_err(format!("timeout_seconds: {error}")))?;
     Ok((timeout, deadline))
-}
-
-#[cfg(test)]
-mod shutdown_timeout_tests {
-    use super::checked_timeout;
-    use std::time::Duration;
-
-    #[test]
-    fn invalid_timeouts_are_rejected_without_panicking() {
-        for seconds in [
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NAN,
-            -1.0,
-            -0.001,
-            1e300,
-            u64::MAX as f64,
-        ] {
-            assert!(checked_timeout(seconds).is_err(), "{seconds:?}");
-        }
-    }
-
-    #[test]
-    fn zero_and_normal_timeouts_remain_valid() {
-        assert_eq!(checked_timeout(0.0), Ok(Duration::ZERO));
-        assert_eq!(checked_timeout(-0.0), Ok(Duration::ZERO));
-        assert_eq!(checked_timeout(0.125), Ok(Duration::from_millis(125)));
-        assert_eq!(checked_timeout(5.0), Ok(Duration::from_secs(5)));
-    }
 }
 
 #[cfg(test)]
@@ -567,9 +529,9 @@ impl PyRuntimeSession {
             .map(|value| parse_client_ipc_overrides(Some(value)))
             .transpose()?;
         let server_startup_timeout = startup_timeout
-            .map(checked_timeout)
+            .map(c2_config::timeout_from_seconds)
             .transpose()
-            .map_err(PyValueError::new_err)?;
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let inner = Runtime::new(RuntimeOptions {
             server_id,
             server_ipc_overrides,
@@ -936,9 +898,9 @@ impl PyRuntimeSession {
             .map(|value| parse_server_ipc_overrides(Some(value)))
             .transpose()?;
         let startup_timeout = startup_timeout
-            .map(checked_timeout)
+            .map(c2_config::timeout_from_seconds)
             .transpose()
-            .map_err(PyValueError::new_err)?;
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         self.inner
             .set_server_options(server_id, server_ipc_overrides, startup_timeout)
             .map_err(runtime_configuration_error_to_py)?;

@@ -3339,7 +3339,19 @@ async fn handshake_test_client_with(
     let (rid, flags, payload) = read_reply_frame(client).await;
     assert_eq!(rid, 0);
     assert_eq!(flags, FLAG_HANDSHAKE | FLAG_RESPONSE);
-    decode_handshake(&payload, true).unwrap()
+    let handshake = decode_handshake(&payload, true).unwrap();
+    // The client can read ACK bytes before the server resumes from its write
+    // receipt. A following PONG proves the server's serial reader has also
+    // committed handshake completion before fixtures access its private book.
+    client
+        .write_all(&encode_frame(0, FLAG_SIGNAL, &[MsgType::Ping.as_byte()]))
+        .await
+        .unwrap();
+    let (rid, flags, payload) = read_reply_frame(client).await;
+    assert_eq!(rid, 0);
+    assert_eq!(flags, FLAG_SIGNAL | FLAG_RESPONSE);
+    assert_eq!(payload, PONG_BYTES);
+    handshake
 }
 
 #[tokio::test]
@@ -3425,14 +3437,12 @@ async fn normal_disconnect_before_eof_preserves_peer_close_message_as_first_caus
             c2_local::ConnectionEvent::Opened(observation) => observation,
             event => panic!("expected accepted connection: {event:?}"),
         };
-        client
-            .write_all(&encode_frame(
-                0,
-                FLAG_SIGNAL,
-                &c2_wire::msg_type::DISCONNECT_BYTES,
-            ))
-            .await
-            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            &encode_frame(0, FLAG_SIGNAL, &c2_wire::msg_type::DISCONNECT_BYTES),
+        )
+        .await
+        .unwrap();
         // The ordinary closer does not consume the ACK before dropping its OS stream.
         drop(client);
         let closed = observation
@@ -3653,6 +3663,9 @@ async fn unrecoverable_server_read_closes_with_published_loan_in_original_pool()
     ));
     let handle = pool.write().alloc_handle(4096).unwrap();
     assert!(handle.is_file_spill());
+    // PONG delivery can precede its writer's final flush receipt. This fixture
+    // temporarily owns the book's writer directly, so await the real drain.
+    conn.wait_idle().await;
     let loan = conn.core.prepare_loan(Arc::clone(&pool), handle).unwrap();
     let mut batch = conn
         .core
@@ -4146,18 +4159,20 @@ async fn assert_bad_call_isolated(flags: u32, payload: &[u8], deactivates: bool)
         assert!(reply_error_message(&reply).contains("not executed"));
     }
     drop(execution);
-    let (id, _, reply) = read_reply_frame(&mut client).await;
-    assert_eq!(id, 41);
-    let (control, consumed) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
-    assert!(matches!(control, ReplyControl::Success));
-    assert_eq!(&reply[consumed..], b"accepted");
-    if !deactivates {
+    // Parallel calls can finish in either order after execution is released.
+    // Match each original request exactly once without imposing reply order.
+    let expected = if deactivates { vec![41] } else { vec![41, 43] };
+    let mut replies = HashMap::new();
+    for _ in &expected {
         let (id, _, reply) = read_reply_frame(&mut client).await;
-        assert_eq!(id, 43);
-        assert!(matches!(
-            c2_wire::control::decode_reply_control(&reply, 0).unwrap().0,
-            ReplyControl::Success
-        ));
+        assert!(expected.contains(&id), "unexpected reply {id}");
+        assert!(replies.insert(id, reply).is_none(), "duplicate reply {id}");
+    }
+    for id in expected {
+        let reply = replies.remove(&id).unwrap();
+        let (control, consumed) = c2_wire::control::decode_reply_control(&reply, 0).unwrap();
+        assert!(matches!(control, ReplyControl::Success));
+        assert_eq!(&reply[consumed..], b"accepted");
     }
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -6388,14 +6403,20 @@ async fn shutdown_preserves_active_reply_refuses_new_calls_and_fences_lifecycle_
             &c2_wire::shutdown_control::encode_shutdown_initiate(),
         );
         if same_connection {
-            f.peer.write_all(&shutdown).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut f.peer, &shutdown)
+                .await
+                .unwrap();
             assert_eq!(read_reply_frame(&mut f.peer).await.0, 99);
         } else {
             let mut admin =
                 LocalStream::connect(f.server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
                     .await
                     .unwrap();
-            admin.write_all(&shutdown).await.unwrap();
+            // The following ACK read proves delivery. A separate native flush
+            // can instead observe the admin peer's already completed close.
+            tokio::io::AsyncWriteExt::write_all(&mut admin, &shutdown)
+                .await
+                .unwrap();
             assert_eq!(read_reply_frame(&mut admin).await.0, 99);
         }
         assert!(

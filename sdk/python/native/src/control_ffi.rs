@@ -6,7 +6,8 @@ use pyo3::prelude::*;
 use crate::endpoint_ffi::{PyLocalEndpointContext, resolve_context};
 
 pub(crate) fn timeout_duration(timeout_seconds: f64) -> PyResult<Duration> {
-    crate::runtime_session_ffi::checked_timeout(timeout_seconds).map_err(PyValueError::new_err)
+    c2_config::timeout_from_seconds(timeout_seconds)
+        .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 #[pyfunction]

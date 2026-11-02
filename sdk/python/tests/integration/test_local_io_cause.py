@@ -337,7 +337,7 @@ def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
     if case != 'busy':
         _assert_io(report, 'connect', 'not_found' if case == 'missing' else 'permission_denied',
                    2 if case == 'missing' else 5)
-    elif timeout in (None, 10):
+    elif timeout is None:
         error = report['error']
         assert (error['category'], error['transport_kind'], error['transport_phase'],
                 error['fallback_eligible']) == ('transport', 'ipc', 'pre_dispatch', True), report
@@ -350,7 +350,8 @@ def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
         assert report['details']['operation'] == 'connect', report
         assert report['details']['stage'] == 'os_connect', report
         assert all(error[key] is None for key in ('io_kind', 'raw_os_error', 'io_operation')), report
-        assert 0.15 <= report['elapsed'] < 2, report
+        lower, upper = (0.15, 2) if timeout == 0.2 else (9.5, 13)
+        assert lower <= report['elapsed'] < upper, report
 
 
 def test_real_listener_conflict_has_no_raw_system_code() -> None:

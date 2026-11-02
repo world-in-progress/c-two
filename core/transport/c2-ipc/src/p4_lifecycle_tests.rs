@@ -240,7 +240,12 @@ async fn failed_and_expired_handshakes_publish_one_open_and_the_original_close()
             let mut hello = [0; 25];
             stream.read_exact(&mut hello).await.unwrap();
             if !expire {
-                stream.write_all(&[0; 25]).await.unwrap();
+                // Rejecting the envelope can close the peer before a native
+                // flush probe. Its original close record below proves that
+                // these bytes reached the parser; no flush is needed here.
+                tokio::io::AsyncWriteExt::write_all(&mut stream, &[0; 25])
+                    .await
+                    .unwrap();
             }
             // The malformed envelope is rejected after 16 bytes, leaving 9
             // unread. Linux reports reset on that close; macOS and Windows

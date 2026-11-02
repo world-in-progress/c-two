@@ -1,7 +1,7 @@
 use c2_config::{
     ConfigResolver, ConfigSources, LocalEndpoint, LocalEndpointContext, LocalEndpointOptions,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{DirectIpcShutdownOutcome, LifecycleError, Runtime};
 
@@ -38,6 +38,8 @@ pub fn ping_direct_ipc(
     context: Option<&LocalEndpointContext>,
     timeout: Duration,
 ) -> Result<bool, LifecycleError> {
+    c2_config::deadline_after(Instant::now(), timeout)
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
     let process_default;
     let context = match context {
         Some(context) => context,
@@ -57,6 +59,8 @@ pub fn shutdown_direct_ipc(
     context: Option<&LocalEndpointContext>,
     timeout: Duration,
 ) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
+    c2_config::deadline_after(Instant::now(), timeout)
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
     let process_default;
     let context = match context {
         Some(context) => context,
@@ -76,11 +80,10 @@ impl Runtime {
         address: &str,
         timeout: Duration,
     ) -> Result<bool, LifecycleError> {
-        ping_direct_ipc(
-            address,
-            Some(&self.freeze_local_endpoint_context()?),
-            timeout,
-        )
+        c2_config::deadline_after(Instant::now(), timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        c2_ipc::ping_with_context(address, &self.freeze_local_endpoint_context()?, timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))
     }
 
     /// Initiate admin shutdown inside this Runtime's frozen local domain.
@@ -90,11 +93,10 @@ impl Runtime {
         address: &str,
         timeout: Duration,
     ) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
-        shutdown_direct_ipc(
-            address,
-            Some(&self.freeze_local_endpoint_context()?),
-            timeout,
-        )
+        c2_config::deadline_after(Instant::now(), timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        c2_ipc::shutdown_with_context(address, &self.freeze_local_endpoint_context()?, timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))
     }
 }
 
@@ -107,6 +109,27 @@ mod tests {
         let error = direct_ipc_endpoint("tcp://not-ipc", None)
             .expect_err("non-IPC address must be rejected");
         assert!(matches!(error, LifecycleError::Configuration(_)));
+    }
+
+    #[test]
+    fn invalid_control_budget_rejects_before_freezing_endpoint_context() {
+        let runtime = Runtime::new(crate::RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let timeout = Duration::from_secs(10_000_000_000_000_000_000);
+        assert!(matches!(
+            runtime.ping_direct_ipc("ipc://unused", timeout),
+            Err(LifecycleError::Configuration(_))
+        ));
+        assert!(matches!(
+            runtime.shutdown_direct_ipc("ipc://unused", timeout),
+            Err(LifecycleError::Configuration(_))
+        ));
+        runtime
+            .set_local_endpoint(LocalEndpointOptions::default())
+            .unwrap();
     }
 
     #[test]

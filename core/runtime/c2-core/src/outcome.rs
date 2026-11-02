@@ -63,3 +63,12 @@ pub struct ShutdownOutcome {
     /// These are terminal local closes, not pending client/server drain work.
     pub ipc_client_close_details: Vec<IpcClientCloseDetail>,
 }
+
+impl ShutdownOutcome {
+    pub(crate) fn invalid_timeout(error: c2_config::TimeoutError) -> Self {
+        Self {
+            runtime_barrier_error: Some(format!("shutdown timeout configuration error: {error}")),
+            ..Default::default()
+        }
+    }
+}

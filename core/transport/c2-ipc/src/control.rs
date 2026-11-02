@@ -351,7 +351,9 @@ mod tests {
     const PROBE_BUDGET: Duration = Duration::from_secs(1);
 
     fn address(label: &str) -> String {
-        format!("ipc://control-{label}-{}", std::process::id())
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("ipc://control-{label}-{}-{sequence}", std::process::id())
     }
 
     /// True when the endpoint does not exist at this instant.

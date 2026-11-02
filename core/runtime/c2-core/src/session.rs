@@ -46,7 +46,7 @@ fn unlimited_lifecycle_error(error: crate::Error) -> LifecycleError {
 }
 
 fn validate_startup_timeout(timeout: Option<Duration>) -> Result<(), LifecycleError> {
-    if timeout.is_some_and(|timeout| Instant::now().checked_add(timeout).is_none()) {
+    if timeout.is_some_and(|timeout| c2_config::deadline_after(Instant::now(), timeout).is_err()) {
         return Err(LifecycleError::Configuration(
             "startup_timeout exceeds the monotonic clock range".into(),
         ));
@@ -329,7 +329,10 @@ impl fmt::Debug for FailedStartShutdownReceipt {
 impl FailedStartShutdownReceipt {
     /// Wait within this caller's budget. Completion is separate from cleanup success.
     pub fn observe_with_timeout(&self, timeout: Duration) -> (ShutdownOutcome, bool) {
-        self.transaction.observation(Instant::now() + timeout)
+        match c2_config::deadline_after(Instant::now(), timeout) {
+            Ok(deadline) => self.transaction.observation(deadline),
+            Err(error) => (ShutdownOutcome::invalid_timeout(error), false),
+        }
     }
 
     /// Return the original terminal outcome, including cleanup errors.
@@ -1780,7 +1783,10 @@ impl Runtime {
         relay_cleanup_config_error: Option<String>,
         shutdown_timeout: Duration,
     ) -> ShutdownOutcome {
-        let deadline = Instant::now() + shutdown_timeout;
+        let deadline = match c2_config::deadline_after(Instant::now(), shutdown_timeout) {
+            Ok(deadline) => deadline,
+            Err(error) => return ShutdownOutcome::invalid_timeout(error),
+        };
         let scopes = server
             .map(|server| self.capture_registration_scopes(server))
             .unwrap_or_default();

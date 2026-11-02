@@ -768,7 +768,7 @@ fn relay_default(seconds: f64) -> Result<Option<Duration>, LifecycleError> {
     if seconds == 0.0 {
         return Ok(None);
     }
-    Duration::try_from_secs_f64(seconds)
+    c2_config::timeout_from_seconds(seconds)
         .map(Some)
         .map_err(|_| LifecycleError::Configuration("HTTP call timeout is not representable".into()))
 }

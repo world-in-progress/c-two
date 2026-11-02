@@ -13,9 +13,10 @@ mod pool;
 mod relay;
 mod remote;
 mod resolver;
+mod timeout;
 
 pub use call::{
-    CallExecutionLimits, CallOptions, CallTimeout, CallTimeoutError, DEFAULT_MAX_OUTSTANDING_CALLS,
+    CallExecutionLimits, CallOptions, CallTimeout, DEFAULT_MAX_OUTSTANDING_CALLS,
     DEFAULT_RETAINED_INPUT_BUDGET_BYTES,
 };
 pub use connect_options::{
@@ -43,3 +44,4 @@ pub use resolver::{
     EnvFilePolicy, EnvMap, RelayConfigOverrides, ResolvedRelayClientConfig, ResolvedRelayConfig,
     RuntimeConfigOverrides, ServerIpcConfigOverrides,
 };
+pub use timeout::{TimeoutError, deadline_after, timeout_from_seconds, validate_timeout};
