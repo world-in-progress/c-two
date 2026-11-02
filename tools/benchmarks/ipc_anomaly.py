@@ -21,7 +21,7 @@ import traceback
 import ipc_memory as bench
 from ipc_evidence import (
     INTERNAL_PROBES, BenchmarkError, CORRECTNESS_FAILURE, Failures, SampleLog,
-    TOOL_FAILURE, process_snapshot,
+    TOOL_FAILURE, process_snapshot, publish_marker, read_marker,
     resume_process, suspend_process, summarize_samples,
 )
 
@@ -56,28 +56,26 @@ RELEASE_TESTS = [
 
 
 def publish(path: Path, value: dict | None = None) -> None:
-    pending = path.with_suffix('.pending')
-    pending.write_text(json.dumps(value or {'monotonic_ns': time.monotonic_ns()}), encoding='utf-8')
-    pending.replace(path)
+    publish_marker(path, value or {'monotonic_ns': time.perf_counter_ns()})
 
 
 def wait_marker(path: Path, timeout: float, children=(), tick=None) -> dict:
-    deadline = time.monotonic() + timeout
-    while not path.exists():
+    deadline = time.perf_counter() + timeout
+    while (value := read_marker(path)) is None:
         if any(child.poll() is not None for child in children):
             raise BenchmarkError(f'child exited before {path.name}')
-        if time.monotonic() >= deadline:
+        if time.perf_counter() >= deadline:
             raise BenchmarkError(f'coordination deadline: {path.name}')
         if tick is not None:
             tick()
         time.sleep(0.005)
-    return json.loads(path.read_text(encoding='utf-8'))
+    return value
 
 
 def wait_for_entered(coord: Path, expected: int, timeout: float, children=(), tick=None) -> int:
     """Bound the whole resource-entry barrier and retain its actual progress."""
     paths = [coord / f'entered-abnormal-{index}.json' for index in range(expected)]
-    deadline = time.monotonic() + timeout
+    deadline = time.perf_counter() + timeout
     while True:
         entered = sum(path.exists() for path in paths)
         if entered == expected:
@@ -85,7 +83,7 @@ def wait_for_entered(coord: Path, expected: int, timeout: float, children=(), ti
         progress = f'resource entry incomplete: entered={entered}, expected={expected}'
         if any(child.poll() is not None for child in children):
             raise RuntimeError(progress + '; child exited')
-        if time.monotonic() >= deadline:
+        if time.perf_counter() >= deadline:
             raise TimeoutError(progress + '; coordination deadline')
         if tick is not None:
             tick()
@@ -164,7 +162,7 @@ def workload_types(cc, coord: Path, spec: dict):
 
 
 def _snapshot(log: SampleLog, phase: str) -> dict:
-    snapshot = {'monotonic_ns': time.monotonic_ns(), 'os': process_snapshot(),
+    snapshot = {'monotonic_ns': time.perf_counter_ns(), 'os': process_snapshot(),
                 'memory': bench.snapshot_memory_stats()}
     if not bench.memory_stats_usable(snapshot['memory']):
         raise BenchmarkError(f"memory_stats unavailable at {phase}: {snapshot['memory']}")
@@ -290,7 +288,8 @@ def anomaly_worker(spec: dict) -> dict:
                 snapshots['before_release'] = _snapshot(log, 'before_release')
         snapshots['completed'] = _snapshot(log, 'completed')
     except Exception as exc:
-        failures.append(f'{type(exc).__name__}: {exc}', getattr(exc, 'category', CORRECTNESS_FAILURE))
+        failures.append(f'{type(exc).__name__}: {exc}', getattr(exc, 'category',
+            TOOL_FAILURE if isinstance(exc, (TimeoutError, OSError)) else CORRECTNESS_FAILURE))
         log.event('worker_error', error_type=type(exc).__name__, error_message=str(exc))
     finally:
         for held, _ in holds:
@@ -340,29 +339,25 @@ def convergence(baseline: dict, current: dict) -> dict:
     before, after = budget_usage(baseline), budget_usage(current)
     budget_ok = all(value <= before.get(key, 0) for key, value in after.items())
     os_checks = {}
-    for key in ('fd_count', 'handle_count', 'mapping_count'):
-        field = 'shared_value' if key == 'mapping_count' else 'value'
-        a, b = baseline['os'][key].get(field), current['os'][key].get(field)
+    for key in ('fd_count', 'handle_count', 'shared_mapping_count'):
+        a, b = baseline['os'][key]['value'], current['os'][key]['value']
         os_checks[key] = {'available': a is not None and b is not None,
                           'before': a, 'after': b,
                           'converged': b <= a if a is not None and b is not None else None}
-        if key == 'mapping_count':
-            os_checks[key].update(before_total=baseline['os'][key]['value'],
-                                  after_total=current['os'][key]['value'],
-                                  scope='shared VMAs; total VMAs include retained private stacks/arenas')
     return {'budget_before': before, 'budget_after': after, 'budget_converged': budget_ok,
+            'total_mapping_count': {'before': baseline['os']['mapping_count']['value'],
+                                    'after': current['os']['mapping_count']['value']},
             'os': os_checks, 'converged': budget_ok and all(value['converged'] is not False for value in os_checks.values()),
             'scope': 'budget cells, fd/HANDLE counts and shared VMAs; unavailable counters are unmeasured',
             'rss_note': 'RSS and its high-water mark are recorded, not equated with backing refunds'}
 
 
-def _finish_child(proc, timeout: float, log: SampleLog) -> dict:
-    stdout, stderr = proc.communicate(timeout=timeout)
+def _finish_child(proc, role: str, timeout: float, log: SampleLog) -> dict:
     code = proc.wait(timeout=timeout)
     log.event('os_wait', pid=proc.pid, exit_code=code)
     output = Path(log.events_path).parent
-    (output / f'child-{proc.pid}.stdout.json').write_text(stdout, encoding='utf-8')
-    (output / f'child-{proc.pid}.stderr.log').write_text(stderr, encoding='utf-8')
+    stdout = (output / f'{role}.stdout.json').read_text(encoding='utf-8')
+    stderr = (output / f'{role}.stderr.log').read_text(encoding='utf-8')
     value = json.loads(stdout)
     if not isinstance(value, dict):
         raise RuntimeError(f'child {proc.pid} returned no object; exit={code}')
@@ -399,21 +394,24 @@ def run_anomaly(args: argparse.Namespace) -> dict:
     failures, children, workers, snapshots, process_points = Failures(), [], [], {}, []
     suspended = False
     abnormal = None
+    abnormal_pid = None
+    worker_pids = {}
     receipt = None
     last_snapshot = 0.0
     def snapshot(phase):
         value = _snapshot(log, phase)
         snapshots[phase] = value
         for child in children:
-            if child.poll() is None:
-                process_points.append({'phase': phase, 'monotonic_ns': time.monotonic_ns(),
-                                       'pid': child.pid, 'os': process_snapshot(child.pid)})
+            if child.poll() is None and child.pid in worker_pids:
+                process_points.append({'phase': phase, 'monotonic_ns': time.perf_counter_ns(),
+                                       'pid': worker_pids[child.pid], 'launcher_pid': child.pid,
+                                       'os': process_snapshot(worker_pids[child.pid])})
         return value
     def tick():
         nonlocal last_snapshot
-        if time.monotonic() - last_snapshot >= 0.05:
+        if time.perf_counter() - last_snapshot >= 0.05:
             snapshot('progress-' + str(len(snapshots)))
-            last_snapshot = time.monotonic()
+            last_snapshot = time.perf_counter()
     try:
         cc.set_transport_policy(shm_threshold=config['shm_threshold'])
         cc.set_server(ipc_overrides=config['server_overrides'])
@@ -424,15 +422,28 @@ def run_anomaly(args: argparse.Namespace) -> dict:
         for index, role in enumerate(('normal', 'abnormal') if args.control == 'parallel' else ('normal',)):
             spec = {'role': role, 'index': index, 'address': address, 'coord_dir': str(coord),
                     'output_dir': str(output), 'config': config}
-            child = subprocess.Popen(
-                [args.python, str(Path(bench.__file__).resolve()), '--python', args.python,
-                 '--anomaly-worker-spec', json.dumps(spec)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
+            # File output cannot fill a Windows pipe while the controller is
+            # waiting for a phase marker after a worker has reported an error.
+            with (output / f'{role}.stdout.json').open('w', encoding='utf-8') as stdout, \
+                    (output / f'{role}.stderr.log').open('w', encoding='utf-8') as stderr:
+                child = subprocess.Popen(
+                    [args.python, str(Path(bench.__file__).resolve()), '--python', args.python,
+                     '--anomaly-worker-spec', json.dumps(spec)],
+                    stdout=stdout, stderr=stderr, text=True,
+                )
             children.append(child)
             if role == 'abnormal':
                 abnormal = child
-        bench.release_workers(coord, children, args.child_timeout, log)
+        barrier = bench.release_workers(coord, children, args.child_timeout, log)
+        for index, child in enumerate(children):
+            ready = barrier['workers'][index]
+            pid = ready.get('pid')
+            if type(pid) is not int or pid <= 0 or ready.get('worker_index') != index:
+                raise BenchmarkError(f'invalid worker readiness identity: {ready}')
+            worker_pids[child.pid] = pid
+            log.event('worker_process', pid=pid, launcher_pid=child.pid, worker_index=index)
+        if abnormal is not None:
+            abnormal_pid = worker_pids[abnormal.pid]
         snapshot('ready')
         publish(coord / 'normal-before.json')
         wait_marker(coord / 'normal-before-done.json', args.child_timeout, children, tick)
@@ -443,18 +454,19 @@ def run_anomaly(args: argparse.Namespace) -> dict:
                 entered = wait_for_entered(coord, config['inflight_calls'], args.child_timeout, children, tick)
                 log.event('resource_gated', calls=config['inflight_calls'], entered=entered)
                 if args.scenario in STOPPED:
-                    suspend_process(abnormal)
+                    suspend_process(abnormal_pid)
                     suspended = True
                     if os.name != 'nt':
-                        waited, status = os.waitpid(abnormal.pid, os.WUNTRACED)
-                        if waited != abnormal.pid or not os.WIFSTOPPED(status):
+                        waited, status = os.waitpid(abnormal_pid, os.WUNTRACED)
+                        if waited != abnormal_pid or not os.WIFSTOPPED(status):
                             raise BenchmarkError('OS did not confirm the owned reader stopped')
-                    log.event('reader_stopped', pid=abnormal.pid, mechanism='native_suspend' if os.name == 'nt' else 'SIGSTOP')
+                    log.event('reader_stopped', pid=abnormal_pid, launcher_pid=abnormal.pid,
+                              mechanism='native_suspend' if os.name == 'nt' else 'SIGSTOP')
                     publish(coord / 'method-release.json')
                     for index in range(config['inflight_calls']):
                         wait_marker(coord / f'returning-abnormal-{index}.json', args.child_timeout, children, tick)
-                    deadline = time.monotonic() + args.pause_seconds
-                    while time.monotonic() < deadline:
+                    deadline = time.perf_counter() + args.pause_seconds
+                    while time.perf_counter() < deadline:
                         tick()
                         time.sleep(0.005)
                 else:
@@ -471,27 +483,27 @@ def run_anomaly(args: argparse.Namespace) -> dict:
         snapshot('during')
         if abnormal is not None:
             if suspended:
-                resume_process(abnormal)
+                resume_process(abnormal_pid)
                 suspended = False
-                log.event('reader_resumed', pid=abnormal.pid)
+                log.event('reader_resumed', pid=abnormal_pid, launcher_pid=abnormal.pid)
             publish(coord / 'method-release.json')
             publish(coord / 'abnormal-stop.json')
-            workers.append(_finish_child(abnormal, args.child_timeout, log))
+            workers.append(_finish_child(abnormal, 'abnormal', args.child_timeout, log))
             snapshot('abnormal_closed')
         publish(coord / 'normal-after.json')
         # The normal process exits after completing its after phase; a marker
         # can race process exit, so this wait deliberately checks only time.
         wait_marker(coord / 'normal-after-done.json', args.child_timeout, tick=tick)
-        workers.insert(0, _finish_child(children[0], args.child_timeout, log))
+        workers.insert(0, _finish_child(children[0], 'normal', args.child_timeout, log))
         for worker in workers:
             if not worker['ok']:
                 failures.extend(worker['failures'])
         snapshot('clients_closed')
-        deadline = time.monotonic() + args.child_timeout
+        deadline = time.perf_counter() + args.child_timeout
         while True:
             current = snapshot('convergence')
             receipt = convergence(snapshots['baseline'], current)
-            if receipt['converged'] or time.monotonic() >= deadline:
+            if receipt['converged'] or time.perf_counter() >= deadline:
                 break
             time.sleep(0.05)
         if not receipt['converged']:
@@ -537,17 +549,25 @@ def run_anomaly(args: argparse.Namespace) -> dict:
     finally:
         if suspended and abnormal is not None and abnormal.poll() is None:
             try:
-                resume_process(abnormal)
-                log.event('reader_resumed_for_cleanup', pid=abnormal.pid)
+                resume_process(abnormal_pid)
+                log.event('reader_resumed_for_cleanup', pid=abnormal_pid, launcher_pid=abnormal.pid)
             except OSError as exc:
                 failures.tool(f'cleanup resume: {exc}')
         publish(coord / 'method-release.json')
         publish(coord / 'abnormal-stop.json')
-        for child in children:
+        for index, child in enumerate(children):
             if child.poll() is None:
                 note = bench.kill_owned_child(child)
                 failures.tool(f'forced termination of owned child {child.pid}: {note or "reaped"}')
                 log.event('os_wait', pid=child.pid, exit_code=child.returncode, forced=True)
+            role = 'normal' if index == 0 else 'abnormal'
+            if not any(worker.get('role') == role for worker in workers):
+                try:
+                    worker = _finish_child(child, role, args.child_timeout, log)
+                    workers.append(worker)
+                    failures.extend(worker.get('failures', []))
+                except Exception as exc:
+                    failures.tool(f'{role} failure report: {type(exc).__name__}: {exc}')
         try:
             shutdown = cc.shutdown(timeout=args.child_timeout)
             if not shutdown['completed']:

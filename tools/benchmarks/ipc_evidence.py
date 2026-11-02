@@ -89,6 +89,46 @@ def _write_json_line(stream, record: dict) -> None:
     stream.flush()
 
 
+_MARKER_SHARING_RETRY_S = 5.0
+_MARKER_SHARING_SLEEP_S = 0.005
+
+
+def publish_marker(path: Path, value: dict) -> None:
+    """Publish each coordination fact once, after closing its complete JSON file."""
+    if path.exists():
+        return
+    pending = path.with_suffix('.pending')
+    pending.write_text(json.dumps(value), encoding='utf-8')
+    deadline = time.perf_counter() + _MARKER_SHARING_RETRY_S
+    while True:
+        try:
+            pending.replace(path)
+            return
+        except PermissionError:
+            # A concurrent reader holds the target open without share-delete
+            # while the closed pending file is renamed into its place. Every
+            # marker lives in a directory the benchmark owns, so a persistent
+            # failure surfaces after this bounded window instead of being lost.
+            if sys.platform != 'win32' or time.perf_counter() >= deadline:
+                raise
+            time.sleep(_MARKER_SHARING_SLEEP_S)
+
+
+def read_marker(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        # Windows sharing windows surface as errno 13 without a winerror,
+        # because io.open maps the CRT _wopen failure instead of GetLastError.
+        # A reader waits them out inside its existing coordination deadline;
+        # no permission, path or deadline is changed.
+        if sys.platform == 'win32':
+            return None
+        raise
+
+
 class SampleLog:
     """Write one process's attempts and timeline to separate JSONL files."""
 
@@ -111,7 +151,8 @@ class SampleLog:
         _write_json_line(self._samples_file, {
             'kind': 'run', 'identity': self.identity,
             'config': config, 'provenance': provenance,
-            'monotonic_ns': time.monotonic_ns(),
+            'monotonic_ns': time.perf_counter_ns(),
+            'clock': {'name': 'perf_counter_ns', **vars(time.get_clock_info('perf_counter'))},
         })
 
     def sample(
@@ -140,7 +181,7 @@ class SampleLog:
     def event(self, event: str, **details) -> dict:
         record = {
             **details, 'kind': 'event', 'identity': self.identity,
-            'event': event, 'monotonic_ns': time.monotonic_ns(),
+            'event': event, 'monotonic_ns': time.perf_counter_ns(),
         }
         with self._lock:
             _write_json_line(self._events_file, record)
@@ -192,7 +233,7 @@ def summarize_samples(samples: list[dict], phase: str | None = None) -> dict:
     }
 
 
-def _available(value: int) -> dict:
+def _available(value: object) -> dict:
     return {'value': value, 'reason': None}
 
 
@@ -204,6 +245,7 @@ def _empty_snapshot(reason: str) -> dict:
     return {key: _unavailable(reason) for key in (
         'current_rss_bytes', 'peak_rss_bytes', 'fd_count',
         'handle_count', 'mapping_count',
+        'shared_mapping_count', 'shared_mappings',
     )}
 
 
@@ -226,9 +268,10 @@ def _linux_process_snapshot(pid: int) -> dict:
     except OSError as exc:
         result['fd_count'] = _unavailable(f'/proc fd unavailable: {type(exc).__name__}')
     try:
-        result['mapping_count'] = linux_mapping_counts((proc / 'maps').read_text(encoding='utf-8'))
+        result.update(linux_mapping_counts((proc / 'maps').read_text(encoding='utf-8')))
     except (OSError, ValueError) as exc:
-        result['mapping_count'] = _unavailable(f'/proc maps unavailable: {type(exc).__name__}')
+        for key in ('mapping_count', 'shared_mapping_count', 'shared_mappings'):
+            result[key] = _unavailable(f'/proc maps unavailable: {type(exc).__name__}')
     return result
 
 
@@ -242,9 +285,10 @@ def linux_mapping_counts(maps: str) -> dict:
     lines = [line.split(maxsplit=5) for line in maps.splitlines() if line.strip()]
     if any(len(fields) < 5 or len(fields[1]) != 4 for fields in lines):
         raise ValueError('invalid /proc maps record')
-    return dict(_available(len(lines)), shared_value=sum(fields[1][3] == 's' for fields in lines),
-                shared_mappings=[' '.join(fields) for fields in lines if fields[1][3] == 's'],
-                scope='total VMAs; shared_value counts all MAP_SHARED mappings including deleted backings')
+    shared = [' '.join(fields) for fields in lines if fields[1][3] == 's']
+    return {'mapping_count': _available(len(lines)),
+            'shared_mapping_count': _available(len(shared)),
+            'shared_mappings': _available(shared)}
 
 
 def _macos_process_snapshot(pid: int) -> dict:
@@ -371,20 +415,20 @@ def _windows_change_process_state(pid: int, resume: bool) -> None:
             raise OSError(ctypes.get_last_error(), f'CloseHandle failed for pid {pid}')
 
 
-def suspend_process(proc: subprocess.Popen) -> None:
-    """Stop a process spawned by the caller until resume_process is called."""
+def suspend_process(pid: int) -> None:
+    """Stop the owned worker PID, which may differ from its venv launcher PID."""
     if sys.platform == 'win32':
-        _windows_change_process_state(proc.pid, resume=False)
+        _windows_change_process_state(pid, resume=False)
     else:
-        os.kill(proc.pid, signal.SIGSTOP)
+        os.kill(pid, signal.SIGSTOP)
 
 
-def resume_process(proc: subprocess.Popen) -> None:
+def resume_process(pid: int) -> None:
     """Continue a previously stopped process spawned by the caller."""
     if sys.platform == 'win32':
-        _windows_change_process_state(proc.pid, resume=True)
+        _windows_change_process_state(pid, resume=True)
     else:
-        os.kill(proc.pid, signal.SIGCONT)
+        os.kill(pid, signal.SIGCONT)
 
 
 def platform_process_support():

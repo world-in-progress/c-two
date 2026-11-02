@@ -4,8 +4,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import itertools
 from pathlib import Path
 import sys
+import subprocess
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -62,6 +64,7 @@ def memory_snapshot(used=0, fd=8):
         'os': {
             'fd_count': {'value': fd}, 'handle_count': {'value': None},
             'mapping_count': {'value': None},
+            'shared_mapping_count': {'value': None}, 'shared_mappings': {'value': None},
         },
     }
 
@@ -80,13 +83,14 @@ def test_convergence_fails_on_backing_or_os_leak(anomaly):
 
 def test_linux_convergence_checks_shared_mappings_and_retains_total_vmas(anomaly):
     before, after = memory_snapshot(), memory_snapshot(fd=6)
-    before['os']['mapping_count'] = {'value': 251, 'shared_value': 1}
-    after['os']['mapping_count'] = {'value': 339, 'shared_value': 1}
+    before['os']['mapping_count'] = {'value': 251, 'reason': None}
+    after['os']['mapping_count'] = {'value': 339, 'reason': None}
+    before['os']['shared_mapping_count'] = {'value': 1, 'reason': None}
+    after['os']['shared_mapping_count'] = {'value': 1, 'reason': None}
     receipt = anomaly.convergence(before, after)
     assert receipt['converged'] is True
-    assert receipt['os']['mapping_count']['before_total'] == 251
-    assert receipt['os']['mapping_count']['after_total'] == 339
-    after['os']['mapping_count']['shared_value'] = 2
+    assert receipt['total_mapping_count'] == {'before': 251, 'after': 339}
+    after['os']['shared_mapping_count']['value'] = 2
     assert anomaly.convergence(before, after)['converged'] is False
 
 
@@ -99,8 +103,33 @@ def test_linux_mapping_counts_include_deleted_shm_and_file_backings(anomaly):
 4000-5000 rw-s 00000000 00:1b 2 /tmp/c2-spill (deleted)
 5000-6000 r--p 00000000 00:1c 3 /lib/python.so
 ''')
-    assert counts['value'] == 5
-    assert counts['shared_value'] == 2
+    assert counts['mapping_count']['value'] == 5
+    assert counts['shared_mapping_count']['value'] == 2
+
+
+def test_rpc_latencies_use_performance_counter(anomaly, monkeypatch, tmp_path):
+    monkeypatch.setattr(anomaly.bench.time, 'monotonic_ns', lambda: 0)
+    ticks = itertools.count(100, 100)
+    monkeypatch.setattr(anomaly.bench.time, 'perf_counter_ns', lambda: next(ticks))
+    with anomaly.SampleLog(tmp_path, {'role': 'normal', 'pid': 1, 'worker_index': 0}, {}, {}) as log:
+        value, sample = anomaly.bench.call_sample(log, 0, lambda value: value, b'payload')
+    assert value == b'payload'
+    assert sample['start_ns'] > 0
+    assert sample['latency_ns'] == 100
+
+
+def test_worker_failure_output_cannot_fill_a_pipe(anomaly, tmp_path):
+    role = 'normal'
+    payload = {'ok': False, 'failures': ['[standalone:tool_failure] marker read failed'],
+               'detail': 'x' * (256 * 1024)}
+    with (tmp_path / f'{role}.stdout.json').open('w') as stdout, \
+            (tmp_path / f'{role}.stderr.log').open('w') as stderr:
+        process = subprocess.Popen([sys.executable, '-c',
+            'import json,sys; print(json.dumps({"ok":False,"failures":["[standalone:tool_failure] marker read failed"],"detail":"x"*(256*1024)})); sys.exit(1)'],
+            stdout=stdout, stderr=stderr)
+    with anomaly.SampleLog(tmp_path, {'role': 'controller', 'pid': 1, 'worker_index': -1}, {}, {}) as log:
+        report = anomaly._finish_child(process, role, 5, log)
+    assert report == dict(payload, exit_code=1)
 
 
 def install_fake_cc(monkeypatch, anomaly):
@@ -161,9 +190,11 @@ def test_controller_gates_stop_release_normal_resume_and_reap(anomaly, monkeypat
     monkeypatch.setattr(anomaly, 'publish', publish)
     monkeypatch.setattr(anomaly, 'wait_marker', wait_marker)
     monkeypatch.setattr(anomaly, 'wait_for_entered', lambda *args: trace.append('entered_calls_ready') or 1)
-    monkeypatch.setattr(anomaly.bench, 'release_workers', lambda *args: None)
-    monkeypatch.setattr(anomaly, 'suspend_process', lambda proc: trace.append('suspend'))
-    monkeypatch.setattr(anomaly, 'resume_process', lambda proc: trace.append('resume'))
+    monkeypatch.setattr(anomaly.bench, 'release_workers', lambda coord, children, *args: {
+        'workers': [{'pid': child.pid + 10000, 'worker_index': i} for i, child in enumerate(children)]})
+    stopped, resumed = [], []
+    monkeypatch.setattr(anomaly, 'suspend_process', lambda pid: (stopped.append(pid), trace.append('suspend')))
+    monkeypatch.setattr(anomaly, 'resume_process', lambda pid: (resumed.append(pid), trace.append('resume')))
     if os.name != 'nt':
         monkeypatch.setattr(anomaly.os, 'waitpid', lambda pid, flags: (pid, 0))
         monkeypatch.setattr(anomaly.os, 'WIFSTOPPED', lambda status: True)
@@ -177,24 +208,24 @@ def test_controller_gates_stop_release_normal_resume_and_reap(anomaly, monkeypat
             self.role = json.loads(args[-1])['role']
             self.spec = json.loads(args[-1])
             self.returncode = None
+            self.stdout_path = Path(kwargs['stdout'].name)
 
         def poll(self):
             return self.returncode
 
-        def communicate(self, timeout=None):
-            self.returncode = 0
-            trace.append('communicate:' + self.role)
-            return json.dumps(raw_worker(anomaly, tmp_path, self.role, self.pid,
-                self.spec['index'], 6 if self.role == 'normal' else 1,
-                self.spec['config'])), ''
-
         def wait(self, timeout=None):
+            self.returncode = 0
+            trace.append('wait:' + self.role)
+            self.stdout_path.write_text(json.dumps(raw_worker(anomaly, tmp_path, self.role, self.pid + 10000,
+                self.spec['index'], 6 if self.role == 'normal' else 1,
+                self.spec['config'])))
             return self.returncode
 
     monkeypatch.setattr(anomaly.subprocess, 'Popen', Child)
     monkeypatch.setattr(anomaly.bench, 'kill_owned_child', lambda child: pytest.fail('unexpected kill'))
     report = anomaly.run_anomaly(options(tmp_path))
     assert report['ok'] is True, report['failures']
+    assert stopped == resumed == [12001]
     assert len(registrations) == 1
     assert vars(registrations[0]) == {'mode': 'parallel', 'max_workers': None, 'max_pending': None}
     assert report['internal_probes'] == anomaly.INTERNAL_PROBES
@@ -202,12 +233,12 @@ def test_controller_gates_stop_release_normal_resume_and_reap(anomaly, monkeypat
     order = [
         'entered_calls_ready', 'suspend', 'publish:method-release.json',
         'wait:returning-abnormal-0.json', 'publish:normal-during.json',
-        'wait:normal-during-done.json', 'resume', 'communicate:abnormal',
-        'publish:normal-after.json', 'communicate:normal',
+        'wait:normal-during-done.json', 'resume', 'wait:abnormal',
+        'publish:normal-after.json', 'wait:normal',
     ]
     positions = [trace.index(item) for item in order]
     assert positions == sorted(positions)
-    events = [json.loads(line) for line in Path(report['benchmark']['events_path']).read_text().splitlines()]
+    events = [json.loads(line) for line in Path(report['benchmark']['events_path']).read_text(encoding='utf-8').splitlines()]
     names = [event['event'] for event in events]
     assert names.index('resource_gated') < names.index('reader_stopped') < names.index('abnormal_ready')
     assert names.index('normal_released') < names.index('reader_resumed') < names.index('os_wait')
@@ -216,7 +247,8 @@ def test_controller_gates_stop_release_normal_resume_and_reap(anomaly, monkeypat
 
 def test_controller_rejects_missing_normal_attempts(anomaly, monkeypatch, tmp_path):
     install_fake_cc(monkeypatch, anomaly)
-    monkeypatch.setattr(anomaly.bench, 'release_workers', lambda *args: None)
+    monkeypatch.setattr(anomaly.bench, 'release_workers', lambda *args: {
+        'workers': [{'pid': 3000, 'worker_index': 0}]})
     monkeypatch.setattr(anomaly, 'wait_marker', lambda *args, **kwargs: {})
 
     class Child:
@@ -224,17 +256,15 @@ def test_controller_rejects_missing_normal_attempts(anomaly, monkeypatch, tmp_pa
         returncode = None
 
         def __init__(self, *args, **kwargs):
-            pass
+            self.stdout_path = Path(kwargs['stdout'].name)
 
         def poll(self):
             return self.returncode
 
-        def communicate(self, timeout=None):
-            self.returncode = 0
-            return json.dumps(raw_worker(anomaly, tmp_path, 'normal', self.pid, 0, 5,
-                anomaly.scenario_spec(options(tmp_path, scenario='hold', control='alone')))), ''
-
         def wait(self, timeout=None):
+            self.returncode = 0
+            self.stdout_path.write_text(json.dumps(raw_worker(anomaly, tmp_path, 'normal', self.pid, 0, 5,
+                anomaly.scenario_spec(options(tmp_path, scenario='hold', control='alone')))))
             return self.returncode
 
     monkeypatch.setattr(anomaly.subprocess, 'Popen', Child)
@@ -242,7 +272,7 @@ def test_controller_rejects_missing_normal_attempts(anomaly, monkeypatch, tmp_pa
     assert report['ok'] is False
     assert any('[standalone:tool_failure] normal client has missing raw attempts' == failure
                for failure in report['failures'])
-    assert json.loads((tmp_path / 'anomaly.json').read_text())['ok'] is False
+    assert json.loads((tmp_path / 'anomaly.json').read_text(encoding='utf-8'))['ok'] is False
 
 
 @pytest.mark.parametrize('control,during_status,during_error,expected_ok', [
@@ -298,7 +328,7 @@ SCENARIOS = (
 @pytest.mark.parametrize('scenario', SCENARIOS)
 def test_overrides_match_their_native_role_key_sets(anomaly, tmp_path, scenario):
     import re
-    source = (ROOT / 'core/foundation/c2-config/src/ipc.rs').read_text()
+    source = (ROOT / 'core/foundation/c2-config/src/ipc.rs').read_text(encoding='utf-8')
     def native_keys(name):
         body = re.search(rf'pub const {name}:.*?= &\[(.*?)\];', source, re.S).group(1)
         return set(re.findall(r'"([a-z_]+)"', body))

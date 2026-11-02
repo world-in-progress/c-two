@@ -37,8 +37,8 @@ def test_raw_attempts_and_timeline_include_identity_and_provenance(evidence, tmp
         assert log.samples_path.is_file()
         assert log.events_path.is_file()
 
-    samples = [json.loads(line) for line in log.samples_path.read_text().splitlines()]
-    events = [json.loads(line) for line in log.events_path.read_text().splitlines()]
+    samples = [json.loads(line) for line in log.samples_path.read_text(encoding='utf-8').splitlines()]
+    events = [json.loads(line) for line in log.events_path.read_text(encoding='utf-8').splitlines()]
     assert samples[0]['kind'] == 'run'
     assert samples[0]['config'] == config
     assert samples[0]['provenance'] == provenance
@@ -96,7 +96,7 @@ os._exit(7)
     )
     assert result.returncode == 7
     path = next(tmp_path.glob('crash-0-*.samples.jsonl'))
-    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
     assert [row['kind'] for row in rows] == ['run', 'sample']
     assert rows[1]['status'] == 'timeout'
     assert rows[1]['latency_ns'] == 3
@@ -107,6 +107,7 @@ def test_unavailable_os_fields_are_null_with_reasons(evidence):
     assert set(foreign) == {
         'current_rss_bytes', 'peak_rss_bytes', 'fd_count',
         'handle_count', 'mapping_count',
+        'shared_mapping_count', 'shared_mappings',
     }
     assert all(item['value'] is None and item['reason'] for item in foreign.values())
     current = evidence.process_snapshot()
@@ -115,6 +116,99 @@ def test_unavailable_os_fields_are_null_with_reasons(evidence):
         assert current['mapping_count']['value'] is None
         assert current['mapping_count']['reason']
     assert all(not probe['available'] and probe['reason'] for probe in evidence.INTERNAL_PROBES.values())
+
+
+def test_linux_snapshot_keeps_every_metric_in_the_same_shape(evidence, monkeypatch):
+    maps = ('1000-2000 rw-p 00000000 00:00 0\n'
+            '2000-3000 rw-s 00000000 00:1a 1 /dev/shm/c2 (deleted)\n'
+            '3000-4000 rw-s 00000000 00:1b 2 /tmp/c2-spill (deleted)\n')
+    monkeypatch.setattr(Path, 'read_text', lambda path, **kwargs:
+                        maps if path.name == 'maps' else 'VmRSS: 100 kB\nVmHWM: 200 kB\n')
+    monkeypatch.setattr(evidence.os, 'listdir', lambda path: ['0', '1', '2'])
+    result = evidence._linux_process_snapshot(123)
+    assert all(set(value) == {'value', 'reason'} for value in result.values())
+    assert result['mapping_count']['value'] == 3
+    assert result['shared_mapping_count']['value'] == 2
+    assert len(result['shared_mappings']['value']) == 2
+
+
+def test_evidence_records_the_high_resolution_clock(evidence, monkeypatch, tmp_path):
+    monkeypatch.setattr(evidence.time, 'monotonic_ns', lambda: 0)
+    monkeypatch.setattr(evidence.time, 'perf_counter_ns', lambda: 1234567)
+    with evidence.SampleLog(tmp_path, {'role': 'normal', 'pid': 1, 'worker_index': 0}, {}, {}) as log:
+        event = log.event('ready')
+    metadata = json.loads(log.samples_path.read_text(encoding='utf-8').splitlines()[0])
+    assert metadata['clock']['name'] == 'perf_counter_ns'
+    assert event['monotonic_ns'] == 1234567
+
+
+@pytest.mark.parametrize('winerror', [None, 5, 32])
+def test_marker_read_waits_for_windows_sharing_windows(evidence, monkeypatch, tmp_path, winerror):
+    path = tmp_path / 'ready.json'
+    path.write_text('{"pid": 1234}')
+    read = Path.read_text
+    calls = 0
+    def sharing_then_ready(target, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # io.open surfaces Windows sharing windows as errno 13 through the
+            # CRT _wopen mapping; the winerror attribute carries no usable
+            # value and must not gate the retry.
+            error = PermissionError(13, 'Permission denied')
+            error.winerror = winerror
+            raise error
+        return read(target, **kwargs)
+    monkeypatch.setattr(evidence.sys, 'platform', 'win32')
+    monkeypatch.setattr(Path, 'read_text', sharing_then_ready)
+    assert evidence.read_marker(path) is None
+    assert evidence.read_marker(path) == {'pid': 1234}
+
+
+def test_marker_read_reraises_permission_errors_off_windows(evidence, monkeypatch, tmp_path):
+    path = tmp_path / 'ready.json'
+    path.write_text('{"pid": 1234}')
+    def denied(target, **kwargs):
+        raise PermissionError(13, 'Permission denied')
+    monkeypatch.setattr(evidence.sys, 'platform', 'linux')
+    monkeypatch.setattr(Path, 'read_text', denied)
+    with pytest.raises(PermissionError):
+        evidence.read_marker(path)
+
+
+def test_marker_publish_retries_windows_replace_sharing(evidence, monkeypatch, tmp_path):
+    path = tmp_path / 'released.json'
+    replace = Path.replace
+    calls = 0
+    def sharing_then_done(target, destination):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise PermissionError(13, 'Permission denied')
+        return replace(target, destination)
+    monkeypatch.setattr(evidence.sys, 'platform', 'win32')
+    monkeypatch.setattr(evidence.time, 'sleep', lambda seconds: None)
+    monkeypatch.setattr(Path, 'replace', sharing_then_done)
+    evidence.publish_marker(path, {'released_ns': 123})
+    assert calls == 3
+    assert evidence.read_marker(path) == {'released_ns': 123}
+
+
+def test_marker_publish_reraises_sharing_off_windows(evidence, monkeypatch, tmp_path):
+    path = tmp_path / 'released.json'
+    def denied(target, destination):
+        raise PermissionError(13, 'Permission denied')
+    monkeypatch.setattr(evidence.sys, 'platform', 'linux')
+    monkeypatch.setattr(Path, 'replace', denied)
+    with pytest.raises(PermissionError):
+        evidence.publish_marker(path, {'released_ns': 123})
+
+
+def test_marker_publish_keeps_the_original_fact(evidence, tmp_path):
+    path = tmp_path / 'released.json'
+    evidence.publish_marker(path, {'released_ns': 123})
+    evidence.publish_marker(path, {'released_ns': 456})
+    assert evidence.read_marker(path) == {'released_ns': 123}
 
 
 class FakeFunction:
@@ -144,9 +238,8 @@ def test_windows_suspend_resume_uses_native_calls_and_closes_handles(evidence, m
         lambda name, **_kwargs: kernel32 if name == 'kernel32' else ntdll,
         raising=False,
     )
-    proc = SimpleNamespace(pid=1234)
-    evidence.suspend_process(proc)
-    evidence.resume_process(proc)
+    evidence.suspend_process(1234)
+    evidence.resume_process(1234)
     assert [name for name, _args in calls] == [
         'OpenProcess', 'NtSuspendProcess', 'CloseHandle',
         'OpenProcess', 'NtResumeProcess', 'CloseHandle',
@@ -171,13 +264,13 @@ def test_windows_native_failure_still_closes_handle(evidence, monkeypatch):
     assert [name for name, _args in calls][-1] == 'CloseHandle'
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='SIGSTOP/SIGCONT are Unix-only signals')
 def test_unix_suspend_resume_signals_only_given_pid(evidence, monkeypatch):
     calls = []
     monkeypatch.setattr(evidence.sys, 'platform', 'linux')
     monkeypatch.setattr(evidence.os, 'kill', lambda pid, sig: calls.append((pid, sig)))
-    proc = SimpleNamespace(pid=1234)
-    evidence.suspend_process(proc)
-    evidence.resume_process(proc)
+    evidence.suspend_process(1234)
+    evidence.resume_process(1234)
     assert calls == [
         (1234, evidence.signal.SIGSTOP),
         (1234, evidence.signal.SIGCONT),

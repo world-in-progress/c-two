@@ -47,8 +47,8 @@ def worker(tmp_path, values=None):
         log.sample(1, 0, 100, 'success', integrity_ok=True)
         log.sample(2, 100, 300, 'success', integrity_ok=True)
         log.event('start')
-    log.samples_path.rename(tmp_path / 'samples.jsonl')
-    log.events_path.rename(tmp_path / 'events.jsonl')
+    log.samples_path.replace(tmp_path / 'samples.jsonl')
+    log.events_path.replace(tmp_path / 'events.jsonl')
     return {**identity, 'summary': values or summary(), 'samples_path': 'samples.jsonl',
             'events_path': 'events.jsonl', 'native_path': '/native.so',
             'native_sha256': 'a' * 64, 'provenance': provenance}
@@ -56,7 +56,7 @@ def worker(tmp_path, values=None):
 
 def set_run_config(tmp_path, config):
     path = tmp_path / 'samples.jsonl'
-    records = [json.loads(line) for line in path.read_text().splitlines()]
+    records = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
     records[0]['config'] = config
     path.write_text(''.join(json.dumps(record) + '\n' for record in records))
 
@@ -64,7 +64,7 @@ def set_run_config(tmp_path, config):
 def test_normal_worker_requires_raw_samples_and_success(paired, tmp_path):
     record = worker(tmp_path)
     assert paired.check_worker(record, tmp_path, True) == record['summary']
-    lines = (tmp_path / 'samples.jsonl').read_text().splitlines()
+    lines = (tmp_path / 'samples.jsonl').read_text(encoding='utf-8').splitlines()
     (tmp_path / 'samples.jsonl').write_text('\n'.join(lines[:-1]) + '\n')
     with pytest.raises(paired.EvidenceError, match='sample count'):
         paired.check_worker(record, tmp_path, True)
@@ -100,7 +100,7 @@ def test_matrix_rejects_missing_row_and_missing_sample(paired, tmp_path):
 def test_anomaly_checks_normal_raw_evidence_and_native_identity(paired, tmp_path):
     normal = dict(worker(tmp_path), role='normal')
     path = tmp_path / 'samples.jsonl'
-    records = [json.loads(line) for line in path.read_text().splitlines()]
+    records = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
     for index in range(4):
         start = 300 + index * 100
         records.append({'kind': 'sample', 'identity': records[0]['identity'],
@@ -245,14 +245,14 @@ def test_workflow_keeps_manual_separate_source_environments():
                          Loader=yaml.BaseLoader)
     assert set(workflow['on']) == {'workflow_dispatch'}
     assert set(workflow['on']['workflow_dispatch']['inputs']) == {'baseline_ref', 'candidate_ref'}
-    assert workflow['env']['FASTDB_PAYLOAD_LINK_MODE'] == 'source'
+    assert 'FASTDB_PAYLOAD_LINK_MODE' not in workflow['env']
     assert set(workflow['jobs']['paired']['strategy']['matrix']['os']) == {
         'ubuntu-24.04', 'macos-15', 'windows-2025', 'windows-11-arm'}
     steps = workflow['jobs']['paired']['steps']
     checkouts = [step['with']['path'] for step in steps if 'with' in step and
                  step['with'].get('path') in {'baseline/c-two', 'candidate/c-two'}]
     assert checkouts == ['baseline/c-two', 'candidate/c-two']
-    assert any('prepare_fastdb_sdk.py' in step.get('run', '') for step in steps)
+    assert not any('prepare_fastdb_sdk.py' in step.get('run', '') for step in steps)
     build = next(step['run'] for step in steps if step.get('name', '').startswith('Build separate'))
     assert 'source_mode_environment' in build
     assert "import c_two; from c_two import _native" in build
@@ -305,7 +305,7 @@ def test_nonzero_harness_exit_keeps_report_for_classification(paired, monkeypatc
         return SimpleNamespace(returncode=1)
     monkeypatch.setattr(paired, 'run_owned', failed_report)
     directory = paired.run_harness(options, 'baseline', 0, 'matrix')
-    assert json.loads((directory / 'invocation.json').read_text())['exit_code'] == 1
+    assert json.loads((directory / 'invocation.json').read_text(encoding='utf-8'))['exit_code'] == 1
 
 
 def test_import_failure_is_a_tool_failure_with_original_log(paired, monkeypatch, tmp_path):

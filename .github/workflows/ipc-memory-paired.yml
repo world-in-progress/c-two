@@ -25,7 +25,6 @@ env:
   CARGO_BUILD_JOBS: "2"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  FASTDB_PAYLOAD_LINK_MODE: source
   PYTHONUTF8: "1"
 
 jobs:
@@ -72,9 +71,6 @@ jobs:
         with:
           arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
       - uses: astral-sh/setup-uv@v6
-      - name: Prepare official FastDB CoreSDK
-        working-directory: candidate/c-two
-        run: python .github/scripts/prepare_fastdb_sdk.py --output "${{ runner.temp }}/fastdb-core-sdk" --emit-github
       - name: Build separate baseline and candidate environments
         shell: python
         run: |

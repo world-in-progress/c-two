@@ -87,7 +87,8 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 from ipc_evidence import (
     INTERNAL_PROBES, CORRECTNESS_FAILURE, Failures, SampleLog,
-    TOOL_FAILURE, failure_message, platform_process_support, process_snapshot, summarize_samples,
+    TOOL_FAILURE, failure_message, platform_process_support, process_snapshot,
+    publish_marker, read_marker, summarize_samples,
 )
 
 
@@ -255,39 +256,39 @@ def common_memory_stats(stats: dict) -> dict:
 
 
 def wait_for_release(coord: Path, worker_index: int, timeout: float, log: SampleLog) -> dict:
-    ready = {'pid': os.getpid(), 'worker_index': worker_index, 'ready_ns': time.monotonic_ns()}
-    (coord / f'ready-{worker_index}.json').write_text(json.dumps(ready))
+    ready = {'pid': os.getpid(), 'worker_index': worker_index, 'ready_ns': time.perf_counter_ns()}
+    publish_marker(coord / f'ready-{worker_index}.json', ready)
     log.event('ready', **ready)
-    deadline = time.monotonic() + timeout
-    while not (coord / 'release.json').exists():
-        if time.monotonic() >= deadline:
+    deadline = time.perf_counter() + timeout
+    while (release := read_marker(coord / 'release.json')) is None:
+        if time.perf_counter() >= deadline:
             raise TimeoutError('controller did not release the ready barrier')
         time.sleep(0.005)
-    release = json.loads((coord / 'release.json').read_text())
     log.event('barrier_observed', **release)
     return release
 
 
 def release_workers(coord: Path, children: list, timeout: float, log: SampleLog) -> dict:
-    deadline = time.monotonic() + timeout
-    while not all((coord / f'ready-{index}.json').exists() for index in range(len(children))):
+    deadline = time.perf_counter() + timeout
+    while True:
+        workers = [read_marker(coord / f'ready-{index}.json') for index in range(len(children))]
+        if all(worker is not None for worker in workers):
+            break
         if any(child.poll() is not None for child in children):
             raise RuntimeError('worker exited before the ready barrier')
-        if time.monotonic() >= deadline:
+        if time.perf_counter() >= deadline:
             raise TimeoutError('workers did not finish connection and warmup')
         time.sleep(0.005)
-    release = {'release_ns': time.monotonic_ns(), 'worker_count': len(children)}
+    release = {'release_ns': time.perf_counter_ns(), 'worker_count': len(children), 'workers': workers}
     # Rename publishes a complete timestamp to every waiter at once.
-    pending = coord / 'release.pending'
-    pending.write_text(json.dumps(release))
-    pending.replace(coord / 'release.json')
+    publish_marker(coord / 'release.json', release)
     log.event('barrier_released', **release)
     return release
 
 
 def call_sample(log: SampleLog, request_id: int, call, payload: bytes, *, phase='measurement', measurement=True):
     log.event('call_started', request_id=request_id, phase=phase)
-    start = time.monotonic_ns()
+    start = time.perf_counter_ns()
     status, error_type, error_message, integrity = 'success', None, None, None
     value = None
     try:
@@ -305,7 +306,7 @@ def call_sample(log: SampleLog, request_id: int, call, payload: bytes, *, phase=
         status = 'timeout' if timed_out else 'error'
         error_type, error_message = type(exc).__name__, str(exc)
     sample = log.sample(
-        request_id, start, time.monotonic_ns(), status, error_type, error_message,
+        request_id, start, time.perf_counter_ns(), status, error_type, error_message,
         phase=phase, integrity_ok=integrity, measurement=measurement,
     )
     return value, sample
@@ -380,7 +381,7 @@ def measure(args: argparse.Namespace) -> dict:
     client = None
     connected_ns = None
     held_stats = after_release = barrier = None
-    started = time.monotonic_ns()
+    started = time.perf_counter_ns()
     try:
         if stats_enabled:
             memory_stats['before_connect'] = snapshot_memory_stats()
@@ -393,7 +394,7 @@ def measure(args: argparse.Namespace) -> dict:
             if expected_error is not None:
                 expected_error.update(raised=True, stage='connect', error_type=type(exc).__name__, error_message=str(exc))
             raise
-        connected_ns = time.monotonic_ns() - started
+        connected_ns = time.perf_counter_ns() - started
         # One public deadline API is used on both source inputs.
         proxy = cc.with_call_options(client, timeout=args.call_timeout)
         request_id = 0
@@ -452,7 +453,7 @@ def measure(args: argparse.Namespace) -> dict:
         os_stats['after_calls'] = process_snapshot()
     except Exception as exc:
         failures.append(f'{type(exc).__name__}: {exc}', getattr(exc, 'category',
-            TOOL_FAILURE if isinstance(exc, TimeoutError) else CORRECTNESS_FAILURE))
+            TOOL_FAILURE if isinstance(exc, (TimeoutError, OSError)) else CORRECTNESS_FAILURE))
         log.event('worker_error', error_type=type(exc).__name__, error_message=str(exc))
     finally:
         if client is not None:
@@ -1131,8 +1132,8 @@ def run_matrix(args: argparse.Namespace) -> int:
                         job.stop()
                         terminated = True
                         drain_failure = 'Windows row Job still had live descendants after controller completion'
-                        deadline = time.monotonic() + POST_KILL_DRAIN_TIMEOUT_S
-                        while job.alive() and time.monotonic() < deadline:
+                        deadline = time.perf_counter() + POST_KILL_DRAIN_TIMEOUT_S
+                        while job.alive() and time.perf_counter() < deadline:
                             time.sleep(0.02)
                         if job.alive():
                             raise OSError('Windows row Job did not become empty after termination')
