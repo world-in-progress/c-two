@@ -164,6 +164,16 @@ impl Drop for WriteDriver {
     }
 }
 
+// Drop the GC task's storage before its retirement fence, including if the
+// executor drops the task without polling it. Physical close then also proves
+// that maintenance no longer retains idle backing.
+struct GcDriver {
+    pool: Arc<RwLock<MemPool>>,
+    peer: Arc<RwLock<ServerPoolState>>,
+    registry: Arc<ChunkRegistry<()>>,
+    _retirement: Arc<PhysicalRetirement>,
+}
+
 enum Disconnect {
     NotRequested,
     Pending(ControlFrame),
@@ -356,6 +366,7 @@ impl ClientConnection {
         pool: Arc<RwLock<MemPool>>,
         peer: Arc<RwLock<ServerPoolState>>,
         registry: Arc<ChunkRegistry<()>>,
+        retirement: Arc<PhysicalRetirement>,
         decay_seconds: f64,
     ) {
         let mut stop = self.gc_stop.subscribe();
@@ -364,7 +375,14 @@ impl ClientConnection {
             .gc_interval
             .min(Duration::from_secs_f64(decay_seconds))
             .max(Duration::from_millis(5));
+        let driver = GcDriver {
+            pool,
+            peer,
+            registry,
+            _retirement: retirement,
+        };
         tokio::spawn(async move {
+            let driver = driver;
             let mut tick = tokio::time::interval(period);
             tick.tick().await;
             loop {
@@ -375,10 +393,10 @@ impl ClientConnection {
                     biased;
                     changed = stop.changed() => { if changed.is_err() || *stop.borrow() { break; } }
                     _ = tick.tick() => {
-                        registry.try_gc_sweep();
-                        if let Some(mut pool) = pool.try_write() { pool.gc_buddy(); }
-                        if let Some(mut pool) = registry.pool().try_write() { pool.gc_buddy(); }
-                        if let Some(peer) = peer.try_read() {
+                        driver.registry.try_gc_sweep();
+                        if let Some(mut pool) = driver.pool.try_write() { pool.gc_buddy(); }
+                        if let Some(mut pool) = driver.registry.pool().try_write() { pool.gc_buddy(); }
+                        if let Some(peer) = driver.peer.try_read() {
                             if let Some(cache) = &peer.cache { cache.gc_idle(); }
                         }
                     }
@@ -453,51 +471,69 @@ impl Drop for QueuedWrite {
         }
     }
 }
-async fn run(
-    mut driver: WriteDriver,
+fn run(
+    driver: WriteDriver,
     conn: Arc<ClientConnection>,
-    mut receiver: mpsc::Receiver<Submission>,
-) {
-    let stream = driver.stream.as_mut().unwrap();
-    loop {
-        if conn.close_ready() || conn.read_stopped.load(Ordering::Acquire) {
-            break;
-        }
-        if let Some(control) = conn.take_disconnect() {
-            if let Ok(Some(batch)) = conn.core.begin_write(WriteRequest::Control(control)) {
-                let frame = driver
-                    .disconnect_bytes
-                    .take()
-                    .expect("one DISCONNECT per connection");
-                if let Ok(batch) = prepare(batch, frame, &conn) {
-                    let _ = write_batch(stream, &conn, batch, &mut None).await;
-                }
+    receiver: mpsc::Receiver<Submission>,
+) -> impl std::future::Future<Output = ()> + Send {
+    // Queued owners and the connection's book go before the retirement fence,
+    // even if the writer is cancelled before its first poll.
+    struct WriteTask {
+        receiver: mpsc::Receiver<Submission>,
+        conn: Arc<ClientConnection>,
+        driver: WriteDriver,
+    }
+    let task = WriteTask {
+        receiver,
+        conn,
+        driver,
+    };
+    async move {
+        let mut task = task;
+        let conn = &task.conn;
+        let receiver = &mut task.receiver;
+        let driver = &mut task.driver;
+        let stream = driver.stream.as_mut().unwrap();
+        loop {
+            if conn.close_ready() || conn.read_stopped.load(Ordering::Acquire) {
+                break;
             }
-            continue;
-        }
-        if let Ok(submission) = receiver.try_recv() {
-            process(stream, &conn, submission).await;
-            continue;
-        }
-        match conn.core.begin_write(WriteRequest::Releases) {
-            Ok(Some(batch)) => {
-                match prepare(batch, Vec::new(), &conn) {
-                    Ok(batch) => {
+            if let Some(control) = conn.take_disconnect() {
+                if let Ok(Some(batch)) = conn.core.begin_write(WriteRequest::Control(control)) {
+                    let frame = driver
+                        .disconnect_bytes
+                        .take()
+                        .expect("one DISCONNECT per connection");
+                    if let Ok(batch) = prepare(batch, frame, &conn) {
                         let _ = write_batch(stream, &conn, batch, &mut None).await;
                     }
-                    Err(_) => conn.end(ConnectionEndReason::ProtocolError, "release_write"),
                 }
                 continue;
             }
-            Ok(None) => {}
-            Err(
-                ConnectionError::WriterBroken
-                | ConnectionError::PeerEnded
-                | ConnectionError::Closed,
-            ) => {}
-            Err(_) => conn.end(ConnectionEndReason::ProtocolError, "release_writer"),
+            if let Ok(submission) = receiver.try_recv() {
+                process(stream, &conn, submission).await;
+                continue;
+            }
+            match conn.core.begin_write(WriteRequest::Releases) {
+                Ok(Some(batch)) => {
+                    match prepare(batch, Vec::new(), &conn) {
+                        Ok(batch) => {
+                            let _ = write_batch(stream, &conn, batch, &mut None).await;
+                        }
+                        Err(_) => conn.end(ConnectionEndReason::ProtocolError, "release_write"),
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(
+                    ConnectionError::WriterBroken
+                    | ConnectionError::PeerEnded
+                    | ConnectionError::Closed,
+                ) => {}
+                Err(_) => conn.end(ConnectionEndReason::ProtocolError, "release_writer"),
+            }
+            tokio::select! { biased; _ = conn.wake.notified() => {} Some(submission) = receiver.recv() => process(stream, &conn, submission).await, }
         }
-        tokio::select! { biased; _ = conn.wake.notified() => {} Some(submission) = receiver.recv() => process(stream, &conn, submission).await, }
     }
 }
 async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submission: Submission) {

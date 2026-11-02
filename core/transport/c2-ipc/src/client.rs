@@ -1312,6 +1312,7 @@ impl IpcClient {
             self.request_pool().unwrap(),
             server_pool.clone(),
             registry.clone(),
+            retirement.clone(),
             self.config.pool_decay_seconds,
         );
         *self.driver.get_mut() = Some(conn.clone());
@@ -2732,15 +2733,12 @@ impl IpcClient {
 
     pub async fn close_shared_bounded(&self, timeout: std::time::Duration) -> bool {
         self.deactivate();
-        let observation = self.connection_observation();
-        let closed = match observation {
+        let closed = match self.connection_observation() {
             Some(observation) => observation.wait_closed(Some(timeout)).await.is_some(),
             None => true,
         };
         if closed {
             self.server_pool.lock().take();
-            self.pool.lock().take();
-            self.chunk_registry.lock().take();
         }
         closed
     }
@@ -2750,6 +2748,11 @@ impl IpcClient {
         if let Some(conn) = self.driver.read().as_ref() {
             conn.deactivate();
         }
+        // The drivers and outstanding allocations own everything required by
+        // dispatched work. A retained business reference must not cache empty
+        // backing after those owners have drained.
+        self.pool.lock().take();
+        self.chunk_registry.lock().take();
     }
 
     /// Exact request-pool owner for bounded lock-contention tests. This is
@@ -2852,15 +2855,19 @@ pub(crate) fn recv_loop(
 ) -> impl std::future::Future<Output = ()> + Send {
     struct ReceiveTask {
         cleanup: ReceiveCleanup,
+        server_pool: Arc<RwLock<ServerPoolState>>,
+        pending: Arc<StdMutex<PendingMap>>,
         driver: ReadDriver,
     }
     let task = ReceiveTask {
         cleanup: ReceiveCleanup {
-            conn: conn.clone(),
-            registry: registry.clone(),
+            conn,
+            registry,
             conn_id,
             finished: false,
         },
+        server_pool,
+        pending,
         driver: ReadDriver {
             stream: Some(reader),
             retirement,
@@ -2868,6 +2875,10 @@ pub(crate) fn recv_loop(
     };
     async move {
         let mut task = task;
+        let conn = &task.cleanup.conn;
+        let registry = &task.cleanup.registry;
+        let server_pool = &task.server_pool;
+        let pending = &task.pending;
         let retirement = task.driver.retirement.clone();
         let reader = task.driver.stream.as_mut().unwrap();
         let mut header = [0u8; HEADER_SIZE];

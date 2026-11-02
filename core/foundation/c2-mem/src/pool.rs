@@ -76,6 +76,8 @@ pub struct MemPool {
     /// When each buddy segment became fully idle (alloc_count == 0).
     /// None means the segment has active allocations.
     idle_since: Vec<Option<Instant>>,
+    /// A stopped owner keeps pool identity, but no longer caches empty backing.
+    retain_idle_backing: bool,
     /// Owner-creation budget context. Owner pools always carry one (shared or
     /// private); peer pools never charge owner-creation budget and carry none.
     budget: Option<MemoryBudget>,
@@ -179,6 +181,7 @@ impl MemPool {
             incarnation: PoolIncarnation::new(),
             dedicated_generations: Vec::new(),
             idle_since: Vec::new(),
+            retain_idle_backing: true,
             budget,
             pressure,
             counters: TierCounters::default(),
@@ -390,6 +393,27 @@ impl MemPool {
         }
     }
 
+    /// Select whether this owner retains empty buddy backing for later reuse.
+    ///
+    /// Disabling retention immediately unmaps every idle segment, regardless
+    /// of decay or the configured retained minimum. Live allocations remain
+    /// valid and their backing is unmapped only when its last allocation is
+    /// released. Re-enabling retention preserves pool identity and generations.
+    pub fn set_idle_backing_retention(&mut self, retain: bool) {
+        self.retain_idle_backing = retain;
+        if !retain {
+            for (index, segment) in self.segments.iter_mut().enumerate() {
+                if segment
+                    .as_ref()
+                    .is_some_and(|segment| segment.allocator().alloc_count() == 0)
+                {
+                    segment.take();
+                    self.idle_since[index] = None;
+                }
+            }
+        }
+    }
+
     /// Reclaim trailing idle owner backings down to the retained minimum.
     /// Allocation handles retained by a loan book keep the local count live.
     /// Slot generations are never truncated or reset.
@@ -437,6 +461,11 @@ impl MemPool {
         }
         if !self.config.buddy_enabled {
             return Err("cannot prewarm buddy segments while the buddy pool is disabled".into());
+        }
+        if count > 0 && !self.retain_idle_backing {
+            return Err(
+                "cannot prewarm buddy segments while idle backing retention is disabled".into(),
+            );
         }
         if count > self.config.max_segments {
             return Err(format!(
@@ -882,7 +911,12 @@ impl MemPool {
         // SAFETY: exact level/offset came from the unique local allocation.
         unsafe { allocator.free(allocation.offset, allocation.level) };
         if allocator.alloc_count() == 0 {
-            self.idle_since[idx] = Some(Instant::now());
+            if self.retain_idle_backing {
+                self.idle_since[idx] = Some(Instant::now());
+            } else {
+                self.segments[idx].take();
+                self.idle_since[idx] = None;
+            }
         }
     }
 

@@ -408,7 +408,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
             deadline(Duration::from_millis(100)),
         )
         .unwrap();
-    let recovered = lease.client();
+    let recovered = lease.client().clone();
     assert!(recovered.is_connected());
     let binding = recovered
         .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(1)))
@@ -427,6 +427,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
         "{report:?}"
     );
     assert_eq!(observer.snapshot().shm.used_bytes, 0);
+    assert!(!recovered.is_connected());
 }
 
 #[test]

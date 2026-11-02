@@ -73,6 +73,70 @@ async fn normal_client_close_does_not_wait_for_frozen_peer_ack() {
     peer.await.unwrap();
 }
 
+async fn assert_closed_backing_released(explicit_close: bool) {
+    let endpoint = Endpoint::new();
+    // Force response reassembly so both local pools have idle SHM backing.
+    let mut server_config = ServerIpcConfig::default();
+    server_config.base.shm_backing_budget_bytes = 0;
+    server_config.base.chunk_size = 4096;
+    let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
+    let mut cfg = config();
+    cfg.base.pool_prewarm_segments = 1;
+    cfg.base.reassembly_segment_size = cfg.base.pool_segment_size;
+    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    client.connect().await.unwrap();
+    let binding = client.acquire_route(&contract()).await.unwrap();
+    assert_eq!(
+        client
+            .call_bound(&binding, "echo", &[5; 8193])
+            .await
+            .unwrap()
+            .into_owned_bytes()
+            .unwrap(),
+        vec![5; 8193]
+    );
+    let request = client.request_pool().unwrap();
+    let registry = client.chunk_registry.lock().clone().unwrap();
+    eventually(|| request.read().stats().alloc_count == 0).await;
+    let request_stats = request.read().stats();
+    let reassembly_stats = registry.pool().read().stats();
+    assert_eq!(request_stats.buddy_occupied_bytes, 0);
+    assert!(request_stats.buddy_idle_bytes > 0);
+    assert_eq!(reassembly_stats.buddy_occupied_bytes, 0);
+    assert!(reassembly_stats.buddy_idle_bytes > 0);
+    let request_weak = Arc::downgrade(&request);
+    let registry_weak = Arc::downgrade(&registry);
+    drop(request);
+    drop(registry);
+    let budget = client.memory_budget.clone();
+    let observation = client.connection_observation().unwrap();
+    if explicit_close {
+        assert!(client.close_shared_bounded(WAIT).await);
+    } else {
+        client.deactivate();
+        observation.wait_closed(Some(WAIT)).await.unwrap();
+    }
+    // Retain the business client, but no transport owner may survive its
+    // completed close merely to cache empty backing or await another GC poll.
+    assert_eq!(budget.snapshot().shm.used_bytes, 0);
+    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    assert!(request_weak.upgrade().is_none());
+    assert!(registry_weak.upgrade().is_none());
+    assert!(!client.is_connected());
+    stop(server, runner).await;
+}
+
+#[tokio::test]
+async fn deactivated_client_releases_idle_backing_before_physical_close() {
+    assert_closed_backing_released(false).await;
+}
+
+#[tokio::test]
+async fn completed_close_releases_idle_backing_before_returning() {
+    assert_closed_backing_released(true).await;
+}
+
 // An unpolled receive task owns its cleanup fence. B retains the actual stream,
 // while an unproved end must leave L allocated in its original owner pool.
 #[tokio::test]
@@ -178,10 +242,13 @@ async fn failed_and_expired_handshakes_publish_one_open_and_the_original_close()
             if !expire {
                 stream.write_all(&[0; 25]).await.unwrap();
             }
-            assert_eq!(
-                timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
-                0
-            );
+            // The malformed envelope is rejected after 16 bytes, leaving 9
+            // unread. Linux reports reset on that close; macOS and Windows
+            // can report EOF. Both must be a native read-side peer end.
+            match timeout(WAIT, stream.read(&mut [0])).await.unwrap() {
+                Ok(size) => assert_eq!(size, 0),
+                Err(error) => assert!(stream.peer_ended(), "{error}"),
+            }
             crate::tests::close_listener(listener).await;
         });
         let source = c2_local::ConnectionEventSource::new();

@@ -821,6 +821,101 @@ async fn same_server_can_start_again_after_shutdown() {
     assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
 }
 
+fn retained_backing_server(label: &str) -> Arc<Server> {
+    let mut config = ServerIpcConfig::default();
+    config.base.pool_segment_size = 64 * 1024;
+    config.base.reassembly_segment_size = 64 * 1024;
+    config.base.pool_prewarm_segments = 1;
+    config.base.pool_min_retained_segments = 1;
+    config.pool_decay_seconds = 3600.0;
+    Arc::new(test_server_new(&unique_readiness_address(label), config).unwrap())
+}
+
+#[tokio::test]
+async fn stopped_server_releases_idle_backing_before_terminal_and_rewarms_on_restart() {
+    let server = retained_backing_server("retired_idle_backing");
+    let observer = server.memory_budget_observer();
+    let reassembly = server.chunk_registry.pool();
+    let handle = reassembly.write().alloc_shm_handle(4096).unwrap();
+    reassembly.write().release_handle(handle);
+    assert_eq!(observer.snapshot().shm.used_bytes, 2 * 64 * 1024);
+    let generation = server.response_pool.read().segment_generation(0).unwrap();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+    server
+        .wait_until_ready(Duration::from_secs(5))
+        .await
+        .unwrap();
+    server
+        .shutdown_and_wait(Duration::from_secs(5))
+        .await
+        .unwrap();
+    // Keep Server, response-pool metadata and reassembly-pool metadata alive.
+    // Its terminal watch must already prove idle backing was actually unmapped.
+    assert_eq!(observer.snapshot().shm.used_bytes, 0);
+    assert_eq!(observer.snapshot().file.used_bytes, 0);
+    assert_eq!(observer.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(server.response_pool.read().stats().buddy_idle_bytes, 0);
+    assert_eq!(reassembly.read().stats().buddy_idle_bytes, 0);
+    runner.await.unwrap().unwrap();
+
+    server.begin_start_attempt().unwrap();
+    assert_eq!(observer.snapshot().shm.used_bytes, 64 * 1024);
+    assert!(server.response_pool.read().segment_generation(0).unwrap() > generation);
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+    server
+        .wait_until_ready(Duration::from_secs(5))
+        .await
+        .unwrap();
+    server
+        .shutdown_and_wait(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(observer.snapshot().shm.used_bytes, 0);
+    runner.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn stopped_server_keeps_live_backing_until_its_original_allocations_release() {
+    let server = retained_backing_server("retired_live_backing");
+    let observer = server.memory_budget_observer();
+    let response = server.response_pool_arc();
+    let reassembly = server.chunk_registry.pool();
+    let response_handle = response.inner.write().alloc_shm_handle(4096).unwrap();
+    let reassembly_handle = reassembly.write().alloc_shm_handle(4096).unwrap();
+    let charged = observer.snapshot().shm.used_bytes;
+    assert_eq!(charged, 2 * 64 * 1024);
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+    server
+        .wait_until_ready(Duration::from_secs(5))
+        .await
+        .unwrap();
+    server
+        .shutdown_and_wait(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(observer.snapshot().shm.used_bytes, charged);
+    assert_eq!(response.read().handle_slice(&response_handle).len(), 4096);
+    assert_eq!(
+        reassembly.read().handle_slice(&reassembly_handle).len(),
+        4096
+    );
+    response.inner.write().release_handle(response_handle);
+    assert_eq!(observer.snapshot().shm.used_bytes, 64 * 1024);
+    reassembly.write().release_handle(reassembly_handle);
+    // No GC tick, Server Drop or extra shutdown call is needed to refund it.
+    assert_eq!(observer.snapshot().shm.used_bytes, 0);
+    runner.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn failed_bind_can_retry_after_socket_released() {
     let address = unique_readiness_address("retry_after_failed_bind");

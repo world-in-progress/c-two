@@ -1095,6 +1095,15 @@ impl Server {
     }
 
     fn set_lifecycle_state(&self, state: ServerLifecycleState) {
+        if matches!(
+            state,
+            ServerLifecycleState::Stopped | ServerLifecycleState::Failed(_)
+        ) {
+            // Terminal metadata may outlive this run and its executor. Keep
+            // only backing still owned by real allocations/connection loans;
+            // their original pool refunds it on the final release.
+            self.set_idle_backing_retention(false);
+        }
         self.lifecycle_tx.send_modify(|snapshot| {
             if matches!(
                 &state,
@@ -1106,6 +1115,17 @@ impl Server {
             }
             snapshot.state = state;
         });
+    }
+
+    fn set_idle_backing_retention(&self, retain: bool) {
+        self.response_pool
+            .inner
+            .write()
+            .set_idle_backing_retention(retain);
+        self.chunk_registry
+            .pool()
+            .write()
+            .set_idle_backing_retention(retain);
     }
 
     fn publish_ready(&self, credential: EndpointCredential) {
@@ -1146,6 +1166,20 @@ impl Server {
             ServerLifecycleState::Initialized
             | ServerLifecycleState::Stopped
             | ServerLifecycleState::Failed(_) => {
+                self.set_idle_backing_retention(true);
+                if self.config.pool_prewarm_segments > 0 {
+                    let prewarm = self
+                        .response_pool
+                        .inner
+                        .write()
+                        .ensure_buddy_segments(self.config.pool_prewarm_segments as usize);
+                    if let Err(error) = prewarm {
+                        self.set_idle_backing_retention(false);
+                        return Err(ServerError::Config(format!(
+                            "response pool prewarm: {error}"
+                        )));
+                    }
+                }
                 if !matches!(self.lifecycle_state(), ServerLifecycleState::Initialized)
                     || registration.is_closed()
                 {
