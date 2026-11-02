@@ -11,3 +11,5 @@
 考虑过而没有采用：对端继续直接释放（R07 那类失败无法根除）；每连接一个响应池（段与映射随连接数成倍增长）；按心跳回收（不安全）；共享内存归还环（更快，但多一块可写共享区和等待设计，只在基准证明释放通道是瓶颈时再议）。
 
 依据：[单一属主评估](../design/2026-10-31-single-owner-release-evaluation.md)、[协议批详细设计](../design/2026-11-01-protocol-batch-design.md)、[跨进程释放调研](../research/2026-10-31-cross-process-release-survey.md)、[共享内存借出调研](../research/2026-11-01-shared-memory-lending-survey.md)。
+
+2026-11-02 补记：每条连接经独立写任务写出，使小调用变慢。最终候选 `d646fc12` 的配对基准（四个 CI 平台各五组）里，1 字节调用的中位延迟是本批之前的 1.13–1.28 倍，每次多 40–60 μs；走 buddy 的 64 KiB 基本持平，4 MiB 在 Linux 与 Windows 上快 6%–14%。设计定的小调用门槛因此没有达成，用户接受这一回退。让提交者在写端空闲时直接写的快速通道评估后没有采纳，见[实验记录](../research/2026-11-02-ipc-write-fast-path-experiment.md)。
