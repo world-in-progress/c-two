@@ -44,6 +44,8 @@ SHM 4 segments carry no header: data starts at offset 0, the format comes from t
 
 Receiver reassembly reserves full capacity, `total_chunks × chunk_size`, before accepting the storage. Allocation tries buddy reuse, reuse after GC, buddy expansion, dedicated SHM and finally file mmap. Completion may trim logical length while the capacity charge remains until storage release. Resources receive the complete assembled input; chunk transfer does not provide incremental resource input.
 
+A server processes at most `max_total_chunks` chunk frames at once. A chunked request is settled by its first refusal, whether a chunk finds no free slot, its first chunk exceeds the size or reassembly limits, or the receive loop and a chunk task refuse it at the same time: the server sends one error reply per connection and request id, then discards the request's remaining chunks before they take a slot, returning any SHM they carry. The connection and its other calls continue. A late chunk of an assembly that GC removed gets one error and settles the request the same way. The settled marker holds metadata only and is removed at the request's last chunk, at connection end, or when the GC sweep finds it older than `chunk_assembler_timeout`.
+
 Rust callers free a local allocation with `MemPool::release_handle`, which consumes the move-only handle. A loaned block is freed only by its owner, when a release record or the connection's peer end settles the loan; nothing frees a block from peer coordinates. A receiver refunds its reassembly reservation as soon as it has copied the assembled payload; cached mapping charges still follow the existing GC policy.
 
 Loans, release records and connection ends are described below. These paths never replay a business call.

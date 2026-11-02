@@ -85,7 +85,7 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 | `live_reassembly_budget_bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | 未完成及仍被保留的重组容量字节预算 |
 | `reassembly_segment_size` | `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | 64 MiB | 重组池每段的字节数 |
 | `reassembly_max_segments` | `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | 4 | 重组池段数上限，范围为 1 到 255 |
-| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | 在途重组达到这个数目时提前清扫一次；它从不拒绝，硬上限是重组预算 |
+| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | 服务端同时处理的分片帧数上限；拿不到名额的分片让它的请求以 `ResourceUnavailable` 失败。在途重组达到这个数目时还会提前清扫一次，清扫本身从不拒绝 |
 | `chunk_size` | `C2_IPC_CHUNK_SIZE` | 128 KiB | 单个分片的字节数 |
 | `chunk_threshold_ratio` | `C2_IPC_CHUNK_THRESHOLD_RATIO` | 0.9 | 最大 frame 大小的配置比例；接受并校验，但当前传输选择不使用此值 |
 | `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 秒 | 未完成分片重组的超时秒数 |

@@ -85,7 +85,7 @@ Set the following fields through the appropriate endpoint's `ipc_overrides`. All
 | `live_reassembly_budget_bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | Byte budget for incomplete and retained reassembly capacity |
 | `reassembly_segment_size` | `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | 64 MiB | Reassembly pool segment size in bytes |
 | `reassembly_max_segments` | `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | 4 | Maximum reassembly pool segments, from 1 to 255 |
-| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | Number of in-flight reassemblies at which an early cleanup sweep runs; it never rejects, and the reassembly budget is the hard bound |
+| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | Server-wide limit on chunk frames processed at once; a chunk that finds no free slot fails its request with `ResourceUnavailable`. The same count also starts an early reassembly cleanup sweep, which never rejects |
 | `chunk_size` | `C2_IPC_CHUNK_SIZE` | 128 KiB | Individual chunk size in bytes |
 | `chunk_threshold_ratio` | `C2_IPC_CHUNK_THRESHOLD_RATIO` | 0.9 | Configured fraction of maximum frame size; accepted and validated, but not currently used by transport selection |
 | `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 seconds | Incomplete chunk-reassembly timeout in seconds |
