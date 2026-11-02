@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import socket
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from queue import SimpleQueue
 from types import ModuleType
@@ -15,6 +16,7 @@ import pytest
 import httpx
 
 from c_two.crm.contract import crm_contract
+from tests.fixtures.http_server import LoopbackHTTPServer
 
 
 def _repo_root() -> Path:
@@ -102,7 +104,12 @@ def test_relay_qps_headers_form_a_valid_hey_request(monkeypatch, tmp_path):
         def log_message(self, *_args):
             pass
 
-    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    def unavailable_dns(*_args):
+        raise AssertionError('numeric loopback fixture attempted reverse DNS')
+
+    monkeypatch.setattr(socket, 'getfqdn', unavailable_dns)
+    monkeypatch.setattr(socket, 'gethostbyaddr', unavailable_dns)
+    server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     monkeypatch.setenv('NO_PROXY', '127.0.0.1')
