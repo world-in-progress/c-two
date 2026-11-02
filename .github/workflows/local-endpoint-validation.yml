@@ -302,7 +302,7 @@ jobs:
 
       - name: Cache the pinned Emscripten SDK
         id: emsdk_cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: emsdk
           key: emsdk-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
@@ -363,7 +363,7 @@ jobs:
       # script), so both npm trees and Emscripten 5.0.2 are required inputs.
       - name: Cache the pinned FastDB WASM prerequisite
         id: fastdb_wasm_cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fastdb/ts/fastdb4ts/src/wasm
           key: fastdb-wasm-${{ runner.os }}-${{ runner.arch }}-${{ env.FASTDB_SOURCE_SHA }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
