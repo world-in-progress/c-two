@@ -103,7 +103,7 @@ jobs:
           ref: ${{ env.FASTDB_SOURCE_SHA }}
           path: fastdb
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
@@ -115,7 +115,7 @@ jobs:
         with:
           arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
       - uses: astral-sh/setup-uv@v6
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           check-latest: true
@@ -132,7 +132,7 @@ jobs:
           assert 'host: aarch64-pc-windows-msvc' in subprocess.check_output(['rustc', '-vV'], text=True)
           assert subprocess.check_output(['node', '-p', 'process.arch'], text=True).strip() == 'arm64'
       - name: Set up Go for relay benchmark tool
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.27.2'
           cache: false
@@ -168,7 +168,7 @@ jobs:
       # All five Cargo workspaces write this target. A workspace-aware pruner
       # would delete the other workspaces' dependencies; Cargo fingerprints
       # validate the complete restored tree before every build/test command.
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6
         id: cargo_cache
         with:
           path: |
@@ -187,7 +187,7 @@ jobs:
           version: v0.16.0
       - name: Cache the pinned Emscripten SDK
         id: emsdk_cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: emsdk
           key: emsdk-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
@@ -237,7 +237,7 @@ jobs:
           (Get-Location).Path | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           (Join-Path (Get-Location).Path "upstream/emscripten") | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Cache the pinned FastDB WASM prerequisite
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fastdb-wasm
           key: source-fastdb-wasm-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.FASTDB_SOURCE_SHA }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
@@ -259,7 +259,7 @@ jobs:
           --output "artifacts/source"
       - name: Save shared Cargo outputs, including after test failures
         if: always() && !cancelled() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -319,7 +319,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
