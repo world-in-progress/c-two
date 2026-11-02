@@ -187,6 +187,13 @@ pub struct Connection {
     /// Number of requests currently being processed.
     inflight: AtomicI32,
     pending_writes: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) signal_reply_pause: parking_lot::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// Route admission is closed; accepted calls retain response write access.
     shutdown_requested: AtomicBool,
 
@@ -242,6 +249,8 @@ impl Connection {
             fail_next_write_allocation: AtomicBool::new(false),
             inflight: AtomicI32::new(0),
             pending_writes: AtomicUsize::new(0),
+            #[cfg(test)]
+            signal_reply_pause: parking_lot::Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
             idle_notify: Notify::new(),
             publisher,
@@ -308,6 +317,14 @@ impl Connection {
 
     fn record_end(&self, end: PendingEnd) {
         self.first_end.lock().get_or_insert(end);
+    }
+
+    pub(crate) fn note_peer_close_message(&self) {
+        let _publication = self.publication_gate.lock();
+        self.record_end(PendingEnd::Explicit {
+            reason: ConnectionEndReason::PeerCloseMessage,
+            operation: "disconnect",
+        });
     }
 
     /// Publish for a connection that ended before a retirement guard was made.

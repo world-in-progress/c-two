@@ -77,7 +77,11 @@ async fn run() -> Result<(), Failure> {
         emit(metadata("probe"));
         return Ok(());
     }
-    if !matches!(arguments[0].as_str(), "serve" | "buffering" | "delayed-accept") || arguments.len() != 5 {
+    if !matches!(
+        arguments[0].as_str(),
+        "serve" | "buffering" | "delayed-accept"
+    ) || arguments.len() != 5
+    {
         return Err(Failure {
             phase: "arguments",
             message: "unknown fixture mode or missing serve arguments".into(),
@@ -115,7 +119,7 @@ async fn run() -> Result<(), Failure> {
         tasks.spawn(async move {
             tokio::time::timeout(Duration::from_secs(15), async {
                 if buffering {
-                    return buffering_exchange(stream, marker == 0).await;
+                    return buffering_exchange(stream, marker).await;
                 }
                 loop {
                     let mut size = [0_u8; 4];
@@ -172,7 +176,7 @@ async fn run() -> Result<(), Failure> {
     Ok(())
 }
 
-async fn buffering_exchange(stream: LocalStream, eof: bool) -> io::Result<()> {
+async fn buffering_exchange(stream: LocalStream, ending: u8) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let mut control = tokio::io::stdin();
     let mut first = [0; 2];
@@ -188,18 +192,64 @@ async fn buffering_exchange(stream: LocalStream, eof: bool) -> io::Result<()> {
         "simultaneous large write must reach the server intact"
     );
 
-    for bytes in [&[8, 9][..], &[1, 2], &[3, 4], &[5, 6, 7], &[1, 2, 3]] {
+    for (index, bytes) in [&[8, 9][..], &[1, 2], &[3, 4], &[5, 6, 7], &[1, 2, 3]]
+        .into_iter()
+        .enumerate()
+    {
         control.read_u8().await?;
-        writer.write_all(bytes).await?;
+        if ending == 3 && index == 4 {
+            // Expose the original race deterministically: the client has its
+            // first byte while this reply still has two bytes left to write.
+            writer.write_all(&bytes[..1]).await?;
+            emit(json!({ "kind": "buffering_last_write_parked" }));
+            control.read_u8().await?;
+            writer.write_all(&bytes[1..]).await?;
+        } else {
+            writer.write_all(bytes).await?;
+        }
     }
-    if eof {
+    emit(json!({ "kind": "buffering_writes_complete" }));
+    if ending == 0 {
         control.read_u8().await?;
     } else {
-        assert_eq!(
-            reader.read(&mut [0]).await?,
-            0,
-            "explicit close must reach the server"
-        );
+        if ending == 2 {
+            control.read_u8().await?;
+        }
+        let result = reader.read(&mut [0]).await;
+        finish_explicit_close(result, reader.peer_ended())?;
     }
     Ok(())
+}
+
+fn finish_explicit_close(result: io::Result<usize>, peer_ended: bool) -> io::Result<()> {
+    match result {
+        // c2-local records native read-side end (including Windows 232 and
+        // Unix ECONNRESET) before returning the original error to its caller.
+        Err(_) if peer_ended => Ok(()),
+        result => {
+            assert_eq!(result?, 0, "explicit close must reach the server");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_close_accepts_native_read_end_and_preserves_other_errors() {
+        finish_explicit_close(Ok(0), true).unwrap();
+        #[cfg(windows)]
+        for code in [109, 232] {
+            finish_explicit_close(Err(io::Error::from_raw_os_error(code)), true).unwrap();
+        }
+        #[cfg(unix)]
+        finish_explicit_close(Err(io::Error::from(io::ErrorKind::ConnectionReset)), true).unwrap();
+        for code in [233, 5] {
+            let error =
+                finish_explicit_close(Err(io::Error::from_raw_os_error(code)), false).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
 }

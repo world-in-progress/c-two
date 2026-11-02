@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { once } from 'node:events';
 import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import test from 'node:test';
@@ -24,18 +25,19 @@ let serverExecutable;
 function buildServer() {
   if (serverExecutable !== undefined) return serverExecutable;
   const target = process.env.CARGO_TARGET_DIR ?? resolve(packageRoot, 'target', 'endpoint-context-server');
-  let result;
   try {
     copyFileSync(resolve(packageRoot, '../../../../Cargo.lock'), resolve(fixtureRoot, 'Cargo.lock'));
-    result = spawnSync(resolveCargo(), [
-      'build', '--offline', '--manifest-path', resolve(fixtureRoot, 'Cargo.toml'),
-      '--target-dir', target,
-    ], { cwd: packageRoot, encoding: 'utf8', timeout: 100_000 });
+    for (const command of ['test', 'build']) {
+      const result = spawnSync(resolveCargo(), [
+        command, '--offline', '--manifest-path', resolve(fixtureRoot, 'Cargo.toml'),
+        '--target-dir', target,
+      ], { cwd: packageRoot, encoding: 'utf8', timeout: 100_000 });
+      assert.equal(result.status, 0, `fixture ${command} failed: ${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
+    }
   } finally {
     // Cargo's generated lock is not a package input or historical receipt.
     rmSync(resolve(fixtureRoot, 'Cargo.lock'), { force: true });
   }
-  assert.equal(result.status, 0, `fixture build failed: ${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
   serverExecutable = resolve(target, 'debug', `c2-node-endpoint-context-server${process.platform === 'win32' ? '.exe' : ''}`);
   return serverExecutable;
 }
@@ -91,6 +93,7 @@ function startServer(server, root, address, marker, connections, mode = 'serve')
       try {
         const message = JSON.parse(line);
         messages.push(message);
+        child.emit('fixture-message', message);
         if (!readySettled && message.kind === 'ready') {
           readySettled = true;
           clearTimeout(readyDeadline);
@@ -124,7 +127,24 @@ function startServer(server, root, address, marker, connections, mode = 'serve')
     }
     resolve({ code, signal, messages, stderr });
   }));
-  return { child, ready, closed };
+  return { child, ready, closed, messages };
+}
+
+function waitForMessage(fixture, kind) {
+  const existing = fixture.messages.find((message) => message.kind === kind);
+  if (existing !== undefined) return Promise.resolve(existing);
+  return new Promise((resolve, reject) => {
+    const receive = (message) => {
+      if (message.kind !== kind) return;
+      fixture.child.off('fixture-message', receive);
+      resolve(message);
+    };
+    fixture.child.on('fixture-message', receive);
+    fixture.closed.then((result) => {
+      fixture.child.off('fixture-message', receive);
+      reject(new Error(`fixture closed before ${kind}: ${JSON.stringify(result.messages)} ${result.stderr}`));
+    });
+  });
 }
 
 async function stopServer(server) {
@@ -404,13 +424,16 @@ if (process.argv[2] === '--endpoint-context-child') {
     assert.equal(result.kind, 'passed');
     t.diagnostic(result.evidence);
   });
-  for (const ending of ['EOF', 'explicit close']) {
+  for (const ending of ['EOF', 'explicit close', 'explicit close before server read', 'explicit close during final write']) {
     test(`native Node IPC pauses idle input and preserves read progress through ${ending}`, { timeout: 10000 }, async () => {
       const root = process.platform === 'win32' ? undefined : mkdtempSync('/tmp/c2-node-');
       const connect = createNodeIpcConnect({ ipcRoot: root });
       const address = `ipc://node-buffer-${process.pid}-${randomBytes(6).toString('hex')}`;
       const socketPath = connect.resolveEndpoint(address);
-      const fixture = startServer(buildServer(), root ?? '-', address, ending === 'EOF' ? 0 : 1, 1, 'buffering');
+      const gatedClose = ending === 'explicit close before server read';
+      const gatedWrite = ending === 'explicit close during final write';
+      const marker = ending === 'EOF' ? 0 : gatedClose ? 2 : gatedWrite ? 3 : 1;
+      const fixture = startServer(buildServer(), root ?? '-', address, marker, 1, 'buffering');
       let connection;
       const sendNext = () => fixture.child.stdin.write('x');
       try {
@@ -439,14 +462,32 @@ if (process.argv[2] === '--endpoint-context-child') {
         assert.deepEqual((await Promise.all(concurrent)).map((bytes) => Array.from(bytes)), [[5], [6, 7]]);
         sendNext();
         assert.deepEqual(Array.from(await connection.readExactly(1)), [1]);
-        const incomplete = connection.readExactly(3);
+        const incomplete = assert.rejects(connection.readExactly(3), /ended|closed/);
         if (ending === 'EOF') sendNext();
-        else connection.close();
-        await assert.rejects(incomplete, /ended|closed/);
+        else {
+          // Receiving the first byte does not prove the fixture's overlapped
+          // write and flush completed. Complete that phase before cancellation.
+          const closing = (async () => {
+            await waitForMessage(fixture, 'buffering_writes_complete');
+            const socketClosed = gatedClose ? once(connection.socket, 'close') : undefined;
+            connection.close();
+            if (socketClosed !== undefined) {
+              await socketClosed;
+              sendNext(); // Force the native read to observe an already closed peer.
+            }
+          })();
+          if (gatedWrite) {
+            await waitForMessage(fixture, 'buffering_last_write_parked');
+            assert.equal(connection.socket.destroyed, false, 'first-byte delivery must not close a reply that is still being written');
+            sendNext();
+          }
+          await closing;
+        }
+        await incomplete;
         if (ending === 'EOF') assert.deepEqual(Array.from(await connection.readExactly(2)), [2, 3]);
         await assert.rejects(connection.readExactly(1), /ended|closed/);
         const result = await fixture.closed;
-        assert.equal(result.code, 0, result.stderr);
+        assert.equal(result.code, 0, `${JSON.stringify(result.messages)} ${result.stderr}`);
         assert.equal(result.messages.at(-1).cleanup, process.platform === 'win32' ? 'NotApplicable' : 'Reaped');
       } finally {
         connection?.close(); connect.close(); await stopServer(fixture);

@@ -85,7 +85,6 @@ const FRAME_FIXED_BODY_LEN: u32 = 12;
 const SHUTDOWN_INITIATE_FRAME_BODY_LEN: u32 =
     FRAME_FIXED_BODY_LEN + c2_wire::msg_type::SHUTDOWN_CLIENT_BYTES.len() as u32;
 const POST_SHUTDOWN_DUPLICATE_INITIATE_READ_TIMEOUT_MS: u64 = 100;
-pub(crate) const CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS: u64 = 50;
 /// Default journal reason for an explicit direct IPC shutdown transaction.
 pub const DIRECT_IPC_SHUTDOWN_REASON: &str = "direct_ipc_shutdown";
 fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
@@ -1956,16 +1955,13 @@ async fn handle_post_shutdown_connection(
             FLAG_RESPONSE | FLAG_SIGNAL,
             &encode_shutdown_ack(),
         );
-        let _ = tokio::time::timeout(DEFAULT_CONNECT_TIMEOUT, async {
+        let deadline = tokio::time::Instant::now() + server.config.write_timeout();
+        let _ = tokio::time::timeout_at(deadline, async {
             tokio::io::AsyncWriteExt::write_all(&mut write_half, &ack).await?;
             tokio::io::AsyncWriteExt::flush(&mut write_half).await
         })
         .await;
-        wait_for_control_peer_close(
-            &mut reader,
-            tokio::time::Instant::now() + Duration::from_millis(CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS),
-        )
-        .await;
+        wait_for_control_peer_close(&mut reader, deadline).await;
     }
 }
 
@@ -2239,7 +2235,17 @@ fn handle_connection(
                     payload.first().and_then(|&b| MsgType::from_byte(b)),
                     Some(MsgType::ShutdownClient)
                 ) {
-                    handle_shutdown_signal(&server, payload, request_id, &writer).await;
+                    let deadline = tokio::time::Instant::now() + server.config.write_timeout();
+                    let initiated =
+                        handle_shutdown_signal(&server, payload, request_id, &writer).await;
+                    if initiated && !conn.handshake_done() {
+                        // Adapter flush does not prove that a Named Pipe peer
+                        // consumed the ACK. Its one-exchange client closes
+                        // after reading it; retain the OS stream until then.
+                        // Established RPC peers keep their ordinary receive
+                        // loop so accepted calls and releases still progress.
+                        wait_for_control_peer_close(&mut reader, deadline).await;
+                    }
                     if *server.shutdown_tx.borrow() {
                         conn.begin_shutdown();
                     } else {
@@ -2247,7 +2253,7 @@ fn handle_connection(
                     }
                     continue;
                 }
-                match handle_signal(payload, request_id, &writer).await {
+                match handle_signal(payload, request_id, &writer, &conn).await {
                     SignalAction::Continue => {}
                     SignalAction::Disconnect => {
                         conn.end(ConnectionEndReason::PeerCloseMessage, "disconnect");
@@ -2760,9 +2766,9 @@ async fn handle_shutdown_signal(
     payload: &[u8],
     request_id: u64,
     writer: &Arc<ConnectionWriter>,
-) {
+) -> bool {
     if decode_shutdown_initiate(payload).is_err() {
-        return;
+        return false;
     }
     let frame = encode_frame(
         request_id,
@@ -2773,12 +2779,14 @@ async fn handle_shutdown_signal(
     // through the server shutdown transaction, independently of this write.
     let _ = writer.queue_control(frame);
     server.request_shutdown_signal();
+    true
 }
 
 async fn handle_signal(
     payload: &[u8],
     request_id: u64,
     writer: &Arc<ConnectionWriter>,
+    conn: &Connection,
 ) -> SignalAction {
     let sig = match payload.first().and_then(|&b| MsgType::from_byte(b)) {
         Some(s) => s,
@@ -2791,8 +2799,29 @@ async fn handle_signal(
         _ => return SignalAction::Continue,
     };
 
+    if matches!(action, SignalAction::Disconnect) {
+        // Parsing DISCONNECT precedes any ACK write failure on another task.
+        // This records the first cause only; the caller still deactivates after
+        // enqueueing the courtesy reply; native read-side end settles loans.
+        conn.note_peer_close_message();
+    }
     let frame = encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, reply);
+    #[cfg(test)]
+    let pause = conn.signal_reply_pause.lock().take();
+    #[cfg(test)]
+    let drain_reply = if let Some((entered, resume)) = pause {
+        let _ = entered.send(());
+        let _ = resume.await;
+        true
+    } else {
+        false
+    };
     let _ = writer.queue_control(frame);
+    #[cfg(test)]
+    if drain_reply {
+        // Allow the writer's terminal result to win the scheduling race.
+        conn.wait_idle().await;
+    }
     action
 }
 

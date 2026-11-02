@@ -2949,6 +2949,7 @@ async fn connection_accepted_after_shutdown_reads_duplicate_shutdown_signal() {
     assert_eq!(frame_header.request_id, 7);
     assert!(frame_header.flags & FLAG_SIGNAL != 0);
     assert!(frame_header.flags & FLAG_RESPONSE != 0);
+    drop(client);
     handler.await.expect("handler completes");
 }
 
@@ -3488,6 +3489,134 @@ async fn established_raw_shutdown_receives_single_byte_ack() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn standalone_shutdown_ack_survives_delayed_read_until_peer_closes() {
+    for already_stopping in [false, true] {
+        let server = Arc::new(
+            test_server_new(
+                &unique_readiness_address("shutdown_delayed_ack"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        if already_stopping {
+            server.request_shutdown_signal();
+        }
+        let (mut client, stream) = isolated_pair().await;
+        let mut handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+        client
+            .write_all(&encode_frame(
+                17,
+                FLAG_SIGNAL,
+                &c2_wire::shutdown_control::encode_shutdown_initiate(),
+            ))
+            .await
+            .unwrap();
+        // Keep the client read parked beyond the retired 50 ms courtesy window.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut handler)
+                .await
+                .is_err(),
+            "the ACK stream must survive until its control peer consumes it and closes"
+        );
+        let (id, flags, payload) = read_reply_frame(&mut client).await;
+        assert_eq!(id, 17);
+        assert_eq!(flags, FLAG_SIGNAL | FLAG_RESPONSE);
+        assert_eq!(payload, c2_wire::shutdown_control::encode_shutdown_ack());
+        assert!(
+            !handler.is_finished(),
+            "reading the ACK alone is not peer close"
+        );
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.active_connection_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn standalone_shutdown_ack_peer_wait_uses_configured_write_budget() {
+    for already_stopping in [false, true] {
+        let server = Arc::new(
+            test_server_new(
+                &unique_readiness_address("shutdown_ack_budget"),
+                ServerIpcConfig {
+                    base: c2_config::BaseIpcConfig {
+                        write_timeout_secs: 0.05,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        if already_stopping {
+            server.request_shutdown_signal();
+        }
+        let (mut client, stream) = isolated_pair().await;
+        let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+        client
+            .write_all(&encode_frame(
+                18,
+                FLAG_SIGNAL,
+                &c2_wire::shutdown_control::encode_shutdown_initiate(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read_reply_frame(&mut client).await.0, 18);
+        // A control peer retaining its stream cannot extend the configured
+        // ACK budget, and receipt of the ACK alone does not prove shutdown.
+        tokio::time::timeout(Duration::from_secs(2), handler)
+            .await
+            .expect("control peer wait respects the existing write budget")
+            .unwrap();
+        drop(client);
+    }
+}
+
+#[tokio::test]
+async fn disconnect_cause_precedes_failed_ack_when_receive_loop_is_paused() {
+    let server = Arc::new(
+        test_server_new(
+            &unique_readiness_address("disconnect_failed_ack"),
+            ServerIpcConfig::default(),
+        )
+        .unwrap(),
+    );
+    let (mut client, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+    handshake_test_client(&mut client).await;
+    let conn = server
+        .active_connection(server.active_connection_ids()[0])
+        .unwrap();
+    let observation = conn.connection_observation();
+    let (entered, paused) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    *conn.signal_reply_pause.lock() = Some((entered, resumed));
+    client
+        .write_all(&encode_frame(
+            0,
+            FLAG_SIGNAL,
+            &c2_wire::msg_type::DISCONNECT_BYTES,
+        ))
+        .await
+        .unwrap();
+    paused.await.unwrap();
+    // The receive loop has decoded DISCONNECT. Its ACK must now fail against
+    // a closed peer, and that writer result is observed before the loop resumes.
+    drop(client);
+    resume.send(()).unwrap();
+    let closed = observation
+        .wait_closed(Some(Duration::from_secs(2)))
+        .await
+        .unwrap();
+    assert_eq!(closed.reason(), ConnectionEndReason::PeerCloseMessage);
+    assert_eq!(closed.operation(), "disconnect");
+    handler.await.unwrap();
 }
 
 #[tokio::test]
