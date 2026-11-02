@@ -16,7 +16,7 @@ Current usage is documented in [lifecycle integration](../reference/local-endpoi
 
 ## 0.10.0 maintenance
 
-The [current slimming record](2026-10-13-local-slimming-batches.md) tracks ownership and runtime convergence; open work and pending decisions are collected in the [backlog](backlog.md), a Chinese working record. The [0.10.0 release notes](../releases/0.10.0.md) cover IPC 14 version diagnostics, Unix endpoint namespace format 3, independent Python Runtime instances and failed-release ownership; the [0.9.0](../releases/0.9.0.md) and [0.8.0](../releases/0.8.0.md) notes cover Windows user scope, physical connection observations, explicit owner recovery, structured local OS causes, chunk admission and SHM response convergence. Two control-session refactors remain deferred. The [0.7.4 implementation](../acceptance/0.7.4.md) and [validation](../acceptance/0.7.4-final-validation.md) remain historical evidence.
+The [current slimming record](2026-10-13-local-slimming-batches.md) tracks ownership and runtime convergence; open work and pending decisions are collected in the [backlog](backlog.md), a Chinese working record. The [0.10.0 release notes](../releases/0.10.0.md) cover IPC 14 version diagnostics, Unix endpoint namespace format 3, independent Python Runtime instances and failed-release ownership; the [0.9.0](../releases/0.9.0.md) and [0.8.0](../releases/0.8.0.md) notes cover Windows user scope, physical connection observations, explicit owner recovery, structured local OS causes, chunk admission and SHM response convergence. The [0.7.4 implementation](../acceptance/0.7.4.md) and [validation](../acceptance/0.7.4-final-validation.md) remain historical evidence.
 
 ## Status Definitions
 

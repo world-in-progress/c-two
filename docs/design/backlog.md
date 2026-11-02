@@ -4,11 +4,11 @@
 
 ## 进行中
 
-- **已验收、待合入上游的三批。** 三个分支依次叠放，都只在本地：
+- **已验收、待合入上游的三批。** 三个分支依次叠放，协议批（`socu/protocol-batch`）叠在最上面：
   - 接口精简第一批（`socu/interface-slimming`）：[接口审查](2026-10-31-api-surface-review.md)第一、二节与决定 2、3。fork 全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331)（`f0f9efaa`）在 Linux、macOS、Windows x64 与 ARM64 上通过。
   - 过度防御复审的真缺陷与死代码两批（`socu/over-defense-batches`）：见[执行计划](2026-10-31-defect-and-dead-code-batches.md)。fork 全量 CI [41192397960](https://github.com/Dsssyc/c-two/actions/runs/41192397960)（`e1630cf1`）在四个平台上通过。
   - 文档与 AGENTS.md 重组（`socu/docs-restructure`）：见[执行计划](2026-10-31-docs-and-agents-restructure.md)。AGENTS.md 从 64,905 字节减到 22,243 字节；`docs/` 按角色分成六个目录；新增术语表 `CONTEXT.md`，并统一了现行文档的用词。fork 全量 CI [41218012397](https://github.com/Dsssyc/c-two/actions/runs/41218012397)（`08b8c65c`）在四个平台上通过。
-  - 之后：用户 2026-11-01 决定这一轮的工作做完再向上游开 PR，不开半截的。在此之前，fork 上的 `socu/docs-restructure-ci`（`08b8c65c`，含整个叠放）是这三批唯一的远端副本，保留。
+  - 之后：用户 2026-11-01 决定这一轮的工作做完再向上游开 PR，不开半截的。fork 上的 `socu/protocol-batch`（`d646fc12`）含这三批与协议批，是它们唯一的远端副本；原先的 `socu/docs-restructure-ci` 已于 2026-11-03 删除。
 
 ## 接下来（Host 建议的顺序，待用户确认）
 
@@ -35,7 +35,7 @@
 7. **TypeScript 与 Node：** R16 剩下的完整 Node→Core 投影迁移；解码不透明的响应 allocator。
 8. **发版工具，方案 B**（[发版敏捷性审查](2026-10-30-release-agility-review.md)第三、四节）：与产品代码无关，可以随时插入。B1 候选重整、B2 删除约 8 千行（`tools/local_rc` 与 `local-endpoint-validation.yml` 仍在）、B3 FastDB 版本只写一处、B5 精简各条线的 gate、B6 修 `PROBE_BUDGET` 的偶发失败。
 
-各批一并删除只钉源码文本或已删名字的测试（复审第六节）；复审附录里各区未裁决的待议项，实施到对应区域时再定。[瘦身账本](2026-10-13-local-slimming-batches.md)暂缓表里的其余各项，包括两份控制会话重构，仍按账本写明的暂缓条件。
+各批一并删除只钉源码文本或已删名字的测试（复审第六节）；复审附录里各区未裁决的待议项，实施到对应区域时再定。[瘦身账本](2026-10-13-local-slimming-batches.md)暂缓表与条目边界表里的其余各项仍按账本写明的条件。
 
 ## 要核实的事
 

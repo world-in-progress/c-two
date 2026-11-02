@@ -18,7 +18,7 @@ Portable-payload 架构与历史本地候选参考为：
 
 ## 0.10.0 维护
 
-[当前瘦身记录](2026-10-13-local-slimming-batches.md)跟踪所有权与运行时收敛；尚未完成的工作与待决定的事项集中在[待办清单](backlog.md)。[0.10.0 更新说明](../releases/0.10.0.md)涵盖 IPC 14 版本诊断、Unix 端点命名空间格式 3、独立 Python Runtime 与释放失败时的所有权；[0.9.0](../releases/0.9.0.md) 与 [0.8.0](../releases/0.8.0.md) 说明涵盖 Windows 用户作用域、物理连接通知、显式所有者恢复、结构化本地 OS 原因、分片准入和 SHM 回复收敛。两份控制会话重构继续暂缓。[0.7.4 实施](../acceptance/0.7.4.zh-CN.md)与[验证记录](../acceptance/0.7.4-final-validation.zh-CN.md)保留为历史证据。
+[当前瘦身记录](2026-10-13-local-slimming-batches.md)跟踪所有权与运行时收敛；尚未完成的工作与待决定的事项集中在[待办清单](backlog.md)。[0.10.0 更新说明](../releases/0.10.0.md)涵盖 IPC 14 版本诊断、Unix 端点命名空间格式 3、独立 Python Runtime 与释放失败时的所有权；[0.9.0](../releases/0.9.0.md) 与 [0.8.0](../releases/0.8.0.md) 说明涵盖 Windows 用户作用域、物理连接通知、显式所有者恢复、结构化本地 OS 原因、分片准入和 SHM 回复收敛。[0.7.4 实施](../acceptance/0.7.4.zh-CN.md)与[验证记录](../acceptance/0.7.4-final-validation.zh-CN.md)保留为历史证据。
 
 ## 状态定义
 
