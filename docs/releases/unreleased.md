@@ -114,6 +114,8 @@ The documentation is organized by role, so links into the old tree no longer res
 
 The full fork CI run [41218012397](https://github.com/Dsssyc/c-two/actions/runs/41218012397) on `08b8c65c` passed on Linux, macOS, Windows x64 and Windows ARM64.
 
+Before this release, the README files, reference pages, examples and Python type declarations were checked statically against the code and corrected; the examples were compiled, not run.
+
 ## Single-owner shared-memory release (breaking)
 
 Each shared-memory block now has one owner ([ADR 0001](../decisions/0001-single-owner-release.md), [design](../design/2026-11-01-protocol-batch-design.md)). The owner lends the block; the receiver copies it into a local buffer and returns the loan in a release frame right after the copy. Requests are released before the resource method runs and responses before decoding or delivering a hold, so a slow resource method or a long `cc.hold` no longer keeps the peer's shared memory.
