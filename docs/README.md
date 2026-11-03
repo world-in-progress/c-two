@@ -50,7 +50,7 @@ This page routes each subject to the document that owns it. It states no behavio
 | Document | Role |
 | --- | --- |
 | [Backlog](design/backlog.md) | The only list of open work and pending decisions |
-| [Roadmap](design/roadmap.md) ([中文](design/roadmap.zh-CN.md)) | Priorities for the 0.x line |
+| [Roadmap](design/roadmap.md) ([中文](design/roadmap.zh-CN.md)) | Direction of the 0.x line and exit criteria of the product capabilities; their order is in the backlog |
 | [Endgame architecture](design/endgame-architecture.md) | The long-range architecture the roadmap works toward |
 | [Contract-release deferred capabilities](design/contract-release-deferred-capabilities.md) | Capabilities deliberately left out of the portable contract release, with their exit conditions |
 
