@@ -1,5 +1,7 @@
 # 协议批详细设计
 
+状态：已实施，2026-11-03 经 [world-in-progress/c-two#215](https://github.com/world-in-progress/c-two/pull/215) 合入上游 main（`b81405fe`），验收见[验收记录](../acceptance/2026-11-03-protocol-batch-acceptance.md)。
+
 日期：2026-11-01；代码依据为本次输入 `dac630f0131b706402e1fb2b89204443a998a06e`。本稿按独立评估、Host 代码复核与用户当日同意的方向制定：请求与响应复制完成即释放传输租约，SDK hold 只保留本地副本；删除自动心跳及两项设置，保留手动 ping；本批不加每连接借出额度。只修订设计，未改代码、构建或运行测试。范围以 `docs/design/backlog.md:17-20` 为准，并将 E-host 并入本批；Host 同步待办中的旧状态。已有论证见[单一属主评估](2026-10-31-single-owner-release-evaluation.md)、[过度防御复审](2026-10-31-over-defense-review.md)与[共享内存借出调研](../research/2026-11-01-shared-memory-lending-survey.md)。用户 2026-11-01 批准本设计，包括第十节的 D7（按所列条件）与性能门槛。
 
 引用中的 `c2-*` 按 `AGENTS.md:107-122` 的 crate 根展开，行号属于上述代码输入。本文先定义几个设计用语：“物理连接 / physical connection”是一对已建立的 OS 流，不是 proxy；“借出 / lending”是属主通过该连接发布一个分配供对端读取；“借出表 / loan book”按连接保存尚未释放的真实分配；“停用 / deactivation”停止业务准入而保留尚需结算的连接；“连接核心 / connection core”是统一管理该连接写队列、借出表和结束状态的内部对象，代码名 `ConnectionCore`。“释放 / release”统一指结束租约或分配；跨进程时借用方交付释放记录，属主收到后回收分配。下文不用“归还”另指同一动作。“属主 / pool owner”与待删除子系统的“所有者 / owner”仍按 `CONTEXT.md:59-68,126-128` 区分。

@@ -1,6 +1,6 @@
 # 交互面精简审查
 
-日期：2026-10-31。输入：upstream main `606b8f13`。状态：用户同意 Host 的建议（2026-10-31）。第一、二节与决定 2、3 已在本地分支 `socu/interface-slimming` 实施并验收，macOS 并排验证与 fork 全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331)（Linux、macOS、Windows x64 与 ARM64）都已通过。第三节的逐项表仍待用户决定；第六节的所有者子系统已决定删除，并入协议批（2026-11-01）。
+日期：2026-10-31。输入：upstream main `606b8f13`。状态：用户同意 Host 的建议（2026-10-31）。第一、二节与决定 2、3 已实施并验收，2026-11-03 经 [world-in-progress/c-two#215](https://github.com/world-in-progress/c-two/pull/215) 合入上游 main，macOS 并排验证与 fork 全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331)（Linux、macOS、Windows x64 与 ARM64）都已通过。第三节的逐项表仍待用户决定；第六节的所有者子系统已决定删除，并入协议批（2026-11-01）。
 
 起因：用户要求按 C-Two 的品味审查各个交互面是否足够精简。理由不只是方便下游开发者：C-Two 不在模型已有的知识里，AI 只能把接口读进上下文，接口越大，越占上下文，也越容易丢掉关键细节，这不利于在 C-Two 之上继续做更复杂的下游应用。流式 RPC 是将来必须有的能力，它新增的接口也按本文的分层与预算来设计。
 
