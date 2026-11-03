@@ -12,9 +12,9 @@ Both server and client IPC overrides accept these independent byte budgets:
 
 | Override | Native default | Charged storage |
 | --- | --- | --- |
-| `shm_backing_budget_bytes` | 8 GiB | Locally created buddy and dedicated SHM mappings, including headers and alignment |
+| `shm_backing_budget_bytes` | 8 GiB | Locally created buddy and dedicated SHM mappings, including alignment |
 | `file_backing_budget_bytes` | 16 GiB | Locally created file backing length |
-| `live_reassembly_budget_bytes` | 8 GiB | Reassembly capacity retained by incomplete, queued, executing or held payloads |
+| `live_reassembly_budget_bytes` | 8 GiB | Incomplete reassembly and assembled payloads not yet copied out; copied before the resource method runs or a hold is delivered, then released immediately |
 
 Zero rejects every positive reservation. The entire `u64` range is valid; zero does not mean unlimited. Per-message `max_payload_size` and `max_reassembly_bytes` limits apply independently; `max_total_chunks` applies to chunks in flight across requests, and `max_pool_segments` limits pool segments. Budgets cover C-Two-owned IPC backing and reassembly, without bounding Python/FastDB heaps, HTTP buffers, receiver-opened peer mappings or total process RSS.
 
@@ -42,7 +42,7 @@ Server responses up to `shm_threshold` use inline frames. Larger responses try b
 
 SHM 4 segments carry no header: data starts at offset 0, the format comes from the handshake, and each segment's kind and generation are part of its OS name. The bitmap, live records, counters and lock stay with the owner, so a segment does not describe itself. A receiver checks a descriptor's range once against the actual OS view span with checked arithmetic. Peer mappings are read-only; only the owner maps a segment writable, and its local lock serializes allocation without waiting on a peer, application code or I/O. Logical sizes still round up to the allocation level, and trimming preserves the original release capacity. IPC 15 uses the [fixed preamble](ipc-handshake.md) with SHM 4 and C/FFI ABI 7; retired handshakes, SHM layouts and ABIs are rejected.
 
-Receiver reassembly reserves full capacity, `total_chunks × chunk_size`, before accepting the storage. Allocation tries buddy reuse, reuse after GC, buddy expansion, dedicated SHM and finally file mmap. Completion may trim logical length while the capacity charge remains until storage release. Resources receive the complete assembled input; chunk transfer does not provide incremental resource input.
+Receiver reassembly reserves full capacity, `total_chunks × chunk_size`, plus one byte per chunk for received flags, before accepting the storage. Allocation tries buddy reuse, reuse after GC, buddy expansion, dedicated SHM and finally file mmap. Completion may trim logical length while the capacity charge remains until storage release. Resources receive the complete assembled input; chunk transfer does not provide incremental resource input.
 
 A server processes at most `max_total_chunks` chunk frames at once. A chunked request is settled by its first refusal, whether a chunk finds no free slot, its first chunk exceeds the size or reassembly limits, or the receive loop and a chunk task refuse it at the same time: the server sends one error reply per connection and request id, then discards the request's remaining chunks before they take a slot, returning any SHM they carry. The connection and its other calls continue. A late chunk of an assembly that GC removed gets one error and settles the request the same way. The settled marker holds metadata only and is removed at the request's last chunk, at connection end, or when the GC sweep finds it older than `chunk_assembler_timeout`; a chunk delayed past that point is treated as a chunk of an unknown request and draws one more error reply.
 
@@ -115,7 +115,7 @@ cc.set_client(ipc_overrides=dict(BUDGET))
 
 Equivalent environment variables are `C2_IPC_SHM_BACKING_BUDGET_BYTES`, `C2_IPC_FILE_BACKING_BUDGET_BYTES` and `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES`. Code overrides take precedence over process environment, `.env` and native defaults. Outgoing client policy freezes on its first connection attempt, including failure; cache reuse requires equality of the complete resolved policy. Close the old Runtime and configure a new Runtime to select different limits. Older retained payloads remain charged to their original domain.
 
-The finite defaults deliberately change the earlier aggregate limit and may need adjustment for workloads exceeding them; they do not guarantee that every scientific workload fits. Refusal happens before allocation and increments `rejected_allocations` / `rejected_bytes` in the relevant cell. Control frames such as ping and heartbeat allocate no data backing and consume none of these budget cells.
+The finite defaults deliberately change the earlier aggregate limit and may need adjustment for workloads exceeding them; they do not guarantee that every scientific workload fits. Refusal happens before allocation and increments `rejected_allocations` / `rejected_bytes` in the relevant cell. Control frames such as ping allocate no data backing and consume none of these budget cells.
 
 ### Standalone relay
 
@@ -143,7 +143,7 @@ The FastDB invalidator is marked attempted before entry and runs at most once, i
 
 A borrower that has not copied, does not read its connection or blocks the release path keeps its loans: the owner reuses a published block only after its release record or the connection's peer end, never after a wait or timeout. Peer end means read EOF or, on Unix, a read-side ECONNRESET; a local cancel, timeout, ordinary I/O error or DISCONNECT does not settle loans. When the read side fails without proof of an end, the remaining loans stay in the original pool until it is destroyed. A process that inherited the connection keeps it alive until its last copy closes. Copy-then-release limits loans to calls in progress and their release window, but it is not a byte limit and does not isolate one connection's traffic from another's; when the shared pool is full, allocation falls back through dedicated SHM, inline or chunked transfer and file reassembly, and returns the original capacity error without truncation when every budget is exhausted.
 
-A prepared SHM reply becomes a loan once it enters the loan book before its first byte. A later write failure, deadline or cancellation leaves it to the release record or peer end and never frees peer-visible storage early. Fill errors, panic, cancellation while waiting for the writer and failure before the first byte free the block locally; an inline/chunk fallback cannot hide their original failure.
+A prepared SHM reply becomes a loan once it enters the loan book before its first byte. A later write failure, deadline or cancellation leaves it to the release record or peer end and never frees peer-visible storage early. Fill errors, panic, cancellation while waiting for the writer and failure before the write begins free the block locally; an inline/chunk fallback cannot hide their original failure.
 
 `cc.shutdown()` does not invalidate the local copies of SDK holds; they stay readable until released. Backing charges remain in retired domains while a real owner keeps them. A zero charge and the removal of an observation record can occur at different times; the weak observation disappears after the last actual owner is gone. Statistics do not keep pools, connections, Runtimes, callbacks or payloads alive.
 

@@ -3,7 +3,7 @@
 Connects to the Grid CRM through the relay using the routing name plus
 the Grid CRM contract fingerprint.
 
-Run (after starting relay.py and resource.py):
+Run (after starting c3 relay and resource.py):
     uv run python examples/python/relay_mesh/client.py
 """
 import sys

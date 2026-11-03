@@ -66,13 +66,13 @@ FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link
 
 The Python SDK does not embed or start a relay server. Start the standalone Rust relay with `c3 relay`, Docker Compose, or orchestration such as Kubernetes, then point Python code at its relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`. The anchor is used for registration and name resolution. Remote HTTP calls still use the resolved route's `relay_url` directly, and local direct IPC is selected only for a loopback/local anchor. Relay-aware clients preflight routes before the first call and may refresh a stale route once. Ambiguous data-plane failures are not replayed.
 
-After the source-mode build, configure the absolute Core SDK library directory for Rust consumers spawned by interoperability tests. Follow the development setup in the repository README and [Windows guide](https://github.com/world-in-progress/c-two/blob/main/docs/reference/windows-native-usage.md) for platform-specific loader paths and test prerequisites. Keep the existing extension build while running the Python tests:
+After the source-mode build, configure the absolute Core SDK library directory for Rust consumers spawned by interoperability tests. The full Python suite requires `hey` v0.1.4 on PATH (`go install github.com/rakyll/hey@v0.1.4`). Follow the development setup in the repository README and [Windows guide](https://github.com/world-in-progress/c-two/blob/main/docs/reference/windows-native-usage.md) for platform-specific loader paths and test prerequisites. Keep the existing extension build while running the Python tests:
 
 ```bash
-C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests -q -n 4 --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests -q --timeout=30
 ```
 
-The four-worker command is for Linux/macOS; omit `-n 4` on Windows. See the [test guide](https://github.com/world-in-progress/c-two/blob/main/sdk/python/tests/README.md) for prerequisites and longer real-idle and interoperability cases.
+For parallel execution, `tools/dev/test_python.py` runs ordinary test files in parallel and the complete matrices serially; see [CONTRIBUTING.md](https://github.com/world-in-progress/c-two/blob/main/CONTRIBUTING.md) for usage. See the [test guide](https://github.com/world-in-progress/c-two/blob/main/sdk/python/tests/README.md) for prerequisites and longer real-idle and interoperability cases.
 
 Run Rust core checks when validating shared native runtime changes:
 

@@ -1,6 +1,6 @@
 # Python tests and benchmarks
 
-Run commands from the repository root. Follow the [development setup](../../../docs/reference/development.md) for the matching FastDB Core SDK, sibling source fixtures, Node/Emscripten and Python 3.10 prerequisites. Build the Python native extension and standalone C3 before relay tests:
+Run commands from the repository root. Follow the [development setup](../../../docs/reference/development.md) for the matching FastDB Core SDK, sibling source fixtures, Node/Emscripten and Python 3.10 prerequisites. The full Python suite also requires `hey` v0.1.4 on PATH (`go install github.com/rakyll/hey@v0.1.4`). Build the Python native extension and standalone C3 before relay tests:
 
 ```bash
 FASTDB_PAYLOAD_LINK_MODE=source uv sync
@@ -11,13 +11,13 @@ The SDK does not embed a relay. Tests start their own `c3 relay` processes using
 
 ## Run the suite
 
-On Linux/macOS, run independent cases with four pytest workers:
+Run the full suite in one process:
 
 ```bash
-C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests -q -n 4 --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests -q --timeout=30
 ```
 
-The shared fixtures isolate IPC names by run and worker and lock relay startup only through readiness. Windows uses the serial Python harness; omit `-n 4`. In PowerShell, clear inherited relay discovery with `$env:C2_RELAY_ANCHOR_ADDRESS = ''` before running the command.
+The shared fixtures isolate IPC names by run and worker and lock relay startup only through readiness. For parallel execution, `tools/dev/test_python.py` runs ordinary test files in parallel and the complete matrices serially; see [CONTRIBUTING.md](../../../CONTRIBUTING.md) for usage. In PowerShell, clear inherited relay discovery with `$env:C2_RELAY_ANCHOR_ADDRESS = ''` before running the command.
 
 The default timeout is 30 seconds per test. Tests that require longer waits declare their own timeout: the real idle-cleanup regression uses 240 seconds and waits through two actual 62-second idle periods. Portable interoperability gates use 300 seconds. Do not shorten those waits to test-only pool settings.
 
@@ -52,7 +52,6 @@ Python 3.10 is the supported minimum; a skipped interpreter check is not a passi
 | `integration/test_client_pool_idle_cleanup.py` | Two real processes, default idle grace and stable Unix socket counts |
 | `integration/test_typescript_persistent_ipc.py` | Generated TypeScript bindings across route changes and reconnects |
 | `integration/test_memory_capacity_errors.py`, `integration/test_memory_budget_lifetime.py` | Capacity errors, accounting and retained input/response lifetimes |
-| `integration/test_owner_bound_lifecycle.py` | Owner capability and shutdown barriers |
 | `integration/test_http_relay.py`, `integration/test_relay_mesh.py` | External relay and mesh discovery/forwarding |
 | `integration/test_portable_payload_cross_language.py`, `integration/test_portable_payload_matrix.py` | Rust/Python portable payloads and the exact 18-row matrix |
 | `integration/test_typescript_real_calls.py` | Generated TypeScript calls and payload lifetimes |

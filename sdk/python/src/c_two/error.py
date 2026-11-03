@@ -93,7 +93,7 @@ class CoreError(CCBaseError, RuntimeError):
         'invalid_server_id', 'config_frozen', 'client_config_frozen',
         'duplicate_route', 'missing_route', 'missing_relay_address',
         'register_failure',
-        'held_response_copy', 'held_response_release', 'response_copy',
+        'held_response_release', 'response_copy',
         'configuration', 'server', 'startup_timeout', 'relay',
         'runtime_retired', 'shutdown_wait_timeout',
     ] | None

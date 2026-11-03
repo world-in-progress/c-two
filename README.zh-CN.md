@@ -33,7 +33,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 - **跨语言契约与载荷**：`@cc.transfer(...)` 绑定 FastDB `Payload` 规格。契约工具验证描述符并生成 Python、Rust、TypeScript 绑定；Python 之间也支持普通 Python 值。
 - **按契约路由**：客户端匹配路由名称、CRM 身份和契约哈希。Relay 发现选择经过验证的本机 IPC 路径或 HTTP 目标；`c3` 独立运行 relay，并支持 relay mesh。
 - **原生内存传输**：IPC 使用按需 buddy 池、独占共享内存、检查过的分片传输及文件溢出。通过预算和空闲回收控制大载荷的内存与文件用量。详见[内存策略](docs/reference/memory-policy.md)。
-- **明确的载荷生命周期**：`cc.hold()` 保留响应租约，资源注册可选择借用输入；释放时先使载荷所有者和 checked view 失效，再释放传输存储。详见 [Python 载荷用法](docs/reference/python-usage.zh-CN.md)。
+- **明确的载荷生命周期**：`cc.hold()` 保留响应的本地副本，注册时可为方法选择借用输入；hold 与借用输入都只保留本地副本，释放时先使载荷所有者和 checked view 失效，再释放本地副本。详见 [Python 载荷用法](docs/reference/python-usage.zh-CN.md)。
 - **连接观察**：`cc.observe.connection_events()` 汇总客户端和服务端物理 IPC 连接，一个可关闭的消费者替代逐连接阻塞等待；原因只描述连接事实，不证明进程已经退出。
 - **资源生命周期管理**：原生 shutdown 排空工作，限定范围的端点维护清理已确认退出的端点。详见[生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
 - **统一 Rust core**：Python 与 Rust 共用路由、传输、内存、错误和生命周期机制。原生 c3 CLI 在 Linux、macOS、Windows x64 / ARM64 上提供 relay、契约工具和端点维护。
