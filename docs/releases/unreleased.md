@@ -4,7 +4,7 @@ The latest release is [C-Two 0.10.1](0.10.1.md) with the existing c3 0.6.0; its 
 
 ## Smaller public surface (breaking)
 
-The Python and Rust SDKs now keep only the everyday API at their roots. Everything else moves into four modules, grouped by who uses it. The reasons and measurements are in the [interface review](../design/2026-10-31-api-surface-review.md). Update imports; no aliases or old paths remain. Protocol, ABI, SHM and storage formats are unchanged.
+The Python and Rust SDKs now keep only the everyday API at their roots. Everything else moves into three modules, grouped by who uses it. The reasons and measurements are in the [interface review](../design/2026-10-31-api-surface-review.md). Update imports; no aliases or old paths remain.
 
 ### Python
 
@@ -14,13 +14,12 @@ The `c_two` root keeps:
 - `hold`, `HeldResult`
 - `register`, `connect`, `close`, `unregister`, `serve`, `shutdown`, `server_address`, `with_call_options`
 - `set_relay_anchor`, `set_server`, `set_client`, `set_transport_policy`, `set_call_execution_limits`
-- `Runtime`, `ConcurrencyConfig`, `error`, and the four modules below, so `import c_two as cc` reaches `cc.observe.memory_stats()` without another import
+- `Runtime`, `ConcurrencyConfig`, `error`, and the three modules below, so `import c_two as cc` reaches `cc.observe.memory_stats()` without another import
 
 Everything else moved:
 
 | Module | Contents | Renamed |
 | --- | --- | --- |
-| `c_two.owner` | owner control, recovery tickets, takeover, owned children, `LifecycleConfig` | `NativeOwnerBootstrap` → `OwnerBootstrap`; use `OwnerBootstrap.adopt_owner_stdin()` instead of `cc.adopt_owner_stdin()` |
 | `c_two.endpoint` | endpoint contexts and credentials, `inspect_endpoint`, `reap_endpoint`, `sweep_endpoints`, `set_local_endpoint`, `server_credential`, `server_id` | — |
 | `c_two.observe` | connection events, `memory_stats` and its types, `call_execution_snapshot` | `native_lifecycle_snapshot` → `lifecycle_snapshot`, `native_terminal_outcome` → `shutdown_outcome` |
 | `c_two.contract` | descriptor export, release reference, diagnostics and code generation | `export_contract_descriptor` → `export_descriptor`, `export_contract_release_ref` → `release_ref`, `contract_descriptor_diagnostics` → `diagnostics`, `compile_contract_artifacts` → `compile_artifacts`, `ContractArtifact` → `Artifact`, `ContractArtifactSet` → `ArtifactSet`, `ContractCodegenError` → `CodegenError`, `ContractCodegenTarget` → `CodegenTarget` |
@@ -42,7 +41,7 @@ Module functions act on the default Runtime. `Runtime` methods of the same name 
 
 ### Rust
 
-The `c_two` crate root keeps runtime, hosting, connection, configuration-source, concurrency and error types. Endpoint administration, owner control, diagnostics and contract types move to `c_two::endpoint`, `c_two::owner`, `c_two::observe` and `c_two::contract`.
+The `c_two` crate root keeps runtime, hosting, connection, configuration-source, concurrency and error types. Endpoint administration, diagnostics and contract types move to `c_two::endpoint`, `c_two::observe` and `c_two::contract`.
 
 `direct_ipc_endpoint`, `ping_direct_ipc` and `shutdown_direct_ipc` take an `Option<&LocalEndpointContext>` and replace the `*_with_context` functions; `None` resolves the process configuration as before. Generated Rust modules use the new paths, so regenerate them.
 
@@ -58,7 +57,6 @@ These come from the [over-defense review](../design/2026-10-31-over-defense-revi
 
 - **Large chunked payloads.** Payloads larger than 64 MiB no longer fail when they travel as chunks, for example when shared memory is unavailable. A request is limited only by `max_payload_size` and `max_reassembly_bytes`; an oversized request reports a size error, not a protocol violation.
 - **Malformed input is an error.**
-  - A malformed call-control frame closes the connection with a protocol error, instead of leaving the caller to wait until its deadline.
   - A malformed shutdown acknowledgement, and a malformed control address, raise errors instead of reporting "not acknowledged" or `False`.
   - `c3 registry` reports malformed relay responses instead of printing "No routes registered."
 - **Local endpoints.**
@@ -86,7 +84,7 @@ These come from the [over-defense review](../design/2026-10-31-over-defense-revi
 | Rust: `FreeResult` | `free_at` and `release_handle` return `()` |
 | Rust: the `SyncClient` preallocation API, injected pools and pool-less `IpcClient` constructors | the configured `IpcClient::with_config` / `with_endpoint` constructors |
 | Rust: IPC route-watch recovery, the relay route event history, and unused `RelayAwareHttpClient` entry points | — |
-| Rust: `ContractLimits`, `ContractLimitsProfile` and the `*_with_limits` functions | contract limits are fixed constants |
+| Rust: `ContractLimits`, `ContractLimitsProfile`, the `*_with_limits` functions, and the `profile` field of `ContractError::LimitExceeded` and of Python `CodegenError` | contract limits are fixed constants |
 | Rust: the never-constructed `RelayDuplicateRoute` and `RelayHttp` errors, and the test-only aggregate config resolver | — |
 | Python native: the producerless server-side writable sink | resources return bytes or buffer-protocol data |
 
@@ -126,7 +124,7 @@ IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh protocol 7 replace 14, 3, 6 
 
 ### Behavior
 
-- `cc.hold` and borrowed inputs keep local copies. `HeldResult` usage is unchanged: `release()` invalidates the FastDB owner once and frees the copy, and it no longer fails or retries because of transport memory.
+- `cc.hold` and borrowed inputs keep local copies. `HeldResult` usage is unchanged: `release()` invalidates the payload owner once and frees the copy, and it no longer fails or retries because of transport memory.
 - A peer that has not copied a block, for example a stopped process or one that does not read its connection, keeps that loan until it releases it or its connection ends (read EOF, or a read-side ECONNRESET on Unix). Nothing reclaims a loan after a wait or timeout.
 - A low-level Host shutdown no longer seals the Runtime's call domain or outgoing clients; only an explicit `Runtime.shutdown()` / `cc.shutdown()` retires them. A low-level shutdown with no Host completes immediately.
 - Request IDs are 64-bit end to end instead of being truncated to 32 bits inside the client, and generated TypeScript carries them and loan IDs as `bigint`.
@@ -154,10 +152,10 @@ IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh protocol 7 replace 14, 3, 6 
 | `abandoned_releases` in every `memory_stats()` scope and `holds.by_storage` | `holds` counts local copies with `active_holds`, `total_held_bytes`, `oldest_hold_seconds` and `by_direction` |
 | The warning logged for a resource input retained over 60 seconds, `NativeServerBridge(hold_warn_seconds=...)`, `LocalCopyTracker.sweep_retained` and `RuntimeSession.sweep_local_copies` | `cc.observe.memory_stats()['holds']['oldest_hold_seconds']` |
 | Python `MemPool.data_addr`, `seg_data_info`, `open_peer`, `ensure_peer_segment`, `read_at`, `free_at`, `destroy`, and `PoolConfig(dedicated_crash_timeout_secs=...)` | The local allocation APIs; a pool is freed with its last owner |
-| Lifecycle snapshot `phase`, `terminal` and `client_held_leases` (Python `ClientHeldLeases`; Rust `HostLifecyclePhase`, `HostClientHeldLeases`) | `finished`, `listener_closed` and `work_drained` |
+| Lifecycle snapshot `policy`, `phase`, `terminal`, `watcher_error` and `client_held_leases` (Python `ClientHeldLeases`; Rust `HostLifecyclePhase`, `HostClientHeldLeases`) | `finished`, `listener_closed` and `work_drained` |
 | The dictionary returned by direct IPC `shutdown()` (`acknowledged`, `shutdown_started`, `server_stopped`, route outcomes); Rust `DirectIpcShutdownRouteOutcome` | `'initiated'`, `'absent'` or `'unconfirmed'`; Rust `DirectIpcShutdownOutcome::{Initiated, Absent, Unconfirmed}` |
 | Route revisions in route bindings, call tokens, relay resolution, HTTP headers and the mesh; IPC `RouteWatch` and route-contract queries | Route UID, server instance and contract identify a route |
-| C/FFI ABI 6 request and response pools, including `request_pool_read_local`, `request_pool_forget_consumed` and `response_pool_release`; TypeScript `createC2MemFfiNativeResponseShmReader`, the `responseShmReader` and `requestShmWriter` options, and block `allocationId` | One ABI 7 memory context per verified connection; blocks carry `loanId: bigint` ([C ABI](../reference/c-abi.md)) |
+| C/FFI ABI 6 request and response pools, including `request_pool_read_local`, `request_pool_forget_consumed` and `response_pool_release`; TypeScript `createC2MemFfiNativeResponseShmReader`, the `responseShmReader` and `requestShmWriter` options, and block `allocationId`; the TypeScript binding's request and response pool types and factories, `C2MemFfiAbiSymbols` and `C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS` | One ABI 7 memory context per verified connection (`C2MemFfiMemoryContext`, with `C2MemFfiBlock`, `C2MemFfiPreparedRequest` and `C2MemFfiWrite`); blocks carry `loanId: bigint`; `C2MemFfiNodeNativeSymbols` keeps only `symbols`, and the Node runtime no longer returns `responsePoolFactory` ([C ABI](../reference/c-abi.md)) |
 | Rust Core `HeldResponse` leases and pins, `has_pending_release`, `abandon`, `RequestLease` and `ResponseLease`, and `c2_ipc::ResponseLease` with `SyncClient::lease_response` | `Held` and `HeldResponse` own a local copy |
 
 ### Further changes
@@ -165,9 +163,9 @@ IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh protocol 7 replace 14, 3, 6 
 Found by the strict comparison against 0.10.1 and not listed above:
 
 - Python:
-  - `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverrides` live in `c_two.config`; `InputLifetimeLike`, `CoreError.body` and `Server.get_slot_info` are removed, and a proxy's tracker is `local_copy_tracker` (was `lease_tracker`).
+  - `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverrides` live in `c_two.config`; `InputLifetimeLike`, `CoreError.body` and `Server.get_slot_info` are removed, `CoreError.lifecycle_kind` no longer lists `relay_duplicate_route`, `relay_http` or `held_response_copy`, and a proxy's tracker is `local_copy_tracker` (was `lease_tracker`).
   - `c_two.mem`: `PoolAlloc.allocation_id` and `PoolStats.dedicated_pending_free_bytes` are removed; `max_dedicated_segments` above 65536 is rejected; a dedicated segment no longer has a 64-byte header.
-- Rust: `Held::release` consumes the value even when invalidation fails or panics, and a later call returns `Ok`. The Core crate `c2-mem` changes its low-level API: `free_at` takes the allocation level instead of the data size and allocation ID, `release_handle` panics on a handle from another pool, `BuddySegment::allocator()` panics on a peer segment, and `destroy`, `gc_dedicated`, `SegmentHeader` and `ShmSpinlock` are removed. `c2-config`'s `CallTimeoutError` is replaced by `TimeoutError`, shared by every waiting budget. Receivers read a peer's blocks through `PeerMappingCache`; `MemPool::ensure_peer_segment`, `ensure_peer_dedicated`, `open_dedicated_at`, `validate_data_at`, `copy_data_at` and `data_ptr_at` are removed, and `MemPool::open_peer` only validates a peer's pool identity.
+- Rust: `Held::release` consumes the value even when invalidation fails or panics, and a later call returns `Ok`. `LifecycleError::HeldResponseCopy` is removed and `HeldResponseRelease` carries one required `invalidation_error`. `Runtime::shutdown_without_host` is removed; `Runtime::begin_session_retirement` with `RuntimeShutdownTarget::ClientsOnly` retires a Runtime that has no Host. `c_two::observe::ConnectionClosed::is_peer_end()` reports whether the peer ended the connection. The Core crate `c2-mem` changes its low-level API: `free_at` takes the allocation level instead of the data size and allocation ID, `release_handle` panics on a handle from another pool, `BuddySegment::allocator()` panics on a peer segment, and `destroy`, `gc_dedicated`, `SegmentHeader` and `ShmSpinlock` are removed. `c2-config`'s `CallTimeoutError` is replaced by `TimeoutError`, shared by every waiting budget. Receivers read a peer's blocks through `PeerMappingCache`; `MemPool::ensure_peer_segment`, `ensure_peer_dedicated`, `open_dedicated_at`, `validate_data_at`, `copy_data_at` and `data_ptr_at` are removed, and `MemPool::open_peer` only validates a peer's pool identity.
 - TypeScript: options accept an explicit `undefined` for `ipcAddress`, `serverId`, `serverInstanceId`, the two `observe` callbacks and `C2Fetch.signal`. Node applies `write_timeout`, deactivates the connection on a zero loan id as Rust does, and accepts every dedicated segment index the wire carries.
 - Wire: `RouteAck` (0x14), `RouteRecord.owner_epoch` and `lease_deadline_ms`, `RouteNack.nonce`, `DigestDiffEntry.hash` and the `FLAG_SHM`, `FLAG_POOL` and `FLAG_DISK_SPILL` flags are removed. A route's state is `ready` or `closed`, its reason is one of `register_committed`, `explicit_unregister` or `shutdown` and is always present, and the route directory and the mesh reject unknown fields.
 - Connections:
