@@ -1,6 +1,8 @@
 import { runNpm } from './npm-tools.mjs';
+import { runCargo } from './cargo-tools.mjs';
+import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -97,176 +99,91 @@ try {
       throw new Error(`clean consumer contains a sibling link dependency at ${path}`);
     }
   }
+  // The consumer installs only published tarballs. Build the test-owned native
+  // peer in the source checkout; no Rust build or sibling link enters the package.
+  const peerRoot = resolve(packageRoot, 'tests/protocol-server');
+  const target = process.env.CARGO_TARGET_DIR ?? resolve(packageRoot, '../../../../target');
+  try {
+    copyFileSync(resolve(packageRoot, '../../../../Cargo.lock'), resolve(peerRoot, 'Cargo.lock'));
+    runCargo(['build', '--offline', '--manifest-path', resolve(peerRoot, 'Cargo.toml'), '--target-dir', target]);
+  } finally { rmSync(resolve(peerRoot, 'Cargo.lock'), { force: true }); }
+  const peer = resolve(target, 'debug', `c2-node-protocol-server${process.platform === 'win32' ? '.exe' : ''}`);
+  const require = createRequire(resolve(consumerRoot, 'package.json'));
+  const ts = require('typescript');
+  const source = readFileSync(resolve(packageRoot, '../../../c2-codegen/assets/typescript_transport.ts'), 'utf8');
+  writeFileSync(resolve(consumerRoot, 'transport.ts'), source);
+  writeFileSync(resolve(consumerRoot, 'transport.mjs'), ts.transpileModule(source, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
+  }).outputText);
   writeFileSync(resolve(consumerRoot, 'smoke.mjs'), `
 import assert from 'node:assert/strict';
-
+import { spawn } from 'node:child_process';
+import { mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import {
-  C2_MEM_FFI_ABI_VERSION,
-  createC2MemFfiRequestPoolFromSymbols,
-  createC2MemFfiResponsePoolFromSymbols,
-  createNodeIpcConnect,
-  loadBundledC2MemFfiNodeNativeSymbols,
+  C2_MEM_FFI_ABI_VERSION, createNodeIpcConnect, loadBundledC2MemFfiNodeNativeSymbols,
 } from '@c-two/c2-mem-ffi';
-
-const { requestSymbols, responseSymbols, symbols } = loadBundledC2MemFfiNodeNativeSymbols();
-
-assert.equal(C2_MEM_FFI_ABI_VERSION, 6);
-assert.equal(symbols.c2_mem_ffi_abi_version(), C2_MEM_FFI_ABI_VERSION);
-assert.equal(typeof createNodeIpcConnect, 'function');
-
-const prefixSeed = process.pid.toString(36);
-const requestPool = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
-  prefix: \`/cc2p\${prefixSeed}a\`,
-  segmentSize: 65536,
-  maxSegments: 1,
-  minBlockSize: 4096,
-});
+import { createIpcEncodedTransport } from './transport.mjs';
+const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
+assert.equal(C2_MEM_FFI_ABI_VERSION, 7);
+assert.equal(symbols.c2_mem_ffi_abi_version(), 7);
+const address = 'ipc://packed-node-' + process.pid;
+const root = resolve('ipc'); mkdirSync(root, {mode: 0o700});
+const child = spawn(process.argv[2], [process.platform === 'win32' ? '-' : root, address], {stdio: ['pipe', 'pipe', 'pipe']});
+let stderr = ''; child.stderr.on('data', b => {stderr += b;});
+const closed = new Promise(resolve => child.once('exit', code => resolve(code)));
+const lines = createInterface({input: child.stdout})[Symbol.asyncIterator]();
+const connect = createNodeIpcConnect(process.platform === 'win32' ? {} : {ipcRoot: root});
+let connection;
+const transport = createIpcEncodedTransport(address, {connect: async address => (connection = await connect(address))});
 try {
-  const payload = new Uint8Array([1, 3, 5, 7]);
-  const block = await requestPool.write(payload);
-  assert.equal(block.dedicated, false);
-  assert.equal(block.byteLength, payload.byteLength);
-  assert.equal(typeof block.allocationId, 'bigint');
-  assert.ok(block.allocationId > 0n);
-  await requestPool.release(block);
+  assert.equal(JSON.parse((await lines.next()).value).kind, 'ready');
+  const contract = {schema: 'c-two.contract.v2', namespace: 'test.p8a', name: 'Echo', version: '0.1.0', descriptorSha256: 'd'.repeat(64), abiHash: 'a'.repeat(64), signatureHash: 'b'.repeat(64)};
+  for (const payload of [new Uint8Array([1, 3, 5, 7]), new Uint8Array(8192).fill(9)]) {
+    assert.deepEqual(await transport.call('echo', contract, 'echo', payload), payload);
+  }
+  const memory = connection.memory;
+  const request = memory.prepareRequest(new Uint8Array([2, 4, 6, 8]));
+  assert.equal(typeof request.block.loanId, 'bigint'); assert.ok(request.block.loanId > 0n);
+  memory.discardRequest(request);
+  await transport.close();
 } finally {
-  await requestPool.close?.();
-}
-
-const handle = (await symbols.c2_mem_ffi_request_pool_new(\`/cc2p\${prefixSeed}b\`, 65536, 1, 4096)).value;
-try {
-  const payload = new Uint8Array([2, 4, 6, 8]);
-  const block = (await symbols.c2_mem_ffi_request_pool_write(handle, payload)).value;
-  assert.equal(typeof block.allocationId, 'bigint');
-  assert.ok(block.allocationId > 0n);
-  const destination = new Uint8Array(payload.byteLength);
-  const readResult = await symbols.c2_mem_ffi_request_pool_read_local(handle, block, destination);
-  assert.equal(readResult.status, 0);
-  assert.equal(readResult.value, payload.byteLength);
-  assert.deepEqual(Array.from(destination), Array.from(payload));
-  await symbols.c2_mem_ffi_request_pool_release(handle, block);
-} finally {
-  await symbols.c2_mem_ffi_request_pool_destroy(handle);
-}
-try {
-  await symbols.c2_mem_ffi_request_pool_prefix(handle);
-  throw new Error('destroyed native request pool handle remained usable');
-} catch (error) {
-  if (!String(error).includes('closed')) {
-    throw error;
-  }
-}
-try {
-  await symbols.c2_mem_ffi_request_pool_destroy(handle);
-  throw new Error('destroyed native request pool handle could be destroyed twice');
-} catch (error) {
-  if (!String(error).includes('closed')) {
-    throw error;
-  }
-}
-
-const responseHandle = (await symbols.c2_mem_ffi_response_pool_new(\`/cc2p\${prefixSeed}d\`, 65536, 1, 4096)).value;
-await symbols.c2_mem_ffi_response_pool_destroy(responseHandle);
-try {
-  await symbols.c2_mem_ffi_response_pool_read(
-    responseHandle,
-    { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, allocationId: 1n, dedicated: false },
-    new Uint8Array(1),
-  );
-  throw new Error('destroyed native response pool handle remained usable');
-} catch (error) {
-  if (!String(error).includes('closed')) {
-    throw error;
-  }
-}
-try {
-  await symbols.c2_mem_ffi_response_pool_destroy(responseHandle);
-  throw new Error('destroyed native response pool handle could be destroyed twice');
-} catch (error) {
-  if (!String(error).includes('closed')) {
-    throw error;
-  }
-}
-
-const fakeServerPool = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
-  prefix: \`/cc2p\${prefixSeed}c\`,
-  segmentSize: 65536,
-  maxSegments: 1,
-  minBlockSize: 4096,
-});
-const responsePool = await createC2MemFfiResponsePoolFromSymbols(responseSymbols, {
-  prefix: fakeServerPool.prefix,
-  segmentSize: 65536,
-  maxSegments: 1,
-  minBlockSize: 4096,
-});
-try {
-  for (const payload of [new Uint8Array([9, 7, 5, 3]), new Uint8Array(128 * 1024 + 3).fill(9)]) {
-    const block = await fakeServerPool.write(payload);
-    assert.equal(block.dedicated, payload.byteLength > 65536);
-    assert.equal(block.generation === 0, block.dedicated);
-    const destination = new Uint8Array(payload.byteLength);
-    await responsePool.read(block, destination);
-    assert.deepEqual(destination, payload);
-    await responsePool.release(block);
-    await fakeServerPool.forgetConsumed(block);
-  }
-} finally {
-  await responsePool.close?.();
-  await fakeServerPool.close?.();
+  connection?.close(); connect.close(); child.stdin.end('quit\\n');
+  const timer = setTimeout(() => child.kill(), 12000);
+  const code = await closed; clearTimeout(timer); assert.equal(code, 0, stderr);
 }
 `);
   writeFileSync(resolve(consumerRoot, 'smoke-types.mts'), `
 import {
   C2_MEM_FFI_ABI_VERSION,
-  type C2MemFfiNativeRequestBackend,
-  type C2MemFfiNativeResponseBackend,
-  type C2MemFfiNodeNativeSymbols,
-  type C2MemFfiPoolConfig,
-  type C2MemFfiRequestBlock,
-  type C2MemFfiResponseBlock,
-  createC2MemFfiNativeRequestBackend,
-  createC2MemFfiNativeResponseBackend,
-  createC2MemFfiRequestPoolFromSymbols,
-  createC2MemFfiResponsePoolFromSymbols,
-  createNodeIpcConnect,
-  loadBundledC2MemFfiNodeNativeSymbols,
+  type C2MemFfiMemoryContext, type C2MemFfiPreparedRequest, type C2MemFfiBlock,
+  type C2MemFfiNodeNativeSymbols, createNodeIpcConnect, loadBundledC2MemFfiNodeNativeSymbols,
 } from '@c-two/c2-mem-ffi';
-
-const abiVersion: 6 = C2_MEM_FFI_ABI_VERSION;
+import type { C2IpcConnect } from './transport.js';
+const abiVersion: 7 = C2_MEM_FFI_ABI_VERSION;
 const symbols: C2MemFfiNodeNativeSymbols = loadBundledC2MemFfiNodeNativeSymbols();
 const connect = createNodeIpcConnect();
-const poolConfig: C2MemFfiPoolConfig = {
-  prefix: '/cc2ptype',
-  segmentSize: 65536,
-  maxSegments: 1,
-  minBlockSize: 4096,
-};
-
-async function smokeTypes(): Promise<C2MemFfiResponseBlock> {
-  const requestPool = await createC2MemFfiRequestPoolFromSymbols(symbols.requestSymbols, poolConfig);
-  const responsePool = await createC2MemFfiResponsePoolFromSymbols(symbols.responseSymbols, poolConfig);
-  const requestBackend: C2MemFfiNativeRequestBackend = createC2MemFfiNativeRequestBackend(requestPool);
-  const responseBackend: C2MemFfiNativeResponseBackend = createC2MemFfiNativeResponseBackend(responsePool);
-  const requestBlock: C2MemFfiRequestBlock = await requestBackend.writeRequest(new Uint8Array([abiVersion]));
-  await requestBackend.releaseRequest(requestBlock);
-  await responseBackend.close();
-  await requestBackend.close();
-  return {
-    ...requestBlock,
-    prefix: poolConfig.prefix,
-    segments: requestPool.segments,
-  };
+const genericConnect: C2IpcConnect = connect;
+void genericConnect;
+async function smokeTypes(): Promise<C2MemFfiBlock | undefined> {
+  const connection = await connect('ipc://typecheck');
+  const memory: C2MemFfiMemoryContext | undefined = connection.memory;
+  if (memory === undefined) return undefined;
+  const request: C2MemFfiPreparedRequest = memory.prepareRequest(new Uint8Array([abiVersion]));
+  const block: C2MemFfiBlock = request.block;
+  const id: bigint = block.loanId;
+  memory.discardRequest(request);
+  await connection.close();
+  void id;
+  return block;
 }
-
-void abiVersion;
-void connect;
-void smokeTypes;
+void symbols; void smokeTypes;
 `);
   writeFileSync(resolve(consumerRoot, 'tsconfig.json'), `
 {
   "compilerOptions": {
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "noEmit": true,
@@ -286,10 +203,10 @@ void smokeTypes;
   ], {
     cwd: consumerRoot,
   });
-  run(process.execPath, ['smoke.mjs'], {
+  run(process.execPath, ['smoke.mjs', peer], {
     cwd: consumerRoot,
   });
-  console.log('npm packed runtime and TypeScript tarballs install, typecheck, and exercise bundled native request/response pool and request/response handle lifecycle paths from a clean consumer project.');
+  console.log('npm packed ABI 7 runtime and TypeScript tarballs install, typecheck, and exercise verified IPC plus opaque memory owners from a clean consumer project.');
 } finally {
   rmSync(tempRoot, { recursive: true, force: true });
 }

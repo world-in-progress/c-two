@@ -5,7 +5,7 @@
 use c2_mem::{MemPool, PoolConfig};
 
 fn main() {
-    let mut pool = MemPool::new(PoolConfig::default());
+    let mut pool = MemPool::new(PoolConfig::default()).unwrap();
     let mut handle = pool.alloc_handle(8192).expect("real allocation");
     let first = pool.handle_slice_mut(&mut handle);
     let second = pool.handle_slice_mut(&mut handle);

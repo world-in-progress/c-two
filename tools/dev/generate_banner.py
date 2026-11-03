@@ -34,7 +34,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate c3 CLI banner asset.")
     parser.add_argument("--width", "-w", type=int, default=50)
     parser.add_argument("--threshold", "-t", type=int, default=100)
-    parser.add_argument("--image", "-i", type=Path, default=Path("docs/images/logo_bw.png"))
+    parser.add_argument("--image", "-i", type=Path, default=Path("docs/assets/logo_bw.png"))
     parser.add_argument("--out", "-o", type=Path, default=Path("cli/assets/banner_unicode.txt"))
     args = parser.parse_args()
 

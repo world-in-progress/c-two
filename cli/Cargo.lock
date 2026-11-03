@@ -222,6 +222,7 @@ dependencies = [
  "percent-encoding",
  "predicates",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing-subscriber",

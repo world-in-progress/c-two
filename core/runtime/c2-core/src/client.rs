@@ -43,7 +43,6 @@ pub enum ObservedPath {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedRoute {
     pub route_uid: String,
-    pub route_revision: u64,
 }
 
 /// Monotonic process-runtime observations of successfully selected paths.
@@ -164,8 +163,8 @@ impl Client {
         self.options
     }
 
-    /// Release this view. Other views, executing calls and held responses retain
-    /// their references to the same connection; no transport is cancelled here.
+    /// Release this view. Other views and executing calls retain their
+    /// references to the same connection; no transport is cancelled here.
     pub fn close(self) {}
 
     /// Start the logical call BEFORE SDK serialization (including non-Send
@@ -268,7 +267,7 @@ impl EncodedCall {
                         ClientInner::Ipc(connection) => {
                             let response = call_ipc(connection, &method, input, scope).await?;
                             response
-                                .into_bytes()
+                                .into_owned_bytes()
                                 .map_err(|error| LifecycleError::ResponseCopy(error).into())
                         }
                         ClientInner::Http(client, _) => {
@@ -292,14 +291,14 @@ impl EncodedCall {
                 self.materialize,
                 move |input, scope| async move {
                     let response = match &inner.transport {
-                        ClientInner::Ipc(connection) => HeldResponse::from_ipc_response(
+                        ClientInner::Ipc(connection) => HeldResponse::from_response_data(
                             call_ipc(connection, &method, input, scope).await?,
                         )?,
                         ClientInner::Http(client, _) => HeldResponse::from_owned_bytes(
                             call_http(client, &method, input, scope).await?,
                         ),
                     };
-                    Ok(response.with_connection(inner))
+                    Ok(response)
                 },
             )?
             .wait()
@@ -377,83 +376,7 @@ async fn call_http(
         })
 }
 
-/// Public held facade also pins the exact acquired client while its underlying
-/// response lease lives. The existing private carrier remains the sole release
-/// and SDK invalidation authority; connection lifetime adds no free mechanism.
-pub struct HeldResponse {
-    response: crate::lifetime::HeldResponse,
-    connection: Option<Arc<ClientConnection>>,
-}
-
-struct HeldPinRelease<'a> {
-    response: &'a mut crate::lifetime::HeldResponse,
-    connection: &'a mut Option<Arc<ClientConnection>>,
-}
-
-impl Drop for HeldPinRelease<'_> {
-    fn drop(&mut self) {
-        if !self.response.has_pending_release() {
-            self.connection.take();
-        }
-    }
-}
-
-impl HeldResponse {
-    // Receive carriers already bind their pool; inline bytes need no transport lease.
-    fn from_ipc_response(response: c2_ipc::ResponseData) -> Result<Self, LifecycleError> {
-        match response {
-            c2_ipc::ResponseData::Inline(bytes) => Ok(Self::from_owned_bytes(bytes)),
-            response => Self::from_response_lease(c2_ipc::ResponseLease::new(response)),
-        }
-    }
-
-    pub fn from_owned_bytes(bytes: Vec<u8>) -> Self {
-        Self {
-            response: crate::lifetime::HeldResponse::from_owned_bytes(bytes),
-            connection: None,
-        }
-    }
-
-    pub fn from_response_lease(lease: c2_ipc::ResponseLease) -> Result<Self, LifecycleError> {
-        Ok(Self {
-            response: crate::lifetime::HeldResponse::from_response_lease(lease)?,
-            connection: None,
-        })
-    }
-
-    fn with_connection(mut self, connection: Arc<ClientConnection>) -> Self {
-        self.connection = Some(connection);
-        self
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        self.response.bytes()
-    }
-    pub fn is_released(&self) -> bool {
-        self.response.is_released()
-    }
-
-    pub fn has_pending_release(&self) -> bool {
-        self.response.has_pending_release()
-    }
-
-    pub fn invalidate_then_release<F>(&mut self, invalidate: F) -> Result<(), LifecycleError>
-    where
-        F: FnOnce() -> Result<(), String>,
-    {
-        let release = HeldPinRelease {
-            response: &mut self.response,
-            connection: &mut self.connection,
-        };
-        release.response.invalidate_then_release(invalidate)
-    }
-
-    /// End a pending transport obligation before returning its concrete pin.
-    pub fn abandon(mut self) {
-        self.response.abandon();
-        self.connection.take();
-    }
-}
+pub use crate::lifetime::HeldResponse;
 
 mod private {
     pub trait Sealed {}
@@ -464,7 +387,7 @@ impl private::Sealed for Client {}
 /// Stable encoded-call boundary consumed by generated clients.
 ///
 /// The private supertrait prevents downstream transport implementations from
-/// bypassing Core route, identity, and lease validation.
+/// bypassing Core route, identity, and transport admission.
 #[doc(hidden)]
 pub trait EncodedClient: private::Sealed {
     fn call_owned(&self, method: &str, request: &[u8]) -> Result<Vec<u8>, Error>;
@@ -523,23 +446,18 @@ impl Runtime {
             }
             Connect::ExplicitRelay { relay_url } => {
                 let settings = self.relay_client_settings_with_deadline(deadline)?;
-                let (client, route_uid, route_revision) = self
-                    .connect_explicit_relay_http_client_with_deadline(
-                        &relay_url,
-                        expected.clone(),
-                        settings.use_proxy,
-                        settings.max_attempts,
-                        settings.call_timeout_secs,
-                        settings.remote_payload_chunk_size,
-                        deadline,
-                    )?;
+                let (client, route_uid) = self.connect_explicit_relay_http_client_with_deadline(
+                    &relay_url,
+                    expected.clone(),
+                    settings.use_proxy,
+                    settings.call_timeout_secs,
+                    settings.remote_payload_chunk_size,
+                    deadline,
+                )?;
                 self.finish_client(
                     expected,
                     ObservedPath::ExplicitRelay,
-                    ObservedRoute {
-                        route_uid,
-                        route_revision,
-                    },
+                    ObservedRoute { route_uid },
                     ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
                     deadline,
                 )
@@ -644,12 +562,8 @@ impl Runtime {
                 ));
             }
 
-            match client.acquire_route_token_with_deadline(
-                expected,
-                &candidate.route_uid,
-                candidate.route_revision,
-                deadline,
-            ) {
+            match client.acquire_route_token_with_deadline(expected, &candidate.route_uid, deadline)
+            {
                 Ok(binding) => {
                     return Ok(PooledIpcClient { client, binding });
                 }
@@ -684,7 +598,6 @@ impl Runtime {
             &relay_anchor_address,
             expected.clone(),
             settings.use_proxy,
-            settings.max_attempts,
             settings.call_timeout_secs,
             settings.remote_payload_chunk_size,
             deadline,
@@ -692,17 +605,10 @@ impl Runtime {
         self.ensure_active_with_deadline(deadline)?;
         let resolved = self.reconcile_relay_connection_with_deadline(resolved, deadline)?;
         match resolved {
-            RelayResolvedConnection::Http {
-                client,
-                route_uid,
-                route_revision,
-            } => self.finish_client(
+            RelayResolvedConnection::Http { client, route_uid } => self.finish_client(
                 expected,
                 ObservedPath::RelayAwareRelay,
-                ObservedRoute {
-                    route_uid,
-                    route_revision,
-                },
+                ObservedRoute { route_uid },
                 ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
                 deadline,
             ),
@@ -732,17 +638,10 @@ impl Runtime {
                     let resolved =
                         self.reconcile_relay_connection_with_deadline(resolved, deadline)?;
                     match resolved {
-                        RelayResolvedConnection::Http {
-                            client,
-                            route_uid,
-                            route_revision,
-                        } => self.finish_client(
+                        RelayResolvedConnection::Http { client, route_uid } => self.finish_client(
                             expected,
                             ObservedPath::RelayAwareRelay,
-                            ObservedRoute {
-                                route_uid,
-                                route_revision,
-                            },
+                            ObservedRoute { route_uid },
                             ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
                             deadline,
                         ),
@@ -768,7 +667,6 @@ impl Runtime {
 fn observed_ipc_route(connection: &PooledIpcClient) -> ObservedRoute {
     ObservedRoute {
         route_uid: connection.binding.route_uid().to_string(),
-        route_revision: connection.binding.route_revision(),
     }
 }
 
@@ -870,7 +768,7 @@ fn relay_default(seconds: f64) -> Result<Option<Duration>, LifecycleError> {
     if seconds == 0.0 {
         return Ok(None);
     }
-    Duration::try_from_secs_f64(seconds)
+    c2_config::timeout_from_seconds(seconds)
         .map(Some)
         .map_err(|_| LifecycleError::Configuration("HTTP call timeout is not representable".into()))
 }
@@ -926,7 +824,7 @@ mod tests {
             let source_ptr = bytes.as_ptr();
             let expected = bytes.clone();
             let mut held =
-                HeldResponse::from_ipc_response(c2_ipc::ResponseData::Inline(bytes)).unwrap();
+                HeldResponse::from_response_data(c2_ipc::ResponseData::Inline(bytes)).unwrap();
             assert_eq!(held.bytes(), expected);
             if !expected.is_empty() {
                 assert_eq!(held.bytes().as_ptr(), source_ptr, "inline bytes must move");

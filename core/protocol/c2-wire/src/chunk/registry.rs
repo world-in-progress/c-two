@@ -1,8 +1,9 @@
 //! Sharded chunk registry.
 //!
 //! [`ChunkRegistry`] is a thread-safe, sharded manager for in-flight chunked
-//! reassemblies. It wraps [`ChunkAssembler`] instances with tracking metadata
-//! and provides `insert` / `feed` / `take` / `abort` lifecycle operations.
+//! reassemblies and settled requests. It wraps [`ChunkAssembler`] instances
+//! with tracking metadata and provides frame admission, one error-reply claim,
+//! reassembly and connection/GC cleanup through the same sharded table.
 //!
 //! Admission is finite: `insert` reserves the checked assembly capacity from
 //! the pool's canonical reassembly budget before any storage is allocated,
@@ -14,7 +15,7 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::assembler::ChunkAssembler;
@@ -34,56 +35,60 @@ pub struct GcStats {
     pub freed_bytes: u64,
 }
 
-/// Identity of one admitted assembly generation.
-///
-/// The registry admits at most one assembly per `(conn_id, request_id)` key at
-/// a time, but a key can be admitted again after its predecessor finished,
-/// aborted, or timed out. The generation makes an entry addressable: teardown
-/// code that only holds the coordinates of the generation it published can
-/// take exactly that generation through [`ChunkRegistry::take_id`] and
-/// never a successor's same-key entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkAssemblyId {
+#[derive(Default)]
+struct RequestState {
+    settled: AtomicBool,
+    last_received: AtomicBool,
+}
+
+/// One request's shared error-reply claim. Dispatched frames retain this exact
+/// claim even after its last frame removes the registry entry.
+pub struct ChunkRequest {
     conn_id: u64,
     request_id: u64,
-    generation: u64,
+    state: Arc<RequestState>,
 }
 
-impl ChunkAssemblyId {
-    /// Connection that owns this assembly.
-    pub fn conn_id(&self) -> u64 {
-        self.conn_id
-    }
-
-    /// Request id this assembly was admitted for.
-    pub fn request_id(&self) -> u64 {
-        self.request_id
-    }
-
-    /// Monotonic per-registry admission generation.
-    pub fn generation(&self) -> u64 {
-        self.generation
+impl ChunkRequest {
+    pub fn is_settled(&self) -> bool {
+        self.state.settled.load(Ordering::Acquire)
     }
 }
 
-/// Per-assembly tracking wrapper around [`ChunkAssembler`].
-struct TrackedAssembler<C> {
+/// One request's pending, assembling or settled state. Empty entries retain no
+/// backing or context and consume none of the reassembly or chunk allowance.
+struct TrackedRequest<C> {
     // Storage and its charge are released before the associated admission.
-    inner: ChunkAssembler,
-    context: C,
-    generation: u64,
+    inner: Option<ChunkAssembler>,
+    context: Option<C>,
+    request: Arc<RequestState>,
     last_activity: Instant,
     total_bytes: u64,
 }
 
+impl<C> TrackedRequest<C> {
+    fn pending(request: Arc<RequestState>) -> Self {
+        Self {
+            inner: None,
+            context: None,
+            request,
+            last_activity: Instant::now(),
+            total_bytes: 0,
+        }
+    }
+
+    fn has_unsettled_frames(&self) -> bool {
+        !self.request.settled.load(Ordering::Acquire) && Arc::strong_count(&self.request) > 1
+    }
+}
+
 /// Sharded chunk reassembly lifecycle manager.
 pub struct ChunkRegistry<C> {
-    shards: [Mutex<HashMap<(u64, u64), TrackedAssembler<C>>>; SHARD_COUNT],
+    shards: [Mutex<HashMap<(u64, u64), TrackedRequest<C>>>; SHARD_COUNT],
     pool: Arc<RwLock<MemPool>>,
     config: ChunkConfig,
     active_count: AtomicUsize,
     total_bytes: AtomicU64,
-    generations: AtomicU64,
     // A completed full sweep proves no entry can expire before this time.
     gc_not_before: Mutex<Option<Instant>>,
     #[cfg(test)]
@@ -104,7 +109,6 @@ impl<C> ChunkRegistry<C> {
             config,
             active_count: AtomicUsize::new(0),
             total_bytes: AtomicU64::new(0),
-            generations: AtomicU64::new(0),
             gc_not_before: Mutex::new(None),
             #[cfg(test)]
             admission_probe: Mutex::new(None),
@@ -113,7 +117,7 @@ impl<C> ChunkRegistry<C> {
         }
     }
 
-    fn shard(&self, conn_id: u64) -> &Mutex<HashMap<(u64, u64), TrackedAssembler<C>>> {
+    fn shard(&self, conn_id: u64) -> &Mutex<HashMap<(u64, u64), TrackedRequest<C>>> {
         &self.shards[conn_id as usize % SHARD_COUNT]
     }
 
@@ -141,20 +145,87 @@ impl<C> ChunkRegistry<C> {
     pub fn contains(&self, conn_id: u64, request_id: u64) -> bool {
         self.shard(conn_id)
             .lock()
-            .contains_key(&(conn_id, request_id))
+            .get(&(conn_id, request_id))
+            .is_some_and(|entry| entry.inner.is_some())
+    }
+
+    /// Observe a frame before dispatch, including before first-chunk admission.
+    /// A settled request's last frame removes its marker without refreshing its
+    /// settlement time. The returned token still suppresses old task replies.
+    pub fn begin_frame(&self, conn_id: u64, request_id: u64, last: bool) -> ChunkRequest {
+        let mut shard = self.shard(conn_id).lock();
+        let key = (conn_id, request_id);
+        let entry = shard
+            .entry(key)
+            .or_insert_with(|| TrackedRequest::pending(Arc::new(RequestState::default())));
+        if last {
+            entry.request.last_received.store(true, Ordering::Release);
+        }
+        let request = ChunkRequest {
+            conn_id,
+            request_id,
+            state: entry.request.clone(),
+        };
+        if request.is_settled() && last {
+            shard.remove(&key);
+        }
+        request
+    }
+
+    pub fn is_settled(&self, conn_id: u64, request_id: u64) -> bool {
+        self.shard(conn_id)
+            .lock()
+            .get(&(conn_id, request_id))
+            .is_some_and(|entry| entry.request.settled.load(Ordering::Acquire))
+    }
+
+    /// Claim the request's one error reply and release any assembly. The
+    /// admission fence is acquired only after claiming the shared outcome,
+    /// under the shard lock; it must not re-enter the registry. Its guard stays
+    /// alive until backing and context release have finished outside the lock.
+    pub fn settle<F>(&self, request: &ChunkRequest, fence: impl FnOnce() -> F) -> bool {
+        let (removed, fence) = {
+            let mut shard = self.shard(request.conn_id).lock();
+            let key = (request.conn_id, request.request_id);
+            if request
+                .state
+                .settled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return false;
+            }
+            let fence = fence();
+            let removed = shard.get_mut(&key).map(|entry| {
+                let removed = (entry.inner.take(), entry.context.take());
+                if removed.0.is_some() {
+                    self.active_count.fetch_sub(1, Ordering::Relaxed);
+                    self.total_bytes
+                        .fetch_sub(entry.total_bytes, Ordering::Relaxed);
+                    entry.total_bytes = 0;
+                }
+                entry.last_activity = Instant::now();
+                removed
+            });
+            if request.state.last_received.load(Ordering::Acquire) {
+                shard.remove(&key);
+            }
+            (removed, fence)
+        };
+        drop(removed);
+        drop(fence);
+        true
     }
 
     /// Begin a new chunked reassembly for `(conn_id, request_id)`.
     ///
     /// Admission order: soft-limit GC sweep (advisory only), per-message
     /// limit and geometry checks, reassembly budget reservation for the
-    /// checked `total_chunks × chunk_size` capacity, then allocation. A
+    /// checked payload and chunk-tracking capacity, then allocation. A
     /// budget rejection returns the cell/size error and creates no mapping.
     ///
-    /// On success the returned [`ChunkAssemblyId`] identifies this exact
-    /// admission generation for identity-checked teardown
-    /// ([`ChunkRegistry::take_id`]). The context is published with the assembly;
-    /// rejection returns it so the caller retains control of its lifetime.
+    /// The context is published with the assembly; rejection returns it so the
+    /// caller retains control of its lifetime.
     pub fn insert(
         &self,
         conn_id: u64,
@@ -162,7 +233,38 @@ impl<C> ChunkRegistry<C> {
         total_chunks: usize,
         chunk_size: usize,
         context: C,
-    ) -> Result<ChunkAssemblyId, (ChunkAdmissionError, C)> {
+    ) -> Result<(), (ChunkAdmissionError, C)> {
+        self.insert_tracked(conn_id, request_id, None, total_chunks, chunk_size, context)
+    }
+
+    /// First-chunk admission rechecks the shared outcome under the shard lock:
+    /// a concurrent refusal may have already removed the last-frame marker.
+    pub fn insert_request(
+        &self,
+        request: &ChunkRequest,
+        total_chunks: usize,
+        chunk_size: usize,
+        context: C,
+    ) -> Result<(), (ChunkAdmissionError, C)> {
+        self.insert_tracked(
+            request.conn_id,
+            request.request_id,
+            Some(request),
+            total_chunks,
+            chunk_size,
+            context,
+        )
+    }
+
+    fn insert_tracked(
+        &self,
+        conn_id: u64,
+        request_id: u64,
+        request: Option<&ChunkRequest>,
+        total_chunks: usize,
+        chunk_size: usize,
+        context: C,
+    ) -> Result<(), (ChunkAdmissionError, C)> {
         // Soft-limit check: GC sweep first, then warn but never reject. The
         // hard admission bound is the reassembly budget cell.
         if self.active_count() >= self.config.soft_limit as usize
@@ -185,7 +287,11 @@ impl<C> ChunkRegistry<C> {
             // must never make us hold this shard while blocking for a write guard:
             // a finished carrier can hold a pool read guard and call contains().
             let mut shard = self.shard(conn_id).lock();
-            if shard.contains_key(&(conn_id, request_id)) {
+            if request.is_some_and(ChunkRequest::is_settled)
+                || shard.get(&(conn_id, request_id)).is_some_and(|entry| {
+                    entry.inner.is_some() || entry.request.settled.load(Ordering::Acquire)
+                })
+            {
                 return Err((
                     ChunkAdmissionError::Duplicate {
                         conn_id,
@@ -203,8 +309,7 @@ impl<C> ChunkRegistry<C> {
             let geometry = match ChunkAssembler::check_geometry(
                 total_chunks,
                 chunk_size,
-                self.config.max_chunks_per_request,
-                self.config.max_bytes_per_request,
+                self.config.max_reassembly_bytes,
             ) {
                 Ok(geometry) => geometry,
                 Err(error) => return Err((error, context)),
@@ -234,13 +339,15 @@ impl<C> ChunkRegistry<C> {
                 Err(error) => return Err((error, context)),
             };
             let alloc_bytes = assembler.capacity_bytes();
-            let generation = self.generations.fetch_add(1, Ordering::Relaxed);
 
             let now = Instant::now();
-            let tracked = TrackedAssembler {
-                inner: assembler,
-                context,
-                generation,
+            let tracked = TrackedRequest {
+                inner: Some(assembler),
+                context: Some(context),
+                request: shard
+                    .get(&(conn_id, request_id))
+                    .map(|entry| entry.request.clone())
+                    .unwrap_or_default(),
                 last_activity: now,
                 total_bytes: alloc_bytes,
             };
@@ -250,11 +357,7 @@ impl<C> ChunkRegistry<C> {
             self.active_count.fetch_add(1, Ordering::Relaxed);
             self.total_bytes.fetch_add(alloc_bytes, Ordering::Relaxed);
             drop(shard);
-            return Ok(ChunkAssemblyId {
-                conn_id,
-                request_id,
-                generation,
-            });
+            return Ok(());
         }
     }
 
@@ -273,7 +376,11 @@ impl<C> ChunkRegistry<C> {
             .get_mut(&(conn_id, request_id))
             .ok_or_else(|| format!("no assembly for ({conn_id}, {request_id})"))?;
 
-        let complete = tracked.inner.feed_chunk(chunk_idx, data)?;
+        let complete = tracked
+            .inner
+            .as_mut()
+            .ok_or_else(|| format!("no assembly for ({conn_id}, {request_id})"))?
+            .feed_chunk(chunk_idx, data)?;
         tracked.last_activity = Instant::now();
         Ok(complete)
     }
@@ -287,31 +394,33 @@ impl<C> ChunkRegistry<C> {
     pub fn take(&self, conn_id: u64, request_id: u64) -> Result<(ChunkAssembler, C), String> {
         let tracked = {
             let mut shard = self.shard(conn_id).lock();
-            let Some(tracked) = shard.remove(&(conn_id, request_id)) else {
+            if !shard
+                .get(&(conn_id, request_id))
+                .is_some_and(|entry| entry.inner.is_some())
+            {
                 return Err(format!("no assembly for ({conn_id}, {request_id})"));
-            };
+            }
+            let tracked = shard.remove(&(conn_id, request_id)).unwrap();
             self.active_count.fetch_sub(1, Ordering::Relaxed);
             self.total_bytes
                 .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
             tracked
         };
-        Ok((tracked.inner, tracked.context))
+        Ok((tracked.inner.unwrap(), tracked.context.unwrap()))
     }
 
     /// Abort an in-flight assembly, releasing all resources.
     ///
-    /// Unconditional by key: this is the connection-teardown / timeout cleanup
-    /// verb, used where the caller cannot or must not keep a generation
-    /// identity. Use [`ChunkRegistry::take_id`] for rollback of one exact
-    /// admission generation.
     pub fn abort(&self, conn_id: u64, request_id: u64) {
         let removed = {
             let mut shard = self.shard(conn_id).lock();
             match shard.remove(&(conn_id, request_id)) {
                 Some(tracked) => {
-                    self.active_count.fetch_sub(1, Ordering::Relaxed);
-                    self.total_bytes
-                        .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
+                    if tracked.inner.is_some() {
+                        self.active_count.fetch_sub(1, Ordering::Relaxed);
+                        self.total_bytes
+                            .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
+                    }
                     Some(tracked)
                 }
                 None => None,
@@ -320,32 +429,6 @@ impl<C> ChunkRegistry<C> {
         // Backing release and charge refund happen on drop, outside the shard
         // lock.
         drop(removed);
-    }
-
-    /// Take exactly the admission generation named by `id`.
-    ///
-    /// Identity-checked rollback: if the key has since been re-admitted (a
-    /// replacement generation with its own charge), this is a no-op for that
-    /// replacement. The caller receives the assembly and context outside the
-    /// shard lock and controls their rollback release order.
-    pub fn take_id(&self, id: ChunkAssemblyId) -> Option<(ChunkAssembler, C)> {
-        let removed = {
-            let mut shard = self.shard(id.conn_id).lock();
-            let key = (id.conn_id, id.request_id);
-            let matches = shard
-                .get(&key)
-                .is_some_and(|tracked| tracked.generation == id.generation);
-            if !matches {
-                None
-            } else {
-                shard.remove(&key).inspect(|tracked| {
-                    self.active_count.fetch_sub(1, Ordering::Relaxed);
-                    self.total_bytes
-                        .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-                })
-            }
-        };
-        removed.map(|tracked| (tracked.inner, tracked.context))
     }
 
     /// Sweep expired assemblies across all shards.
@@ -373,18 +456,28 @@ impl<C> ChunkRegistry<C> {
                     .map(|(key, _)| *key)
                     .collect();
                 for key in expired_keys {
-                    if let Some(tracked) = shard.remove(&key) {
+                    if let Some(tracked) = shard.get_mut(&key) {
                         // Counters move with the entry removal, under the
                         // same shard lock.
-                        self.active_count.fetch_sub(1, Ordering::Relaxed);
-                        self.total_bytes
-                            .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-                        stats.expired += 1;
-                        stats.freed_bytes += tracked.total_bytes;
-                        removed.push(tracked);
+                        if tracked.inner.is_some() {
+                            self.active_count.fetch_sub(1, Ordering::Relaxed);
+                            self.total_bytes
+                                .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
+                            stats.expired += 1;
+                            stats.freed_bytes += tracked.total_bytes;
+                            tracked.total_bytes = 0;
+                        }
+                        removed.push((tracked.inner.take(), tracked.context.take()));
+                        // A frame already dispatched must retain its exact
+                        // reply claim if GC removes its assembly underneath it.
+                        // With no frame tasks, GC removes the entire request as
+                        // before: a later continuation then fails its own feed.
+                        if !tracked.has_unsettled_frames() {
+                            shard.remove(&key);
+                        }
                     }
                 }
-                remaining = shard.len();
+                remaining = shard.values().filter(|entry| entry.inner.is_some()).count();
             }
             stats.remaining += remaining;
             // Backing release and charge refund happen on drop, outside the
@@ -413,9 +506,11 @@ impl<C> ChunkRegistry<C> {
                 .collect();
             for key in conn_keys {
                 if let Some(tracked) = shard.remove(&key) {
-                    self.active_count.fetch_sub(1, Ordering::Relaxed);
-                    self.total_bytes
-                        .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
+                    if tracked.inner.is_some() {
+                        self.active_count.fetch_sub(1, Ordering::Relaxed);
+                        self.total_bytes
+                            .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
+                    }
                     removed.push(tracked);
                 }
             }
@@ -426,11 +521,16 @@ impl<C> ChunkRegistry<C> {
     }
 
     /// Nonblocking connection teardown. Busy releases retain the complete
-    /// assembler for retry; an actual release error abandons its obligation.
+    /// assembler until its local pool lock is available.
     /// Finished carriers are independent.
     pub fn try_cleanup_connection(&self, conn_id: u64) -> bool {
-        self.try_drain_shard(self.shard(conn_id), |(cid, _), _| *cid == conn_id, None)
-            .0
+        self.try_drain_shard(
+            self.shard(conn_id),
+            |(cid, _), _| *cid == conn_id,
+            None,
+            false,
+        )
+        .0
     }
 
     /// Connection teardown with a deadline checked before each release.
@@ -439,6 +539,7 @@ impl<C> ChunkRegistry<C> {
             self.shard(conn_id),
             |(cid, _), _| *cid == conn_id,
             Some(deadline),
+            false,
         )
         .0
     }
@@ -449,6 +550,7 @@ impl<C> ChunkRegistry<C> {
             self.shard(conn_id),
             |key, _| *key == (conn_id, request_id),
             None,
+            false,
         )
         .0
     }
@@ -465,6 +567,7 @@ impl<C> ChunkRegistry<C> {
                     now.duration_since(tracked.last_activity) >= self.config.assembler_timeout
                 },
                 None,
+                true,
             );
             stats.expired += released.expired;
             stats.freed_bytes += released.freed_bytes;
@@ -475,19 +578,19 @@ impl<C> ChunkRegistry<C> {
 
     fn try_drain_shard(
         &self,
-        shard: &Mutex<HashMap<(u64, u64), TrackedAssembler<C>>>,
-        matches: impl Fn(&(u64, u64), &TrackedAssembler<C>) -> bool,
+        shard: &Mutex<HashMap<(u64, u64), TrackedRequest<C>>>,
+        matches: impl Fn(&(u64, u64), &TrackedRequest<C>) -> bool,
         deadline: Option<Instant>,
+        keep_frames: bool,
     ) -> (bool, GcStats) {
         // Declared before the guard so unwinding also drops contexts unlocked.
         let mut removed = Vec::new();
-        let mut failures = HashMap::new();
         let Some(mut shard) = shard.try_lock() else {
             return (false, GcStats::default());
         };
         let mut complete = true;
         let mut stats = GcStats::default();
-        for (key, tracked) in shard.extract_if(|key, tracked| {
+        for (_, tracked) in shard.extract_if(|key, tracked| {
             if !matches(key, tracked) {
                 return false;
             }
@@ -495,45 +598,32 @@ impl<C> ChunkRegistry<C> {
                 complete = false;
                 return false;
             }
-            // The physical release and validation occur under the same pool
-            // guard. A busy pool retains the entry; an actual error exits the
-            // recovery loop and is abandoned outside the shard lock.
-            match tracked.inner.try_release() {
-                Ok(true) => {
-                    stats.expired += 1;
-                    stats.freed_bytes += tracked.total_bytes;
-                    true
-                }
-                Ok(false) => {
-                    complete = false;
-                    false
-                }
-                Err(error) => {
-                    failures.insert(*key, error);
-                    true
-                }
+            if tracked
+                .inner
+                .as_mut()
+                .is_some_and(|inner| !inner.try_release())
+            {
+                complete = false;
+                return false;
             }
+            if tracked.inner.is_some() {
+                self.active_count.fetch_sub(1, Ordering::Relaxed);
+                self.total_bytes
+                    .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
+                stats.expired += 1;
+                stats.freed_bytes += tracked.total_bytes;
+                tracked.total_bytes = 0;
+            }
+            removed.push((tracked.inner.take(), tracked.context.take()));
+            !keep_frames || !tracked.has_unsettled_frames()
         }) {
-            self.active_count.fetch_sub(1, Ordering::Relaxed);
-            self.total_bytes
-                .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-            removed.push((key, tracked));
+            // Only empty metadata remains; backing/context drop below, unlocked.
+            drop(tracked);
         }
-        stats.remaining = shard.len();
+        stats.remaining = shard.values().filter(|entry| entry.inner.is_some()).count();
         drop(shard);
-        // All context Drop and failed-release finalization run after both
-        // shard and pool guards are gone. Do not let an Err take the ordinary
-        // assembler Drop, which would retry the same physical release.
-        for (key, tracked) in removed {
-            if let Some(error) = failures.remove(&key) {
-                warn!(conn_id = key.0, request_id = key.1, %error, "final chunk release failed");
-                let TrackedAssembler { inner, context, .. } = tracked;
-                inner.abandon();
-                drop(context);
-            } else {
-                drop(tracked);
-            }
-        }
+        // Context Drop runs outside both shard and pool guards.
+        drop(removed);
         (complete, stats)
     }
 }
@@ -549,7 +639,7 @@ impl ChunkRegistry<()> {
         total_size: u64,
         total_chunks: usize,
         first_data_len: usize,
-    ) -> Result<ChunkAssemblyId, ChunkAdmissionError> {
+    ) -> Result<(), ChunkAdmissionError> {
         if total_size == 0 {
             return Err(ChunkAdmissionError::Protocol(
                 "total_size must be > 0".to_string(),
@@ -600,7 +690,7 @@ mod tests {
             min_block_size: 4096,
             max_segments: 2,
             max_dedicated_segments: 2,
-            dedicated_crash_timeout_secs: 0.0,
+
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_reg_test"),
@@ -609,26 +699,165 @@ mod tests {
     }
 
     fn test_pool() -> Arc<RwLock<MemPool>> {
-        Arc::new(RwLock::new(MemPool::new_with_prefix(
-            base_config(),
-            unique_prefix(""),
-        )))
+        Arc::new(RwLock::new(
+            MemPool::new_with_prefix(base_config(), unique_prefix("")).unwrap(),
+        ))
     }
 
     fn budgeted_pool(reassembly_limit: u64) -> (Arc<RwLock<MemPool>>, MemoryBudget) {
         let budget = MemoryBudget::new(1 << 20, 1 << 20, reassembly_limit);
         (
-            Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-                base_config(),
-                unique_prefix("b"),
-                budget.clone(),
-            ))),
+            Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    base_config(),
+                    unique_prefix("b"),
+                    budget.clone(),
+                )
+                .unwrap(),
+            )),
             budget,
         )
     }
 
     fn reassembly_used(budget: &MemoryBudget) -> u64 {
         budget.snapshot().cell(BudgetKind::Reassembly).used_bytes
+    }
+
+    #[test]
+    fn settled_request_releases_backing_and_last_frame_preserves_old_reply_claims() {
+        let (pool, budget) = budgeted_pool(128);
+        let reg = ChunkRegistry::new(pool, ChunkConfig::default());
+        let first = reg.begin_frame(1, 7, false);
+        let competing = reg.begin_frame(1, 7, false);
+        reg.insert(1, 7, 2, 32, ()).unwrap();
+        assert!(reassembly_used(&budget) > 0);
+        assert!(reg.settle(&first, || ()));
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+        assert!(reg.is_settled(1, 7));
+        assert!(reg.begin_frame(1, 7, true).is_settled());
+        assert!(!reg.shard(1).lock().contains_key(&(1, 7)));
+        assert!(
+            !reg.settle(&competing, || ()),
+            "a delayed task cannot reply again after last-frame cleanup"
+        );
+    }
+
+    #[test]
+    fn settled_records_use_no_chunk_budget_and_gc_does_not_refresh_their_age() {
+        for nonblocking in [false, true] {
+            let (pool, budget) = budgeted_pool(128);
+            let reg = ChunkRegistry::new(
+                pool,
+                ChunkConfig {
+                    soft_limit: 1,
+                    ..Default::default()
+                },
+            );
+            for id in 1..=100 {
+                let request = reg.begin_frame(1, id, false);
+                assert!(reg.settle(&request, || ()));
+            }
+            assert_eq!(reassembly_used(&budget), 0);
+            assert_eq!(reg.active_count(), 0);
+            reg.insert(2, 1, 2, 32, ()).unwrap();
+            reg.abort(2, 1);
+            let expired = Instant::now() - reg.config.assembler_timeout;
+            for entry in reg.shard(1).lock().values_mut() {
+                entry.last_activity = expired;
+            }
+            assert!(reg.begin_frame(1, 1, false).is_settled());
+            assert_eq!(reg.shard(1).lock()[&(1, 1)].last_activity, expired);
+            let swept = if nonblocking {
+                reg.try_gc_sweep()
+            } else {
+                reg.gc_sweep()
+            };
+            assert_eq!(swept.expired, 0, "settled entries own no assemblies");
+            assert_eq!(swept.freed_bytes, 0);
+            assert_eq!(swept.remaining, 0);
+            assert!(reg.shard(1).lock().is_empty());
+            assert_eq!(reassembly_used(&budget), 0);
+        }
+    }
+
+    #[test]
+    fn gc_releases_assembly_but_keeps_inflight_frames_on_one_error_claim() {
+        let (pool, budget) = budgeted_pool(128);
+        let reg = ChunkRegistry::new(pool, ChunkConfig::default());
+        let queued = reg.begin_frame(1, 9, false);
+        reg.insert(1, 9, 2, 32, ()).unwrap();
+        reg.shard(1).lock().get_mut(&(1, 9)).unwrap().last_activity =
+            Instant::now() - reg.config.assembler_timeout;
+        assert_eq!(reg.gc_sweep().expired, 1);
+        assert!(!reg.contains(1, 9));
+        assert_eq!(reassembly_used(&budget), 0);
+        let late = reg.begin_frame(1, 9, false);
+        assert!(Arc::ptr_eq(&queued.state, &late.state));
+        assert!(reg.settle(&queued, || ()));
+        assert!(!reg.settle(&late, || ()));
+        reg.cleanup_connection(1);
+        assert!(reg.shard(1).lock().is_empty());
+        assert!(!reg.settle(&queued, || ()));
+    }
+
+    #[test]
+    fn forced_chunked_100_mib_request_reassembles_beyond_512_chunks() {
+        const CHUNK_SIZE: usize = 128 * 1024;
+        const TOTAL_CHUNKS: usize = 800;
+        const TOTAL_SIZE: usize = CHUNK_SIZE * TOTAL_CHUNKS;
+
+        let spill_dir = std::env::temp_dir().join(format!(
+            "c2-wire-100mib-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, TestOrdering::Relaxed)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&spill_dir).unwrap();
+
+        let budget = MemoryBudget::new(0, TOTAL_SIZE as u64, (TOTAL_SIZE + TOTAL_CHUNKS) as u64);
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    buddy_enabled: false,
+                    spill_threshold: 0.0,
+                    spill_dir: spill_dir.clone(),
+                    ..base_config()
+                },
+                unique_prefix("large"),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
+        let reg = ChunkRegistry::new(pool, ChunkConfig::default());
+        reg.insert(1, 1, TOTAL_CHUNKS, CHUNK_SIZE, ()).unwrap();
+        let data = vec![0xa5; CHUNK_SIZE];
+        for index in 0..TOTAL_CHUNKS {
+            assert_eq!(
+                reg.feed(1, 1, index, &data).unwrap(),
+                index + 1 == TOTAL_CHUNKS
+            );
+        }
+        let (assembler, ()) = reg.take(1, 1).unwrap();
+        let mut backing = assembler.finish().unwrap();
+        assert_eq!(backing.len(), TOTAL_SIZE);
+        assert_eq!(backing.capacity_bytes(), (TOTAL_SIZE + TOTAL_CHUNKS) as u64);
+        assert!(
+            backing
+                .copy_bytes()
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        backing.release();
+        assert_eq!(reassembly_used(&budget), 0);
+        std::fs::remove_dir(&spill_dir).unwrap();
     }
 
     #[test]
@@ -639,7 +868,7 @@ mod tests {
         reg.insert(1, 100, 1, data.len(), ()).unwrap();
         assert!(reg.contains(1, 100));
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reg.total_bytes(), data.len() as u64);
+        assert_eq!(reg.total_bytes(), data.len() as u64 + 1);
         let complete = reg.feed(1, 100, 0, data).unwrap();
         assert!(complete);
         let (assembler, ()) = reg.take(1, 100).unwrap();
@@ -649,7 +878,7 @@ mod tests {
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
         assert_eq!(finished.copy_bytes().unwrap(), data);
-        finished.release().unwrap();
+        finished.release();
     }
 
     #[test]
@@ -659,88 +888,14 @@ mod tests {
         reg.insert(1, 200, 3, 1024, ()).unwrap();
         assert!(!reg.feed(1, 200, 0, &[7; 200]).unwrap());
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reg.total_bytes(), 3 * 1024);
-        assert_eq!(reassembly_used(&budget), 3 * 1024);
+        assert_eq!(reg.total_bytes(), 3 * 1024 + 3);
+        assert_eq!(reassembly_used(&budget), 3 * 1024 + 3);
         reg.abort(1, 200);
         // Idempotent: a missing entry aborts nothing.
         reg.abort(1, 200);
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
         assert_eq!(reassembly_used(&budget), 0);
-    }
-
-    #[test]
-    fn failed_nonblocking_extraction_abandons_once_without_refunding() {
-        for exit in ["abort", "connection", "gc"] {
-            let (pool, budget) = budgeted_pool(4096);
-            let reg = ChunkRegistry::new(
-                Arc::clone(&pool),
-                ChunkConfig {
-                    assembler_timeout: Duration::ZERO,
-                    ..ChunkConfig::default()
-                },
-            );
-            reg.insert(1, 7, 1, 4096, ()).unwrap();
-            let original = std::mem::replace(
-                &mut *pool.write(),
-                MemPool::new_with_prefix(base_config(), unique_prefix("failed")),
-            );
-
-            match exit {
-                "abort" => assert!(reg.try_abort(1, 7)),
-                "connection" => assert!(reg.try_cleanup_connection(1)),
-                "gc" => {
-                    let stats = reg.try_gc_sweep();
-                    assert_eq!(stats.expired, 0, "failed release did not free storage");
-                    assert_eq!(stats.remaining, 0);
-                }
-                _ => unreachable!(),
-            }
-            assert!(!reg.contains(1, 7), "{exit}");
-            assert_eq!(reg.active_count(), 0, "{exit}");
-            assert_eq!(reg.total_bytes(), 0, "{exit}");
-            assert_eq!(original.stats().alloc_count, 1, "{exit}");
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 4096, "{exit}");
-            assert_eq!(budget.snapshot().abandoned_releases, 1, "{exit}");
-            assert!(reg.try_cleanup_connection(1));
-            assert_eq!(reg.try_gc_sweep().remaining, 0);
-            assert_eq!(budget.snapshot().abandoned_releases, 1, "{exit}");
-            assert!(
-                budget.reserve(BudgetKind::Reassembly, 4096).is_err(),
-                "{exit}"
-            );
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 4096, "{exit}");
-        }
-    }
-
-    #[test]
-    fn take_id_releases_only_its_own_generation() {
-        let (pool, budget) = budgeted_pool(1 << 20);
-        let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        // First generation is admitted, then removed; a replacement generation
-        // is admitted under the same key with its own charge.
-        let first = reg.insert(1, 250, 1, 256, ()).unwrap();
-        reg.abort(1, 250);
-        let replacement = reg.insert(1, 250, 2, 256, ()).unwrap();
-        assert_ne!(first.generation(), replacement.generation());
-        assert_eq!(reg.active_count(), 1);
-        assert_eq!(reassembly_used(&budget), 512);
-
-        // A stale generation's rollback must not touch the replacement.
-        drop(reg.take_id(first));
-        assert!(reg.contains(1, 250));
-        assert_eq!(reg.active_count(), 1);
-        assert_eq!(reassembly_used(&budget), 512);
-
-        // The matching generation releases exactly its own charge.
-        drop(reg.take_id(replacement));
-        assert!(!reg.contains(1, 250));
-        assert_eq!(reg.active_count(), 0);
-        assert_eq!(reg.total_bytes(), 0);
-        assert_eq!(reassembly_used(&budget), 0);
-        // Repeated identity abort stays a no-op.
-        drop(reg.take_id(replacement));
-        assert_eq!(reg.active_count(), 0);
     }
 
     #[test]
@@ -771,12 +926,12 @@ mod tests {
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
         reg.insert(1, 500, 2, 64, ()).unwrap();
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reassembly_used(&budget), 128);
+        assert_eq!(reassembly_used(&budget), 128 + 2);
         // Second insert for same key must fail and keep exactly one charge.
         let err = reg.insert(1, 500, 3, 128, ()).unwrap_err().0.to_string();
         assert!(err.contains("duplicate"), "expected duplicate error: {err}");
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reassembly_used(&budget), 128);
+        assert_eq!(reassembly_used(&budget), 128 + 2);
         // Original entry still intact and feedable to completion.
         assert!(!reg.feed(1, 500, 0, &[7u8; 64]).unwrap());
         assert!(reg.feed(1, 500, 1, &[6u8; 32]).unwrap());
@@ -790,7 +945,7 @@ mod tests {
         let (pool, budget) = budgeted_pool(1 << 20);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
         reg.insert(1, 510, 2, 64, ()).unwrap();
-        assert_eq!(reassembly_used(&budget), 128);
+        assert_eq!(reassembly_used(&budget), 128 + 2);
         // Duplicate chunk index is an invalid chunk: caller aborts.
         reg.feed(1, 510, 0, &[1u8; 64]).unwrap();
         assert!(reg.feed(1, 510, 0, &[2u8; 64]).is_err());
@@ -819,7 +974,7 @@ mod tests {
         assert_eq!(&slice[128..256], &[1u8; 128]);
         assert_eq!(&slice[256..384], &[2u8; 128]);
         assert_eq!(&slice[384..384 + 64], &[3u8; 64]);
-        finished.release().unwrap();
+        finished.release();
     }
 
     #[test]
@@ -859,7 +1014,7 @@ mod tests {
                 },
             )
             .unwrap_or_else(|(error, _)| panic!("{error}"));
-            assert_eq!(reassembly_used(&budget), 1024);
+            assert_eq!(reassembly_used(&budget), 1024 + 1);
             match *action {
                 "abort" => reg.abort(1, 1),
                 "disconnect" => reg.cleanup_connection(1),
@@ -871,7 +1026,7 @@ mod tests {
                     let held_pool = pool.read();
                     assert!(!reg.try_cleanup_connection(1));
                     assert_eq!(dropped.load(Ordering::SeqCst), index);
-                    assert_eq!(reassembly_used(&budget), 1024);
+                    assert_eq!(reassembly_used(&budget), 1024 + 1);
                     drop(held_pool);
                     assert!(reg.try_cleanup_connection(1));
                 }
@@ -891,16 +1046,19 @@ mod tests {
         reg.insert(1, 100, 1, 1024, ()).unwrap();
         reg.insert(1, 200, 2, 512, ()).unwrap();
         reg.insert(2, 100, 1, 256, ()).unwrap();
-        assert_eq!(reassembly_used(&budget), 1024 + 1024 + 256);
+        assert_eq!(
+            reassembly_used(&budget),
+            (1024 + 1) + (1024 + 2) + (256 + 1)
+        );
         reg.cleanup_connection(1);
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reassembly_used(&budget), 256);
+        assert_eq!(reassembly_used(&budget), 256 + 1);
         // Conn 2's assembly survives and completes.
         let complete = reg.feed(2, 100, 0, &[42u8; 256]).unwrap();
         assert!(complete);
         let (assembler, ()) = reg.take(2, 100).unwrap();
         let mut finished = assembler.finish().unwrap();
-        finished.release().unwrap();
+        finished.release();
         assert_eq!(reassembly_used(&budget), 0);
     }
 
@@ -914,7 +1072,7 @@ mod tests {
                 }
             }
         }
-        let (pool, budget) = budgeted_pool(64);
+        let (pool, budget) = budgeted_pool(64 + 1);
         let reg = Arc::new(ChunkRegistry::new(
             pool,
             ChunkConfig {
@@ -956,7 +1114,7 @@ mod tests {
             .unwrap_or_else(|(e, _)| panic!("{e}"));
         assert!(!reg.contains(0, 2));
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reassembly_used(&budget), 64);
+        assert_eq!(reassembly_used(&budget), 64 + 1);
         drop(reg);
         assert_eq!(reassembly_used(&budget), 0);
     }
@@ -970,7 +1128,7 @@ mod tests {
             (2, 4096, false, false),
             (512, 4096, true, false),
         ] {
-            let (pool, budget) = budgeted_pool(128);
+            let (pool, budget) = budgeted_pool(2 * (64 + 1));
             let reg = ChunkRegistry::new(
                 pool,
                 ChunkConfig {
@@ -1010,7 +1168,10 @@ mod tests {
                 ));
             }
             assert_eq!(reg.active_count(), if reclaimed { 1 } else { 2 });
-            assert_eq!(reassembly_used(&budget), if reclaimed { 64 } else { 128 });
+            assert_eq!(
+                reassembly_used(&budget),
+                if reclaimed { 64 + 1 } else { 2 * (64 + 1) }
+            );
             assert_eq!(
                 budget.snapshot().reassembly.rejected_allocations,
                 u64::from(!reclaimed)
@@ -1022,7 +1183,7 @@ mod tests {
 
     #[test]
     fn pressure_gc_skips_a_proven_fresh_unrelated_shard() {
-        let (pool, budget) = budgeted_pool(128);
+        let (pool, budget) = budgeted_pool(2 * (64 + 1));
         let reg = Arc::new(ChunkRegistry::new(
             pool,
             ChunkConfig {
@@ -1078,7 +1239,7 @@ mod tests {
         assert_eq!(reg.total_bytes(), 0);
         // …but the budget charge for the full capacity stays live through the
         // trim and until the carrier is released.
-        assert_eq!(reassembly_used(&budget), 4 * 128);
+        assert_eq!(reassembly_used(&budget), 4 * (128 + 1));
         assert_eq!(finished.len(), 3 * 128 + 64);
         drop(finished);
         assert_eq!(reassembly_used(&budget), 0);
@@ -1100,31 +1261,31 @@ mod tests {
         // and the charge held.
         drop(reg);
         drop(registry_pool_view);
-        assert_eq!(reassembly_used(&budget), 512);
+        assert_eq!(reassembly_used(&budget), 512 + 2);
         let mut backing = finished;
         assert_eq!(backing.len(), 384);
         assert_eq!(&backing.copy_bytes().unwrap()[0..256], &[9u8; 256]);
         assert_eq!(&backing.copy_bytes().unwrap()[256..384], &[8u8; 128]);
 
-        backing.release().unwrap();
+        backing.release();
         assert_eq!(reassembly_used(&budget), 0);
     }
 
     #[test]
     fn admission_rejects_before_mapping_with_cell_and_size_error() {
-        let (pool, budget) = budgeted_pool(256);
+        let (pool, budget) = budgeted_pool(2 * 128 + 2);
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
-        // 3 × 128 = 384 > 256: rejected with the cell and size named.
+        // Three payload chunks and their flags exceed the two-chunk budget.
         let err = reg.insert(1, 620, 3, 128, ()).unwrap_err().0.to_string();
         assert!(
             err.contains("'reassembly'"),
             "error must name the cell: {err}"
         );
         assert!(
-            err.contains("384"),
+            err.contains("387"),
             "error must name the requested size: {err}"
         );
-        assert!(err.contains("256"), "error must name the limit: {err}");
+        assert!(err.contains("258"), "error must name the limit: {err}");
         assert_eq!(reg.active_count(), 0);
         // No mapping was created and only rejection statistics moved.
         let stats = pool.read().stats();
@@ -1133,7 +1294,7 @@ mod tests {
         let snap = budget.snapshot();
         assert_eq!(snap.reassembly.used_bytes, 0);
         assert_eq!(snap.reassembly.rejected_allocations, 1);
-        assert_eq!(snap.reassembly.rejected_bytes, 384);
+        assert_eq!(snap.reassembly.rejected_bytes, 384 + 3);
 
         // Zero geometry is rejected without any budget interaction.
         let err = reg.insert(1, 621, 1, 0, ()).unwrap_err().0.to_string();
@@ -1144,7 +1305,7 @@ mod tests {
 
         // After one admitted assembly fills the cell, a second is rejected.
         reg.insert(1, 623, 2, 128, ()).unwrap();
-        assert_eq!(reassembly_used(&budget), 256);
+        assert_eq!(reassembly_used(&budget), 256 + 2);
         let err = reg.insert(1, 624, 1, 128, ()).unwrap_err().0.to_string();
         assert!(err.contains("'reassembly'"));
         assert_eq!(reg.active_count(), 1);
@@ -1156,32 +1317,35 @@ mod tests {
     fn shared_budget_bounds_independent_registries() {
         // Two registries over two pools sharing one MemoryBudget: concurrent
         // admissions cannot exceed the shared live bytes.
-        let budget = MemoryBudget::new(1 << 20, 1 << 20, 4 * 256);
+        let budget = MemoryBudget::new(1 << 20, 1 << 20, 4 * (256 + 2));
         let mk_registry = |tag: char| {
-            let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-                base_config(),
-                unique_prefix(&tag.to_string()),
-                budget.clone(),
-            )));
+            let pool = Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    base_config(),
+                    unique_prefix(&tag.to_string()),
+                    budget.clone(),
+                )
+                .unwrap(),
+            ));
             ChunkRegistry::new(pool, ChunkConfig::default())
         };
         let reg_a = mk_registry('a');
         let reg_b = mk_registry('b');
 
-        // Exactly four 256-byte assemblies fit; the fifth is rejected no
+        // Exactly four 258-byte assemblies fit; the fifth is rejected no
         // matter which registry tries.
-        reg_a.insert(1, 1, 2, 128, ()).unwrap(); // 256
-        reg_b.insert(2, 1, 2, 128, ()).unwrap(); // 512
-        reg_a.insert(1, 2, 2, 128, ()).unwrap(); // 768
-        reg_b.insert(2, 2, 2, 128, ()).unwrap(); // 1024 = limit
-        assert_eq!(reassembly_used(&budget), 1024);
+        reg_a.insert(1, 1, 2, 128, ()).unwrap(); // 258
+        reg_b.insert(2, 1, 2, 128, ()).unwrap(); // 516
+        reg_a.insert(1, 2, 2, 128, ()).unwrap(); // 774
+        reg_b.insert(2, 2, 2, 128, ()).unwrap(); // 1032 = limit
+        assert_eq!(reassembly_used(&budget), 4 * (256 + 2));
         assert!(reg_a.insert(1, 3, 1, 1, ()).is_err());
         assert!(reg_b.insert(2, 3, 1, 1, ()).is_err());
         // Releasing one admission frees room for exactly one more.
         reg_a.abort(1, 1);
-        assert_eq!(reassembly_used(&budget), 768);
+        assert_eq!(reassembly_used(&budget), 3 * (256 + 2));
         reg_b.insert(2, 3, 2, 128, ()).unwrap();
-        assert_eq!(reassembly_used(&budget), 1024);
+        assert_eq!(reassembly_used(&budget), 4 * (256 + 2));
         reg_a.abort(1, 2);
         reg_a.abort(1, 2);
         reg_b.abort(2, 1);
@@ -1194,31 +1358,36 @@ mod tests {
     fn concurrent_admissions_never_exceed_shared_live_bytes() {
         use std::sync::Barrier;
 
-        const SEATS: usize = 4; // concurrent 512-byte assemblies that fit
+        const SEATS: usize = 4; // concurrent 516-byte assemblies that fit
         const ASSEMBLY_BYTES: usize = 512;
-        const LIMIT: u64 = SEATS as u64 * ASSEMBLY_BYTES as u64;
+        const CHUNKS_PER_ASSEMBLY: usize = 4;
+        const CHARGED_BYTES: u64 = (ASSEMBLY_BYTES + CHUNKS_PER_ASSEMBLY) as u64;
+        const LIMIT: u64 = SEATS as u64 * CHARGED_BYTES;
 
         let budget = MemoryBudget::new(1 << 20, 1 << 20, LIMIT);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                segment_size: 256 * 1024,
-                min_block_size: 4096,
-                max_segments: 4,
-                max_dedicated_segments: 8,
-                dedicated_crash_timeout_secs: 0.0,
-                buddy_idle_decay_secs: 0.0,
-                spill_threshold: 1.0,
-                spill_dir: std::env::temp_dir().join("c2_reg_test"),
-                ..PoolConfig::default()
-            },
-            unique_prefix("c"),
-            budget.clone(),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    segment_size: 256 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 4,
+                    max_dedicated_segments: 8,
+
+                    buddy_idle_decay_secs: 0.0,
+                    spill_threshold: 1.0,
+                    spill_dir: std::env::temp_dir().join("c2_reg_test"),
+                    ..PoolConfig::default()
+                },
+                unique_prefix("c"),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         let reg = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
 
         // Phase 1: SEATS threads race to admit one assembly each and HOLD
         // it at a barrier. Exactly SEATS must succeed because the shared
-        // cell fits exactly SEATS × 512 bytes.
+        // cell fits exactly SEATS × 516 bytes.
         let admit_barrier = Arc::new(Barrier::new(SEATS));
         let mut handles = Vec::new();
         for t in 0..SEATS {
@@ -1263,10 +1432,7 @@ mod tests {
         assert_eq!(reg.active_count(), SEATS);
         let snap = budget.snapshot();
         assert_eq!(snap.reassembly.rejected_allocations, SEATS as u64);
-        assert_eq!(
-            snap.reassembly.rejected_bytes,
-            SEATS as u64 * ASSEMBLY_BYTES as u64
-        );
+        assert_eq!(snap.reassembly.rejected_bytes, SEATS as u64 * CHARGED_BYTES);
         assert!(snap.reassembly.peak_bytes <= LIMIT && snap.reassembly.peak_bytes > 0);
 
         // Phase 3: releasing every held admission refunds exactly once and
@@ -1279,7 +1445,7 @@ mod tests {
         assert_eq!(reg.total_bytes(), 0);
         reg.insert(200, 1, 4, ASSEMBLY_BYTES / 4, ())
             .expect("freed budget must admit again");
-        assert_eq!(reassembly_used(&budget), ASSEMBLY_BYTES as u64);
+        assert_eq!(reassembly_used(&budget), CHARGED_BYTES);
         reg.abort(200, 1);
         assert_eq!(reassembly_used(&budget), 0);
     }
@@ -1298,7 +1464,7 @@ mod tests {
                     let (assembler, ()) = reg.take(conn_id, req_id).unwrap();
                     let mut finished = assembler.finish().unwrap();
                     assert_eq!(finished.copy_bytes().unwrap(), &[conn_id as u8; 64]);
-                    finished.release().unwrap();
+                    finished.release();
                 }
             });
             handles.push(h);
@@ -1325,7 +1491,7 @@ mod tests {
                     reg.feed(conn_id, req_id, 0, &[0u8; 64]).unwrap();
                     let (assembler, ()) = reg.take(conn_id, req_id).unwrap();
                     let mut finished = assembler.finish().unwrap();
-                    finished.release().unwrap();
+                    finished.release();
                 }
             });
             handles.push(h);
@@ -1339,14 +1505,14 @@ mod tests {
 
     #[test]
     fn interleaved_requests_keep_content_and_charges_independent() {
-        let (pool, budget) = budgeted_pool(2048);
+        let (pool, budget) = budgeted_pool(2 * (1024 + 2));
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
         for request_id in [100, 200] {
             reg.insert(42, request_id, 2, 512, ()).unwrap();
         }
         assert_eq!(reg.active_count(), 2);
-        assert_eq!(reg.total_bytes(), 2048);
-        assert_eq!(reassembly_used(&budget), 2048);
+        assert_eq!(reg.total_bytes(), 2 * (1024 + 2));
+        assert_eq!(reassembly_used(&budget), 2 * (1024 + 2));
         assert!(!reg.feed(42, 100, 0, &[1; 512]).unwrap());
         assert!(!reg.feed(42, 200, 0, &[2; 512]).unwrap());
         assert!(reg.feed(42, 100, 1, &[3; 100]).unwrap());
@@ -1356,13 +1522,13 @@ mod tests {
         assert!(!reg.contains(42, 100));
         assert!(reg.contains(42, 200));
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reg.total_bytes(), 1024);
-        assert_eq!(reassembly_used(&budget), 2048);
+        assert_eq!(reg.total_bytes(), 1024 + 2);
+        assert_eq!(reassembly_used(&budget), 2 * (1024 + 2));
         let expected_first = [vec![1; 512], vec![3; 100]].concat();
         assert_eq!(first.len(), 612);
         assert_eq!(first.copy_bytes().unwrap(), expected_first);
-        first.release().unwrap();
-        assert_eq!(reassembly_used(&budget), 1024);
+        first.release();
+        assert_eq!(reassembly_used(&budget), 1024 + 2);
         assert_eq!(pool.read().stats().alloc_count, 1);
 
         assert!(reg.feed(42, 200, 1, &[4; 200]).unwrap());
@@ -1370,11 +1536,11 @@ mod tests {
         let mut second = second.finish().unwrap();
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
-        assert_eq!(reassembly_used(&budget), 1024);
+        assert_eq!(reassembly_used(&budget), 1024 + 2);
         let expected_second = [vec![2; 512], vec![4; 200]].concat();
         assert_eq!(second.len(), 712);
         assert_eq!(second.copy_bytes().unwrap(), expected_second);
-        second.release().unwrap();
+        second.release();
         assert_eq!(reassembly_used(&budget), 0);
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
@@ -1385,26 +1551,32 @@ mod tests {
     /// `should_spill` returns true for any size when the threshold is 0.0,
     /// and the pool starts with no pre-created buddy segments.
     fn spill_pool() -> Arc<RwLock<MemPool>> {
-        Arc::new(RwLock::new(MemPool::new_with_prefix(
-            PoolConfig {
-                spill_threshold: 0.0,
-                ..base_config()
-            },
-            unique_prefix("s"),
-        )))
+        Arc::new(RwLock::new(
+            MemPool::new_with_prefix(
+                PoolConfig {
+                    spill_threshold: 0.0,
+                    ..base_config()
+                },
+                unique_prefix("s"),
+            )
+            .unwrap(),
+        ))
     }
 
     fn budgeted_spill_pool(reassembly_limit: u64) -> (Arc<RwLock<MemPool>>, MemoryBudget) {
         let budget = MemoryBudget::new(1 << 20, 1 << 20, reassembly_limit);
         (
-            Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-                PoolConfig {
-                    spill_threshold: 0.0,
-                    ..base_config()
-                },
-                unique_prefix("t"),
-                budget.clone(),
-            ))),
+            Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    PoolConfig {
+                        spill_threshold: 0.0,
+                        ..base_config()
+                    },
+                    unique_prefix("t"),
+                    budget.clone(),
+                )
+                .unwrap(),
+            )),
             budget,
         )
     }
@@ -1454,7 +1626,7 @@ mod tests {
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
 
-        finished.release().unwrap();
+        finished.release();
         assert_no_shm_mappings(&pool);
     }
 
@@ -1471,13 +1643,13 @@ mod tests {
         let (assembler, ()) = reg.take(1, 710).unwrap();
         let held = assembler.finish().unwrap();
         assert!(held.is_file_spill());
-        assert_eq!(reassembly_used(&budget), 1024);
+        assert_eq!(reassembly_used(&budget), 1024 + 2);
         drop(reg);
         let slice = held.copy_bytes().unwrap();
         assert_eq!(&slice[0..512], &[7u8; 512]);
         assert_eq!(&slice[512..768], &[6u8; 256]);
         let mut held = held;
-        held.release().unwrap();
+        held.release();
         assert_eq!(reassembly_used(&budget), 0);
 
         // Abort path on a fresh file-backed registry.
@@ -1498,7 +1670,7 @@ mod tests {
         let mut finished = assembler.finish().unwrap();
         assert!(finished.is_file_spill());
         assert_eq!(finished.copy_bytes().unwrap(), &[9u8; 1024]);
-        finished.release().unwrap();
+        finished.release();
         assert_no_shm_mappings(&pool);
     }
 
@@ -1524,7 +1696,7 @@ mod tests {
         let (assembler, ()) = reg.take(1, 721).unwrap();
         let mut finished = assembler.finish().unwrap();
         assert!(finished.is_file_spill());
-        finished.release().unwrap();
+        finished.release();
         assert_eq!(reassembly_used(&budget), 0);
     }
 
@@ -1555,7 +1727,7 @@ mod tests {
         reg.feed(1, 11, 0, &[11; 512]).unwrap();
         let (assembler, ()) = reg.take(1, 11).unwrap();
         let held = assembler.finish().unwrap();
-        let partial = reg.insert(1, 22, 2, 1024, ()).unwrap();
+        reg.insert(1, 22, 2, 1024, ()).unwrap();
         reg.feed(1, 22, 0, &[22; 1024]).unwrap();
         let other_conn = 1 + SHARD_COUNT as u64; // share a shard, not an owner
         reg.insert(other_conn, 22, 1, 1024, ()).unwrap();
@@ -1586,7 +1758,7 @@ mod tests {
                 budget.snapshot(),
                 reg.active_count(),
                 reg.total_bytes(),
-                reg.shard(1).lock()[&(1, 22)].generation == partial.generation(),
+                reg.contains(1, 22),
             )
         });
         let _ = release_tx.send(());
@@ -1594,11 +1766,11 @@ mod tests {
         worker.join().unwrap();
         let (closed, aborted) =
             completed.expect("try_cleanup_connection/try_abort blocked on live owner");
-        let (live, count, bytes, same_generation) = locked_phase.unwrap();
+        let (live, count, bytes, assembly_retained) = locked_phase.unwrap();
         assert!(!closed && !aborted);
         assert_eq!(count, 2);
-        assert_eq!(bytes, 3072);
-        assert!(same_generation);
+        assert_eq!(bytes, (2048 + 2) + (1024 + 1));
+        assert!(assembly_retained);
         assert_eq!(live.file.used_bytes, charged.file.used_bytes);
         assert_eq!(live.reassembly.used_bytes, charged.reassembly.used_bytes);
         assert!(!reg.try_cleanup_connection_until(1, Instant::now()));
@@ -1607,14 +1779,17 @@ mod tests {
         assert!(!reg.contains(1, 22));
         assert!(reg.contains(other_conn, 22));
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reg.total_bytes(), 1024);
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 1536);
+        assert_eq!(reg.total_bytes(), 1024 + 1);
+        assert_eq!(
+            budget.snapshot().reassembly.used_bytes,
+            (1024 + 1) + (512 + 1)
+        );
         let (assembler, ()) = reg.take(other_conn, 22).unwrap();
         let mut other = assembler.finish().unwrap();
         assert_eq!(other.copy_bytes().unwrap(), &[33; 1024]);
-        other.release().unwrap();
+        other.release();
         assert_eq!(held.copy_bytes().unwrap(), &[11; 512]);
-        held.release().unwrap();
+        held.release();
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }
@@ -1701,14 +1876,14 @@ mod tests {
         assert_eq!(live.file.used_bytes, charged.file.used_bytes);
         assert_eq!(live.reassembly.used_bytes, charged.reassembly.used_bytes);
         assert_eq!(released_one.expired, 1);
-        assert_eq!(released_one.freed_bytes, 2048);
+        assert_eq!(released_one.freed_bytes, 2048 + 2);
         assert_eq!(released_one.remaining, 1);
         let released_other = reg.try_gc_sweep();
         assert_eq!(released_other.expired, 1);
         assert_eq!(released_other.remaining, 0);
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 512 + 1);
         assert_eq!(held.copy_bytes().unwrap(), &[11; 512]);
-        held.release().unwrap();
+        held.release();
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }
@@ -1724,15 +1899,18 @@ mod tests {
         ));
         std::fs::create_dir_all(&spill_dir).unwrap();
         let budget = MemoryBudget::new(1 << 20, 1 << 20, 100);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                spill_threshold: 0.0,
-                spill_dir: spill_dir.clone(),
-                ..base_config()
-            },
-            unique_prefix("r"),
-            budget.clone(),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    spill_threshold: 0.0,
+                    spill_dir: spill_dir.clone(),
+                    ..base_config()
+                },
+                unique_prefix("r"),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         let before: Vec<std::path::PathBuf> = std::fs::read_dir(&spill_dir)
             .into_iter()
             .flatten()
@@ -1763,15 +1941,18 @@ mod tests {
         file_limit: u64,
     ) -> (Arc<ChunkRegistry<()>>, Arc<RwLock<MemPool>>, MemoryBudget) {
         let budget = MemoryBudget::new(0, file_limit, live_limit);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                buddy_enabled: false,
-                spill_threshold: 0.0,
-                ..base_config()
-            },
-            unique_prefix("typed"),
-            budget.clone(),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    buddy_enabled: false,
+                    spill_threshold: 0.0,
+                    ..base_config()
+                },
+                unique_prefix("typed"),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         (
             Arc::new(ChunkRegistry::new(pool.clone(), ChunkConfig::default())),
             pool,
@@ -1785,8 +1966,8 @@ mod tests {
         size: u64,
         chunks: u32,
         data_len: usize,
-    ) -> Result<ChunkAssemblyId, ChunkAdmissionError> {
-        use crate::chunk::{decode_reply_chunk_meta, encode_reply_chunk_meta};
+    ) -> Result<(), ChunkAdmissionError> {
+        use crate::chunk::header::{decode_reply_chunk_meta, encode_reply_chunk_meta};
         let mut bytes = encode_reply_chunk_meta(size, chunks, 0).to_vec();
         bytes.resize(bytes.len() + data_len, 0x42);
         let (size, chunks, index, consumed) = decode_reply_chunk_meta(&bytes, 0).unwrap();
@@ -1803,7 +1984,6 @@ mod tests {
             (0, 2, 64),
             (128, 2, 0),
             (128, 1, 0),
-            (1024, 513, 1),
         ] {
             let error = raw_reply(&reg, 1, size, chunks, len).unwrap_err();
             assert!(
@@ -1821,16 +2001,83 @@ mod tests {
     }
 
     #[test]
+    fn reassembly_byte_limit_is_a_size_error_before_reservation() {
+        let (_default_reg, pool, budget) = typed_file_registry(0, 0);
+        let reg = ChunkRegistry::new(
+            pool.clone(),
+            ChunkConfig {
+                max_reassembly_bytes: 100,
+                ..ChunkConfig::default()
+            },
+        );
+        let error = raw_reply(&reg, 1, 128, 2, 64).unwrap_err();
+        assert!(matches!(error, ChunkAdmissionError::Capacity(_)));
+        assert_eq!(error.to_string(), "reassembly size 128 exceeds limit 100");
+        assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
+        assert_eq!(reg.active_count(), 0);
+        assert_no_shm_mappings(&pool);
+    }
+
+    #[test]
     fn typed_budget_capacity_rejection_creates_no_mapping() {
         let (reg, pool, budget) = typed_file_registry(0, 4096);
         let error = raw_reply(&reg, 1, 128, 2, 64).unwrap_err();
         assert!(matches!(error, ChunkAdmissionError::Capacity(_)));
         assert!(error.to_string().contains("'reassembly'"));
-        assert!(error.to_string().contains("128"));
+        assert!(error.to_string().contains("130"));
         assert_eq!(budget.snapshot().reassembly.rejected_allocations, 1);
+        assert_eq!(budget.snapshot().reassembly.rejected_bytes, 130);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         assert_eq!(reg.active_count(), 0);
+        assert_no_shm_mappings(&pool);
+    }
+
+    #[test]
+    fn flags_are_included_in_the_admission_budget() {
+        let (reg, pool, budget) = typed_file_registry(128, 4096);
+        let error = raw_reply(&reg, 1, 128, 2, 64).unwrap_err();
+        assert!(matches!(error, ChunkAdmissionError::Capacity(_)));
+        assert!(error.to_string().contains("'reassembly'"));
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.reassembly.rejected_allocations, 1);
+        assert_eq!(snapshot.reassembly.rejected_bytes, 130);
+        assert_eq!(snapshot.reassembly.used_bytes, 0);
+        assert_eq!(snapshot.file.rejected_allocations, 0);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+        assert_eq!(pool.read().stats().alloc_count, 0);
+        assert_no_shm_mappings(&pool);
+    }
+
+    #[test]
+    fn enormous_chunk_count_is_rejected_before_flags_or_backing_allocation() {
+        let (_default_reg, pool, budget) = typed_file_registry(u32::MAX as u64, 0);
+        let reg = ChunkRegistry::<()>::new(
+            pool.clone(),
+            ChunkConfig {
+                max_reassembly_bytes: u64::MAX,
+                ..ChunkConfig::default()
+            },
+        );
+        let error = reg
+            .insert_reply(1, 1, u64::MAX, u32::MAX as usize, 1)
+            .unwrap_err();
+        assert!(matches!(error, ChunkAdmissionError::Capacity(_)));
+        assert!(error.to_string().contains("'reassembly'"));
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.reassembly.rejected_allocations, 1);
+        assert_eq!(snapshot.reassembly.rejected_bytes, 2 * u32::MAX as u64);
+        assert_eq!(snapshot.reassembly.used_bytes, 0);
+        assert_eq!(snapshot.reassembly.peak_bytes, 0);
+        assert_eq!(snapshot.file.rejected_allocations, 0);
+        assert_eq!(snapshot.file.used_bytes, 0);
+        assert_eq!(snapshot.file.peak_bytes, 0);
+        assert_eq!(snapshot.shm.used_bytes, 0);
+        assert_eq!(snapshot.shm.peak_bytes, 0);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+        assert_eq!(pool.read().stats().alloc_count, 0);
         assert_no_shm_mappings(&pool);
     }
 
@@ -1840,7 +2087,7 @@ mod tests {
         let error = raw_reply(&reg, 1, 128, 2, 64).unwrap_err();
         assert!(matches!(error, ChunkAdmissionError::Capacity(_)));
         let snapshot = budget.snapshot();
-        assert_eq!(snapshot.reassembly.peak_bytes, 128);
+        assert_eq!(snapshot.reassembly.peak_bytes, 128 + 2);
         assert_eq!(snapshot.reassembly.used_bytes, 0);
         assert_eq!(snapshot.reassembly.rejected_allocations, 0);
         assert_eq!(snapshot.file.used_bytes, 0);
@@ -1851,10 +2098,10 @@ mod tests {
 
     #[test]
     fn typed_duplicate_at_full_budget_is_protocol_without_reservation() {
-        let (reg, pool, budget) = typed_file_registry(128, 4096);
+        let (reg, pool, budget) = typed_file_registry(128 + 2, 4096);
         raw_reply(&reg, 11, 128, 2, 64).unwrap();
         reg.feed(1, 11, 0, &[0x11; 64]).unwrap();
-        assert_eq!(reassembly_used(&budget), 128);
+        assert_eq!(reassembly_used(&budget), 128 + 2);
         let error = raw_reply(&reg, 11, 128, 2, 64).unwrap_err();
         assert!(matches!(
             error,
@@ -1866,7 +2113,7 @@ mod tests {
         assert!(error.to_string().contains("duplicate"));
         assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reg.total_bytes(), 128);
+        assert_eq!(reg.total_bytes(), 128 + 2);
         // An unrelated RID is a genuine capacity rejection, not a duplicate.
         assert!(matches!(
             raw_reply(&reg, 12, 128, 2, 64),
@@ -1885,14 +2132,14 @@ mod tests {
         let bytes = finished.copy_bytes().unwrap();
         assert_eq!(&bytes[..64], &[0x11; 64]);
         assert_eq!(&bytes[64..], &[0x22; 64]);
-        finished.release().unwrap();
+        finished.release();
         assert_eq!(reassembly_used(&budget), 0);
         assert_no_shm_mappings(&pool);
     }
 
     #[test]
     fn typed_gc_removal_makes_same_key_a_fresh_capacity_decision() {
-        let (reg, pool, budget) = typed_file_registry(128, 4096);
+        let (reg, pool, budget) = typed_file_registry(2 * (64 + 1), 4096);
         raw_reply(&reg, 11, 64, 1, 64).unwrap();
         raw_reply(&reg, 22, 64, 1, 64).unwrap();
         assert!(reg.contains(1, 11)); // A caller's old snapshot is now deliberately stale.
@@ -1909,7 +2156,7 @@ mod tests {
         assert!(reg.contains(1, 22));
         assert!(reg.contains(1, 33));
         assert_eq!(reg.active_count(), 2);
-        assert_eq!(reassembly_used(&budget), 128);
+        assert_eq!(reassembly_used(&budget), 2 * (64 + 1));
         reg.cleanup_connection(1);
         assert_eq!(reassembly_used(&budget), 0);
         assert_no_shm_mappings(&pool);
@@ -1917,7 +2164,7 @@ mod tests {
 
     #[test]
     fn typed_gc_and_duplicate_are_rechecked_after_pool_contention() {
-        let (reg, pool, budget) = typed_file_registry(128, 4096);
+        let (reg, pool, budget) = typed_file_registry(2 * (64 + 1), 4096);
         raw_reply(&reg, 11, 64, 1, 64).unwrap();
         raw_reply(&reg, 22, 64, 1, 64).unwrap();
         reg.shard(1).lock().get_mut(&(1, 11)).unwrap().last_activity =
@@ -1951,10 +2198,10 @@ mod tests {
         assert_eq!(reg.active_count(), 1);
         // Storage release waits for the real pool lock, so the old charge is
         // still live even though GC already removed the expired registry key.
-        assert_eq!(reassembly_used(&budget), 128);
+        assert_eq!(reassembly_used(&budget), 2 * (64 + 1));
         drop(pool_guard);
         assert_eq!(gc_thread.join().unwrap().expired, 1);
-        assert_eq!(reassembly_used(&budget), 64);
+        assert_eq!(reassembly_used(&budget), 64 + 1);
         // Another actual insert publishes the waiting key and fills the budget.
         // Retrying insert must now see Duplicate, without attempting a charge.
         raw_reply(&reg, 33, 64, 1, 64).unwrap();
@@ -1969,8 +2216,8 @@ mod tests {
         assert!(reg.contains(1, 22));
         assert!(reg.contains(1, 33));
         assert_eq!(reg.active_count(), 2);
-        assert_eq!(reg.total_bytes(), 128);
-        assert_eq!(reassembly_used(&budget), 128);
+        assert_eq!(reg.total_bytes(), 2 * (64 + 1));
+        assert_eq!(reassembly_used(&budget), 2 * (64 + 1));
         assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
         reg.cleanup_connection(1);
         assert_eq!(reassembly_used(&budget), 0);
@@ -2085,15 +2332,14 @@ mod tests {
         read_gate.wait();
         insert_gate.wait();
         let mut carrier = reader.join().unwrap();
-        let identity = writer.join().unwrap().unwrap();
-        assert_eq!(identity.request_id(), 22);
+        writer.join().unwrap().unwrap();
         assert!(reg.contains(1, 22));
         assert_eq!(reg.active_count(), 1);
-        assert_eq!(reassembly_used(&budget), 128);
+        assert_eq!(reassembly_used(&budget), 2 * (64 + 1));
         assert_eq!(carrier.copy_bytes().unwrap(), &[0x11; 64]);
         reg.abort(1, 22);
-        assert_eq!(reassembly_used(&budget), 64);
-        carrier.release().unwrap();
+        assert_eq!(reassembly_used(&budget), 64 + 1);
+        carrier.release();
         assert_eq!(reassembly_used(&budget), 0);
         assert_no_shm_mappings(&pool);
     }

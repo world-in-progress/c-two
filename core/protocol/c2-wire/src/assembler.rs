@@ -30,7 +30,6 @@ pub struct ChunkAssembler {
     /// High-water mark: one past the last byte written.
     written_end: usize,
     backing: ReassemblyBacking,
-    received_flags: Vec<bool>,
 }
 
 /// Checked immutable geometry. Only the canonical checks can create this token.
@@ -54,22 +53,16 @@ impl ChunkAssembler {
     ///
     /// `pool` is the shared owner pool that allocates the reassembly buffer
     /// and carries the canonical reassembly budget. `total_chunks` and
-    /// `chunk_size` come from the first chunk's header. Per-message limits
-    /// (`max_total_chunks`, `max_reassembly_bytes`) and geometry are checked
+    /// `chunk_size` come from the first chunk's header. The per-message byte
+    /// limit and geometry are checked
     /// before any budget reservation or allocation.
     pub fn new(
         pool: Arc<RwLock<MemPool>>,
         total_chunks: usize,
         chunk_size: usize,
-        max_total_chunks: usize,
-        max_reassembly_bytes: usize,
+        max_reassembly_bytes: u64,
     ) -> Result<Self, ChunkAdmissionError> {
-        let geometry = Self::check_geometry(
-            total_chunks,
-            chunk_size,
-            max_total_chunks,
-            max_reassembly_bytes,
-        )?;
+        let geometry = Self::check_geometry(total_chunks, chunk_size, max_reassembly_bytes)?;
         let guard = pool.write();
         Self::new_with_guard(Arc::clone(&pool), guard, geometry)
     }
@@ -77,18 +70,12 @@ impl ChunkAssembler {
     pub(crate) fn check_geometry(
         total_chunks: usize,
         chunk_size: usize,
-        max_total_chunks: usize,
-        max_reassembly_bytes: usize,
+        max_reassembly_bytes: u64,
     ) -> Result<ChunkGeometry, ChunkAdmissionError> {
-        if total_chunks > max_total_chunks {
-            return Err(ChunkAdmissionError::Protocol(format!(
-                "total_chunks {total_chunks} exceeds limit {max_total_chunks}"
-            )));
-        }
         let capacity =
             checked_capacity(total_chunks, chunk_size).map_err(ChunkAdmissionError::Protocol)?;
-        if capacity > max_reassembly_bytes {
-            return Err(ChunkAdmissionError::Protocol(format!(
+        if u64::try_from(capacity).map_or(true, |capacity| capacity > max_reassembly_bytes) {
+            return Err(ChunkAdmissionError::Capacity(format!(
                 "reassembly size {capacity} exceeds limit {max_reassembly_bytes}"
             )));
         }
@@ -108,15 +95,23 @@ impl ChunkAssembler {
             total_chunks,
             chunk_size,
         } = geometry;
-        let backing = ReassemblyBacking::admit_with_guard(pool, guard, total_chunks, chunk_size)
-            .map_err(ChunkAdmissionError::Capacity)?;
+        // Vec<bool> stores one byte per flag. Reserve those bytes together with
+        // the payload before allocating either storage, using the same owner
+        // reservation throughout the backing's lifetime.
+        let backing = ReassemblyBacking::admit_with_guard(
+            pool,
+            guard,
+            total_chunks,
+            chunk_size,
+            total_chunks,
+        )
+        .map_err(ChunkAdmissionError::Capacity)?;
         Ok(Self {
             total_chunks,
             chunk_size,
             received: 0,
             written_end: 0,
             backing,
-            received_flags: vec![false; total_chunks],
         })
     }
 
@@ -130,7 +125,7 @@ impl ChunkAssembler {
                 self.total_chunks
             ));
         }
-        if self.received_flags[chunk_idx] {
+        if self.backing.chunk_received(chunk_idx)? {
             return Err(format!("duplicate chunk_idx {chunk_idx}"));
         }
         if data.len() > self.chunk_size {
@@ -142,7 +137,7 @@ impl ChunkAssembler {
         }
         let offset = chunk_idx * self.chunk_size;
         self.backing.write_at(offset, data)?;
-        self.received_flags[chunk_idx] = true;
+        self.backing.mark_chunk_received(chunk_idx)?;
         self.received += 1;
         let end = offset + data.len();
         if end > self.written_end {
@@ -161,7 +156,7 @@ impl ChunkAssembler {
         self.received
     }
 
-    /// The allocated (and budget-charged) capacity in bytes.
+    /// The allocated payload and chunk-tracking capacity charged to the budget.
     pub fn capacity_bytes(&self) -> u64 {
         self.backing.capacity_bytes()
     }
@@ -170,8 +165,8 @@ impl ChunkAssembler {
     ///
     /// The returned backing's logical length is trimmed to `written_end` (one
     /// past the last byte written), which may be less than the allocated and
-    /// charged `total_chunks × chunk_size` capacity if the last chunk was
-    /// short. The trim never changes the charge.
+    /// charged payload capacity if the last chunk was short. The backing also
+    /// retains its chunk flags and their charge; trimming never refunds storage.
     ///
     /// On an incomplete assembly this returns `Err`; the assembler value
     /// drops on that return, releasing the backing storage through the pool
@@ -197,19 +192,9 @@ impl ChunkAssembler {
         drop(self)
     }
 
-    /// Try to release without consuming the assembler on pool contention.
-    ///
-    /// Cleanup owners retain this assembler on `Ok(false)` or an error and
-    /// retry it later. Only a successful release permits removing the entry;
-    /// its subsequent Drop then has no storage or reservation left to release.
-    pub fn try_release(&mut self) -> Result<bool, String> {
+    /// Try to release without consuming the assembler on local pool contention.
+    pub fn try_release(&mut self) -> bool {
         self.backing.try_release()
-    }
-
-    /// End a failed final release without another pool access or budget refund.
-    pub(crate) fn abandon(self) {
-        let Self { backing, .. } = self;
-        backing.abandon();
     }
 
     /// One past the last byte written (actual data length).
@@ -226,95 +211,104 @@ mod tests {
     use c2_mem::config::PoolConfig;
 
     fn test_pool_arc() -> Arc<RwLock<MemPool>> {
-        Arc::new(RwLock::new(MemPool::new(PoolConfig {
-            segment_size: 64 * 1024,
-            min_block_size: 4096,
-            max_segments: 2,
-            max_dedicated_segments: 2,
-            dedicated_crash_timeout_secs: 0.0,
-            buddy_idle_decay_secs: 0.0,
-            spill_threshold: 1.0,
-            spill_dir: std::env::temp_dir().join("c2_asm_test"),
-            ..PoolConfig::default()
-        })))
+        Arc::new(RwLock::new(
+            MemPool::new(PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 2,
+                max_dedicated_segments: 2,
+
+                buddy_idle_decay_secs: 0.0,
+                spill_threshold: 1.0,
+                spill_dir: std::env::temp_dir().join("c2_asm_test"),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        ))
     }
 
     fn budgeted_pool_arc(reassembly_limit: u64) -> (Arc<RwLock<MemPool>>, MemoryBudget) {
         let budget = MemoryBudget::new(1 << 20, 1 << 20, reassembly_limit);
         (
-            Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-                PoolConfig {
-                    segment_size: 64 * 1024,
-                    min_block_size: 4096,
-                    max_segments: 2,
-                    max_dedicated_segments: 2,
-                    dedicated_crash_timeout_secs: 0.0,
-                    buddy_idle_decay_secs: 0.0,
-                    spill_threshold: 1.0,
-                    spill_dir: std::env::temp_dir().join("c2_asm_test_budget"),
-                    ..PoolConfig::default()
-                },
-                format!("/cc3ab{:08x}", std::process::id()),
-                budget.clone(),
-            ))),
+            Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    PoolConfig {
+                        segment_size: 64 * 1024,
+                        min_block_size: 4096,
+                        max_segments: 2,
+                        max_dedicated_segments: 2,
+
+                        buddy_idle_decay_secs: 0.0,
+                        spill_threshold: 1.0,
+                        spill_dir: std::env::temp_dir().join("c2_asm_test_budget"),
+                        ..PoolConfig::default()
+                    },
+                    format!("/cc3ab{:08x}", std::process::id()),
+                    budget.clone(),
+                )
+                .unwrap(),
+            )),
             budget,
         )
     }
 
     #[test]
     fn try_release_file_keeps_partial_assembly_for_retry() {
-        let budget = MemoryBudget::new(0, 8192, 8192);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                spill_threshold: 0.0,
-                ..PoolConfig::default()
-            },
-            "assembler-try-release-file".into(),
-            budget.clone(),
-        )));
-        let mut asm = ChunkAssembler::new(Arc::clone(&pool), 2, 4096, 2, 8192).unwrap();
+        let budget = MemoryBudget::new(0, 8192, 8194);
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    spill_threshold: 0.0,
+                    ..PoolConfig::default()
+                },
+                "assembler-try-release-file".into(),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
+        let mut asm = ChunkAssembler::new(Arc::clone(&pool), 2, 4096, 8192).unwrap();
         assert!(asm.backing.is_file_spill());
         assert!(!asm.feed_chunk(0, &[27; 4096]).unwrap());
         {
             let _reader = pool.read();
-            assert!(!asm.try_release().unwrap());
+            assert!(!asm.try_release());
             assert_eq!(asm.received(), 1);
             assert_eq!(asm.written_end(), 4096);
-            assert_eq!(asm.capacity_bytes(), 8192);
+            assert_eq!(asm.capacity_bytes(), 8194);
             assert_eq!(budget.snapshot().file.used_bytes, 8192);
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 8192);
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
         }
         // Failed cleanup left data and chunk geometry intact, rather than
         // consuming the assembler or silently refunding an unfinished owner.
         assert!(asm.feed_chunk(1, &[38; 1024]).unwrap());
         assert_eq!(&asm.backing.copy_bytes().unwrap()[..4096], &[27; 4096]);
         assert_eq!(&asm.backing.copy_bytes().unwrap()[4096..5120], &[38; 1024]);
-        assert!(asm.try_release().unwrap());
+        assert!(asm.try_release());
         assert_eq!(asm.capacity_bytes(), 0);
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
         let _writer = pool.write();
-        assert!(asm.try_release().unwrap());
+        assert!(asm.try_release());
         drop(asm); // successful cleanup's Drop must not reacquire the pool
     }
 
     #[test]
     fn test_single_chunk() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool.clone(), 1, 4096, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 1, 4096, 8 * (1 << 30)).unwrap();
         let data = b"hello world";
         let complete = asm.feed_chunk(0, data).unwrap();
         assert!(complete);
         let mut backing = asm.finish().unwrap();
         assert_eq!(backing.len(), data.len());
         assert_eq!(&backing.copy_bytes().unwrap()[..data.len()], data);
-        backing.release().unwrap();
+        backing.release();
     }
 
     #[test]
     fn test_multi_chunk_in_order() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(0, b"aaaaaaaa").unwrap()); // full
         assert!(!asm.feed_chunk(1, b"bbbbbbbb").unwrap()); // full
         assert!(asm.feed_chunk(2, b"cc").unwrap()); // last, short
@@ -325,14 +319,14 @@ mod tests {
         assert_eq!(&slice[8..16], b"bbbbbbbb");
         assert_eq!(&slice[16..18], b"cc");
         // Trim happened but the full capacity stays charged until release.
-        assert_eq!(backing.capacity_bytes(), 24);
-        backing.release().unwrap();
+        assert_eq!(backing.capacity_bytes(), 27);
+        backing.release();
     }
 
     #[test]
     fn test_out_of_order() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool.clone(), 2, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 2, 8, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(1, b"second").unwrap()); // last, short
         assert!(asm.feed_chunk(0, b"firstttt").unwrap()); // full
         let mut backing = asm.finish().unwrap();
@@ -340,7 +334,7 @@ mod tests {
         let slice = backing.copy_bytes().unwrap();
         assert_eq!(&slice[0..8], b"firstttt");
         assert_eq!(&slice[8..14], b"second");
-        backing.release().unwrap();
+        backing.release();
     }
 
     #[test]
@@ -364,8 +358,7 @@ mod tests {
                 })
                 .collect();
             let mut asm =
-                ChunkAssembler::new(pool.clone(), total_chunks, chunk_size, 512, 8 * (1 << 30))
-                    .unwrap();
+                ChunkAssembler::new(pool.clone(), total_chunks, chunk_size, 8 * (1 << 30)).unwrap();
             for step in 0..total_chunks {
                 let idx = if reverse {
                     total_chunks - 1 - step
@@ -381,15 +374,18 @@ mod tests {
             let mut backing = asm.finish().unwrap();
             assert_eq!(backing.len(), (total_chunks - 1) * chunk_size + last_size);
             assert_eq!(backing.copy_bytes().unwrap(), chunks.concat());
-            assert_eq!(backing.capacity_bytes(), (total_chunks * chunk_size) as u64);
-            backing.release().unwrap();
+            assert_eq!(
+                backing.capacity_bytes(),
+                (total_chunks * (chunk_size + 1)) as u64
+            );
+            backing.release();
         }
     }
 
     #[test]
     fn test_duplicate_chunk_rejected() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool.clone(), 2, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 2, 8, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(0, b"data0000").unwrap());
         assert_eq!(asm.received(), 1);
         let err = asm.feed_chunk(0, b"dup").unwrap_err();
@@ -400,35 +396,38 @@ mod tests {
         assert_eq!(asm.received(), 2);
         let mut backing = asm.finish().unwrap();
         assert_eq!(backing.copy_bytes().unwrap(), b"data0000tail");
-        backing.release().unwrap();
+        backing.release();
     }
 
     #[test]
     fn test_abort_releases_handle_and_charge() {
         let budget = MemoryBudget::new(1 << 20, 0, 64 * 1024);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 1,
-                min_retained_segments: 1,
-                max_dedicated_segments: 0,
-                spill_threshold: 1.0,
-                ..PoolConfig::default()
-            },
-            format!("/cc3abort{:08x}", std::process::id()),
-            budget.clone(),
-        )));
-        let mut asm = ChunkAssembler::new(pool.clone(), 4, 4096, 512, 8 * (1 << 30)).unwrap();
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    segment_size: 64 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 1,
+                    min_retained_segments: 1,
+                    max_dedicated_segments: 0,
+                    spill_threshold: 1.0,
+                    ..PoolConfig::default()
+                },
+                format!("/cc3abort{:08x}", std::process::id()),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
+        let mut asm = ChunkAssembler::new(pool.clone(), 4, 4096, 8 * (1 << 30)).unwrap();
         assert!(asm.backing.is_buddy());
         assert_eq!(pool.read().stats().alloc_count, 1);
         assert!(!asm.feed_chunk(0, &[7; 200]).unwrap());
         assert_eq!(asm.received(), 1);
         assert_eq!(asm.written_end(), 200);
-        assert_eq!(asm.capacity_bytes(), 4 * 4096);
+        assert_eq!(asm.capacity_bytes(), 4 * (4096 + 1));
         assert_eq!(
             budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            4 * 4096
+            4 * (4096 + 1)
         );
         asm.abort();
         assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
@@ -446,7 +445,7 @@ mod tests {
         assert_eq!(after.buddy_expanded_allocs, before.buddy_expanded_allocs);
         assert_eq!(after.dedicated_allocs, 0);
         assert_eq!(after.file_spill_allocs, 0);
-        guard.release_handle(handle).unwrap();
+        guard.release_handle(handle);
         assert_eq!(guard.stats().alloc_count, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }
@@ -454,25 +453,25 @@ mod tests {
     #[test]
     fn test_finish_incomplete_fails_and_returns_charge_once() {
         let (pool, budget) = budgeted_pool_arc(64 * 1024);
-        let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 8 * (1 << 30)).unwrap();
         asm.feed_chunk(0, b"data").unwrap();
         assert_eq!(
             budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            24
+            27
         );
         let err = asm.finish().unwrap_err();
         assert!(err.contains("incomplete"));
         // The dropped incomplete assembler released storage and refunded.
         assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
         // The pool remains usable for a fresh assembly.
-        let fresh = ChunkAssembler::new(pool, 1, 4096, 512, 8 * (1 << 30)).unwrap();
+        let fresh = ChunkAssembler::new(pool, 1, 4096, 8 * (1 << 30)).unwrap();
         fresh.abort();
     }
 
     #[test]
     fn test_zero_chunks_rejected() {
         let pool = test_pool_arc();
-        let err = ChunkAssembler::new(pool, 0, 4096, 512, 8 * (1 << 30))
+        let err = ChunkAssembler::new(pool, 0, 4096, 8 * (1 << 30))
             .unwrap_err()
             .to_string();
         assert!(err.contains("total_chunks must be > 0"));
@@ -481,7 +480,7 @@ mod tests {
     #[test]
     fn test_zero_chunk_size_rejected_before_charge_or_allocation() {
         let (pool, budget) = budgeted_pool_arc(64 * 1024);
-        let err = ChunkAssembler::new(pool.clone(), 1, 0, 512, 8 * (1 << 30))
+        let err = ChunkAssembler::new(pool.clone(), 1, 0, 8 * (1 << 30))
             .unwrap_err()
             .to_string();
         assert!(err.contains("chunk_size must be > 0"));
@@ -496,7 +495,7 @@ mod tests {
     #[test]
     fn test_oversized_chunk_data() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool, 2, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool, 2, 8, 8 * (1 << 30)).unwrap();
         let err = asm.feed_chunk(0, &[0u8; 16]).unwrap_err();
         assert!(err.contains("exceeds chunk_size"));
         asm.abort();
@@ -505,14 +504,14 @@ mod tests {
     #[test]
     fn budget_rejection_leaves_no_mapping_and_reports_cell_and_size() {
         let (pool, budget) = budgeted_pool_arc(100);
-        let err = ChunkAssembler::new(pool.clone(), 2, 64, 512, 8 * (1 << 30))
+        let err = ChunkAssembler::new(pool.clone(), 2, 64, 8 * (1 << 30))
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("'reassembly'"),
             "error must name the cell: {err}"
         );
-        assert!(err.contains("128"), "error must name the size: {err}");
+        assert!(err.contains("130"), "error must name the size: {err}");
         assert!(err.contains("100"), "error must name the limit: {err}");
 
         // The rejection happened before any mapping: no buddy or dedicated
@@ -523,14 +522,14 @@ mod tests {
         let snap = budget.snapshot();
         assert_eq!(snap.reassembly.used_bytes, 0);
         assert_eq!(snap.reassembly.rejected_allocations, 1);
-        assert_eq!(snap.reassembly.rejected_bytes, 128);
+        assert_eq!(snap.reassembly.rejected_bytes, 130);
     }
 
     #[test]
     fn finished_backing_keeps_charge_and_pool_alive_after_creators_drop() {
         let (pool, budget) = budgeted_pool_arc(64 * 1024);
         let registry_view = pool.clone();
-        let mut asm = ChunkAssembler::new(pool, 2, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool, 2, 8, 8 * (1 << 30)).unwrap();
         asm.feed_chunk(0, b"firstttt").unwrap();
         asm.feed_chunk(1, b"sec").unwrap();
         let mut backing = asm.finish().unwrap();
@@ -542,12 +541,12 @@ mod tests {
         drop(registry_view);
         assert_eq!(
             budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            16
+            18
         );
         assert_eq!(backing.copy_bytes().unwrap(), b"firsttttsec");
         // Idempotent release refunds exactly once.
-        backing.release().unwrap();
-        backing.release().unwrap();
+        backing.release();
+        backing.release();
         assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
         assert!(backing.is_released());
     }

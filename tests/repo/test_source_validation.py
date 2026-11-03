@@ -241,10 +241,28 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
     assert "c2-core" in local[0][1] and "c2-http/relay" in local[0][1] and "--lib" not in local[0][1]
     windows_local = runner.gates(sys.executable, Path("evidence"), runner.LOCAL_PLATFORM_SCOPE, target_platform="windows")
     assert [name for name, _, _ in windows_local] == ["local-platform-tests", "windows-pipe-identity-test"]
-    assert windows_local[1][1][-3:] == ["--", "--ignored", "--exact"]
+    assert windows_local[1][1][-4:] == [
+        "foreign_object_owner_rejects_connect_and_listener_join", "--", "--ignored", "--exact",
+    ]
     python = {name for name, _, _ in runner.gates(sys.executable, Path("evidence"), runner.PYTHON_SCOPE)}
     assert {"python-suite", "python-native-test", "python-build", "cli-artifact", "python310-install"} <= python
     assert "core-test" not in python and "python-wheel-build" not in python
+
+
+@pytest.mark.parametrize("target_platform", ["linux", "macos", "windows"])
+@pytest.mark.parametrize("scope", ["full", "python"])
+def test_node_fixtures_fetch_core_lock_before_offline_builds(target_platform, scope):
+    runner = _runner()
+    gates = runner.gates(sys.executable, Path("evidence"), scope, target_platform=target_platform)
+    names = [name for name, _, _ in gates]
+    commands = {name: command for name, command, _ in gates}
+    dependencies = {name: set(required) for name, _, required in gates}
+    assert commands["core-dependencies"] == [
+        "cargo", "fetch", "--locked", "--manifest-path", "core/Cargo.toml",
+    ]
+    assert "core-dependencies" in dependencies["c2-mem-build"]
+    for gate in ("c2-mem-build", "c2-mem-node-tests", "c2-mem-node-package"):
+        assert names.index("core-dependencies") < names.index(gate)
 
 
 def test_ipc_memory_matrix_gate_runs_full_required_stats_bounded_matrix():
@@ -647,7 +665,7 @@ def test_independent_setup_overlaps_but_consumers_wait(tmp_path, monkeypatch):
 
 
 def test_artifact_inventory_retains_proofs_without_disposable_build_trees(tmp_path):
-    paths = ["cli/c3", "python-suite/run.json", "python-suite/portable.v1.json",
+    paths = ["cli/c3", "python-suite/run.json", "python-suite/portable-matrix-receipt.v2.json",
              "python-suite/ordinary/junit.xml", "python-suite/typescript/output.log",
              "python-suite/portable/tmp/build/unneeded", "python-suite/typescript/tmp/node_modules/typescript/index.js"]
     for name in paths:

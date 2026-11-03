@@ -124,7 +124,7 @@ def _crm_exit(self, exc_type, exc_val, exc_tb):
     return False
 
 
-def crm(*, namespace: str = 'cc', version: str = '0.1.0'):
+def crm(*, namespace: str, version: str):
     """CRM (Core Resource Model) decorator.
 
     Declares a CRM contract — the interface that resource implementations

@@ -121,12 +121,7 @@ class TestServerBasic:
         server = _hello_server(addr)
         server.start()
         _wait_for_server(addr)
-        assert shutdown(addr) == {
-            'acknowledged': True,
-            'shutdown_started': True,
-            'server_stopped': False,
-            'route_outcomes': [],
-        }
+        assert shutdown(addr) == 'initiated'
         # Server should be shutting down; give it a moment.
         time.sleep(0.3)
 

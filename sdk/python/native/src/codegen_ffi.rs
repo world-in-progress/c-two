@@ -1,15 +1,12 @@
 use c2_codegen::{
-    CodegenError, ContractCodegenOptions, ContractCodegenTarget, compile_contract_artifacts,
+    CodegenError as CoreCodegenError, ContractCodegenOptions, ContractCodegenTarget,
+    compile_contract_artifacts,
 };
 use c2_contract::{ContractError, ContractRelease};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
-pyo3::create_exception!(
-    c_two._native,
-    ContractCodegenError,
-    pyo3::exceptions::PyException
-);
+pyo3::create_exception!(c_two._native, CodegenError, pyo3::exceptions::PyException);
 
 #[pyfunction]
 #[pyo3(signature = (descriptor_json, *, target))]
@@ -19,19 +16,8 @@ fn compile_contract_artifacts_projection(
     target: &str,
 ) -> PyResult<Py<PyAny>> {
     let target = parse_target(py, target)?;
-    #[cfg(debug_assertions)]
-    let before = c2_contract::descriptor_admission_count_for_current_thread();
     let release = ContractRelease::from_descriptor_json(descriptor_json);
-    #[cfg(debug_assertions)]
-    {
-        let after = c2_contract::descriptor_admission_count_for_current_thread();
-        debug_assert_eq!(
-            after.saturating_sub(before),
-            1,
-            "Python codegen must enter ContractRelease admission exactly once"
-        );
-    }
-    let release = release.map_err(|error| codegen_error(py, CodegenError::Contract(error)))?;
+    let release = release.map_err(|error| codegen_error(py, CoreCodegenError::Contract(error)))?;
     let artifacts = py
         .detach(move || {
             compile_contract_artifacts(&release, target, &ContractCodegenOptions::default())
@@ -71,11 +57,10 @@ fn parse_target(py: Python<'_>, target: &str) -> PyResult<ContractCodegenTarget>
     }
 }
 
-fn codegen_error(py: Python<'_>, error: CodegenError) -> PyErr {
+fn codegen_error(py: Python<'_>, error: CoreCodegenError) -> PyErr {
     let message = error.to_string();
     match error {
-        CodegenError::Contract(ContractError::LimitExceeded {
-            profile,
+        CoreCodegenError::Contract(ContractError::LimitExceeded {
             metric,
             limit,
             observed,
@@ -84,14 +69,13 @@ fn codegen_error(py: Python<'_>, error: CodegenError) -> PyErr {
             py,
             message,
             ErrorFields::Admission {
-                profile: profile.as_str(),
                 metric: metric.as_str(),
                 limit,
                 observed,
                 path,
             },
         ),
-        CodegenError::FastDb {
+        CoreCodegenError::FastDb {
             binding_path,
             code,
             symbol,
@@ -127,7 +111,6 @@ enum ErrorFields {
     None,
     FastDb(FastDbErrorFields),
     Admission {
-        profile: &'static str,
         metric: &'static str,
         limit: u64,
         observed: u64,
@@ -136,7 +119,7 @@ enum ErrorFields {
 }
 
 fn public_error(py: Python<'_>, display_message: String, fields: ErrorFields) -> PyErr {
-    let error = PyErr::new::<ContractCodegenError, _>(display_message.clone());
+    let error = PyErr::new::<CodegenError, _>(display_message.clone());
     let value = error.value(py);
     let set_common_empty = || {
         value
@@ -147,8 +130,7 @@ fn public_error(py: Python<'_>, display_message: String, fields: ErrorFields) ->
     };
     let set_admission_empty = || {
         value
-            .setattr("profile", py.None())
-            .and_then(|()| value.setattr("metric", py.None()))
+            .setattr("metric", py.None())
             .and_then(|()| value.setattr("limit", py.None()))
             .and_then(|()| value.setattr("observed", py.None()))
     };
@@ -162,13 +144,11 @@ fn public_error(py: Python<'_>, display_message: String, fields: ErrorFields) ->
             .and_then(|()| value.setattr("details_json", fields.details_json))
             .and_then(|()| set_admission_empty()),
         ErrorFields::Admission {
-            profile,
             metric,
             limit,
             observed,
             path,
         } => set_common_empty()
-            .and_then(|()| value.setattr("profile", profile))
             .and_then(|()| value.setattr("metric", metric))
             .and_then(|()| value.setattr("limit", limit))
             .and_then(|()| value.setattr("observed", observed))
@@ -187,10 +167,7 @@ fn public_error(py: Python<'_>, display_message: String, fields: ErrorFields) ->
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add(
-        "ContractCodegenError",
-        m.py().get_type::<ContractCodegenError>(),
-    )?;
+    m.add("CodegenError", m.py().get_type::<CodegenError>())?;
     m.add_function(wrap_pyfunction!(compile_contract_artifacts_projection, m)?)?;
     Ok(())
 }

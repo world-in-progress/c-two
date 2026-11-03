@@ -381,7 +381,7 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
         env = {**environment, 'FASTDB_PAYLOAD_LINK_MODE': step.link_mode}
         print(f'{step.name}: {subprocess.list2cmdline(step.command)}', flush=True)
         if step.name == 'typescript':
-            env.update(CTWO_PYTHON_STAGE_DIR=str(directory), C2_TYPESCRIPT_RECEIPT=str(directory / 'typescript.v1.json'),
+            env.update(CTWO_PYTHON_STAGE_DIR=str(directory), C2_TYPESCRIPT_RECEIPT=str(directory / 'typescript-real-call-receipt.v2.json'),
                        C2_TYPESCRIPT_EVIDENCE_STAGE='development')
         # The strict Python subprocess acquires all its own resource leases.
         with ExitStack() as stack:
@@ -432,7 +432,7 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
                     if planned is not None and record['status'] == 'passed':
                         strict.validate_execution(directory, planned, 1)
                         from tools.local_rc.typescript_receipt import load_and_validate_receipt
-                        load_and_validate_receipt(directory / 'typescript.v1.json', expected_stage='development')
+                        load_and_validate_receipt(directory / 'typescript-real-call-receipt.v2.json', expected_stage='development')
                 except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
                     record['status'] = 'cancelled' if isinstance(error, KeyboardInterrupt) else 'timed_out'
                     record['error'] = str(error)
@@ -485,8 +485,11 @@ def preparation_steps(options, staging: Path) -> list[Step]:
             raise LocalError(f'Core tests require the FastDB sibling locked npm project: {sibling}')
         node = Path(find_tool('node', env))
         result.append(Step('core-typescript-dependencies', npm_command(node, 'ci', '--ignore-scripts', '--prefix', str(sibling))))
+    # Node's offline test/consumer peers copy core/Cargo.lock, including when
+    # only TypeScript is selected or the npm tarballs were supplied prebuilt.
+    core_dependencies = any(s in selected for s in ('core', 'node', 'python', 'typescript'))
     for suite, manifest in (('core', 'core/Cargo.toml'), ('rust-sdk', 'sdk/rust/Cargo.toml'), ('native', 'sdk/python/native/Cargo.toml')):
-        if suite in selected:
+        if suite in selected or (suite == 'core' and core_dependencies):
             result.append(Step(f'{suite}-dependencies', ['cargo', 'fetch', '--locked', '--manifest-path', manifest],
                                'source' if suite == 'native' else 'system'))
     if any(s in selected for s in ('cli', 'python', 'typescript')):

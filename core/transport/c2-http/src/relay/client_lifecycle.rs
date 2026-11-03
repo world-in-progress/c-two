@@ -1,4 +1,4 @@
-//! Bounded Relay ownership of native clients, including unconfirmed cleanup.
+//! Relay ownership of native clients, including unconfirmed cleanup.
 //!
 //! A slot is reserved before connecting. Unique-client cancellation hands the
 //! client to this domain; published clients remain owned until confirmed close.
@@ -10,8 +10,6 @@ use std::time::Duration;
 use c2_ipc::{IpcClient, IpcError};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
-
-const MAX_CLIENT_OWNERS: usize = 1024;
 
 struct Entry {
     client: Option<Arc<IpcClient>>,
@@ -75,7 +73,7 @@ impl ClientLifecycle {
 
     pub(crate) fn manage(
         self: &Arc<Self>,
-        construct: impl FnOnce() -> IpcClient,
+        construct: impl FnOnce() -> Result<IpcClient, IpcError>,
     ) -> Result<ManagedClient, IpcError> {
         let mut inner = self.inner.lock();
         if inner.closed {
@@ -85,21 +83,25 @@ impl ClientLifecycle {
         }
         let slot = if let Some(slot) = inner.entries.iter().position(Option::is_none) {
             slot
-        } else if inner.entries.len() < MAX_CLIENT_OWNERS {
+        } else {
             inner.entries.push(None);
             inner.entries.len() - 1
-        } else {
-            return Err(IpcError::Protocol(
-                "relay native client owner capacity exhausted".into(),
-            ));
         };
         inner.entries[slot] = Some(Entry {
             client: None,
             closing: false,
         });
         drop(inner);
+        let client = match construct() {
+            Ok(client) => client,
+            Err(error) => {
+                self.inner.lock().entries[slot] = None;
+                self.drained.notify_waiters();
+                return Err(error);
+            }
+        };
         Ok(ManagedClient {
-            client: Some(construct()),
+            client: Some(client),
             domain: self.clone(),
             slot,
         })
@@ -113,24 +115,32 @@ impl ClientLifecycle {
         let mut inner = self.inner.lock();
         let closed = inner.closed;
         let entry = inner.entries[slot].as_mut().expect("reserved native owner");
-        entry.client = Some(client);
+        entry.client = Some(client.clone());
         entry.closing = closing || closed;
         drop(inner);
+        if closing || closed {
+            client.deactivate();
+        }
         self.changed.notify_one();
     }
 
     pub(crate) fn close(&self, client: &Arc<IpcClient>) {
         let mut inner = self.inner.lock();
-        for entry in inner.entries.iter_mut().flatten() {
-            if entry
+        let found = inner.entries.iter_mut().flatten().any(|entry| {
+            let matched = entry
                 .client
                 .as_ref()
-                .is_some_and(|owned| Arc::ptr_eq(owned, client))
-            {
+                .is_some_and(|owned| Arc::ptr_eq(owned, client));
+            if matched {
                 entry.closing = true;
-                self.changed.notify_one();
-                return;
             }
+            matched
+        });
+        if found {
+            drop(inner);
+            client.deactivate();
+            self.changed.notify_one();
+            return;
         }
         // Production clients are always registered before connection I/O.
         // Test-only manually inserted clients have no native runtime work.
@@ -161,7 +171,10 @@ impl ClientLifecycle {
                     .collect::<Vec<_>>()
             };
             for (slot, client) in work {
-                if client.close_shared_bounded(Duration::from_millis(50)).await {
+                // A closing owner stops new work immediately. Existing writes,
+                // replies and loans retain the connection until they settle.
+                let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+                if confirmed {
                     self.inner.lock().entries[slot] = None;
                     self.drained.notify_waiters();
                 }
@@ -175,12 +188,20 @@ impl ClientLifecycle {
     }
 
     pub(crate) async fn shutdown(&self) {
-        {
+        let clients = {
             let mut inner = self.inner.lock();
             inner.closed = true;
+            let mut clients = Vec::new();
             for entry in inner.entries.iter_mut().flatten() {
                 entry.closing = true;
+                if let Some(client) = &entry.client {
+                    clients.push(client.clone());
+                }
             }
+            clients
+        };
+        for client in clients {
+            client.deactivate();
         }
         self.changed.notify_one();
         loop {
@@ -213,7 +234,6 @@ impl ClientLifecycle {
         if let Some(slot) = inner.entries.iter().position(Option::is_none) {
             inner.entries[slot] = entry;
         } else {
-            assert!(inner.entries.len() < MAX_CLIENT_OWNERS);
             inner.entries.push(entry);
         }
     }
@@ -228,32 +248,36 @@ impl ClientLifecycle {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_client_construction_releases_reserved_slot() {
+        let domain = ClientLifecycle::new();
+        let result = domain.manage(|| Err(IpcError::Config("invalid pool".into())));
+        assert!(matches!(result, Err(IpcError::Config(_))));
+        assert_eq!(domain.outstanding(), 0);
+    }
+
     #[tokio::test]
-    async fn native_owner_capacity_includes_unpublished_and_closing_clients() {
+    async fn native_owner_tracking_accepts_more_than_1024_clients() {
+        const CLIENT_COUNT: usize = 1025;
         let domain = ClientLifecycle::new();
         let mut reserved = Vec::new();
-        for _ in 0..MAX_CLIENT_OWNERS {
+        for _ in 0..CLIENT_COUNT {
             reserved.push(
                 domain
-                    .manage(|| IpcClient::new("ipc://not-connected"))
+                    .manage(|| {
+                        IpcClient::with_config(
+                            "ipc://not-connected",
+                            c2_config::ClientIpcConfig::default(),
+                        )
+                    })
                     .unwrap(),
             );
         }
-        assert!(
-            domain
-                .manage(|| IpcClient::new("ipc://not-connected"))
-                .is_err()
-        );
-        assert!(
-            domain
-                .manage(|| panic!("exhausted ownership must reject before client allocation"))
-                .is_err()
-        );
-        assert_eq!(domain.outstanding(), MAX_CLIENT_OWNERS);
+        assert_eq!(domain.outstanding(), CLIENT_COUNT);
         // Unique candidates (including failed acquisition) cannot lose their
         // cleanup observer on future cancellation; dropping transfers ownership.
         drop(reserved);
-        assert_eq!(domain.outstanding(), MAX_CLIENT_OWNERS);
+        assert_eq!(domain.outstanding(), CLIENT_COUNT);
         let observer = {
             let domain = domain.clone();
             tokio::spawn(async move { domain.run().await })
@@ -265,7 +289,10 @@ mod tests {
         assert_eq!(domain.outstanding(), 0);
         assert!(
             domain
-                .manage(|| IpcClient::new("ipc://not-connected"))
+                .manage(|| IpcClient::with_config(
+                    "ipc://not-connected",
+                    c2_config::ClientIpcConfig::default()
+                ))
                 .is_err()
         );
     }
@@ -274,7 +301,9 @@ mod tests {
     async fn shutdown_observes_reserved_candidate_until_ownership_is_published() {
         let domain = ClientLifecycle::new();
         let candidate = domain
-            .manage(|| IpcClient::new("ipc://not-connected"))
+            .manage(|| {
+                IpcClient::with_config("ipc://not-connected", c2_config::ClientIpcConfig::default())
+            })
             .unwrap();
         let observer = {
             let domain = domain.clone();

@@ -76,7 +76,7 @@ fn bound_guard_keeps_live_device_identity_after_persistent_identity_drops_it() {
     let fixture = TestNamespace::new();
     let root = fixture.path();
     let endpoint = managed_endpoint_at(root, "guard-device");
-    let namespace = open_root_bounded(root, true).unwrap();
+    let namespace = open_root_bounded(root, true, None).unwrap();
     let names = managed_names(&endpoint).unwrap();
     let lease = namespace
         .directories
@@ -118,40 +118,6 @@ fn bound_guard_keeps_live_device_identity_after_persistent_identity_drops_it() {
     .unwrap();
     assert_unverified_bind(&error, EndpointUnverifiedReason::UnexpectedObject);
     fs::remove_file(socket_path(&endpoint)).unwrap();
-}
-
-#[test]
-fn bind_context_capture_keeps_named_reason_without_changing_read_only_context_kind() {
-    let fixture = TestNamespace::new();
-    let root = fixture.path();
-    test_namespace_root(root).unwrap();
-    let endpoint = managed_endpoint_at(root, "owner-context-reason");
-    let namespace = ManagedNamespace::open_root(root, false, false).unwrap();
-    let marker = root.join(MARKER_NAME);
-    let mut old = fs::read(&marker).unwrap();
-    old[8] = 2;
-    fs::write(&marker, &old).unwrap();
-    // This namespace was already admitted. A subsequent format replacement
-    // fails its identity recheck; only a fresh namespace entry classifies format.
-    let error = ContextBinding::from_namespace(root, &namespace)
-        .err()
-        .unwrap();
-    assert!(matches!(
-        error,
-        NamespaceError::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
-    ));
-    assert_unverified_bind(
-        &namespace_bind_error(error),
-        EndpointUnverifiedReason::CoordinatorReplaced,
-    );
-    drop(namespace);
-    let context_error = ContextBinding::capture(&endpoint).err().unwrap();
-    assert_eq!(context_error.kind(), io::ErrorKind::InvalidData);
-    assert!(
-        context_error
-            .to_string()
-            .contains("endpoint context is unverifiable: UnsupportedNamespaceFormat")
-    );
 }
 
 #[test]
@@ -462,6 +428,27 @@ fn lease_path(endpoint: &LocalEndpoint) -> PathBuf {
         .records
         .path()
         .join(OsStr::from_bytes(names.lock.as_bytes()))
+}
+
+/// Observe the original owner's release through an independently opened file
+/// description. The returned guard keeps that observation stable until the
+/// caller is ready to release the probe lock. The deadline only bounds a
+/// broken fixture; it never decides which retirement outcome to expect.
+fn wait_for_released_lease(probe: File) -> Lease {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match try_lock_lease(&probe) {
+            Ok(()) => return Lease(Some(probe)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "background retirement did not release its lease"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("lease release probe failed: {error}"),
+        }
+    }
 }
 
 fn identity_of(path: &Path) -> SocketIdentity {
@@ -1091,9 +1078,9 @@ async fn managed_listener_pins_original_gate_until_lease_ownership_ends() {
     let endpoint = managed_endpoint_at(&root, "gate-pin");
     let listener = bind_managed_at(&endpoint, root).unwrap();
     let gate = root.join(GATE_NAME);
-    let original = fstat(listener._gate_pin.as_raw_fd()).unwrap();
+    let original = fstat(listener._gate_pin.as_ref().unwrap().as_raw_fd()).unwrap();
     std::fs::remove_file(&gate).unwrap();
-    let unlinked = fstat(listener._gate_pin.as_raw_fd()).unwrap();
+    let unlinked = fstat(listener._gate_pin.as_ref().unwrap().as_raw_fd()).unwrap();
     assert!(same_file(&original, &unlinked));
     assert_eq!(
         unlinked.st_nlink, 0,
@@ -1453,8 +1440,95 @@ async fn managed_failed_initialization_withdraws_its_socket_and_rebinds() {
     assert!(!lease_path_at(root, &endpoint).exists());
 }
 
-/// A Drop that cannot take the gate stays bounded, releases its handles in
-/// order, and leaves complete metadata for the reaper.
+#[tokio::test]
+async fn managed_drop_after_gate_contention_settles_ownership() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint_at(root, "drop-transient-gate");
+    let mut listener = bind_managed_at(&endpoint, root).unwrap();
+    let credential = listener.credential();
+    let duplicate = listener.duplicate_lease_fd_for_test();
+    let lease_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path_at(root, &endpoint))
+        .unwrap();
+    let gate = ManagedNamespace::open_root(root, false, true).unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    listener.retry_observer = Some(DropRetryObserver {
+        started: started_tx,
+        resume: resume_rx,
+    });
+
+    // Drop must return while this thread still holds the gate. A channel
+    // observes that ordering without comparing scheduler-dependent durations.
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(listener);
+        dropped_tx.send(()).unwrap();
+    });
+    let dropped = dropped_rx.recv_timeout(Duration::from_secs(10));
+    let started = started_rx.recv_timeout(Duration::from_secs(10));
+    // Release before reporting a failed fixture, so a blocked Drop can finish.
+    drop(gate);
+    resume_tx.send(()).unwrap();
+    dropper.join().unwrap();
+    dropped.expect("Drop waited for the gate instead of handing off retirement");
+    started.expect("Drop must start its background retirement retry");
+
+    let released = wait_for_released_lease(lease_probe);
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
+    drop(released);
+    let reaped = reap_managed_at(&endpoint, &credential, root);
+    assert!(
+        matches!(reaped, EndpointReapResult::AlreadyAbsent),
+        "the background retry must retire the complete slot: {reaped:?}"
+    );
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
+    drop(duplicate);
+}
+
+#[tokio::test]
+async fn managed_drop_gate_replacement_keeps_record_and_releases_lease() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint_at(root, "drop-replaced-gate");
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    let lease_path = lease_path_at(root, &endpoint);
+    let lease_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lease_path)
+        .unwrap();
+    let held_gate = ManagedNamespace::open_root(root, false, true).unwrap();
+
+    drop(listener);
+    let gate_path = root.join(GATE_NAME);
+    std::fs::remove_file(&gate_path).unwrap();
+    let replacement = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&gate_path)
+        .unwrap();
+
+    // Keep the original gate held until the worker has released ownership.
+    // Its earlier timeout and its rejection of the replacement are both safe
+    // outcomes, and neither may retire this record through the new gate.
+    let released = wait_for_released_lease(lease_probe);
+    assert!(socket_path_at(root, &endpoint).exists());
+    assert!(lease_path.exists());
+    assert_eq!(replacement.metadata().unwrap().len(), 0);
+    drop(released);
+    drop(held_gate);
+}
+
+/// A gate held beyond the bounded retry leaves complete metadata for the
+/// reaper after the background retirement attempt releases its lease.
 #[tokio::test]
 async fn managed_drop_without_gate_leaves_metadata_for_the_reaper() {
     let namespace = TestNamespace::new();
@@ -1462,33 +1536,24 @@ async fn managed_drop_without_gate_leaves_metadata_for_the_reaper() {
     let endpoint = managed_endpoint_at(&root, "drop-gate");
     let listener = bind_managed_at(&endpoint, root).unwrap();
     let credential = listener.credential();
-
-    let held_root = root.to_owned();
-    let holder = std::thread::spawn(move || {
-        let namespace = ManagedNamespace::open_root(&held_root, false, true).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        drop(namespace);
-    });
-    // Wait until the gate is provably held by the other thread.
-    let mut holding = false;
-    for _ in 0..400 {
-        match ManagedNamespace::open_root(root, false, false) {
-            Err(NamespaceError::Busy) => {
-                holding = true;
-                break;
-            }
-            _ => std::thread::sleep(Duration::from_millis(2)),
-        }
-    }
-    assert!(holding, "gate holder never acquired the coordinator lock");
+    let lease_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path_at(root, &endpoint))
+        .unwrap();
+    let held_gate = ManagedNamespace::open_root(root, false, true).unwrap();
 
     drop(listener);
+    // The gate stays held until an independent flock proves the bounded
+    // background attempt has given up and released its original lease.
+    let released = wait_for_released_lease(lease_probe);
     assert!(
         socket_path_at(root, &endpoint).exists(),
         "a Drop without the gate must keep its registered metadata"
     );
     assert!(lease_path_at(root, &endpoint).exists());
-    holder.join().unwrap();
+    drop(released);
+    drop(held_gate);
 
     assert!(matches!(
         reap_managed_at(&endpoint, &credential, root),
@@ -2039,8 +2104,7 @@ fn managed_bind_does_not_change_cwd_in_an_independent_subprocess() {
 }
 
 /// A held coordinator must never make `bind_managed_at` wait unboundedly: server
-/// startup reaches it, so a foreign gate holder becomes a bounded `WouldBlock`
-/// that the upper start layer can retry with its own timeout.
+/// startup without an explicit deadline retains the default `WouldBlock` guard.
 #[tokio::test]
 async fn managed_bind_is_bounded_when_the_gate_is_held() {
     let namespace = TestNamespace::new();
@@ -2249,7 +2313,7 @@ async fn managed_duplicate_lease_cannot_extend_ownership_across_retirement() {
     assert!(matches!(replacement.close(), EndpointReapResult::Reaped));
     drop(duplicate);
 
-    // --- Part 2: a Drop that never takes the gate. ---
+    // --- Part 2: a Drop whose caller cannot take the gate. ---
     // This is the case where the duplicate would otherwise keep the *same*
     // lease inode locked forever: the entry is not unlinked, so the reaper must
     // observe a released flock on the surviving inode even though the duplicate
@@ -2257,53 +2321,31 @@ async fn managed_duplicate_lease_cannot_extend_ownership_across_retirement() {
     let listener = bind_managed_at(&endpoint, root).unwrap();
     let duplicate = listener.duplicate_lease_fd_for_test();
 
-    // Hold the coordinator so the Drop cannot retire and is forced onto the
-    // bounded "leave metadata for the reaper" path.
-    let held_root = root.to_owned();
-    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let holder = {
-        let release = release.clone();
-        std::thread::spawn(move || {
-            let namespace = ManagedNamespace::open_root(&held_root, false, true).unwrap();
-            while !release.load(std::sync::atomic::Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            drop(namespace);
-        })
-    };
-    // Wait until the gate is provably held, then Drop the listener.
-    let mut holding = false;
-    for _ in 0..1000 {
-        if matches!(
-            ManagedNamespace::open_root(root, false, false),
-            Err(NamespaceError::Busy)
-        ) {
-            holding = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert!(holding, "gate holder never acquired the coordinator");
-
+    let lease_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path_at(root, &endpoint))
+        .unwrap();
+    let held_gate = ManagedNamespace::open_root(root, false, true).unwrap();
     let credential = listener.credential();
     drop(listener);
+
+    // The duplicate stays open while this separate description acquires the
+    // flock. Holding the gate until then forces the worker to give up, proving
+    // that its explicit LOCK_UN releases even a surviving duplicate's lock.
+    let released = wait_for_released_lease(lease_probe);
     assert!(
         socket_path_at(root, &endpoint).exists(),
         "a Drop without the gate must keep its registered metadata"
     );
 
-    release.store(true, std::sync::atomic::Ordering::SeqCst);
-    holder.join().unwrap();
-
-    // The duplicate is STILL OPEN. The reaper must not be blocked by it: the
-    // listener already issued `LOCK_UN` on the shared description during Drop.
-    assert!(
-        matches!(
-            reap_managed_at(&endpoint, &credential, root),
-            EndpointReapResult::Reaped
-        ),
-        "a live duplicate must not keep the retired lease locked"
-    );
+    assert!(lease_path_at(root, &endpoint).exists());
+    drop(released);
+    drop(held_gate);
+    assert!(matches!(
+        reap_managed_at(&endpoint, &credential, root),
+        EndpointReapResult::Reaped
+    ));
     assert!(!socket_path_at(root, &endpoint).exists());
     assert!(!lease_path_at(root, &endpoint).exists());
     // The retired lease entry never comes back, so the duplicate cannot
@@ -2315,10 +2357,10 @@ async fn managed_duplicate_lease_cannot_extend_ownership_across_retirement() {
     drop(duplicate);
 }
 
-/// A first-initialization scan is bounded: a namespace that exceeds the entry
-/// cap fails closed instead of traversing an unbounded directory.
-#[test]
-fn managed_first_initialization_scan_is_bounded_and_fails_closed() {
+/// Unrelated files beyond the old scan cap must not block first use of a
+/// private namespace.
+#[tokio::test]
+async fn managed_first_initialization_scans_past_unrelated_entries() {
     let parent = tempfile::Builder::new()
         .prefix("c2s-")
         .tempdir_in("/tmp")
@@ -2332,19 +2374,21 @@ fn managed_first_initialization_scan_is_bounded_and_fails_closed() {
     )
     .unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    for index in 0..(INIT_SCAN_LIMIT + 4) {
+    for index in 0..68 {
         std::fs::write(root.join(format!("noise-{index:03}")), b"x").unwrap();
     }
 
-    let error = ManagedNamespace::open_root(&root, true, true).map(|_| ());
-    assert!(matches!(
-        error,
-        Err(NamespaceError::Io(_)) | Err(NamespaceError::Unverified(_))
-    ));
-    assert!(
-        !root.join(MARKER_NAME).exists(),
-        "an over-budget namespace must never be adopted"
-    );
+    let endpoint = managed_endpoint_at(&root, "scan-past-noise");
+    let listener =
+        bind_managed_at(&endpoint, &root).expect("unrelated files must not prevent first bind");
+    assert!(root.join(MARKER_NAME).exists());
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    for index in 0..68 {
+        assert_eq!(
+            std::fs::read(root.join(format!("noise-{index:03}"))).unwrap(),
+            b"x"
+        );
+    }
 }
 
 /// The descriptor-anchored bind never touches the *calling* thread's working
@@ -3270,7 +3314,7 @@ async fn before_listen_checkpoint_rejects_an_already_listening_socket() {
     let root = fixture.path();
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
     let endpoint = managed_endpoint_at(root, "pre-listen-negative-control");
-    let namespace = open_root_bounded(root, true).unwrap();
+    let namespace = open_root_bounded(root, true, None).unwrap();
     let names = managed_names(&endpoint).unwrap();
     let lease = namespace
         .directories
@@ -3328,7 +3372,7 @@ fn failed_bind_after_lock_releases_lease_with_live_duplicate() {
         let lease_path = lease_path_at(root, &endpoint);
         let old_identity = original.map(|bytes| {
             // Initialize the namespace, then place an old, incomplete lease.
-            drop(open_root_bounded(root, true).unwrap());
+            drop(open_root_bounded(root, true, None).unwrap());
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -3535,207 +3579,6 @@ async fn native_listener_in_directory_with_spaces_and_unicode() {
     let (client, accepted) = tokio::join!(connecting, listener.accept());
     drop(client.unwrap());
     drop(accepted.unwrap());
-    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
-}
-
-#[tokio::test]
-async fn binding_alias_digest_ignores_paths_and_directory_churn() {
-    let root = TestNamespace::new();
-    let endpoint = managed_endpoint_at(root.path(), "binding-alias");
-    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
-    let binding = listener.context_binding().unwrap();
-    let alias_parent = root._parent.path().join("alias");
-    std::os::unix::fs::symlink(root._parent.path(), &alias_parent).unwrap();
-    let alias = context_for_namespace(&alias_parent.join("ipc"))
-        .endpoint(endpoint.address())
-        .unwrap();
-    let alias_binding = crate::EndpointContextBinding::capture(&alias).unwrap();
-    assert_eq!(binding.digest(), alias_binding.digest());
-    assert_ne!(
-        endpoint.context().namespace_id(),
-        alias.context().namespace_id()
-    );
-    let other = crate::LocalListener::bind_with_context_binding(&managed_endpoint_at(
-        root.path(),
-        "binding-churn",
-    ))
-    .unwrap();
-    assert_eq!(other.context_binding().unwrap().digest(), binding.digest());
-    assert!(matches!(other.close(), EndpointReapResult::Reaped));
-    binding.validate().unwrap();
-    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
-    // An independent binding pins identity only, never a listener lease or a held gate lock.
-    binding.validate().unwrap();
-    alias_binding.validate().unwrap();
-    let rebound = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
-    assert_eq!(
-        rebound.context_binding().unwrap().digest(),
-        binding.digest()
-    );
-    assert!(matches!(rebound.close(), EndpointReapResult::Reaped));
-    let gate_flags = unsafe { libc::fcntl(binding.0.gate_pin.as_raw_fd(), libc::F_GETFL) };
-    assert_eq!(gate_flags & libc::O_ACCMODE, libc::O_RDONLY);
-}
-
-#[test]
-fn binding_capture_never_initializes_an_absent_namespace() {
-    let root = TestNamespace::new();
-    let endpoint = managed_endpoint_at(root.path(), "binding-absent");
-    assert_eq!(
-        crate::EndpointContextBinding::capture(&endpoint)
-            .err()
-            .unwrap()
-            .kind(),
-        io::ErrorKind::NotFound
-    );
-    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
-}
-
-#[tokio::test]
-async fn binding_missing_marker_is_refused_without_repair() {
-    let root = TestNamespace::new();
-    let endpoint = managed_endpoint_at(root.path(), "binding-marker");
-    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
-    let binding = listener.context_binding().unwrap();
-    let marker = root.path().join(MARKER_NAME);
-    let original = fs::read(&marker).unwrap();
-    fs::remove_file(&marker).unwrap();
-    assert!(binding.validate().is_err());
-    assert!(listener.context_binding().unwrap().validate().is_err());
-    assert!(crate::EndpointContextBinding::capture(&endpoint).is_err());
-    assert!(
-        !marker.exists(),
-        "validation/capture must never recreate a marker"
-    );
-    let mut restored = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&marker)
-        .unwrap();
-    restored.write_all(&original).unwrap();
-    binding.validate().unwrap();
-    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
-}
-
-#[tokio::test]
-async fn binding_keeps_the_original_bind_directory_instead_of_adopting_a_replacement() {
-    let root = TestNamespace::new();
-    let endpoint = managed_endpoint_at(root.path(), "binding-replaced");
-    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
-    let credential = listener.credential();
-    let binding = listener.context_binding().unwrap();
-    let original_root = root._parent.path().join("original");
-    fs::rename(root.path(), &original_root).unwrap();
-    fs::create_dir(root.path()).unwrap();
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let replacement = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
-    assert_ne!(
-        binding.digest(),
-        replacement.context_binding().unwrap().digest()
-    );
-    assert!(binding.validate().is_err());
-    // This method must return the old bind pin, never recapture the currently valid pathname.
-    assert!(listener.context_binding().unwrap().validate().is_err());
-    assert!(matches!(replacement.close(), EndpointReapResult::Reaped));
-    drop(listener);
-    fs::remove_dir_all(root.path()).unwrap();
-    fs::rename(&original_root, root.path()).unwrap();
-    binding.validate().unwrap();
-    assert!(matches!(
-        crate::reap_endpoint(&endpoint, &credential),
-        EndpointReapResult::Reaped
-    ));
-}
-
-#[tokio::test]
-async fn binding_rejects_gate_inode_or_nonce_changes_with_strict_marker_checks() {
-    let root = TestNamespace::new();
-    let endpoint = managed_endpoint_at(root.path(), "binding-gate");
-    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
-    let binding = listener.context_binding().unwrap();
-    let gate = root.path().join(GATE_NAME);
-    let original_gate = root.path().join("original-gate");
-    fs::rename(&gate, &original_gate).unwrap();
-    let original = fs::read(&original_gate).unwrap();
-    let mut replacement = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&gate)
-        .unwrap();
-    replacement.write_all(&original).unwrap();
-    assert!(binding.validate().is_err());
-    assert!(crate::EndpointContextBinding::capture(&endpoint).is_err());
-    fs::remove_file(&gate).unwrap();
-    fs::rename(&original_gate, &gate).unwrap();
-    binding.validate().unwrap();
-    let mut changed = original.clone();
-    changed[9] ^= 0xff;
-    let file = OpenOptions::new().write(true).open(&gate).unwrap();
-    file.write_all_at(&changed, 0).unwrap();
-    assert!(binding.validate().is_err());
-    assert!(crate::EndpointContextBinding::capture(&endpoint).is_err());
-    assert_eq!(
-        fs::read(root.path().join(MARKER_NAME)).unwrap()[17..33],
-        original[9..25]
-    );
-    file.write_all_at(&original, 0).unwrap();
-    binding.validate().unwrap();
-    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
-}
-
-#[tokio::test]
-async fn binding_readers_share_the_gate_and_preserve_writer_exclusion() {
-    let root = TestNamespace::new();
-    let endpoint = managed_endpoint_at(root.path(), "binding-busy");
-    let listener = crate::LocalListener::bind_with_context_binding(&endpoint).unwrap();
-    let binding = listener.context_binding().unwrap();
-    let gate = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(root.path().join(GATE_NAME))
-        .unwrap();
-    assert_eq!(
-        unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0
-    );
-    let started = Instant::now();
-    for result in [
-        crate::EndpointContextBinding::capture(&endpoint).map(|_| ()),
-        binding.validate(),
-    ] {
-        let error = result.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(error.to_string().contains("busy"));
-    }
-    // Projecting the identity already captured under bind's gate must not
-    // reacquire it and make successful startup fail on unrelated socket churn.
-    assert_eq!(
-        listener.context_binding().unwrap().digest(),
-        binding.digest()
-    );
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_UN) }, 0);
-    assert_eq!(
-        unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
-        0
-    );
-    // Concurrent identity readers succeed under the same gate, but the
-    // existing namespace mutation path still requires exclusive ownership.
-    assert_eq!(
-        crate::EndpointContextBinding::capture(&endpoint)
-            .unwrap()
-            .digest(),
-        binding.digest()
-    );
-    binding.validate().unwrap();
-    listener.context_binding().unwrap();
-    assert!(matches!(
-        ManagedNamespace::open_root(root.path(), false, false),
-        Err(NamespaceError::Busy)
-    ));
-    assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_UN) }, 0);
     assert!(matches!(listener.close(), EndpointReapResult::Reaped));
 }
 
@@ -4306,4 +4149,47 @@ async fn final_lease_stat_rollback_keeps_initialization_error() {
             .to_string()
             .contains("injected socket permission failure before rollback stat")
     );
+}
+
+#[tokio::test]
+async fn managed_bind_gate_wait_uses_the_callers_deadline() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let seed = bind_managed_at(&managed_endpoint_at(root, "deadline-seed"), root).unwrap();
+    seed.abandon_for_test();
+    let held_root = root.to_owned();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let gate = ManagedNamespace::open_root(&held_root, false, true).unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        drop(gate);
+    });
+    ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let endpoint = managed_endpoint_at(root, "deadline-bind");
+    let started = std::time::Instant::now();
+    let error =
+        crate::LocalListener::bind_until(&endpoint, Some(started + Duration::from_millis(15)))
+            .err()
+            .expect("a held gate must expire within the caller budget");
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(started.elapsed() >= Duration::from_millis(15));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
+
+    // Hold beyond the old 50 x 2 ms guard, within the explicit startup budget.
+    let started = std::time::Instant::now();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(175));
+        release_tx.send(()).unwrap();
+    });
+    let listener =
+        crate::LocalListener::bind_until(&endpoint, Some(started + Duration::from_secs(3)))
+            .expect("the caller budget must replace the default gate guard");
+    assert!(started.elapsed() >= Duration::from_millis(175));
+    release.join().unwrap();
+    holder.join().unwrap();
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
 }

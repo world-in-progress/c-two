@@ -16,6 +16,10 @@ import uuid
 import pytest
 
 import c_two as cc
+
+import c_two.endpoint
+
+import c_two.observe
 from c_two import _native
 from c_two.transport.client import util
 
@@ -53,6 +57,8 @@ def _unused_root() -> str:
 def test_shutdown_preserves_unused_endpoint_policy_without_resolving_it() -> None:
     _run_isolated('''
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two.transport.client import util
         from c_two.transport.registry import _get_default_runtime
         before = _get_default_runtime()._runtime_session
@@ -80,8 +86,10 @@ def test_unused_code_root_survives_session_replacement_and_env_change(replace: s
         import os
         from pathlib import Path
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two.transport.registry import _get_default_runtime
-        cc.set_local_endpoint(root={root!r})
+        cc.endpoint.set_local_endpoint(root={root!r})
         before = _get_default_runtime()._runtime_session
         assert not before.local_endpoint_frozen
         if {replace!r} == 'shutdown':
@@ -92,12 +100,12 @@ def test_unused_code_root_survives_session_replacement_and_env_change(replace: s
         assert after is not before
         assert not after.local_endpoint_frozen
         os.environ['C2_IPC_ROOT'] = {other!r}
-        assert cc.local_endpoint_context().root == {root!r}
+        assert cc.endpoint.local_endpoint_context().root == {root!r}
         assert not Path({root!r}).exists()
         assert not Path({other!r}).exists()
         assert not after.local_endpoint_frozen
         assert cc.shutdown()['completed']
-        assert cc.local_endpoint_context().root == {root!r}
+        assert cc.endpoint.local_endpoint_context().root == {root!r}
     ''', C2_IPC_ROOT='relative')
 
 
@@ -107,13 +115,15 @@ def test_unused_environment_policy_is_still_lazy_after_shutdown() -> None:
     _run_isolated(f'''
         import os
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two.transport.registry import _get_default_runtime
         assert cc.shutdown()['completed']
         os.environ['C2_IPC_ROOT'] = {root!r}
-        assert cc.local_endpoint_context().root == {root!r}
+        assert cc.endpoint.local_endpoint_context().root == {root!r}
         assert cc.shutdown()['completed']
         os.environ['C2_IPC_ROOT'] = {other!r}
-        assert cc.local_endpoint_context().root == {other!r}
+        assert cc.endpoint.local_endpoint_context().root == {other!r}
         assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
     ''', C2_IPC_ROOT='relative')
 
@@ -123,6 +133,8 @@ def test_unresolved_policy_survives_transport_policy_replacement() -> None:
     # platform may resolve it merely to replace an unused native session.
     _run_isolated('''
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two.transport.client import util
         from c_two.transport.registry import _get_default_runtime
         before = _get_default_runtime()._runtime_session
@@ -184,7 +196,7 @@ def test_admin_probes_accept_long_directory_and_report_missing_endpoint(probe: s
         if {probe!r} == 'ping':
             assert result is False, result
         else:
-            assert result == {{'acknowledged': True, 'shutdown_started': False, 'server_stopped': True, 'route_outcomes': []}}, result
+            assert result == 'absent', result
     ''')
 
 
@@ -204,20 +216,22 @@ def test_admin_probes_accept_long_directory_in_all_contexts(
         updates = {'C2_ENV_FILE': str(dotenv)}
     _run_isolated(f'''
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two import _native
         from c_two.transport.client import util
         from c_two.transport.registry import _get_default_runtime
         kwargs = {{}}
         if {selection!r} == 'context':
-            kwargs['context'] = cc.local_endpoint_context(root={root!r})
+            kwargs['context'] = cc.endpoint.local_endpoint_context(root={root!r})
         elif {selection!r} == 'runtime':
-            cc.set_local_endpoint(root={root!r})
+            cc.endpoint.set_local_endpoint(root={root!r})
         operation = getattr(util, {probe!r})
         result = operation('ipc://long-directory', 0.01, **kwargs)
         if {probe!r} == 'ping':
             assert result is False, result
         else:
-            assert result == {{'acknowledged': True, 'shutdown_started': False, 'server_stopped': True, 'route_outcomes': []}}, result
+            assert result == 'absent', result
         session = _get_default_runtime()._runtime_session
         assert session.local_endpoint_frozen == ({selection!r} != 'context')
         assert not session.client_config_frozen
@@ -225,19 +239,17 @@ def test_admin_probes_accept_long_directory_in_all_contexts(
 
 
 @pytest.mark.parametrize('probe', ['ping', 'shutdown'])
-def test_admin_invalid_targets_remain_negative_in_native_and_public_contexts(probe: str) -> None:
+def test_admin_invalid_targets_raise_in_native_and_public_contexts(probe: str) -> None:
     _run_isolated(f'''
         from functools import partial
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two import _native
         from c_two.transport.client import util
         from c_two.transport.registry import _get_default_runtime
         session = _native.RuntimeSession(use_process_relay_anchor=False)
         context = session.local_endpoint_context()
-        expected = False if {probe!r} == 'ping' else {{
-            'acknowledged': False, 'shutdown_started': False,
-            'server_stopped': False, 'route_outcomes': [],
-        }}
         for address in (
             'tcp://not-ipc', 'ipc://', 'ipc://../escape', 'ipc://bad/name',
             'ipc://bad\\\\name', 'ipc://.', 'ipc://..', 'ipc:// leading',
@@ -253,7 +265,12 @@ def test_admin_invalid_targets_remain_negative_in_native_and_public_contexts(pro
             if context.root is not None:
                 operations.append(partial(getattr(util, {probe!r}), address, root=context.root))
             for operation in operations:
-                assert operation(0.01) == expected, address
+                try:
+                    operation(0.01)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f'invalid target was accepted: {{address}}')
                 for timeout in (-1.0, float('nan'), float('inf'), 1e300):
                     try:
                         operation(timeout)
@@ -275,16 +292,15 @@ def test_admin_runtime_configuration_precedence_and_freeze(probe: str) -> None:
         import os
         import uuid
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two.transport.client import util
         from c_two.transport.registry import _get_default_runtime
-        cc.set_local_endpoint(root={root!r})
+        cc.endpoint.set_local_endpoint(root={root!r})
         session = _get_default_runtime()._runtime_session
         assert not session.local_endpoint_frozen
         address = 'ipc://admin-freeze-' + uuid.uuid4().hex
-        expected = False if {probe!r} == 'ping' else {{
-            'acknowledged': True, 'shutdown_started': False,
-            'server_stopped': True, 'route_outcomes': [],
-        }}
+        expected = False if {probe!r} == 'ping' else 'absent'
         assert getattr(util, {probe!r})(address, 0.01) == expected
         assert session.local_endpoint_frozen
         assert not session.client_config_frozen
@@ -321,10 +337,12 @@ def test_common_default_is_opaque_native_and_query_does_not_freeze() -> None:
     _run_isolated('''
         import sys
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two import _native
         session = _native.RuntimeSession(use_process_relay_anchor=False)
         context = session.local_endpoint_context()
-        assert isinstance(context, cc.LocalEndpointContext)
+        assert isinstance(context, cc.endpoint.LocalEndpointContext)
         assert len(context.namespace_id) == 64
         assert not session.local_endpoint_frozen
         assert not session.client_config_frozen
@@ -344,7 +362,7 @@ def test_common_default_is_opaque_native_and_query_does_not_freeze() -> None:
             assert Path(name).parent == Path(context.root)
             assert len(Path(name).name) == 32
         try:
-            cc.LocalEndpointContext()
+            cc.endpoint.LocalEndpointContext()
         except TypeError:
             pass
         else:
@@ -386,24 +404,26 @@ def test_public_code_override_wins_env_and_dotenv_and_survives_session_replaceme
     _run_isolated(f'''
         import os
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two.transport.registry import _get_default_runtime
-        assert cc.local_endpoint_context().root == {env!r}
-        cc.set_local_endpoint(root={code!r})
-        captured = cc.local_endpoint_context()
+        assert cc.endpoint.local_endpoint_context().root == {env!r}
+        cc.endpoint.set_local_endpoint(root={code!r})
+        captured = cc.endpoint.local_endpoint_context()
         assert captured.root == {code!r}
         old = _get_default_runtime()._runtime_session
         assert not old.local_endpoint_frozen
         os.environ['C2_IPC_ROOT'] = {file!r}
-        assert cc.local_endpoint_context() == captured
+        assert cc.endpoint.local_endpoint_context() == captured
         assert cc.shutdown()['completed']
         new = _get_default_runtime()._runtime_session
         assert new is not old
         assert not new.local_endpoint_frozen
-        assert cc.local_endpoint_context() == captured
+        assert cc.endpoint.local_endpoint_context() == captured
         cc.set_transport_policy(shm_threshold=8192)
-        assert cc.local_endpoint_context() == captured
-        cc.set_local_endpoint(root=None)
-        assert cc.local_endpoint_context().root == {file!r}
+        assert cc.endpoint.local_endpoint_context() == captured
+        cc.endpoint.set_local_endpoint(root=None)
+        assert cc.endpoint.local_endpoint_context().root == {file!r}
         assert cc.shutdown()['completed']
     ''', C2_IPC_ROOT=env, C2_ENV_FILE=str(dotenv))
 
@@ -448,12 +468,14 @@ def test_space_in_root_is_not_trimmed() -> None:
     root = _unused_root() + ' '
     _run_isolated(f'''
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two import _native
-        assert cc.local_endpoint_context().root == {root!r}
-        cc.set_local_endpoint(root={root!r})
-        assert cc.local_endpoint_context().root == {root!r}
+        assert cc.endpoint.local_endpoint_context().root == {root!r}
+        cc.endpoint.set_local_endpoint(root={root!r})
+        assert cc.endpoint.local_endpoint_context().root == {root!r}
         without_space = _native.resolve_local_endpoint_context(root={root.rstrip()!r})
-        assert without_space.namespace_id != cc.local_endpoint_context().namespace_id
+        assert without_space.namespace_id != cc.endpoint.local_endpoint_context().namespace_id
     ''', C2_IPC_ROOT=root)
 
 
@@ -482,23 +504,25 @@ def test_admin_name_defaults_to_runtime_code_context_without_freezing() -> None:
     _run_isolated(f'''
         import os
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two import _native
         from c_two.transport.client import util
         from c_two.transport.registry import _get_default_runtime
-        cc.set_local_endpoint(root={root!r})
-        context = cc.local_endpoint_context()
+        cc.endpoint.set_local_endpoint(root={root!r})
+        context = cc.endpoint.local_endpoint_context()
         session = _get_default_runtime()._runtime_session
         address = 'ipc://admin-name-context'
         os.environ['C2_IPC_ROOT'] = {other!r}
         assert util._endpoint_name_from_address(address) == context.endpoint_name(address)
-        independent = cc.local_endpoint_context(root={other!r})
+        independent = cc.endpoint.local_endpoint_context(root={other!r})
         assert independent != context
         assert util._endpoint_name_from_address(address, root={other!r}) == independent.endpoint_name(address)
         assert util._endpoint_name_from_address(address, context=independent) == independent.endpoint_name(address)
         assert _native.ipc_endpoint_name(address, context=context) == context.endpoint_name(address)
         assert not session.local_endpoint_frozen
         assert not session.client_config_frozen
-        assert cc.local_endpoint_context() == context
+        assert cc.endpoint.local_endpoint_context() == context
         assert cc.shutdown()['completed']
     ''', C2_IPC_ROOT=other)
 
@@ -506,11 +530,11 @@ def test_admin_name_defaults_to_runtime_code_context_without_freezing() -> None:
 @pytest.mark.parametrize('root', [False, 1, b'/tmp/root', Path('/tmp/root'), {}])
 def test_public_facades_validate_shapes_without_mirroring_root_rules(root: object) -> None:
     with pytest.raises(TypeError, match='root'):
-        cc.set_local_endpoint(root=root)
+        cc.endpoint.set_local_endpoint(root=root)
     with pytest.raises(TypeError, match='root'):
-        cc.local_endpoint_context(root=root)
+        cc.endpoint.local_endpoint_context(root=root)
     with pytest.raises(TypeError, match='root'):
-        cc.inspect_endpoint('ipc://shape', root=root)
+        cc.endpoint.inspect_endpoint('ipc://shape', root=root)
     with pytest.raises(TypeError, match='root'):
         util.ping('ipc://shape', root=root)
 
@@ -518,9 +542,9 @@ def test_public_facades_validate_shapes_without_mirroring_root_rules(root: objec
 def test_context_shape_and_conflicting_selection_reject_before_io() -> None:
     context = _native.RuntimeSession(use_process_relay_anchor=False).local_endpoint_context()
     with pytest.raises(TypeError, match='context'):
-        cc.inspect_endpoint('ipc://shape', context={})
+        cc.endpoint.inspect_endpoint('ipc://shape', context={})
     with pytest.raises(TypeError, match='mutually exclusive'):
-        cc.sweep_endpoints(root='/tmp', context=context)
+        cc.endpoint.sweep_endpoints(root='/tmp', context=context)
     with pytest.raises(ValueError, match='mutually exclusive'):
         _native.PyEndpointSweep(root='/tmp', context=context)
     with pytest.raises(ValueError, match='mutually exclusive'):
@@ -546,28 +570,30 @@ def test_public_replacement_preserves_root_and_native_retirement_observations() 
     root = _unused_root()
     _run_isolated(f'''
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two.transport.registry import _get_default_runtime
-        cc.set_local_endpoint(root={root!r})
+        cc.endpoint.set_local_endpoint(root={root!r})
         old = _get_default_runtime()._runtime_session
-        tracker = old.lease_tracker()
+        tracker = old.local_copy_tracker()
         lease = tracker.track_retained(route_name='endpoint-retirement', method_name='echo',
-            direction='client_response', storage='inline', bytes=64)
-        captured = cc.local_endpoint_context()
+            direction='client_response', bytes=64)
+        captured = cc.endpoint.local_endpoint_context()
         for _ in range(3):
             assert cc.shutdown()['completed']
-            assert cc.local_endpoint_context() == captured
-            assert cc.hold_stats()['active_holds'] == 1
-            assert cc.memory_stats()['holds']['total_held_bytes'] == 64
+            assert cc.endpoint.local_endpoint_context() == captured
+            assert cc.observe.memory_stats()["holds"]['active_holds'] == 1
+            assert cc.observe.memory_stats()['holds']['total_held_bytes'] == 64
         lease.release()
-        assert cc.hold_stats()['active_holds'] == 0
+        assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
         # An old producer remains observable after the endpoint handoff.
         late = tracker.track_retained(route_name='endpoint-retirement', method_name='echo',
-            direction='client_response', storage='inline', bytes=96)
-        assert cc.hold_stats()['active_holds'] == 1
-        assert cc.memory_stats()['holds']['total_held_bytes'] == 96
+            direction='client_response', bytes=96)
+        assert cc.observe.memory_stats()["holds"]['active_holds'] == 1
+        assert cc.observe.memory_stats()['holds']['total_held_bytes'] == 96
         late.release()
-        assert cc.hold_stats()['active_holds'] == 0
-        assert cc.local_endpoint_context() == captured
+        assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
+        assert cc.endpoint.local_endpoint_context() == captured
     ''')
 
 
@@ -578,26 +604,28 @@ def test_credential_retains_recorded_directory_under_new_environment() -> None:
     _run_isolated(f'''
         import json
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two import _native
-        context = cc.local_endpoint_context(root={other!r})
+        context = cc.endpoint.local_endpoint_context(root={other!r})
         document = {{'schemaVersion': 4, 'address': 'ipc://recorded-context',
             'protocol': 'managed-v2', 'platform': 'unix', 'unixRoot': context.root,
             'namespaceId': context.namespace_id, 'incarnation': '00112233445566778899aabbccddeeff',
             'inode': 2, 'changedSecs': 3, 'changedNanos': 4}}
-        credential = cc.EndpointCredential.from_json(json.dumps(document))
-        assert cc.local_endpoint_context().root == {root!r}
+        credential = cc.endpoint.EndpointCredential.from_json(json.dumps(document))
+        assert cc.endpoint.local_endpoint_context().root == {root!r}
         assert credential.context == context
-        assert credential.to_json() == cc.EndpointCredential.from_json(credential.to_json()).to_json()
+        assert credential.to_json() == cc.endpoint.EndpointCredential.from_json(credential.to_json()).to_json()
         for result in (
-            cc.reap_endpoint(credential.address, credential, root={root!r}),
-            cc.reap_endpoint(credential.address, credential, context=cc.local_endpoint_context()),
+            cc.endpoint.reap_endpoint(credential.address, credential, root={root!r}),
+            cc.endpoint.reap_endpoint(credential.address, credential, context=cc.endpoint.local_endpoint_context()),
             _native.reap_endpoint_credential(credential.address, credential, root={root!r}),
         ):
             assert result['status'] == 'stale-target', result
             assert result['reason'] == 'credential-context-mismatch', result
         document['schemaVersion'] = 2
         try:
-            cc.EndpointCredential.from_json(json.dumps(document))
+            cc.endpoint.EndpointCredential.from_json(json.dumps(document))
         except ValueError:
             pass
         else:
@@ -615,10 +643,12 @@ def test_public_python_rpc_and_maintenance_use_a_long_final_directory(tmp_path: 
     _run_isolated(f'''
         from pathlib import Path
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         root = Path({str(root)!r})
         sentinel = root / 'application-data'
         sentinel.write_text('preserve')
-        cc.set_local_endpoint(root=str(root))
+        cc.endpoint.set_local_endpoint(root=str(root))
         @cc.crm(namespace='test.long-directory', version='1.0.0')
         class Echo:
             def echo(self, value: bytes) -> bytes: ...
@@ -626,21 +656,21 @@ def test_public_python_rpc_and_maintenance_use_a_long_final_directory(tmp_path: 
             def echo(self, value: bytes) -> bytes: return value
         cc.register(Echo, EchoResource(), name='echo')
         address = cc.server_address()
-        context = cc.local_endpoint_context()
+        context = cc.endpoint.local_endpoint_context()
         endpoint = Path(context.endpoint_name(address))
         assert endpoint.parent == root
         assert len(endpoint.name) == 32
         with cc.connect(Echo, name='echo', address=address) as proxy:
             assert proxy.echo(b'long directory') == b'long directory'
-        observed = cc.inspect_endpoint(address)
+        observed = cc.endpoint.inspect_endpoint(address)
         assert observed['status'] == 'present', observed
         credential = observed['credential']
         assert credential.context == context
-        assert cc.EndpointCredential.from_json(credential.to_json()).to_json() == credential.to_json()
+        assert cc.endpoint.EndpointCredential.from_json(credential.to_json()).to_json() == credential.to_json()
         assert cc.shutdown()['completed']
         assert not endpoint.exists()
         assert root.is_dir() and sentinel.read_text() == 'preserve'
-        assert cc.reap_endpoint(address, credential)['status'] == 'already-absent'
+        assert cc.endpoint.reap_endpoint(address, credential)['status'] == 'already-absent'
     ''')
 
 
@@ -648,19 +678,21 @@ def test_public_python_rpc_and_maintenance_use_a_long_final_directory(tmp_path: 
 def test_windows_root_override_is_explicitly_unsupported_and_preserves_default() -> None:
     _run_isolated('''
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two import _native
         from c_two.transport.client import util
-        context = cc.local_endpoint_context()
+        context = cc.endpoint.local_endpoint_context()
         session = _native.RuntimeSession(use_process_relay_anchor=False)
         for operation in (
-            lambda: cc.set_local_endpoint(root='C:\\\\tmp'),
-            lambda: cc.local_endpoint_context(root='C:\\\\tmp'),
+            lambda: cc.endpoint.set_local_endpoint(root='C:\\\\tmp'),
+            lambda: cc.endpoint.local_endpoint_context(root='C:\\\\tmp'),
             lambda: session.set_local_endpoint(root='C:\\\\tmp'),
             lambda: _native.ipc_endpoint_name('ipc://windows-root', root='C:\\\\tmp'),
             lambda: util.ping('ipc://windows-root', root='C:\\\\tmp'),
             lambda: util.shutdown('ipc://windows-root', root='C:\\\\tmp'),
-            lambda: cc.inspect_endpoint('ipc://windows-root', root='C:\\\\tmp'),
-            lambda: cc.sweep_endpoints(addresses=[], root='C:\\\\tmp'),
+            lambda: cc.endpoint.inspect_endpoint('ipc://windows-root', root='C:\\\\tmp'),
+            lambda: cc.endpoint.sweep_endpoints(addresses=[], root='C:\\\\tmp'),
         ):
             try:
                 operation()
@@ -668,9 +700,38 @@ def test_windows_root_override_is_explicitly_unsupported_and_preserves_default()
                 assert 'not applicable' in str(exc), exc
             else:
                 raise AssertionError('Windows silently ignored a Unix root')
-        assert cc.local_endpoint_context() == context
+        assert cc.endpoint.local_endpoint_context() == context
         assert session.local_endpoint_context() == context
         assert not session.local_endpoint_frozen
         assert cc.shutdown()['completed']
-        assert cc.local_endpoint_context() == context
+        assert cc.endpoint.local_endpoint_context() == context
+    ''')
+
+
+@pytest.mark.parametrize('surface', ['native', 'session', 'public_runtime', 'public_context'])
+def test_shutdown_without_confirmation_returns_unconfirmed(surface, tmp_path) -> None:
+    """A deadline before any exchange cannot claim initiation or absence."""
+    _run_isolated(f'''
+        import os
+        import uuid
+        import c_two.endpoint
+        from c_two import _native
+        from c_two.transport.client import util
+
+        session = _native.RuntimeSession(use_process_relay_anchor=False)
+        if os.name != 'nt':
+            session.set_local_endpoint(root={str(tmp_path)!r})
+            c_two.endpoint.set_local_endpoint(root={str(tmp_path)!r})
+        context = session.local_endpoint_context()
+        address = 'ipc://no-confirmation-' + uuid.uuid4().hex
+        if {surface!r} == 'native':
+            result = _native.ipc_shutdown(address, 0.0, context=context)
+        elif {surface!r} == 'session':
+            result = session.shutdown_direct_ipc(address, 0.0)
+        elif {surface!r} == 'public_context':
+            result = util.shutdown(address, 0.0, context=context)
+        else:
+            result = util.shutdown(address, 0.0)
+        assert type(result) is str, result
+        assert result == 'unconfirmed', result
     ''')

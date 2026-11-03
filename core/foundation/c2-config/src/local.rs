@@ -323,7 +323,7 @@ impl LocalEndpoint {
                 format!("invalid IPC address: {address}"),
             )
         })?;
-        crate::validate_ipc_region_id(server_id)
+        crate::validate_server_id(server_id)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         Ok(server_id)
     }

@@ -146,53 +146,33 @@ def test_import_does_not_expose_logo_banner():
 
 def test_top_level_exposes_register_concurrency_facade():
     import c_two as cc
-    from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
+    import c_two.contract
+    from c_two.transport.server.scheduler import ConcurrencyConfig
 
     assert cc.ConcurrencyConfig is ConcurrencyConfig
-    assert cc.ConcurrencyMode is ConcurrencyMode
-    assert {'ConcurrencyConfig', 'ConcurrencyMode'} <= set(cc.__all__)
+    assert 'ConcurrencyConfig' in cc.__all__
 
-    cfg = cc.ConcurrencyConfig(mode=cc.ConcurrencyMode.PARALLEL)
-    assert cfg.mode is cc.ConcurrencyMode.PARALLEL
+    cfg = cc.ConcurrencyConfig(mode='parallel')
+    assert cfg.mode == 'parallel'
 
 
-def test_top_level_exposes_public_override_schemas():
+def test_contract_module_exposes_projection_tools():
     import c_two as cc
-    from c_two.config import (
-        BaseIPCOverrides,
-        ClientIPCOverrides,
-        ServerIPCOverrides,
-    )
-
-    assert cc.BaseIPCOverrides is BaseIPCOverrides
-    assert cc.ServerIPCOverrides is ServerIPCOverrides
-    assert cc.ClientIPCOverrides is ClientIPCOverrides
-    assert {
-        'BaseIPCOverrides',
-        'ServerIPCOverrides',
-        'ClientIPCOverrides',
-    } <= set(cc.__all__)
-
-
-def test_top_level_exposes_contract_projection_tools():
-    import c_two as cc
+    import c_two.contract
     from c_two.crm.descriptor import (
-        contract_descriptor_diagnostics,
-        export_contract_descriptor,
-        export_contract_release_ref,
+        diagnostics,
+        export_descriptor,
+        release_ref,
     )
-    from c_two.crm.infer import infer_crm_from_resource
 
-    assert cc.contract_descriptor_diagnostics is contract_descriptor_diagnostics
-    assert cc.export_contract_descriptor is export_contract_descriptor
-    assert cc.export_contract_release_ref is export_contract_release_ref
-    assert cc.infer_crm_from_resource is infer_crm_from_resource
+    assert cc.contract.diagnostics is diagnostics
+    assert cc.contract.export_descriptor is export_descriptor
+    assert cc.contract.release_ref is release_ref
     assert {
-        'contract_descriptor_diagnostics',
-        'export_contract_descriptor',
-        'export_contract_release_ref',
-        'infer_crm_from_resource',
-    } <= set(cc.__all__)
+        'diagnostics',
+        'export_descriptor',
+        'release_ref',
+    } <= set(cc.contract.__all__)
 
 
 def test_contract_release_identity_is_not_reimplemented_in_python():
@@ -208,7 +188,7 @@ def test_contract_release_identity_is_not_reimplemented_in_python():
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == 'export_contract_release_ref'
+        and node.name == 'release_ref'
     )
 
     native_imports = {
@@ -250,6 +230,8 @@ def test_payload_abi_internals_are_not_public_sdk_surface():
     import importlib.util
 
     import c_two as cc
+
+    import c_two.contract
 
     forbidden = {
         'CodecBinding',
@@ -334,7 +316,6 @@ def test_registry_does_not_own_generic_relay_or_route_authority():
         "resolve_matching",
         "resolve_routes",
         "route_uid",
-        "route_revision",
         "FallbackDenied(",
     ]
     offenders = [needle for needle in forbidden if needle in source]
@@ -746,39 +727,6 @@ def test_core_python_response_bridge_does_not_accept_shm_coordinate_tuples():
     ]
     offenders = [needle for needle in forbidden if needle in parser_source]
     assert offenders == []
-    assert 'materialize_python_payload_plan(py,value,nbytes)' in _rust_compact(parser_source)
-
-    sink_source = (core_ffi.parent / 'writable_sink.rs').read_text(encoding='utf-8')
-    sink = _rust_compact(sink_source)
-    assert 'bytes:Option<Vec<u8>>' in sink
-    export = _rust_compact(_rust_function(sink_source, '__getbuffer__'))
-    transfer = _rust_compact(_rust_function(sink_source, 'take_bytes'))
-    assert 'letmutstate=this.inner.lock();' in export
-    assert 'if!state.active' in export
-    assert '(*view).buf=bytes.as_mut_ptr().cast();' in export
-    assert '(*view).obj=ffi::Py_NewRef(slf.as_ptr());' in export
-    assert 'state.exports+=1;' in export
-    assert 'letmutstate=self.inner.lock();' in transfer
-    assert 'state.active=false;' in transfer
-    assert transfer.index('ifstate.exports!=0') < transfer.index('.bytes.take()')
-    assert 'Err(PyBufferError::new_err(' in transfer
-    release = _rust_compact(_rust_function(sink_source, '__releasebuffer__'))
-    assert 'self.inner.lock().exports-=1;' in release
-
-
-def test_prepared_payload_detection_requires_write_into_before_nbytes():
-    root = Path(__file__).resolve().parents[4]
-    sink_source = (
-        root / "sdk" / "python" / "native" / "src" / "writable_sink.rs"
-    ).read_text(encoding="utf-8")
-    helper_source = _rust_compact(_rust_function(sink_source, 'prepared_plan_nbytes'))
-
-    assert 'plan.getattr("write_into")' in helper_source
-    assert "value.is_callable()" in helper_source
-    assert helper_source.index('plan.getattr("write_into")') < helper_source.index('plan.getattr("nbytes")')
-    assert helper_source.index('plan.getattr("write_into")') < helper_source.index('plan.getattr("byte_length")')
-    assert 'Ok(_)=>returnOk(None)' in helper_source
-    assert 'Err(err)if!err.is_instance_of::<PyAttributeError>(plan.py())=>returnErr(err)' in helper_source
 
 
 def test_python_ipc_config_facade_does_not_validate_override_keys():
@@ -916,6 +864,9 @@ def test_native_transport_dependencies_reject_production_tables(crate, table, re
 
 def test_python_native_server_start_wait_uses_core_responsive_fence():
     root = Path(__file__).resolve().parents[4]
+    python_server = (
+        root / "sdk" / "python" / "src" / "c_two" / "transport" / "server" / "native.py"
+    ).read_text(encoding="utf-8")
     core_host = (
         root / "core" / "runtime" / "c2-core" / "src" / "host.rs"
     ).read_text(encoding="utf-8")
@@ -923,7 +874,12 @@ def test_python_native_server_start_wait_uses_core_responsive_fence():
         root / "core" / "transport" / "c2-server" / "src" / "server.rs"
     ).read_text(encoding="utf-8")
 
-    assert "wait_until_responsive(startup_timeout)" in core_host
+    assert "self._runtime_session.ensure_host_started()" in python_server
+    assert "os.path.exists" not in python_server
+    assert "time.sleep" not in python_server
+    assert "letstartup_deadline=c2_config::deadline_after(Instant::now(),startup_timeout)" in _rust_compact(core_host)
+    assert "run_server.run_with_startup_deadline(startup_deadline,startup_timeout)" in _rust_compact(core_host)
+    assert "wait_until_responsive(startup_deadline.saturating_duration_since(Instant::now()))" in _rust_compact(core_host)
     assert "wait_until_ready(startup_timeout)" not in core_host
     assert "pub async fn wait_until_responsive(&self, timeout: Duration)" in core_server
 
@@ -997,13 +953,8 @@ def test_route_table_direct_mutations_validate_tombstones_and_private_identity()
         assert 'if!self.apply_tombstone(tombstone)' in mutation
     apply = _rust_compact(_rust_function(source, 'apply_tombstone'))
     assert apply.index('if!self.valid_tombstone(&tombstone)') < apply.index(
-        'self.advance_catalog_revision()',
-    ) < apply.index('self.routes.remove(&key)')
-    address = _rust_compact(_rust_function(source, 'valid_ipc_address'))
-    assert 'address.strip_prefix("ipc://")' in address
-    assert '.is_some_and(|id|c2_config::validate_ipc_region_id(id).is_ok())' in address
-    assert 'local_endpoint_from_ipc_address' not in address
-    assert 'ConfigSources::from_process' not in address
+        'self.routes.remove(&key)',
+    ) < apply.index('self.tombstones.insert(key,tombstone)')
     identity = _rust_compact(_rust_function(source, 'valid_server_id'))
     assert 'c2_config::validate_server_id(server_id).is_ok()' in identity
     assert 'server_id.len()<=MAX_WIRE_TEXT_BYTES' in identity
@@ -1087,7 +1038,7 @@ def test_relay_router_does_not_silence_response_materialization_errors():
     call_handler = production[production.index("async fn call_handler"):]
     call_handler = call_handler[:call_handler.index("async fn acquire_request_client")]
 
-    assert "result.into_bytes()" in call_handler
+    assert "result.into_owned_bytes()" in call_handler
     materialization = call_handler[call_handler.index("fn materialized_response_or_error"):]
     assert "resource_unavailable_response_with_phase" in materialization
     assert '"dispatch_uncertain"' in materialization

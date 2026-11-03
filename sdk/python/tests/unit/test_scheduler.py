@@ -8,7 +8,6 @@ import pytest
 
 from c_two.transport.server.scheduler import (
     ConcurrencyConfig,
-    ConcurrencyMode,
     Scheduler,
 )
 
@@ -16,13 +15,13 @@ from c_two.transport.server.scheduler import (
 class TestConcurrencyConfig:
     def test_default_mode(self):
         cfg = ConcurrencyConfig()
-        assert cfg.mode is ConcurrencyMode.READ_PARALLEL
+        assert cfg.mode == 'read_parallel'
         assert cfg.max_workers is None
         assert cfg.max_pending is None
 
-    def test_string_mode_coerces_to_enum(self):
+    def test_string_mode_is_preserved(self):
         cfg = ConcurrencyConfig(mode='parallel')
-        assert cfg.mode is ConcurrencyMode.PARALLEL
+        assert cfg.mode == 'parallel'
 
     def test_invalid_mode(self):
         with pytest.raises(ValueError):

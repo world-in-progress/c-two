@@ -81,7 +81,7 @@ impl fmt::Display for CallScopeError {
         match self {
             Self::DeadlineNotRepresentable { timeout } => write!(
                 f,
-                "call deadline configuration error: {timeout:?} exceeds the local Instant range"
+                "call deadline configuration error: {timeout:?} exceeds the monotonic clock range"
             ),
             Self::DeadlineExceeded { phase } => {
                 write!(f, "call deadline exceeded ({phase:?})")
@@ -144,9 +144,8 @@ impl CallScope {
         let deadline = options
             .effective_timeout(path_default)
             .map(|timeout| {
-                start
-                    .checked_add(timeout)
-                    .ok_or(CallScopeError::DeadlineNotRepresentable { timeout })
+                c2_config::deadline_after(start, timeout)
+                    .map_err(|_| CallScopeError::DeadlineNotRepresentable { timeout })
             })
             .transpose()?;
         let state = if deadline.is_some_and(|deadline| start >= deadline) {
@@ -425,19 +424,19 @@ mod tests {
     fn instant_overflow_is_an_explicit_configuration_error() {
         let start = Instant::now();
         assert!(start.checked_add(Duration::MAX).is_none());
-        for options in [
-            CallOptions::with_timeout(CallTimeout::After(Duration::MAX)),
-            CallOptions::new(),
+        for timeout in [
+            Duration::MAX,
+            Duration::from_secs(10_000_000_000_000_000_000),
         ] {
-            let error = CallScope::new_at(options, Some(Duration::MAX), start).unwrap_err();
-            assert_eq!(
-                error,
-                CallScopeError::DeadlineNotRepresentable {
-                    timeout: Duration::MAX
-                }
-            );
-            assert!(error.to_string().contains("configuration error"));
-            let _: &dyn std::error::Error = &error;
+            for options in [
+                CallOptions::with_timeout(CallTimeout::After(timeout)),
+                CallOptions::new(),
+            ] {
+                let error = CallScope::new_at(options, Some(timeout), start).unwrap_err();
+                assert_eq!(error, CallScopeError::DeadlineNotRepresentable { timeout });
+                assert!(error.to_string().contains("configuration error"));
+                let _: &dyn std::error::Error = &error;
+            }
         }
     }
 

@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use c_two::contract::ContractReleaseRef;
 use c_two::generated::{
     C2Error, EncodedClient, EncodedService, ErrorCode, MethodAccess, MethodDefinition,
     ServiceDefinition, fastdb_cause_details,
 };
 use c_two::{
-    Connect, ContractLimits, ContractRelease, ContractReleaseRef, Error, HostOptions, Runtime,
-    RuntimeOptions, ServiceConcurrencyMode,
+    Connect, ContractRelease, Error, HostOptions, Runtime, RuntimeOptions, ServiceConcurrencyMode,
 };
 use c2_http::relay::{RelayConfig, RelayServer};
 use fastdb::{BuildPolicy, Builder, CompiledSpec};
@@ -143,12 +143,39 @@ fn unique_name(prefix: &str) -> String {
     )
 }
 
+fn test_context() -> &'static c_two::endpoint::LocalEndpointContext {
+    static CONTEXT: std::sync::OnceLock<c_two::endpoint::LocalEndpointContext> =
+        std::sync::OnceLock::new();
+    CONTEXT.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let root = Path::new("/tmp").join(unique_name("c2-sdk"));
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&root)
+                .expect("private SDK test endpoint root");
+            c_two::endpoint::LocalEndpointContext::with_unix_root(&root).unwrap()
+        }
+        #[cfg(windows)]
+        c_two::endpoint::LocalEndpointContext::default_for_platform().unwrap()
+    })
+}
+
+fn test_runtime(options: RuntimeOptions) -> Result<Runtime, c_two::LifecycleError> {
+    let runtime = Runtime::new(options)?;
+    let mut endpoint_options = c_two::endpoint::LocalEndpointOptions::default();
+    #[cfg(unix)]
+    {
+        endpoint_options.unix_root = test_context().unix_root().map(Path::to_path_buf);
+    }
+    runtime.set_local_endpoint_with_sources(endpoint_options, c_two::ConfigSources::empty())?;
+    Ok(runtime)
+}
+
 fn release() -> ContractRelease {
-    ContractRelease::from_descriptor_json_with_limits(
-        DESCRIPTOR.as_bytes(),
-        ContractLimits::default(),
-    )
-    .expect("valid release")
+    ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes()).expect("valid release")
 }
 
 fn definition(route_name: &str) -> ServiceDefinition {
@@ -179,14 +206,17 @@ fn relay() -> (RelayServer, String) {
     let address = probe.local_addr().expect("relay address");
     drop(probe);
     let relay_url = format!("http://{address}");
-    let relay = RelayServer::start(RelayConfig {
-        bind: address.to_string(),
-        advertise_url: relay_url.clone(),
-        idle_timeout_secs: 0,
-        anti_entropy_interval: std::time::Duration::ZERO,
-        heartbeat_interval: std::time::Duration::ZERO,
-        ..RelayConfig::default()
-    })
+    let relay = RelayServer::start_with_context(
+        RelayConfig {
+            bind: address.to_string(),
+            advertise_url: relay_url.clone(),
+            idle_timeout_secs: 0,
+            anti_entropy_interval: std::time::Duration::ZERO,
+            heartbeat_interval: std::time::Duration::ZERO,
+            ..RelayConfig::default()
+        },
+        test_context().clone(),
+    )
     .expect("relay starts");
     (relay, relay_url)
 }
@@ -198,7 +228,7 @@ fn package_identity_and_root_imports_are_exact() {
 
     let release = release();
     accepts_release_ref(&release.reference());
-    let _runtime = Runtime::new(RuntimeOptions::default()).expect("runtime");
+    let _runtime = test_runtime(RuntimeOptions::default()).expect("runtime");
     let _host_options = HostOptions::default();
     let _connect = Connect::RelayAware;
 
@@ -237,7 +267,7 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
     fn accepts_client(_: &c_two::Client) {}
 
     let (mut relay, relay_url) = relay();
-    let runtime = Runtime::new(RuntimeOptions {
+    let runtime = test_runtime(RuntimeOptions {
         server_id: Some(unique_name("rust-sdk")),
         relay_anchor_address: Some(relay_url.clone()),
         use_process_relay_anchor: false,
@@ -250,7 +280,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         .register(definition(&route_name))
         .expect("route registration");
     let registered_route_uid = registration.outcome().route_uid.clone();
-    let registered_route_revision = registration.outcome().route_revision;
     let expected = release()
         .expected_route(&route_name)
         .expect("expected route");
@@ -265,10 +294,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         .expect("direct IPC client");
     accepts_client(&direct);
     assert_eq!(direct.observed_route().route_uid, registered_route_uid);
-    assert_eq!(
-        direct.observed_route().route_revision,
-        registered_route_revision
-    );
     assert_eq!(
         direct.call_owned("echo", b"direct").expect("direct call"),
         b"direct"
@@ -285,10 +310,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
     accepts_client(&explicit);
     assert_eq!(explicit.observed_route().route_uid, registered_route_uid);
     assert_eq!(
-        explicit.observed_route().route_revision,
-        registered_route_revision
-    );
-    assert_eq!(
         explicit
             .call_owned("echo", b"explicit")
             .expect("explicit relay call"),
@@ -300,10 +321,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         .expect("relay-aware client");
     accepts_client(&relay_aware);
     assert_eq!(relay_aware.observed_route().route_uid, registered_route_uid);
-    assert_eq!(
-        relay_aware.observed_route().route_revision,
-        registered_route_revision
-    );
     assert_eq!(
         relay_aware
             .call_owned("echo", b"aware")
@@ -318,7 +335,7 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
 
 #[test]
 fn registration_projects_the_core_owned_route_concurrency() {
-    let runtime = Runtime::new(RuntimeOptions {
+    let runtime = test_runtime(RuntimeOptions {
         server_id: Some(unique_name("rust-sdk-concurrency")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
@@ -353,7 +370,7 @@ fn registration_projects_the_core_owned_route_concurrency() {
 
 #[test]
 fn semantic_error_fields_match_the_cross_language_fixture_shape() {
-    let runtime = Runtime::new(RuntimeOptions {
+    let runtime = test_runtime(RuntimeOptions {
         server_id: Some(unique_name("semantic")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
@@ -428,6 +445,14 @@ fn official_fastdb_error_projects_only_the_six_frozen_outer_keys() {
 
 #[test]
 fn low_level_transports_are_not_importable_and_encoded_client_is_sealed() {
+    assert_external_crate_rejected(
+        "moved-root-surface",
+        r#"
+use c_two::{EndpointCredential, ConnectionObservation};
+fn main() {}
+"#,
+        "unresolved imports",
+    );
     assert_external_crate_rejected(
         "transport-surface",
         r#"
@@ -523,34 +548,19 @@ fn assert_external_crate_rejected(name: &str, source: &str, expected_stderr: &st
 }
 
 #[test]
-fn owner_lifecycle_facade_uses_the_exact_core_capability_types() {
-    let pair: fn() -> std::io::Result<(c2_core::OwnerControl, c2_core::OwnerBootstrap)> =
-        c_two::owner_control_pair;
+fn native_endpoint_and_admin_probes_are_thin_facade_reexports() {
     assert_eq!(
-        std::any::TypeId::of::<c_two::ServerLifecyclePolicy>(),
-        std::any::TypeId::of::<c2_core::ServerLifecyclePolicy>(),
+        std::any::TypeId::of::<c_two::endpoint::DirectIpcShutdownOutcome>(),
+        std::any::TypeId::of::<c2_ipc::DirectIpcShutdownOutcome>(),
     );
+
     assert_eq!(
-        std::any::TypeId::of::<c_two::HostLifecycleSnapshot>(),
+        std::any::TypeId::of::<c_two::observe::HostLifecycleSnapshot>(),
         std::any::TypeId::of::<c2_core::HostLifecycleSnapshot>(),
     );
-    let (keepalive, receiver) = pair().expect("native capability pair");
-    let runtime = Runtime::new(RuntimeOptions::default()).expect("runtime");
-    runtime
-        .set_lifecycle_policy(c_two::ServerLifecyclePolicy::owner_bound(Duration::ZERO).unwrap())
-        .expect("Core validates the policy");
-    runtime
-        .attach_owner_control(receiver)
-        .expect("Core takes receiver");
-    assert!(runtime.owner_control_attached());
-    keepalive.close();
-}
-
-#[test]
-fn native_endpoint_and_admin_probes_are_thin_facade_reexports() {
-    use c_two::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc};
+    use c_two::endpoint::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc};
     let address = format!("ipc://{}", unique_name("rust-sdk-native"));
-    let endpoint = direct_ipc_endpoint(&address).expect("native endpoint");
+    let endpoint = direct_ipc_endpoint(&address, None).expect("native endpoint");
     assert_eq!(
         endpoint,
         c2_config::LocalEndpoint::from_address(&address).unwrap()
@@ -563,20 +573,63 @@ fn native_endpoint_and_admin_probes_are_thin_facade_reexports() {
             "managed-v2"
         }
     );
-    assert!(!ping_direct_ipc(&address, Duration::from_millis(20)).unwrap());
-    let outcome = shutdown_direct_ipc(&address, Duration::from_millis(20)).unwrap();
-    assert!(outcome.server_stopped && !outcome.shutdown_started);
-    assert!(outcome.route_outcomes.is_empty());
+    assert!(!ping_direct_ipc(&address, Some(test_context()), Duration::from_millis(20)).unwrap());
+    let outcome =
+        shutdown_direct_ipc(&address, Some(test_context()), Duration::from_millis(20)).unwrap();
+    assert_eq!(outcome, c_two::endpoint::DirectIpcShutdownOutcome::Absent);
+}
+
+#[test]
+fn direct_shutdown_receipt_finishes_while_held_checked_view_stays_live() {
+    use c_two::generated::open_held;
+
+    let (runtime, host, _registration, client, _calls) = preparation_fixture(1, 4096);
+    let spec = CompiledSpec::compile(FASTDB_RECORD_U8_SPEC).unwrap();
+    let mut builder = Builder::create(&spec).unwrap();
+    builder.entry_begin(0, 1).unwrap().value_u8(23).unwrap();
+    let payload = builder
+        .freeze()
+        .unwrap()
+        .execute(BuildPolicy::AllowStaging)
+        .unwrap()
+        .payload;
+    let bytes = payload.binary_bytes().unwrap();
+    let response = client.call_held("echo", &bytes).unwrap();
+    let mut held = open_held(&spec, response).unwrap();
+    let view = held.value().unwrap().entry_view(0).unwrap().at(0).unwrap();
+    assert_eq!(view.get_u8().unwrap(), 23);
+    assert!(!host.lifecycle_snapshot().finished);
+
+    let acknowledgement = runtime
+        .shutdown_direct_ipc(&runtime.server_address().unwrap(), Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        acknowledgement,
+        c_two::endpoint::DirectIpcShutdownOutcome::Initiated
+    );
+    let receipt = host.shutdown();
+    assert!(receipt.runtime_barrier_error.is_none(), "{receipt:?}");
+    assert!(receipt.route_close_error.is_none(), "{receipt:?}");
+    assert_eq!(host.shutdown_outcome().unwrap(), receipt);
+    let snapshot = host.lifecycle_snapshot();
+    assert!(snapshot.finished);
+    assert!(snapshot.listener_closed);
+    assert_eq!(snapshot.work_drained, Some(true));
+    assert_eq!(view.get_u8().unwrap(), 23);
+
+    held.release().unwrap();
+    assert_eq!(view.kind().unwrap_err().symbol(), "VIEW_INVALIDATED");
 }
 
 #[test]
 fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
+    use c_two::observe::CallExecutionSnapshot;
     use c_two::{
-        CallExecutionLimits, CallExecutionLimitsOverrides, CallExecutionSnapshot, CallOptions,
-        CallTimeout, ConfigSources, EnvFilePolicy, EnvMap,
+        CallExecutionLimits, CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources,
+        EnvFilePolicy, EnvMap,
     };
 
-    let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    let runtime = test_runtime(RuntimeOptions::default()).unwrap();
     runtime
         .set_call_execution_limits_with_sources(
             CallExecutionLimitsOverrides::default(),
@@ -626,14 +679,14 @@ fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
 #[cfg(unix)]
 #[test]
 fn runtime_roots_and_admin_contexts_share_the_core_freeze_authority() {
-    use c_two::{
-        ConfigSources, LifecycleError, LocalEndpointContext, LocalEndpointNamespace,
-        LocalEndpointOptions, direct_ipc_endpoint_with_context, ping_direct_ipc_with_context,
-        shutdown_direct_ipc_with_context,
+    use c_two::endpoint::{
+        LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions, direct_ipc_endpoint,
+        ping_direct_ipc, shutdown_direct_ipc,
     };
+    use c_two::{ConfigSources, LifecycleError};
 
-    let first = Runtime::new(RuntimeOptions::default()).unwrap();
-    let second = Runtime::new(RuntimeOptions::default()).unwrap();
+    let first = test_runtime(RuntimeOptions::default()).unwrap();
+    let second = test_runtime(RuntimeOptions::default()).unwrap();
     // Pure projection uses deliberately absent roots: no fixture directory or endpoint is created.
     // Darwin's sun_path is only 104 bytes, including Core's endpoint suffix.
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -659,15 +712,17 @@ fn runtime_roots_and_admin_contexts_share_the_core_freeze_authority() {
         LocalEndpointNamespace::UnixFilesystem
     );
     assert_ne!(first_context, second_context);
-    let first_endpoint = direct_ipc_endpoint_with_context(&address, &first_context).unwrap();
+    let first_endpoint = direct_ipc_endpoint(&address, Some(&first_context)).unwrap();
     assert_eq!(first_endpoint, first.local_endpoint(&address).unwrap());
     assert_ne!(first_endpoint, second.local_endpoint(&address).unwrap());
     assert!(!first.local_endpoint_frozen());
-    assert!(!ping_direct_ipc_with_context(&address, &first_context, Duration::ZERO).unwrap());
-    let stopped =
-        shutdown_direct_ipc_with_context(&address, &first_context, Duration::ZERO).unwrap();
+    assert!(!ping_direct_ipc(&address, Some(&first_context), Duration::ZERO).unwrap());
+    let stopped = shutdown_direct_ipc(&address, Some(&first_context), Duration::ZERO).unwrap();
     // A zero observation budget makes no exchange and cannot establish absence.
-    assert!(!stopped.acknowledged && !stopped.server_stopped && !stopped.shutdown_started);
+    assert_eq!(
+        stopped,
+        c_two::endpoint::DirectIpcShutdownOutcome::Unconfirmed
+    );
     assert!(!first.local_endpoint_frozen());
     assert!(!first.ping_direct_ipc(&address, Duration::ZERO).unwrap());
     assert!(first.local_endpoint_frozen());
@@ -696,11 +751,11 @@ fn runtime_roots_and_admin_contexts_share_the_core_freeze_authority() {
 #[cfg(windows)]
 #[test]
 fn runtime_admin_context_uses_the_windows_namespace_without_unix_overrides() {
-    use c_two::{
-        ConfigSources, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
-        direct_ipc_endpoint_with_context,
+    use c_two::ConfigSources;
+    use c_two::endpoint::{
+        LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions, direct_ipc_endpoint,
     };
-    let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    let runtime = test_runtime(RuntimeOptions::default()).unwrap();
     runtime
         .set_local_endpoint_with_sources(LocalEndpointOptions::default(), ConfigSources::empty())
         .unwrap();
@@ -711,7 +766,7 @@ fn runtime_admin_context_uses_the_windows_namespace_without_unix_overrides() {
     );
     let address = format!("ipc://{}", unique_name("sdk-windows-context"));
     assert_eq!(
-        direct_ipc_endpoint_with_context(&address, &context).unwrap(),
+        direct_ipc_endpoint(&address, Some(&context)).unwrap(),
         runtime.local_endpoint(&address).unwrap()
     );
     assert!(!runtime.ping_direct_ipc(&address, Duration::ZERO).unwrap());
@@ -738,7 +793,7 @@ fn preparation_fixture(
     Arc<AtomicU64>,
 ) {
     use c_two::{CallExecutionLimitsOverrides, ConfigSources};
-    let runtime = Runtime::new(RuntimeOptions {
+    let runtime = test_runtime(RuntimeOptions {
         server_id: Some(unique_name("sdk-preparation")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()

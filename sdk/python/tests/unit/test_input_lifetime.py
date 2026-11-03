@@ -2,7 +2,6 @@ import pytest
 
 from c_two.crm.payload_plan import PayloadBinding, PayloadPlanKind, no_payload_binding
 from c_two.crm.transferable import _build_transfer_wrapper
-from c_two.transport.input_lifetime import InputLifetime
 from c_two.transport.server.native import CRMSlot
 
 
@@ -30,7 +29,7 @@ def test_borrowed_dispatch_requires_fdb_payload_binding():
         method_table=object(),
         scheduler=object(),
         methods=['total'],
-        input_lifetime={'total': InputLifetime.BORROWED},
+        input_lifetime={'total': 'borrowed'},
     )
 
     with pytest.raises(ValueError, match='explicit FastDB Payload input binding'):

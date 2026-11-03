@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, Weak};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BudgetKind {
     /// Owner-created shared-memory backing (buddy and dedicated segments),
-    /// including allocator header/alignment overhead.
+    /// including OS alignment overhead.
     Shm,
     /// Owner-created file backing (file spill).
     File,
@@ -70,8 +70,6 @@ pub struct BudgetCellSnapshot {
 /// Consistent view of all three cells, taken under one lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetSnapshot {
-    /// Release obligations abandoned by this process; saturating history, not live blocks.
-    pub abandoned_releases: u64,
     pub shm: BudgetCellSnapshot,
     pub file: BudgetCellSnapshot,
     pub reassembly: BudgetCellSnapshot,
@@ -185,7 +183,6 @@ impl BudgetCell {
 
 #[derive(Debug)]
 struct BudgetCells {
-    abandoned_releases: u64,
     shm: BudgetCell,
     file: BudgetCell,
     reassembly: BudgetCell,
@@ -194,7 +191,6 @@ struct BudgetCells {
 impl BudgetCells {
     fn new(shm_limit: u64, file_limit: u64, reassembly_limit: u64) -> Self {
         Self {
-            abandoned_releases: 0,
             shm: BudgetCell::new(shm_limit),
             file: BudgetCell::new(file_limit),
             reassembly: BudgetCell::new(reassembly_limit),
@@ -207,10 +203,6 @@ impl BudgetCells {
             BudgetKind::File => &mut self.file,
             BudgetKind::Reassembly => &mut self.reassembly,
         }
-    }
-
-    fn record_abandoned_release(&mut self) {
-        self.abandoned_releases = self.abandoned_releases.saturating_add(1);
     }
 }
 
@@ -271,20 +263,23 @@ impl MemoryBudget {
         })
     }
 
-    /// Record one obligation whose final owner cannot confirm release.
-    pub fn record_abandoned_release(&self) {
-        let mut cells = lock_cells(&self.state.cells);
-        cells.record_abandoned_release();
-    }
-
     /// Consistent snapshot of all three cells.
     pub fn snapshot(&self) -> BudgetSnapshot {
         let cells = lock_cells(&self.state.cells);
         BudgetSnapshot {
-            abandoned_releases: cells.abandoned_releases,
             shm: cells.shm.snapshot(),
             file: cells.file.snapshot(),
             reassembly: cells.reassembly.snapshot(),
+        }
+    }
+
+    /// Resolved limits enforced by these same accounting cells.
+    pub fn limits(&self) -> c2_config::MemoryBudgetLimits {
+        let cells = lock_cells(&self.state.cells);
+        c2_config::MemoryBudgetLimits {
+            shm_backing_budget_bytes: cells.shm.limit_bytes,
+            file_backing_budget_bytes: cells.file.limit_bytes,
+            live_reassembly_budget_bytes: cells.reassembly.limit_bytes,
         }
     }
 }
@@ -297,7 +292,7 @@ fn lock_cells(cells: &Mutex<BudgetCells>) -> std::sync::MutexGuard<'_, BudgetCel
 
 /// Read-only handle to one budget domain that can outlive its owner.
 ///
-/// Retains only the shared accounting state and the resolved limits — never a
+/// Retains only the shared accounting state — never a
 /// pool, mapping, client cache, Runtime, connection, or callback — so a
 /// retired domain (a closed Runtime's outgoing context, a stopped Server) can
 /// stay observable without retaining live transport authority. Observing never
@@ -312,19 +307,18 @@ fn lock_cells(cells: &Mutex<BudgetCells>) -> std::sync::MutexGuard<'_, BudgetCel
 /// domain.
 #[derive(Debug, Clone)]
 pub struct BudgetObserver {
-    limits: c2_config::MemoryBudgetLimits,
     budget: MemoryBudget,
 }
 
 impl BudgetObserver {
-    /// Wraps the shared counters of one domain with its resolved limits.
-    pub fn new(limits: c2_config::MemoryBudgetLimits, budget: MemoryBudget) -> Self {
-        Self { limits, budget }
+    /// Wraps the shared counters and limits of one domain.
+    pub fn new(budget: MemoryBudget) -> Self {
+        Self { budget }
     }
 
     /// Resolved limits the observed domain enforces.
-    pub fn limits(&self) -> &c2_config::MemoryBudgetLimits {
-        &self.limits
+    pub fn limits(&self) -> c2_config::MemoryBudgetLimits {
+        self.budget.limits()
     }
 
     /// Consistent snapshot of all three cells.
@@ -355,7 +349,6 @@ impl BudgetObserver {
     /// such owner is gone.
     pub fn downgrade(&self) -> BudgetObserverWeak {
         BudgetObserverWeak {
-            limits: self.limits,
             state: Arc::downgrade(&self.budget.state),
         }
     }
@@ -363,12 +356,11 @@ impl BudgetObserver {
 
 /// Weak, read-only view of one budget domain's shared accounting state.
 ///
-/// Sharing only a [`Weak`] handle to the accounting state plus the resolved
-/// limits, this can never create charges and never keeps a retired domain's
+/// Sharing only a [`Weak`] handle to the accounting state, this can never
+/// create charges and never keeps a retired domain's
 /// counters alive by itself. See [`BudgetObserver::downgrade`].
 #[derive(Debug, Clone)]
 pub struct BudgetObserverWeak {
-    limits: c2_config::MemoryBudgetLimits,
     state: Weak<BudgetState>,
 }
 
@@ -384,7 +376,7 @@ impl BudgetObserverWeak {
         Weak::ptr_eq(&self.state, &other.state)
     }
 
-    /// Reattach to the live accounting state, with its resolved limits.
+    /// Reattach to the live accounting state and its resolved limits.
     ///
     /// `None` once every owner of the domain is gone; such a record carries no
     /// observable values anymore and may be pruned.
@@ -392,10 +384,7 @@ impl BudgetObserverWeak {
         let budget = MemoryBudget {
             state: self.state.upgrade()?,
         };
-        Some(BudgetObserver {
-            limits: self.limits,
-            budget,
-        })
+        Some(BudgetObserver { budget })
     }
 }
 
@@ -416,16 +405,6 @@ pub struct BudgetReservation {
 }
 
 impl BudgetReservation {
-    /// Consume the guard without refunding an unconfirmed allocation.
-    /// Accounting has no payload ownership and is not pinned after abandonment.
-    pub fn abandon(mut self) {
-        {
-            let mut cells = lock_cells(&self.state.cells);
-            cells.record_abandoned_release();
-        }
-        self.bytes = 0;
-    }
-
     /// The cell this guard charges.
     pub fn kind(&self) -> BudgetKind {
         self.kind
@@ -453,23 +432,6 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn abandonment_keeps_charge_saturates_and_does_not_pin_retired_scope() {
-        let budget = MemoryBudget::new(100, 100, 100);
-        let observer =
-            BudgetObserver::new(c2_config::MemoryBudgetLimits::default(), budget.clone())
-                .downgrade();
-        let reservation = budget.reserve(BudgetKind::Reassembly, 60).unwrap();
-        reservation.abandon();
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 60);
-        assert_eq!(budget.snapshot().abandoned_releases, 1);
-        lock_cells(&budget.state.cells).abandoned_releases = u64::MAX;
-        budget.record_abandoned_release();
-        assert_eq!(budget.snapshot().abandoned_releases, u64::MAX);
-        drop(budget);
-        assert!(observer.upgrade().is_none());
-    }
-
-    #[test]
     fn from_limits_builds_the_canonical_cells() {
         let limits = c2_config::MemoryBudgetLimits {
             shm_backing_budget_bytes: 7,
@@ -478,6 +440,7 @@ mod tests {
         };
         let budget = MemoryBudget::from_limits(&limits);
         let snap = budget.snapshot();
+        assert_eq!(budget.limits(), limits);
         assert_eq!(snap.shm.limit_bytes, 7);
         assert_eq!(snap.file.limit_bytes, 11);
         assert_eq!(snap.reassembly.limit_bytes, 13);
@@ -674,14 +637,14 @@ mod tests {
         // weak observation stays attached and keeps reporting live values.
         let weak = {
             let budget = MemoryBudget::from_limits(&limits);
-            let observer = BudgetObserver::new(limits, budget.clone());
+            let observer = BudgetObserver::new(budget.clone());
             let weak = observer.downgrade();
             let _charge = budget.reserve(BudgetKind::File, 512).unwrap();
             drop((budget, observer));
             assert!(weak.is_alive());
             let reattached = weak.upgrade().expect("charge keeps state alive");
             assert_eq!(reattached.snapshot().file.used_bytes, 512);
-            assert_eq!(*reattached.limits(), limits);
+            assert_eq!(reattached.limits(), limits);
             weak
         };
         // The charge dropped with the scope above; no owner remains, so the
@@ -690,10 +653,33 @@ mod tests {
         assert!(weak.upgrade().is_none());
 
         // Identity distinguishes two domains even with equal limits.
-        let first = BudgetObserver::new(limits, MemoryBudget::from_limits(&limits)).downgrade();
-        let second = BudgetObserver::new(limits, MemoryBudget::from_limits(&limits)).downgrade();
+        let first = BudgetObserver::new(MemoryBudget::from_limits(&limits)).downgrade();
+        let second = BudgetObserver::new(MemoryBudget::from_limits(&limits)).downgrade();
         assert!(first.ptr_eq(&first));
         assert!(!first.ptr_eq(&second));
+    }
+
+    #[test]
+    fn observer_reports_the_limits_its_budget_enforces() {
+        let budget = MemoryBudget::new(7, 11, 13);
+        let observer = BudgetObserver::new(budget.clone());
+        let weak = observer.downgrade();
+        let limits = c2_config::MemoryBudgetLimits {
+            shm_backing_budget_bytes: 7,
+            file_backing_budget_bytes: 11,
+            live_reassembly_budget_bytes: 13,
+        };
+        assert_eq!(observer.limits(), limits);
+
+        let charge = budget.reserve(BudgetKind::File, 11).unwrap();
+        assert_eq!(budget.reserve(BudgetKind::File, 1).unwrap_err().limit, 11);
+        drop((budget, observer));
+
+        let reattached = weak.upgrade().expect("charge retains the budget state");
+        assert_eq!(reattached.limits(), limits);
+        assert_eq!(reattached.snapshot().file.used_bytes, 11);
+        drop((reattached, charge));
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub fn spawn_background_tasks(
         handles.push(tokio::spawn(dead_peer_probe_loop(s, c)));
     }
 
-    if !config.seed_retry_interval.is_zero() && !config.seeds.is_empty() {
+    if !config.seeds.is_empty() {
         let s = state.clone();
         let c = cancel.clone();
         handles.push(tokio::spawn(seed_retry_loop(s, c)));
@@ -107,13 +107,7 @@ async fn tombstone_gc_loop(state: Arc<RelayState>, cancel: CancellationToken) {
             eprintln!("{}", tombstone_gc_detail_line(tombstone));
         }
         if !removed.is_empty() {
-            let (catalog_revision, compaction_revision) = state.route_catalog_revisions();
-            eprintln!(
-                "[relay] GC removed {} route tombstones catalog_revision={} compaction_revision={}",
-                removed.len(),
-                catalog_revision,
-                compaction_revision
-            );
+            eprintln!("[relay] GC removed {} route tombstones", removed.len());
         }
     }
 }
@@ -122,13 +116,11 @@ fn tombstone_gc_detail_line(removed: &TombstoneGcEntry) -> String {
     let tombstone = &removed.tombstone;
     let server_id = tombstone.server_id.as_deref().unwrap_or("<none>");
     format!(
-        "[relay] GC removed route tombstone: name={} relay_id={} server_id={} removed_at={} removed_revision={} compaction_revision={} reason={}",
+        "[relay] GC removed route tombstone: name={} relay_id={} server_id={} removed_at={} reason={}",
         tombstone.name,
         tombstone.relay_id,
         server_id,
         tombstone.removed_at,
-        tombstone.removed_revision,
-        removed.compaction_revision,
         removed.reason.as_str()
     )
 }
@@ -316,57 +308,54 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
     }
 }
 
-/// Retry seed nodes when no alive peers exist.
+/// Join seeds immediately, then retry while no alive peers exist.
 async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     let interval = state.config().seed_retry_interval;
     let seeds = state.config().seeds.clone();
-    let mut ticker = tokio::time::interval(interval);
-    ticker.tick().await;
-
     let client = crate::relay_client_builder_with_proxy(state.config().use_proxy)
         .timeout(Duration::from_secs(5))
         .build()
         .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = ticker.tick() => {}
-        }
-
-        // Only retry if no alive peers
+        // The first join and later retries use the same path.
         let has_alive = state.with_route_table(|rt| !rt.alive_peers().is_empty());
-        if has_alive {
-            continue;
-        }
-
-        for seed_url in &seeds {
-            let join_url = peer_endpoint_url(seed_url, "/_peer/join");
-            let envelope = PeerEnvelope::new(
-                state.relay_id(),
-                PeerMessage::RelayJoin {
-                    relay_id: state.relay_id().to_string(),
-                    url: state.config().effective_advertise_url(),
-                },
-            );
-            if let Ok(resp) = client.post(&join_url).json(&envelope).send().await
-                && let Ok(envelope) = resp.json::<FullSyncEnvelope>().await
-            {
-                let Ok(snapshot) = ValidatedFullSync::try_from(envelope) else {
-                    continue;
-                };
-                state.merge_snapshot(snapshot);
-                let peers = state.list_peers();
-                let announce = PeerEnvelope::new(
+        if !has_alive {
+            for seed_url in &seeds {
+                let join_url = peer_endpoint_url(seed_url, "/_peer/join");
+                let envelope = PeerEnvelope::new(
                     state.relay_id(),
                     PeerMessage::RelayJoin {
                         relay_id: state.relay_id().to_string(),
                         url: state.config().effective_advertise_url(),
                     },
                 );
-                state.disseminator().broadcast(announce, &peers);
-                break;
+                if let Ok(resp) = client.post(&join_url).json(&envelope).send().await
+                    && let Ok(envelope) = resp.json::<FullSyncEnvelope>().await
+                {
+                    let Ok(snapshot) = ValidatedFullSync::try_from(envelope) else {
+                        continue;
+                    };
+                    state.merge_snapshot(snapshot);
+                    let peers = state.list_peers();
+                    let announce = PeerEnvelope::new(
+                        state.relay_id(),
+                        PeerMessage::RelayJoin {
+                            relay_id: state.relay_id().to_string(),
+                            url: state.config().effective_advertise_url(),
+                        },
+                    );
+                    state.disseminator().broadcast(announce, &peers);
+                    break;
+                }
             }
+        }
+        if interval.is_zero() {
+            break;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(interval) => {}
         }
     }
 }
@@ -376,6 +365,51 @@ mod tests {
     use super::*;
     use crate::relay::route_table::{TombstoneGcEntry, TombstoneGcReason};
 
+    #[tokio::test]
+    async fn seed_bootstrap_runs_once_when_retries_are_disabled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let joins = Arc::new(AtomicUsize::new(0));
+        let received = joins.clone();
+        let app = axum::Router::new().route(
+            "/_peer/join",
+            axum::routing::post(move || {
+                let received = received.clone();
+                async move {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"status": "ignored"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = Arc::new(RelayState::new(
+            Arc::new(c2_config::RelayConfig {
+                seeds: vec![seed],
+                heartbeat_interval: Duration::ZERO,
+                anti_entropy_interval: Duration::ZERO,
+                dead_peer_probe_interval: Duration::ZERO,
+                seed_retry_interval: Duration::ZERO,
+                ..Default::default()
+            }),
+            Arc::new(crate::relay::test_support::NoopDisseminator),
+        ));
+        let cancel = CancellationToken::new();
+        let mut handles = spawn_background_tasks(state, cancel.clone());
+        tokio::time::timeout(Duration::from_secs(2), handles.remove(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(joins.load(Ordering::SeqCst), 1);
+        cancel.cancel();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn tombstone_gc_log_message_names_removed_route() {
         let removed = TombstoneGcEntry {
@@ -383,13 +417,10 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 2000.0,
-                removed_revision: 17,
-                local_catalog_revision: 17,
                 server_id: Some("server-grid".into()),
                 observed_at: std::time::Instant::now(),
             },
             reason: TombstoneGcReason::RetentionExpired,
-            compaction_revision: 17,
         };
 
         let line = tombstone_gc_detail_line(&removed);
@@ -399,8 +430,6 @@ mod tests {
         assert!(line.contains("relay_id=relay-a"));
         assert!(line.contains("server_id=server-grid"));
         assert!(line.contains("removed_at=2000"));
-        assert!(line.contains("removed_revision=17"));
-        assert!(line.contains("compaction_revision=17"));
         assert!(line.contains("reason=retention-expired"));
     }
 }

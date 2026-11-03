@@ -1,16 +1,8 @@
-//! A connection's ServerPoolState must not expose bare-coordinate methods
-//! or its raw pool. Retired Connection raw read/free methods have no probe
-//! call sites. Compiled only, never run.
+//! A peer mapping cache must not expose raw coordinate access or its pool.
 #![forbid(unsafe_code)]
-
 use c2_ipc::ServerPoolState;
-
-#[allow(dead_code)]
-fn raw_server_pool_access(state: &mut ServerPoolState) -> Result<(), String> {
-    state.copy_response(0, 1, 0, 4096, false)?;
-    state.release_response(0, 1, 0, 4096, false, 7)?;
-    let _ = &state.pool;
-    Ok(())
+fn raw(state: &ServerPoolState) {
+    let _ = ServerPoolState::admit;
+    let _ = &state.cache;
 }
-
 fn main() {}

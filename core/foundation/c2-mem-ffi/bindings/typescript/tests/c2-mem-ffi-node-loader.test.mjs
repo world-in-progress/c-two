@@ -11,8 +11,6 @@ import {
   C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
   C2NodeIpcConnectionError,
   createBundledC2MemFfiNodeRuntime,
-  createC2MemFfiRequestPoolFromSymbols,
-  createC2MemFfiResponsePoolFromSymbols,
   createNodeIpcConnect,
   loadBundledC2MemFfiNodeNativeSymbols,
   loadC2MemFfiNodeNativeSymbols,
@@ -43,12 +41,12 @@ function compileContextFixture(directory, omittedSymbol, connectStatus = 1) {
     // socket. The reference-count tests do not need an injected JS connector.
     if (name === 'c2_mem_ffi_local_endpoint_context_connect_unix') return `
       #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
-        _ctx: *const Context, _address: *const u8, fd: *mut i32, os: *mut i32) -> u32 {
+        _ctx: *const Context, _address: *const u8, _timeout: *const u64, fd: *mut i32, os: *mut i32) -> u32 {
         unsafe { *fd = -1; *os = 0; } ${connectStatus}
       }`;
     if (name === 'c2_mem_ffi_local_endpoint_context_connect_windows') return `
       #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
-        _ctx: *const Context, _address: *const u8, pipe: *mut usize, process: *mut usize, os: *mut i32) -> u32 {
+        _ctx: *const Context, _address: *const u8, _timeout: *const u64, pipe: *mut usize, process: *mut usize, os: *mut i32) -> u32 {
         unsafe { *pipe = 0; *process = 0; *os = 0; } ${connectStatus}
       }`;
     return `#[unsafe(no_mangle)] pub extern "C" fn ${name}() { std::process::abort(); }`;
@@ -56,7 +54,7 @@ function compileContextFixture(directory, omittedSymbol, connectStatus = 1) {
   const fixture = resolve(directory, 'context.rs');
   writeFileSync(fixture, `
     const NAME: &str = "/tmp/c2-context-fixture.sock";
-    #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 6 }
+    #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 7 }
     ${body}
       use std::sync::atomic::{AtomicUsize, Ordering};
       static FREES: AtomicUsize = AtomicUsize::new(0);
@@ -347,8 +345,8 @@ test('Windows context keeps current-SID pipe defaults and rejects Unix roots nat
   }
 });
 
-test('native addon rejects ABI 6 without the complete context symbol group', () => {
-  const directory = localTestDirectory('incomplete-abi6-');
+test('native addon rejects ABI 7 without the complete context symbol group', () => {
+  const directory = localTestDirectory('incomplete-abi7-');
   try {
     const library = compileContextFixture(directory, 'c2_mem_ffi_local_endpoint_context_connect_unix');
     assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /Failed to load.*c2_mem_ffi_local_endpoint_context_connect_unix/);
@@ -491,239 +489,6 @@ test('typed shared snapshot frees after its last factory or accessor owner, incl
   }
 });
 
-test('c2-mem-ffi Node native loader wraps the real request pool C ABI', async () => {
-  const dylib = libraryPath();
-  assert.equal(existsSync(dylib), true, `${dylib} must exist; run npm run build:rust`);
-  const { requestSymbols, symbols } = loadC2MemFfiNodeNativeSymbols(dylib);
-  assert.equal(symbols.c2_mem_ffi_abi_version(), C2_MEM_FFI_ABI_VERSION);
-
-  const pool = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
-    prefix: '/cc2nnode1',
-    segmentSize: 65536,
-    maxSegments: 1,
-    minBlockSize: 4096,
-  });
-  assert.match(pool.prefix, /^\/cc2nnode1_[0-9a-f]{40}$/);
-  assert.equal(pool.segments.length, 1);
-  assert.equal(pool.segments[0].size, 65536);
-
-  const payload = new Uint8Array([10, 20, 30, 40]);
-  const block = await pool.write(payload);
-  assert.equal(block.dedicated, false);
-  assert.equal(block.byteLength, payload.byteLength);
-  assert.equal(typeof block.allocationId, 'bigint');
-  assert.ok(block.allocationId > 0n);
-
-  const handle = (await symbols.c2_mem_ffi_request_pool_new('/cc2nnode2', 65536, 1, 4096)).value;
-  const rawBlock = (await symbols.c2_mem_ffi_request_pool_write(handle, payload)).value;
-  const destination = new Uint8Array(payload.byteLength);
-  const readResult = await symbols.c2_mem_ffi_request_pool_read_local(handle, rawBlock, destination);
-  assert.equal(readResult.status, 0);
-  assert.equal(readResult.value, payload.byteLength);
-  assert.deepEqual(Array.from(destination), Array.from(payload));
-  await symbols.c2_mem_ffi_request_pool_release(handle, rawBlock);
-  await symbols.c2_mem_ffi_request_pool_destroy(handle);
-  await assert.rejects(
-    async () => symbols.c2_mem_ffi_request_pool_prefix(handle),
-    /closed/,
-  );
-
-  await pool.release(block);
-  await pool.close?.();
-});
-
-test('c2-mem-ffi Node native loader composes real request and response pools', async () => {
-  const { requestSymbols, responseSymbols } = loadC2MemFfiNodeNativeSymbols(libraryPath());
-  const fakeServerPool = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
-    prefix: '/cc2snode1',
-    segmentSize: 65536,
-    maxSegments: 1,
-    minBlockSize: 4096,
-  });
-  const responsePool = await createC2MemFfiResponsePoolFromSymbols(responseSymbols, {
-    prefix: fakeServerPool.prefix,
-    segmentSize: 65536,
-    maxSegments: 1,
-    minBlockSize: 4096,
-  });
-  const payload = new Uint8Array([5, 4, 3, 2, 1]);
-  const block = await fakeServerPool.write(payload);
-  await fakeServerPool.forgetConsumed(block);
-
-  const destination = new Uint8Array(payload.byteLength);
-  await responsePool.read(block, destination);
-  assert.deepEqual(Array.from(destination), Array.from(payload));
-  await responsePool.release(block);
-
-  await responsePool.close?.();
-  await fakeServerPool.close?.();
-});
-
-test('c2-mem-ffi response pool bootstraps a differently sized owner backing', async () => {
-  const { requestSymbols, responseSymbols } = loadC2MemFfiNodeNativeSymbols(libraryPath());
-  const owner = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
-    prefix: '/cc2snode2',
-    segmentSize: 1024 * 1024,
-    maxSegments: 1,
-    minBlockSize: 4096,
-  });
-  // The reader only declares the minimum legal peer geometry: the real backing
-  // geometry must come from the mapped segment, never from this bootstrap floor.
-  const bootstrapFloor = 2 * 4096;
-  const responsePool = await createC2MemFfiResponsePoolFromSymbols(responseSymbols, {
-    prefix: owner.prefix,
-    segmentSize: bootstrapFloor,
-    maxSegments: 1,
-    minBlockSize: 4096,
-  });
-  assert.ok(owner.segments[0].size >= 1024 * 1024);
-
-  const payload = new Uint8Array(4096).fill(0x5a);
-  const block = await owner.write(payload);
-  await owner.forgetConsumed(block);
-
-  const destination = new Uint8Array(payload.byteLength);
-  await responsePool.read(block, destination);
-  assert.deepEqual(Array.from(destination), Array.from(payload));
-  await responsePool.release(block);
-  await assert.rejects(
-    () => responsePool.release(block),
-    /INVALID_ARGUMENT|POOL_ERROR/,
-  );
-
-  await assert.rejects(
-    () => responsePool.read(
-      { ...block, generation: block.generation + 1 },
-      new Uint8Array(payload.byteLength),
-    ),
-    /POOL_ERROR/,
-    'an unbacked generation must never be fabricated',
-  );
-
-  await responsePool.close?.();
-  await owner.close?.();
-});
-
-test('bundled Node runtime exposes generated-transport compatible IPC support', async () => {
-  const { requestSymbols } = loadBundledC2MemFfiNodeNativeSymbols();
-  const fakeServerPool = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
-    prefix: '/cc2snode3',
-    segmentSize: 65536,
-    maxSegments: 1,
-    minBlockSize: 4096,
-  });
-  const runtime = createBundledC2MemFfiNodeRuntime();
-  assert.equal(typeof runtime.connect, 'function');
-  assert.equal(
-    typeof runtime.responsePoolFactory.createResponsePool,
-    'function',
-  );
-  const responsePool = await runtime.responsePoolFactory.createResponsePool({
-    prefix: fakeServerPool.prefix,
-    segmentSize: 65536,
-    maxSegments: 1,
-    minBlockSize: 4096,
-  });
-  const payload = new Uint8Array([6, 5, 4]);
-  const block = await fakeServerPool.write(payload);
-  await fakeServerPool.forgetConsumed(block);
-  const destination = new Uint8Array(payload.byteLength);
-  await responsePool.read(block, destination);
-  assert.deepEqual(Array.from(destination), Array.from(payload));
-  await responsePool.release(block);
-  await responsePool.close?.();
-  await fakeServerPool.close?.();
-});
-
-test('c2-mem-ffi Node native loader rejects values before lossy native narrowing', async () => {
-  const { symbols } = loadC2MemFfiNodeNativeSymbols(libraryPath());
-
-  assert.throws(
-    () => symbols.c2_mem_ffi_request_pool_new('/cc2nnode3', 65536, 65537, 4096),
-    /maxSegments/,
-  );
-  assert.throws(
-    () => symbols.c2_mem_ffi_request_pool_new('/cc2nnode5', 65536, 1.5, 4096),
-    /maxSegments/,
-  );
-
-  const handle = (await symbols.c2_mem_ffi_request_pool_new('/cc2nnode4', 65536, 1, 4096)).value;
-  try {
-    const validCoordinates = { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false };
-    for (const allocationId of [undefined, 1, -1n, 0n, 0x1_0000_0000_0000_0000n]) {
-      assert.throws(
-        () => symbols.c2_mem_ffi_request_pool_release(handle, { ...validCoordinates, allocationId }),
-        /allocationId/,
-      );
-    }
-    assert.equal(
-      symbols.c2_mem_ffi_request_pool_release(handle, { ...validCoordinates, allocationId: 0xffffffffffffffffn }).status,
-      2,
-      'max u64 reaches native ownership validation without narrowing',
-    );
-    assert.throws(
-      () => symbols.c2_mem_ffi_request_pool_release(handle, {
-        segmentIndex: 0, generation: 7,
-        offset: 0x1_0000_0000,
-        byteLength: 1,
-        allocationId: 1n, dedicated: false,
-      }),
-      /offset/,
-    );
-    assert.throws(
-      () => symbols.c2_mem_ffi_request_pool_release(handle, {
-        segmentIndex: 0, generation: 7,
-        offset: 0,
-        byteLength: 1.5,
-        allocationId: 1n, dedicated: false,
-      }),
-      /byteLength/,
-    );
-    assert.throws(
-      () => symbols.c2_mem_ffi_request_pool_release(handle, {
-        segmentIndex: 65536, generation: 7,
-        offset: 0,
-        byteLength: 1,
-        allocationId: 1n, dedicated: false,
-      }),
-      /segmentIndex/,
-    );
-    assert.throws(
-      () => symbols.c2_mem_ffi_request_pool_release(handle, {
-        segmentIndex: 0.5, generation: 7,
-        offset: 0,
-        byteLength: 1,
-        allocationId: 1n, dedicated: false,
-      }),
-      /segmentIndex/,
-    );
-  } finally {
-    await symbols.c2_mem_ffi_request_pool_destroy(handle);
-  }
-});
-
-test('old allocation ID cannot release a new block at the same coordinates', async () => {
-  const { symbols } = loadC2MemFfiNodeNativeSymbols(libraryPath());
-  const handle = symbols.c2_mem_ffi_request_pool_new('/cc2nnode-reuse', 65536, 1, 4096).value;
-  try {
-    const payload = new Uint8Array([7, 8, 9]);
-    const first = symbols.c2_mem_ffi_request_pool_write(handle, payload).value;
-    assert.equal(symbols.c2_mem_ffi_request_pool_release(handle, first).status, 0);
-    const second = symbols.c2_mem_ffi_request_pool_write(handle, payload).value;
-    assert.equal(second.segmentIndex, first.segmentIndex);
-    assert.equal(second.generation, first.generation);
-    assert.equal(second.offset, first.offset);
-    assert.notEqual(second.allocationId, first.allocationId);
-    assert.equal(symbols.c2_mem_ffi_request_pool_release(handle, first).status, 2);
-    const destination = new Uint8Array(payload.length);
-    assert.equal(symbols.c2_mem_ffi_request_pool_read_local(handle, second, destination).status, 0);
-    assert.deepEqual(destination, payload);
-    assert.equal(symbols.c2_mem_ffi_request_pool_release(handle, second).status, 0);
-  } finally {
-    symbols.c2_mem_ffi_request_pool_destroy(handle);
-  }
-});
-
 test('native endpoint resolution preserves logical identity and rejects path input', () => {
   const address = `ipc://node-native-${process.pid}`;
   const endpoint = resolveLocalIpcEndpoint(address);
@@ -756,37 +521,6 @@ test('native loader accepts a library in a Unicode directory with spaces', () =>
 });
 
 
-test('native request and response paths reject a different backing generation', async () => {
-  const { symbols, responseSymbols } = loadBundledC2MemFfiNodeNativeSymbols();
-  const result = await symbols.c2_mem_ffi_request_pool_new('/c2_generation', 65536, 1, 4096);
-  assert.equal(result.status, 0);
-  const handle = result.value;
-  let response;
-  let block;
-  try {
-    const prefix = (await symbols.c2_mem_ffi_request_pool_prefix(handle)).value;
-    block = (await symbols.c2_mem_ffi_request_pool_write(handle, new Uint8Array([3, 2, 1]))).value;
-    assert.ok(block.generation > 0);
-    const stale = { ...block, generation: block.generation + 1 };
-    const destination = new Uint8Array(3);
-    assert.notEqual((await symbols.c2_mem_ffi_request_pool_read_local(handle, stale, destination)).status, 0);
-    assert.notEqual((await symbols.c2_mem_ffi_request_pool_release(handle, stale)).status, 0);
-    response = await createC2MemFfiResponsePoolFromSymbols(responseSymbols, {
-      prefix, segmentSize: 65536, maxSegments: 1, minBlockSize: 4096,
-    });
-    await assert.rejects(() => response.read(stale, destination), /POOL_ERROR/);
-    await response.read(block, destination);
-    assert.deepEqual(Array.from(destination), [3, 2, 1]);
-    await symbols.c2_mem_ffi_request_pool_forget_consumed(handle, block);
-    await response.release(block);
-    block = undefined;
-  } finally {
-    await response?.close();
-    if (block !== undefined) await symbols.c2_mem_ffi_request_pool_release(handle, block);
-    await symbols.c2_mem_ffi_request_pool_destroy(handle);
-  }
-});
-
 test('bundled runtime defers native loading until an IPC operation', () => {
   const runtime = createBundledC2MemFfiNodeRuntime({ addonPath: '/missing-c2-addon.node' });
   assert.equal(typeof runtime.connect, 'function');
@@ -794,51 +528,24 @@ test('bundled runtime defers native loading until an IPC operation', () => {
 });
 
 
-test('native dedicated requests and responses complete repeatedly without exhausting the owner', async () => {
-  const { requestSymbols, responseSymbols } = loadBundledC2MemFfiNodeNativeSymbols();
-  const owner = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
-    prefix: '/c2_dedicated', segmentSize: 65536, maxSegments: 1, minBlockSize: 4096,
-  });
-  const peer = await createC2MemFfiResponsePoolFromSymbols(responseSymbols, {
-    prefix: owner.prefix, segmentSize: 65536, maxSegments: 1, minBlockSize: 4096,
-  });
-  try {
-    // More requests than the native dedicated concurrency limit proves completion
-    // drops local authority and allows acknowledged creator mappings to be reclaimed.
-    for (let index = 0; index < 8; index += 1) {
-      const payload = new Uint8Array(128 * 1024 + 3).fill(index + 1);
-      const block = await owner.write(payload);
-      assert.equal(block.dedicated, true);
-      assert.equal(block.generation, 0);
-      assert.equal(block.offset, 0);
-      await owner.forgetConsumed(block);
-      if (index % 2 === 0) {
-        const destination = new Uint8Array(payload.byteLength);
-        await peer.read(block, destination);
-        assert.deepEqual(destination, payload);
-      }
-      await peer.release(block);
-      await assert.rejects(() => peer.release(block));
-    }
-  } finally {
-    await peer.close();
-    await owner.close();
-  }
-});
-
-
-test('native addon rejects ABI 5 before loading endpoint or pool symbols', () => {
+test('native addon rejects ABI 6 before loading endpoint or memory symbols', () => {
   const directory = mkdtempSync(resolve(tmpdir(), 'c2-stale-abi-'));
   try {
     const fixture = resolve(directory, 'stale.rs');
-    writeFileSync(fixture, '#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 5 }');
+    writeFileSync(fixture, '#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 6 }');
     const library = resolve(directory, process.platform === 'win32' ? 'stale.dll' : process.platform === 'darwin' ? 'stale.dylib' : 'stale.so');
     const output = spawnSync(process.env.RUSTC ?? 'rustc',
       ['--edition=2024', '--crate-type=cdylib', fixture, '-o', library],
       { cwd: directory, encoding: 'utf8' });
     assert.equal(output.status, 0, `${output.error ?? ''} ${output.stdout} ${output.stderr}`);
-    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 5.*expected version 6/);
+    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 6.*expected version 7/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+test('bundled runtime supplies the verified connector lazily', () => {
+  const runtime = createBundledC2MemFfiNodeRuntime();
+  assert.equal(typeof runtime.connect, 'function');
+  assert.equal(typeof runtime.resolveEndpoint, 'function');
+  runtime.close();
 });

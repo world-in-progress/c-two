@@ -8,7 +8,7 @@ use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, INVALID
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_MAPPED,
     MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingW,
-    PAGE_READWRITE, UnmapViewOfFile, VirtualQuery,
+    PAGE_READONLY, PAGE_READWRITE, UnmapViewOfFile, VirtualQuery,
 };
 
 struct MappedView {
@@ -23,7 +23,8 @@ impl Drop for MappedView {
     }
 }
 
-/// One named shared region. Allocator participants require a read/write view.
+/// One named shared region. The owner has a read/write view; peers have a
+/// read-only view.
 ///
 /// The logical name remains portable. Its OS name is encoded inside the
 /// current TokenUser scope; the DACL permits only that user SID. Windows removes
@@ -74,7 +75,7 @@ impl ShmRegion {
         if error == ERROR_ALREADY_EXISTS {
             return Err("shared memory mapping already exists".to_string());
         }
-        let mut view = map_full_view(&mapping, size)?;
+        let mut view = map_full_view(&mapping, size, true)?;
         // Creators know the exact requested backing size. Openers report the
         // committed view capacity, which Windows rounds to a page boundary.
         view.size = size;
@@ -86,12 +87,12 @@ impl ShmRegion {
         })
     }
 
-    /// Map the entire backing, including allocator metadata. `expected_size`
-    /// is a minimum capacity, not the length to map.
+    /// Map the entire backing read-only. `expected_size` is a minimum
+    /// capacity, not the length to map.
     pub fn open(name: &str, expected_size: usize) -> Result<Self, String> {
         validate_size(expected_size)?;
         let os_name = mapping_name(name)?;
-        let raw = unsafe { OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, 0, os_name.as_ptr()) };
+        let raw = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, os_name.as_ptr()) };
         if raw.is_null() {
             return Err(format!(
                 "OpenFileMappingW failed: {}",
@@ -100,7 +101,7 @@ impl ShmRegion {
         }
         // SAFETY: OpenFileMappingW returned a newly owned handle.
         let mapping = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let view = map_full_view(&mapping, expected_size)?;
+        let view = map_full_view(&mapping, expected_size, false)?;
         Ok(Self {
             name: name.to_string(),
             view,
@@ -113,6 +114,8 @@ impl ShmRegion {
         &self.name
     }
 
+    /// Raw mapping address. Only the owner may write through this pointer;
+    /// `open()` returns an OS-enforced read-only view.
     pub fn base_ptr(&self) -> *mut u8 {
         self.view.address.Value.cast()
     }
@@ -123,18 +126,6 @@ impl ShmRegion {
 
     pub fn is_owner(&self) -> bool {
         self.is_owner
-    }
-
-    /// # Safety
-    /// The caller must synchronize access to the full mapped region.
-    pub unsafe fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.base_ptr(), self.size()) }
-    }
-
-    /// # Safety
-    /// The caller must ensure exclusive access to the full mapped region.
-    pub unsafe fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.base_ptr(), self.size()) }
     }
 }
 
@@ -164,13 +155,21 @@ fn mapping_name(name: &str) -> Result<Vec<u16>, String> {
         .collect())
 }
 
-fn map_full_view(mapping: &OwnedHandle, expected_size: usize) -> Result<MappedView, String> {
-    // A zero length maps the complete object, including buddy metadata.
+fn map_full_view(
+    mapping: &OwnedHandle,
+    expected_size: usize,
+    writable: bool,
+) -> Result<MappedView, String> {
+    // A zero length maps the complete object.
     // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile
     let address = unsafe {
         MapViewOfFile(
             mapping.as_raw_handle(),
-            FILE_MAP_READ | FILE_MAP_WRITE,
+            if writable {
+                FILE_MAP_READ | FILE_MAP_WRITE
+            } else {
+                FILE_MAP_READ
+            },
             0,
             0,
             0,
@@ -183,7 +182,7 @@ fn map_full_view(mapping: &OwnedHandle, expected_size: usize) -> Result<MappedVi
         ));
     }
     let mut view = MappedView { address, size: 0 };
-    view.size = committed_view_size(address.Value)?;
+    view.size = committed_view_size(address.Value, writable)?;
     if view.size < expected_size {
         return Err(format!(
             "SHM region too small: actual {} < expected {}",
@@ -193,7 +192,7 @@ fn map_full_view(mapping: &OwnedHandle, expected_size: usize) -> Result<MappedVi
     Ok(view)
 }
 
-fn committed_view_size(base: *mut c_void) -> Result<usize, String> {
+fn committed_view_size(base: *mut c_void, writable: bool) -> Result<usize, String> {
     let base_address = base as usize;
     let mut cursor = base_address;
     loop {
@@ -221,9 +220,14 @@ fn committed_view_size(base: *mut c_void) -> Result<usize, String> {
             || info.RegionSize == 0
             || info.State != MEM_COMMIT
             || info.Type != MEM_MAPPED
-            || info.Protect != PAGE_READWRITE
+            || info.Protect
+                != if writable {
+                    PAGE_READWRITE
+                } else {
+                    PAGE_READONLY
+                }
         {
-            return Err("shared memory view is not fully committed read/write memory".to_string());
+            return Err("shared memory view has unexpected protection or state".to_string());
         }
         cursor = cursor
             .checked_add(info.RegionSize)
@@ -291,14 +295,36 @@ mod tests {
     fn peer_keeps_backing_alive_until_last_close() {
         let name = name();
         let owner = ShmRegion::create(&name, 4096).unwrap();
+        unsafe { *owner.base_ptr() = 0x77 };
         let reader = ShmRegion::open(&name, 4096).unwrap();
         drop(owner);
         assert!(ShmRegion::create(&name, 4096).is_err());
-        unsafe { *reader.base_ptr() = 0x77 };
         assert_eq!(unsafe { *reader.base_ptr() }, 0x77);
         drop(reader);
         assert!(ShmRegion::open(&name, 4096).is_err());
         assert!(ShmRegion::create(&name, 4096).is_ok());
+    }
+
+    #[test]
+    fn owner_and_peer_views_have_os_enforced_protection() {
+        let logical = name();
+        let owner = ShmRegion::create(&logical, 4096).unwrap();
+        let peer = ShmRegion::open(&logical, 4096).unwrap();
+
+        for (region, expected_protection) in [(&owner, PAGE_READWRITE), (&peer, PAGE_READONLY)] {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let queried = unsafe {
+                VirtualQuery(
+                    region.base_ptr().cast(),
+                    &mut info,
+                    std::mem::size_of_val(&info),
+                )
+            };
+            assert_eq!(queried, std::mem::size_of_val(&info));
+            assert_eq!(info.State, MEM_COMMIT);
+            assert_eq!(info.Type, MEM_MAPPED);
+            assert_eq!(info.Protect, expected_protection);
+        }
     }
 
     #[test]

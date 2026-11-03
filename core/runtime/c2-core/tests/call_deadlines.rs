@@ -17,8 +17,8 @@ use c2_config::{ClientIpcConfigOverrides, ConfigSources, ServerIpcConfigOverride
 use c2_contract::{ContractRelease, MethodAccess};
 use c2_core::{
     CallExecutionLimitsOverrides, CallOptions, CallTimeout, Client, Connect, EncodedClient,
-    EncodedService, Error, Host, HostOptions, MethodDefinition, Registration, Runtime,
-    RuntimeOptions, ServiceConcurrencyMode, ServiceDefinition,
+    EncodedService, Error, Host, HostOptions, LifecycleError, MethodDefinition, Registration,
+    Runtime, RuntimeOptions, ServiceConcurrencyMode, ServiceDefinition,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_http::client::RelayRouteInfo;
@@ -658,13 +658,18 @@ fn concurrent_options_views_and_successful_held_ignore_other_deadline() {
             .used_operations
             == 0
     });
-    assert!(fixture.host.memory_stats().server.unwrap().shm.used_bytes > 0);
-    held.invalidate_then_release(|| Ok(())).unwrap();
     observe_until(|| fixture.host.memory_stats().server.unwrap().shm.used_bytes == 0);
+    assert!(
+        fixture.host.memory_stats().server.unwrap().shm.peak_bytes >= bytes.len() as u64,
+        "the response must have used dedicated SHM"
+    );
+    assert_eq!(held.bytes(), bytes);
+    held.invalidate_then_release(|| Ok(())).unwrap();
+    assert!(held.bytes().is_empty());
 }
 
 #[test]
-fn shutdown_closes_finite_domain_without_refunding_prepared_owner_or_blocking_unlimited() {
+fn retirement_seals_calls_without_refunding_the_prepared_owner() {
     let fixture = fixture(Carrier::Inline);
     let runtime = Runtime::new(RuntimeOptions {
         use_process_relay_anchor: false,
@@ -693,7 +698,15 @@ fn shutdown_closes_finite_domain_without_refunding_prepared_owner_or_blocking_un
         .with_call_options(finite());
     let mut prepared = client.begin_call("echo").unwrap();
     prepared.charge_input(8).unwrap();
-    runtime.shutdown_without_host(EVENT_WAIT);
+    let retirement_deadline = std::time::Instant::now() + EVENT_WAIT;
+    let (retirement_outcome, retirement_completed) = runtime
+        .begin_session_retirement(
+            c2_core::RuntimeShutdownTarget::ClientsOnly,
+            retirement_deadline,
+        )
+        .expect("begin client-only retirement")
+        .observe_until(retirement_deadline);
+    assert!(retirement_completed, "{retirement_outcome:?}");
     let observed = runtime.clone().call_execution_snapshot().unwrap();
     assert!(observed.closed);
     assert_eq!(observed.used_operations, 1);
@@ -718,20 +731,21 @@ fn shutdown_closes_finite_domain_without_refunding_prepared_owner_or_blocking_un
             .used_retained_bytes,
         0
     );
-    let fresh = runtime
-        .connect(expected, Connect::DirectIpc { address })
-        .unwrap();
-    let error = match fresh.with_call_options(finite()).begin_call("echo") {
+    assert!(matches!(
+        runtime.connect(expected, Connect::DirectIpc { address }),
+        Err(Error::Lifecycle(LifecycleError::RuntimeRetired))
+    ));
+    let error = match client.with_call_options(finite()).begin_call("echo") {
         Err(error) => error,
         Ok(_) => panic!("shutdown-created closed finite budget reopened"),
     };
     assert_semantic(error, ErrorCode::CallCapacityExceeded, "pre_dispatch");
-    assert_eq!(
-        fresh
+    assert!(
+        client
             .with_call_options(unlimited())
-            .call_owned("echo", b"after-shutdown")
-            .unwrap(),
-        b"after-shutdown"
+            .call_owned("echo", b"after-retirement")
+            .is_err(),
+        "retirement must close the outgoing client used by an unlimited call too"
     );
 }
 
@@ -892,13 +906,12 @@ async fn http_resolve(State(state): State<RefreshState>) -> Json<Vec<RelayRouteI
 fn http_route(
     expected: &c2_contract::ExpectedRouteContract,
     url: &str,
-    revision: u64,
+    token: u64,
 ) -> RelayRouteInfo {
     RelayRouteInfo {
         name: expected.route_name.clone(),
         relay_url: url.into(),
-        route_uid: format!("route-{revision}"),
-        route_revision: revision,
+        route_uid: format!("route-{token}"),
         ipc_address: None,
         server_id: None,
         server_instance_id: None,

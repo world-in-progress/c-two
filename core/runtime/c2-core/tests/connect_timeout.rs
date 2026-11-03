@@ -8,7 +8,7 @@ use c2_error::ErrorCode;
 
 #[test]
 fn connect_timeout_seconds_are_checked() {
-    for seconds in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    for seconds in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e19] {
         assert!(ConnectOptions::from_timeout_secs(Some(seconds)).is_err());
     }
     assert_eq!(ConnectOptions::new().timeout(), None);
@@ -22,6 +22,15 @@ fn connect_timeout_seconds_are_checked() {
             .timeout(),
         Some(Duration::ZERO)
     );
+}
+
+#[test]
+fn native_connect_budget_cannot_bypass_portable_range() {
+    let timeout = Duration::from_secs(10_000_000_000_000_000_000);
+    assert!(matches!(
+        ConnectAttempt::start(ConnectOptions::new().with_timeout(timeout)),
+        Err(Error::Lifecycle(c2_core::LifecycleError::Configuration(_)))
+    ));
 }
 
 fn expected() -> ExpectedRouteContract {

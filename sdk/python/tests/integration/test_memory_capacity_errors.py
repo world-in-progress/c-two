@@ -4,6 +4,8 @@ from __future__ import annotations
 import pytest
 
 import c_two as cc
+
+import c_two.observe
 from c_two.transport.client.util import ping
 
 
@@ -62,11 +64,11 @@ def test_chunked_response_capacity_is_canonical_and_resource_executes_once(failu
         # Both control traffic and an unrelated small CRM reply remain usable.
         assert ping(address, timeout=0.5)
         assert proxy.calls() == 1
-        cells = cc.memory_stats()['runtime_outgoing']['cells']
+        cells = cc.observe.memory_stats()['runtime_outgoing']['cells']
         assert cells['reassembly']['used_bytes'] == 0
         assert cells['file']['used_bytes'] == 0
         assert cells['shm']['used_bytes'] == 0
-        assert cc.hold_stats()['active_leases'] == 0
+        assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
         if failure == 'reassembly':
             assert cells['reassembly']['rejected_allocations'] >= 1
         else:

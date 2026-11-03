@@ -88,6 +88,10 @@ def test_plain_crm_local_calls_and_errors_never_import_fastdb(
 ):
     run_isolated(isolated_source, """
         import c_two as cc
+
+        for name in ('endpoint', 'observe', 'contract'):
+            assert name in cc.__all__
+            assert getattr(cc, name).__name__ == f'c_two.{name}'
         assert_no_optional_imports()
 
         class Packet:
@@ -136,14 +140,15 @@ def test_no_payload_portable_descriptor_needs_no_fastdb(isolated_source):
     run_isolated(isolated_source, """
         import json
         import c_two as cc
+        import c_two.contract
 
         @cc.crm(namespace='test.optional-empty', version='0.1.0')
         class Empty:
             @cc.transfer()
             def ping(self) -> None: ...
 
-        descriptor = json.loads(cc.export_contract_descriptor(Empty))
-        reference = json.loads(cc.export_contract_release_ref(Empty))
+        descriptor = json.loads(cc.contract.export_descriptor(Empty))
+        reference = json.loads(cc.contract.release_ref(Empty))
         assert descriptor['methods'][0]['bindings'] == {'input': None, 'output': None}
         assert reference['contract_schema'] == 'c-two.contract.v2'
         assert_no_optional_imports()
@@ -153,6 +158,7 @@ def test_no_payload_portable_descriptor_needs_no_fastdb(isolated_source):
 def test_plain_annotation_validation_without_fastdb(isolated_source):
     run_isolated(isolated_source, """
         import c_two as cc
+
         from c_two.crm.descriptor import build_contract_descriptor
 
         Payload = type('Payload', (), {'__module__': 'fastdb4py.payload'})
@@ -197,6 +203,7 @@ def test_ordinary_error_details_do_not_load_or_impersonate_fastdb(isolated_sourc
 def test_pickle_ipc_between_processes_without_fastdb(isolated_source):
     contract = textwrap.dedent("""
         import c_two as cc
+
 
         @cc.crm(namespace='test.optional-ipc', version='0.1.0')
         class Echo:
@@ -254,6 +261,7 @@ def test_pickle_ipc_between_processes_without_fastdb(isolated_source):
 def test_fastdb_use_without_extra_reports_install_command(isolated_source, entry):
     code = """
         import c_two as cc
+
         from c_two.crm.payload_plan import fastdb_payload_binding
 
         try:
@@ -285,6 +293,7 @@ def test_fastdb_use_without_extra_reports_install_command(isolated_source, entry
 @pytest.mark.parametrize("direction", ["input", "output"])
 def test_payload_name_and_module_cannot_forge_fastdb_identity(name, module, direction):
     import c_two as cc
+    import c_two.contract
     from c_two.crm.descriptor import build_contract_descriptor
     from c_two.crm.payload_plan import fastdb_payload_binding
     from fastdb4py.payload import Payload
@@ -325,12 +334,13 @@ def test_payload_name_and_module_cannot_forge_fastdb_identity(name, module, dire
     annotation = "value" if direction == "input" else "return"
     Portable.echo.__wrapped__.__annotations__[annotation] = pretender
     with pytest.raises(TypeError, match="fastdb4py.payload.Payload"):
-        cc.export_contract_descriptor(Portable)
+        cc.contract.export_descriptor(Portable)
 
 
 @pytest.mark.parametrize("direction", ["input", "output"])
 def test_real_payload_still_requires_explicit_binding(direction):
     import c_two as cc
+
     from fastdb4py.payload import Payload
 
     with pytest.raises(TypeError, match=f"without @cc.transfer\\({direction}="):

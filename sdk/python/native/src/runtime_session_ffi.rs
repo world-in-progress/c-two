@@ -13,14 +13,13 @@ use c2_contract::{
     ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract, MethodAccess,
     PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
 };
+use c2_core::memory::{LocalCopyStats, LocalCopyTracker};
 use c2_core::{
-    CallExecutionObserver, Connect, FailedStartShutdownReceipt, Host, HostClientHeldLeases,
-    HostLifecyclePhase, HostLifecycleSnapshot, HostOptions, MethodDefinition, RegisterOutcome,
-    Registration, RetiredMemoryObservation, Runtime, RuntimeOptions, RuntimeShutdownReceipt,
-    RuntimeShutdownTarget, ServerLifecyclePolicy, ServiceConcurrencyMode, ServiceDefinition,
-    ShutdownOutcome, UnregisterOutcome,
+    CallExecutionObserver, Connect, FailedStartShutdownReceipt, Host, HostLifecycleSnapshot,
+    HostOptions, MethodDefinition, RegisterOutcome, Registration, RetiredMemoryObservation,
+    Runtime, RuntimeOptions, RuntimeShutdownReceipt, RuntimeShutdownTarget, ServiceConcurrencyMode,
+    ServiceDefinition, ShutdownOutcome, UnregisterOutcome,
 };
-use c2_mem::{BufferLeaseStats, BufferLeaseTracker};
 
 use crate::config_ffi::{
     PyConnectAttempt, client_ipc_overrides_to_dict, client_ipc_to_dict, parse_client_ipc_overrides,
@@ -32,75 +31,20 @@ use crate::core_error_ffi::{
 };
 use crate::core_ffi::{PyCoreClient, PyCoreService};
 use crate::endpoint_ffi::{PyEndpointCredential, PyLocalEndpointContext};
-use crate::lease_ffi::{PyBufferLeaseTracker, lease_stats_dict};
-use crate::owner_ffi::{
-    PyNativeOwnerBootstrap, PyOwnerRecoveryTicket, PyPreparedOwnerTakeover, owner_error,
-};
+use crate::local_copy_ffi::{PyLocalCopyTracker, local_copy_stats_dict};
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 
-pub(crate) fn checked_timeout(seconds: f64) -> Result<Duration, &'static str> {
-    const INVALID: &str =
-        "timeout_seconds must be finite, non-negative, and representable as a Duration";
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err(INVALID);
-    }
-    Duration::try_from_secs_f64(seconds).map_err(|_| INVALID)
-}
-
-#[cfg(test)]
-mod shutdown_timeout_tests {
-    use super::checked_timeout;
-    use std::time::Duration;
-
-    #[test]
-    fn invalid_timeouts_are_rejected_without_panicking() {
-        for seconds in [
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NAN,
-            -1.0,
-            -0.001,
-            1e300,
-            u64::MAX as f64,
-        ] {
-            assert!(checked_timeout(seconds).is_err(), "{seconds:?}");
-        }
-    }
-
-    #[test]
-    fn zero_and_normal_timeouts_remain_valid() {
-        assert_eq!(checked_timeout(0.0), Ok(Duration::ZERO));
-        assert_eq!(checked_timeout(-0.0), Ok(Duration::ZERO));
-        assert_eq!(checked_timeout(0.125), Ok(Duration::from_millis(125)));
-        assert_eq!(checked_timeout(5.0), Ok(Duration::from_secs(5)));
-    }
+fn checked_shutdown_deadline(timeout_seconds: f64) -> PyResult<(Duration, Instant)> {
+    let timeout = c2_config::timeout_from_seconds(timeout_seconds)
+        .map_err(|error| PyValueError::new_err(format!("timeout_seconds: {error}")))?;
+    let deadline = c2_config::deadline_after(Instant::now(), timeout)
+        .map_err(|error| PyValueError::new_err(format!("timeout_seconds: {error}")))?;
+    Ok((timeout, deadline))
 }
 
 #[cfg(test)]
 mod connect_attempt_tests {
     use super::*;
-
-    #[test]
-    fn retired_hostless_session_keeps_explicit_name_validation() {
-        Python::initialize();
-        Python::attach(|py| {
-            let session = Py::new(
-                py,
-                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
-                    .unwrap(),
-            )
-            .unwrap();
-            PyRuntimeSession::begin_shutdown(session.clone_ref(py), py, 3.0)
-                .unwrap()
-                .observe(py)
-                .unwrap();
-            let error = session
-                .borrow(py)
-                .shutdown(py, Some(vec!["missing".into()]), None, 1.0)
-                .unwrap_err();
-            assert!(error.is_instance_of::<PyValueError>(py));
-        });
-    }
 
     #[test]
     fn retirement_owner_lock_timeout_does_not_seal_or_hold_the_gil() {
@@ -247,68 +191,6 @@ cc.error.CoreError.__init__ = observe_error
     }
 
     #[test]
-    fn retired_explicit_name_observation_keeps_all_lock_waits_in_original_deadline() {
-        Python::initialize();
-        Python::attach(|py| {
-            let session = Py::new(
-                py,
-                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
-                    .unwrap(),
-            )
-            .unwrap();
-            PyRuntimeSession::begin_shutdown(session.clone_ref(py), py, 3.0)
-                .unwrap()
-                .observe(py)
-                .unwrap();
-            let borrowed = session.borrow(py);
-            for stage in ["shutdown_owner_wait", "shutdown_registrations_wait"] {
-                let owner = (stage == "shutdown_owner_wait").then(|| borrowed.host.lock());
-                let registrations =
-                    (stage == "shutdown_registrations_wait").then(|| borrowed.registrations.lock());
-                let worker_session = session.clone_ref(py);
-                let (done, observed) = std::sync::mpsc::channel();
-                let worker = std::thread::spawn(move || {
-                    Python::attach(|py| {
-                        let error = worker_session
-                            .borrow(py)
-                            .shutdown(py, Some(Vec::new()), None, 0.0)
-                            .unwrap_err();
-                        let value = error.value(py);
-                        done.send((
-                            value
-                                .getattr("lifecycle_kind")
-                                .unwrap()
-                                .extract::<String>()
-                                .unwrap(),
-                            value
-                                .getattr("details")
-                                .unwrap()
-                                .get_item("stage")
-                                .unwrap()
-                                .extract::<String>()
-                                .unwrap(),
-                            value
-                                .getattr("timeout_seconds")
-                                .unwrap()
-                                .extract::<f64>()
-                                .unwrap(),
-                        ))
-                        .unwrap();
-                    })
-                });
-                let result = py.detach(move || observed.recv_timeout(Duration::from_secs(3)));
-                drop(registrations);
-                drop(owner);
-                py.detach(|| worker.join()).unwrap();
-                assert_eq!(
-                    result.unwrap(),
-                    ("shutdown_wait_timeout".into(), stage.into(), 0.0)
-                );
-            }
-        });
-    }
-
-    #[test]
     fn relay_override_host_lock_expires_before_owner_releases_and_recovers() {
         Python::initialize();
         let session = Arc::new(
@@ -378,14 +260,14 @@ cc.error.CoreError.__init__ = observe_error
 #[pyclass(name = "RuntimeSession", frozen)]
 pub struct PyRuntimeSession {
     inner: Arc<Runtime>,
-    lease_tracker: Arc<BufferLeaseTracker>,
+    local_copy_tracker: Arc<LocalCopyTracker>,
     host: Mutex<HostRecord>,
     registrations: Mutex<HashMap<String, Registration>>,
     server_bridge: Mutex<Option<Py<PyAny>>>,
     /// Retired read-only observations adopted from previous sessions.
     ///
     /// Each entry is one retirement event: it holds only weak views of budget
-    /// accounting and lease metadata, so a closed session's outstanding
+    /// accounting and local-copy metadata, so a closed session's outstanding
     /// charges stay observable after `cc.shutdown()` for exactly as long as
     /// real owners (old proxies, in-flight responses, outstanding holds and
     /// reservations) keep them alive — never by retaining the retired
@@ -458,39 +340,6 @@ pub struct PyRetiredMemoryObservation {
 }
 
 impl PyRuntimeSession {
-    fn check_shutdown_route_names(
-        &self,
-        route_names: Option<&[String]>,
-        wait: Option<(Instant, f64)>,
-    ) -> PyResult<()> {
-        if let Some(names) = route_names {
-            let registered = match wait {
-                Some((deadline, seconds)) => {
-                    self.registrations.try_lock_until(deadline).ok_or_else(|| {
-                        Python::attach(|py| {
-                            shutdown_error_to_py(
-                                py,
-                                c2_core::LifecycleError::ShutdownWaitTimeout {
-                                    stage: "shutdown_registrations_wait",
-                                },
-                                seconds,
-                            )
-                        })
-                    })?
-                }
-                None => self.registrations.lock(),
-            };
-            for name in names {
-                if !registered.contains_key(name) {
-                    return Err(PyValueError::new_err(format!(
-                        "Name not registered: {name:?}"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn project_shutdown_observation<'py>(
         &self,
         py: Python<'py>,
@@ -513,11 +362,7 @@ impl PyRuntimeSession {
 
     /// Start this session's one Core host.
     ///
-    /// The default [`HostOptions`] inherits the native lifecycle policy the
-    /// Runtime has frozen (or the one `set_lifecycle_policy` pinned), so an
-    /// `OwnerBound` policy consumes the attached owner capability here and a
-    /// `Persistent` one does not. The capability is consumed at most once: a
-    /// second `ensure_host` reuses the live host and never re-consumes.
+    /// Reuse the live Host, or publish a fresh Host after native startup succeeds.
     fn ensure_host(&self) -> PyResult<Host> {
         let mut host_guard = self.host.lock();
         if let Err(error) = self.inner.ensure_active() {
@@ -532,14 +377,6 @@ impl PyRuntimeSession {
                     ));
                 }
                 return Ok(host.clone());
-            }
-            if !matches!(
-                self.inner.lifecycle_policy(),
-                ServerLifecyclePolicy::Persistent
-            ) {
-                return Err(PyRuntimeError::new_err(
-                    "owner-bound host cannot restart with an already consumed owner capability",
-                ));
             }
             if !self.registrations.lock().is_empty() {
                 return Err(PyRuntimeError::new_err(
@@ -586,7 +423,7 @@ impl PyRuntimeSession {
         if let Some(host) = self.host.lock().host.as_ref() {
             pending.push_scope(c2_core::scope::SERVER, host.server_memory_observer());
         }
-        pending.push_tracker(Arc::clone(&self.lease_tracker));
+        pending.push_tracker(Arc::clone(&self.local_copy_tracker));
         PyRetiredMemoryObservation {
             inner: c2_core::RetirementHandoff::new(pending, self.retired.lock().clone()),
             call_execution: {
@@ -603,7 +440,7 @@ impl PyRuntimeSession {
     /// Live retired observations, pruning records whose last owner is gone.
     ///
     /// Delegates to the shared Core list-maintenance rule: a record survives
-    /// exactly while a real owner keeps its budget accounting or lease
+    /// exactly while a real owner keeps its budget accounting or local-copy
     /// metadata alive — zero counters alone never prune, because a supported
     /// producer (an old proxy, an in-flight response) may still publish — and
     /// an emptied bundle goes away.
@@ -620,11 +457,13 @@ impl PyRuntimeSession {
             .retain(CallExecutionObserver::is_live);
     }
 
-    /// Retained-lease counters across the live tracker and every retired one.
-    fn merged_lease_stats(&self) -> BufferLeaseStats {
-        let mut stats = self.lease_tracker.stats();
+    /// Local-copy counters across the live tracker and every retired one.
+    fn merged_local_copy_stats(&self) -> LocalCopyStats {
+        let mut stats = self.local_copy_tracker.stats();
         let retired = self.live_retired_observations();
-        stats.merge(&RetiredMemoryObservation::compose_lease_stats(&retired));
+        stats.merge(&RetiredMemoryObservation::compose_local_copy_stats(
+            &retired,
+        ));
         stats
     }
 
@@ -657,6 +496,12 @@ impl PyRuntimeSession {
 
 #[pymethods]
 impl PyRuntimeSession {
+    /// Validate the exact native shutdown budget before serve installs signals
+    /// or prints its banner, without starting retirement or waiting.
+    fn validate_shutdown_timeout(&self, timeout_seconds: f64) -> PyResult<()> {
+        checked_shutdown_deadline(timeout_seconds).map(|_| ())
+    }
+
     fn connection_events(&self) -> crate::connection_ffi::PyConnectionEvents {
         crate::connection_ffi::PyConnectionEvents {
             inner: self.inner.connection_events(),
@@ -684,9 +529,9 @@ impl PyRuntimeSession {
             .map(|value| parse_client_ipc_overrides(Some(value)))
             .transpose()?;
         let server_startup_timeout = startup_timeout
-            .map(checked_timeout)
+            .map(c2_config::timeout_from_seconds)
             .transpose()
-            .map_err(PyValueError::new_err)?;
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let inner = Runtime::new(RuntimeOptions {
             server_id,
             server_ipc_overrides,
@@ -709,7 +554,7 @@ impl PyRuntimeSession {
         }
         Ok(Self {
             inner: Arc::new(inner),
-            lease_tracker: Arc::new(BufferLeaseTracker::default()),
+            local_copy_tracker: Arc::new(LocalCopyTracker::default()),
             host: Mutex::new(HostRecord::default()),
             registrations: Mutex::new(HashMap::new()),
             server_bridge: Mutex::new(None),
@@ -718,8 +563,8 @@ impl PyRuntimeSession {
         })
     }
 
-    fn lease_tracker(&self) -> PyBufferLeaseTracker {
-        PyBufferLeaseTracker::from_arc(Arc::clone(&self.lease_tracker))
+    fn local_copy_tracker(&self) -> PyLocalCopyTracker {
+        PyLocalCopyTracker::from_arc(Arc::clone(&self.local_copy_tracker))
     }
 
     /// Configure Core's local domain; no Python/native copy of root authority.
@@ -799,22 +644,25 @@ impl PyRuntimeSession {
             .map_err(runtime_configuration_error_to_py)
     }
 
+    /// Return "initiated", "absent" or "unconfirmed" for this Runtime's endpoint context.
+    /// Only "initiated" confirms initiation; completion uses the original Host receipt.
+    /// "absent" means this endpoint has no listener.
     #[pyo3(signature = (address, timeout_seconds=0.5))]
-    fn shutdown_direct_ipc<'py>(
+    fn shutdown_direct_ipc(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
         address: &str,
         timeout_seconds: f64,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    ) -> PyResult<&'static str> {
         let timeout = crate::control_ffi::timeout_duration(timeout_seconds)?;
         let outcome = py
             .detach(|| self.inner.shutdown_direct_ipc(address, timeout))
             .map_err(runtime_configuration_error_to_py)?;
-        crate::control_ffi::shutdown_ack_dict(py, outcome)
+        Ok(crate::control_ffi::shutdown_outcome_name(outcome))
     }
 
     fn hold_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        lease_stats_dict(py, &self.merged_lease_stats())
+        local_copy_stats_dict(py, &self.merged_local_copy_stats())
     }
 
     #[pyo3(signature = (*, max_outstanding_calls=None, retained_input_budget_bytes=None))]
@@ -934,8 +782,10 @@ impl PyRuntimeSession {
                 .collect::<PyResult<Vec<_>>>()?,
         )?;
         dict.set_item("retired", retired_list)?;
-        dict.set_item("holds", lease_stats_dict(py, &self.merged_lease_stats())?)?;
-        dict.set_item("budget_cells_note", MEMORY_ACCOUNTING_NOTE)?;
+        dict.set_item(
+            "holds",
+            local_copy_stats_dict(py, &self.merged_local_copy_stats())?,
+        )?;
         Ok(dict)
     }
 
@@ -944,7 +794,7 @@ impl PyRuntimeSession {
     /// The process registry calls this before shutting down this session and
     /// hands the result to its replacement, so charges retained by held data
     /// and retired budget domains stay observable after `cc.shutdown()`. The
-    /// pending bundle holds only weak views of budget accounting and lease
+    /// pending bundle holds only weak views of budget accounting and local-copy
     /// metadata. Call-execution observers keep only Core publication/counter
     /// metadata, even when captured before first finite-domain initialization.
     /// They retain no Runtime, transport, service or payload registry, and
@@ -976,37 +826,6 @@ impl PyRuntimeSession {
                 execution.push(observer.clone());
             }
         }
-    }
-
-    fn sweep_hold_leases<'py>(
-        &self,
-        py: Python<'py>,
-        threshold_seconds: f64,
-    ) -> PyResult<Bound<'py, PyList>> {
-        if !threshold_seconds.is_finite() || threshold_seconds < 0.0 {
-            return Err(PyValueError::new_err(
-                "threshold_seconds must be a non-negative finite number",
-            ));
-        }
-        // Compose the live tracker with every retired bundle's snapshots so
-        // retired lease metadata does not disappear while a real owner keeps
-        // it alive. The retired trackers themselves stay inside the
-        // observation bundles; only their snapshot values reach Python.
-        let threshold = Duration::from_secs_f64(threshold_seconds);
-        let retired = self.live_retired_observations();
-        let mut snapshots = self.lease_tracker.sweep_retained(threshold);
-        snapshots.extend(RetiredMemoryObservation::compose_sweep_snapshots(
-            &retired, threshold,
-        ));
-        snapshots.sort_by_key(|snapshot| snapshot.id);
-        let list = PyList::new(
-            py,
-            snapshots
-                .iter()
-                .map(|snapshot| crate::lease_ffi::lease_snapshot_dict(py, snapshot))
-                .collect::<PyResult<Vec<_>>>()?,
-        )?;
-        Ok(list)
     }
 
     fn ensure_server<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -1079,9 +898,9 @@ impl PyRuntimeSession {
             .map(|value| parse_server_ipc_overrides(Some(value)))
             .transpose()?;
         let startup_timeout = startup_timeout
-            .map(checked_timeout)
+            .map(c2_config::timeout_from_seconds)
             .transpose()
-            .map_err(PyValueError::new_err)?;
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         self.inner
             .set_server_options(server_id, server_ipc_overrides, startup_timeout)
             .map_err(runtime_configuration_error_to_py)?;
@@ -1142,13 +961,6 @@ impl PyRuntimeSession {
     }
 
     #[getter]
-    fn effective_relay_anchor_address(&self) -> PyResult<Option<String>> {
-        self.inner
-            .effective_relay_anchor_address()
-            .map_err(lifecycle_error_to_py)
-    }
-
-    #[getter]
     fn remote_payload_chunk_size_override(&self) -> Option<u64> {
         self.inner.remote_payload_chunk_size_override()
     }
@@ -1204,7 +1016,7 @@ impl PyRuntimeSession {
         let module = py.import("c_two.transport.server.native")?;
         let class = module.getattr("NativeServerBridge")?;
         let kwargs = PyDict::new(py);
-        kwargs.set_item("lease_tracker", slf.lease_tracker())?;
+        kwargs.set_item("local_copy_tracker", slf.local_copy_tracker())?;
         kwargs.set_item("runtime_session", &slf)?;
         let server = class.call((), Some(&kwargs))?.unbind();
         *slf.server_bridge.lock() = Some(server.clone_ref(py));
@@ -1226,7 +1038,7 @@ impl PyRuntimeSession {
     ///
     /// This reports the native `Host.is_running()` observation instead of the
     /// SDK's mere handle presence, so a host that already stopped (explicit
-    /// shutdown, owner EOF, or a failed start attempt) does not read as
+    /// shutdown or a failed start attempt) does not read as
     /// started.
     #[getter]
     fn host_started(&self) -> bool {
@@ -1239,10 +1051,9 @@ impl PyRuntimeSession {
 
     /// Thin read-only lifecycle observation for the bridge.
     ///
-    /// The projection exposes only the native policy/phase and the separate
-    /// listener, drained-work and client-held-lease facts. `None` means no
-    /// host exists, never "stopped". It never initiates or consumes shutdown
-    /// and never exposes the owner capability.
+    /// The projection exposes the finished flag and the separate
+    /// listener and drained-work facts. `None` means no
+    /// host exists. It never initiates or consumes shutdown or endpoint cleanup.
     fn native_lifecycle_snapshot<'py>(
         &self,
         py: Python<'py>,
@@ -1285,74 +1096,7 @@ impl PyRuntimeSession {
         }
     }
 
-    /// Whether the native owner capability is attached and not yet consumed.
-    #[getter]
-    fn owner_control_attached(&self) -> bool {
-        self.inner.owner_control_attached()
-    }
-
-    /// Attach one opaque native owner control receiver.
-    ///
-    /// The receiver is consumed exactly once. A duplicate attach, a late
-    /// attach after a host consumed the capability, and a capability that is
-    /// already closed are all rejected by Core before any host can publish
-    /// readiness, so a policy name alone can never create an owner-bound host.
-    fn prepare_owner_takeover(
-        &self,
-        py: Python<'_>,
-        ticket: &PyOwnerRecoveryTicket,
-    ) -> PyResult<PyPreparedOwnerTakeover> {
-        py.detach(|| self.inner.prepare_owner_takeover(ticket.inner.clone()))
-            .map(|inner| PyPreparedOwnerTakeover { inner })
-            .map_err(|error| owner_error(py, error))
-    }
-
-    fn attach_owner_control(&self, receiver: &PyNativeOwnerBootstrap) -> PyResult<()> {
-        let host_guard = self.host.lock();
-        if host_guard.host.is_some() || self.inner.owner_control_consumed() {
-            return Err(PyRuntimeError::new_err(
-                "owner control capability must be attached before the Core host starts",
-            ));
-        }
-        if !matches!(
-            self.inner.lifecycle_policy(),
-            ServerLifecyclePolicy::OwnerBound { .. }
-        ) {
-            return Err(PyValueError::new_err(
-                "owner_control requires the owner_bound lifecycle policy",
-            ));
-        }
-        if self.inner.owner_control_attached() {
-            return Err(PyRuntimeError::new_err(
-                "owner control capability already attached",
-            ));
-        }
-        let receiver = receiver.take_for_attach()?;
-        self.inner
-            .attach_owner_control(receiver)
-            .map_err(runtime_configuration_error_to_py)
-    }
-
-    /// Set the native lifecycle policy before the first host freezes it.
-    #[pyo3(signature = (policy=None, owner_missing_grace_seconds=None))]
-    fn set_lifecycle_policy(
-        &self,
-        policy: Option<&str>,
-        owner_missing_grace_seconds: Option<f64>,
-    ) -> PyResult<()> {
-        let policy = parse_lifecycle_policy(policy, owner_missing_grace_seconds)?;
-        self.inner
-            .set_lifecycle_policy(policy)
-            .map_err(runtime_configuration_error_to_py)
-    }
-
-    /// Read-only projection of the frozen native lifecycle policy.
-    #[getter]
-    fn lifecycle_policy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        lifecycle_policy_to_dict(py, &self.inner.lifecycle_policy())
-    }
-
-    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, descriptor_json, relay_anchor_address=None))]
+    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, descriptor_json))]
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn register_route<'py>(
         &self,
@@ -1370,23 +1114,12 @@ impl PyRuntimeSession {
         abi_hash: &str,
         signature_hash: &str,
         descriptor_json: &[u8],
-        relay_anchor_address: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         if self.registrations.lock().contains_key(name) {
             return Err(PyValueError::new_err(format!(
                 "Name already registered: {name:?}",
             )));
         }
-        if let Some(relay_anchor_address) = relay_anchor_address {
-            if self.host.lock().host.is_some() {
-                return Err(PyRuntimeError::new_err(
-                    "explicit registration relay anchor must be configured before the Core host starts",
-                ));
-            }
-            self.inner
-                .set_relay_anchor_address(Some(relay_anchor_address));
-        }
-
         let methods = method_definitions(&method_names, access_map)?;
         let expected =
             expected_route_contract(name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash)?;
@@ -1417,12 +1150,7 @@ impl PyRuntimeSession {
             .unbind())
     }
 
-    fn unregister_route<'py>(
-        &self,
-        py: Python<'py>,
-        name: &str,
-        _relay_anchor_address: Option<String>,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    fn unregister_route<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyDict>> {
         let mut registration = self
             .registrations
             .lock()
@@ -1432,13 +1160,6 @@ impl PyRuntimeSession {
             .detach(|| registration.close())
             .map_err(core_error_to_py)?;
         unregister_outcome_to_dict(py, outcome)
-    }
-
-    /// Extract Python numeric input before the SDK takes its binding lock.
-    /// Range/deadline validation occurs once, at begin_shutdown.
-    #[staticmethod]
-    fn shutdown_timeout_seconds(seconds: f64) -> f64 {
-        seconds
     }
 
     #[pyo3(signature = (connect_attempt=None))]
@@ -1467,10 +1188,7 @@ impl PyRuntimeSession {
         py: Python<'_>,
         timeout_seconds: f64,
     ) -> PyResult<PyRuntimeShutdownWait> {
-        let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            PyValueError::new_err("timeout_seconds cannot be represented as a shutdown deadline")
-        })?;
+        let (_, deadline) = checked_shutdown_deadline(timeout_seconds)?;
         let receipt = {
             let borrowed = slf.borrow(py);
             let session: &PyRuntimeSession = &borrowed;
@@ -1496,52 +1214,14 @@ impl PyRuntimeSession {
         })
     }
 
-    #[pyo3(signature = (route_names=None, relay_anchor_address=None, timeout_seconds=5.0))]
-    fn shutdown<'py>(
-        &self,
-        py: Python<'py>,
-        route_names: Option<Vec<String>>,
-        relay_anchor_address: Option<String>,
-        timeout_seconds: f64,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    #[pyo3(signature = (timeout_seconds=5.0))]
+    fn shutdown<'py>(&self, py: Python<'py>, timeout_seconds: f64) -> PyResult<Bound<'py, PyDict>> {
         // Validate before taking the Host or changing any session state.
-        let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
-        let _ = relay_anchor_address;
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            PyValueError::new_err("timeout_seconds cannot be represented as a shutdown deadline")
-        })?;
+        let (timeout, deadline) = checked_shutdown_deadline(timeout_seconds)?;
         let receipt = py
             .detach(|| self.inner.retirement_receipt(deadline))
             .map_err(|error| shutdown_error_to_py(py, error, timeout_seconds))?;
         if let Some(receipt) = receipt {
-            if route_names.is_some() {
-                let check_names = py
-                    .detach(|| {
-                        let record = self.host.try_lock_until(deadline).ok_or(
-                            c2_core::LifecycleError::ShutdownWaitTimeout {
-                                stage: "shutdown_owner_wait",
-                            },
-                        )?;
-                        if record.failed_start_receipt.is_some() {
-                            return Ok(false);
-                        }
-                        let host = record.host.clone();
-                        drop(record);
-                        Ok::<_, c2_core::LifecycleError>(match host {
-                            Some(host) => host.shutdown_outcome_until(deadline)?.is_none(),
-                            None => true,
-                        })
-                    })
-                    .map_err(|error| shutdown_error_to_py(py, error, timeout_seconds))?;
-                if check_names {
-                    py.detach(|| {
-                        self.check_shutdown_route_names(
-                            route_names.as_deref(),
-                            Some((deadline, timeout_seconds)),
-                        )
-                    })?;
-                }
-            }
             let (outcome, completed) = py.detach(|| receipt.observe_until(deadline));
             return self.project_shutdown_observation(py, outcome, completed);
         }
@@ -1569,12 +1249,6 @@ impl PyRuntimeSession {
             dict.set_item("completed", completed)?;
             return Ok(dict);
         }
-        if host
-            .as_ref()
-            .is_none_or(|host| host.shutdown_outcome().is_none())
-        {
-            self.check_shutdown_route_names(route_names.as_deref(), None)?;
-        }
         let (outcome, completed) = py.detach(|| {
             // Completion and the projected result are one immutable native
             // observation. Rust may finish while this thread reacquires the
@@ -1587,9 +1261,9 @@ impl PyRuntimeSession {
                     None => (pending, false),
                 }
             } else {
-                let outcome = self.inner.shutdown_without_host(timeout);
-                let completed = !shutdown_outcome_is_incomplete(&outcome);
-                (outcome, completed)
+                // No Host was selected. Low-level close leaves this Runtime's
+                // outgoing clients and call admission available.
+                (ShutdownOutcome::default(), true)
             }
         });
         if completed {
@@ -1628,10 +1302,6 @@ impl PyRuntimeSession {
         self.inner
             .clear_server_identity()
             .map_err(runtime_configuration_error_to_py)
-    }
-
-    fn clear_relay_projection_cache(&self) {
-        self.inner.clear_relay_projection_cache();
     }
 
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
@@ -1746,7 +1416,7 @@ impl PyRuntimeSession {
 
 // `PyRetiredMemoryObservation` intentionally exposes no Python surface: the
 // observation lifecycle is decided by real owners (weak handles detach when
-// the last producer/lease owner is gone), so there is no fence to mark and no
+// the last producer/local-copy owner is gone), so there is no fence to mark and no
 // state to read from Python. It exists only as the opaque handoff token the
 // registry moves between sessions.
 #[pymethods]
@@ -1893,18 +1563,12 @@ fn register_outcome_to_dict<'py>(
     let dict = PyDict::new(py);
     dict.set_item("route_name", outcome.route_name)?;
     dict.set_item("route_uid", outcome.route_uid)?;
-    dict.set_item("route_revision", outcome.route_revision)?;
     dict.set_item("server_id", outcome.server_id)?;
     dict.set_item("server_instance_id", outcome.server_instance_id)?;
     dict.set_item("ipc_address", outcome.ipc_address)?;
     dict.set_item("relay_registered", outcome.relay_registered)?;
     Ok(dict)
 }
-
-/// Human-readable reminder attached to the native snapshot: the budget cells
-/// are C-Two-owned accounting scopes, not process RSS.
-const MEMORY_ACCOUNTING_NOTE: &str =
-    "C-Two-owned IPC backing and live reassembly charges; not process RSS";
 
 fn call_execution_snapshot_dict<'py>(
     py: Python<'py>,
@@ -1944,7 +1608,6 @@ fn memory_scope_dict<'py>(
     let dict = PyDict::new(py);
     dict.set_item("role", role)?;
     dict.set_item("state", state)?;
-    dict.set_item("abandoned_releases", scope.abandoned_releases)?;
     let limits = PyDict::new(py);
     limits.set_item("shm_backing_bytes", scope.limits.shm_backing_budget_bytes)?;
     limits.set_item("file_backing_bytes", scope.limits.file_backing_budget_bytes)?;
@@ -1996,14 +1659,9 @@ fn shutdown_outcome_to_dict<'py>(
     dict.set_item("relay_errors", PyList::new(py, relay_errors)?)?;
     dict.set_item("server_was_started", outcome.server_was_started)?;
     dict.set_item("ipc_clients_drained", outcome.ipc_clients_drained)?;
-    dict.set_item("http_clients_drained", outcome.http_clients_drained)?;
     dict.set_item("route_close_error", outcome.route_close_error)?;
     dict.set_item("runtime_barrier_error", outcome.runtime_barrier_error)?;
     dict.set_item("ipc_client_close_error", outcome.ipc_client_close_error)?;
-    dict.set_item(
-        "ipc_clients_abnormally_closed",
-        outcome.ipc_clients_abnormally_closed,
-    )?;
     let client_close_details = outcome
         .ipc_client_close_details
         .into_iter()
@@ -2021,112 +1679,14 @@ fn shutdown_outcome_to_dict<'py>(
     Ok(dict)
 }
 
-/// Whether a shutdown outcome still has work that no later close may treat
-/// as finished.
-///
-/// An incomplete transaction is not terminal: the native host keeps the
-/// actual server, its route journal and the outgoing client barriers, and a
-/// later consume observes the real completion. No SDK-side state may claim
-/// the host stopped, release its registration slots, or clear its identity
-/// while this is true.
-fn shutdown_outcome_is_incomplete(outcome: &ShutdownOutcome) -> bool {
-    outcome.runtime_barrier_error.is_some()
-        || outcome.route_close_error.is_some()
-        || outcome.ipc_client_close_error.is_some()
-        || outcome
-            .route_outcomes
-            .iter()
-            .any(|route| !route.active_drained || route.close_error.is_some())
-}
-
-fn lifecycle_policy_to_dict<'py>(
-    py: Python<'py>,
-    policy: &ServerLifecyclePolicy,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    match policy {
-        ServerLifecyclePolicy::Persistent => {
-            dict.set_item("policy", "persistent")?;
-            dict.set_item("owner_bound", false)?;
-            dict.set_item("owner_missing_grace_seconds", py.None())?;
-        }
-        ServerLifecyclePolicy::OwnerBound {
-            owner_missing_grace,
-        } => {
-            dict.set_item("policy", "owner_bound")?;
-            dict.set_item("owner_bound", true)?;
-            dict.set_item(
-                "owner_missing_grace_seconds",
-                owner_missing_grace.as_secs_f64(),
-            )?;
-        }
-    }
-    Ok(dict)
-}
-
-fn parse_lifecycle_policy(
-    policy: Option<&str>,
-    owner_missing_grace_seconds: Option<f64>,
-) -> PyResult<ServerLifecyclePolicy> {
-    match policy {
-        None | Some("persistent") => {
-            if owner_missing_grace_seconds.is_some() {
-                return Err(PyValueError::new_err(
-                    "owner_missing_grace_seconds is only valid with the owner_bound policy",
-                ));
-            }
-            Ok(ServerLifecyclePolicy::Persistent)
-        }
-        Some("owner_bound") => {
-            let seconds = owner_missing_grace_seconds.ok_or_else(|| {
-                PyValueError::new_err(
-                    "owner_bound requires an explicit owner_missing_grace_seconds window",
-                )
-            })?;
-            let grace = checked_timeout(seconds).map_err(PyValueError::new_err)?;
-            ServerLifecyclePolicy::owner_bound(grace).map_err(PyValueError::new_err)
-        }
-        Some(other) => Err(PyValueError::new_err(format!(
-            "invalid lifecycle policy {other:?}; expected \"persistent\" or \"owner_bound\"",
-        ))),
-    }
-}
-
-fn lifecycle_phase_name(phase: &HostLifecyclePhase) -> PyResult<&'static str> {
-    Ok(match phase {
-        HostLifecyclePhase::Persistent => "persistent",
-        HostLifecyclePhase::Armed => "armed",
-        HostLifecyclePhase::OwnerMissing => "owner_missing",
-        HostLifecyclePhase::Draining => "draining",
-        HostLifecyclePhase::Finished => "finished",
-        HostLifecyclePhase::WatcherIoError(_) => "watcher_io_error",
-    })
-}
-
 fn lifecycle_snapshot_to_dict<'py>(
     py: Python<'py>,
     snapshot: &HostLifecycleSnapshot,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item("policy", lifecycle_policy_to_dict(py, &snapshot.policy)?)?;
-    dict.set_item("phase", lifecycle_phase_name(&snapshot.phase)?)?;
-    match &snapshot.phase {
-        HostLifecyclePhase::WatcherIoError(message) => {
-            dict.set_item("watcher_error", message)?;
-        }
-        _ => dict.set_item("watcher_error", py.None())?,
-    }
-    // A finished transaction is terminal; every earlier phase, including a
-    // bounded draining transaction, still has native work outstanding.
-    dict.set_item("terminal", snapshot.phase == HostLifecyclePhase::Finished)?;
+    dict.set_item("finished", snapshot.finished)?;
     dict.set_item("listener_closed", snapshot.listener_closed)?;
     dict.set_item("work_drained", snapshot.work_drained)?;
-    let leases: HostClientHeldLeases = snapshot.client_held_leases;
-    let held = PyDict::new(py);
-    held.set_item("response_shm_bytes", leases.response_shm_bytes)?;
-    held.set_item("response_file_bytes", leases.response_file_bytes)?;
-    held.set_item("reassembly_bytes", leases.reassembly_bytes)?;
-    dict.set_item("client_held_leases", held)?;
     Ok(dict)
 }
 

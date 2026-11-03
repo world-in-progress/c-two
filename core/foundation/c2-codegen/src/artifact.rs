@@ -1,4 +1,5 @@
-use crate::{CodegenError, lower_hex};
+use crate::CodegenError;
+use c2_contract::lower_hex;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 

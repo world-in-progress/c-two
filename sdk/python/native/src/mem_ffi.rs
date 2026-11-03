@@ -2,17 +2,17 @@
 //!
 //! Exposes the pool to Python with a clean, safe API:
 //! - MemPool: main pool object (was MemPoolHandle)
-//! - PoolAlloc: allocation result (seg_idx, offset, size, level, is_dedicated, allocation_id)
+//! - PoolAlloc: allocation result (seg_idx, offset, size, level, is_dedicated)
 //! - PoolConfig: configuration dataclass
 //! - PoolStats: statistics dataclass
 
 use c2_mem::{MemPool, PoolAllocation, PoolConfig};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// Python-visible pool configuration.
 #[pyclass(name = "PoolConfig", frozen, skip_from_py_object)]
@@ -26,8 +26,6 @@ pub struct PyPoolConfig {
     pub max_segments: usize,
     #[pyo3(get)]
     pub max_dedicated_segments: usize,
-    #[pyo3(get)]
-    pub dedicated_crash_timeout_secs: f64,
     #[pyo3(get)]
     pub buddy_idle_decay_secs: f64,
     #[pyo3(get)]
@@ -44,7 +42,6 @@ impl PyPoolConfig {
         min_block_size = 4096,
         max_segments = 8,
         max_dedicated_segments = 4,
-        dedicated_crash_timeout_secs = 60.0,
         buddy_idle_decay_secs = 60.0,
         spill_threshold = 0.8,
         spill_dir = String::from("/tmp/c_two_spill/"),
@@ -55,7 +52,6 @@ impl PyPoolConfig {
         min_block_size: usize,
         max_segments: usize,
         max_dedicated_segments: usize,
-        dedicated_crash_timeout_secs: f64,
         buddy_idle_decay_secs: f64,
         spill_threshold: f64,
         spill_dir: String,
@@ -71,7 +67,6 @@ impl PyPoolConfig {
         if !segment_size.is_power_of_two() {
             return Err(PyValueError::new_err("segment_size must be a power of 2"));
         }
-        validate_duration_secs("dedicated_crash_timeout_secs", dedicated_crash_timeout_secs)?;
         validate_duration_secs("buddy_idle_decay_secs", buddy_idle_decay_secs)?;
         if !(0.0..=1.0).contains(&spill_threshold) || spill_threshold.is_nan() {
             return Err(PyValueError::new_err(
@@ -83,7 +78,6 @@ impl PyPoolConfig {
             min_block_size,
             max_segments,
             max_dedicated_segments,
-            dedicated_crash_timeout_secs,
             buddy_idle_decay_secs,
             spill_threshold,
             spill_dir,
@@ -128,7 +122,6 @@ impl From<&PyPoolConfig> for PoolConfig {
             min_block_size: py.min_block_size,
             max_segments: py.max_segments,
             max_dedicated_segments: py.max_dedicated_segments,
-            dedicated_crash_timeout_secs: py.dedicated_crash_timeout_secs,
             buddy_idle_decay_secs: py.buddy_idle_decay_secs,
             spill_threshold: py.spill_threshold,
             spill_dir: std::path::PathBuf::from(&py.spill_dir),
@@ -153,28 +146,39 @@ pub struct PyPoolAlloc {
     pub level: u16,
     #[pyo3(get)]
     pub is_dedicated: bool,
-    #[pyo3(get)]
-    pub allocation_id: u64,
+    owner: Weak<RwLock<MemPool>>,
+    released: Arc<Mutex<bool>>,
 }
 
 #[pymethods]
 impl PyPoolAlloc {
     fn __repr__(&self) -> String {
         format!(
-            "PoolAlloc(seg={}, generation={}, off={}, size={}, lvl={}, ded={}, allocation_id={})",
+            "PoolAlloc(seg={}, generation={}, off={}, size={}, lvl={}, ded={})",
             self.seg_idx,
             self.generation,
             self.offset,
             self.actual_size,
             self.level,
-            self.is_dedicated,
-            self.allocation_id
+            self.is_dedicated
         )
     }
 }
 
-impl From<PoolAllocation> for PyPoolAlloc {
-    fn from(a: PoolAllocation) -> Self {
+impl PyPoolAlloc {
+    fn validate_for(&self, owner: &Arc<RwLock<MemPool>>) -> PyResult<()> {
+        if !Weak::ptr_eq(&self.owner, &Arc::downgrade(owner)) {
+            return Err(PyRuntimeError::new_err(
+                "allocation belongs to a different memory pool",
+            ));
+        }
+        if *self.released.lock() {
+            return Err(PyRuntimeError::new_err("allocation already released"));
+        }
+        Ok(())
+    }
+
+    fn from_allocation(a: PoolAllocation, owner: &Arc<RwLock<MemPool>>) -> Self {
         Self {
             seg_idx: a.seg_idx,
             generation: a.generation,
@@ -182,7 +186,8 @@ impl From<PoolAllocation> for PyPoolAlloc {
             actual_size: a.actual_size,
             level: a.level,
             is_dedicated: a.is_dedicated,
-            allocation_id: a.allocation_id,
+            owner: Arc::downgrade(owner),
+            released: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -191,7 +196,7 @@ impl From<PoolAllocation> for PyPoolAlloc {
 ///
 /// Scope notes mirror the Rust `PoolStats`: byte fields describe the pool's
 /// own backing capacities, never whole-process RSS. Buddy fields cover the
-/// data region only; dedicated fields include freed-but-pending-GC entries.
+/// data region only; dedicated fields cover live dedicated mappings.
 /// File and live-reassembly bytes belong to the memory-budget cells.
 #[pyclass(name = "PoolStats", frozen, skip_from_py_object)]
 #[derive(Debug, Clone)]
@@ -215,8 +220,6 @@ pub struct PyPoolStats {
     #[pyo3(get)]
     pub dedicated_active_bytes: u64,
     #[pyo3(get)]
-    pub dedicated_pending_free_bytes: u64,
-    #[pyo3(get)]
     pub buddy_reused_allocs: u64,
     #[pyo3(get)]
     pub buddy_expanded_allocs: u64,
@@ -234,14 +237,13 @@ pub struct PyPoolStats {
 impl PyPoolStats {
     fn __repr__(&self) -> String {
         format!(
-            "PoolStats(segs={}, ded={}, allocs={}, buddy={}/{} occupied, ded_mapped={}B ({} pending), reused={}, expanded={}, dedicated={}, file={}, pressure_denied={}, util={:.2}%)",
+            "PoolStats(segs={}, ded={}, allocs={}, buddy={}/{} occupied, ded_mapped={}B, reused={}, expanded={}, dedicated={}, file={}, pressure_denied={}, util={:.2}%)",
             self.total_segments,
             self.dedicated_segments,
             self.alloc_count,
             self.buddy_occupied_bytes,
             self.buddy_data_bytes,
             self.dedicated_mapped_bytes,
-            self.dedicated_pending_free_bytes,
             self.buddy_reused_allocs,
             self.buddy_expanded_allocs,
             self.dedicated_allocs,
@@ -254,11 +256,8 @@ impl PyPoolStats {
 
 /// The main memory pool handle exposed to Python.
 ///
-/// Thread-safe via internal `RwLock`. Read-only operations (`stats`,
-/// `segment_name`, `segment_count`, `seg_data_info`, `data_addr`, `read_at`)
-/// take a shared read lock; mutating operations (`alloc`, `alloc_ptr`,
-/// `free`, `free_at`, `open_segment`, `gc`, `destroy`) take an exclusive
-/// write lock.  This allows concurrent readers without blocking.
+/// Thread-safe via an internal `RwLock`. Local reads share a read lock;
+/// allocation, release and garbage collection take an exclusive write lock.
 #[pyclass(name = "MemPool", frozen)]
 pub struct PyMemPool {
     pool: Arc<RwLock<MemPool>>,
@@ -271,7 +270,9 @@ impl PyMemPool {
     fn new(config: Option<&PyPoolConfig>) -> PyResult<Self> {
         let cfg = config.map(PoolConfig::from).unwrap_or_default();
         Ok(Self {
-            pool: Arc::new(RwLock::new(MemPool::new(cfg))),
+            pool: Arc::new(RwLock::new(
+                MemPool::new(cfg).map_err(PyValueError::new_err)?,
+            )),
         })
     }
 
@@ -284,24 +285,10 @@ impl PyMemPool {
         let mut pool = self.pool.write();
         let alloc = pool.alloc(size).map_err(PyRuntimeError::new_err)?;
         let ptr = pool.data_ptr(&alloc).map_err(PyRuntimeError::new_err)?;
-        Ok((PyPoolAlloc::from(alloc), ptr as usize))
-    }
-
-    /// Get the raw address for a (seg_idx, offset) pair — for remote reading.
-    ///
-    /// Returns the usize pointer that Python can pass to ctypes.memmove.
-    fn data_addr(
-        &self,
-        seg_idx: u32,
-        generation: u32,
-        offset: u32,
-        is_dedicated: bool,
-    ) -> PyResult<usize> {
-        let pool = self.pool.read();
-        let ptr = pool
-            .data_ptr_at(seg_idx, generation, offset, is_dedicated)
-            .map_err(PyRuntimeError::new_err)?;
-        Ok(ptr as usize)
+        Ok((
+            PyPoolAlloc::from_allocation(alloc, &self.pool),
+            ptr as usize,
+        ))
     }
 
     /// Allocate `size` bytes from the pool.
@@ -309,13 +296,14 @@ impl PyMemPool {
     fn alloc(&self, size: usize) -> PyResult<PyPoolAlloc> {
         let mut pool = self.pool.write();
         pool.alloc(size)
-            .map(PyPoolAlloc::from)
+            .map(|alloc| PyPoolAlloc::from_allocation(alloc, &self.pool))
             .map_err(PyRuntimeError::new_err)
     }
 
     /// Free a previously allocated block.
     fn free(&self, alloc: &PyPoolAlloc) -> PyResult<()> {
         let mut pool = self.pool.write();
+        alloc.validate_for(&self.pool)?;
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             generation: alloc.generation,
@@ -323,15 +311,16 @@ impl PyMemPool {
             actual_size: alloc.actual_size,
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
-            allocation_id: alloc.allocation_id,
         };
         unsafe { pool.free(&pa) }.map_err(PyRuntimeError::new_err)?;
+        *alloc.released.lock() = true;
         Ok(())
     }
 
     /// Write data into an allocated block.
     fn write(&self, alloc: &PyPoolAlloc, data: &[u8]) -> PyResult<()> {
         let pool = self.pool.read();
+        alloc.validate_for(&self.pool)?;
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             generation: alloc.generation,
@@ -339,7 +328,6 @@ impl PyMemPool {
             actual_size: alloc.actual_size,
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
-            allocation_id: alloc.allocation_id,
         };
         let ptr = pool.data_ptr(&pa).map_err(PyRuntimeError::new_err)?;
         if data.len() > alloc.actual_size as usize {
@@ -359,6 +347,7 @@ impl PyMemPool {
         size: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let pool = self.pool.read();
+        alloc.validate_for(&self.pool)?;
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             generation: alloc.generation,
@@ -366,7 +355,6 @@ impl PyMemPool {
             actual_size: alloc.actual_size,
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
-            allocation_id: alloc.allocation_id,
         };
         let ptr = pool.data_ptr(&pa).map_err(PyRuntimeError::new_err)?;
         if size > alloc.actual_size as usize {
@@ -385,6 +373,7 @@ impl PyMemPool {
         alloc: &PyPoolAlloc,
     ) -> PyResult<()> {
         let pool = self.pool.read();
+        alloc.validate_for(&self.pool)?;
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             generation: alloc.generation,
@@ -392,7 +381,6 @@ impl PyMemPool {
             actual_size: alloc.actual_size,
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
-            allocation_id: alloc.allocation_id,
         };
         let ptr = pool.data_ptr(&pa).map_err(PyRuntimeError::new_err)?;
         let len = data.len_bytes();
@@ -403,56 +391,6 @@ impl PyMemPool {
         unsafe {
             data.copy_to_slice(py, std::slice::from_raw_parts_mut(ptr, len))?;
         }
-        Ok(())
-    }
-
-    /// Read data from a specific (seg_idx, offset) without a PoolAlloc object.
-    ///
-    /// Used by the remote side to read from SHM blocks allocated by the peer.
-    #[pyo3(name = "read_at")]
-    fn read_at<'py>(
-        &self,
-        py: Python<'py>,
-        seg_idx: u32,
-        generation: u32,
-        offset: u32,
-        size: usize,
-        is_dedicated: bool,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        let pool = self.pool.read();
-        let ptr = pool
-            .data_ptr_at(seg_idx, generation, offset, is_dedicated)
-            .map_err(PyRuntimeError::new_err)?;
-        let slice = unsafe { std::slice::from_raw_parts(ptr, size) };
-        Ok(PyBytes::new(py, slice))
-    }
-
-    /// Free a block given its coordinates, data size, and allocation identity.
-    ///
-    /// Used by the remote side to free SHM blocks after reading.
-    /// Recomputes the buddy level from data_size internally.
-    #[pyo3(name = "free_at")]
-    fn free_at(
-        &self,
-        seg_idx: u32,
-        generation: u32,
-        offset: u32,
-        data_size: u32,
-        is_dedicated: bool,
-        allocation_id: u64,
-    ) -> PyResult<()> {
-        let mut pool = self.pool.write();
-        let _ = unsafe {
-            pool.free_at(
-                seg_idx,
-                generation,
-                offset,
-                data_size,
-                is_dedicated,
-                allocation_id,
-            )
-        }
-        .map_err(PyRuntimeError::new_err)?;
         Ok(())
     }
 
@@ -470,7 +408,6 @@ impl PyMemPool {
             dedicated_mapped_bytes: s.dedicated_mapped_bytes,
             dedicated_active_count: s.dedicated_active_count,
             dedicated_active_bytes: s.dedicated_active_bytes,
-            dedicated_pending_free_bytes: s.dedicated_pending_free_bytes,
             buddy_reused_allocs: s.buddy_reused_allocs,
             buddy_expanded_allocs: s.buddy_expanded_allocs,
             dedicated_allocs: s.dedicated_allocs,
@@ -486,10 +423,9 @@ impl PyMemPool {
         Ok(pool.segment_count())
     }
 
-    /// Run garbage collection on freed dedicated segments and idle buddy segments.
+    /// Run garbage collection on idle buddy segments.
     fn gc(&self) -> PyResult<()> {
         let mut pool = self.pool.write();
-        pool.gc_dedicated();
         pool.gc_buddy();
         Ok(())
     }
@@ -515,67 +451,22 @@ impl PyMemPool {
         is_dedicated: bool,
     ) -> PyResult<String> {
         let pool = self.pool.read();
+        if generation == 0 {
+            return Err(PyValueError::new_err("backing generation must be positive"));
+        }
         if is_dedicated {
-            if generation != 0 {
-                return Err(PyValueError::new_err("dedicated generation must be 0"));
-            }
-            Ok(MemPool::dedicated_segment_name(pool.prefix(), seg_idx))
+            Ok(MemPool::dedicated_segment_name(
+                pool.prefix(),
+                seg_idx,
+                generation,
+            ))
         } else {
-            if generation == 0 {
-                return Err(PyValueError::new_err("buddy generation must be positive"));
-            }
             Ok(MemPool::buddy_segment_name(
                 pool.prefix(),
                 seg_idx,
                 generation,
             ))
         }
-    }
-
-    /// Get the data region base address and size for a buddy segment.
-    ///
-    /// Returns (data_base_addr, data_region_size).  Python creates a persistent
-    /// memoryview from this instead of per-request ctypes arrays.
-    fn seg_data_info(&self, seg_idx: u32, generation: u32) -> PyResult<(usize, usize)> {
-        let pool = self.pool.read();
-        let (ptr, size) = pool
-            .seg_data_info(seg_idx, generation)
-            .map_err(PyRuntimeError::new_err)?;
-        Ok((ptr as usize, size))
-    }
-
-    /// Create a receive-side cache for a peer's advertised pool incarnation.
-    #[staticmethod]
-    #[pyo3(signature = (prefix, config = None))]
-    fn open_peer(prefix: String, config: Option<&PyPoolConfig>) -> PyResult<Self> {
-        let cfg = config.map(PoolConfig::from).unwrap_or_default();
-        if prefix.len() > 255
-            || !prefix.starts_with('/')
-            || prefix.len() < 2
-            || prefix[1..].contains('/')
-            || prefix.contains('\0')
-        {
-            return Err(PyValueError::new_err("invalid peer pool prefix"));
-        }
-        MemPool::validate_config(&cfg).map_err(PyValueError::new_err)?;
-        Ok(Self {
-            pool: Arc::new(RwLock::new(MemPool::open_peer(cfg, prefix))),
-        })
-    }
-
-    /// Open or validate a peer backing by its slot and generation.
-    fn ensure_peer_segment(&self, seg_idx: u32, generation: u32, min_size: usize) -> PyResult<()> {
-        self.pool
-            .write()
-            .ensure_peer_segment(seg_idx, generation, min_size)
-            .map_err(PyRuntimeError::new_err)
-    }
-
-    /// Destroy the pool and all its SHM segments.
-    fn destroy(&self) -> PyResult<()> {
-        let mut pool = self.pool.write();
-        pool.destroy();
-        Ok(())
     }
 }
 

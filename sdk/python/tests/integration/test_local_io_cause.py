@@ -22,6 +22,8 @@ from tests.unit.test_endpoint_context import IS_WINDOWS, _run_isolated
 COMMON = '''
 import json
 import c_two as cc
+import c_two.endpoint
+import c_two.observe
 from c_two import _native
 
 @cc.crm(namespace='test.local.io.cause', version='0.1.0')
@@ -72,14 +74,14 @@ def test_bind_unverified_reason_survives_the_startup_watch(case, reason) -> None
             import socket
             from pathlib import Path
             root = Path({container!r})
-            cc.set_local_endpoint(root=str(root))
+            cc.endpoint.set_local_endpoint(root=str(root))
             # Initialize this private coordinator, then leave no live listener.
             prepare = _native.RuntimeSession(use_process_relay_anchor=False)
             prepare.set_local_endpoint(root=str(root))
             prepare.ensure_host_started()
             assert prepare.shutdown(timeout_seconds=5)['completed']
             address = 'ipc://unverified-bind'
-            endpoint = Path(cc.local_endpoint_context().endpoint_name(address))
+            endpoint = Path(cc.endpoint.local_endpoint_context().endpoint_name(address))
             raw_socket = None
             error = None
             if {case!r} == 'old-format':
@@ -97,7 +99,7 @@ def test_bind_unverified_reason_survives_the_startup_watch(case, reason) -> None
                     cc.register(Echo, Resource(), name='refused')
                 except cc.error.CoreError as exc:
                     error = diagnostic(exc)
-                observed = cc.inspect_endpoint(address)
+                observed = cc.endpoint.inspect_endpoint(address)
             finally:
                 stopped = cc.shutdown(timeout=5)
                 if raw_socket is not None:
@@ -144,8 +146,8 @@ def test_unix_local_io_cause(case, operation, kind, raw) -> None:
                 from pathlib import Path
                 root = Path({str(root)!r})
                 address = {address!r}
-                cc.set_local_endpoint(root=str(root))
-                endpoint = Path(cc.local_endpoint_context().endpoint_name(address))
+                cc.endpoint.set_local_endpoint(root=str(root))
+                endpoint = Path(cc.endpoint.local_endpoint_context().endpoint_name(address))
                 raw_socket = client = error = None
                 try:
                     if {case!r} in ('unwritable', 'inaccessible'):
@@ -192,7 +194,7 @@ def test_response_admission_preserves_outer_transport_and_inner_semantic_message
             from pathlib import Path
             root = Path({root!r})
             if not {IS_WINDOWS!r}:
-                cc.set_local_endpoint(root=str(root))
+                cc.endpoint.set_local_endpoint(root=str(root))
             cc.set_server(ipc_overrides={{
                 'pool_enabled': False, 'shm_backing_budget_bytes': 0, 'chunk_size': 65536,
             }})
@@ -235,8 +237,8 @@ def test_response_admission_preserves_outer_transport_and_inner_semantic_message
                 assert resource.calls == 1
                 assert proxy.echo('after') == 'after'
                 assert resource.calls == 2
-                assert cc.hold_stats()['active_leases'] == 0
-                cells = cc.memory_stats()['runtime_outgoing']['cells']
+                assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
+                cells = cc.observe.memory_stats()['runtime_outgoing']['cells']
                 assert all(cells[cell]['used_bytes'] == 0 for cell in ('reassembly', 'file', 'shm'))
             finally:
                 if proxy is not None:
@@ -278,7 +280,7 @@ invalid = ctypes.c_void_p(-1).value
 def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
     result = _run_isolated(COMMON + WIN32 + textwrap.dedent(f'''
         address = 'ipc://io-' + {uuid.uuid4().hex!r}
-        name = cc.local_endpoint_context().endpoint_name(address)
+        name = cc.endpoint.local_endpoint_context().endpoint_name(address)
         descriptor = w.LPVOID()
         handles = []
         client = error = details = None
@@ -335,7 +337,7 @@ def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
     if case != 'busy':
         _assert_io(report, 'connect', 'not_found' if case == 'missing' else 'permission_denied',
                    2 if case == 'missing' else 5)
-    elif timeout in (None, 10):
+    elif timeout is None:
         error = report['error']
         assert (error['category'], error['transport_kind'], error['transport_phase'],
                 error['fallback_eligible']) == ('transport', 'ipc', 'pre_dispatch', True), report
@@ -348,13 +350,14 @@ def test_windows_connect_cause_and_busy_deadline(case, timeout) -> None:
         assert report['details']['operation'] == 'connect', report
         assert report['details']['stage'] == 'os_connect', report
         assert all(error[key] is None for key in ('io_kind', 'raw_os_error', 'io_operation')), report
-        assert 0.15 <= report['elapsed'] < 2, report
+        lower, upper = (0.15, 2) if timeout == 0.2 else (9.5, 13)
+        assert lower <= report['elapsed'] < upper, report
 
 
 def test_real_listener_conflict_has_no_raw_system_code() -> None:
     with tempfile.TemporaryDirectory(prefix='c2-', dir=None if IS_WINDOWS else '/tmp') as root:
         address = f'ipc://io-{uuid.uuid4().hex}'
-        policy = '' if IS_WINDOWS else f'cc.set_local_endpoint(root={root!r})\n'
+        policy = '' if IS_WINDOWS else f'cc.endpoint.set_local_endpoint(root={root!r})\n'
         contender = COMMON + policy + textwrap.dedent(f'''
             error = None
             try:

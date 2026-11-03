@@ -1,8 +1,9 @@
 //! Rust SDK projects the Core connection deadline without changing call options.
 use std::time::Duration;
 
+use c_two::contract::ExpectedRouteContract;
 use c_two::generated::ErrorCode;
-use c_two::{Connect, ConnectOptions, Error, ExpectedRouteContract, Runtime, RuntimeOptions};
+use c_two::{Connect, ConnectOptions, Error, Runtime, RuntimeOptions};
 
 fn expected() -> ExpectedRouteContract {
     ExpectedRouteContract {

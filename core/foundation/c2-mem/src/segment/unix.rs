@@ -9,7 +9,7 @@ use std::ffi::CString;
 /// A raw POSIX SHM region.
 ///
 /// Owner process: `create()` → shm_open + ftruncate + mmap.
-/// Remote process: `open()` → shm_open + mmap.
+/// Remote process: `open()` → read-only shm_open + mmap.
 /// Drop: munmap, and shm_unlink if owner.
 pub struct ShmRegion {
     name: String,
@@ -77,7 +77,7 @@ impl ShmRegion {
         }
     }
 
-    /// Open an existing SHM region created by another process.
+    /// Open an existing SHM region created by another process, read-only.
     ///
     /// Validates that the actual SHM file is at least `expected_size` bytes
     /// to prevent SIGBUS on access.
@@ -88,7 +88,7 @@ impl ShmRegion {
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
 
         unsafe {
-            let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDWR, 0);
+            let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0);
             if fd < 0 {
                 return Err(format!(
                     "shm_open failed: {}",
@@ -122,7 +122,7 @@ impl ShmRegion {
             let ptr = libc::mmap(
                 std::ptr::null_mut(),
                 map_size,
-                libc::PROT_READ | libc::PROT_WRITE,
+                libc::PROT_READ,
                 libc::MAP_SHARED,
                 fd,
                 0,
@@ -146,6 +146,8 @@ impl ShmRegion {
         &self.name
     }
 
+    /// Raw mapping address. Only the owner may write through this pointer;
+    /// `open()` returns an OS-enforced read-only view.
     pub fn base_ptr(&self) -> *mut u8 {
         self.base
     }
@@ -156,18 +158,6 @@ impl ShmRegion {
 
     pub fn is_owner(&self) -> bool {
         self.is_owner
-    }
-
-    /// # Safety
-    /// The caller must ensure the full range is within the mapped region.
-    pub unsafe fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.base, self.size) }
-    }
-
-    /// # Safety
-    /// The caller must ensure exclusive access and valid range.
-    pub unsafe fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.base, self.size) }
     }
 }
 
@@ -248,5 +238,50 @@ mod tests {
         let name = format!("/c2zero_{}", std::process::id());
         assert!(ShmRegion::create(&name, 0).is_err());
         assert!(ShmRegion::open(&name, 1).is_err());
+    }
+
+    #[test]
+    fn peer_mapping_rejects_writes_in_child_process() {
+        let name = format!("/c2readonly_{}", std::process::id());
+        let owner = ShmRegion::create(&name, 4096).unwrap();
+        unsafe { *owner.base_ptr() = 0x42 };
+        let peer = ShmRegion::open(&name, 4096).unwrap();
+
+        // The expected fault must not take down the test runner or leave a core dump.
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe {
+                libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+                std::ptr::write_volatile(peer.base_ptr(), 0x77);
+                libc::_exit(0);
+            }
+        }
+
+        let mut status = 0;
+        loop {
+            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+            if waited == child {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR)
+            );
+        }
+        assert!(libc::WIFSIGNALED(status));
+        assert!(matches!(
+            libc::WTERMSIG(status),
+            libc::SIGSEGV | libc::SIGBUS
+        ));
+        assert_eq!(unsafe { *owner.base_ptr() }, 0x42);
     }
 }

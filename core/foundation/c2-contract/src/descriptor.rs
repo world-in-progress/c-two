@@ -1,9 +1,9 @@
 use crate::{
     CONTRACT_HASH_HEX_BYTES, ContractDescriptorDigest, ContractError, ContractFingerprintField,
-    ContractLimitMetric, ContractLimits, PORTABLE_CONTRACT_SCHEMA,
+    ContractLimitMetric, MAX_CONTRACT_METHODS, PORTABLE_CONTRACT_SCHEMA,
     admission::{
-        JsonDocumentKind, checked_observed_add, parse_bounded_json, record_descriptor_admission,
-        usize_to_u64, validate_descriptor_limit_configuration,
+        JsonDocumentKind, MAX_CONTRACT_NESTED_FASTDB_BYTES, checked_observed_add,
+        parse_bounded_json, usize_to_u64,
     },
     validate_contract_text_field,
 };
@@ -106,17 +106,8 @@ pub struct ValidatedContractDescriptor {
 
 impl ValidatedContractDescriptor {
     pub fn from_json(json_bytes: &[u8]) -> Result<Self, ContractError> {
-        Self::from_json_with_limits(json_bytes, ContractLimits::default())
-    }
-
-    pub fn from_json_with_limits(
-        json_bytes: &[u8],
-        limits: ContractLimits,
-    ) -> Result<Self, ContractError> {
-        record_descriptor_admission();
-        validate_descriptor_limit_configuration(limits)?;
-        let value = parse_bounded_json(json_bytes, limits, JsonDocumentKind::ContractDescriptor)?;
-        let parsed = parse_outer_descriptor(&value, limits)?;
+        let value = parse_bounded_json(json_bytes, JsonDocumentKind::ContractDescriptor)?;
+        let parsed = parse_outer_descriptor(&value)?;
         let derived = derive_contract_fingerprints_value(&value, &parsed)?;
         verify_fingerprint(
             ContractFingerprintField::AbiHash,
@@ -195,28 +186,13 @@ struct ParsedOuterDescriptor {
 pub fn derive_contract_fingerprints_json(
     json_bytes: &[u8],
 ) -> Result<ContractFingerprints, ContractError> {
-    derive_contract_fingerprints_json_with_limits(json_bytes, ContractLimits::default())
-}
-
-pub fn derive_contract_fingerprints_json_with_limits(
-    json_bytes: &[u8],
-    limits: ContractLimits,
-) -> Result<ContractFingerprints, ContractError> {
-    validate_descriptor_limit_configuration(limits)?;
-    let value = parse_bounded_json(json_bytes, limits, JsonDocumentKind::ContractDescriptor)?;
-    let parsed = parse_outer_descriptor(&value, limits)?;
+    let value = parse_bounded_json(json_bytes, JsonDocumentKind::ContractDescriptor)?;
+    let parsed = parse_outer_descriptor(&value)?;
     derive_contract_fingerprints_value(&value, &parsed)
 }
 
 pub fn contract_descriptor_sha256_hex(json_bytes: &[u8]) -> Result<String, ContractError> {
-    contract_descriptor_sha256_hex_with_limits(json_bytes, ContractLimits::default())
-}
-
-pub fn contract_descriptor_sha256_hex_with_limits(
-    json_bytes: &[u8],
-    limits: ContractLimits,
-) -> Result<String, ContractError> {
-    let value = parse_bounded_json(json_bytes, limits, JsonDocumentKind::ContractDescriptor)?;
+    let value = parse_bounded_json(json_bytes, JsonDocumentKind::ContractDescriptor)?;
     Ok(sha256_hex(canonical_json(&value).as_bytes()))
 }
 
@@ -224,10 +200,7 @@ pub fn validate_portable_contract_descriptor_json(json_bytes: &[u8]) -> Result<(
     ValidatedContractDescriptor::from_json(json_bytes).map(|_| ())
 }
 
-fn parse_outer_descriptor(
-    value: &Value,
-    limits: ContractLimits,
-) -> Result<ParsedOuterDescriptor, ContractError> {
+fn parse_outer_descriptor(value: &Value) -> Result<ParsedOuterDescriptor, ContractError> {
     let root = object_at(value, "$")?;
     ensure_keys(root, "$", &["schema", "crm", "fingerprints", "methods"])?;
     let schema = string_at(required(root, "$", "schema")?, "$.schema")?;
@@ -265,11 +238,10 @@ fn parse_outer_descriptor(
 
     let method_values = array_at(required(root, "$", "methods")?, "$.methods")?;
     let method_count = usize_to_u64(method_values.len());
-    if method_count > limits.max_methods() {
+    if method_count > MAX_CONTRACT_METHODS as u64 {
         return Err(ContractError::LimitExceeded {
-            profile: limits.profile(),
             metric: ContractLimitMetric::Methods,
-            limit: limits.max_methods(),
+            limit: MAX_CONTRACT_METHODS as u64,
             observed: method_count,
             path: "$.methods".to_string(),
         });
@@ -283,7 +255,6 @@ fn parse_outer_descriptor(
             method,
             &path,
             &mut method_names,
-            limits,
             &mut nested_fastdb_bytes,
         )?);
     }
@@ -302,7 +273,6 @@ fn parse_method_descriptor(
     value: &Value,
     path: &str,
     method_names: &mut BTreeSet<String>,
-    limits: ContractLimits,
     nested_fastdb_bytes: &mut u64,
 ) -> Result<ValidatedMethodDescriptor, ContractError> {
     let object = object_at(value, path)?;
@@ -348,14 +318,12 @@ fn parse_method_descriptor(
         required(bindings, &bindings_path, "input")?,
         &format!("{bindings_path}.input"),
         BindingDirection::Input,
-        limits,
         nested_fastdb_bytes,
     )?;
     let output = parse_binding(
         required(bindings, &bindings_path, "output")?,
         &format!("{bindings_path}.output"),
         BindingDirection::Output,
-        limits,
         nested_fastdb_bytes,
     )?;
 
@@ -480,7 +448,6 @@ fn parse_binding(
     value: &Value,
     path: &str,
     direction: BindingDirection,
-    limits: ContractLimits,
     nested_fastdb_bytes: &mut u64,
 ) -> Result<Option<NestedFastDbSpec>, ContractError> {
     if value.is_null() {
@@ -499,9 +466,8 @@ fn parse_binding(
     let spec = required(object, path, "spec")?;
     let canonical_json = canonical_json(spec);
     *nested_fastdb_bytes = checked_observed_add(
-        limits,
         ContractLimitMetric::NestedFastDbBytes,
-        limits.max_nested_fastdb_bytes(),
+        MAX_CONTRACT_NESTED_FASTDB_BYTES,
         *nested_fastdb_bytes,
         usize_to_u64(canonical_json.len()),
         &spec_path,
@@ -673,7 +639,8 @@ fn invalid(path: impl Into<String>, message: impl Into<String>) -> ContractError
     }
 }
 
-pub(crate) fn canonical_json(value: &Value) -> String {
+/// Serialize JSON with sorted object keys for stable contract identity.
+pub fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.to_string(),
         Value::Array(values) => {
@@ -688,7 +655,7 @@ pub(crate) fn canonical_json(value: &Value) -> String {
             // Canonical identity cannot depend on serde_json's preserve_order
             // feature being unified into the downstream dependency graph.
             let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(key, _)| *key);
             let body = entries
                 .into_iter()
                 .map(|(key, value)| {
@@ -707,7 +674,8 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     lower_hex(&digest)
 }
 
-fn lower_hex(bytes: &[u8]) -> String {
+/// Encode bytes as lowercase hexadecimal text.
+pub fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

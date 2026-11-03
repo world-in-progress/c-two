@@ -7,6 +7,7 @@ use c2_core::{
     RuntimeOptions, ServiceConcurrencyMode, ServiceDefinition,
 };
 use c2_error::{C2Error, ErrorCode};
+use c2_http::relay::{RelayConfig, RelayServer};
 
 const DESCRIPTOR: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json");
@@ -330,4 +331,69 @@ fn registration_projects_the_core_owned_route_concurrency_state() {
     drop(guard);
     registration.close().expect("close route");
     assert!(concurrency.snapshot().closed);
+}
+
+#[test]
+fn ordinary_host_shutdown_withdraws_its_actual_registered_relay_route() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
+    let address = probe.local_addr().expect("relay address");
+    drop(probe);
+    let relay_url = format!("http://{address}");
+    let mut relay = RelayServer::start(RelayConfig {
+        bind: address.to_string(),
+        advertise_url: relay_url.clone(),
+        idle_timeout_secs: 0,
+        anti_entropy_interval: std::time::Duration::ZERO,
+        heartbeat_interval: std::time::Duration::ZERO,
+        ..RelayConfig::default()
+    })
+    .expect("relay starts");
+
+    let runtime = Runtime::new(RuntimeOptions {
+        server_id: Some(unique_name("relay-shutdown-server")),
+        use_process_relay_anchor: false,
+        ..RuntimeOptions::default()
+    })
+    .expect("runtime");
+    let host = runtime
+        .host(
+            HostOptions::default()
+                .with_relay_anchor_address(relay_url)
+                .with_relay_use_proxy(false),
+        )
+        .expect("host");
+    let route_name = unique_name("relay-shutdown-route");
+    let release = release();
+    let definition = ServiceDefinition::new(
+        &release,
+        release.reference(),
+        &route_name,
+        methods(),
+        Arc::new(Echo),
+    )
+    .expect("definition");
+    let registration = host.register(definition).expect("register route");
+    assert!(registration.outcome().relay_registered);
+    assert!(
+        relay
+            .list_routes()
+            .expect("list published routes")
+            .iter()
+            .any(|(name, _)| name == &route_name),
+        "real relay must contain the route before shutdown"
+    );
+
+    let shutdown = host.shutdown();
+    assert!(shutdown.runtime_barrier_error.is_none(), "{shutdown:?}");
+    assert!(shutdown.route_close_error.is_none(), "{shutdown:?}");
+    assert!(shutdown.relay_errors.is_empty(), "{shutdown:?}");
+    assert!(
+        relay
+            .list_routes()
+            .expect("list routes after shutdown")
+            .is_empty(),
+        "real relay must withdraw the Host route"
+    );
+    drop(registration);
+    relay.stop().expect("relay stops");
 }

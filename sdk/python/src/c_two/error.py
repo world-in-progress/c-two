@@ -91,17 +91,16 @@ class CoreError(CCBaseError, RuntimeError):
     peer_protocol_version: int | None
     lifecycle_kind: Literal[
         'invalid_server_id', 'config_frozen', 'client_config_frozen',
-        'duplicate_route', 'missing_route', 'relay_duplicate_route',
-        'missing_relay_address', 'relay_http', 'register_failure',
+        'duplicate_route', 'missing_route', 'missing_relay_address',
+        'register_failure',
         'held_response_copy', 'held_response_release', 'response_copy',
         'configuration', 'server', 'startup_timeout', 'relay',
         'runtime_retired', 'shutdown_wait_timeout',
     ] | None
-    startup_stage: Literal['readiness', 'responsiveness', 'owner_control'] | None
+    startup_stage: Literal['readiness', 'responsiveness'] | None
     timeout_seconds: float | None
     route_name: str | None
     status_code: int | None
-    body: str | None
     relay_duplicate: bool | None
     failure_source: Literal[
         'relay_projection', 'relay_prepare', 'commit', 'relay_register', 'route_open',
@@ -137,7 +136,6 @@ class CoreError(CCBaseError, RuntimeError):
         self.timeout_seconds = None
         self.route_name = None
         self.status_code = None
-        self.body = None
         self.relay_duplicate = None
         self.failure_source = None
         self.registration_failure = None
@@ -281,7 +279,7 @@ class ResourceUnavailable(CCError):
         super().__init__(code=ERROR_Code.ERROR_RESOURCE_UNAVAILABLE, message=msg, details=details)
 
 class ResourceAlreadyRegistered(CCError):
-    """Raised when a relay rejects duplicate registration for a resource name."""
+    """Raised when a relay rejects duplicate registration for a route name."""
     ERROR_CODE = 703
 
     def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
@@ -441,3 +439,36 @@ _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE:            UnsupportedCallMode,
     ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED:           CallCapacityExceeded,
 }
+
+
+__all__ = [
+    'CCBaseError',
+    'CoreError',
+    'CCError',
+    'ResourceDeserializeInput',
+    'ResourceInputFromBuffer',
+    'ResourceSerializeOutput',
+    'ResourceExecuteFunction',
+    'ClientSerializeInput',
+    'ClientDeserializeOutput',
+    'ClientOutputFromBuffer',
+    'ClientCallResource',
+    'ResourceNotFound',
+    'ResourceUnavailable',
+    'ResourceAlreadyRegistered',
+    'RouteStale',
+    'RegistryUnavailable',
+    'WriteConflict',
+    'ResourceClosed',
+    'ResourceRemoved',
+    'ContractMismatch',
+    'IdentityMismatch',
+    'RouteCatalogCompacted',
+    'RouteWatchUnavailable',
+    'ProtocolViolation',
+    'FallbackDenied',
+    'CallDeadlineExceeded',
+    'UnsupportedCallMode',
+    'CallCapacityExceeded',
+    'ERROR_Code',
+]

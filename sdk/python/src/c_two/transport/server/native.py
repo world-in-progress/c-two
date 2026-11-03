@@ -5,19 +5,17 @@ transport, scheduling, and lifecycle to ``c2-core`` through PyO3.
 
 CRM domain logic (CRM instance creation, method discovery, dispatch tables,
 shutdown callbacks) remains in Python.  The native local accept loop,
-frame parsing, heartbeat, and concurrency scheduling move to Rust.
+frame parsing and concurrency scheduling move to Rust.
 """
 from __future__ import annotations
 
 import json
 import logging
-import math
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ...crm.bridge import ResourceBridge, normalize_bridge_map, wrap_resource
 from ...crm.contract import (
     CRMContract,
     crm_contract_identity,
@@ -28,11 +26,11 @@ from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...crm.payload_plan import PayloadPlanKind
 from ...error import ResourceAlreadyRegistered
 from ..input_lifetime import (
-    InputLifetime,
-    InputLifetimeLike,
+    _InputLifetime,
     normalize_input_lifetime_map,
     validate_input_lifetime_resource_contract,
 )
+from .._snapshots import LifecycleSnapshot, ShutdownOutcome
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
 from .reply import unpack_resource_result
@@ -69,7 +67,7 @@ class CRMSlot:
     scheduler: Scheduler
     methods: list[str]
     shutdown_method: str | None = None
-    input_lifetime: dict[str, InputLifetime] = field(default_factory=dict)
+    input_lifetime: dict[str, _InputLifetime] = field(default_factory=dict)
     _dispatch_table: dict[str, tuple[Any, MethodAccess, str]] = field(
         default_factory=dict, repr=False,
     )
@@ -82,7 +80,7 @@ class CRMSlot:
             if method is not None:
                 access = get_method_access(method)
                 lifetime = self.input_lifetime.get(name)
-                if lifetime is InputLifetime.BORROWED:
+                if lifetime == 'borrowed':
                     binding = getattr(method, '_input_payload_binding', None)
                     if (
                         getattr(binding, 'kind', None) is not PayloadPlanKind.FASTDB
@@ -141,8 +139,7 @@ class NativeServerBridge:
         self,
         runtime_session: object,
         *,
-        hold_warn_seconds: float = 60.0,
-        lease_tracker: object | None = None,
+        local_copy_tracker: object | None = None,
     ) -> None:
         # Keep config failures at bridge construction, before CRM binding work.
         runtime_session._preflight_server_config()
@@ -150,19 +147,10 @@ class NativeServerBridge:
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
 
-        if lease_tracker is None:
-            from c_two._native import BufferLeaseTracker
-            lease_tracker = BufferLeaseTracker()
-        self._lease_tracker = lease_tracker
-        self._hold_warn_seconds = float(hold_warn_seconds)
-        if (
-            not math.isfinite(self._hold_warn_seconds)
-            or self._hold_warn_seconds < 0.0
-        ):
-            raise ValueError(
-                'hold_warn_seconds must be a non-negative finite number',
-            )
-        self._hold_sweep_interval = 10
+        if local_copy_tracker is None:
+            from c_two._native import LocalCopyTracker
+            local_copy_tracker = LocalCopyTracker()
+        self._local_copy_tracker = local_copy_tracker
 
         self._runtime_session = runtime_session
 
@@ -177,15 +165,13 @@ class NativeServerBridge:
         concurrency: ConcurrencyConfig | None = None,
         *,
         name: str,
-        bridge: dict[str, ResourceBridge] | None = None,
-        input_lifetime: Mapping[str, InputLifetimeLike] | None = None,
+        input_lifetime: Mapping[str, _InputLifetime] | None = None,
     ) -> str:
         crm_ns, crm_name, crm_ver = self._extract_contract_identity(crm_class)
         if not isinstance(name, str):
             raise TypeError('name must be an explicit route name string')
         routing_name = name
         methods = self._discover_methods(crm_class)
-        method_bridge_map = normalize_bridge_map(bridge, method_names=methods)
         input_lifetime_map = normalize_input_lifetime_map(
             input_lifetime,
             method_names=methods,
@@ -194,10 +180,8 @@ class NativeServerBridge:
             crm_class,
             crm_instance,
             input_lifetime_map,
-            bridge=method_bridge_map,
         )
-        runtime_resource = wrap_resource(crm_instance, method_bridge_map)
-        instance = self._create_crm_instance(crm_class, runtime_resource)
+        instance = self._create_crm_instance(crm_class, crm_instance)
         cc_config = concurrency or ConcurrencyConfig()
         sd_method = get_shutdown_method(crm_class)
 
@@ -215,7 +199,7 @@ class NativeServerBridge:
         slot = CRMSlot(
             name=routing_name,
             crm_instance=instance,
-            direct_instance=runtime_resource,
+            direct_instance=crm_instance,
             crm_ns=crm_ns,
             crm_name=crm_name,
             crm_ver=crm_ver,
@@ -247,14 +231,14 @@ class NativeServerBridge:
                 raise ValueError(f'Name already registered: {routing_name!r}')
             from ...crm.descriptor import (
                 build_contract_descriptor,
-                contract_descriptor_diagnostics,
+                diagnostics,
             )
 
-            diagnostics = contract_descriptor_diagnostics(crm_class, methods)
+            portability_diagnostics = diagnostics(crm_class, methods)
             descriptor = build_contract_descriptor(
                 crm_class,
                 methods,
-                portable=not diagnostics,
+                portable=not portability_diagnostics,
             )
             descriptor_json = json.dumps(
                 descriptor,
@@ -269,7 +253,7 @@ class NativeServerBridge:
                     dispatcher,
                     methods,
                     access_map,
-                    cc_config.mode.value,
+                    cc_config.mode,
                     cc_config.max_pending,
                     cc_config.max_workers,
                     crm_ns,
@@ -278,7 +262,6 @@ class NativeServerBridge:
                     abi_hash,
                     signature_hash,
                     descriptor_json,
-                    None,
                 )
             except Exception as exc:
                 if (
@@ -301,29 +284,14 @@ class NativeServerBridge:
             if slot is None:
                 raise KeyError(f'Name not registered: {name!r}')
 
-        outcome = dict(self._runtime_session.unregister_route(name, None))
+        outcome = dict(self._runtime_session.unregister_route(name))
         if not outcome.get('local_removed', False):
             raise KeyError(f'Name not registered in native server: {name!r}')
-        close = outcome.get('close')
-        if not _close_outcome_is_hook_safe(close):
-            # The route is gone from the native table but its work is still
-            # draining (or the close reported an error). Keep the Python slot:
-            # dropping it here would either run the hook early or lose it, and
-            # the same slot must serve the later structured completion.
-            return outcome
-
         with self._slots_lock:
             slot = self._slots.pop(name, None)
         if slot is not None:
             self._invoke_shutdown(slot)
         return outcome
-
-    def get_slot_info(self, name: str) -> Scheduler:
-        with self._slots_lock:
-            slot = self._slots.get(name)
-        if slot is None:
-            raise KeyError(f'Name not registered: {name!r}')
-        return slot.scheduler
 
     def get_local_slot_info(
         self, name: str, *, connect_attempt=None,
@@ -364,22 +332,20 @@ class NativeServerBridge:
         """Whether the Core host is actually running.
 
         Delegates to the native ``Host.is_running()`` projection, so a host
-        that already stopped (explicit shutdown, owner EOF) does not read as
+        that already stopped (explicit shutdown) does not read as
         started even while this bridge object is still alive.
         """
         return bool(self._runtime_session.host_started)
 
-    def native_lifecycle_snapshot(self) -> dict[str, Any] | None:
+    def lifecycle_snapshot(self) -> LifecycleSnapshot | None:
         """Thin read-only Core lifecycle observation for the bridge.
 
-        Reports the native policy and phase plus the separate listener,
-        drained-work and client-held-lease facts. ``None`` means no host
-        exists, never "stopped". ``owner_missing`` and ``draining`` are not
-        terminal.
+        Reports whether shutdown finished, whether the listener closed
+        and whether work drained. ``None`` means no host exists.
         """
         return self._runtime_session.native_lifecycle_snapshot()
 
-    def native_terminal_outcome(self) -> dict[str, Any] | None:
+    def shutdown_outcome(self) -> ShutdownOutcome | None:
         """Terminal native shutdown outcome, or ``None`` while not terminal.
 
         Repeated observation returns the same one outcome; observing never
@@ -390,10 +356,8 @@ class NativeServerBridge:
     def start(self) -> None:
         self._runtime_session.ensure_host_started()
 
-    def shutdown(self, *, timeout: float = 5.0) -> dict[str, Any]:
+    def shutdown(self, *, timeout: float = 5.0) -> ShutdownOutcome:
         outcome = dict(self._runtime_session.shutdown(
-            route_names=None,
-            relay_anchor_address=None,
             timeout_seconds=float(timeout),
         ))
 
@@ -431,10 +395,6 @@ class NativeServerBridge:
         return rpc_method_names(crm_class)
 
     @staticmethod
-    def _extract_namespace(crm_class: type) -> str:
-        return NativeServerBridge._extract_contract_identity(crm_class)[0]
-
-    @staticmethod
     def _extract_contract_identity(crm_class: type) -> tuple[str, str, str]:
         return crm_contract_identity(crm_class)
 
@@ -467,10 +427,6 @@ class NativeServerBridge:
                 'Error invoking @on_shutdown for %s', slot.name, exc_info=True,
             )
 
-    def hold_stats(self) -> dict:
-        """Return retained runtime buffer tracking statistics."""
-        return dict(self._lease_tracker.stats())
-
     # ------------------------------------------------------------------
     # Dispatch callable factory
     # ------------------------------------------------------------------
@@ -482,7 +438,7 @@ class NativeServerBridge:
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
         held.  Signature: ``(route_name, method_idx, request_buf)``.
-        It reads the owned request snapshot via ``memoryview(request_buf)``, resolves the
+        It reads the owned local request copy via ``memoryview(request_buf)``, resolves the
         method, calls the resource, and returns serialized result data (or
         *None* for empty responses). Rust native code owns the response
         allocation choice for inline, SHM, or chunked transport.
@@ -490,10 +446,7 @@ class NativeServerBridge:
         idx_to_name = slot.method_table._idx_to_name
         dispatch_table = slot._dispatch_table
 
-        lease_tracker = self._lease_tracker
-        hold_warn_seconds = self._hold_warn_seconds
-        hold_sweep_interval = self._hold_sweep_interval
-        hold_dispatch_count = 0
+        local_copy_tracker = self._local_copy_tracker
 
         def dispatch(
             _route_name: str, method_idx: int,
@@ -537,9 +490,9 @@ class NativeServerBridge:
                         release_fn()
             else:  # borrowed
                 try:
-                    if lease_tracker is not None and hasattr(request_buf, 'track_retained'):
+                    if local_copy_tracker is not None and hasattr(request_buf, 'track_retained'):
                         request_buf.track_retained(
-                            lease_tracker,
+                            local_copy_tracker,
                             route_name,
                             method_name,
                             'resource_input',
@@ -555,27 +508,6 @@ class NativeServerBridge:
                     raise
                 if buffer_mode == 'borrowed' and not released:
                     release_fn()
-
-                nonlocal hold_dispatch_count
-                hold_dispatch_count += 1
-                should_sweep_holds = (
-                    lease_tracker is not None
-                    and hold_dispatch_count % hold_sweep_interval == 0
-                )
-                if should_sweep_holds:
-                    for stale in lease_tracker.sweep_retained(hold_warn_seconds):
-                        if stale.get('direction') != 'resource_input':
-                            continue
-                        logger.warning(
-                            "Retained resource input buffer pinned for %.1fs — "
-                            "route=%s method=%s storage=%s size=%d bytes. "
-                            "Resource may be storing buffer-backed views.",
-                            stale['age_seconds'],
-                            stale['route_name'],
-                            stale['method_name'],
-                            stale['storage'],
-                            stale['bytes'],
-                        )
 
             # 3. Unpack result
             res_part, err_part = unpack_resource_result(result)

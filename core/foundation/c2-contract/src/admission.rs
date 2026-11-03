@@ -3,33 +3,16 @@
 use crate::ContractError;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
-#[cfg(debug_assertions)]
-use std::cell::Cell;
 use std::fmt;
 
-const V1_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
-const V1_MAX_JSON_VALUES: u64 = 1_000_000;
-const V1_MAX_NESTING_DEPTH: u64 = 128;
-const V1_MAX_NESTED_FASTDB_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_CONTRACT_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_CONTRACT_JSON_VALUES: u64 = 1_000_000;
+pub const MAX_CONTRACT_NESTING_DEPTH: u64 = 128;
+pub const MAX_CONTRACT_NESTED_FASTDB_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The single hard method capacity shared by contract admission and C-Two wire
 /// metadata.
 pub const MAX_CONTRACT_METHODS: usize = 256;
-
-/// Versioned default-policy identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ContractLimitsProfile {
-    /// The initial bounded contract admission profile.
-    V1,
-}
-
-impl ContractLimitsProfile {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::V1 => "v1",
-        }
-    }
-}
 
 /// Stable resource dimension reported by [`ContractError::LimitExceeded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,128 +41,6 @@ impl ContractLimitMetric {
     }
 }
 
-/// Versioned control-plane admission limits.
-///
-/// These values never enter canonical descriptor bytes or release identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ContractLimits {
-    profile: ContractLimitsProfile,
-    max_source_bytes: u64,
-    max_json_values: u64,
-    max_nesting_depth: u64,
-    max_methods: u64,
-    max_nested_fastdb_bytes: u64,
-}
-
-impl ContractLimits {
-    /// Returns the immutable V1 default table.
-    pub const fn v1() -> Self {
-        Self {
-            profile: ContractLimitsProfile::V1,
-            max_source_bytes: V1_MAX_SOURCE_BYTES,
-            max_json_values: V1_MAX_JSON_VALUES,
-            max_nesting_depth: V1_MAX_NESTING_DEPTH,
-            max_methods: MAX_CONTRACT_METHODS as u64,
-            max_nested_fastdb_bytes: V1_MAX_NESTED_FASTDB_BYTES,
-        }
-    }
-
-    pub const fn profile(&self) -> ContractLimitsProfile {
-        self.profile
-    }
-
-    pub const fn max_source_bytes(&self) -> u64 {
-        self.max_source_bytes
-    }
-
-    pub const fn max_json_values(&self) -> u64 {
-        self.max_json_values
-    }
-
-    pub const fn max_nesting_depth(&self) -> u64 {
-        self.max_nesting_depth
-    }
-
-    pub const fn max_methods(&self) -> u64 {
-        self.max_methods
-    }
-
-    pub const fn max_nested_fastdb_bytes(&self) -> u64 {
-        self.max_nested_fastdb_bytes
-    }
-
-    /// Tightens or relaxes the source byte policy within platform allocation
-    /// representability.
-    pub const fn with_max_source_bytes(mut self, limit: u64) -> Self {
-        self.max_source_bytes = limit;
-        self
-    }
-
-    /// Tightens or relaxes the JSON value-count policy within platform
-    /// allocation representability.
-    pub const fn with_max_json_values(mut self, limit: u64) -> Self {
-        self.max_json_values = limit;
-        self
-    }
-
-    /// Tightens or relaxes the JSON depth policy within platform allocation
-    /// representability.
-    pub const fn with_max_nesting_depth(mut self, limit: u64) -> Self {
-        self.max_nesting_depth = limit;
-        self
-    }
-
-    /// Sets the method policy without allowing it to exceed the hard C-Two
-    /// method capacity.
-    pub const fn with_max_methods(mut self, limit: u64) -> Self {
-        self.max_methods = if limit > MAX_CONTRACT_METHODS as u64 {
-            MAX_CONTRACT_METHODS as u64
-        } else {
-            limit
-        };
-        self
-    }
-
-    /// Tightens or relaxes cumulative nested FastDB extraction bytes within
-    /// platform allocation representability.
-    pub const fn with_max_nested_fastdb_bytes(mut self, limit: u64) -> Self {
-        self.max_nested_fastdb_bytes = limit;
-        self
-    }
-}
-
-impl Default for ContractLimits {
-    fn default() -> Self {
-        Self::v1()
-    }
-}
-
-#[cfg(debug_assertions)]
-thread_local! {
-    static DESCRIPTOR_ADMISSION_COUNT: Cell<u64> = const { Cell::new(0) };
-}
-
-pub(crate) fn record_descriptor_admission() {
-    #[cfg(debug_assertions)]
-    DESCRIPTOR_ADMISSION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
-}
-
-#[doc(hidden)]
-/// Returns this thread's descriptor-admission count in debug builds.
-///
-/// This is an implementation-test probe, not a production metric. Release
-/// builds return zero and do not maintain the counter.
-pub fn descriptor_admission_count_for_current_thread() -> u64 {
-    #[cfg(debug_assertions)]
-    {
-        DESCRIPTOR_ADMISSION_COUNT.with(Cell::get)
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        0
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum JsonDocumentKind {
     ContractDescriptor,
@@ -197,27 +58,22 @@ impl JsonDocumentKind {
 
 pub(crate) fn parse_bounded_json(
     bytes: &[u8],
-    limits: ContractLimits,
     kind: JsonDocumentKind,
 ) -> Result<Value, ContractError> {
-    validate_json_limit_configuration(limits)?;
-
     let source_bytes = usize_to_u64(bytes.len());
     ensure_within_limit(
-        limits,
         ContractLimitMetric::SourceBytes,
-        limits.max_source_bytes(),
+        MAX_CONTRACT_SOURCE_BYTES,
         source_bytes,
         "$",
     )?;
 
     let mut state = AdmissionState {
-        limits,
         values: 0,
         limit_error: None,
     };
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    // ContractLimits is the recursion authority. The V1 guard stops a child
+    // The fixed depth guard stops a child
     // before depth 129 is handed back to serde_json.
     deserializer.disable_recursion_limit();
     let result = BoundedValueSeed {
@@ -240,7 +96,6 @@ pub(crate) fn parse_bounded_json(
 }
 
 pub(crate) fn checked_observed_add(
-    limits: ContractLimits,
     metric: ContractLimitMetric,
     limit: u64,
     current: u64,
@@ -250,63 +105,14 @@ pub(crate) fn checked_observed_add(
     let observed = match current.checked_add(increment) {
         Some(observed) => observed,
         None => {
-            return Err(limit_exceeded(limits, metric, limit, u64::MAX, path));
+            return Err(limit_exceeded(metric, limit, u64::MAX, path));
         }
     };
-    ensure_within_limit(limits, metric, limit, observed, path)?;
+    ensure_within_limit(metric, limit, observed, path)?;
     Ok(observed)
 }
 
-pub(crate) fn validate_descriptor_limit_configuration(
-    limits: ContractLimits,
-) -> Result<(), ContractError> {
-    validate_json_limit_configuration(limits)?;
-    validate_representable_limit(
-        limits,
-        ContractLimitMetric::NestedFastDbBytes,
-        limits.max_nested_fastdb_bytes(),
-        "$limits.max_nested_fastdb_bytes",
-    )
-}
-
-fn validate_json_limit_configuration(limits: ContractLimits) -> Result<(), ContractError> {
-    for (metric, configured, path) in [
-        (
-            ContractLimitMetric::SourceBytes,
-            limits.max_source_bytes(),
-            "$limits.max_source_bytes",
-        ),
-        (
-            ContractLimitMetric::JsonValues,
-            limits.max_json_values(),
-            "$limits.max_json_values",
-        ),
-        (
-            ContractLimitMetric::JsonDepth,
-            limits.max_nesting_depth(),
-            "$limits.max_nesting_depth",
-        ),
-    ] {
-        validate_representable_limit(limits, metric, configured, path)?;
-    }
-    Ok(())
-}
-
-fn validate_representable_limit(
-    limits: ContractLimits,
-    metric: ContractLimitMetric,
-    configured: u64,
-    path: &str,
-) -> Result<(), ContractError> {
-    // Rust allocation APIs cannot represent lengths above isize::MAX even on
-    // a target whose usize is wider. Reject such policy values before parsing
-    // rather than silently truncating them during later capacity decisions.
-    let platform_max = usize_to_u64(isize::MAX as usize);
-    ensure_within_limit(limits, metric, platform_max, configured, path)
-}
-
 fn ensure_within_limit(
-    limits: ContractLimits,
     metric: ContractLimitMetric,
     limit: u64,
     observed: u64,
@@ -315,18 +121,16 @@ fn ensure_within_limit(
     if observed <= limit {
         return Ok(());
     }
-    Err(limit_exceeded(limits, metric, limit, observed, path))
+    Err(limit_exceeded(metric, limit, observed, path))
 }
 
 fn limit_exceeded(
-    limits: ContractLimits,
     metric: ContractLimitMetric,
     limit: u64,
     observed: u64,
     path: &str,
 ) -> ContractError {
     ContractError::LimitExceeded {
-        profile: limits.profile(),
         metric,
         limit,
         observed,
@@ -339,7 +143,6 @@ pub(crate) fn usize_to_u64(value: usize) -> u64 {
 }
 
 struct AdmissionState {
-    limits: ContractLimits,
     values: u64,
     limit_error: Option<ContractError>,
 }
@@ -347,17 +150,15 @@ struct AdmissionState {
 impl AdmissionState {
     fn observe_value(&mut self, depth: u64, path: &str) -> Result<(), ContractError> {
         self.values = checked_observed_add(
-            self.limits,
             ContractLimitMetric::JsonValues,
-            self.limits.max_json_values(),
+            MAX_CONTRACT_JSON_VALUES,
             self.values,
             1,
             path,
         )?;
         ensure_within_limit(
-            self.limits,
             ContractLimitMetric::JsonDepth,
-            self.limits.max_nesting_depth(),
+            MAX_CONTRACT_NESTING_DEPTH,
             depth,
             path,
         )
@@ -369,9 +170,8 @@ impl AdmissionState {
     {
         depth.checked_add(1).ok_or_else(|| {
             self.record_error::<E>(limit_exceeded(
-                self.limits,
                 ContractLimitMetric::JsonDepth,
-                self.limits.max_nesting_depth(),
+                MAX_CONTRACT_NESTING_DEPTH,
                 u64::MAX,
                 path,
             ))
@@ -421,7 +221,7 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value within the configured contract limits")
+        formatter.write_str("a JSON value within the contract admission limits")
     }
 
     fn visit_unit<E>(self) -> Result<Self::Value, E> {
@@ -523,20 +323,17 @@ mod tests {
 
     #[test]
     fn checked_add_reports_a_limit_error_instead_of_wrapping() {
-        let limits = ContractLimits::v1();
         assert_eq!(
             checked_observed_add(
-                limits,
                 ContractLimitMetric::JsonValues,
-                limits.max_json_values(),
+                MAX_CONTRACT_JSON_VALUES,
                 u64::MAX,
                 1,
                 "$.overflow",
             ),
             Err(ContractError::LimitExceeded {
-                profile: ContractLimitsProfile::V1,
                 metric: ContractLimitMetric::JsonValues,
-                limit: limits.max_json_values(),
+                limit: MAX_CONTRACT_JSON_VALUES,
                 observed: u64::MAX,
                 path: "$.overflow".to_string(),
             })

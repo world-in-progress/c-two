@@ -10,6 +10,7 @@ import uuid
 
 import pytest
 import c_two as cc
+import c_two.endpoint
 from tests.fixtures.process_control import readline_with_timeout
 
 REPOSITORY = Path(__file__).resolve().parents[4]
@@ -40,7 +41,7 @@ def ipc_version_peer_binary(tmp_path_factory):
 def running_version_peer(binary, reply):
     # macOS tempdir paths may exceed sun_path; this is a private final root.
     root = tempfile.mkdtemp(prefix="c2v-", dir=None if os.name == "nt" else "/tmp")
-    context = cc.local_endpoint_context(**({"root": root} if os.name != "nt" else {}))
+    context = cc.endpoint.local_endpoint_context(**({"root": root} if os.name != "nt" else {}))
     address = f"ipc://version-{uuid.uuid4().hex}"
     command = [str(binary), address, root, reply]
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

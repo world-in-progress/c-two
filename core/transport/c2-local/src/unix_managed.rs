@@ -37,10 +37,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
-
-use sha2::{Digest, Sha256};
 
 mod directories;
 use directories::{DirectoryEntries, NamespaceDirectories};
@@ -379,28 +376,11 @@ impl ManagedNamespace {
         create: bool,
         blocking: bool,
     ) -> Result<Self, NamespaceError> {
-        Self::open_root_locked(
-            root,
-            create,
-            if blocking {
-                libc::LOCK_EX
-            } else {
-                libc::LOCK_EX | libc::LOCK_NB
-            },
-        )
-    }
-
-    /// Identity readers share the existing coordinator. They create nothing;
-    /// every namespace mutation keeps the original exclusive-lock path.
-    fn open_existing_shared(root: &Path) -> Result<Self, NamespaceError> {
-        Self::open_root_locked(root, false, libc::LOCK_SH | libc::LOCK_NB)
-    }
-
-    fn open_root_locked(
-        root: &Path,
-        create: bool,
-        operation: libc::c_int,
-    ) -> Result<Self, NamespaceError> {
+        let operation = if blocking {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_EX | libc::LOCK_NB
+        };
         let directories = NamespaceDirectories::open(root, create)?;
         let directory = &directories.records;
 
@@ -498,155 +478,6 @@ impl ManagedNamespace {
     }
 }
 
-/// Native context identity, captured only while the verified namespace gate is held.
-/// The gate pin is independently opened read-only, so it never shares a flock or a lease.
-#[derive(Clone)]
-pub(crate) struct ContextBinding {
-    root: PathBuf,
-    directories: NamespaceDirectories,
-    gate_pin: Arc<File>,
-    nonce: [u8; 16],
-    digest: [u8; 32],
-}
-
-impl ContextBinding {
-    pub(crate) fn capture(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        let root = endpoint.context().unix_root().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "not a Unix endpoint context")
-        })?;
-        let namespace =
-            ManagedNamespace::open_existing_shared(root).map_err(context_binding_error)?;
-        Self::from_namespace(root, &namespace).map_err(context_binding_error)
-    }
-
-    fn from_namespace(root: &Path, namespace: &ManagedNamespace) -> Result<Self, NamespaceError> {
-        namespace.directories.validate()?;
-        if !namespace.gate_still_named() {
-            return Err(NamespaceError::Unverified(
-                EndpointUnverifiedReason::CoordinatorReplaced,
-            ));
-        }
-        validate_marker(&namespace.directories.records, &namespace.gate)?;
-        // Do not dup the locked file description: an independent read-only open is the pin.
-        let gate_pin = namespace
-            .directories
-            .records
-            .open_file(&gate_name(), libc::O_RDONLY, 0)?
-            .ok_or(NamespaceError::Unverified(
-                EndpointUnverifiedReason::CoordinatorReplaced,
-            ))?;
-        verify_gate_file(&gate_pin)?;
-        let original = fstat(namespace.gate.as_raw_fd())?;
-        let pinned = fstat(gate_pin.as_raw_fd())?;
-        let nonce = gate_nonce(&namespace.gate)?;
-        if !same_file(&original, &pinned) || gate_nonce(&gate_pin)? != nonce {
-            return Err(NamespaceError::Unverified(
-                EndpointUnverifiedReason::CoordinatorReplaced,
-            ));
-        }
-        let digest = context_digest(&namespace.directories, &pinned, nonce)?;
-        // Fence both roles and the marker again after opening the independent gate pin.
-        namespace.directories.validate()?;
-        if !gate_entry_is_current(&namespace.directories.records, &gate_pin) {
-            return Err(NamespaceError::Unverified(
-                EndpointUnverifiedReason::CoordinatorReplaced,
-            ));
-        }
-        validate_marker(&namespace.directories.records, &gate_pin)?;
-        Ok(Self {
-            root: root.to_owned(),
-            directories: namespace.directories.clone(),
-            gate_pin: Arc::new(gate_pin),
-            nonce,
-            digest,
-        })
-    }
-
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        self.digest
-    }
-
-    pub(crate) fn validate(&self) -> io::Result<()> {
-        // Check the old pins first. Reopening the original pathname must never authorize a
-        // replacement directory, even if that replacement is a valid managed namespace.
-        self.directories.validate()?;
-        verify_gate_file(&self.gate_pin).map_err(context_binding_error)?;
-        if !gate_entry_is_current(&self.directories.records, &self.gate_pin)
-            || gate_nonce(&self.gate_pin).map_err(context_binding_error)? != self.nonce
-        {
-            return Err(changed_context());
-        }
-        let namespace =
-            ManagedNamespace::open_existing_shared(&self.root).map_err(context_binding_error)?;
-        if !self.directories.same_as(&namespace.directories)?
-            || !same_file(
-                &fstat(self.gate_pin.as_raw_fd())?,
-                &fstat(namespace.gate.as_raw_fd())?,
-            )
-            || gate_nonce(&namespace.gate).map_err(context_binding_error)? != self.nonce
-            || context_digest(
-                &namespace.directories,
-                &fstat(namespace.gate.as_raw_fd())?,
-                self.nonce,
-            )? != self.digest
-        {
-            return Err(changed_context());
-        }
-        validate_marker(&self.directories.records, &self.gate_pin)
-            .map_err(context_binding_error)?;
-        self.directories.validate()
-    }
-}
-
-fn context_digest(
-    directories: &NamespaceDirectories,
-    gate: &libc::stat,
-    nonce: [u8; 16],
-) -> io::Result<[u8; 32]> {
-    let mut digest = Sha256::new();
-    digest.update(b"c2.owner.unix-context.v1\0");
-    // Even a colocated namespace encodes two roles. Paths and directory ctime are excluded:
-    // aliases share the native identity and ordinary socket/lease churn must not change it.
-    for (role, directory) in [
-        (b"sockets\0".as_slice(), directories.socket_directory()?),
-        (b"records\0".as_slice(), directories.records.as_ref()),
-    ] {
-        let stat = fstat(directory.fd())?;
-        digest.update(role);
-        digest.update((stat.st_dev as u64).to_le_bytes());
-        digest.update((stat.st_ino as u64).to_le_bytes());
-        digest.update(stat.st_uid.to_le_bytes());
-    }
-    digest.update(b"gate\0");
-    digest.update((gate.st_dev as u64).to_le_bytes());
-    digest.update((gate.st_ino as u64).to_le_bytes());
-    digest.update(nonce);
-    Ok(digest.finalize().into())
-}
-
-fn changed_context() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "native endpoint context identity changed",
-    )
-}
-
-fn context_binding_error(error: NamespaceError) -> io::Error {
-    match error {
-        NamespaceError::Absent => {
-            io::Error::new(io::ErrorKind::NotFound, "endpoint context is absent")
-        }
-        NamespaceError::Busy => {
-            io::Error::new(io::ErrorKind::WouldBlock, "endpoint context gate is busy")
-        }
-        NamespaceError::Unverified(reason) => io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("endpoint context is unverifiable: {reason:?}"),
-        ),
-        NamespaceError::Io(error) => error,
-    }
-}
-
 fn open_gate(directory: &EndpointDirectory, create: bool) -> Result<File, NamespaceError> {
     if create {
         match directory.open_file(
@@ -713,28 +544,14 @@ fn gate_entry_is_current(directory: &EndpointDirectory, gate: &File) -> bool {
         .is_some_and(|current| same_file(&opened, &current))
 }
 
-/// Bound on the first-initialization scan. A namespace with no identity marker
-/// is only adoptable when it is provably empty of endpoint objects, so the scan
-/// stops at the first endpoint entry; the cap keeps a hostile or accidental
-/// directory from turning initialization into an unbounded traversal.
-const INIT_SCAN_LIMIT: usize = 64;
-
 /// Whether a namespace already holds endpoint objects.
 ///
-/// Bounded to [`INIT_SCAN_LIMIT`] entries. Exceeding the cap fails closed: an
-/// unenumerated directory cannot prove "no endpoint objects", and adopting it
-/// would risk writing a first marker into a namespace whose real identity is
-/// simply too large to inspect.
+/// A namespace without an identity marker can only be adopted after the scan
+/// reaches EOF without finding an endpoint object.
 fn has_endpoint_entries(
     entries: impl Iterator<Item = io::Result<fs::DirEntry>>,
 ) -> io::Result<bool> {
-    for (index, entry) in entries.enumerate() {
-        if index >= INIT_SCAN_LIMIT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed namespace first-initialization scan exceeded its bound",
-            ));
-        }
+    for entry in entries {
         let name = entry?.file_name();
         let bytes = name.as_bytes();
         if is_endpoint_stem(bytes)
@@ -778,7 +595,7 @@ fn gate_nonce(gate: &File) -> Result<[u8; 16], NamespaceError> {
 }
 
 fn write_marker(directory: &EndpointDirectory, gate: &File) -> Result<(), NamespaceError> {
-    // Only first initialization, under the gate and after the bounded scan,
+    // Only first initialization, under the gate and after a complete scan,
     // may assign an identity. A marker-bearing empty/replaced gate is rejected
     // by validate_marker and never reaches this path.
     if gate.metadata().map_err(NamespaceError::Io)?.len() == 0 {
@@ -1024,31 +841,35 @@ fn verified_socket_stat(
     Ok(stat)
 }
 
-/// Opens the coordinator gate with a short, bounded retry instead of an
-/// unbounded wait.
-///
-/// A blocked bind is reachable from server startup, so waiting forever on a
-/// coordinator another process holds would stall `Server::start`. The bounded
-/// wait lets a transient same-address race resolve (the existing
-/// winner/loser semantics), while a persistently held or otherwise busy gate
-/// degrades to `Busy` and surfaces as `WouldBlock`. Retrying the whole start
-/// attempt, with the caller's own timeout, is left to the layer above.
-fn open_root_bounded(root: &Path, create: bool) -> Result<ManagedNamespace, NamespaceError> {
+/// Wait under the caller's deadline, or retain the default 50-attempt guard
+/// for cleanup and callers without a startup budget.
+fn open_root_bounded(
+    root: &Path,
+    create: bool,
+    deadline: Option<std::time::Instant>,
+) -> Result<ManagedNamespace, NamespaceError> {
     const ATTEMPTS: usize = 50;
-    let mut last = NamespaceError::Busy;
-    for attempt in 0..ATTEMPTS {
+    let pause = std::time::Duration::from_millis(2);
+    let mut attempts = 0;
+    loop {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(NamespaceError::Busy);
+        }
         match ManagedNamespace::open_root(root, create, false) {
             Ok(namespace) => return Ok(namespace),
-            Err(error @ NamespaceError::Busy) => {
-                last = error;
-                if attempt + 1 < ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
+            Err(NamespaceError::Busy) => {}
             Err(error) => return Err(error),
         }
+        attempts += 1;
+        let wait = match deadline {
+            Some(deadline) => {
+                pause.min(deadline.saturating_duration_since(std::time::Instant::now()))
+            }
+            None if attempts == ATTEMPTS => return Err(NamespaceError::Busy),
+            None => pause,
+        };
+        std::thread::sleep(wait);
     }
-    Err(last)
 }
 
 /// Binds the managed socket inside the exact verified directory.
@@ -1182,6 +1003,21 @@ fn retire_owned(
     EndpointReapResult::Reaped
 }
 
+fn retire_listener_with_namespace(
+    namespace: &ManagedNamespace,
+    directories_pin: Option<&NamespaceDirectories>,
+    endpoint: &LocalEndpoint,
+    lease: &Lease,
+    record: &OwnerRecord,
+) -> EndpointReapResult {
+    if directories_pin
+        .is_some_and(|directories| !directories.same_as(&namespace.directories).unwrap_or(false))
+    {
+        return EndpointReapResult::Unverified(EndpointUnverifiedReason::UnsafeDirectory);
+    }
+    retire_owned(namespace, endpoint, lease.file(), record)
+}
+
 /// The per-endpoint lease a listener holds for life.
 ///
 /// `flock` locks are attached to the *open file description*, not the
@@ -1220,6 +1056,44 @@ impl Drop for Lease {
         // A lease that is dropped without an explicit retire still must not
         // outlive its listener through a shared OFD.
         self.release();
+    }
+}
+
+/// The Drop worker owns the listener's lease and original gate pin until its
+/// bounded retirement attempt ends. Field order releases the lease first.
+struct DropRetirement {
+    lease: Lease,
+    _gate_pin: File,
+    directories_pin: Option<NamespaceDirectories>,
+    root: PathBuf,
+    endpoint: LocalEndpoint,
+    record: OwnerRecord,
+    #[cfg(test)]
+    retry_observer: Option<DropRetryObserver>,
+}
+
+#[cfg(test)]
+struct DropRetryObserver {
+    started: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+impl DropRetirement {
+    fn run(self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.retry_observer {
+            observer.started.send(()).unwrap();
+            observer.resume.recv().unwrap();
+        }
+        if let Ok(namespace) = open_root_bounded(&self.root, false, None) {
+            let _ = retire_listener_with_namespace(
+                &namespace,
+                self.directories_pin.as_ref(),
+                &self.endpoint,
+                &self.lease,
+                &self.record,
+            );
+        }
     }
 }
 
@@ -1274,20 +1148,21 @@ pub(crate) struct ManagedListener {
     // including a close/drop that cannot reacquire its named gate. Namespace
     // Drop releases the shared OFD flock; this descriptor holds only the inode.
     // Field order releases the lease before this last listener pin closes.
-    _gate_pin: File,
+    _gate_pin: Option<File>,
     directories_pin: Option<NamespaceDirectories>,
-    context_binding: Option<ContextBinding>,
     #[cfg(test)]
     gate_identity: SocketIdentity,
+    #[cfg(test)]
+    retry_observer: Option<DropRetryObserver>,
     cleaned: bool,
 }
 
 impl ManagedListener {
-    pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        bind_managed(endpoint, false)
-    }
-    pub(crate) fn bind_with_context_binding(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        bind_managed(endpoint, true)
+    pub fn bind_until(
+        endpoint: &LocalEndpoint,
+        deadline: Option<std::time::Instant>,
+    ) -> io::Result<Self> {
+        bind_managed(endpoint, deadline)
     }
     pub(crate) fn credential(&self) -> EndpointCredential {
         EndpointCredential::unix_managed(
@@ -1295,16 +1170,6 @@ impl ManagedListener {
             self.identity,
             self.record.incarnation,
         )
-    }
-
-    pub(crate) fn context_binding(&self) -> io::Result<ContextBinding> {
-        let binding = self.context_binding.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "listener has no owner context pin",
-            )
-        })?;
-        Ok(binding.clone())
     }
 
     pub(crate) async fn accept(&mut self) -> io::Result<tokio::net::UnixStream> {
@@ -1329,7 +1194,7 @@ impl ManagedListener {
     pub(crate) fn close(mut self) -> EndpointReapResult {
         self.cleaned = true;
         self.inner.take();
-        let namespace = match open_root_bounded(&self.root, false) {
+        let namespace = match open_root_bounded(&self.root, false, None) {
             Ok(namespace) => namespace,
             Err(error) => {
                 // Even when the gate cannot be taken, this listener's ownership
@@ -1340,40 +1205,59 @@ impl ManagedListener {
                 return namespace_reap_error(error);
             }
         };
-        if self.directories_pin.as_ref().is_some_and(|directories| {
-            !directories.same_as(&namespace.directories).unwrap_or(false)
-        }) {
-            self.lease.take();
-            return EndpointReapResult::Unverified(EndpointUnverifiedReason::UnsafeDirectory);
-        }
         match self.lease.as_ref() {
-            Some(lease) => retire_owned(&namespace, &self.endpoint, lease.file(), &self.record),
+            Some(lease) => retire_listener_with_namespace(
+                &namespace,
+                self.directories_pin.as_ref(),
+                &self.endpoint,
+                lease,
+                &self.record,
+            ),
             None => EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership),
         }
     }
 
-    /// Bounded Drop path: close the listening descriptor in order, then retry
-    /// the gate without waiting. A missed gate leaves the lease record for the
-    /// reaper instead of starting unbounded background work. Either way the
-    /// lease flock is released and this listener's descriptor closed, so a
-    /// duplicate of it can never keep ownership alive.
+    /// Close the listening descriptor, then try immediate retirement. Gate
+    /// contention moves the lease to a short-lived thread that uses the same
+    /// bounded wait as explicit close, without waiting on the Drop caller.
+    /// A failed wait leaves the complete record for the reaper and releases
+    /// the lease flock even when another descriptor shares its description.
     fn drop_bounded(&mut self) {
         if self.cleaned {
             return;
         }
         self.cleaned = true;
-        let namespace = ManagedNamespace::open_root(&self.root, false, false);
         self.inner.take();
-        if let (Ok(namespace), Some(lease)) = (namespace, self.lease.as_ref()) {
-            if self.directories_pin.as_ref().is_none_or(|directories| {
-                directories.same_as(&namespace.directories).unwrap_or(false)
-            }) {
-                let _ = retire_owned(&namespace, &self.endpoint, lease.file(), &self.record);
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        match ManagedNamespace::open_root(&self.root, false, false) {
+            Ok(namespace) => {
+                let _ = retire_listener_with_namespace(
+                    &namespace,
+                    self.directories_pin.as_ref(),
+                    &self.endpoint,
+                    &lease,
+                    &self.record,
+                );
             }
+            Err(NamespaceError::Busy) => {
+                let retirement = DropRetirement {
+                    lease,
+                    _gate_pin: self._gate_pin.take().expect("bound listener pins its gate"),
+                    directories_pin: self.directories_pin.take(),
+                    root: self.root.clone(),
+                    endpoint: self.endpoint.clone(),
+                    record: self.record.clone(),
+                    #[cfg(test)]
+                    retry_observer: self.retry_observer.take(),
+                };
+                let _ = std::thread::Builder::new()
+                    .name("c2-local-drop-retire".into())
+                    .spawn(move || retirement.run());
+            }
+            Err(_) => {}
         }
-        // Retire (or a missed gate) leaves the record for the reaper; in both
-        // cases the lease flock must not survive this listener.
-        self.lease.take();
     }
     /// Test-only: simulate a process exit without destructors, leaving the
     /// socket and its complete record behind while releasing the lease flock.
@@ -1414,14 +1298,17 @@ impl Drop for ManagedListener {
 }
 
 /// Binds a managed-v2 endpoint under the fixed coordinator gate.
-fn bind_managed(endpoint: &LocalEndpoint, capture_context: bool) -> io::Result<ManagedListener> {
+fn bind_managed(
+    endpoint: &LocalEndpoint,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<ManagedListener> {
     let root = Path::new(endpoint.os_name()).parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "endpoint has no namespace directory",
         )
     })?;
-    bind_at(endpoint, root, capture_context)
+    bind_at(endpoint, root, deadline)
 }
 
 #[cfg(test)]
@@ -1429,13 +1316,13 @@ pub(crate) fn bind_managed_at(
     endpoint: &LocalEndpoint,
     root: &Path,
 ) -> io::Result<ManagedListener> {
-    bind_at(endpoint, root, false)
+    bind_at(endpoint, root, None)
 }
 
 fn bind_at(
     endpoint: &LocalEndpoint,
     root: &Path,
-    capture_context: bool,
+    deadline: Option<std::time::Instant>,
 ) -> io::Result<ManagedListener> {
     if Path::new(endpoint.os_name()).parent() != Some(root) {
         return Err(io::Error::new(
@@ -1443,7 +1330,7 @@ fn bind_at(
             "endpoint context does not match namespace",
         ));
     }
-    let namespace = open_root_bounded(root, true).map_err(namespace_bind_error)?;
+    let namespace = open_root_bounded(root, true, deadline).map_err(namespace_bind_error)?;
     let gate_pin = namespace.gate.try_clone()?;
     let names = managed_names(endpoint)?;
     let (file, created) = match namespace.directories.records.open_file(
@@ -1582,10 +1469,6 @@ fn bind_at(
     #[cfg(test)]
     let gate_identity =
         SocketIdentity::from_stat(&fstat(namespace.gate.as_raw_fd()).map_err(|error| error)?);
-    let context_binding = capture_context
-        .then(|| ContextBinding::from_namespace(root, &namespace))
-        .transpose()
-        .map_err(namespace_bind_error)?;
     guard.disarm();
     drop(guard);
     lease_guard.created = false;
@@ -1597,14 +1480,15 @@ fn bind_at(
         record,
         root: root.to_owned(),
         lease: Some(lease),
-        _gate_pin: gate_pin,
+        _gate_pin: Some(gate_pin),
         directories_pin: namespace
             .directories
             .split()
             .then(|| namespace.directories.clone()),
-        context_binding,
         #[cfg(test)]
         gate_identity,
+        #[cfg(test)]
+        retry_observer: None,
         cleaned: false,
     })
 }

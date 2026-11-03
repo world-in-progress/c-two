@@ -38,7 +38,7 @@ CONCURRENCY = 32
 PAYLOAD_FILE = '/tmp/c2_bench_payload.bin'
 
 
-def _route_hey_args(expected: CRMContract, route_uid: str, route_revision: int) -> list[str]:
+def _route_hey_args(expected: CRMContract, route_uid: str) -> list[str]:
     return [
         '-H',
         f'x-c2-expected-crm-ns: {expected.crm_ns}',
@@ -52,8 +52,6 @@ def _route_hey_args(expected: CRMContract, route_uid: str, route_revision: int) 
         f'x-c2-expected-signature-hash: {expected.signature_hash}',
         '-H',
         f'x-c2-route-uid: {route_uid}',
-        '-H',
-        f'x-c2-route-revision: {route_revision}',
     ]
 
 
@@ -102,7 +100,7 @@ def main():
                 cc.register(Hello, HelloImpl(), name=route_name)
                 with cc.connect(Hello, name=route_name, address=relay_url) as hello:
                     expected_header_args = _route_hey_args(
-                        crm_contract(Hello), hello.client.route_uid, hello.client.route_revision,
+                        crm_contract(Hello), hello.client.route_uid,
                     )
 
                 # Warmup with hey

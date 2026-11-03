@@ -8,6 +8,8 @@ import sys
 import pytest
 
 import c_two as cc
+
+import c_two.contract
 from fastdb4py.payload import Payload
 
 
@@ -37,7 +39,7 @@ def unicode_contract(monkeypatch):
             ...
 
     monkeypatch.setattr(sys.modules[__name__], "UnicodeContract", 问候, raising=False)
-    return f"{__name__}:UnicodeContract", cc.export_contract_descriptor(问候)
+    return f"{__name__}:UnicodeContract", cc.contract.export_descriptor(问候)
 
 
 def test_portable_export_rejects_python_pickle() -> None:
@@ -47,7 +49,7 @@ def test_portable_export_rejects_python_pickle() -> None:
             ...
 
     with pytest.raises(ValueError, match="python-pickle-default"):
-        cc.export_contract_descriptor(PythonOnly)
+        cc.contract.export_descriptor(PythonOnly)
 
 
 def test_contract_diagnostics_report_only_python_runtime_fallbacks() -> None:
@@ -58,7 +60,7 @@ def test_contract_diagnostics_report_only_python_runtime_fallbacks() -> None:
 
     assert [
         (item["method"], item["position"], item["code"])
-        for item in cc.contract_descriptor_diagnostics(PythonOnly)
+        for item in cc.contract.diagnostics(PythonOnly)
     ] == [
         ("echo", "input", "python_only_pickle"),
         ("echo", "output", "python_only_pickle"),
@@ -72,17 +74,17 @@ def test_explicit_fastdb_contract_has_no_python_diagnostics() -> None:
         def echo(self, payload: Payload) -> Payload:
             ...
 
-    assert cc.contract_descriptor_diagnostics(Portable) == []
+    assert cc.contract.diagnostics(Portable) == []
 
 
-def test_export_contract_descriptor_returns_canonical_v2_json() -> None:
+def test_export_descriptor_returns_canonical_v2_json() -> None:
     @cc.crm(namespace="test.contract-export", version="0.1.0")
     class Portable:
         @cc.transfer(input=SPEC, output=SPEC)
         def echo(self, payload: Payload) -> Payload:
             ...
 
-    exported = cc.export_contract_descriptor(Portable)
+    exported = cc.contract.export_descriptor(Portable)
     descriptor = json.loads(exported)
     from c_two.crm.contract import crm_contract
 
@@ -126,15 +128,15 @@ def test_native_release_projection_matches_shared_golden_vectors() -> None:
     )
 
 
-def test_export_contract_release_ref_is_rust_derived_and_route_independent() -> None:
+def test_release_ref_is_rust_derived_and_route_independent() -> None:
     @cc.crm(namespace="test.release-export", version="0.1.0")
     class Portable:
         @cc.transfer(input=SPEC, output=SPEC)
         def echo(self, payload: Payload) -> Payload:
             ...
 
-    descriptor = cc.export_contract_descriptor(Portable)
-    reference = json.loads(cc.export_contract_release_ref(Portable))
+    descriptor = cc.contract.export_descriptor(Portable)
+    reference = json.loads(cc.contract.release_ref(Portable))
     from c_two._native import contract_release_ref_json
 
     assert reference == json.loads(contract_release_ref_json(descriptor.encode()))
@@ -156,10 +158,10 @@ def test_pretty_descriptor_and_reference_preserve_release_identity() -> None:
         def ping(self) -> None:
             ...
 
-    compact_descriptor = cc.export_contract_descriptor(Ping)
-    pretty_descriptor = cc.export_contract_descriptor(Ping, pretty=True)
-    compact_reference = cc.export_contract_release_ref(Ping)
-    pretty_reference = cc.export_contract_release_ref(Ping, pretty=True)
+    compact_descriptor = cc.contract.export_descriptor(Ping)
+    pretty_descriptor = cc.contract.export_descriptor(Ping, pretty=True)
+    compact_reference = cc.contract.release_ref(Ping)
+    pretty_reference = cc.contract.release_ref(Ping, pretty=True)
     from c_two._native import contract_release_ref_json
 
     assert json.loads(compact_descriptor) == json.loads(pretty_descriptor)
@@ -172,7 +174,7 @@ def test_contract_export_cli_writes_v2_descriptor(tmp_path, monkeypatch) -> None
     module_path.write_text(
         "\n".join(
             [
-                "import c_two as cc",
+                "import c_two as cc; import c_two.contract",
                 '@cc.crm(namespace="test.contract-export-cli", version="0.1.0")',
                 "class Ping:",
                 "    def ping(self) -> None:",
@@ -240,7 +242,7 @@ def test_contract_diagnose_cli_writes_python_only_diagnostics(
     module_path.write_text(
         "\n".join(
             [
-                "import c_two as cc",
+                "import c_two as cc; import c_two.contract",
                 '@cc.crm(namespace="test.contract-diagnose-cli", version="0.1.0")',
                 "class PythonNative:",
                 "    def echo(self, value: int) -> str:",

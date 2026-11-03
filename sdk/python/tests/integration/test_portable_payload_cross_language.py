@@ -15,6 +15,8 @@ from typing import Any
 import pytest
 
 import c_two as cc
+
+import c_two.contract
 from tests.fixtures.process_control import readline_with_timeout
 from c_two.config.settings import settings
 from c_two.error import ContractMismatch
@@ -41,7 +43,7 @@ RUST_HARNESS_SOURCE = (
     REPOSITORY
     / "sdk/python/tests/fixtures/portable_interop_rust.rs"
 )
-TARGET_DIR = REPOSITORY / "core/target"
+TARGET_DIR = REPOSITORY / os.environ.get("CARGO_TARGET_DIR", "core/target")
 
 pytestmark = pytest.mark.timeout(300)
 
@@ -108,7 +110,7 @@ def _path_dependency(path: Path) -> str:
 
 
 def _prepare_harness(work: Path) -> tuple[Path, ModuleType]:
-    descriptor_text = cc.export_contract_descriptor(PortableInterop)
+    descriptor_text = cc.contract.export_descriptor(PortableInterop)
     descriptor = descriptor_text.encode("utf-8")
     descriptor_value = json.loads(descriptor)
     assert [method["name"] for method in descriptor_value["methods"]] == [
@@ -117,10 +119,10 @@ def _prepare_harness(work: Path) -> tuple[Path, ModuleType]:
         "record_roundtrip",
     ]
 
-    rust_artifacts = cc.compile_contract_artifacts(descriptor, target="rust")
-    rust_artifacts_repeat = cc.compile_contract_artifacts(descriptor, target="rust")
-    python_artifacts = cc.compile_contract_artifacts(descriptor, target="python")
-    python_artifacts_repeat = cc.compile_contract_artifacts(
+    rust_artifacts = cc.contract.compile_artifacts(descriptor, target="rust")
+    rust_artifacts_repeat = cc.contract.compile_artifacts(descriptor, target="rust")
+    python_artifacts = cc.contract.compile_artifacts(descriptor, target="python")
+    python_artifacts_repeat = cc.contract.compile_artifacts(
         descriptor,
         target="python",
     )
@@ -319,7 +321,7 @@ def test_generated_rust_python_runtime_composition_is_bidirectional() -> None:
             resource,
             name=python_route,
             input_lifetime={
-                "graph_roundtrip": cc.InputLifetime.BORROWED,
+                "graph_roundtrip": 'borrowed',
             },
         )
         python_address = cc.server_address()

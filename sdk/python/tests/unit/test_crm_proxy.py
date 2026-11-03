@@ -90,6 +90,11 @@ class TestThreadLocalProxy:
         with pytest.raises(RuntimeError, match='closed'):
             proxy.call_direct('greet', ('x',))
 
+    def test_closed_proxy_hasattr_is_false(self):
+        proxy = CRMProxy.thread_local(_DummyCRM())
+        proxy.terminate()
+        assert not hasattr(proxy, 'missing_attribute')
+
 
 # ---------------------------------------------------------------------------
 # IPC proxy

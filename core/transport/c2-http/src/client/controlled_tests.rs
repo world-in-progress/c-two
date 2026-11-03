@@ -43,7 +43,6 @@ fn route(url: &str) -> RelayRouteInfo {
         name: contract.route_name,
         relay_url: url.into(),
         route_uid: "controlled-grid-route".into(),
-        route_revision: 7,
         ipc_address: None,
         server_id: None,
         server_instance_id: None,
@@ -169,10 +168,8 @@ enum Reply {
 #[derive(Clone)]
 struct Data {
     calls: Arc<AtomicUsize>,
-    probes: Arc<AtomicUsize>,
     received: Arc<Mutex<Vec<(HeaderMap, Bytes)>>>,
     reply: Arc<Mutex<Reply>>,
-    probe_gate: Option<Arc<Gate>>,
     call_gate: Option<Arc<Gate>>,
 }
 
@@ -180,10 +177,8 @@ impl Data {
     fn new(reply: Reply) -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
-            probes: Arc::new(AtomicUsize::new(0)),
             received: Arc::new(Mutex::new(Vec::new())),
             reply: Arc::new(Mutex::new(reply)),
-            probe_gate: None,
             call_gate: None,
         }
     }
@@ -238,19 +233,10 @@ async fn business(
     }
 }
 
-async fn probe(State(state): State<Data>) -> StatusCode {
-    state.probes.fetch_add(1, Ordering::SeqCst);
-    if let Some(gate) = state.probe_gate {
-        gate.wait().await;
-    }
-    StatusCode::OK
-}
-
 async fn data_server(state: &Data) -> Server {
     serve(
         Router::new()
             .route("/{route}/{method}", post(business))
-            .route("/_probe/{route}", get(probe))
             .layer(DefaultBodyLimit::disable())
             .with_state(state.clone()),
     )
@@ -358,39 +344,6 @@ async fn owner_deadline_rejection_after_route_wait_never_dispatches() {
     assert_local(&result.unwrap_err());
     assert_eq!(resolves.load(Ordering::SeqCst), 1);
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
-    assert_eq!(data.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn owner_rejection_after_probe_wait_is_not_business_dispatch() {
-    let gate = Arc::new(Gate::default());
-    let mut data = Data::new(Reply::Echo);
-    data.probe_gate = Some(Arc::clone(&gate));
-    let server = data_server(&data).await;
-    let (registry, _) = registry(&[&server.url], None).await;
-    let client = client(&registry);
-    let expired = Arc::new(AtomicBool::new(false));
-    let observed = Arc::clone(&expired);
-    let control = HttpCallControl::new(
-        move || {
-            if observed.load(Ordering::SeqCst) {
-                Err(rejected())
-            } else {
-                Ok(())
-            }
-        },
-        |_| panic!("a route probe must not invoke the business dispatch guard"),
-    );
-    let resolve = client.resolve_http_target_controlled_async(&control);
-    let expire_while_probing = async {
-        gate.entered.notified().await;
-        expired.store(true, Ordering::SeqCst);
-        gate.resume.notify_one();
-    };
-    let (result, ()) = tokio::join!(resolve, expire_while_probing);
-
-    assert_local_source(&result.unwrap_err());
-    assert_eq!(data.probes.load(Ordering::SeqCst), 1);
     assert_eq!(data.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -614,7 +567,6 @@ fn assert_headers(headers: &HeaderMap, len: usize) {
         ("x-c2-expected-abi-hash", ABI_HASH),
         ("x-c2-expected-signature-hash", SIGNATURE_HASH),
         ("x-c2-route-uid", "controlled-grid-route"),
-        ("x-c2-route-revision", "7"),
         ("content-type", "application/octet-stream"),
     ] {
         assert_eq!(headers[key], expected, "header {key}");

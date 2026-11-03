@@ -1,6 +1,8 @@
 """Direct IPC admin helpers projected through the current Core Runtime."""
 from __future__ import annotations
 
+from typing import Literal
+
 from ..endpoint import LocalEndpointContext, _selected_context, _selection
 
 
@@ -51,15 +53,15 @@ def shutdown(
     *,
     root: str | None = None,
     context: LocalEndpointContext | None = None,
-) -> dict[str, object]:
+) -> Literal['initiated', 'absent', 'unconfirmed']:
     """Send a direct IPC shutdown signal to a server.
 
     Defaults to the current Runtime, including its code override and frozen
     context. Independent supervisors may supply a Unix root or captured context.
-    The acknowledgement proves initiation; observe the owner-side native
-    shutdown barrier before running hooks or considering work drained.
-    Core returns an unconfirmed result for malformed targets; configuration and
-    timeout errors propagate to the caller.
+    Only 'initiated' confirms that shutdown was initiated; completion is
+    observed through the original Host shutdown receipt. 'absent' means this
+    endpoint has no listener. 'unconfirmed' means initiation was not confirmed.
+    Configuration, target and timeout errors propagate to the caller.
     """
     from c_two._native import ipc_shutdown
 
@@ -69,5 +71,5 @@ def shutdown(
         if root is not None or context is not None else None
     )
     if selected is not None:
-        return dict(ipc_shutdown(server_address, float(timeout), context=selected))
-    return dict(_session().shutdown_direct_ipc(server_address, float(timeout)))
+        return ipc_shutdown(server_address, float(timeout), context=selected)
+    return _session().shutdown_direct_ipc(server_address, float(timeout))

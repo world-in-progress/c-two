@@ -11,6 +11,17 @@ Modes:
   budget fallback/exhaustion) under default-buddy and buddy-disabled
   configurations. Each row runs in its own controller subprocess; artifacts
   are written under --output-dir.
+- anomaly: runs one alone/parallel control with before/during/after phases.
+  See --scenario. ipc_paired.py alternates separate baseline/candidate Python
+  environments for at least five groups, reporting performance thresholds.
+
+Every worker flushes per-attempt samples and events to JSONL. Each sample
+file starts with run configuration, commit and the imported native hash.
+Warmups and hold-validation calls are retained but excluded from measured
+quantiles. P50/P95/P99 use nearest rank over all measured attempts, including
+errors and timeouts. Throughput counts successful calls over the measurement
+wall envelope, including between-call harness overhead. Workers connect and
+warm up before the controller publishes one common barrier timestamp.
 
 Expected-capacity-failure rows (--expect-error-substring) require the CRM
 call to raise an error containing the substring; the stable native phrase is
@@ -35,13 +46,13 @@ A worker writes its JSON report to stdout and exits 0 only when it produced a
 complete report; otherwise it exits 1, so a validation failure stays
 distinguishable from a missing report.
 
-RSS is a process high-water mark, including Python and serialization; it is
-not an allocator byte counter and never a backing-capacity measurement, so
-the report keeps OS RSS, configured backing budgets, and held-buffer counts
-in separate fields. Windows reports null when resource is absent. Runtime
-memory snapshots use the public cc.memory_stats when present; when the API
-is absent the snapshot is recorded as unavailable, and --require-memory-stats
-fails instead of fabricating zero values. In require mode every advertised
+OS current/peak RSS includes Python and serialization; it is not an allocator
+byte counter or backing-capacity measurement. RSS, backing budgets and local
+hold counts are separate fields. Unavailable OS counters are null with a
+reason. Internal loan/queue probes are explicitly unmeasured. Runtime
+memory snapshots use the public c_two.observe.memory_stats API; snapshot errors
+are recorded, and --require-memory-stats fails instead of fabricating zero
+values. In require mode every advertised
 snapshot point is enforced, including after cleanup. Post-shutdown
 unavailability can only be exempted explicitly through
 --allow-unavailable-stats-after-shutdown, which records the exemption inside
@@ -67,8 +78,18 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from ipc_evidence import (
+    INTERNAL_PROBES, CORRECTNESS_FAILURE, Failures, SampleLog,
+    TOOL_FAILURE, failure_message, platform_process_support, process_snapshot,
+    publish_marker, read_marker, summarize_samples,
+)
 
 
 BUDGET_ERROR_PHRASE = 'memory budget cell'
@@ -168,7 +189,8 @@ def runtime_provenance(native_module) -> dict:
 
 
 def source_commit() -> str | None:
-    state = repo_state(Path(__file__))
+    root = os.environ.get('C2_BENCH_SOURCE_ROOT')
+    state = repo_state(Path(root) / 'pyproject.toml' if root else Path(__file__))
     return state['head'] if state else None
 
 
@@ -207,18 +229,105 @@ def configure(cc, args: argparse.Namespace) -> dict:
     return overrides
 
 
-def snapshot_memory_stats(cc) -> dict:
-    """One runtime snapshot through the public API, or an explicit unavailable record."""
-    if not hasattr(cc, 'memory_stats'):
-        return {'available': False, 'reason': 'installed c_two exposes no public cc.memory_stats'}
+def snapshot_memory_stats() -> dict:
+    """One runtime snapshot through the public API, or an explicit error record."""
+    from c_two.observe import memory_stats
+
     try:
-        return {'available': True, 'stats': dict(cc.memory_stats())}
+        return {'available': True, 'stats': common_memory_stats(dict(memory_stats()))}
     except Exception as exc:  # recorded honestly, never replaced with zeros
-        return {'available': True, 'error': f'{type(exc).__name__}: {exc}'}
+        return {'available': False, 'error': f'{type(exc).__name__}: {exc}'}
+
+
+def common_memory_stats(stats: dict) -> dict:
+    """The same current public fields on both inputs; no retired counters."""
+    def scope(value):
+        if value is None:
+            return None
+        return {key: value[key] for key in ('role', 'state', 'limits', 'cells')}
+    return {
+        'runtime_outgoing': scope(stats['runtime_outgoing']),
+        'server': scope(stats['server']),
+        'retired': [scope(value) for value in stats['retired']],
+        'holds': {key: stats['holds'][key] for key in (
+            'active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_direction',
+        )},
+    }
+
+
+def wait_for_release(coord: Path, worker_index: int, timeout: float, log: SampleLog) -> dict:
+    ready = {'pid': os.getpid(), 'worker_index': worker_index, 'ready_ns': time.perf_counter_ns()}
+    publish_marker(coord / f'ready-{worker_index}.json', ready)
+    log.event('ready', **ready)
+    deadline = time.perf_counter() + timeout
+    while (release := read_marker(coord / 'release.json')) is None:
+        if time.perf_counter() >= deadline:
+            raise TimeoutError('controller did not release the ready barrier')
+        time.sleep(0.005)
+    log.event('barrier_observed', **release)
+    return release
+
+
+def release_workers(coord: Path, children: list, timeout: float, log: SampleLog) -> dict:
+    deadline = time.perf_counter() + timeout
+    while True:
+        workers = [read_marker(coord / f'ready-{index}.json') for index in range(len(children))]
+        if all(worker is not None for worker in workers):
+            break
+        if any(child.poll() is not None for child in children):
+            raise RuntimeError('worker exited before the ready barrier')
+        if time.perf_counter() >= deadline:
+            raise TimeoutError('workers did not finish connection and warmup')
+        time.sleep(0.005)
+    release = {'release_ns': time.perf_counter_ns(), 'worker_count': len(children), 'workers': workers}
+    # Rename publishes a complete timestamp to every waiter at once.
+    publish_marker(coord / 'release.json', release)
+    log.event('barrier_released', **release)
+    return release
+
+
+def call_sample(log: SampleLog, request_id: int, call, payload: bytes, *, phase='measurement', measurement=True):
+    log.event('call_started', request_id=request_id, phase=phase)
+    start = time.perf_counter_ns()
+    status, error_type, error_message, integrity = 'success', None, None, None
+    value = None
+    try:
+        value = call(payload)
+        integrity = value == payload
+        if not integrity:
+            raise ValueError('IPC payload mismatch')
+    except Exception as exc:
+        timed_out = (
+            isinstance(exc, TimeoutError)
+            or type(exc).__name__ in ('CallDeadlineExceeded', 'TimeoutError')
+            or getattr(exc, 'name', None) == 'CallDeadlineExceeded'
+            or getattr(exc, 'io_kind', None) == 'TimedOut'
+        )
+        status = 'timeout' if timed_out else 'error'
+        error_type, error_message = type(exc).__name__, str(exc)
+    sample = log.sample(
+        request_id, start, time.perf_counter_ns(), status, error_type, error_message,
+        phase=phase, integrity_ok=integrity, measurement=measurement,
+    )
+    return value, sample
 
 
 def memory_stats_usable(snapshot: dict) -> bool:
     return bool(snapshot.get('available')) and 'stats' in snapshot and 'error' not in snapshot
+
+
+def require_no_charges(snapshot: dict, point: str, failures: list[str]) -> None:
+    if not memory_stats_usable(snapshot):
+        return  # require_snapshot owns unavailable-snapshot enforcement.
+    stats = snapshot['stats']
+    scopes = [stats['runtime_outgoing'], stats['server'], *stats['retired']]
+    charged = [
+        f"{scope['role']}/{name}={cell['used_bytes']}"
+        for scope in scopes if scope is not None
+        for name, cell in scope['cells'].items() if cell['used_bytes']
+    ]
+    if charged or stats['holds']['active_holds']:
+        failures.append(f'{point}: cleanup retains charges or local holds: {charged}')
 
 
 def require_snapshot(
@@ -243,7 +352,7 @@ def require_snapshot(
             '--allow-unavailable-stats-after-shutdown; not a fabricated snapshot'
         )
         return
-    failures.append(f'memory stats required but unavailable at {point}')
+    failures.append(failure_message(f'memory stats required but unavailable at {point}', TOOL_FAILURE))
 
 
 def measure(args: argparse.Namespace) -> dict:
@@ -252,120 +361,100 @@ def measure(args: argparse.Namespace) -> dict:
     import c_two as cc
     from c_two import _native
 
-    failures: list[str] = []
+    failures = Failures()
     cleanup: dict[str, object] = {}
     Echo, EchoResource = echo_types(cc)
     overrides = configure(cc, args)
-    rss = {'imported': peak_rss_bytes()}
+    provenance = dict(runtime_provenance(_native), source_commit=source_commit())
+    identity = {'role': 'normal', 'pid': os.getpid(), 'worker_index': args.worker_index}
+    log = SampleLog(args.output_dir, identity, vars_for_config(args), provenance)
     stats_enabled = args.memory_stats or args.require_memory_stats
     memory_stats: dict[str, dict] = {}
-    if stats_enabled:
-        memory_stats['before_connect'] = snapshot_memory_stats(cc)
-        if args.require_memory_stats:
-            require_snapshot(memory_stats['before_connect'], 'before_connect (worker)', failures)
-
+    os_stats = {'before_connect': process_snapshot()}
     expected = args.expect_error_substring
-    expected_error = None
-    if expected is not None:
-        expected_error = {
-            'required_substring': expected,
-            'required_stage': 'call',
-            'raised': False,
-            'stage': None,
-            'stage_matched': None,
-            'error_type': None,
-            'error_message': None,
-            'observed': None,
-            'control_ping_ok': None,
-            'matched': None,
-        }
-
+    expected_error = None if expected is None else {
+        'required_substring': expected, 'required_stage': 'call', 'raised': False,
+        'stage': None, 'stage_matched': None, 'error_type': None,
+        'error_message': None, 'observed': None, 'control_ping_ok': None, 'matched': None,
+    }
     payload = payload_pattern('c-two-ipc-memory', args.payload_bytes)
     client = None
-    address = args.address
-    latencies: list[int] = []
     connected_ns = None
-    held_stats = None
-    after_release = None
+    held_stats = after_release = barrier = None
     started = time.perf_counter_ns()
     try:
-        try:
-            if address is None:
-                cc.register(Echo, EchoResource(), name='echo')
-                rss['registered'] = peak_rss_bytes()
-                address = cc.server_address()
-            try:
-                client = cc.connect(Echo, name='echo', address=address)
-            except Exception as exc:
-                if expected is None:
-                    raise
-                expected_error.update(
-                    raised=True, stage='connect',
-                    error_type=type(exc).__name__, error_message=str(exc),
-                )
-            else:
-                connected_ns = time.perf_counter_ns() - started
-                rss['connected'] = peak_rss_bytes()
-                for _ in range(args.calls):
-                    before = time.perf_counter_ns()
-                    try:
-                        result = client.echo(payload)
-                    except Exception as exc:
-                        if expected is None:
-                            raise
-                        expected_error.update(
-                            raised=True, stage='call',
-                            error_type=type(exc).__name__, error_message=str(exc),
-                        )
-                        break
-                    elapsed = time.perf_counter_ns() - before
-                    if result != payload:
-                        raise RuntimeError('IPC payload mismatch')
-                    latencies.append(elapsed)
-                if expected is not None and not expected_error['raised']:
-                    failures.append('expected native capacity error was not raised; the call succeeded')
-            if expected_error is not None and expected_error['raised']:
-                observed = f"{expected_error['error_type']}: {expected_error['error_message']}"
-                expected_error['observed'] = observed
-                expected_error['matched'] = expected in observed
-                expected_error['stage_matched'] = expected_error['stage'] == 'call'
-                if not expected_error['matched']:
-                    failures.append(f'raised error lacks required substring {expected!r}: {observed}')
-                if not expected_error['stage_matched']:
-                    failures.append(
-                        'expected the native capacity error at the call stage, but it was raised '
-                        f"during {expected_error['stage']}: {observed}; a connect-stage error is not "
-                        'the failure under test even when the substring and control ping match'
-                    )
-                from c_two.transport.client import util
-                try:
-                    ping_ok = bool(util.ping(address, timeout=2.0))
-                except Exception as exc:
-                    expected_error['control_ping_ok'] = False
-                    failures.append(f'direct IPC control ping raised {type(exc).__name__}: {exc}')
-                else:
-                    expected_error['control_ping_ok'] = ping_ok
-                    if not ping_ok:
-                        failures.append('direct IPC control ping failed after the capacity error')
-            if expected_error is None and client is not None:
-                held = cc.hold(client.echo)(payload)
-                try:
-                    if held.value != payload:
-                        raise RuntimeError('held IPC payload mismatch')
-                    held_stats = cc.hold_stats()
-                finally:
-                    held.release()
-                after_release = cc.hold_stats()
-                if after_release['active_holds'] != 0:
-                    raise RuntimeError('benchmark retained a transport hold')
-        except Exception as exc:
-            # Recorded as a failure so the artifact still carries cleanup,
-            # latency, and RSS evidence for the failing run.
-            failures.append(f'{type(exc).__name__}: {exc}')
         if stats_enabled:
-            memory_stats['after_calls'] = snapshot_memory_stats(cc)
-            if args.require_memory_stats:
-                require_snapshot(memory_stats['after_calls'], 'after_calls (worker)', failures)
+            memory_stats['before_connect'] = snapshot_memory_stats()
+        if args.address is None:
+            cc.register(Echo, EchoResource(), name='echo')
+        address = args.address or cc.server_address()
+        try:
+            client = cc.connect(Echo, name='echo', address=address, timeout=args.call_timeout)
+        except Exception as exc:
+            if expected_error is not None:
+                expected_error.update(raised=True, stage='connect', error_type=type(exc).__name__, error_message=str(exc))
+            raise
+        connected_ns = time.perf_counter_ns() - started
+        # One public deadline API is used on both source inputs.
+        proxy = cc.with_call_options(client, timeout=args.call_timeout)
+        request_id = 0
+        if expected is None:
+            for _ in range(args.warmup):
+                _, sample = call_sample(log, request_id, proxy.echo, payload, phase='warmup', measurement=False)
+                request_id += 1
+                if sample['status'] != 'success':
+                    raise RuntimeError(f"warmup failed: {sample['error_type']}: {sample['error_message']}")
+        barrier = wait_for_release(args.coord_dir, args.worker_index, args.child_timeout, log)
+        for _ in range(args.calls):
+            _, sample = call_sample(log, request_id, proxy.echo, payload)
+            request_id += 1
+            if expected_error is not None and sample['status'] == 'success':
+                failures.setup(f"request {sample['request_id']}: expected capacity error but call succeeded")
+            if sample['status'] != 'success':
+                if expected_error is None:
+                    failures.append(f"request {sample['request_id']}: {sample['error_type']}: {sample['error_message']}")
+                else:
+                    observed = f"{sample['error_type']}: {sample['error_message']}"
+                    expected_error.update(
+                        raised=True, stage='call', stage_matched=True,
+                        error_type=sample['error_type'], error_message=sample['error_message'],
+                        observed=observed, matched=expected in observed,
+                    )
+                    if expected not in observed:
+                        failures.append(f'wrong capacity error: {observed}')
+        if expected_error is not None:
+            if not expected_error['raised']:
+                failures.setup('expected native capacity error was not raised; the call succeeded')
+            if expected_error['stage'] != 'call':
+                failures.setup('expected capacity failure at call stage')
+            from c_two.transport.client import util
+            expected_error['control_ping_ok'] = bool(util.ping(address, timeout=2.0))
+            if not expected_error['control_ping_ok']:
+                failures.append('direct IPC control ping failed after capacity error')
+        else:
+            # Validate hold without mixing this additional call into measured RPCs.
+            held_box = []
+            def held_call(value):
+                held_box.append(cc.hold(proxy.echo)(value))
+                return held_box[-1].value
+            try:
+                _, sample = call_sample(log, request_id, held_call, payload, phase='hold_validation', measurement=False)
+                if sample['status'] != 'success':
+                    failures.append(f"hold validation: {sample['error_message']}")
+                held_stats = snapshot_memory_stats()['stats']['holds']
+            finally:
+                for held in held_box:
+                    held.release()
+            after_release = snapshot_memory_stats()['stats']['holds']
+            if after_release['active_holds'] != 0:
+                failures.append('benchmark retained a local hold')
+        if stats_enabled:
+            memory_stats['after_calls'] = snapshot_memory_stats()
+        os_stats['after_calls'] = process_snapshot()
+    except Exception as exc:
+        failures.append(f'{type(exc).__name__}: {exc}', getattr(exc, 'category',
+            TOOL_FAILURE if isinstance(exc, (TimeoutError, OSError)) else CORRECTNESS_FAILURE))
+        log.event('worker_error', error_type=type(exc).__name__, error_message=str(exc))
     finally:
         if client is not None:
             try:
@@ -375,65 +464,50 @@ def measure(args: argparse.Namespace) -> dict:
                 cleanup['close_client'] = f'{type(exc).__name__}: {exc}'
                 failures.append('client close failed after the run')
         try:
-            cc.shutdown()
-            cleanup['shutdown'] = 'ok'
+            shutdown = cc.shutdown(timeout=args.child_timeout)
+            cleanup['shutdown'] = shutdown
+            if not shutdown['completed']:
+                failures.append('cc.shutdown did not complete')
         except Exception as exc:
             cleanup['shutdown'] = f'{type(exc).__name__}: {exc}'
             failures.append('cc.shutdown failed after the run')
         if stats_enabled:
-            memory_stats['after_cleanup'] = snapshot_memory_stats(cc)
-            if args.require_memory_stats:
+            memory_stats['after_cleanup'] = snapshot_memory_stats()
+            require_no_charges(memory_stats['after_cleanup'], 'worker after_cleanup', failures)
+        if args.require_memory_stats:
+            for name in ('before_connect', 'after_calls', 'after_cleanup'):
                 require_snapshot(
-                    memory_stats['after_cleanup'], 'after_cleanup (worker, after shutdown)', failures,
-                    allow_unavailable_after_shutdown=args.allow_unavailable_stats_after_shutdown,
+                    memory_stats.get(name, {}), name + ' (worker)', failures,
+                    allow_unavailable_after_shutdown=name == 'after_cleanup' and args.allow_unavailable_stats_after_shutdown,
                 )
-
-    ordered = sorted(latencies)
-    rpc_elapsed_ns = sum(latencies) if latencies else None
-    provenance = runtime_provenance(_native)
-    if not provenance['module_path'] or not provenance['sha256']:
-        failures.append(
-            'native provenance missing in the worker: '
-            f"module_path={provenance['module_path']!r} sha256={provenance['sha256']!r}"
-        )
-    result = {
-        'pid': os.getpid(),
-        'python_executable': sys.executable,
-        'version': distribution_version('c-two'),
-        'fastdb_version': distribution_version('fastdb4py'),
-        'native_path': provenance['module_path'],
-        'native_sha256': provenance['sha256'],
-        'native_repo': provenance['repo'],
-        'python': sys.version,
-        'platform': sys.platform,
-        'argv': list(sys.argv),
-        'overrides': overrides,
-        'stats_contract': {
-            'require_memory_stats': args.require_memory_stats,
-            'allow_unavailable_after_shutdown': args.allow_unavailable_stats_after_shutdown,
-        },
-        'shm_threshold': args.shm_threshold,
-        'payload_bytes': args.payload_bytes,
-        'calls': args.calls,
-        'calls_completed': len(latencies),
-        'connect_ns': connected_ns,
-        'first_call_ns': latencies[0] if latencies else None,
-        'median_call_ns': statistics.median(latencies) if latencies else None,
-        'p95_call_ns': ordered[min(len(ordered) - 1, (95 * len(ordered) + 99) // 100 - 1)] if ordered else None,
-        'rpc_elapsed_ns': rpc_elapsed_ns,
-        # Throughput is derived from measured call latencies only: no connect,
-        # import, or payload-build time is folded into it.
-        'throughput_calls_per_s': len(latencies) / (rpc_elapsed_ns / 1e9) if rpc_elapsed_ns else None,
-        'rss_high_water_bytes': rss,
-        'held': held_stats,
-        'after_release': after_release,
-        'memory_stats': memory_stats or None,
-        'expected_error': expected_error,
-        'cleanup': cleanup,
-        'failures': failures,
+        os_stats['after_cleanup'] = process_snapshot()
+        log.event('closed', cleanup=cleanup)
+        log.close()
+    summary = summarize_samples(log.samples)
+    if summary['attempts'] != args.calls:
+        failures.tool(f"sample count mismatch: expected {args.calls}, measured {summary['attempts']}")
+    if not provenance['module_path'] or not provenance['sha256'] or not provenance['source_commit']:
+        failures.tool('native path/hash or source commit missing')
+    return {
+        'pid': os.getpid(), 'role': 'normal', 'worker_index': args.worker_index,
+        'python_executable': sys.executable, 'version': distribution_version('c-two'),
+        'fastdb_version': distribution_version('fastdb4py'), 'python': sys.version,
+        'platform': sys.platform, 'argv': list(sys.argv), 'overrides': overrides,
+        'native_path': provenance['module_path'], 'native_sha256': provenance['sha256'],
+        'native_repo': provenance['repo'], 'provenance': provenance,
+        'config': vars_for_config(args), 'barrier': barrier, 'connect_ns': connected_ns,
+        'summary': summary, 'samples_path': str(log.samples_path), 'events_path': str(log.events_path),
+        'held': held_stats, 'after_release': after_release, 'os_stats': os_stats,
+        'memory_stats': memory_stats, 'internal_probes': INTERNAL_PROBES,
+        'expected_error': expected_error, 'cleanup': cleanup, 'failures': failures, 'ok': not failures,
     }
-    result['ok'] = not failures
-    return result
+
+
+def vars_for_config(args: argparse.Namespace) -> dict:
+    return {key: getattr(args, key) for key in (
+        'pool_enabled', 'segment_size', 'payload_bytes', 'shm_threshold', 'calls',
+        'ipc_overrides', 'expect_error_substring', 'warmup', 'call_timeout',
+    )}
 
 
 def run_worker(args: argparse.Namespace) -> dict:
@@ -448,7 +522,7 @@ def run_worker(args: argparse.Namespace) -> dict:
             'error_type': type(exc).__name__,
             'error_message': str(exc),
             'traceback_tail': traceback.format_exc()[-2000:],
-            'failures': [f'{type(exc).__name__}: {exc}'],
+            'failures': [failure_message(f'{type(exc).__name__}: {exc}', TOOL_FAILURE)],
         }
 
 
@@ -491,6 +565,17 @@ def kill_owned_child(proc: subprocess.Popen) -> str | None:
 
 
 def run_controller(args: argparse.Namespace) -> dict:
+    args.output_dir = Path(args.output_dir or tempfile.mkdtemp(prefix='c2-ipc-evidence-')).resolve()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.coord_dir = args.output_dir / 'coord'
+    args.coord_dir.mkdir(mode=0o700)
+    endpoint_root = tempfile.mkdtemp(prefix='c2-bench-') if os.name != 'nt' else None
+    if endpoint_root is not None:
+        os.environ['C2_IPC_ROOT'] = endpoint_root
+    controller_log = SampleLog(
+        args.output_dir, {'role': 'controller', 'pid': os.getpid(), 'worker_index': -1},
+        vars_for_config(args), {'source_commit': source_commit()},
+    )
     command = [
         args.python, str(Path(__file__).resolve()), '--worker',
         '--pool-enabled' if args.pool_enabled else '--no-pool-enabled',
@@ -498,6 +583,9 @@ def run_controller(args: argparse.Namespace) -> dict:
         '--payload-bytes', str(args.payload_bytes),
         '--shm-threshold', str(args.shm_threshold), '--calls', str(args.calls),
         '--ipc-overrides', json.dumps(args.ipc_overrides),
+        '--output-dir', str(args.output_dir), '--coord-dir', str(args.coord_dir),
+        '--warmup', str(args.warmup), '--call-timeout', str(args.call_timeout),
+        '--child-timeout', str(args.child_timeout),
     ]
     if args.expect_error_substring is not None:
         command.extend(['--expect-error-substring', args.expect_error_substring])
@@ -512,13 +600,14 @@ def run_controller(args: argparse.Namespace) -> dict:
     results = []
     child_processes: list[dict] = []
     terminated: list[int] = []
-    failures: list[str] = []
+    failures = Failures()
     cleanup: dict[str, object] = {}
     server_cc = None
     server_stats = None
     server_memory_stats: dict[str, dict] = {}
     stats_enabled = args.memory_stats or args.require_memory_stats
     started = time.perf_counter_ns()
+    barrier = None
     try:
         if args.topology == 'shared':
             os.environ['C2_ENV_FILE'] = ''
@@ -537,13 +626,19 @@ def run_controller(args: argparse.Namespace) -> dict:
                 'native_path': server_provenance['module_path'],
                 'native_sha256': server_provenance['sha256'],
                 'native_repo': server_provenance['repo'],
+                'provenance': dict(server_provenance, source_commit=source_commit()),
+                'os_stats': {'after_register': process_snapshot()},
             }
             if stats_enabled:
-                server_memory_stats['after_register'] = snapshot_memory_stats(server_cc)
+                server_memory_stats['after_register'] = snapshot_memory_stats()
                 if args.require_memory_stats:
                     require_snapshot(server_memory_stats['after_register'], 'after_register (server)', failures)
-        for _ in range(args.workers):
-            children.append(subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        for index in range(args.workers):
+            children.append(subprocess.Popen(
+                command + ['--worker-index', str(index)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ))
+        barrier = release_workers(args.coord_dir, children, args.child_timeout, controller_log)
         for child in children:
             try:
                 stdout, stderr = child.communicate(timeout=args.child_timeout)
@@ -554,14 +649,16 @@ def run_controller(args: argparse.Namespace) -> dict:
                     'pid': child.pid, 'exit_code': child.returncode,
                     'forced_termination': True, 'drain': drain_note or 'ok',
                 })
-                failures.append(
+                failures.tool(
                     f'benchmark child {child.pid} exceeded the {args.child_timeout}s join timeout '
                     'and was terminated; termination is reported as a failure'
                 )
                 if drain_note:
-                    failures.append(f'benchmark child {child.pid} post-kill drain failed: {drain_note}')
+                    failures.tool(f'benchmark child {child.pid} post-kill drain failed: {drain_note}')
                 continue
             child_processes.append({'pid': child.pid, 'exit_code': child.returncode, 'forced_termination': False})
+            (args.output_dir / f'child-{child.pid}.stdout.json').write_text(stdout, encoding='utf-8')
+            (args.output_dir / f'child-{child.pid}.stderr.log').write_text(stderr, encoding='utf-8')
             worker_result = None
             if stdout.strip():
                 try:
@@ -574,24 +671,30 @@ def run_controller(args: argparse.Namespace) -> dict:
                     detail = '; '.join(worker_result.get('failures') or [])
                 if not detail:
                     detail = (stderr or '').strip()[-2000:]
-                failures.append(
-                    f'benchmark child {child.pid} failed with exit code {child.returncode}: {detail}'
-                )
+                if isinstance(worker_result, dict) and worker_result.get('failures'):
+                    failures.extend(worker_result['failures'])
+                else:
+                    failures.tool(f'benchmark child {child.pid} failed with exit code {child.returncode}: {detail}')
                 if isinstance(worker_result, dict):
                     results.append(worker_result)
                 continue
             if not isinstance(worker_result, dict):
-                failures.append(f'benchmark child {child.pid} produced no JSON result')
+                failures.tool(f'benchmark child {child.pid} produced no JSON result')
                 continue
             if not worker_result.get('ok'):
-                failures.append(f'benchmark child {child.pid} reported validation failures')
+                failures.extend(worker_result.get('failures') or [failure_message(
+                    f'benchmark child {child.pid} reported failure without a reason', TOOL_FAILURE)])
             results.append(worker_result)
         if server_stats is not None:
             server_stats['rss_after_calls_high_water_bytes'] = peak_rss_bytes()
+            server_stats['os_stats']['after_calls'] = process_snapshot()
             if stats_enabled:
-                server_memory_stats['after_workers'] = snapshot_memory_stats(server_cc)
+                server_memory_stats['after_workers'] = snapshot_memory_stats()
                 if args.require_memory_stats:
                     require_snapshot(server_memory_stats['after_workers'], 'after_workers (server)', failures)
+    except Exception as exc:
+        failures.append(f'controller: {type(exc).__name__}: {exc}', getattr(exc, 'category', TOOL_FAILURE))
+        controller_log.event('controller_error', error_type=type(exc).__name__, error_message=str(exc))
     finally:
         for child in children:
             if child.poll() is None:
@@ -602,30 +705,59 @@ def run_controller(args: argparse.Namespace) -> dict:
                 })
                 if child.pid not in terminated:
                     terminated.append(child.pid)
-                    failures.append(
+                    failures.tool(
                         f'benchmark child {child.pid} was still running during cleanup and was terminated'
                     )
                 if drain_note:
-                    failures.append(f'benchmark child {child.pid} post-kill drain failed: {drain_note}')
+                    failures.tool(f'benchmark child {child.pid} post-kill drain failed: {drain_note}')
+            elif not any(record['pid'] == child.pid for record in child_processes):
+                # A worker can fail before readiness. Retain its original
+                # failure report instead of losing it behind a barrier error.
+                try:
+                    stdout, stderr = child.communicate(timeout=POST_KILL_DRAIN_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    note = drain_killed_child(child)
+                    stdout, stderr = '', note or 'worker pipes stayed open after exit'
+                    failures.tool(f'worker {child.pid} failure-report drain timed out: {stderr}')
+                (args.output_dir / f'child-{child.pid}.stdout.json').write_text(stdout, encoding='utf-8')
+                (args.output_dir / f'child-{child.pid}.stderr.log').write_text(stderr, encoding='utf-8')
+                child_processes.append({'pid': child.pid, 'exit_code': child.returncode, 'forced_termination': False})
+                try:
+                    failed_worker = json.loads(stdout)
+                    if isinstance(failed_worker, dict):
+                        results.append(failed_worker)
+                except json.JSONDecodeError:
+                    failures.tool(f'worker {child.pid} exited without a JSON failure record')
         if server_cc is not None:
             try:
-                server_cc.shutdown()
-                cleanup['server_shutdown'] = 'ok'
+                shutdown = server_cc.shutdown(timeout=args.child_timeout)
+                cleanup['server_shutdown'] = shutdown
+                if not shutdown['completed']:
+                    failures.append('controller shutdown did not complete')
             except Exception as exc:
                 cleanup['server_shutdown'] = f'{type(exc).__name__}: {exc}'
                 failures.append('controller server shutdown failed after the run')
             if stats_enabled:
-                server_memory_stats['after_cleanup'] = snapshot_memory_stats(server_cc)
+                server_memory_stats['after_cleanup'] = snapshot_memory_stats()
+                require_no_charges(server_memory_stats['after_cleanup'], 'server after_cleanup', failures)
                 if args.require_memory_stats:
                     require_snapshot(
                         server_memory_stats['after_cleanup'], 'after_cleanup (server, after shutdown)', failures,
                         allow_unavailable_after_shutdown=args.allow_unavailable_stats_after_shutdown,
                     )
+            server_stats['os_stats']['after_cleanup'] = process_snapshot()
+        controller_log.event('closed', cleanup=cleanup)
+        controller_log.close()
 
     native_hashes: set[str] = set()
+    from ipc_paired import check_worker
     for worker in results:
+        try:
+            check_worker(worker, args.output_dir, False, source_commit(), args.calls, vars_for_config(args), failures)
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            failures.append(f"worker {worker.get('pid')} raw evidence: {exc}", getattr(exc, 'category', TOOL_FAILURE))
         if not worker.get('native_path') or not worker.get('native_sha256'):
-            failures.append(
+            failures.tool(
                 f"benchmark child {worker.get('pid')} reported no native path/hash; "
                 'provenance must be present instead of an empty-set hash agreement'
             )
@@ -633,22 +765,22 @@ def run_controller(args: argparse.Namespace) -> dict:
         native_hashes.add(worker['native_sha256'])
     if server_stats is not None:
         if not server_stats.get('native_path') or not server_stats.get('native_sha256'):
-            failures.append('controller server reported no native path/hash; provenance failure')
+            failures.tool('controller server reported no native path/hash; provenance failure')
         else:
             native_hashes.add(server_stats['native_sha256'])
     if len(native_hashes) > 1:
-        failures.append(f'processes disagree on the imported native hash: {sorted(native_hashes)}')
+        failures.tool(f'processes disagree on the imported native hash: {sorted(native_hashes)}')
     for record in child_processes:
         if record['exit_code'] is None:
-            failures.append(f"benchmark child {record['pid']} was never reaped (exit code is None)")
+            failures.tool(f"benchmark child {record['pid']} was never reaped (exit code is None)")
     recorded_pids = {record['pid'] for record in child_processes}
     if len(recorded_pids) != args.workers or len(child_processes) != args.workers:
-        failures.append(
+        failures.tool(
             f'worker bookkeeping mismatch: --workers {args.workers}, spawned {len(children)}, '
             f'child records {len(child_processes)} ({len(recorded_pids)} distinct pids)'
         )
     report = {
-        'schema': 'c-two.ipc-memory-benchmark.v1',
+        'schema': 'c-two.ipc-memory-benchmark.v2',
         'note': (
             'RSS is per-process peak, not summed shared backing or allocator usage; '
             'backing budget overrides are capacity configuration, not RSS measurements; '
@@ -658,6 +790,10 @@ def run_controller(args: argparse.Namespace) -> dict:
         'python': args.python,
         'worker_command': command,
         'topology': args.topology,
+        'source_commit': source_commit(), 'config': vars_for_config(args),
+        'output_dir': str(args.output_dir), 'endpoint_root': endpoint_root,
+        'barrier': barrier, 'events_path': str(controller_log.events_path),
+        'internal_probes': INTERNAL_PROBES,
         'expected_workers': args.workers,
         'spawned_child_count': len(children),
         'stats_contract': {
@@ -780,6 +916,8 @@ def row_namespace(spec: dict) -> argparse.Namespace:
         address=None,
         worker=False,
         output=None,
+        output_dir=Path(spec['output_dir']) if spec.get('output_dir') else None,
+        warmup=spec.get('warmup', 3), call_timeout=spec.get('call_timeout', 30.0),
     )
 
 
@@ -797,11 +935,12 @@ def run_row(spec: dict) -> dict:
 def build_row_spec(table_row: dict, args: argparse.Namespace) -> dict:
     spec = dict(table_row)
     spec.update(
-        memory_stats=args.memory_stats,
-        require_memory_stats=args.require_memory_stats,
+        memory_stats=args.memory_stats or table_row['workload'] == 'forced_budget',
+        require_memory_stats=args.require_memory_stats or table_row['workload'] == 'forced_budget',
         allow_unavailable_stats_after_shutdown=args.allow_unavailable_stats_after_shutdown,
         child_timeout=args.child_timeout,
         python=args.python,
+        warmup=getattr(args, 'warmup', 3), call_timeout=getattr(args, 'call_timeout', 30.0),
     )
     return spec
 
@@ -877,6 +1016,9 @@ def validate_row_spec(parser: argparse.ArgumentParser, spec: object) -> None:
         spec['shm_threshold'], spec['payload_bytes'], '--row-spec',
     )
     validate_timeout(parser, spec.get('child_timeout', 120.0), '--row-spec child_timeout', MAX_CHILD_TIMEOUT_S)
+    validate_timeout(parser, spec.get('call_timeout', 30.0), '--row-spec call_timeout', MAX_CHILD_TIMEOUT_S)
+    if not isinstance(spec.get('warmup', 3), int) or isinstance(spec.get('warmup'), bool) or spec.get('warmup', 3) < 0:
+        parser.error('--row-spec warmup must be a non-negative integer')
     validate_python_path(parser, spec['python'])
 
 
@@ -898,6 +1040,10 @@ def terminate_owned_session(proc: subprocess.Popen, drain_timeout: float = POST_
     if proc.poll() is None:
         proc.kill()
     return drain_killed_child(proc, drain_timeout)
+
+
+def row_job():
+    return platform_process_support()._WindowsJob() if os.name == 'nt' else None
 
 
 def run_matrix(args: argparse.Namespace) -> int:
@@ -923,7 +1069,7 @@ def run_matrix(args: argparse.Namespace) -> int:
             'no throughput improvement claims. Forced-budget rows encode post-wiring '
             'expectations and are recorded honestly on candidates without Runtime budget '
             'wiring; their checks are never weakened. RSS stays separate from backing '
-            'capacities; cc.memory_stats snapshots are recorded as unavailable when absent.'
+            'capacities; c_two.observe.memory_stats snapshot errors are recorded.'
         ),
         'generated_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(started_wall)),
         'source_commit': source_commit(),
@@ -940,7 +1086,7 @@ def run_matrix(args: argparse.Namespace) -> int:
         # is never mistaken for the full matrix.
         'complete': False,
         'rows': [],
-        'failures': [],
+        'failures': Failures(),
     }
     all_ok = True
     native_hashes: dict[str, str | None] = {}
@@ -949,17 +1095,22 @@ def run_matrix(args: argparse.Namespace) -> int:
     skipped = [row['name'] for row in all_rows if row['name'] not in {r['name'] for r in selected}]
     for table_row in selected:
         spec = build_row_spec(table_row, args)
+        spec['output_dir'] = str((output_dir / 'raw' / spec['name']).resolve())
         row_file = rows_dir / f"{spec['name']}.json"
         row_started = time.perf_counter_ns()
         terminated = False
         drain_failure = None
         row_record = None
+        job = row_job()
         proc = subprocess.Popen(
             [args.python, str(Path(__file__).resolve()), '--python', args.python,
              '--row-spec', json.dumps(spec)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=job is None, creationflags=4 if job else 0,
         )
         try:
+            if job is not None:
+                job.assign_and_resume(proc)
             stdout, stderr = proc.communicate(timeout=args.row_timeout)
         except subprocess.TimeoutExpired:
             terminated = True
@@ -974,18 +1125,34 @@ def run_matrix(args: argparse.Namespace) -> int:
                     row_record = json.loads(stdout)
                 except json.JSONDecodeError:
                     row_record = None
+        finally:
+            if job is not None:
+                try:
+                    if job.alive():
+                        job.stop()
+                        terminated = True
+                        drain_failure = 'Windows row Job still had live descendants after controller completion'
+                        deadline = time.perf_counter() + POST_KILL_DRAIN_TIMEOUT_S
+                        while job.alive() and time.perf_counter() < deadline:
+                            time.sleep(0.02)
+                        if job.alive():
+                            raise OSError('Windows row Job did not become empty after termination')
+                finally:
+                    job.close()
         elapsed_ns = time.perf_counter_ns() - row_started
+        (rows_dir / f"{spec['name']}.stdout.json").write_text(stdout or '', encoding='utf-8')
+        (rows_dir / f"{spec['name']}.stderr.log").write_text(stderr or '', encoding='utf-8')
         if terminated:
             row_record = {
                 'schema': 'c-two.ipc-memory-row.v1',
                 'row': {'name': spec['name'], 'workload': spec['workload'], 'config': spec['config']},
                 'spec': spec,
                 'ok': False,
-                'failures': [
+                'failures': [failure_message(
                     f'row controller exceeded the {args.row_timeout}s join timeout; the row session '
                     'it led was terminated by the matrix. Forced termination is reported as a failure, '
-                    'not clean shutdown.'
-                ] + ([f'pipe drain: {drain_failure}'] if drain_failure else []),
+                    'not clean shutdown.', TOOL_FAILURE)
+                ] + ([failure_message(f'pipe drain: {drain_failure}', TOOL_FAILURE)] if drain_failure else []),
             }
         elif not isinstance(row_record, dict):
             row_record = {
@@ -993,14 +1160,16 @@ def run_matrix(args: argparse.Namespace) -> int:
                 'row': {'name': spec['name'], 'workload': spec['workload'], 'config': spec['config']},
                 'spec': spec,
                 'ok': False,
-                'failures': [f'row controller exited with code {proc.returncode} without JSON output'],
+                'failures': [failure_message(f'row controller exited with code {proc.returncode} without JSON output; '
+                             f'stderr={(stderr or "").strip()[-2000:]}', TOOL_FAILURE)],
                 'stderr_tail': (stderr or '').strip()[-2000:],
             }
-        row_failures = row_record.get('failures', [])
+        row_failures = row_record.get('failures', row_record.get('benchmark', {}).get('failures', []))
         if not isinstance(row_failures, list):
-            row_failures = ['row controller emitted an invalid failures field']
-        if proc.returncode != 0 and not terminated:
-            row_failures.append(f'row controller exited with nonzero status {proc.returncode}')
+            row_failures = [failure_message('row controller emitted an invalid failures field', TOOL_FAILURE)]
+        if proc.returncode != 0 and not terminated and not row_failures:
+            row_failures.append(failure_message(f'row controller exited with nonzero status {proc.returncode} '
+                                               'without classified failures', TOOL_FAILURE))
         row_record['failures'] = row_failures
         row_record['ok'] = row_record.get('ok') is True and proc.returncode == 0 and not terminated and not row_failures
         row_record['terminated_by_matrix'] = terminated
@@ -1044,12 +1213,12 @@ def run_matrix(args: argparse.Namespace) -> int:
             all_ok = False
 
     if missing_provenance_rows:
-        matrix['failures'].append(
+        matrix['failures'].tool(
             f'rows with missing process native path/hash: {sorted(missing_provenance_rows)}; '
             'missing provenance is a failure, not an empty-set agreement'
         )
     if inconsistent_provenance_rows:
-        matrix['failures'].append(
+        matrix['failures'].tool(
             f'rows whose processes disagree on the native hash: {sorted(inconsistent_provenance_rows)}'
         )
     distinct = sorted({value for value in native_hashes.values() if value and not value.startswith('inconsistent:')})
@@ -1092,12 +1261,14 @@ def list_rows() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--mode', choices=['single', 'matrix'], default='single')
+    parser.add_argument('--mode', choices=['single', 'matrix', 'anomaly'], default='single')
     parser.add_argument('--pool-enabled', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--segment-size', type=int, default=2 * 1024 * 1024)
     parser.add_argument('--payload-bytes', type=int, default=1)
     parser.add_argument('--shm-threshold', type=int, default=4096)
     parser.add_argument('--calls', type=int, default=200)
+    parser.add_argument('--warmup', type=int, default=3, help='Recorded warmup calls before the common start barrier')
+    parser.add_argument('--call-timeout', type=float, default=30.0, help='Public per-call deadline; expired attempts stay in raw samples')
     parser.add_argument('--workers', type=int, default=1)
     parser.add_argument('--topology', choices=['shared', 'pairs'], default='shared')
     parser.add_argument('--ipc-overrides', type=json.loads, default={}, help='Additional native IPC overrides as a JSON object')
@@ -1108,12 +1279,12 @@ def main() -> None:
     )
     parser.add_argument(
         '--memory-stats', action='store_true',
-        help='Capture optional cc.memory_stats snapshots before/after calls and shutdown; '
-             'recorded as unavailable when the public API is absent',
+        help='Capture optional c_two.observe.memory_stats snapshots before/after calls and shutdown; '
+             'record snapshot errors without fabricating counters',
     )
     parser.add_argument(
         '--require-memory-stats', action='store_true',
-        help='Fail when any advertised cc.memory_stats snapshot point, including after cleanup, '
+        help='Fail when any advertised c_two.observe.memory_stats snapshot point, including after cleanup, '
              'is unavailable instead of fabricating zeros',
     )
     parser.add_argument(
@@ -1131,12 +1302,23 @@ def main() -> None:
     )
     parser.add_argument('--python', default=sys.executable, help='Interpreter used for spawned benchmark processes')
     parser.add_argument('--output', type=Path)
-    parser.add_argument('--output-dir', type=Path, help='Artifact directory for --mode matrix')
+    parser.add_argument('--output-dir', type=Path, help='Raw artifact directory; required for matrix and anomaly modes')
     parser.add_argument('--only', help='Comma-separated substrings; run matrix rows whose name contains any')
     parser.add_argument('--list-rows', action='store_true', help='Print the matrix row table and exit')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--address', help=argparse.SUPPRESS)
     parser.add_argument('--row-spec', help=argparse.SUPPRESS)
+    parser.add_argument('--worker-index', type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument('--coord-dir', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--scenario', choices=[
+        'hold', 'slow', 'stopped', 'fallback_dedicated', 'fallback_inline',
+        'fallback_file', 'exhausted', 'release_idle', 'release_busy',
+        'release_blocked', 'release_batch',
+    ], default='hold')
+    parser.add_argument('--control', choices=['alone', 'parallel'], default='parallel')
+    parser.add_argument('--pause-seconds', type=float, default=0.25)
+    parser.add_argument('--abnormal-calls', type=int, default=80)
+    parser.add_argument('--anomaly-worker-spec', help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.list_rows:
@@ -1153,6 +1335,10 @@ def main() -> None:
     )
     validate_timeout(parser, args.child_timeout, '--child-timeout', MAX_CHILD_TIMEOUT_S)
     validate_timeout(parser, args.row_timeout, '--row-timeout', MAX_ROW_TIMEOUT_S)
+    validate_timeout(parser, args.call_timeout, '--call-timeout', MAX_CHILD_TIMEOUT_S)
+    validate_timeout(parser, args.pause_seconds, '--pause-seconds', MAX_CHILD_TIMEOUT_S)
+    if args.warmup < 0 or args.abnormal_calls < 1:
+        parser.error('--warmup must be non-negative and --abnormal-calls positive')
     validate_python_path(parser, args.python)
 
     if args.row_spec:
@@ -1165,10 +1351,24 @@ def main() -> None:
         print(json.dumps(row, indent=2))
         sys.exit(0 if row['ok'] else 1)
 
+    if args.anomaly_worker_spec:
+        from ipc_anomaly import anomaly_worker
+        report = anomaly_worker(json.loads(args.anomaly_worker_spec))
+        print(json.dumps(report))
+        sys.exit(0 if report['ok'] else 1)
+
     if args.worker:
         worker = run_worker(args)
         print(json.dumps(worker, indent=2))
         sys.exit(0 if worker['ok'] else 1)
+
+    if args.mode == 'anomaly':
+        if args.output_dir is None:
+            parser.error('--mode anomaly requires --output-dir')
+        from ipc_anomaly import run_anomaly
+        report = run_anomaly(args)
+        print(json.dumps(report, indent=2))
+        sys.exit(0 if report['ok'] else 1)
 
     if args.mode == 'matrix':
         if args.output_dir is None:

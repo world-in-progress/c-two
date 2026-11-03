@@ -9,9 +9,8 @@ fn peer_free(owner: &MemPool, peer: &mut MemPool, handle: &mut MemHandle, raw: P
         raw.seg_idx,
         raw.generation,
         raw.offset,
-        raw.actual_size,
+        raw.level,
         raw.is_dedicated,
-        raw.allocation_id,
     )
     .unwrap();
     std::hint::black_box(writer);

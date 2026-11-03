@@ -725,12 +725,27 @@ fn context_scope_derives_every_target_from_the_captured_context() {
             .is_empty()
     );
     assert!(EndpointSweepScope::from_addresses(&endpoint, &["ipc://../outside".into()]).is_err());
-    assert!(
-        EndpointSweepScope::from_addresses(
-            &endpoint,
-            &vec![addresses[0].clone(); EndpointSweepScope::MAX_ADDRESSES + 1]
-        )
-        .is_err()
+}
+
+#[cfg(unix)]
+#[test]
+fn context_scope_accepts_more_than_4096_addresses() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let context = LocalEndpointContext::with_unix_root(root.path()).unwrap();
+    let endpoint = context.endpoint("ipc://scope-anchor").unwrap();
+    let addresses: Vec<_> = (0..4097)
+        .map(|index| format!("ipc://scope-{index}"))
+        .collect();
+
+    let scope = EndpointSweepScope::from_addresses(&endpoint, &addresses)
+        .expect("scope size is determined by its caller");
+    assert_eq!(scope.targets.len(), addresses.len());
+    assert_eq!(
+        scope.targets.last().unwrap().address(),
+        addresses.last().unwrap()
     );
 }
 

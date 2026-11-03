@@ -13,37 +13,26 @@ use std::time::Duration;
 
 pub const MAX_EXECUTION_WORKERS: u32 = 64;
 
+/// Maximum number of loan IDs carried by one IPC release frame.
+pub const IPC_RELEASE_BATCH_CAPACITY: usize = 64;
+
+// total_len excludes its own u32: request_id + flags + type + count + loan IDs.
+const MIN_IPC_FRAME_SIZE: u64 = 8 + 4 + 1 + 1 + 8 * IPC_RELEASE_BATCH_CAPACITY as u64;
+
 /// Canonical upper bound on configured buddy pool segments
 /// (`max_pool_segments` / `reassembly_max_segments`). This is the actual
 /// supported IPC segment-index space, not an arbitrary limit: both peers size
 /// their receive-side peer caches to this bound so every segment index a
 /// legitimately configured peer can reference is accepted, while indices
-/// beyond it stay rejected (`MemPool::ensure_peer_segment` bounds checks
-/// against the peer-cache `max_segments`).
+/// beyond it stay rejected (`PeerMappingCache::admit` refuses an index at or
+/// above the peer cache's `max_segments`).
 pub const MAX_IPC_POOL_SEGMENTS: u32 = 255;
-
-/// Code-level IPC override fields shared by both server and client roles.
-pub const BASE_IPC_OVERRIDE_KEYS: &[&str] = &[
-    "pool_enabled",
-    "pool_segment_size",
-    "max_pool_segments",
-    "pool_prewarm_segments",
-    "pool_min_retained_segments",
-    "reassembly_segment_size",
-    "reassembly_max_segments",
-    "max_total_chunks",
-    "chunk_gc_interval",
-    "chunk_threshold_ratio",
-    "chunk_assembler_timeout",
-    "max_reassembly_bytes",
-    "chunk_size",
-    "shm_backing_budget_bytes",
-    "file_backing_budget_bytes",
-    "live_reassembly_budget_bytes",
-];
 
 /// Code-level IPC override fields accepted for server config resolution.
 pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
+    "write_timeout",
+    "max_dedicated_segments",
+    "spill_threshold",
     "pool_enabled",
     "pool_segment_size",
     "max_pool_segments",
@@ -65,12 +54,13 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
     "max_pending_requests",
     "max_execution_workers",
     "pool_decay_seconds",
-    "heartbeat_interval",
-    "heartbeat_timeout",
 ];
 
 /// Code-level IPC override fields accepted for client config resolution.
 pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
+    "write_timeout",
+    "max_dedicated_segments",
+    "spill_threshold",
     "pool_enabled",
     "pool_segment_size",
     "max_pool_segments",
@@ -90,9 +80,6 @@ pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
     "pool_decay_seconds",
 ];
 
-/// Global transport policy fields that are not valid role-level IPC overrides.
-pub const FORBIDDEN_IPC_OVERRIDE_KEYS: &[&str] = &["shm_threshold"];
-
 // ─── Base ────────────────────────────────────────────────────────────────────
 
 /// Fields shared by both server and client IPC configs.
@@ -104,6 +91,8 @@ pub const FORBIDDEN_IPC_OVERRIDE_KEYS: &[&str] = &["shm_threshold"];
 /// than mutating a shared value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BaseIpcConfig {
+    /// Total budget for one local write, including flush, in seconds.
+    pub write_timeout_secs: f64,
     // ── Pool SHM settings ────────────────────────────────────────────────
     /// Buddy-pool policy switch. Disabling it skips only the buddy tiers
     /// (reuse and expansion); dedicated SHM, chunked transfer, inline frames,
@@ -111,6 +100,8 @@ pub struct BaseIpcConfig {
     pub pool_enabled: bool,
     pub pool_segment_size: u64,
     pub max_pool_segments: u32,
+    pub max_dedicated_segments: u32,
+    pub spill_threshold: f64,
     /// Buddy segments to map eagerly at connect/register (default 0 = fully
     /// lazy). Prewarming is an explicit transport action: without it, no buddy
     /// memory is mapped until the first allocation that needs it.
@@ -151,8 +142,6 @@ pub struct ServerIpcConfig {
     pub max_pending_requests: u32,
     pub max_execution_workers: u32,
     pub pool_decay_seconds: f64,
-    pub heartbeat_interval_secs: f64,
-    pub heartbeat_timeout_secs: f64,
 }
 
 // ─── Client ──────────────────────────────────────────────────────────────────
@@ -182,9 +171,12 @@ impl Default for BaseIpcConfig {
     fn default() -> Self {
         let budget_limits = crate::MemoryBudgetLimits::default();
         Self {
+            write_timeout_secs: 30.0,
             pool_enabled: true,
             pool_segment_size: 268_435_456, // 256 MB
             max_pool_segments: 4,
+            max_dedicated_segments: 4,
+            spill_threshold: 0.8,
             pool_prewarm_segments: 0,
             pool_min_retained_segments: 0,
 
@@ -216,8 +208,6 @@ impl Default for ServerIpcConfig {
             max_pending_requests: 1024,
             max_execution_workers: default_max_execution_workers(),
             pool_decay_seconds: 60.0,
-            heartbeat_interval_secs: 15.0,
-            heartbeat_timeout_secs: 30.0,
         }
     }
 }
@@ -225,10 +215,7 @@ impl Default for ServerIpcConfig {
 impl Default for ClientIpcConfig {
     fn default() -> Self {
         Self {
-            base: BaseIpcConfig {
-                reassembly_segment_size: 64 * 1024 * 1024, // 64 MB override
-                ..BaseIpcConfig::default()
-            },
+            base: BaseIpcConfig::default(),
             shm_threshold: 4_096,
             pool_decay_seconds: 60.0,
         }
@@ -263,10 +250,6 @@ impl Deref for ClientIpcConfig {
 pub struct PoolRoleTuning {
     /// Idle window before a fully idle buddy segment may be retired.
     pub buddy_idle_decay_secs: f64,
-    /// Crash-recovery timeout for dedicated segments.
-    pub dedicated_crash_timeout_secs: f64,
-    /// Maximum simultaneously active dedicated segments.
-    pub max_dedicated_segments: usize,
     /// File-spill directory for allocations that cannot stay in SHM.
     pub spill_dir: std::path::PathBuf,
 }
@@ -275,14 +258,17 @@ impl Default for PoolRoleTuning {
     fn default() -> Self {
         Self {
             buddy_idle_decay_secs: 60.0,
-            dedicated_crash_timeout_secs: 60.0,
-            max_dedicated_segments: 4,
             spill_dir: crate::default_spill_dir(),
         }
     }
 }
 
 impl BaseIpcConfig {
+    /// Local-write duration after boundary validation by the resolver.
+    pub fn write_timeout(&self) -> Duration {
+        Duration::from_secs_f64(self.write_timeout_secs)
+    }
+
     /// Project this config's buddy policy onto an owner pool config for the
     /// primary request/response pool role (`pool_segment_size` /
     /// `max_pool_segments`). Disabling `pool_enabled` disables only the buddy
@@ -292,10 +278,9 @@ impl BaseIpcConfig {
             segment_size: self.pool_segment_size as usize,
             min_block_size: 4096,
             max_segments: self.max_pool_segments as usize,
-            max_dedicated_segments: tuning.max_dedicated_segments,
-            dedicated_crash_timeout_secs: tuning.dedicated_crash_timeout_secs,
+            max_dedicated_segments: self.max_dedicated_segments as usize,
             buddy_idle_decay_secs: tuning.buddy_idle_decay_secs,
-            spill_threshold: 0.8,
+            spill_threshold: self.spill_threshold,
             spill_dir: tuning.spill_dir.clone(),
             buddy_enabled: self.pool_enabled,
             min_retained_segments: self.pool_min_retained_segments as usize,
@@ -312,10 +297,9 @@ impl BaseIpcConfig {
             segment_size: self.reassembly_segment_size as usize,
             min_block_size: 4096,
             max_segments: self.reassembly_max_segments as usize,
-            max_dedicated_segments: tuning.max_dedicated_segments,
-            dedicated_crash_timeout_secs: tuning.dedicated_crash_timeout_secs,
+            max_dedicated_segments: self.max_dedicated_segments as usize,
             buddy_idle_decay_secs: tuning.buddy_idle_decay_secs,
-            spill_threshold: 0.8,
+            spill_threshold: self.spill_threshold,
             spill_dir: tuning.spill_dir.clone(),
             buddy_enabled: self.pool_enabled,
             min_retained_segments: self.pool_min_retained_segments as usize,
@@ -328,8 +312,6 @@ impl ServerIpcConfig {
     pub fn response_pool_tuning(&self) -> PoolRoleTuning {
         PoolRoleTuning {
             buddy_idle_decay_secs: self.pool_decay_seconds,
-            dedicated_crash_timeout_secs: 5.0,
-            max_dedicated_segments: 4,
             spill_dir: std::path::PathBuf::from("/tmp/c_two_response_spill"),
         }
     }
@@ -338,8 +320,6 @@ impl ServerIpcConfig {
     pub fn reassembly_pool_tuning(&self) -> PoolRoleTuning {
         PoolRoleTuning {
             buddy_idle_decay_secs: self.pool_decay_seconds,
-            dedicated_crash_timeout_secs: 5.0,
-            max_dedicated_segments: 4,
             spill_dir: std::path::PathBuf::from("/tmp/c_two_reassembly"),
         }
     }
@@ -363,12 +343,26 @@ impl BaseIpcConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if !self.write_timeout_secs.is_finite() || self.write_timeout_secs <= 0.0 {
+            return Err("write_timeout_secs must be finite and > 0".into());
+        }
+        validate_duration_secs("write_timeout_secs", self.write_timeout_secs)?;
+        if !self.spill_threshold.is_finite() || !(0.0..=1.0).contains(&self.spill_threshold) {
+            return Err("spill_threshold must be finite and in [0, 1]".into());
+        }
+        if self.max_dedicated_segments > u32::from(u16::MAX) + 1 {
+            return Err("max_dedicated_segments exceeds the wire segment-index range".into());
+        }
         if self.pool_segment_size == 0 {
             return Err("pool_segment_size must be > 0".into());
         }
-        if self.pool_segment_size > u32::MAX as u64 {
+        if self
+            .pool_segment_size
+            .checked_next_power_of_two()
+            .is_none_or(|size| size > u32::MAX as u64)
+        {
             return Err(format!(
-                "pool_segment_size ({}) must be <= u32::MAX ({}) for wire format compatibility",
+                "pool_segment_size ({}) must round to at most u32::MAX ({}) for wire format compatibility",
                 self.pool_segment_size,
                 u32::MAX,
             ));
@@ -470,9 +464,9 @@ impl BaseIpcConfig {
 impl ServerIpcConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.base.validate()?;
-        if self.max_frame_size <= 16 {
+        if self.max_frame_size < MIN_IPC_FRAME_SIZE {
             return Err(format!(
-                "max_frame_size ({}) must be > 16 (header size)",
+                "max_frame_size ({}) must be >= {MIN_IPC_FRAME_SIZE} (full release frame)",
                 self.max_frame_size,
             ));
         }
@@ -481,12 +475,6 @@ impl ServerIpcConfig {
         }
         if self.max_execution_workers == 0 {
             return Err("max_execution_workers must be > 0".into());
-        }
-        if self.max_execution_workers > MAX_EXECUTION_WORKERS {
-            return Err(format!(
-                "max_execution_workers ({}) must be <= {}",
-                self.max_execution_workers, MAX_EXECUTION_WORKERS
-            ));
         }
         // Pool segment capacity and the per-message `max_payload_size` limit
         // are independent dimensions (0.7.1 design section 3): one segment
@@ -506,34 +494,6 @@ impl ServerIpcConfig {
             ));
         }
         validate_duration_secs("pool_decay_seconds", self.pool_decay_seconds)?;
-        if !self.heartbeat_interval_secs.is_finite() {
-            return Err(format!(
-                "heartbeat_interval_secs ({}) must be finite",
-                self.heartbeat_interval_secs,
-            ));
-        }
-        if self.heartbeat_interval_secs < 0.0 {
-            return Err(format!(
-                "heartbeat_interval_secs ({}) must be >= 0",
-                self.heartbeat_interval_secs,
-            ));
-        }
-        validate_duration_secs("heartbeat_interval_secs", self.heartbeat_interval_secs)?;
-        if !self.heartbeat_timeout_secs.is_finite() {
-            return Err(format!(
-                "heartbeat_timeout_secs ({}) must be finite",
-                self.heartbeat_timeout_secs,
-            ));
-        }
-        validate_duration_secs("heartbeat_timeout_secs", self.heartbeat_timeout_secs)?;
-        if self.heartbeat_interval_secs > 0.0
-            && self.heartbeat_timeout_secs <= self.heartbeat_interval_secs
-        {
-            return Err(format!(
-                "heartbeat_timeout_secs ({}) must exceed heartbeat_interval_secs ({})",
-                self.heartbeat_timeout_secs, self.heartbeat_interval_secs,
-            ));
-        }
         Ok(())
     }
 }
@@ -584,35 +544,6 @@ mod tests {
     // ── Default validation ───────────────────────────────────────────────
 
     #[test]
-    fn override_key_catalogs_exclude_derived_and_global_fields() {
-        // The client catalog is the shared base keys plus exactly one
-        // role-specific key: the client-side idle decay window.
-        assert_eq!(
-            CLIENT_IPC_OVERRIDE_KEYS.len(),
-            BASE_IPC_OVERRIDE_KEYS.len() + 1
-        );
-        for key in BASE_IPC_OVERRIDE_KEYS {
-            assert!(CLIENT_IPC_OVERRIDE_KEYS.contains(key));
-        }
-        assert!(CLIENT_IPC_OVERRIDE_KEYS.contains(&"pool_decay_seconds"));
-        assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"max_frame_size"));
-        assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"max_execution_workers"));
-        assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"heartbeat_timeout"));
-        assert!(!CLIENT_IPC_OVERRIDE_KEYS.contains(&"max_frame_size"));
-        assert!(!CLIENT_IPC_OVERRIDE_KEYS.contains(&"heartbeat_interval"));
-
-        for keys in [
-            BASE_IPC_OVERRIDE_KEYS,
-            SERVER_IPC_OVERRIDE_KEYS,
-            CLIENT_IPC_OVERRIDE_KEYS,
-        ] {
-            assert!(!keys.contains(&"max_pool_memory"));
-            assert!(!keys.contains(&"shm_threshold"));
-        }
-        assert_eq!(FORBIDDEN_IPC_OVERRIDE_KEYS, &["shm_threshold"]);
-    }
-
-    #[test]
     fn server_default_validates() {
         assert!(ServerIpcConfig::default().validate().is_ok());
     }
@@ -636,6 +567,24 @@ mod tests {
                 .unwrap_err()
                 .contains("max_execution_workers")
         );
+    }
+
+    #[test]
+    fn explicit_execution_workers_above_default_cap_are_valid() {
+        let cfg = ServerIpcConfig {
+            max_execution_workers: MAX_EXECUTION_WORKERS + 1,
+            ..ServerIpcConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn buddy_segment_size_that_rounds_past_wire_limit_is_rejected() {
+        let cfg = BaseIpcConfig {
+            pool_segment_size: u32::MAX as u64,
+            ..BaseIpcConfig::default()
+        };
+        assert!(cfg.validate().unwrap_err().contains("pool_segment_size"));
     }
 
     #[test]
@@ -705,12 +654,23 @@ mod tests {
     // ── Server-only validations ──────────────────────────────────────────
 
     #[test]
-    fn reject_small_frame_size() {
+    fn reject_frame_smaller_than_full_release_batch() {
         let cfg = ServerIpcConfig {
-            max_frame_size: 16,
+            shm_threshold: 525,
+            max_frame_size: 525,
             ..ServerIpcConfig::default()
         };
         assert!(cfg.validate().unwrap_err().contains("max_frame_size"));
+    }
+
+    #[test]
+    fn accept_frame_equal_to_full_release_batch() {
+        let cfg = ServerIpcConfig {
+            shm_threshold: 526,
+            max_frame_size: 526,
+            ..ServerIpcConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -751,7 +711,7 @@ mod tests {
     fn reject_threshold_exceeds_frame() {
         let cfg = ServerIpcConfig {
             shm_threshold: 1000,
-            max_frame_size: 500,
+            max_frame_size: 600,
             ..ServerIpcConfig::default()
         };
         assert!(cfg.validate().unwrap_err().contains("shm_threshold"));
@@ -836,19 +796,6 @@ mod tests {
             ..BaseIpcConfig::default()
         };
         assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn budget_override_keys_are_role_visible() {
-        for key in [
-            "shm_backing_budget_bytes",
-            "file_backing_budget_bytes",
-            "live_reassembly_budget_bytes",
-        ] {
-            assert!(BASE_IPC_OVERRIDE_KEYS.contains(&key));
-            assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&key));
-            assert!(CLIENT_IPC_OVERRIDE_KEYS.contains(&key));
-        }
     }
 
     // ── Deref ────────────────────────────────────────────────────────────
@@ -984,11 +931,11 @@ mod tests {
         cfg.max_pool_segments = 3;
         cfg.pool_enabled = false;
         cfg.pool_min_retained_segments = 2;
+        cfg.max_dedicated_segments = 7;
+        cfg.spill_threshold = 0.6;
 
         let tuning = PoolRoleTuning {
             buddy_idle_decay_secs: 12.0,
-            dedicated_crash_timeout_secs: 5.0,
-            max_dedicated_segments: 7,
             spill_dir: std::path::PathBuf::from("/tmp/projection_test"),
         };
         let pool = cfg.primary_pool_config(&tuning);
@@ -998,8 +945,8 @@ mod tests {
         assert!(!pool.buddy_enabled);
         assert_eq!(pool.min_retained_segments, 2);
         assert_eq!(pool.buddy_idle_decay_secs, 12.0);
-        assert_eq!(pool.dedicated_crash_timeout_secs, 5.0);
         assert_eq!(pool.max_dedicated_segments, 7);
+        assert_eq!(pool.spill_threshold, 0.6);
         assert_eq!(
             pool.spill_dir,
             std::path::PathBuf::from("/tmp/projection_test")
@@ -1096,15 +1043,7 @@ mod tests {
         cfg.pool_decay_seconds = 2.5;
         let tuning = cfg.pool_tuning();
         assert_eq!(tuning.buddy_idle_decay_secs, 2.5);
-        // Role defaults for the non-decay fields stay intact.
-        assert_eq!(
-            tuning.dedicated_crash_timeout_secs,
-            PoolRoleTuning::default().dedicated_crash_timeout_secs
-        );
-        assert_eq!(
-            tuning.max_dedicated_segments,
-            PoolRoleTuning::default().max_dedicated_segments
-        );
+        assert_eq!(tuning.spill_dir, PoolRoleTuning::default().spill_dir);
     }
 
     // ── Complete resolved-config equality ────────────────────────────────
@@ -1122,6 +1061,18 @@ mod tests {
         assert_eq!(pristine, pristine.clone());
 
         let base_mutations = [
+            BaseIpcConfig {
+                write_timeout_secs: base.write_timeout_secs + 1.0,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                max_dedicated_segments: base.max_dedicated_segments + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                spill_threshold: base.spill_threshold - 0.1,
+                ..base.clone()
+            },
             BaseIpcConfig {
                 pool_enabled: !base.pool_enabled,
                 ..base.clone()

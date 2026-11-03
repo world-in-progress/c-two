@@ -8,14 +8,14 @@ mod descriptor;
 mod release;
 
 pub use admission::{
-    ContractLimitMetric, ContractLimits, ContractLimitsProfile, MAX_CONTRACT_METHODS,
-    descriptor_admission_count_for_current_thread,
+    ContractLimitMetric, MAX_CONTRACT_JSON_VALUES, MAX_CONTRACT_METHODS,
+    MAX_CONTRACT_NESTED_FASTDB_BYTES, MAX_CONTRACT_NESTING_DEPTH, MAX_CONTRACT_SOURCE_BYTES,
 };
 pub use descriptor::{
     BindingDirection, ContractFingerprints, MethodAccess, NestedFastDbSpec,
-    ValidatedContractDescriptor, ValidatedMethodDescriptor, contract_descriptor_sha256_hex,
-    contract_descriptor_sha256_hex_with_limits, derive_contract_fingerprints_json,
-    derive_contract_fingerprints_json_with_limits, validate_portable_contract_descriptor_json,
+    ValidatedContractDescriptor, ValidatedMethodDescriptor, canonical_json,
+    contract_descriptor_sha256_hex, derive_contract_fingerprints_json, lower_hex,
+    validate_portable_contract_descriptor_json,
 };
 pub use release::{
     CONTRACT_RELEASE_REF_SCHEMA, ContractDescriptorDigest, ContractRelease, ContractReleaseRef,
@@ -72,10 +72,9 @@ pub enum ContractError {
     #[error("contract descriptor must be valid JSON: {0}")]
     InvalidJson(String),
     #[error(
-        "contract admission limit exceeded for {metric:?} at {path}: profile={profile:?}, limit={limit}, observed={observed}"
+        "contract admission limit exceeded for {metric:?} at {path}: limit={limit}, observed={observed}"
     )]
     LimitExceeded {
-        profile: ContractLimitsProfile,
         metric: ContractLimitMetric,
         limit: u64,
         observed: u64,
@@ -101,10 +100,6 @@ pub enum ContractError {
         expected: String,
         actual: String,
     },
-}
-
-pub fn validate_named_route_name(field: &'static str, value: &str) -> Result<(), ContractError> {
-    validate_route_text_field(field, value)
 }
 
 pub fn validate_call_route_key(field: &'static str, value: &str) -> Result<(), ContractError> {
@@ -166,7 +161,7 @@ pub fn validate_contract_hash(field: &'static str, value: &str) -> Result<(), Co
 pub fn validate_expected_route_contract(
     expected: &ExpectedRouteContract,
 ) -> Result<(), ContractError> {
-    validate_named_route_name("route name", &expected.route_name)?;
+    validate_call_route_key("route name", &expected.route_name)?;
     validate_crm_tag(&expected.crm_ns, &expected.crm_name, &expected.crm_ver)?;
     validate_contract_hash("abi_hash", &expected.abi_hash)?;
     validate_contract_hash("signature_hash", &expected.signature_hash)?;
@@ -208,9 +203,8 @@ mod tests {
 
     #[test]
     fn route_name_allows_forward_slash_but_rejects_backslash() {
-        validate_named_route_name("route name", "toodle/grid/0").unwrap();
         validate_call_route_key("route name", "toodle/grid/0").unwrap();
-        assert!(validate_named_route_name("route name", "bad\\route").is_err());
+        assert!(validate_call_route_key("route name", "bad\\route").is_err());
     }
 
     #[test]

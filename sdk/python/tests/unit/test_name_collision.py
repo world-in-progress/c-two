@@ -15,7 +15,7 @@ from tests.fixtures import local_server
 
 import c_two as cc
 from c_two.config import settings
-from c_two.transport import ConcurrencyConfig, ConcurrencyMode
+from c_two.transport import ConcurrencyConfig
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from c_two.transport.server.native import CRMSlot, NativeServerBridge
 from c_two.transport.wire import MethodTable
@@ -92,8 +92,8 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def unregister_route(self, name, relay_anchor_address=None):  # noqa: ANN001
-                events.append(f'native_unregister:{name}:{relay_anchor_address}')
+            def unregister_route(self, name):  # noqa: ANN001
+                events.append(f'native_unregister:{name}')
                 return {
                     'route_name': name,
                     'local_removed': True,
@@ -139,7 +139,7 @@ class TestServerNameCollision:
         bridge.unregister_crm('grid')
 
         assert events == [
-            'native_unregister:grid:None',
+            'native_unregister:grid',
             'crm_shutdown',
         ]
         assert bridge.names == []
@@ -149,7 +149,7 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def unregister_route(self, name, relay_anchor_address=None):  # noqa: ANN001
+            def unregister_route(self, name):  # noqa: ANN001
                 events.append('native_unregister_missing')
                 return {
                     'route_name': name,
@@ -206,15 +206,10 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(  # noqa: ANN001, ARG002
                 self,
-                route_names=None,
-                relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                assert route_names is None
                 closed = ['grid']  # The native journal owns the registered route list.
-                events.append(
-                    f'native_shutdown:{route_names}:{relay_anchor_address}'
-                )
+                events.append('native_shutdown')
                 return {
                     'completed': True,
                     'removed_routes': list(closed),
@@ -231,7 +226,6 @@ class TestServerNameCollision:
                     'relay_errors': [],
                     'server_was_started': True,
                     'ipc_clients_drained': True,
-                    'http_clients_drained': False,
                     'route_close_error': None,
                     'runtime_barrier_error': None,
                 }
@@ -276,7 +270,7 @@ class TestServerNameCollision:
         bridge.shutdown()
 
         assert events == [
-            'native_shutdown:None:None',
+            'native_shutdown',
             'crm_shutdown',
         ]
         assert bridge.names == []
@@ -287,14 +281,11 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(
                 self,
-                route_names=None,
-                relay_anchor_address=None,
                 timeout_seconds=None,
             ):  # noqa: ANN001
-                assert route_names is None
                 closed = ['grid']  # The native journal owns the registered route list.
                 events.append(
-                    f'native_shutdown:{route_names}:{relay_anchor_address}:{timeout_seconds}'
+                    f'native_shutdown:{timeout_seconds}'
                 )
                 return {
                     'completed': True,
@@ -312,7 +303,6 @@ class TestServerNameCollision:
                     'relay_errors': [],
                     'server_was_started': True,
                     'ipc_clients_drained': True,
-                    'http_clients_drained': False,
                     'route_close_error': None,
                     'runtime_barrier_error': None,
                 }
@@ -354,7 +344,7 @@ class TestServerNameCollision:
         bridge.shutdown(timeout=1.25)
 
         assert events == [
-            'native_shutdown:None:None:1.25',
+            'native_shutdown:1.25',
             'crm_shutdown',
         ]
 
@@ -365,11 +355,9 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(  # noqa: ANN001, ARG002
                 self,
-                route_names=None,
-                relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                events.append(f'native_shutdown:{route_names}')
+                events.append('native_shutdown')
                 return {
                     'completed': True,
                     'removed_routes': [],
@@ -377,7 +365,6 @@ class TestServerNameCollision:
                     'relay_errors': [],
                     'server_was_started': True,
                     'ipc_clients_drained': True,
-                    'http_clients_drained': False,
                     'route_close_error': None,
                     'runtime_barrier_error': None,
                 }
@@ -421,7 +408,7 @@ class TestServerNameCollision:
         bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
         bridge.shutdown()
 
-        assert events == ['native_shutdown:None']
+        assert events == ['native_shutdown']
         assert bridge.names == ['grid']
 
     def test_shutdown_drains_native_runtime_even_when_lifecycle_stopped(self):
@@ -431,11 +418,9 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(  # noqa: ANN001, ARG002
                 self,
-                route_names=None,
-                relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                events.append(f'native_shutdown:{route_names}')
+                events.append('native_shutdown')
                 return {
                     'completed': True,
                     'removed_routes': [],
@@ -443,7 +428,6 @@ class TestServerNameCollision:
                     'relay_errors': [],
                     'server_was_started': False,
                     'ipc_clients_drained': True,
-                    'http_clients_drained': False,
                     'route_close_error': None,
                     'runtime_barrier_error': None,
                 }
@@ -462,7 +446,7 @@ class TestServerNameCollision:
         bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
         bridge.shutdown()
 
-        assert events == ['native_shutdown:None']
+        assert events == ['native_shutdown']
 
     def test_shutdown_keeps_slot_and_skips_hook_when_native_route_not_drained(self):
         events: list[str] = []
@@ -470,11 +454,9 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(  # noqa: ANN001, ARG002
                 self,
-                route_names=None,
-                relay_anchor_address=None,
                 timeout_seconds=None,
             ):
-                events.append(f'native_shutdown:{route_names}')
+                events.append('native_shutdown')
                 return {
                     'completed': False,
                     'removed_routes': ['grid'],
@@ -490,7 +472,6 @@ class TestServerNameCollision:
                     'relay_errors': [],
                     'server_was_started': True,
                     'ipc_clients_drained': True,
-                    'http_clients_drained': False,
                     'route_close_error': None,
                     'runtime_barrier_error': None,
                 }
@@ -531,7 +512,7 @@ class TestServerNameCollision:
         bridge._runtime_session = FakeRuntimeSession()  # noqa: SLF001
         bridge.shutdown()
 
-        assert events == ['native_shutdown:None']
+        assert events == ['native_shutdown']
         assert bridge.names == ['grid']
 
     def test_register_rolls_back_python_slot_when_rust_registration_fails(self, monkeypatch):
@@ -558,7 +539,6 @@ class TestServerNameCollision:
                 abi_hash,
                 signature_hash,
                 descriptor_json,
-                relay_anchor_address,
             ):  # noqa: ARG002
                 events.append(
                     f'native_register:{concurrency_mode}:{max_pending}:{max_workers}:{crm_ns}:{crm_name}:{crm_ver}'
@@ -579,15 +559,11 @@ class TestServerNameCollision:
         def fake_discover(_crm_class):
             return []
 
-        def fake_extract_namespace(_crm_class):
-            return 'unit'
-
         def fake_make_dispatcher(route_name, slot):  # noqa: ARG001
             return lambda *_args, **_kwargs: None
 
         bridge._create_crm_instance = fake_create  # noqa: SLF001
         bridge._discover_methods = fake_discover  # noqa: SLF001
-        bridge._extract_namespace = fake_extract_namespace  # noqa: SLF001
         bridge._make_dispatcher = fake_make_dispatcher  # noqa: SLF001
 
         with pytest.raises(RuntimeError, match='boom'):

@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+See the [unreleased notes](docs/releases/unreleased.md).
+
+### Changed
+
+- Breaking: the Python `c_two` root and the Rust `c_two` crate root keep only the everyday API. Owner control, endpoint maintenance, diagnostics and contract tooling move to the `owner`, `endpoint`, `observe` and `contract` modules, and several of their names lose redundant prefixes. Snapshot and endpoint results are typed.
+- Breaking: Rust `direct_ipc_endpoint`, `ping_direct_ipc` and `shutdown_direct_ipc` take an optional endpoint context and replace the `*_with_context` functions.
+
+### Removed
+
+- `C2_RELAY_ROUTE_MAX_ATTEMPTS`, the sweep and relay owner caps, duplicate lease counters, two shutdown-outcome fields, and dead Rust surface: `FreeResult`, the `SyncClient` preallocation API, IPC route-watch recovery, the relay route event history, configurable contract limits, and never-constructed errors.
+- `cc.Held`, `cc.hold_stats()`, the public `ConcurrencyMode` and `InputLifetime` enums (use string values), and the default namespace and version of `@cc.crm`.
+- Contract inference (`infer_crm_from_resource`, `c3 contract infer`) and the resource bridge (`cc.bridge`, `cc.ResourceBridge`, `register(bridge=...)`).
+
+### Fixed
+
+- Large chunked payloads, malformed control frames and acknowledgements, custom IPC roots with many entries, contended listener drops, oversized pool segments, relay mesh versions and registration retries, `c3 registry` on malformed responses, TypeScript NACKs with new error codes, and several silent Python fallbacks. See the [unreleased notes](docs/releases/unreleased.md).
+
 ## [0.10.1] — companion c3 0.6.0
 
 Published 2026-10-30. See the [release notes](docs/releases/0.10.1.md).
@@ -175,7 +192,7 @@ migration requirements and the release evidence.
 
 ### Validation status
 
-- [The source validation](docs/reports/canonical-local-endpoint-validation.md)
+- [The source validation](docs/acceptance/canonical-local-endpoint-validation.md)
   records Linux and Windows Server 2022/2025 gates, portable matrices and
   installed-wheel consumers. These are development artifacts, not published
   0.7 packages. The formal release retains its own source-bound candidate

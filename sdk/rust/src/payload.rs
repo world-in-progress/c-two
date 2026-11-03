@@ -31,21 +31,12 @@ pub fn open_owned(spec: &CompiledSpec, bytes: &[u8]) -> Result<Payload, PayloadE
     Payload::open_copy(spec, bytes, &OpenOptions::default())
 }
 
-/// Open a copy-backed FastDB payload while retaining the Core response lease.
+/// Open a copy-backed FastDB payload while retaining the local response copy.
 pub fn open_held(
     spec: &CompiledSpec,
-    mut response: HeldResponse,
+    response: HeldResponse,
 ) -> Result<Held<Payload>, PayloadError> {
-    let payload = match Payload::open_copy(spec, response.bytes(), &OpenOptions::default()) {
-        Ok(payload) => payload,
-        Err(error) => {
-            if let Err(cleanup_error) = response.invalidate_then_release(|| Ok(())) {
-                eprintln!("Warning: held payload open cleanup failed: {cleanup_error}");
-                response.abandon();
-            }
-            return Err(error);
-        }
-    };
+    let payload = Payload::open_copy(spec, response.bytes(), &OpenOptions::default())?;
     Ok(Held::new(payload, response, invalidate_payload))
 }
 
@@ -56,8 +47,8 @@ fn invalidate_payload(payload: &Payload) -> Result<(), String> {
 /// Callback-scoped owner for a generated service's copy-backed FastDB input.
 ///
 /// Generated adapters construct this guard inside [`c2_core::EncodedService`]
-/// invocation. Its `Drop` therefore invalidates the FastDB owner before Core
-/// returns from the callback and releases the request lease.
+/// invocation, after Core has released the request transport storage. Its `Drop`
+/// invalidates the FastDB owner before the callback-scoped local copy ends.
 pub struct BorrowedPayload {
     payload: Payload,
 }

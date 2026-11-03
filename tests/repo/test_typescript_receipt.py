@@ -65,7 +65,7 @@ def _receipt() -> dict[str, object]:
                 "fastdb_spec_sha256": (
                     None if payload == "no-payload" else _digest("b")
                 ),
-                "route": {"uid": f"typescript-route-{index}", "revision": 1},
+                "route": {"uid": f"typescript-route-{index}"},
                 "logical_result_sha256": _digest("c"),
                 "path_counters": {
                     "requests": 2 if row_id == OPAQUE_ROW_ID else 1,
@@ -84,7 +84,7 @@ def _receipt() -> dict[str, object]:
             }
         )
     return {
-        "schema": "c-two.typescript-real-call-receipt.v1",
+        "schema": "c-two.typescript-real-call-receipt.v2",
         "evidence_stage": "development",
         "runtime": {
             "node_version": "v25.8.1",
@@ -125,7 +125,6 @@ def _receipt() -> dict[str, object]:
             "host_processes_stopped": True,
             "relay_processes_stopped": True,
             "node_processes_stopped": True,
-            "response_readers_closed": True,
         },
     }
 
@@ -143,7 +142,7 @@ def test_dimensions_freeze_all_real_node_paths() -> None:
 
 def test_receipt_round_trips_as_canonical_json(tmp_path: Path) -> None:
     receipt = _receipt()
-    destination = tmp_path / "typescript-real-call-receipt.v1.json"
+    destination = tmp_path / "typescript-real-call-receipt.v2.json"
 
     write_receipt(destination, receipt, expected_stage="development")
     first = destination.read_bytes()
@@ -155,6 +154,30 @@ def test_receipt_round_trips_as_canonical_json(tmp_path: Path) -> None:
         destination,
         expected_stage="development",
     ) == receipt
+
+
+def test_v1_schema_is_rejected() -> None:
+    receipt = _receipt()
+    receipt["schema"] = "c-two.typescript-real-call-receipt.v1"
+
+    with pytest.raises(ReceiptValidationError, match=r"\$\.schema.*v2"):
+        validate_receipt(receipt, expected_stage="development")
+
+
+def test_route_revision_is_rejected() -> None:
+    receipt = _receipt()
+    receipt["rows"][0]["route"]["revision"] = 1
+
+    with pytest.raises(ReceiptValidationError, match="unknown field.*revision"):
+        validate_receipt(receipt, expected_stage="development")
+
+
+def test_response_reader_cleanup_field_is_rejected() -> None:
+    receipt = _receipt()
+    receipt["cleanup"]["response_readers_closed"] = True
+
+    with pytest.raises(ReceiptValidationError, match="unknown field.*response_readers_closed"):
+        validate_receipt(receipt, expected_stage="development")
 
 
 @pytest.mark.parametrize(

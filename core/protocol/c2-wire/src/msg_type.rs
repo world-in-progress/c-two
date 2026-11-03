@@ -18,17 +18,12 @@ pub enum MsgType {
     DisconnectAck = 0x09,
     PendingRouteAttest = 0x0A,
     PendingRouteAttestAck = 0x0B,
-    RouteContract = 0x0C,
-    RouteContractAck = 0x0D,
     RouteList = 0x0E,
     RouteListAck = 0x0F,
     RouteLookup = 0x10,
     RouteLookupAck = 0x11,
-    RouteWatch = 0x12,
-    RouteWatchEvent = 0x13,
-    RouteAck = 0x14,
     RouteNack = 0x15,
-    OwnerControl = 0x16,
+    Release = 0x17,
 }
 
 impl MsgType {
@@ -46,17 +41,12 @@ impl MsgType {
             0x09 => Some(Self::DisconnectAck),
             0x0A => Some(Self::PendingRouteAttest),
             0x0B => Some(Self::PendingRouteAttestAck),
-            0x0C => Some(Self::RouteContract),
-            0x0D => Some(Self::RouteContractAck),
             0x0E => Some(Self::RouteList),
             0x0F => Some(Self::RouteListAck),
             0x10 => Some(Self::RouteLookup),
             0x11 => Some(Self::RouteLookupAck),
-            0x12 => Some(Self::RouteWatch),
-            0x13 => Some(Self::RouteWatchEvent),
-            0x14 => Some(Self::RouteAck),
             0x15 => Some(Self::RouteNack),
-            0x16 => Some(Self::OwnerControl),
+            0x17 => Some(Self::Release),
             _ => None,
         }
     }
@@ -86,9 +76,7 @@ impl MsgType {
 /// first byte as this discriminant and append type-specific fields.
 pub const SIGNAL_SIZE: usize = 1;
 
-// Pre-encoded signal bytes from the canonical wire protocol. `ShutdownClient`
-// is a complete single-byte initiate command; `ShutdownAck` is only a
-// discriminant because acknowledgements carry a structured payload.
+// Complete single-byte signal payloads.
 pub const PING_BYTES: [u8; 1] = [MsgType::Ping as u8];
 pub const PONG_BYTES: [u8; 1] = [MsgType::Pong as u8];
 pub const SHUTDOWN_CLIENT_BYTES: [u8; 1] = [MsgType::ShutdownClient as u8];
@@ -113,17 +101,12 @@ mod tests {
             (0x09, MsgType::DisconnectAck),
             (0x0A, MsgType::PendingRouteAttest),
             (0x0B, MsgType::PendingRouteAttestAck),
-            (0x0C, MsgType::RouteContract),
-            (0x0D, MsgType::RouteContractAck),
             (0x0E, MsgType::RouteList),
             (0x0F, MsgType::RouteListAck),
             (0x10, MsgType::RouteLookup),
             (0x11, MsgType::RouteLookupAck),
-            (0x12, MsgType::RouteWatch),
-            (0x13, MsgType::RouteWatchEvent),
-            (0x14, MsgType::RouteAck),
             (0x15, MsgType::RouteNack),
-            (0x16, MsgType::OwnerControl),
+            (0x17, MsgType::Release),
         ] {
             let parsed = MsgType::from_byte(byte).unwrap();
             assert_eq!(parsed, expected);
@@ -148,6 +131,5 @@ mod tests {
         assert!(MsgType::DisconnectAck.is_signal());
         assert!(!MsgType::CrmCall.is_signal());
         assert!(!MsgType::CrmReply.is_signal());
-        assert!(!MsgType::OwnerControl.is_signal());
     }
 }

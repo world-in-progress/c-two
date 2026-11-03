@@ -1,56 +1,22 @@
-//! Reference-counted pool of [`SyncClient`] instances.
-//!
-//! Clients connecting to the same server address share a single
-//! `SyncClient`. When all references are released the client is
-//! kept alive for a grace period before being destroyed.
-
-use parking_lot::{Condvar, Mutex};
-use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
-
-use c2_config::{ConnectDeadline, LocalEndpoint, LocalEndpointContext, MemoryBudgetLimits};
-use c2_mem::{MemPool, PoolConfig};
-
-/// Label counter for client pools. MemPool adds its incarnation and owns
-/// platform segment-name derivation.
-static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
-const CONNECT_TRANSIENT_RETRY_ATTEMPTS: usize = 3;
-
+//! Cache of business references. Each native connection independently owns
+//! its writer, loans and deactivation; cache eviction only stops admission.
 use crate::client::{ClientIpcConfig, IpcError};
 use crate::sync_client::SyncClient;
-
+use c2_config::{ConnectDeadline, LocalEndpointContext, MemoryBudgetLimits};
+use c2_local::ConnectionObservation;
+use c2_mem::{MemPool, PoolConfig};
+use parking_lot::{Condvar, Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn pool_config_from_client_config(cfg: &ClientIpcConfig) -> PoolConfig {
     // Centralized projection: the pooled-client acquire path must follow the
     // same buddy policy and client idle window as `with_config`. A disabled
     // buddy pool is still a real `MemPool` — it keeps serving dedicated SHM
     // requests and the wire prefix, only the buddy tiers are policy-disabled.
     cfg.base.primary_pool_config(&cfg.pool_tuning())
-}
-
-/// The cache's shared transport memory context.
-///
-/// Installed from the resolved config of the first connection attempt —
-/// including one that later fails — and then frozen for the cache's lifetime.
-/// Every cached connection's request pool and reassembly pool charges this one
-/// budget, so one owning domain cannot double its cap by opening more
-/// connections. The context owns only accounting counters; pools, clients, and
-/// callbacks never cycle through it.
-struct DomainMemory {
-    limits: MemoryBudgetLimits,
-    budget: c2_mem::MemoryBudget,
-}
-
-impl DomainMemory {
-    fn from_config(cfg: &ClientIpcConfig) -> Self {
-        let limits = cfg.memory_budget_limits();
-        Self {
-            limits,
-            budget: c2_mem::MemoryBudget::from_limits(&limits),
-        }
-    }
 }
 
 /// Structured rejection for a configuration whose memory-budget limits
@@ -164,110 +130,6 @@ fn connect_lock<'a, T>(
     Ok(guard)
 }
 
-fn cleanup_deadline(deadline: ConnectDeadline) -> Instant {
-    let guard = Instant::now() + DETACHED_CLOSE_TIMEOUT;
-    deadline.instant().map_or(guard, |caller| caller.min(guard))
-}
-
-fn is_transient_connect_error(error: &IpcError) -> bool {
-    matches!(
-        error,
-        IpcError::Io(io_error) | IpcError::Connect(io_error)
-            if matches!(
-                io_error.kind(),
-                ErrorKind::UnexpectedEof
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::NotConnected
-            )
-    )
-}
-
-fn connect_with_transient_retry(
-    owner: &ClientPool,
-    epoch: u64,
-    endpoint: &LocalEndpoint,
-    cfg: &ClientIpcConfig,
-    budget: &c2_mem::MemoryBudget,
-    deadline: ConnectDeadline,
-    mut fresh: FreshClientGuard,
-) -> Result<(Arc<SyncClient>, FreshClientGuard), IpcError> {
-    crate::sync_client::ensure_runtime_with_deadline(deadline)?;
-    let pool_config = pool_config_from_client_config(cfg);
-    let prewarm_segments = cfg.pool_prewarm_segments as usize;
-
-    for attempt in 0..CONNECT_TRANSIENT_RETRY_ATTEMPTS {
-        crate::client::connect_check(deadline, "pool_connect")?;
-        let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
-        let prefix = format!("/cc3c{:08x}{:08x}", std::process::id(), counter);
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
-            pool_config.clone(),
-            prefix,
-            budget.clone(),
-        )));
-        // Explicit prewarm only: without it the pool stays unmapped until the
-        // first allocation (config validation rejects prewarm with buddy
-        // disabled).
-        if prewarm_segments > 0 {
-            pool.lock()
-                .ensure_buddy_segments(prewarm_segments)
-                .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
-        }
-
-        let (client, result) = SyncClient::connect_transport_pool_attempt_with_deadline(
-            endpoint.clone(),
-            pool,
-            cfg.clone(),
-            budget.clone(),
-            deadline,
-            owner.connection_event_source.as_ref(),
-        );
-        let client = Arc::new(client);
-        fresh.attach(client.clone());
-        match result {
-            Ok(()) => return Ok((client, fresh)),
-            Err(error) => {
-                // Even a handshake attempt that spawned native receive work
-                // must keep its exact owner until the native close confirms.
-                fresh.retire();
-                if matches!(&error, IpcError::LocalCallRejected(error) if error.code == c2_error::ErrorCode::CallDeadlineExceeded)
-                {
-                    return Err(error);
-                }
-                crate::client::connect_check(deadline, "pool_cleanup")?;
-                let confirmed = fresh.work.record.state() == RetiredState::Confirmed;
-                if attempt + 1 >= CONNECT_TRANSIENT_RETRY_ATTEMPTS
-                    || !confirmed
-                    || !is_transient_connect_error(&error)
-                {
-                    return Err(error);
-                }
-                let delay = Duration::from_millis(10 * (attempt as u64 + 1));
-                let remaining = deadline
-                    .remaining("pool_retry")
-                    .map_err(|_| crate::client::connect_expired("pool_retry"))?;
-                std::thread::sleep(remaining.map_or(delay, |left| delay.min(left)));
-                crate::client::connect_check(deadline, "pool_retry")?;
-                fresh = {
-                    let state = connect_lock(&owner.state, deadline, "pool_wait")?;
-                    let mut coordinator =
-                        connect_lock(&owner.close_txn.0, deadline, "pool_cleanup_wait")?;
-                    owner.register_preparing(
-                        &state,
-                        &mut coordinator,
-                        &fresh.work.record.address,
-                        epoch,
-                        deadline,
-                    )?
-                };
-            }
-        }
-    }
-
-    unreachable!("connect retry loop always returns before exhausting attempts")
-}
-
 /// Exact-entry reference state: a cancelled connect never needs to wait for
 /// either RuntimeState or the global cache lock to release its reference.
 struct PoolReferences {
@@ -302,7 +164,7 @@ impl PoolReferences {
         self.released_tick.fetch_max(self.tick(), Ordering::AcqRel);
         match self
             .count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             }) {
             Ok(_) => true,
@@ -356,722 +218,302 @@ impl Drop for ClientLease {
     }
 }
 
-// ── Pool entry ───────────────────────────────────────────────────────────
-
 struct PoolEntry {
     client: Arc<SyncClient>,
     references: Arc<PoolReferences>,
 }
 
-/// Close-barrier deadline for clients detached by pool bookkeeping
-/// (evictions, stale replacements, race losers, discards).
-const DETACHED_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-
-// ── ClientPool ───────────────────────────────────────────────────────────
-
-/// Mutable cache state guarded by the pool lock.
-struct CacheState {
-    entries: HashMap<String, PoolEntry>,
-    /// Monotonic cache generation. `close_all` bumps the epoch after a drain
-    /// so a connect that started before the shutdown fence cannot insert
-    /// itself afterwards, while later acquires (restart/reacquire) proceed
-    /// under the new epoch. `None` permanently seals admission.
-    epoch: Option<u64>,
-    /// `Some(generation)` while a `close_all` drain transaction is between
-    /// its fence and its epoch bump. Acquisitions started or observed in
-    /// this window reject.
-    closing_generation: Option<u64>,
-    /// Shared transport memory context, frozen by the first connection
-    /// attempt. Draining the cache closes connections but never uninstalls
-    /// or resets this context: charges retained by completed or held data
-    /// stay observable after shutdown, and reacquires under a new epoch keep
-    /// charging the same domain limits.
-    domain_memory: Option<DomainMemory>,
+// Keep detached client metadata until its original physical close is observed.
+// Preparing records fence connects across cache drains/seal.
+enum CloseState {
+    Preparing,
+    Closing {
+        observation: Option<ConnectionObservation>,
+        _client: Option<Arc<SyncClient>>,
+    },
+    Finished,
 }
-
-/// Lifecycle of one retired (detached) client record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetiredState {
-    /// A bounded close barrier for this record is currently running.
-    Closing = 1,
-    /// A fresh acquire is still connecting. It is fenced by the cache epoch;
-    /// a reopenable drain need not wait for its I/O, but a sealed drain must.
-    Preparing = 2,
-    /// Native work has confirmed close, or a fresh acquire published its client.
-    Confirmed = 3,
-    /// The last close barrier returned unconfirmed. The record keeps
-    /// ownership of the client reachable for bounded settlement, ordinary
-    /// acquire/sweep, or a later drain to retry. Never treated as stopped.
-    UnconfirmedIdle = 4,
-}
-
-/// One client detached from the cache whose bounded close is owned by the
-/// coordinator. Records are inserted in the same critical section that
-/// removes the entry from `CacheState.entries` and removed only after a
-/// close confirms, so a `close_all` can never observe an empty cache with
-/// unaccounted detached work.
-struct RetiredClose {
+struct CloseRecord {
     address: String,
-    client: Mutex<Option<Arc<SyncClient>>>,
-    state: AtomicU8,
-    // Published before Confirmed, without retaining the client or its SHM.
-    abnormal_reason: OnceLock<&'static str>,
-    // Per-record notification avoids Condvar's unbounded re-acquisition of
-    // the global coordinator after a caller's timed wait has expired.
-    waiters: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
+    state: Mutex<CloseState>,
+    changed: Condvar,
 }
-
-impl RetiredClose {
-    fn new(address: String, client: Option<Arc<SyncClient>>, state: RetiredState) -> Self {
+impl CloseRecord {
+    fn preparing(address: &str) -> Self {
         Self {
-            address,
-            client: Mutex::new(client),
-            state: AtomicU8::new(state as u8),
-            abnormal_reason: OnceLock::new(),
-            waiters: Mutex::new(Vec::new()),
+            address: address.into(),
+            state: Mutex::new(CloseState::Preparing),
+            changed: Condvar::new(),
         }
     }
-    fn state(&self) -> RetiredState {
-        match self.state.load(Ordering::Acquire) {
-            1 => RetiredState::Closing,
-            2 => RetiredState::Preparing,
-            3 => RetiredState::Confirmed,
-            4 => RetiredState::UnconfirmedIdle,
-            _ => unreachable!("invalid native retired close state"),
-        }
+    fn finish(&self) {
+        *self.state.lock() = CloseState::Finished;
+        self.changed.notify_all();
     }
-    fn set_state(&self, state: RetiredState) {
-        self.state.store(state as u8, Ordering::Release);
-        // Waiter registration checks the state again after releasing this
-        // short, record-local slot; a concurrent completion cannot be lost.
-        let waiters = std::mem::take(&mut *self.waiters.lock());
-        for waiter in waiters {
-            let _ = waiter.send(());
-        }
-    }
-    fn wait_until_settled(
-        &self,
-        deadline: ConnectDeadline,
-        include_preparing: bool,
-    ) -> Result<(), IpcError> {
-        let pending = || match self.state() {
-            RetiredState::Closing => true,
-            RetiredState::Preparing => include_preparing,
-            _ => false,
+    fn deactivate(&self, client: Arc<SyncClient>) {
+        // Install the observation and retain the business Arc before changing
+        // admission. Native tasks still own the stream and loan book.
+        *self.state.lock() = CloseState::Closing {
+            observation: client.connection_observation(),
+            _client: Some(client.clone()),
         };
-        while pending() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let mut waiters = connect_lock(&self.waiters, deadline, "pool_cleanup_wait")?;
-            waiters.push(tx);
-            drop(waiters);
-            if !pending() {
-                break;
-            }
-            match deadline.instant() {
-                Some(end) => {
-                    rx.recv_timeout(end.saturating_duration_since(Instant::now()))
-                        .map_err(|_| crate::client::connect_expired("pool_cleanup_wait"))?;
-                }
-                None => {
-                    let _ = rx.recv();
-                }
-            }
-            crate::client::connect_check(deadline, "pool_cleanup_wait")?;
-        }
-        crate::client::connect_check(deadline, "pool_cleanup_wait")
+        client.deactivate();
+        self.changed.notify_all();
     }
-    /// Exactly one settlement/acquire/sweep/drain owns each retry barrier.
-    fn claim_retry(&self) -> bool {
-        self.state
-            .compare_exchange(
-                RetiredState::UnconfirmedIdle as u8,
-                RetiredState::Closing as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+    fn complete(&self) -> bool {
+        match &*self.state.lock() {
+            CloseState::Preparing => false,
+            CloseState::Closing {
+                observation: Some(observation),
+                ..
+            } => observation.snapshot().is_some(),
+            CloseState::Closing {
+                observation: None, ..
+            }
+            | CloseState::Finished => true,
+        }
+    }
+    fn wait(&self, deadline: Instant, preparing: bool) -> bool {
+        let mut state = self.state.lock();
+        while matches!(*state, CloseState::Preparing) {
+            if !preparing {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.changed.wait_until(&mut state, deadline);
+        }
+        let observation = match &*state {
+            CloseState::Closing {
+                observation: Some(observation),
+                ..
+            } => observation.clone(),
+            _ => return true,
+        };
+        drop(state);
+        if observation.snapshot().is_some() {
+            return true;
+        }
+        let Ok(handle) = crate::sync_client::shared_io_handle(
+            ConnectDeadline::start(
+                c2_config::ConnectOptions::new()
+                    .with_timeout(deadline.saturating_duration_since(Instant::now())),
             )
-            .is_ok()
-    }
-}
-
-struct RetiredWork {
-    ticket: u64,
-    record: Arc<RetiredClose>,
-}
-
-/// Reserve cleanup ownership before connection I/O. Even expiry while waiting
-/// for the map/coordinator to publish can retain the unconfirmed native client
-/// without acquiring either global lock after the caller deadline.
-struct FreshClientGuard {
-    work: RetiredWork,
-    coordinator: Arc<(Mutex<CloseTxnState>, Condvar)>,
-    deadline: ConnectDeadline,
-    done: bool,
-}
-
-impl FreshClientGuard {
-    fn attach(&self, client: Arc<SyncClient>) {
-        *self.work.record.client.lock() = Some(client);
-        self.work.record.set_state(RetiredState::Closing);
-    }
-    fn complete(&mut self) {
-        self.work.record.client.lock().take();
-        self.work.record.set_state(RetiredState::Confirmed);
-        self.done = true;
-        prune_confirmed(&self.coordinator, &self.work);
-    }
-    fn retire(&mut self) {
-        if !self.done {
-            if close_retired_work(
-                &self.coordinator,
-                &self.work,
-                cleanup_deadline(self.deadline),
+            .expect("bounded close deadline"),
+        ) else {
+            return false;
+        };
+        handle
+            .block_on(
+                observation.wait_closed(Some(deadline.saturating_duration_since(Instant::now()))),
             )
-            .is_err()
-            {
-                schedule_retired_settlement(&self.coordinator, &self.work);
+            .is_some()
+    }
+    fn abnormal(&self) -> Option<IpcClientCloseDetail> {
+        let state = self.state.lock();
+        let CloseState::Closing {
+            observation: Some(observation),
+            ..
+        } = &*state
+        else {
+            return None;
+        };
+        let closed = observation.snapshot()?;
+        (closed.reason() != c2_local::ConnectionEndReason::LocalClose).then(|| {
+            IpcClientCloseDetail {
+                address: self.address.clone(),
+                reason: closed.operation().into(),
             }
-            self.done = true;
+        })
+    }
+}
+
+struct FreshClient {
+    record: Arc<CloseRecord>,
+    client: Option<Arc<SyncClient>>,
+    published: bool,
+}
+impl Drop for FreshClient {
+    fn drop(&mut self) {
+        if self.published {
+            self.record.finish();
+        } else if let Some(client) = self.client.take() {
+            self.record.deactivate(client);
+        } else {
+            self.record.finish();
         }
     }
 }
-impl Drop for FreshClientGuard {
-    fn drop(&mut self) {
-        self.retire();
-    }
-}
 
-struct RetiredBatch {
-    work: Vec<RetiredWork>,
-    coordinator: Arc<(Mutex<CloseTxnState>, Condvar)>,
-    deadline: ConnectDeadline,
-}
-impl RetiredBatch {
-    fn push(&mut self, work: RetiredWork) {
-        self.work.push(work);
-    }
-    fn close(&mut self) {
-        run_retired_work(
-            &self.coordinator,
-            &self.work,
-            cleanup_deadline(self.deadline),
-        );
-        for work in &self.work {
-            schedule_retired_settlement(&self.coordinator, work);
-        }
-        self.work.clear();
-    }
-}
-impl Drop for RetiredBatch {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-/// Drain-transaction coordinator, guarded separately from [`CacheState`] so
-/// entry bookkeeping never happens while a drain holds I/O and concurrent
-/// `close_all` callers serialize instead of interleaving their fences.
-struct CloseTxnState {
-    next_generation: u64,
-    /// Drain transaction currently owning the closing window, if any. A
-    /// second `close_all` waits for this to clear (bounded by its own
-    /// deadline) instead of clearing the fence under the active drain.
-    active_generation: Option<u64>,
-    /// Detached clients with a registered (running or unconfirmed-idle)
-    /// close barrier. Keyed by ticket; see [`RetiredClose`].
-    retired: HashMap<u64, Arc<RetiredClose>>,
-    next_ticket: u64,
-}
-
-/// One confirmed local IPC close without a normal disconnect ACK.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpcClientCloseDetail {
     pub address: String,
     pub reason: String,
 }
-
-/// Local drain and protocol completion are separate observations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientCacheCloseReport {
-    /// Number of cache entries detached for close.
     pub detached: usize,
-    /// Addresses whose close barrier did not confirm within the deadline.
     pub unconfirmed: Vec<String>,
-    /// Why this caller could not claim a completed drain: it timed out
-    /// waiting for a concurrent drain transaction or for detached-close
-    /// barriers started by discard/sweep/loser cleanup. Nothing is claimed
-    /// stopped in this case.
     pub error: Option<String>,
-    /// Clients observed by this drain that confirmed locally closed without
-    /// a normal DISCONNECT_ACK. These do not make the local close unconfirmed.
     pub abnormal: Vec<IpcClientCloseDetail>,
 }
 
-/// Reference-counted pool of `SyncClient` instances.
-///
-/// Clients connecting to the same server address share a single
-/// `SyncClient`. When all references are released the client is
-/// kept alive for a grace period before being destroyed.
-///
-/// Every connect and close happens outside the pool lock; the lock only
-/// guards entry bookkeeping, the closing fence, and the epoch. Detached
-/// clients (expiry sweeps, stale replacements, concurrent same-address race
-/// losers, discards, drains) are always closed explicitly through the bounded
-/// shared-ownership close instead of relying on `Drop`.
+struct CacheState {
+    entries: HashMap<String, PoolEntry>,
+    epoch: Option<u64>,
+    draining: bool,
+    budget: Option<c2_mem::MemoryBudget>,
+    records: HashMap<u64, Arc<CloseRecord>>,
+    next_record: u64,
+}
+impl CacheState {
+    fn record(&mut self, address: &str) -> Arc<CloseRecord> {
+        let record = Arc::new(CloseRecord::preparing(address));
+        let id = self.next_record;
+        self.next_record = id
+            .checked_add(1)
+            .expect("cache close record sequence exhausted");
+        self.records.insert(id, record.clone());
+        record
+    }
+    fn check_epoch(&self, epoch: u64) -> Result<(), IpcError> {
+        if self.epoch.is_none() {
+            return Err(IpcError::PoolRetired);
+        }
+        if self.draining || self.epoch != Some(epoch) {
+            return Err(IpcError::Pool("client pool closed while connecting".into()));
+        }
+        Ok(())
+    }
+}
+
+type ObservedCloses = HashMap<u64, Option<Arc<CloseRecord>>>;
+
 pub struct ClientPool {
-    // One immutable namespace per cache. Address keys are scoped by this owner;
-    // draining changes only the epoch, never the endpoint or memory domain.
     endpoint_context: Result<LocalEndpointContext, String>,
     connection_event_source: Option<c2_local::ConnectionEventSource>,
-    state: Mutex<CacheState>,
+    state: Arc<Mutex<CacheState>>,
     grace_period: Duration,
     default_config: Mutex<Option<ClientIpcConfig>>,
-    /// See [`CloseTxnState`]. Shared shape so test hooks can wait on it.
-    close_txn: Arc<(Mutex<CloseTxnState>, Condvar)>,
+    drain_gate: Mutex<()>,
 }
 
-// Compile-time assertion: ClientPool must be Send + Sync.
-const _: () = {
-    fn _assert_send<T: Send>() {}
-    fn _assert_sync<T: Sync>() {}
-    fn _assertions() {
-        _assert_send::<ClientPool>();
-        _assert_sync::<ClientPool>();
-    }
-};
-
-/// Run one registered retired record's bounded close barrier.
-///
-/// The barrier runs with the time remaining to `deadline` (an absolute
-/// aggregate budget owned by the caller, e.g. one cache shutdown), never a
-/// fresh timeout. On confirmation the exact ticket's record is removed; on
-/// an unconfirmed timeout the record **stays** in the registry as
-/// `RetiredState::UnconfirmedIdle`, keeping the client's ownership reachable
-/// so ordinary maintenance or a later drain can retry it honestly.
-/// Returns `Err(address)` when the close did not confirm.
-fn prune_confirmed(txn: &(Mutex<CloseTxnState>, Condvar), work: &RetiredWork) {
-    if let Some(mut state) = txn.0.try_lock() {
-        if work.record.state() == RetiredState::Confirmed
-            && state
-                .retired
-                .get(&work.ticket)
-                .is_some_and(|record| Arc::ptr_eq(record, &work.record))
-        {
-            state.retired.remove(&work.ticket);
-        }
-    }
-    txn.1.notify_all();
-}
-
-fn close_retired_work(
-    txn: &(Mutex<CloseTxnState>, Condvar),
-    work: &RetiredWork,
-    deadline: Instant,
-) -> Result<(), String> {
-    let client = work.record.client.lock().clone();
-    let confirmed = client.as_ref().is_none_or(|client| {
-        client.close_shared(deadline.saturating_duration_since(Instant::now()))
-    });
-    if confirmed {
-        if let Some(reason) = client
-            .as_ref()
-            .and_then(|client| client.abnormal_close_reason())
-        {
-            let _ = work.record.abnormal_reason.set(reason);
-        }
-        // Confirmation, rather than registry-lock availability, releases this
-        // exact owner. Retained payloads keep their own pool Arcs and charges.
-        work.record.client.lock().take();
-    }
-    drop(client);
-    work.record.set_state(if confirmed {
-        RetiredState::Confirmed
-    } else {
-        RetiredState::UnconfirmedIdle
-    });
-    prune_confirmed(txn, work);
-    if confirmed {
-        Ok(())
-    } else {
-        Err(work.record.address.clone())
-    }
-}
-
-/// A caller whose total budget is exhausted cannot wait for native cleanup.
-/// Give its registered owner one independent, bounded settlement attempt.
-/// This finite worker closes only this record; it never loops, acquires pool
-/// metadata locks, resets the connect deadline, or publishes a client. A
-/// failed spawn/barrier leaves UnconfirmedIdle for ordinary maintenance.
-fn schedule_retired_settlement(txn: &Arc<(Mutex<CloseTxnState>, Condvar)>, work: &RetiredWork) {
-    if !work.record.claim_retry() {
-        return;
-    }
-    let settlement = RetiredWork {
-        ticket: work.ticket,
-        record: work.record.clone(),
-    };
-    let coordinator = txn.clone();
-    let deadline = Instant::now() + DETACHED_CLOSE_TIMEOUT;
-    if std::thread::Builder::new()
-        .name("c2-client-retire".into())
-        .spawn(move || {
-            let _ = close_retired_work(&coordinator, &settlement, deadline);
-        })
-        .is_err()
-    {
-        work.record.set_state(RetiredState::UnconfirmedIdle);
-        txn.1.notify_all();
-    }
-}
-
-/// Claim idle failures under the coordinator, without touching healthy cache
-/// entries or changing the domain/epoch. Close outside every metadata lock.
-fn claim_retired_retries(coordinator: &CloseTxnState) -> Vec<RetiredWork> {
-    if coordinator.active_generation.is_some() {
-        return Vec::new();
-    }
-    coordinator
-        .retired
-        .iter()
-        .filter_map(|(ticket, record)| {
-            record.claim_retry().then(|| RetiredWork {
-                ticket: *ticket,
-                record: record.clone(),
-            })
-        })
-        .collect()
-}
-
-fn close_retired_ticket(
-    txn: &(Mutex<CloseTxnState>, Condvar),
-    ticket: u64,
-    deadline: Instant,
-) -> Result<(), String> {
-    let record = {
-        let state = txn.0.lock();
-        match state.retired.get(&ticket) {
-            Some(record) if record.state() == RetiredState::Closing => record.clone(),
-            _ => return Ok(()),
-        }
-    };
-    close_retired_work(txn, &RetiredWork { ticket, record }, deadline)
-}
-
-fn run_retired_work(
-    txn: &(Mutex<CloseTxnState>, Condvar),
-    work: &[RetiredWork],
-    deadline: Instant,
-) {
-    for record in work {
-        let _ = close_retired_work(txn, record, deadline);
-    }
-}
-
-fn run_retired_closes_until(
-    txn: &(Mutex<CloseTxnState>, Condvar),
-    tickets: &[u64],
-    deadline: Instant,
-) {
-    for ticket in tickets {
-        let _ = close_retired_ticket(txn, *ticket, deadline);
-    }
-}
-
-// A consumed ticket retains only None until this transaction's observer drops.
-// A seed merged after an earlier drain reported completion cannot replay it.
-type ObservedCloses = HashMap<u64, Option<Arc<RetiredClose>>>;
-
-fn observe_retired_closes(txn: &CloseTxnState, observed: &mut ObservedCloses) {
-    for (ticket, record) in &txn.retired {
-        // Preparing can attach and close between coordinator acquisitions.
-        // Already Confirmed records are history, unless observed earlier.
-        if record.state() != RetiredState::Confirmed {
-            observed
-                .entry(*ticket)
-                .or_insert_with(|| Some(record.clone()));
-        }
-    }
-}
-
-fn take_observed_abnormal_closes(observed: &mut ObservedCloses) -> Vec<IpcClientCloseDetail> {
-    let mut abnormal = Vec::new();
-    for entry in observed.values_mut() {
-        if !entry
-            .as_ref()
-            .is_some_and(|record| record.state() == RetiredState::Confirmed)
-        {
-            continue;
-        }
-        let record = entry.take().unwrap();
-        if let Some(reason) = record.abnormal_reason.get() {
-            abnormal.push(IpcClientCloseDetail {
-                address: record.address.clone(),
-                reason: (*reason).to_owned(),
-            });
-        }
-    }
-    abnormal
-}
-
-/// Core keeps this observation across retries of one shutdown transaction.
-/// Completed records are reported once; pending records retain metadata only
-/// after their local close releases the client. Consumed tickets retain no
-/// record owner and prevent a late seal seed from replaying completion.
 #[doc(hidden)]
 pub struct ClientCloseObservation<'a> {
     pool: &'a ClientPool,
     observed: ObservedCloses,
 }
-
-/// Unforgeable snapshot of unfinished records captured at permanent seal.
-/// It shares the original records and coordinator, without copying payloads.
 #[doc(hidden)]
 pub struct ClientCloseSeed {
-    coordinator: Arc<(Mutex<CloseTxnState>, Condvar)>,
+    state: std::sync::Weak<Mutex<CacheState>>,
     observed: ObservedCloses,
 }
-
-/// Prepared admission fence, holding only the existing pool metadata locks.
-/// Dropping it without commit leaves admission unchanged.
 #[doc(hidden)]
-#[must_use = "commit the prepared seal to permanently close admission"]
+#[must_use]
 pub struct ClientPoolSeal<'a> {
     state: parking_lot::MutexGuard<'a, CacheState>,
-    txn: parking_lot::MutexGuard<'a, CloseTxnState>,
-    coordinator: &'a Arc<(Mutex<CloseTxnState>, Condvar)>,
+    source: &'a Arc<Mutex<CacheState>>,
 }
-
 impl ClientPoolSeal<'_> {
-    /// Capture unfinished records and seal admission after driver preparation.
-    /// No I/O, new close records or detached Closing batch is started here.
     pub fn commit(mut self) -> ClientCloseSeed {
-        let mut observed = HashMap::new();
-        observe_retired_closes(&self.txn, &mut observed);
-        // Snapshot first: a close may confirm without the coordinator lock.
-        // Every record unfinished at the seal must already be captured.
+        let observed = self
+            .state
+            .records
+            .iter()
+            .filter(|(_, record)| !record.complete())
+            .map(|(id, record)| (*id, Some(record.clone())))
+            .collect();
         self.state.epoch = None;
-        self.coordinator.1.notify_all();
         ClientCloseSeed {
-            coordinator: self.coordinator.clone(),
+            state: Arc::downgrade(self.source),
             observed,
         }
     }
 }
-
 impl ClientCloseObservation<'_> {
-    /// Merge a seal captured before this transaction's driver was scheduled.
-    /// A seed belongs to exactly one pool; cross-pool ticket reuse is invalid.
     pub fn merge_seed(&mut self, seed: ClientCloseSeed) {
         assert!(
-            Arc::ptr_eq(&self.pool.close_txn, &seed.coordinator),
+            std::sync::Weak::ptr_eq(&Arc::downgrade(&self.pool.state), &seed.state),
             "client close seed belongs to a different pool"
         );
-        for (ticket, record) in seed.observed {
-            self.observed.entry(ticket).or_insert(record);
+        for (id, record) in seed.observed {
+            self.observed.entry(id).or_insert(record);
         }
     }
-
     pub fn close_all(&mut self, timeout: Duration) -> ClientCacheCloseReport {
         self.pool.close_all_observed(timeout, &mut self.observed)
     }
 }
 
 impl ClientPool {
-    /// Create a new pool with the given grace period.
     pub fn new(grace_period: Duration) -> Self {
         Self::from_endpoint_context(
             grace_period,
             LocalEndpointContext::default_for_platform().map_err(|error| error.to_string()),
         )
     }
-
-    /// Create one cache domain from a resolved, immutable endpoint context.
-    /// Unix custom-root containers must exist before acquire. Windows callers
-    /// supply the platform's Named Pipe context, with no Unix path projection.
     pub fn with_endpoint_context(grace_period: Duration, context: LocalEndpointContext) -> Self {
         Self::from_endpoint_context(grace_period, Ok(context))
     }
-
-    /// Publish every physical connection incarnation through the owner's feed.
     pub fn with_connection_event_source(mut self, source: c2_local::ConnectionEventSource) -> Self {
         self.connection_event_source = Some(source);
         self
     }
-
     fn from_endpoint_context(
         grace_period: Duration,
-        context: Result<LocalEndpointContext, String>,
+        endpoint_context: Result<LocalEndpointContext, String>,
     ) -> Self {
         Self {
-            endpoint_context: context,
+            endpoint_context,
             connection_event_source: None,
-            state: Mutex::new(CacheState {
+            state: Arc::new(Mutex::new(CacheState {
                 entries: HashMap::new(),
                 epoch: Some(0),
-                closing_generation: None,
-                domain_memory: None,
-            }),
+                draining: false,
+                budget: None,
+                records: HashMap::new(),
+                next_record: 0,
+            })),
             grace_period,
             default_config: Mutex::new(None),
-            close_txn: Arc::new((
-                Mutex::new(CloseTxnState {
-                    next_generation: 0,
-                    active_generation: None,
-                    retired: HashMap::new(),
-                    next_ticket: 0,
-                }),
-                Condvar::new(),
-            )),
+            drain_gate: Mutex::new(()),
         }
     }
-
-    /// The namespace shared by every entry and every epoch of this cache.
     pub fn endpoint_context(&self) -> Result<&LocalEndpointContext, IpcError> {
         self.endpoint_context
             .as_ref()
             .map_err(|error| IpcError::Config(error.clone()))
     }
-
-    /// Set the default IPC config for newly created clients.
-    ///
-    /// After the domain memory context freezes (first connection attempt), a
-    /// default whose budget limits diverge from the frozen domain is rejected:
-    /// the cache must not be able to acquire a second budget policy through
-    /// its default configuration path.
     pub fn set_default_config(&self, config: ClientIpcConfig) -> Result<(), IpcError> {
         let state = self.state.lock();
-        if let Some(domain) = state.domain_memory.as_ref() {
-            let limits = config.memory_budget_limits();
-            if domain.limits != limits {
-                return Err(budget_limits_mismatch(
-                    &domain.limits,
-                    &limits,
-                    "cache default",
-                ));
+        if let Some(budget) = state.budget.as_ref() {
+            let limits = budget.limits();
+            let requested = config.memory_budget_limits();
+            if limits != requested {
+                return Err(budget_limits_mismatch(&limits, &requested, "cache default"));
             }
         }
         *self.default_config.lock() = Some(config);
         Ok(())
     }
-
-    /// Read-only snapshot of this cache's shared client memory context.
-    ///
-    /// `None` until the first connection attempt freezes the domain. This
-    /// never connects, never creates the context, and never resets usage:
-    /// charges retained by completed or held data stay observable across
-    /// shutdowns for as long as the pool (or any budget guard) exists.
     pub fn memory_budget_snapshot(&self) -> Option<ClientCacheMemorySnapshot> {
         self.state
             .lock()
-            .domain_memory
+            .budget
             .as_ref()
-            .map(|domain| ClientCacheMemorySnapshot {
-                limits: domain.limits,
-                budget: domain.budget.snapshot(),
+            .map(|budget| ClientCacheMemorySnapshot {
+                limits: budget.limits(),
+                budget: budget.snapshot(),
             })
     }
-
-    /// Read-only observer of this cache's frozen domain budget, if frozen.
-    ///
-    /// The returned handle shares only the accounting counters and the
-    /// resolved limits, so a retired cache can keep reporting charges held by
-    /// outstanding owners without retaining any client, pool, or callback
-    /// authority. Observing never connects and never installs a context.
     pub fn memory_budget_observer(&self) -> Option<c2_mem::BudgetObserver> {
         self.state
             .lock()
-            .domain_memory
-            .as_ref()
-            .map(|domain| c2_mem::BudgetObserver::new(domain.limits, domain.budget.clone()))
+            .budget
+            .clone()
+            .map(c2_mem::BudgetObserver::new)
     }
-
-    /// Register one detached client as a pending bounded close.
-    ///
-    /// MUST be called in the same critical section that removed the client
-    /// from `CacheState.entries` (the caller holds the state lock); this
-    /// takes the coordinator lock internally (state → txn order), so
-    /// detachment and close-accounting become one atomic step and a
-    /// concurrent `close_all` can never observe an empty cache with the
-    /// detached client unaccounted. Performs no I/O.
-    fn retire_locked(&self, address: &str, client: Arc<SyncClient>) -> u64 {
-        let mut txn = self.close_txn.0.lock();
-        self.retire_under_coordinator(&mut txn, address, client)
-            .ticket
-    }
-
-    fn register_close_work(
-        &self,
-        txn: &mut CloseTxnState,
-        address: &str,
-        client: Option<Arc<SyncClient>>,
-        state: RetiredState,
-    ) -> RetiredWork {
-        let ticket = txn.next_ticket;
-        txn.next_ticket += 1;
-        let record = Arc::new(RetiredClose::new(address.to_string(), client, state));
-        txn.retired.insert(ticket, record.clone());
-        self.close_txn.1.notify_all();
-        RetiredWork { ticket, record }
-    }
-
-    fn retire_under_coordinator(
-        &self,
-        txn: &mut CloseTxnState,
-        address: &str,
-        client: Arc<SyncClient>,
-    ) -> RetiredWork {
-        self.register_close_work(txn, address, Some(client), RetiredState::Closing)
-    }
-
-    fn check_acquire_epoch(state: &CacheState, epoch: u64) -> Result<(), IpcError> {
-        if state.epoch.is_none() {
-            return Err(IpcError::PoolRetired);
-        }
-        if state.closing_generation.is_some() {
-            return Err(IpcError::Pool(
-                "client pool acquire rejected: cache is closing".to_string(),
-            ));
-        }
-        if state.epoch != Some(epoch) {
-            return Err(IpcError::Pool(
-                "client pool acquire rejected: cache closed while connecting".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Both initial and transient-retry admission hold state then coordinator.
-    /// The original epoch is rechecked before reserving any new native work.
-    fn register_preparing(
-        &self,
-        state: &CacheState,
-        coordinator: &mut CloseTxnState,
-        address: &str,
-        epoch: u64,
-        deadline: ConnectDeadline,
-    ) -> Result<FreshClientGuard, IpcError> {
-        Self::check_acquire_epoch(state, epoch)?;
-        Ok(FreshClientGuard {
-            work: self.register_close_work(coordinator, address, None, RetiredState::Preparing),
-            coordinator: self.close_txn.clone(),
-            deadline,
-            done: false,
-        })
-    }
-
-    /// Acquire a client for `address`. Creates and connects if needed.
-    /// Increments reference count.
-    ///
-    /// The connect runs outside the pool lock under an epoch fence: if a
-    /// concurrent `close_all` drains the cache while this acquire is
-    /// connecting, the fresh connection is closed explicitly and the acquire
-    /// fails instead of inserting an entry after the drain.
-    ///
-    /// The shared memory context freezes atomically under the pool lock with
-    /// the resolved config, before any connection I/O: the first attempt —
-    /// including one that later fails — installs the domain budget from that
-    /// config, and every later acquire must resolve the same budget limits or
-    /// reject, so per-address configuration can never bypass the domain's
-    /// limits or race a second budget policy into existence.
     pub fn acquire(
         &self,
         address: &str,
@@ -1079,7 +521,6 @@ impl ClientPool {
     ) -> Result<Arc<SyncClient>, IpcError> {
         self.acquire_with_deadline(address, config, ConnectDeadline::default())
     }
-
     pub fn acquire_with_deadline(
         &self,
         address: &str,
@@ -1089,1225 +530,318 @@ impl ClientPool {
         self.acquire_lease_with_deadline(address, config, deadline)
             .map(ClientLease::into_client)
     }
-
     pub fn acquire_lease_with_deadline(
         &self,
         address: &str,
         config: Option<&ClientIpcConfig>,
         deadline: ConnectDeadline,
     ) -> Result<ClientLease, IpcError> {
-        let mut retired = RetiredBatch {
-            work: Vec::new(),
-            coordinator: self.close_txn.clone(),
-            deadline,
-        };
-        let mut fresh = None;
         let epoch;
         let cfg;
         let budget;
-        let mut rejection: Option<IpcError> = None;
+        let mut fresh;
+        let mut detached = Vec::new();
         {
             let mut state = connect_lock(&self.state, deadline, "pool_wait")?;
-            let mut coordinator = connect_lock(&self.close_txn.0, deadline, "pool_cleanup_wait")?;
-            coordinator
-                .retired
-                .retain(|_, record| record.state() != RetiredState::Confirmed);
             epoch = state.epoch.ok_or(IpcError::PoolRetired)?;
-            Self::check_acquire_epoch(&state, epoch)?;
-            // Resolve config before any fast-path return: the domain budget
-            // gate below must see the same resolved config on a cache hit as
-            // on a fresh connect, so a per-address configuration can never
-            // bypass the frozen domain limits on the same-address fast path.
+            state.check_epoch(epoch)?;
+            state.records.retain(|_, record| !record.complete());
             cfg = match config {
-                Some(c) => c.clone(),
+                Some(config) => config.clone(),
                 None => connect_lock(&self.default_config, deadline, "pool_config_wait")?
                     .clone()
                     .unwrap_or_default(),
             };
-            // Detach expired entries before potentially creating a new one;
-            // each detachment registers its pending close in this same
-            // critical section.
-            for (expired_address, client) in
-                Self::sweep_expired_locked(&mut state, self.grace_period)
-            {
-                retired.push(self.retire_under_coordinator(
-                    &mut coordinator,
-                    &expired_address,
-                    client,
-                ));
+            let requested = cfg.memory_budget_limits();
+            budget = state
+                .budget
+                .get_or_insert_with(|| c2_mem::MemoryBudget::from_limits(&requested))
+                .clone();
+            let limits = budget.limits();
+            if limits != requested {
+                return Err(budget_limits_mismatch(&limits, &requested, "cache domain"));
             }
-            // First-connect-wins memory context, installed or validated in
-            // the same critical section that resolved the config so a racing
-            // acquire can never connect under a second budget policy.
-            let limits = cfg.memory_budget_limits();
-            match state.domain_memory.as_ref() {
-                Some(domain) if domain.limits != limits => {
-                    budget = domain.budget.clone();
-                    rejection = Some(budget_limits_mismatch(
-                        &domain.limits,
-                        &limits,
-                        "cache domain",
-                    ));
-                }
-                Some(domain) => {
-                    budget = domain.budget.clone();
-                }
-                None => {
-                    let domain = DomainMemory::from_config(&cfg);
-                    budget = domain.budget.clone();
-                    state.domain_memory = Some(domain);
-                }
-            }
-            // A same-address hit is only valid when the cached connection was
-            // created from the same complete resolved policy. The domain
-            // budget identity is shared, but buddy policy, prewarm, SHM
-            // threshold, chunking, and reassembly geometry must not be
-            // silently bypassed by returning an old client.
-            if rejection.is_none()
-                && let Some(entry) = state.entries.get(address)
-                && entry.client.is_connected()
-                && entry.client.config() != &cfg
-            {
-                rejection = Some(client_policy_mismatch(address, entry.client.config(), &cfg));
-            }
-            // A rejected acquire must not detach a live entry: the frozen
-            // domain or the cached policy already rejected the requested
-            // configuration, so the cache keeps serving existing callers
-            // unchanged.
-            if rejection.is_none()
-                && let Some(entry) = state.entries.get_mut(address)
-            {
-                if entry.client.is_connected() {
-                    crate::client::connect_check(deadline, "pool_acquire")?;
+            if let Some(entry) = state.entries.get(address) {
+                if entry.client.is_connected() && !entry.references.expired(self.grace_period) {
+                    if entry.client.config() != &cfg {
+                        return Err(client_policy_mismatch(address, entry.client.config(), &cfg));
+                    }
                     entry.references.acquire();
-                    let lease = ClientLease {
+                    return Ok(ClientLease {
                         client: entry.client.clone(),
                         references: entry.references.clone(),
                         counted: true,
-                    };
-                    drop(coordinator);
-                    drop(state);
-                    retired.close();
-                    if let Err(error) = crate::client::connect_check(deadline, "pool_acquire") {
-                        return Err(error);
-                    }
-                    return Ok(lease);
-                }
-                // Stale — detach and fall through to create a new one.
-                if let Some(entry) = state.entries.remove(address) {
-                    retired.push(self.retire_under_coordinator(
-                        &mut coordinator,
-                        address,
-                        entry.client,
-                    ));
+                    });
                 }
             }
-            if rejection.is_none() {
-                for work in claim_retired_retries(&coordinator) {
-                    retired.push(work);
-                }
-                fresh = Some(self.register_preparing(
-                    &state,
-                    &mut coordinator,
-                    address,
-                    epoch,
-                    deadline,
-                )?);
+            let expired: Vec<_> = state
+                .entries
+                .iter()
+                .filter(|(key, entry)| {
+                    key.as_str() == address || entry.references.expired(self.grace_period)
+                })
+                .map(|(address, _)| address.clone())
+                .collect();
+            for address in expired {
+                let entry = state.entries.remove(&address).unwrap();
+                detached.push((state.record(&address), entry.client));
             }
+            fresh = FreshClient {
+                record: state.record(address),
+                client: None,
+                published: false,
+            };
         }
-        // Drop the pool lock before closing retired records or connecting
-        // (both may block). Retired tickets registered above are closed even
-        // when this acquire is rejected, so no detached client is stranded.
-        retired.close();
-        if let Some(error) = rejection {
-            return Err(error);
+        for (record, client) in detached {
+            record.deactivate(client);
         }
-
-        // Another caller's finite settlement can still own backing charges.
-        // A fresh allocation waits for it using this operation's remaining
-        // budget. Cache hits already returned above and stay independent.
-        self.wait_retired_settlement(deadline)?;
-        // Derive once before retries; every attempt uses this same snapshot.
         let endpoint = self
             .endpoint_context()?
             .endpoint(address)
             .map_err(crate::control::endpoint_error)?;
-        let (client, mut fresh) = connect_with_transient_retry(
-            self,
-            epoch,
-            &endpoint,
-            &cfg,
-            &budget,
-            deadline,
-            fresh.expect("fresh acquisition reserves cleanup ownership"),
-        )?;
-
-        let mut state = match connect_lock(&self.state, deadline, "pool_publish_wait") {
-            Ok(state) => state,
-            Err(error) => return Err(error),
-        };
-        let mut coordinator = match connect_lock(&self.close_txn.0, deadline, "pool_cleanup_wait") {
-            Ok(coordinator) => coordinator,
-            Err(error) => {
-                drop(state);
-                return Err(error);
+        crate::sync_client::shared_io_handle(deadline)?;
+        let mut attempt = 0;
+        let client = loop {
+            crate::client::connect_check(deadline, "pool_connect")?;
+            connect_lock(&self.state, deadline, "pool_wait")?.check_epoch(epoch)?;
+            let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed);
+            let prefix = format!("/cc3c{:08x}{counter:016x}", std::process::id());
+            let pool = Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    pool_config_from_client_config(&cfg),
+                    prefix,
+                    budget.clone(),
+                )
+                .map_err(IpcError::Config)?,
+            ));
+            let (candidate, result) = SyncClient::connect_transport_pool_attempt_with_deadline(
+                endpoint.clone(),
+                pool,
+                cfg.clone(),
+                budget.clone(),
+                deadline,
+                self.connection_event_source.as_ref(),
+            )?;
+            let candidate = Arc::new(candidate);
+            fresh.client = Some(candidate.clone());
+            match result {
+                Ok(()) => break candidate,
+                Err(error) => {
+                    // These are initial, unpublished connect attempts. A
+                    // business connection never reconnects or replays here.
+                    let transient = matches!(&error, IpcError::Io(error) | IpcError::Connect(error) if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected));
+                    if !transient || attempt == 2 {
+                        return Err(error);
+                    }
+                    let remaining = deadline
+                        .remaining("pool_cleanup")
+                        .map_err(|_| crate::client::connect_expired("pool_cleanup"))?;
+                    if !candidate.close_shared(
+                        remaining
+                            .unwrap_or(Duration::from_secs(5))
+                            .min(Duration::from_secs(5)),
+                    ) {
+                        return Err(error);
+                    }
+                    fresh.client.take();
+                    attempt += 1;
+                    let remaining = deadline
+                        .remaining("pool_retry")
+                        .map_err(|_| crate::client::connect_expired("pool_retry"))?;
+                    let delay = Duration::from_millis(10 * attempt);
+                    std::thread::sleep(remaining.map_or(delay, |left| delay.min(left)));
+                }
             }
         };
-        if let Err(error) = Self::check_acquire_epoch(&state, epoch) {
-            // A drain completed while this connect was in flight. The entry
-            // cannot join the drained generation; register and close it
-            // explicitly while still holding the state lock so the barrier
-            // is accounted before we release it.
-            drop(coordinator);
-            drop(state);
-            fresh.retire();
-            return Err(error);
-        }
-        if let Some(entry) = state.entries.get_mut(address)
-            && entry.client.is_connected()
-        {
-            if entry.client.config() != &cfg {
-                // A racing acquire inserted a connection built from a
-                // different resolved policy. Its entry stays intact for its
-                // existing callers; this fresh connection is the loser and is
-                // closed explicitly, and the caller gets a deterministic
-                // mismatch instead of a wrong-policy client.
-                let winner_policy = entry.client.config().clone();
-                drop(coordinator);
-                drop(state);
-                fresh.retire();
-                return Err(client_policy_mismatch(address, &winner_policy, &cfg));
+        let mut state = connect_lock(&self.state, deadline, "pool_publish_wait")?;
+        state.check_epoch(epoch)?;
+        if let Some(entry) = state.entries.get(address) {
+            if entry.client.is_connected() && !entry.references.expired(self.grace_period) {
+                if entry.client.config() != &cfg {
+                    return Err(client_policy_mismatch(address, entry.client.config(), &cfg));
+                }
+                entry.references.acquire();
+                return Ok(ClientLease {
+                    client: entry.client.clone(),
+                    references: entry.references.clone(),
+                    counted: true,
+                });
             }
-            // Another thread raced and inserted the same address; its client
-            // wins and this fresh connection is the loser. Bump the winner
-            // under the lock, register the loser's close, then run it
-            // outside the lock.
-            crate::client::connect_check(deadline, "pool_acquire")?;
-            entry.references.acquire();
-            let winner = ClientLease {
-                client: entry.client.clone(),
-                references: entry.references.clone(),
-                counted: true,
-            };
-            drop(coordinator);
-            drop(state);
-            fresh.retire();
-            if let Err(error) = crate::client::connect_check(deadline, "pool_acquire") {
-                return Err(error);
-            }
-            return Ok(winner);
         }
-        crate::client::connect_check(deadline, "pool_publish")?;
         let references = Arc::new(PoolReferences::new(1, None));
-        let lease = ClientLease {
-            client: client.clone(),
-            references: references.clone(),
-            counted: true,
-        };
         let replaced = state.entries.insert(
-            address.to_owned(),
+            address.into(),
             PoolEntry {
-                client: Arc::clone(&client),
-                references,
+                client: client.clone(),
+                references: references.clone(),
             },
         );
-        // A stale entry raced back in and lost; register its close in the
-        // same critical section that replaced it.
-        let replaced_ticket = replaced
-            .map(|old| self.retire_under_coordinator(&mut coordinator, address, old.client));
-        fresh.complete();
-        coordinator.retired.remove(&fresh.work.ticket);
-        drop(coordinator);
+        let replacement = replaced.map(|entry| (state.record(address), entry.client));
+        fresh.published = true;
+        fresh.record.finish();
         drop(state);
-        if let Some(work) = replaced_ticket {
-            let _ = close_retired_work(&self.close_txn, &work, cleanup_deadline(deadline));
+        if let Some((record, client)) = replacement {
+            record.deactivate(client);
         }
-        if let Err(error) = crate::client::connect_check(deadline, "pool_acquire") {
-            return Err(error);
-        }
-        Ok(lease)
+        Ok(ClientLease {
+            client,
+            references,
+            counted: true,
+        })
     }
-
-    /// Decrement reference count. When it reaches 0, mark for grace-period
-    /// cleanup.
-    pub fn release(&self, address: &str) {
-        let mut state = self.state.lock();
-        if let Some(entry) = state.entries.get_mut(address) {
-            if !entry.references.release() {
-                eprintln!("ClientPool::release: ref_count already 0 for {address}");
-            }
-        } else {
-            eprintln!("ClientPool::release: no entry for {address}");
-        }
+    pub fn release_if_same(&self, address: &str, client: &Arc<SyncClient>) -> bool {
+        self.state
+            .lock()
+            .entries
+            .get(address)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.client, client) && entry.references.release())
     }
-
-    /// Release one reference only when the pool still contains the acquired client.
-    ///
-    /// This identity check prevents a late drop from an evicted connection
-    /// decrementing the reference count of a replacement at the same address.
-    pub fn release_if_same(&self, address: &str, observed: &Arc<SyncClient>) -> bool {
-        let mut state = self.state.lock();
-        let Some(entry) = state.entries.get_mut(address) else {
-            return false;
-        };
-        if !Arc::ptr_eq(&entry.client, observed) {
-            return false;
-        }
-        entry.references.release()
-    }
-
-    /// Remove one observed unusable client without evicting a racing replacement.
-    ///
-    /// Callers must use this only after a pre-dispatch operation proves that
-    /// the exact acquired connection can no longer serve requests. The
-    /// detached client's bounded close is registered in the same critical
-    /// section that removes the entry, then runs outside the pool lock.
-    pub fn discard_if_same(&self, address: &str, observed: &Arc<SyncClient>) -> bool {
-        self.discard_if_same_with_deadline(address, observed, ConnectDeadline::default())
+    pub fn discard_if_same(&self, address: &str, client: &Arc<SyncClient>) -> bool {
+        self.discard_if_same_with_deadline(address, client, ConnectDeadline::default())
             .unwrap_or(false)
     }
-
     pub fn discard_if_same_with_deadline(
         &self,
         address: &str,
-        observed: &Arc<SyncClient>,
+        client: &Arc<SyncClient>,
         deadline: ConnectDeadline,
     ) -> Result<bool, IpcError> {
-        let ticket = {
+        let detached = {
             let mut state = connect_lock(&self.state, deadline, "pool_discard_wait")?;
-            let mut coordinator = connect_lock(&self.close_txn.0, deadline, "pool_cleanup_wait")?;
-            let is_same = state
+            if !state
                 .entries
                 .get(address)
-                .is_some_and(|entry| Arc::ptr_eq(&entry.client, observed));
-            if is_same {
-                let entry = state
-                    .entries
-                    .remove(address)
-                    .expect("entry presence checked above");
-                Some(self.retire_under_coordinator(&mut coordinator, address, entry.client))
-            } else {
-                None
+                .is_some_and(|entry| Arc::ptr_eq(&entry.client, client))
+            {
+                return Ok(false);
             }
+            let entry = state.entries.remove(address).unwrap();
+            (state.record(address), entry.client)
         };
-        match ticket {
-            Some(ticket) => {
-                let _ = close_retired_work(&self.close_txn, &ticket, cleanup_deadline(deadline));
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        detached.0.deactivate(detached.1);
+        Ok(true)
     }
-
-    /// Detach entries that have been unreferenced longer than `grace_period`.
-    fn sweep_expired_locked(
-        state: &mut CacheState,
-        grace: Duration,
-    ) -> Vec<(String, Arc<SyncClient>)> {
-        let mut detached = Vec::new();
-        state.entries.retain(|address, entry| {
-            if entry.references.expired(grace) {
-                detached.push((address.clone(), Arc::clone(&entry.client)));
-                return false;
-            }
-            true
-        });
-        detached
-    }
-
-    fn wait_retired_settlement(&self, deadline: ConnectDeadline) -> Result<(), IpcError> {
-        let records = {
-            let coordinator = connect_lock(&self.close_txn.0, deadline, "pool_cleanup_wait")?;
-            coordinator
-                .retired
-                .values()
-                .filter(|record| record.state() == RetiredState::Closing)
-                .cloned()
+    pub fn sweep_expired(&self) {
+        let detached = {
+            let mut state = self.state.lock();
+            state.records.retain(|_, record| !record.complete());
+            let expired: Vec<_> = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.references.expired(self.grace_period))
+                .map(|(address, _)| address.clone())
+                .collect();
+            expired
+                .into_iter()
+                .map(|address| {
+                    let entry = state.entries.remove(&address).unwrap();
+                    (state.record(&address), entry.client)
+                })
                 .collect::<Vec<_>>()
         };
-        for record in records {
-            record.wait_until_settled(deadline, false)?;
+        for (record, client) in detached {
+            record.deactivate(client);
         }
-        Ok(())
     }
-
-    /// Sweep expired entries and retry unconfirmed retired owners outside the
-    /// pool lock. All barriers share one bounded maintenance budget.
-    /// Call this periodically from SDK bindings or before acquire.
-    pub fn sweep_expired(&self) {
-        let maintenance = ConnectDeadline::start(
-            c2_config::ConnectOptions::new().with_timeout(DETACHED_CLOSE_TIMEOUT),
-        )
-        .expect("fixed maintenance budget is representable");
-        let tickets = {
-            let mut state = self.state.lock();
-            Self::sweep_expired_locked(&mut state, self.grace_period)
-                .into_iter()
-                .map(|(address, client)| self.retire_locked(&address, client))
-                .collect::<Vec<u64>>()
-        };
-        let deadline = maintenance.instant().unwrap();
-        let retries = claim_retired_retries(&self.close_txn.0.lock());
-        run_retired_closes_until(&self.close_txn, &tickets, deadline);
-        run_retired_work(&self.close_txn, &retries, deadline);
-        let _ = self.wait_retired_settlement(maintenance);
-    }
-
-    /// Drain and explicitly close every cache entry, then reopen the cache
-    /// under a new epoch unless permanently sealed.
-    ///
-    /// Drain transactions are serialized through a closing generation: a
-    /// concurrent `close_all` waits for the active drain to finish (bounded
-    /// by this caller's absolute deadline) and then performs its own drain,
-    /// so no caller can clear the fence or bump the epoch while another
-    /// drain is still closing slow clients, and an entry raced in between
-    /// two drains is covered by the second. Before starting, a reopenable drain waits
-    /// (within the same deadline) for registered pending-close records from
-    /// discard/sweep/loser cleanup — registration happens atomically with
-    /// detachment, so a shutdown can never observe an empty cache with
-    /// unaccounted detached work — and reports an `error` instead of
-    /// claiming completion if the wait expires.
-    ///
-    /// All child closes share **one aggregate absolute deadline** derived
-    /// from `timeout`: each child receives only the time remaining, so a
-    /// cache of N blocked clients costs at most one deadline, not N. Drain
-    /// children are registered as retired records in the same critical
-    /// section that empties the map; an unconfirmed child keeps its record
-    /// (`UnconfirmedIdle`) so its ownership stays reachable. The drain also
-    /// retries records left unconfirmed by earlier barriers and reports
-    /// every record still registered at finalize time as unconfirmed — a
-    /// client is only claimed stopped once its record is removed after a
-    /// confirmed close. No backing memory is force-released. Acquisitions
-    /// during the closing window reject; after this returns, new acquires
-    /// (restart/reacquire) proceed under the new epoch unless sealed. A sealed
-    /// drain also waits for Preparing records through their original notification.
-    pub fn close_all(&self, timeout: Duration) -> ClientCacheCloseReport {
-        self.observe_closes().close_all(timeout)
-    }
-
-    /// Prepare a permanent seal within one absolute deadline, in the same
-    /// state -> coordinator lock order as connection admission. Admission
-    /// changes only when the caller commits after preparing its sole driver.
     pub fn prepare_seal(&self, deadline: Instant) -> Option<ClientPoolSeal<'_>> {
-        let state = self.state.try_lock_until(deadline)?;
-        let txn = self.close_txn.0.try_lock_until(deadline)?;
-        Some(ClientPoolSeal {
-            state,
-            txn,
-            coordinator: &self.close_txn,
-        })
+        self.state
+            .try_lock_until(deadline)
+            .map(|state| ClientPoolSeal {
+                state,
+                source: &self.state,
+            })
     }
-
-    /// Observe one shutdown transaction without replaying completed history.
-    #[doc(hidden)]
     pub fn observe_closes(&self) -> ClientCloseObservation<'_> {
         ClientCloseObservation {
             pool: self,
             observed: HashMap::new(),
         }
     }
-
+    pub fn close_all(&self, timeout: Duration) -> ClientCacheCloseReport {
+        self.observe_closes().close_all(timeout)
+    }
     fn close_all_observed(
         &self,
         timeout: Duration,
         observed: &mut ObservedCloses,
     ) -> ClientCacheCloseReport {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
         let mut report = ClientCacheCloseReport {
             detached: 0,
             unconfirmed: Vec::new(),
             error: None,
             abnormal: Vec::new(),
         };
-        let wait_deadline =
-            ConnectDeadline::start(c2_config::ConnectOptions::new().with_timeout(timeout))
-                .unwrap_or_else(|_| {
-                    ConnectDeadline::start(
-                        c2_config::ConnectOptions::new()
-                            .with_timeout(Duration::from_secs(86400 * 365)),
-                    )
-                    .expect("fallback drain deadline is representable")
-                });
-        let deadline = wait_deadline.instant().unwrap();
-
-        let generation = {
-            let (txn_lock, txn_condvar) = &*self.close_txn;
-            let mut txn = txn_lock.lock();
-            loop {
-                observe_retired_closes(&txn, observed);
-                txn.retired
-                    .retain(|_, record| record.state() != RetiredState::Confirmed);
-                if txn.active_generation.is_none()
-                    && !txn
-                        .retired
-                        .values()
-                        .any(|record| record.state() == RetiredState::Closing)
-                {
-                    break;
-                }
-                if txn.active_generation.is_none() {
-                    // A sealed drain must detach entries even while another
-                    // exact owner is closing. Recheck without reversing the
-                    // state -> coordinator lock order used by admission/seal.
-                    drop(txn);
-                    let state = self.state.lock();
-                    txn = txn_lock.lock();
-                    let sealed = state.epoch.is_none();
-                    drop(state);
-                    if txn.active_generation.is_none()
-                        && (sealed
-                            || !txn
-                                .retired
-                                .values()
-                                .any(|record| record.state() == RetiredState::Closing))
-                    {
-                        observe_retired_closes(&txn, observed);
-                        break;
-                    }
-                }
-                let now = Instant::now();
-                let blocked_by_drain = txn.active_generation.is_some();
-                if now >= deadline {
-                    report.error = Some(Self::drain_wait_error(blocked_by_drain));
-                    report.abnormal = take_observed_abnormal_closes(observed);
-                    return report;
-                }
-                txn_condvar.wait_for(&mut txn, (deadline - now).min(Duration::from_millis(5)));
-            }
-            let generation = txn.next_generation;
-            txn.next_generation += 1;
-            txn.active_generation = Some(generation);
-            generation
+        let Some(_drain) = self.drain_gate.try_lock_until(deadline) else {
+            report.error = Some("timed out waiting for a concurrent cache drain".into());
+            return report;
         };
-        self.close_txn.1.notify_all();
-
-        // Empty the map and register every drained child as a pending close
-        // in the same critical section; also claim (for retry) records that
-        // earlier barriers left unconfirmed.
-        let (drained_tickets, retry_tickets) = {
+        let (detached, sealed) = {
             let mut state = self.state.lock();
-            state.closing_generation = Some(generation);
-            let drained: Vec<(String, Arc<SyncClient>)> = std::mem::take(&mut state.entries)
+            state.draining = true;
+            let entries = std::mem::take(&mut state.entries);
+            report.detached = entries.len();
+            let detached = entries
                 .into_iter()
-                .map(|(address, entry)| (address, entry.client))
-                .collect();
-            let mut txn = self.close_txn.0.lock();
-            let drained_tickets: Vec<u64> = drained
-                .into_iter()
-                .map(|(address, client)| {
-                    let ticket = txn.next_ticket;
-                    txn.next_ticket += 1;
-                    txn.retired.insert(
-                        ticket,
-                        Arc::new(RetiredClose::new(
-                            address,
-                            Some(client),
-                            RetiredState::Closing,
-                        )),
-                    );
-                    ticket
-                })
-                .collect();
-            let retry_tickets: Vec<u64> = txn
-                .retired
-                .iter_mut()
-                .filter(|(_, record)| record.claim_retry())
-                .map(|(ticket, _)| *ticket)
-                .collect();
-            observe_retired_closes(&txn, observed);
-            (drained_tickets, retry_tickets)
+                .map(|(address, entry)| (state.record(&address), entry.client))
+                .collect::<Vec<_>>();
+            for (id, record) in &state.records {
+                if !record.complete() {
+                    observed.entry(*id).or_insert_with(|| Some(record.clone()));
+                }
+            }
+            (detached, state.epoch.is_none())
         };
-        self.close_txn.1.notify_all();
-        report.detached = drained_tickets.len();
-
-        // Children first, then retries, all bounded by the one aggregate
-        // deadline (each receives only the time remaining).
-        for ticket in drained_tickets.into_iter().chain(retry_tickets) {
-            if let Err(address) = close_retired_ticket(&self.close_txn, ticket, deadline) {
-                report.unconfirmed.push(address);
+        for (record, client) in detached {
+            record.deactivate(client);
+        }
+        for record in observed.values_mut() {
+            let Some(original) = record.as_ref() else {
+                continue;
+            };
+            if !original.wait(deadline, sealed) {
+                if !report.unconfirmed.contains(&original.address) {
+                    report.unconfirmed.push(original.address.clone());
+                }
+            } else if original.complete() {
+                if let Some(detail) = original.abnormal() {
+                    report.abnormal.push(detail);
+                }
+                record.take();
             }
         }
-
-        // Barriers may have started while this drain was closing entries (a
-        // concurrent discard of a drained-but-live client). Do not claim
-        // completion while any are active; the wait stays inside the same
-        // aggregate deadline.
-        {
-            let (txn_lock, txn_condvar) = &*self.close_txn;
-            let mut txn = txn_lock.lock();
-            observe_retired_closes(&txn, observed);
-            while txn
-                .retired
-                .values()
-                .any(|record| record.state() == RetiredState::Closing)
-            {
-                let now = Instant::now();
-                if now >= deadline {
-                    report.error = Some(Self::drain_wait_error(false));
-                    break;
-                }
-                let result =
-                    txn_condvar.wait_for(&mut txn, (deadline - now).min(Duration::from_millis(5)));
-                observe_retired_closes(&txn, observed);
-                if result.timed_out()
-                    && Instant::now() >= deadline
-                    && txn
-                        .retired
-                        .values()
-                        .any(|record| record.state() == RetiredState::Closing)
-                {
-                    report.error = Some(Self::drain_wait_error(false));
-                    break;
-                }
-            }
-        }
-
-        // Finalize the generation and report every record still registered:
-        // those clients are owned by this cache, not confirmed stopped, and
-        // must stay visible to callers.
-        {
-            let mut state = self.state.lock();
-            if state.epoch.is_none() {
-                // Sealed admission cannot add more Preparing records. Wait on
-                // each original record's notification, outside metadata locks.
-                let records = {
-                    let txn = self.close_txn.0.lock();
-                    observe_retired_closes(&txn, observed);
-                    txn.retired
-                        .values()
-                        .filter(|record| {
-                            matches!(
-                                record.state(),
-                                RetiredState::Preparing | RetiredState::Closing
-                            )
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                };
-                drop(state);
-                for record in records {
-                    if record.wait_until_settled(wait_deadline, true).is_err() {
-                        report.error = Some(Self::drain_wait_error(false));
-                    }
-                }
-                state = self.state.lock();
-            }
-            let sealed = state.epoch.is_none();
-            debug_assert_eq!(state.closing_generation, Some(generation));
-            state.closing_generation = None;
-            state.epoch = state.epoch.map(|epoch| epoch.saturating_add(1));
-            let mut txn = self.close_txn.0.lock();
-            debug_assert_eq!(txn.active_generation, Some(generation));
-            txn.active_generation = None;
-            observe_retired_closes(&txn, observed);
-            txn.retired
-                .retain(|_, record| record.state() != RetiredState::Confirmed);
-            for record in txn.retired.values().filter(|record| {
-                // A preparing acquire can confirm after retain above.
-                // Only unfinished close states belong in this report.
-                match record.state() {
-                    RetiredState::Preparing => sealed,
-                    RetiredState::Closing | RetiredState::UnconfirmedIdle => true,
-                    RetiredState::Confirmed => false,
-                }
-            }) {
-                let already_reported = report
-                    .unconfirmed
-                    .iter()
-                    .any(|address| *address == record.address);
-                if !already_reported {
-                    report.unconfirmed.push(record.address.clone());
-                }
-            }
-        }
-        self.close_txn.1.notify_all();
-        report.abnormal = take_observed_abnormal_closes(observed);
+        let mut state = self.state.lock();
+        state.draining = false;
+        state.epoch = state
+            .epoch
+            .map(|epoch| epoch.checked_add(1).expect("client cache epoch exhausted"));
+        state.records.retain(|_, record| !record.complete());
         report
     }
-
-    fn drain_wait_error(blocked_by_drain: bool) -> String {
-        if blocked_by_drain {
-            "timed out waiting for a concurrent cache drain".to_string()
-        } else {
-            "timed out waiting for in-flight detached client closes".to_string()
-        }
-    }
-
-    /// Number of active entries (for testing).
     pub fn active_count(&self) -> usize {
         self.state.lock().entries.len()
     }
-
-    /// Reference count for an address (for testing).
     pub fn refcount(&self, address: &str) -> usize {
         self.state
             .lock()
             .entries
             .get(address)
-            .map_or(0, |e| e.references.count.load(Ordering::Acquire))
+            .map_or(0, |entry| entry.references.count.load(Ordering::Acquire))
     }
-
-    /// Check if a client exists for the address (for testing).
     pub fn has_client(&self, address: &str) -> bool {
         self.state.lock().entries.contains_key(address)
     }
 }
-
-#[cfg(test)]
-impl ClientPool {
-    /// Whether a drain transaction currently owns the closing window.
-    pub(crate) fn is_draining_for_test(&self) -> bool {
-        self.close_txn.0.lock().active_generation.is_some()
-    }
-
-    /// Wait for the same closing fence that acquire checks. The coordinator
-    /// announcement precedes that fence; observing it alone is too early.
-    pub(crate) fn wait_until_draining_for_test(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if self.state.lock().closing_generation.is_some() {
-                return true;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            // Never hold the coordinator while locking state: production
-            // registers drained entries in the opposite lock order. A short
-            // bounded wait also covers a notification between checking the
-            // fence and entering the condvar wait.
-            let (lock, condvar) = &*self.close_txn;
-            let mut txn = lock.lock();
-            condvar.wait_for(&mut txn, (deadline - now).min(Duration::from_millis(5)));
-        }
-    }
-
-    /// Deterministically wait until at least one retired record with a
-    /// pending (Closing) close barrier is registered. Registration happens
-    /// atomically with detachment and notifies this condvar, so the wake
-    /// fires exactly in the window between detach and close I/O.
-    pub(crate) fn wait_until_detached_close_in_flight_for_test(&self, timeout: Duration) -> bool {
-        let (lock, condvar) = &*self.close_txn;
-        let mut txn = lock.lock();
-        let has_closing = |txn: &CloseTxnState| {
-            txn.retired
-                .values()
-                .any(|record| record.state() == RetiredState::Closing)
-        };
-        let deadline = Instant::now() + timeout;
-        while !has_closing(&txn) {
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let result = condvar.wait_for(&mut txn, deadline - now);
-            if result.timed_out() {
-                return has_closing(&txn);
-            }
-        }
-        true
-    }
-
-    /// Number of registered close records; completed metadata awaiting prune
-    /// is excluded. Preparing records retain only acquisition bookkeeping.
-    pub(crate) fn retired_records_for_test(&self) -> usize {
-        self.close_txn
-            .0
-            .lock()
-            .retired
-            .values()
-            .filter(|record| record.state() != RetiredState::Confirmed)
-            .count()
-    }
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::IpcClient;
-    use c2_local::{LocalEndpoint, LocalListener};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::Barrier;
-    use std::thread;
-    use tokio::io::AsyncReadExt;
-
-    use c2_server::{
-        ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
-        SchedulerLimits, Server, ServerIpcConfig,
-    };
-
-    struct Echo;
-
-    impl CrmCallback for Echo {
-        fn invoke(
-            &self,
-            _route_name: &str,
-            _method_idx: u16,
-            _request: RequestData,
-            _response_pool: Arc<c2_server::ResponsePool>,
-        ) -> Result<ResponseMeta, CrmError> {
-            Ok(ResponseMeta::Inline(b"ok".to_vec()))
-        }
-    }
-
-    fn connect_budget(milliseconds: u64) -> ConnectDeadline {
-        ConnectDeadline::start(
-            c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(milliseconds)),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn connect_deadline_pool_state_wait_uses_caller_budget() {
-        let pool = Arc::new(ClientPool::new(Duration::from_secs(30)));
-        let state = pool.state.lock();
-        let waiting_pool = pool.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiter = thread::spawn(move || {
-            let result =
-                waiting_pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
-            let _ = done_tx.send(result);
-        });
-        // Completion must precede lock release; scheduling time is not part
-        // of the worker's 25ms connect budget.
-        let result = done_rx.recv_timeout(Duration::from_secs(2));
-        drop(state);
-        waiter.join().unwrap();
-        let result = result.expect("connect must expire while pool state remains locked");
-        let IpcError::LocalCallRejected(error) =
-            result.err().expect("deadline before endpoint lookup")
-        else {
-            panic!("canonical deadline required")
-        };
-        assert_eq!(error.details["stage"], "pool_wait");
-        assert_eq!(pool.active_count(), 0);
-        assert!(pool.memory_budget_snapshot().is_none());
-    }
-
-    #[test]
-    fn connect_deadline_coordinator_wait_cannot_freeze_or_publish() {
-        let pool = Arc::new(ClientPool::new(Duration::from_secs(30)));
-        let coordinator = pool.close_txn.0.lock();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiting_pool = pool.clone();
-        let waiter = thread::spawn(move || {
-            let result =
-                waiting_pool.acquire_with_deadline("malformed-no-io", None, connect_budget(25));
-            let _ = done_tx.send(result);
-        });
-        // Prove completion while the coordinator is still held. The watchdog
-        // allows scheduler delay; the actual caller budget remains 25 ms.
-        let observed = done_rx.recv_timeout(Duration::from_secs(2));
-        drop(coordinator);
-        waiter.join().unwrap();
-        let result = observed.expect("connect deadline must finish before coordinator release");
-        let IpcError::LocalCallRejected(error) = result.err().unwrap() else {
-            panic!("canonical deadline required")
-        };
-        assert_eq!(error.details["stage"], "pool_cleanup_wait");
-        assert_eq!(pool.active_count(), 0);
-        assert!(pool.memory_budget_snapshot().is_none());
-    }
-
-    #[test]
-    fn connect_deadline_lease_drop_avoids_map_and_coordinator_locks() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let references = Arc::new(PoolReferences::new(1, None));
-        let client = Arc::new(make_disconnected_client());
-        let lease = ClientLease {
-            client,
-            references: references.clone(),
-            counted: true,
-        };
-        let state = pool.state.lock();
-        let coordinator = pool.close_txn.0.lock();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let releaser = thread::spawn(move || {
-            drop(lease);
-            done_tx.send(()).unwrap();
-        });
-        let observed = done_rx.recv_timeout(Duration::from_secs(2));
-        let count = references.count.load(Ordering::Acquire);
-        let released_tick = references.released_tick.load(Ordering::Acquire);
-        drop(coordinator);
-        drop(state);
-        releaser.join().unwrap();
-        observed.expect("exact-entry release must not wait on global locks");
-        assert_eq!(count, 0);
-        assert_ne!(released_tick, 0);
-    }
-
-    #[test]
-    fn connect_deadline_expired_fresh_client_retains_cleanup_and_recovers() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let shared = Arc::new(make_disconnected_client());
-        let refs = Arc::new(PoolReferences::new(2, None));
-        pool.state.lock().entries.insert(
-            "ipc://unrelated-shared".into(),
-            PoolEntry {
-                client: shared.clone(),
-                references: refs.clone(),
-            },
-        );
-        let epoch = pool.state.lock().epoch;
-        let client = Arc::new(make_disconnected_client());
-        let weak = Arc::downgrade(&client);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        client.hold_writer_slot_for_test(ready_tx, release_rx);
-        ready_rx.blocking_recv().unwrap();
-        let work = {
-            let mut coordinator = pool.close_txn.0.lock();
-            pool.register_close_work(
-                &mut coordinator,
-                "ipc://fresh-expired",
-                None,
-                RetiredState::Preparing,
-            )
-        };
-        let fresh = FreshClientGuard {
-            work,
-            coordinator: pool.close_txn.clone(),
-            deadline: connect_budget(0),
-            done: false,
-        };
-        fresh.attach(client.clone());
-        drop(client);
-        let state = pool.state.lock();
-        let coordinator = pool.close_txn.0.lock();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let closer = thread::spawn(move || {
-            drop(fresh);
-            done_tx.send(()).unwrap();
-        });
-        let observed = done_rx.recv_timeout(Duration::from_secs(2));
-        let retained = weak.upgrade().is_some();
-        let retired_state = coordinator.retired.values().next().map(|work| work.state());
-        drop(coordinator);
-        drop(state);
-        release_tx.send(()).unwrap();
-        closer.join().unwrap();
-        observed.expect("expiry cleanup must not wait on pool metadata locks");
-        assert!(retained, "unconfirmed close retains its client");
-        assert_eq!(retired_state, Some(RetiredState::Closing));
-        wait_for_retired_settlement(&pool);
-        assert_eq!(pool.retired_records_for_test(), 0);
-        assert!(
-            weak.upgrade().is_none(),
-            "confirmed close retires exact ownership without a pool drain"
-        );
-        let state = pool.state.lock();
-        assert_eq!(state.epoch, epoch);
-        assert_eq!(refs.count.load(Ordering::Acquire), 2);
-        assert!(Arc::ptr_eq(
-            &state.entries["ipc://unrelated-shared"].client,
-            &shared
-        ));
-    }
-
-    fn wait_for_retired_settlement(pool: &ClientPool) {
-        let end = Instant::now() + Duration::from_secs(1);
-        let mut coordinator = pool.close_txn.0.lock();
-        loop {
-            coordinator
-                .retired
-                .retain(|_, record| record.state() != RetiredState::Confirmed);
-            if coordinator.retired.is_empty() {
-                return;
-            }
-            assert!(
-                Instant::now() < end,
-                "ordinary settlement left retired native owners behind"
-            );
-            pool.close_txn.1.wait_until(&mut coordinator, end);
-        }
-    }
-
-    #[test]
-    fn connect_deadline_idle_cleanup_retried_by_acquire_and_sweep() {
-        for use_acquire in [false, true] {
-            let pool = ClientPool::new(Duration::from_secs(30));
-            let cfg = ClientIpcConfig::default();
-            pool.state.lock().domain_memory = Some(DomainMemory::from_config(&cfg));
-            let epoch = pool.state.lock().epoch;
-            let client = Arc::new(make_disconnected_client());
-            let weak = Arc::downgrade(&client);
-            pool.register_close_work(
-                &mut pool.close_txn.0.lock(),
-                "ipc://idle",
-                Some(client),
-                RetiredState::UnconfirmedIdle,
-            );
-            if use_acquire {
-                // Invalid endpoint rejects after ordinary retired settlement,
-                // without listening, changing epoch, or draining the cache.
-                assert!(
-                    pool.acquire_with_deadline("invalid-address", Some(&cfg), connect_budget(100))
-                        .is_err()
-                );
-            } else {
-                pool.sweep_expired();
-            }
-            assert!(weak.upgrade().is_none());
-            assert_eq!(pool.retired_records_for_test(), 0);
-            assert_eq!(pool.state.lock().epoch, epoch);
-            assert_eq!(
-                pool.memory_budget_snapshot().unwrap().limits,
-                cfg.memory_budget_limits()
-            );
-        }
-    }
-
-    #[test]
-    fn connect_deadline_settlement_wait_does_not_relock_global_coordinator() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let client = Arc::new(make_disconnected_client());
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        client.hold_writer_slot_for_test(ready_tx, release_rx);
-        ready_rx.blocking_recv().unwrap();
-        let work = pool.register_close_work(
-            &mut pool.close_txn.0.lock(),
-            "ipc://settlement-wait",
-            Some(client),
-            RetiredState::UnconfirmedIdle,
-        );
-        schedule_retired_settlement(&pool.close_txn, &work);
-        let coordinator = pool.close_txn.0.lock();
-        let record = work.record.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiter = thread::spawn(move || {
-            let result = record.wait_until_settled(connect_budget(100), false);
-            let _ = done_tx.send(result);
-        });
-        let observed = done_rx.recv_timeout(Duration::from_secs(2));
-        let state_while_blocked = work.record.state();
-        drop(coordinator);
-        release_tx.send(()).unwrap();
-        waiter.join().unwrap();
-        wait_for_retired_settlement(&pool);
-        let error = observed
-            .expect("settlement deadline must finish before coordinator release")
-            .unwrap_err();
-        assert!(matches!(error, IpcError::LocalCallRejected(ref error)
-            if error.code == c2_error::ErrorCode::CallDeadlineExceeded
-                && error.details.get("stage").map(String::as_str) == Some("pool_cleanup_wait")));
-        assert_eq!(state_while_blocked, RetiredState::Closing);
-    }
-
-    #[test]
-    fn connect_deadline_finite_settlement_preserves_unconfirmed_owner_for_maintenance() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let client = Arc::new(make_disconnected_client());
-        let weak = Arc::downgrade(&client);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        client.hold_writer_slot_for_test(ready_tx, release_rx);
-        ready_rx.blocking_recv().unwrap();
-        let work = pool.register_close_work(
-            &mut pool.close_txn.0.lock(),
-            "ipc://still-blocked",
-            Some(client),
-            RetiredState::UnconfirmedIdle,
-        );
-        let started = Instant::now();
-        schedule_retired_settlement(&pool.close_txn, &work);
-        // A second scheduler cannot start another close for the same owner.
-        schedule_retired_settlement(&pool.close_txn, &work);
-        work.record
-            .wait_until_settled(connect_budget(7000), false)
-            .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(7));
-        assert_eq!(work.record.state(), RetiredState::UnconfirmedIdle);
-        assert!(weak.upgrade().is_some());
-        assert_eq!(pool.retired_records_for_test(), 1);
-        // No automatic loop: retry is driven by ordinary maintenance after
-        // the blocked native writer has actually become available.
-        release_tx.send(()).unwrap();
-        pool.sweep_expired();
-        assert_eq!(pool.retired_records_for_test(), 0);
-        assert_eq!(work.record.state(), RetiredState::Confirmed);
-        assert!(weak.upgrade().is_none());
-    }
-
-    #[test]
-    fn connect_deadline_prewarm_accounting_settles_without_drain() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let mut cfg = ClientIpcConfig::default();
-        cfg.base.pool_segment_size = 1024 * 1024;
-        cfg.base.max_pool_segments = 1;
-        cfg.base.pool_prewarm_segments = 1;
-        cfg.base.shm_backing_budget_bytes = 1_536_000;
-        let domain = DomainMemory::from_config(&cfg);
-        let budget = domain.budget.clone();
-        pool.state.lock().domain_memory = Some(domain);
-        pool.set_default_config(cfg.clone()).unwrap();
-        let initial_epoch = pool.state.lock().epoch;
-        let mem = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
-            pool_config_from_client_config(&cfg),
-            format!("/timeout_accounting_{}", std::process::id()),
-            budget.clone(),
-        )));
-        mem.lock().ensure_buddy_segments(1).unwrap();
-        let charged = budget.snapshot().shm.used_bytes;
-        assert!(charged > 1024 * 1024);
-        assert!(charged * 2 > cfg.base.shm_backing_budget_bytes);
-        // Zero expires before OS connect. The real prewarmed transport pool
-        // is still attached to the failed attempt, exactly as after handshake.
-        let (client, result) = SyncClient::connect_transport_pool_attempt_with_deadline(
-            LocalEndpoint::from_address("ipc://prewarm-accounting").unwrap(),
-            mem,
-            cfg.clone(),
-            budget.clone(),
-            connect_budget(0),
-            None,
-        );
-        assert!(matches!(result, Err(IpcError::LocalCallRejected(_))));
-        let client = Arc::new(client);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        client.hold_writer_slot_for_test(ready_tx, release_rx);
-        ready_rx.blocking_recv().unwrap();
-        let work = pool.register_close_work(
-            &mut pool.close_txn.0.lock(),
-            "ipc://prewarm-accounting",
-            None,
-            RetiredState::Preparing,
-        );
-        let fresh = FreshClientGuard {
-            work,
-            coordinator: pool.close_txn.clone(),
-            deadline: connect_budget(0),
-            done: false,
-        };
-        fresh.attach(client.clone());
-        drop(client);
-        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
-        let dropper = thread::spawn(move || {
-            drop(fresh);
-            let _ = dropped_tx.send(());
-        });
-        let observed = dropped_rx.recv_timeout(Duration::from_secs(2)).map(|()| {
-            (
-                budget.snapshot().shm.used_bytes,
-                pool.active_count(),
-                pool.refcount("ipc://prewarm-accounting"),
-            )
-        });
-        let _ = release_tx.send(());
-        dropper.join().unwrap();
-        let (retained, active, references) =
-            observed.expect("dropping the fresh guard must not wait for the writer slot");
-        assert_eq!(
-            retained, charged,
-            "busy native owner must retain its actual charge"
-        );
-        assert_eq!(active, 0);
-        assert_eq!(references, 0);
-        wait_for_retired_settlement(&pool);
-        assert_eq!(budget.snapshot().shm.used_bytes, 0);
-        assert_eq!(pool.state.lock().epoch, initial_epoch);
-        assert_eq!(
-            pool.memory_budget_snapshot().unwrap().limits,
-            cfg.memory_budget_limits()
-        );
-        assert_eq!(pool.default_config.lock().as_ref(), Some(&cfg));
-        // The same domain can fund the same prewarm again without close_all,
-        // increasing its limit, or disabling prewarm.
-        let mut recovered = MemPool::new_with_prefix_and_budget(
-            pool_config_from_client_config(&cfg),
-            format!("/timeout_accounting_recovered_{}", std::process::id()),
-            budget.clone(),
-        );
-        recovered.ensure_buddy_segments(1).unwrap();
-        assert_eq!(budget.snapshot().shm.used_bytes, charged);
-        assert_eq!(budget.snapshot().shm.rejected_allocations, 0);
-        drop(recovered);
-        assert_eq!(budget.snapshot().shm.used_bytes, 0);
-    }
-
-    #[test]
-    fn connect_deadline_old_lease_cannot_release_replacement() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let old = Arc::new(PoolReferences::new(1, None));
-        let replacement = Arc::new(PoolReferences::new(1, None));
-        let lease = ClientLease {
-            client: Arc::new(make_disconnected_client()),
-            references: old.clone(),
-            counted: true,
-        };
-        pool.state.lock().entries.insert(
-            "ipc://replacement".into(),
-            PoolEntry {
-                client: Arc::new(make_disconnected_client()),
-                references: replacement.clone(),
-            },
-        );
-        drop(lease);
-        assert_eq!(old.count.load(Ordering::Acquire), 0);
-        assert_eq!(pool.refcount("ipc://replacement"), 1);
-    }
-
-    fn unique_ipc_address(prefix: &str) -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        format!(
-            "ipc://{}_{}_{}",
-            prefix,
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        )
-    }
-
-    fn expected_contract(name: &str) -> c2_contract::ExpectedRouteContract {
-        c2_contract::ExpectedRouteContract {
-            route_name: name.to_string(),
-            crm_ns: "test.pool".to_string(),
-            crm_name: "Grid".to_string(),
-            crm_ver: "0.1.0".to_string(),
-            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .to_string(),
-            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                .to_string(),
-        }
-    }
-
-    async fn register_test_route(server: &Server, name: &str) {
-        let expected = expected_contract(name);
-        let built = server
-            .build_route(
-                RouteBuildSpec {
-                    name: name.to_string(),
-                    crm_ns: expected.crm_ns,
-                    crm_name: expected.crm_name,
-                    crm_ver: expected.crm_ver,
-                    abi_hash: expected.abi_hash,
-                    signature_hash: expected.signature_hash,
-                    method_names: vec!["ping".to_string()],
-                    access_map: HashMap::new(),
-                    concurrency_mode: ConcurrencyMode::ReadParallel,
-                    limits: SchedulerLimits::default(),
-                },
-                Arc::new(Echo),
-            )
-            .expect("test route should build");
-        let reservation = server
-            .reserve_route(built)
-            .await
-            .expect("test route should reserve");
-        server
-            .commit_reserved_route(reservation)
-            .await
-            .expect("test route should commit");
-    }
-
     #[test]
     fn test_pool_new() {
         let pool = ClientPool::new(Duration::from_secs(30));
         assert_eq!(pool.active_count(), 0);
     }
-
     #[test]
     fn test_pool_grace_period_sweep() {
         let pool = ClientPool::new(Duration::from_millis(50));
@@ -2332,7 +866,6 @@ mod tests {
         pool.sweep_expired();
         assert_eq!(pool.active_count(), 0, "expired entry should be swept");
     }
-
     #[test]
     fn test_pool_grace_period_not_expired() {
         let pool = ClientPool::new(Duration::from_secs(60));
@@ -2357,7 +890,6 @@ mod tests {
             "recently released entry should survive"
         );
     }
-
     #[test]
     fn test_pool_refcount_tracking() {
         let pool = ClientPool::new(Duration::from_secs(30));
@@ -2378,23 +910,21 @@ mod tests {
 
         assert_eq!(pool.refcount(addr), 2);
 
-        pool.release(addr);
+        let observed = pool.state.lock().entries[addr].client.clone();
+        assert!(pool.release_if_same(addr, &observed));
         assert_eq!(pool.refcount(addr), 1);
         assert!(pool.has_client(addr));
 
-        pool.release(addr);
+        assert!(pool.release_if_same(addr, &observed));
         assert_eq!(pool.refcount(addr), 0);
         // last_release should now be set; entry still present.
         assert!(pool.has_client(addr));
     }
-
     #[test]
     fn test_pool_release_unknown_address() {
-        // Should not panic — just print a warning.
         let pool = ClientPool::new(Duration::from_secs(30));
-        pool.release("ipc://nonexistent");
+        assert!(!pool.release_if_same("ipc://nonexistent", &Arc::new(make_disconnected_client())));
     }
-
     #[test]
     fn test_pool_release_already_zero() {
         let pool = ClientPool::new(Duration::from_secs(30));
@@ -2413,10 +943,10 @@ mod tests {
         }
 
         // Should not panic or underflow.
-        pool.release(addr);
+        let observed = pool.state.lock().entries[addr].client.clone();
+        assert!(!pool.release_if_same(addr, &observed));
         assert_eq!(pool.refcount(addr), 0);
     }
-
     #[test]
     fn discard_if_same_removes_only_the_observed_stale_client() {
         let pool = ClientPool::new(Duration::from_secs(30));
@@ -2437,7 +967,6 @@ mod tests {
         assert!(pool.discard_if_same(address, &observed));
         assert!(!pool.has_client(address));
     }
-
     #[test]
     fn release_if_same_cannot_decrement_a_racing_replacement() {
         let pool = ClientPool::new(Duration::from_secs(30));
@@ -2458,7 +987,6 @@ mod tests {
         assert!(pool.release_if_same(address, &replacement));
         assert_eq!(pool.refcount(address), 0);
     }
-
     #[test]
     fn test_pool_close_all_drains_and_reopens_under_new_epoch() {
         let pool = ClientPool::new(Duration::from_secs(30));
@@ -2491,2621 +1019,11 @@ mod tests {
         assert!(report.error.is_none(), "{report:?}");
         // Cache reopened: no active closing generation and epoch bumped.
         let state = pool.state.lock();
-        assert_eq!(state.closing_generation, None);
+        assert!(!state.draining);
         assert_eq!(state.epoch, Some(1));
         drop(state);
-        assert!(!pool.is_draining_for_test());
+        assert!(!pool.state.lock().draining);
     }
-
-    #[test]
-    fn acquire_rejects_while_cache_is_closing() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        // Enter the closing window without draining, exactly like an
-        // in-progress close_all does between its fence and epoch bump.
-        pool.state.lock().closing_generation = Some(0);
-
-        let result = pool.acquire("ipc:///nonexistent_socket_path", None);
-        match result {
-            Err(IpcError::Pool(message)) => assert!(
-                message.contains("closing"),
-                "acquire must reject during the closing window, got {message}"
-            ),
-            Err(other) => panic!("unexpected error kind: {other}"),
-            Ok(_) => panic!("acquire must reject during the closing window"),
-        }
-
-        pool.state.lock().closing_generation = None;
-    }
-
-    #[test]
-    fn test_pool_acquire_no_server() {
-        // acquire() should fail gracefully when no server is listening.
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let result = pool.acquire("ipc:///nonexistent_socket_path", None);
-        assert!(result.is_err(), "acquire without server should fail");
-    }
-
-    #[test]
-    fn acquire_retries_transient_handshake_eof() {
-        let address = format!("ipc://pool_retry_{}", std::process::id());
-        let endpoint = LocalEndpoint::from_address(&address).unwrap();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let server_thread = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let mut listener = LocalListener::bind(&endpoint).unwrap();
-                ready_tx.send(()).unwrap();
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    for attempt in 0..2 {
-                        let mut stream = listener.accept().await.unwrap();
-
-                        crate::tests::accept_version_preamble(&mut stream).await;
-                        let mut len_buf = [0_u8; 4];
-                        stream.read_exact(&mut len_buf).await.unwrap();
-                        let body_len = u32::from_le_bytes(len_buf) as usize;
-                        let mut body = vec![0_u8; body_len];
-                        stream.read_exact(&mut body).await.unwrap();
-
-                        if attempt == 0 {
-                            continue;
-                        }
-
-                        let route = c2_wire::handshake::RouteInfo {
-                            name: "grid".to_string(),
-                            route_uid: "grid-route-uid-0001".to_string(),
-                            route_revision: 1,
-                            crm_ns: "test.pool".to_string(),
-                            crm_name: "Grid".to_string(),
-                            crm_ver: "0.1.0".to_string(),
-                            abi_hash:
-                                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                                    .to_string(),
-                            signature_hash:
-                                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                                    .to_string(),
-                            max_payload_size: 1024,
-                            methods: vec![c2_wire::handshake::MethodEntry {
-                                name: "ping".to_string(),
-                                index: 0,
-                            }],
-                        };
-                        let identity = c2_wire::handshake::ServerIdentity {
-                            server_id: "pool-retry-server".to_string(),
-                            server_instance_id: "pool-retry-instance".to_string(),
-                        };
-                        let payload = c2_wire::handshake::encode_server_handshake(
-                            &[],
-                            c2_wire::handshake::CAP_CALL_V2
-                                | c2_wire::handshake::CAP_METHOD_IDX
-                                | c2_wire::handshake::CAP_CHUNKED,
-                            &[route],
-                            "",
-                            &identity,
-                        )
-                        .unwrap();
-                        let frame = c2_wire::frame::encode_frame(
-                            0,
-                            c2_wire::flags::FLAG_HANDSHAKE | c2_wire::flags::FLAG_RESPONSE,
-                            &payload,
-                        );
-                        stream.write_all(&frame).await.unwrap();
-                        let mut extra_len = [0_u8; 4];
-                        match tokio::time::timeout(
-                            Duration::from_millis(150),
-                            stream.read_exact(&mut extra_len),
-                        )
-                        .await
-                        {
-                            Err(_) => {}
-                            Ok(Ok(_)) => {
-                                panic!("direct IPC connect must not open a route-watch stream")
-                            }
-                            Ok(Err(err)) => panic!("unexpected post-handshake read error: {err}"),
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                })
-                .await
-                .expect("retry handshake fixture must finish");
-                crate::tests::close_listener(listener).await;
-            });
-        });
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("retry listener readiness");
-
-        let pool = ClientPool::new(Duration::from_secs(60));
-        let client = pool.acquire(&address, None).unwrap();
-        assert_eq!(client.route_names(), vec!["grid".to_string()]);
-        pool.release(&address);
-
-        server_thread.join().unwrap();
-    }
-
-    /// One valid server handshake reply frame for the "grid" route.
-    fn grid_handshake_reply_frame() -> Vec<u8> {
-        let route = c2_wire::handshake::RouteInfo {
-            name: "grid".to_string(),
-            route_uid: "grid-route-uid-0001".to_string(),
-            route_revision: 1,
-            crm_ns: "test.pool".to_string(),
-            crm_name: "Grid".to_string(),
-            crm_ver: "0.1.0".to_string(),
-            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .to_string(),
-            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                .to_string(),
-            max_payload_size: 1024 * 1024 * 1024,
-            methods: vec![c2_wire::handshake::MethodEntry {
-                name: "ping".to_string(),
-                index: 0,
-            }],
-        };
-        let identity = c2_wire::handshake::ServerIdentity {
-            server_id: "pool-race-server".to_string(),
-            server_instance_id: "pool-race-instance".to_string(),
-        };
-        let payload = c2_wire::handshake::encode_server_handshake(
-            &[],
-            c2_wire::handshake::CAP_CALL_V2
-                | c2_wire::handshake::CAP_METHOD_IDX
-                | c2_wire::handshake::CAP_CHUNKED,
-            &[route],
-            "",
-            &identity,
-        )
-        .unwrap();
-        c2_wire::frame::encode_frame(
-            0,
-            c2_wire::flags::FLAG_HANDSHAKE | c2_wire::flags::FLAG_RESPONSE,
-            &payload,
-        )
-    }
-
-    mod close_report {
-        use super::*;
-
-        // Low-level constructors deliberately ignore process environment. Pass
-        // the runner's private namespace explicitly to every real pool fixture.
-        fn test_endpoint_context() -> LocalEndpointContext {
-            #[cfg(unix)]
-            if let Some(root) = std::env::var_os("C2_IPC_ROOT") {
-                return LocalEndpointContext::with_unix_root(std::path::Path::new(&root)).unwrap();
-            }
-            LocalEndpointContext::default_for_platform().unwrap()
-        }
-
-        fn test_endpoint(address: &str) -> LocalEndpoint {
-            test_endpoint_context().endpoint(address).unwrap()
-        }
-
-        fn test_pool(grace_period: Duration) -> ClientPool {
-            ClientPool::with_endpoint_context(grace_period, test_endpoint_context())
-        }
-
-        struct NoAckPeer {
-            address: String,
-            stop: Option<tokio::sync::oneshot::Sender<()>>,
-            runner: Option<thread::JoinHandle<()>>,
-        }
-
-        impl NoAckPeer {
-            fn start() -> Self {
-                Self::with_first_handshake(|| {})
-            }
-
-            fn with_first_handshake(hook: impl FnOnce() + Send + 'static) -> Self {
-                let address = unique_ipc_address("pool_close_report");
-                let endpoint = test_endpoint(&address);
-                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-                let (stop, mut stopped) = tokio::sync::oneshot::channel();
-                let runner = thread::spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-                    runtime.block_on(async move {
-                        let mut listener = LocalListener::bind(&endpoint).unwrap();
-                        ready_tx.send(()).unwrap();
-                        let mut streams = Vec::new();
-                        let mut hook = Some(hook);
-                        loop {
-                            tokio::select! {
-                                _ = &mut stopped => break,
-                                accepted = listener.accept() => {
-                                    let mut stream = accepted.unwrap();
-                                    crate::tests::accept_version_preamble(&mut stream).await;
-                                    let (header, _) = read_peer_frame(&mut stream).await.unwrap().unwrap();
-                                    assert_ne!(header.flags & c2_wire::flags::FLAG_HANDSHAKE, 0);
-                                    if let Some(hook) = hook.take() {
-                                        hook();
-                                    }
-                                    stream.write_all(&grid_handshake_reply_frame()).await.unwrap();
-                                    // Keep real transports open without replying to DISCONNECT.
-                                    streams.push(stream);
-                                }
-                            }
-                        }
-                        drop(streams);
-                        crate::tests::close_listener(listener).await;
-                    });
-                });
-                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                Self {
-                    address,
-                    stop: Some(stop),
-                    runner: Some(runner),
-                }
-            }
-        }
-
-        impl Drop for NoAckPeer {
-            fn drop(&mut self) {
-                self.stop.take();
-                self.runner.take().unwrap().join().unwrap();
-            }
-        }
-
-        fn hold_writer(client: &SyncClient) -> tokio::sync::oneshot::Sender<()> {
-            let (held_tx, held_rx) = tokio::sync::oneshot::channel();
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-            client.hold_writer_slot_for_test(held_tx, release_rx);
-            held_rx.blocking_recv().unwrap();
-            release_tx
-        }
-
-        fn wait_for_close_waiter(pool: &ClientPool) {
-            // No other thread waits on this Condvar in these fixtures. A true
-            // return proves close_all has inspected the registered records.
-            let watchdog = Instant::now() + Duration::from_secs(2);
-            while !pool.close_txn.1.notify_one() {
-                assert!(
-                    Instant::now() < watchdog,
-                    "close_all did not enter its wait"
-                );
-                thread::yield_now();
-            }
-        }
-
-        fn expected(peer: &NoAckPeer) -> IpcClientCloseDetail {
-            IpcClientCloseDetail {
-                address: peer.address.clone(),
-                reason: "disconnect_ack_timeout".to_owned(),
-            }
-        }
-
-        fn seal(pool: &ClientPool) -> ClientCloseSeed {
-            pool.prepare_seal(Instant::now() + Duration::from_secs(1))
-                .expect("uncontended seal preparation")
-                .commit()
-        }
-
-        fn preparing(
-            pool: &ClientPool,
-            address: &str,
-            deadline: ConnectDeadline,
-        ) -> FreshClientGuard {
-            let state = pool.state.lock();
-            pool.register_preparing(
-                &state,
-                &mut pool.close_txn.0.lock(),
-                address,
-                state.epoch.unwrap(),
-                deadline,
-            )
-            .unwrap()
-        }
-
-        fn assert_prepare_seal_deadline_under_contention(hold_coordinator: bool) {
-            for budget in [Duration::ZERO, Duration::from_millis(25)] {
-                let pool = Arc::new(test_pool(Duration::from_secs(60)));
-                let state = (!hold_coordinator).then(|| pool.state.lock());
-                let coordinator = hold_coordinator.then(|| pool.close_txn.0.lock());
-                let waiting_pool = pool.clone();
-                let (done_tx, done_rx) = std::sync::mpsc::channel();
-                let waiter = thread::spawn(move || {
-                    let started = Instant::now();
-                    let prepared = waiting_pool.prepare_seal(started + budget).is_some();
-                    done_tx.send((prepared, started.elapsed())).unwrap();
-                });
-                // Completion must precede lock release. The watchdog allows
-                // scheduling delay; preparation itself owns zero or 25 ms.
-                let result = done_rx.recv_timeout(Duration::from_secs(2));
-                if result.is_ok() {
-                    if hold_coordinator {
-                        assert!(
-                            pool.state.try_lock().is_some(),
-                            "failed preparation kept state locked"
-                        );
-                    } else {
-                        assert!(pool.close_txn.0.try_lock().is_some());
-                    }
-                }
-                drop(coordinator);
-                drop(state);
-                waiter.join().unwrap();
-                let (prepared, elapsed) =
-                    result.expect("preparation must finish while lock is held");
-                assert!(!prepared);
-                assert!(elapsed >= budget);
-                assert_eq!(pool.state.lock().epoch, Some(0));
-                assert!(pool.close_txn.0.lock().retired.is_empty());
-                // Both failed lock paths leave the same pool recoverable.
-                drop(
-                    pool.prepare_seal(Instant::now())
-                        .expect("released locks recover"),
-                );
-                assert_eq!(pool.state.lock().epoch, Some(0));
-                let error = pool.acquire("malformed-no-io", None).err().unwrap();
-                assert!(!matches!(error, IpcError::PoolRetired));
-            }
-        }
-
-        #[test]
-        fn prepare_seal_state_lock_respects_zero_and_short_deadlines() {
-            assert_prepare_seal_deadline_under_contention(false);
-        }
-
-        #[test]
-        fn prepare_seal_coordinator_lock_respects_zero_and_short_deadlines() {
-            assert_prepare_seal_deadline_under_contention(true);
-        }
-
-        #[test]
-        fn uncommitted_seal_guard_leaves_admission_open() {
-            let pool = test_pool(Duration::from_secs(60));
-            let guard = pool
-                .prepare_seal(Instant::now())
-                .expect("uncontended zero budget");
-            assert_eq!(guard.state.epoch, Some(0));
-            assert!(guard.txn.retired.is_empty());
-            drop(guard);
-            assert_eq!(pool.state.lock().epoch, Some(0));
-            let error = pool.acquire("malformed-no-io", None).err().unwrap();
-            assert!(!matches!(error, IpcError::PoolRetired));
-            seal(&pool);
-            assert!(matches!(
-                pool.acquire("malformed-no-io", None),
-                Err(IpcError::PoolRetired)
-            ));
-        }
-
-        #[test]
-        fn sealed_pool_rejects_new_acquires_and_never_reopens() {
-            let peer = NoAckPeer::start();
-            let pool = test_pool(Duration::from_secs(60));
-            let client = pool.acquire(&peer.address, None).unwrap();
-            let seed = seal(&pool);
-            // Seal leaves live entries for the sole drain driver to detach.
-            assert_eq!(pool.active_count(), 1);
-            assert!(pool.close_txn.0.lock().retired.is_empty());
-            assert!(matches!(
-                pool.acquire(&peer.address, None),
-                Err(IpcError::PoolRetired)
-            ));
-            let mut observation = pool.observe_closes();
-            observation.merge_seed(seed);
-            let report = observation.close_all(Duration::from_secs(3));
-            assert_eq!(report.detached, 1);
-            assert!(
-                report.error.is_none() && report.unconfirmed.is_empty(),
-                "{report:?}"
-            );
-            assert_eq!(report.abnormal, vec![expected(&peer)]);
-            assert!(!client.is_connected());
-            assert_eq!(pool.active_count(), 0);
-            assert_eq!(pool.state.lock().epoch, None);
-            assert!(pool.close_all(Duration::ZERO).unconfirmed.is_empty());
-            assert!(matches!(
-                pool.acquire("malformed-no-io", None),
-                Err(IpcError::PoolRetired)
-            ));
-        }
-
-        #[test]
-        fn sealed_publication_retires_the_exact_in_flight_client() {
-            let (request_tx, request_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let peer = NoAckPeer::with_first_handshake(move || {
-                request_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            });
-            let pool = Arc::new(test_pool(Duration::from_secs(60)));
-            let acquiring_pool = pool.clone();
-            let address = peer.address.clone();
-            let acquire = thread::spawn(move || acquiring_pool.acquire(&address, None));
-            request_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            let seed = seal(&pool);
-            let record = seed
-                .observed
-                .values()
-                .next()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .clone();
-            assert_eq!(record.state(), RetiredState::Preparing);
-            release_tx.send(()).unwrap();
-            assert!(matches!(
-                acquire.join().unwrap(),
-                Err(IpcError::PoolRetired)
-            ));
-            assert_eq!(pool.active_count(), 0);
-            assert_eq!(record.state(), RetiredState::Confirmed);
-            assert!(record.client.lock().is_none());
-            let mut observation = pool.observe_closes();
-            observation.merge_seed(seed);
-            let report = observation.close_all(Duration::from_secs(3));
-            assert!(
-                report.error.is_none() && report.unconfirmed.is_empty(),
-                "{report:?}"
-            );
-            assert_eq!(report.abnormal, vec![expected(&peer)]);
-        }
-
-        #[test]
-        fn sealed_pool_rejects_transient_retry_after_first_owner_retires() {
-            let pool = Arc::new(test_pool(Duration::from_secs(60)));
-            let address = unique_ipc_address("sealed_retry");
-            let endpoint = test_endpoint(&address);
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
-            let sealing_pool = pool.clone();
-            let server = thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                runtime.block_on(async move {
-                    let mut listener = LocalListener::bind(&endpoint).unwrap();
-                    ready_tx.send(()).unwrap();
-                    let mut stream = listener.accept().await.unwrap();
-                    crate::tests::accept_version_preamble(&mut stream).await;
-                    read_peer_frame(&mut stream).await.unwrap().unwrap();
-                    let seed = seal(&sealing_pool);
-                    // EOF is transient, but after this original attempt retires
-                    // the next Preparing registration must reject before I/O.
-                    drop(stream);
-                    tokio::select! {
-                        result = &mut done_rx => result.unwrap(),
-                        _ = listener.accept() => panic!("sealed pool opened a retry transport"),
-                    }
-                    crate::tests::close_listener(listener).await;
-                    seed
-                })
-            });
-            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            let result = pool.acquire(&address, None);
-            done_tx.send(()).unwrap();
-            let seed = server.join().unwrap();
-            assert!(matches!(result, Err(IpcError::PoolRetired)));
-            assert_eq!(seed.observed.len(), 1);
-            assert_eq!(
-                seed.observed
-                    .values()
-                    .next()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .state(),
-                RetiredState::Confirmed
-            );
-            assert!(pool.close_txn.0.lock().retired.is_empty());
-            assert_eq!(pool.active_count(), 0);
-        }
-
-        #[test]
-        fn sealed_preparing_drain_waits_on_the_original_record_notification() {
-            let pool = Arc::new(test_pool(Duration::from_secs(60)));
-            let mut fresh = preparing(&pool, "ipc://sealed-preparing", ConnectDeadline::default());
-            let record = fresh.work.record.clone();
-            let seed = seal(&pool);
-            let closing_pool = pool.clone();
-            let closer = thread::spawn(move || {
-                let mut observation = closing_pool.observe_closes();
-                observation.merge_seed(seed);
-                observation.close_all(Duration::from_secs(3))
-            });
-            let watchdog = Instant::now() + Duration::from_secs(2);
-            while record.waiters.lock().is_empty() {
-                assert!(
-                    Instant::now() < watchdog,
-                    "sealed drain did not subscribe to Preparing"
-                );
-                thread::yield_now();
-            }
-            assert_eq!(record.state(), RetiredState::Preparing);
-            assert!(pool.is_draining_for_test());
-            fresh.attach(Arc::new(make_disconnected_client()));
-            fresh.retire();
-            let report = closer.join().unwrap();
-            assert!(
-                report.error.is_none() && report.unconfirmed.is_empty(),
-                "{report:?}"
-            );
-            assert_eq!(record.state(), RetiredState::Confirmed);
-            assert_eq!(pool.state.lock().epoch, None);
-        }
-
-        #[test]
-        fn sealed_zero_budget_keeps_preparing_and_late_native_owner() {
-            let pool = test_pool(Duration::from_secs(60));
-            let mut fresh = preparing(&pool, "ipc://sealed-expired", connect_budget(0));
-            let record = fresh.work.record.clone();
-            let seed = seal(&pool);
-            let mut observation = pool.observe_closes();
-            observation.merge_seed(seed);
-            let first = observation.close_all(Duration::ZERO);
-            assert_eq!(first.unconfirmed, vec![record.address.clone()]);
-            assert!(first.error.is_some());
-            assert_eq!(record.state(), RetiredState::Preparing);
-
-            let client = Arc::new(make_disconnected_client());
-            let weak = Arc::downgrade(&client);
-            let release = hold_writer(&client);
-            fresh.attach(client);
-            fresh.retire();
-            assert!(
-                weak.upgrade().is_some(),
-                "expired connect keeps exact native owner"
-            );
-            assert!(record.client.lock().is_some());
-            let pending = observation.close_all(Duration::ZERO);
-            assert_eq!(pending.detached, 0);
-            assert_eq!(pool.active_count(), 0);
-            assert!(pending.unconfirmed.contains(&record.address));
-            assert!(weak.upgrade().is_some());
-            release.send(()).unwrap();
-            let final_report = observation.close_all(Duration::from_secs(3));
-            assert!(
-                final_report.error.is_none() && final_report.unconfirmed.is_empty(),
-                "{final_report:?}"
-            );
-            assert!(
-                weak.upgrade().is_none(),
-                "only confirmed close releases the owner"
-            );
-            assert!(record.client.lock().is_none());
-            assert_eq!(pool.state.lock().epoch, None);
-        }
-
-        #[test]
-        fn sealed_drain_detaches_entries_while_an_exact_owner_is_closing() {
-            let peer = NoAckPeer::start();
-            let pool = test_pool(Duration::from_secs(60));
-            pool.acquire(&peer.address, None).unwrap();
-            let mut fresh = preparing(&pool, "ipc://sealed-closing", ConnectDeadline::default());
-            let client = Arc::new(make_disconnected_client());
-            let weak = Arc::downgrade(&client);
-            let release = hold_writer(&client);
-            fresh.attach(client);
-            let seed = seal(&pool);
-            let mut observation = pool.observe_closes();
-            observation.merge_seed(seed);
-            let report = observation.close_all(Duration::ZERO);
-            assert_eq!(report.detached, 1);
-            assert_eq!(pool.active_count(), 0);
-            assert!(report.unconfirmed.contains(&fresh.work.record.address));
-            assert!(weak.upgrade().is_some());
-            release.send(()).unwrap();
-            fresh.retire();
-            let report = observation.close_all(Duration::from_secs(3));
-            assert!(
-                report.error.is_none() && report.unconfirmed.is_empty(),
-                "{report:?}"
-            );
-            assert!(weak.upgrade().is_none());
-            assert_eq!(pool.state.lock().epoch, None);
-        }
-
-        #[test]
-        fn seal_seed_retains_abnormal_completion_before_driver_merge_once() {
-            let peer = NoAckPeer::start();
-            let pool = test_pool(Duration::from_secs(60));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
-            let weak = Arc::downgrade(&client);
-            let work =
-                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
-            let seed = seal(&pool);
-            close_retired_work(
-                &pool.close_txn,
-                &work,
-                Instant::now() + Duration::from_secs(3),
-            )
-            .unwrap();
-            assert!(pool.close_txn.0.lock().retired.is_empty());
-            assert!(weak.upgrade().is_none());
-            let mut observation = pool.observe_closes();
-            observation.merge_seed(seed);
-            let report = observation.close_all(Duration::from_secs(3));
-            assert_eq!(report.abnormal, vec![expected(&peer)]);
-            assert!(
-                observation
-                    .close_all(Duration::from_secs(3))
-                    .abnormal
-                    .is_empty()
-            );
-        }
-
-        #[test]
-        fn late_seed_merge_does_not_replay_a_consumed_close_ticket() {
-            let peer = NoAckPeer::start();
-            let pool = test_pool(Duration::from_secs(60));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
-            let work =
-                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
-            let mut observation = pool.observe_closes();
-            assert!(observation.close_all(Duration::ZERO).error.is_some());
-            let seed = seal(&pool);
-            close_retired_work(
-                &pool.close_txn,
-                &work,
-                Instant::now() + Duration::from_secs(3),
-            )
-            .unwrap();
-            assert_eq!(
-                observation.close_all(Duration::from_secs(3)).abnormal,
-                vec![expected(&peer)]
-            );
-            // Scope upgrade was captured before the first report but reaches
-            // the same driver afterwards. A consumed ticket cannot reappear.
-            observation.merge_seed(seed);
-            assert!(
-                observation
-                    .close_all(Duration::from_secs(3))
-                    .abnormal
-                    .is_empty()
-            );
-        }
-
-        #[test]
-        #[should_panic(expected = "client close seed belongs to a different pool")]
-        fn seal_seed_rejects_another_pool_coordinator() {
-            let source = test_pool(Duration::from_secs(60));
-            let other = test_pool(Duration::from_secs(60));
-            other.observe_closes().merge_seed(seal(&source));
-        }
-
-        #[test]
-        fn observed_detached_abnormal_close_is_reported() {
-            let peer = NoAckPeer::start();
-            let pool = Arc::new(test_pool(Duration::ZERO));
-            let client = pool.acquire(&peer.address, None).unwrap();
-            pool.release(&peer.address);
-            let release = hold_writer(&client);
-            let maintenance_pool = pool.clone();
-            let maintenance = thread::spawn(move || {
-                assert!(maintenance_pool.acquire("malformed-no-io", None).is_err());
-            });
-            assert!(pool.wait_until_detached_close_in_flight_for_test(Duration::from_secs(2)));
-            let record = pool
-                .close_txn
-                .0
-                .lock()
-                .retired
-                .values()
-                .find(|record| record.address == peer.address)
-                .unwrap()
-                .clone();
-            assert!(Arc::ptr_eq(record.client.lock().as_ref().unwrap(), &client));
-            let closing_pool = pool.clone();
-            let closer = thread::spawn(move || closing_pool.close_all(Duration::from_secs(3)));
-            wait_for_close_waiter(&pool);
-            assert_eq!(record.state(), RetiredState::Closing);
-            release.send(()).unwrap();
-            maintenance.join().unwrap();
-            let report = closer.join().unwrap();
-            assert_eq!(record.state(), RetiredState::Confirmed);
-            assert!(record.client.lock().is_none());
-            assert_eq!(pool.retired_records_for_test(), 0);
-            assert_eq!(report.detached, 0);
-            assert!(
-                report.error.is_none() && report.unconfirmed.is_empty(),
-                "{report:?}"
-            );
-            assert_eq!(report.abnormal, vec![expected(&peer)]);
-            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
-        }
-
-        #[test]
-        fn abnormal_close_between_shutdown_retries_is_reported_once() {
-            let peer = NoAckPeer::start();
-            let pool = test_pool(Duration::from_secs(60));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
-            let weak = Arc::downgrade(&client);
-            let work =
-                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
-            let mut observation = pool.observe_closes();
-            let first = observation.close_all(Duration::ZERO);
-            assert_eq!(first.error, Some(ClientPool::drain_wait_error(false)));
-            assert!(first.abnormal.is_empty());
-
-            // Complete and prune after the first attempt returned, before retry.
-            close_retired_work(
-                &pool.close_txn,
-                &work,
-                Instant::now() + Duration::from_secs(3),
-            )
-            .unwrap();
-            assert!(pool.close_txn.0.lock().retired.is_empty());
-            assert!(weak.upgrade().is_none(), "observers retain only metadata");
-            let retry = observation.close_all(Duration::from_secs(3));
-            assert!(retry.error.is_none() && retry.unconfirmed.is_empty());
-            assert_eq!(retry.abnormal, vec![expected(&peer)]);
-            assert!(
-                observation
-                    .close_all(Duration::from_secs(3))
-                    .abnormal
-                    .is_empty()
-            );
-            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
-        }
-
-        #[test]
-        fn direct_abnormal_close_is_bounded_and_not_replayed() {
-            let peer = NoAckPeer::start();
-            let pool = test_pool(Duration::from_secs(60));
-            let client = pool.acquire(&peer.address, None).unwrap();
-            let started = Instant::now();
-            let report = pool.close_all(Duration::from_secs(3));
-            assert!(started.elapsed() < Duration::from_secs(2));
-            assert_eq!(report.detached, 1);
-            assert!(
-                report.error.is_none() && report.unconfirmed.is_empty(),
-                "{report:?}"
-            );
-            assert_eq!(report.abnormal, vec![expected(&peer)]);
-            assert_eq!(
-                client.abnormal_close_reason(),
-                Some("disconnect_ack_timeout")
-            );
-            assert_eq!(pool.retired_records_for_test(), 0);
-            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
-        }
-
-        #[test]
-        fn completed_historical_abnormal_close_is_not_replayed() {
-            let peer = NoAckPeer::start();
-            let pool = test_pool(Duration::ZERO);
-            let client = pool.acquire(&peer.address, None).unwrap();
-            pool.release(&peer.address);
-            assert!(pool.acquire("malformed-no-io", None).is_err());
-            assert!(client.abnormal_close_reason().is_some());
-            assert_eq!(pool.retired_records_for_test(), 0);
-            let report = pool.close_all(Duration::from_secs(3));
-            assert!(
-                report.error.is_none() && report.unconfirmed.is_empty(),
-                "{report:?}"
-            );
-            assert!(report.abnormal.is_empty());
-
-            // A confirmed record can also remain registered when prune's
-            // nonblocking coordinator acquisition loses to another caller.
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
-            let work =
-                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
-            let coordinator = pool.close_txn.0.lock();
-            close_retired_work(
-                &pool.close_txn,
-                &work,
-                Instant::now() + Duration::from_secs(3),
-            )
-            .unwrap();
-            assert_eq!(work.record.state(), RetiredState::Confirmed);
-            assert!(coordinator.retired.contains_key(&work.ticket));
-            drop(coordinator);
-            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
-            assert!(pool.close_txn.0.lock().retired.is_empty());
-        }
-
-        #[test]
-        fn pre_wait_timeout_keeps_already_confirmed_abnormal_detail() {
-            let peer = NoAckPeer::start();
-            let pool = Arc::new(test_pool(Duration::from_secs(60)));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
-            let weak = Arc::downgrade(&client);
-            let completed =
-                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
-            // Reserve a second barrier without running it until after this
-            // caller times out, so the first close cannot end the pre-wait.
-            let pending = pool.register_close_work(
-                &mut pool.close_txn.0.lock(),
-                "ipc://still-closing",
-                None,
-                RetiredState::Closing,
-            );
-            let closing_pool = pool.clone();
-            let closer = thread::spawn(move || closing_pool.close_all(Duration::from_secs(1)));
-            wait_for_close_waiter(&pool);
-            close_retired_work(
-                &pool.close_txn,
-                &completed,
-                Instant::now() + Duration::from_secs(3),
-            )
-            .unwrap();
-            assert!(completed.record.client.lock().is_none());
-            assert!(weak.upgrade().is_none(), "observers retain only metadata");
-            let report = closer.join().unwrap();
-            assert_eq!(report.detached, 0);
-            assert_eq!(report.error, Some(ClientPool::drain_wait_error(false)));
-            assert_eq!(report.abnormal, vec![expected(&peer)]);
-            assert!(!pool.is_draining_for_test());
-            assert_eq!(pool.state.lock().epoch, Some(0));
-            close_retired_work(&pool.close_txn, &pending, Instant::now()).unwrap();
-            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
-        }
-
-        #[test]
-        fn final_wait_timeout_keeps_late_observed_abnormal_detail() {
-            let peer = NoAckPeer::start();
-            let pool = Arc::new(test_pool(Duration::from_secs(60)));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
-            let pending = pool.register_close_work(
-                &mut pool.close_txn.0.lock(),
-                "ipc://late-closing",
-                None,
-                RetiredState::Preparing,
-            );
-            // Pause between the initial observation and drain registration.
-            // Preparing does not block claiming a drain generation.
-            let state = pool.state.lock();
-            let closing_pool = pool.clone();
-            let closer = thread::spawn(move || closing_pool.close_all(Duration::from_secs(1)));
-            let watchdog = Instant::now() + Duration::from_secs(2);
-            while !pool.is_draining_for_test() {
-                assert!(Instant::now() < watchdog, "drain was not announced");
-                thread::yield_now();
-            }
-            pending.record.set_state(RetiredState::Closing);
-            drop(state);
-            wait_for_close_waiter(&pool);
-            // Register after the final wait began. Registration notifies
-            // its old waiter under the coordinator; the next waiter proves
-            // this newly registered record has been observed as well.
-            let completed =
-                pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
-            wait_for_close_waiter(&pool);
-            close_retired_work(
-                &pool.close_txn,
-                &completed,
-                Instant::now() + Duration::from_secs(3),
-            )
-            .unwrap();
-            let report = closer.join().unwrap();
-            assert_eq!(report.detached, 0);
-            assert_eq!(report.error, Some(ClientPool::drain_wait_error(false)));
-            assert_eq!(report.unconfirmed, vec![pending.record.address.clone()]);
-            assert_eq!(report.abnormal, vec![expected(&peer)]);
-            assert!(!pool.is_draining_for_test());
-            assert_eq!(pool.state.lock().epoch, Some(1));
-            close_retired_work(&pool.close_txn, &pending, Instant::now()).unwrap();
-            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
-        }
-
-        #[test]
-        fn preparing_close_between_observation_and_drain_is_reported() {
-            let peer = NoAckPeer::start();
-            let pool = Arc::new(test_pool(Duration::from_secs(60)));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
-            let weak = Arc::downgrade(&client);
-            let work = pool.register_close_work(
-                &mut pool.close_txn.0.lock(),
-                &peer.address,
-                None,
-                RetiredState::Preparing,
-            );
-            let record = work.record.clone();
-            let mut fresh = FreshClientGuard {
-                work,
-                coordinator: pool.close_txn.clone(),
-                deadline: ConnectDeadline::default(),
-                done: false,
-            };
-            let state = pool.state.lock();
-            let closing_pool = pool.clone();
-            let closer = thread::spawn(move || closing_pool.close_all(Duration::from_secs(3)));
-            let watchdog = Instant::now() + Duration::from_secs(2);
-            while !pool.is_draining_for_test() {
-                assert!(Instant::now() < watchdog, "drain was not announced");
-                thread::yield_now();
-            }
-            fresh.attach(client);
-            fresh.retire();
-            assert_eq!(record.state(), RetiredState::Confirmed);
-            assert!(pool.close_txn.0.lock().retired.is_empty());
-            assert!(record.client.lock().is_none());
-            assert!(weak.upgrade().is_none(), "observers retain only metadata");
-            drop(state);
-            let report = closer.join().unwrap();
-            assert_eq!(report.detached, 0);
-            assert!(
-                report.error.is_none() && report.unconfirmed.is_empty(),
-                "{report:?}"
-            );
-            assert_eq!(report.abnormal, vec![expected(&peer)]);
-            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
-        }
-
-        #[test]
-        fn same_address_drain_and_retry_have_distinct_close_tickets() {
-            let peer = NoAckPeer::start();
-            let pool = test_pool(Duration::from_secs(60));
-            let active = pool.acquire(&peer.address, None).unwrap();
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
-            let weak = Arc::downgrade(&client);
-            let retry = pool.register_close_work(
-                &mut pool.close_txn.0.lock(),
-                &peer.address,
-                Some(client),
-                RetiredState::UnconfirmedIdle,
-            );
-            let report = pool.close_all(Duration::from_secs(3));
-            assert_eq!(report.detached, 1);
-            assert!(
-                report.error.is_none() && report.unconfirmed.is_empty(),
-                "{report:?}"
-            );
-            assert_eq!(report.abnormal, vec![expected(&peer), expected(&peer)]);
-            assert_eq!(retry.record.state(), RetiredState::Confirmed);
-            assert!(retry.record.client.lock().is_none());
-            assert!(weak.upgrade().is_none());
-            assert!(!active.is_connected());
-            assert!(pool.close_txn.0.lock().retired.is_empty());
-            assert!(pool.close_all(Duration::from_secs(3)).abnormal.is_empty());
-        }
-    }
-
-    #[derive(Default)]
-    struct PeerObservation {
-        pongs: usize,
-        eof: bool,
-    }
-
-    #[derive(Default)]
-    struct PeerObservations {
-        connections: Vec<PeerObservation>,
-        errors: Vec<String>,
-    }
-
-    /// A real local peer on Unix and Windows. A zero-byte read or Windows
-    /// ERROR_NO_DATA at a new frame boundary counts as closure; DISCONNECT is
-    /// acknowledged and followed through to EOF. Keeping the listener and all
-    /// readers alive makes leaked sockets
-    /// observable even when the pool has already forgotten their entries.
-    struct PoolPeer {
-        address: String,
-        observations: Arc<(Mutex<PeerObservations>, Condvar)>,
-        probes: tokio::sync::broadcast::Sender<usize>,
-        stop: Option<tokio::sync::oneshot::Sender<()>>,
-        runner: Option<thread::JoinHandle<()>>,
-    }
-
-    async fn read_peer_frame(
-        reader: &mut (impl tokio::io::AsyncRead + Unpin),
-    ) -> Result<Option<(c2_wire::frame::FrameHeader, Vec<u8>)>, String> {
-        let mut prefix = [0_u8; 4];
-        match reader.read(&mut prefix[..1]).await {
-            Ok(0) => return Ok(None),
-            #[cfg(windows)]
-            Err(error) if error.raw_os_error() == Some(232) => return Ok(None),
-            Err(error) => {
-                return Err(format!(
-                    "new frame read: {error} (raw={:?})",
-                    error.raw_os_error()
-                ));
-            }
-            Ok(_) => {}
-        }
-        reader
-            .read_exact(&mut prefix[1..])
-            .await
-            .map_err(|e| format!("frame prefix read: {e} (raw={:?})", e.raw_os_error()))?;
-        let len = u32::from_le_bytes(prefix);
-        if !(12..=65536).contains(&len) {
-            return Err(format!("invalid fixture frame length: {len}"));
-        }
-        let mut body = vec![0_u8; len as usize];
-        reader
-            .read_exact(&mut body)
-            .await
-            .map_err(|e| format!("frame body read: {e} (raw={:?})", e.raw_os_error()))?;
-        let (header, payload) =
-            c2_wire::frame::decode_frame_body(&body, len).map_err(|e| e.to_string())?;
-        Ok(Some((header, payload.to_vec())))
-    }
-
-    struct PeerReadThenError {
-        bytes: std::io::Cursor<Vec<u8>>,
-        code: i32,
-    }
-
-    impl tokio::io::AsyncRead for PeerReadThenError {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            if buf.remaining() == 0 {
-                return std::task::Poll::Ready(Ok(()));
-            }
-            let position = self.bytes.position() as usize;
-            let available = &self.bytes.get_ref()[position..];
-            if available.is_empty() {
-                return std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(self.code)));
-            }
-            let count = available.len().min(buf.remaining());
-            buf.put_slice(&available[..count]);
-            self.bytes.set_position((position + count) as u64);
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn read_peer_frame_windows_closed_pipe_at_frame_boundary_is_eof() {
-        let mut reader = PeerReadThenError {
-            bytes: std::io::Cursor::new(vec![]),
-            code: 232,
-        };
-        assert!(read_peer_frame(&mut reader).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn read_peer_frame_closed_pipe_inside_frame_is_error() {
-        for bytes in [vec![12], vec![12, 0, 0, 0], vec![12, 0, 0, 0, 1]] {
-            let mut reader = PeerReadThenError {
-                bytes: std::io::Cursor::new(bytes),
-                code: 232,
-            };
-            assert!(read_peer_frame(&mut reader).await.is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn read_peer_frame_unrelated_boundary_error_is_error() {
-        let mut reader = PeerReadThenError {
-            bytes: std::io::Cursor::new(vec![]),
-            code: 5,
-        };
-        assert!(read_peer_frame(&mut reader).await.is_err());
-    }
-
-    async fn confirm_peer_disconnect(
-        reader: &mut (impl tokio::io::AsyncRead + Unpin),
-        ack_result: std::io::Result<()>,
-    ) -> Result<(), String> {
-        if let Err(error) = ack_result {
-            // A bounded client close may abort before receiving our ACK. Only
-            // Windows peer-closed errors qualify; the read below must still
-            // independently prove EOF. This does not apply to PING writes.
-            let peer_closed = cfg!(windows) && matches!(error.raw_os_error(), Some(109 | 232));
-            if !peer_closed {
-                return Err(format!(
-                    "ACK write: {error} (raw={:?})",
-                    error.raw_os_error()
-                ));
-            }
-        }
-        match read_peer_frame(reader).await? {
-            None => Ok(()),
-            Some(_) => Err("expected EOF after DISCONNECT_ACK".into()),
-        }
-    }
-
-    async fn write_peer_disconnect_ack(
-        writer: &mut c2_local::LocalWriteHalf,
-        ack: &[u8],
-    ) -> std::io::Result<()> {
-        // The production convenience method aborts both halves on any write
-        // failure. This observer must keep its read half alive after a remote
-        // close so confirm_peer_disconnect can independently prove peer EOF.
-        tokio::io::AsyncWriteExt::write_all(writer, ack).await?;
-        tokio::io::AsyncWriteExt::flush(writer).await
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn disconnect_ack_write_failure_preserves_peer_eof_observer() {
-        let (client, peer) = c2_local::LocalStream::pair().await.unwrap();
-        let peer_abort = peer.abort_handle();
-        let (mut reader, mut writer) = peer.into_split();
-        client.abort_handle().abort();
-        // First prove that the remote endpoint closed. An ACK-write failure
-        // must not abort our observer and replace that EOF with a local error.
-        assert!(read_peer_frame(&mut reader).await.unwrap().is_none());
-        let ack = c2_wire::frame::encode_frame(
-            0,
-            c2_wire::flags::FLAG_SIGNAL | c2_wire::flags::FLAG_RESPONSE,
-            &[0x09],
-        );
-        let result = write_peer_disconnect_ack(&mut writer, &ack).await;
-        assert!(
-            result.is_err(),
-            "ACK unexpectedly succeeded on a closed pipe"
-        );
-        assert!(
-            !peer_abort.is_aborted(),
-            "ACK failure aborted the EOF observer"
-        );
-        confirm_peer_disconnect(&mut reader, result).await.unwrap();
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn disconnect_ack_closed_pipe_still_requires_eof() {
-        for code in [109, 232] {
-            let mut closed = PeerReadThenError {
-                bytes: std::io::Cursor::new(vec![]),
-                code: 232,
-            };
-            assert!(
-                confirm_peer_disconnect(&mut closed, Err(std::io::Error::from_raw_os_error(code)))
-                    .await
-                    .is_ok()
-            );
-            let mut partial = PeerReadThenError {
-                bytes: std::io::Cursor::new(vec![12]),
-                code: 232,
-            };
-            assert!(
-                confirm_peer_disconnect(&mut partial, Err(std::io::Error::from_raw_os_error(code)))
-                    .await
-                    .is_err()
-            );
-            let mut live = PeerReadThenError {
-                bytes: std::io::Cursor::new(c2_wire::frame::encode_frame(
-                    0,
-                    c2_wire::flags::FLAG_SIGNAL,
-                    &[0x02],
-                )),
-                code: 232,
-            };
-            assert!(
-                confirm_peer_disconnect(&mut live, Err(std::io::Error::from_raw_os_error(code)))
-                    .await
-                    .is_err()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn disconnect_ack_unrelated_error_is_rejected() {
-        let mut closed = tokio::io::empty();
-        assert!(
-            confirm_peer_disconnect(&mut closed, Err(std::io::Error::from_raw_os_error(5)))
-                .await
-                .is_err()
-        );
-        #[cfg(not(windows))]
-        assert!(
-            confirm_peer_disconnect(&mut closed, Err(std::io::Error::from_raw_os_error(232)))
-                .await
-                .is_err()
-        );
-        assert!(confirm_peer_disconnect(&mut closed, Ok(())).await.is_ok());
-    }
-
-    impl PoolPeer {
-        fn start() -> Self {
-            // MemPool's lazy identity includes a fresh UUID; no new Cargo
-            // dependency, process-global environment or endpoint cleanup.
-            let identity = MemPool::new(PoolConfig::default());
-            let address = format!(
-                "ipc://pool_peer_{}",
-                identity.prefix().trim_start_matches('/')
-            );
-            let endpoint = LocalEndpoint::from_address(&address).unwrap();
-            let observations = Arc::new((Mutex::new(PeerObservations::default()), Condvar::new()));
-            let (probes, _) = tokio::sync::broadcast::channel(16);
-            let (stop, stopped) = tokio::sync::oneshot::channel();
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let server_observations = observations.clone();
-            let server_probes = probes.clone();
-            let runner = thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(async move {
-                    let mut listener = match LocalListener::bind(&endpoint) {
-                        Ok(listener) => listener,
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(error.to_string()));
-                            return;
-                        }
-                    };
-                    ready_tx.send(Ok(())).unwrap();
-                    let mut stopped = stopped;
-                    let mut watchers = tokio::task::JoinSet::new();
-                    loop {
-                        let stream = tokio::select! {
-                            _ = &mut stopped => break,
-                            accepted = listener.accept() => accepted.unwrap(),
-                        };
-                        let observations = server_observations.clone();
-                        let mut probes = server_probes.subscribe();
-                        watchers.spawn(async move {
-                            let result: Result<(), String> = async {
-                                let mut stream = stream;
-                                let handshake = tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    async {
-                                        crate::tests::accept_version_preamble(&mut stream).await;
-                                        read_peer_frame(&mut stream).await
-                                    },
-                                )
-                                .await
-                                .map_err(|e| e.to_string())??
-                                .ok_or("EOF before handshake")?;
-                                if !handshake.0.is_handshake() || handshake.0.is_response() {
-                                    return Err("expected client handshake".into());
-                                }
-                                c2_wire::handshake::decode_handshake(&handshake.1)
-                                    .map_err(|e| e.to_string())?;
-                                stream
-                                    .write_all(&grid_handshake_reply_frame())
-                                    .await
-                                    .map_err(|e| e.to_string())?;
-                                let id = {
-                                    let mut state = observations.0.lock();
-                                    let id = state.connections.len();
-                                    state.connections.push(PeerObservation::default());
-                                    observations.1.notify_all();
-                                    id
-                                };
-                                let (mut reader, writer) = stream.into_split();
-                                let writer = tokio::sync::Mutex::new(writer);
-                                let read = async {
-                                    loop {
-                                        let Some((header, payload)) =
-                                            read_peer_frame(&mut reader)
-                                                .await
-                                                .map_err(|error| format!("connection {id}: {error}"))?
-                                        else {
-                                            observations.0.lock().connections[id].eof = true;
-                                            observations.1.notify_all();
-                                            return Ok::<(), String>(());
-                                        };
-                                        if !header.is_signal() {
-                                            return Err(format!(
-                                                "unexpected non-signal frame: {header:?}"
-                                            ));
-                                        }
-                                        match payload.as_slice() {
-                                            [0x08] => {
-                                                let ack = c2_wire::frame::encode_frame(
-                                                    header.request_id,
-                                                    c2_wire::flags::FLAG_SIGNAL
-                                                        | c2_wire::flags::FLAG_RESPONSE,
-                                                    &[0x09],
-                                                );
-                                                let ack_result = write_peer_disconnect_ack(
-                                                    &mut *writer.lock().await,
-                                                    &ack,
-                                                )
-                                                .await;
-                                                confirm_peer_disconnect(&mut reader, ack_result)
-                                                    .await
-                                                    .map_err(|error| format!("connection {id}: {error}"))?;
-                                                observations.0.lock().connections[id].eof = true;
-                                                observations.1.notify_all();
-                                                return Ok(());
-                                            }
-                                            [0x02] => {
-                                                observations.0.lock().connections[id].pongs += 1;
-                                                observations.1.notify_all();
-                                            }
-                                            _ => {
-                                                return Err(format!(
-                                                    "unexpected signal: {payload:?}"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                };
-                                let probe = async {
-                                    while let Ok(target) = probes.recv().await {
-                                        if target == id {
-                                            let ping = c2_wire::frame::encode_frame(
-                                                0,
-                                                c2_wire::flags::FLAG_SIGNAL,
-                                                &[0x01],
-                                            );
-                                            writer
-                                                .lock()
-                                                .await
-                                                .write_all(&ping)
-                                                .await
-                                                .map_err(|e| {
-                                                    format!(
-                                                        "connection {id} PING write: {e} (raw={:?})",
-                                                        e.raw_os_error()
-                                                    )
-                                                })?;
-                                        }
-                                    }
-                                    Err::<(), String>("probe channel closed".into())
-                                };
-                                tokio::select! { result = read => result, result = probe => result }
-                            }
-                            .await;
-                            if let Err(error) = result {
-                                observations.0.lock().errors.push(error);
-                                observations.1.notify_all();
-                            }
-                        });
-                    }
-                    watchers.abort_all();
-                    while watchers.join_next().await.is_some() {}
-                    crate::tests::close_listener(listener).await;
-                });
-            });
-            ready_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("local listener readiness")
-                .expect("real local listener bind");
-            let peer = Self {
-                address,
-                observations,
-                probes,
-                stop: Some(stop),
-                runner: Some(runner),
-            };
-            peer
-        }
-
-        fn wait(&self, description: &str, predicate: impl Fn(&PeerObservations) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut state = self.observations.0.lock();
-            loop {
-                assert!(state.errors.is_empty(), "peer errors: {:?}", state.errors);
-                if predicate(&state) {
-                    return;
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                assert!(!remaining.is_zero(), "timed out waiting for {description}");
-                self.observations.1.wait_for(&mut state, remaining);
-            }
-        }
-
-        fn accepted(&self, count: usize) {
-            self.wait("handshaken connections", |s| s.connections.len() == count);
-        }
-
-        fn eof(&self, id: usize) {
-            self.wait("actual peer EOF", |s| s.connections[id].eof);
-        }
-
-        fn assert_live(&self, id: usize) {
-            let pongs = self.observations.0.lock().connections[id].pongs;
-            self.probes.send(id).unwrap();
-            self.wait("live connection PONG", |s| s.connections[id].pongs > pongs);
-            assert!(!self.observations.0.lock().connections[id].eof);
-        }
-
-        fn live_count(&self) -> usize {
-            self.observations
-                .0
-                .lock()
-                .connections
-                .iter()
-                .filter(|c| !c.eof)
-                .count()
-        }
-    }
-
-    impl Drop for PoolPeer {
-        fn drop(&mut self) {
-            let _ = self.stop.take().unwrap().send(());
-            self.runner.take().unwrap().join().unwrap();
-        }
-    }
-
-    fn real_idle_pool_reclaims_connection(explicit_sweep: bool) {
-        let peer = PoolPeer::start();
-        let pool = ClientPool::new(Duration::from_millis(50));
-        let old = pool.acquire(&peer.address, None).unwrap();
-        peer.accepted(1);
-        pool.release(&peer.address);
-        // Deterministically exercise the unexpired state without depending
-        // on the OS scheduling this test inside a 50ms wall-clock window.
-        let unexpired = pool.state.lock().entries[&peer.address].references.clone();
-        unexpired.released_tick.store(
-            unexpired.tick().saturating_add(5_000_000_000),
-            Ordering::Release,
-        );
-        pool.sweep_expired();
-        peer.assert_live(0);
-        let reused = pool.acquire(&peer.address, None).unwrap();
-        assert!(Arc::ptr_eq(&old, &reused));
-        thread::sleep(Duration::from_millis(80));
-        pool.sweep_expired();
-        peer.assert_live(0); // Active references must survive even past grace.
-        pool.release(&peer.address);
-        thread::sleep(Duration::from_millis(80));
-        if explicit_sweep {
-            pool.sweep_expired();
-            peer.eof(0);
-            assert_eq!(peer.live_count(), 0);
-        }
-        let replacement = pool.acquire(&peer.address, None).unwrap();
-        peer.accepted(2);
-        peer.eof(0); // `old` and `reused` are still retained: Drop cannot mask this.
-        assert!(!Arc::ptr_eq(&old, &replacement));
-        assert!(!old.is_connected());
-        peer.assert_live(1);
-        assert_eq!(peer.live_count(), 1);
-        assert_eq!(pool.active_count(), 1);
-        let report = pool.close_all(Duration::from_secs(2));
-        assert!(
-            report.error.is_none() && report.unconfirmed.is_empty(),
-            "{report:?}"
-        );
-        peer.eof(1);
-    }
-
-    #[test]
-    fn real_idle_pool_acquire_closes_expired_connection() {
-        real_idle_pool_reclaims_connection(false);
-    }
-
-    #[test]
-    fn real_idle_pool_sweep_closes_expired_connection() {
-        real_idle_pool_reclaims_connection(true);
-    }
-
-    #[test]
-    fn real_pool_discard_closes_connected_observed_and_preserves_replacement() {
-        let peer = PoolPeer::start();
-        let pool = ClientPool::new(Duration::from_millis(50));
-        let observed = pool.acquire(&peer.address, None).unwrap();
-        peer.accepted(1);
-        peer.assert_live(0);
-        assert!(observed.is_connected());
-        // Core discards a still-connected observed client when relay endpoint
-        // identity validation fails before dispatch (c2-core/client.rs). A
-        // healthy stream is not proof that it belongs to the expected server.
-        assert_ne!(
-            observed.server_instance_id(),
-            Some("replacement-server-instance")
-        );
-        assert!(pool.discard_if_same(&peer.address, &observed));
-        peer.eof(0);
-        assert_eq!(peer.live_count(), 0);
-        let replacement = pool.acquire(&peer.address, None).unwrap();
-        peer.accepted(2);
-        assert!(!Arc::ptr_eq(&observed, &replacement));
-        assert!(!pool.discard_if_same(&peer.address, &observed));
-        assert_eq!(pool.refcount(&peer.address), 1);
-        peer.assert_live(1);
-        assert_eq!(peer.live_count(), 1);
-        let report = pool.close_all(Duration::from_secs(2));
-        assert!(
-            report.error.is_none() && report.unconfirmed.is_empty(),
-            "{report:?}"
-        );
-        peer.eof(1);
-    }
-
-    #[test]
-    fn real_pool_close_all_closes_active_and_idle_connections_and_reopens() {
-        let active_peer = PoolPeer::start();
-        let idle_peer = PoolPeer::start();
-        let pool = ClientPool::new(Duration::from_secs(60));
-        let active = pool.acquire(&active_peer.address, None).unwrap();
-        let idle = pool.acquire(&idle_peer.address, None).unwrap();
-        active_peer.accepted(1);
-        idle_peer.accepted(1);
-        pool.release(&idle_peer.address);
-        let report = pool.close_all(Duration::from_secs(2));
-        assert_eq!(report.detached, 2);
-        assert!(
-            report.error.is_none() && report.unconfirmed.is_empty(),
-            "{report:?}"
-        );
-        active_peer.eof(0);
-        idle_peer.eof(0);
-        assert!(!active.is_connected() && !idle.is_connected());
-        let replacement = pool.acquire(&active_peer.address, None).unwrap();
-        active_peer.accepted(2);
-        assert!(!Arc::ptr_eq(&active, &replacement));
-        active_peer.assert_live(1);
-        assert_eq!(active_peer.live_count(), 1);
-        let report = pool.close_all(Duration::from_secs(2));
-        assert!(
-            report.error.is_none() && report.unconfirmed.is_empty(),
-            "{report:?}"
-        );
-        active_peer.eof(1);
-    }
-
-    #[test]
-    fn concurrent_same_address_loser_is_explicitly_closed() {
-        let address = format!("ipc://pool_loser_{}", std::process::id());
-        let endpoint = LocalEndpoint::from_address(&address).unwrap();
-        let (listener_ready_tx, listener_ready_rx) = std::sync::mpsc::channel();
-        let (observation_tx, observation_rx) = std::sync::mpsc::channel();
-
-        let server_thread = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let mut listener = LocalListener::bind(&endpoint).unwrap();
-                listener_ready_tx.send(()).unwrap();
-
-                // Accept both version preambles and read each metadata request
-                // before replying to either metadata request, so both clients
-                // finish connect() only after both are already dialing: the
-                // insert race is deterministic no matter which thread wins.
-                let mut streams = Vec::new();
-                for _ in 0..2 {
-                    let mut stream = listener.accept().await.unwrap();
-                    crate::tests::accept_version_preamble(&mut stream).await;
-                    let mut len_buf = [0_u8; 4];
-                    stream.read_exact(&mut len_buf).await.unwrap();
-                    let body_len = u32::from_le_bytes(len_buf) as usize;
-                    let mut body = vec![0_u8; body_len];
-                    stream.read_exact(&mut body).await.unwrap();
-                    streams.push(stream);
-                }
-                let reply = grid_handshake_reply_frame();
-                for stream in &mut streams {
-                    stream.write_all(&reply).await.unwrap();
-                }
-
-                // Watch both server-side streams. The losing client must be
-                // closed explicitly: its disconnect signal or EOF arrives
-                // while the pool still holds both references and the winner
-                // stays silently connected.
-                let mut watchers = Vec::new();
-                for stream in streams {
-                    let observation_tx = observation_tx.clone();
-                    watchers.push(tokio::spawn(async move {
-                        let mut stream = stream;
-                        let mut len_buf = [0_u8; 4];
-                        let observed = match tokio::time::timeout(
-                            Duration::from_secs(3),
-                            stream.read_exact(&mut len_buf),
-                        )
-                        .await
-                        {
-                            // Bytes arrived (disconnect signal) or the peer
-                            // closed the stream: either proves an explicit
-                            // close of this connection.
-                            Ok(Ok(_)) | Ok(Err(_)) => true,
-                            // Silence for the whole window: still connected.
-                            Err(_) => false,
-                        };
-                        let _ = observation_tx.send(observed);
-                    }));
-                }
-                for watcher in watchers {
-                    watcher.await.unwrap();
-                }
-                crate::tests::close_listener(listener).await;
-            });
-        });
-        listener_ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("loser-race listener readiness");
-
-        let pool = Arc::new(ClientPool::new(Duration::from_secs(60)));
-        let barrier = Arc::new(Barrier::new(2));
-        let mut acquire_threads = Vec::new();
-        for _ in 0..2 {
-            let pool = Arc::clone(&pool);
-            let barrier = Arc::clone(&barrier);
-            let address = address.clone();
-            acquire_threads.push(thread::spawn(move || {
-                barrier.wait();
-                pool.acquire(&address, None)
-            }));
-        }
-        let first = acquire_threads
-            .remove(0)
-            .join()
-            .expect("first acquire thread")
-            .expect("first acquire should connect");
-        let second = acquire_threads
-            .remove(0)
-            .join()
-            .expect("second acquire thread")
-            .expect("second acquire should connect");
-
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "same-address acquires must share one client"
-        );
-        assert!(first.is_connected());
-        assert_eq!(pool.active_count(), 1, "no duplicate entry may remain");
-        assert_eq!(pool.refcount(&address), 2);
-
-        let observations: Vec<bool> = (0..2)
-            .map(|_| {
-                observation_rx
-                    .recv_timeout(Duration::from_secs(6))
-                    .expect("stream observation")
-            })
-            .collect();
-        assert_eq!(
-            observations.iter().filter(|closed| **closed).count(),
-            1,
-            "exactly the losing connection must be closed, saw {observations:?}"
-        );
-
-        server_thread.join().unwrap();
-    }
-
-    #[test]
-    fn close_shared_is_bounded_and_honest_when_writer_slot_is_held() {
-        // The blocked-writer scenario is modeled deterministically: a test
-        // task holds the writer slot exactly like a bulk write stuck on a
-        // non-reading peer would, with a readiness signal instead of pipe
-        // buffer pressure and no oversized stack buffers.
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let address = unique_ipc_address("pool_close_writer_held");
-            let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
-            register_test_route(&server, "grid").await;
-            let runner = {
-                let server = Arc::clone(&server);
-                tokio::spawn(async move { server.run().await })
-            };
-            server
-                .wait_until_responsive(Duration::from_secs(2))
-                .await
-                .expect("server should be responsive");
-
-            // All SyncClient operations below block on the shared global
-            // client runtime and must run on a plain thread, not on this
-            // runtime's worker.
-            let client = Arc::new(
-                tokio::task::spawn_blocking(move || {
-                    SyncClient::connect(&address, None, ClientIpcConfig::default())
-                })
-                .await
-                .expect("connect task")
-                .expect("connect"),
-            );
-            assert!(client.is_connected());
-
-            let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-            client.hold_writer_slot_for_test(acquired_tx, release_rx);
-            acquired_rx.await.expect("writer slot hold readiness");
-
-            let (close_tx, close_rx) = std::sync::mpsc::channel::<(bool, Duration)>();
-            let close_client = Arc::clone(&client);
-            let close_thread = thread::spawn(move || {
-                let started = Instant::now();
-                let confirmed = close_client.close_shared(Duration::from_secs(1));
-                close_tx.send((confirmed, started.elapsed()))
-            });
-            let (confirmed, elapsed) =
-                close_rx.recv_timeout(Duration::from_secs(20)).expect("close result");
-            assert!(
-                elapsed < Duration::from_secs(10),
-                "close barrier must be bounded even with a held writer slot, took {elapsed:?}"
-            );
-            assert!(
-                !confirmed,
-                "a close whose writer slot stays held for the whole deadline must not claim confirmation"
-            );
-            assert!(!client.is_connected());
-            close_thread.join().unwrap().expect("close channel send");
-
-            // Honesty and recovery: once the holder releases, a later close
-            // must be able to confirm. An unconfirmed close may not poison
-            // the client or block forever.
-            drop(release_tx);
-            let reconfirmed =
-                tokio::task::spawn_blocking(move || client.close_shared(Duration::from_secs(5)))
-                    .await
-                    .expect("re-close task");
-            assert!(
-                reconfirmed,
-                "close must confirm once the writer slot frees again"
-            );
-
-            server
-                .shutdown_and_wait(Duration::from_secs(2))
-                .await
-                .expect("server should shut down");
-            runner.await.unwrap().unwrap();
-        });
-    }
-
-    #[test]
-    fn close_shared_aborts_blocked_receiver_within_deadline() {
-        // Fake peer serves the real handshake, then delivers two bytes of a
-        // frame length prefix and goes silent. A receive-side probe confirms
-        // that this task consumed those bytes and polled the rest to Pending
-        // before close starts. The close barrier must abort
-        // the stalled stream, let the receive task finish within its bounded
-        // join slice, and confirm — without waiting for the peer.
-        let address = unique_ipc_address("pool_close_receiver_blocked");
-        let endpoint = LocalEndpoint::from_address(&address).unwrap();
-        let (listener_ready_tx, listener_ready_rx) = std::sync::mpsc::channel();
-        let (receiver_blocked_tx, receiver_blocked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-
-        let server_thread = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let mut listener = LocalListener::bind(&endpoint).unwrap();
-                listener_ready_tx.send(()).unwrap();
-                let mut stream = listener.accept().await.unwrap();
-
-                crate::tests::accept_version_preamble(&mut stream).await;
-                let mut len_buf = [0_u8; 4];
-                stream.read_exact(&mut len_buf).await.unwrap();
-                let body_len = u32::from_le_bytes(len_buf) as usize;
-                let mut body = vec![0_u8; body_len];
-                stream.read_exact(&mut body).await.unwrap();
-
-                stream
-                    .write_all(&grid_handshake_reply_frame())
-                    .await
-                    .unwrap();
-                // Partial next frame: two length-prefix bytes, then silence.
-                stream.write_all(&[0_u8, 0]).await.unwrap();
-
-                let _ = release_rx.recv();
-                drop(stream);
-                crate::tests::close_listener(listener).await;
-            });
-        });
-        listener_ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("blocked-receiver listener readiness");
-
-        let client = SyncClient::connect_with_partial_header_probe_for_test(
-            &address,
-            ClientIpcConfig::default(),
-            receiver_blocked_tx,
-            None,
-        )
-        .expect("connect against the real handshake");
-        receiver_blocked_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the receive task must consume two header bytes and poll the rest to Pending");
-        let started = Instant::now();
-        let confirmed = client.close_shared(Duration::from_secs(2));
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "close barrier must be bounded with a blocked receiver, took {elapsed:?}"
-        );
-        assert!(
-            confirmed,
-            "aborting the stalled stream must let the receive task finish and the close confirm"
-        );
-        assert!(!client.is_connected());
-
-        let _ = release_tx.send(());
-        server_thread.join().unwrap();
-    }
-
-    #[test]
-    fn close_all_rejects_in_flight_connect_and_reopens_under_new_epoch() {
-        // A stalled handshake peer holds one pool acquire deterministically
-        // mid-connect: version selection completed and the metadata request
-        // has been read, but its reply is held. Draining must fence the connect
-        // out of the new epoch: when the handshake finally succeeds, the
-        // fresh connection is closed explicitly and the acquire rejects. A
-        // later acquire under the new epoch must succeed (restart/reacquire).
-        let address = unique_ipc_address("pool_epoch_fence");
-        let endpoint = LocalEndpoint::from_address(&address).unwrap();
-        let (listener_ready_tx, listener_ready_rx) = std::sync::mpsc::channel();
-        let (request_read_tx, request_read_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<bool>();
-
-        let server_thread = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let mut listener = LocalListener::bind(&endpoint).unwrap();
-                listener_ready_tx.send(()).unwrap();
-                let mut stream = listener.accept().await.unwrap();
-
-                crate::tests::accept_version_preamble(&mut stream).await;
-                let mut len_buf = [0_u8; 4];
-                stream.read_exact(&mut len_buf).await.unwrap();
-                let body_len = u32::from_le_bytes(len_buf) as usize;
-                let mut body = vec![0_u8; body_len];
-                stream.read_exact(&mut body).await.unwrap();
-                request_read_tx.send(()).unwrap();
-
-                // Deterministic stall: complete the handshake only on release.
-                let _ = release_rx.recv();
-                stream
-                    .write_all(&grid_handshake_reply_frame())
-                    .await
-                    .unwrap();
-
-                let mut probe = [0_u8; 1];
-                let closed = match tokio::time::timeout(
-                    Duration::from_secs(3),
-                    stream.read_exact(&mut probe),
-                )
-                .await
-                {
-                    // Disconnect bytes arrived or the peer closed: either
-                    // proves the epoch-loser connection was closed.
-                    Ok(Ok(_)) | Ok(Err(_)) => true,
-                    Err(_) => false,
-                };
-                let _ = closed_tx.send(closed);
-                drop(stream);
-                crate::tests::close_listener(listener).await;
-            });
-        });
-        listener_ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("epoch-fence listener readiness");
-
-        let pool = Arc::new(ClientPool::new(Duration::from_secs(60)));
-        let acquire_pool = Arc::clone(&pool);
-        let acquire_address = address.clone();
-        let acquire_thread = thread::spawn(move || acquire_pool.acquire(&acquire_address, None));
-        request_read_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("handshake request observed while the connect is stalled");
-
-        // Drain while the connect is in flight. The cache is empty; the drain
-        // exists to fence the in-flight connect out of the new epoch.
-        let report = pool.close_all(Duration::from_secs(1));
-        assert_eq!(report.detached, 0);
-        assert!(report.unconfirmed.is_empty(), "{report:?}");
-
-        // Resume the handshake. The transport connect now succeeds, but the
-        // epoch fence must reject the insert and close the connection.
-        release_tx.send(()).unwrap();
-        let rejected = match acquire_thread.join().unwrap() {
-            Err(IpcError::Pool(message)) => message,
-            Err(other) => panic!("unexpected error kind: {other:?}"),
-            Ok(_) => panic!("an acquire that straddled a drain must reject"),
-        };
-        assert!(
-            rejected.contains("closed while connecting"),
-            "epoch fence must reject the straddled acquire, got {rejected}"
-        );
-        assert!(
-            closed_rx
-                .recv_timeout(Duration::from_secs(6))
-                .expect("post-drain connection observation"),
-            "the post-drain connection must be closed explicitly"
-        );
-        server_thread.join().unwrap();
-
-        // Reopen: a fresh acquire under the new epoch succeeds against a
-        // serving peer, and a second drain closes it.
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let reopen_address = unique_ipc_address("pool_epoch_reopen");
-            let server =
-                Arc::new(Server::new(&reopen_address, ServerIpcConfig::default()).unwrap());
-            let runner = {
-                let server = Arc::clone(&server);
-                tokio::spawn(async move { server.run().await })
-            };
-            server
-                .wait_until_responsive(Duration::from_secs(2))
-                .await
-                .expect("reopen server should be responsive");
-
-            // The pool's blocking acquire/drain must run off this runtime's
-            // workers; hop to a blocking thread like production SDK glue.
-            let reopen_pool = Arc::clone(&pool);
-            let (client, report) = tokio::task::spawn_blocking(move || {
-                let client = reopen_pool
-                    .acquire(&reopen_address, None)
-                    .expect("acquire must work under the new epoch");
-                let report = reopen_pool.close_all(Duration::from_secs(2));
-                (client, report)
-            })
-            .await
-            .expect("reopen acquire task");
-            assert_eq!(report.detached, 1);
-            assert!(report.unconfirmed.is_empty(), "{report:?}");
-            assert!(!client.is_connected());
-
-            server
-                .shutdown_and_wait(Duration::from_secs(2))
-                .await
-                .expect("reopen server should shut down");
-            runner.await.unwrap().unwrap();
-        });
-    }
-
-    #[test]
-    fn drain_readiness_waits_for_the_acquire_fence() {
-        let pool = ClientPool::new(Duration::from_secs(60));
-        // close_all announces its coordinator before taking the map lock and
-        // setting the acquire fence. That announcement is not readiness.
-        pool.close_txn.0.lock().active_generation = Some(0);
-        assert!(pool.is_draining_for_test());
-        assert!(!pool.wait_until_draining_for_test(Duration::ZERO));
-
-        pool.state.lock().closing_generation = Some(0);
-        assert!(pool.wait_until_draining_for_test(Duration::ZERO));
-        pool.state.lock().closing_generation = None;
-        pool.close_txn.0.lock().active_generation = None;
-    }
-
-    #[test]
-    fn concurrent_close_all_drains_serialize_and_acquires_reject_during_blocked_drain() {
-        // Two close_all callers race while the first drain's only entry is a
-        // client whose writer slot is held. The second caller must neither
-        // clear the fence nor bump the epoch under the active drain: it times
-        // out against its own deadline with an honest error, acquires keep
-        // rejecting, and after the first drain completes (guard released) the
-        // cache reopens under the new epoch.
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let address = unique_ipc_address("pool_serial_drains");
-            let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
-            let runner = {
-                let server = Arc::clone(&server);
-                tokio::spawn(async move { server.run().await })
-            };
-            server
-                .wait_until_responsive(Duration::from_secs(2))
-                .await
-                .expect("server should be responsive");
-
-            let pool = Arc::new(ClientPool::new(Duration::from_secs(60)));
-            let client = {
-                let pool = Arc::clone(&pool);
-                let address = address.clone();
-                tokio::task::spawn_blocking(move || pool.acquire(&address, None))
-                    .await
-                    .expect("acquire task")
-                    .expect("acquire")
-            };
-            let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-            client.hold_writer_slot_for_test(acquired_tx, release_rx);
-            acquired_rx.await.expect("writer slot hold readiness");
-
-            // First drain: blocks on the held writer slot.
-            let drain_pool = Arc::clone(&pool);
-            let drain_thread = thread::spawn(move || {
-                let started = Instant::now();
-                let report = drain_pool.close_all(Duration::from_secs(3));
-                (report, started.elapsed())
-            });
-            assert!(
-                pool.wait_until_draining_for_test(Duration::from_secs(5)),
-                "first drain must enter its closing generation"
-            );
-
-            // Acquisitions during the active drain reject. (Blocking pool
-            // operations run off this runtime's workers.)
-            let probe_pool = Arc::clone(&pool);
-            let probe_address = address.clone();
-            let probe_result =
-                tokio::task::spawn_blocking(move || probe_pool.acquire(&probe_address, None))
-                    .await
-                    .expect("acquire probe task");
-            match probe_result {
-                Err(IpcError::Pool(message)) => assert!(
-                    message.contains("closing"),
-                    "acquire must reject during the active drain, got {message}"
-                ),
-                Err(other) => panic!("acquire during active drain must reject: {other:?}"),
-                Ok(_) => panic!("acquire during active drain must reject"),
-            }
-
-            // Second caller: times out waiting for the serialized drain and
-            // reports an error instead of claiming a drain or clearing the
-            // fence.
-            let second_pool = Arc::clone(&pool);
-            let second = tokio::task::spawn_blocking(move || {
-                second_pool.close_all(Duration::from_millis(300))
-            })
-            .await
-            .expect("second drain task");
-            assert_eq!(second.detached, 0, "{second:?}");
-            assert!(
-                second
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("concurrent cache drain")),
-                "second caller must report the serialized-drain timeout: {second:?}"
-            );
-            assert!(
-                pool.is_draining_for_test(),
-                "the timed-out caller must not clear the active drain fence"
-            );
-
-            // Release the writer: the first drain confirms and reopens the
-            // cache under a new epoch.
-            drop(release_tx);
-            let (first_report, first_elapsed) = drain_thread.join().expect("first drain thread");
-            assert_eq!(first_report.detached, 1, "{first_report:?}");
-            assert!(first_report.unconfirmed.is_empty(), "{first_report:?}");
-            assert!(first_report.error.is_none(), "{first_report:?}");
-            assert!(
-                first_elapsed < Duration::from_secs(5),
-                "first drain must stay bounded, took {first_elapsed:?}"
-            );
-            assert!(!pool.is_draining_for_test());
-            assert_eq!(pool.state.lock().epoch, Some(1));
-
-            // Restart semantics: a fresh acquire under the new epoch works.
-            let reopen_pool = Arc::clone(&pool);
-            let reopen_address = address.clone();
-            let reopened =
-                tokio::task::spawn_blocking(move || reopen_pool.acquire(&reopen_address, None))
-                    .await
-                    .expect("reopen acquire task")
-                    .expect("acquire after drain");
-            assert!(reopened.is_connected());
-            let final_pool = Arc::clone(&pool);
-            let final_report =
-                tokio::task::spawn_blocking(move || final_pool.close_all(Duration::from_secs(2)))
-                    .await
-                    .expect("final drain task");
-            assert!(final_report.error.is_none(), "{final_report:?}");
-            assert!(final_report.unconfirmed.is_empty(), "{final_report:?}");
-
-            server
-                .shutdown_and_wait(Duration::from_secs(2))
-                .await
-                .expect("server should shut down");
-            runner.await.unwrap().unwrap();
-        });
-    }
-
-    #[test]
-    fn two_concurrent_closes_of_one_blocked_receiver_serialize_and_stay_retryable() {
-        // The receive task is proven blocked mid-frame. Its cancellation Drop
-        // then parks until this test releases it. Both concurrent close
-        // barriers must stay bounded and unconfirmed while that exact task
-        // remains nonterminal; a later close joins its restored handle.
-        let address = unique_ipc_address("pool_double_close_receiver");
-        let endpoint = LocalEndpoint::from_address(&address).unwrap();
-        let (listener_ready_tx, listener_ready_rx) = std::sync::mpsc::channel();
-        let (receiver_blocked_tx, receiver_blocked_rx) = std::sync::mpsc::channel();
-        let (receiver_drop_entered_tx, receiver_drop_entered_rx) = std::sync::mpsc::channel();
-        let (release_receiver_drop_tx, release_receiver_drop_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-
-        let server_thread = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let mut listener = LocalListener::bind(&endpoint).unwrap();
-                listener_ready_tx.send(()).unwrap();
-                let mut stream = listener.accept().await.unwrap();
-                crate::tests::accept_version_preamble(&mut stream).await;
-                let mut len_buf = [0_u8; 4];
-                stream.read_exact(&mut len_buf).await.unwrap();
-                let body_len = u32::from_le_bytes(len_buf) as usize;
-                let mut body = vec![0_u8; body_len];
-                stream.read_exact(&mut body).await.unwrap();
-                stream
-                    .write_all(&grid_handshake_reply_frame())
-                    .await
-                    .unwrap();
-                stream.write_all(&[0_u8, 0]).await.unwrap();
-                let _ = release_rx.recv();
-                drop(stream);
-                crate::tests::close_listener(listener).await;
-            });
-        });
-        listener_ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("double-close listener readiness");
-
-        let client = Arc::new(
-            SyncClient::connect_with_partial_header_probe_for_test(
-                &address,
-                ClientIpcConfig::default(),
-                receiver_blocked_tx,
-                Some(crate::client::ReceiverDropGateForTest {
-                    entered: receiver_drop_entered_tx,
-                    release: release_receiver_drop_rx,
-                }),
-            )
-            .expect("connect against the real handshake"),
-        );
-        receiver_blocked_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("this receive task must poll the rest of the partial header to Pending");
-
-        let barrier = Arc::new(Barrier::new(2));
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<(bool, Duration)>();
-        let mut close_threads = Vec::new();
-        for _ in 0..2 {
-            let client = Arc::clone(&client);
-            let barrier = Arc::clone(&barrier);
-            let result_tx = result_tx.clone();
-            close_threads.push(thread::spawn(move || {
-                barrier.wait();
-                let started = Instant::now();
-                let confirmed = client.close_shared(Duration::from_secs(2));
-                let _ = result_tx.send((confirmed, started.elapsed()));
-            }));
-        }
-        drop(result_tx);
-        receiver_drop_entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the blocked receiver must enter its cancellation Drop gate");
-        let mut results = Vec::new();
-        for _ in 0..2 {
-            results.push(
-                result_rx
-                    .recv_timeout(Duration::from_secs(10))
-                    .expect("both concurrent closes must return"),
-            );
-        }
-        for (_, elapsed) in &results {
-            assert!(
-                elapsed < &Duration::from_secs(8),
-                "each concurrent close must stay bounded, took {elapsed:?}"
-            );
-        }
-        assert!(
-            results.iter().all(|(confirmed, _)| !confirmed),
-            "neither close may confirm while the receiver's cancellation Drop is gated: {results:?}"
-        );
-        for thread in close_threads {
-            thread.join().expect("close thread");
-        }
-
-        // Retryability: the aborted receive task is still observable through
-        // its restored handle; a subsequent close joins it and confirms.
-        release_receiver_drop_tx
-            .send(())
-            .expect("release the receiver cancellation gate");
-        let retry = client.close_shared(Duration::from_secs(2));
-        assert!(
-            retry,
-            "a later close must confirm after the serialized barriers"
-        );
-        assert!(!client.is_connected());
-
-        let _ = release_tx.send(());
-        server_thread.join().unwrap();
-    }
-
-    #[test]
-    fn close_all_does_not_claim_drained_while_discard_barrier_is_in_flight() {
-        // A discard closes a detached client outside the pool lock; while
-        // that bounded barrier is still active (writer slot held), close_all
-        // must withhold any drained claim with an error instead of silently
-        // reporting success.
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let address = unique_ipc_address("pool_discard_in_flight");
-            let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
-            let runner = {
-                let server = Arc::clone(&server);
-                tokio::spawn(async move { server.run().await })
-            };
-            server
-                .wait_until_responsive(Duration::from_secs(2))
-                .await
-                .expect("server should be responsive");
-
-            let pool = Arc::new(ClientPool::new(Duration::from_secs(60)));
-            let client = {
-                let pool = Arc::clone(&pool);
-                let address = address.clone();
-                tokio::task::spawn_blocking(move || pool.acquire(&address, None))
-                    .await
-                    .expect("acquire task")
-                    .expect("acquire")
-            };
-            let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-            client.hold_writer_slot_for_test(acquired_tx, release_rx);
-            acquired_rx.await.expect("writer slot hold readiness");
-
-            // Discard on another thread: detaches the entry, then blocks in
-            // its accounted close barrier on the held writer slot.
-            let discard_pool = Arc::clone(&pool);
-            let discard_address = address.clone();
-            let discard_client = Arc::clone(&client);
-            let discard_thread = thread::spawn(move || {
-                discard_pool.discard_if_same(&discard_address, &discard_client)
-            });
-            assert!(
-                pool.wait_until_detached_close_in_flight_for_test(Duration::from_secs(5)),
-                "discard must register its pending close before any close I/O"
-            );
-
-            // This moment is exactly the reviewed detach→I/O gap: the entry
-            // is detached and the record registered, while the barrier has
-            // not made progress (its writer slot is held). close_all must
-            // not be able to claim a false success here.
-            let report = pool.close_all(Duration::from_millis(300));
-            assert_eq!(report.detached, 0, "{report:?}");
-            assert!(
-                report
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("in-flight detached client closes")),
-                "close_all must not claim drained while a discard barrier is active: {report:?}"
-            );
-            assert!(
-                !pool.is_draining_for_test(),
-                "the withheld close_all must not start a drain generation"
-            );
-
-            // Let the discard barrier finish; a later close_all is clean.
-            drop(release_tx);
-            assert!(
-                discard_thread.join().expect("discard thread"),
-                "discard must complete once the writer slot frees"
-            );
-            let clean_pool = Arc::clone(&pool);
-            let clean =
-                tokio::task::spawn_blocking(move || clean_pool.close_all(Duration::from_secs(2)))
-                    .await
-                    .expect("clean drain task");
-            assert_eq!(clean.detached, 0, "{clean:?}");
-            assert!(clean.error.is_none(), "{clean:?}");
-            assert!(clean.unconfirmed.is_empty(), "{clean:?}");
-            assert_eq!(pool.retired_records_for_test(), 0);
-
-            server
-                .shutdown_and_wait(Duration::from_secs(2))
-                .await
-                .expect("server should shut down");
-            runner.await.unwrap().unwrap();
-        });
-    }
-
-    #[test]
-    fn prior_unconfirmed_drained_client_is_retried_and_reported_by_later_close_all() {
-        // A drain whose child close cannot confirm (held writer slot) must
-        // keep the client's retired record registered and report it
-        // unconfirmed; a later close_all retries that record and only clears
-        // it after a confirmed close. Unconfirmed ownership never disappears
-        // silently.
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let address = unique_ipc_address("pool_retry_unconfirmed");
-            let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
-            let runner = {
-                let server = Arc::clone(&server);
-                tokio::spawn(async move { server.run().await })
-            };
-            server
-                .wait_until_responsive(Duration::from_secs(2))
-                .await
-                .expect("server should be responsive");
-
-            let pool = Arc::new(ClientPool::new(Duration::from_secs(60)));
-            let client = {
-                let pool = Arc::clone(&pool);
-                let address = address.clone();
-                tokio::task::spawn_blocking(move || pool.acquire(&address, None))
-                    .await
-                    .expect("acquire task")
-                    .expect("acquire")
-            };
-            let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-            client.hold_writer_slot_for_test(acquired_tx, release_rx);
-            acquired_rx.await.expect("writer slot hold readiness");
-
-            // First drain: the child close cannot confirm within 200 ms.
-            let first_pool = Arc::clone(&pool);
-            let first = tokio::task::spawn_blocking(move || {
-                first_pool.close_all(Duration::from_millis(200))
-            })
-            .await
-            .expect("first drain task");
-            assert_eq!(first.detached, 1, "{first:?}");
-            assert!(first.error.is_none(), "{first:?}");
-            assert_eq!(first.unconfirmed, vec![address.clone()], "{first:?}");
-            assert_eq!(
-                pool.retired_records_for_test(),
-                1,
-                "the unconfirmed client must stay registered for retry"
-            );
-            assert!(!pool.is_draining_for_test());
-
-            // Free the writer, then drain again: the retry pass owns the
-            // unconfirmed record and confirms its close.
-            drop(release_tx);
-            let second_pool = Arc::clone(&pool);
-            let second =
-                tokio::task::spawn_blocking(move || second_pool.close_all(Duration::from_secs(2)))
-                    .await
-                    .expect("second drain task");
-            assert_eq!(second.detached, 0, "{second:?}");
-            assert!(second.error.is_none(), "{second:?}");
-            assert!(
-                second.unconfirmed.is_empty(),
-                "the retried record must confirm and be removed: {second:?}"
-            );
-            assert_eq!(pool.retired_records_for_test(), 0);
-
-            server
-                .shutdown_and_wait(Duration::from_secs(2))
-                .await
-                .expect("server should shut down");
-            runner.await.unwrap().unwrap();
-        });
-    }
-
-    #[test]
-    fn close_all_deadline_is_aggregate_across_blocked_entries() {
-        // Three cached clients, each with a held writer slot so every child
-        // close barrier would block for the full timeout if given one. All
-        // children share ONE absolute drain deadline: total wall time stays
-        // near a single timeout (independent of N) and every blocked entry
-        // is reported honestly as unconfirmed.
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let address = unique_ipc_address("pool_aggregate_deadline");
-            let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
-            let runner = {
-                let server = Arc::clone(&server);
-                tokio::spawn(async move { server.run().await })
-            };
-            server
-                .wait_until_responsive(Duration::from_secs(2))
-                .await
-                .expect("server should be responsive");
-
-            let pool = Arc::new(ClientPool::new(Duration::from_secs(60)));
-            let mut release_guards = Vec::new();
-            let mut entries: Vec<(String, Arc<SyncClient>)> = Vec::new();
-            for index in 0..3 {
-                let connect_address = address.clone();
-                let client =
-                    tokio::task::spawn_blocking(move || {
-                        SyncClient::connect(&connect_address, None, ClientIpcConfig::default())
-                    })
-                    .await
-                    .expect("connect task")
-                    .expect("connect");
-                let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
-                let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-                client.hold_writer_slot_for_test(acquired_tx, release_rx);
-                acquired_rx.await.expect("writer slot hold readiness");
-                release_guards.push(release_tx);
-                entries.push((format!("ipc://aggregate-{index}"), Arc::new(client)));
-            }
-            {
-                let mut state = pool.state.lock();
-                for (key, client) in entries {
-                    state.entries.insert(
-                        key,
-                        PoolEntry {
-                            client,
-                            references: Arc::new(PoolReferences::new(1, None)),
-                        },
-                    );
-                }
-            }
-
-            let drain_pool = Arc::clone(&pool);
-            let (report_tx, report_rx) = std::sync::mpsc::channel::<(ClientCacheCloseReport, Duration)>();
-            let drain_thread = thread::spawn(move || {
-                let started = Instant::now();
-                let report = drain_pool.close_all(Duration::from_secs(1));
-                let _ = report_tx.send((report, started.elapsed()));
-            });
-            let (report, elapsed) = report_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("aggregate drain must return");
-            drain_thread.join().unwrap();
-
-            assert_eq!(report.detached, 3, "{report:?}");
-            assert_eq!(report.unconfirmed.len(), 3, "{report:?}");
-            assert!(report.error.is_none(), "{report:?}");
-            assert!(
-                elapsed < Duration::from_secs(2),
-                "one aggregate deadline must bound all children (got {elapsed:?} for 3 blocked entries)"
-            );
-            assert_eq!(pool.active_count(), 0);
-            assert!(!pool.is_draining_for_test());
-
-            // Release the held slots; nothing remains pinned.
-            drop(release_guards);
-            server
-                .shutdown_and_wait(Duration::from_secs(2))
-                .await
-                .expect("server should shut down");
-            runner.await.unwrap().unwrap();
-        });
-    }
-
-    #[test]
-    fn pooled_direct_client_observes_route_registered_after_handshake() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let address = unique_ipc_address("pool_live_route_refresh");
-            let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
-            register_test_route(&server, "manager").await;
-            let runner = {
-                let server = Arc::clone(&server);
-                tokio::spawn(async move { server.run().await })
-            };
-            server
-                .wait_until_responsive(Duration::from_secs(2))
-                .await
-                .expect("server should be responsive");
-
-            let pool = Arc::new(ClientPool::new(Duration::from_secs(60)));
-            let acquire_pool = Arc::clone(&pool);
-            let acquire_address = address.clone();
-            let client =
-                tokio::task::spawn_blocking(move || acquire_pool.acquire(&acquire_address, None))
-                    .await
-                    .expect("acquire task should complete")
-                    .expect("manager client");
-            assert!(client.route_names().contains(&"manager".to_string()));
-            assert!(!client.route_names().contains(&"builder".to_string()));
-
-            register_test_route(&server, "builder").await;
-            let builder_contract = expected_contract("builder");
-
-            let ensure_client = Arc::clone(&client);
-            let ensure_contract = builder_contract.clone();
-            let binding =
-                tokio::task::spawn_blocking(move || ensure_client.acquire_route(&ensure_contract))
-                    .await
-                    .expect("ensure task should complete")
-                    .expect("direct pooled IPC client should acquire builder through route lookup");
-            assert_eq!(binding.route_name(), "builder");
-
-            assert!(
-                client.route_names().contains(&"builder".to_string()),
-                "route lookup should cache the acquired builder route without watch"
-            );
-            pool.release(&address);
-
-            server
-                .shutdown_and_wait(Duration::from_secs(2))
-                .await
-                .expect("server should shut down");
-            runner.await.unwrap().unwrap();
-        });
-    }
-
-    #[test]
-    fn registration_attestation_accepts_committed_closed_route_without_business_acquire() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let address = unique_ipc_address("registration_closed_route");
-            let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
-            let expected = expected_contract("grid");
-            let built = server
-                .build_route(
-                    RouteBuildSpec {
-                        name: "grid".to_string(),
-                        crm_ns: expected.crm_ns.clone(),
-                        crm_name: expected.crm_name.clone(),
-                        crm_ver: expected.crm_ver.clone(),
-                        abi_hash: expected.abi_hash.clone(),
-                        signature_hash: expected.signature_hash.clone(),
-                        method_names: vec!["ping".to_string()],
-                        access_map: HashMap::new(),
-                        concurrency_mode: ConcurrencyMode::ReadParallel,
-                        limits: SchedulerLimits::default(),
-                    },
-                    Arc::new(Echo),
-                )
-                .expect("test route should build");
-            let reservation = server.reserve_route(built).await.expect("reserve route");
-            let admission = server
-                .commit_reserved_route_closed(reservation)
-                .await
-                .expect("closed registration commit");
-            let runner = {
-                let server = Arc::clone(&server);
-                tokio::spawn(async move { server.run().await })
-            };
-            server
-                .wait_until_responsive(Duration::from_secs(2))
-                .await
-                .expect("server should be responsive");
-
-            let mut client = IpcClient::with_config(&address, ClientIpcConfig::default());
-            client.connect().await.expect("client connects");
-            assert!(
-                matches!(
-                    client.acquire_route(&expected).await,
-                    Err(IpcError::RouteClosed { .. })
-                ),
-                "business acquire must reject closed registration routes"
-            );
-            let binding = client
-                .attest_route_for_registration(&expected)
-                .await
-                .expect("registration attestation accepts committed closed route");
-            assert_eq!(binding.route_name(), "grid");
-
-            server
-                .open_route_admission(admission)
-                .await
-                .expect("route admission opens for cleanup");
-            client.close().await;
-            server
-                .shutdown_and_wait(Duration::from_secs(2))
-                .await
-                .expect("server should shut down");
-            runner.await.unwrap().unwrap();
-        });
-    }
-
     #[test]
     fn test_pool_set_default_config() {
         let pool = ClientPool::new(Duration::from_secs(30));
@@ -5126,247 +1044,6 @@ mod tests {
         assert_eq!(c.shm_threshold, 1024);
         assert_eq!(c.chunk_size, 65536);
     }
-
-    #[test]
-    fn pool_rejects_default_config_with_divergent_budget_after_freeze() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        // Freeze the domain from a config with a distinctive budget cell.
-        let frozen = ClientIpcConfig {
-            base: c2_config::BaseIpcConfig {
-                shm_backing_budget_bytes: 1,
-                ..c2_config::BaseIpcConfig::default()
-            },
-            ..ClientIpcConfig::default()
-        };
-        let snapshot = pool.memory_budget_snapshot();
-        assert!(snapshot.is_none(), "snapshot must not create the context");
-        let _ = pool.acquire("ipc:///nonexistent_memory_context_freeze", Some(&frozen));
-        let snapshot = pool
-            .memory_budget_snapshot()
-            .expect("first attempt freezes the domain");
-        assert_eq!(snapshot.limits.shm_backing_budget_bytes, 1);
-
-        let divergent = ClientIpcConfig {
-            base: c2_config::BaseIpcConfig {
-                shm_backing_budget_bytes: 2,
-                ..c2_config::BaseIpcConfig::default()
-            },
-            ..ClientIpcConfig::default()
-        };
-        let error = pool
-            .set_default_config(divergent)
-            .expect_err("divergent default must be rejected after freeze");
-        assert!(
-            error.to_string().contains("memory budget frozen"),
-            "{error}"
-        );
-        // The frozen domain budget is unchanged and still observable.
-        let after = pool.memory_budget_snapshot().unwrap();
-        assert_eq!(after.limits.shm_backing_budget_bytes, 1);
-    }
-
-    /// The cache's frozen domain observer must survive a full drain: closing
-    /// every client never uninstalls or resets the domain, so retained charges
-    /// stay observable after shutdown.
-    #[test]
-    fn client_cache_budget_observer_reports_frozen_domain_across_close_all() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let config = ClientIpcConfig {
-            base: c2_config::BaseIpcConfig {
-                shm_backing_budget_bytes: 4096,
-                file_backing_budget_bytes: 2048,
-                live_reassembly_budget_bytes: 1024,
-                ..c2_config::BaseIpcConfig::default()
-            },
-            ..ClientIpcConfig::default()
-        };
-        assert!(
-            pool.memory_budget_observer().is_none(),
-            "observing must not create or freeze a domain"
-        );
-        // A failed first attempt still freezes the domain atomically.
-        let _ = pool.acquire("ipc:///nonexistent_cache_budget_observer", Some(&config));
-        let observer = pool
-            .memory_budget_observer()
-            .expect("the first attempt freezes the domain");
-        assert_eq!(*observer.limits(), config.memory_budget_limits());
-        assert_eq!(observer.used_bytes(), 0);
-
-        let report = pool.close_all(Duration::from_secs(1));
-        assert!(report.error.is_none(), "{report:?}");
-
-        let after = pool
-            .memory_budget_observer()
-            .expect("draining clients must not uninstall the frozen domain");
-        assert_eq!(*after.limits(), config.memory_budget_limits());
-        assert_eq!(after.snapshot(), observer.snapshot());
-    }
-
-    /// A same-address cache hit must match the complete resolved client
-    /// policy, not only the shared budget limits: buddy policy, prewarm,
-    /// chunking, threshold, decay, and reassembly geometry all change how the
-    /// cached connection transfers data.
-    #[test]
-    fn same_address_hit_requires_the_complete_resolved_config() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let address = unique_ipc_address("same_address_full_config");
-        let (server, runner) = {
-            let address = address.clone();
-            rt.block_on(async move {
-                let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
-                let runner = {
-                    let server = Arc::clone(&server);
-                    tokio::spawn(async move { server.run().await })
-                };
-                server
-                    .wait_until_responsive(Duration::from_secs(2))
-                    .await
-                    .expect("server should be responsive");
-                (server, runner)
-            })
-        };
-
-        // Pool acquires connect through the global sync client runtime, so
-        // they must run outside this test's `block_on` context.
-        let pool = ClientPool::new(Duration::from_secs(60));
-        let base = c2_config::BaseIpcConfig {
-            pool_segment_size: 65_536,
-            max_pool_segments: 1,
-            ..c2_config::BaseIpcConfig::default()
-        };
-        let canonical = ClientIpcConfig {
-            base: base.clone(),
-            shm_threshold: 1,
-            pool_decay_seconds: 30.0,
-        };
-
-        let first = pool
-            .acquire(&address, Some(&canonical))
-            .expect("first acquire connects");
-        let reused = pool
-            .acquire(&address, Some(&canonical))
-            .expect("an identical resolved config reuses the cached connection");
-        assert!(
-            Arc::ptr_eq(&first, &reused),
-            "identical resolved config must reuse the same client"
-        );
-
-        // Every variant keeps the budget limits identical to `canonical`.
-        let mut variants: Vec<(&str, ClientIpcConfig)> = vec![
-            (
-                "chunk_size",
-                ClientIpcConfig {
-                    base: c2_config::BaseIpcConfig {
-                        chunk_size: 65_536,
-                        ..base.clone()
-                    },
-                    ..canonical.clone()
-                },
-            ),
-            (
-                "shm_threshold",
-                ClientIpcConfig {
-                    shm_threshold: 4_096,
-                    ..canonical.clone()
-                },
-            ),
-            (
-                "pool_enabled",
-                ClientIpcConfig {
-                    base: c2_config::BaseIpcConfig {
-                        pool_enabled: false,
-                        ..base.clone()
-                    },
-                    ..canonical.clone()
-                },
-            ),
-            (
-                "pool_prewarm_segments",
-                ClientIpcConfig {
-                    base: c2_config::BaseIpcConfig {
-                        pool_prewarm_segments: 1,
-                        ..base.clone()
-                    },
-                    ..canonical.clone()
-                },
-            ),
-            (
-                "chunk_threshold_ratio",
-                ClientIpcConfig {
-                    base: c2_config::BaseIpcConfig {
-                        chunk_threshold_ratio: 0.5,
-                        ..base.clone()
-                    },
-                    ..canonical.clone()
-                },
-            ),
-            (
-                "reassembly_segment_size",
-                ClientIpcConfig {
-                    base: c2_config::BaseIpcConfig {
-                        reassembly_segment_size: 32 * 1024 * 1024,
-                        ..base.clone()
-                    },
-                    ..canonical.clone()
-                },
-            ),
-            (
-                "pool_decay_seconds",
-                ClientIpcConfig {
-                    pool_decay_seconds: 5.0,
-                    ..canonical.clone()
-                },
-            ),
-        ];
-
-        let mut combined = canonical.clone();
-        combined.base.chunk_size = 65_536;
-        combined.shm_threshold = 4_096;
-        variants.push(("chunk_size, shm_threshold", combined));
-
-        for (field, variant) in variants {
-            assert_eq!(
-                variant.memory_budget_limits(),
-                canonical.memory_budget_limits(),
-                "fixture for {field} must keep budget identity equal"
-            );
-            let error = pool
-                .acquire(&address, Some(&variant))
-                .err()
-                .expect("a divergent resolved policy must be rejected on a cache hit");
-            let message = error.to_string();
-            assert!(
-                message.contains("different resolved client policy"),
-                "{field}: {message}"
-            );
-            assert!(
-                message.contains(&format!("differing fields: {field})")),
-                "{message}"
-            );
-            // The rejection must not evict or alter the live entry.
-            let still_cached = pool
-                .acquire(&address, Some(&canonical))
-                .expect("the canonical policy still serves the cache");
-            assert!(
-                Arc::ptr_eq(&first, &still_cached),
-                "{field}: a rejected policy must not disturb the cached entry"
-            );
-        }
-
-        // Rejected acquires leave exactly the original entry in place.
-        assert_eq!(pool.active_count(), 1);
-        let report = pool.close_all(Duration::from_secs(2));
-        assert!(report.error.is_none(), "{report:?}");
-
-        rt.block_on(async move {
-            server
-                .shutdown_and_wait(Duration::from_secs(2))
-                .await
-                .expect("server should shut down");
-            runner.await.unwrap().unwrap();
-        });
-    }
-
     #[test]
     fn pool_config_from_client_config_uses_max_pool_segments() {
         let cfg = ClientIpcConfig {
@@ -5384,7 +1061,6 @@ mod tests {
         assert_eq!(pc.segment_size, 65_536);
         assert_eq!(pc.max_segments, 3);
     }
-
     #[test]
     fn pool_config_from_client_config_projects_client_decay() {
         let cfg = ClientIpcConfig {
@@ -5396,9 +1072,6 @@ mod tests {
             3.25
         );
     }
-
-    // ── Helper ───────────────────────────────────────────────────────────
-
     #[test]
     fn test_client_pool_unique_prefixes() {
         // Verify that successive client MemPool creations get different
@@ -5410,18 +1083,20 @@ mod tests {
         let p2 = format!("/cc3c{:08x}{:08x}", std::process::id(), c2);
         assert_ne!(p1, p2, "consecutive prefixes must differ");
         // Verify the pools can be created with these prefixes.
-        let pool1 = MemPool::new_with_prefix(pc.clone(), p1.clone());
-        let pool2 = MemPool::new_with_prefix(pc.clone(), p2.clone());
-        let repeated_label = MemPool::new_with_prefix(pc, p1.clone());
+        let pool1 = MemPool::new_with_prefix(pc.clone(), p1.clone()).unwrap();
+        let pool2 = MemPool::new_with_prefix(pc.clone(), p2.clone()).unwrap();
+        let repeated_label = MemPool::new_with_prefix(pc, p1.clone()).unwrap();
         assert!(pool1.prefix().starts_with(&format!("{p1}_")));
         assert!(pool2.prefix().starts_with(&format!("{p2}_")));
         assert_ne!(pool1.prefix(), repeated_label.prefix());
         assert_ne!(pool1.prefix(), pool2.prefix());
         assert!(pool1.prefix().len() <= c2_contract::MAX_WIRE_TEXT_BYTES);
     }
-
-    /// Create a disconnected SyncClient for testing pool bookkeeping.
     fn make_disconnected_client() -> SyncClient {
         SyncClient::new_unconnected("ipc:///pool_test_fake")
     }
 }
+
+#[cfg(test)]
+#[path = "pool_tests.rs"]
+mod pool_tests;

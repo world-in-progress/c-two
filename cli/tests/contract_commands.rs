@@ -249,38 +249,6 @@ print(Path(__file__).with_name("payload.txt").read_text(encoding="utf-8"), end="
     }
 }
 
-#[cfg(unix)]
-fn fake_python_requiring_arg(
-    tempdir: &tempfile::TempDir,
-    required_arg: &str,
-    matched_payload: &str,
-    missing_payload: &str,
-) -> FakePython {
-    let cli_package = write_fake_python_package(tempdir);
-    std::fs::write(cli_package.join("matched_payload.txt"), matched_payload).unwrap();
-    std::fs::write(cli_package.join("missing_payload.txt"), missing_payload).unwrap();
-    std::fs::write(
-        cli_package.join("contract.py"),
-        format!(
-            r#"import sys
-from pathlib import Path
-
-payload = "matched_payload.txt" if {required_arg:?} in sys.argv[1:] else "missing_payload.txt"
-print(Path(__file__).with_name(payload).read_text(encoding="utf-8"), end="")
-"#
-        ),
-    )
-    .unwrap();
-    FakePython {
-        pythonpath: tempdir.path().to_path_buf(),
-    }
-}
-
-fn assert_valid_contract_file(path: &Path) {
-    let payload = std::fs::read_to_string(path).unwrap();
-    c2_contract::validate_portable_contract_descriptor_json(payload.as_bytes()).unwrap();
-}
-
 #[test]
 fn contract_help_lists_descriptor_commands() {
     let mut cmd = Command::cargo_bin("c3").unwrap();
@@ -290,7 +258,6 @@ fn contract_help_lists_descriptor_commands() {
         .stdout(predicate::str::contains("codegen"))
         .stdout(predicate::str::contains("diagnose"))
         .stdout(predicate::str::contains("export"))
-        .stdout(predicate::str::contains("infer"))
         .stdout(predicate::str::contains("validate"));
 }
 
@@ -306,13 +273,6 @@ fn contract_help_omits_removed_sidecar_artifact_commands() {
             .any(|line| line.split_whitespace().next() == Some("artifacts")),
         "{stdout}",
     );
-
-    let mut infer = Command::cargo_bin("c3").unwrap();
-    infer
-        .args(["contract", "infer", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--artifacts").not());
 }
 
 #[test]
@@ -503,133 +463,6 @@ fn contract_export_wraps_python_and_validates_output() {
     .assert()
     .success()
     .stdout(predicate::str::contains(r#""schema": "c-two.contract.v2""#));
-}
-
-#[cfg(unix)]
-#[test]
-fn contract_infer_wraps_python_and_writes_validated_output() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let python = fake_python(&tempdir, &valid_contract_json());
-    let output = tempdir.path().join("inferred.contract.json");
-
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("PYTHONPATH", python.pythonpath());
-    cmd.args([
-        "contract",
-        "infer",
-        "example.resources:GridResource",
-        "--python",
-        python.executable(),
-        "--namespace",
-        "example.grid",
-        "--version",
-        "0.1.0",
-        "--name",
-        "Grid",
-        "--method",
-        "echo",
-        "--out",
-        output.to_str().unwrap(),
-    ])
-    .assert()
-    .success()
-    .stdout(predicate::str::is_empty());
-
-    assert_valid_contract_file(&output);
-}
-
-#[cfg(unix)]
-#[test]
-fn contract_infer_diagnose_wraps_python_and_validates_diagnostic_shape() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let diagnostics = r#"[{"code":"python_only_pickle","message":"Python-only fallback","method":"echo","position":"input","severity":"warning"}]"#;
-    let python =
-        fake_python_requiring_arg(&tempdir, "--diagnose", diagnostics, &valid_contract_json());
-    let output = tempdir.path().join("inferred.diagnostics.json");
-
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("PYTHONPATH", python.pythonpath());
-    cmd.args([
-        "contract",
-        "infer",
-        "example.resources:GridResource",
-        "--python",
-        python.executable(),
-        "--namespace",
-        "example.grid",
-        "--version",
-        "0.1.0",
-        "--name",
-        "Grid",
-        "--method",
-        "echo",
-        "--diagnose",
-        "--out",
-        output.to_str().unwrap(),
-    ])
-    .assert()
-    .success()
-    .stdout(predicate::str::is_empty());
-
-    assert_eq!(std::fs::read_to_string(output).unwrap().trim(), diagnostics);
-}
-
-#[cfg(unix)]
-#[test]
-fn contract_infer_diagnose_rejects_non_array_python_output() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let python = fake_python(&tempdir, r#"{"code":"python_only_pickle"}"#);
-
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("PYTHONPATH", python.pythonpath());
-    cmd.args([
-        "contract",
-        "infer",
-        "example.resources:GridResource",
-        "--python",
-        python.executable(),
-        "--namespace",
-        "example.grid",
-        "--version",
-        "0.1.0",
-        "--method",
-        "echo",
-        "--diagnose",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains(
-        "diagnostic output must be a JSON array",
-    ));
-}
-
-#[cfg(unix)]
-#[test]
-fn contract_infer_diagnose_rejects_non_object_diagnostics() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let python = fake_python(&tempdir, r#"["python_only_pickle"]"#);
-
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("PYTHONPATH", python.pythonpath());
-    cmd.args([
-        "contract",
-        "infer",
-        "example.resources:GridResource",
-        "--python",
-        python.executable(),
-        "--namespace",
-        "example.grid",
-        "--version",
-        "0.1.0",
-        "--method",
-        "echo",
-        "--diagnose",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains(
-        "diagnostic output must be a JSON array of objects",
-    ));
 }
 
 #[cfg(unix)]

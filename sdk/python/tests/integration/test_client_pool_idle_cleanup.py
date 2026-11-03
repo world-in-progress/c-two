@@ -16,6 +16,7 @@ from contextlib import contextmanager
 
 import pytest
 import c_two as cc
+import c_two.endpoint
 
 from tests.fixtures.process_control import readline_with_timeout
 
@@ -136,7 +137,7 @@ def test_client_pool_idle_cleanup(tmp_path):
             hello = _message(server, server_log)
             assert hello['pid'] == server.pid
             assert hello['address'].startswith('ipc://')
-            endpoint_name = Path(cc.local_endpoint_context(root=ipc_root).endpoint_name(
+            endpoint_name = Path(cc.endpoint.local_endpoint_context(root=ipc_root).endpoint_name(
                 hello['address'],
             )).name
             # READY follows PONG, before the server necessarily drops that

@@ -7,11 +7,17 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 import uuid
 
 import pytest
 
 import c_two as cc
+
+import c_two.endpoint
+
+import c_two.observe
 from c_two._native import RuntimeSession
 from c_two.config.settings import C2Settings, settings
 from c_two.transport import registry
@@ -122,8 +128,8 @@ def test_empty_start_uses_native_readiness_and_leaves_directory_owned_by_caller(
         runtime.set_server(startup_timeout=5.0)
         runtime.start()
         assert runtime.names == []
-        assert runtime.native_lifecycle_snapshot()['listener_closed'] is False
-        assert runtime.native_terminal_outcome() is None
+        assert runtime.lifecycle_snapshot()['listener_closed'] is False
+        assert runtime.shutdown_outcome() is None
         credential = runtime.server_credential()
         assert credential.address == runtime.server_address()
         assert registry._default_runtime is None
@@ -146,7 +152,7 @@ def test_two_runtime_names_connections_and_shutdown_are_independent(runtimes):
         assert direct.echo('local') == 'first:local'
     with second.connect(Echo, name='same', address=second.server_address()) as remote:
         assert remote.client.observed_path == 'direct_ipc'
-        observation = cc.connection_observation(remote)
+        observation = cc.observe.connection_observation(remote)
         assert first.shutdown()['completed']
         assert resources[0].stopped == 1
         assert resources[1].stopped == 0
@@ -159,6 +165,145 @@ def test_two_runtime_names_connections_and_shutdown_are_independent(runtimes):
     assert resources[1].stopped == 1
 
 
+def test_serve_shutdown_timeout_returns_pending_and_cleanup_continues(capsys) -> None:
+    import inspect
+
+    assert (
+        inspect.signature(cc.serve).parameters['shutdown_timeout'].default
+        == inspect.signature(cc.shutdown).parameters['timeout'].default
+    )
+
+    class BlockingResource:
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.proceed = threading.Event()
+            self.finished = threading.Event()
+            self.stopped = 0
+
+        def echo(self, value: str) -> str:
+            self.entered.set()
+            try:
+                if not self.proceed.wait(timeout=10):
+                    raise RuntimeError('callback was not released')
+                return value
+            finally:
+                self.finished.set()
+
+        def stop(self) -> None:
+            assert self.finished.is_set()
+            self.stopped += 1
+
+    resource = BlockingResource()
+    cc.register(Echo, resource, name='serve-timeout')
+    client = cc.Runtime()
+    proxy = client.connect(Echo, name='serve-timeout', address=cc.server_address())
+    call_result: dict[str, object] = {}
+    serve_result: dict[str, object] = {}
+
+    def call() -> None:
+        try:
+            call_result['value'] = proxy.echo('alive')
+        except BaseException as exc:
+            call_result['error'] = exc
+
+    def run_serve() -> None:
+        try:
+            serve_result['outcome'] = cc.serve(shutdown_timeout=0.05)
+        except BaseException as exc:
+            serve_result['error'] = exc
+
+    call_thread = threading.Thread(target=call, daemon=True)
+    serve_thread = threading.Thread(target=run_serve, daemon=True)
+    try:
+        call_thread.start()
+        assert resource.entered.wait(timeout=5), 'remote callback did not start'
+        serve_thread.start()
+        deadline = time.monotonic() + 5
+        runtime = registry._get_default_runtime()
+        while runtime._serve_stop is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert runtime._serve_stop is not None, 'serve did not install its stop event'
+        runtime._serve_stop.set()  # The signal handler sets this same event.
+        serve_thread.join(timeout=5)
+        assert not serve_thread.is_alive(), 'serve exceeded its shutdown wait budget'
+        assert 'error' not in serve_result, serve_result
+        assert serve_result['outcome']['completed'] is False
+        output = capsys.readouterr().out
+        assert 'Shutting down...' in output
+        assert 'Resource server shutdown is still in progress.' in output
+        assert 'Resource server stopped.' not in output
+        assert resource.stopped == 0
+        assert not resource.proceed.is_set()
+
+        resource.proceed.set()
+        call_thread.join(timeout=5)
+        assert not call_thread.is_alive(), 'callback client did not finish'
+        assert call_result == {'value': 'alive'}, call_result
+        assert resource.finished.wait(timeout=5), 'resource callback did not finish'
+        completed = cc.shutdown(timeout=5)
+        assert completed['completed'] is True, completed
+        assert resource.stopped == 1
+    finally:
+        resource.proceed.set()
+        if call_thread.ident is not None:
+            call_thread.join(timeout=5)
+        if serve_thread.ident is not None:
+            serve_thread.join(timeout=5)
+        cc.close(proxy)
+        client.shutdown(timeout=5)
+        cc.shutdown(timeout=5)
+
+
+@pytest.mark.parametrize('timeout', [
+    -1.0, float('nan'), float('inf'), 1e19, 1e300, '0.5', None,
+])
+def test_serve_rejects_invalid_shutdown_timeout_before_side_effects(
+    monkeypatch, timeout,
+) -> None:
+    runtime = registry._get_default_runtime()
+    session = runtime._runtime_session
+    with pytest.raises((TypeError, ValueError)) as shutdown_error:
+        runtime.shutdown(timeout=timeout)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError('invalid serve timeout caused a side effect')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(registry.signal, 'signal', unexpected)
+        patch.setattr(registry, '_print_serve_message', unexpected)
+        patch.setattr(runtime, 'shutdown', unexpected)
+        with pytest.raises(type(shutdown_error.value)) as serve_error:
+            cc.serve(blocking=False, shutdown_timeout=timeout)
+
+    assert str(serve_error.value) == str(shutdown_error.value)
+    assert runtime._serve_stop is None
+    assert runtime._runtime_session is session
+    session.check_active()
+
+
+@pytest.mark.parametrize('timeout', [1e19, float(2**63)])
+def test_call_connect_and_lifecycle_share_portable_timeout_range(timeout):
+    from c_two._native import ConnectAttempt, NativeCallOptions
+
+    for construct in (
+        lambda: NativeCallOptions(timeout=timeout),
+        lambda: ConnectAttempt(timeout_seconds=timeout),
+        lambda: RuntimeSession(startup_timeout=timeout),
+    ):
+        with pytest.raises(ValueError):
+            construct()
+
+    session = RuntimeSession(use_process_relay_anchor=False)
+    try:
+        with pytest.raises(ValueError):
+            session.validate_shutdown_timeout(timeout)
+        with pytest.raises(ValueError):
+            session.shutdown(timeout_seconds=timeout)
+        session.check_active()
+    finally:
+        assert session.shutdown()['completed']
+
+
 def test_explicit_instances_communicate_through_real_ipc(runtimes):
     server, client = runtimes
     context = server.local_endpoint_context()
@@ -169,7 +314,7 @@ def test_explicit_instances_communicate_through_real_ipc(runtimes):
     try:
         with client.connect(Echo, name='echo', address=server.server_address()) as proxy:
             assert proxy.echo('ok') == 'remote:ok'
-            observation = cc.connection_observation(proxy)
+            observation = cc.observe.connection_observation(proxy)
             opened = events.recv(timeout=1.0)
             assert opened.kind == 'opened' and opened.side == 'client'
             assert opened.connection_id == observation.connection_id
@@ -188,7 +333,7 @@ def test_start_then_failed_registration_preserves_host(runtimes):
     with pytest.raises((ValueError, cc.error.CoreError)):
         runtime.register(Echo, EchoResource('bad:'), name='')
     assert runtime.server_credential().to_json() == credential
-    assert runtime.native_lifecycle_snapshot()['listener_closed'] is False
+    assert runtime.lifecycle_snapshot()['listener_closed'] is False
     runtime.register(Echo, EchoResource('ok:'), name='valid')
     with runtime.connect(Echo, name='valid', address=runtime.server_address()) as proxy:
         assert proxy.echo('after') == 'ok:after'
@@ -214,7 +359,7 @@ def test_default_api_and_explicit_runtime_keep_separate_owners(runtimes):
     runtime = runtimes[0]
     context = runtime.local_endpoint_context()
     if context.root is not None:
-        cc.set_local_endpoint(root=context.root)
+        cc.endpoint.set_local_endpoint(root=context.root)
     cc.set_transport_policy(shm_threshold=16384)
     cc.register(Echo, EchoResource('default:'), name='same')
     runtime.register(Echo, EchoResource('explicit:'), name='same')
@@ -233,6 +378,8 @@ def test_start_error_projection_allows_native_lifecycle_observation(tmp_path):
     script = textwrap.dedent('''
         import os, sys
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two._native import RuntimeSession
         session = RuntimeSession(startup_timeout=0, use_process_relay_anchor=False)
         if os.name != 'nt':
@@ -301,6 +448,8 @@ def test_public_start_preserves_native_bind_denial_and_cleanup(tmp_path):
         import os, sys
         from pathlib import Path
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         root = Path(sys.argv[1])
         runtime = cc.Runtime()
         runtime.set_local_endpoint(root=str(root))

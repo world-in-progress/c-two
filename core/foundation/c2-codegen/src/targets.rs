@@ -60,13 +60,13 @@ pub fn contract_release() -> Result<c_two::ContractRelease, c_two::Error> {
     )?)
 }
 
-pub fn contract_release_ref() -> Result<c_two::ContractReleaseRef, c_two::Error> {
+pub fn contract_release_ref() -> Result<c_two::contract::ContractReleaseRef, c_two::Error> {
     Ok(contract_release()?.reference())
 }
 
 pub fn expected_route(
     route_name: impl Into<String>,
-) -> Result<c_two::ExpectedRouteContract, c_two::Error> {
+) -> Result<c_two::contract::ExpectedRouteContract, c_two::Error> {
     Ok(contract_release()?.expected_route(route_name)?)
 }
 
@@ -81,7 +81,7 @@ impl ContractClient {
     pub fn new(client: c_two::Client) -> Result<Self, c_two::Error> {
         let expected = expected_route(client.expected_route().route_name.clone())?;
         if client.expected_route() != &expected {
-            return Err(c_two::ContractError::InvalidDescriptor {
+            return Err(c_two::contract::ContractError::InvalidDescriptor {
                 path: "$.client.expected_route".to_string(),
                 message: format!(
                     "client route facts do not match generated release {}: expected {:?}, got {:?}",
@@ -104,12 +104,12 @@ impl ContractClient {
         self.client.call_options()
     }
 
-    pub fn expected_route(&self) -> &c_two::ExpectedRouteContract {
+    pub fn expected_route(&self) -> &c_two::contract::ExpectedRouteContract {
         self.client.expected_route()
     }
 
     /// Read the already-acquired physical IPC connection without reconnecting.
-    pub fn connection_observation(&self) -> Result<c_two::ConnectionObservation, c_two::Error> {
+    pub fn connection_observation(&self) -> Result<c_two::observe::ConnectionObservation, c_two::Error> {
         self.client.connection_observation()
     }
 "#,
@@ -187,7 +187,7 @@ pub fn service_definition<S: Service>(
         .iter()
         .map(|method| -> Result<c_two::generated::MethodDefinition, c_two::Error> {
             let index = u16::try_from(method.index).map_err(|_| {
-                c_two::ContractError::InvalidDescriptor {
+                c_two::contract::ContractError::InvalidDescriptor {
                     path: "$.methods".to_string(),
                     message: format!(
                         "generated method index {} exceeds the C-Two wire capacity",
@@ -515,7 +515,7 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
              \x20       ))\n\
              \x20   }})?;\n\
              \x20   let Some(payload) = held.value() else {{\n\
-             \x20       return Err(c_two::ContractError::InvalidDescriptor {{\n\
+             \x20       return Err(c_two::contract::ContractError::InvalidDescriptor {{\n\
              \x20           path: \"$.held\".to_string(),\n\
              \x20           message: \"new held payload was already released\".to_string(),\n\
              \x20       }}.into());\n\

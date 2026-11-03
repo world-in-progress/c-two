@@ -1,9 +1,11 @@
 use crate::{
     ArtifactComposer, ArtifactKind, ArtifactLimits, ArtifactProvenance, CodegenError,
-    ContractArtifact, ContractArtifactSet, fastdb_error, lower_hex,
+    ContractArtifact, ContractArtifactSet, fastdb_error,
     targets::{TargetMethod, render_target_artifacts},
 };
-use c2_contract::{BindingDirection, ContractRelease, MethodAccess, NestedFastDbSpec};
+use c2_contract::{
+    BindingDirection, ContractRelease, MethodAccess, NestedFastDbSpec, canonical_json, lower_hex,
+};
 use fastdb::{
     ArtifactKind as FastDbArtifactKind, Capabilities, CodegenOptions as FastDbCodegenOptions,
     CodegenTarget as FastDbCodegenTarget, CompiledSpec,
@@ -351,32 +353,5 @@ fn direction_name(direction: BindingDirection) -> &'static str {
     match direction {
         BindingDirection::Input => "input",
         BindingDirection::Output => "output",
-    }
-}
-
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.to_string(),
-        Value::Array(values) => {
-            let body = values
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{body}]")
-        }
-        Value::Object(map) => {
-            let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-            let body = entries
-                .into_iter()
-                .map(|(key, value)| {
-                    let key = Value::String(key.clone()).to_string();
-                    format!("{key}:{}", canonical_json(value))
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{body}}}")
-        }
     }
 }

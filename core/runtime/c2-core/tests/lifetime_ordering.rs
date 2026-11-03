@@ -3,9 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use c2_core::{HeldResponse, LifecycleError};
-use c2_ipc::{ResponseData, ResponseLease};
+use c2_ipc::ResponseData;
 use c2_mem::{MemPool, PoolConfig};
-use c2_server::{RequestData, RequestLease};
 use parking_lot::{Mutex, RwLock};
 
 #[derive(Clone)]
@@ -70,7 +69,7 @@ fn run_adapter_scope(
 }
 
 #[test]
-fn borrowed_input_invalidates_before_request_release_on_every_exit() {
+fn borrowed_input_invalidates_before_local_buffer_drop_on_every_exit() {
     for exit in [
         AdapterExit::Normal,
         AdapterExit::Error,
@@ -87,7 +86,7 @@ fn borrowed_input_invalidates_before_request_release_on_every_exit() {
         };
         let shared_clone = view.clone();
         let detached = view.materialize();
-        let mut request = RequestLease::new(RequestData::Inline(b"transport".to_vec()));
+        let request = b"local copy".to_vec();
 
         events.lock().push("callback-enter");
         let _ = catch_unwind(AssertUnwindSafe({
@@ -96,8 +95,8 @@ fn borrowed_input_invalidates_before_request_release_on_every_exit() {
             move || run_adapter_scope(exit, owner, events)
         }));
         events.lock().push("callback-exit");
-        request.release().expect("request release");
-        events.lock().push("request-lease-release");
+        drop(request);
+        events.lock().push("local-buffer-drop");
 
         assert_eq!(
             events.lock().as_slice(),
@@ -105,7 +104,7 @@ fn borrowed_input_invalidates_before_request_release_on_every_exit() {
                 "callback-enter",
                 "fastdb-invalidate",
                 "callback-exit",
-                "request-lease-release",
+                "local-buffer-drop",
             ]
         );
         assert_eq!(view.checked_bytes(), Err("owner invalidated"));
@@ -115,184 +114,107 @@ fn borrowed_input_invalidates_before_request_release_on_every_exit() {
 }
 
 #[test]
-fn owned_response_copies_releases_then_opens_the_detached_copy() {
-    let events = Mutex::new(Vec::new());
-    let mut lease = inline_response_lease(b"owned");
-
-    let copied = lease.copy_bytes().expect("response copy");
-    events.lock().push("response-copy");
-    lease.release().expect("response release");
-    events.lock().push("response-lease-release");
-    let opened = copied.clone();
-    events.lock().push("adapter-open-copy");
-    events.lock().push("return");
-
-    assert_eq!(opened, b"owned");
-    assert_eq!(
-        events.lock().as_slice(),
-        [
-            "response-copy",
-            "response-lease-release",
-            "adapter-open-copy",
-            "return",
-        ]
-    );
+fn owned_response_moves_inline_storage_before_adapter_open() {
+    let bytes = b"owned".to_vec();
+    let original = bytes.as_ptr();
+    let owned = ResponseData::Inline(bytes).into_owned_bytes().unwrap();
+    assert_eq!(owned, b"owned");
+    assert_eq!(owned.as_ptr(), original);
 }
 
 #[test]
-fn held_response_explicit_release_invalidates_then_releases_exactly_once() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let invalidations = Arc::new(AtomicUsize::new(0));
-    let mut held =
-        HeldResponse::from_response_lease(inline_response_lease(b"held")).expect("held response");
-
-    let events_for_invalidate = events.clone();
-    let invalidations_for_release = invalidations.clone();
-    held.invalidate_then_release(move || {
-        invalidations_for_release.fetch_add(1, Ordering::AcqRel);
-        events_for_invalidate.lock().push("fastdb-invalidate");
-        Ok(())
-    })
-    .expect("held release");
-    events.lock().push("response-lease-release");
-
+fn held_response_explicit_release_invalidates_then_drops_local_bytes_exactly_once() {
+    let owner = Arc::new(FakeOwner {
+        valid: AtomicBool::new(true),
+        bytes: b"held".to_vec(),
+    });
+    let view = CheckedView {
+        owner: owner.clone(),
+    };
+    let detached = view.materialize();
+    let mut held = HeldResponse::from_owned_bytes(b"held".to_vec());
+    let invalidations = AtomicUsize::new(0);
     held.invalidate_then_release(|| {
         invalidations.fetch_add(1, Ordering::AcqRel);
-        Err("must not run twice".to_string())
+        owner.valid.store(false, Ordering::Release);
+        Ok(())
     })
-    .expect("second release is idempotent");
-
+    .unwrap();
+    assert!(held.bytes().is_empty());
+    assert_eq!(view.checked_bytes(), Err("owner invalidated"));
+    assert_eq!(detached, b"held");
+    held.invalidate_then_release(|| {
+        invalidations.fetch_add(1, Ordering::AcqRel);
+        Err("must not run twice".into())
+    })
+    .unwrap();
     assert_eq!(invalidations.load(Ordering::Acquire), 1);
     assert!(held.is_released());
+}
+
+#[test]
+fn held_invalidation_error_is_preserved_after_local_cleanup() {
+    let mut held = HeldResponse::from_owned_bytes(b"invalidation failure".to_vec());
+    let error = held
+        .invalidate_then_release(|| Err("original invalidator error".into()))
+        .unwrap_err();
     assert_eq!(
-        events.lock().as_slice(),
-        ["fastdb-invalidate", "response-lease-release"]
+        error,
+        LifecycleError::HeldResponseRelease {
+            invalidation_error: "original invalidator error".into(),
+        }
     );
+    assert!(held.is_released());
+    assert!(held.bytes().is_empty());
+    held.invalidate_then_release(|| panic!("must not repeat invalidation"))
+        .unwrap();
 }
 
-#[test]
-fn held_release_attempts_invalidation_and_transport_cleanup_and_retains_both_failures() {
-    let (mut release_failure, release_pool) = breakable_handle_response(b"release failure");
-    *release_pool.write() = replacement_pool("release_failure");
-    let release_error = release_failure
-        .invalidate_then_release(|| Ok(()))
-        .expect_err("transport cleanup must fail");
-    assert_held_release_error(&release_error, None, Some("response handle release failed"));
-
-    let mut invalidation_failure =
-        HeldResponse::from_response_lease(inline_response_lease(b"invalidation failure"))
-            .expect("held response");
-    let invalidation_error = invalidation_failure
-        .invalidate_then_release(|| Err("invalidation failed".to_string()))
-        .expect_err("invalidation must fail");
-    assert_held_release_error(&invalidation_error, Some("invalidation failed"), None);
-
-    let (mut combined_failure, combined_pool) = breakable_handle_response(b"combined failure");
-    *combined_pool.write() = replacement_pool("combined_failure");
-    let combined_error = combined_failure
-        .invalidate_then_release(|| Err("invalidation failed".to_string()))
-        .expect_err("both cleanup actions must fail");
-    assert_held_release_error(
-        &combined_error,
-        Some("invalidation failed"),
-        Some("response handle release failed"),
-    );
-
-    assert!(release_failure.is_released());
-    assert!(invalidation_failure.is_released());
-    assert!(combined_failure.is_released());
-}
-
-#[test]
-fn held_response_copy_failure_attempts_cleanup_and_retains_both_causes() {
-    let pool = Arc::new(RwLock::new(replacement_pool("copy_source")));
-    let mut handle = c2_wire::chunk::ReassemblyBacking::admit(Arc::clone(&pool), 1, 16)
-        .expect("handle admission");
-    handle
-        .write_at(0, b"copy and release")
-        .expect("handle write");
-    let lease = ResponseLease::new(ResponseData::Handle(handle));
-    *pool.write() = replacement_pool("copy_failure");
-
-    let error = match HeldResponse::from_response_lease(lease) {
-        Ok(_) => panic!("copy and cleanup must fail"),
-        Err(error) => error,
-    };
-    let LifecycleError::HeldResponseCopy {
-        copy_error,
-        transport_error,
-    } = error
-    else {
-        panic!("expected HeldResponseCopy, got {error:?}");
-    };
-    assert!(copy_error.contains("response handle copy failed"));
-    assert!(
-        transport_error
-            .as_deref()
-            .is_some_and(|error| error.contains("response handle release failed"))
-    );
-}
-
-fn inline_response_lease(bytes: &[u8]) -> ResponseLease {
-    ResponseLease::new(ResponseData::Inline(bytes.to_vec()))
-}
-
-fn breakable_handle_response(bytes: &[u8]) -> (HeldResponse, Arc<RwLock<MemPool>>) {
-    let pool = Arc::new(RwLock::new(replacement_pool("handle")));
-    let mut handle =
-        c2_wire::chunk::ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len().max(1))
-            .expect("handle admission");
-    handle.write_at(0, bytes).expect("handle write");
-    let lease = ResponseLease::new(ResponseData::Handle(handle));
-    (
-        HeldResponse::from_response_lease(lease).expect("held handle response"),
-        pool,
-    )
-}
-
-fn replacement_pool(label: &str) -> MemPool {
-    static NEXT_POOL: AtomicUsize = AtomicUsize::new(0);
-    let sequence = NEXT_POOL.fetch_add(1, Ordering::Relaxed);
-    MemPool::new_with_prefix(
-        PoolConfig {
-            segment_size: 64 * 1024,
-            min_block_size: 4096,
-            max_segments: 2,
-            max_dedicated_segments: 2,
-            ..PoolConfig::default()
-        },
-        format!(
-            "/c2lt{:x}{:x}{}",
-            std::process::id(),
-            sequence,
-            label.chars().next().unwrap_or('x')
+fn local_pool() -> Arc<RwLock<MemPool>> {
+    Arc::new(RwLock::new(
+        MemPool::new_with_prefix(
+            PoolConfig {
+                buddy_enabled: false,
+                max_dedicated_segments: 0,
+                ..PoolConfig::default()
+            },
+            format!("/c2-local-{}", uuid::Uuid::new_v4().simple()),
         )
-        .chars()
-        .take(24)
-        .collect(),
-    )
+        .unwrap(),
+    ))
 }
 
-fn assert_held_release_error(
-    error: &LifecycleError,
-    expected_invalidation: Option<&str>,
-    expected_transport: Option<&str>,
-) {
-    let LifecycleError::HeldResponseRelease {
-        invalidation_error,
-        transport_error,
-    } = error
-    else {
-        panic!("expected HeldResponseRelease, got {error:?}");
-    };
-    assert_eq!(invalidation_error.as_deref(), expected_invalidation);
-    match expected_transport {
-        Some(expected) => assert!(
-            transport_error
-                .as_deref()
-                .is_some_and(|actual| actual.contains(expected)),
-            "transport error {transport_error:?} did not contain {expected:?}"
-        ),
-        None => assert!(transport_error.is_none()),
-    }
+#[test]
+fn consumed_reassembly_refunds_before_hold_and_does_not_retain_pool() {
+    let pool = local_pool();
+    let weak_pool = Arc::downgrade(&pool);
+    let budget = pool.read().budget().unwrap().clone();
+    let mut backing = c2_wire::chunk::ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
+    let bytes = vec![0x5a; 512];
+    backing.write_at(0, &bytes).unwrap();
+    assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+    let mut held = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();
+    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    drop(pool);
+    assert!(
+        weak_pool.upgrade().is_none(),
+        "local hold must not pin the original pool"
+    );
+    assert_eq!(held.bytes(), bytes);
+    held.invalidate_then_release(|| Ok(())).unwrap();
+    assert!(held.bytes().is_empty());
+}
+
+#[test]
+fn consumption_failure_is_reported_before_a_hold_exists() {
+    let pool = local_pool();
+    let budget = pool.read().budget().unwrap().clone();
+    let mut backing = c2_wire::chunk::ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
+    backing.release();
+    let error = HeldResponse::from_response_data(ResponseData::Handle(backing))
+        .err()
+        .expect("a consumed backing cannot create another hold");
+    assert!(matches!(error, LifecycleError::ResponseCopy(message) if message.contains("released")));
+    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
 }

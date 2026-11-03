@@ -126,7 +126,6 @@ pub struct RelayRegistrationScope {
     pub server_id: String,
     pub server_instance_id: String,
     pub route_uid: String,
-    pub route_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,7 +139,6 @@ pub struct RelayRouteInfo {
     pub name: String,
     pub relay_url: String,
     pub route_uid: String,
-    pub route_revision: u64,
     pub ipc_address: Option<String>,
     pub server_id: Option<String>,
     pub server_instance_id: Option<String>,
@@ -156,7 +154,6 @@ impl RelayRouteInfo {
     pub(crate) fn route_token(&self) -> HttpRouteToken {
         HttpRouteToken {
             route_uid: self.route_uid.clone(),
-            route_revision: self.route_revision,
         }
     }
 }
@@ -552,11 +549,6 @@ impl RelayControlClient {
 fn validate_resolved_route(route: &RelayRouteInfo) -> Result<(), HttpError> {
     c2_contract::validate_call_route_key("route_uid", &route.route_uid)
         .map_err(|err| HttpError::Transport(format!("malformed relay route token: {err}")))?;
-    if route.route_revision == 0 {
-        return Err(HttpError::Transport(
-            "malformed relay route token: route_revision must be > 0".to_string(),
-        ));
-    }
     Ok(())
 }
 
@@ -790,7 +782,6 @@ mod tests {
                     name: "grid".into(),
                     relay_url: "http://relay-a.test".into(),
                     route_uid: "grid-route-uid-0001".into(),
-                    route_revision: 1,
                     ipc_address: None,
                     server_id: None,
                     server_instance_id: None,

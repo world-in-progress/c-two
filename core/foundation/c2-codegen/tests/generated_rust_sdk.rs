@@ -129,6 +129,10 @@ fn rust_generation_is_transport_neutral_for_no_payload_record_and_object_graph_c
             "c_two::generated::EncodedService",
             "pub fn service_definition",
             "c_two::ServiceDefinition",
+            "c_two::contract::ContractReleaseRef",
+            "c_two::contract::ExpectedRouteContract",
+            "c_two::contract::ContractError",
+            "c_two::observe::ConnectionObservation",
             ".expected_route(",
         ] {
             assert!(
@@ -146,8 +150,12 @@ fn rust_generation_is_transport_neutral_for_no_payload_record_and_object_graph_c
             "HttpClientPool",
             "relay_url",
             "ipc_address",
-            "let expected = c_two::ExpectedRouteContract {",
-            "Ok(c_two::ExpectedRouteContract {",
+            "c_two::ContractReleaseRef",
+            "c_two::ExpectedRouteContract",
+            "c_two::ContractError",
+            "c_two::ConnectionObservation",
+            "let expected = c_two::contract::ExpectedRouteContract {",
+            "Ok(c_two::contract::ExpectedRouteContract {",
         ] {
             assert!(
                 !source.contains(forbidden),

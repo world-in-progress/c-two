@@ -3,7 +3,6 @@ use super::{
     SweepBudget,
 };
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -40,26 +39,11 @@ pub fn shared_memory_available(_stream: &Stream) -> io::Result<bool> {
     Ok(true)
 }
 
-pub fn raw_handle(stream: &Stream) -> usize {
-    stream.as_raw_fd() as usize
-}
-
-pub fn cancel(raw: usize) {
-    unsafe {
-        libc::shutdown(raw as i32, libc::SHUT_RDWR);
-    }
-}
-
-pub fn cancel_stream(stream: &Stream) {
-    cancel(raw_handle(stream));
-}
-
 pub fn poll_flush(stream: &mut Stream, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
     Pin::new(stream).poll_flush(cx)
 }
 
 pub type Listener = crate::unix_managed::ManagedListener;
-pub(crate) use crate::unix_managed::ContextBinding;
 
 pub(crate) fn inspect_endpoint(endpoint: &LocalEndpoint) -> EndpointInspection {
     crate::unix_managed::inspect_managed(endpoint)

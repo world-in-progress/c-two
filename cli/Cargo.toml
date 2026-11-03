@@ -22,6 +22,7 @@ c2-core = { version = "0.1.0", path = "../core/runtime/c2-core" }
 c2-http = { version = "0.1.0", path = "../core/transport/c2-http", features = ["relay"] }
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

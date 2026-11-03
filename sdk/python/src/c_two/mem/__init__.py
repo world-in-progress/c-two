@@ -17,9 +17,9 @@ Typical usage::
     pool.write(alloc, b'hello')
     data = pool.read(alloc, 5)
     pool.free(alloc)
-    pool.destroy()
+    del pool
 
-This module also carries the typed shape of :func:`c_two.memory_stats`.
+This module also carries the typed shape of :func:`c_two.observe.memory_stats`.
 Those counters describe C-Two-owned IPC backing and live reassembly
 accounting. They are independent scopes, not process RSS, and must never be
 summed and presented as physical memory usage.
@@ -62,13 +62,12 @@ class MemoryScopeStats(TypedDict):
     or ``"server"`` for the server direction. ``state`` is ``"active"`` for
     the current session's scope or ``"retired"`` for a domain kept observable
     after ``cc.shutdown()`` while a real owner — an old proxy's native client,
-    an in-flight response, or outstanding hold/charge guards — still keeps its
+    an in-flight call, or outstanding backing charge guards — still keeps its
     accounting alive.
     """
 
     role: str
     state: str
-    abandoned_releases: int
     limits: MemoryLimits
     cells: dict[str, MemoryCellStats]
 
@@ -76,21 +75,19 @@ class MemoryScopeStats(TypedDict):
 class RetiredScopeStats(MemoryScopeStats):
     """A retired scope report.
 
-    A retired record stays listed for exactly as long as a real owner keeps
-    its budget accounting or lease metadata alive; it detaches once the last
-    owner is gone, so zero counters alone never end an observation and
-    repeated empty session swaps never accumulate records.
+    A retired scope stays listed while a real owner keeps its backing
+    accounting alive. Local-copy metadata contributes to ``holds`` separately
+    and never retains an otherwise ownerless backing scope.
     """
 
 
 class MemoryStats(TypedDict):
-    """Result shape of :func:`c_two.memory_stats`."""
+    """Result shape of :func:`c_two.observe.memory_stats`."""
 
     runtime_outgoing: MemoryScopeStats | None
     server: MemoryScopeStats | None
     retired: list[RetiredScopeStats]
     holds: dict
-    budget_cells_note: str
 
 
 __all__ = [

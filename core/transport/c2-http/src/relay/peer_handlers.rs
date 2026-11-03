@@ -36,7 +36,7 @@ fn current_full_sync_envelope(state: &RelayState) -> FullSyncEnvelope {
 }
 
 fn check_protocol_version(envelope: &PeerEnvelope) -> bool {
-    if envelope.protocol_version > PROTOCOL_VERSION {
+    if envelope.protocol_version != PROTOCOL_VERSION {
         eprintln!(
             "[relay] Ignoring message from {} with protocol_version {}",
             envelope.sender_relay_id, envelope.protocol_version
@@ -88,7 +88,6 @@ pub async fn handle_peer_announce(
             signature_hash,
             max_payload_size,
             route_uid,
-            route_revision,
             registered_at,
         } => {
             // Peer wire data never carries owner-private fields; keep peer
@@ -109,7 +108,6 @@ pub async fn handle_peer_announce(
                     signature_hash,
                     max_payload_size,
                     route_uid,
-                    route_revision,
                     locality: Locality::Peer,
                     registered_at,
                 },
@@ -119,14 +117,12 @@ pub async fn handle_peer_announce(
             name,
             relay_id,
             removed_at,
-            removed_revision,
         } => {
             let _ = RouteAuthority::new(&state).withdraw_peer(
                 sender_relay_id,
                 name,
                 relay_id,
                 removed_at,
-                removed_revision,
             );
         }
         _ => {
@@ -318,13 +314,10 @@ pub async fn handle_peer_digest(
                     let tombstone = state
                         .authoritative_missing_tombstone(&peer_entry.name, &peer_entry.relay_id);
                     if let Some(tombstone) = tombstone {
-                        let hash = tombstone_digest_hash(&tombstone);
                         diff_entries.push(DigestDiffEntry::Deleted {
                             name: tombstone.name,
                             relay_id: tombstone.relay_id,
                             removed_at: tombstone.removed_at,
-                            removed_revision: tombstone.removed_revision,
-                            hash,
                         });
                     }
                 }
@@ -410,7 +403,7 @@ mod tests {
         relay_url: &str,
         crm_name: &str,
     ) -> crate::relay::peer::DigestDiffEntry {
-        let mut entry = crate::relay::peer::DigestDiffEntry::Active {
+        let entry = crate::relay::peer::DigestDiffEntry::Active {
             name: name.into(),
             relay_id: relay_id.into(),
             relay_url: relay_url.into(),
@@ -421,14 +414,8 @@ mod tests {
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
             route_uid: "grid-route-uid-0001".into(),
-            route_revision: 1,
             registered_at: 1000.0,
-            hash: String::new(),
         };
-        let hash = crate::relay::peer::route_digest_hash_for_diff_entry(&entry).unwrap();
-        if let crate::relay::peer::DigestDiffEntry::Active { hash: slot, .. } = &mut entry {
-            *slot = hash;
-        }
         entry
     }
 
@@ -437,17 +424,11 @@ mod tests {
         relay_id: &str,
         removed_at: f64,
     ) -> crate::relay::peer::DigestDiffEntry {
-        let mut entry = crate::relay::peer::DigestDiffEntry::Deleted {
+        let entry = crate::relay::peer::DigestDiffEntry::Deleted {
             name: name.into(),
             relay_id: relay_id.into(),
             removed_at,
-            removed_revision: 1,
-            hash: String::new(),
         };
-        let hash = crate::relay::peer::route_digest_hash_for_diff_entry(&entry).unwrap();
-        if let crate::relay::peer::DigestDiffEntry::Deleted { hash: slot, .. } = &mut entry {
-            *slot = hash;
-        }
         entry
     }
 
@@ -474,7 +455,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -504,7 +484,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -535,7 +514,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -578,7 +556,6 @@ mod tests {
                     signature_hash: TEST_SIGNATURE_HASH.into(),
                     max_payload_size: 1024,
                     route_uid: "grid-route-uid-0001".into(),
-                    route_revision: 1,
                     registered_at: 1000.0,
                 },
             );
@@ -612,7 +589,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -645,7 +621,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -657,6 +632,29 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(state.list_routes().is_empty());
         assert!(state.list_routes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_requires_the_current_protocol_version() {
+        for protocol_version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            let state = test_state();
+            let mut envelope = PeerEnvelope::new(
+                "relay-b",
+                PeerMessage::RelayJoin {
+                    relay_id: "relay-b".into(),
+                    url: "http://relay-b:8080".into(),
+                },
+            );
+            envelope.protocol_version = protocol_version;
+            let response = handle_peer_join(State(state.clone()), Json(envelope))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                state.list_peers().is_empty(),
+                "accepted version {protocol_version}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -707,7 +705,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -806,7 +803,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -817,7 +813,7 @@ mod tests {
                 relay_id: "relay-b".into(),
             },
         );
-        envelope.protocol_version = crate::relay::peer::ROUTE_HASH_PEER_VERSION - 1;
+        envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
         let response = handle_peer_leave(State(state.clone()), Json(envelope))
             .await
@@ -848,7 +844,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -859,10 +854,9 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
                 removed_at: 1001.0,
-                removed_revision: 1,
             },
         );
-        envelope.protocol_version = crate::relay::peer::ROUTE_HASH_PEER_VERSION - 1;
+        envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
         let response = handle_peer_announce(State(state.clone()), Json(envelope))
             .await
@@ -889,7 +883,7 @@ mod tests {
                 }],
             },
         );
-        envelope.protocol_version = crate::relay::peer::ROUTE_HASH_PEER_VERSION - 1;
+        envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
         let response = handle_peer_digest(State(state.clone()), Json(envelope))
             .await
@@ -919,7 +913,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -930,7 +923,7 @@ mod tests {
                 entries: vec![deleted_diff("grid", "relay-b", 1001.0)],
             },
         );
-        envelope.protocol_version = crate::relay::peer::ROUTE_HASH_PEER_VERSION - 1;
+        envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
         let response = handle_peer_digest(State(state.clone()), Json(envelope))
             .await
@@ -961,7 +954,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -972,7 +964,6 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 1001.0,
-                removed_revision: 1,
             },
         );
 
@@ -1139,7 +1130,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1160,7 +1150,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1001.0,
             },
@@ -1271,7 +1260,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -1327,7 +1315,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1363,7 +1350,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });

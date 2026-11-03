@@ -7,28 +7,27 @@ mod call;
 mod connect_options;
 mod identity;
 mod ipc;
-mod lifecycle;
 mod local;
 mod memory;
 mod pool;
 mod relay;
 mod remote;
 mod resolver;
+mod timeout;
 
 pub use call::{
-    CallExecutionLimits, CallOptions, CallTimeout, CallTimeoutError, DEFAULT_MAX_OUTSTANDING_CALLS,
+    CallExecutionLimits, CallOptions, CallTimeout, DEFAULT_MAX_OUTSTANDING_CALLS,
     DEFAULT_RETAINED_INPUT_BUDGET_BYTES,
 };
 pub use connect_options::{
     ConnectDeadline, ConnectDeadlineExceeded, ConnectOptions, ConnectTimeoutError,
 };
-pub use identity::{validate_ipc_region_id, validate_relay_id, validate_server_id};
+pub use identity::{validate_relay_id, validate_server_id};
 pub use ipc::{
-    BASE_IPC_OVERRIDE_KEYS, BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig,
-    FORBIDDEN_IPC_OVERRIDE_KEYS, MAX_EXECUTION_WORKERS, MAX_IPC_POOL_SEGMENTS, PoolRoleTuning,
-    SERVER_IPC_OVERRIDE_KEYS, ServerIpcConfig,
+    BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig, IPC_RELEASE_BATCH_CAPACITY,
+    MAX_EXECUTION_WORKERS, MAX_IPC_POOL_SEGMENTS, PoolRoleTuning, SERVER_IPC_OVERRIDE_KEYS,
+    ServerIpcConfig,
 };
-pub use lifecycle::{MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace};
 pub use local::{
     LocalEndpoint, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
     UNIX_NAMESPACE_FORMAT_VERSION,
@@ -43,5 +42,6 @@ pub use remote::{
 pub use resolver::{
     CallExecutionLimitsOverrides, ClientIpcConfigOverrides, ConfigResolver, ConfigSources,
     EnvFilePolicy, EnvMap, RelayConfigOverrides, ResolvedRelayClientConfig, ResolvedRelayConfig,
-    ResolvedRuntimeConfig, RuntimeConfigOverrides, ServerIpcConfigOverrides,
+    RuntimeConfigOverrides, ServerIpcConfigOverrides,
 };
+pub use timeout::{TimeoutError, deadline_after, timeout_from_seconds, validate_timeout};

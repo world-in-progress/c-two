@@ -51,7 +51,7 @@ def test_public_core_error_has_complete_independent_fields(category):
         'code', 'name', 'error_bytes', 'transport_kind', 'transport_phase',
         'fallback_eligible', 'route_withdrawal', 'io_operation', 'io_kind',
         'raw_os_error', 'lifecycle_kind', 'startup_stage', 'timeout_seconds',
-        'route_name', 'status_code', 'body', 'relay_duplicate', 'failure_source',
+        'route_name', 'status_code', 'relay_duplicate', 'failure_source',
         'registration_failure', 'rollback', 'relay_cleanup_error',
         'local_protocol_version', 'peer_protocol_version', 'endpoint_unverified_reason',
     }
@@ -79,7 +79,7 @@ def test_public_core_error_annotations_expose_native_literal_values():
         'coordinator-missing', 'coordinator-replaced', 'initialization-incomplete',
         'unsupported-namespace-format',
     ] | None
-    assert hints['startup_stage'] == Literal['readiness', 'responsiveness', 'owner_control'] | None
+    assert hints['startup_stage'] == Literal['readiness', 'responsiveness'] | None
     assert hints['code'] == int | None
     assert hints['local_protocol_version'] == hints['peer_protocol_version'] == int | None
     assert hints['details'] == dict[str, str]
@@ -174,7 +174,7 @@ def test_registry_projects_budget_with_full_expected_contract(timeout, address, 
         pass
 
     class Session:
-        def lease_tracker(self):
+        def local_copy_tracker(self):
             return None
 
         def set_relay_anchor_address(self, address, *, connect_attempt=None):
@@ -189,8 +189,7 @@ def test_registry_projects_budget_with_full_expected_contract(timeout, address, 
             return projected
 
     monkeypatch.setattr(registry, '_runtime_session', Session())
-    expected_exception = cc.error.RegistryUnavailable if method == 'connect_via_relay' else ProjectionReached
-    with pytest.raises(expected_exception):
+    with pytest.raises(ProjectionReached):
         registry.connect(ConnectContract, name='connect-timeout', address=address, timeout=timeout)
     args = ('connect-timeout', *crm_contract(ConnectContract).native_args())
     if address is not None:
@@ -198,6 +197,31 @@ def test_registry_projects_budget_with_full_expected_contract(timeout, address, 
     assert len(attempts) == 1
     assert captured == [(args, {'connect_attempt': attempts[0]})]
     assert sync_attempts == ([attempts[0]] if method == 'connect_via_relay' else [])
+
+
+def test_relay_connect_preserves_unmapped_native_exception(monkeypatch):
+    marker = ValueError('empty route name')
+    registry = Runtime()
+
+    class Session:
+        def local_copy_tracker(self):
+            return None
+
+        def set_relay_anchor_address(self, address, *, connect_attempt=None):
+            pass
+
+        def connect_via_relay(self, *args, **kwargs):
+            raise marker
+
+    monkeypatch.setattr(registry, '_runtime_session', Session())
+    with pytest.raises(ValueError) as failure:
+        registry.connect(ConnectContract, name='connect-timeout')
+    assert failure.value is marker
+
+
+def test_close_rejects_non_proxy():
+    with pytest.raises(TypeError, match='connected CRM instance'):
+        cc.close(object())
 
 
 def test_native_deadline_error_round_trip_preserves_connect_details():
@@ -321,7 +345,7 @@ def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
             raise AssertionError(f'connect reread replaced session: {name}')
 
     class CapturedSession:
-        def lease_tracker(self):
+        def local_copy_tracker(self):
             registry._runtime_session = ReplacedSession()
             return None
 
@@ -330,11 +354,13 @@ def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
 
         def connect_via_relay(self, *args, connect_attempt=None):
             observed.append(connect_attempt)
-            raise cc.error.CoreError('lifecycle', 'projection reached')
+            raise marker
 
+    marker = cc.error.CoreError('lifecycle', 'projection reached')
     registry._runtime_session = CapturedSession()
-    with pytest.raises(cc.error.RegistryUnavailable, match='projection reached'):
+    with pytest.raises(cc.error.CoreError, match='projection reached') as failure:
         registry.connect(ConnectContract, name='connect-timeout', timeout=0.5)
+    assert failure.value is marker
     assert len(observed) == 2
     assert observed[0] is observed[1]
 
@@ -355,9 +381,9 @@ def test_python_preparation_and_native_entry_keep_original_attempt_budget(monkey
     observed = []
 
     class Session:
-        def lease_tracker(self):
+        def local_copy_tracker(self):
             time.sleep(0.06)
-            return native_session.lease_tracker()
+            return native_session.local_copy_tracker()
 
         def acquire_ipc_client(self, *args, connect_attempt=None):
             observed.append(connect_attempt)
@@ -387,7 +413,6 @@ def test_native_unlimited_attempt_keeps_python_lock_behavior():
         lock.release()
 
 
-
 def test_expiry_after_python_lock_acquisition_releases_only_new_acquisition():
     lock = threading.Lock()
     released = []
@@ -410,12 +435,11 @@ def test_expiry_after_python_lock_acquisition_releases_only_new_acquisition():
     assert not lock.locked()
 
 
-
 def test_relay_override_deadline_keeps_canonical_error_before_registry_wrapping():
     registry = Runtime()
 
     class Session:
-        def lease_tracker(self):
+        def local_copy_tracker(self):
             return None
 
         def set_relay_anchor_address(self, address, *, connect_attempt=None):

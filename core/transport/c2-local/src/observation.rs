@@ -37,7 +37,6 @@ pub enum ConnectionEndReason {
     PeerCloseMessage,
     PeerEof,
     ConnectionReset,
-    HeartbeatTimeout,
     ProtocolError,
     IoError,
 }
@@ -49,7 +48,6 @@ impl ConnectionEndReason {
             Self::PeerCloseMessage => "peer_close_message",
             Self::PeerEof => "peer_eof",
             Self::ConnectionReset => "connection_reset",
-            Self::HeartbeatTimeout => "heartbeat_timeout",
             Self::ProtocolError => "protocol_error",
             Self::IoError => "io_error",
         }
@@ -62,9 +60,66 @@ impl ConnectionEndReason {
 pub struct ConnectionClosed {
     connection_id: u64,
     side: ConnectionSide,
+    end: ConnectionEnd,
+}
+
+/// Native end facts shared by stream ownership and metadata publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConnectionEnd {
     reason: ConnectionEndReason,
     operation: &'static str,
     os_error: Option<i32>,
+    peer_end: bool,
+}
+
+impl ConnectionEnd {
+    pub(crate) fn new(
+        reason: ConnectionEndReason,
+        operation: &'static str,
+        os_error: Option<i32>,
+    ) -> Self {
+        Self {
+            reason,
+            operation,
+            os_error,
+            peer_end: reason == ConnectionEndReason::PeerEof,
+        }
+    }
+
+    pub(crate) fn io(operation: &'static str, error: &io::Error) -> Self {
+        Self::new(
+            match error.kind() {
+                io::ErrorKind::ConnectionReset => ConnectionEndReason::ConnectionReset,
+                _ => ConnectionEndReason::IoError,
+            },
+            operation,
+            error.raw_os_error(),
+        )
+    }
+
+    pub(crate) fn read_error(operation: &'static str, error: &io::Error) -> Self {
+        let mut end = Self::io(operation, error);
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            end.reason = ConnectionEndReason::PeerEof;
+            end.peer_end = true;
+        }
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ECONNRESET) {
+            end.peer_end = true;
+        }
+        // Mio normalizes 109 to EOF; byte-mode pipes can also return 232.
+        // ERROR_PIPE_NOT_CONNECTED (233) is not proof of peer end.
+        #[cfg(windows)]
+        if matches!(error.raw_os_error(), Some(109 | 232)) {
+            end.reason = ConnectionEndReason::PeerEof;
+            end.peer_end = true;
+        }
+        end
+    }
+
+    pub(crate) const fn is_peer_end(self) -> bool {
+        self.peer_end
+    }
 }
 
 impl ConnectionClosed {
@@ -77,15 +132,21 @@ impl ConnectionClosed {
     }
 
     pub const fn reason(&self) -> ConnectionEndReason {
-        self.reason
+        self.end.reason
     }
 
     pub const fn operation(&self) -> &'static str {
-        self.operation
+        self.end.operation
     }
 
     pub const fn os_error(&self) -> Option<i32> {
-        self.os_error
+        self.end.os_error
+    }
+
+    /// Whether this record came from EOF or a native read-side peer end.
+    /// A write error or a DISCONNECT message provides no such proof.
+    pub const fn is_peer_end(&self) -> bool {
+        self.end.peer_end
     }
 }
 
@@ -306,6 +367,10 @@ impl ConnectionPublisher {
         operation: &'static str,
         os_error: Option<i32>,
     ) -> bool {
+        self.close_end(ConnectionEnd::new(reason, operation, os_error))
+    }
+
+    pub(crate) fn close_end(&self, end: ConnectionEnd) -> bool {
         self.closed.send_if_modified(|state| {
             if state.is_some() {
                 return false;
@@ -313,9 +378,7 @@ impl ConnectionPublisher {
             let closed = ConnectionClosed {
                 connection_id: self.connection_id,
                 side: self.side,
-                reason,
-                operation,
-                os_error,
+                end,
             };
             *state = Some(closed);
             if let Some(source) = self.events.upgrade()
@@ -328,27 +391,11 @@ impl ConnectionPublisher {
     }
 
     pub fn close_io(&self, operation: &'static str, error: &io::Error) -> bool {
-        let reason = match error.kind() {
-            io::ErrorKind::UnexpectedEof => ConnectionEndReason::PeerEof,
-            io::ErrorKind::ConnectionReset => ConnectionEndReason::ConnectionReset,
-            _ => ConnectionEndReason::IoError,
-        };
-        self.close(reason, operation, error.raw_os_error())
+        self.close_end(ConnectionEnd::io(operation, error))
     }
 
     pub fn close_read_error(&self, operation: &'static str, error: &io::Error) -> bool {
-        // Mio normalizes ERROR_BROKEN_PIPE reads to EOF. ERROR_NO_DATA may
-        // still arrive directly from a byte-mode Named Pipe. Both describe
-        // this connection only; ERROR_PIPE_NOT_CONNECTED is not peer EOF.
-        #[cfg(windows)]
-        if matches!(error.raw_os_error(), Some(109 | 232)) {
-            return self.close(
-                ConnectionEndReason::PeerEof,
-                operation,
-                error.raw_os_error(),
-            );
-        }
-        self.close_io(operation, error)
+        self.close_end(ConnectionEnd::read_error(operation, error))
     }
 }
 
@@ -410,13 +457,8 @@ mod tests {
         let first = source.open_connection(ConnectionSide::Server);
         let second = first.clone();
         let winners = std::thread::scope(|scope| {
-            let first = scope.spawn(|| {
-                first.close(
-                    ConnectionEndReason::HeartbeatTimeout,
-                    "heartbeat_timeout",
-                    None,
-                )
-            });
+            let first = scope
+                .spawn(|| first.close(ConnectionEndReason::ProtocolError, "protocol_error", None));
             let second =
                 scope.spawn(|| second.close(ConnectionEndReason::LocalClose, "drop", None));
             u8::from(first.join().unwrap()) + u8::from(second.join().unwrap())
@@ -528,6 +570,44 @@ mod tests {
         assert_eq!(closed.reason(), ConnectionEndReason::IoError);
         assert_eq!(closed.operation(), "read_header");
         assert_eq!(closed.os_error(), Some(12345));
+        assert!(!closed.is_peer_end());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_native_read_reset_proves_peer_end() {
+        let error = io::Error::from_raw_os_error(libc::ECONNRESET);
+        let reader = ConnectionPublisher::new(ConnectionSide::Client);
+        reader.close_read_error("read_header", &error);
+        let closed = reader.observation().snapshot().unwrap();
+        assert_eq!(closed.reason(), ConnectionEndReason::ConnectionReset);
+        assert_eq!(closed.os_error(), Some(libc::ECONNRESET));
+        assert!(closed.is_peer_end());
+
+        let writer = ConnectionPublisher::new(ConnectionSide::Client);
+        writer.close_io("write", &error);
+        let closed = writer.observation().snapshot().unwrap();
+        assert_eq!(closed.reason(), ConnectionEndReason::ConnectionReset);
+        assert_eq!(closed.os_error(), Some(libc::ECONNRESET));
+        assert!(!closed.is_peer_end());
+    }
+
+    #[test]
+    fn read_eof_is_distinct_from_write_failure_and_peer_close_message() {
+        let error = io::Error::from(io::ErrorKind::UnexpectedEof);
+        let reader = ConnectionPublisher::new(ConnectionSide::Server);
+        reader.close_read_error("read_header", &error);
+        assert!(reader.observation().snapshot().unwrap().is_peer_end());
+
+        let writer = ConnectionPublisher::new(ConnectionSide::Server);
+        writer.close_io("write", &error);
+        let closed = writer.observation().snapshot().unwrap();
+        assert_eq!(closed.reason(), ConnectionEndReason::IoError);
+        assert!(!closed.is_peer_end());
+
+        let control = ConnectionPublisher::new(ConnectionSide::Server);
+        control.close(ConnectionEndReason::PeerCloseMessage, "disconnect", None);
+        assert!(!control.observation().snapshot().unwrap().is_peer_end());
     }
 
     #[cfg(windows)]
@@ -538,6 +618,7 @@ mod tests {
             publisher.close_read_error("read_header", &io::Error::from_raw_os_error(code));
             let closed = publisher.observation().snapshot().unwrap();
             assert_eq!(closed.os_error(), Some(code));
+            assert_eq!(closed.is_peer_end(), code != 233);
             assert_eq!(
                 closed.reason(),
                 if code == 233 {
@@ -546,6 +627,9 @@ mod tests {
                     ConnectionEndReason::PeerEof
                 }
             );
+            let writer = ConnectionPublisher::new(ConnectionSide::Client);
+            writer.close_io("write", &io::Error::from_raw_os_error(code));
+            assert!(!writer.observation().snapshot().unwrap().is_peer_end());
         }
     }
 }

@@ -14,7 +14,7 @@ address scope and budgets::
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 from c_two._native import EndpointCredential, LocalEndpointContext
 
@@ -27,6 +27,30 @@ __all__ = [
     'reap_endpoint',
     'sweep_endpoints',
 ]
+
+class EndpointInspection(TypedDict):
+    """Observation of one local endpoint; presence alone does not prove liveness."""
+
+    status: Literal['absent', 'present', 'not-applicable', 'unverified', 'io-error']
+    credential: EndpointCredential | None
+    reason: str | None
+    io_kind: str | None
+    raw_os_error: int | None
+    retryable: bool
+
+
+class EndpointReap(TypedDict):
+    """Identity-constrained cleanup result for one endpoint."""
+
+    status: Literal[
+        'reaped', 'already-absent', 'busy', 'stale-target', 'unverified', 'not-applicable', 'io-error',
+    ]
+    credential: EndpointCredential | None
+    reason: str | None
+    io_kind: str | None
+    raw_os_error: int | None
+    retryable: bool
+
 
 # Statuses that describe which layer owns endpoint lifetime rather than a live
 # instance. They are honest observations, not proofs of liveness.
@@ -83,7 +107,7 @@ def inspect_endpoint(
     *,
     root: str | None = None,
     context: LocalEndpointContext | None = None,
-) -> dict[str, Any]:
+) -> EndpointInspection:
     """Inspect one logical local endpoint without creating ownership metadata.
 
     Args:
@@ -117,7 +141,7 @@ def reap_endpoint(
     *,
     root: str | None = None,
     context: LocalEndpointContext | None = None,
-) -> dict[str, Any]:
+) -> EndpointReap:
     """Reap the exact endpoint object named by ``credential``.
 
     Rust uses the endpoint captured by the strict credential codec, including

@@ -11,7 +11,7 @@ fn copy_of(source: &MemHandle) -> MemHandle {
 }
 
 fn main() {
-    let mut pool = MemPool::new(PoolConfig::default());
+    let mut pool = MemPool::new(PoolConfig::default()).unwrap();
     let mut original = pool.alloc_handle(8192).expect("real allocation");
     let forged = copy_of(&original);
     let writer = pool.handle_slice_mut(&mut original);

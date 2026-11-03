@@ -1,147 +1,52 @@
-from importlib.metadata import version
-__version__ = version('c-two')
+"""Resource RPC for applications: declare contracts, register resources and connect clients.
 
-from ._native import (
-    NativeOwnerBootstrap, OwnerControl, OwnedChild,
-    OwnerRecoveryTicket, PreparedOwnerTakeover, OwnerStatus, OwnerControlError,
-    ConnectionClosed, ConnectionObservation, ConnectionEvent, ConnectionEvents, ConnectionEventsLagged,
-)
+Supervisors use ``endpoint`` for local endpoint administration; operators use
+``observe`` for diagnostics, and authors use
+``contract`` for descriptor and code-generation tools.
+"""
+from importlib.metadata import version as _version
+
+__version__ = _version('c-two')
+
 from . import error
-from .config import (
-    BaseIPCOverrides,
-    ClientIPCOverrides,
-    LifecycleConfig,
-    ServerIPCOverrides,
-)
-from .codegen import (
-    ContractArtifact,
-    ContractArtifactSet,
-    ContractCodegenError,
-    ContractCodegenTarget,
-    compile_contract_artifacts,
-)
-from .crm.bridge import ResourceBridge, bridge
-from .crm.descriptor import (
-    contract_descriptor_diagnostics,
-    export_contract_descriptor,
-    export_contract_release_ref,
-)
-from .crm.infer import infer_crm_from_resource
 from .crm.meta import crm, read, write, on_shutdown
-from .crm.transferable import hold, transfer, Held, HeldResult
-from .mem import MemoryCellStats, MemoryLimits, MemoryScopeStats, MemoryStats
-from .transport.endpoint import (
-    LocalEndpointContext,
-    local_endpoint_context,
-    EndpointCredential,
-    EndpointSweep,
-    inspect_endpoint,
-    reap_endpoint,
-    sweep_endpoints,
-)
-from .transport.client.proxy import connection_observation, with_call_options
-from .transport.input_lifetime import InputLifetime
-from .transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
+from .crm.transferable import hold, transfer, HeldResult
+from .transport.client.proxy import with_call_options
+from .transport.server.scheduler import ConcurrencyConfig
 from .transport.registry import (
-    Runtime,
-    set_local_endpoint,
-
-    set_call_execution_limits,
-    call_execution_snapshot,
-    set_transport_policy,
-    set_server,
-    set_client,
-    set_relay_anchor,
-    register,
-    connect,
-    close,
-    unregister,
-    server_address,
-    server_id,
-    server_credential,
-    shutdown,
-    serve,
-    hold_stats,
-    memory_stats,
-    owner_control_pair,
-    prepare_owner_takeover,
-    adopt_owner_stdin,
-    spawn_owned_child,
-    native_lifecycle_snapshot,
-    connection_events,
-    native_terminal_outcome,
+    Runtime, register, connect, close, unregister, serve, shutdown,
+    server_address, set_relay_anchor, set_server, set_client,
+    set_transport_policy, set_call_execution_limits,
 )
+
+from . import endpoint, observe, contract
 
 __all__ = [
-    'Runtime',
-    'ConnectionClosed', 'ConnectionObservation', 'ConnectionEvent', 'ConnectionEvents',
-    'ConnectionEventsLagged', 'connection_observation', 'connection_events',
-    '__version__',
-    'error',
-    'BaseIPCOverrides',
-    'ClientIPCOverrides',
-    'LifecycleConfig',
-    'NativeOwnerBootstrap',
-    'OwnerControl',
-    'OwnerRecoveryTicket', 'PreparedOwnerTakeover', 'OwnerStatus', 'OwnerControlError',
-    'OwnedChild',
-    'ServerIPCOverrides',
-    'ContractArtifact',
-    'ContractArtifactSet',
-    'ContractCodegenError',
-    'ContractCodegenTarget',
-    'compile_contract_artifacts',
-    'ResourceBridge',
-    'bridge',
-    'contract_descriptor_diagnostics',
-    'export_contract_descriptor',
-    'export_contract_release_ref',
-    'infer_crm_from_resource',
     'crm',
     'read',
     'write',
+    'transfer',
     'on_shutdown',
     'hold',
-    'transfer',
-    'Held',
     'HeldResult',
-    'MemoryCellStats',
-    'MemoryLimits',
-    'MemoryScopeStats',
-    'MemoryStats',
-    'EndpointCredential',
-    'LocalEndpointContext',
-    'local_endpoint_context',
-    'EndpointSweep',
-    'inspect_endpoint',
-    'reap_endpoint',
-    'sweep_endpoints',
-    'InputLifetime',
-    'ConcurrencyConfig',
-    'ConcurrencyMode',
-    'with_call_options',
-    'set_call_execution_limits',
-    'call_execution_snapshot',
-    'set_transport_policy',
-    'set_local_endpoint',
-    'set_server',
-    'set_client',
-    'set_relay_anchor',
     'register',
     'connect',
     'close',
     'unregister',
-    'server_address',
-    'server_id',
-    'server_credential',
-    'shutdown',
     'serve',
-    'hold_stats',
-    'memory_stats',
-    'owner_control_pair',
-    'prepare_owner_takeover',
-    'adopt_owner_stdin',
-    'spawn_owned_child',
-    'native_lifecycle_snapshot',
-    'native_terminal_outcome',
+    'shutdown',
+    'server_address',
+    'with_call_options',
+    'set_relay_anchor',
+    'set_server',
+    'set_client',
+    'Runtime',
+    'ConcurrencyConfig',
+    'error',
+    'endpoint',
+    'observe',
+    'contract',
+    '__version__',
+    'set_transport_policy',
+    'set_call_execution_limits',
 ]

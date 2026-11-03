@@ -78,11 +78,6 @@ fn validate_server_id(server_id: &str) -> PyResult<()> {
     c2_config::validate_server_id(server_id).map_err(PyValueError::new_err)
 }
 
-#[pyfunction]
-fn validate_ipc_region_id(region_id: &str) -> PyResult<()> {
-    c2_config::validate_ipc_region_id(region_id).map_err(PyValueError::new_err)
-}
-
 /// Opaque projection of one Core-owned deadline across SDK glue and transport.
 #[pyclass(name = "ConnectAttempt", module = "c_two._native", frozen)]
 pub(crate) struct PyConnectAttempt {
@@ -168,6 +163,9 @@ fn parse_server_ipc_overrides_dict(dict: &Bound<'_, PyDict>) -> PyResult<ServerI
     reject_forbidden_ipc_fields(dict)?;
     reject_unknown_ipc_fields(dict, c2_config::SERVER_IPC_OVERRIDE_KEYS)?;
     Ok(ServerIpcConfigOverrides {
+        write_timeout_secs: get_opt(dict, "write_timeout")?,
+        max_dedicated_segments: get_opt(dict, "max_dedicated_segments")?,
+        spill_threshold: get_opt(dict, "spill_threshold")?,
         pool_enabled: get_opt(dict, "pool_enabled")?,
         pool_segment_size: get_opt(dict, "pool_segment_size")?,
         max_pool_segments: get_opt(dict, "max_pool_segments")?,
@@ -189,8 +187,6 @@ fn parse_server_ipc_overrides_dict(dict: &Bound<'_, PyDict>) -> PyResult<ServerI
         max_pending_requests: get_opt(dict, "max_pending_requests")?,
         max_execution_workers: get_opt(dict, "max_execution_workers")?,
         pool_decay_seconds: get_opt(dict, "pool_decay_seconds")?,
-        heartbeat_interval_secs: get_opt(dict, "heartbeat_interval")?,
-        heartbeat_timeout_secs: get_opt(dict, "heartbeat_timeout")?,
         ..Default::default()
     })
 }
@@ -206,6 +202,15 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     overrides: &ServerIpcConfigOverrides,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
+    if let Some(value) = overrides.write_timeout_secs {
+        dict.set_item("write_timeout", value)?;
+    }
+    if let Some(value) = overrides.max_dedicated_segments {
+        dict.set_item("max_dedicated_segments", value)?;
+    }
+    if let Some(value) = overrides.spill_threshold {
+        dict.set_item("spill_threshold", value)?;
+    }
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -269,12 +274,6 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     if let Some(value) = overrides.pool_decay_seconds {
         dict.set_item("pool_decay_seconds", value)?;
     }
-    if let Some(value) = overrides.heartbeat_interval_secs {
-        dict.set_item("heartbeat_interval", value)?;
-    }
-    if let Some(value) = overrides.heartbeat_timeout_secs {
-        dict.set_item("heartbeat_timeout", value)?;
-    }
     Ok(dict)
 }
 
@@ -283,6 +282,15 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     overrides: &ClientIpcConfigOverrides,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
+    if let Some(value) = overrides.write_timeout_secs {
+        dict.set_item("write_timeout", value)?;
+    }
+    if let Some(value) = overrides.max_dedicated_segments {
+        dict.set_item("max_dedicated_segments", value)?;
+    }
+    if let Some(value) = overrides.spill_threshold {
+        dict.set_item("spill_threshold", value)?;
+    }
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -362,6 +370,9 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
     reject_forbidden_ipc_fields(&dict)?;
     reject_unknown_ipc_fields(&dict, c2_config::CLIENT_IPC_OVERRIDE_KEYS)?;
     Ok(ClientIpcConfigOverrides {
+        write_timeout_secs: get_opt(&dict, "write_timeout")?,
+        max_dedicated_segments: get_opt(&dict, "max_dedicated_segments")?,
+        spill_threshold: get_opt(&dict, "spill_threshold")?,
         pool_enabled: get_opt(&dict, "pool_enabled")?,
         pool_segment_size: get_opt(&dict, "pool_segment_size")?,
         max_pool_segments: get_opt(&dict, "max_pool_segments")?,
@@ -384,12 +395,10 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
 }
 
 fn reject_forbidden_ipc_fields(dict: &Bound<'_, PyDict>) -> PyResult<()> {
-    for key in c2_config::FORBIDDEN_IPC_OVERRIDE_KEYS {
-        if dict.contains(*key)? {
-            return Err(PyValueError::new_err(
-                "shm_threshold is a global transport policy; use set_transport_policy(shm_threshold=...)",
-            ));
-        }
+    if dict.contains("shm_threshold")? {
+        return Err(PyValueError::new_err(
+            "shm_threshold is a global transport policy; use set_transport_policy(shm_threshold=...)",
+        ));
     }
     Ok(())
 }
@@ -432,8 +441,6 @@ fn server_ipc_to_dict<'py>(py: Python<'py>, cfg: &ServerIpcConfig) -> PyResult<B
     dict.set_item("max_pending_requests", cfg.max_pending_requests)?;
     dict.set_item("max_execution_workers", cfg.max_execution_workers)?;
     dict.set_item("pool_decay_seconds", cfg.pool_decay_seconds)?;
-    dict.set_item("heartbeat_interval", cfg.heartbeat_interval_secs)?;
-    dict.set_item("heartbeat_timeout", cfg.heartbeat_timeout_secs)?;
     Ok(dict)
 }
 
@@ -452,6 +459,9 @@ fn base_ipc_to_dict<'py>(
     cfg: &c2_config::BaseIpcConfig,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
+    dict.set_item("write_timeout", cfg.write_timeout_secs)?;
+    dict.set_item("max_dedicated_segments", cfg.max_dedicated_segments)?;
+    dict.set_item("spill_threshold", cfg.spill_threshold)?;
     dict.set_item("pool_enabled", cfg.pool_enabled)?;
     dict.set_item("pool_segment_size", cfg.pool_segment_size)?;
     dict.set_item("max_pool_segments", cfg.max_pool_segments)?;
@@ -487,7 +497,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolve_server_ipc_config, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_client_ipc_config, m)?)?;
     m.add_function(wrap_pyfunction!(validate_server_id, m)?)?;
-    m.add_function(wrap_pyfunction!(validate_ipc_region_id, m)?)?;
     Ok(())
 }
 

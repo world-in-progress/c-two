@@ -23,18 +23,14 @@ mod endpoint_ffi;
 #[cfg(feature = "python")]
 mod error_ffi;
 #[cfg(feature = "python")]
-mod lease_ffi;
+mod local_copy_ffi;
 #[cfg(feature = "python")]
 mod mem_ffi;
 #[cfg(feature = "python")]
-mod owner_ffi;
 #[cfg(feature = "python")]
 mod route_concurrency_ffi;
 #[cfg(feature = "python")]
 mod runtime_session_ffi;
-#[cfg(feature = "python")]
-mod writable_sink;
-
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
@@ -52,9 +48,8 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     config_ffi::register_module(m)?;
     codegen_ffi::register_module(m)?;
     endpoint_ffi::register_module(m)?;
-    lease_ffi::register_module(m)?;
+    local_copy_ffi::register_module(m)?;
     mem_ffi::register_module(m)?;
-    owner_ffi::register_module(m)?;
     route_concurrency_ffi::register_module(m)?;
     runtime_session_ffi::register_module(m)?;
     contract_ffi::register_module(m)?;

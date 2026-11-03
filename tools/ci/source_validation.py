@@ -371,12 +371,12 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
     windows_identity = [cargo(
         "windows-pipe-identity-test", "core/Cargo.toml", "-p", "c2-local",
         "--test", "windows_identity",
-        "foreign_object_owner_rejects_connect_listener_join_and_bootstrap_adoption",
+        "foreign_object_owner_rejects_connect_and_listener_join",
         "--", "--ignored", "--exact",
     )] if target_platform == "windows" else []
 
     if scope == LOCAL_PLATFORM_SCOPE:
-        # Include native integration tests (notably owner-control) and Core
+        # Include native integration tests and Core
         # call-state tests at each implementation stage, without SDK matrices.
         return [cargo("local-platform-tests", "core/Cargo.toml", "--no-fail-fast",
                       "--features", "c2-http/relay",
@@ -397,7 +397,10 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
         ("fastdb-wasm-build", [python, str(ROOT / "tools/ci/source_prerequisites.py"), "wasm"], ()),
         ("fastdb-npm-build", [python, str(ROOT / "tools/ci/source_prerequisites.py"), "fastdb"], ("fastdb-npm-install", "fastdb-wasm-build")),
         ("c2-mem-npm-install", npm_command("ci", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", c2_mem_typescript), ()),
-        ("c2-mem-build", ["node", f"{c2_mem_typescript}/scripts/build-runtime.mjs"], ("c2-mem-npm-install",)),
+        # Node's standalone peers reuse core/Cargo.lock and build offline.
+        # Building c2-mem-ffi alone does not fetch the server's dependencies.
+        ("core-dependencies", ["cargo", "fetch", "--locked", "--manifest-path", "core/Cargo.toml"], ()),
+        ("c2-mem-build", ["node", f"{c2_mem_typescript}/scripts/build-runtime.mjs"], ("c2-mem-npm-install", "core-dependencies")),
         ("c2-mem-node-tests", npm_command("test", "--ignore-scripts", "--prefix", c2_mem_typescript), ("c2-mem-build",)),
         ("c2-mem-node-package", npm_command("run", "pack:check", "--prefix", c2_mem_typescript, "--", "--prepared"), ("c2-mem-build",)),
         cargo("fastdb-rust-test", "../fastdb/bindings/rust/Cargo.toml", "--workspace", "--all-features"),

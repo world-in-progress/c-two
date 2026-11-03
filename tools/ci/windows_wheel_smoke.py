@@ -79,6 +79,7 @@ import sys
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 import c_two as cc
+from c_two.observe import memory_stats
 import c_two._native
 import fastdb4py
 import numpy
@@ -168,7 +169,7 @@ if sys.argv[1] == "host":
     cc.set_relay_anchor(sys.argv[2])
     resource = Resource()
     cc.register(Echo, resource, name="wheel-echo",
-                input_lifetime={"echo":cc.InputLifetime.BORROWED})
+                input_lifetime={"echo":"borrowed"})
     emit({**facts, "address":cc.server_address(), "status":"ready"})
     try:
         assert sys.stdin.readline().strip() == "stop"
@@ -191,7 +192,7 @@ else:
         with cc.hold(proxy.echo)(source) as held:
             retained = held.value
             view = inspect(retained)
-            assert cc.hold_stats()["active_holds"] == 1
+            assert memory_stats()["holds"]["active_holds"] == 1
         try:
             with view.acquire():
                 raise AssertionError("released checked view remained valid")
@@ -200,7 +201,7 @@ else:
         finally:
             view.close()
             retained.close()
-        assert cc.hold_stats()["active_holds"] == 0
+        assert memory_stats()["holds"]["active_holds"] == 0
         emit({**facts, "status":"passed", "transport":sys.argv[3],
               "observed_mode":observed_mode, "payload_bytes":len(DATA),
               "held_view_invalidated":True})

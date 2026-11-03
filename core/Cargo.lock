@@ -262,6 +262,8 @@ dependencies = [
  "c2-config",
  "c2-local",
  "c2-mem",
+ "c2-wire",
+ "parking_lot",
  "tokio",
 ]
 

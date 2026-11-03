@@ -2,7 +2,7 @@ import c_two as cc
 from crm import IGrid
 from crm import GridAttribute, GridSchema
 
-@cc.crm
+@cc.crm(namespace='test.template', version='0.1.0')
 class Grid(IGrid):
     """
     This is an auto-generated template. Please implement the methods below.

@@ -18,8 +18,6 @@ pub enum ContractCommand {
     Diagnose(PythonDiagnoseArgs),
     /// Export a portable descriptor from a Python CRM class.
     Export(PythonExportArgs),
-    /// Infer a portable descriptor or diagnostics from a Python resource class.
-    Infer(PythonInferArgs),
     /// Derive a route-independent release reference from a portable descriptor.
     ReleaseRef(ReleaseRefArgs),
     /// Validate a portable c-two.contract.v2 descriptor.
@@ -105,42 +103,11 @@ pub struct PythonExportArgs {
     pub pretty: bool,
 }
 
-#[derive(Debug, Args)]
-pub struct PythonInferArgs {
-    /// Python resource class target as module:ClassName.
-    pub target: String,
-    /// CRM namespace for the inferred projection.
-    #[arg(long)]
-    pub namespace: String,
-    /// CRM version for the inferred projection.
-    #[arg(long)]
-    pub version: String,
-    /// CRM class name for the inferred projection.
-    #[arg(long)]
-    pub name: Option<String>,
-    /// Public resource method to expose; repeatable.
-    #[arg(long = "method", required = true)]
-    pub methods: Vec<String>,
-    /// Python executable used for import/reflection. Defaults to C2_PYTHON or python3.
-    #[arg(long)]
-    pub python: Option<String>,
-    /// Write portability diagnostics for the inferred projection instead of exporting a portable descriptor.
-    #[arg(long)]
-    pub diagnose: bool,
-    /// Write descriptor or diagnostics JSON to this file instead of stdout.
-    #[arg(long)]
-    pub out: Option<String>,
-    /// Pretty-print descriptor or diagnostics JSON.
-    #[arg(long)]
-    pub pretty: bool,
-}
-
 pub fn run(args: ContractArgs) -> Result<()> {
     match args.command {
         ContractCommand::Codegen(args) => codegen(args),
         ContractCommand::Diagnose(args) => diagnose(args),
         ContractCommand::Export(args) => export(args),
-        ContractCommand::Infer(args) => infer(args),
         ContractCommand::ReleaseRef(args) => release_ref(args),
         ContractCommand::Validate(args) => validate(&args.path),
     }
@@ -213,19 +180,7 @@ fn codegen(args: CodegenArgs) -> Result<()> {
 }
 
 fn admit_contract_once(payload: &[u8]) -> Result<c2_contract::ContractRelease> {
-    #[cfg(debug_assertions)]
-    let before = c2_contract::descriptor_admission_count_for_current_thread();
-    let release = c2_contract::ContractRelease::from_descriptor_json(payload);
-    #[cfg(debug_assertions)]
-    {
-        let after = c2_contract::descriptor_admission_count_for_current_thread();
-        debug_assert_eq!(
-            after.saturating_sub(before),
-            1,
-            "a CLI descriptor operation must enter ContractRelease admission exactly once"
-        );
-    }
-    release.map_err(|error| anyhow!("{error}"))
+    c2_contract::ContractRelease::from_descriptor_json(payload).map_err(|error| anyhow!("{error}"))
 }
 
 fn export(args: PythonExportArgs) -> Result<()> {
@@ -244,40 +199,6 @@ fn export(args: PythonExportArgs) -> Result<()> {
     }
     let payload = run_python_contract(args.python.as_deref(), &py_args)?;
     validate_descriptor_payload(&payload)?;
-    write_payload(&payload, args.out.as_deref())
-}
-
-fn infer(args: PythonInferArgs) -> Result<()> {
-    let mut py_args = vec![
-        "-m".to_string(),
-        "c_two.cli.contract".to_string(),
-        "infer".to_string(),
-        args.target,
-        "--namespace".to_string(),
-        args.namespace,
-        "--version".to_string(),
-        args.version,
-    ];
-    if let Some(name) = args.name {
-        py_args.push("--name".to_string());
-        py_args.push(name);
-    }
-    for method in args.methods {
-        py_args.push("--method".to_string());
-        py_args.push(method);
-    }
-    if args.diagnose {
-        py_args.push("--diagnose".to_string());
-    }
-    if args.pretty {
-        py_args.push("--pretty".to_string());
-    }
-    let payload = run_python_contract(args.python.as_deref(), &py_args)?;
-    if args.diagnose {
-        validate_diagnostic_payload(&payload)?;
-    } else {
-        validate_descriptor_payload(&payload)?;
-    }
     write_payload(&payload, args.out.as_deref())
 }
 

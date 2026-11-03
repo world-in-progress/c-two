@@ -43,27 +43,6 @@ fn descriptor_with_nested_spec(spec: serde_json::Value) -> String {
 }
 
 #[test]
-fn codegen_reuses_one_admitted_release_without_reparsing_descriptor_bytes() {
-    let before = c2_contract::descriptor_admission_count_for_current_thread();
-    let release = c2_contract::ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes())
-        .expect("fixture must admit");
-    let admitted = c2_contract::descriptor_admission_count_for_current_thread();
-    assert_eq!(admitted.saturating_sub(before), 1);
-
-    compile_admitted_contract_artifacts(
-        &release,
-        ContractCodegenTarget::Rust,
-        &ContractCodegenOptions::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        c2_contract::descriptor_admission_count_for_current_thread(),
-        admitted,
-        "codegen must consume the admitted release rather than parsing bytes again"
-    );
-}
-
-#[test]
 fn delegates_nested_specs_to_core_and_deduplicates_by_core_identity() {
     let set = compile_contract_artifacts(
         DESCRIPTOR.as_bytes(),

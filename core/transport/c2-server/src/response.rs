@@ -84,18 +84,8 @@ where
         handle,
         data_size,
     );
-    let coordinates = prepared
-        .shm_allocation()
-        .expect("SHM response backing carries coordinates");
-    if coordinates.seg_idx > u16::MAX as u32 {
-        return Err(prepared.rollback(format!(
-            "response segment index {} exceeds buddy response wire limit {}",
-            coordinates.seg_idx,
-            u16::MAX,
-        )));
-    }
     if let Err(error) = prepared.fill(write_into) {
-        return Err(prepared.rollback(error));
+        return Err(error);
     }
     Ok(Some(prepared))
 }
@@ -115,20 +105,22 @@ mod tests {
     }
 
     fn test_pool() -> ResponsePool {
-        ResponsePool::new(MemPool::new_with_prefix(
-            PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 1,
-                max_dedicated_segments: 1,
-                dedicated_crash_timeout_secs: 0.0,
-                buddy_idle_decay_secs: 60.0,
-                spill_threshold: 0.8,
-                spill_dir: std::env::temp_dir().join("c2_response_helper_test"),
-                ..PoolConfig::default()
-            },
-            unique_prefix("a"),
-        ))
+        ResponsePool::new(
+            MemPool::new_with_prefix(
+                PoolConfig {
+                    segment_size: 64 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 1,
+                    max_dedicated_segments: 1,
+                    buddy_idle_decay_secs: 60.0,
+                    spill_threshold: 0.8,
+                    spill_dir: std::env::temp_dir().join("c2_response_helper_test"),
+                    ..PoolConfig::default()
+                },
+                unique_prefix("a"),
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -157,8 +149,27 @@ mod tests {
         .expect("large payload should allocate response SHM");
 
         assert_eq!(prepared.data_size() as usize, payload.len());
-        assert_eq!(prepared.copy_logical_bytes(&pool.read()).unwrap(), payload);
-        prepared.release().unwrap();
+        assert_eq!(prepared.copy_logical_bytes().unwrap(), payload);
+        prepared.release();
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[test]
+    fn prepared_response_moves_original_owner_into_connection() {
+        use c2_wire::connection::{ConnectionCore, ConnectionSide};
+
+        let pool = test_pool();
+        let prepared = super::try_prepare_shm_response(&pool, 1024, 8192, |dst| {
+            dst.fill(0x5a);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        let core = ConnectionCore::new(ConnectionSide::Server, || {});
+        core.finish_handshake().unwrap();
+        let loan = prepared.into_loan(&core).unwrap();
+        assert_eq!(pool.read().stats().alloc_count, 1);
+        drop(loan);
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
@@ -185,30 +196,28 @@ mod tests {
         }));
         assert!(panic.is_err());
         assert_eq!(pool.read().stats().alloc_count, 0);
-        assert_eq!(
-            pool.read().budget().unwrap().snapshot().abandoned_releases,
-            0
-        );
     }
 
     #[test]
     fn allocation_failure_falls_back_to_owned_inline_path() {
-        let pool = ResponsePool::new(MemPool::new_with_prefix(
-            PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 0,
-                max_dedicated_segments: 0,
-                dedicated_crash_timeout_secs: 0.0,
-                buddy_idle_decay_secs: 60.0,
-                spill_threshold: 0.8,
-                spill_dir: std::env::temp_dir().join("c2_response_helper_alloc_fail"),
-                // max_segments 0 requires a zero retirement floor.
-                min_retained_segments: 0,
-                ..PoolConfig::default()
-            },
-            unique_prefix("b"),
-        ));
+        let pool = ResponsePool::new(
+            MemPool::new_with_prefix(
+                PoolConfig {
+                    segment_size: 64 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 0,
+                    max_dedicated_segments: 0,
+                    buddy_idle_decay_secs: 60.0,
+                    spill_threshold: 0.8,
+                    spill_dir: std::env::temp_dir().join("c2_response_helper_alloc_fail"),
+                    // max_segments 0 requires a zero retirement floor.
+                    min_retained_segments: 0,
+                    ..PoolConfig::default()
+                },
+                unique_prefix("b"),
+            )
+            .unwrap(),
+        );
 
         let meta = super::try_prepare_shm_response(&pool, 1024, 8192, |_| {
             panic!("allocation failure should not request a SHM destination")

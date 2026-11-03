@@ -1,16 +1,13 @@
 //! Real relay-owned budget/lifetime regressions (phase 2).
 //!
-//! The first six tests cover RelayState -> IpcClient -> LocalStream -> Server,
+//! The first five tests cover RelayState -> IpcClient -> LocalStream -> Server,
 //! not HTTP. Connections perform real identity/contract/token handshakes; no
-//! force_connected, injected pools, synthetic reservations, or acquire bypass.
+//! injected pools, synthetic reservations, or acquire bypass.
 //! The last test uses an actual TCP listener and build_router, including an
 //! incomplete HTTP Content-Length upload and a later complete HTTP call.
-//! IPC endpoints and file carriers have unique owner incarnations. The spool
-//! directory is the canonical config projection; tests inspect only their own
-//! carrier's exact debug path, never scan/delete shared spool directories.
-//! Unix unlinks a spill at creation; Windows owns an exclusive delete-on-close
-//! file. Live ownership is proved by carrier contents and budget charges, not
-//! path existence or the ability to reopen that path.
+//! IPC endpoints have unique owner incarnations. Reply reassembly is copied
+//! into a local Vec before a public call returns; budget peaks and refunds
+//! observe its real transport allocation during admission.
 //! The HTTP EOF case requires pre_dispatch and the original healthy client;
 //! it intentionally rejects the baseline's pre-publication classification bug.
 
@@ -25,10 +22,9 @@ use c2_config::{ClientIpcConfig, RelayConfig};
 use c2_ipc::{IpcClient, IpcError, ResponseData, RouteBinding};
 use c2_mem::{BudgetSnapshot, DedicatedSegment};
 use c2_server::{
-    ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
-    RouteBuildSpec, SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
+    ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,
+    ServerIdentity, ServerIpcConfig,
 };
-use c2_wire::chunk::ReassemblyBacking;
 use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
@@ -42,6 +38,7 @@ use super::types::RouteEntry;
 
 const PAYLOAD_LEN: usize = 8192;
 const CHUNK_SIZE: u64 = 4096;
+const REASSEMBLY_CHARGE: u64 = PAYLOAD_LEN as u64 + (PAYLOAD_LEN as u64).div_ceil(CHUNK_SIZE);
 const DEADLINE: Duration = Duration::from_secs(10);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -111,16 +108,13 @@ fn state(policy: ClientIpcConfig) -> Arc<RelayState> {
     ))
 }
 
-/// Checks content through the Rust request lease and releases the actual
-/// transport owner on every path (including failed content assertions).
-/// Small replies identify the observed request carrier; large replies force
-/// the server's checked chunk fallback and the relay's real receive allocation.
+/// Checks the owned request bytes after the server has released its transport
+/// carrier. Large replies force the server's checked chunk fallback and the
+/// relay's real receive allocation.
 struct Probe {
     expected: Vec<u8>,
     large_reply: bool,
     calls: AtomicUsize,
-    shm_calls: AtomicUsize,
-    handle_calls: AtomicUsize,
 }
 
 impl CrmCallback for Probe {
@@ -128,45 +122,22 @@ impl CrmCallback for Probe {
         &self,
         _route: &str,
         method: u16,
-        request: RequestData,
+        request: Vec<u8>,
         _response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
-        let kind = match &request {
-            RequestData::Shm(shm) if shm.is_dedicated() => {
-                self.shm_calls.fetch_add(1, Ordering::SeqCst);
-                "dedicated"
-            }
-            RequestData::Shm(_) => "buddy",
-            RequestData::Handle(_) => {
-                self.handle_calls.fetch_add(1, Ordering::SeqCst);
-                "handle"
-            }
-            RequestData::Inline(_) => "inline",
-        };
-        let mut lease = RequestLease::new(request);
-        // This is Rust-side validation, not a Python bytes conversion before
-        // dispatch. The server really receives SHM coordinates/owned Handle.
-        let bytes = lease.copy_bytes().unwrap();
-        lease
-            .release()
-            .expect("callback must release its actual request");
-        assert_ne!(
-            kind, "buddy",
-            "buddy was disabled; actual owner released first"
-        );
         if method == 1 {
             assert!(
-                bytes.is_empty(),
+                request.is_empty(),
                 "response-only method has an inline empty request"
             );
         } else {
-            assert_eq!(bytes, self.expected);
+            assert_eq!(request, self.expected);
         }
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(ResponseMeta::Inline(if self.large_reply || method == 1 {
             self.expected.clone()
         } else {
-            kind.as_bytes().to_vec()
+            b"ok".to_vec()
         }))
     }
 }
@@ -208,8 +179,6 @@ impl Upstream {
             expected: payload(marker),
             large_reply,
             calls: AtomicUsize::new(0),
-            shm_calls: AtomicUsize::new(0),
-            handle_calls: AtomicUsize::new(0),
         });
         let route = server
             .build_route(
@@ -236,7 +205,8 @@ impl Upstream {
             .await
             .unwrap();
         // Attestation uses its own real, lazy control-plane connection.
-        let mut attestor = IpcClient::new(&address);
+        let mut attestor =
+            IpcClient::with_config(&address, c2_config::ClientIpcConfig::default()).unwrap();
         bounded(attestor.connect()).await.unwrap();
         let contract = attestor.route_contract(name).unwrap();
         let attestation = bounded(attestor.attest_route_for_registration(&contract))
@@ -255,7 +225,6 @@ impl Upstream {
             TEST_SIGNATURE_HASH.into(),
             attestation.max_payload_size(),
             attestation.route_uid().to_string(),
-            attestation.route_revision(),
             None,
         ) {
             RegisterCommitResult::Registered { entry } => entry,
@@ -276,7 +245,6 @@ impl Upstream {
             Err(_) => panic!("real attested upstream acquisition failed"),
         };
         assert_eq!(binding.route_uid(), self.entry.route_uid);
-        assert_eq!(binding.route_revision(), self.entry.route_revision);
         let client = lease.client();
         assert!(client.is_connected());
         assert_eq!(client.server_id(), self.entry.server_id.as_deref());
@@ -301,12 +269,10 @@ impl Upstream {
         );
         let budget = self.server.memory_budget_snapshot().budget;
         eprintln!(
-            "[relay-memory] {} route={} callbacks={} shm_requests={} handle_requests={} server-after-join={budget:?}",
+            "[relay-memory] {} route={} callbacks={} server-after-join={budget:?}",
             state.relay_id(),
             self.entry.name,
             self.probe.calls.load(Ordering::SeqCst),
-            self.probe.shm_calls.load(Ordering::SeqCst),
-            self.probe.handle_calls.load(Ordering::SeqCst),
         );
         assert_eq!(
             (
@@ -348,48 +314,6 @@ fn refunded(state: &RelayState) {
     );
 }
 
-fn file_carrier(response: ResponseData, expected: &[u8]) -> ReassemblyBacking {
-    let ResponseData::Handle(backing) = response else {
-        panic!("real server chunk fallback must return ReassemblyBacking");
-    };
-    assert!(
-        backing.is_file_spill(),
-        "this receive allocation must use the file fallback"
-    );
-    assert_eq!(backing.capacity_bytes(), PAYLOAD_LEN as u64);
-    assert_eq!(backing.copy_bytes().unwrap(), expected);
-    assert_live_file_path_contract(&backing);
-    backing
-}
-
-fn assert_live_file_path_contract(backing: &ReassemblyBacking) {
-    // This is a debug path, not a handle. Unix removes the directory entry
-    // before sizing/mapping the still-owned file; Windows share_mode(0) and
-    // delete-on-close prohibit using reopen/exists as a live-owner proof.
-    let path = backing
-        .file_spill_path()
-        .expect("file carrier records its debug path");
-    #[cfg(unix)]
-    assert!(
-        !path.exists(),
-        "Unix must unlink a spill at creation: {path:?}"
-    );
-    #[cfg(not(unix))]
-    let _ = path;
-}
-
-fn release(backing: &mut ReassemblyBacking) {
-    let path = backing.file_spill_path().unwrap();
-    backing.release().unwrap();
-    backing.release().unwrap();
-    assert!(backing.is_released());
-    assert!(backing.copy_bytes().is_err());
-    assert!(
-        !path.exists(),
-        "released file carrier must leave no directory entry at its exact debug path"
-    );
-}
-
 async fn call(client: &IpcClient, binding: &RouteBinding, upstream: &Upstream) -> ResponseData {
     bounded(client.call_bound(binding, "probe", &upstream.probe.expected))
         .await
@@ -411,12 +335,12 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
     let a = Upstream::start(&state, "a", 17, false).await;
     let b = Upstream::start(&state, "b", 93, false).await;
     assert_ne!(a.entry.ipc_address, b.entry.ipc_address);
-    // Both real endpoints independently succeed on the preferred SHM path.
+    // Both real endpoints independently serve the request before contention.
     for upstream in [&a, &b] {
         let (lease, client, binding) = upstream.acquire(&state).await;
         assert_eq!(
             expect_inline(call(&client, &binding, upstream).await),
-            b"dedicated"
+            b"ok"
         );
         drop(lease);
         close(&state.evict_connection(&upstream.entry.name).unwrap()).await;
@@ -455,10 +379,7 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
             .all(|(_, client)| client.is_none()),
         "active leases prevent idle eviction"
     );
-    assert_eq!(
-        expect_inline(call(&client_b, &binding_b, &b).await),
-        b"handle"
-    );
+    assert_eq!(expect_inline(call(&client_b, &binding_b, &b).await), b"ok");
     let competed = snapshot(&state, "request-b-fallback");
     assert_eq!(competed.shm.peak_bytes, charge);
     assert!(competed.shm.rejected_allocations > before.shm.rejected_allocations);
@@ -466,12 +387,11 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
     body_tx.send(a.probe.expected.clone()).unwrap();
     assert_eq!(
         expect_inline(bounded(pending.join()).await.unwrap().unwrap()),
-        b"dedicated"
+        b"ok"
     );
     drop(lease_b);
-    assert_eq!(a.probe.shm_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(b.probe.shm_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(b.probe.handle_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(a.probe.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(b.probe.calls.load(Ordering::SeqCst), 2);
     a.stop(&state).await;
     b.stop(&state).await;
     refunded(&state);
@@ -482,32 +402,34 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() {
     let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64;
-    let state = state(policy(charge, PAYLOAD_LEN as u64, PAYLOAD_LEN as u64));
+    let state = state(policy(charge, PAYLOAD_LEN as u64, REASSEMBLY_CHARGE));
     let a = Upstream::start(&state, "request", 23, false).await;
     let b = Upstream::start(&state, "reply", 181, true).await;
     // Each role individually succeeds with real dedicated SHM storage.
     let (lease, client, binding) = a.acquire(&state).await;
-    assert_eq!(
-        expect_inline(call(&client, &binding, &a).await),
-        b"dedicated"
-    );
+    assert_eq!(expect_inline(call(&client, &binding, &a).await), b"ok");
     drop(lease);
     close(&state.evict_connection(&a.entry.name).unwrap()).await;
     refunded(&state);
     let (lease, client, binding) = b.acquire(&state).await;
-    let response = bounded(client.call_bound(&binding, "reply", &[]))
-        .await
-        .unwrap();
-    let ResponseData::Handle(mut solo) = response else {
-        panic!("expected real chunked response");
-    };
-    assert!(solo.is_dedicated());
-    assert_eq!(solo.copy_bytes().unwrap(), b.probe.expected);
+    let before_solo = snapshot(&state, "reply-before-standalone-reassembly");
+    assert_eq!(
+        expect_inline(
+            bounded(client.call_bound(&binding, "reply", &[]))
+                .await
+                .unwrap()
+        ),
+        b.probe.expected
+    );
     let standalone = snapshot(&state, "reply-reassembly-alone-uses-SHM");
-    assert_eq!(standalone.shm.used_bytes, charge);
+    assert_eq!(standalone.shm.peak_bytes, charge);
+    assert_eq!(standalone.shm.used_bytes, 0);
+    assert_eq!(
+        standalone.shm.rejected_allocations,
+        before_solo.shm.rejected_allocations
+    );
     assert_eq!(standalone.file.used_bytes, 0);
-    solo.release().unwrap();
-    drop(solo);
+    assert_eq!(standalone.reassembly.used_bytes, 0);
     drop(lease);
     close(&state.evict_connection(&b.entry.name).unwrap()).await;
     refunded(&state);
@@ -535,10 +457,14 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() 
     bounded(ready_rx).await.unwrap();
     let held = snapshot(&state, "request-SHM-held-before-reply");
     assert_eq!(held.shm.used_bytes, charge);
-    let response = bounded(client_b.call_bound(&binding_b, "reply", &[]))
-        .await
-        .unwrap();
-    let mut fallback = file_carrier(response, &b.probe.expected);
+    assert_eq!(
+        expect_inline(
+            bounded(client_b.call_bound(&binding_b, "reply", &[]))
+                .await
+                .unwrap()
+        ),
+        b.probe.expected
+    );
     let overlap = snapshot(
         &state,
         "reply-reassembly-file-fallback-competes-with-request",
@@ -550,15 +476,17 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() 
         held.shm.rejected_allocations + 1
     );
     assert_eq!(overlap.shm.rejected_bytes, held.shm.rejected_bytes + charge);
+    assert_eq!(overlap.file.peak_bytes, PAYLOAD_LEN as u64);
+    assert_eq!(overlap.reassembly.peak_bytes, REASSEMBLY_CHARGE);
     assert_eq!(
         (overlap.file.used_bytes, overlap.reassembly.used_bytes),
-        (PAYLOAD_LEN as u64, PAYLOAD_LEN as u64)
+        (0, 0),
+        "the returned Vec does not retain reply reassembly"
     );
-    release(&mut fallback);
     body_tx.send(a.probe.expected.clone()).unwrap();
     assert_eq!(
         expect_inline(bounded(pending.join()).await.unwrap().unwrap()),
-        b"dedicated"
+        b"ok"
     );
     assert_eq!(a.probe.calls.load(Ordering::SeqCst), 2);
     assert_eq!(b.probe.calls.load(Ordering::SeqCst), 2);
@@ -570,70 +498,89 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() 
 
 async fn shared_response_capacity(file_is_tighter: bool) {
     let one = PAYLOAD_LEN as u64;
-    let limit = one + one / 2;
-    let state = state(policy(
-        0,
-        if file_is_tighter { limit } else { 2 * one },
-        if file_is_tighter { 2 * one } else { limit },
-    ));
-    let a = Upstream::start(&state, "a", 31, true).await;
-    let b = Upstream::start(&state, "b", 149, true).await;
-    let (lease_a, client_a, binding_a) = a.acquire(&state).await;
-    let (lease_b, client_b, binding_b) = b.acquire(&state).await;
-    // Each independently admits a real chunked reply and removes its file.
-    for (upstream, client, binding) in [(&a, &client_a, &binding_a), (&b, &client_b, &binding_b)] {
-        let mut backing = file_carrier(
-            call(client, binding, upstream).await,
-            &upstream.probe.expected,
+    // Observe real admissions from two distinct upstreams in the same relay
+    // budget domain. A completed call has already copied and refunded its
+    // reassembly backing, so capacity refusal is exercised separately with a
+    // limit below one reply, then checked on both connections.
+    for admits in [true, false] {
+        let limit = if admits { one + one / 2 } else { one / 2 };
+        let state = state(policy(
+            0,
+            if file_is_tighter { limit } else { 2 * one },
+            if file_is_tighter { 2 * one } else { limit },
+        ));
+        let a = Upstream::start(&state, "a", 31, false).await;
+        let b = Upstream::start(&state, "b", 149, false).await;
+        assert_ne!(a.entry.ipc_address, b.entry.ipc_address);
+        let (lease_a, client_a, binding_a) = a.acquire(&state).await;
+        let (lease_b, client_b, binding_b) = b.acquire(&state).await;
+        let mut previous = snapshot(&state, "before-response-admission");
+        for (upstream, client, binding) in
+            [(&a, &client_a, &binding_a), (&b, &client_b, &binding_b)]
+        {
+            if admits {
+                assert_eq!(
+                    expect_inline(
+                        bounded(client.call_bound(binding, "reply", &[]))
+                            .await
+                            .unwrap()
+                    ),
+                    upstream.probe.expected
+                );
+            } else {
+                let error = bounded(client.call_bound(binding, "reply", &[]))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        IpcError::ResponseFailure(inner)
+                            if matches!(*inner, IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_)))
+                    ),
+                    "local reply admission must fail only this call"
+                );
+            }
+            let current = snapshot(&state, "after-response-admission");
+            let (old_cell, cell) = if file_is_tighter {
+                (previous.file, current.file)
+            } else {
+                (previous.reassembly, current.reassembly)
+            };
+            if admits {
+                assert_eq!(current.file.peak_bytes, one);
+                assert_eq!(current.reassembly.peak_bytes, REASSEMBLY_CHARGE);
+                assert_eq!(cell.rejected_allocations, old_cell.rejected_allocations);
+            } else {
+                assert_eq!(cell.rejected_allocations, old_cell.rejected_allocations + 1);
+                let charge = if file_is_tighter { one } else { REASSEMBLY_CHARGE };
+                assert_eq!(cell.rejected_bytes, old_cell.rejected_bytes + charge);
+                assert_eq!(
+                    expect_inline(call(client, binding, upstream).await),
+                    b"ok",
+                    "capacity refusal must leave this upstream usable"
+                );
+            }
+            assert_eq!(
+                (current.file.used_bytes, current.reassembly.used_bytes),
+                (0, 0),
+                "the completed call or failed admission must refund real backing"
+            );
+            assert!(client.is_connected());
+            previous = snapshot(&state, "after-response-health-probe");
+        }
+        assert_eq!(
+            a.probe.calls.load(Ordering::SeqCst),
+            if admits { 1 } else { 2 }
         );
-        release(&mut backing);
+        assert_eq!(
+            b.probe.calls.load(Ordering::SeqCst),
+            if admits { 1 } else { 2 }
+        );
+        drop((lease_a, lease_b));
+        a.stop(&state).await;
+        b.stop(&state).await;
         refunded(&state);
     }
-    let mut old = file_carrier(call(&client_a, &binding_a, &a).await, &a.probe.expected);
-    let before = snapshot(&state, "reply-a-held");
-    assert_eq!(
-        (before.file.used_bytes, before.reassembly.used_bytes),
-        (one, one)
-    );
-    // The second allocation overlaps the first carrier's live receive scope.
-    // Its callback executes exactly once; local capacity failure is not replayed.
-    let error = bounded(client_b.call_bound(&binding_b, "probe", &b.probe.expected))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_))
-        ),
-        "{error}"
-    );
-    let after = snapshot(&state, "reply-b-capacity-rejection");
-    assert_eq!(
-        (after.file.used_bytes, after.reassembly.used_bytes),
-        (one, one)
-    );
-    let (before_cell, after_cell) = if file_is_tighter {
-        (before.file, after.file)
-    } else {
-        (before.reassembly, after.reassembly)
-    };
-    assert_eq!(
-        after_cell.rejected_allocations,
-        before_cell.rejected_allocations + 1
-    );
-    assert_eq!(after_cell.rejected_bytes, before_cell.rejected_bytes + one);
-    assert_eq!(b.probe.calls.load(Ordering::SeqCst), 2);
-    assert!(client_a.is_connected() && client_b.is_connected());
-    assert_eq!(old.copy_bytes().unwrap(), a.probe.expected);
-    release(&mut old);
-    refunded(&state);
-    let mut retry = file_carrier(call(&client_b, &binding_b, &b).await, &b.probe.expected);
-    release(&mut retry);
-    assert_eq!(b.probe.calls.load(Ordering::SeqCst), 3);
-    drop((lease_a, lease_b));
-    a.stop(&state).await;
-    b.stop(&state).await;
-    refunded(&state);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -647,77 +594,13 @@ async fn different_upstreams_share_file_capacity_and_refund_failed_admission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finished_file_carrier_keeps_charge_across_idle_close_and_reconnect() {
-    let one = PAYLOAD_LEN as u64;
-    let state = state(policy(0, 2 * one, one + one / 2));
-    let upstream = Upstream::start(&state, "held", 203, true).await;
-    let (lease, old_client, binding) = upstream.acquire(&state).await;
-    let mut old = file_carrier(
-        call(&old_client, &binding, &upstream).await,
-        &upstream.probe.expected,
-    );
-    let path = old.file_spill_path().unwrap();
-    drop(lease);
-    let idle = state.evict_idle(0);
-    assert_eq!(idle.len(), 1);
-    let detached = idle.into_iter().next().unwrap().1.unwrap();
-    assert!(Arc::ptr_eq(&detached, &old_client));
-    close(&detached).await;
-    let held = snapshot(&state, "finished-carrier-after-confirmed-close");
-    assert_eq!(
-        (held.file.used_bytes, held.reassembly.used_bytes),
-        (one, one)
-    );
-    assert_live_file_path_contract(&old);
-    assert_eq!(old.copy_bytes().unwrap(), upstream.probe.expected);
-    let (lease, new_client, binding) = upstream.acquire(&state).await;
-    assert!(!Arc::ptr_eq(&old_client, &new_client));
-    let reconnected = snapshot(&state, "finished-carrier-after-reconnect");
-    assert_eq!(
-        (
-            reconnected.file.used_bytes,
-            reconnected.reassembly.used_bytes
-        ),
-        (one, one)
-    );
-    let error = bounded(new_client.call_bound(&binding, "probe", &upstream.probe.expected))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_))
-        ),
-        "{error}"
-    );
-    let rejected = snapshot(&state, "new-incarnation-competes-with-old-carrier");
-    assert_eq!(
-        rejected.reassembly.rejected_allocations,
-        held.reassembly.rejected_allocations + 1
-    );
-    assert_eq!(old.copy_bytes().unwrap(), upstream.probe.expected);
-    release(&mut old);
-    refunded(&state);
-    let mut fresh = file_carrier(
-        call(&new_client, &binding, &upstream).await,
-        &upstream.probe.expected,
-    );
-    assert_ne!(fresh.file_spill_path().unwrap(), path);
-    release(&mut fresh);
-    assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 3);
-    drop(lease);
-    upstream.stop(&state).await;
-    refunded(&state);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_response_budgets_reject_real_allocation_without_charge_or_replay() {
     for file_zero in [false, true] {
         let one = PAYLOAD_LEN as u64;
         let state = state(policy(
             0,
             if file_zero { 0 } else { one },
-            if file_zero { one } else { 0 },
+            if file_zero { REASSEMBLY_CHARGE } else { 0 },
         ));
         let upstream = Upstream::start(&state, "zero", 67, true).await;
         let (lease, client, binding) = upstream.acquire(&state).await;
@@ -725,13 +608,11 @@ async fn zero_response_budgets_reject_real_allocation_without_charge_or_replay()
         let error = bounded(client.call_bound(&binding, "probe", &upstream.probe.expected))
             .await
             .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_))
-            ),
-            "{error}"
-        );
+        assert!(matches!(
+            error,
+            IpcError::ResponseFailure(inner)
+                if matches!(*inner, IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_)))
+        ));
         let after = snapshot(&state, "zero-after-real-call");
         let (before_cell, after_cell) = if file_zero {
             (before.file, after.file)
@@ -745,9 +626,9 @@ async fn zero_response_budgets_reject_real_allocation_without_charge_or_replay()
             after_cell.rejected_allocations,
             before_cell.rejected_allocations + 1
         );
-        assert_eq!(after_cell.rejected_bytes, before_cell.rejected_bytes + one);
+        let charge = if file_zero { one } else { REASSEMBLY_CHARGE };
+        assert_eq!(after_cell.rejected_bytes, before_cell.rejected_bytes + charge);
         assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(upstream.probe.handle_calls.load(Ordering::SeqCst), 1);
         assert!(client.is_connected());
         drop(lease);
         upstream.stop(&state).await;
@@ -770,10 +651,6 @@ fn http_headers(entry: &RouteEntry) -> reqwest::header::HeaderMap {
     ] {
         headers.insert(key, value.parse().unwrap());
     }
-    headers.insert(
-        "x-c2-route-revision",
-        entry.route_revision.to_string().parse().unwrap(),
-    );
     headers
 }
 
@@ -925,7 +802,6 @@ async fn exercise_http_upload(
         upstream.probe.expected
     );
     assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(upstream.probe.shm_calls.load(Ordering::SeqCst), 1);
     let complete = snapshot(&state, "HTTP-complete-call-consumed-response");
     assert!(complete.reassembly.peak_bytes >= PAYLOAD_LEN as u64);
     assert_eq!(
@@ -956,7 +832,7 @@ async fn exercise_http_upload(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_http_incomplete_upload_and_completed_call_refund_after_idle_close() {
     let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64;
-    let state = state(policy(charge, PAYLOAD_LEN as u64, PAYLOAD_LEN as u64));
+    let state = state(policy(charge, PAYLOAD_LEN as u64, REASSEMBLY_CHARGE));
     let upstream = Upstream::start(&state, "http", 113, true).await;
     // Keep the original acquired client so an unnoticed eviction/replacement
     // cannot masquerade as survival of the HTTP upload's connection.

@@ -1,30 +1,23 @@
 """Concurrency configuration and thin native route-concurrency adapter."""
 from __future__ import annotations
 
-import enum
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 # Re-export access helpers for existing import sites. Scheduling authority lives
 # in Rust; these are metadata helpers used while building the method index map.
 from ...crm.meta import MethodAccess, get_method_access  # noqa: F401
 
 
-@enum.unique
-class ConcurrencyMode(enum.Enum):
-    PARALLEL = 'parallel'
-    EXCLUSIVE = 'exclusive'
-    READ_PARALLEL = 'read_parallel'
-
-
 @dataclass(frozen=True)
 class ConcurrencyConfig:
-    mode: ConcurrencyMode | str = ConcurrencyMode.READ_PARALLEL
+    mode: Literal['parallel', 'exclusive', 'read_parallel'] = 'read_parallel'
     max_workers: int | None = None
     max_pending: int | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, 'mode', ConcurrencyMode(self.mode))
+        if self.mode not in ('parallel', 'exclusive', 'read_parallel'):
+            raise ValueError('mode must be parallel, exclusive, or read_parallel')
         if self.max_workers is not None and self.max_workers < 1:
             raise ValueError('max_workers must be at least 1 when provided.')
         if self.max_pending is not None and self.max_pending < 1:

@@ -38,16 +38,11 @@ def _hello_server(address: str, *, name: str = 'hello') -> Server:
     return server
 
 
-def _assert_shutdown_initiated(outcome: dict[str, object]) -> None:
-    assert outcome == {
-        'acknowledged': True,
-        'shutdown_started': True,
-        'server_stopped': False,
-        'route_outcomes': [],
-    }
+def _assert_shutdown_initiated(outcome: str) -> None:
+    assert outcome == 'initiated'
 
 
-def _assert_shutdown_accepted_not_finished(outcome: dict[str, object]) -> None:
+def _assert_shutdown_accepted_not_finished(outcome: str) -> None:
     _assert_shutdown_initiated(outcome)
 
 
@@ -122,7 +117,7 @@ def test_shutdown_stops_direct_ipc_without_relay(monkeypatch):
     server.shutdown()
 
 
-def test_shutdown_returns_structured_outcome(monkeypatch):
+def test_shutdown_returns_initiated(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("shutdown_outcome")}'
     server = _hello_server(address)
@@ -145,13 +140,10 @@ def test_shutdown_returns_structured_outcome(monkeypatch):
 
 
 def test_control_helpers_reject_invalid_addresses():
-    assert ping('tcp://not-ipc', timeout=0.01) is False
-    assert shutdown('tcp://not-ipc', timeout=0.01) == {
-        'acknowledged': False,
-        'shutdown_started': False,
-        'server_stopped': False,
-        'route_outcomes': [],
-    }
+    with pytest.raises(ValueError):
+        ping('tcp://not-ipc', timeout=0.01)
+    with pytest.raises(ValueError):
+        shutdown('tcp://not-ipc', timeout=0.01)
 
 
 def test_server_start_returns_only_after_direct_ipc_ready(monkeypatch):
@@ -354,11 +346,13 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_waits_for_active_call_before_
         call_thread = threading.Thread(target=invoke_block)
         call_thread.start()
         assert impl.started.wait(timeout=5.0), 'active call did not start'
-        assert server.get_slot_info('cleanup').snapshot().active_workers == 1
+        assert call_thread.is_alive(), 'active call ended before shutdown initiate'
 
         _assert_shutdown_accepted_not_finished(shutdown(address, timeout=0.5))
         assert call_thread.is_alive(), 'active call ended before release after shutdown initiate'
-        _assert_shutdown_accepted_not_finished(shutdown(address, timeout=0.5))
+        # The first request closes the listener before active work drains. A
+        # second probe can race that closure and observe initiation or absence.
+        assert shutdown(address, timeout=0.5) in ('initiated', 'absent')
 
         def invoke_shutdown() -> None:
             shutdown_result['bridge_outcome'] = server.shutdown()
@@ -439,3 +433,13 @@ def test_failed_start_can_retry_after_active_socket_released(monkeypatch):
             second.shutdown()
         finally:
             first.shutdown()
+
+
+def test_shutdown_returns_absent_for_missing_endpoint():
+    address = f'ipc://{_unique_region("absent")}'
+    assert shutdown(address, timeout=0.5) == 'absent'
+
+
+def test_shutdown_returns_unconfirmed_with_zero_timeout():
+    address = f'ipc://{_unique_region("unconfirmed")}'
+    assert shutdown(address, timeout=0.0) == 'unconfirmed'

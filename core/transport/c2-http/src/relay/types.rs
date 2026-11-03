@@ -27,7 +27,6 @@ pub struct RouteEntry {
     pub signature_hash: String,
     pub max_payload_size: u64,
     pub route_uid: String,
-    pub route_revision: u64,
     pub locality: Locality,
     pub registered_at: f64,
 }
@@ -97,10 +96,6 @@ pub struct RouteTombstone {
     pub name: String,
     pub relay_id: String,
     pub removed_at: f64,
-    /// Delete-event revision assigned by the owner relay.
-    pub removed_revision: u64,
-    /// Local route-table revision assigned when this relay applies the tombstone.
-    pub local_catalog_revision: u64,
     pub server_id: Option<String>,
     pub observed_at: Instant,
 }
@@ -120,7 +115,6 @@ pub struct RouteInfo {
     pub signature_hash: String,
     pub max_payload_size: u64,
     pub route_uid: String,
-    pub route_revision: u64,
 }
 
 impl RouteEntry {
@@ -152,7 +146,6 @@ impl RouteEntry {
             signature_hash: self.signature_hash.clone(),
             max_payload_size: self.max_payload_size,
             route_uid: self.route_uid.clone(),
-            route_revision: self.route_revision,
         }
     }
 }
@@ -170,7 +163,6 @@ pub(crate) fn local_route_matches(entry: &RouteEntry, expected: &RouteEntry) -> 
         && entry.signature_hash == expected.signature_hash
         && entry.max_payload_size == expected.max_payload_size
         && entry.route_uid == expected.route_uid
-        && entry.route_revision == expected.route_revision
         && entry.locality == Locality::Local
         && expected.locality == Locality::Local
 }
@@ -228,6 +220,7 @@ pub struct FullSyncSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FullSyncRoute {
     pub name: String,
     pub relay_id: String,
@@ -239,17 +232,16 @@ pub struct FullSyncRoute {
     pub signature_hash: String,
     pub max_payload_size: u64,
     pub route_uid: String,
-    pub route_revision: u64,
     pub registered_at: f64,
     pub hash: RouteDigestHash,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FullSyncTombstone {
     pub name: String,
     pub relay_id: String,
     pub removed_at: f64,
-    pub removed_revision: u64,
     pub hash: RouteDigestHash,
 }
 
@@ -298,7 +290,6 @@ impl FullSyncRoute {
             signature_hash: entry.signature_hash.clone(),
             max_payload_size: entry.max_payload_size,
             route_uid: entry.route_uid.clone(),
-            route_revision: entry.route_revision,
             registered_at: entry.registered_at,
             hash: route_entry_digest_hash(entry),
         }
@@ -319,7 +310,6 @@ impl FullSyncRoute {
             signature_hash: self.signature_hash.clone(),
             max_payload_size: self.max_payload_size,
             route_uid: self.route_uid.clone(),
-            route_revision: self.route_revision,
             locality: Locality::Peer,
             registered_at: self.registered_at,
         }
@@ -332,7 +322,6 @@ impl FullSyncTombstone {
             name: tombstone.name.clone(),
             relay_id: tombstone.relay_id.clone(),
             removed_at: tombstone.removed_at,
-            removed_revision: tombstone.removed_revision,
             hash: tombstone_digest_hash(tombstone),
         }
     }
@@ -342,8 +331,6 @@ impl FullSyncTombstone {
             name: self.name.clone(),
             relay_id: self.relay_id.clone(),
             removed_at: self.removed_at,
-            removed_revision: self.removed_revision,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: observed_now(),
         }
@@ -436,7 +423,6 @@ fn valid_full_sync_route(route: &FullSyncRoute) -> bool {
         && c2_contract::validate_contract_hash("signature_hash", &route.signature_hash).is_ok()
         && route.max_payload_size > 0
         && c2_contract::validate_call_route_key("route_uid", &route.route_uid).is_ok()
-        && route.route_revision > 0
         && route.registered_at.is_finite()
         && valid_route_digest_hash(&route.hash)
 }
@@ -445,7 +431,6 @@ fn valid_full_sync_tombstone(tombstone: &FullSyncTombstone) -> bool {
     crate::relay::route_table::valid_route_name(&tombstone.name)
         && valid_wire_relay_id(&tombstone.relay_id)
         && tombstone.removed_at.is_finite()
-        && tombstone.removed_revision > 0
         && valid_route_digest_hash(&tombstone.hash)
 }
 
@@ -472,18 +457,12 @@ pub(crate) fn route_entry_digest_hash(entry: &RouteEntry) -> RouteDigestHash {
         &entry.signature_hash,
         entry.max_payload_size,
         &entry.route_uid,
-        entry.route_revision,
         entry.registered_at,
     )
 }
 
 pub(crate) fn tombstone_digest_hash(tombstone: &RouteTombstone) -> RouteDigestHash {
-    deleted_route_digest_hash(
-        &tombstone.name,
-        &tombstone.relay_id,
-        tombstone.removed_at,
-        tombstone.removed_revision,
-    )
+    deleted_route_digest_hash(&tombstone.name, &tombstone.relay_id, tombstone.removed_at)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -498,7 +477,6 @@ pub(crate) fn active_route_digest_hash(
     signature_hash: &str,
     max_payload_size: u64,
     route_uid: &str,
-    route_revision: u64,
     registered_at: f64,
 ) -> RouteDigestHash {
     stable_route_digest_hash(&[
@@ -513,7 +491,6 @@ pub(crate) fn active_route_digest_hash(
         signature_hash,
         &max_payload_size.to_string(),
         route_uid,
-        &route_revision.to_string(),
         &registered_at.to_bits().to_string(),
     ])
 }
@@ -522,15 +499,8 @@ pub(crate) fn deleted_route_digest_hash(
     name: &str,
     relay_id: &str,
     removed_at: f64,
-    removed_revision: u64,
 ) -> RouteDigestHash {
-    stable_route_digest_hash(&[
-        "deleted",
-        name,
-        relay_id,
-        &removed_at.to_bits().to_string(),
-        &removed_revision.to_string(),
-    ])
+    stable_route_digest_hash(&["deleted", name, relay_id, &removed_at.to_bits().to_string()])
 }
 
 fn stable_route_digest_hash(fields: &[&str]) -> RouteDigestHash {
@@ -568,7 +538,6 @@ mod tests {
             signature_hash: SIGNATURE_HASH.to_string(),
             max_payload_size: 1024,
             route_uid: format!("{name}-uid"),
-            route_revision: 1,
             locality: Locality::Local,
             registered_at: 1000.0,
         }
@@ -594,6 +563,47 @@ mod tests {
             ValidatedFullSync::try_from(envelope),
             Err(FullSyncValidationError::RouteSnapshotTooOld { .. }),
         ));
+    }
+
+    #[test]
+    fn full_sync_seven_rejects_six_and_retired_revision_fields() {
+        let envelope = FullSyncEnvelope {
+            protocol_version: 6,
+            snapshot: FullSyncSnapshot::from_internal(FullSync {
+                routes: vec![local_route("grid")],
+                tombstones: vec![RouteTombstone {
+                    name: "removed".into(),
+                    relay_id: "relay-a".into(),
+                    removed_at: 1001.0,
+                    server_id: None,
+                    observed_at: Instant::now(),
+                }],
+                peers: Vec::new(),
+            }),
+        };
+        assert!(matches!(
+            ValidatedFullSync::try_from(envelope.clone()),
+            Err(FullSyncValidationError::UnsupportedRouteSnapshotVersion {
+                got: 6,
+                supported: 7
+            })
+        ));
+        let mut current = serde_json::to_value(envelope).unwrap();
+        current["protocol_version"] = 7.into();
+        assert!(
+            ValidatedFullSync::try_from(
+                serde_json::from_value::<FullSyncEnvelope>(current.clone()).unwrap()
+            )
+            .is_ok()
+        );
+        for (collection, retired) in [
+            ("routes", "route_revision"),
+            ("tombstones", "removed_revision"),
+        ] {
+            let mut invalid = current.clone();
+            invalid["snapshot"][collection][0][retired] = 1.into();
+            assert!(serde_json::from_value::<FullSyncEnvelope>(invalid).is_err());
+        }
     }
 
     #[test]

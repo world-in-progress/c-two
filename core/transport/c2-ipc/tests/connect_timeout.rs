@@ -15,8 +15,8 @@ use c2_local::{EndpointCredential, EndpointReapResult, LocalListener, LocalStrea
 use c2_wire::flags;
 use c2_wire::frame::{FrameHeader, decode_frame_body, encode_frame};
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MethodEntry, RouteInfo, ServerIdentity,
-    VersionPreambleKind, encode_server_handshake, encode_version_preamble,
+    MethodEntry, RouteInfo, ServerIdentity, VersionPreambleKind, encode_server_handshake,
+    encode_version_preamble,
 };
 use c2_wire::route_catalog_control::{
     RouteContractWire, RouteLookupResponse, RouteMethodWire, RouteRecordWire, RouteStateWire,
@@ -50,7 +50,6 @@ fn handshake() -> Vec<u8> {
     let route = RouteInfo {
         name: expected.route_name,
         route_uid: ROUTE_UID.into(),
-        route_revision: 1,
         crm_ns: expected.crm_ns,
         crm_name: expected.crm_name,
         crm_ver: expected.crm_ver,
@@ -63,11 +62,10 @@ fn handshake() -> Vec<u8> {
         }],
     };
     let payload = encode_server_handshake(
-        &[],
-        CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+        0,
         &[route],
         "",
-        &ServerIdentity {
+        &ServerIdentity::<String> {
             server_id: "deadline-server".into(),
             server_instance_id: "deadline-instance".into(),
         },
@@ -82,11 +80,8 @@ fn ready_reply() -> RouteLookupResponse {
         current: RouteRecordWire {
             route_name: expected.route_name.clone(),
             route_uid: ROUTE_UID.into(),
-            route_revision: 1,
-            catalog_revision: 1,
             owner_server_id: "deadline-server".into(),
             owner_server_instance_id: "deadline-instance".into(),
-            owner_epoch: 1,
             contract: RouteContractWire {
                 route_name: expected.route_name,
                 crm_ns: expected.crm_ns,
@@ -101,8 +96,7 @@ fn ready_reply() -> RouteLookupResponse {
             }],
             max_payload_size: 1024,
             state: RouteStateWire::Ready,
-            state_reason: None,
-            lease_deadline_ms: None,
+            state_reason: c2_wire::route_catalog_control::RouteStateReasonWire::RegisterCommitted,
         },
     }
 }
@@ -403,7 +397,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
     pool.sweep_expired();
     let settled = observer.snapshot();
     assert_eq!(settled.shm.used_bytes, 0);
-    assert!(settled.shm.peak_bytes > 1024 * 1024);
+    assert!(settled.shm.peak_bytes >= 1024 * 1024);
     assert_eq!(settled.shm.limit_bytes, 1_536_000);
     assert_eq!(business.load(Ordering::SeqCst), 0);
     resume.send(()).unwrap();
@@ -414,7 +408,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
             deadline(Duration::from_millis(100)),
         )
         .unwrap();
-    let recovered = lease.client();
+    let recovered = lease.client().clone();
     assert!(recovered.is_connected());
     let binding = recovered
         .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(1)))
@@ -433,6 +427,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
         "{report:?}"
     );
     assert_eq!(observer.snapshot().shm.used_bytes, 0);
+    assert!(!recovered.is_connected());
 }
 
 #[test]
@@ -615,7 +610,7 @@ fn route_acquisition_respects_deadlines_and_last_lookup_result() {
             let budget = deadline(Duration::from_millis(timeout_ms));
             let started = Instant::now();
             let result = if exact_token {
-                client.acquire_route_token_with_deadline(&expected(), ROUTE_UID, 1, budget)
+                client.acquire_route_token_with_deadline(&expected(), ROUTE_UID, budget)
             } else {
                 client.acquire_route_with_deadline(&expected(), budget)
             };

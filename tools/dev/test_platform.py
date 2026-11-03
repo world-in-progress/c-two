@@ -216,6 +216,7 @@ class ProcessTree:
             raise
 
     def alive(self) -> bool:
+        """Return False only when the owned group or Job is confirmed empty."""
         if self._closed:
             return False
         if self._job:
@@ -225,6 +226,10 @@ class ProcessTree:
             return True
         except ProcessLookupError:
             return False
+        except PermissionError:
+            # Darwin can return EPERM while a group contains only zombies.
+            # A permission failure supplies no empty-group proof; keep waiting.
+            return True
 
     def stop(self) -> None:
         if self._closed:
@@ -247,7 +252,7 @@ class ProcessTree:
         while self.alive() and time.monotonic() < deadline:
             time.sleep(.02)
         if self.alive():
-            raise OSError('Owned process tree remains alive after termination')
+            raise OSError('Owned process tree remains alive or unconfirmed after termination')
 
     def diagnostics(self) -> list[dict]:
         if self._closed:
@@ -279,10 +284,8 @@ class ProcessTree:
     def close(self) -> None:
         if self._closed:
             return
-        try:
-            if self.alive():
-                self.stop()
-        finally:
-            if self._job:
-                self._job.close()
-            self._closed = True
+        if self.alive():
+            self.stop()
+        if self._job:
+            self._job.close()
+        self._closed = True

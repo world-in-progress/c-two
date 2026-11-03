@@ -10,6 +10,10 @@ from typing import Any, Iterator
 import pytest
 
 import c_two as cc
+
+import c_two.observe
+
+import c_two.contract
 from c_two.config.settings import settings
 from c_two.error import (
     ContractMismatch,
@@ -100,17 +104,15 @@ def _assert_client_receipt(
     receipt: dict[str, str],
     *,
     expected_path: str,
-) -> tuple[str, int, int, int]:
+) -> tuple[str, int, int]:
     assert receipt["observed_path"] == expected_path
     route_uid = receipt["route_uid"]
-    route_revision = int(receipt["route_revision"])
     requests = int(receipt["requests"])
     responses = int(receipt["responses"])
     assert route_uid
-    assert route_revision > 0
     assert requests > 0
     assert responses > 0
-    return route_uid, route_revision, requests, responses
+    return route_uid, requests, responses
 
 
 def _run_python_host_row(
@@ -120,7 +122,7 @@ def _run_python_host_row(
     transport: str,
     route_name: str,
     relay_url: str | None,
-) -> tuple[str, int, int, int]:
+) -> tuple[str, int, int]:
     resource = resource_for(payload)
     configure_python_runtime(
         server=True,
@@ -160,7 +162,6 @@ def _run_python_host_row(
         )
         if resolved is not None:
             assert resolved["route_uid"] == result[0]
-            assert resolved["route_revision"] == result[1]
         return result
     finally:
         _reset_default_runtime()
@@ -176,7 +177,7 @@ def _run_rust_host_row(
     route_name: str,
     address: str,
     relay_url: str | None,
-) -> tuple[str, int, int, int]:
+) -> tuple[str, int, int]:
     host = RustHost(
         artifacts,
         payload=payload,
@@ -184,7 +185,7 @@ def _run_rust_host_row(
         route_name=route_name,
         relay_url=relay_url,
     )
-    result: tuple[str, int, int, int] | None = None
+    result: tuple[str, int, int] | None = None
     try:
         resolved = (
             wait_for_contract_resolution(
@@ -197,7 +198,6 @@ def _run_rust_host_row(
         )
         if resolved is not None:
             assert resolved["route_uid"] == host.route_uid
-            assert resolved["route_revision"] == host.route_revision
         endpoint = address if transport == "direct" else relay_url or ""
         if client_language == "rust":
             receipt = run_rust_client(
@@ -236,7 +236,6 @@ def _run_rust_host_row(
                 assert proxy.client.observed_path == expected_path
                 result = (
                     proxy.client.route_uid,
-                    proxy.client.route_revision,
                     1,
                     1,
                 )
@@ -248,7 +247,6 @@ def _run_rust_host_row(
     assert host_calls == 1
     assert result is not None
     assert result[0] == host.route_uid
-    assert result[1] == host.route_revision
     return result
 
 
@@ -271,7 +269,7 @@ def test_portable_payload_matrix_row(
     with relay_context as relay:
         relay_url = relay.url if relay is not None else None
         if host_language == "python":
-            route_uid, route_revision, requests, responses = (
+            route_uid, requests, responses = (
                 _run_python_host_row(
                     matrix_artifacts,
                     payload=payload,
@@ -281,7 +279,7 @@ def test_portable_payload_matrix_row(
                 )
             )
         else:
-            route_uid, route_revision, requests, responses = (
+            route_uid, requests, responses = (
                 _run_rust_host_row(
                     matrix_artifacts,
                     payload=payload,
@@ -308,7 +306,6 @@ def test_portable_payload_matrix_row(
         "fastdb_spec_sha256": facts.fastdb_spec_sha256,
         "route": {
             "uid": route_uid,
-            "revision": route_revision,
         },
         "logical_result_sha256": logical_result_sha256(payload),
         "packages": {
@@ -339,10 +336,10 @@ def test_portable_payload_matrix_writes_complete_receipt(
         Path(configured_path)
         if configured_path
         else REPOSITORY
-        / "target/local-rc/portable-matrix-receipt.v1.json"
+        / "target/local-rc/portable-matrix-receipt.v2.json"
     )
     receipt = {
-        "schema": "c-two.portable-matrix-receipt.v1",
+        "schema": "c-two.portable-matrix-receipt.v2",
         "evidence_stage": evidence_stage,
         "rows": [_MATRIX_ROWS[row_id] for row_id in EXPECTED_ROW_IDS],
     }
@@ -383,7 +380,7 @@ def test_route_disappearance_preserves_release_reference(
         assert address is not None
         endpoint = address if transport == "direct" else relay_url
         assert endpoint is not None
-        retained_ref = cc.export_contract_release_ref(PortableNoPayload)
+        retained_ref = cc.contract.release_ref(PortableNoPayload)
         proxy = cc.connect(
             PortableNoPayload,
             name=route_name,
@@ -391,10 +388,7 @@ def test_route_disappearance_preserves_release_reference(
         )
         try:
             assert proxy.ping() is None
-            retained_route = (
-                proxy.client.route_uid,
-                proxy.client.route_revision,
-            )
+            retained_route = proxy.client.route_uid
             cc.unregister(route_name)
             expected_error = (
                 ResourceRemoved
@@ -403,9 +397,8 @@ def test_route_disappearance_preserves_release_reference(
             )
             with pytest.raises(expected_error):
                 proxy.ping()
-            assert cc.export_contract_release_ref(PortableNoPayload) == retained_ref
-            assert retained_route[0]
-            assert retained_route[1] > 0
+            assert cc.contract.release_ref(PortableNoPayload) == retained_ref
+            assert retained_route
         finally:
             cc.close(proxy)
             _reset_default_runtime()
@@ -475,7 +468,7 @@ def test_contract_fingerprint_mismatch_is_transport_scoped(
             resource.close()
 
 
-def test_held_response_invalidates_before_relay_lease_release(
+def test_held_response_invalidates_before_local_buffer_release(
     matrix_artifacts: MatrixArtifacts,
 ) -> None:
     with MatrixRelay(matrix_artifacts, "held-response-relay") as relay:
@@ -505,12 +498,12 @@ def test_held_response_invalidates_before_relay_lease_release(
             with cc.hold(proxy.roundtrip)(source) as held:
                 retained = held.value
                 root, detached = inspect_record_payload(retained)
-                assert cc.hold_stats()["active_holds"] == 1
+                assert cc.observe.memory_stats()["holds"]["active_holds"] == 1
             assert root is not None
             assert detached is not None
             assert_view_invalidated(root)
             assert_record_detached(detached)
-            assert cc.hold_stats()["active_holds"] == 0
+            assert cc.observe.memory_stats()["holds"]["active_holds"] == 0
             resource.assert_lifetime()
         finally:
             for value in (root, detached, retained, source):

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
@@ -62,6 +63,77 @@ def test_close_stops_a_live_tree(tmp_path):
         assert tree.process.poll() is not None
         assert not tree.alive()
         tree.close()
+
+
+def _posix_probe_tree(platform):
+    tree = platform.ProcessTree.__new__(platform.ProcessTree)
+    tree._closed = False
+    tree._job = None
+    tree.process = SimpleNamespace(pid=12345, wait=lambda **kwargs: 0)
+    return tree
+
+
+def test_stop_waits_for_confirmed_empty_process_group(monkeypatch):
+    platform = backend()
+    tree = _posix_probe_tree(platform)
+    probes = []
+
+    def killpg(pid, sig):
+        assert pid == tree.process.pid
+        if sig == 0:
+            probes.append(sig)
+            if len(probes) <= 2:
+                raise PermissionError(1, 'Operation not permitted')
+            raise ProcessLookupError(3, 'No such process')
+
+    monkeypatch.setattr(platform.os, 'killpg', killpg, raising=False)
+    monkeypatch.setattr(platform, 'time', SimpleNamespace(monotonic=lambda: 0, sleep=lambda _: None))
+    tree.stop()
+    assert len(probes) >= 3
+    assert not tree.alive()
+
+
+def test_close_keeps_unconfirmed_process_group_open(monkeypatch):
+    platform = backend()
+    tree = _posix_probe_tree(platform)
+    absent = False
+
+    def killpg(pid, sig):
+        assert pid == tree.process.pid
+        if absent:
+            raise ProcessLookupError(3, 'No such process')
+        if sig == 0:
+            raise PermissionError(1, 'Operation not permitted')
+
+    ticks = iter((0, 6))
+    monkeypatch.setattr(platform.os, 'killpg', killpg, raising=False)
+    monkeypatch.setattr(platform, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+    with pytest.raises(OSError, match='unconfirmed'):
+        tree.close()
+    assert not tree._closed
+    assert tree.alive()
+    absent = True
+    tree.close()
+    assert not tree.alive()
+
+
+def test_close_preserves_job_when_empty_query_fails():
+    platform = backend()
+    tree = _posix_probe_tree(platform)
+    closed = []
+
+    def unknown():
+        raise PermissionError(1, 'Cannot query owned Job')
+
+    tree._job = SimpleNamespace(alive=unknown, close=lambda: closed.append(True))
+    with pytest.raises(PermissionError, match='Cannot query'):
+        tree.close()
+    assert not tree._closed
+    assert closed == []
+    tree._job.alive = lambda: False
+    tree.close()
+    assert closed == [True]
+    assert not tree.alive()
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows Job process image diagnostics')
@@ -121,9 +193,11 @@ def test_compiler_helper_cleanup_requires_exact_scope(tmp_path, monkeypatch, liv
             tree.close()
 
 
-def test_resource_lease_rejects_competing_process_and_releases(tmp_path):
+def test_resource_lease_rejects_competing_process_and_releases(tmp_path, monkeypatch):
     platform = backend()
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
     code = ('from pathlib import Path\nfrom tools.dev.test_platform import resource_lease, PlatformError\n'
+            f'Path.home = lambda: Path({str(tmp_path)!r})\n'
             f'try:\n    with resource_lease(Path({str(tmp_path)!r})):\n        raise SystemExit(9)\n'
             'except PlatformError:\n    print("rejected")\n')
     env = {**os.environ, 'PYTHONPATH': str(ROOT), 'TMP': str(tmp_path)}

@@ -19,7 +19,7 @@ import c_two as cc
 from c_two.transport.server import Server
 from c_two.transport.client.util import ping
 from c_two.transport.registry import _get_default_runtime
-from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
+from c_two.transport.server.scheduler import ConcurrencyConfig
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +284,7 @@ class TestUnregisterDrain:
             DrainImpl(),
             name='drain_route',
             concurrency=ConcurrencyConfig(
-                mode=ConcurrencyMode.PARALLEL,
+                mode='parallel',
                 max_workers=2,
             ),
         )

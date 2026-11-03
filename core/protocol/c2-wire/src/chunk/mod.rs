@@ -10,14 +10,10 @@ pub mod config;
 pub mod header;
 pub mod registry;
 
-// Re-export header codec at chunk:: level for backward compatibility.
-// Existing code uses c2_wire::chunk::encode_chunk_header etc.
-pub use header::*;
-
 // Re-export key types at chunk:: level.
 pub use backing::ReassemblyBacking;
 pub use config::ChunkConfig;
-pub use registry::{ChunkAssemblyId, ChunkRegistry, GcStats};
+pub use registry::{ChunkRegistry, ChunkRequest, GcStats};
 
 /// The actual reason chunk admission failed, decided before publication.
 /// Diagnostic text never determines protocol versus local capacity semantics.

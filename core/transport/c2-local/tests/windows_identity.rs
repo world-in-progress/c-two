@@ -5,7 +5,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::time::Duration;
 
-use c2_local::{LocalEndpoint, LocalListener, LocalStream, OwnerBootstrap, connect_windows_pipe};
+use c2_local::{LocalEndpoint, LocalListener, LocalStream, connect_windows_pipe};
 use c2_local_security::{
     LocalSecurityAttributes, current_user_sid, verify_current_user_pipe_owner,
 };
@@ -218,15 +218,6 @@ fn token_user_owner_is_verified_even_when_no_client_has_connected() {
     let server = raw_server(&endpoint, security.as_mut_ptr());
     use std::os::windows::io::AsHandle;
     verify_current_user_pipe_owner(server.as_handle()).unwrap();
-    // Bootstrap adoption is a launcher capability. It must not depend on a
-    // connected/live controller or query the PID of a missing peer.
-    let adopted = unsafe { OwnerBootstrap::from_inherited_handle(server.as_raw_handle()) }.unwrap();
-    drop(adopted);
-    let mut flags = 0;
-    assert_ne!(
-        unsafe { GetHandleInformation(server.as_raw_handle(), &mut flags) },
-        0
-    );
 }
 
 // This test creates a real foreign-owned pipe object. Ordinary user tokens
@@ -235,13 +226,13 @@ fn token_user_owner_is_verified_even_when_no_client_has_connected() {
 // runner cannot create this fixture.
 #[tokio::test]
 #[ignore = "requires a Windows token permitted to create Administrators-owned objects; run elevated with --ignored"]
-async fn foreign_object_owner_rejects_connect_listener_join_and_bootstrap_adoption() {
+async fn foreign_object_owner_rejects_connect_and_listener_join() {
     use std::os::windows::io::AsHandle;
     let sddl: Vec<_> = format!("O:BAD:P(A;;GA;;;{})", current_user_sid().unwrap())
         .encode_utf16()
         .chain(Some(0))
         .collect();
-    for mode in ["raw", "stream", "listener", "bootstrap"] {
+    for mode in ["raw", "stream", "listener"] {
         let endpoint = endpoint();
         let mut descriptor = std::ptr::null_mut();
         assert_ne!(
@@ -276,9 +267,6 @@ async fn foreign_object_owner_rejects_connect_listener_join_and_bootstrap_adopti
                 .err()
                 .unwrap(),
             "listener" => LocalListener::bind(&endpoint).err().unwrap(),
-            "bootstrap" => unsafe { OwnerBootstrap::from_inherited_handle(server.as_raw_handle()) }
-                .err()
-                .unwrap(),
             _ => unreachable!(),
         };
         assert_eq!(

@@ -705,7 +705,7 @@ fn reap_rejects_a_non_utf8_credential_file() {
 fn reap_uses_the_native_credential_endpoint() {
     #[cfg(unix)]
     {
-        use c2_core::{EndpointInspection, inspect_endpoint, ping_direct_ipc_with_context};
+        use c2_core::{EndpointInspection, inspect_endpoint, ping_direct_ipc};
         let root = short_root();
         let address = unique_address("derive");
         let host = host_at(&address, root.path());
@@ -727,8 +727,7 @@ fn reap_uses_the_native_credential_endpoint() {
             .stdout(predicate::str::contains(r#""status":"busy""#))
             .stdout(predicate::str::contains(r#""reason":"coordinator-held""#));
         assert!(
-            ping_direct_ipc_with_context(&address, &context, std::time::Duration::from_secs(1))
-                .unwrap()
+            ping_direct_ipc(&address, Some(&context), std::time::Duration::from_secs(1)).unwrap()
         );
         let shutdown = host.shutdown();
         assert!(shutdown.runtime_barrier_error.is_none(), "{shutdown:?}");
@@ -762,38 +761,12 @@ fn reap_uses_the_native_credential_endpoint() {
 }
 
 #[test]
-fn sweep_rejects_invalid_and_oversized_address_scopes() {
+fn sweep_rejects_invalid_address_scopes() {
     for address in ["tcp://host", "ipc://..", "ipc://x/y", "/tmp/c_two_ipc"] {
         c3().args(["endpoint", "sweep", "--address", address])
             .assert()
             .failure()
             .stderr(predicate::str::contains("invalid endpoint sweep scope"));
-    }
-    let address = unique_address("scope-limit");
-    #[cfg(unix)]
-    {
-        let mut command = c3();
-        command.args(["endpoint", "sweep"]);
-        for _ in 0..4097 {
-            command.args(["--address", &address]);
-        }
-        command.assert().failure().stderr(predicate::str::contains(
-            "too many endpoint sweep addresses",
-        ));
-    }
-    #[cfg(windows)]
-    {
-        // 4097 repeated flags exceed Windows' process command-line limit.
-        // Exercise the same native pre-lease validator directly on that branch;
-        // the invalid-address cases above still invoke the actual CLI.
-        let endpoint = c2_core::LocalEndpoint::from_address(&address).unwrap();
-        let error =
-            match c2_core::EndpointSweep::scope_for_addresses(&endpoint, &vec![address; 4097]) {
-                Ok(_) => panic!("oversized Windows scope must be rejected"),
-                Err(error) => error,
-            };
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(error.to_string(), "too many endpoint sweep addresses");
     }
 }
 

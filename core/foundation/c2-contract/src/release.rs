@@ -1,6 +1,6 @@
 use crate::descriptor::canonical_json;
 use crate::{
-    ContractError, ContractLimits, ExpectedRouteContract, ValidatedContractDescriptor,
+    ContractError, ExpectedRouteContract, ValidatedContractDescriptor,
     admission::{JsonDocumentKind, parse_bounded_json},
     validate_contract_hash, validate_contract_text_field, validate_expected_route_contract,
 };
@@ -67,15 +67,8 @@ pub struct ContractRelease {
 
 impl ContractRelease {
     pub fn from_descriptor_json(bytes: &[u8]) -> Result<Self, ContractError> {
-        Self::from_descriptor_json_with_limits(bytes, ContractLimits::default())
-    }
-
-    pub fn from_descriptor_json_with_limits(
-        bytes: &[u8],
-        limits: ContractLimits,
-    ) -> Result<Self, ContractError> {
         Ok(Self {
-            descriptor: ValidatedContractDescriptor::from_json_with_limits(bytes, limits)?,
+            descriptor: ValidatedContractDescriptor::from_json(bytes)?,
         })
     }
 
@@ -129,14 +122,7 @@ pub struct ContractReleaseRef {
 
 impl ContractReleaseRef {
     pub fn from_json(bytes: &[u8]) -> Result<Self, ContractError> {
-        Self::from_json_with_limits(bytes, ContractLimits::default())
-    }
-
-    pub fn from_json_with_limits(
-        bytes: &[u8],
-        limits: ContractLimits,
-    ) -> Result<Self, ContractError> {
-        let value = parse_bounded_json(bytes, limits, JsonDocumentKind::ContractReleaseRef)?;
+        let value = parse_bounded_json(bytes, JsonDocumentKind::ContractReleaseRef)?;
         let root = ref_object_at(&value, "$")?;
         ensure_ref_keys(
             root,

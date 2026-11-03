@@ -3,7 +3,7 @@
 //! Encodes/decodes the pointer to a buddy-allocated SHM block:
 //!
 //! ```text
-//! [2B seg_idx LE][4B generation LE][4B offset LE][4B data_size LE][1B flags][8B allocation_id LE]
+//! [2B slot LE][4B generation LE][4B offset LE][4B data_size LE][1B kind][8B loan_id LE]
 //! ```
 //!
 //! This layout is part of the canonical wire protocol and is shared by all SDKs.
@@ -11,16 +11,17 @@
 /// Size of the buddy payload header in bytes.
 pub const BUDDY_PAYLOAD_SIZE: usize = 23;
 
-/// Flag bit within the 1-byte buddy flags field: block is a dedicated
-/// (fallback) allocation, not from the main pool.
-pub const BUDDY_FLAG_DEDICATED: u8 = 1 << 0;
+/// Ordinary buddy allocation kind.
+pub const SHM_KIND_BUDDY: u8 = 0;
+/// Dedicated allocation kind.
+pub const SHM_KIND_DEDICATED: u8 = 1;
 
 /// Decoded buddy payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuddyPayload {
     /// Segment index within the buddy pool.
     pub seg_idx: u16,
-    /// Concrete backing generation. Dedicated allocations use zero.
+    /// Concrete nonzero backing generation, for either kind.
     pub generation: u32,
     /// Byte offset within the segment.
     pub offset: u32,
@@ -28,8 +29,8 @@ pub struct BuddyPayload {
     pub data_size: u32,
     /// Whether this is a dedicated (fallback) segment.
     pub is_dedicated: bool,
-    /// Exact allocation instance for buddy blocks; dedicated allocations use zero.
-    pub allocation_id: u64,
+    /// Nonzero loan identity in the sending direction of this physical connection.
+    pub loan_id: u64,
 }
 
 // ── Encoding ─────────────────────────────────────────────────────────────
@@ -42,11 +43,11 @@ pub fn encode_buddy_payload(bp: &BuddyPayload) -> [u8; BUDDY_PAYLOAD_SIZE] {
     buf[6..10].copy_from_slice(&bp.offset.to_le_bytes());
     buf[10..14].copy_from_slice(&bp.data_size.to_le_bytes());
     buf[14] = if bp.is_dedicated {
-        BUDDY_FLAG_DEDICATED
+        SHM_KIND_DEDICATED
     } else {
-        0
+        SHM_KIND_BUDDY
     };
-    buf[15..23].copy_from_slice(&bp.allocation_id.to_le_bytes());
+    buf[15..23].copy_from_slice(&bp.loan_id.to_le_bytes());
     buf
 }
 
@@ -68,25 +69,27 @@ pub fn decode_buddy_payload(buf: &[u8]) -> Result<(BuddyPayload, usize), DecodeE
     let generation = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
     let offset = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
     let data_size = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
-    let flags = buf[14];
-    if flags & !BUDDY_FLAG_DEDICATED != 0 {
-        return Err(DecodeError::InvalidValue {
-            field: "buddy flags",
-            value: flags as u64,
-        });
-    }
-    let is_dedicated = flags & BUDDY_FLAG_DEDICATED != 0;
-    if is_dedicated != (generation == 0) {
+    let is_dedicated = match buf[14] {
+        SHM_KIND_BUDDY => false,
+        SHM_KIND_DEDICATED => true,
+        kind => {
+            return Err(DecodeError::InvalidValue {
+                field: "SHM kind",
+                value: kind as u64,
+            });
+        }
+    };
+    if generation == 0 {
         return Err(DecodeError::InvalidValue {
             field: "backing generation",
             value: generation as u64,
         });
     }
-    let allocation_id = u64::from_le_bytes(buf[15..23].try_into().unwrap());
-    if (is_dedicated && allocation_id != 0) || (!is_dedicated && allocation_id == 0) {
+    let loan_id = u64::from_le_bytes(buf[15..23].try_into().unwrap());
+    if loan_id == 0 {
         return Err(DecodeError::InvalidValue {
-            field: "allocation id",
-            value: allocation_id,
+            field: "loan id",
+            value: loan_id,
         });
     }
     Ok((
@@ -96,7 +99,7 @@ pub fn decode_buddy_payload(buf: &[u8]) -> Result<(BuddyPayload, usize), DecodeE
             offset,
             data_size,
             is_dedicated,
-            allocation_id,
+            loan_id,
         },
         BUDDY_PAYLOAD_SIZE,
     ))

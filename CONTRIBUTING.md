@@ -53,7 +53,7 @@ For local Unix validation with two Python workers, prepare the native extension,
   --c3 cli/target/debug/c3 --workers 2 --output /tmp/c-two-python-validation
 ```
 
-The output directory must be new. Ordinary test files run in parallel; the complete Rust/Python and TypeScript matrices run serially and retain strict receipts. The runner rejects missing inputs, skips, omitted tests and failed cleanup. A test that applies to only one platform family uses `@pytest.mark.platform("windows")` or `@pytest.mark.platform("posix")`; that marker's skip is the only one the runner accepts. See [the validation guide](docs/reports/2026-10-02-python-parallel-validation.md) for preparation and evidence details. Windows uses its existing native gates.
+The output directory must be new. Ordinary test files run in parallel; the complete Rust/Python and TypeScript matrices run serially and retain strict receipts. The runner rejects missing inputs, skips, omitted tests and failed cleanup. A test that applies to only one platform family uses `@pytest.mark.platform("windows")` or `@pytest.mark.platform("posix")`; that marker's skip is the only one the runner accepts. See [the validation guide](docs/acceptance/2026-10-02-python-parallel-validation.md) for preparation and evidence details. Windows uses its existing native gates.
 
 All new code **must** include tests. Ensure the full suite passes before opening a PR.
 

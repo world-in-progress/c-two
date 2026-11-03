@@ -9,7 +9,6 @@ import pytest
 
 from c_two.error import ResourceClosed
 from c_two.transport.client.proxy import CRMProxy
-from c_two.transport.server.scheduler import ConcurrencyMode
 
 
 class Resource:
@@ -52,7 +51,7 @@ class FakeScheduler:
 def test_unconstrained_call_direct_still_enters_native_guard_for_lifecycle():
     scheduler = FakeScheduler(
         snapshot=SimpleNamespace(
-            mode=ConcurrencyMode.PARALLEL,
+            mode='parallel',
             max_pending=None,
             max_workers=None,
             closed=False,
@@ -68,7 +67,7 @@ def test_unconstrained_call_direct_still_enters_native_guard_for_lifecycle():
 def test_constrained_call_direct_enters_native_guard_by_method_index():
     scheduler = FakeScheduler(
         snapshot=SimpleNamespace(
-            mode=ConcurrencyMode.EXCLUSIVE,
+            mode='exclusive',
             max_pending=None,
             max_workers=None,
             closed=False,
@@ -85,7 +84,7 @@ def test_closed_call_direct_fails_before_entering_resource():
     resource = RecordingResource()
     scheduler = FakeScheduler(
         snapshot=SimpleNamespace(
-            mode=ConcurrencyMode.PARALLEL,
+            mode='parallel',
             max_pending=None,
             max_workers=None,
             closed=True,
@@ -105,7 +104,7 @@ def test_closed_call_direct_fails_before_entering_resource():
 def test_resource_runtime_error_named_route_closed_is_not_reclassified():
     scheduler = FakeScheduler(
         snapshot=SimpleNamespace(
-            mode=ConcurrencyMode.PARALLEL,
+            mode='parallel',
             max_pending=None,
             max_workers=None,
             closed=False,

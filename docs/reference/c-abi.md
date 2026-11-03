@@ -1,0 +1,19 @@
+# C/FFI ABI
+
+This page defines the current `c2-mem-ffi` ABI boundary for native endpoint and memory consumers.
+
+## ABI 7 and consumers
+
+The current `c2-mem-ffi` ABI is 7. It requires the complete endpoint-context symbol group, including verified Windows connection transfer, and one memory context per verified connection. Official Windows Node connections must use that native entry; raw socket, path, or symbol injection is rejected. Transfer an unregistered pipe into Node's own CRT/libuv, retain the process pin through socket closure, and close late results through their existing owner. Do not create a second receive loop or compatibility loader. Endpoint C functions accept the logical address without a protocol selector; consumers validate the ABI before exposing or invoking functions. The Unix and Windows connect entries take a nullable `timeout_millis`: NULL keeps the native five-second phase guards, and a value is the budget remaining for that connection attempt, including the namespace gate and endpoint identity verification. The caller subtracts any time spent queued before the call. Historical manifests and receipts retain their actual source ABI.
+
+## Memory context
+
+`c2_mem_ffi_memory_context_new` borrows a connection that c2-local has already verified (on Windows, the pipe and its pinned server process) and performs no transport I/O: the consumer's driver alone reads and writes. After the final metadata ACK, `c2_mem_ffi_memory_context_finish_handshake` records the peer's prefix; a NULL prefix disables response SHM. A `C2MemFfiBlock` descriptor carries the segment index, dedicated flag, generation, offset, byte length and a nonzero `loan_id`. Node and TypeScript carry `loan_id` and request IDs as lossless `bigint` values.
+
+- `c2_mem_ffi_request_prepare` copies the caller's bytes into a block of the context's own pool and returns an opaque owner with its descriptor; `c2_mem_ffi_request_discard` frees an owner that was never written.
+- `c2_mem_ffi_write_begin` takes the connection's unique writer for one business frame, one control frame or queued releases only, and consumes the request owner on every path. Its prefix holds any queued release frames, which the driver writes before its own frame. `c2_mem_ffi_write_start` marks that I/O has begun, and `c2_mem_ffi_write_complete` with success proves that every frame was written and flushed; without success the I/O failed or is uncertain, the framing is broken, and the prefix is never replayed nor its loans reclaimed. `c2_mem_ffi_write_discard` ends a write without completing it.
+- `c2_mem_ffi_response_admit` admits each received descriptor once; a mapping failure also queues the release. `c2_mem_ffi_response_consume` copies into the caller's `dst`, ends the remote read and queues the release in one step, and consumes the response even when `dst` is NULL or too short. `c2_mem_ffi_response_discard` releases a response that is never read.
+- `c2_mem_ffi_memory_context_receive_release` settles the context's own loans named by a release frame from the peer.
+- `c2_mem_ffi_memory_context_deactivate` stops new loans while control frames stay writable. `c2_mem_ffi_memory_context_peer_end` is reported only for read EOF or Unix ECONNRESET, never for a local close, write failure or deadline. `c2_mem_ffi_memory_context_try_close` reports when every remote read and loan is settled and the stream may close.
+
+ABI 7 removes the request and response pool objects with their segment queries, `request_pool_read_local`, `request_pool_forget_consumed`, and the split read-then-release contract of `response_pool_read` / `response_pool_release`. The [IPC handshake specification](ipc-handshake.md) describes protocol version 15. See the [memory policy](memory-policy.md) for loans and release frames, and the [Windows native implementation](windows-native-implementation.md) for the verified connection path.

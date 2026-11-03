@@ -2,6 +2,14 @@ import { createRequire } from "node:module";
 import { createConnection, Socket } from "node:net";
 import { closeSync } from "node:fs";
 
+interface C2NodeTimer { unref(): void; }
+const { setTimeout, clearTimeout, setImmediate } = createRequire(import.meta.url)("node:timers") as {
+  setTimeout(callback: () => void, delayMillis: number): C2NodeTimer;
+  clearTimeout(timer: C2NodeTimer): void;
+  setImmediate(callback: () => void): void;
+};
+const { performance } = createRequire(import.meta.url)("node:perf_hooks") as { performance: { now(): number } };
+
 export const C2_MEM_FFI_STATUS_OK = 0;
 export const C2_MEM_FFI_STATUS_NULL_POINTER = 1;
 export const C2_MEM_FFI_STATUS_INVALID_ARGUMENT = 2;
@@ -12,8 +20,7 @@ export const C2_MEM_FFI_STATUS_PERMISSION_DENIED = 6;
 export const C2_MEM_FFI_STATUS_IDENTITY_MISMATCH = 7;
 
 export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 255;
-export const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
-export const C2_MEM_FFI_ABI_VERSION = 6;
+export const C2_MEM_FFI_ABI_VERSION = 7;
 
 export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_OK
@@ -32,105 +39,62 @@ export interface C2MemFfiCallResult<T = void> {
   readonly value?: T;
 }
 
-export interface C2MemFfiPoolConfig {
-  readonly prefix: string;
-  /**
-   * Request pools create backings with this exact data capacity. Response
-   * pools only open peer backings, so for them this is a bootstrap capacity
-   * floor: c2-mem derives the real geometry from the mapped segment at
-   * prefix/index/generation and validates capacity, byte range, and
-   * generation. Response readers must not treat this value as a claim about
-   * the server's segment size.
-   */
-  readonly segmentSize: number;
-  readonly maxSegments: number;
-  readonly minBlockSize: number;
-}
-
-export interface C2MemFfiShmSegment {
-  readonly name: string;
-  readonly size: number;
-}
-
-export interface C2MemFfiRequestBlock {
+export interface C2MemFfiBlock {
   readonly segmentIndex: number;
   readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
-  readonly allocationId: bigint;
+  readonly loanId: bigint;
   readonly dedicated: boolean;
 }
-
-export interface C2MemFfiResponseBlock extends C2MemFfiRequestBlock {
-  readonly prefix?: string;
-  readonly segments?: readonly C2MemFfiShmSegment[];
+export interface C2MemFfiPreparedRequest { readonly block: C2MemFfiBlock; }
+export interface C2MemFfiWrite {
+  readonly prefix: Uint8Array;
+  start(): void;
+  complete(success: boolean): void;
+  discard(): void;
 }
-
-export interface C2MemFfiNativeResponsePool {
-  read(block: C2MemFfiResponseBlock, destination: Uint8Array): MaybePromise<void>;
-  release(block: C2MemFfiResponseBlock): MaybePromise<void>;
-  close?(): MaybePromise<void>;
-}
-
-export interface C2MemFfiNativeRequestPool {
+export interface C2MemFfiMemoryContext {
   readonly prefix: string;
-  readonly segments: readonly C2MemFfiShmSegment[];
-  write(payload: Uint8Array): MaybePromise<C2MemFfiRequestBlock>;
-  release(block: C2MemFfiRequestBlock): MaybePromise<void>;
-  forgetConsumed(block: C2MemFfiRequestBlock): MaybePromise<void>;
-  close?(): MaybePromise<void>;
+  readonly writeTimeoutMillis: number;
+  finishHandshake(prefix: string | null): void;
+  prepareRequest(payload: Uint8Array): C2MemFfiPreparedRequest;
+  discardRequest(request: C2MemFfiPreparedRequest): void;
+  admitResponse(block: C2MemFfiBlock): unknown;
+  consumeResponse(response: unknown, destination: Uint8Array): void;
+  discardResponse(response: unknown): void;
+  beginWrite(kind: 0 | 1 | 2, request?: C2MemFfiPreparedRequest): C2MemFfiWrite | undefined;
+  receiveRelease(frame: Uint8Array): void;
+  gc(): number;
+  deactivate(): void;
+  peerEnd(): void;
+  tryClose(): boolean;
+  close(): void;
 }
-
-export interface C2MemFfiNativeResponseBackend {
-  readResponse(block: C2MemFfiResponseBlock, destination: Uint8Array): MaybePromise<void>;
-  releaseResponse(block: C2MemFfiResponseBlock): MaybePromise<void>;
-  close(): Promise<void>;
-}
-
-export interface C2MemFfiNativeRequestBackend {
-  readonly prefix: string;
-  readonly segments: readonly C2MemFfiShmSegment[];
-  writeRequest(payload: Uint8Array): MaybePromise<C2MemFfiRequestBlock>;
-  releaseRequest(block: C2MemFfiRequestBlock): MaybePromise<void>;
-  markRequestConsumed(block: C2MemFfiRequestBlock): MaybePromise<void>;
-  close(): Promise<void>;
-}
-
-export interface C2MemFfiAbiSymbols {
-  c2_mem_ffi_abi_version(): MaybePromise<number>;
-}
-
-export interface C2MemFfiRequestPoolSymbols<Handle = unknown> extends C2MemFfiAbiSymbols {
-  c2_mem_ffi_request_pool_new(
-    prefix: string,
-    segmentSize: number,
-    maxSegments: number,
-    minBlockSize: number,
-  ): MaybePromise<C2MemFfiCallResult<Handle>>;
-  c2_mem_ffi_request_pool_destroy(pool: Handle): MaybePromise<void>;
-  c2_mem_ffi_request_pool_prefix(pool: Handle): MaybePromise<C2MemFfiCallResult<string>>;
-  c2_mem_ffi_request_pool_segment_count(pool: Handle): MaybePromise<C2MemFfiCallResult<number>>;
-  c2_mem_ffi_request_pool_segment_name(pool: Handle, segmentIndex: number): MaybePromise<C2MemFfiCallResult<string>>;
-  c2_mem_ffi_request_pool_segment_data_size(pool: Handle, segmentIndex: number): MaybePromise<C2MemFfiCallResult<number>>;
-  c2_mem_ffi_request_pool_write(pool: Handle, payload: Uint8Array): MaybePromise<C2MemFfiCallResult<C2MemFfiRequestBlock>>;
-  c2_mem_ffi_request_pool_release(pool: Handle, block: C2MemFfiRequestBlock): MaybePromise<C2MemFfiCallResult>;
-  c2_mem_ffi_request_pool_forget_consumed(pool: Handle, block: C2MemFfiRequestBlock): MaybePromise<C2MemFfiCallResult>;
-}
-
-export interface C2MemFfiResponsePoolSymbols<Handle = unknown> extends C2MemFfiAbiSymbols {
-  c2_mem_ffi_response_pool_new(
-    prefix: string,
-    segmentSize: number,
-    maxSegments: number,
-    minBlockSize: number,
-  ): MaybePromise<C2MemFfiCallResult<Handle>>;
-  c2_mem_ffi_response_pool_destroy(pool: Handle): MaybePromise<void>;
-  c2_mem_ffi_response_pool_read(pool: Handle, block: C2MemFfiResponseBlock, destination: Uint8Array): MaybePromise<C2MemFfiCallResult>;
-  c2_mem_ffi_response_pool_release(pool: Handle, block: C2MemFfiResponseBlock): MaybePromise<C2MemFfiCallResult>;
+export interface C2MemFfiNativeMemoryContext {
+  prefix(): C2MemFfiCallResult<string>;
+  finishHandshake(prefix: string | null): C2MemFfiCallResult;
+  prepareRequest(payload: Uint8Array): C2MemFfiCallResult<C2MemFfiPreparedRequest>;
+  discardRequest(request: C2MemFfiPreparedRequest): C2MemFfiCallResult;
+  admitResponse(block: C2MemFfiBlock): C2MemFfiCallResult<unknown>;
+  consumeResponse(response: unknown, destination: Uint8Array): C2MemFfiCallResult<number>;
+  discardResponse(response: unknown): C2MemFfiCallResult;
+  beginWrite(kind: number, request?: C2MemFfiPreparedRequest): C2MemFfiCallResult<{ readonly prefix: Uint8Array }>;
+  startWrite(write: unknown): C2MemFfiCallResult;
+  completeWrite(write: unknown, success: boolean): C2MemFfiCallResult;
+  discardWrite(write: unknown): C2MemFfiCallResult;
+  receiveRelease(frame: Uint8Array): C2MemFfiCallResult;
+  gc(): C2MemFfiCallResult<number>;
+  writeTimeout(): C2MemFfiCallResult<number>;
+  deactivate(): C2MemFfiCallResult;
+  peerEnd(): C2MemFfiCallResult;
+  tryClose(): C2MemFfiCallResult<boolean>;
+  close(): C2MemFfiCallResult;
 }
 
 /** Native addon owner; the Rust context pointer is never exposed to JavaScript. */
 export interface C2MemFfiNativeUnixSocket {
+  takeMemory(): C2MemFfiNativeMemoryContext;
   takeFd(): number;
   close(): void;
 }
@@ -142,6 +106,7 @@ export interface C2MemFfiNativeUnixSocket {
  * the owner is closed or collected.
  */
 export interface C2MemFfiNativeWindowsSocket {
+  takeMemory(): C2MemFfiNativeMemoryContext;
   takeFd(): number;
   close(): void;
 }
@@ -149,8 +114,8 @@ export interface C2MemFfiNativeWindowsSocket {
 export interface C2MemFfiNativeLocalEndpointContext {
   endpointName(address: string): C2MemFfiCallResult<string>;
   namespaceId(): C2MemFfiCallResult<string>;
-  connectUnix?(address: string): Promise<C2MemFfiCallResult<C2MemFfiNativeUnixSocket>>;
-  connectWindows?(address: string): Promise<C2MemFfiCallResult<C2MemFfiNativeWindowsSocket>>;
+  connectUnix?(address: string, timeoutMs?: number): Promise<C2MemFfiCallResult<C2MemFfiNativeUnixSocket>>;
+  connectWindows?(address: string, timeoutMs?: number): Promise<C2MemFfiCallResult<C2MemFfiNativeWindowsSocket>>;
   close(): void;
 }
 
@@ -169,22 +134,12 @@ export interface C2MemFfiLocalEndpointSymbols {
   c2_mem_ffi_endpoint_context_connect_windows?(
     context: C2MemFfiNativeLocalEndpointContext,
     address: string,
+    timeoutMs?: number,
   ): Promise<C2MemFfiCallResult<C2MemFfiNativeWindowsSocket>>;
 }
 
-export interface C2MemFfiNodeNativeExtraSymbols<Handle = unknown> extends C2MemFfiLocalEndpointSymbols {
-  c2_mem_ffi_request_pool_read_local(pool: Handle, block: C2MemFfiRequestBlock, destination: Uint8Array): MaybePromise<C2MemFfiCallResult<number>>;
-}
-
-export type C2MemFfiNodeNativeRawSymbols<Handle = unknown> =
-  C2MemFfiRequestPoolSymbols<Handle>
-  & C2MemFfiResponsePoolSymbols<Handle>
-  & C2MemFfiNodeNativeExtraSymbols<Handle>;
-
-export interface C2MemFfiNodeNativeSymbols<Handle = unknown> {
-  readonly requestSymbols: C2MemFfiRequestPoolSymbols<Handle>;
-  readonly responseSymbols: C2MemFfiResponsePoolSymbols<Handle>;
-  readonly symbols: C2MemFfiNodeNativeRawSymbols<Handle>;
+export interface C2MemFfiNodeNativeSymbols {
+  readonly symbols: C2MemFfiLocalEndpointSymbols;
 }
 
 export interface C2MemFfiNodeNativeLoadOptions {
@@ -215,25 +170,23 @@ export interface C2MemFfiLocalEndpointOptions extends C2MemFfiNodeNativeLoadOpti
   readonly endpointContext?: C2MemFfiLocalEndpointContext;
 }
 
-export interface C2MemFfiResponsePoolFactory {
-  createResponsePool(config: C2MemFfiPoolConfig): Promise<C2MemFfiNativeResponsePool>;
-}
-
 export interface C2MemFfiNodeRuntime {
   readonly connect: C2NodeIpcConnector;
   readonly resolveEndpoint: (address: string) => string;
-  readonly responsePoolFactory: C2MemFfiResponsePoolFactory;
-  /** Release this runtime's endpoint snapshot; existing sockets remain usable. */
   close(): void;
 }
 
 export interface C2NodeIpcConnection {
+  readonly memory?: C2MemFfiMemoryContext | undefined;
+  readonly deactivated?: boolean;
+  readonly deactivation?: Promise<void>;
+  deactivate?(): void;
   write(data: Uint8Array): MaybePromise<void>;
   readExactly(byteLength: number): MaybePromise<Uint8Array>;
   close(): MaybePromise<void>;
 }
 
-export type C2NodeIpcConnect = (address: string) => MaybePromise<C2NodeIpcConnection>;
+export type C2NodeIpcConnect = (address: string, timeoutMs?: number) => MaybePromise<C2NodeIpcConnection>;
 
 /** First connect attempt freezes native configuration, including failed attempts. */
 export type C2NodeIpcConnector = C2NodeIpcConnect & {
@@ -268,11 +221,11 @@ export interface C2NodeIpcConnectOptions extends C2MemFfiLocalEndpointOptions {
   readonly createConnection?: (socketPath: string) => C2NodeIpcSocket;
 }
 
-interface C2MemFfiNodeNativeAddon<Handle = unknown> {
-  load(libraryPath: string): C2MemFfiNodeNativeRawSymbols<Handle>;
+interface C2MemFfiNodeNativeAddon {
+  load(libraryPath: string): C2MemFfiLocalEndpointSymbols;
 }
 
-const nodeNativeSymbolsCache = new Map<string, C2MemFfiNodeNativeRawSymbols<unknown>>();
+const nodeNativeSymbolsCache = new Map<string, C2MemFfiLocalEndpointSymbols>();
 const C2_MEM_FFI_NODE_ADDON_PATH = "./native/c2_mem_ffi_node.node";
 
 export class C2MemFfiBindingError extends Error {
@@ -343,7 +296,7 @@ export function captureLocalIpcEndpointContext(
   return captureLocalIpcEndpointContextFromSymbols(symbols, options);
 }
 
-/** Capture through a loaded ABI 6 library. */
+/** Capture through a loaded ABI 7 library. */
 export function captureLocalIpcEndpointContextFromSymbols(
   symbols: C2MemFfiLocalEndpointSymbols,
   options: C2MemFfiLocalEndpointCaptureOptions = {},
@@ -438,9 +391,9 @@ export function resolveBundledC2MemFfiNodeNativeLibraryPath(): string {
   return require.resolve(`./native/${libraryName}`);
 }
 
-export function loadBundledC2MemFfiNodeNativeSymbols<Handle = unknown>(
+export function loadBundledC2MemFfiNodeNativeSymbols(
   options: C2MemFfiNodeNativeLoadOptions = {},
-): C2MemFfiNodeNativeSymbols<Handle> {
+): C2MemFfiNodeNativeSymbols {
   return loadC2MemFfiNodeNativeSymbols(resolveBundledC2MemFfiNodeNativeLibraryPath(), options);
 }
 
@@ -448,23 +401,7 @@ export function createBundledC2MemFfiNodeRuntime(
   options: C2MemFfiLocalEndpointOptions = {},
 ): C2MemFfiNodeRuntime {
   const connect = createNodeIpcConnect(options);
-  const loadOptions: C2MemFfiNodeNativeLoadOptions = options.addonPath === undefined ? {} : { addonPath: options.addonPath };
-  return Object.freeze({
-    connect,
-    resolveEndpoint: connect.resolveEndpoint,
-    close: connect.close,
-    responsePoolFactory: Object.freeze({
-      async createResponsePool(
-        config: C2MemFfiPoolConfig,
-      ): Promise<C2MemFfiNativeResponsePool> {
-        const { responseSymbols } = loadBundledC2MemFfiNodeNativeSymbols(loadOptions);
-        return await createC2MemFfiResponsePoolFromSymbols(
-          responseSymbols,
-          config,
-        );
-      },
-    }),
-  });
+  return Object.freeze({ connect, resolveEndpoint: connect.resolveEndpoint, close: connect.close });
 }
 
 /**
@@ -589,7 +526,7 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
     }
     return requireNativeEndpointString(symbols.c2_mem_ffi_local_endpoint(address), "endpoint resolution");
   };
-  const connect = async (address: string): Promise<C2NodeIpcConnection> => {
+  const connect = async (address: string, timeoutMs?: number): Promise<C2NodeIpcConnection> => {
     let socket: C2NodeIpcSocket | undefined;
     try {
       freeze();
@@ -606,24 +543,26 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
         let owner: C2MemFfiNativeWindowsSocket | undefined;
         try {
           const native = nativeEndpointContext(active);
-          const result = await verifiedConnect(native, address);
+          const result = await verifiedConnect(native, address, timeoutMs);
           owner = result?.value;
           if (result?.status !== C2_MEM_FFI_STATUS_OK || owner === undefined
             || typeof owner.takeFd !== "function" || typeof owner.close !== "function") {
             throw new C2NodeIpcConnectionError(`C-Two Node IPC connect failed (${c2MemFfiStatusName(result?.status)}).`);
           }
           requireOpen();
+          const memory = memoryFromNative(owner.takeMemory());
           const fd = owner.takeFd();
           try {
             socket = new Socket({ fd, readable: true, writable: true });
           } catch (error) {
             closeSync(fd);
+            memory.close();
             throw error;
           }
           const pinnedOwner = owner;
           socket.once("close", () => pinnedOwner.close());
           owner = undefined;
-          return new NodeIpcConnection(socket);
+          return new NodeIpcConnection(socket, memory);
         } finally {
           owner?.close();
           closeEndpointContextLease(active);
@@ -637,21 +576,23 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
         const active = leaseEndpointContext(snapshot.owner.state);
         let owner: C2MemFfiNativeUnixSocket | undefined;
         try {
-          const result = await nativeEndpointContext(active).connectUnix!(address);
+          const result = await nativeEndpointContext(active).connectUnix!(address, timeoutMs);
           owner = result?.value;
           if (result?.status !== C2_MEM_FFI_STATUS_OK || owner === undefined
             || typeof owner.takeFd !== "function" || typeof owner.close !== "function") {
             throw new C2NodeIpcConnectionError(`C-Two Node IPC connect failed (${c2MemFfiStatusName(result?.status)}).`);
           }
           requireOpen();
+          const memory = memoryFromNative(owner.takeMemory());
           const fd = owner.takeFd();
           try {
             socket = new Socket({ fd, readable: true, writable: true });
           } catch (error) {
             closeSync(fd);
+            memory.close();
             throw error;
           }
-          return new NodeIpcConnection(socket);
+          return new NodeIpcConnection(socket, memory);
         } finally {
           owner?.close();
           closeEndpointContextLease(active);
@@ -715,10 +656,10 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
   }));
 }
 
-export function loadC2MemFfiNodeNativeSymbols<Handle = unknown>(
+export function loadC2MemFfiNodeNativeSymbols(
   libraryPath: string,
   options: C2MemFfiNodeNativeLoadOptions = {},
-): C2MemFfiNodeNativeSymbols<Handle> {
+): C2MemFfiNodeNativeSymbols {
   if (typeof libraryPath !== "string" || libraryPath.length === 0) {
     throw new C2MemFfiBindingError("c2-mem-ffi native libraryPath must be a non-empty string.");
   }
@@ -729,23 +670,19 @@ export function loadC2MemFfiNodeNativeSymbols<Handle = unknown>(
   const cacheKey = `${addonPath}\0${libraryPath}`;
   const cached = nodeNativeSymbolsCache.get(cacheKey);
   if (cached !== undefined) {
-    const symbols = cached as C2MemFfiNodeNativeRawSymbols<Handle>;
+    const symbols = cached as C2MemFfiLocalEndpointSymbols;
     return {
-      requestSymbols: symbols,
-      responseSymbols: symbols,
       symbols,
     };
   }
   const require = createRequire(import.meta.url);
-  const addon = require(addonPath) as C2MemFfiNodeNativeAddon<Handle>;
+  const addon = require(addonPath) as C2MemFfiNodeNativeAddon;
   if (typeof addon !== "object" || addon === null || typeof addon.load !== "function") {
     throw new C2MemFfiBindingError("c2-mem-ffi Node native addon must export load(libraryPath).");
   }
   const symbols = addon.load(libraryPath);
-  nodeNativeSymbolsCache.set(cacheKey, symbols as C2MemFfiNodeNativeRawSymbols<unknown>);
+  nodeNativeSymbolsCache.set(cacheKey, symbols as C2MemFfiLocalEndpointSymbols);
   return {
-    requestSymbols: symbols,
-    responseSymbols: symbols,
     symbols,
   };
 }
@@ -763,227 +700,61 @@ function bundledC2MemFfiNodeNativeLibraryName(): string {
   throw new C2MemFfiBindingError(`c2-mem-ffi bundled Node native library is not available for ${process.platform}.`);
 }
 
-export async function createC2MemFfiRequestPoolFromSymbols<Handle>(
-  symbols: C2MemFfiRequestPoolSymbols<Handle>,
-  config: C2MemFfiPoolConfig,
-): Promise<C2MemFfiNativeRequestPool> {
-  const normalizedConfig = normalizePoolConfig(config, "c2-mem-ffi request pool config");
-  await requireAbiVersion(symbols, "c2-mem-ffi request pool symbols");
-  const handle = await requireOkValue(
-    await symbols.c2_mem_ffi_request_pool_new(
-      normalizedConfig.prefix,
-      normalizedConfig.segmentSize,
-      normalizedConfig.maxSegments,
-      normalizedConfig.minBlockSize,
-    ),
-    "c2_mem_ffi_request_pool_new",
-  );
-  let closed = false;
+function memoryFromNative(native: C2MemFfiNativeMemoryContext): C2MemFfiMemoryContext {
+  let prefix: string, writeTimeoutMillis: number;
   try {
-    const prefix = await requireOkValue(
-      await symbols.c2_mem_ffi_request_pool_prefix(handle),
-      "c2_mem_ffi_request_pool_prefix",
-    );
-    const segmentCount = await requireOkValue(
-      await symbols.c2_mem_ffi_request_pool_segment_count(handle),
-      "c2_mem_ffi_request_pool_segment_count",
-    );
-    if (segmentCount !== normalizedConfig.maxSegments) {
-      throw new C2MemFfiBindingError(
-        `c2-mem-ffi request pool reported ${segmentCount} segments, expected ${normalizedConfig.maxSegments}.`,
-      );
-    }
-    const segments: C2MemFfiShmSegment[] = [];
-    for (let index = 0; index < segmentCount; index += 1) {
-      const name = await requireOkValue(
-        await symbols.c2_mem_ffi_request_pool_segment_name(handle, index),
-        `c2_mem_ffi_request_pool_segment_name(${index})`,
-      );
-      const size = await requireOkValue(
-        await symbols.c2_mem_ffi_request_pool_segment_data_size(handle, index),
-        `c2_mem_ffi_request_pool_segment_data_size(${index})`,
-      );
-      segments.push({ name, size });
-    }
-    const pool = normalizeRequestPool({
-      prefix,
-      segments,
-      async write(payload: Uint8Array): Promise<C2MemFfiRequestBlock> {
-        ensurePoolOpen(closed, "request");
-        const block = await requireOkValue(
-          await symbols.c2_mem_ffi_request_pool_write(handle, requireUint8Array(payload, "payload")),
-          "c2_mem_ffi_request_pool_write",
-        );
-        try {
-          return requireOwnedRequestBlock(block, payload.byteLength, segments, "write");
-        } catch (error) {
-          await releaseInvalidRequestSymbolBlock(symbols, handle, block, error);
-          throw error;
-        }
-      },
-      async release(block: C2MemFfiRequestBlock): Promise<void> {
-        ensurePoolOpen(closed, "request");
-        await requireOk(
-          await symbols.c2_mem_ffi_request_pool_release(
-            handle,
-            requireOwnedRequestBlock(block, undefined, segments, "release"),
-          ),
-          "c2_mem_ffi_request_pool_release",
-        );
-      },
-      async forgetConsumed(block: C2MemFfiRequestBlock): Promise<void> {
-        ensurePoolOpen(closed, "request");
-        await requireOk(
-          await symbols.c2_mem_ffi_request_pool_forget_consumed(
-            handle,
-            requireOwnedRequestBlock(block, undefined, segments, "forget consumed"),
-          ),
-          "c2_mem_ffi_request_pool_forget_consumed",
-        );
-      },
-      async close(): Promise<void> {
-        if (closed) {
-          return;
-        }
-        closed = true;
-        await symbols.c2_mem_ffi_request_pool_destroy(handle);
-      },
-    }, "c2-mem-ffi request pool symbols");
-    return pool;
-  } catch (error) {
-    if (!closed) {
-      closed = true;
-      await symbols.c2_mem_ffi_request_pool_destroy(handle);
-    }
-    throw error;
+    prefix = requireOkValue(native.prefix(), "memory prefix");
+    writeTimeoutMillis = Math.max(1, Math.ceil(requireOkValue(native.writeTimeout(), "write timeout") * 1000));
   }
-}
-
-/**
- * Open a peer response pool over an owner's advertised SHM prefix.
- *
- * The pool maps nothing until a block references a backing. `config.segmentSize`
- * is only the minimum capacity accepted for buddy backings opened lazily by
- * prefix/index/generation; actual geometry and validation stay in c2-mem.
- */
-export async function createC2MemFfiResponsePoolFromSymbols<Handle>(
-  symbols: C2MemFfiResponsePoolSymbols<Handle>,
-  config: C2MemFfiPoolConfig,
-): Promise<C2MemFfiNativeResponsePool> {
-  const normalizedConfig = normalizePoolConfig(config, "c2-mem-ffi response pool config");
-  await requireAbiVersion(symbols, "c2-mem-ffi response pool symbols");
-  const handle = await requireOkValue(
-    await symbols.c2_mem_ffi_response_pool_new(
-      normalizedConfig.prefix,
-      normalizedConfig.segmentSize,
-      normalizedConfig.maxSegments,
-      normalizedConfig.minBlockSize,
-    ),
-    "c2_mem_ffi_response_pool_new",
-  );
-  let closed = false;
+  catch (error) { native.close(); throw error; }
   return {
-    async read(block: C2MemFfiResponseBlock, destination: Uint8Array): Promise<void> {
-      ensurePoolOpen(closed, "response");
-      const responseBlock = requireResponseBlock(block, "read");
-      requireUint8Array(destination, "destination");
-      if (destination.byteLength !== responseBlock.byteLength) {
-        throw new C2MemFfiBindingError(`c2-mem-ffi response destination length ${destination.byteLength} does not match block byteLength ${responseBlock.byteLength}.`);
-      }
-      await requireOk(
-        await symbols.c2_mem_ffi_response_pool_read(handle, responseBlock, destination),
-        "c2_mem_ffi_response_pool_read",
-      );
+    prefix,
+    writeTimeoutMillis,
+    finishHandshake(prefix) { requireOk(native.finishHandshake(prefix), "finish handshake"); },
+    prepareRequest(payload) { return requireOkValue(native.prepareRequest(payload), "prepare request"); },
+    discardRequest(request) { requireOk(native.discardRequest(request), "discard request"); },
+    admitResponse(block) { return requireOkValue(native.admitResponse(block), "admit response"); },
+    consumeResponse(response, dst) { requireOk(native.consumeResponse(response, dst), "consume response"); },
+    discardResponse(response) { requireOk(native.discardResponse(response), "discard response"); },
+    beginWrite(kind, request) {
+      const result = request === undefined ? native.beginWrite(kind) : native.beginWrite(kind, request);
+      requireOk(result, "begin write");
+      const write = result.value;
+      if (write === undefined) return undefined;
+      return {
+        prefix: write.prefix,
+        start() { requireOk(native.startWrite(write), "start write"); },
+        complete(success) { requireOk(native.completeWrite(write, success), "complete write"); },
+        discard() { requireOk(native.discardWrite(write), "discard write"); },
+      };
     },
-    async release(block: C2MemFfiResponseBlock): Promise<void> {
-      ensurePoolOpen(closed, "response");
-      await requireOk(
-        await symbols.c2_mem_ffi_response_pool_release(handle, requireResponseBlock(block, "release")),
-        "c2_mem_ffi_response_pool_release",
-      );
-    },
-    async close(): Promise<void> {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      await symbols.c2_mem_ffi_response_pool_destroy(handle);
-    },
-  };
-}
-
-export function createC2MemFfiNativeResponseBackend(
-  pool: C2MemFfiNativeResponsePool,
-): C2MemFfiNativeResponseBackend {
-  const normalized = normalizeResponsePool(pool, "c2-mem-ffi native response pool");
-  let closed = false;
-  return {
-    async readResponse(block: C2MemFfiResponseBlock, destination: Uint8Array): Promise<void> {
-      ensureOpen(closed, "response");
-      const normalizedBlock = requireResponseBlock(block, "read");
-      requireUint8Array(destination, "destination");
-      if (destination.byteLength !== normalizedBlock.byteLength) {
-        throw new C2MemFfiBindingError(`c2-mem-ffi response destination length ${destination.byteLength} does not match block byteLength ${normalizedBlock.byteLength}.`);
-      }
-      await normalized.read(normalizedBlock, destination);
-    },
-    async releaseResponse(block: C2MemFfiResponseBlock): Promise<void> {
-      ensureOpen(closed, "response");
-      await normalized.release(requireResponseBlock(block, "release"));
-    },
-    async close(): Promise<void> {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      await normalized.close?.();
-    },
-  };
-}
-
-export function createC2MemFfiNativeRequestBackend(
-  pool: C2MemFfiNativeRequestPool,
-): C2MemFfiNativeRequestBackend {
-  const normalized = normalizeRequestPool(pool, "c2-mem-ffi native request pool");
-  let closed = false;
-  return {
-    prefix: normalized.prefix,
-    segments: normalized.segments,
-    async writeRequest(payload: Uint8Array): Promise<C2MemFfiRequestBlock> {
-      ensureOpen(closed, "request");
-      const block = await normalized.write(requireUint8Array(payload, "payload"));
-      try {
-        return requireOwnedRequestBlock(block, payload.byteLength, normalized.segments, "write");
-      } catch (error) {
-        await releaseInvalidRequestBlock(normalized, block, error);
-        throw error;
-      }
-    },
-    releaseRequest(block: C2MemFfiRequestBlock): void | Promise<void> {
-      ensureOpen(closed, "request");
-      return normalized.release(requireOwnedRequestBlock(block, undefined, normalized.segments, "release"));
-    },
-    markRequestConsumed(block: C2MemFfiRequestBlock): void | Promise<void> {
-      ensureOpen(closed, "request");
-      return normalized.forgetConsumed(requireOwnedRequestBlock(block, undefined, normalized.segments, "mark consumed"));
-    },
-    async close(): Promise<void> {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      await normalized.close?.();
-    },
+    receiveRelease(frame) { requireOk(native.receiveRelease(frame), "receive release"); },
+    gc() { return requireOkValue(native.gc(), "memory GC"); },
+    deactivate() { requireOk(native.deactivate(), "deactivate"); },
+    peerEnd() { requireOk(native.peerEnd(), "peer end"); },
+    tryClose() { return requireOkValue(native.tryClose(), "try close"); },
+    close() { requireOk(native.close(), "close memory context"); },
   };
 }
 
 class NodeIpcConnection implements C2NodeIpcConnection {
   private readonly chunks: Uint8Array[] = [];
+  // IPC 15 release batches contain at most 64 u64 IDs plus tag/count. This
+  // reserve also holds a frame header or SHM response descriptor, preserving
+  // loan settlement if the complete local read target cannot be allocated.
+  private readonly readFailurePrefix = new Uint8Array(2 + 64 * 8);
   private bufferedBytes = 0;
   private readonly waiters: Array<() => void> = [];
   private terminalError: C2NodeIpcConnectionError | undefined;
   private closed = false;
-  constructor(private readonly socket: C2NodeIpcSocket) {
+  private inactive = false;
+  private notifyDeactivation!: () => void;
+  readonly deactivation = new Promise<void>(resolve => { this.notifyDeactivation = resolve; });
+  private peerReadEnded = false;
+  private peerEndReported = false;
+  private peerEndScheduled = false;
+  private gcTimer: C2NodeTimer | undefined;
+  constructor(private readonly socket: C2NodeIpcSocket, readonly memory?: C2MemFfiMemoryContext) {
     socket.pause();
     socket.on("data", (chunk: Uint8Array): void => {
       if (chunk.byteLength === 0) {
@@ -995,14 +766,18 @@ class NodeIpcConnection implements C2NodeIpcConnection {
       this.wake();
     });
     socket.on("error", (error: Error): void => {
+      const failure = error as Error & { code?: string; syscall?: string };
+      if (!this.closed && process.platform !== "win32" && failure.code === "ECONNRESET" && failure.syscall === "read") this.markPeerEnd();
       this.fail(nodeIpcError("C-Two Node IPC socket error", error));
     });
     socket.on("end", (): void => {
+      if (!this.closed) this.markPeerEnd();
       this.fail(new C2NodeIpcConnectionError("C-Two Node IPC socket ended."));
     });
     socket.on("close", (): void => {
       this.fail(new C2NodeIpcConnectionError("C-Two Node IPC socket closed."));
     });
+    if (this.memory !== undefined) this.scheduleGc();
   }
 
   async write(data: Uint8Array): Promise<void> {
@@ -1018,7 +793,9 @@ class NodeIpcConnection implements C2NodeIpcConnection {
     }
     await new Promise<void>((resolve, reject) => {
       let settled = false;
+      let timeout: C2NodeTimer | undefined;
       const cleanup = (): void => {
+        if (timeout !== undefined) clearTimeout(timeout);
         this.socket.off("error", onError);
         this.socket.off("close", onClose);
       };
@@ -1038,12 +815,35 @@ class NodeIpcConnection implements C2NodeIpcConnection {
       const onClose = (): void => finish(this.terminalError ?? new C2NodeIpcConnectionError("C-Two Node IPC socket closed before write completed."));
       this.socket.once("error", onError);
       this.socket.once("close", onClose);
+      if (this.memory !== undefined) {
+        const deadline = performance.now() + this.memory.writeTimeoutMillis;
+        const checkTimeout = (): void => {
+          if (settled) return;
+          const remaining = deadline - performance.now();
+          if (remaining <= 0) this.deactivate();
+          else {
+            timeout = setTimeout(checkTimeout, Math.min(Math.ceil(remaining), 0x7fffffff));
+            timeout.unref();
+          }
+        };
+        timeout = setTimeout(checkTimeout, Math.min(this.memory.writeTimeoutMillis, 0x7fffffff));
+        timeout.unref();
+      }
       try {
         this.socket.write(bytes, (error) => finish(error ?? undefined));
       } catch (error) {
         finish(error);
       }
     });
+  }
+
+  get deactivated(): boolean { return this.inactive; }
+
+  deactivate(): void {
+    if (this.inactive) return;
+    this.inactive = true;
+    this.memory?.deactivate();
+    this.notifyDeactivation();
   }
 
   async readExactly(byteLength: number): Promise<Uint8Array> {
@@ -1053,6 +853,9 @@ class NodeIpcConnection implements C2NodeIpcConnection {
     }
     while (this.bufferedBytes < requested) {
       if (this.terminalError !== undefined) {
+        // A short terminal read cannot contain the complete frame requested
+        // by the caller. Its remaining bytes will not settle a release.
+        this.reportPeerEnd();
         throw this.terminalError;
       }
       await new Promise<void>((resolve) => {
@@ -1060,7 +863,9 @@ class NodeIpcConnection implements C2NodeIpcConnection {
         this.socket.resume();
       });
     }
-    return this.take(requested);
+    const bytes = this.take(requested);
+    this.schedulePeerEnd();
+    return bytes;
   }
 
   close(): void {
@@ -1068,16 +873,75 @@ class NodeIpcConnection implements C2NodeIpcConnection {
       return;
     }
     this.closed = true;
+    this.deactivate();
+    if (this.gcTimer !== undefined) clearTimeout(this.gcTimer);
+    this.gcTimer = undefined;
     this.fail(new C2NodeIpcConnectionError("C-Two Node IPC connection closed."));
-    this.socket.end();
+    // Native remote reads retain a duplicate OS reference. SHUT_WR on this
+    // socket would expose EOF to the peer before the last such read ends.
+    if (this.memory === undefined) this.socket.end();
     this.socket.destroy();
+    if (this.peerReadEnded) this.reportPeerEnd();
+    this.memory?.close();
+  }
+
+  private markPeerEnd(): void {
+    this.peerReadEnded = true;
+    this.schedulePeerEnd();
+  }
+
+  private scheduleGc(): void {
+    if (this.closed || this.memory === undefined) return;
+    const delayMillis = this.memory.gc();
+    this.gcTimer = setTimeout(() => {
+      this.gcTimer = undefined;
+      if (!this.closed) this.scheduleGc();
+    }, delayMillis);
+    this.gcTimer.unref();
+  }
+
+  private schedulePeerEnd(): void {
+    if (!this.peerReadEnded || this.peerEndReported || this.peerEndScheduled || this.bufferedBytes !== 0) return;
+    this.peerEndScheduled = true;
+    // The consumer parses the final buffered frame and delivers its release
+    // record in microtasks following readExactly(). Settle remaining loans only
+    // after that parser has run.
+    setImmediate(() => {
+      this.peerEndScheduled = false;
+      if (this.bufferedBytes === 0) this.reportPeerEnd();
+    });
+  }
+
+  private reportPeerEnd(): void {
+    if (!this.peerReadEnded || this.peerEndReported) return;
+    this.peerEndReported = true;
+    this.memory?.peerEnd();
   }
 
   private take(byteLength: number): Uint8Array {
     if (byteLength === 0) {
       return new Uint8Array();
     }
-    const output = new Uint8Array(byteLength);
+    let output: Uint8Array;
+    try { output = new Uint8Array(byteLength); }
+    catch (error) {
+      const prefixLength = Math.min(byteLength, this.readFailurePrefix.byteLength);
+      let copied = 0;
+      for (const chunk of this.chunks) {
+        const count = Math.min(chunk.byteLength, prefixLength - copied);
+        for (let index = 0; index < count; index++) this.readFailurePrefix[copied + index] = chunk[index];
+        copied += count;
+        if (copied === prefixLength) break;
+      }
+      this.skip(byteLength);
+      this.schedulePeerEnd();
+      const failure = new C2NodeIpcConnectionError(`C-Two Node IPC local read allocation failed: ${String(error)}`) as C2NodeIpcConnectionError & { c2LocalAllocationFailure: boolean; c2ReadPrefix: Uint8Array };
+      failure.c2LocalAllocationFailure = true;
+      // The serialized reader consumes this reserved prefix before another
+      // failed read can overwrite it; no payload or mapping owner is retained.
+      failure.c2ReadPrefix = this.readFailurePrefix.subarray(0, prefixLength);
+      throw failure;
+    }
     let outputOffset = 0;
     while (outputOffset < byteLength) {
       const chunk = this.chunks[0];
@@ -1097,6 +961,19 @@ class NodeIpcConnection implements C2NodeIpcConnection {
     return output;
   }
 
+  private skip(byteLength: number): void {
+    let remaining = byteLength;
+    while (remaining > 0) {
+      const chunk = this.chunks[0];
+      if (chunk === undefined) throw new C2NodeIpcConnectionError("C-Two Node IPC internal buffer underflow.");
+      const length = Math.min(chunk.byteLength, remaining);
+      if (length === chunk.byteLength) this.chunks.shift();
+      else this.chunks[0] = chunk.subarray(length);
+      remaining -= length;
+    }
+    this.bufferedBytes -= byteLength;
+  }
+
   private fail(error: C2NodeIpcConnectionError): void {
     this.terminalError ??= error;
     this.wake();
@@ -1110,99 +987,8 @@ class NodeIpcConnection implements C2NodeIpcConnection {
   }
 }
 
-function normalizeResponsePool(pool: C2MemFfiNativeResponsePool, label: string): C2MemFfiNativeResponsePool {
-  if (typeof pool !== "object" || pool === null) {
-    throw new C2MemFfiBindingError(`${label} must be an object.`);
-  }
-  if (typeof pool.read !== "function") {
-    throw new C2MemFfiBindingError(`${label}.read must be a function.`);
-  }
-  if (typeof pool.release !== "function") {
-    throw new C2MemFfiBindingError(`${label}.release must be a function.`);
-  }
-  if (pool.close !== undefined && typeof pool.close !== "function") {
-    throw new C2MemFfiBindingError(`${label}.close must be a function when provided.`);
-  }
-  return pool;
-}
-
-function normalizeRequestPool(pool: C2MemFfiNativeRequestPool, label: string): C2MemFfiNativeRequestPool {
-  if (typeof pool !== "object" || pool === null) {
-    throw new C2MemFfiBindingError(`${label} must be an object.`);
-  }
-  const prefix = requirePrefix(pool.prefix, `${label}.prefix`);
-  if (!Array.isArray(pool.segments)) {
-    throw new C2MemFfiBindingError(`${label}.segments must be an array.`);
-  }
-  if (pool.segments.length === 0 || pool.segments.length > C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS) {
-    throw new C2MemFfiBindingError(`${label}.segments length must be between 1 and ${C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS}.`);
-  }
-  const segments = Object.freeze(pool.segments.map((segment, index) => normalizeSegment(segment, `${label}.segments[${index}]`)));
-  if (typeof pool.write !== "function") {
-    throw new C2MemFfiBindingError(`${label}.write must be a function.`);
-  }
-  if (typeof pool.release !== "function") {
-    throw new C2MemFfiBindingError(`${label}.release must be a function.`);
-  }
-  if (typeof pool.forgetConsumed !== "function") {
-    throw new C2MemFfiBindingError(`${label}.forgetConsumed must be a function.`);
-  }
-  if (pool.close !== undefined && typeof pool.close !== "function") {
-    throw new C2MemFfiBindingError(`${label}.close must be a function when provided.`);
-  }
-  return {
-    prefix,
-    segments,
-    write(payload: Uint8Array): C2MemFfiRequestBlock | Promise<C2MemFfiRequestBlock> {
-      return pool.write(payload);
-    },
-    release(block: C2MemFfiRequestBlock): void | Promise<void> {
-      return pool.release(block);
-    },
-    forgetConsumed(block: C2MemFfiRequestBlock): void | Promise<void> {
-      return pool.forgetConsumed(block);
-    },
-    close(): void | Promise<void> {
-      return pool.close?.();
-    },
-  };
-}
-
-function normalizeSegment(segment: C2MemFfiShmSegment, label: string): C2MemFfiShmSegment {
-  if (typeof segment !== "object" || segment === null) {
-    throw new C2MemFfiBindingError(`${label} must be an object.`);
-  }
-  requireShmIdentity(segment.name, `${label}.name`);
-  if (!Number.isSafeInteger(segment.size) || segment.size <= 0 || segment.size > 0xffffffff) {
-    throw new C2MemFfiBindingError(`${label}.size must be a positive u32 integer.`);
-  }
-  return Object.freeze({ name: segment.name, size: segment.size });
-}
-
-function requirePrefix(value: string, label: string): string {
-  requireShmIdentity(value, label);
-  if (utf8ByteLength(value) > C2_MEM_FFI_MAX_SHM_PREFIX_BYTES) {
-    throw new C2MemFfiBindingError(`${label} cannot exceed ${C2_MEM_FFI_MAX_SHM_PREFIX_BYTES} bytes.`);
-  }
-  return value;
-}
-
-function requireShmIdentity(value: string, label: string): void {
-  if (typeof value !== "string" || value.length <= 1 || !value.startsWith("/")) {
-    throw new C2MemFfiBindingError(`${label} must be a non-empty shared-memory identity name beginning with "/".`);
-  }
-  if (value.slice(1).includes("/")) {
-    throw new C2MemFfiBindingError(`${label} must not contain "/" after the leading slash.`);
-  }
-  if (/[\u0000-\u001F\u007F-\u009F]/.test(value)) {
-    throw new C2MemFfiBindingError(`${label} must not contain control characters.`);
-  }
-}
-
 function requireUint8Array(value: Uint8Array, label: string): Uint8Array {
-  if (!(value instanceof Uint8Array)) {
-    throw new C2MemFfiBindingError(`${label} must be a Uint8Array.`);
-  }
+  if (!(value instanceof Uint8Array)) throw new C2MemFfiBindingError(`${label} must be a Uint8Array.`);
   return value;
 }
 
@@ -1238,145 +1024,6 @@ function nodeIpcError(prefix: string, error: unknown): C2NodeIpcConnectionError 
     return new C2NodeIpcConnectionError(`${prefix}: ${error.message}`);
   }
   return new C2NodeIpcConnectionError(`${prefix}: ${String(error)}`);
-}
-
-function requireResponseBlock(block: C2MemFfiResponseBlock, action: string): C2MemFfiResponseBlock {
-  const normalized = requireBlockShape(block, `response block ${action}`);
-  validateResponseBlockMetadata(block, normalized);
-  return block;
-}
-
-function validateResponseBlockMetadata(
-  block: C2MemFfiResponseBlock,
-  normalized: { readonly segmentIndex: number; readonly offset: number; readonly byteLength: number },
-): void {
-  if (block.prefix !== undefined) {
-    requirePrefix(block.prefix, "c2-mem-ffi response block prefix");
-  }
-  if (block.segments === undefined) {
-    return;
-  }
-  if (!Array.isArray(block.segments)) {
-    throw new C2MemFfiBindingError("c2-mem-ffi response block segments must be an array when provided.");
-  }
-  if (block.segments.length > C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi response block segments length must be no greater than ${C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS}.`);
-  }
-  for (const [index, segment] of block.segments.entries()) {
-    normalizeSegment(segment, `c2-mem-ffi response block segments[${index}]`);
-  }
-  if (block.dedicated) return;
-  const segment = block.segments[normalized.segmentIndex];
-  if (segment !== undefined && normalized.offset + normalized.byteLength > segment.size) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi response block range exceeds advertised segment ${normalized.segmentIndex} size ${segment.size}.`);
-  }
-}
-
-function requireOwnedRequestBlock(
-  block: C2MemFfiRequestBlock,
-  expectedByteLength: number | undefined,
-  segments: readonly C2MemFfiShmSegment[],
-  action: string,
-): C2MemFfiRequestBlock {
-  const normalized = requireBlockShape(block, `request block ${action}`);
-  if (expectedByteLength !== undefined && normalized.byteLength !== expectedByteLength) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi request block byteLength ${normalized.byteLength} does not match payload length ${expectedByteLength}.`);
-  }
-  if (normalized.dedicated) return block;
-  const segment = segments[normalized.segmentIndex];
-  if (segment === undefined) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi request block segmentIndex ${normalized.segmentIndex} is not advertised.`);
-  }
-  const end = normalized.offset + normalized.byteLength;
-  if (end > segment.size) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi request block range ${normalized.offset}+${normalized.byteLength} exceeds advertised segment ${normalized.segmentIndex} size ${segment.size}.`);
-  }
-  return block;
-}
-
-function requireBlockShape(
-  block: C2MemFfiRequestBlock,
-  label: string,
-): { readonly segmentIndex: number; readonly generation: number; readonly offset: number; readonly byteLength: number; readonly allocationId: bigint; readonly dedicated: boolean } {
-  if (typeof block !== "object" || block === null) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} must be an object.`);
-  }
-  if (!Number.isSafeInteger(block.segmentIndex) || block.segmentIndex < 0 || block.segmentIndex > 0xffff) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} segmentIndex must be a u16 integer.`);
-  }
-  if (!Number.isSafeInteger(block.offset) || block.offset < 0 || block.offset > 0xffffffff) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} offset must be a u32 integer.`);
-  }
-  if (!Number.isSafeInteger(block.generation) || block.generation < 0 || block.generation > 0xffffffff || (!block.dedicated && block.generation === 0) || (block.dedicated && block.generation !== 0)) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} generation must be a positive u32 for buddy memory or 0 for dedicated memory.`);
-  }
-  if (!Number.isSafeInteger(block.byteLength) || block.byteLength <= 0 || block.byteLength > 0xffffffff) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} byteLength must be a positive u32 integer.`);
-  }
-  if (typeof block.dedicated !== "boolean") {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} dedicated must be a boolean.`);
-  }
-  if (block.dedicated && block.offset !== 0) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} dedicated offset must be 0.`);
-  }
-  if (typeof block.allocationId !== "bigint" || block.allocationId < 0n || block.allocationId > 0xffffffffffffffffn || (block.dedicated ? block.allocationId !== 0n : block.allocationId === 0n)) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} allocationId must be a nonzero u64 bigint for buddy memory or 0n for dedicated memory.`);
-  }
-  return {
-    segmentIndex: block.segmentIndex,
-    generation: block.generation,
-    offset: block.offset,
-    byteLength: block.byteLength,
-    allocationId: block.allocationId,
-    dedicated: block.dedicated,
-  };
-}
-
-function ensureOpen(closed: boolean, label: string): void {
-  if (closed) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi native ${label} backend is closed.`);
-  }
-}
-
-function ensurePoolOpen(closed: boolean, label: string): void {
-  if (closed) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} pool is closed.`);
-  }
-}
-
-function normalizePoolConfig(config: C2MemFfiPoolConfig, label: string): C2MemFfiPoolConfig {
-  if (typeof config !== "object" || config === null) {
-    throw new C2MemFfiBindingError(`${label} must be an object.`);
-  }
-  const prefix = requirePrefix(config.prefix, `${label}.prefix`);
-  if (!Number.isSafeInteger(config.segmentSize) || config.segmentSize <= 0 || config.segmentSize > 0xffffffff) {
-    throw new C2MemFfiBindingError(`${label}.segmentSize must be a positive u32 integer.`);
-  }
-  if (!Number.isSafeInteger(config.maxSegments) || config.maxSegments < 1 || config.maxSegments > C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS) {
-    throw new C2MemFfiBindingError(`${label}.maxSegments must be between 1 and ${C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS}.`);
-  }
-  if (!Number.isSafeInteger(config.minBlockSize) || config.minBlockSize <= 0 || config.minBlockSize > 0xffffffff) {
-    throw new C2MemFfiBindingError(`${label}.minBlockSize must be a positive u32 integer.`);
-  }
-  return {
-    prefix,
-    segmentSize: config.segmentSize,
-    maxSegments: config.maxSegments,
-    minBlockSize: config.minBlockSize,
-  };
-}
-
-async function requireAbiVersion(symbols: C2MemFfiAbiSymbols, label: string): Promise<void> {
-  if (typeof symbols !== "object" || symbols === null) {
-    throw new C2MemFfiBindingError(`${label} must be an object.`);
-  }
-  if (typeof symbols.c2_mem_ffi_abi_version !== "function") {
-    throw new C2MemFfiBindingError(`${label}.c2_mem_ffi_abi_version must be a function.`);
-  }
-  const version = await symbols.c2_mem_ffi_abi_version();
-  if (!Number.isSafeInteger(version) || version !== C2_MEM_FFI_ABI_VERSION) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi ABI version ${String(version)} is incompatible with expected version ${C2_MEM_FFI_ABI_VERSION}.`);
-  }
 }
 
 function requireOk(result: C2MemFfiCallResult<unknown>, label: string): void {
@@ -1417,59 +1064,4 @@ function c2MemFfiStatusName(status: unknown): string {
     default:
       return `UNKNOWN(${String(status)})`;
   }
-}
-
-async function releaseInvalidRequestBlock(
-  pool: C2MemFfiNativeRequestPool,
-  block: C2MemFfiRequestBlock,
-  priorError: unknown,
-): Promise<void> {
-  try {
-    if (typeof block === "object" && block !== null) {
-      await pool.release(block);
-    }
-  } catch (releaseError) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi request block validation failed and release failed: validation=${String(priorError)} release=${String(releaseError)}`);
-  }
-}
-
-async function releaseInvalidRequestSymbolBlock<Handle>(
-  symbols: C2MemFfiRequestPoolSymbols<Handle>,
-  handle: Handle,
-  block: C2MemFfiRequestBlock,
-  priorError: unknown,
-): Promise<void> {
-  try {
-    if (typeof block === "object" && block !== null) {
-      await requireOk(
-        await symbols.c2_mem_ffi_request_pool_release(handle, block),
-        "c2_mem_ffi_request_pool_release",
-      );
-    }
-  } catch (releaseError) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi request block validation failed and C ABI release failed: validation=${String(priorError)} release=${String(releaseError)}`);
-  }
-}
-
-function utf8ByteLength(value: string): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code < 0x80) {
-      bytes += 1;
-    } else if (code < 0x800) {
-      bytes += 2;
-    } else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
-      const next = value.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        bytes += 4;
-        index += 1;
-      } else {
-        bytes += 3;
-      }
-    } else {
-      bytes += 3;
-    }
-  }
-  return bytes;
 }

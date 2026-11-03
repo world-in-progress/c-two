@@ -18,7 +18,7 @@ class TestCRMMeta:
 
 
 class TestIcrmDecorator:
-    """Tests for the @cc.crm() decorator."""
+    """Tests for the @cc.crm decorator."""
 
     def test_direction_attribute(self):
         @cc.crm(namespace="ns", version="1.0.0")
@@ -144,3 +144,9 @@ class TestHelloFixture:
         expected = {"greeting", "add", "echo_none", "get_items", "get_data"}
         actual = {name for name in dir(Hello) if not name.startswith("_")}
         assert expected.issubset(actual)
+
+
+@pytest.mark.parametrize('kwargs', [{}, {'namespace': 'test.identity'}, {'version': '0.1.0'}])
+def test_crm_requires_explicit_contract_identity(kwargs):
+    with pytest.raises(TypeError):
+        cc.crm(**kwargs)

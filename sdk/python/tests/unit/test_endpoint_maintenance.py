@@ -1,7 +1,7 @@
 """Unit coverage for the native local-endpoint maintenance projection.
 
 These tests exercise the real public native objects: the same
-``_native.PyEndpointSweep`` / ``cc.EndpointCredential`` objects the
+``_native.PyEndpointSweep`` / ``cc.endpoint.EndpointCredential`` objects the
 Python maintenance API uses. Nothing is monkeypatched into a fake, because the
 properties under test (the process maintenance lease, strict credential
 parsing, honest result statuses) are owned by Rust and would not be proven by
@@ -27,6 +27,8 @@ from pathlib import Path
 import pytest
 
 import c_two as cc
+
+import c_two.endpoint
 from c_two import _native
 from c_two.transport import endpoint as endpoint_module
 
@@ -45,8 +47,8 @@ IS_WINDOWS = sys.platform == 'win32'
 #: A well-formed managed-v2 credential document. Managed-v2 is a Unix
 #: filesystem namespace, so this document is only meaningful on POSIX.
 def _unix_document(address: str) -> str:
-    root = cc.local_endpoint_context().root if not IS_WINDOWS else '/tmp/c2-unix'
-    namespace = cc.local_endpoint_context(root=root).namespace_id if not IS_WINDOWS else '0' * 64
+    root = cc.endpoint.local_endpoint_context().root if not IS_WINDOWS else '/tmp/c2-unix'
+    namespace = cc.endpoint.local_endpoint_context(root=root).namespace_id if not IS_WINDOWS else '0' * 64
     return json.dumps({
         'schemaVersion': 4, 'address': address, 'protocol': 'managed-v2', 'platform': 'unix',
         'incarnation': '00112233445566778899aabbccddeeff',
@@ -73,7 +75,7 @@ def native_namespace():
     def inspect():
         deadline = time.monotonic() + 1.0
         while True:
-            observed = cc.inspect_endpoint(address, context=context)
+            observed = cc.endpoint.inspect_endpoint(address, context=context)
             if observed['io_kind'] != 'WouldBlock' or time.monotonic() >= deadline:
                 return observed
             time.sleep(0.01)
@@ -83,7 +85,7 @@ def native_namespace():
         assert session.server_credential is None
         bridge.start()
         credential = session.server_credential
-        assert type(credential) is cc.EndpointCredential
+        assert type(credential) is cc.endpoint.EndpointCredential
     finally:
         outcome = session.shutdown(timeout_seconds=5.0)
         assert outcome['completed'] and outcome['runtime_barrier_error'] is None, outcome
@@ -97,7 +99,7 @@ def native_namespace():
             if credential is not None:
                 deadline = time.monotonic() + 1.0
                 while True:
-                    reaped = cc.reap_endpoint(address, credential, context=context)
+                    reaped = cc.endpoint.reap_endpoint(address, credential, context=context)
                     if reaped['status'] != 'busy' or time.monotonic() >= deadline:
                         break
                     time.sleep(0.05)
@@ -110,8 +112,8 @@ def native_namespace():
 def empty_sweep_context(tmp_path):
     """Keep EOF tests independent of entries in the process-default root."""
     if IS_WINDOWS:
-        return cc.local_endpoint_context()
-    return cc.local_endpoint_context(root=str(tmp_path))
+        return cc.endpoint.local_endpoint_context()
+    return cc.endpoint.local_endpoint_context(root=str(tmp_path))
 
 
 def _native_document(address: str = 'ipc://unit-native-endpoint') -> str:
@@ -120,19 +122,19 @@ def _native_document(address: str = 'ipc://unit-native-endpoint') -> str:
     return json.dumps({'schemaVersion': 1, 'address': address, 'protocol': 'named-pipe', 'platform': 'windows'}, separators=(',', ':'))
 
 
-def _native_credential(address: str = 'ipc://unit-native-endpoint') -> cc.EndpointCredential:
-    return cc.EndpointCredential.from_json(_native_document(address))
+def _native_credential(address: str = 'ipc://unit-native-endpoint') -> cc.endpoint.EndpointCredential:
+    return cc.endpoint.EndpointCredential.from_json(_native_document(address))
 
 
 def test_credential_is_an_opaque_native_value() -> None:
     credential = _native_credential()
-    assert type(credential) is cc.EndpointCredential is _native.EndpointCredential
+    assert type(credential) is cc.endpoint.EndpointCredential is _native.EndpointCredential
     assert not hasattr(_native, 'PyEndpointCredential')
     assert not hasattr(credential, '_native')
     with pytest.raises(TypeError):
-        cc.EndpointCredential(credential)
+        cc.endpoint.EndpointCredential(credential)
     with pytest.raises(TypeError):
-        type('CredentialSubclass', (cc.EndpointCredential,), {})
+        type('CredentialSubclass', (cc.endpoint.EndpointCredential,), {})
     with pytest.raises(AttributeError):
         credential._native = object()
     with pytest.raises(TypeError):
@@ -145,11 +147,11 @@ def test_credential_is_an_opaque_native_value() -> None:
 @pytest.mark.parametrize('address', ['ipc://unit-native-endpoint', 'ipc://quote"-雪', 'ipc://both\'"-\ue000'])
 def test_credential_round_trips_through_the_one_rust_codec(address) -> None:
     document = _native_document(address)
-    credential = cc.EndpointCredential.from_json(document=document)
+    credential = cc.endpoint.EndpointCredential.from_json(document=document)
     # `to_json` is produced by the Rust encoder; re-parsing it must yield the
     # same metadata, proving the value never passes through a Python field
     # table on the way out.
-    reparsed = cc.EndpointCredential.from_json(credential.to_json())
+    reparsed = cc.endpoint.EndpointCredential.from_json(credential.to_json())
     assert reparsed.address == credential.address
     assert reparsed.protocol == credential.protocol
     assert reparsed.to_json() == credential.to_json()
@@ -159,19 +161,19 @@ def test_credential_round_trips_through_the_one_rust_codec(address) -> None:
 
 def test_credential_from_json_rejects_a_non_string_document() -> None:
     with pytest.raises(TypeError):
-        cc.EndpointCredential.from_json(b'{}')  # type: ignore[arg-type]
+        cc.endpoint.EndpointCredential.from_json(b'{}')  # type: ignore[arg-type]
 
 
 def test_credential_rejects_device_and_retired_unix_schema() -> None:
     document = json.loads(_native_document())
     document['device'] = 1
     with pytest.raises(ValueError, match='malformed-json'):
-        cc.EndpointCredential.from_json(json.dumps(document))
+        cc.endpoint.EndpointCredential.from_json(json.dumps(document))
     if not IS_WINDOWS:
         document.pop('device')
         document['schemaVersion'] = 3
         with pytest.raises(ValueError):
-            cc.EndpointCredential.from_json(json.dumps(document))
+            cc.endpoint.EndpointCredential.from_json(json.dumps(document))
 
 
 @pytest.mark.parametrize(
@@ -236,14 +238,14 @@ def test_credential_from_json_rejects_invalid_documents(
     document: str, fragment: str
 ) -> None:
     with pytest.raises(ValueError) as excinfo:
-        cc.EndpointCredential.from_json(document)
+        cc.endpoint.EndpointCredential.from_json(document)
     assert fragment in str(excinfo.value)
 
 
 def test_credential_from_json_enforces_the_byte_limit() -> None:
     oversized = ' ' * (MAX_CREDENTIAL_BYTES + 1)
     with pytest.raises(ValueError) as excinfo:
-        cc.EndpointCredential.from_json(oversized)
+        cc.endpoint.EndpointCredential.from_json(oversized)
     assert 'too-large' in str(excinfo.value)
 
 
@@ -252,12 +254,12 @@ def test_managed_v2_credential_is_rejected_on_windows() -> None:
     # must reject it rather than fabricate a kernel-managed pipe credential.
     if IS_WINDOWS:
         with pytest.raises(ValueError) as excinfo:
-            cc.EndpointCredential.from_json(MANAGED_V2_DOCUMENT)
+            cc.endpoint.EndpointCredential.from_json(MANAGED_V2_DOCUMENT)
         assert 'unsupported-platform' in str(excinfo.value) or 'invalid' in str(
             excinfo.value
         )
     else:
-        credential = cc.EndpointCredential.from_json(MANAGED_V2_DOCUMENT)
+        credential = cc.endpoint.EndpointCredential.from_json(MANAGED_V2_DOCUMENT)
         assert credential.protocol == 'managed-v2'
         assert credential.to_json() == MANAGED_V2_DOCUMENT
 
@@ -266,11 +268,11 @@ def test_windows_kernel_managed_credential_parses_without_unix_fields() -> None:
     # The mirror of the test above: a kernel-managed pipe record has no inode,
     # so it must be accepted only on Windows and rejected on Unix.
     if IS_WINDOWS:
-        credential = cc.EndpointCredential.from_json(_native_document())
+        credential = cc.endpoint.EndpointCredential.from_json(_native_document())
         assert credential.platform == 'windows'
     else:
         with pytest.raises(ValueError):
-            cc.EndpointCredential.from_json(
+            cc.endpoint.EndpointCredential.from_json(
                 json.dumps(
                     {
                         'schemaVersion': 1,
@@ -284,7 +286,7 @@ def test_windows_kernel_managed_credential_parses_without_unix_fields() -> None:
 
 
 def test_inspect_preserves_platform_and_io_status_fields(tmp_path: Path) -> None:
-    result = cc.inspect_endpoint(
+    result = cc.endpoint.inspect_endpoint(
         'ipc://unit-absent-endpoint'
     )
     if IS_WINDOWS:
@@ -312,7 +314,7 @@ def test_inspect_preserves_platform_and_io_status_fields(tmp_path: Path) -> None
         previous_mode = tmp_path.stat().st_mode
         try:
             tmp_path.chmod(0o777)
-            denied = cc.inspect_endpoint('ipc://policy-denial', root=str(tmp_path))
+            denied = cc.endpoint.inspect_endpoint('ipc://policy-denial', root=str(tmp_path))
         finally:
             tmp_path.chmod(previous_mode)
         assert set(denied) == set(result)
@@ -326,12 +328,12 @@ def test_inspect_preserves_platform_and_io_status_fields(tmp_path: Path) -> None
 
 def test_inspect_rejects_an_invalid_address() -> None:
     with pytest.raises(ValueError):
-        cc.inspect_endpoint('http://not-an-ipc-address')
+        cc.endpoint.inspect_endpoint('http://not-an-ipc-address')
 
 
 def test_reap_reports_stale_target_for_a_foreign_address() -> None:
     credential = _native_credential('ipc://unit-credential-owner')
-    result = cc.reap_endpoint('ipc://unit-credential-other', credential)
+    result = cc.endpoint.reap_endpoint('ipc://unit-credential-other', credential)
     assert result['status'] == 'stale-target'
     assert result['reason'] == 'credential-address-mismatch'
     assert result['retryable'] is False
@@ -341,14 +343,14 @@ def test_reap_never_removes_from_the_wrong_root() -> None:
     # A credential for another logical address must not probe this address's
     # namespace at all: the outcome is a mismatch, not `already-absent`.
     owner = _native_credential('ipc://unit-root-a')
-    result = cc.reap_endpoint('ipc://unit-root-b', owner)
+    result = cc.endpoint.reap_endpoint('ipc://unit-root-b', owner)
     assert result['status'] != 'already-absent'
     assert result['status'] == 'stale-target'
 
 
 def test_reap_of_an_unbound_endpoint_is_platform_honest() -> None:
     credential = _native_credential('ipc://unit-unbound-endpoint')
-    result = cc.reap_endpoint('ipc://unit-unbound-endpoint', credential)
+    result = cc.endpoint.reap_endpoint('ipc://unit-unbound-endpoint', credential)
     assert set(result) == {
         'status',
         'credential',
@@ -368,7 +370,7 @@ def test_reap_of_an_unbound_endpoint_is_platform_honest() -> None:
 
 def test_reap_requires_an_endpoint_credential() -> None:
     with pytest.raises(TypeError):
-        cc.reap_endpoint('ipc://unit-type-check', object())  # type: ignore[arg-type]
+        cc.endpoint.reap_endpoint('ipc://unit-type-check', object())  # type: ignore[arg-type]
 
 
 def test_reap_does_not_accept_a_decoded_credential_for_a_new_incarnation() -> None:
@@ -397,12 +399,12 @@ def _assert_new_incarnation_preserved() -> None:
         # before a credential exists. A kernel-managed record must still never
         # report a filesystem removal.
         with pytest.raises(ValueError) as excinfo:
-            cc.EndpointCredential.from_json(MANAGED_V2_DOCUMENT)
+            cc.endpoint.EndpointCredential.from_json(MANAGED_V2_DOCUMENT)
         assert 'invalid' in str(excinfo.value) or 'unsupported-platform' in str(
             excinfo.value
         )
         credential = _native_credential('ipc://unit-windows-incarnation')
-        result = cc.reap_endpoint('ipc://unit-windows-incarnation', credential)
+        result = cc.endpoint.reap_endpoint('ipc://unit-windows-incarnation', credential)
         assert result['status'] == 'not-applicable'
         return
     @cc.crm(namespace='cc.test.endpoint.scope', version='0.1.0')
@@ -421,31 +423,31 @@ def _assert_new_incarnation_preserved() -> None:
         cc.set_server(server_id=server_id)
         cc.register(ScopeProbe, ProbeResource(), name='scope-probe')
         address = cc.server_address()
-        first_credential = cc.server_credential()
-        first = cc.inspect_endpoint(address)
+        first_credential = cc.endpoint.server_credential()
+        first = cc.endpoint.inspect_endpoint(address)
         assert first['status'] == 'present', first
-        assert type(first['credential']) is cc.EndpointCredential
+        assert type(first['credential']) is cc.endpoint.EndpointCredential
         assert first_credential.to_json() == first['credential'].to_json()
-        old = cc.EndpointCredential.from_json(first_credential.to_json())
+        old = cc.endpoint.EndpointCredential.from_json(first_credential.to_json())
         cc.shutdown()
-        assert cc.server_credential() is None
+        assert cc.endpoint.server_credential() is None
         cc.set_server(server_id=server_id)
         cc.register(ScopeProbe, ProbeResource(), name='scope-probe')
         assert cc.server_address() == address
-        second = cc.inspect_endpoint(address)
+        second = cc.endpoint.inspect_endpoint(address)
         assert second['status'] == 'present', second
-        current = cc.server_credential()
+        current = cc.endpoint.server_credential()
         assert current.to_json() == second['credential'].to_json()
         assert current.to_json() != old.to_json()
-        result = cc.reap_endpoint(address, old)
+        result = cc.endpoint.reap_endpoint(address, old)
         assert result['status'] in {'busy', 'stale-target'}
-        after = cc.inspect_endpoint(address)
+        after = cc.endpoint.inspect_endpoint(address)
         assert after['status'] == 'present', after
         assert after['credential'].to_json() == current.to_json()
     finally:
         cc.shutdown()
         if current is not None:
-            assert cc.reap_endpoint(address, current)['status'] in {'already-absent', 'reaped'}
+            assert cc.endpoint.reap_endpoint(address, current)['status'] in {'already-absent', 'reaped'}
 
 
 def test_reap_uses_the_recorded_context_not_the_process_default(
@@ -454,7 +456,7 @@ def test_reap_uses_the_recorded_context_not_the_process_default(
     credential = _native_credential('ipc://unit-recorded-context')
     # A malformed process root must not reinterpret the captured credential.
     monkeypatch.setenv('C2_IPC_ROOT', 'invalid-relative-root')
-    result = cc.reap_endpoint(credential.address, credential)
+    result = cc.endpoint.reap_endpoint(credential.address, credential)
     if IS_WINDOWS:
         assert result['status'] == 'not-applicable'
         assert result['reason'] == 'no-filesystem-entry'
@@ -466,18 +468,18 @@ class TestSweepLease:
     """The process lease is owned by Rust and allows exactly one sweep."""
 
     def test_one_sweep_at_a_time(self) -> None:
-        first = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
+        first = cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES)
         try:
             with pytest.raises(RuntimeError) as excinfo:
-                cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
+                cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES)
             assert 'already active' in str(excinfo.value)
         finally:
             first.close()
 
     def test_close_releases_only_its_own_lease(self, empty_sweep_context) -> None:
-        first = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        first = cc.endpoint.sweep_endpoints(addresses=[], context=empty_sweep_context)
         first.close()
-        second = cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+        second = cc.endpoint.sweep_endpoints(addresses=[], context=empty_sweep_context)
         protocol = second.protocol
         try:
             # End the native round so its own lease cannot hide an incorrect
@@ -489,7 +491,7 @@ class TestSweepLease:
             del first
             gc.collect()
             with pytest.raises(RuntimeError, match='already active'):
-                cc.sweep_endpoints(addresses=[], context=empty_sweep_context)
+                cc.endpoint.sweep_endpoints(addresses=[], context=empty_sweep_context)
         finally:
             second.close()
         assert second.closed is True
@@ -501,18 +503,18 @@ class TestSweepLease:
             second.next_batch(max_entries=False)
 
     def test_context_manager_releases_the_lease(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             assert sweep.closed is False
         assert sweep.closed is True
         # The lease is free again after the context exits.
-        cc.sweep_endpoints(addresses=SWEEP_ADDRESSES).close()
+        cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES).close()
 
     def test_dropping_an_abandoned_sweep_releases_the_lease(self) -> None:
-        abandoned = cc.sweep_endpoints(addresses=SWEEP_ADDRESSES)
+        abandoned = cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES)
         # Dropping without close is the abandoned path; the native Drop impl
         # must still release the process lease.
         del abandoned
-        cc.sweep_endpoints(addresses=SWEEP_ADDRESSES).close()
+        cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES).close()
 
     def test_lease_admits_exactly_one_sweep_under_concurrent_open(self) -> None:
         # The lease is one atomic compare-exchange, so two concurrent openers
@@ -522,7 +524,7 @@ class TestSweepLease:
 
         def open_sweep() -> None:
             try:
-                outcomes.append(cc.sweep_endpoints(addresses=SWEEP_ADDRESSES))
+                outcomes.append(cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES))
             except RuntimeError as error:
                 outcomes.append(error)
 
@@ -532,7 +534,7 @@ class TestSweepLease:
         for thread in threads:
             thread.join()
 
-        sweeps = [item for item in outcomes if isinstance(item, cc.EndpointSweep)]
+        sweeps = [item for item in outcomes if isinstance(item, cc.endpoint.EndpointSweep)]
         refusals = [item for item in outcomes if isinstance(item, RuntimeError)]
         try:
             assert len(sweeps) == 1
@@ -549,27 +551,27 @@ class TestSweepBudget:
     """Budgets are validated in Rust before any `Duration` arithmetic."""
 
     def test_zero_entries_is_rejected(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_entries=0)
 
     def test_entries_above_the_ceiling_are_rejected(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_entries=MAX_SWEEP_ENTRIES + 1)
 
     def test_zero_milliseconds_is_rejected(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_ms=0)
 
     def test_milliseconds_above_the_ceiling_are_rejected(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_ms=MAX_SWEEP_MS + 1)
 
     def test_non_integer_budgets_are_rejected(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(TypeError):
                 sweep.next_batch(max_entries=1.5)  # type: ignore[arg-type]
             with pytest.raises(TypeError):
@@ -578,16 +580,16 @@ class TestSweepBudget:
     def test_boolean_budget_is_rejected_as_a_non_integer(self) -> None:
         # `bool` is an `int` subclass; a sweep budget is not a flag.
         with pytest.raises(TypeError):
-            cc.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=True)  # type: ignore[arg-type]
+            cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=True)  # type: ignore[arg-type]
 
     def test_huge_budget_cannot_panic_or_overflow_native_duration(self) -> None:
         # Values far beyond `u64` milliseconds would overflow a `Duration`
         # multiplication in a naive implementation. The Rust gate bounds the
         # budget before any arithmetic, so this is a clean ValueError.
         with pytest.raises(ValueError):
-            cc.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_ms=10**19)
+            cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_ms=10**19)
         with pytest.raises(ValueError):
-            cc.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=10**19)
+            cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=10**19)
 
     @pytest.mark.parametrize('value', [2**32, 2**64, 2**70, 10**40])
     def test_out_of_range_budget_never_reaches_native_duration_arithmetic(
@@ -597,13 +599,13 @@ class TestSweepBudget:
         # accepted at open time and only surface later (or overflow). It must
         # be a clean ValueError at open time for both budget fields.
         with pytest.raises(ValueError):
-            cc.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_ms=value)
+            cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_ms=value)
         with pytest.raises(ValueError):
-            cc.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=value)
+            cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=value)
 
     def test_boundary_budgets_are_accepted(self) -> None:
         # The inclusive ceilings are legal; only values beyond them are not.
-        with cc.sweep_endpoints(
+        with cc.endpoint.sweep_endpoints(
             addresses=SWEEP_ADDRESSES, max_entries=MAX_SWEEP_ENTRIES, max_ms=MAX_SWEEP_MS
         ) as sweep:
             batch = sweep.next_batch(
@@ -615,7 +617,7 @@ class TestSweepBudget:
         # Every batch re-enters the native gate, and the override may differ
         # from the budget validated at open time. There is no Python pre-check
         # to bypass, so the ValueError can only be the native rejection.
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_ms=2**64)
             with pytest.raises(ValueError):
@@ -664,17 +666,17 @@ class TestSweepBudget:
 
     def test_negative_budget_is_rejected(self) -> None:
         with pytest.raises(ValueError):
-            cc.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=-1)
+            cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=-1)
 
     def test_open_validates_every_budget_before_taking_the_process_lease(self) -> None:
         # Both dimensions are validated by the native constructor before it
         # takes the process lease or opens the iterator, so a rejected open
         # cannot leave the lease held or wedge the next sweep.
         with pytest.raises(ValueError):
-            cc.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=0)
+            cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_entries=0)
         with pytest.raises(TypeError):
-            cc.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_ms=True)
-        cc.sweep_endpoints(addresses=SWEEP_ADDRESSES).close()
+            cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES, max_ms=True)
+        cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES).close()
 
     def test_rejected_batch_override_keeps_the_iterator_and_stored_default(
         self,
@@ -682,7 +684,7 @@ class TestSweepBudget:
         # An explicit override is validated by the same native gate that
         # validated the stored default. Rejection must not close the sweep or
         # lose the default, so a bare next_batch still advances batch 1.
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_entries=MAX_SWEEP_ENTRIES + 1)
             with pytest.raises(TypeError):
@@ -713,7 +715,7 @@ class TestSweepBatches:
     }
 
     def test_first_batch_reports_the_full_counter_set(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             batch = sweep.next_batch()
         assert set(batch) == self.EXPECTED_KEYS
         assert batch['batch'] == 1
@@ -723,7 +725,7 @@ class TestSweepBatches:
         assert isinstance(batch['namespace_changed'], bool)
 
     def test_batch_index_advances(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             first = sweep.next_batch()
             assert first['batch'] == 1
             if not (first['round_complete'] or first['round_interrupted']):
@@ -732,20 +734,20 @@ class TestSweepBatches:
                 assert second['entries_visited'] > 0
 
     def test_budget_is_consumed_per_batch_not_dropped(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             batch = sweep.next_batch(max_entries=1, max_ms=1)
         # A single-entry budget can never exceed one visited entry.
         assert batch['entries_visited'] <= 1
 
     def test_round_never_claims_completion_while_interrupted(self) -> None:
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             batch = sweep.next_batch()
         if batch['round_interrupted']:
             assert batch['round_complete'] is False
 
     def test_windows_sweep_reports_not_applicable(self) -> None:
         # The Windows branch must produce an executable observation, not a skip.
-        with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+        with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
             batch = sweep.next_batch()
         if IS_WINDOWS:
             assert batch['not_applicable'] >= 1
@@ -758,7 +760,7 @@ class TestSweepBatches:
 
     def test_repeated_sweeps_do_not_leak_the_lease(self) -> None:
         for _ in range(3):
-            with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
+            with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES) as sweep:
                 sweep.next_batch(max_entries=1, max_ms=1)
 
 
@@ -787,12 +789,12 @@ def test_endpoint_module_keeps_no_python_field_tables() -> None:
     assert endpoint_module.EndpointSweep.__slots__ == ('_native',)
 
 
-def test_top_level_exports_are_the_facade_objects() -> None:
-    assert cc.inspect_endpoint is endpoint_module.inspect_endpoint
-    assert cc.reap_endpoint is endpoint_module.reap_endpoint
-    assert cc.sweep_endpoints is endpoint_module.sweep_endpoints
-    assert cc.EndpointCredential is endpoint_module.EndpointCredential
-    assert cc.EndpointSweep is endpoint_module.EndpointSweep
+def test_endpoint_exports_are_the_facade_objects() -> None:
+    assert cc.endpoint.inspect_endpoint is endpoint_module.inspect_endpoint
+    assert cc.endpoint.reap_endpoint is endpoint_module.reap_endpoint
+    assert cc.endpoint.sweep_endpoints is endpoint_module.sweep_endpoints
+    assert cc.endpoint.EndpointCredential is endpoint_module.EndpointCredential
+    assert cc.endpoint.EndpointSweep is endpoint_module.EndpointSweep
     for name in (
         'EndpointCredential',
         'EndpointSweep',
@@ -800,7 +802,7 @@ def test_top_level_exports_are_the_facade_objects() -> None:
         'reap_endpoint',
         'sweep_endpoints',
     ):
-        assert name in cc.__all__
+        assert name in cc.endpoint.__all__
 
 
 def test_no_liveness_status_is_fabricated_for_kernel_managed_platforms() -> None:
@@ -809,16 +811,16 @@ def test_no_liveness_status_is_fabricated_for_kernel_managed_platforms() -> None
     assert 'present' not in endpoint_module.NON_LIVENESS_STATUSES
 
 
-@pytest.mark.parametrize('addresses', [['http://wrong'], ['/tmp/forged.sock'], [SWEEP_ADDRESSES[0]] * 4097])
+@pytest.mark.parametrize('addresses', [['http://wrong'], ['/tmp/forged.sock']])
 def test_sweep_address_scope_rejects_before_taking_the_lease(addresses: list[str]) -> None:
     with pytest.raises(ValueError):
-        cc.sweep_endpoints(addresses=addresses)
-    with cc.sweep_endpoints(addresses=SWEEP_ADDRESSES):
+        cc.endpoint.sweep_endpoints(addresses=addresses)
+    with cc.endpoint.sweep_endpoints(addresses=SWEEP_ADDRESSES):
         pass
 
 
 def test_empty_sweep_scope_never_inspects_endpoints() -> None:
-    with cc.sweep_endpoints(addresses=[]) as sweep:
+    with cc.endpoint.sweep_endpoints(addresses=[]) as sweep:
         for _ in range(10000):
             batch = sweep.next_batch(max_entries=MAX_SWEEP_ENTRIES)
             assert batch['endpoints_examined'] == 0

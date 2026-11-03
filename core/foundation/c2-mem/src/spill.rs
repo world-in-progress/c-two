@@ -42,18 +42,9 @@ impl std::ops::DerefMut for SpillMapping {
 impl SpillMapping {
     /// Attach this mapping's single file-backing budget reservation.
     ///
-    /// Crate-private and single-shot by invariant: [`create_file_spill`]
-    /// stays a raw OS creator, and the pool layer that reserved the bytes
-    /// attaches the guard exactly once, immediately after creation succeeds —
-    /// so a failed creation simply drops its guard and releases the charge,
-    /// and no caller can replace or drop the charge while the mapping is
-    /// live. A second attachment is an internal bug and panics rather than
-    /// silently releasing the live charge. There is no way to clear the guard.
+    /// The pool attaches this once after budgeted creation and before
+    /// publishing the mapping.
     pub(crate) fn with_budget_guard(mut self, guard: BudgetReservation) -> Self {
-        assert!(
-            self._budget_guard.is_none(),
-            "a backing carries at most one owner-creation reservation"
-        );
         self._budget_guard = Some(guard);
         self
     }

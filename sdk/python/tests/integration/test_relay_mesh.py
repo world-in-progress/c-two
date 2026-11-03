@@ -17,7 +17,9 @@ import urllib.request
 import pytest
 
 import c_two as cc
-from c_two.config.ipc import _resolve_server_ipc_config
+
+import c_two.endpoint
+from c_two._native import resolve_server_ipc_config
 from c_two.config.settings import settings
 from c_two.crm.contract import crm_contract
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
@@ -35,7 +37,7 @@ class MeshImpl:
 
 
 MESH_CONTRACT = crm_contract(MeshResource)
-DEFAULT_MAX_PAYLOAD_SIZE = int(_resolve_server_ipc_config()['max_payload_size'])
+DEFAULT_MAX_PAYLOAD_SIZE = int(resolve_server_ipc_config(None, None)['max_payload_size'])
 
 
 @pytest.fixture(autouse=True)
@@ -71,7 +73,7 @@ def _register_body(name: str, server_id: str) -> dict[str, object]:
     cc.set_server(server_id=server_id)
     cc.register(MeshResource, MeshImpl(), name=name)
     address = cc.server_address()
-    actual_server_id = cc.server_id()
+    actual_server_id = cc.endpoint.server_id()
     assert address is not None
     assert actual_server_id == server_id
     server_instance_id = _server_instance_id_for(address)
@@ -89,7 +91,7 @@ def _registration_scope(base_url: str, name: str) -> dict[str, object]:
     # projection (remote entries deliberately omit local server identity).
     route = _http_get_json(_resolve_url(base_url, name))[0]
     return {key: route[key] for key in (
-        'name', 'server_id', 'server_instance_id', 'route_uid', 'route_revision',
+        'name', 'server_id', 'server_instance_id', 'route_uid',
     )}
 
 

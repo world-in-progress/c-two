@@ -3,6 +3,8 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::{deadline_after, timeout_from_seconds};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConnectOptions {
     timeout: Option<Duration>,
@@ -26,8 +28,7 @@ impl ConnectOptions {
     pub fn from_timeout_secs(seconds: Option<f64>) -> Result<Self, ConnectTimeoutError> {
         match seconds {
             None => Ok(Self::new()),
-            Some(seconds) if !seconds.is_finite() || seconds < 0.0 => Err(ConnectTimeoutError),
-            Some(seconds) => Duration::try_from_secs_f64(seconds)
+            Some(seconds) => timeout_from_seconds(seconds)
                 .map(|duration| Self::new().with_timeout(duration))
                 .map_err(|_| ConnectTimeoutError),
         }
@@ -54,7 +55,7 @@ impl ConnectDeadline {
         let now = Instant::now();
         options
             .timeout
-            .map(|duration| now.checked_add(duration).ok_or(ConnectTimeoutError))
+            .map(|duration| deadline_after(now, duration).map_err(|_| ConnectTimeoutError))
             .transpose()
             .map(Self)
     }

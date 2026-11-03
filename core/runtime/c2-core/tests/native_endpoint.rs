@@ -79,7 +79,7 @@ fn native_host(server_id: String) -> (Runtime, c2_core::Host, String) {
 fn wait_until_pingable(address: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if ping_direct_ipc(address, Duration::from_millis(200)).unwrap() {
+        if ping_direct_ipc(address, None, Duration::from_millis(200)).unwrap() {
             return;
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -152,11 +152,11 @@ fn native_host_serves_calls_and_admin_shutdown_initiates_draining() {
         .unwrap();
     assert_eq!(client.call_owned("echo", b"native").unwrap(), b"native");
     assert_eq!(
-        direct_ipc_endpoint(&address).unwrap(),
+        direct_ipc_endpoint(&address, None).unwrap(),
         c2_config::LocalEndpoint::from_address(&address).unwrap()
     );
-    let shutdown = shutdown_direct_ipc(&address, Duration::from_millis(500)).unwrap();
-    assert!(shutdown.acknowledged && shutdown.shutdown_started && !shutdown.server_stopped);
+    let shutdown = shutdown_direct_ipc(&address, None, Duration::from_millis(500)).unwrap();
+    assert_eq!(shutdown, c2_core::DirectIpcShutdownOutcome::Initiated);
     let completed = host.shutdown();
     assert!(completed.runtime_barrier_error.is_none(), "{completed:?}");
     drop(runtime);
@@ -168,7 +168,7 @@ fn runtime_restart_reuses_endpoint_and_gets_a_fresh_instance() {
     let route = unique_name("restart-route");
     let _registration = host.register(definition(&route)).unwrap();
     wait_until_pingable(&address);
-    let first = direct_ipc_endpoint(&address).unwrap();
+    let first = direct_ipc_endpoint(&address, None).unwrap();
     #[cfg(unix)]
     let first_credential = loop {
         match c2_core::inspect_endpoint(&first) {
@@ -187,7 +187,7 @@ fn runtime_restart_reuses_endpoint_and_gets_a_fresh_instance() {
     let (_runtime, next, next_address) = native_host(server_id);
     let _registration = next.register(definition(&route)).unwrap();
     wait_until_pingable(&next_address);
-    assert_eq!(first, direct_ipc_endpoint(&next_address).unwrap());
+    assert_eq!(first, direct_ipc_endpoint(&next_address, None).unwrap());
     #[cfg(unix)]
     {
         assert!(matches!(
@@ -195,5 +195,5 @@ fn runtime_restart_reuses_endpoint_and_gets_a_fresh_instance() {
             c2_core::EndpointReapResult::Busy | c2_core::EndpointReapResult::StaleTarget
         ));
     }
-    assert!(ping_direct_ipc(&next_address, Duration::from_millis(200)).unwrap());
+    assert!(ping_direct_ipc(&next_address, None, Duration::from_millis(200)).unwrap());
 }

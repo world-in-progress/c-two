@@ -1,7 +1,7 @@
 """Real local context isolation and cleanup, with spawned Python participants.
 
 Custom filesystem roots are Unix-only and deliberately short, pre-created
-containers. Common Persistent/OwnerBound lifecycle cases run on both Unix and
+containers. Common Host lifecycle cases run on both Unix and
 Windows. No test changes the pytest process environment or assumes fork.
 """
 from __future__ import annotations
@@ -23,6 +23,9 @@ from tests.unit.test_endpoint_context import IS_WINDOWS, _isolated_env, _run_iso
 
 CONTRACT = '''
 import c_two as cc
+
+import c_two.endpoint
+import c_two.observe
 
 @cc.crm(namespace='test.endpoint.context', version='0.1.0')
 class Echo:
@@ -48,12 +51,12 @@ class Resource:
         self.hooks += 1
 
 root, address, label = sys.argv[1:]
-cc.set_local_endpoint(root=root)
+cc.endpoint.set_local_endpoint(root=root)
 cc.set_server(server_id=address.removeprefix('ipc://'))
 resource = Resource(label)
 cc.register(Echo, resource, name='same-route')
-context = cc.local_endpoint_context()
-credential = cc.server_credential()
+context = cc.endpoint.local_endpoint_context()
+credential = cc.endpoint.server_credential()
 assert credential is not None
 print(json.dumps({
     'address': cc.server_address(), 'root': context.root,
@@ -82,14 +85,14 @@ def test_server_credential_does_not_wait_for_the_namespace_gate() -> None:
                 def value(self): return 'ready'
                 def done(self): pass
 
-            assert cc.server_credential() is None
+            assert cc.endpoint.server_credential() is None
             assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
             holder = None
             try:
                 cc.register(Echo, Resource(), name='own')
                 address = cc.server_address()
-                credential = cc.server_credential()
-                observed = cc.inspect_endpoint(address)
+                credential = cc.endpoint.server_credential()
+                observed = cc.endpoint.inspect_endpoint(address)
                 assert observed['status'] == 'present', observed
                 assert credential.to_json() == observed['credential'].to_json()
                 document = json.loads(credential.to_json())
@@ -102,25 +105,25 @@ def test_server_credential_does_not_wait_for_the_namespace_gate() -> None:
                     "assert sys.stdin.readline().strip() == 'release'", str(gate),
                 ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 assert holder.stdout.readline().strip() == 'locked'
-                held = cc.inspect_endpoint(address)
+                held = cc.endpoint.inspect_endpoint(address)
                 assert (held['status'], held['io_kind'], held['retryable']) == (
                     'io-error', 'WouldBlock', True,
                 ), held
                 # The holder cannot release until the own-listener query returns.
-                assert cc.server_credential().to_json() == credential.to_json()
+                assert cc.endpoint.server_credential().to_json() == credential.to_json()
                 _, stderr = holder.communicate('release\\n', timeout=5)
                 assert holder.returncode == 0, stderr
-                assert cc.reap_endpoint(address, credential)['status'] == 'busy'
+                assert cc.endpoint.reap_endpoint(address, credential)['status'] == 'busy'
                 cc.unregister('own')
-                assert cc.server_credential().to_json() == credential.to_json()
+                assert cc.endpoint.server_credential().to_json() == credential.to_json()
             finally:
                 if holder is not None and holder.poll() is None:
                     holder.kill()
                     holder.communicate(timeout=5)
                 stopped = cc.shutdown(timeout=5)
             assert stopped['completed'], stopped
-            assert cc.server_credential() is None
-            assert cc.reap_endpoint(address, credential)['status'] == 'already-absent'
+            assert cc.endpoint.server_credential() is None
+            assert cc.endpoint.reap_endpoint(address, credential)['status'] == 'already-absent'
         '''), C2_IPC_ROOT=root)
 
 
@@ -198,8 +201,8 @@ def test_same_logical_address_registers_connects_and_stays_isolated(short_roots)
         for root, label, other in ((first, 'a', second), (second, 'b', first)):
             _run_isolated(CONTRACT + textwrap.dedent(f'''
                 from c_two.transport.client import util
-                cc.set_local_endpoint(root={root!r})
-                context = cc.local_endpoint_context()
+                cc.endpoint.set_local_endpoint(root={root!r})
+                context = cc.endpoint.local_endpoint_context()
                 assert util._endpoint_name_from_address({address!r}) == context.endpoint_name({address!r})
                 assert util.ping({address!r})
                 proxy = cc.connect(Echo, name='same-route', address={address!r})
@@ -207,24 +210,23 @@ def test_same_logical_address_registers_connects_and_stays_isolated(short_roots)
                 cc.close(proxy)
                 assert util.ping({address!r})
                 # An explicit independent context reaches the other namespace.
-                other = cc.local_endpoint_context(root={other!r})
+                other = cc.endpoint.local_endpoint_context(root={other!r})
                 assert util.ping({address!r}, context=other)
-                assert cc.inspect_endpoint({address!r})['credential'].context == context
+                assert cc.endpoint.inspect_endpoint({address!r})['credential'].context == context
                 assert cc.shutdown()['completed']
-                assert cc.local_endpoint_context() == context
+                assert cc.endpoint.local_endpoint_context() == context
             '''), C2_IPC_ROOT=other, C2_RELAY_ANCHOR_ADDRESS='http://127.0.0.1:1')
         a.stop()
         # Retirement in one namespace does not stop the identical name in the other.
         _run_isolated(CONTRACT + textwrap.dedent(f'''
             from c_two.transport.client import util
-            cc.set_local_endpoint(root={second!r})
+            cc.endpoint.set_local_endpoint(root={second!r})
             assert util.ping({address!r})
             proxy = cc.connect(Echo, name='same-route', address={address!r})
             assert proxy.value() == 'b'
             cc.close(proxy)
             ack = util.shutdown({address!r})
-            assert ack['acknowledged'] and ack['shutdown_started'], ack
-            assert not ack['server_stopped'], ack
+            assert ack == 'initiated', ack
             assert cc.shutdown()['completed']
         '''))
         b.stop()
@@ -243,7 +245,7 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
         from c_two.transport.registry import _get_default_runtime
         from c_two.transport.client import util
         session = _get_default_runtime()._runtime_session
-        captured = cc.local_endpoint_context()
+        captured = cc.endpoint.local_endpoint_context()
         assert captured.root == {missing!r}
         assert not session.local_endpoint_frozen
         if {attempt!r} == 'bind':
@@ -266,17 +268,16 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
             assert not util.ping({address!r}, timeout=.01)
         else:
             stopped = util.shutdown({address!r}, timeout=.01)
-            assert stopped['acknowledged'] and stopped['server_stopped'], stopped
-            assert not stopped['shutdown_started'], stopped
+            assert stopped == 'absent', stopped
         assert session.local_endpoint_frozen
         assert not Path({missing!r}).exists()
         os.environ['C2_IPC_ROOT'] = {changed!r}
-        assert cc.local_endpoint_context() == captured
+        assert cc.endpoint.local_endpoint_context() == captured
         assert util._endpoint_name_from_address({address!r}) == captured.endpoint_name({address!r})
-        cc.set_local_endpoint(root={missing!r})
+        cc.endpoint.set_local_endpoint(root={missing!r})
         session.set_local_endpoint(context=captured)
         try:
-            cc.set_local_endpoint(root={changed!r})
+            cc.endpoint.set_local_endpoint(root={changed!r})
         except cc.error.CoreError as exc:
             assert exc.lifecycle_kind == 'config_frozen', exc
         else:
@@ -285,9 +286,9 @@ def test_first_failed_local_attempt_freezes_context_without_creating_missing_con
         replacement = _get_default_runtime()._runtime_session
         assert replacement is not session
         assert not replacement.local_endpoint_frozen
-        assert cc.local_endpoint_context() == captured
-        cc.set_local_endpoint(root={changed!r})
-        assert cc.local_endpoint_context().root == {changed!r}
+        assert cc.endpoint.local_endpoint_context() == captured
+        cc.endpoint.set_local_endpoint(root={changed!r})
+        assert cc.endpoint.local_endpoint_context().root == {changed!r}
     '''), C2_IPC_ROOT=missing)
 
 
@@ -300,23 +301,26 @@ def test_used_selection_survives_repeated_shutdown_then_refreezes(source: str) -
         import os
         from pathlib import Path
         import c_two as cc
+
+        import c_two.endpoint
+        import c_two.observe
         from c_two import _native
         from c_two.transport.client import util
         from c_two.transport.registry import _get_default_runtime
         if {source!r} == 'code':
-            cc.set_local_endpoint(root={missing!r})
-        context = cc.local_endpoint_context()
+            cc.endpoint.set_local_endpoint(root={missing!r})
+        context = cc.endpoint.local_endpoint_context()
         assert not util.ping('ipc://failed-inheritance', .01)
         assert _get_default_runtime()._runtime_session.local_endpoint_frozen
         os.environ['C2_IPC_ROOT'] = {changed!r}
         for _ in range(2):
             assert cc.shutdown()['completed']
             assert not _get_default_runtime()._runtime_session.local_endpoint_frozen
-            assert cc.local_endpoint_context() == context
+            assert cc.endpoint.local_endpoint_context() == context
         assert not util.ping('ipc://failed-inheritance', .01)
         assert _get_default_runtime()._runtime_session.local_endpoint_frozen
         try:
-            cc.set_local_endpoint(root={changed!r})
+            cc.endpoint.set_local_endpoint(root={changed!r})
         except cc.error.CoreError as error:
             assert error.lifecycle_kind == 'config_frozen', error
         else:
@@ -324,8 +328,8 @@ def test_used_selection_survives_repeated_shutdown_then_refreezes(source: str) -
         assert not Path({missing!r}).exists()
         assert not Path({changed!r}).exists()
         assert cc.shutdown()['completed']
-        cc.set_local_endpoint(root={changed!r})
-        assert cc.local_endpoint_context().root == {changed!r}
+        cc.endpoint.set_local_endpoint(root={changed!r})
+        assert cc.endpoint.local_endpoint_context().root == {changed!r}
     ''', C2_IPC_ROOT=missing)
 
 
@@ -340,19 +344,22 @@ def test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state(ab
         document = ready['credential']
         _run_isolated(f'''
             import c_two as cc
+
+            import c_two.endpoint
+            import c_two.observe
             from c_two import _native
             from pathlib import Path
-            credential = cc.EndpointCredential.from_json({document!r})
+            credential = cc.endpoint.EndpointCredential.from_json({document!r})
             assert credential.context.root == {root!r}
-            assert cc.local_endpoint_context().root == {other!r}
-            assert cc.reap_endpoint({address!r}, credential)['status'] == 'busy'
+            assert cc.endpoint.local_endpoint_context().root == {other!r}
+            assert cc.endpoint.reap_endpoint({address!r}, credential)['status'] == 'busy'
             def snapshot():
                 return {{str(p): p.read_bytes() for p in Path({root!r}).rglob('*') if p.is_file()}}
             before = snapshot()
             assert before  # Real ownership/gate records, not fabricated state.
             for result in (
-                cc.reap_endpoint({address!r}, credential, root={other!r}),
-                cc.reap_endpoint({address!r}, credential, context=cc.local_endpoint_context()),
+                cc.endpoint.reap_endpoint({address!r}, credential, root={other!r}),
+                cc.endpoint.reap_endpoint({address!r}, credential, context=cc.endpoint.local_endpoint_context()),
                 _native.reap_endpoint_credential({address!r}, credential, root={other!r}),
             ):
                 assert result['status'] == 'stale-target', result
@@ -365,11 +372,14 @@ def test_exact_reap_uses_credential_context_and_mismatch_does_not_touch_state(ab
             resource.stop()
         _run_isolated(f'''
             import c_two as cc
-            credential = cc.EndpointCredential.from_json({document!r})
-            result = cc.reap_endpoint({address!r}, credential)
+
+            import c_two.endpoint
+            import c_two.observe
+            credential = cc.endpoint.EndpointCredential.from_json({document!r})
+            result = cc.endpoint.reap_endpoint({address!r}, credential)
             assert result['status'] in ('reaped', 'already-absent'), result
-            assert cc.inspect_endpoint({address!r}, context=credential.context)['status'] == 'absent'
-            with cc.sweep_endpoints(addresses=[{address!r}], context=credential.context) as sweep:
+            assert cc.endpoint.inspect_endpoint({address!r}, context=credential.context)['status'] == 'absent'
+            with cc.endpoint.sweep_endpoints(addresses=[{address!r}], context=credential.context) as sweep:
                 assert sweep.context == credential.context
                 for _ in range(100):
                     batch = sweep.next_batch(max_entries=1)
@@ -395,14 +405,17 @@ def test_sweep_captures_code_context_once_and_keeps_it_across_env_flip(short_roo
         _run_isolated(f'''
             import os
             import c_two as cc
+
+            import c_two.endpoint
+            import c_two.observe
             from c_two import _native
-            credential = cc.EndpointCredential.from_json({document!r})
-            cc.set_local_endpoint(root={root!r})
-            with cc.sweep_endpoints(addresses=[{address!r}], max_entries=1) as sweep:
+            credential = cc.endpoint.EndpointCredential.from_json({document!r})
+            cc.endpoint.set_local_endpoint(root={root!r})
+            with cc.endpoint.sweep_endpoints(addresses=[{address!r}], max_entries=1) as sweep:
                 assert sweep.context == credential.context
                 os.environ['C2_IPC_ROOT'] = {other!r}
-                cc.set_local_endpoint(root={other!r})
-                assert cc.local_endpoint_context() != sweep.context
+                cc.endpoint.set_local_endpoint(root={other!r})
+                assert cc.endpoint.local_endpoint_context() != sweep.context
                 reaped = 0
                 for _ in range(100):
                     batch = sweep.next_batch()
@@ -414,7 +427,7 @@ def test_sweep_captures_code_context_once_and_keeps_it_across_env_flip(short_roo
                 else:
                     raise AssertionError('sweep did not complete')
                 assert reaped == 1, reaped
-            assert cc.inspect_endpoint({address!r}, context=credential.context)['status'] == 'absent'
+            assert cc.endpoint.inspect_endpoint({address!r}, context=credential.context)['status'] == 'absent'
             # The raw native constructor also captures env once for its round.
             os.environ['C2_IPC_ROOT'] = {root!r}
             native = _native.PyEndpointSweep(addresses=[])
@@ -428,63 +441,13 @@ def test_sweep_captures_code_context_once_and_keeps_it_across_env_flip(short_roo
         resource.close()
 
 
-def test_common_owner_bound_transfer_default_context_and_business_disconnect() -> None:
-    address = f'ipc://owner-context-{uuid.uuid4().hex[:12]}'
-    business = CONTRACT + textwrap.dedent(f'''
-        proxy = cc.connect(Echo, name='same-route', address={address!r})
-        assert proxy.value() == 'owner'
-        cc.close(proxy)
-        assert cc.shutdown()['completed']
-    ''')
-    _run_isolated(CONTRACT + textwrap.dedent(f'''
-        import subprocess
-        import sys
-        import time
-        from c_two.transport.registry import _get_default_runtime
-        keepalive, receiver = cc.owner_control_pair()
-        class Resource:
-            hooks = 0
-            def value(self): return 'owner'
-            def done(self): self.hooks += 1
-        resource = Resource()
-        try:
-            cc.set_server(server_id={address.removeprefix('ipc://')!r},
-                lifecycle=cc.LifecycleConfig.owner_bound(.05), owner_control=receiver)
-            original = _get_default_runtime()._runtime_session
-            context = cc.local_endpoint_context()
-            cc.set_transport_policy(shm_threshold=8192)
-            replacement = _get_default_runtime()._runtime_session
-            assert replacement is not original
-            assert replacement.owner_control_attached
-            assert not original.owner_control_attached
-            assert cc.local_endpoint_context() == context
-            cc.register(Echo, resource, name='same-route')
-            assert replacement.local_endpoint_frozen
-            result = subprocess.run([sys.executable, '-c', {business!r}],
-                capture_output=True, text=True, timeout=8)
-            assert result.returncode == 0, result.stderr
-            assert cc.native_lifecycle_snapshot()['phase'] == 'armed'
-            assert cc.native_terminal_outcome() is None
-            assert resource.hooks == 0
-            keepalive.close()
-            deadline = time.monotonic() + 5
-            while cc.native_terminal_outcome() is None:
-                assert time.monotonic() < deadline, 'owner EOF did not drain'
-                time.sleep(.01)
-            outcome = cc.shutdown(timeout=5)
-            assert outcome['completed'], outcome
-            assert resource.hooks == 1
-            assert cc.local_endpoint_context() == context
-        finally:
-            keepalive.close()
-            cc.shutdown(timeout=5)
-    '''))
-
-
 def test_common_active_incomplete_shutdown_retains_session_bindings_and_context() -> None:
     _run_isolated('''
         import threading
         import c_two as cc
+
+        import c_two.endpoint
+        import c_two.observe
         from c_two.transport.registry import _get_default_runtime
         @cc.crm(namespace='test.endpoint.active', version='0.1.0')
         class Blocking:
@@ -505,7 +468,7 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
         cc.register(Blocking, resource, name='blocking')
         proxy = cc.connect(Blocking, name='blocking')
         session = _get_default_runtime()._runtime_session
-        context = cc.local_endpoint_context()
+        context = cc.endpoint.local_endpoint_context()
         worker = threading.Thread(target=lambda: results.append(proxy.wait()))
         worker.start()
         try:
@@ -514,7 +477,7 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
             assert not pending['completed'], pending
             assert _get_default_runtime()._runtime_session is session
             assert _get_default_runtime().names == ['blocking']
-            assert cc.local_endpoint_context() == context
+            assert cc.endpoint.local_endpoint_context() == context
             assert resource.hooks == 0
         finally:
             resource.release.set()
@@ -523,7 +486,7 @@ def test_common_active_incomplete_shutdown_retains_session_bindings_and_context(
             assert cc.shutdown(timeout=5)['completed']
         assert results == ['drained']
         assert resource.hooks == 1
-        assert cc.local_endpoint_context() == context
+        assert cc.endpoint.local_endpoint_context() == context
         assert _get_default_runtime()._runtime_session is not session
         cc.close(proxy)
     ''')

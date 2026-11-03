@@ -9,8 +9,7 @@ class TestHeldResultBasic:
     """HeldResult lifecycle: access, release, double-release."""
 
     def test_access_value(self):
-        from c_two.crm.transferable import Held, HeldResult
-        assert Held is HeldResult
+        from c_two.crm.transferable import HeldResult
         hr = HeldResult(42, release_cb=None)
         assert hr.value == 42
 
@@ -91,47 +90,15 @@ class TestHeldResultBasic:
             hr.__del__()
             assert len(w) == 0
 
-    def test_del_reports_pending_native_cleanup_after_release_failure(self):
-        from c_two.crm.transferable import HeldResult
-
-        class Response:
-            is_released = True
-            has_pending_release = True
-            abandoned = 0
-
-            def release(self):
-                raise RuntimeError('native cleanup failed')
-
-            def _abandon_after_failed_release(self):
-                self.abandoned += 1
-                self.has_pending_release = False
-
-        response = Response()
-        held = HeldResult('value')
-        held._native_response = response
-        held._released = True
-        held._release_attempted = True
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
-            held.__del__()
-
-        assert response.abandoned == 1
-        assert len(caught) == 2
-        assert 'pending native cleanup after release() failed' in str(caught[0].message)
-        assert 'final release failed: native cleanup failed' in str(caught[1].message)
 
     def test_del_reports_prior_release_rejected_before_invalidation(self):
         from c_two.crm.transferable import HeldResult
 
         class Response:
             is_released = False
-            has_pending_release = False
 
             def release(self):
                 raise BufferError('another export is active')
-
-            def _abandon_after_failed_release(self):
-                pass
 
         held = HeldResult('value')
         held._native_response = Response()
@@ -183,7 +150,7 @@ class TestHeldResultBasic:
         HeldResult(owner, release_cb=None).release()
         assert owner.invalidated is False
 
-    def test_invalidation_failure_does_not_skip_transport_release(self):
+    def test_invalidation_failure_does_not_skip_local_release(self):
         from c_two.crm.transferable import HeldResult
 
         events = []

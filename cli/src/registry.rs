@@ -1,7 +1,61 @@
 use anyhow::{Result, anyhow};
 use c2_config::{ConfigResolver, ConfigSources};
 use clap::{Args, Subcommand};
-use serde_json::Value;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+
+#[derive(Deserialize)]
+struct RoutesResponse {
+    routes: Vec<RouteRecord>,
+}
+
+#[derive(Deserialize)]
+// Deserialize every endpoint field so a partial route cannot appear valid.
+#[allow(dead_code)]
+struct RouteRecord {
+    name: String,
+    relay_id: String,
+    relay_url: String,
+    locality: RouteLocality,
+    crm_ns: String,
+    crm_name: String,
+    crm_ver: String,
+    abi_hash: String,
+    signature_hash: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RouteLocality {
+    Local,
+    Peer,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct PeerRecord {
+    relay_id: String,
+    url: String,
+    route_count: u32,
+    status: PeerStatus,
+}
+
+#[derive(Deserialize)]
+enum PeerStatus {
+    Alive,
+    Suspect,
+    Dead,
+}
+
+impl PeerStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Alive => "Alive",
+            Self::Suspect => "Suspect",
+            Self::Dead => "Dead",
+        }
+    }
+}
 
 #[derive(Debug, Args)]
 pub struct RegistryArgs {
@@ -31,7 +85,7 @@ pub fn run(args: RegistryArgs) -> Result<()> {
     }
 }
 
-fn get_json(relay: &str, path: &str) -> Result<Value> {
+fn get_json<T: DeserializeOwned>(relay: &str, path: &str) -> Result<T> {
     let url = format!(
         "{}/{}",
         relay.trim_end_matches('/'),
@@ -55,7 +109,7 @@ fn get_json(relay: &str, path: &str) -> Result<Value> {
         return Err(anyhow!("relay returned HTTP {status} for {url}"));
     }
     response
-        .json::<Value>()
+        .json::<T>()
         .map_err(|e| anyhow!("invalid JSON from {url}: {e}"))
 }
 
@@ -64,39 +118,30 @@ fn resolve_relay_use_proxy(sources: ConfigSources) -> Result<bool> {
 }
 
 fn list_routes(relay: &str) -> Result<()> {
-    let value = get_json(relay, "/_routes")?;
-    let routes = value
-        .get("routes")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let RoutesResponse { routes } = get_json(relay, "/_routes")?;
     if routes.is_empty() {
         println!("No routes registered.");
         return Ok(());
     }
     for route in routes {
-        if let Some(name) = route.get("name").and_then(Value::as_str) {
-            println!("{name}");
-        }
+        println!("{}", route.name);
     }
     Ok(())
 }
 
 fn peers(relay: &str) -> Result<()> {
-    let value = get_json(relay, "/_peers")?;
-    let peers = value.as_array().cloned().unwrap_or_default();
+    let peers: Vec<PeerRecord> = get_json(relay, "/_peers")?;
     if peers.is_empty() {
         println!("No peers known.");
         return Ok(());
     }
     for peer in peers {
-        let relay_id = peer.get("relay_id").and_then(Value::as_str).unwrap_or("?");
-        let url = peer.get("url").and_then(Value::as_str).unwrap_or("?");
-        let status = peer
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        println!("{relay_id} ({url}) - {status}");
+        println!(
+            "{} ({}) - {}",
+            peer.relay_id,
+            peer.url,
+            peer.status.as_str()
+        );
     }
     Ok(())
 }

@@ -4,6 +4,7 @@ import pickle
 
 import pytest
 import c_two as cc
+import c_two.endpoint
 from c_two.config.settings import settings
 from c_two.error import CoreError, ProtocolViolation
 from c_two.transport.registry import _reset_default_runtime
@@ -30,12 +31,12 @@ def _clean_runtime():
 
 
 @pytest.mark.parametrize(("reply", "peer_version"), [
-    ("mismatch15", 15), ("mismatch13", 13), ("mismatch-max", 0xFFFFFFFF),
-    ("bad-magic", None), ("accepted15", None), ("mismatch14", None),
+    ("mismatch16", 16), ("mismatch14", 14), ("mismatch13", 13), ("mismatch-max", 0xFFFFFFFF),
+    ("bad-magic", None), ("accepted16", None), ("mismatch15", None),
 ])
 def test_connect_fixed_version_peer(ipc_version_peer_binary, reply, peer_version):
     with running_version_peer(ipc_version_peer_binary, reply) as (address, context):
-        cc.set_local_endpoint(root=context.root)
+        cc.endpoint.set_local_endpoint(root=context.root)
         with pytest.raises(CoreError if peer_version is not None else ProtocolViolation) as failure:
             cc.connect(VersionContract, name="version", address=address, timeout=3)
         # Malformed handshakes retain the public semantic ProtocolViolation.
@@ -48,7 +49,7 @@ def test_connect_fixed_version_peer(ipc_version_peer_binary, reply, peer_version
             assert (error.local_protocol_version, error.peer_protocol_version) == (None, None)
         else:
             assert error.category == "protocol_version_mismatch"
-            assert (error.local_protocol_version, error.peer_protocol_version) == (14, peer_version)
+            assert (error.local_protocol_version, error.peer_protocol_version) == (15, peer_version)
             assert type(error.local_protocol_version) is type(error.peer_protocol_version) is int
             assert (error.transport_kind, error.transport_phase) == ("ipc", "pre_dispatch")
             assert error.fallback_eligible is False

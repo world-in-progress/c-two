@@ -3,23 +3,14 @@
 //! Defines the canonical frame flag constants shared by all SDKs.
 //! All flags occupy the 4-byte LE `flags` field of the frame header.
 
-/// Payload references a per-request SharedMemory segment (legacy).
-pub const FLAG_SHM: u32 = 1 << 0;
-
 /// Server→client direction marker.
 pub const FLAG_RESPONSE: u32 = 1 << 1;
 
 /// Handshake message (pool SHM exchange or capability negotiation).
 pub const FLAG_HANDSHAKE: u32 = 1 << 2;
 
-/// Payload references pre-allocated pool SharedMemory (legacy).
-pub const FLAG_POOL: u32 = 1 << 3;
-
-/// Control message (segment announce, consumed signal).
+/// Control message.
 pub const FLAG_CTRL: u32 = 1 << 4;
-
-/// Reserved for disk spillover.
-pub const FLAG_DISK_SPILL: u32 = 1 << 5;
 
 /// Payload references a buddy-allocated SHM block.
 pub const FLAG_BUDDY: u32 = 1 << 6;

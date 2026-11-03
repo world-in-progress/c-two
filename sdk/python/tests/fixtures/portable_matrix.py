@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import quote, urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
+from typing import Literal
 import c_two as cc
 from tests.fixtures.process_control import portable_command, readline_with_timeout
 from c_two.config.settings import settings
@@ -45,7 +46,7 @@ REPOSITORY = Path(__file__).resolve().parents[4]
 RUST_HARNESS_SOURCE = (
     REPOSITORY / "sdk/python/tests/fixtures/portable_matrix_rust.rs"
 )
-TARGET_DIR = REPOSITORY / "core/target"
+TARGET_DIR = REPOSITORY / os.environ.get("CARGO_TARGET_DIR", "core/target")
 _CANDIDATE_CONTRACT_ROOT = os.environ.get(
     "C2_PORTABLE_MATRIX_CONTRACT_ROOT"
 )
@@ -154,9 +155,10 @@ def _c3_binary() -> Path:
             )
         return candidate
     name = "c3.exe" if os.name == "nt" else "c3"
+    target = REPOSITORY / os.environ.get("CARGO_TARGET_DIR", "cli/target")
     candidates = (
-        REPOSITORY / "cli/target/debug" / name,
-        REPOSITORY / "cli/target/release" / name,
+        target / "debug" / name,
+        target / "release" / name,
     )
     for candidate in candidates:
         if candidate.is_file():
@@ -406,7 +408,6 @@ publish = false
         raise AssertionError(f"unknown SDK language: {language}")
 
 
-
 def _parse_key_values(line: str, prefix: str) -> dict[str, str]:
     if not line.startswith(prefix):
         raise AssertionError(f"expected {prefix!r} line, got {line!r}")
@@ -457,7 +458,6 @@ class RustHost:
                     f"Rust matrix host address mismatch: {ready!r}"
                 )
             self.route_uid = ready["route_uid"]
-            self.route_revision = int(ready["route_revision"])
         except BaseException:
             self._kill_and_collect()
             raise
@@ -657,7 +657,7 @@ def wait_for_contract_resolution(
                         raise AssertionError(
                             f"relay resolution {route_key} mismatch: {route!r}"
                         )
-                if not route.get("route_uid") or route.get("route_revision", 0) <= 0:
+                if not route.get("route_uid"):
                     raise AssertionError(
                         f"relay resolution omitted route token: {route!r}"
                     )
@@ -681,7 +681,6 @@ def wait_for_contract_resolution(
                             "signature_hash"
                         ],
                         "x-c2-route-uid": route["route_uid"],
-                        "x-c2-route-revision": str(route["route_revision"]),
                     },
                 )
                 with opener.open(probe, timeout=1) as response:
@@ -822,10 +821,10 @@ def resource_for(payload: str) -> NoPayloadResource | RecordResource | ObjectGra
     raise AssertionError(f"unknown payload profile: {payload}")
 
 
-def input_lifetime_for(payload: str) -> dict[str, cc.InputLifetime]:
+def input_lifetime_for(payload: str) -> dict[str, Literal['materialized', 'borrowed']]:
     if payload == "no-payload":
         return {}
-    return {"roundtrip": cc.InputLifetime.BORROWED}
+    return {"roundtrip": 'borrowed'}
 
 
 def invoke_generated_python(

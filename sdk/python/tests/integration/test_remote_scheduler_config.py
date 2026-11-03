@@ -8,9 +8,10 @@ from dataclasses import dataclass
 import pytest
 
 import c_two as cc
+
 from c_two.config import settings
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
-from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
+from c_two.transport.server.scheduler import ConcurrencyConfig
 
 
 @pytest.fixture(autouse=True)
@@ -20,10 +21,8 @@ def _clean_env_and_registry(monkeypatch):
     settings.relay_anchor_address = None
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     try:
-        # These scheduler tests own a Persistent host, never a prior test's
-        # OwnerBound capability or frozen server configuration.
+        # Start each scheduler test with fresh server configuration.
         assert cc.shutdown()['completed']
-        cc.set_server(lifecycle=cc.LifecycleConfig.persistent())
         yield
     finally:
         try:
@@ -138,7 +137,7 @@ def test_remote_ipc_exclusive_serializes_reads():
         RemoteSchedulerProbe,
         RemoteSchedulerProbeImpl(),
         name='remote_exclusive',
-        concurrency=ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE),
+        concurrency=ConcurrencyConfig(mode='exclusive'),
     )
     cc.serve(blocking=False)
 
@@ -171,7 +170,7 @@ def test_remote_ipc_parallel_allows_concurrent_writes():
         RemoteSchedulerProbe,
         RemoteSchedulerProbeImpl(),
         name='remote_parallel',
-        concurrency=ConcurrencyConfig(mode=ConcurrencyMode.PARALLEL),
+        concurrency=ConcurrencyConfig(mode='parallel'),
     )
     cc.serve(blocking=False)
 
@@ -204,7 +203,7 @@ def test_remote_ipc_read_parallel_allows_concurrent_reads():
         RemoteSchedulerProbe,
         RemoteSchedulerProbeImpl(),
         name='remote_read_parallel_reads',
-        concurrency=ConcurrencyConfig(mode=ConcurrencyMode.READ_PARALLEL),
+        concurrency=ConcurrencyConfig(mode='read_parallel'),
     )
     cc.serve(blocking=False)
 
@@ -237,7 +236,7 @@ def test_remote_ipc_read_parallel_serializes_writes():
         RemoteSchedulerProbe,
         RemoteSchedulerProbeImpl(),
         name='remote_read_parallel_writes',
-        concurrency=ConcurrencyConfig(mode=ConcurrencyMode.READ_PARALLEL),
+        concurrency=ConcurrencyConfig(mode='read_parallel'),
     )
 
     write_errors: list[BaseException] = []
@@ -266,10 +265,10 @@ def test_remote_ipc_read_parallel_serializes_writes():
 
 @pytest.mark.parametrize(
     'mode',
-    [ConcurrencyMode.PARALLEL, ConcurrencyMode.EXCLUSIVE, ConcurrencyMode.READ_PARALLEL],
+    ['parallel', 'exclusive', 'read_parallel'],
 )
 def test_remote_ipc_registers_all_public_concurrency_modes(mode):
-    name = f'remote_mode_{mode.value}'
+    name = f'remote_mode_{mode}'
     cc.register(
         RemoteSchedulerProbe,
         RemoteSchedulerProbeImpl(),
@@ -289,7 +288,7 @@ def test_remote_ipc_scheduler_direct_address_ignores_bad_relay(monkeypatch):
         RemoteSchedulerProbe,
         RemoteSchedulerProbeImpl(),
         name='direct_no_relay_scheduler',
-        concurrency=ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE),
+        concurrency=ConcurrencyConfig(mode='exclusive'),
     )
     cc.serve(blocking=False)
     direct_address = cc.server_address()
@@ -317,7 +316,7 @@ def test_remote_ipc_scheduler_max_workers_shares_with_local_thread_calls():
         SharedLimitProbeImpl(),
         name='mixed_limit_workers',
         concurrency=ConcurrencyConfig(
-            mode=ConcurrencyMode.PARALLEL,
+            mode='parallel',
             max_workers=1,
         ),
     )
@@ -375,7 +374,7 @@ def test_remote_ipc_scheduler_max_pending_shares_with_local_thread_calls():
         SharedLimitProbeImpl(),
         name='mixed_limit_pending',
         concurrency=ConcurrencyConfig(
-            mode=ConcurrencyMode.PARALLEL,
+            mode='parallel',
             max_pending=1,
         ),
     )

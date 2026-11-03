@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 use pyo3::buffer::PyBuffer;
@@ -8,16 +8,15 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
+use c2_core::memory::LocalCopyGuard;
 use c2_core::{
     CallOptions, CallTimeout, Client, EncodedService, HeldResponse, LifecycleError, ObservedPath,
     ObservedRoute, PreparedCall, ServerFailure,
 };
 use c2_error::{C2Error, ErrorCode};
-use c2_mem::BufferLeaseGuard;
 
 use crate::core_error_ffi::{core_error_to_py, lifecycle_error_to_py};
-use crate::lease_ffi::PyBufferLeaseTracker;
-use crate::writable_sink::{materialize_python_payload_plan, prepared_plan_nbytes};
+use crate::local_copy_ffi::PyLocalCopyTracker;
 
 #[pyclass(name = "CoreClient", frozen, skip_from_py_object)]
 pub(crate) struct PyCoreClient {
@@ -69,11 +68,7 @@ fn call_options(py: Python<'_>, timeout: &Py<PyAny>) -> PyResult<CallOptions> {
         CallTimeout::try_after_seconds(timeout.extract::<f64>()?)
             .map_err(|error| PyValueError::new_err(error.to_string()))?
     };
-    // Validate the monotonic clock range through Core as well as Duration.
-    let options = CallOptions::with_timeout(timeout);
-    c2_core::CallScope::new(options, None)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    Ok(options)
+    Ok(CallOptions::with_timeout(timeout))
 }
 
 #[pymethods]
@@ -215,11 +210,6 @@ impl PyCoreClient {
         &self.observed_route.route_uid
     }
 
-    #[getter]
-    fn route_revision(&self) -> u64 {
-        self.observed_route.route_revision
-    }
-
     #[pyo3(signature = (*, timeout=inherit_timeout()))]
     fn with_call_options(&self, py: Python<'_>, timeout: Py<PyAny>) -> PyResult<Self> {
         let client = self.client()?;
@@ -261,7 +251,7 @@ impl PyCoreClient {
 #[pyclass(name = "ResponseBuffer", frozen, skip_from_py_object)]
 pub(crate) struct PyCoreResponse {
     inner: Mutex<Option<HeldResponse>>,
-    lease: Mutex<Option<BufferLeaseGuard>>,
+    local_copy: Mutex<Option<LocalCopyGuard>>,
     data_len: usize,
     exports: AtomicU32,
     #[cfg(test)]
@@ -273,7 +263,7 @@ impl PyCoreResponse {
         let data_len = held.bytes().len();
         Self {
             inner: Mutex::new(Some(held)),
-            lease: Mutex::new(None),
+            local_copy: Mutex::new(None),
             data_len,
             exports: AtomicU32::new(0),
             #[cfg(test)]
@@ -288,53 +278,6 @@ impl PyCoreResponse {
             Err(PyBufferError::new_err(
                 "cannot release: buffer is currently exported as memoryview",
             ))
-        }
-    }
-}
-
-fn attach_cleanup_error(py: Python<'_>, primary: &PyErr, cleanup: PyErr) {
-    if cleanup.value(py).is(primary.value(py)) {
-        return;
-    }
-    let previous = primary.context(py);
-    let mut cursor = cleanup.clone_ref(py);
-    let mut seen = vec![cursor.clone_ref(py)];
-    loop {
-        match cursor.context(py) {
-            Some(next) if next.value(py).is(primary.value(py)) => {
-                let replacement = previous
-                    .filter(|prior| !seen.iter().any(|error| error.value(py).is(prior.value(py))));
-                cursor.set_context(py, replacement);
-                break;
-            }
-            Some(next) if seen.iter().any(|error| error.value(py).is(next.value(py))) => {
-                break;
-            }
-            Some(next) => {
-                seen.push(next.clone_ref(py));
-                cursor = next;
-            }
-            None => {
-                let replacement = previous
-                    .filter(|prior| !seen.iter().any(|error| error.value(py).is(prior.value(py))));
-                cursor.set_context(py, replacement);
-                break;
-            }
-        }
-    }
-    primary.set_context(py, Some(cleanup.clone_ref(py)));
-    if py.version_info() >= (3, 11) {
-        if let Err(error) = py
-            .get_type::<pyo3::exceptions::PyBaseException>()
-            .call_method1(
-                "add_note",
-                (
-                    primary.value(py),
-                    format!("C-Two Core release also failed: {cleanup}"),
-                ),
-            )
-        {
-            eprintln!("Warning: attaching Core cleanup note failed: {error}");
         }
     }
 }
@@ -365,14 +308,6 @@ impl PyCoreResponse {
             .is_none_or(HeldResponse::is_released)
     }
 
-    #[getter]
-    fn has_pending_release(&self) -> bool {
-        self.inner
-            .lock()
-            .as_ref()
-            .is_some_and(HeldResponse::has_pending_release)
-    }
-
     fn release(&self) -> PyResult<()> {
         #[cfg(test)]
         if let Some(pause) = self.before_release.lock().take() {
@@ -380,14 +315,12 @@ impl PyCoreResponse {
         }
         let mut inner = self.inner.lock();
         self.ensure_not_exported()?;
-        let Some(held) = inner.as_mut() else {
+        let Some(mut held) = inner.take() else {
             return Ok(());
         };
-        let result = held.invalidate_then_release(|| Ok(()));
-        if !held.has_pending_release() {
-            self.lease.lock().take();
-        }
-        result.map_err(lifecycle_error_to_py)
+        let _local_copy = self.local_copy.lock().take();
+        held.invalidate_then_release(|| Ok(()))
+            .map_err(lifecycle_error_to_py)
     }
 
     fn invalidate_then_release(
@@ -402,54 +335,31 @@ impl PyCoreResponse {
         }
         let mut inner = self.inner.lock();
         self.ensure_not_exported()?;
-        let Some(held) = inner.as_mut() else {
+        let Some(mut held) = inner.take() else {
             return Ok(());
         };
-
+        let _local_copy = self.local_copy.lock().take();
         let mut python_error = None;
-        let release_result =
-            held.invalidate_then_release(|| match invalidator.call1(py, (value.clone_ref(py),)) {
-                Ok(_) => Ok(()),
-                Err(error) => {
+        let result = held.invalidate_then_release(|| {
+            invalidator
+                .call1(py, (value,))
+                .map(|_| ())
+                .map_err(|error| {
                     let message = error.to_string();
                     python_error = Some(error);
-                    Err(message)
-                }
-            });
-        let pending_release = held.has_pending_release();
-        if !pending_release {
-            self.lease.lock().take();
-        }
-
+                    message
+                })
+        });
         if let Some(error) = python_error {
-            if pending_release {
-                if let Err(release_error) = release_result {
-                    let cleanup_error = lifecycle_error_to_py(release_error);
-                    attach_cleanup_error(py, &error, cleanup_error);
-                }
-            }
             return Err(error);
         }
-        release_result.map_err(lifecycle_error_to_py)
-    }
-
-    /// Only a consuming Python error path may call this after an actual native
-    /// release failure. Export rejection has not entered Core and keeps its owner.
-    fn _abandon_after_failed_release(&self) {
-        let mut inner = self.inner.lock();
-        if inner
-            .as_ref()
-            .is_some_and(|held| held.is_released() && held.has_pending_release())
-        {
-            inner.take().unwrap().abandon();
-            self.lease.lock().take();
-        }
+        result.map_err(lifecycle_error_to_py)
     }
 
     #[pyo3(signature = (tracker, route_name, method_name, direction="client_response"))]
     fn track_retained(
         &self,
-        tracker: &PyBufferLeaseTracker,
+        tracker: &PyLocalCopyTracker,
         route_name: &str,
         method_name: &str,
         direction: &str,
@@ -458,14 +368,9 @@ impl PyCoreResponse {
         if inner.as_ref().is_none_or(HeldResponse::is_released) {
             return Ok(());
         }
-        let lease = tracker.track_retained_guard(
-            route_name,
-            method_name,
-            direction,
-            "inline",
-            self.data_len,
-        )?;
-        *self.lease.lock() = Some(lease);
+        let local_copy =
+            tracker.track_retained_guard(route_name, method_name, direction, self.data_len)?;
+        *self.local_copy.lock() = Some(local_copy);
         Ok(())
     }
 
@@ -515,13 +420,16 @@ impl PyCoreResponse {
     }
 }
 
+struct LocalRequestBuffer {
+    bytes: Vec<u8>,
+    local_copy: Option<LocalCopyGuard>,
+}
+
 #[pyclass(name = "CoreRequestBuffer", frozen, skip_from_py_object)]
 struct PyCoreRequestBuffer {
-    bytes: Vec<u8>,
-    released: AtomicBool,
+    // One lock serializes buffer access, export admission, release and tracking.
+    inner: Mutex<Option<LocalRequestBuffer>>,
     exports: AtomicU32,
-    // Serializes export, release and retained-lease admission.
-    lease: Mutex<Option<BufferLeaseGuard>>,
     #[cfg(test)]
     before_release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -531,10 +439,11 @@ struct PyCoreRequestBuffer {
 impl PyCoreRequestBuffer {
     fn new(bytes: Vec<u8>) -> Self {
         Self {
-            bytes,
-            released: AtomicBool::new(false),
+            inner: Mutex::new(Some(LocalRequestBuffer {
+                bytes,
+                local_copy: None,
+            })),
             exports: AtomicU32::new(0),
-            lease: Mutex::new(None),
             #[cfg(test)]
             before_release: Mutex::new(None),
             #[cfg(test)]
@@ -546,11 +455,11 @@ impl PyCoreRequestBuffer {
 #[pymethods]
 impl PyCoreRequestBuffer {
     fn __len__(&self) -> PyResult<usize> {
-        if self.released.load(Ordering::Acquire) {
-            Err(PyValueError::new_err("buffer already released"))
-        } else {
-            Ok(self.bytes.len())
-        }
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|state| state.bytes.len())
+            .ok_or_else(|| PyValueError::new_err("buffer already released"))
     }
 
     fn release(&self) -> PyResult<()> {
@@ -558,21 +467,20 @@ impl PyCoreRequestBuffer {
         if let Some(pause) = self.before_release.lock().take() {
             Python::attach(|py| py.detach(pause));
         }
-        let mut lease = self.lease.lock();
+        let mut inner = self.inner.lock();
         if self.exports.load(Ordering::Acquire) > 0 {
             return Err(PyBufferError::new_err(
                 "cannot release: buffer is currently exported as memoryview",
             ));
         }
-        self.released.store(true, Ordering::Release);
-        lease.take();
+        inner.take();
         Ok(())
     }
 
     #[pyo3(signature = (tracker, route_name, method_name, direction="resource_input"))]
     fn track_retained(
         &self,
-        tracker: &PyBufferLeaseTracker,
+        tracker: &PyLocalCopyTracker,
         route_name: &str,
         method_name: &str,
         direction: &str,
@@ -581,18 +489,16 @@ impl PyCoreRequestBuffer {
         if let Some(pause) = self.before_track_retained.lock().take() {
             Python::attach(|py| py.detach(pause));
         }
-        let mut lease_slot = self.lease.lock();
-        if self.released.load(Ordering::Acquire) {
+        let mut inner = self.inner.lock();
+        let Some(state) = inner.as_mut() else {
             return Ok(());
-        }
-        let lease = tracker.track_retained_guard(
+        };
+        state.local_copy = Some(tracker.track_retained_guard(
             route_name,
             method_name,
             direction,
-            "inline",
-            self.bytes.len(),
-        )?;
-        *lease_slot = Some(lease);
+            state.bytes.len(),
+        )?);
         Ok(())
     }
 
@@ -602,14 +508,14 @@ impl PyCoreRequestBuffer {
         flags: std::os::raw::c_int,
     ) -> PyResult<()> {
         let this = slf.borrow();
-        let _lease = this.lease.lock();
-        if this.released.load(Ordering::Acquire) {
-            return Err(PyBufferError::new_err("buffer already released"));
-        }
+        let inner = this.inner.lock();
+        let state = inner
+            .as_ref()
+            .ok_or_else(|| PyBufferError::new_err("buffer already released"))?;
         unsafe {
-            (*view).buf = this.bytes.as_ptr().cast_mut().cast();
+            (*view).buf = state.bytes.as_ptr().cast_mut().cast();
             (*view).obj = ffi::Py_NewRef(slf.as_ptr());
-            (*view).len = this.bytes.len() as isize;
+            (*view).len = state.bytes.len() as isize;
             (*view).readonly = 1;
             (*view).itemsize = 1;
             (*view).format = if flags & ffi::PyBUF_FORMAT != 0 {
@@ -690,11 +596,8 @@ fn materialize_python_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResul
         let materialized = to_bytes.call0()?;
         return materialize_python_bytes(py, &materialized);
     }
-    if let Some(nbytes) = prepared_plan_nbytes(value)? {
-        return materialize_python_payload_plan(py, value, nbytes);
-    }
     Err(PyValueError::new_err(
-        "Core service/client payload must expose the buffer protocol, to_bytes(), or write_into()",
+        "Core service/client payload must expose the buffer protocol or to_bytes()",
     ))
 }
 
@@ -850,104 +753,20 @@ mod payload_tests {
         (waiting, resume)
     }
 
-    fn tracker() -> PyBufferLeaseTracker {
-        PyBufferLeaseTracker::from_arc(Arc::new(c2_mem::BufferLeaseTracker::new(false)))
+    fn tracker() -> PyLocalCopyTracker {
+        PyLocalCopyTracker::from_arc(Arc::new(c2_core::memory::LocalCopyTracker::new()))
     }
 
-    fn assert_counts(tracker: &PyBufferLeaseTracker, holds: usize, bytes: usize) {
+    fn assert_counts(tracker: &PyLocalCopyTracker, holds: usize, bytes: usize) {
         let stats = tracker.inner.stats();
-        assert_eq!((stats.active_leases, stats.active_holds), (holds, holds));
-        assert_eq!(
-            (stats.total_leased_bytes, stats.total_held_bytes),
-            (bytes, bytes)
-        );
+        assert_eq!(stats.active_holds, holds);
+        assert_eq!(stats.total_held_bytes, bytes);
     }
 
     fn assert_buffer_error(py: Python<'_>, result: PyResult<()>, message: &str) {
         let error = result.unwrap_err();
         assert!(error.is_instance_of::<PyBufferError>(py));
         assert_eq!(error.value(py).str().unwrap().to_str().unwrap(), message);
-    }
-
-    #[test]
-    fn cleanup_note_preserves_both_context_chains_and_explicit_causes() {
-        Python::initialize();
-        Python::attach(|py| {
-            let errors = module(
-                py,
-                r#"
-def primary():
-    try:
-        raise KeyError('prior context')
-    except KeyError:
-        raise ValueError('primary') from LookupError('explicit cause')
-
-def cleanup():
-    try:
-        raise TypeError('cleanup context')
-    except TypeError:
-        raise RuntimeError('cleanup') from OSError('cleanup cause')
-"#,
-            );
-            let primary = errors.getattr("primary").unwrap().call0().unwrap_err();
-            let cleanup = errors.getattr("cleanup").unwrap().call0().unwrap_err();
-            let original_context = primary.context(py).unwrap();
-            let original_cause = primary.cause(py).unwrap();
-            let cleanup_context = cleanup.context(py).unwrap();
-            let cleanup_cause = cleanup.cause(py).unwrap();
-
-            attach_cleanup_error(py, &primary, cleanup.clone_ref(py));
-
-            let attached = primary.context(py).unwrap();
-            assert!(attached.value(py).is(cleanup.value(py)));
-            assert!(
-                attached
-                    .context(py)
-                    .unwrap()
-                    .value(py)
-                    .is(cleanup_context.value(py))
-            );
-            assert!(
-                attached
-                    .context(py)
-                    .unwrap()
-                    .context(py)
-                    .unwrap()
-                    .value(py)
-                    .is(original_context.value(py))
-            );
-            assert!(
-                primary
-                    .cause(py)
-                    .unwrap()
-                    .value(py)
-                    .is(original_cause.value(py))
-            );
-            assert!(
-                attached
-                    .cause(py)
-                    .unwrap()
-                    .value(py)
-                    .is(cleanup_cause.value(py))
-            );
-            if py.version_info() >= (3, 11) {
-                let notes = primary.value(py).getattr("__notes__").unwrap();
-                let notes: Vec<String> = notes.extract().unwrap();
-                assert!(notes.iter().any(|note| note.contains("cleanup")));
-                let traceback: Vec<String> = py
-                    .import("traceback")
-                    .unwrap()
-                    .call_method1("format_exception", (primary.value(py),))
-                    .unwrap()
-                    .extract()
-                    .unwrap();
-                assert!(
-                    traceback
-                        .join("")
-                        .contains("C-Two Core release also failed")
-                );
-            }
-        });
     }
 
     fn response_release_race(invalidate: bool) {
@@ -991,10 +810,7 @@ def cleanup():
             );
             let owner = response.borrow(py);
             assert!(!owner.is_released());
-            assert!(owner.lease.lock().is_some());
-            owner._abandon_after_failed_release();
-            assert!(!owner.is_released());
-            assert!(!owner.has_pending_release());
+            assert!(owner.local_copy.lock().is_some());
             assert_counts(&tracker, 1, 32);
             assert_eq!(calls.len(), 0);
             assert_eq!(exported.to_vec(py).unwrap(), vec![b'r'; 32]);
@@ -1007,7 +823,7 @@ def cleanup():
                 owner.release().unwrap();
             }
             assert!(owner.is_released());
-            assert!(owner.lease.lock().is_none());
+            assert!(owner.local_copy.lock().is_none());
             owner
                 .invalidate_then_release(py, invalidator, py.None())
                 .unwrap();
@@ -1023,96 +839,65 @@ def cleanup():
     }
 
     #[test]
-    fn failed_native_response_keeps_tracking_until_retry_or_abandonment() {
+    fn response_copy_releases_reassembly_before_local_hold() {
         Python::initialize();
         Python::attach(|py| {
-            for abandon in [false, true] {
-                let config = c2_mem::PoolConfig {
+            let pool = Arc::new(parking_lot::RwLock::new(
+                c2_mem::MemPool::new(c2_mem::PoolConfig {
                     segment_size: 65536,
                     min_block_size: 4096,
-                    max_segments: 1,
                     ..Default::default()
-                };
-                let pool = Arc::new(parking_lot::RwLock::new(c2_mem::MemPool::new(
-                    config.clone(),
-                )));
-                let budget = pool.read().budget().unwrap().clone();
-                let backing =
-                    c2_wire::chunk::ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
-                let held = HeldResponse::from_response_lease(c2_ipc::ResponseLease::new(
-                    c2_ipc::ResponseData::Handle(backing),
-                ))
+                })
+                .unwrap(),
+            ));
+            let budget = pool.read().budget().unwrap().clone();
+            let mut backing =
+                c2_wire::chunk::backing::ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
+            backing.write_at(0, &[b'r'; 512]).unwrap();
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+            let held =
+                HeldResponse::from_response_data(c2_ipc::ResponseData::Handle(backing)).unwrap();
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+            assert_eq!(pool.read().stats().alloc_count, 0);
+            let owner = PyCoreResponse::new(held);
+            let tracker = tracker();
+            owner
+                .track_retained(&tracker, "local", "copy", "client_response")
                 .unwrap();
-                let response = Py::new(py, PyCoreResponse::new(held)).unwrap();
-                let tracker = tracker();
-                let owner = response.borrow(py);
-                owner
-                    .track_retained(&tracker, "retry", "release", "client_response")
-                    .unwrap();
-                let original = std::mem::replace(&mut *pool.write(), c2_mem::MemPool::new(config));
-                let globals = pyo3::types::PyDict::new(py);
-                py.run(
-                    c"def invalidator(value):
- try:
-  raise KeyError('prior')
- except KeyError:
-  raise ValueError('primary')",
-                    Some(&globals),
-                    None,
-                )
+            assert_counts(&tracker, 1, 512);
+            drop(pool);
+            assert_eq!(owner.__bytes__(py).unwrap().as_bytes(), &[b'r'; 512]);
+            owner.release().unwrap();
+            assert!(owner.inner.lock().is_none());
+            assert_counts(&tracker, 0, 0);
+        });
+    }
+
+    #[test]
+    fn response_invalidator_error_preserves_original_and_drops_local_bytes_once() {
+        Python::initialize();
+        Python::attach(|py| {
+            let source = module(
+                py,
+                "calls = []\nerror = ValueError('original')\ndef invalidate(value):\n calls.append(value)\n raise error\n",
+            );
+            let owner = PyCoreResponse::new(HeldResponse::from_owned_bytes(vec![1; 32]));
+            let tracker = tracker();
+            owner
+                .track_retained(&tracker, "local", "error", "client_response")
                 .unwrap();
-                let invalidator = globals.get_item("invalidator").unwrap().unwrap().unbind();
-                let error = owner
-                    .invalidate_then_release(py, invalidator, py.None())
-                    .unwrap_err();
-                assert!(error.is_instance_of::<PyValueError>(py));
-                let cleanup = error
-                    .context(py)
-                    .expect("cleanup error stays in exception chain");
-                assert!(
-                    cleanup
-                        .to_string()
-                        .contains("pool owner incarnation mismatch")
-                );
-                assert!(
-                    cleanup
-                        .context(py)
-                        .unwrap()
-                        .is_instance_of::<pyo3::exceptions::PyKeyError>(py)
-                );
-                assert!(owner.is_released());
-                assert!(owner.has_pending_release());
-                assert_counts(&tracker, 1, 512);
-                // A direct release retry must retain tracking on native failure too.
-                let retry_error = owner.release().unwrap_err();
-                assert!(
-                    retry_error
-                        .to_string()
-                        .contains("pool owner incarnation mismatch")
-                );
-                assert!(owner.has_pending_release());
-                assert_counts(&tracker, 1, 512);
-                assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
-                assert_eq!(budget.snapshot().abandoned_releases, 0);
-                if abandon {
-                    owner._abandon_after_failed_release();
-                    assert_eq!(budget.snapshot().abandoned_releases, 1);
-                    assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
-                } else {
-                    *pool.write() = original;
-                    owner.release().unwrap();
-                    assert_eq!(budget.snapshot().abandoned_releases, 0);
-                    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
-                    assert!(!owner.has_pending_release());
-                    assert_counts(&tracker, 0, 0);
-                    pool.write().destroy();
-                    continue;
-                }
-                assert!(!owner.has_pending_release());
-                assert_counts(&tracker, 0, 0);
-                *pool.write() = original;
-                pool.write().destroy();
-            }
+            let invalidator = source.getattr("invalidate").unwrap().unbind();
+            let error = owner
+                .invalidate_then_release(py, invalidator.clone_ref(py), py.None())
+                .unwrap_err();
+            assert!(error.value(py).is(&source.getattr("error").unwrap()));
+            assert!(owner.inner.lock().is_none());
+            assert_counts(&tracker, 0, 0);
+            owner
+                .invalidate_then_release(py, invalidator, py.None())
+                .unwrap();
+            owner.release().unwrap();
+            assert_eq!(source.getattr("calls").unwrap().len().unwrap(), 1);
         });
     }
 
@@ -1153,16 +938,16 @@ def cleanup():
                 "cannot release: buffer is currently exported as memoryview",
             );
             let owner = request.borrow(py);
-            assert!(!owner.released.load(Ordering::Acquire));
-            assert!(owner.lease.lock().is_some());
+            assert!(owner.inner.lock().is_some());
+            assert!(owner.inner.lock().as_ref().unwrap().local_copy.is_some());
             assert_counts(&tracker, 1, 32);
             let exported = PyBuffer::<u8>::get(view.as_any()).unwrap();
             assert_eq!(exported.to_vec(py).unwrap(), vec![b'q'; 32]);
             drop(exported);
             view.call_method0("release").unwrap();
             owner.release().unwrap();
-            assert!(owner.released.load(Ordering::Acquire));
-            assert!(owner.lease.lock().is_none());
+            assert!(owner.inner.lock().is_none());
+            assert!(owner.inner.lock().is_none());
             owner.release().unwrap();
             assert_counts(&tracker, 0, 0);
             assert_buffer_error(
@@ -1174,7 +959,7 @@ def cleanup():
     }
 
     #[test]
-    fn request_tracking_after_release_does_not_revive_lease() {
+    fn request_tracking_after_release_does_not_revive_local_copy() {
         Python::initialize();
         Python::attach(|py| {
             let request = Py::new(py, PyCoreRequestBuffer::new(vec![b'q'; 32])).unwrap();
@@ -1209,9 +994,9 @@ def cleanup():
                 (0, 0)
             );
             let owner = request.borrow(py);
-            assert!(owner.released.load(Ordering::Acquire));
+            assert!(owner.inner.lock().is_none());
             assert_counts(&tracker, 0, 0);
-            assert!(owner.lease.lock().is_none());
+            assert!(owner.inner.lock().is_none());
             owner
                 .track_retained(&tracker, "request", "later", "resource_input")
                 .unwrap();
@@ -1250,14 +1035,14 @@ def dispatch(route, method, request):
                 let view = module.getattr("view").unwrap();
                 let owner = view.getattr("obj").unwrap();
                 let owner = owner.cast::<PyCoreRequestBuffer>().unwrap().borrow();
-                let tracker = PyBufferLeaseTracker::from_arc(std::sync::Arc::new(
-                    c2_mem::BufferLeaseTracker::new(false),
+                let tracker = PyLocalCopyTracker::from_arc(std::sync::Arc::new(
+                    c2_core::memory::LocalCopyTracker::new(),
                 ));
                 owner
                     .track_retained(&tracker, "request-owner", "dispatch", "resource_input")
                     .unwrap();
                 assert_eq!(tracker.inner.stats().total_held_bytes, 32);
-                assert_eq!(owner.bytes.as_ptr(), address);
+                assert_eq!(owner.inner.lock().as_ref().unwrap().bytes.as_ptr(), address);
                 assert_eq!(
                     view.call_method0("tobytes")
                         .unwrap()
@@ -1337,69 +1122,6 @@ source = CustomBytes(b'snapshot')
             let caller: u64 = module.getattr("caller").unwrap().extract().unwrap();
             let events: Vec<u64> = module.getattr("events").unwrap().extract().unwrap();
             assert_eq!(events, vec![caller]);
-        });
-    }
-
-    #[test]
-    fn response_writer_transfers_its_only_vec_and_escaped_failure_stays_safe() {
-        Python::initialize();
-        Python::attach(|py| {
-            let module = module(
-                py,
-                r#"
-import ctypes
-class Plan:
-    nbytes = 32
-    def write_into(self, sink):
-        self.address = ctypes.addressof(ctypes.c_char.from_buffer(sink))
-        with memoryview(sink) as view:
-            view[:] = b'a' * self.nbytes
-plan = Plan()
-class EscapingPlan:
-    nbytes = 32
-    def __init__(self, fail):
-        self.fail = fail
-    def write_into(self, sink):
-        self.view = memoryview(sink)
-        self.view[:] = b'b' * self.nbytes
-        if self.fail:
-            raise ValueError('writer failed')
-"#,
-            );
-            let plan = module.getattr("plan").unwrap();
-            let bytes = materialize_python_bytes(py, &plan).unwrap();
-            let address: usize = plan.getattr("address").unwrap().extract().unwrap();
-            assert_eq!(address, bytes.as_ptr() as usize);
-            assert_eq!(bytes, vec![b'a'; 32]);
-            for fail in [false, true] {
-                let plan = module
-                    .getattr("EscapingPlan")
-                    .unwrap()
-                    .call1((fail,))
-                    .unwrap();
-                let error = materialize_python_bytes(py, &plan).unwrap_err();
-                if fail {
-                    assert!(error.is_instance_of::<PyValueError>(py));
-                } else {
-                    assert!(error.is_instance_of::<PyBufferError>(py));
-                }
-                // A Python exception traceback can also retain callback
-                // locals. Release it before proving export-only ownership.
-                drop(error);
-                let view = plan.getattr("view").unwrap();
-                // Drop the plan/sink callback owners before using the escaped
-                // view: its buffer export alone keeps the native Vec alive.
-                drop(plan);
-                assert_eq!(
-                    view.call_method0("tobytes")
-                        .unwrap()
-                        .extract::<Vec<u8>>()
-                        .unwrap(),
-                    vec![b'b'; 32]
-                );
-                view.set_item(0, b'c').unwrap();
-                view.call_method0("release").unwrap();
-            }
         });
     }
 }

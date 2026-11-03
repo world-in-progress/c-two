@@ -21,8 +21,9 @@
 //! and a zero admission limit rejects every positive request instead of
 //! disabling the limit.
 
-use std::fmt;
 use std::time::Duration;
+
+use crate::{TimeoutError, timeout_from_seconds};
 
 /// Total-wait deadline policy for one logical call.
 ///
@@ -50,7 +51,7 @@ impl CallTimeout {
     /// [`CallTimeout::After`] deadline.
     ///
     /// Rejects NaN, infinities, negative values, and finite values beyond
-    /// the range [`Duration`] can represent. Otherwise the standard
+    /// the common range of supported monotonic clocks. Otherwise the standard
     /// [`Duration::try_from_secs_f64`] conversion applies with its normal
     /// nearest-nanosecond quantization — no additional precision gate is
     /// imposed on top of it. [`0.0`] (and `-0.0`, which compares equal to
@@ -58,19 +59,8 @@ impl CallTimeout {
     /// unlimited — and a positive value smaller than half a nanosecond
     /// quantizes to that same immediate [`Duration::ZERO`] deadline, which
     /// is still `After`, not [`CallTimeout::Unlimited`].
-    pub fn try_after_seconds(seconds: f64) -> Result<Self, CallTimeoutError> {
-        if seconds.is_nan() {
-            return Err(CallTimeoutError::NotANumber);
-        }
-        if seconds.is_infinite() {
-            return Err(CallTimeoutError::Infinite);
-        }
-        if seconds < 0.0 {
-            return Err(CallTimeoutError::Negative);
-        }
-        let duration =
-            Duration::try_from_secs_f64(seconds).map_err(|_| CallTimeoutError::NotRepresentable)?;
-        Ok(CallTimeout::After(duration))
+    pub fn try_after_seconds(seconds: f64) -> Result<Self, TimeoutError> {
+        timeout_from_seconds(seconds).map(CallTimeout::After)
     }
 
     /// Resolves this policy against the path's inherited default.
@@ -88,37 +78,6 @@ impl CallTimeout {
         }
     }
 }
-
-/// Why finite float seconds could not become a call deadline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CallTimeoutError {
-    /// NaN is not a waiting time.
-    NotANumber,
-    /// Positive or negative infinity is not a finite waiting time.
-    Infinite,
-    /// Negative seconds are rejected at the entry point.
-    Negative,
-    /// Finite non-negative seconds beyond the range a [`Duration`] can
-    /// represent. Values inside the range are accepted with the standard
-    /// nearest-nanosecond quantization of [`Duration::try_from_secs_f64`].
-    NotRepresentable,
-}
-
-impl fmt::Display for CallTimeoutError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self {
-            CallTimeoutError::NotANumber => "call timeout is not a number (NaN)",
-            CallTimeoutError::Infinite => "call timeout is infinite",
-            CallTimeoutError::Negative => "call timeout is negative",
-            CallTimeoutError::NotRepresentable => {
-                "call timeout seconds are beyond the range representable as a finite Duration"
-            }
-        };
-        f.write_str(message)
-    }
-}
-
-impl std::error::Error for CallTimeoutError {}
 
 /// Immutable per-call policy view.
 ///
@@ -276,11 +235,11 @@ mod tests {
             let err = CallTimeout::try_after_seconds(seconds)
                 .expect_err("non-finite or negative seconds must be rejected");
             let expected = if seconds.is_nan() {
-                CallTimeoutError::NotANumber
+                TimeoutError::NotANumber
             } else if seconds.is_infinite() {
-                CallTimeoutError::Infinite
+                TimeoutError::Infinite
             } else {
-                CallTimeoutError::Negative
+                TimeoutError::Negative
             };
             assert_eq!(err, expected);
             assert!(!err.to_string().is_empty());
@@ -288,21 +247,22 @@ mod tests {
 
         // The error is a real std error.
         fn assert_std_error(_: &dyn Error) {}
-        assert_std_error(&CallTimeoutError::Negative);
+        assert_std_error(&TimeoutError::Negative);
     }
 
     #[test]
     fn try_after_seconds_rejects_non_representable_durations() {
-        // Beyond the u64-second range of Duration.
+        // Includes values representable by Duration and Windows Instant,
+        // but beyond the signed seconds used by Linux and macOS Instant.
+        for seconds in [1e19, 1.8e19, 2e19, i64::MAX as f64] {
+            assert_eq!(
+                CallTimeout::try_after_seconds(seconds).unwrap_err(),
+                TimeoutError::NotRepresentable
+            );
+        }
         assert_eq!(
-            CallTimeout::try_after_seconds(2e19).unwrap_err(),
-            CallTimeoutError::NotRepresentable
-        );
-        // Every in-range non-negative value is accepted, so this is the
-        // only NotRepresentable case.
-        assert_eq!(
-            CallTimeout::try_after_seconds(1.8e19).unwrap(),
-            CallTimeout::After(Duration::from_secs(18_000_000_000_000_000_000))
+            CallTimeout::try_after_seconds(8e18).unwrap(),
+            CallTimeout::After(Duration::from_secs(8_000_000_000_000_000_000))
         );
     }
 

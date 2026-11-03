@@ -90,7 +90,6 @@ pub enum UnregisterResult {
     Removed {
         entry: Box<RouteEntry>,
         removed_at: f64,
-        removed_revision: u64,
         client: Option<Arc<IpcClient>>,
     },
     AlreadyRemoved,
@@ -139,20 +138,6 @@ fn is_route_local_acquire_failure(error: &c2_ipc::IpcError) -> bool {
 fn should_treat_as_semantic_route_failure(error: &c2_ipc::IpcError) -> bool {
     is_route_local_acquire_failure(error)
         || matches!(error, c2_ipc::IpcError::IdentityMismatch { .. })
-}
-
-async fn verify_route_after_watch_unavailable(
-    lease: &UpstreamLease,
-    expected: &c2_contract::ExpectedRouteContract,
-) -> Result<(), c2_ipc::IpcError> {
-    match lease.client().lookup_route(expected).await {
-        Err(c2_ipc::IpcError::CatalogCompacted { .. })
-        | Err(c2_ipc::IpcError::WatchUnavailable(_)) => {
-            lease.client().rebuild_route_catalog().await?;
-            lease.client().lookup_route(expected).await
-        }
-        other => other,
-    }
 }
 
 impl RelayState {
@@ -266,8 +251,7 @@ impl RelayState {
             | Err(ControlError::InvalidServerId { reason })
             | Err(ControlError::InvalidServerInstanceId { reason })
             | Err(ControlError::InvalidAddress { reason })
-            | Err(ControlError::ContractMismatch { reason })
-            | Err(ControlError::UpstreamUnavailable { reason }) => {
+            | Err(ControlError::ContractMismatch { reason }) => {
                 RegisterCommitResult::Invalid { reason }
             }
             Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
@@ -284,14 +268,12 @@ impl RelayState {
             Ok(UnregisterLocalResult::Unregistered {
                 entry,
                 removed_at,
-                removed_revision,
                 client,
             }) => {
                 self.stop_upstream_control_if_owner_idle_for_route(&entry);
                 UnregisterResult::Removed {
                     entry: Box::new(entry),
                     removed_at,
-                    removed_revision,
                     client,
                 }
             }
@@ -303,8 +285,7 @@ impl RelayState {
             | Err(ControlError::InvalidServerId { .. })
             | Err(ControlError::InvalidServerInstanceId { .. })
             | Err(ControlError::InvalidAddress { .. })
-            | Err(ControlError::ContractMismatch { .. })
-            | Err(ControlError::UpstreamUnavailable { .. }) => UnregisterResult::OwnerMismatch,
+            | Err(ControlError::ContractMismatch { .. }) => UnregisterResult::OwnerMismatch,
             Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
         }
     }
@@ -312,11 +293,10 @@ impl RelayState {
     pub fn remove_unreachable_local_upstream_if_matches(
         &self,
         expected: &RouteEntry,
-    ) -> Option<(RouteEntry, f64, u64, Option<Arc<IpcClient>>)> {
-        let (entry, removed_at, removed_revision, client) = {
+    ) -> Option<(RouteEntry, f64, Option<Arc<IpcClient>>)> {
+        let (entry, removed_at, client) = {
             let mut route_table = self.route_table.write();
-            let (entry, removed_at, removed_revision) =
-                route_table.unregister_local_route_if_matches(expected);
+            let (entry, removed_at) = route_table.unregister_local_route_if_matches(expected);
             let client = entry
                 .as_ref()
                 .and_then(UpstreamEndpointKey::from_route)
@@ -327,9 +307,9 @@ impl RelayState {
                         self.conn_pool.remove(&key)
                     }
                 });
-            (entry, removed_at, removed_revision, client)
+            (entry, removed_at, client)
         };
-        entry.map(|entry| (entry, removed_at, removed_revision, client))
+        entry.map(|entry| (entry, removed_at, client))
     }
 
     // -- Route-only operations --
@@ -483,7 +463,7 @@ impl RelayState {
         let lease_address = lease.address();
         let expected_contract = expected_contract_for_route(expected);
         if let Some(reason) = self.upstream_control_watch_unavailable_for_route(expected) {
-            match verify_route_after_watch_unavailable(&lease, &expected_contract).await {
+            match lease.client().lookup_route(&expected_contract).await {
                 Ok(()) => {}
                 Err(error) if should_treat_as_semantic_route_failure(&error) => {
                     if !is_route_local_acquire_failure(&error)
@@ -512,11 +492,7 @@ impl RelayState {
         }
         let binding = match lease
             .client()
-            .acquire_route_token(
-                &expected_contract,
-                &expected.route_uid,
-                expected.route_revision,
-            )
+            .acquire_route_token(&expected_contract, &expected.route_uid)
             .await
         {
             Ok(binding) => binding,
@@ -561,11 +537,17 @@ impl RelayState {
         }
     }
 
-    // Mark the exact registered owner before awaiting native disconnect initiation.
+    // Mark the exact registered owner before awaiting native retirement.
     // A false confirmation leaves that owner with the bounded lifecycle observer.
     async fn close_failed_acquire_client(&self, client: &Arc<IpcClient>) {
         self.clients.close(client);
-        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        let confirmed = match client.connection_observation() {
+            Some(observation) => observation
+                .wait_closed(Some(Duration::from_millis(50)))
+                .await
+                .is_some(),
+            None => true,
+        };
         if !confirmed {
             tracing::debug!("relay acquire cleanup remains owned by lifecycle observer");
         }
@@ -900,6 +882,7 @@ impl RelayState {
         {
             self.clients.adopt_for_test(&client);
             self.conn_pool.reconnect(&key, client);
+            self.conn_pool.set_connected_for_test(&key, true);
         }
     }
 
@@ -979,10 +962,6 @@ impl RelayState {
         self.route_table.write().gc_tombstones(retention)
     }
 
-    pub(crate) fn route_catalog_revisions(&self) -> (u64, u64) {
-        self.with_route_table(|rt| (rt.catalog_revision(), rt.compaction_revision()))
-    }
-
     pub(crate) fn with_route_table<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&RouteTable) -> R,
@@ -1049,12 +1028,11 @@ mod tests {
             &self,
             _: &str,
             method: u16,
-            request: c2_server::RequestData,
+            request: Vec<u8>,
             _: Arc<c2_server::ResponsePool>,
         ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
-            let mut owner = c2_server::RequestLease::new(request);
             if method == 0 {
-                assert_eq!(owner.copy_bytes().unwrap(), vec![7; 8192]);
+                assert_eq!(request, vec![7; 8192]);
                 self.entered.notify_one();
                 if let Some(release) = self.release.lock().take() {
                     release.recv_timeout(ACQUIRE_STEP).unwrap();
@@ -1062,7 +1040,6 @@ mod tests {
             } else {
                 self.pings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            owner.release().unwrap();
             Ok(c2_server::ResponseMeta::Inline(b"completed".to_vec()))
         }
     }
@@ -1072,7 +1049,6 @@ mod tests {
         server_task: tokio::task::JoinHandle<Result<(), c2_server::ServerError>>,
         state: Arc<RelayState>,
         observer: tokio::task::JoinHandle<()>,
-        endpoint_context: LocalEndpointContext,
         #[cfg(unix)]
         endpoint_root: std::path::PathBuf,
         probes: [Arc<AcquireProbe>; 2],
@@ -1167,7 +1143,6 @@ mod tests {
                 server_task,
                 state,
                 observer,
-                endpoint_context,
                 #[cfg(unix)]
                 endpoint_root,
                 probes,
@@ -1196,7 +1171,6 @@ mod tests {
                         TEST_SIGNATURE_HASH.into(),
                         binding.max_payload_size(),
                         binding.route_uid().into(),
-                        binding.route_revision(),
                         None
                     ) {
                         RegisterCommitResult::Registered { entry } => entry,
@@ -1217,11 +1191,10 @@ mod tests {
 
         fn client(&self) -> IpcClient {
             IpcClient::with_endpoint(
-                self.endpoint_context
-                    .endpoint(self.server.ipc_address())
-                    .unwrap(),
+                self.server.local_endpoint().clone(),
                 ClientIpcConfig::default(),
             )
+            .unwrap()
         }
 
         fn release(&mut self, index: usize) {
@@ -1277,10 +1250,10 @@ mod tests {
             acquire_step(ordinary.connect()).await.unwrap();
             let contract = expected_contract_for_route(&fixture.entries[1]);
             let old = acquire_step(exact.acquire_route(&contract)).await.unwrap();
-            let ready = acquire_step(exact.acquire_route_token(&contract, old.route_uid(), old.route_revision())).await.unwrap();
-            assert_eq!((ready.route_uid(), ready.route_revision()), (old.route_uid(), old.route_revision()));
+            let ready = acquire_step(exact.acquire_route_token(&contract, old.route_uid())).await.unwrap();
+            assert_eq!(ready.route_uid(), old.route_uid());
             match transition {
-                AcquireTransition::Closed => { assert_eq!(fixture.server.close_business_admission("OwnerMissing").await, 2); }
+                AcquireTransition::Closed => { assert_eq!(fixture.server.close_business_admission("maintenance").await, 2); }
                 AcquireTransition::Removed | AcquireTransition::Reregistered => {
                     assert!(fixture.server.unregister_route("b").await);
                     if matches!(transition, AcquireTransition::Reregistered) {
@@ -1289,7 +1262,7 @@ mod tests {
                 }
             }
             // Check exact first: ordinary lookup must not refresh its positive cache.
-            let token = acquire_step(exact.acquire_route_token(&contract, old.route_uid(), old.route_revision())).await;
+            let token = acquire_step(exact.acquire_route_token(&contract, old.route_uid())).await;
             let plain = acquire_step(ordinary.acquire_route(&contract)).await;
             match transition {
                 AcquireTransition::Closed => {
@@ -1303,9 +1276,9 @@ mod tests {
                 AcquireTransition::Reregistered => {
                     let current = plain.unwrap();
                     assert_ne!(current.route_uid(), old.route_uid());
-                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteStale { ref current_route_uid, current_route_revision, .. })
-                        if current_route_uid == current.route_uid() && current_route_revision == current.route_revision()), "exact: {token:?}");
-                    let fresh = acquire_step(exact.acquire_route_token(&contract, current.route_uid(), current.route_revision())).await.unwrap();
+                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteStale { ref current_route_uid, .. })
+                        if current_route_uid == current.route_uid()), "exact: {token:?}");
+                    let fresh = acquire_step(exact.acquire_route_token(&contract, current.route_uid())).await.unwrap();
                     assert_eq!(fresh.route_uid(), current.route_uid());
                 }
             }
@@ -1318,8 +1291,7 @@ mod tests {
                 AcquireTransition::Reregistered => c2_error::ErrorCode::RouteStale,
             });
             assert_eq!(fixture.probes[1].pings.load(std::sync::atomic::Ordering::SeqCst), 0);
-            assert_eq!((old.route_uid(), old.route_revision()),
-                (fixture.entries[1].route_uid.as_str(), fixture.entries[1].route_revision));
+            assert_eq!(old.route_uid(), fixture.entries[1].route_uid.as_str());
         }).catch_unwind().await;
         acquire_step(exact.close()).await;
         acquire_step(ordinary.close()).await;
@@ -1388,11 +1360,17 @@ mod tests {
                     async move { server.unregister_route("b").await },
                 ));
                 acquire_step(async {
-                    while fixture.server.contains_route("b").await {
+                    while !fixture
+                        .server
+                        .route_scheduler_snapshot("b")
+                        .await
+                        .is_some_and(|snapshot| snapshot.closed)
+                    {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await;
+                assert!(fixture.server.contains_route("b").await);
             } else {
                 assert!(fixture.server.unregister_route("b").await);
                 if matches!(transition, AcquireTransition::Reregistered) {
@@ -1401,8 +1379,17 @@ mod tests {
             }
             drop(lease_b);
             let pool = unsafe { client.request_pool_for_test() }.unwrap();
-            let allocations = pool.lock().stats().alloc_count;
-            assert!(allocations > 0, "inflight A owns a real SHM request");
+            acquire_step(async {
+                while pool.read().stats().alloc_count != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let allocations = pool.read().stats().alloc_count;
+            assert_eq!(
+                allocations, 0,
+                "Core releases the SHM request before invoking A"
+            );
             if watch_unavailable {
                 let key = super::super::upstream_control::owner_key_for_route(&fixture.entries[1])
                     .unwrap();
@@ -1435,17 +1422,17 @@ mod tests {
                     assert!(matches!(rejected, Err(UpstreamAcquireError::Stale { .. })))
                 }
             }
-            let retained_allocations = pool.lock().stats().alloc_count;
+            let retained_allocations = pool.read().stats().alloc_count;
             // Observe A's actual result before checking pool/connection survival.
             fixture.release(0);
             let response = acquire_step(call_a.take().unwrap())
                 .await
                 .unwrap()
                 .expect("B semantic rejection must preserve A result");
-            assert_eq!(response.into_bytes().unwrap(), b"completed");
+            assert_eq!(response.into_owned_bytes().unwrap(), b"completed");
             assert_eq!(
                 retained_allocations, allocations,
-                "B rejection must retain A's request carrier"
+                "B rejection must preserve the completed request release"
             );
             assert!(
                 client.is_connected(),
@@ -1491,7 +1478,7 @@ mod tests {
                 "no endpoint reconnect on route rejection"
             );
             acquire_step(async {
-                while pool.lock().stats().alloc_count != 0 {
+                while pool.read().stats().alloc_count != 0 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -1579,30 +1566,18 @@ mod tests {
         assert!(!err.contains("Invalid bind address"), "{err}");
     }
 
-    struct RequestTransportProbe;
+    struct RequestBytesProbe;
 
-    impl c2_server::CrmCallback for RequestTransportProbe {
+    impl c2_server::CrmCallback for RequestBytesProbe {
         fn invoke(
             &self,
             _route_name: &str,
             _method_idx: u16,
-            request: c2_server::RequestData,
+            request: Vec<u8>,
             _response_pool: Arc<c2_server::ResponsePool>,
         ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
-            let transport = match &request {
-                c2_server::RequestData::Shm(shm) if shm.is_dedicated() => "dedicated",
-                c2_server::RequestData::Shm(_) => "buddy",
-                c2_server::RequestData::Handle(_) => "chunked",
-                c2_server::RequestData::Inline(_) => "inline",
-            };
-            let mut lease = c2_server::RequestLease::new(request);
-            assert_eq!(lease.copy_bytes().unwrap(), [7; 32]);
-            lease
-                .release()
-                .expect("probe must release its actual request owner");
-            Ok(c2_server::ResponseMeta::Inline(
-                transport.as_bytes().to_vec(),
-            ))
+            assert_eq!(request, [7; 32]);
+            Ok(c2_server::ResponseMeta::Inline(b"accepted".to_vec()))
         }
     }
 
@@ -1663,7 +1638,7 @@ mod tests {
                     concurrency_mode: ConcurrencyMode::ReadParallel,
                     limits: SchedulerLimits::default(),
                 },
-                Arc::new(RequestTransportProbe),
+                Arc::new(RequestBytesProbe),
             )
             .unwrap();
         let reservation = server.reserve_route(route).await.unwrap();
@@ -1677,7 +1652,8 @@ mod tests {
 
         // Registration attestation is a private lazy default client. It must
         // remain usable even when the data-plane budget is zero.
-        let mut probe = IpcClient::new(&address);
+        let mut probe =
+            IpcClient::with_config(&address, c2_config::ClientIpcConfig::default()).unwrap();
         probe.connect().await.unwrap();
         let contract = probe.route_contract("grid").unwrap();
         let attestation = probe
@@ -1697,7 +1673,6 @@ mod tests {
             TEST_SIGNATURE_HASH.into(),
             attestation.max_payload_size(),
             attestation.route_uid().to_string(),
-            attestation.route_revision(),
             None,
         ) {
             RegisterCommitResult::Registered { entry } => entry,
@@ -1743,17 +1718,7 @@ mod tests {
                 .call_bound(&binding, "probe", &[7; 32])
                 .await
                 .unwrap();
-            let expected = if zero_budget {
-                "chunked"
-            } else if buddy {
-                "buddy"
-            } else {
-                "dedicated"
-            };
-            match response {
-                c2_ipc::ResponseData::Inline(bytes) => assert_eq!(bytes, expected.as_bytes()),
-                _ => panic!("probe must return inline transport evidence"),
-            }
+            assert_eq!(response.into_owned_bytes().unwrap(), b"accepted");
             let snapshot = state.upstream_memory_snapshot();
             assert_eq!(
                 snapshot.shm.limit_bytes,
@@ -1906,7 +1871,6 @@ mod tests {
             contract.signature_hash.to_string(),
             1024,
             format!("{name}-{server_id}-uid"),
-            1,
             None,
         ) {
             RegisterCommitResult::Registered { entry }
@@ -2000,7 +1964,6 @@ mod tests {
                 name.to_string(),
                 relay_id.to_string(),
                 1001.0,
-                1,
             )
             .unwrap();
     }
@@ -2026,7 +1989,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-old-uid".into(),
-            1,
             None,
         );
 
@@ -2053,7 +2015,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         );
 
@@ -2066,7 +2027,9 @@ mod tests {
     #[test]
     fn register_and_resolve_upstream() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         let registered = register_local(&state, "grid", "server-grid", "ipc://grid", client);
         let routes = state.resolve_matching(&expected_contract_for_route(&registered));
         assert_eq!(routes.len(), 1);
@@ -2094,7 +2057,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -2111,8 +2073,9 @@ mod tests {
     #[test]
     fn local_routes_on_same_endpoint_share_one_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let manager = Arc::new(IpcClient::new("ipc://shared"));
-        manager.force_connected(true);
+        let manager = Arc::new(
+            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "manager",
@@ -2122,8 +2085,9 @@ mod tests {
             TEST_ROUTE_CONTRACT,
             manager,
         );
-        let builder = Arc::new(IpcClient::new("ipc://shared"));
-        builder.force_connected(true);
+        let builder = Arc::new(
+            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "builder",
@@ -2149,11 +2113,13 @@ mod tests {
     #[test]
     fn unregister_one_route_keeps_shared_endpoint_for_remaining_routes() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let manager = Arc::new(IpcClient::new("ipc://shared"));
-        manager.force_connected(true);
+        let manager = Arc::new(
+            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "manager", "server-grid", "ipc://shared", manager);
-        let builder = Arc::new(IpcClient::new("ipc://shared"));
-        builder.force_connected(true);
+        let builder = Arc::new(
+            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "builder", "server-grid", "ipc://shared", builder);
 
         assert!(matches!(
@@ -2183,7 +2149,10 @@ mod tests {
             "grid",
             "server-grid",
             "ipc://grid",
-            Arc::new(IpcClient::new("ipc://grid")),
+            Arc::new(
+                IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default())
+                    .unwrap(),
+            ),
         );
         let key = upstream_control::owner_key_for_route(&entry).unwrap();
         state.mark_upstream_control_watch_unavailable(&key, "watch stream closed");
@@ -2207,7 +2176,8 @@ mod tests {
         let old_token = Arc::new(());
         let token = Arc::new(());
         // Only the task/token bookkeeping is under test here; real control
-        // connections and owner drain are covered by the capacity regressions.
+        // connections are covered by upstream_control tests; owner drain by
+        // client_lifecycle tests.
         state.upstream_controls.write().tasks.insert(
             key.clone(),
             UpstreamControlTask::new(old_token.clone(), tokio::spawn(async {})),
@@ -2280,7 +2250,9 @@ mod tests {
     #[test]
     fn unregister_upstream() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
         assert!(matches!(
             state.unregister_upstream("grid", "server-grid"),
@@ -2292,8 +2264,9 @@ mod tests {
     #[test]
     fn unregister_upstream_rejects_wrong_server_id() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
-        client.force_connected(true);
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         assert!(matches!(
@@ -2330,7 +2303,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -2347,7 +2319,9 @@ mod tests {
         // would silently demote a Local route (with ipc_address) to a Peer
         // route (without ipc_address) and break local IPC dispatch.
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         // Echo of our own route arriving via DigestDiff with our relay_id.
@@ -2367,7 +2341,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -2385,7 +2358,9 @@ mod tests {
     #[test]
     fn unregister_peer_route_does_not_remove_local_route() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         let result = RouteAuthority::new(&state).withdraw_peer(
@@ -2393,7 +2368,6 @@ mod tests {
             "grid".into(),
             "test-relay".into(),
             1001.0,
-            1,
         );
         assert!(matches!(result, Err(ControlError::OwnerMismatch)));
 
@@ -2404,7 +2378,9 @@ mod tests {
     #[test]
     fn remove_routes_by_relay_does_not_remove_local_routes() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         remove_peer_routes(&state, "test-relay");
@@ -2431,7 +2407,6 @@ mod tests {
                 signature_hash: TEST_SIGNATURE_HASH.to_string(),
                 max_payload_size: 1024,
                 route_uid: "grid-route-uid-0001".into(),
-                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -2460,10 +2435,6 @@ mod tests {
     #[test]
     fn register_commit_rechecks_owner_after_preflight_no_owner() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let first = Arc::new(IpcClient::new("ipc://first"));
-        first.force_connected(true);
-        let second = Arc::new(IpcClient::new("ipc://second"));
-        second.force_connected(true);
 
         let first_result = test_commit_registration!(
             &state,
@@ -2478,7 +2449,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         );
         assert!(matches!(
@@ -2499,7 +2469,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         );
         assert!(matches!(
@@ -2520,8 +2489,6 @@ mod tests {
             .unwrap();
         assert!(replacement.is_none());
 
-        let racer = Arc::new(IpcClient::new("ipc://racer"));
-        racer.force_connected(true);
         let racer_result = test_commit_registration!(
             &state,
             "grid".into(),
@@ -2535,7 +2502,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-test-route-uid".into(),
-            1,
             None,
         );
         assert!(matches!(
@@ -2543,8 +2509,6 @@ mod tests {
             RegisterCommitResult::Registered { .. }
         ));
 
-        let candidate = Arc::new(IpcClient::new("ipc://candidate"));
-        candidate.force_connected(true);
         let candidate_result = test_commit_registration!(
             &state,
             "grid".into(),
@@ -2558,7 +2522,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-test-route-uid".into(),
-            1,
             None,
         );
 
@@ -2574,8 +2537,9 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_can_replace_same_slot_only_while_still_evicted() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://old"));
-        old.force_connected(true);
+        let old = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "grid",
@@ -2590,8 +2554,6 @@ mod tests {
             confirmed_dead_replacement(&state, "grid", "server-new", "instance-new", "ipc://new")
                 .await;
 
-        let replacement = Arc::new(IpcClient::new("ipc://new"));
-        replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,
             "grid".into(),
@@ -2605,7 +2567,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-test-route-uid".into(),
-            1,
             Some(replacement_proof),
         );
 
@@ -2616,8 +2577,9 @@ mod tests {
     #[tokio::test]
     async fn route_replacement_keeps_old_endpoint_when_other_routes_still_reference_it() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let manager = Arc::new(IpcClient::new("ipc://old"));
-        manager.force_connected(true);
+        let manager = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "manager",
@@ -2627,8 +2589,9 @@ mod tests {
             TEST_ROUTE_CONTRACT,
             manager,
         );
-        let builder = Arc::new(IpcClient::new("ipc://old"));
-        builder.force_connected(true);
+        let builder = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "builder",
@@ -2660,7 +2623,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "manager-server-new-uid".into(),
-            1,
             Some(replacement_proof),
         );
 
@@ -2677,8 +2639,9 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_does_not_match_re_registered_same_address_owner() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://same"));
-        old.force_connected(true);
+        let old = Arc::new(
+            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-old", "ipc://same", old);
         state.evict_connection("grid");
         let replacement_proof = confirmed_dead_replacement(
@@ -2694,8 +2657,9 @@ mod tests {
             UnregisterResult::Removed { .. }
         ));
 
-        let new_same_address = Arc::new(IpcClient::new("ipc://same"));
-        new_same_address.force_connected(true);
+        let new_same_address = Arc::new(
+            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(
             &state,
             "grid",
@@ -2704,8 +2668,6 @@ mod tests {
             new_same_address,
         );
 
-        let stale_replacement = Arc::new(IpcClient::new("ipc://replacement"));
-        stale_replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,
             "grid".into(),
@@ -2719,7 +2681,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-test-route-uid".into(),
-            1,
             Some(replacement_proof),
         );
 
@@ -2735,8 +2696,9 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_is_rejected_after_same_owner_lease_renewal() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://old"));
-        old.force_connected(true);
+        let old = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "grid",
@@ -2756,8 +2718,6 @@ mod tests {
         )
         .await;
 
-        let same_owner = Arc::new(IpcClient::new("ipc://old"));
-        same_owner.force_connected(true);
         let same_owner_result = test_commit_registration!(
             &state,
             "grid".into(),
@@ -2771,7 +2731,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-old-uid".into(),
-            1,
             None,
         );
         assert!(matches!(
@@ -2779,8 +2738,6 @@ mod tests {
             RegisterCommitResult::SameOwner { .. }
         ));
 
-        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
-        replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,
             "grid".into(),
@@ -2794,7 +2751,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-test-route-uid".into(),
-            1,
             Some(replacement_proof),
         );
 
@@ -2810,8 +2766,9 @@ mod tests {
     #[test]
     fn owner_lease_renewal_is_not_peer_visible_route_state() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://old"));
-        old.force_connected(true);
+        let old = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-old", "ipc://old", old);
 
         let before_snapshot =
@@ -2830,8 +2787,9 @@ mod tests {
     #[test]
     fn stale_unreachable_removal_does_not_delete_new_same_address_owner_with_different_tag() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://same"));
-        old.force_connected(true);
+        let old = Arc::new(
+            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "grid",
@@ -2853,8 +2811,9 @@ mod tests {
             UnregisterResult::Removed { .. }
         ));
 
-        let new_same_address = Arc::new(IpcClient::new("ipc://same"));
-        new_same_address.force_connected(true);
+        let new_same_address = Arc::new(
+            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "grid",
@@ -2885,7 +2844,6 @@ mod tests {
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
             route_uid: "grid-route-uid-0001".into(),
-            route_revision: 1,
             locality: Locality::Local,
             registered_at: 0.0,
         };
@@ -2903,8 +2861,10 @@ mod tests {
     #[test]
     fn replacement_proof_cannot_replace_reconnected_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://same-slot"));
-        old.force_connected(true);
+        let old = Arc::new(
+            IpcClient::with_config("ipc://same-slot", c2_config::ClientIpcConfig::default())
+                .unwrap(),
+        );
         register_local(&state, "grid", "server-old", "ipc://same-slot", old);
         state.evict_connection("grid");
         let replacement_proof = tokio::runtime::Builder::new_current_thread()
@@ -2919,12 +2879,12 @@ mod tests {
                 "ipc://replacement",
             ));
 
-        let reconnected_old = Arc::new(IpcClient::new("ipc://same-slot"));
-        reconnected_old.force_connected(true);
+        let reconnected_old = Arc::new(
+            IpcClient::with_config("ipc://same-slot", c2_config::ClientIpcConfig::default())
+                .unwrap(),
+        );
         state.reconnect("grid", reconnected_old);
 
-        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
-        replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,
             "grid".into(),
@@ -2938,7 +2898,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-test-route-uid".into(),
-            1,
             Some(replacement_proof),
         );
 
@@ -2957,8 +2916,9 @@ mod tests {
     #[test]
     fn same_server_registration_is_idempotent_without_repairing_evicted_client() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://grid"));
-        original.force_connected(true);
+        let original = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "grid",
@@ -2983,7 +2943,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         );
 
@@ -2997,8 +2956,9 @@ mod tests {
     #[test]
     fn same_owner_registration_rejects_contract_change_without_new_instance() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://grid"));
-        original.force_connected(true);
+        let original = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", original);
 
         let result = test_commit_registration!(
@@ -3014,7 +2974,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         );
 
@@ -3031,8 +2990,9 @@ mod tests {
     #[test]
     fn same_server_new_instance_refreshes_local_route_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://grid"));
-        original.force_connected(true);
+        let original = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_instance(
             &state,
             "grid",
@@ -3065,7 +3025,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-test-route-uid".into(),
-            1,
             None,
         );
 
@@ -3081,12 +3040,11 @@ mod tests {
     #[test]
     fn same_server_registration_with_different_address_conflicts() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://old"));
-        original.force_connected(true);
+        let original = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://old", original);
 
-        let moved = Arc::new(IpcClient::new("ipc://new"));
-        moved.force_connected(true);
         let result = test_commit_registration!(
             &state,
             "grid".into(),
@@ -3100,7 +3058,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-test-route-uid".into(),
-            1,
             None,
         );
 
@@ -3116,8 +3073,9 @@ mod tests {
     #[tokio::test]
     async fn acquire_after_unregister_reports_not_found() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
-        client.force_connected(true);
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         assert!(matches!(
@@ -3134,8 +3092,9 @@ mod tests {
     #[tokio::test]
     async fn same_server_register_does_not_repair_evicted_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://grid"));
-        original.force_connected(true);
+        let original = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local_with_contract(
             &state,
             "grid",
@@ -3147,8 +3106,6 @@ mod tests {
         );
         state.evict_connection("grid");
 
-        let replacement = Arc::new(IpcClient::new("ipc://grid"));
-        replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,
             "grid".into(),
@@ -3162,7 +3119,6 @@ mod tests {
             TEST_SIGNATURE_HASH.to_string(),
             1024,
             "grid-server-grid-uid".into(),
-            1,
             None,
         );
 

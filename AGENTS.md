@@ -15,8 +15,18 @@ C-Two is a resource-oriented RPC runtime that enables remote invocation of state
 The core abstraction is resources, not services.
 
 - CRM (Core Resource Model): the contract class decorated with `@cc.crm(...)`. It declares remotely callable methods. Method bodies are `...`.
-- Resource: the runtime instance implementing a CRM contract. It is a plain Python class, not decorated. Name it by domain semantics.
+- Resource: the stateful object implementing a CRM contract. It is a plain Python class, not decorated. Name it by domain semantics.
 - Client: any code that calls `cc.connect(...)` to consume a resource. There is no separate "Component" abstraction.
+
+## Stateful RPC for scientific computation
+
+C-Two resources hold state, and their calls are often non-idempotent and ordered by the caller, which awaits one call before issuing the next. Several choices that are safe for stateless RPC such as gRPC are therefore wrong here:
+
+- Never turn a completed call into an unknown outcome. A failure fails only the call it belongs to. Deactivating a connection stops new calls and loans on it while calls already sent still finish; its other in-flight calls fail only when its framing can no longer be trusted.
+- C-Two never abandons a dispatched call on its own: deactivation, eviction and Runtime shutdown stop new calls but let calls already sent finish and deliver their results. A caller stops waiting only through its own call deadline or a genuine failure (peer end, broken framing), reported as dispatch-uncertain.
+- Only pre-dispatch failures are retry-safe. A dispatch-uncertain call is never retried, replayed or hedged automatically; the caller decides.
+- Lifecycle reports are truthful. `completed` means the real terminal state; a caller's budget bounds only its own wait and never cancels cleanup. A stopped or stuck peer keeps its loans until it releases them or its connection ends, and no block is reused without that proof.
+- Do not size waits, payloads or budgets for the "usual" case. Durations and sizes that grow with a workload are exposed through the existing per-call or configuration path rather than fixed.
 
 ## Build, Test, And Run
 
@@ -25,6 +35,9 @@ Package manager: `uv`, not direct `pip`. Build backend: `maturin`, which compile
 Native Rust tests embed Python and import the real public exception class. After building the extension, run `uv run python tools/dev/test_native.py`; this forwards that interpreter's library and installed-package paths to Cargo. Both shared CI and local test runners reuse this entry point.
 
 ```bash
+# Share one Cargo build directory across all workspaces in this checkout.
+export CARGO_TARGET_DIR="$PWD/core/target"
+
 # Install dependencies and compile the Rust native extension
 uv sync
 
@@ -70,8 +83,8 @@ C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 uv run python examples/python/local.py
 
 # IPC example, two terminals
-uv run python examples/python/crm_process.py
-uv run python examples/python/client.py <address>
+uv run python examples/python/ipc_resource.py
+uv run python examples/python/ipc_client.py <address>
 
 # Relay mesh example, three terminals
 python tools/dev/c3_tool.py --build --link
@@ -91,154 +104,24 @@ Windows ARM64 uses the same native source gates on `windows-11-arm`, including R
 
 The full Python suite runs the real relay benchmark and requires `hey` v0.1.4 on PATH. Install it with `go install github.com/rakyll/hey@v0.1.4` and expose the Go binary directory (`go env GOPATH` plus `/bin`, or `GOBIN`). Both CI suite entry points provision this prerequisite.
 
-`C2_IPC_ROOT` is configuration, not an isolation boundary for the complete Rust relay suite: some fixtures explicitly derive the platform-default namespace while others resolve the environment. Do not override it globally to isolate those fixtures. When the host's historical namespace must remain untouched, run that suite in a clean runner; local targeted fixtures must explicitly use the same task-owned context on both ends. `LocalStream::pair()` also derives the platform default through `LocalEndpoint::from_address()` and ignores `C2_IPC_ROOT`; an isolated probe must explicitly pass its task-owned `LocalEndpointContext` into both endpoints rather than treating that environment variable as sufficient.
-
 Tests use `pytest` with a 30-second per-test timeout. Tests live under `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared fixtures under `sdk/python/tests/fixtures/`. The minimum-supported-Python syntax test discovers `python3.10` or `uv python find 3.10`; run `uv python install 3.10` before the suite if you need to guarantee it does not skip. For broader 3.10 smoke coverage without replacing the default `.venv`, use a separate environment:
 
 ```bash
 UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ANCHOR_ADDRESS= uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
 ```
 
-## Local Release-Candidate Evidence
+## Architecture and invariants
 
-The complete Phase 0B upstream local candidate is recorded in [`docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md`](docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md). Package inputs are C-Two implementation commit `bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02` and FastDB implementation commit `7eb74734926bd8fe911229eee9744a6dd8172487`; later documentation-only commits are never artifact source commits.
-
-The retained canonical manifest and receipts under `docs/reports/evidence/` prove 42 exact artifacts, 4/4 isolated Rust/Python/Node consumers, 18/18 Rust/Python direct/relay rows, 12/12 generated TypeScript Node rows, and the 12-row SDK parity inventory. They are evidence records only. Do not add package archives, local registries, wheelhouses, native libraries, generated trees, or build outputs to Git.
-
-FastDB 0.2.0 is now published separately; its release does not change these historical candidate inputs or prove C-Two publication. Current Windows source builds pin the additional MSVC repair documented in `docs/windows-native-implementation.md`. Official C-Two portable-package distribution, browser runtime, C++ C-Two SDK, compatibility ranges, trust/signature/revocation, streaming, post-dispatch retry/deduplication, and Toodle consumption remain open. Hosted evidence must name its actual source pair and passing gates; never infer it from the local candidate.
-
-## Architecture
-
-C-Two has a language-neutral Rust core and user-facing Rust and Python SDKs. Neither SDK is the canonical home for generic runtime mechanisms. The Rust SDK at `sdk/rust` is package `c-two`, imported as `c_two`, and is a thin facade over Core plus generated typed clients/services. The Python SDK owns Python domain logic, CRM authoring, Python resource invocation, serialization orchestration, and same-process direct-call glue. Rust `c2-core` is the single shared owner of route selection, client/host calls, retry classification, error normalization, transport lease ordering, and runtime lifecycle; the lower Core crates own memory, wire, contract, relay, and configuration mechanisms. PyO3/maturin projects that same Core into Python as `c_two._native`.
-
-The Rust SDK may depend on the official `fastdb` Rust binding to adapt portable payloads, but `c2-core` must remain payload-owner-neutral. Rust users continue to name `fastdb::Payload`; do not re-export it under a C-Two semantic namespace. Rust and Python must expose the same portable route, payload, error, and lifetime capabilities even when their language-level syntax differs.
-
-### CRM Layer
-
-Path: `sdk/python/src/c_two/crm/`
-
-- CRM contracts are interface classes decorated with `@cc.crm(namespace='...', version='...')`.
-- Only methods in the contract are exposed remotely.
-- CRM route contracts are identified by route name plus the CRM namespace, CRM name, CRM version, ABI hash, and signature hash. Python may compute the descriptor/fingerprints from the CRM class, but Rust `c2-contract` validates the complete expected route contract at IPC and relay boundaries.
-- A persistent CRM contract release is a Rust-validated `ContractReleaseRef` derived from canonical `c-two.contract.v2` content. It never contains a route name. `ExpectedRouteContract` is derived later from a validated release plus a runtime route name.
-- Resource implementations are plain Python classes and are not decorated.
-- Portable methods declare zero or one input and zero or one output with `@cc.transfer(input=FASTDB_SPEC, output=FASTDB_SPEC)`. Their Python parameter and return type is `fastdb4py.payload.Payload`; C-Two embeds each nested specification as an opaque JSON value and delegates it to FastDB Core.
-- Python-only fallback values use pickle and must not be treated as portable descriptor or codegen inputs.
-- C-Two 0.10.1 source uses FastDB 0.2.4; published releases keep the FastDB version recorded in their release notes. Python FastDB payloads require the optional `c-two[fastdb]` extra, pinned to `fastdb4py==0.2.4`. Ordinary imports, CRM definitions, calls and error wrapping must not import FastDB or NumPy. The dev group selects the extra for full tests; native Core/Rust pins are independent.
-- FastDB retained response owners are selected by call-site `cc.hold(...)`; server-side borrowed inputs are selected only by `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})`.
-- CRM methods can use `@cc.read` or `@cc.write`; writes are the default.
-- `@cc.transfer(input=..., output=...)` is the only portable FastDB binding authoring surface. `@cc.transferable` and `@cc.transfer(buffer='hold')` are obsolete and must not be reintroduced as codec or lifetime selection mechanisms.
-- `@on_shutdown` marks one public CRM contract method as a shutdown callback. The resource implements it normally; registration rejects implementation-only shutdown markers. It is not exposed through RPC.
-
-### Client Layer
-
-Any code that calls `cc.connect(CRMClass, name='...', address='...')` is a client. The returned proxy is a typed object matching the CRM contract and supports context-manager close:
-
-```python
-with cc.connect(Grid, name='grid', address='ipc://server') as grid:
-    result = grid.subdivide_grids([1], [0])
-```
-
-There is no separate `compo/` module, no `@cc.runtime.connect` decorator, and no "Component" type.
-
-### Config Layer
-
-Paths: `sdk/python/src/c_two/config/`, `core/foundation/c2-config/`
-
-Unified configuration is resolved by the Rust `c2-config` resolver. Python stores SDK code-level overrides and asks the native resolver for environment, `.env`, and default values. Relay server configuration belongs to the standalone Rust `c3 relay` runtime.
-
-| File | Purpose |
-| --- | --- |
-| `settings.py` | `C2Settings` facade for Runtime-owned code overrides such as relay anchor and transport policy |
-| `ipc.py` | Typed override schemas: `BaseIPCOverrides`, `ServerIPCOverrides`, `ClientIPCOverrides`; Rust owns defaults and validation |
-
-IPC override key validation belongs to Rust/native config parsing. Python `ipc.py` may expose typed override schemas and forward mappings, but it must not keep allowed-key or forbidden-key validation tables.
-
-Config priority chain:
-
-```text
-explicit kwargs / cc.set_*() > process environment / .env > Rust defaults
-```
-
-Do not reintroduce Python-side default validation for IPC or relay internals. SDKs should provide typed override facades and leave environment/default resolution to Rust.
-
-Scheduler-related config follows the same boundary. Python may expose `ConcurrencyConfig` and SDK-level enums, but Rust now owns the resolved route concurrency handle, including mode, `max_pending`, `max_workers`, and close state. Python must pass the full typed config into Rust, then treat the native handle as the source of truth for both same-process direct calls and remote dispatch. Do not keep a second Python-owned scheduler state or hidden default policy alive after registration.
-
-Runtime config follows the same ownership rule. Rust `c2-core::Runtime` owns its instance server identity, canonical `ipc://` address derivation, server IPC override storage/projection, direct IPC client acquire/release, client IPC config projection/freeze, route registration transactions, unregister/shutdown transaction outcomes, relay projection, relay-backed name resolution, explicit HTTP relay contract validation, and low-level HTTP client pool projection. Python exposes that authority through its native `RuntimeSession` projection and may expose typed override facades, but must not keep separate `_server_ipc_overrides`, `_client_config`, `_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address, direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`, `_rollback_registration`, relay control-client caches, or independent route unregister/shutdown ordering authority in `registry.py`. Python still owns Python CRM local bindings and invokes `@on_shutdown` callbacks exactly once from native structured outcomes.
-
-### Transport Layer
-
-Path: `sdk/python/src/c_two/transport/`
-
-The Python transport layer is a thin orchestration shell around a Rust-native core. Python handles CRM registration, Python callback dispatch, serialization orchestration, and same-process direct-call glue. Rust handles IPC, wire framing, SHM, response allocation/transport selection, route concurrency enforcement, runtime session state, HTTP relay transport, and relay-aware route fallback. Response allocation must enforce native IPC payload limits before allocating owned fallback buffers, skip buddy SHM when buddy wire metadata cannot represent the payload, and use checked chunked fallback rather than truncating frame or chunk metadata.
-
-| File | Purpose |
-| --- | --- |
-| `registry.py` | Public `cc.Runtime()` owns independent Python bindings over one native session; module-level registration, connection, shutdown and setters use the default Runtime. `cc.close(proxy)` follows the proxy's owner. |
-| `wire.py` | `MethodTable` for Python resource method dispatch |
-| `server/native.py` | `NativeServerBridge` exported as `Server` |
-| `server/scheduler.py` | `ConcurrencyConfig` facade plus thin native route-concurrency adapter for same-process direct calls |
-| `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
-| `client/proxy.py` | `CRMProxy` for thread-local, IPC, and HTTP modes |
-| `client/util.py` | Thin native-backed `ping()` and `shutdown()` probes for direct IPC |
-
-`registry.py` asks native `RuntimeSession.ensure_server_bridge()` for the server bridge, `RuntimeSession.acquire_ipc_client()` for direct IPC clients, `RuntimeSession.connect_explicit_relay_http()` for explicit HTTP relay clients, and `RuntimeSession.connect_via_relay()` for relay name resolution. It consumes native unregister/shutdown outcomes before mutating Python local bindings. Do not reintroduce `_relay_control_client`, `_relay_control_address`, `_relay_control_client_for()`, `_http_pool`, direct `RustHttpClientPool.instance()`, or direct construction of `RustRelayAwareHttpClient` in `registry.py`.
-
-An explicit Python `Runtime` owns its code overrides and native session; it does not inherit the default Runtime's code overrides. Process environment and `.env` remain common resolver inputs. Instance `start()` uses the existing native readiness/PONG path, including for an empty Host. `cc.serve()` alone manages process signals for the default Runtime; explicit instances are shut down by their callers. A completed shutdown replaces that instance's native session under the existing handoff rules; old event subscriptions stay with their old source. Custom endpoint directories remain application-owned. Do not add a Runtime context manager, `Runtime.serve()`, a global instance registry, or automatic directory deletion.
-
-Failed Host startup cleanup is observed through the concrete attempt's existing `ShutdownTransaction` receipt. NativeSession retains it under its original Host ownership lock, preferring it over an empty hostless result or an older Host outcome; pending and terminal-with-error are distinct. Release the Host lock before reattaching the Python GIL. Do not add a Python pending/closed state, a second cleanup transaction, or a scan that merges historical outcomes.
-
-Transport modes:
-
-- Thread-local: same-process `cc.connect()` returns a zero-serialization proxy. It passes Python objects directly and may use the native route-concurrency handle through a thin Python adapter; do not route this path through Rust bytes dispatch for symmetry.
-- IPC (`ipc://`): Rust `c2-local` owns local streams (Unix UDS or Windows byte-mode Named Pipes), while `c2-mem` owns POSIX SHM or Windows named mappings. `c2-config::LocalEndpoint` derives the OS endpoint from the logical address; SDKs must use that authority. Remote IPC concurrency semantics and route capacity limits belong to Rust `c2-server`; Python only projects the native handle for same-process calls. The RPC IPC handshake is version 14 and opens with the permanent fixed 25-byte version preamble (see `docs/ipc-handshake.md`): native identity checks precede the preamble, un-negotiated CALL/ordinary-CTRL frames are fenced until the final metadata ACK, a complete `VersionMismatch` is a typed terminal error with no route/HTTP fallback and no retry, and handshake-13-or-older peers (0.9.x and older wheels) are incompatible with no compatibility path.
-- HTTP (`http://`): relay-based cross-machine transport through Rust.
-
-Optional connection deadlines belong to Core. `cc.connect(..., timeout=...)` creates one native `ConnectAttempt` before SDK binding locks; the same absolute deadline covers singleton/registry/local-slot/relay override waits, pools, OS connection, handshake and live route/relay acquisition. SDKs project the attempt and never restart its budget, implement their own timer or leave a waiting thread after returning. Omitted/None retains existing phase guards; zero expires before transport. Connect expiry uses `CallDeadlineExceeded` with `operation=connect`, `transport_phase=pre_dispatch` and `stage`; it cannot execute or replay a business method. Preserve healthy shared clients on waiter expiry and isolate partial control writes.
-
-Direct IPC is a complete standalone mode. `cc.connect(..., address='ipc://...')` must bypass relay discovery and remain usable when no relay is configured or a relay environment variable points at an unavailable server. Relay is only a discovery/forwarding projection above IPC; do not make relay the owner of IPC registration, scheduling, or connection establishment.
-
-Direct IPC `shutdown("ipc://...")` under `c_two.transport.client.util` is an admin/control-plane helper for high-privilege same-host supervisors of `Persistent` hosts. `OwnerBound` hosts reject ordinary admin shutdown with the existing negative ACK, including pre-handshake and duplicate initiate requests; their current owner uses `OwnerControl.request_shutdown()`. Trusted in-process `Runtime.shutdown()` / `cc.shutdown()` retains its authority. An accepted shutdown ACK proves initiation only, without proving that active callbacks have drained or shutdown hooks are safe to run. Completion and route close outcomes must be observed through `RuntimeSession.shutdown()` / bridge barriers or a future explicit wait helper. Future name-based or HTTP/relay-propagated shutdown must be designed as an explicit authenticated admin control plane with clear route-level vs server-level scope, not as a hidden normal RPC side effect.
-
-Startup wait configuration also belongs to Core: Python `cc.set_server(startup_timeout=...)` and native `RuntimeSession` project seconds into `RuntimeOptions.server_startup_timeout`; explicit Rust `HostOptions.with_startup_timeout` wins, then the Runtime value, then the finite five-second default. Server options freeze atomically on the first Host start attempt, including failure, and pre-use session replacement must preserve the timeout. `ServerStartupTimeout` survives the lifecycle watch and projects as `CoreError.lifecycle_kind='startup_timeout'`, with stage and configured seconds; deadline failures have no OS cause. Native shutdown cleanup retains its own budget after startup expiry. Do not reintroduce a Python timer, readiness polling, or the `config error` label on a `ServerError::Failed`.
-
-Server lifecycle/readiness belongs to Rust. Python `NativeServerBridge` may expose `start()`, `is_started()`, and shutdown facades, but must delegate readiness to native `RustServer.start_and_wait()` and native state projection. Do not reintroduce Python socket-file polling, `os.path.exists(socket_path)` readiness checks, or Python-owned `_started` authority. Each native start attempt must be fenced in Rust before readiness waiters run: reset stale `Stopped` / `Failed` lifecycle state and the one-shot shutdown signal, then observe readiness for that attempt. A Rust `Server` may only unlink its IPC socket path after that concrete instance successfully bound the socket; failed duplicate startups must not remove another server's active socket path. Bridge shutdown must still drive the idempotent native runtime barrier through `RuntimeSession.shutdown()` so the PyO3 runtime handle drains even when native lifecycle state is already stopped by an external direct IPC shutdown signal. That native runtime barrier is a lifecycle fence: after it returns, runtime-owned server work must be terminal (`Initialized`, `Stopped`, or `Failed`) so a following start attempt does not observe stale `Stopping` state.
-
-Python Core errors are defined and typed by the public `c_two.error.CoreError` class, sharing `CCBaseError` with semantic `CCError` and retaining `RuntimeError` ancestry. PyO3 imports that same class; do not restore `_native.CoreError` or add a compatibility alias. Local bind/connect diagnostics follow the original error chain and lifecycle watch. `IpcError::Connect` retains `EndpointIoError`; server bind failures retain `EndpointBindCause` through `ServerFailure.bind_cause`. Core exposes `LocalIoCause`, and Python projects `io_operation`, `io_kind`, `raw_os_error` and the bind-only `endpoint_unverified_reason`. Preserve the original OS kind/code inside directory context while retaining outer policy refusals. Deadline, handshake and contract errors must not gain fabricated local causes. These fields do not authorize retries, restart or cleanup; do not add an error cache or infer the operation from transport phase.
-
-`NativeServerBridge` (exported as Python `Server`) is bound to one `RuntimeSession` at construction. Identity, IPC overrides and relay settings belong to that session; bridge operations cannot replace it or select a per-operation relay anchor. Keep configuration preflight at bridge construction without retaining a Python config snapshot. `start()` has no timeout argument; the actual `shutdown(timeout=...)` budget and structured completion handling remain. Independent low-level hosts must configure their session explicitly; the process registry obtains its bridge through `RuntimeSession.ensure_server_bridge()`.
-
-Python resource servers create an auto-generated `ipc://` address. Use `cc.server_address()` after registration only when a same-host process needs to connect directly.
-
-Relay anchor priority:
-
-```text
-cc.set_relay_anchor() > C2_RELAY_ANCHOR_ADDRESS > none
-```
-
-`C2_RELAY_ANCHOR_ADDRESS` is the SDK process's relay anchor for control-plane registration and name resolution. It is not necessarily the relay that will carry every data-plane call: after resolution, remote HTTP calls use the selected route's `relay_url` directly. Direct IPC selection from relay resolution is allowed only when the anchor endpoint is loopback/local; nonlocal relay responses must be treated as HTTP relay targets even if they include an `ipc_address`.
-
-Relay resolution and data-plane calls are contract-scoped, not name-only. `cc.connect(CRMClass, name='...')` derives an `ExpectedRouteContract` from the CRM class and the route name. Runtime relay resolve, probe, and call paths must carry and validate the full route name, CRM tag, ABI hash, and signature hash. Do not add production APIs, fallback behavior, cache keys, or wire paths that resolve, probe, or call a CRM route by name alone. A future "find by name" or diagnostic relay-mesh lookup must be a separate discovery/admin surface that returns candidate route metadata and CRM tags; it must not be reused as the normal CRM call path.
-
-Relay-discovered IPC fast paths must validate endpoint identity in Rust before accepting the IPC client. The relay response identity (`server_id` and `server_instance_id`) must match the identity returned by the IPC handshake, and then the requested route name must exist. Do not reintroduce Python-side or route-name-only trust decisions for relay IPC.
-
-The Python SDK does not embed or start a relay server. Start `c3 relay` outside the SDK, through the CLI, Docker Compose, Kubernetes, or other orchestration. Do not add SDK APIs that embed, start, or manage relay-server lifecycle.
-
-Connection observations share the existing native terminal publisher. `Runtime.connection_events()` / `cc.connection_events()` includes managed outgoing and accepted IPC connections with a client/server side; it creates no host or configuration authority. Python waits only through `ConnectionEvents.recv()`, releases the GIL, and may close that subscription from another thread. Do not restore Python `wait_closed()` or its Core blocking bridge, or add per-connection observation workers. Snapshots and the existing Rust async close barrier retain their terminal metadata and no payload/transport ownership.
-
-### Rust Native Layer
-
-Paths: `core/`, `sdk/python/native/`
-
-`core/` is a language-neutral Cargo workspace. The Python SDK owns its PyO3 extension crate under `sdk/python/native/`.
+The language-neutral Cargo workspace is `core/`; the Python SDK owns its PyO3/maturin extension in `sdk/python/native/`, projecting Core as `c_two._native`.
 
 | Layer | Crate | Purpose |
 | --- | --- | --- |
 | foundation | `c2-contract` | `c-two.contract.v2` validation, canonical descriptor hashing, release identity, and opaque nested-spec extraction |
 | foundation | `c2-codegen` | FastDB Core delegation plus deterministic multi-owner artifact composition and new-tree publication |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
-| foundation | `c2-error` | Canonical error registry and `code:message` wire codec |
+| foundation | `c2-error` | Canonical error registry and versioned `C2E1` wire codec |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
+| foundation | `c2-mem-ffi` | Native memory and endpoint ABI, including verified Windows connection transfer |
 | protocol | `c2-wire` | Wire protocol codec, frames, chunk assembler, chunk registry |
 | transport | `c2-local` | Async Unix UDS / Windows Named Pipe streams, listener ownership and cancellation |
 | transport | `c2-ipc` | Async IPC client, local streams, SHM, chunked transfer |
@@ -248,272 +131,94 @@ Paths: `core/`, `sdk/python/native/`
 | sdk/rust | `c-two` / `c_two` | User-facing Rust facade, FastDB adapter, and checked held/borrowed owners |
 | sdk/python/native | `c2-python-native` | PyO3 bindings for `c_two._native` |
 
-Memory subsystem:
+- Rust Core owns generic runtime, transport, resolver, route, retry and error mechanisms; SDKs own language glue and domain authoring.
+- Direct IPC remains a complete standalone mode when relay is unset or unavailable.
+- Route acquisition and dispatch validate the route name, complete CRM identity, ABI hash and signature hash in Rust.
+- Core owns deadlines, readiness, registration and lifecycle transactions; Python projects the native authority without retaining a second state machine.
+- Each direction copies a transport payload into a local `Vec` and releases its lease before handing the bytes on: a request is released before the resource method runs, a response before decoding or delivering a hold; PyO3 moves that same `Vec` into its buffer projection without a second copy.
+- `c2-core` does not depend on FastDB; Rust users name `fastdb::Payload`, and Rust and Python expose the same portable capabilities.
+- Same-process calls pass Python objects directly and skip serialization.
+- Python imports `c_two as cc`; Rust applications import the `c_two` facade and leave hidden `c_two::generated` seams to generated code.
+- CRM classes use plain names without an `I` prefix; resource implementations use domain names, with `{ContractName}Impl` allowed for generated code.
 
-- Python no longer exports the manual `c_two.mem.ChunkAssembler` / `MemHandle` wrappers or their `_native` names. Keep automatic IPC chunking in the existing Rust `ChunkRegistry` / `ChunkAssembler` / `ReassemblyBacking` chain; the Rust types and memory-pool APIs remain supported. Do not restore Python consumed/released wrappers or compatibility aliases for the retired manual entry points.
-- Allocation tiers: buddy SHM, dedicated SHM, file spill.
-- `MemHandle` abstracts buddy, dedicated, and file-spill handles.
-- `MemHandle` is a private, move-only allocation owner. Its SHM authority is
-  bound to a non-reused process-local pool identity; `PoolAllocation` and wire
-  coordinates carry metadata only. Raw copy, free and dedicated-mapping
-  adoption require explicit `unsafe` ownership/lifetime contracts. Raw pointer
-  queries alone do not grant safe memory access. `alloc_shm_handle()` retains
-  `alloc()`'s GC and error behavior for transport callers.
-- Request and response SHM carriers are minted at frame admission and bind
-  their actual pool. Prepared SHM replies carry the allocated owner. Do not
-  expose replaceable receive-pool slots or restore safe coordinate-to-lease
-  constructors. A reconnect gives its receive task and replies a new pool
-  container while retained replies keep the old one. Request preallocation
-  keeps its existing Armed/Dispatched/Released transaction; it must not gain
-  a second release state machine. `IpcClient` and `SyncClient` take ownership of an injected
-  pool; preallocated publication uses the block's requested length and checks
-  the connection's request-pool identity before dispatch. Server callbacks
-  receive the fixed `ResponsePool` owner; normal response preparation uses
-  `try_prepare_shm_response`, while raw mutable pool access requires `unsafe`.
-  Read access returns a mapped guard: an ordinary read guard can reveal its
-  original writable lock through `RwLockReadGuard::rwlock`.
-- Explicit failed release retains its original owner: `release_handle` returns `ReleaseHandleError` with the moved handle; request/response leases clear their carrier only on success. `RequestPreparationError` privately holds a failed request block for cleanup only, preserving both initial errors. Do not extract/publish that block, replay its fill, or silently discard a `pool_free` error. Core/Held keeps a failed native lease for explicit retry; invalidation is attempted once. Consuming exits and final carrier Drop abandon unconfirmed cleanup without refunding its charge and increment the original scope's saturating `abandoned_releases` once; no background recovery.
-- `c2-mem` owns SDK-visible buffer lease accounting. Lease tracking records metadata and retention state only; it must not read payload bytes, allocate a second buffer, or replace `MemPool::free_at()` / `release_handle()` as the memory release authority.
-- Python buffer export admission and lifecycle transitions share the existing owner boundary: `PyCoreResponse` checks exports under `inner`; `PyCoreRequestBuffer` serializes export, release and retained tracking under `lease`. An active export must reject release before invalidation or lease removal, and tracking after release cannot revive a lease. Keep view-release counter decrements atomic and preserve Core snapshot and release authority.
-- Each owner pool appends a fresh PID/UUID incarnation to its logical label. `MemPool` alone derives bounded OS backing names; SDKs must not concatenate prefix/index suffixes.
-- Buddy references carry a checked `u32` backing generation and `u64 allocation_id` in handshake protocol version 14, whose RPC connections now open with the fixed version preamble. Receiver pools use `MemPool::open_peer()` and lazy-open the exact prefix/index/generation; handshake segment names are descriptive metadata. Every buddy release must match the original allocation id and level under the shared allocator lock, so a released id cannot free a new allocation at the same offset. Dedicated descriptors use allocation id 0. A live allocation prevents retirement.
-- The last peer free drops an idle cached view. Owner GC observes remote frees and preserves slot generation counters across reclamation. Dedicated indices never wrap past the wire's `u16` range. There is no separate segment announcement protocol.
-- Shared allocator header version 3 adds a non-wrapping allocation sequence and shared live records while preserving the full PID in the 64-bit lock word. Layout creation and attach use the same checked geometry; OS page-rounded trailing capacity does not enlarge the logical data region. Death observers refuse access without changing that PID-only word; a panicking holder poisons its own backing. Never steal a dead holder's lock or infer retirement from independently sampled lock/count fields. Retirement checks the allocation count while holding the same SHM lock, with one nonblocking acquisition attempt.
-- Windows pipes and mappings use the process TokenUser SID with explicit user ownership and protected user DACLs. Listener leases use the Global namespace; mappings stay Local and need no global-mapping privilege. Native pipe session facts and handshake 14 request/response capabilities exclude inaccessible cross-session SHM references, including prepared requests and replies; reuse owned/inline/chunked transfer and the original owner for release. Unknown native reachability is an error, never a capability downgrade. File spill has an owner that closes its mapping before the backing file, with Windows delete-on-close cleanup.
-- Local endpoints have one automatic implementation per OS, derived only by `c2-config::LocalEndpoint::from_address()`. Unix uses the final owner-controlled directory (default `/tmp/c2-v3-<uidhex>`, created 0700; custom 0755 accepted with owner/access/no-other-write checks and sockets verified 0600 before listen) with 32-character lowercase endpoint ids and no socket suffix; bind/connect/probe are descriptor-relative. The default directory suffix is the namespace disk format version 3; custom roots are used exactly as configured. macOS default-namespace gate/marker/lease files live in `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`, with default socket-directory aliases sharing that coordinator by directory identity; Linux and non-default custom roots remain colocated. Both directories must be identity-checked under the same gate; listener close/Drop must preserve its original directory pins. Format 3 retains fixed `c2mgatv2` / `c2mgrec2` backend magic, removes persisted device and the record's redundant protocol byte, and uses 25-byte gates, 33-byte markers and 51-byte fixed record headers. A recognizable different gate/marker version is `unsupported-namespace-format`; do not read, delete or adopt old default directories. An explicit custom root shared by different disk formats is unsupported; safely archive and rebuild it offline only after every old process exits and cannot restart. The original gate inode stays pinned until listener lease ownership ends. Windows uses a TokenUser-scoped Named Pipe and a non-inheritable Global listener lease, so restart can succeed while old stream handles survive. Before any ordinary/control/owner-recovery bytes, verify the actual pipe owner and pinned server process TokenUser plus at least Medium integrity; preserve OS causes and identification SQOS. A listener grants only same-user process-query/synchronize and token-query access so Medium peers can verify High hosts. Do not grant process control or token duplication, weaken checks after permission failure, or add a logon-name fallback. There is no endpoint_protocol configuration or protocol-selecting SDK/CLI API. Credential managed-v2 / named-pipe fields are backend metadata only. Never recreate a recorded missing coordinator or infer cleanup permission from age, PID or connection failure.
-- `c2-core` owns the default `Persistent` and explicit `OwnerBound` lifecycle policies and the single duplex owner supervisor. `owner_control_pair()` returns `OwnerControl` plus a one-use Rust `OwnerBootstrap` / Python `NativeOwnerBootstrap`; the trusted launcher transfers only the bootstrap to its intended child, which explicitly adopts it before readiness. Raw inherited descriptor/handle adoption still requires trusted provenance; OS type checks do not authenticate a launcher. A consumed bootstrap cannot be replaced by a late attach; restarting a terminal OwnerBound host requires a fresh bootstrap and Runtime. SDKs must not add an owner watcher, recovery worker, shutdown transaction or endpoint path derivation. Ordinary client disconnects and relay eviction do not end ownership.
-- `OwnerControl.close()` / drop ends the relationship and starts the bounded owner-missing grace; `request_shutdown(timeout)` requests native drain and acknowledges initiation only. In `OwnerMissing`, the existing native admission authority pauses the host while published routes stay `Ready` with the same UID/revision and server instance; calls, including Python thread-local calls, report existing `ResourceUnavailable`. Already admitted work and payload leases retain their lifetime rules. A valid takeover restores only the host gate; it cannot reopen closed/unregistered routes, revive old pending permits or authorize late registration tokens. Preserve B's exact identity/generation checks and validation/error ordering; do not infer pre-dispatch retry safety or replay business requests from `ResourceUnavailable`.
-- Only the current owner session/epoch can issue or revoke the single recovery grant. Repeated `recovery_ticket(timeout)` returns that grant; `revoke_recovery(timeout)` clears it idempotently. `OwnerRecoveryTicket` uses explicit `export()` and Rust `import()` / Python `from_bytes()`, with redacted repr and no implicit pickle or SDK persistence. Applications save tickets outside the controller. `Runtime.prepare_owner_takeover(ticket)` / `cc.prepare_owner_takeover(ticket)` uses and freezes existing endpoint configuration, including failed preparation; native directory identity permits aliases of the same directory and rejects replacements or a different root/instance. Tickets and endpoint credentials cannot instruct directory adoption. Listener binding projection transfers the identity captured under bind's gate without reacquiring it; grant issuance/use still validates the current native pins. `inspect(timeout)` observes identity/epoch/phase without proving a transaction succeeded; save `successor_ticket()` in Rust / the Python `successor_ticket` property before one `commit(timeout)`, which returns the new `OwnerControl`.
-- Takeover requires `OwnerMissing` and monotonic `now < original grace deadline`; a late timer or failed attempt cannot extend it. The same native commit consumes the old grant, installs the saved successor, advances the epoch and transfers supervision; old tickets, commands, EOF and timers have no authority over that epoch. `WatcherIoError`, draining and terminal hosts cannot recover. Owner control uses one absolute request budget and one request slot per session; a waiter timeout cannot terminate another operation, and expiry before the first write preserves an otherwise healthy owner session. Preserve `NotSent` versus `Indeterminate` (`not_sent` / `indeterminate` in Python), explicit refusal kinds and bounded `cause_kind`; after an uncertain submission, only application-selected saved tickets may start a new prepared attempt. Never infer success from inspect or automatically retry old/new keys, ordinary admin shutdown, HTTP or relay.
-- Owner control has its own version 1, bounded 4 KiB messages in the existing frame envelope; ordinary and owner connection roles cannot mix or upgrade after classification. Keep the existing startup fence, readiness-bound ticket issuance, first-frame timeout and bounded candidate setup (the earlier of the native 5-second setup limit and original grace deadline). Owner-control encoding remains 1. The current transport uses IPC handshake 14 with the permanent fixed version preamble, SHM 3 and C/FFI ABI 6; business frame/call/reply representations keep their existing layouts. Rust exhaustive matches must handle `MsgType::OwnerControl`, `SchedulerAcquireError::Unavailable`, `RouteConcurrencyError::Unavailable`, and the typed `IpcError::ProtocolVersionMismatch` / Core `Error::ProtocolVersionMismatch` variants (both carry nonzero `u32` local/peer versions). Remove superseded single-direction owner types, formats and aliases without compatibility paths; the low-level API and grace changes still require exact-candidate Linux/macOS/Windows GitHub Actions evidence before acceptance.
-- For the Python SDK, explicit `Runtime.shutdown()` / `cc.shutdown()` starts the Core Runtime's single permanent retirement scope, sealing its client pool and refusing new register/start/remote-connect work; pending retains the old session and slots until a later SDK shutdown consumes the completed receipt and hands off a replacement. The zero/short caller budget does not cancel its driver. Expiry before handoff is `shutdown_wait_timeout` with stage and timeout details, not pending. Python instance-lock wait remains outside the deadline; after acquisition, Native Host, Core and pool waits share one absolute deadline. The connect publication check uses the original connect deadline and never retries; normal successful client reuse is unchanged. Low-level Rust/Native Host shutdown remains restartable. Core exposes `RuntimeShutdownTarget` borrowing `Host`, `FailedStartShutdownReceipt` or `ClientsOnly`, `RuntimeShutdownReceipt`, and `begin_session_retirement(..., deadline) -> Result<_, LifecycleError>`; `retirement_receipt(deadline)` observes the same scope. Keep the `FailedStartShutdownReceipt`'s concrete cleanup role, and use `Host.shutdown_outcome_until(deadline)` for bounded observation of its existing journal. Listener closure, work drain and retained payload leases are distinct; HTTP-only retirement creates no IPC pool and promises no physical closure of every HTTP keepalive socket. Shutdown error projection and hooks run outside the binding lock; hooks run after replacement, and failed replacement retains original slots/journal. These Runtime retirement semantics do not alter IPC 14, SHM 3 or C/FFI ABI 6; R07 final Drop remains separate.
-- Endpoint credentials and bounded sweep state belong to `c2-local` and are projected through Core/SDK/CLI. Unix credential JSON is schema 4 without device; schema 3 is rejected. Windows stays kernel-managed schema 1. `cc.server_credential()` reads the current listener credential from the existing lifecycle watch without inspect, I/O or a namespace gate; it returns a credential in Ready and Stopping, `None` before start and after terminal state, and may return the prior snapshot between run cancellation and finalization. The value is neither liveness proof nor cleanup or owner authority. Controllers capture credentials after readiness, confirm child exit with OS wait when killing it, then request exact native reap. Bind policy refusals carry `EndpointBindCause.unverified_reason` through `ServerFailure.bind_cause` and `LocalIoCause::Bind`; `EndpointIoError` remains unchanged. Tests and runners select their own logical addresses for maintenance; historical unknown endpoints are never a test cleanup target. See [the lifecycle integration guide](docs/local-endpoint-lifecycle.md).
+The Phase 0B local candidate and its exact source provenance are recorded in the [local candidate evidence](docs/acceptance/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md); current qualifications are in the [development guide](docs/reference/development.md#local-candidate-evidence-and-provenance).
 
-Current c2-mem-ffi ABI is 6 and requires the complete endpoint-context symbol group, including verified Windows connection transfer, and allocation-bearing block descriptors. Official Windows Node connections must use that native entry; raw socket/path/symbol injection is rejected. Transfer an unregistered pipe into Node's own CRT/libuv, retain the process pin through socket closure, and close late results through their existing owner. Do not create a second receive loop or compatibility loader. Node and TypeScript carry allocation ids as lossless `bigint` values. Endpoint C functions accept the logical address without a protocol selector; consumers validate ABI before exposing or invoking functions. Historical manifests/receipts retain their actual source ABI.
+## Retired interfaces
 
-### CLI
+Retired surfaces have no compatibility aliases; names of still-supported internal Rust types below identify forbidden SDK authority or application construction, not removal of those Core types.
 
-The `c3` command is implemented by the root `cli/` Rust package. Python does not own CLI behavior. For source-checkout development, build and link a local `c3` with:
+| Retired interface or SDK pattern | Current owner or replacement |
+| --- | --- |
+| `@cc.transferable`, `@cc.transfer(buffer='hold')` | Use `@cc.transfer(input=..., output=...)`; select retained responses with `cc.hold(...)` and borrowed inputs at registration. |
+| `compo/`, `@cc.runtime.connect`, `Component` | Use CRM contracts, plain resource classes and `cc.connect(...)` clients. |
+| `_server_ipc_overrides`, `_client_config`, `_client_ipc_overrides`, `_pool_config_applied`, Python server-id/server-address authorities | Core Runtime and `RuntimeSession` own identity and configuration projection/freeze. |
+| Direct `RustClientPool`, `RustHttpClientPool`, `RustHttpClientPool.instance()`, `_http_pool`, `_rollback_registration` in Python registry | Use native session acquire/connect and registration/unregister/shutdown outcomes. |
+| `_relay_control_client`, `_relay_control_address`, `_relay_control_client_for()`, direct `RustRelayAwareHttpClient` construction in `registry.py` | Use `RuntimeSession.connect_via_relay()` and `connect_explicit_relay_http()` with full route contracts. |
+| Python IPC/relay default and key validation tables, duplicate scheduler state | Rust `c2-config` validates defaults and overrides; the native route-concurrency handle owns scheduling. |
+| Runtime context manager, `Runtime.serve()`, global Runtime registry, automatic endpoint directory deletion | Call explicit Runtime startup/shutdown; `cc.serve()` owns signals only for the default Runtime, and applications own custom directories. |
+| Python pending/closed cleanup state, extra cleanup transactions, historical-outcome scans | Observe the concrete attempt’s original native `ShutdownTransaction` receipt. |
+| Python startup timers, readiness polling, `os.path.exists(socket_path)`, `_started`, `config error` on `ServerError::Failed` | Use native lifecycle projection and `RustServer.start_and_wait()`; preserve typed startup failures. |
+| `_native.CoreError`, legacy-named error codec APIs, Python error-wire parsers | Use public `c_two.error.CoreError` and the native canonical error registry/wire codec. |
+| Name-only relay resolve/probe/call and Python or route-name-only relay IPC trust | Validate `ExpectedRouteContract` plus native server and server-instance identity. |
+| SDK relay-server lifecycle APIs | Run standalone `c3 relay` through external orchestration. |
+| Python `wait_closed()`, its Core blocking bridge, per-connection observation workers | Use `ConnectionEvents.recv()` and the existing Rust async close barrier. |
+| Python `c_two.mem.ChunkAssembler`, `MemHandle`, `_native.ChunkAssembler`, `_native.MemHandle`, consumed/released manual wrappers | Use automatic Rust `ChunkRegistry` / `ChunkAssembler` / `ReassemblyBacking`; Rust memory APIs remain supported. |
+| Replaceable receive-pool slots and safe coordinate-to-lease constructors | Frame admission mints pool-bound carriers; prepared SHM replies carry their allocated owner. |
+| `endpoint_protocol`, protocol-selecting SDK/CLI APIs, logon-name fallback | `c2-config::LocalEndpoint::from_address()` derives one OS implementation and verifies native identity. |
+| The owner subsystem: `OwnerBound`, owner control and its 0x16 frame, `OwnerBootstrap`, recovery tickets and takeover, owned children, `LifecycleConfig` | Removed without replacement ([ADR 0002](docs/decisions/0002-remove-owner-subsystem.md)); supervise host processes with ordinary process management and shutdown. |
+| Handshake 14 or older, SHM 3, C/FFI ABI 6, relay mesh 6, old Unix credential schemas and namespace-format adoption | Use IPC 15, SHM 4, C/FFI ABI 7, relay mesh 7 and Unix credential schema 4; unsupported roots require offline archive/rebuild. |
+| Second Node receive loop or compatibility ABI loader, raw socket/path/symbol injection, ABI 6 request/response pools and their split read/release | Use the complete ABI 7 endpoint-context symbols, the per-connection memory context and verified Windows connection transfer. |
+| `CRMProxy.call_prepared`, `CoreClient.call_prepared`, `NativePreparedCall.call_prepared`, arbitrary client write plans | Use `begin_call` / `charge_input` / `call` / `close`, explicit FastDB payloads or Python-only pickle fallback. |
+| Producerless server writable sinks and Rust IPC preallocation API | Core receives owned response bytes; `c2-server` selects allocation and transport. |
+| Python held-buffer weakref registries; holds that retain transport memory (`HeldResponse` leases and pins, `abandon`, `_abandon_after_failed_release`) | A hold owns only a local copy; Core `LocalCopy*` accounting backs `memory_stats()['holds']`. |
+| Automatic IPC heartbeat: `heartbeat_interval` / `heartbeat_timeout`, `C2_IPC_HEARTBEAT_INTERVAL` / `C2_IPC_HEARTBEAT_TIMEOUT`, the `heartbeat_timeout` end reason | Connection ends come from OS facts such as EOF and reset; calls wait on their own deadlines; manual ping remains. |
+| Python peer memory entries `MemPool.data_addr`, `seg_data_info`, `open_peer`, `ensure_peer_segment`, `read_at`, `free_at`, `destroy`, and the c2-mem SDK lease module | Use the local allocation APIs; a pool is freed with its last owner. |
+| Route revisions, `RouteWatch`, route-contract queries, `RouteAck`, NACK nonces and handshake segment lists | Identify routes by route UID, server instance and contract; the dispatcher is the single route truth; peers open SHM backings from prefix, slot and generation. |
+| Host lifecycle `phase`, `terminal` and `client_held_leases` | Lifecycle snapshots report `finished`, `listener_closed` and `work_drained`. |
+| The multi-field direct shutdown ACK (`acknowledged`, `shutdown_started`, `server_stopped`, route outcomes) | A one-byte ACK; direct shutdown returns `Initiated`, `Absent` or `Unconfirmed` (Python `'initiated'`, `'absent'`, `'unconfirmed'`), and completion is observed through the original receipt. |
+| `PyShmBuffer`, `c_two._native.ShmBuffer`, Python wire codecs and handshake objects | Use native Core buffer owners; Python `wire.py` retains `MethodTable` and the five existing native contract projections remain available. |
+| Python response-pool access, SHM coordinate tuples, threshold-based response dispatch and `bytes(memoryview)` transport conversion | Return serialized bytes or buffer-protocol data and leave native payload limits and transport allocation to `c2-server`. |
 
-```bash
-python tools/dev/c3_tool.py --build --link
-```
+## Documentation rules and routing
 
-Do not add CLI command behavior under `sdk/python/src/c_two`.
+**Instruction size.** Keep this file within 32 KiB: Codex reads at most `project_doc_max_bytes` (32 KiB by default) of the AGENTS.md files from the project root to its working directory and drops the rest. `tests/repo/test_docs_hygiene.py` fails above the limit. Mechanism detail belongs in `docs/reference/`, routed from the table below.
 
-`c3 relay` options:
+**Read before changing.** Before changing files under a path in this table, read the documents it names; they own that mechanism and its invariants. Update the owning document in the same change as the behavior.
 
-| Option | Env var | Default | Purpose |
-| --- | --- | --- | --- |
-| `--bind` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address |
-| `--seeds` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh |
-| `--relay-id` | `C2_RELAY_ID` | auto UUID | Stable relay identifier |
-| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Publicly reachable URL for peers |
-| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `60` | IPC idle disconnect timeout in seconds; `0` disables time-based eviction |
-| `--upstream` | none | empty | Pre-register upstream as `NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must match the IPC server handshake identity |
+**Documentation layout.** `docs/README.md` routes each subject to the document that owns it. `docs/reference/` states current behavior; `docs/decisions/` holds one ADR per decision, amended with dated notes rather than rewritten; `docs/design/` holds the backlog, the roadmap and plans in progress; `docs/acceptance/` holds verification records and evidence; `docs/research/` holds notes made before a decision. Before deleting a superseded document, move what still holds into its owning page. Name locations with `~` or a placeholder, never a machine's home directory.
 
-Relay-aware clients use `C2_RELAY_ROUTE_MAX_ATTEMPTS` to cap route acquisition attempts before reporting failure. This setting belongs to the client side, not the relay server resolver.
+**Terms.** [`CONTEXT.md`](CONTEXT.md) is the glossary. Use its words in code, comments, documentation and messages. When a term is defined or renamed, update `CONTEXT.md` and every current use in the same change; frozen records under `docs/acceptance/` and past release notes keep their wording.
 
-## Key Conventions
-
-### Import Style
-
-Python imports the package as `c_two` and commonly aliases it as `cc`:
-
-```python
-import c_two as cc
-```
-
-Rust users import the user-facing package as `c_two`, not by a Core or
-transport crate name:
-
-```rust
-use c_two::{Connect, ContractRelease, Runtime};
-use fastdb::Payload;
-```
-
-Generated Rust modules may use the hidden `c_two::generated` seam. Ordinary
-application code must not assemble `c2-ipc`, `c2-http`, `c2-server`,
-`SyncClient`, or route bindings directly.
-
-### CRM Contract Pattern
-
-CRM contract classes are interfaces. Method bodies are `...`. The `@cc.crm()` decorator requires `namespace` and `version`. Do not use an `I` prefix on the contract class name.
-
-```python
-@cc.crm(namespace='cc.demo', version='0.1.0')
-class Grid:
-    def some_method(self, arg: int) -> str:
-        ...
-```
-
-### FastDB CRM Pattern
-
-Author the nested payload specification with FastDB's `fastdb.payload.v1` schema and bind it explicitly with `@cc.transfer(...)`. The method surface carries one `fastdb4py.payload.Payload` envelope; C-Two must not infer payload structure from annotations or add a second FastDB helper module.
-
-```python
-import c_two as cc
-from fastdb4py.payload import Payload
-
-CELL_SPEC = {
-    "schema": "fastdb.payload.v1",
-    "profile": "record.v1",
-    "entries": [
-        {
-            "id": "value",
-            "cardinality": "one",
-            "type": {"kind": "u8", "nullable": False},
-        },
-    ],
-    "components": [],
-}
-
-@cc.crm(namespace='demo.grid', version='0.1.0')
-class Grid:
-    @cc.transfer(input=CELL_SPEC, output=CELL_SPEC)
-    def echo(self, payload: Payload) -> Payload:
-        ...
-```
-
-FastDB Core is the sole authority for nested parsing, canonical identity, digest, binary layout, build/open/view/materialize/invalidate behavior, and payload-only codegen. C-Two validates only the outer contract and binding relationship. Server-side borrowed input is explicit registration policy through `cc.register(..., input_lifetime={...})`; method metadata must not bypass that gate.
-
-The old Python `CRMProxy.call_prepared`, `CoreClient.call_prepared`, and `NativePreparedCall.call_prepared` write-plan entry points are retired. Client requests retain `begin_call` / `charge_input` / `call` / `close` and the Python-only pickle fallback; do not restore arbitrary client encoding plans as a formal alternative to FastDB. Core opaque-byte interfaces, server-side writable sinks, Rust IPC preallocation, and the existing custom client/scheduler adaptation protocols remain unchanged.
-
-### Hold Mode Pattern
-
-`cc.hold()` wraps a CRM proxy bound method for client-side SHM retention. It returns `HeldResult` with `.value`, `.unsafe_buffer`, and `.release()`. Safety layers are explicit release, context manager, and `__del__` fallback.
-
-Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle, and file-spill buffers can all be retained leases; do not special-case hold as SHM-only and do not reintroduce Python weakref registries for held buffers. For a portable method, `held.value` is a FastDB `Payload` owner. Releasing the hold invalidates that owner and its checked views before releasing the C-Two lease. The proven receive path is copy-backed; hold is a lifetime contract, not proof of direct response-SHM construction or zero-copy decoding. `held.unsafe_buffer` is a raw `memoryview` escape hatch for advanced users and cannot mechanically invalidate raw NumPy or pointer aliases created from it; normal code should use FastDB checked views and materialize values before storing them beyond the hold scope.
-
-```python
-with cc.hold(proxy.method)(args) as held:
-    data = held.value
-
-a = cc.hold(proxy.method)(args_a)
-b = cc.hold(proxy.method)(args_b)
-try:
-    process(a.value, b.value)
-finally:
-    a.release()
-    b.release()
-```
-
-### FastDB View Lifetime Boundary
-
-FastDB can enforce stale-use detection only through its public `Payload` owner and checked-view contract. C-Two must invalidate held responses and borrowed inputs before releasing the associated transport lease. Values that must outlive that lease must be materialized through the official FastDB API.
-
-FastDB cannot reliably invalidate every raw pointer a user deliberately extracts from a view. In particular, unsafe NumPy access can produce an ndarray or pointer that no longer consults the FastDB owner on later reads. Treat such APIs as explicit unsafe escapes: tests should assert normal FastDB view invalidation after release, but do not claim that a leaked raw NumPy pointer can be made mechanically impossible in Python.
-
-The C-Two transport design reduces the practical blast radius of those unsafe escapes. IPC request and response memory pools are directional rather than a single full-duplex shared pool, so leaked or malicious stale access in one direction should not expose the opposite channel. HTTP/relay paths necessarily copy at the relay/network boundary, which breaks the shared-memory eavesdropping path. These mitigations are not a substitute for FastDB view invalidation or explicit materialization; they are the reason C-Two treats stale raw-pointer exposure as a developer-safety/performance footgun rather than a primary cross-channel security model.
-
-### SOTA API Pattern
-
-The module-level registration, connection, configuration and shutdown API on `cc` delegates to the default Python Runtime. `cc.close(proxy)` follows that proxy's owner. `cc.Runtime()` also creates application-owned instances with the same register/connect/configure/shutdown methods and an empty-Host `start()`:
-
-```python
-import c_two as cc
-
-# Server side
-cc.set_relay_anchor('http://relay-host:8080')
-cc.set_transport_policy(shm_threshold=64 * 1024)
-cc.set_server(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
-cc.register(Grid, grid_instance, name='grid')
-cc.register(Network, net_instance, name='network')
-cc.serve()
-
-# Client side, same process: thread preference
-grid = cc.connect(Grid, name='grid')
-grid.some_method(arg)
-cc.close(grid)
-
-# Client side, direct IPC
-cc.set_client(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
-grid = cc.connect(Grid, name='grid', address='ipc://my_server')
-grid.some_method(arg)
-cc.close(grid)
-
-# Client side, relay-based name resolution and routing
-cc.set_relay_anchor('http://relay-host:8080')
-grid = cc.connect(Grid, name='grid')
-grid.some_method(arg)
-cc.close(grid)
-
-# Cleanup
-cc.unregister('grid')
-cc.shutdown()
-```
-
-The `name` parameter in `cc.register()` is a user-chosen routing key. It is not the CRM namespace. Multiple resources using different CRM contracts, or the same CRM contract with different instances, can coexist under distinct names. For remote IPC/relay paths, name is necessary but not sufficient: the native runtime also matches the expected CRM tag and contract hashes derived from the client's CRM class.
-
-### Error Handling
-
-Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Rust `core/foundation/c2-error` owns the canonical error registry and `code:message` wire codec. Python generates `ERROR_Code` from `_native.error_registry()` and delegates `CCError.serialize()` / `CCError.deserialize()` to `_native.encode_error_wire()` and `_native.decode_error_wire_parts()`. Do not reintroduce Python-side parsing of the error wire payload, and do not use or add legacy-named error codec APIs. Error classes are named by location, for example `ResourceDeserializeInput`, `ClientSerializeInput`, `ResourceExecuteFunction`, and `ClientCallResource`. Enum values live under `ERROR_AT_RESOURCE_*` and `ERROR_AT_CLIENT_*`. Transfer hook errors are split by hook type: `deserialize()` failures remain `ERROR_AT_RESOURCE_INPUT_DESERIALIZING` or `ERROR_AT_CLIENT_OUTPUT_DESERIALIZING`, while `from_buffer()` / `fromBuffer()` failures use `ERROR_AT_RESOURCE_INPUT_FROM_BUFFER` or `ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER`. Do not label zero-deserialization buffer view construction as deserialization. The public `CoreError` category literal now includes `protocol_version_mismatch`, whose `local_protocol_version` / `peer_protocol_version` are nonzero on that category and `None` on every other error. On any `from_buffer()` failure before a resource/user receives a retained value, release the native memoryview and buffer owner immediately so Rust lease stats do not retain stale holds.
-
-### Naming
-
-- CRM contract classes: plain names, no `I` prefix.
-- Resource implementation classes: domain names such as `NestedGrid` or `PostgresVectorLayer`; `{ContractName}Impl` is acceptable for generated code.
-- Transferable classes: descriptive data names such as `GridAttribute`.
-- Routing names: user-chosen strings passed to `cc.register(name=...)` and `cc.connect(name=...)`; distinct from CRM `namespace`.
-
-### Performance-Sensitive Code
-
-Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize zero-copy and single-allocation patterns. Python `wire.py` retains only `MethodTable`; wire codecs and handshake objects are not exposed by the Python SDK. The five native contract projection functions remain available under their existing names. The thread-local transport skips serialization entirely. SHM segment names are deterministic for lazy peer-side opening. The buddy allocator's `alloc()` and `free_at()` are thread-safe. Remote dispatch follows `RequestData -> RequestLease.copy_bytes() -> EncodedService.invoke(Vec<u8>) -> PyCoreRequestBuffer -> Python memoryview`. Core retains the original transport lease until `invoke` returns or unwinds; PyO3 moves the same owned snapshot into the request buffer without a second copy. Preserve this snapshot and lease ordering when changing dispatch or scheduler code. The unused `PyShmBuffer` projection and low-level `c_two._native.ShmBuffer` export are retired without compatibility aliases. Core moves an IPC `ResponseData::Inline(Vec)` into the existing owned `HeldResponse`; SHM and chunked carriers retain `ResponseLease.copy_bytes() -> HeldResponse -> PyCoreResponse` and their transport leases. Preserve response snapshots and Core transport release ordering; do not add an inline clone or release non-inline carriers early. Python server dispatch may return serialized `bytes` or buffer-protocol data, but must not receive native response pools, compare result length against `shm_threshold`, return SHM coordinate tuples, or call `bytes(memoryview)` for transport. Core receives owned response bytes; `c2-server` owns payload-limit checks, response SHM allocation and inline/SHM/chunked transport selection. Thread-local same-process calls must continue to pass Python objects directly instead of being routed through Rust serialized dispatch for symmetry.
-
-## Environment Variables
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `C2_RELAY_ANCHOR_ADDRESS` | SDK relay anchor URL for CRM registration and client name resolution | none |
-| `C2_RELAY_ROUTE_MAX_ATTEMPTS` | Relay-aware client route acquisition attempts | `3` |
-| `C2_RELAY_CALL_TIMEOUT` | Relay HTTP CRM call timeout seconds; `0` disables the reqwest total timeout | `300` |
-| `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | C-Two remote payload body batching size for relay HTTP and future remote protocols; not a TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame guarantee | `1048576` |
-| `C2_RELAY_BIND` | Relay HTTP listen address for `c3 relay --bind` | `0.0.0.0:8080` |
-| `C2_RELAY_ID` | Stable relay identifier for mesh protocol | auto UUID |
-| `C2_RELAY_ADVERTISE_URL` | Publicly reachable URL announced to mesh peers | derived |
-| `C2_RELAY_SEEDS` | Comma-separated seed relay URLs for mesh mode | none |
-| `C2_RELAY_IDLE_TIMEOUT` | Upstream IPC idle disconnect timeout in seconds; `0` disables time-based eviction | `60` |
-| `C2_RELAY_ANTI_ENTROPY_INTERVAL` | Anti-entropy digest exchange interval in seconds | `60.0` |
-| `C2_RELAY_USE_PROXY` | Use system proxy variables for relay HTTP clients | `false` |
-| `C2_SHM_THRESHOLD` | Payload size threshold for SHM vs inline | `4096` |
-| `C2_IPC_POOL_SEGMENT_SIZE` | Buddy pool segment size in bytes | `268435456` |
-| `C2_IPC_MAX_POOL_SEGMENTS` | Max buddy pool segments, 1 to 255 | `4` |
-| `C2_IPC_POOL_DECAY_SECONDS` | Idle segment decay time | `60.0` |
-| `C2_IPC_POOL_ENABLED` | Enable or disable SHM pool | `true` |
-| `C2_IPC_MAX_FRAME_SIZE` | Max inline frame size | `2147483648` |
-| `C2_IPC_MAX_PAYLOAD_SIZE` | Max single-call payload size | `17179869184` |
-| `C2_IPC_MAX_PENDING_REQUESTS` | Max concurrent pending requests per connection | `1024` |
-| `C2_IPC_MAX_EXECUTION_WORKERS` | Max blocking execution workers for server-side resource callbacks | available parallelism clamped to `4..=64` |
-| `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds; `0` disables | `15.0` |
-| `C2_IPC_HEARTBEAT_TIMEOUT` | Heartbeat timeout seconds | `30.0` |
-| `C2_IPC_MAX_TOTAL_CHUNKS` | Max total in-flight chunks across all connections | `512` |
-| `C2_IPC_CHUNK_GC_INTERVAL` | Chunk GC sweep interval seconds | `5.0` |
-| `C2_IPC_CHUNK_THRESHOLD_RATIO` | Fraction of max frame size that triggers chunking | `0.9` |
-| `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | Chunk assembler timeout seconds | `60.0` |
-| `C2_IPC_MAX_REASSEMBLY_BYTES` | Max reassembly buffer memory | `8589934592` |
-| `C2_IPC_CHUNK_SIZE` | Individual chunk size | `131072` |
-| `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | Reassembly pool segment size | `67108864` |
-| `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | Max reassembly pool segments | `4` |
-| `C2_ENV_FILE` | Path to `.env`; empty string disables env-file loading | `.env` |
-
-The Rust `c2-config` resolver loads `.env` and process environment values. Precedence is explicit code overrides, then process environment / `.env`, then defaults. See `.env.example` for the full reference.
-
-Do not add environment variables for values that can be derived from existing canonical settings. Pool memory limits should be derived from segment size and segment count.
+| Path or mechanism | Owning documents to read before changing |
+| --- | --- |
+| `core/foundation/c2-mem/`, `core/foundation/c2-mem-ffi/` | [Memory policy](docs/reference/memory-policy.md), [C ABI](docs/reference/c-abi.md), [payload lifetimes](docs/reference/payload-lifetime.md) |
+| `core/transport/c2-local/`, endpoint parts of `core/foundation/c2-config/` | [Local endpoint lifecycle](docs/reference/local-endpoint-lifecycle.md), [Windows native implementation](docs/reference/windows-native-implementation.md), [configuration](docs/reference/configuration.md) |
+| `core/protocol/c2-wire/`, `core/transport/c2-ipc/`, `core/transport/c2-server/` | [IPC handshake](docs/reference/ipc-handshake.md), [memory policy](docs/reference/memory-policy.md), [payload lifetimes](docs/reference/payload-lifetime.md), [Runtime lifecycle](docs/reference/runtime-lifecycle.md) |
+| Relay in `core/transport/c2-http/` | [Contracts and routing](docs/reference/contracts-and-routing.md), [configuration](docs/reference/configuration.md), [c3](cli/README.md) |
+| `core/runtime/c2-core/` | [Runtime lifecycle](docs/reference/runtime-lifecycle.md), [contracts and routing](docs/reference/contracts-and-routing.md), [errors](docs/reference/errors.md) |
+| `core/foundation/c2-contract/`, `core/foundation/c2-codegen/` | [Contracts and routing](docs/reference/contracts-and-routing.md), [c3 portable contracts](cli/README.md#portable-contracts) |
+| `core/foundation/c2-error/` | [Errors](docs/reference/errors.md) |
+| `sdk/python/` | [Python usage](docs/reference/python-usage.md), [Runtime lifecycle](docs/reference/runtime-lifecycle.md), [payload lifetimes](docs/reference/payload-lifetime.md), [errors](docs/reference/errors.md) |
+| `sdk/rust/` | [Rust SDK](sdk/rust/README.md), [contracts and routing](docs/reference/contracts-and-routing.md), [payload lifetimes](docs/reference/payload-lifetime.md) |
+| `cli/` | [c3](cli/README.md), [configuration](docs/reference/configuration.md) |
+| Configuration in `core/foundation/c2-config/`, `sdk/python/src/c_two/config/`, `.env.example` | [Configuration](docs/reference/configuration.md), [Runtime lifecycle](docs/reference/runtime-lifecycle.md) |
+| Build, CI and local runners | [Development](docs/reference/development.md), [CI and release qualification](docs/reference/ci-cd.md), [local development testing](docs/reference/local-development-testing.md), [Windows usage](docs/reference/windows-native-usage.md) |
 
 ## Python Version
 
-Requires Python 3.10 or newer. Keep Python 3.10 compatibility intentional: downstream Taichi-based workloads can still be pinned to 3.10 even when normal development prefers Python 3.12 and free-threading validation targets 3.14t. Use modern type hints such as `list[int]`, `str | None`, and `tuple[...]`. Free-threading Python is a target platform; be cautious with C extensions, shared mutable state, and GIL assumptions.
+Requires Python 3.10 or newer, including downstream Taichi stacks pinned to 3.10; use modern hints such as `list[int]`, `str | None`, and `tuple[...]`, and retain intentional 3.10 compatibility alongside Python 3.12 development and 3.14t free-threading validation, checking C extensions, shared state and GIL assumptions.
 
 ## Agent Working Rules
 
+- Open work and pending decisions live only in `docs/design/backlog.md`. Read it before starting work and update it whenever an item's status changes; remove finished items and note them in the acceptance or release record. Plans and reviews keep the details; do not keep a second todo list elsewhere.
 - Read the existing code before changing it.
 - Prefer `rg` and `rg --files` for repository searches.
-- After testing or a task finishes, promptly remove rebuildable artifacts no longer needed by ongoing work, including Cargo target directories, native libraries, dist bundles, wheels and package archives in temporary validation directories and worktrees. Confirm that no active build, test or runtime still uses them. Preserve source, Git state, test logs, receipts and explicitly retained deliverables; historical IPC directories and coordination files are not build-cleanup targets. Do not accumulate copies of build outputs across completed batches.
+- Remove rebuildable artifacts as soon as later steps no longer need them, not only when a task finishes: Cargo target directories, `.venv` environments, native libraries, downloaded SDKs, dist bundles, wheels and package archives in validation directories and worktrees. Share one Cargo target directory per checkout, as CI does with `CARGO_TARGET_DIR=<checkout>/core/target`, instead of building a separate target for each workspace. Confirm that no active build, test or runtime still uses an artifact before removing it. Preserve source, Git state, test logs, receipts and explicitly retained deliverables; historical IPC directories and coordination files are not build-cleanup targets. Do not accumulate copies of build outputs across completed batches.
 - Keep Python SDKs as glue around Rust mechanisms. Do not move shared transport, resolver, route fallback, or protocol mechanisms into Python SDK code.
 - Use Rust core crates for cross-language behavior so later SDKs do not have to reimplement mechanisms independently.
 - Do not treat the Python SDK as the reference implementation for generic runtime behavior. If behavior is language-neutral, prefer a Rust-core owner with thin SDK facades.
 - Preserve direct IPC as relay-independent. If touching registration, client routing, or runtime session code, include checks for explicit `ipc://` connections with relay unset or unavailable.
-- Preserve the Core request snapshot and transport lease ordering. If touching wire, SHM, scheduler, or native callback code, check that PyO3 moves the owned request `Vec` into its buffer projection without a second copy and exposes a Python `memoryview`.
+- Preserve the copy, release, move ordering. If touching wire, SHM, scheduler, or native callback code, check that the transport lease ends right after the copy, before the resource method or a hold, and that PyO3 moves the owned request `Vec` into its buffer projection without a second copy and exposes a Python `memoryview`.
 - Do not turn a transport-level SHM proof into a FastDB direct-backing claim. The current portable receive adapters are copy-backed; stronger wording requires resource-time construction into the final C-Two backing, truthful FastDB direct/staged reports, and Rust/Python proof.
 - Keep local-candidate truth separate from official release truth. Reused version metadata identifies an artifact only together with its source commit and SHA-256; do not substitute registry packages for the retained candidate or call documentation-only commits package inputs.
 - For bug fixes and behavior changes, add or update focused tests first when feasible, then implement the correct production-grade code change needed to satisfy the verified behavior; do not use phase boundaries to justify temporary shims or lower-quality shortcuts.

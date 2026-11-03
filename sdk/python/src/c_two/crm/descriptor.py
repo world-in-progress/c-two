@@ -154,7 +154,7 @@ def build_portable_contract_descriptor(
     return json.loads(canonical)
 
 
-def contract_descriptor_diagnostics(
+def diagnostics(
     crm_class: type,
     methods: list[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -187,7 +187,7 @@ def contract_descriptor_diagnostics(
     return diagnostics
 
 
-def export_contract_descriptor(
+def export_descriptor(
     crm_class: type,
     methods: list[str] | None = None,
     *,
@@ -198,7 +198,7 @@ def export_contract_descriptor(
     return _pretty_json(compact) if pretty else compact
 
 
-def export_contract_release_ref(
+def release_ref(
     crm_class: type,
     methods: list[str] | None = None,
     *,
@@ -206,7 +206,7 @@ def export_contract_release_ref(
 ) -> str:
     from c_two._native import contract_release_ref_json
 
-    descriptor = export_contract_descriptor(crm_class, methods)
+    descriptor = export_descriptor(crm_class, methods)
     compact = contract_release_ref_json(descriptor.encode())
     return _pretty_json(compact) if pretty else compact
 

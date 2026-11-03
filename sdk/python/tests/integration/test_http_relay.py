@@ -16,8 +16,10 @@ import pytest
 import httpx
 
 import c_two as cc
+
+import c_two.endpoint
 from c_two.config.settings import settings
-from c_two.config.ipc import _resolve_server_ipc_config
+from c_two._native import resolve_server_ipc_config
 from c_two.error import ResourceNotFound
 from c_two.crm.contract import crm_contract
 from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
@@ -26,7 +28,7 @@ from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
 from tests.fixtures.counter import Counter, CounterImpl
 
-DEFAULT_MAX_PAYLOAD_SIZE = int(_resolve_server_ipc_config()['max_payload_size'])
+DEFAULT_MAX_PAYLOAD_SIZE = int(resolve_server_ipc_config(None, None)['max_payload_size'])
 
 
 def _server_instance_id_for(
@@ -70,7 +72,7 @@ def _registration_scope(http: httpx.Client, relay_url: str, name: str) -> dict:
     assert response.status_code == 200, response.text
     route = response.json()[0]
     return {key: route[key] for key in (
-        'name', 'server_id', 'server_instance_id', 'route_uid', 'route_revision',
+        'name', 'server_id', 'server_instance_id', 'route_uid',
     )}
 
 
@@ -97,7 +99,7 @@ def relay_stack(start_c3_relay):
     cc.register(Hello, HelloImpl(), name='hello')
     cc.register(Counter, CounterImpl(), name='counter')
     ipc_addr = cc.server_address()
-    server_id = cc.server_id()
+    server_id = cc.endpoint.server_id()
     server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
     relay = start_c3_relay()
@@ -266,7 +268,7 @@ class TestCcConnectHttp:
 
     def test_connect_http_call_route_not_found_raises_cc_error(self, relay_stack):
         relay_url, _ = relay_stack
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
 
         crm = cc.connect(Hello, name='hello', address=relay_url)
         try:
@@ -321,7 +323,7 @@ class TestCcConnectHttp:
         slashed_name = 'toodle/grid/0'
         cc.register(Hello, HelloImpl(), name=slashed_name)
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(
             _get_default_runtime(),
             ipc_addr,
@@ -543,7 +545,7 @@ class TestRelayControlPlane:
         """POST /_register adds an upstream and allows calls."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
@@ -585,7 +587,7 @@ class TestRelayControlPlane:
         """POST /_register with same name upserts (returns 201)."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
@@ -621,7 +623,7 @@ class TestRelayControlPlane:
         """POST /_unregister removes the route; calls return 404."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
@@ -641,12 +643,11 @@ class TestRelayControlPlane:
             )
             assert registered.status_code == 201, registered.text
             scope = _registration_scope(http, relay_url, 'hello')
-            # A stale incarnation, UID, owner or revision cannot remove this route.
+            # A stale incarnation, UID or owner cannot remove this route.
             for key, value in (
                 ('server_id', 'other-server'),
                 ('server_instance_id', 'stale-instance'),
                 ('route_uid', 'stale-route'),
-                ('route_revision', scope['route_revision'] + 1),
             ):
                 rejected = http.post(
                     f'{relay_url}/_unregister', json={**scope, key: value},
@@ -690,7 +691,7 @@ class TestRelayControlPlane:
                 json={
                     'name': 'nonexistent', 'server_id': 'missing-server',
                     'server_instance_id': 'missing-instance',
-                    'route_uid': 'missing-route', 'route_revision': 1,
+                    'route_uid': 'missing-route',
                 },
             )
             assert resp.status_code == 404
@@ -700,7 +701,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         cc.register(Counter, CounterImpl(), name='counter')
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()

@@ -81,22 +81,6 @@ impl RelayConfig {
     }
 
     fn build_generated_relay_id(host: &str, pid: u32, suffix: &str) -> String {
-        let suffix = suffix
-            .trim()
-            .chars()
-            .map(|ch| {
-                if ch.is_control() || ch == '/' || ch == '\\' {
-                    '_'
-                } else {
-                    ch
-                }
-            })
-            .collect::<String>();
-        let suffix = if suffix.is_empty() || suffix == "." || suffix == ".." {
-            "00000000".to_string()
-        } else {
-            suffix
-        };
         let tail = format!("_{pid}_{suffix}");
 
         let mut host = host

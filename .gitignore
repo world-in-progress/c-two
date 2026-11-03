@@ -203,7 +203,7 @@ sdk/python/benchmarks/results/*
 .worktrees/
 .bin/
 
-# Agent-local planning notes. Keep durable project issues under docs/issues/.
+# Agent-local planning notes. Keep durable project issues under docs/design/.
 /findings.md
 /progress.md
 /task_plan.md

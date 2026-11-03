@@ -3,16 +3,15 @@
 //! Wraps [`IpcClient`] for blocking calls from SDK bindings.
 //! Multiple `SyncClient` instances share a single tokio runtime.
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::sync::{Arc, OnceLock};
 
-use c2_mem::{MemPool, ReleaseHandleError};
+use c2_mem::MemPool;
 
 use crate::client::{
-    ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RequestBlock,
-    RequestTransportKind, RouteBinding, choose_request_transport,
+    ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding,
 };
-use crate::response::{ResponseData, ResponseLease};
+use crate::response::ResponseData;
 
 /// Whether an IPC call failure is proven to precede CRM dispatch.
 ///
@@ -70,104 +69,10 @@ impl std::error::Error for IpcCallError {
     }
 }
 
-/// Failed request preparation, retaining any allocation that failed cleanup.
-///
-/// The pending block is deliberately private: incomplete input can only be
-/// released, never recovered as a publishable request. Cleanup does not replay
-/// the fill callback or replace the original failure diagnostics.
-///
-/// ```compile_fail
-/// fn publishable(error: c2_ipc::RequestPreparationError) -> c2_ipc::RequestBlock {
-///     error.pending.unwrap()
-/// }
-/// ```
-#[derive(Debug)]
-pub struct RequestPreparationError {
-    source: IpcError,
-    release_error: Option<IpcError>,
-    pending: Option<RequestBlock>,
-}
-
-impl RequestPreparationError {
-    pub fn source_error(&self) -> &IpcError {
-        &self.source
-    }
-
-    pub fn release_error(&self) -> Option<&IpcError> {
-        self.release_error.as_ref()
-    }
-
-    pub fn has_pending_release(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    /// Attempt pending cleanup once through the block's original owner.
-    pub fn release(&mut self) -> Result<(), IpcError> {
-        if let Some(block) = &self.pending {
-            block.release()?;
-        }
-        self.pending.take();
-        Ok(())
-    }
-
-    fn rollback(
-        source: IpcError,
-        pool: Arc<Mutex<MemPool>>,
-        failure: Option<ReleaseHandleError>,
-    ) -> Self {
-        match failure {
-            Some(error) => Self {
-                source,
-                release_error: Some(IpcError::Pool(error.reason)),
-                pending: Some(RequestBlock::new(pool, error.handle)),
-            },
-            None => Self::from(source),
-        }
-    }
-
-    fn release_failed_block(source: IpcError, block: RequestBlock) -> Self {
-        match block.release() {
-            Ok(()) => Self::from(source),
-            Err(error) => Self {
-                source,
-                release_error: Some(error),
-                pending: Some(block),
-            },
-        }
-    }
-}
-
-impl From<IpcError> for RequestPreparationError {
-    fn from(source: IpcError) -> Self {
-        Self {
-            source,
-            release_error: None,
-            pending: None,
-        }
-    }
-}
-
-impl std::fmt::Display for RequestPreparationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(f)?;
-        if let Some(error) = &self.release_error {
-            write!(f, "; request cleanup also failed: {error}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for RequestPreparationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
 pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
     match error {
         IpcError::LocalCallRejected(_)
         | IpcError::Config(_)
-        | IpcError::Handshake(_)
         | IpcError::Protocol(_)
         | IpcError::ProtocolVersionMismatch { .. }
         | IpcError::IdentityMismatch { .. }
@@ -176,13 +81,12 @@ pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
         | IpcError::RouteRemoved { .. }
         | IpcError::RouteClosed { .. }
         | IpcError::RouteStale { .. }
-        | IpcError::CatalogCompacted { .. }
-        | IpcError::WatchUnavailable(_)
         | IpcError::MethodNotFound { .. }
         | IpcError::Shm(_)
         | IpcError::Pool(_)
         | IpcError::PoolRetired => TransportPhase::PreDispatch,
-        IpcError::Io(_)
+        IpcError::ResponseFailure(_)
+        | IpcError::Io(_)
         | IpcError::Connect(_)
         | IpcError::Decode(_)
         | IpcError::Chunk(_)
@@ -238,13 +142,7 @@ fn initialize_runtime<'a>(
         .expect("executor was published by its coordinator"))
 }
 
-pub(crate) fn ensure_runtime_with_deadline(
-    deadline: c2_config::ConnectDeadline,
-) -> Result<(), IpcError> {
-    initialize_runtime(&GLOBAL_RUNTIME, &RUNTIME_INIT, deadline).map(|_| ())
-}
-
-/// Core's dedicated owner-control streams use the existing client I/O executor.
+/// Share the client I/O executor with Core's native connection operations.
 #[doc(hidden)]
 pub fn shared_io_handle(
     deadline: c2_config::ConnectDeadline,
@@ -288,96 +186,33 @@ const _: () = {
 };
 
 impl SyncClient {
-    /// Connect, taking ownership of an optional pool for SHM transfers.
-    /// No mutable pool alias may survive while a fill callback borrows its storage.
-    pub fn connect(
-        address: &str,
-        pool: Option<MemPool>,
-        config: ClientIpcConfig,
-    ) -> Result<Self, IpcError> {
-        Self::connect_with_endpoint(
-            crate::control::local_endpoint_from_ipc_address(address)?,
-            pool,
-            config,
-        )
-    }
-
-    /// Connect using the caller's already-derived, immutable platform endpoint.
-    pub fn connect_with_endpoint(
-        endpoint: c2_config::LocalEndpoint,
-        pool: Option<MemPool>,
-        config: ClientIpcConfig,
-    ) -> Result<Self, IpcError> {
-        let rt = get_or_create_runtime();
-        let mut client = Self::client_for_endpoint(endpoint, pool, config);
-        rt.block_on(client.connect())?;
-        Ok(Self {
-            inner: client,
-            rt: rt.handle().clone(),
-        })
-    }
-
-    /// Share construction with pure policy tests without performing connection I/O.
-    fn client_for_endpoint(
-        endpoint: c2_config::LocalEndpoint,
-        pool: Option<MemPool>,
-        config: ClientIpcConfig,
-    ) -> IpcClient {
-        match pool {
-            Some(pool) => IpcClient::with_endpoint_and_pool(endpoint, pool, config),
-            None => IpcClient::with_endpoint(endpoint, config),
-        }
-    }
-
-    /// Test-only connect that arms a probe before the receive task is spawned.
-    #[cfg(test)]
-    pub(crate) fn connect_with_partial_header_probe_for_test(
-        address: &str,
-        config: ClientIpcConfig,
-        ready: std::sync::mpsc::Sender<()>,
-        receiver_drop_gate: Option<crate::client::ReceiverDropGateForTest>,
-    ) -> Result<Self, IpcError> {
-        let rt = get_or_create_runtime();
-        let mut client = IpcClient::with_config(address, config);
-        client.set_partial_header_pending_for_test(ready);
-        if let Some(gate) = receiver_drop_gate {
-            client.set_receiver_drop_gate_for_test(gate);
-        }
-        rt.block_on(client.connect())?;
-        Ok(Self {
-            inner: client,
-            rt: rt.handle().clone(),
-        })
-    }
-
     /// Connect with a transport-internal pool (pooled-client acquire path).
     ///
     /// The pool was built from `config` by the caller inside this crate and is
-    /// owned solely by the resulting client, so it is not subject to the
-    /// injected-pool policy gate. `budget` is the owning cache's shared domain
+    /// owned solely by the resulting client. `budget` is the owning cache's shared domain
     /// context: the pool already charges it and the client's reassembly pool
     /// charges the same context.
     pub(crate) fn connect_transport_pool_attempt_with_deadline(
         endpoint: c2_config::LocalEndpoint,
-        pool: Arc<Mutex<MemPool>>,
+        pool: Arc<RwLock<MemPool>>,
         config: ClientIpcConfig,
         budget: c2_mem::MemoryBudget,
         deadline: c2_config::ConnectDeadline,
         event_source: Option<&c2_local::ConnectionEventSource>,
-    ) -> (Self, Result<(), IpcError>) {
+    ) -> Result<(Self, Result<(), IpcError>), IpcError> {
         let rt = get_or_create_runtime();
-        let mut client = IpcClient::with_transport_pool(endpoint, pool, config, budget);
+        let mut client = IpcClient::with_transport_pool(endpoint, pool, config, budget)?;
         if let Some(source) = event_source {
             client = client.with_connection_event_source(source.clone());
         }
         let result = rt.block_on(client.connect_with_deadline(deadline));
-        (
+        Ok((
             Self {
                 inner: client,
                 rt: rt.handle().clone(),
             },
             result,
-        )
+        ))
     }
 
     /// The native endpoint retained by this connection.
@@ -459,166 +294,11 @@ impl SyncClient {
             .await
     }
 
-    /// Whether the client has a SHM pool and data exceeds the threshold.
-    pub fn should_use_shm(&self, data_len: usize) -> bool {
-        choose_request_transport(
-            &self.inner.config,
-            self.inner.shm_request_available(),
-            data_len,
-        ) == RequestTransportKind::Buddy
-    }
-
-    /// Allocate from the client SHM pool and write data in a single lock scope.
-    ///
-    /// The returned [`RequestBlock`] carries the exact pool that owns the
-    /// allocation. Later writes and every release path go through that owner,
-    /// so a confirmed close that detaches the client's pool (or a reconnect
-    /// that installs a fresh incarnation) can never redirect the coordinates
-    /// into a replacement pool.
-    ///
-    /// On error, settle any pending cleanup before choosing a canonical
-    /// route-bound fallback.
-    pub fn pool_alloc_and_write(
-        &self,
-        data: &[u8],
-    ) -> Result<RequestBlock, RequestPreparationError> {
-        let pool_arc = self
-            .inner
-            .select_request_pool()
-            .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
-        let mut pool = pool_arc.lock();
-        let handle = pool
-            .alloc_shm_handle(data.len())
-            .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
-        let ptr = match pool.data_ptr(&handle.shm_allocation().expect("SHM allocation")) {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                let failure = pool.release_handle(handle).err();
-                drop(pool);
-                return Err(RequestPreparationError::rollback(
-                    IpcError::Pool(format!("data_ptr failed: {e}")),
-                    pool_arc,
-                    failure,
-                ));
-            }
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-        drop(pool);
-        Ok(RequestBlock::new(pool_arc, handle))
-    }
-
-    /// Allocate from the client SHM pool and let the caller fill the block.
-    ///
-    /// The fill callback receives exactly `data_size` bytes and runs without
-    /// any pool lock held; the returned [`RequestBlock`] keeps the owning pool
-    /// alive. Callback failure attempts release through that same owner; if
-    /// cleanup fails the error retains the block. A panicking callback uses
-    /// the existing armed `Drop` fallback, outside this explicit-error recovery.
-    pub fn pool_alloc_and_fill<F>(
-        &self,
-        data_size: usize,
-        fill: F,
-    ) -> Result<RequestBlock, RequestPreparationError>
-    where
-        F: FnOnce(&mut [u8]) -> Result<(), String>,
-    {
-        let pool_arc = self
-            .inner
-            .select_request_pool()
-            .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
-        let (handle, ptr) = {
-            let mut pool = pool_arc.lock();
-            let handle = pool
-                .alloc_shm_handle(data_size)
-                .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
-            match pool.data_ptr(&handle.shm_allocation().expect("SHM allocation")) {
-                Ok(ptr) => (handle, ptr),
-                Err(e) => {
-                    let failure = pool.release_handle(handle).err();
-                    drop(pool);
-                    return Err(RequestPreparationError::rollback(
-                        IpcError::Pool(format!("data_ptr failed: {e}")),
-                        pool_arc,
-                        failure,
-                    ));
-                }
-            }
-        };
-        let block = RequestBlock::new(pool_arc, handle);
-        let destination = unsafe { std::slice::from_raw_parts_mut(ptr, data_size) };
-        if let Err(err) = fill(destination) {
-            return Err(RequestPreparationError::release_failed_block(
-                IpcError::Pool(format!("fill failed: {err}")),
-                block,
-            ));
-        }
-        Ok(block)
-    }
-
-    /// Release a request block through the exact pool that owns it.
-    ///
-    /// Used on send failure for cleanup. Never resolves the client's current
-    /// pool slot: the block already carries its owner.
-    pub fn pool_free(&self, block: &RequestBlock) -> Result<(), IpcError> {
-        block.release()
-    }
-
-    /// Publish the block's original requested length through its allocating
-    /// connection and an immutable route binding.
-    pub fn call_bound_prealloc(
-        &self,
-        binding: &RouteBinding,
-        method_name: &str,
-        block: &RequestBlock,
-    ) -> Result<ResponseData, IpcError> {
-        let data_size = block.len();
-        let (method_idx, identity) = match (|| {
-            let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
-            let data_size_u64 = u64::try_from(data_size).unwrap_or(u64::MAX);
-            if data_size_u64 > max_payload_size {
-                return Err(IpcError::Config(format!(
-                    "request payload size {data_size_u64} exceeds route '{}' max_payload_size {max_payload_size}",
-                    binding.route_name()
-                )));
-            }
-            Ok((method_idx, identity))
-        })() {
-            Ok(target) => target,
-            Err(err) => {
-                if let Err(cleanup) = block.release() {
-                    eprintln!("Warning: preallocated request cleanup failed: {cleanup}");
-                }
-                return Err(err);
-            }
-        };
-        self.rt
-            .block_on(self.inner.call_with_prealloc(&identity, method_idx, block))
-    }
-
-    /// The transport-owned request pool this client currently holds, if any.
-    ///
-    /// `None` for clients without a config-owned pool and after a confirmed
-    /// close detached an idle pool (`connect` recreates a fresh incarnation).
-    #[cfg(test)]
-    pub(crate) fn request_pool(&self) -> Option<Arc<Mutex<MemPool>>> {
-        self.inner.request_pool()
-    }
-
     /// The complete resolved client configuration this connection was created
     /// from. Used by the owning cache to reject a same-address hit whose
     /// requested policy differs from the cached connection's policy.
     pub(crate) fn config(&self) -> &ClientIpcConfig {
         self.inner.config()
-    }
-
-    /// Bind a response to the exact transport pool that owns its backing.
-    ///
-    /// Reassembled handles carry their own pool and budget charge inside the
-    /// [`c2_wire::chunk::ReassemblyBacking`] carrier.
-    pub fn lease_response(&self, response: ResponseData) -> ResponseLease {
-        ResponseLease::new(response)
     }
 
     /// Synchronous close.
@@ -629,20 +309,16 @@ impl SyncClient {
     /// Synchronous shared-ownership close with a bounded close barrier.
     ///
     /// Usable through `Arc<SyncClient>` when unique ownership cannot be
-    /// proven. Returns `true` when maintenance and receive tasks finished,
-    /// the writer cleared, pending requests settled, and transport-owned pool
-    /// slots detached within `timeout`. Live RequestBlocks, held carriers and
-    /// dedicated-retire jobs retain their exact pools and budget charges.
-    /// IPC-owned cleanup-lock contention returns `false` with the cleanup
-    /// owners reachable for a later close; injected pools remain attached.
-    /// Busy connection cleanup stays owned for retry. This is not a hard
-    /// real-time bound on OS scheduling or mapping destruction.
+    /// proven. The connection's driver owns outstanding frames and loans;
+    /// copied responses retain no physical connection.
+    /// False leaves the original driver settling its loans. A later observer
+    /// sees that same physical close; no cleanup worker is started.
     pub fn close_shared(&self, timeout: std::time::Duration) -> bool {
         self.rt.block_on(self.inner.close_shared_bounded(timeout))
     }
 
-    pub(crate) fn abnormal_close_reason(&self) -> Option<&'static str> {
-        self.inner.abnormal_close_reason()
+    pub(crate) fn deactivate(&self) {
+        self.inner.deactivate();
     }
 
     /// Whether the client is connected.
@@ -673,14 +349,6 @@ impl SyncClient {
         self.inner.validate_route_contract(expected)
     }
 
-    /// Ensure the connected server currently exports a route matching an expected CRM contract.
-    pub fn ensure_route_contract(
-        &self,
-        expected: &c2_contract::ExpectedRouteContract,
-    ) -> Result<(), IpcError> {
-        self.rt.block_on(self.inner.ensure_route_contract(expected))
-    }
-
     /// Authoritatively acquire and bind a route against an expected CRM contract.
     pub fn acquire_route(
         &self,
@@ -694,12 +362,9 @@ impl SyncClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
         route_uid: &str,
-        route_revision: u64,
     ) -> Result<RouteBinding, IpcError> {
-        self.rt.block_on(
-            self.inner
-                .acquire_route_token(expected, route_uid, route_revision),
-        )
+        self.rt
+            .block_on(self.inner.acquire_route_token(expected, route_uid))
     }
 
     /// Acquire under the caller's unchanged absolute connection deadline.
@@ -716,16 +381,12 @@ impl SyncClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
         route_uid: &str,
-        route_revision: u64,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RouteBinding, IpcError> {
-        self.rt
-            .block_on(self.inner.acquire_route_token_with_deadline(
-                expected,
-                route_uid,
-                route_revision,
-                deadline,
-            ))
+        self.rt.block_on(
+            self.inner
+                .acquire_route_token_with_deadline(expected, route_uid, deadline),
+        )
     }
 
     /// CRM tag advertised by a route, if present.
@@ -765,31 +426,11 @@ impl SyncClient {
     /// `is_connected()` returns `false` and route-bound calls will fail.
     pub(crate) fn new_unconnected(address: &str) -> Self {
         let rt = get_or_create_runtime();
-        let inner = IpcClient::new(address);
+        let inner = IpcClient::with_config(address, ClientIpcConfig::default()).unwrap();
         Self {
             inner,
             rt: rt.handle().clone(),
         }
-    }
-
-    /// Deterministically occupy the writer slot exactly like a bulk write
-    /// stuck on a non-reading peer would, signalling `acquired` once the
-    /// slot is held and releasing it when `release` resolves.
-    ///
-    /// This replaces timing-dependent blocked-pipe fixtures: the close
-    /// barrier's writer phase observes an unavailable writer slot without
-    /// any 32 MiB stack buffers or kernel pipe-buffer pressure.
-    pub(crate) fn hold_writer_slot_for_test(
-        &self,
-        acquired: tokio::sync::oneshot::Sender<()>,
-        release: tokio::sync::oneshot::Receiver<()>,
-    ) {
-        let writer = self.inner.writer_slot_for_test();
-        self.rt.spawn(async move {
-            let _guard = writer.lock().await;
-            let _ = acquired.send(());
-            let _ = release.await;
-        });
     }
 }
 
@@ -902,7 +543,8 @@ pub(crate) mod tests {
                 c2_mem::PoolConfig::default(),
                 "phase-pure".to_string(),
                 budget,
-            ),
+            )
+            .unwrap(),
         ));
         let registry =
             c2_wire::chunk::ChunkRegistry::new(pool, c2_wire::chunk::ChunkConfig::default());
@@ -925,601 +567,5 @@ pub(crate) mod tests {
         assert_eq!(client.server_identity(), Some(&identity));
         assert_eq!(client.server_id(), Some("identity-server"));
         assert_eq!(client.server_instance_id(), Some("identity-instance"));
-    }
-
-    #[test]
-    fn sync_client_shm_projection_reuses_canonical_selector() {
-        let config = ClientIpcConfig {
-            shm_threshold: 100,
-            base: c2_config::BaseIpcConfig {
-                chunk_size: 500,
-                ..c2_config::BaseIpcConfig::default()
-            },
-            ..ClientIpcConfig::default()
-        };
-        let pool = MemPool::new(c2_mem::PoolConfig::default());
-        let client = SyncClient {
-            inner: IpcClient::with_pool("ipc://sync_selector", pool, config),
-            rt: get_or_create_runtime().handle().clone(),
-        };
-
-        assert!(!client.should_use_shm(50));
-        // A live pool alone never selects SHM: the direction must also be
-        // negotiated by this client's connection handshake.
-        assert!(!client.should_use_shm(200));
-        client.inner.set_shm_request_negotiated_for_test(true);
-        assert!(client.should_use_shm(200));
-        assert_eq!(
-            choose_request_transport(
-                &client.inner.config,
-                client.inner.shm_request_available(),
-                200
-            ),
-            RequestTransportKind::Buddy
-        );
-    }
-
-    fn factory_test_config() -> ClientIpcConfig {
-        ClientIpcConfig {
-            base: c2_config::BaseIpcConfig {
-                pool_enabled: false,
-                pool_segment_size: 2 * 1024 * 1024,
-                max_pool_segments: 2,
-                pool_prewarm_segments: 0,
-                pool_min_retained_segments: 1,
-                reassembly_segment_size: 1024 * 1024,
-                reassembly_max_segments: 3,
-                max_total_chunks: 37,
-                chunk_gc_interval_secs: 0.75,
-                chunk_threshold_ratio: 0.625,
-                chunk_assembler_timeout_secs: 4.25,
-                max_reassembly_bytes: 7 * 1024 * 1024,
-                chunk_size: 8192,
-                shm_backing_budget_bytes: 11 * 1024 * 1024,
-                file_backing_budget_bytes: 13 * 1024 * 1024,
-                live_reassembly_budget_bytes: 3 * 1024 * 1024,
-            },
-            shm_threshold: 257,
-            pool_decay_seconds: 2.5,
-        }
-    }
-
-    fn factory_test_endpoint() -> c2_config::LocalEndpoint {
-        #[cfg(unix)]
-        let context =
-            c2_config::LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/sf"))
-                .unwrap();
-        #[cfg(windows)]
-        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
-        context.endpoint("ipc://sync_factory").unwrap()
-    }
-
-    #[test]
-    fn sync_client_connect_without_external_pool_preserves_config() {
-        let endpoint = factory_test_endpoint();
-        for buddy_enabled in [false, true] {
-            let mut config = factory_test_config();
-            config.base.pool_enabled = buddy_enabled;
-            config.base.pool_prewarm_segments = u32::from(buddy_enabled);
-            config.validate().unwrap();
-            let client = SyncClient {
-                inner: SyncClient::client_for_endpoint(endpoint.clone(), None, config.clone()),
-                rt: get_or_create_runtime().handle().clone(),
-            };
-            assert_eq!(client.inner.config(), &config);
-            assert_eq!(client.local_endpoint(), &endpoint);
-            let pool = client
-                .inner
-                .request_pool()
-                .expect("config-owned request pool");
-            assert_eq!(pool.lock().config().buddy_enabled, buddy_enabled);
-            assert_eq!(
-                pool.lock().config().segment_size,
-                config.pool_segment_size as usize
-            );
-            assert_eq!(
-                pool.lock().config().max_segments,
-                config.max_pool_segments as usize
-            );
-            assert_eq!(pool.lock().config().min_retained_segments, 1);
-            assert_eq!(
-                pool.lock().config().buddy_idle_decay_secs,
-                config.pool_decay_seconds
-            );
-            let threshold = config.shm_threshold as usize;
-            assert!(!client.should_use_shm(threshold - 1));
-            assert!(!client.should_use_shm(threshold));
-            // Disabling buddy retains a request pool for dedicated SHM, but
-            // the projection still requires the negotiated direction: an
-            // unconnected client never claims SHM transport.
-            assert!(!client.should_use_shm(threshold + 1));
-            client.inner.set_shm_request_negotiated_for_test(true);
-            // With the direction negotiated, the same threshold governs
-            // selection of that pool for both buddy policies.
-            assert!(client.should_use_shm(threshold + 1));
-        }
-    }
-
-    #[test]
-    fn sync_client_factory_with_external_pool_preserves_snapshot_and_policy_gate() {
-        let endpoint = factory_test_endpoint();
-        let config = factory_test_config();
-        let pool = MemPool::new_with_prefix_and_budget(
-            config.base.primary_pool_config(&config.pool_tuning()),
-            "sync-factory-injected".into(),
-            c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits()),
-        );
-        let client = SyncClient::client_for_endpoint(endpoint.clone(), Some(pool), config.clone());
-        assert_eq!(client.config(), &config);
-        assert_eq!(client.local_endpoint().unwrap(), &endpoint);
-        let pool = client.request_pool().unwrap();
-        assert!(!pool.lock().config().buddy_enabled);
-
-        // Both injected-pool rejections occur before OS connection or allocation.
-        for (buddy_enabled, prewarm, expected_error) in [
-            (true, 0, "injected pool has buddy enabled"),
-            (false, 1, "cannot be applied to an injected pool"),
-        ] {
-            let mut config = factory_test_config();
-            config.base.pool_enabled = prewarm > 0;
-            config.base.pool_prewarm_segments = prewarm;
-            config.validate().unwrap();
-            let mut pool_config = config.base.primary_pool_config(&config.pool_tuning());
-            pool_config.buddy_enabled = buddy_enabled;
-            let pool = MemPool::new_with_prefix_and_budget(
-                pool_config,
-                "sync-factory-rejected".into(),
-                c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits()),
-            );
-            let mut client =
-                SyncClient::client_for_endpoint(endpoint.clone(), Some(pool), config.clone());
-            assert_eq!(client.config(), &config);
-            assert_eq!(client.local_endpoint().unwrap(), &endpoint);
-            let pool = client.request_pool().unwrap();
-            let error = get_or_create_runtime()
-                .block_on(client.connect())
-                .unwrap_err();
-            assert!(matches!(error, IpcError::Pool(message) if message.contains(expected_error)));
-            assert_eq!(pool.lock().config().buddy_enabled, buddy_enabled);
-            assert_eq!(pool.lock().stats().alloc_count, 0);
-        }
-    }
-
-    #[test]
-    fn call_prealloc_rejects_route_payload_limit_and_frees_alloc() {
-        let config = ClientIpcConfig {
-            shm_threshold: 1,
-            ..ClientIpcConfig::default()
-        };
-        let pool = MemPool::new(c2_mem::PoolConfig::default());
-        let inner = IpcClient::with_pool("ipc://sync_payload_limit", pool, config);
-        let pool = inner.request_pool().unwrap();
-        inner.route_directory.write().insert_table(
-            "grid".to_string(),
-            MethodTable::from_entries(
-                &[c2_wire::handshake::MethodEntry {
-                    name: "ping".to_string(),
-                    index: 0,
-                }],
-                c2_wire::control::RouteCallIdentity {
-                    route_name: "grid".to_string(),
-                    route_uid: "grid-route-uid-0001".to_string(),
-                    observed_route_revision: 1,
-                    crm_ns: "cc.test".to_string(),
-                    crm_name: "Grid".to_string(),
-                    crm_ver: "0.1.0".to_string(),
-                    abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                        .to_string(),
-                    signature_hash:
-                        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                            .to_string(),
-                },
-                4,
-            ),
-        );
-        let client = SyncClient {
-            inner,
-            rt: get_or_create_runtime().handle().clone(),
-        };
-
-        let alloc = client.pool_alloc_and_write(&[1, 2, 3, 4, 5]).unwrap();
-        assert_eq!(pool.lock().stats().alloc_count, 1);
-        let expected = c2_contract::ExpectedRouteContract {
-            route_name: "grid".to_string(),
-            crm_ns: "cc.test".to_string(),
-            crm_name: "Grid".to_string(),
-            crm_ver: "0.1.0".to_string(),
-            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .to_string(),
-            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                .to_string(),
-        };
-        let binding = client
-            .inner
-            .bind_cached_route(&expected)
-            .expect("cached test route should bind");
-        let err = client
-            .call_bound_prealloc(&binding, "ping", &alloc)
-            .unwrap_err();
-
-        assert!(err.to_string().contains("max_payload_size"));
-        assert_eq!(pool.lock().stats().alloc_count, 0);
-    }
-
-    #[test]
-    fn production_sync_client_api_is_route_acquire_and_bound_call_only() {
-        let source = include_str!("sync_client.rs");
-        let production = source
-            .split("// ── Test-only helpers")
-            .next()
-            .expect("sync_client.rs must contain a production section");
-        assert!(production.contains("pub fn acquire_route("));
-        assert!(production.contains("pub fn acquire_route_token("));
-        assert!(!production.contains(concat!("pub fn ", "call(\n")));
-        assert!(!production.contains(concat!("pub fn ", "call_prealloc(")));
-        assert!(production.contains("pub fn call_bound("));
-        assert!(production.contains("pub fn call_bound_prealloc("));
-    }
-
-    // ── Owner affinity across close/reconnect ────────────────────────────
-
-    use c2_config::BaseIpcConfig;
-    use c2_server::{Server, ServerIpcConfig};
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    use std::time::Duration;
-
-    static RACE_ADDRESS_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-    fn race_client_config() -> ClientIpcConfig {
-        ClientIpcConfig {
-            shm_threshold: 1,
-            base: BaseIpcConfig {
-                pool_segment_size: 65_536,
-                max_pool_segments: 1,
-                ..BaseIpcConfig::default()
-            },
-            ..ClientIpcConfig::default()
-        }
-    }
-
-    /// Route-less IPC server plus the private runtime that keeps it running.
-    fn start_race_server(label: &str) -> (tokio::runtime::Runtime, Arc<Server>, String) {
-        let address = format!(
-            "ipc://{label}_{}_{}",
-            std::process::id(),
-            RACE_ADDRESS_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
-        );
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("race test runtime");
-        let server = runtime.block_on(async {
-            let server = Arc::new(
-                Server::new(&address, ServerIpcConfig::default()).expect("bind race test server"),
-            );
-            let running = Arc::clone(&server);
-            tokio::spawn(async move {
-                let _ = running.run().await;
-            });
-            server
-                .wait_until_ready(Duration::from_secs(5))
-                .await
-                .expect("race test server ready");
-            server
-        });
-        (runtime, server, address)
-    }
-
-    /// Deterministically race one preallocation against a confirmed close and
-    /// a fresh pool incarnation in the client slot.
-    ///
-    /// The selection hook pauses the calling thread after it has cloned the
-    /// old pool and before it allocates. The companion thread then confirms a
-    /// close (which detaches the idle old pool), installs the returned fresh
-    /// pool exactly as a reconnect would, and allocates a live canary in it.
-    /// `MemPool` frees are explicit, so the canary stays allocated while the
-    /// caller asserts on the block under test.
-    fn install_replacement_race(
-        client: &Arc<SyncClient>,
-        old_pool: &Arc<Mutex<MemPool>>,
-        canary_size: usize,
-    ) -> (Arc<Mutex<MemPool>>, std::thread::JoinHandle<()>) {
-        let fresh_config = old_pool.lock().config().clone();
-        let fresh_budget = old_pool
-            .lock()
-            .budget()
-            .cloned()
-            .expect("owner pool carries the domain budget");
-        let fresh = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
-            fresh_config,
-            format!(
-                "/cc3crace{:08x}{:08x}",
-                std::process::id(),
-                RACE_ADDRESS_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
-            ),
-            fresh_budget,
-        )));
-        let (selected_tx, selected_rx) = std::sync::mpsc::channel::<()>();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
-        let resume_rx = std::sync::Mutex::new(resume_rx);
-        client
-            .inner
-            .set_prealloc_selection_hook_for_test(Some(Box::new(move || {
-                let _ = selected_tx.send(());
-                // Bounded so a panicking companion fails the test instead of
-                // hanging the suite in this hook.
-                let _ = resume_rx
-                    .lock()
-                    .expect("resume lock")
-                    .recv_timeout(Duration::from_secs(10));
-            })));
-        let companion_client = Arc::clone(client);
-        let companion_fresh = Arc::clone(&fresh);
-        let join = std::thread::spawn(move || {
-            selected_rx.recv().expect("selection hook must fire");
-            assert!(
-                companion_client.close_shared(Duration::from_secs(5)),
-                "the race requires a confirmed close"
-            );
-            companion_client
-                .inner
-                .replace_request_pool_for_test(Some(Arc::clone(&companion_fresh)));
-            let _canary = companion_fresh
-                .lock()
-                .alloc(canary_size)
-                .expect("fresh-pool canary");
-            resume_tx.send(()).expect("main is paused in the hook");
-        });
-        (fresh, join)
-    }
-
-    #[test]
-    fn prealloc_selection_race_frees_only_the_owning_pool() {
-        let (runtime, server, address) = start_race_server("prealloc_race_pool_free");
-        let client = Arc::new(
-            SyncClient::connect(&address, None, race_client_config()).expect("connect race client"),
-        );
-        let old_pool = client
-            .inner
-            .request_pool()
-            .expect("transport-owned request pool");
-        let (fresh_pool, companion) = install_replacement_race(&client, &old_pool, 64);
-
-        let data = vec![7u8; 64];
-        let block = client
-            .pool_alloc_and_write(&data)
-            .expect("the originally selected pool serves the allocation");
-        assert_eq!(
-            old_pool.lock().stats().alloc_count,
-            1,
-            "the paused allocation must be charged to the originally selected pool"
-        );
-        assert_eq!(
-            fresh_pool.lock().stats().alloc_count,
-            1,
-            "the replacement pool must hold only its own live canary"
-        );
-
-        client.pool_free(&block).unwrap();
-
-        assert_eq!(
-            old_pool.lock().stats().alloc_count,
-            0,
-            "pool_free must release through the owning pool, not leak the old coordinates"
-        );
-        assert_eq!(
-            fresh_pool.lock().stats().alloc_count,
-            1,
-            "the replacement pool's live canary must never be freed by stale coordinates"
-        );
-        companion.join().expect("companion thread");
-        runtime
-            .block_on(server.shutdown_and_wait(Duration::from_secs(5)))
-            .expect("race server should shut down");
-    }
-
-    #[test]
-    fn prealloc_selection_race_fill_failure_frees_only_the_owning_pool() {
-        let (runtime, server, address) = start_race_server("prealloc_race_fill");
-        let client = Arc::new(
-            SyncClient::connect(&address, None, race_client_config()).expect("connect race client"),
-        );
-        let old_pool = client
-            .inner
-            .request_pool()
-            .expect("transport-owned request pool");
-        let (fresh_pool, companion) = install_replacement_race(&client, &old_pool, 64);
-
-        let error = client
-            .pool_alloc_and_fill(64, |_buffer| Err("injected fill failure".to_string()))
-            .expect_err("a failing fill must fail the allocation");
-        assert!(error.to_string().contains("fill failed"), "{error}");
-
-        assert_eq!(
-            old_pool.lock().stats().alloc_count,
-            0,
-            "fill failure must release through the owning pool"
-        );
-        assert_eq!(
-            fresh_pool.lock().stats().alloc_count,
-            1,
-            "the replacement pool's live canary must never be freed by stale coordinates"
-        );
-        companion.join().expect("companion thread");
-        runtime
-            .block_on(server.shutdown_and_wait(Duration::from_secs(5)))
-            .expect("race server should shut down");
-    }
-
-    /// A panicking fill callback must not leak the allocation.
-    ///
-    /// The callback runs between the allocation and any frame write, so the
-    /// block is purely local when the panic unwinds through
-    /// `pool_alloc_and_fill`; unwinding must release it through the owning
-    /// pool instead of stranding the charge until the client is dropped.
-    #[test]
-    fn pool_alloc_and_fill_panic_releases_the_allocation() {
-        let pool = MemPool::new(c2_mem::PoolConfig {
-            segment_size: 65_536,
-            max_segments: 1,
-            ..c2_mem::PoolConfig::default()
-        });
-        let inner = IpcClient::with_pool(
-            "ipc://fill_panic_release",
-            pool,
-            ClientIpcConfig {
-                shm_threshold: 1,
-                ..ClientIpcConfig::default()
-            },
-        );
-        let pool = inner.request_pool().unwrap();
-        let client = SyncClient {
-            inner,
-            rt: get_or_create_runtime().handle().clone(),
-        };
-
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.pool_alloc_and_fill(64, |_| panic!("injected fill callback panic"))
-        }));
-        std::panic::set_hook(previous_hook);
-
-        assert!(panic.is_err(), "the injected fill panic must unwind");
-        assert_eq!(
-            pool.lock().stats().alloc_count,
-            0,
-            "a panicking fill callback must release the allocation through the owning pool"
-        );
-    }
-
-    #[test]
-    fn preparation_error_retains_cleanup_and_never_replays_fill() {
-        let inner = IpcClient::with_pool(
-            "ipc://r07_preparation_error",
-            MemPool::new(c2_mem::PoolConfig {
-                segment_size: 65_536,
-                spill_threshold: 1.0,
-                ..c2_mem::PoolConfig::default()
-            }),
-            ClientIpcConfig::default(),
-        );
-        let pool = inner.request_pool().unwrap();
-        let client = SyncClient {
-            inner,
-            rt: get_or_create_runtime().handle().clone(),
-        };
-        let mut held_lock = None;
-        let mut fills = 0;
-        let mut error = client
-            .pool_alloc_and_fill(64, |bytes| {
-                fills += 1;
-                bytes[0] = 0xAB;
-                let base = pool.lock().segment(0).unwrap().base_ptr();
-                // SAFETY: this test owns the backing and keeps its pool alive.
-                let lock = unsafe {
-                    c2_mem::ShmSpinlock::new(
-                        base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
-                    )
-                };
-                lock.try_lock().unwrap();
-                held_lock = Some(lock);
-                Err("injected fill failure".into())
-            })
-            .unwrap_err();
-        let original_cleanup = error.release_error().unwrap().to_string();
-        let retained = error.has_pending_release();
-        let rejected_again = error.release().is_err() && error.has_pending_release();
-        let live = pool.lock().stats().alloc_count;
-        held_lock.take().unwrap().unlock();
-        error.release().unwrap();
-        error.release().unwrap();
-        assert!(retained && rejected_again);
-        assert_eq!(live, 1);
-        assert_eq!(pool.lock().stats().alloc_count, 0);
-        assert!(!error.has_pending_release());
-        assert!(
-            error
-                .source_error()
-                .to_string()
-                .contains("fill failed: injected fill failure")
-        );
-        assert_eq!(error.release_error().unwrap().to_string(), original_cleanup);
-        assert_eq!(fills, 1);
-
-        let block = client.pool_alloc_and_write(b"ready").unwrap();
-        let base = pool.lock().segment(0).unwrap().base_ptr();
-        // SAFETY: same owned live backing; with_lock restores the word.
-        let lock = unsafe {
-            c2_mem::ShmSpinlock::new(
-                base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
-            )
-        };
-        let rejected = lock
-            .with_lock(|| client.pool_free(&block))
-            .unwrap()
-            .is_err();
-        client.pool_free(&block).unwrap();
-        assert!(rejected);
-        assert_eq!(pool.lock().stats().alloc_count, 0);
-    }
-
-    #[test]
-    fn preparation_rollback_keeps_returned_handle_and_allocation_failure_has_no_owner() {
-        let mut memory = MemPool::new(c2_mem::PoolConfig {
-            segment_size: 65_536,
-            spill_threshold: 1.0,
-            ..c2_mem::PoolConfig::default()
-        });
-        let handle = memory.alloc_shm_handle(64).unwrap();
-        let base = memory.segment(0).unwrap().base_ptr();
-        // SAFETY: the moved pool below outlives this lock.
-        let lock = unsafe {
-            c2_mem::ShmSpinlock::new(
-                base.add(std::mem::offset_of!(c2_mem::SegmentHeader, spinlock)),
-            )
-        };
-        let failure = lock
-            .with_lock(|| memory.release_handle(handle))
-            .unwrap()
-            .err();
-        let pool = Arc::new(Mutex::new(memory));
-        let mut error = RequestPreparationError::rollback(
-            IpcError::Pool("data_ptr failed: injected".into()),
-            pool.clone(),
-            failure,
-        );
-        let retained = error.has_pending_release();
-        error.release().unwrap();
-        assert!(retained);
-        assert_eq!(pool.lock().stats().alloc_count, 0);
-        assert!(
-            error
-                .to_string()
-                .starts_with("Pool error: data_ptr failed: injected")
-        );
-
-        let inner = IpcClient::with_pool(
-            "ipc://r07_no_allocation",
-            MemPool::new_with_prefix_and_budget(
-                c2_mem::PoolConfig {
-                    spill_threshold: 1.0,
-                    ..c2_mem::PoolConfig::default()
-                },
-                "/r07denied".into(),
-                c2_mem::MemoryBudget::new(0, 0, 0),
-            ),
-            ClientIpcConfig::default(),
-        );
-        let client = SyncClient {
-            inner,
-            rt: get_or_create_runtime().handle().clone(),
-        };
-        let mut error = client.pool_alloc_and_write(b"no allocation").unwrap_err();
-        assert!(!error.has_pending_release());
-        assert!(error.release_error().is_none());
-        assert!(error.source_error().to_string().contains("alloc failed"));
-        error.release().unwrap();
     }
 }

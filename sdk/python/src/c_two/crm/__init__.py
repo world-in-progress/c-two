@@ -1,15 +1,13 @@
-from .bridge import ResourceBridge, bridge
 from .meta import CRMMeta, MethodAccess, get_method_access, read, write
 from .contract import CRMContract, crm_contract, crm_contract_identity
 from .descriptor import (
     build_contract_descriptor,
     build_contract_fingerprints,
-    contract_descriptor_diagnostics,
-    export_contract_descriptor,
-    export_contract_release_ref,
+    diagnostics,
+    export_descriptor,
+    release_ref,
 )
-from .infer import infer_crm_from_resource
 from .methods import rpc_method_names
 from .template import generate_crm_template
 from .payload_plan import DEFAULT_PICKLE_PROTOCOL
-from .transferable import hold, transfer, Held, HeldResult
+from .transferable import hold, transfer, HeldResult

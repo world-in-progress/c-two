@@ -27,7 +27,6 @@ def test_direct_ipc_is_selected_by_the_single_core_client():
         assert proxy.client._client.mode == "ipc"  # noqa: SLF001
         assert proxy.client.observed_path == "direct_ipc"
         assert proxy.client.route_uid
-        assert proxy.client.route_revision == 1
         counters = _get_default_runtime()._runtime_session.path_counters()  # noqa: SLF001
         assert counters == {
             "direct_ipc": 1,
@@ -132,3 +131,58 @@ def test_semantic_error_fields_match_direct_explicit_and_relay_aware(
             client_registry.shutdown()
         _reset_default_runtime()
         settings._relay_anchor_address = previous_anchor  # noqa: SLF001
+
+
+@pytest.mark.parametrize('relay_anchor', [None, 'http://127.0.0.1:1'])
+def test_low_level_host_shutdown_keeps_outgoing_calls_until_runtime_retirement(
+    relay_anchor, monkeypatch, tmp_path,
+):
+    """A Host receipt cannot close the Runtime's client execution domain."""
+    import os
+    from c_two._native import RuntimeSession
+
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
+    remote = RuntimeSession(use_process_relay_anchor=False)
+    if os.name != 'nt':
+        remote.set_local_endpoint(root=str(tmp_path))
+    remote_bridge = remote.ensure_server_bridge()
+    remote_bridge.register_crm(Hello, HelloImpl(), name='outgoing-target')
+    remote_bridge.start()
+    client = Runtime()
+    if os.name != 'nt':
+        client.set_local_endpoint(root=str(tmp_path))
+    if relay_anchor is not None:
+        client.set_relay_anchor(relay_anchor)
+    client.set_call_execution_limits(max_outstanding_calls=4)
+    client.start()  # An empty local Host still has a real shutdown receipt.
+    old_session = client._runtime_session
+    proxy = None
+    try:
+        proxy = client.connect(Hello, name='outgoing-target', address=remote.server_address)
+        bounded = cc.with_call_options(proxy, timeout=2.0)
+        try:
+            assert bounded.add(1, 2) == 3
+            bridge = client._server
+            assert bridge.shutdown()['completed']
+            assert old_session.native_lifecycle_snapshot() == {
+                'finished': True, 'listener_closed': True, 'work_drained': True,
+            }
+            assert not client.call_execution_snapshot()['closed']
+            assert bounded.add(3, 4) == 7
+            bridge.start()
+            assert bridge.is_started()
+            assert client.shutdown()['completed']
+            assert old_session.retired
+            with pytest.raises(cc.error.CallCapacityExceeded) as refused:
+                bounded.add(5, 6)
+            assert refused.value.details['admission_reason'] == 'Closed'
+            with pytest.raises(cc.error.CoreError) as retired:
+                old_session.check_active()
+            assert retired.value.lifecycle_kind == 'runtime_retired'
+        finally:
+            cc.close(bounded)
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        client.shutdown()
+        remote_bridge.shutdown()

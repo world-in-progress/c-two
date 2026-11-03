@@ -7,7 +7,7 @@ import time
 import pytest
 
 import c_two as cc
-from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
+from c_two.transport.server.scheduler import ConcurrencyConfig
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +91,7 @@ class TestThreadLocalConcurrency:
         crm = CounterImpl()
         cc.register(
             Counter, crm, name='ctr_iso',
-            concurrency=ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE),
+            concurrency=ConcurrencyConfig(mode='exclusive'),
         )
 
         errors = []
@@ -130,7 +130,7 @@ class TestThreadLocalConcurrency:
         crm = SlowReader()
         cc.register(
             ISlowReader, crm, name='slow',
-            concurrency=ConcurrencyConfig(mode=ConcurrencyMode.READ_PARALLEL),
+            concurrency=ConcurrencyConfig(mode='read_parallel'),
         )
 
         results = [None, None]

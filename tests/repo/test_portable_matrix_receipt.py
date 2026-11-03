@@ -80,7 +80,6 @@ def _valid_receipt() -> dict[str, Any]:
                 ),
                 "route": {
                     "uid": f"matrix-route-{index:02d}",
-                    "revision": 1,
                 },
                 "logical_result_sha256": _digest("c"),
                 "packages": {
@@ -96,7 +95,7 @@ def _valid_receipt() -> dict[str, Any]:
             }
         )
     return {
-        "schema": "c-two.portable-matrix-receipt.v1",
+        "schema": "c-two.portable-matrix-receipt.v2",
         "evidence_stage": "development",
         "rows": rows,
     }
@@ -115,7 +114,7 @@ def test_dimensions_and_exact_order_are_frozen() -> None:
 
 def test_valid_receipt_round_trips_as_canonical_json(tmp_path: Path) -> None:
     receipt = _valid_receipt()
-    destination = tmp_path / "portable-matrix-receipt.v1.json"
+    destination = tmp_path / "portable-matrix-receipt.v2.json"
 
     write_receipt(destination, receipt, expected_stage="development")
     first = destination.read_bytes()
@@ -127,6 +126,22 @@ def test_valid_receipt_round_trips_as_canonical_json(tmp_path: Path) -> None:
         destination,
         expected_stage="development",
     ) == receipt
+
+
+def test_v1_schema_is_rejected() -> None:
+    receipt = _valid_receipt()
+    receipt["schema"] = "c-two.portable-matrix-receipt.v1"
+
+    with pytest.raises(ReceiptValidationError, match=r"\$\.schema.*v2"):
+        validate_receipt(receipt, expected_stage="development")
+
+
+def test_route_revision_is_rejected() -> None:
+    receipt = _valid_receipt()
+    receipt["rows"][0]["route"]["revision"] = 1
+
+    with pytest.raises(ReceiptValidationError, match="unknown field.*revision"):
+        validate_receipt(receipt, expected_stage="development")
 
 
 @pytest.mark.parametrize(
@@ -235,8 +250,8 @@ def test_absolute_paths_are_rejected() -> None:
 def test_duplicate_json_keys_are_rejected(tmp_path: Path) -> None:
     destination = tmp_path / "duplicate.json"
     destination.write_text(
-        '{"schema":"c-two.portable-matrix-receipt.v1",'
-        '"schema":"c-two.portable-matrix-receipt.v1",'
+        '{"schema":"c-two.portable-matrix-receipt.v2",'
+        '"schema":"c-two.portable-matrix-receipt.v2",'
         '"evidence_stage":"development","rows":[]}',
         encoding="utf-8",
     )
@@ -297,7 +312,7 @@ def test_expected_evidence_stage_is_enforced() -> None:
 def test_raw_json_is_standard_json_not_nan(tmp_path: Path) -> None:
     destination = tmp_path / "nan.json"
     destination.write_text(
-        json.dumps(_valid_receipt()).replace('"revision": 1', '"revision": NaN', 1),
+        json.dumps(_valid_receipt()).replace('"requests": 1', '"requests": NaN', 1),
         encoding="utf-8",
     )
 

@@ -680,7 +680,7 @@ try:
         Echo,
         resource,
         name="package-candidate",
-        input_lifetime={"save_borrowed": cc.InputLifetime.BORROWED},
+        input_lifetime={"save_borrowed": "borrowed"},
     )
     time.sleep(0.2)
     address = cc.server_address()
@@ -921,14 +921,14 @@ def run_candidate_suites(
             ),
             "C2_PORTABLE_MATRIX_EVIDENCE_STAGE": "candidate",
             "C2_PORTABLE_MATRIX_RECEIPT": str(
-                candidate / "portable-matrix-receipt.v1.json"
+                candidate / "portable-matrix-receipt.v2.json"
             ),
             "C2_TYPESCRIPT_FASTDB_PACKAGE": str(fastdb4ts),
             "C2_TYPESCRIPT_C2_MEM_PACKAGE": str(c2_mem),
             "C2_TYPESCRIPT_COMPILER_PACKAGE": str(typescript),
             "C2_TYPESCRIPT_EVIDENCE_STAGE": "candidate",
             "C2_TYPESCRIPT_RECEIPT": str(
-                candidate / "typescript-real-call-receipt.v1.json"
+                candidate / "typescript-real-call-receipt.v2.json"
             ),
         }
     )
@@ -948,11 +948,11 @@ def run_candidate_suites(
         timeout=1800,
     )
     portable = load_portable_receipt(
-        candidate / "portable-matrix-receipt.v1.json",
+        candidate / "portable-matrix-receipt.v2.json",
         expected_stage="candidate",
     )
     typescript_receipt = load_typescript_receipt(
-        candidate / "typescript-real-call-receipt.v1.json",
+        candidate / "typescript-real-call-receipt.v2.json",
         expected_stage="candidate",
     )
     expected_language_hashes = {

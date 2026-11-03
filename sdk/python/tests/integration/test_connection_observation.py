@@ -13,6 +13,8 @@ import threading
 
 import pytest
 import c_two as cc
+import c_two.endpoint
+import c_two.observe
 from c_two.config.settings import settings
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from tests.fixtures.process_control import python_process_options, readline_with_timeout
@@ -39,15 +41,13 @@ def isolated_runtime(tmp_path, monkeypatch):
         root = tmp_path / 'ipc'
         root.mkdir(mode=0o700)
         monkeypatch.setenv('C2_IPC_ROOT', str(root))
-        cc.set_local_endpoint(root=str(root))
-    # A dead peer must be observable without heartbeat or business calls.
-    cc.set_server(ipc_overrides={'heartbeat_interval': 0.0})
-    context = cc.local_endpoint_context()
+        cc.endpoint.set_local_endpoint(root=str(root))
+    context = cc.endpoint.local_endpoint_context()
     yield
     address = cc.server_address()
     _reset_default_runtime()
     if address:
-        assert cc.inspect_endpoint(address, context=context)['status'] in {'absent', 'not-applicable'}
+        assert cc.endpoint.inspect_endpoint(address, context=context)['status'] in {'absent', 'not-applicable'}
 
 
 @contextmanager
@@ -55,13 +55,14 @@ def peer_process(role: str, address: str | None = None):
     script = """
 import json, sys
 import c_two as cc
+import c_two.endpoint
+import c_two.observe
 from tests.integration.test_connection_observation import ObservationPeer, PeerResource
 role, address = sys.argv[1:]
 if role == 'server':
-    cc.set_server(ipc_overrides={'heartbeat_interval': 0.0})
     cc.register(ObservationPeer, PeerResource(), name='peer')
     address = cc.server_address()
-    credential = cc.inspect_endpoint(address)['credential']
+    credential = cc.endpoint.inspect_endpoint(address)['credential']
     print(json.dumps({'address': address, 'credential': credential.to_json() if credential else None}), flush=True)
 else:
     proxy = cc.connect(ObservationPeer, name='peer', address=address)
@@ -75,7 +76,7 @@ finally:
     sdk = Path(__file__).resolve().parents[2]
     env['PYTHONPATH'] = os.pathsep.join([str(sdk / 'src'), str(sdk), env.get('PYTHONPATH', '')])
     env['C2_ENV_FILE'] = ''
-    context = cc.local_endpoint_context()
+    context = cc.endpoint.local_endpoint_context()
     ready = {}
     with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as stderr:
         process = subprocess.Popen([sys.executable, '-u', '-c', script, role, address or ''],
@@ -99,18 +100,18 @@ finally:
             process.stdout.close()
             if role == 'server' and ready:
                 if ready['credential']:
-                    credential = cc.EndpointCredential.from_json(ready['credential'])
-                    assert cc.reap_endpoint(ready['address'], credential, context=context)['status'] in {'reaped', 'already-absent'}
-                assert cc.inspect_endpoint(ready['address'], context=context)['status'] in {'absent', 'not-applicable'}
+                    credential = cc.endpoint.EndpointCredential.from_json(ready['credential'])
+                    assert cc.endpoint.reap_endpoint(ready['address'], credential, context=context)['status'] in {'reaped', 'already-absent'}
+                assert cc.endpoint.inspect_endpoint(ready['address'], context=context)['status'] in {'absent', 'not-applicable'}
 
 
 def test_one_client_subscription_observes_multiple_idle_connections():
-    events = cc.connection_events()
+    events = cc.observe.connection_events()
     with ExitStack() as stack:
         peers = [stack.enter_context(peer_process('server')) for _ in range(3)]
         clients = [cc.connect(ObservationPeer, name='peer', address=ready['address'])
                    for _, ready in peers]
-        observations = [cc.connection_observation(client) for client in clients]
+        observations = [cc.observe.connection_observation(client) for client in clients]
         ids = {observation.connection_id for observation in observations}
         assert len(ids) == 3
         opened = [events.recv(5.0) for _ in range(3)]
@@ -119,7 +120,7 @@ def test_one_client_subscription_observes_multiple_idle_connections():
         assert all(observation.snapshot() is None for observation in observations)
         assert not hasattr(observations[0], 'wait_closed')
         shared = cc.connect(ObservationPeer, name='peer', address=peers[0][1]['address'])
-        assert cc.connection_observation(shared).connection_id == observations[0].connection_id
+        assert cc.observe.connection_observation(shared).connection_id == observations[0].connection_id
         cc.close(shared)
         cc.close(clients[1])
         assert observations[1].snapshot() is None
@@ -149,8 +150,8 @@ def test_one_client_subscription_observes_multiple_idle_connections():
 
 def test_subscription_wait_releases_gil_and_close_wakes_only_that_subscription():
     with peer_process('server') as (_, ready):
-        events = cc.connection_events()
-        other = cc.connection_events()
+        events = cc.observe.connection_events()
+        other = cc.observe.connection_events()
         entered = threading.Event()
         def wait():
             entered.set()
@@ -175,7 +176,7 @@ def test_subscription_wait_releases_gil_and_close_wakes_only_that_subscription()
         opened = other.recv(5.0)
         assert opened.side == 'client' and opened.kind == 'opened'
         assert client.echo(b'after observer close') == b'after observer close'
-        assert cc.connection_observation(client).snapshot() is None
+        assert cc.observe.connection_observation(client).snapshot() is None
         with pytest.raises(StopIteration):
             events.recv(0.0)
         other.close()
@@ -200,7 +201,7 @@ def finish_startup_connections(events):
 @pytest.mark.parametrize('terminate', ['kill', 'close'])
 @pytest.mark.parametrize('reconfigure', [False, True], ids=['default', 'reconfigured'])
 def test_idle_client_end_notifies_server(terminate, reconfigure):
-    events = cc.connection_events()
+    events = cc.observe.connection_events()
     if reconfigure:
         cc.set_transport_policy(shm_threshold=8192, remote_payload_chunk_size=8192)
         assert events.recv(0.0) is None
@@ -249,25 +250,25 @@ def test_non_ipc_and_unconnected_values_are_explicitly_rejected():
     from c_two.transport.client.proxy import CRMProxy
     from c_two.error import UnsupportedCallMode
     with pytest.raises(TypeError, match='connected CRM'):
-        cc.connection_observation(object())
+        cc.observe.connection_observation(object())
     for native in [CRMProxy.thread_local(PeerResource()), CRMProxy.http(object(), 'peer')]:
         proxy = ObservationPeer()
         proxy.client = native
         with pytest.raises(UnsupportedCallMode, match='physical IPC'):
-            cc.connection_observation(proxy)
+            cc.observe.connection_observation(proxy)
 
 
 def test_lagged_subscription_ends_but_existing_observation_remains_usable():
     from c_two.transport.client.util import ping
 
-    events = cc.connection_events()
+    events = cc.observe.connection_events()
     cc.register(ObservationPeer, PeerResource(), name='peer')
     finish_startup_connections(events)
     with peer_process('client', cc.server_address()) as (client, _):
         opened = events.recv(5.0)
         assert opened.kind == 'opened'
         observation = opened.value
-        progress = cc.connection_events()
+        progress = cc.observe.connection_events()
         # A second consumer accounts for every real probe pair while the first
         # intentionally stops consuming. No timing assumption about reader EOF.
         for _ in range(513):
@@ -277,7 +278,7 @@ def test_lagged_subscription_ends_but_existing_observation_remains_usable():
             assert probe.kind == 'opened'
             assert closed.kind == 'closed'
             assert probe.connection_id == closed.connection_id
-        with pytest.raises(cc.ConnectionEventsLagged) as error:
+        with pytest.raises(cc.observe.ConnectionEventsLagged) as error:
             events.recv(0.0)
         assert error.value.missed == 2
         with pytest.raises(StopIteration):

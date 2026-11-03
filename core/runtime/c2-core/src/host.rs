@@ -10,10 +10,10 @@ use c2_contract::{
     MAX_CONTRACT_METHODS, MethodAccess, PORTABLE_CONTRACT_SCHEMA, validate_contract_text_field,
     validate_expected_route_contract,
 };
-use c2_error::{C2Error, ErrorCode};
+use c2_error::C2Error;
 use c2_server::{
-    AccessLevel, ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
-    RouteBuildSpec, RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerLimits,
+    AccessLevel, ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec,
+    RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerLimits,
     SchedulerSnapshot, Server, ServerFailure, ServerIdentity, ServerRuntimeBuilder,
 };
 
@@ -32,9 +32,9 @@ pub struct MethodDefinition {
 
 /// Opaque-byte service boundary implemented by generated host adapters.
 ///
-/// The service receives an owned snapshot, independent of transport storage.
-/// Core retains the request transport lease until invocation returns or unwinds;
-/// adapters must invalidate callback-scoped payload owners before that point.
+/// The service receives an owned local copy, independent of transport storage.
+/// Transport storage has already been released before invocation; adapters
+/// invalidate callback-scoped payload owners before dropping the local bytes.
 pub trait EncodedService: Send + Sync + 'static {
     fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error>;
 }
@@ -446,8 +446,6 @@ pub struct HostOptions {
     relay_use_proxy: Option<bool>,
     startup_timeout: Option<Duration>,
     shutdown_timeout: Duration,
-    lifecycle: c2_config::ServerLifecyclePolicy,
-    lifecycle_explicit: bool,
     #[cfg(test)]
     startup_gate: Option<Arc<StartupGateForTest>>,
 }
@@ -469,8 +467,6 @@ impl Default for HostOptions {
             relay_use_proxy: None,
             startup_timeout: None,
             shutdown_timeout: Duration::from_secs(5),
-            lifecycle: c2_config::ServerLifecyclePolicy::Persistent,
-            lifecycle_explicit: false,
             #[cfg(test)]
             startup_gate: None,
         }
@@ -505,28 +501,6 @@ impl HostOptions {
         self.shutdown_timeout = timeout;
         self
     }
-
-    /// Select the validated server lifecycle policy.
-    ///
-    /// `Persistent` (the default) keeps the explicit-shutdown semantics. An
-    /// `OwnerBound` policy additionally requires the native owner control
-    /// capability to be attached to the Runtime before the host starts.
-    pub fn with_lifecycle(mut self, policy: c2_config::ServerLifecyclePolicy) -> Self {
-        self.lifecycle = policy;
-        self.lifecycle_explicit = true;
-        self
-    }
-
-    /// Shorthand for the `OwnerBound` policy with one grace window.
-    pub fn with_owner_bound(self, owner_missing_grace: Duration) -> Self {
-        self.with_lifecycle(c2_config::ServerLifecyclePolicy::OwnerBound {
-            owner_missing_grace,
-        })
-    }
-
-    pub fn lifecycle(&self) -> &c2_config::ServerLifecyclePolicy {
-        &self.lifecycle
-    }
 }
 
 /// Core-owned host for one process server and any number of validated routes.
@@ -540,7 +514,7 @@ impl fmt::Debug for Host {
         formatter
             .debug_struct("Host")
             .field("server_id", &self.inner.server.server_id())
-            .field("ipc_address", &self.inner.server.ipc_address())
+            .field("ipc_address", &self.inner.server.local_endpoint().address())
             .finish_non_exhaustive()
     }
 }
@@ -555,8 +529,7 @@ struct HostInner {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown_outcome: Mutex<Option<ShutdownOutcome>>,
     shutdown_gate: Mutex<()>,
-    lifecycle: crate::owner_bound::HostLifecycleCell,
-    lifecycle_policy: c2_config::ServerLifecyclePolicy,
+    lifecycle: crate::lifecycle::HostLifecycleCell,
 }
 
 impl HostInner {
@@ -575,7 +548,10 @@ impl HostInner {
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> ShutdownOutcome {
-        let deadline = Instant::now() + timeout;
+        let deadline = match c2_config::deadline_after(Instant::now(), timeout) {
+            Ok(deadline) => deadline,
+            Err(error) => return ShutdownOutcome::invalid_timeout(error),
+        };
         self.refresh_shutdown_outcome();
         if let Some(outcome) = self.shutdown_outcome.lock().clone() {
             return outcome;
@@ -639,37 +615,23 @@ impl HostInner {
         )
     }
 
-    fn finish_owner_shutdown_from_host_thread(&self) {
-        let Some(_gate) = self.shutdown_gate.try_lock() else {
-            return;
-        };
-        self.run_shutdown_transaction(self.shutdown_timeout);
-    }
-
-    fn lifecycle_snapshot(&self) -> crate::owner_bound::HostLifecycleSnapshot {
+    fn lifecycle_snapshot(&self) -> crate::lifecycle::HostLifecycleSnapshot {
         self.refresh_shutdown_outcome();
         let server_state = self.server.lifecycle_state();
-        let budget = self.server.memory_budget_snapshot().budget;
         let work_drained = self.shutdown_outcome.lock().as_ref().map(|outcome| {
             outcome
                 .route_outcomes
                 .iter()
                 .all(|close| close.active_drained)
         });
-        crate::owner_bound::HostLifecycleSnapshot {
-            policy: self.lifecycle_policy,
-            phase: self.lifecycle.phase(),
+        crate::lifecycle::HostLifecycleSnapshot {
+            finished: self.lifecycle.finished(),
             listener_closed: matches!(
                 server_state,
                 c2_server::ServerLifecycleState::Stopped
                     | c2_server::ServerLifecycleState::Failed(_)
             ),
             work_drained,
-            client_held_leases: crate::owner_bound::HostClientHeldLeases {
-                response_shm_bytes: budget.shm.used_bytes,
-                response_file_bytes: budget.file.used_bytes,
-                reassembly_bytes: budget.reassembly.used_bytes,
-            },
         }
     }
 
@@ -765,8 +727,8 @@ impl Host {
     /// Composes the Runtime's outgoing client domain with the Core host's
     /// server direction (response pool, reassembly pool, and response
     /// prewarm). Observation never connects, maps memory, freezes
-    /// configuration, or resets accounting; charges retained by outstanding
-    /// response or held data stay visible until their backing is released.
+    /// configuration, or resets accounting. In-flight transport charges follow
+    /// actual backing lifetime; local holds do not retain this backing.
     pub fn memory_stats(&self) -> crate::RuntimeMemoryStats {
         crate::RuntimeMemoryStats {
             runtime_outgoing: self.inner.runtime.outgoing_memory_stats(),
@@ -858,11 +820,9 @@ impl Host {
 
     /// Read-only lifecycle observation for this host.
     ///
-    /// The snapshot exposes the policy and phase plus the separately
-    /// observable listener, drained-work, and client-held lease facts. It
-    /// never exposes OS handles or the owner control capability, and it does
-    /// not report endpoint (socket/lock) cleanup results.
-    pub fn lifecycle_snapshot(&self) -> crate::owner_bound::HostLifecycleSnapshot {
+    /// Reports completion of the original transaction, listener closure and
+    /// business drain. Transport storage is observed through memory statistics.
+    pub fn lifecycle_snapshot(&self) -> crate::lifecycle::HostLifecycleSnapshot {
         self.inner.lifecycle_snapshot()
     }
 }
@@ -933,17 +893,11 @@ impl Runtime {
         options: HostOptions,
         on_failed_start: impl FnOnce(FailedStartShutdownReceipt),
     ) -> Result<Host, Error> {
-        options
-            .lifecycle
-            .validate()
-            .map_err(|message| LifecycleError::Configuration(message))?;
-        let policy = if options.lifecycle_explicit {
-            options.lifecycle
-        } else {
-            self.lifecycle_policy()
-        };
-        let startup_timeout = self.freeze_host_options(policy, options.startup_timeout)?;
-        let options = options.with_lifecycle(policy);
+        c2_config::deadline_after(Instant::now(), options.shutdown_timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        let startup_timeout = self.freeze_host_options(options.startup_timeout)?;
+        let startup_deadline = c2_config::deadline_after(Instant::now(), startup_timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
         let identity = self.ensure_server()?;
         let config = self.server_ipc_config()?;
         let relay_anchor_address = match options.relay {
@@ -964,60 +918,15 @@ impl Runtime {
             server_id: identity.server_id,
             server_instance_id: identity.server_instance_id,
         };
-        let (server, owner_admission) = if options.lifecycle.is_owner_bound() {
-            let (server, admission) = Server::new_owner_bound_with_identity_and_endpoint(
-                endpoint,
-                config.clone(),
-                server_identity.clone(),
-            )
-            .map_err(LifecycleError::from)?;
-            (server, Some(admission))
-        } else {
-            (
-                Server::new_with_identity_and_endpoint(
-                    endpoint,
-                    config.clone(),
-                    server_identity.clone(),
-                )
-                .map_err(LifecycleError::from)?,
-                None,
-            )
-        };
-        let lifecycle = crate::owner_bound::HostLifecycleCell::new(&options.lifecycle);
-        let owner_supervisor = owner_admission.map(|admission| {
-            Arc::new(crate::owner_bound::OwnerSupervisor::new(
-                lifecycle.clone(),
-                admission,
-                server_identity,
-                identity.ipc_address,
-                options
-                    .lifecycle
-                    .owner_missing_grace()
-                    .expect("owner-bound policy"),
-            ))
-        });
-        let server = server.with_connection_event_source(self.connection_event_source());
-        let server = Arc::new(match &owner_supervisor {
-            Some(owner) => server.with_owner_control_handler(owner.clone()),
-            None => server,
-        });
-        if let Some(owner) = &owner_supervisor {
-            owner.attach_server(&server);
-        }
+        let server =
+            Server::new_with_identity_and_endpoint(endpoint, config.clone(), server_identity)
+                .map_err(LifecycleError::from)?;
+        let lifecycle = crate::lifecycle::HostLifecycleCell::new();
+        let server = Arc::new(server.with_connection_event_source(self.connection_event_source()));
         let server_runtime = ServerRuntimeBuilder::build(&config)
             .map_err(|error| LifecycleError::Server(ServerFailure::new(error.to_string())))?;
         server.begin_start_attempt().map_err(LifecycleError::from)?;
 
-        // Consume the native owner control capability before this host can
-        // publish readiness. Naming the OwnerBound policy alone fails here,
-        // and the capability leaves the Runtime state so it can never be
-        // cloned, reattached, or logged with the options.
-        let owner_receiver = match options.lifecycle {
-            c2_config::ServerLifecyclePolicy::Persistent => None,
-            c2_config::ServerLifecyclePolicy::OwnerBound { .. } => {
-                Some(self.consume_owner_control()?)
-            }
-        };
         let inner = Arc::new(HostInner {
             runtime: self.clone(),
             server: Arc::clone(&server),
@@ -1029,14 +938,8 @@ impl Runtime {
             shutdown_outcome: Mutex::new(None),
             shutdown_gate: Mutex::new(()),
             lifecycle: lifecycle.clone(),
-            lifecycle_policy: options.lifecycle,
         });
-        // The host thread observes the inner state only through a Weak
-        // reference: a live watcher must never keep a dropped Host/Runtime
-        // alive, and the thread always ends within bounded shutdown waits.
-        let weak_inner = Arc::downgrade(&inner);
         let run_server = Arc::clone(&server);
-        let owner_startup_timeout = startup_timeout;
         #[cfg(test)]
         let startup_gate = options.startup_gate.clone();
         #[cfg(test)]
@@ -1050,87 +953,21 @@ impl Runtime {
             Err(std::io::Error::other("injected host thread spawn failure"))
         } else {
             std::thread::Builder::new()
-            .name(format!("c2-host-{}", server.server_id()))
-            .spawn(move || {
-                #[cfg(test)]
-                if let Some(gate) = startup_gate {
-                    let _ = gate.entered.send(Arc::clone(&run_server));
-                    let _ = gate.proceed.lock().recv();
-                }
-                let Some(mut receiver) = owner_receiver else {
-                    // Persistent policy: the accept loop alone decides
-                    // nothing about lifecycle; explicit shutdown does.
-                    let result = server_runtime.block_on(run_server.run());
+                .name(format!("c2-host-{}", server.server_id()))
+                .spawn(move || {
+                    #[cfg(test)]
+                    if let Some(gate) = startup_gate {
+                        let _ = gate.entered.send(Arc::clone(&run_server));
+                        let _ = gate.proceed.lock().recv();
+                    }
+                    let result = server_runtime.block_on(
+                        run_server.run_with_startup_deadline(startup_deadline, startup_timeout),
+                    );
                     if result.is_err() {
                         run_server.finalize_runtime_stopped();
                     }
-                    return;
-                };
-                enum ThreadOutcome {
-                    ServerFinished(Result<(), c2_server::ServerError>),
-                    PreReadyRefused,
-                }
-                let outcome = server_runtime.block_on(async {
-                    // Arm the owner watcher before the accept loop runs, so
-                    // readiness can only be published behind a live watcher
-                    // and an already-gone capability is refused pre-ready.
-                    let session = match crate::owner_bound::arm_owner_watch_with_fence(crate::owner_bound::arm_owner_watch(&mut receiver), &run_server, owner_startup_timeout).await {
-                        crate::owner_bound::OwnerArmOutcome::Alive(session) => session,
-                        crate::owner_bound::OwnerArmOutcome::Closed => {
-                            receiver.close();
-                            let _ = run_server.reject_start_attempt(ServerFailure::new(
-                                "owner control capability was already closed before the host became ready"
-                                    .to_string(),
-                            ));
-                            return ThreadOutcome::PreReadyRefused;
-                        }
-                        crate::owner_bound::OwnerArmOutcome::IoError(message) => {
-                            receiver.close();
-                            let _ = run_server.reject_start_attempt(ServerFailure::new(format!(
-                                "owner control watcher failed before the host became ready: {message}"
-                            )));
-                            return ThreadOutcome::PreReadyRefused;
-                        }
-                        crate::owner_bound::OwnerArmOutcome::StartupTimeout => {
-                            receiver.close();
-                            let error = c2_server::ServerError::StartupTimeout(crate::ServerStartupTimeout {
-                                stage: crate::ServerStartupStage::OwnerControl,
-                                timeout: owner_startup_timeout,
-                            });
-                            let _ = run_server.reject_start_attempt((&error).into());
-                            return ThreadOutcome::PreReadyRefused;
-                        }
-                    };
-                    let run = run_server.run();
-                    let supervision = owner_supervisor.expect("owner-bound supervisor").supervise(session);
-                    tokio::pin!(run);
-                    tokio::pin!(supervision);
-                    tokio::select! {
-                        result = &mut run => {
-                            supervision.await;
-                            ThreadOutcome::ServerFinished(result)
-                        },
-                        _ = &mut supervision => {
-                            // Owner supervision only initiates drain. Never drop the run future
-                            // after a caller timeout; it owns the route journal and callbacks.
-                            ThreadOutcome::ServerFinished(run.await)
-                        }
-                    }
-
-                });
-                match outcome {
-                    ThreadOutcome::ServerFinished(result) => {
-                        if result.is_err() { run_server.finalize_runtime_stopped(); }
-                        // Reconcile every cause of run termination, including an explicit stop
-                        // winning the select. The watcher/grace has already been cancelled.
-                        if let Some(inner) = weak_inner.upgrade() {
-                            inner.finish_owner_shutdown_from_host_thread();
-                        }
-                    }
-                    ThreadOutcome::PreReadyRefused => {}
-
-                }
-            })
+                    server_runtime.block_on(run_server.wait_connections_settled());
+                })
         };
         let thread = match thread {
             Ok(thread) => thread,
@@ -1181,8 +1018,13 @@ impl Runtime {
                 return Err(error.into());
             }
         };
-        if let Err(error) = wait_runtime.block_on(server.wait_until_responsive(startup_timeout)) {
-            let _ = wait_runtime.block_on(server.shutdown_and_wait(options.shutdown_timeout));
+        if let Err(mut error) = wait_runtime.block_on(
+            server
+                .wait_until_responsive(startup_deadline.saturating_duration_since(Instant::now())),
+        ) {
+            if let c2_server::ServerError::StartupTimeout(ref mut expired) = error {
+                expired.timeout = startup_timeout;
+            }
             if let Some(thread) = inner.thread.lock().take() {
                 if thread.is_finished() {
                     let _ = thread.join();
@@ -1239,63 +1081,299 @@ impl CrmCallback for CoreCallback {
         &self,
         _route_name: &str,
         method_idx: u16,
-        request: RequestData,
+        request: Vec<u8>,
         _response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
-        let mut lease = RequestLease::new(request);
-        let bytes = match lease.copy_bytes() {
-            Ok(bytes) => bytes,
-            Err(copy_error) => {
-                let release_error = match lease.release() {
-                    Ok(()) => None,
-                    Err(error) => {
-                        lease.abandon();
-                        Some(error)
-                    }
-                };
-                return Err(CrmError::UserError(
-                    protocol_violation(
-                        "request transport bytes could not be copied",
-                        copy_error,
-                        release_error,
-                    )
-                    .to_wire_bytes(),
-                ));
-            }
-        };
-        let result = self.service.invoke(method_idx, bytes);
-        if let Err(release_error) = lease.release() {
-            lease.abandon();
-            return Err(CrmError::UserError(
-                protocol_violation(
-                    "request transport lease could not be released",
-                    release_error,
-                    None,
-                )
-                .to_wire_bytes(),
-            ));
-        }
-        result
+        self.service
+            .invoke(method_idx, request)
             .map(ResponseMeta::Inline)
             .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
     }
 }
 
-fn protocol_violation(message: &str, cause: String, release_error: Option<String>) -> C2Error {
-    let mut details = std::collections::BTreeMap::from([
-        ("cause".to_string(), cause),
-        ("protocol".to_string(), "c-two.error.v1".to_string()),
-        ("transport".to_string(), "ipc".to_string()),
-    ]);
-    if let Some(release_error) = release_error {
-        details.insert("release_error".to_string(), release_error);
-    }
-    C2Error::new(ErrorCode::ProtocolViolation, message).with_details(details)
-}
-
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    struct LocalEcho;
+    impl EncodedService for LocalEcho {
+        fn invoke(&self, _: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+            Ok(request)
+        }
+    }
+
+    fn local_echo_definition() -> ServiceDefinition {
+        let release = ContractRelease::from_descriptor_json(include_bytes!(
+            "../../../../tests/fixtures/contracts/portable-release.contract.json"
+        ))
+        .unwrap();
+        let methods = release
+            .descriptor()
+            .methods()
+            .iter()
+            .enumerate()
+            .map(|(index, method)| MethodDefinition {
+                index: index as u16,
+                name: method.name().into(),
+                access: method.access(),
+            })
+            .collect::<Vec<_>>();
+        ServiceDefinition::new(
+            &release,
+            release.reference(),
+            "echo",
+            methods,
+            Arc::new(LocalEcho),
+        )
+        .unwrap()
+    }
+
+    fn small_shm_host(runtime: &Runtime) -> Host {
+        runtime
+            .set_server_options(
+                None,
+                Some(c2_config::ServerIpcConfigOverrides {
+                    pool_segment_size: Some(64 * 1024),
+                    max_pool_segments: Some(1),
+                    pool_prewarm_segments: Some(1),
+                    pool_decay_seconds: Some(60.0),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        runtime
+            .host(HostOptions::default().without_relay())
+            .unwrap()
+    }
+
+    #[test]
+    fn core_callback_moves_the_materialized_request_without_a_second_copy() {
+        struct RecordsPointer(std::sync::atomic::AtomicUsize);
+        impl EncodedService for RecordsPointer {
+            fn invoke(&self, _: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+                self.0.store(
+                    request.as_ptr() as usize,
+                    std::sync::atomic::Ordering::Release,
+                );
+                Ok(request)
+            }
+        }
+        let (runtime, root) = receipt_test_runtime();
+        let endpoint = runtime
+            .local_endpoint_context()
+            .unwrap()
+            .endpoint("ipc://callback-move")
+            .unwrap();
+        let server =
+            Server::new_with_endpoint(endpoint, c2_config::ServerIpcConfig::default()).unwrap();
+        let service = Arc::new(RecordsPointer(std::sync::atomic::AtomicUsize::new(0)));
+        let callback = CoreCallback {
+            service: service.clone(),
+        };
+        let bytes = vec![3; 512];
+        let original = bytes.as_ptr() as usize;
+        let response = callback
+            .invoke("echo", 1, bytes, server.response_pool_arc())
+            .unwrap();
+        assert_eq!(
+            service.0.load(std::sync::atomic::Ordering::Acquire),
+            original
+        );
+        let ResponseMeta::Inline(bytes) = response else {
+            panic!("inline response");
+        };
+        assert_eq!(bytes.as_ptr() as usize, original);
+        drop((server, runtime));
+        close_receipt_root(root);
+    }
+
+    #[test]
+    fn local_hold_allows_shm_reuse_and_connection_close_before_release() {
+        use crate::{Connect, EncodedClient};
+        let (runtime, root) = receipt_test_runtime();
+        let host = small_shm_host(&runtime);
+        let definition = local_echo_definition();
+        let expected = definition.expected_route().clone();
+        let registration = host.register(definition).unwrap();
+        let response_pool = host.inner.server.response_pool_arc();
+        let weak_pool = Arc::downgrade(&response_pool);
+        let client = runtime
+            .connect(
+                expected,
+                Connect::DirectIpc {
+                    address: host.local_endpoint().address().into(),
+                },
+            )
+            .unwrap();
+        let observation = client.connection_observation().unwrap();
+        let first = vec![0x5a; 32 * 1024];
+        let mut held = client.call_held("echo", &first).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while response_pool.read().stats().alloc_count != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "response loan did not settle while hold lived"
+            );
+            std::thread::yield_now();
+        }
+        let before = response_pool.read().stats();
+        assert!(before.buddy_reused_allocs > 0, "test must exercise SHM");
+        let second = vec![0x6b; 32 * 1024];
+        assert_eq!(client.call_owned("echo", &second).unwrap(), second);
+        assert!(response_pool.read().stats().buddy_reused_allocs > before.buddy_reused_allocs);
+        assert_eq!(held.bytes(), first);
+        let outcome = host.shutdown();
+        assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observation.snapshot().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "connection close waited for local hold"
+            );
+            std::thread::yield_now();
+        }
+        drop((registration, host, response_pool));
+        while weak_pool.strong_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "closed Host pool stayed alive with only a local hold"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(held.bytes(), first);
+        held.invalidate_then_release(|| Ok(())).unwrap();
+        assert!(held.bytes().is_empty());
+        let retirement_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (retirement_outcome, retirement_completed) = runtime
+            .begin_session_retirement(
+                crate::RuntimeShutdownTarget::ClientsOnly,
+                retirement_deadline,
+            )
+            .expect("begin client-only retirement")
+            .observe_until(retirement_deadline);
+        assert!(retirement_completed, "{retirement_outcome:?}");
+        drop((held, client, runtime));
+        close_receipt_root(root);
+    }
+
+    #[test]
+    fn host_executor_settles_loans_after_the_business_shutdown_receipt() {
+        use c2_wire::{flags::*, frame::encode_frame};
+        let (runtime, root) = receipt_test_runtime();
+        let host = small_shm_host(&runtime);
+        let definition = local_echo_definition();
+        let expected = definition.expected_route().clone();
+        let registration = host.register(definition).unwrap();
+        let rt = Runtime::server_runtime().unwrap();
+        let mut peer = rt
+            .block_on(c2_local::LocalStream::connect(
+                host.local_endpoint(),
+                Duration::from_secs(5),
+            ))
+            .unwrap();
+        let response = rt.block_on(async {
+            use c2_wire::handshake::{
+                CAP_SHM_RESPONSE, VersionPreambleKind, encode_client_handshake,
+                encode_version_preamble,
+            };
+            peer.write_all(&encode_version_preamble(VersionPreambleKind::Hello))
+                .await
+                .unwrap();
+            let mut accepted = [0; 25];
+            tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut accepted))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                accepted,
+                encode_version_preamble(VersionPreambleKind::Accepted)
+            );
+            peer.write_all(&encode_frame(
+                0,
+                FLAG_HANDSHAKE,
+                &encode_client_handshake(CAP_SHM_RESPONSE, "").unwrap(),
+            ))
+            .await
+            .unwrap();
+            read_raw_frame(&mut peer).await;
+            let identity = c2_wire::control::RouteCallIdentity {
+                route_name: expected.route_name,
+                route_uid: registration.outcome().route_uid.clone(),
+                crm_ns: expected.crm_ns,
+                crm_name: expected.crm_name,
+                crm_ver: expected.crm_ver,
+                abi_hash: expected.abi_hash,
+                signature_hash: expected.signature_hash,
+            };
+            let mut call = c2_wire::control::encode_call_control(&identity, 1).unwrap();
+            call.extend_from_slice(&vec![0x5a; 32 * 1024]);
+            peer.write_all(&encode_frame(1, FLAG_CALL_V2, &call))
+                .await
+                .unwrap();
+            read_raw_frame(&mut peer).await
+        });
+        let (header, payload) = c2_wire::frame::decode_frame(&response).unwrap();
+        assert!(
+            header.is_buddy(),
+            "test must retain an actual response loan"
+        );
+        let (descriptor, _) = c2_wire::buddy::decode_buddy_payload(payload).unwrap();
+        assert_eq!(
+            host.inner
+                .server
+                .response_pool_arc()
+                .read()
+                .stats()
+                .alloc_count,
+            1
+        );
+        let outcome = host.shutdown();
+        assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+        assert!(host.lifecycle_snapshot().finished);
+        assert!(!host.inner.thread.lock().as_ref().unwrap().is_finished());
+        assert_eq!(host.inner.server.active_connection_count(), 1);
+        rt.block_on(async {
+            let batch = c2_wire::release::ReleaseBatch::new(&[descriptor.loan_id]).unwrap();
+            peer.write_all(&c2_wire::release::encode_release_frame(&batch, false))
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                host.inner.server.wait_connections_settled(),
+            )
+            .await
+            .unwrap();
+        });
+        let thread = host.inner.thread.lock().take().unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            host.inner
+                .server
+                .response_pool_arc()
+                .read()
+                .stats()
+                .alloc_count,
+            0
+        );
+        assert_eq!(host.shutdown_outcome(), Some(outcome));
+        drop((peer, registration, host, runtime, rt));
+        close_receipt_root(root);
+    }
+
+    async fn read_raw_frame(peer: &mut c2_local::LocalStream) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut length = [0; 4];
+            peer.read_exact(&mut length).await.unwrap();
+            let mut frame = vec![0; u32::from_le_bytes(length) as usize + 4];
+            frame[..4].copy_from_slice(&length);
+            peer.read_exact(&mut frame[4..]).await.unwrap();
+            frame
+        })
+        .await
+        .unwrap()
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1351,6 +1429,38 @@ mod lifecycle_tests {
             runtime.server_startup_timeout(),
             Some(Duration::from_secs(30))
         );
+    }
+
+    #[test]
+    fn unportable_shutdown_budget_rejects_before_start_or_stop() {
+        let (runtime, directory) = receipt_test_runtime();
+        let timeout = Duration::from_secs(10_000_000_000_000_000_000);
+        let result = runtime.host(HostOptions::default().with_shutdown_timeout(timeout));
+        assert!(matches!(
+            result,
+            Err(Error::Lifecycle(LifecycleError::Configuration(_)))
+        ));
+        assert!(runtime.server_id().is_none());
+        runtime
+            .set_server_options(None, None, Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let host = runtime
+            .host(HostOptions::default().without_relay())
+            .unwrap();
+        let rejected = host.shutdown_with_timeout(timeout);
+        assert!(
+            rejected
+                .runtime_barrier_error
+                .unwrap()
+                .contains("portable monotonic clock range")
+        );
+        assert!(host.is_running());
+        assert!(host.shutdown_outcome().is_none());
+        assert!(host.shutdown().runtime_barrier_error.is_none());
+        drop(host);
+        drop(runtime);
+        close_receipt_root(directory);
     }
 
     #[test]
@@ -1675,11 +1785,21 @@ mod lifecycle_tests {
         let (runtime, directory) = receipt_test_runtime();
         let attempt = failed_attempt(launch_failed_attempt(&runtime));
         assert!(runtime.shutdown_pending(&attempt.server));
+        let (invalid, completed) = attempt
+            .receipt
+            .observe_with_timeout(Duration::from_secs(10_000_000_000_000_000_000));
+        assert!(!completed);
+        assert!(
+            invalid
+                .runtime_barrier_error
+                .unwrap()
+                .contains("portable monotonic clock range")
+        );
+        assert!(attempt.receipt.terminal_outcome().is_none());
         let (pending, completed) = attempt.receipt.observe_with_timeout(Duration::ZERO);
         assert!(!completed);
         assert!(pending.runtime_barrier_error.is_some());
         assert!(attempt.receipt.terminal_outcome().is_none());
-        assert!(!attempt.receipt.delivered_for_test());
 
         let (terminal, receipt) = finish_failed_attempt(attempt);
         assert_eq!(receipt.terminal_outcome(), Some(terminal.clone()));
@@ -1687,7 +1807,6 @@ mod lifecycle_tests {
             receipt.observe_with_timeout(Duration::ZERO),
             (terminal, true)
         );
-        assert!(!receipt.delivered_for_test());
 
         // A terminal cleanup failure remains terminal and retains its field.
         // This test-only injection isolates receipt projection from OS faults.
@@ -1699,7 +1818,6 @@ mod lifecycle_tests {
             Some("terminal cleanup failure")
         );
         assert_eq!(receipt.terminal_outcome(), Some(failed));
-        assert!(!receipt.delivered_for_test());
         drop(receipt);
         drop(runtime);
         close_receipt_root(directory);
@@ -1748,32 +1866,6 @@ mod lifecycle_tests {
         close_receipt_root(directory);
     }
 
-    #[test]
-    fn live_owner_watcher_does_not_keep_a_dropped_host_alive() {
-        let runtime = Runtime::new(crate::RuntimeOptions {
-            use_process_relay_anchor: false,
-            ..Default::default()
-        })
-        .unwrap();
-        let (_owner, receiver) = crate::owner_control_pair().unwrap();
-        runtime.attach_owner_control(receiver).unwrap();
-        let host = runtime
-            .host(
-                HostOptions::default()
-                    .without_relay()
-                    .with_shutdown_timeout(Duration::from_millis(100))
-                    .with_owner_bound(Duration::from_secs(30)),
-            )
-            .unwrap();
-        let weak = Arc::downgrade(&host.inner);
-        let started = Instant::now();
-        drop(host);
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(
-            weak.upgrade().is_none(),
-            "pending watcher must not own HostInner"
-        );
-    }
     #[test]
     fn real_relay_idle_eviction_does_not_stop_persistent_host() {
         use crate::{Connect, EncodedClient};
@@ -1866,10 +1958,7 @@ mod lifecycle_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(host.is_running());
-        assert_eq!(
-            host.lifecycle_snapshot().phase,
-            crate::HostLifecyclePhase::Persistent
-        );
+        assert!(!host.lifecycle_snapshot().finished);
         let client = client_runtime
             .connect(
                 release.expected_route(&route).unwrap(),

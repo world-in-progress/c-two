@@ -9,6 +9,8 @@ import pytest
 
 import c_two as cc
 
+import c_two.contract
+
 
 def _contract_hashes(crm_class: type) -> tuple[str, str]:
     from c_two.crm.descriptor import build_contract_fingerprints
@@ -20,6 +22,19 @@ def test_top_level_exposes_only_explicit_transfer_api():
     assert not hasattr(cc, 'transferable')
     assert callable(cc.transfer)
     assert 'transfer' in cc.__all__
+
+
+def test_invalid_callable_signature_is_reported():
+    from c_two.crm.transferable import _rpc_parameters
+
+    class BrokenSignature:
+        __signature__ = 42
+
+        def __call__(self, payload):
+            return payload
+
+    with pytest.raises(TypeError):
+        _rpc_parameters(BrokenSignature())
 
 
 def test_default_transferables_use_pinned_pickle_protocol(monkeypatch):
@@ -122,7 +137,7 @@ def test_non_portable_descriptor_allows_pickle_fallback_for_plain_python_payload
     }
     assert _contract_hashes(PickleFallback)
     with pytest.raises(ValueError, match='python-pickle-default'):
-        cc.export_contract_descriptor(PickleFallback)
+        cc.contract.export_descriptor(PickleFallback)
 
 
 @pytest.mark.parametrize(
@@ -173,7 +188,7 @@ def test_plain_python_annotations_are_python_pickle_fallback_not_payload_plan():
         'name': 'PlainPayload',
     }
     with pytest.raises(ValueError, match='python-pickle-default'):
-        cc.export_contract_descriptor(PythonOnlyContract)
+        cc.contract.export_descriptor(PythonOnlyContract)
 
 
 def test_remote_surface_transferables_do_not_use_implicit_abi_declarations():

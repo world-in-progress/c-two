@@ -1,6 +1,6 @@
 use super::{
-    EndpointCredential, EndpointInspection, EndpointReapResult, LocalEndpoint,
-    LocalEndpointContext, SweepBatch, SweepBudget,
+    EndpointCredential, EndpointInspection, EndpointReapResult, LocalEndpoint, SweepBatch,
+    SweepBudget,
 };
 use c2_local_security::{
     LocalSecurityAttributes, current_session_id, grant_server_identity_query_access,
@@ -27,7 +27,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
     SECURITY_SQOS_PRESENT,
 };
-use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{
     GetNamedPipeClientSessionId, GetNamedPipeServerProcessId, GetNamedPipeServerSessionId,
 };
@@ -42,11 +41,7 @@ pub enum Stream {
         pipe: NamedPipeClient,
         _server_process: OwnedHandle,
     },
-    // A private owner pair is a trusted launcher capability, including after
-    // transfer to a child. It does not require its creator to stay alive.
-    OwnerClient(NamedPipeClient),
     Server(NamedPipeServer),
-    OwnerServer(NamedPipeServer),
 }
 
 /// An owned, verified overlapped pipe that has never been associated with IOCP,
@@ -173,10 +168,8 @@ pub async fn connect(endpoint: &LocalEndpoint) -> io::Result<Stream> {
 
 pub fn raw_handle(stream: &Stream) -> usize {
     match stream {
-        Stream::Client { pipe: client, .. } | Stream::OwnerClient(client) => {
-            client.as_raw_handle() as usize
-        }
-        Stream::Server(server) | Stream::OwnerServer(server) => server.as_raw_handle() as usize,
+        Stream::Client { pipe: client, .. } => client.as_raw_handle() as usize,
+        Stream::Server(server) => server.as_raw_handle() as usize,
     }
 }
 
@@ -187,35 +180,14 @@ pub fn shared_memory_available(stream: &Stream) -> io::Result<bool> {
     // Query errors must reach the caller instead of silently disabling SHM.
     let result = unsafe {
         match stream {
-            Stream::Client { .. } | Stream::OwnerClient(..) => {
-                GetNamedPipeServerSessionId(raw, &mut peer_session)
-            }
-            Stream::Server(..) | Stream::OwnerServer(..) => {
-                GetNamedPipeClientSessionId(raw, &mut peer_session)
-            }
+            Stream::Client { .. } => GetNamedPipeServerSessionId(raw, &mut peer_session),
+            Stream::Server(..) => GetNamedPipeClientSessionId(raw, &mut peer_session),
         }
     };
     if result == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(peer_session == current_session_id()?)
-}
-
-pub fn cancel(raw: usize) {
-    // Tokio/mio retain their buffers until cancelled overlapped operations
-    // complete. They remain the sole owners that close this handle.
-    unsafe {
-        CancelIoEx(raw as HANDLE, std::ptr::null());
-    }
-}
-
-pub fn cancel_stream(stream: &Stream) {
-    if let Stream::OwnerServer(server) = stream {
-        // The bootstrap may have been adopted from stdin. Closing only the registered
-        // duplicate leaves that original server handle open and keeps the client alive.
-        let _ = server.disconnect();
-    }
-    cancel(raw_handle(stream));
 }
 
 impl AsyncRead for Stream {
@@ -225,12 +197,8 @@ impl AsyncRead for Stream {
         bytes: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Client { pipe: client, .. } | Self::OwnerClient(client) => {
-                Pin::new(client).poll_read(cx, bytes)
-            }
-            Self::Server(server) | Self::OwnerServer(server) => {
-                Pin::new(server).poll_read(cx, bytes)
-            }
+            Self::Client { pipe: client, .. } => Pin::new(client).poll_read(cx, bytes),
+            Self::Server(server) => Pin::new(server).poll_read(cx, bytes),
         }
     }
 }
@@ -242,12 +210,8 @@ impl AsyncWrite for Stream {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
-            Self::Client { pipe: client, .. } | Self::OwnerClient(client) => {
-                Pin::new(client).poll_write(cx, bytes)
-            }
-            Self::Server(server) | Self::OwnerServer(server) => {
-                Pin::new(server).poll_write(cx, bytes)
-            }
+            Self::Client { pipe: client, .. } => Pin::new(client).poll_write(cx, bytes),
+            Self::Server(server) => Pin::new(server).poll_write(cx, bytes),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -266,74 +230,39 @@ pub fn poll_flush(stream: &mut Stream, cx: &mut Context<'_>) -> Poll<io::Result<
     Pin::new(stream).poll_write(cx, &[]).map_ok(|_| ())
 }
 
-/// Native identity of the current Windows TokenUser scope at listener creation.
-#[derive(Clone)]
-pub(crate) struct ContextBinding {
-    user_scope_id: String,
-}
-
-impl ContextBinding {
-    pub(crate) fn capture(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        let user_scope_id = endpoint
-            .context()
-            .windows_user_scope_id()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a Windows endpoint"))?
-            .to_owned();
-        let binding = Self { user_scope_id };
-        Ok(binding)
-    }
-
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        let mut hash = Sha256::new();
-        hash.update(b"c2.owner.windows-user-scope.v1\0");
-        hash.update((self.user_scope_id.len() as u64).to_le_bytes());
-        hash.update(self.user_scope_id.as_bytes());
-        hash.finalize().into()
-    }
-
-    pub(crate) fn validate(&self) -> io::Result<()> {
-        let current = LocalEndpointContext::default_for_platform()?;
-        if current.windows_user_scope_id() != Some(self.user_scope_id.as_str()) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Windows endpoint user scope changed",
-            ));
-        }
-        Ok(())
-    }
-}
-
 pub struct Listener {
     // Declaration order matters: close the pending server instance before
     // releasing the exclusive listener lease. Connected streams do not retain it.
     pending: NamedPipeServer,
     endpoint: LocalEndpoint,
-    context_binding: Option<ContextBinding>,
     security: LocalSecurityAttributes,
     _ownership: OwnedHandle,
 }
 
 impl Listener {
-    pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        Self::bind_with_capture(endpoint, false)
-    }
-
-    pub(crate) fn bind_with_context_binding(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        Self::bind_with_capture(endpoint, true)
-    }
-
-    fn bind_with_capture(endpoint: &LocalEndpoint, capture_context: bool) -> io::Result<Self> {
-        let context_binding = capture_context
-            .then(|| ContextBinding::capture(endpoint))
-            .transpose()?;
+    pub fn bind_until(
+        endpoint: &LocalEndpoint,
+        deadline: Option<std::time::Instant>,
+    ) -> io::Result<Self> {
+        let check_deadline = || {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "local listener deadline expired",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        check_deadline()?;
         let mut security = LocalSecurityAttributes::new()?;
         let ownership = claim_listener(endpoint, &mut security)?;
         grant_server_identity_query_access()?;
         let pending = create_instance(endpoint, &mut security)?;
+        check_deadline()?;
         Ok(Self {
             pending,
             endpoint: endpoint.clone(),
-            context_binding,
             security,
             _ownership: ownership,
         })
@@ -350,17 +279,6 @@ impl Listener {
 
     pub fn credential(&self) -> EndpointCredential {
         EndpointCredential::kernel_managed(self.endpoint.clone())
-    }
-
-    pub fn context_binding(&self) -> io::Result<ContextBinding> {
-        let binding = self.context_binding.clone().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "listener has no owner context pin",
-            )
-        })?;
-        binding.validate()?;
-        Ok(binding)
     }
 
     pub fn close(self) -> EndpointReapResult {
@@ -520,7 +438,7 @@ mod tests {
         use windows_sys::Win32::System::Threading::OpenMutexW;
 
         let endpoint = endpoint(&format!("global-lease-{}", uuid::Uuid::new_v4().simple()));
-        let listener = Listener::bind(&endpoint).unwrap();
+        let listener = Listener::bind_until(&endpoint, None).unwrap();
         let name = listener_lease_name(endpoint.os_name());
         let wide: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
         let raw = unsafe { OpenMutexW(READ_CONTROL, 0, wide.as_ptr()) };
@@ -561,7 +479,7 @@ mod tests {
         unsafe { LocalFree(descriptor) };
         assert_ne!(same_owner, 0);
         assert_eq!(
-            Listener::bind(&endpoint).err().unwrap().kind(),
+            Listener::bind_until(&endpoint, None).err().unwrap().kind(),
             io::ErrorKind::AddrInUse
         );
         drop(lease);

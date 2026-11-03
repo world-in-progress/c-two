@@ -1,4 +1,5 @@
-use crate::{CodegenError, ContractArtifactSet, lower_hex};
+use crate::{CodegenError, ContractArtifactSet};
+use c2_contract::lower_hex;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};

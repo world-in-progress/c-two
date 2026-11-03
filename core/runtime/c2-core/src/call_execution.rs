@@ -659,7 +659,7 @@ mod tests {
         }
     }
 
-    // Owns an actual HeldResponse with a real inline ResponseLease. The probe
+    // Owns an actual HeldResponse containing local response bytes. The probe
     // observes destruction after dropping that owner, and re-enters outcome
     // metadata to assert cleanup is outside its lock and on native execution.
     struct TrackedResponse {
@@ -670,9 +670,8 @@ mod tests {
 
     impl TrackedResponse {
         fn new(drops: Arc<AtomicUsize>, cleanup: impl FnOnce() + Send + Sync + 'static) -> Self {
-            let lease = c2_ipc::ResponseLease::new(c2_ipc::ResponseData::Inline(vec![9; 4096]));
             Self {
-                held: Some(HeldResponse::from_response_lease(lease).unwrap()),
+                held: Some(HeldResponse::from_owned_bytes(vec![9; 4096])),
                 drops,
                 cleanup: Some(Box::new(cleanup)),
             }

@@ -1,6 +1,6 @@
 # Python tests and benchmarks
 
-Run commands from the repository root. Follow the [development setup](../../../docs/development.md) for the matching FastDB Core SDK, sibling source fixtures, Node/Emscripten and Python 3.10 prerequisites. Build the Python native extension and standalone C3 before relay tests:
+Run commands from the repository root. Follow the [development setup](../../../docs/reference/development.md) for the matching FastDB Core SDK, sibling source fixtures, Node/Emscripten and Python 3.10 prerequisites. Build the Python native extension and standalone C3 before relay tests:
 
 ```bash
 FASTDB_PAYLOAD_LINK_MODE=source uv sync
@@ -72,7 +72,7 @@ uv run --no-sync pytest tests/repo/test_portable_matrix_receipt.py -q
 cargo test --manifest-path core/Cargo.toml -p c2-ipc
 ```
 
-See the [0.7.4 publication record](../../../docs/reports/0.7.4-publication.md) and [FD regression record](../../../docs/reports/0.7.4-fd-leak-regression.md) for executed source-specific evidence.
+See the [0.7.4 publication record](../../../docs/acceptance/0.7.4-publication.md) and [FD regression record](../../../docs/acceptance/0.7.4-fd-leak-regression.md) for executed source-specific evidence.
 
 ## Benchmarks
 

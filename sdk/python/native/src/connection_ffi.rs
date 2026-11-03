@@ -13,11 +13,8 @@ pyo3::create_exception!(_native, ConnectionEventsLagged, PyRuntimeError);
 fn wait_timeout(timeout: Option<f64>) -> PyResult<Option<Duration>> {
     timeout
         .map(|seconds| {
-            Duration::try_from_secs_f64(seconds).map_err(|_| {
-                PyValueError::new_err(
-                    "timeout must be finite, non-negative, and representable as a Duration",
-                )
-            })
+            c2_config::timeout_from_seconds(seconds)
+                .map_err(|error| PyValueError::new_err(error.to_string()))
         })
         .transpose()
 }

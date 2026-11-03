@@ -24,7 +24,6 @@ const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
 const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
 const ROUTE_UID_HEADER: &str = "x-c2-route-uid";
-const ROUTE_REVISION_HEADER: &str = "x-c2-route-revision";
 
 fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, PATH_SEGMENT).to_string()
@@ -80,9 +79,8 @@ fn runtime_cell_with_deadline<'a>(
         HttpError::Transport(format!("failed to create c2-http runtime: {error}"))
     })?;
     // The coordinator is the sole publication authority for this cell.
-    if let Err(unpublished) = cell.set(runtime) {
-        unpublished.shutdown_background();
-    }
+    cell.set(runtime)
+        .expect("runtime initializer holds the coordinator");
     Ok(cell
         .get()
         .expect("runtime initializer must publish before returning"))
@@ -163,7 +161,6 @@ impl HttpCallInput<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HttpRouteToken {
     pub route_uid: String,
-    pub route_revision: u64,
 }
 
 impl HttpClient {
@@ -378,12 +375,7 @@ fn add_route_token_headers(
     request: reqwest::RequestBuilder,
     route_token: &HttpRouteToken,
 ) -> reqwest::RequestBuilder {
-    request
-        .header(ROUTE_UID_HEADER, &route_token.route_uid)
-        .header(
-            ROUTE_REVISION_HEADER,
-            route_token.route_revision.to_string(),
-        )
+    request.header(ROUTE_UID_HEADER, &route_token.route_uid)
 }
 
 #[cfg(test)]
@@ -451,7 +443,6 @@ mod tests {
         };
         let token = HttpRouteToken {
             route_uid: "route-grid".into(),
-            route_revision: 1,
         };
         let owner = Arc::new(vec![1, 2, 3, 4, 5, 6, 7]);
         let weak = Arc::downgrade(&owner);

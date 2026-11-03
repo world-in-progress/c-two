@@ -61,11 +61,7 @@ mod tests {
             None
         ));
         let publisher = source.open_connection(c2_local::ConnectionSide::Server);
-        publisher.close(
-            ConnectionEndReason::HeartbeatTimeout,
-            "heartbeat_timeout",
-            None,
-        );
+        publisher.close(ConnectionEndReason::LocalClose, "local_close", None);
         let observation = match recv_connection_event(&events, Some(Duration::from_secs(2)))
             .unwrap()
             .expect("queued events survive an earlier timed-out receive")
@@ -79,7 +75,7 @@ mod tests {
         {
             ConnectionEventWait::Event(ConnectionEvent::Closed(record)) => {
                 assert_eq!(record.connection_id(), observation.connection_id());
-                assert_eq!(record.reason(), ConnectionEndReason::HeartbeatTimeout);
+                assert_eq!(record.reason(), ConnectionEndReason::LocalClose);
             }
             other => panic!("expected Closed, got {other:?}"),
         }

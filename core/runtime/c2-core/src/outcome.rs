@@ -4,7 +4,6 @@ pub use c2_ipc::pool::IpcClientCloseDetail;
 pub struct RegisterOutcome {
     pub route_name: String,
     pub route_uid: String,
-    pub route_revision: u64,
     pub server_id: String,
     pub server_instance_id: String,
     pub ipc_address: String,
@@ -51,8 +50,9 @@ pub struct ShutdownOutcome {
     pub route_outcomes: Vec<RouteCloseOutcome>,
     pub relay_errors: Vec<RelayCleanupError>,
     pub server_was_started: bool,
+    /// Explicit Runtime retirement drained its outgoing client scope. Ordinary
+    /// Host shutdown does not select that scope and leaves this false.
     pub ipc_clients_drained: bool,
-    pub http_clients_drained: bool,
     pub route_close_error: Option<String>,
     pub runtime_barrier_error: Option<String>,
     /// Addresses in this Runtime's outgoing IPC client cache whose close
@@ -61,6 +61,14 @@ pub struct ShutdownOutcome {
     pub ipc_client_close_error: Option<String>,
     /// Locally closed outgoing connections without a normal disconnect ACK.
     /// These are terminal local closes, not pending client/server drain work.
-    pub ipc_clients_abnormally_closed: usize,
     pub ipc_client_close_details: Vec<IpcClientCloseDetail>,
+}
+
+impl ShutdownOutcome {
+    pub(crate) fn invalid_timeout(error: c2_config::TimeoutError) -> Self {
+        Self {
+            runtime_barrier_error: Some(format!("shutdown timeout configuration error: {error}")),
+            ..Default::default()
+        }
+    }
 }

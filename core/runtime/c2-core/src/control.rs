@@ -1,26 +1,9 @@
 use c2_config::{
     ConfigResolver, ConfigSources, LocalEndpoint, LocalEndpointContext, LocalEndpointOptions,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::{LifecycleError, Runtime};
-
-/// Per-route fact returned by a direct IPC shutdown acknowledgement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirectIpcShutdownRouteOutcome {
-    pub route_name: String,
-    pub active_drained: bool,
-    pub closed_reason: String,
-}
-
-/// Language-neutral direct IPC shutdown acknowledgement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirectIpcShutdownOutcome {
-    pub acknowledged: bool,
-    pub shutdown_started: bool,
-    pub server_stopped: bool,
-    pub route_outcomes: Vec<DirectIpcShutdownRouteOutcome>,
-}
+use crate::{DirectIpcShutdownOutcome, LifecycleError, Runtime};
 
 /// Capture process configuration once for an independent admin operation.
 fn process_context() -> Result<LocalEndpointContext, LifecycleError> {
@@ -31,63 +14,62 @@ fn process_context() -> Result<LocalEndpointContext, LifecycleError> {
     .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
-/// Derive an endpoint from current process configuration without local I/O.
-pub fn direct_ipc_endpoint(address: &str) -> Result<LocalEndpoint, LifecycleError> {
-    direct_ipc_endpoint_with_context(address, &process_context()?)
-}
-
-pub fn direct_ipc_endpoint_with_context(
+/// Derive an endpoint without local I/O. `None` resolves process defaults once.
+pub fn direct_ipc_endpoint(
     address: &str,
-    context: &LocalEndpointContext,
+    context: Option<&LocalEndpointContext>,
 ) -> Result<LocalEndpoint, LifecycleError> {
+    let process_default;
+    let context = match context {
+        Some(context) => context,
+        None => {
+            process_default = process_context()?;
+            &process_default
+        }
+    };
     context
         .endpoint(address)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
-/// Probe using one process configuration snapshot for all retries.
-pub fn ping_direct_ipc(address: &str, timeout: Duration) -> Result<bool, LifecycleError> {
-    ping_direct_ipc_with_context(address, &process_context()?, timeout)
-}
-
-pub fn ping_direct_ipc_with_context(
+/// Probe using the supplied context, or one process-default snapshot for all retries.
+pub fn ping_direct_ipc(
     address: &str,
-    context: &LocalEndpointContext,
+    context: Option<&LocalEndpointContext>,
     timeout: Duration,
 ) -> Result<bool, LifecycleError> {
-    // A malformed probe target has no reachable server. Configuration and
-    // native-name derivation failures for valid targets must remain errors.
-    if LocalEndpoint::validate_address(address).is_err() {
-        return Ok(false);
-    }
+    c2_config::deadline_after(Instant::now(), timeout)
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+    let process_default;
+    let context = match context {
+        Some(context) => context,
+        None => {
+            process_default = process_context()?;
+            &process_default
+        }
+    };
     c2_ipc::ping_with_context(address, context, timeout)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
 /// Initiate direct IPC shutdown without waiting for the owner-side drain.
-/// All retries retain a single process configuration snapshot.
+/// All retries retain the supplied context, or one process-default snapshot.
 pub fn shutdown_direct_ipc(
     address: &str,
+    context: Option<&LocalEndpointContext>,
     timeout: Duration,
 ) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
-    shutdown_direct_ipc_with_context(address, &process_context()?, timeout)
-}
-
-pub fn shutdown_direct_ipc_with_context(
-    address: &str,
-    context: &LocalEndpointContext,
-    timeout: Duration,
-) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
-    if LocalEndpoint::validate_address(address).is_err() {
-        return Ok(DirectIpcShutdownOutcome {
-            acknowledged: false,
-            shutdown_started: false,
-            server_stopped: false,
-            route_outcomes: Vec::new(),
-        });
-    }
+    c2_config::deadline_after(Instant::now(), timeout)
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+    let process_default;
+    let context = match context {
+        Some(context) => context,
+        None => {
+            process_default = process_context()?;
+            &process_default
+        }
+    };
     c2_ipc::shutdown_with_context(address, context, timeout)
-        .map(DirectIpcShutdownOutcome::from)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
@@ -98,7 +80,10 @@ impl Runtime {
         address: &str,
         timeout: Duration,
     ) -> Result<bool, LifecycleError> {
-        ping_direct_ipc_with_context(address, &self.freeze_local_endpoint_context()?, timeout)
+        c2_config::deadline_after(Instant::now(), timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        c2_ipc::ping_with_context(address, &self.freeze_local_endpoint_context()?, timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))
     }
 
     /// Initiate admin shutdown inside this Runtime's frozen local domain.
@@ -108,26 +93,10 @@ impl Runtime {
         address: &str,
         timeout: Duration,
     ) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
-        shutdown_direct_ipc_with_context(address, &self.freeze_local_endpoint_context()?, timeout)
-    }
-}
-
-impl From<c2_ipc::DirectShutdownAck> for DirectIpcShutdownOutcome {
-    fn from(outcome: c2_ipc::DirectShutdownAck) -> Self {
-        Self {
-            acknowledged: outcome.acknowledged,
-            shutdown_started: outcome.shutdown_started,
-            server_stopped: outcome.server_stopped,
-            route_outcomes: outcome
-                .route_outcomes
-                .into_iter()
-                .map(|route| DirectIpcShutdownRouteOutcome {
-                    route_name: route.route_name,
-                    active_drained: route.active_drained,
-                    closed_reason: route.closed_reason,
-                })
-                .collect(),
-        }
+        c2_config::deadline_after(Instant::now(), timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        c2_ipc::shutdown_with_context(address, &self.freeze_local_endpoint_context()?, timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))
     }
 }
 
@@ -137,24 +106,63 @@ mod tests {
 
     #[test]
     fn invalid_address_is_a_core_configuration_error() {
-        let error =
-            direct_ipc_endpoint("tcp://not-ipc").expect_err("non-IPC address must be rejected");
+        let error = direct_ipc_endpoint("tcp://not-ipc", None)
+            .expect_err("non-IPC address must be rejected");
         assert!(matches!(error, LifecycleError::Configuration(_)));
+    }
+
+    #[test]
+    fn invalid_control_budget_rejects_before_freezing_endpoint_context() {
+        let runtime = Runtime::new(crate::RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let timeout = Duration::from_secs(10_000_000_000_000_000_000);
+        assert!(matches!(
+            runtime.ping_direct_ipc("ipc://unused", timeout),
+            Err(LifecycleError::Configuration(_))
+        ));
+        assert!(matches!(
+            runtime.shutdown_direct_ipc("ipc://unused", timeout),
+            Err(LifecycleError::Configuration(_))
+        ));
+        runtime
+            .set_local_endpoint(LocalEndpointOptions::default())
+            .unwrap();
     }
 
     #[test]
     fn absent_server_probe_is_false() {
         let address = format!("ipc://core-control-absent-{}", std::process::id());
-        direct_ipc_endpoint(&address).expect("valid address");
+        #[cfg(unix)]
+        let context = {
+            use std::os::unix::fs::DirBuilderExt;
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .unwrap()
+                .join("target/control-test-ipc")
+                .join(std::process::id().to_string());
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            LocalEndpointContext::with_unix_root(&root).unwrap()
+        };
+        #[cfg(windows)]
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        direct_ipc_endpoint(&address, Some(&context)).expect("valid address");
 
         assert!(
-            !ping_direct_ipc(&address, Duration::from_millis(10))
+            !ping_direct_ipc(&address, Some(&context), Duration::from_millis(10))
                 .expect("absent server is not an error")
         );
     }
 
     #[test]
-    fn malformed_probe_targets_are_negative_results() {
+    fn malformed_control_targets_are_configuration_errors() {
         let context = LocalEndpointContext::default_for_platform().unwrap();
         for address in [
             "tcp://not-ipc",
@@ -168,14 +176,15 @@ mod tests {
             "ipc://trailing ",
             "ipc://bad\nname",
         ] {
-            assert!(!ping_direct_ipc_with_context(address, &context, Duration::ZERO).unwrap());
-            let outcome =
-                shutdown_direct_ipc_with_context(address, &context, Duration::ZERO).unwrap();
-            assert!(!outcome.acknowledged);
-            assert!(!outcome.shutdown_started);
-            assert!(!outcome.server_stopped);
-            assert!(outcome.route_outcomes.is_empty());
-            assert!(direct_ipc_endpoint_with_context(address, &context).is_err());
+            assert!(matches!(
+                ping_direct_ipc(address, Some(&context), Duration::ZERO),
+                Err(LifecycleError::Configuration(_))
+            ));
+            assert!(matches!(
+                shutdown_direct_ipc(address, Some(&context), Duration::ZERO),
+                Err(LifecycleError::Configuration(_))
+            ));
+            assert!(direct_ipc_endpoint(address, Some(&context)).is_err());
         }
     }
 
@@ -194,9 +203,8 @@ mod tests {
             )
             .unwrap();
         for result in [
-            ping_direct_ipc_with_context("ipc://capacity", &context, Duration::ZERO).map(|_| ()),
-            shutdown_direct_ipc_with_context("ipc://capacity", &context, Duration::ZERO)
-                .map(|_| ()),
+            ping_direct_ipc("ipc://capacity", Some(&context), Duration::ZERO).map(|_| ()),
+            shutdown_direct_ipc("ipc://capacity", Some(&context), Duration::ZERO).map(|_| ()),
             runtime
                 .ping_direct_ipc("ipc://capacity", Duration::ZERO)
                 .map(|_| ()),
@@ -206,11 +214,9 @@ mod tests {
         ] {
             assert!(result.is_ok());
         }
-        assert!(!ping_direct_ipc_with_context("ipc://capacity", &context, Duration::ZERO).unwrap());
+        assert!(!ping_direct_ipc("ipc://capacity", Some(&context), Duration::ZERO).unwrap());
         let outcome =
-            shutdown_direct_ipc_with_context("ipc://capacity", &context, Duration::ZERO).unwrap();
-        assert!(!outcome.acknowledged);
-        assert!(!outcome.shutdown_started);
-        assert!(!outcome.server_stopped);
+            shutdown_direct_ipc("ipc://capacity", Some(&context), Duration::ZERO).unwrap();
+        assert_eq!(outcome, DirectIpcShutdownOutcome::Unconfirmed);
     }
 }

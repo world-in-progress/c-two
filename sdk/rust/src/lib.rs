@@ -2,34 +2,25 @@
 //!
 //! Contract identity and runtime behavior are re-exported from their
 //! authoritative Core crates. Portable payload values continue to use the
-//! official [`fastdb`] crate directly.
+//! official [`fastdb`] crate directly. Endpoint administration, diagnostics
+//! and contract tooling live in [`endpoint`], [`observe`]
+//! and [`contract`].
 
 mod error;
 mod held;
 mod payload;
 
-pub use c2_contract::{
-    ContractError, ContractLimits, ContractLimitsProfile, ContractRelease, ContractReleaseRef,
-    ExpectedRouteContract,
-};
+pub mod contract;
+pub mod endpoint;
+pub mod observe;
+
+pub use c2_contract::ContractRelease;
 pub use c2_core::{
-    CallExecutionLimits, CallExecutionLimitsOverrides, CallExecutionObservation,
-    CallExecutionObserver, CallExecutionSnapshot, CallOptions, CallTimeout, Client, ConfigSources,
-    Connect, ConnectOptions, ConnectionClosed, ConnectionEndReason, ConnectionEvent,
-    ConnectionEvents, ConnectionEventsError, ConnectionObservation, ConnectionSide,
-    DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, ENDPOINT_CREDENTIAL_MAX_BYTES,
-    ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointBindCause, EndpointCredential,
-    EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
-    EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, EnvFilePolicy,
-    EnvMap, Host, HostOptions, LifecycleError, LocalEndpoint, LocalEndpointContext,
-    LocalEndpointNamespace, LocalEndpointOptions, LocalIoCause, MemoryCellStats, MemoryScopeStats,
-    ObservedPath, ObservedRoute, PathCounters, Registration, RouteConcurrency,
-    RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot, Runtime,
-    RuntimeIdentity, RuntimeMemoryStats, RuntimeOptions, ServerFailure, ServerStartupStage,
-    ServerStartupTimeout, ServiceConcurrencyMode, ServiceDefinition, SweepBatch, SweepBudget,
-    direct_ipc_endpoint, direct_ipc_endpoint_with_context, inspect_endpoint, ping_direct_ipc,
-    ping_direct_ipc_with_context, reap_endpoint, shutdown_direct_ipc,
-    shutdown_direct_ipc_with_context,
+    CallExecutionLimits, CallExecutionLimitsOverrides, CallOptions, CallTimeout, Client,
+    ConfigSources, Connect, ConnectOptions, EnvFilePolicy, EnvMap, Host, HostOptions,
+    LifecycleError, Registration, RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard,
+    Runtime, RuntimeOptions, ServerFailure, ServerStartupStage, ServerStartupTimeout,
+    ServiceConcurrencyMode, ServiceDefinition,
 };
 pub use error::Error;
 pub use held::Held;
@@ -55,10 +46,3 @@ pub mod generated {
         BorrowedPayload, charge_payload_input, open_borrowed, open_held, open_owned,
     };
 }
-
-/// Native lifecycle and private owner capability, projected from Core.
-pub use c2_core::{
-    HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot, OwnerBootstrap, OwnerControl,
-    OwnerControlError, OwnerControlErrorKind, OwnerPhase, OwnerRecoveryTicket, OwnerStatus,
-    PreparedOwnerTakeover, ServerLifecyclePolicy, owner_control_pair,
-};

@@ -2,7 +2,7 @@
 
 This focused fixture does not build or modify sibling repositories. It consumes
 already built packages (or the same three supplied tarballs as the TS matrix),
-uses current native codegen, and retains command/Node logs under /tmp.
+uses current native codegen, and retains command/Node logs under the platform temporary directory.
 """
 from __future__ import annotations
 
@@ -20,6 +20,10 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
+
+import c_two.endpoint
+
+import c_two.contract
 from c_two.transport.server import Server
 from tests.fixtures.process_control import portable_command, readline_with_timeout
 
@@ -78,7 +82,7 @@ def _run(command: list[str], root: Path, label: str) -> None:
 
 @pytest.fixture(scope="module")
 def persistent_node_project() -> Iterator[tuple[Path, str]]:
-    log_root = tempfile.gettempdir() if os.name == "nt" else "/tmp"
+    log_root = tempfile.gettempdir()
     root = Path(tempfile.mkdtemp(prefix="c2-t3-persistent-", dir=log_root))
     node = shutil.which("node")
     assert node is not None, "real persistent IPC regression requires Node"
@@ -123,8 +127,8 @@ def persistent_node_project() -> Iterator[tuple[Path, str]]:
     tsc = compiler / "bin/tsc"
     assert tsc.is_file(), f"pinned TS compiler missing: {tsc}"
     for name, crm in (("manager", Manager), ("builder", Builder)):
-        artifacts = cc.compile_contract_artifacts(
-            cc.export_contract_descriptor(crm).encode(), target="typescript",
+        artifacts = cc.contract.compile_artifacts(
+            cc.contract.export_descriptor(crm).encode(), target="typescript",
         )
         for artifact in artifacts.artifacts:
             destination = root / "generated" / name / artifact.relative_path
@@ -214,7 +218,7 @@ class PersistentNode:
 
 
 def _ok(result: dict[str, Any]) -> dict[str, Any]:
-    assert result["ok"], result
+    assert result["ok"], json.dumps(result, ensure_ascii=False)
     return result
 
 
@@ -224,11 +228,11 @@ def _reject(result: dict[str, Any], text: str | None = None) -> None:
         assert text in result["error"]["message"], result
 
 
-def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
+def test_generated_node_early_chunk_rejection_stops_upload_and_reuses_connection(
     persistent_node_project: tuple[Path, str], unique_ipc_address: str,
 ) -> None:
     with tempfile.TemporaryDirectory(
-        prefix="c2-r16-", dir=tempfile.gettempdir() if os.name == "nt" else "/tmp",
+        prefix="c2-r16-", dir=tempfile.gettempdir(),
     ) as directory:
         ipc_root = directory if os.name != "nt" else None
         server = local_server(unique_ipc_address, ipc_overrides={
@@ -256,33 +260,37 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
             rejected = node.request("large")
             _reject(rejected)
             assert rejected["error"]["name"] == "C2CrmMethodError", rejected
-            # Either native limit may win the first-reply race. Neither a
-            # client-side preflight refusal nor close-induced I/O is acceptable.
+            # The first-chunk size check and the global chunk-processing
+            # permit check can race to reply. Both are native capacity
+            # refusals; client preflight and close-induced I/O cannot replace them.
             wire_error = rejected["error"]["payload"]
             assert wire_error.startswith("C2E1"), rejected
             native_error = json.loads(wire_error[4:])
             assert native_error["version"] == 1 and native_error["details"] == {}
             assert (native_error["code"], native_error["name"], native_error["message"]) in (
-                (713, "ProtocolViolation",
-                 "chunked call reassembly admission failed: total_chunks 16384 exceeds limit 2"),
+                (702, "ResourceUnavailable",
+                 "chunked call reassembly admission failed: "
+                 "reassembly size 67108864 exceeds limit 65536"),
                 (702, "ResourceUnavailable",
                  "server chunk processing capacity exceeded: max_total_chunks=2"),
             ), rejected
             assert manager.calls == 1 and rejected["chunkRequests"] == 1
             stopped_at = rejected["chunkWrites"]
             assert 0 < stopped_at < 64 * 1024 * 1024 // 4096, rejected
+            assert rejected["completedChunkWrites"] == stopped_at, rejected
             assert rejected["activeWrites"] == 0 and rejected["writesAfterClose"] == 0
-            assert rejected["connects"] == 1 and rejected["closes"] == 1
+            assert rejected["connects"] == 1 and rejected["closes"] == 0
             assert rejected["observations"] == first["observations"]
 
             for calls in (2, 3):
                 resumed = _ok(node.request("call"))
-                assert resumed["connects"] == 2 and resumed["closes"] == 1
+                assert resumed["connects"] == 1 and resumed["closes"] == 0
                 assert manager.calls == calls and resumed["chunkRequests"] == 1
                 assert resumed["chunkWrites"] == stopped_at
+                assert resumed["completedChunkWrites"] == stopped_at
                 assert resumed["businessWrites"] == rejected["businessWrites"] + calls - 1
                 assert resumed["activeWrites"] == 0 and resumed["writesAfterClose"] == 0
-                for key in ("serverId", "serverInstanceId", "routeName", "routeUid", "routeRevision"):
+                for key in ("serverId", "serverInstanceId", "routeName", "routeUid"):
                     assert resumed["observations"][-1][key] == bound[key], resumed
         finally:
             try:
@@ -290,7 +298,7 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
                     node.stop()
             finally:
                 assert server.shutdown()["completed"]
-                inspection = cc.inspect_endpoint(
+                inspection = cc.endpoint.inspect_endpoint(
                     unique_ipc_address, context=server._runtime_session.local_endpoint_context(),
                 )
                 assert inspection["status"] in ("absent", "not-applicable"), inspection
@@ -299,6 +307,86 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
                     if entry.is_socket() or entry.name.endswith(".lease")
                 ]
                 assert not residue, f"private endpoint socket/lease residue: {residue}"
+
+
+def test_generated_node_connection_deadline_covers_slow_connect_and_prevents_dispatch(
+    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
+) -> None:
+    # The existing Windows TypeScript integration gate runs this same Node path.
+    server = local_server(unique_ipc_address)
+    manager = CountingResource()
+    node: PersistentNode | None = None
+    try:
+        server.register_crm(Manager, manager, name="manager")
+        server.start()
+        node = PersistentNode(persistent_node_project, unique_ipc_address)
+
+        slow = _ok(node.request(
+            "call", transport="slow", connectDelayMs=5100, connectTimeoutMs=7000,
+        ))
+        assert slow["connects"] == 1 and slow["closes"] == 0
+        assert manager.calls == 1
+
+        expired = node.request(
+            "call", transport="expired", connectDelayMs=100, connectTimeoutMs=25,
+        )
+        _reject(expired, "connection deadline expired")
+        assert manager.calls == 1 and expired["businessWrites"] == 0
+        settled = _ok(node.request("wait", transport="expired", ms=200))
+        assert settled["connects"] == 1 and settled["closes"] == 1
+        assert settled["businessWrites"] == 0 and manager.calls == 1
+    finally:
+        try:
+            if node is not None:
+                node.stop()
+        finally:
+            assert server.shutdown()["completed"]
+
+
+def test_generated_node_close_during_chunk_upload_preserves_dispatched_outcome(
+    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
+) -> None:
+    server = local_server(unique_ipc_address, ipc_overrides={"pool_enabled": False})
+    manager = CountingResource()
+    node: PersistentNode | None = None
+    try:
+        server.register_crm(Manager, manager, name="manager")
+        server.start()
+        node = PersistentNode(persistent_node_project, unique_ipc_address)
+        result = _ok(node.request("closeDuringUpload"))
+        assert result["chunkRequests"] == 1, result
+        assert result["completedChunkWrites"] > 0, result
+        assert result["activeWrites"] == 0 and result["writesAfterClose"] == 0, result
+        assert result["closes"] == 1, result
+        _reject(node.request("call"), "deactivated")
+    finally:
+        try:
+            if node is not None:
+                node.stop()
+        finally:
+            assert server.shutdown()["completed"]
+
+
+def test_generated_node_local_response_copy_failure_preserves_persistent_stream(
+    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
+) -> None:
+    server = local_server(unique_ipc_address)
+    manager = CountingResource()
+    node: PersistentNode | None = None
+    try:
+        server.register_crm(Manager, manager, name="manager")
+        server.start()
+        node = PersistentNode(persistent_node_project, unique_ipc_address)
+        failed = _ok(node.request("copyFail"))
+        assert manager.calls == 1 and failed["closes"] == 0, failed
+        resumed = _ok(node.request("call"))
+        assert manager.calls == 2 and resumed["connects"] == 1, resumed
+    finally:
+        try:
+            if node is not None:
+                node.stop()
+        finally:
+            assert server.shutdown()["completed"]
 
 
 def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
@@ -329,7 +417,6 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
         resumed = _ok(node.request("call", "builder"))
         assert builder.calls == 3 and resumed["connects"] == 2
         assert resumed["observations"][-1]["routeUid"] == bound["routeUid"]
-        assert resumed["observations"][-1]["routeRevision"] == bound["routeRevision"]
         _ok(node.request("prepare", "builder"))
 
         removed = server.unregister_crm("builder")
@@ -348,11 +435,10 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
         fresh = _ok(node.request("call", "builder", transport="fresh"))
         assert replacement.calls == 1
         assert fresh["observations"][-1]["routeUid"] != bound["routeUid"]
-        _ok(node.request("close"))
         _reject(node.request("call", "builder"), "route token mismatch")
         assert replacement.calls == 1
         healthy = _ok(node.request("call"))
-        assert healthy["connects"] == 3 and manager.calls == 3
+        assert healthy["connects"] == 2 and manager.calls == 3
 
         _ok(node.request("close"))
         _ok(node.request("close", transport="fresh"))
@@ -365,8 +451,8 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
         new_identity = dict(server._runtime_session.ensure_server())
         assert new_identity["server_id"] == native_identity["server_id"]
         assert new_identity["server_instance_id"] != native_identity["server_instance_id"]
-        _reject(node.request("call"), "server identity mismatch")
-        _reject(node.request("prepare", "builder", transport="fresh"), "server identity mismatch")
+        _reject(node.request("call"), "deactivated")
+        _reject(node.request("prepare", "builder", transport="fresh"), "deactivated")
         assert restarted_manager.calls == 0 and restarted_builder.calls == 0
         restarted = _ok(node.request("call", "builder", transport="restarted"))
         assert restarted_builder.calls == 1
@@ -377,5 +463,5 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
                 node.stop()
         finally:
             assert server.shutdown()["completed"]
-    inspection = cc.inspect_endpoint(unique_ipc_address)
+    inspection = cc.endpoint.inspect_endpoint(unique_ipc_address)
     assert inspection["status"] in ("absent", "not-applicable"), inspection

@@ -2,64 +2,46 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping
-from enum import Enum
-from typing import Any, get_type_hints
-
-from c_two.crm.bridge import ResourceBridge
+from typing import Any, Literal, get_type_hints
 
 
-class InputLifetime(str, Enum):
-    MATERIALIZED = 'materialized'
-    BORROWED = 'borrowed'
 
-
-InputLifetimeLike = InputLifetime | str
+_InputLifetime = Literal['materialized', 'borrowed']
 
 
 def normalize_input_lifetime_map(
-    input_lifetime: Mapping[str, InputLifetimeLike] | None,
+    input_lifetime: Mapping[str, _InputLifetime] | None,
     *,
     method_names: list[str] | tuple[str, ...],
-) -> dict[str, InputLifetime]:
+) -> dict[str, _InputLifetime]:
     if input_lifetime is None:
         return {}
     if not isinstance(input_lifetime, Mapping):
-        raise TypeError('input_lifetime must be a mapping from method name to InputLifetime')
+        raise TypeError('input_lifetime must be a mapping from method name to materialized or borrowed')
 
     known = set(method_names)
-    normalized: dict[str, InputLifetime] = {}
+    normalized: dict[str, _InputLifetime] = {}
     for method_name, lifetime in input_lifetime.items():
         if not isinstance(method_name, str):
             raise TypeError('input_lifetime keys must be method names')
         if method_name not in known:
             raise ValueError(f'input_lifetime references unknown CRM method {method_name!r}')
-        try:
-            normalized[method_name] = (
-                lifetime if isinstance(lifetime, InputLifetime) else InputLifetime(str(lifetime))
-            )
-        except ValueError as exc:
-            allowed = ', '.join(item.value for item in InputLifetime)
+        if lifetime not in ('materialized', 'borrowed'):
             raise ValueError(
-                f'input_lifetime for {method_name!r} must be one of: {allowed}',
-            ) from exc
+                f'input_lifetime for {method_name!r} must be one of: materialized, borrowed',
+            )
+        normalized[method_name] = lifetime
     return normalized
 
 
 def validate_input_lifetime_resource_contract(
     crm_class: type,
     resource: object,
-    input_lifetime: Mapping[str, InputLifetime],
-    *,
-    bridge: Mapping[str, ResourceBridge],
+    input_lifetime: Mapping[str, _InputLifetime],
 ) -> None:
     for method_name, lifetime in input_lifetime.items():
-        if lifetime is not InputLifetime.BORROWED:
+        if lifetime != 'borrowed':
             continue
-        bridge_plan = bridge.get(method_name)
-        if bridge_plan is not None and bridge_plan.input is not None:
-            raise ValueError(
-                f'input_lifetime BORROWED for {method_name!r} cannot be combined with bridge.input',
-            )
         binding = getattr(
             getattr(crm_class, method_name),
             '_input_payload_binding',

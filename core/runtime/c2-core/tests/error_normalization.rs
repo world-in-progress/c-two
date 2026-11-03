@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::Path;
 
-use c2_contract::{ContractError, ContractLimitMetric, ContractLimitsProfile};
+use c2_contract::{ContractError, ContractLimitMetric};
 use c2_core::{
     AdapterFailure, AdapterFailurePhase, Error, ExternalCause, Runtime, RuntimeOptions,
     TransportPhase, external_cause_details, normalize_adapter_failure, normalize_http_error,
@@ -72,7 +70,6 @@ fn malformed_semantic_payloads_become_protocol_violations() {
 #[test]
 fn contract_limit_failures_are_distinct_from_other_contract_failures() {
     let admission = Error::from(ContractError::LimitExceeded {
-        profile: ContractLimitsProfile::V1,
         metric: ContractLimitMetric::SourceBytes,
         limit: 16,
         observed: 17,
@@ -198,96 +195,9 @@ fn existing_semantic_adapter_error_passes_through_unchanged() {
     assert_eq!(actual, expected);
 }
 
-#[test]
-fn obsolete_runtime_crate_identity_is_absent_from_current_sources() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .expect("c2-core must be nested at core/runtime/c2-core");
-    let needles = [
-        ["c2-", "runtime"].concat(),
-        ["c2_", "runtime"].concat(),
-        ["core/runtime/c2-", "runtime"].concat(),
-    ];
-    let scopes = [
-        repo.join("core"),
-        repo.join("cli"),
-        repo.join("sdk"),
-        repo.join("README.md"),
-        repo.join("AGENTS.md"),
-        repo.join("docs/roadmap.md"),
-        repo.join("docs/issues"),
-    ];
-
-    let mut offenders = Vec::new();
-    for scope in scopes {
-        collect_current_source_offenders(&scope, &needles, &mut offenders);
-    }
-
-    assert!(
-        offenders.is_empty(),
-        "obsolete runtime crate identity remains in current sources:\n{}",
-        offenders.join("\n")
-    );
-}
-
 fn assert_semantic_eq(actual: Error, expected: &C2Error) {
     let Error::Semantic(actual) = actual else {
         panic!("expected normalized semantic error");
     };
     assert_eq!(&actual, expected);
-}
-
-fn collect_current_source_offenders(path: &Path, needles: &[String], offenders: &mut Vec<String>) {
-    if ignored_path(path) {
-        return;
-    }
-    if path.is_dir() {
-        let mut entries = fs::read_dir(path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap_or_else(|error| panic!("read {} entry: {error}", path.display()));
-        entries.sort_by_key(|entry| entry.path());
-        for entry in entries {
-            collect_current_source_offenders(&entry.path(), needles, offenders);
-        }
-        return;
-    }
-
-    let Ok(source) = fs::read_to_string(path) else {
-        return;
-    };
-    for (line_index, line) in source.lines().enumerate() {
-        if line.to_ascii_lowercase().contains("historical") {
-            continue;
-        }
-        for needle in needles {
-            if line.contains(needle) {
-                offenders.push(format!(
-                    "{}:{}: {}",
-                    path.display(),
-                    line_index + 1,
-                    line.trim()
-                ));
-            }
-        }
-    }
-}
-
-fn ignored_path(path: &Path) -> bool {
-    path.components().any(|component| {
-        matches!(
-            component.as_os_str().to_str(),
-            Some(
-                ".git"
-                    | ".pytest_cache"
-                    | ".uv_cache"
-                    | ".venv"
-                    | "__pycache__"
-                    | "node_modules"
-                    | "target"
-            )
-        )
-    })
 }

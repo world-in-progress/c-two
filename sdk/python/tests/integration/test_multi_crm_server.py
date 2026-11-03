@@ -14,7 +14,7 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
-from c_two.transport import ConcurrencyConfig, ConcurrencyMode
+from c_two.transport import ConcurrencyConfig
 from c_two.transport.client.util import ping
 
 from tests.fixtures.ihello import Hello

@@ -17,19 +17,10 @@
 //!   success, admission refusal, request abort, and owner teardown on
 //!   cancellation. No waiter, permit, or registry entry is left behind.
 //!
-//! Identity and fencing rules:
-//!
-//! - A terminal outcome is published through one atomic single-winner
-//!   transition ([`ChunkAdmissionEntry::try_publish`]), so a refusal or abort
-//!   that races the owner's commit can never be overwritten by `Admitted`.
-//! - Removal is identity-checked. A stale owner that was replaced or torn down
-//!   can only release the exact entry it began; it can never remove a
-//!   successor's same-key entry or wake that successor's waiters.
-//! - An entry stays in the gate as a teardown fence until every participant
-//!   released it: the owner plus any request-level aborter that is still
-//!   releasing published state. That keeps a same-key successor from beginning
-//!   while an older generation's rollback is in flight, so an old rollback can
-//!   never observe (or delete) a successor's state.
+//! A terminal outcome uses one atomic single-winner transition, so a refusal
+//! racing admission cannot be overwritten by `Admitted`. The entry stays in
+//! the gate until the owner and every request-level teardown finish releasing
+//! their published assembly and route admission.
 //!
 //! Bounds: the receive loop already holds one chunk-processing permit per
 //! dispatched chunk frame before it can create an entry, and an entry is
@@ -69,7 +60,7 @@ pub(crate) enum ChunkAdmissionOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkOrderingError {
     /// A first chunk for this request is already tracked: either awaiting
-    /// admission or still tearing its generation down.
+    /// admission or still tearing its request down.
     AlreadyPending,
     /// The gate already tracks its configured maximum number of requests.
     Capacity { limit: usize },
@@ -94,7 +85,7 @@ impl std::fmt::Display for ChunkOrderingError {
 struct ChunkAdmissionEntry {
     outcome: watch::Sender<ChunkAdmissionOutcome>,
     /// One fence for the owner plus one for every request-level aborter that is
-    /// still releasing this generation's published state. The entry remains in
+    /// still releasing this request's published state. The entry remains in
     /// the gate map while any fence is held.
     fences: AtomicUsize,
 }
@@ -179,9 +170,7 @@ impl ChunkAdmissionGate {
     /// The returned owner is the teardown fence: if the owning task disappears
     /// without committing the admission, the entry publishes `Aborted` and is
     /// released so no waiter is stranded. Any existing entry — pending or a
-    /// terminal generation that is still tearing down — refuses the claim, so a
-    /// successor generation can never begin while an older one still holds
-    /// published state.
+    /// terminal request that is still tearing down — refuses the claim.
     pub(crate) fn begin(
         &self,
         key: ChunkRequestKey,
@@ -220,19 +209,27 @@ impl ChunkAdmissionGate {
         })
     }
 
-    /// Publish an abort for the current entry of `key` and hold a teardown
+    /// Publish a refusal or abort for the current entry and hold a teardown
     /// fence that keeps the entry in place until the returned guard is dropped.
     ///
     /// The caller must have finished (or be about to finish, before dropping
     /// the guard) releasing this request's published assembly and route
     /// admission. `None` means no entry is tracked: the request has no
-    /// in-flight first-chunk admission for a successor to race.
-    pub(crate) fn abort_key(&self, key: ChunkRequestKey) -> Option<ChunkAdmissionReclaim> {
+    /// in-flight first-chunk admission to fence.
+    pub(crate) fn terminate_key(
+        &self,
+        key: ChunkRequestKey,
+        outcome: ChunkAdmissionOutcome,
+    ) -> Option<ChunkAdmissionReclaim> {
+        debug_assert!(matches!(
+            outcome,
+            ChunkAdmissionOutcome::Refused | ChunkAdmissionOutcome::Aborted
+        ));
         let entries = self.inner.entries.lock();
         let entry = Arc::clone(entries.get(&key)?);
         entry.fences.fetch_add(1, Ordering::AcqRel);
         drop(entries);
-        entry.try_publish(ChunkAdmissionOutcome::Aborted);
+        entry.try_publish(outcome);
         Some(ChunkAdmissionReclaim {
             gate: self.clone(),
             key,
@@ -243,7 +240,7 @@ impl ChunkAdmissionGate {
     /// Abort every admission entry owned by a connection and return how many
     /// were torn down (connection disconnect/cancellation cleanup).
     ///
-    /// Removes outright: a closing connection dispatches no successor frame, so
+    /// Removes outright: a closing connection dispatches no further frame, so
     /// no teardown fence is needed.
     pub(crate) fn abort_connection(&self, conn_id: u64) -> usize {
         let mut entries = self.inner.entries.lock();
@@ -265,29 +262,23 @@ impl ChunkAdmissionGate {
         self.inner.entries.lock().len()
     }
 
-    /// Identity-checked fence release.
+    /// Release one teardown fence.
     ///
     /// The fence count and the map are read/updated under the same lock so a
-    /// concurrent [`ChunkAdmissionGate::abort_key`] either adds its fence
+    /// concurrent [`ChunkAdmissionGate::terminate_key`] either adds its fence
     /// before the last release (and the entry survives) or observes no entry at
-    /// all. The removal is identity-checked, so a stale participant can never
-    /// release a replacement generation's entry.
+    /// all.
     fn release_entry(&self, key: ChunkRequestKey, entry: &Arc<ChunkAdmissionEntry>) {
         let mut entries = self.inner.entries.lock();
         if entry.fences.fetch_sub(1, Ordering::AcqRel) > 1 {
             return;
         }
-        if entries
-            .get(&key)
-            .is_some_and(|current| Arc::ptr_eq(current, entry))
-        {
-            entries.remove(&key);
-        }
+        entries.remove(&key);
     }
 }
 
 /// Teardown fence for a request-level abort taken through
-/// [`ChunkAdmissionGate::abort_key`]. The tracked entry is not removed until
+/// [`ChunkAdmissionGate::terminate_key`]. The tracked entry is not removed until
 /// this guard is dropped.
 pub(crate) struct ChunkAdmissionReclaim {
     gate: ChunkAdmissionGate,
@@ -325,14 +316,6 @@ impl ChunkAdmissionOwner {
         true
     }
 
-    /// Publish a refusal (the correlated error reply was or will be written).
-    ///
-    /// The entry intentionally stays as a teardown fence until
-    /// [`ChunkAdmissionOwner::release`] or drop.
-    pub(crate) fn refuse(&mut self) -> bool {
-        self.entry.try_publish(ChunkAdmissionOutcome::Refused)
-    }
-
     /// Publish an abort (no reply will be written; disconnect/cancellation).
     pub(crate) fn abort(&mut self) -> bool {
         self.entry.try_publish(ChunkAdmissionOutcome::Aborted)
@@ -349,10 +332,7 @@ impl ChunkAdmissionOwner {
         }
     }
 
-    /// Remove this exact entry after the generation's teardown is complete.
-    ///
-    /// Identity-checked: a stale owner that was already replaced cannot remove
-    /// a successor's same-key entry.
+    /// Remove this entry after the request's teardown is complete.
     pub(crate) fn release(&mut self) {
         if !self.released {
             self.released = true;
@@ -366,7 +346,7 @@ impl Drop for ChunkAdmissionOwner {
         if !self.released {
             // Cancellation/panic teardown: publish an abort (only if this owner
             // still wins the terminal transition) and release the fence so
-            // waiters wake and the key can be admitted again.
+            // waiters wake.
             self.entry.try_publish(ChunkAdmissionOutcome::Aborted);
             self.release();
         }
@@ -411,12 +391,15 @@ mod tests {
 
         let mut owner = gate.begin((1, 8)).unwrap();
         let waiter = gate.waiter((1, 8)).unwrap();
-        assert!(owner.refuse());
+        let refused = gate
+            .terminate_key((1, 8), ChunkAdmissionOutcome::Refused)
+            .unwrap();
         // The refusal is published immediately; the entry stays as the
         // teardown fence until the owner releases it.
         assert_eq!(waiter.wait().await, ChunkAdmissionOutcome::Refused);
         assert_eq!(gate.len(), 1);
         owner.release();
+        drop(refused);
         assert_eq!(gate.len(), 0);
     }
 
@@ -469,7 +452,9 @@ mod tests {
         let mut owner = gate.begin((1, 1)).unwrap();
         let other_owner = gate.begin((1, 2)).unwrap();
         let waiter = gate.waiter((1, 1)).unwrap();
-        let reclaim = gate.abort_key((1, 1)).expect("entry is tracked");
+        let reclaim = gate
+            .terminate_key((1, 1), ChunkAdmissionOutcome::Aborted)
+            .expect("entry is tracked");
         assert_eq!(waiter.wait().await, ChunkAdmissionOutcome::Aborted);
         assert_eq!(gate.len(), 2);
         assert!(
@@ -494,11 +479,20 @@ mod tests {
         let gate = ChunkAdmissionGate::new(4);
         let mut owner = gate.begin((1, 1)).unwrap();
         let waiter = gate.waiter((1, 1)).unwrap();
-        let reclaim = gate.abort_key((1, 1)).expect("entry is tracked");
+        let reclaim = gate
+            .terminate_key((1, 1), ChunkAdmissionOutcome::Aborted)
+            .expect("entry is tracked");
         // Abort won first: the owner's late commit must lose and must not turn
         // the request back into an admitted one.
         assert!(!owner.admit());
-        assert!(!owner.refuse());
+        let refused = gate
+            .terminate_key((1, 1), ChunkAdmissionOutcome::Refused)
+            .unwrap();
+        assert_eq!(
+            owner.terminal_waiter().wait().await,
+            ChunkAdmissionOutcome::Aborted
+        );
+        drop(refused);
         assert_eq!(waiter.wait().await, ChunkAdmissionOutcome::Aborted);
         owner.release();
         drop(reclaim);
@@ -507,7 +501,10 @@ mod tests {
         // entry is left to fence).
         let mut owner = gate.begin((1, 2)).unwrap();
         assert!(owner.admit());
-        assert!(gate.abort_key((1, 2)).is_none());
+        assert!(
+            gate.terminate_key((1, 2), ChunkAdmissionOutcome::Aborted)
+                .is_none()
+        );
         assert!(gate.waiter((1, 2)).is_none());
         assert_eq!(gate.len(), 0);
         drop(owner);
@@ -552,61 +549,5 @@ mod tests {
             );
             assert_ne!(entry.outcome(), ChunkAdmissionOutcome::Pending);
         }
-    }
-
-    /// A same-key successor cannot begin while the previous generation is still
-    /// tearing down, and a stale owner release cannot touch the successor.
-    #[tokio::test]
-    async fn stale_generation_release_never_removes_the_replacement_entry() {
-        let gate = ChunkAdmissionGate::new(4);
-        let stale_owner = gate.begin((1, 7)).unwrap();
-        // The stale generation's entry disappears through connection teardown
-        // while the owner object is still alive in a task that has not returned
-        // yet.
-        assert_eq!(gate.abort_connection(1), 1);
-        assert_eq!(gate.len(), 0);
-
-        // A replacement generation under the same key.
-        let mut replacement = gate.begin((1, 7)).unwrap();
-        let replacement_waiter = gate.waiter((1, 7)).expect("replacement is tracked");
-
-        // The stale owner's drop must not remove the replacement entry nor
-        // publish a terminal outcome on its waiters.
-        drop(stale_owner);
-        assert_eq!(gate.len(), 1);
-        assert!(gate.waiter((1, 7)).is_some());
-
-        // The replacement still commits normally.
-        assert!(replacement.admit());
-        assert_eq!(
-            replacement_waiter.wait().await,
-            ChunkAdmissionOutcome::Admitted
-        );
-        assert_eq!(gate.len(), 0);
-    }
-
-    /// The abort fence keeps the entry (and therefore the key) reserved until
-    /// both the request-level aborter and the owner released it.
-    #[tokio::test]
-    async fn abort_fence_blocks_a_successor_until_the_abort_teardown_finishes() {
-        let gate = ChunkAdmissionGate::new(4);
-        let mut owner = gate.begin((1, 3)).unwrap();
-        let reclaim = gate.abort_key((1, 3)).unwrap();
-        assert_eq!(
-            gate.begin((1, 3)).unwrap_err(),
-            ChunkOrderingError::AlreadyPending,
-            "a successor must not begin while the abort teardown is in flight"
-        );
-        owner.release();
-        assert_eq!(gate.len(), 1);
-        assert_eq!(
-            gate.begin((1, 3)).unwrap_err(),
-            ChunkOrderingError::AlreadyPending,
-            "the abort fence alone still reserves the key"
-        );
-        drop(reclaim);
-        assert_eq!(gate.len(), 0);
-        let _successor = gate.begin((1, 3)).expect("key is free after teardown");
-        assert_eq!(gate.len(), 1);
     }
 }
