@@ -234,6 +234,6 @@ cc.shutdown()
 
 `cc.serve(shutdown_timeout=30.0)` 在开始服务之前就拒绝无效的预算，之后阻塞到 Unix 上收到 SIGINT 或 SIGTERM、Windows 上收到 SIGINT 或 SIGBREAK，或原生 Host 自己停止（例如收到直接 IPC 关停请求），再以 `shutdown(timeout=shutdown_timeout)` 调用一次关闭并返回其结果。结果为待定时，清理在后台继续，之后再调用 `cc.shutdown()` 可以观察到它完成。`blocking=False` 时立即返回 `None`。
 
-传给远程 `connect()` 的截止时间也约束 SDK 最终发布检查。若原截止时间在发布前到期，connect 抛出对应的截止时间错误，仅释放自身的逻辑客户端，且不重试。其他情况下成功的连接继续正常复用其池化客户端。`runtime_retired` 生命周期错误没有 I/O 原因。仅使用 HTTP 不会创建 IPC 池，shutdown 也不保证每个 HTTP keepalive 套接字都已物理关闭。Rust 底层 Host 的关闭/重启生命周期仍独立且可重启；永久退役仅适用于 Python SDK Runtime 作用域。R07 final Drop 仍是独立工作。
+传给远程 `connect()` 的截止时间也约束 SDK 最终发布检查。若原截止时间在发布前到期，connect 抛出对应的截止时间错误，仅释放自身的逻辑客户端，且不重试。其他情况下成功的连接继续正常复用其池化客户端。`runtime_retired` 生命周期错误没有 I/O 原因。仅使用 HTTP 不会创建 IPC 池，shutdown 也不保证每个 HTTP keepalive 套接字都已物理关闭。Rust 底层 Host 的关闭/重启生命周期仍独立且可重启；永久退役仅适用于 Python SDK Runtime 作用域。
 
 完成交接后，已配置的端点选择、传输策略、调用限制和 relay 覆盖值保留现有交接行为，而服务端身份、IPC 覆盖值和启动超时会重置。现有的 `connection_events()` 订阅只观察原会话；新会话需要重新订阅。返回值是正在关闭的会话的结果；已保留的载荷继续遵循自身的生命周期。应用拥有自己创建的任何自定义端点目录；Runtime 不会移除该目录。[预检示例](../../examples/python/independent_runtime.py)在删除新建的私有目录前检查关闭结果。

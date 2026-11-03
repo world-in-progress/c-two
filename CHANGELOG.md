@@ -15,7 +15,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Breaking: direct IPC `shutdown()` returns `'initiated'`, `'absent'` or `'unconfirmed'`; lifecycle snapshots report `finished`, `listener_closed` and `work_drained`; `cc.serve(shutdown_timeout=...)` returns the shutdown outcome.
 - Breaking: Rust `direct_ipc_endpoint`, `ping_direct_ipc` and `shutdown_direct_ipc` take an optional endpoint context and replace the `*_with_context` functions.
 - `cc.connect(timeout=...)` also bounds the OS connection, the namespace gate wait and the handshake.
-- Small IPC calls are slower: a 1-byte call takes about 40–60 µs more. See the [unreleased notes](docs/releases/unreleased.md).
+- Small IPC calls are slower: a 1-byte call takes about 40–70 µs more. See the [unreleased notes](docs/releases/unreleased.md).
 
 ### Added
 
