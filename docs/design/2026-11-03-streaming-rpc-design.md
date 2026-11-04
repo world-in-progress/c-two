@@ -109,7 +109,7 @@ Runtime shutdown 与路由注销都向本路由开着的流的调用记录提交
 
 ### 3.8 relay、HTTP 及 Body 背压
 
-沿现有栈：请求体一次发完，响应体逐条流式发送；“一次”指一次业务输入，不要求物化整份请求，已知长度仍可经现有 sized-stream 传输。Node 继续用可注入 fetch（`core/foundation/c2-codegen/assets/typescript_transport.ts:178`、`:810`），Rust 继续 reqwest/axum；HTTP 不发送 CREDIT。取消由客户端中止该 HTTP 请求/响应，relay 观察下游结束后向上游 IPC 提交 CANCEL；其他共享上游调用不随之取消。
+沿现有栈：请求体一次发完，响应体逐条流式发送；“一次”指一次业务输入，不要求物化整份请求，已知长度仍可经现有 sized-stream 传输。Node 继续用可注入 fetch（`core/foundation/c2-codegen/assets/typescript_transport.ts:178`、`:810`），Rust 继续 reqwest/axum；HTTP 不发送 CREDIT。取消由客户端中止该 HTTP 请求/响应，relay 观察下游结束后向上游 IPC 提交 CANCEL；其他共享上游调用不随之取消。经 relay 的调用只发一次业务 POST，不为重发保留输入：relay 在读请求体之前按请求头核对契约与路由 token，路由已过期就报派发前错误，由调用方决定是否重试，下一次调用重新解析路由。过期路由通常意味着资源换了实例，新实例没有原来的状态，应用应先从检查点恢复再继续按顺序调用（维护者 2026-11-04 确认）。
 
 relay 只有在下游 Body 被拉取且取得本地缓冲预约时才从上游取下一片；多跳同样逐跳拉取。原生 IPC 响应必须提供绑定实际 carrier 的增量读接口，relay 不先调用 into_owned_bytes，不先组成完整条目 Vec。whole SHM 沿 3.4 保留真实 owner，逐片复制后交给 HTTP；Bytes clone/slice 保留同一 reservation，到最后实际引用结束退款，Body 自身 Drop 不是所有字节已经释放的证明。unary HTTP 调用的资源语义不变，只把响应转发改成这个 Body。
 
@@ -294,7 +294,7 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 - 块 1：c2-mem 与 c2-local 的 `AtomicU64::fetch_update` 改为 `try_update`，先确认它在 Rust 1.95 上可用。
 - 块 3：c2-http 连接池里的同一处 `fetch_update`。
 - 块 4：删掉 c2-server 构造时多余的一次响应池预热。
-- 块 5：c2-ipc 判定零借出 ID 改用 c2-wire 的专用错误类型，不再匹配字段名 `"loan id"`；给已接纳调用的回复不再借用 `WriteRequest::Control` 的名字。
+- 块 5：c2-ipc 判定零借出 ID 改用 c2-wire 的专用错误类型，不再匹配字段名 `"loan id"`；给已接纳调用的回复不再借用 `WriteRequest::Control` 的名字；资源进程在执行前的路由准入拒绝（例如路由过期）要报成派发前失败，现在它经资源错误的路径报成 HTTP 500（`core/transport/c2-server/src/server.rs:3179`、`:3338`）。
 - 块 6：Python `register` 的 `input_lifetime` 写成 `Literal['materialized', 'borrowed']`，与服务端桥的私有别名 `_InputLifetime` 合成一处；服务端桥 `shutdown()` 的 5 秒缺省只在注册失败的回滚路径上用到（`sdk/python/src/c_two/transport/registry.py:529`），统一为 30 秒。
 - 块 7：c2-mem-ffi 连接入口的 Rust 文档注释与 C 头文件对身份校验失败状态码的写法统一。
 - 块 8：`LocalEndpointNamespaceRequired` 的消息改为资源一方的本地端点命名空间。
