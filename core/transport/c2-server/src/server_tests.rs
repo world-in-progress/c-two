@@ -3829,11 +3829,20 @@ async fn read_release_id(client: &mut LocalStream) -> u64 {
 async fn raw_buddy_request_releases_before_blocked_callback_completes() {
     use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
     use c2_wire::control::{ReplyControl, decode_reply_control, encode_call_control};
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct BlockingEcho {
-        started: Arc<AtomicBool>,
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+    // Lets a failed assertion end the test instead of leaving the callback
+    // blocked, which would make runtime shutdown wait forever.
+    struct ReleaseOnDrop(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (lock, changed) = &*self.0;
+            *lock.lock().unwrap() = true;
+            changed.notify_all();
+        }
     }
     impl CrmCallback for BlockingEcho {
         fn invoke(
@@ -3844,7 +3853,9 @@ async fn raw_buddy_request_releases_before_blocked_callback_completes() {
             _: Arc<crate::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             assert_eq!(request, b"copied before callback");
-            self.started.store(true, Ordering::SeqCst);
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
             let (lock, changed) = &*self.release;
             let mut released = lock.lock().unwrap();
             while !*released {
@@ -3861,11 +3872,12 @@ async fn raw_buddy_request_releases_before_blocked_callback_completes() {
         )
         .unwrap(),
     );
-    let started = Arc::new(AtomicBool::new(false));
+    let (started, callback_started) = tokio::sync::oneshot::channel();
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release_callback = ReleaseOnDrop(Arc::clone(&release));
     let mut route = make_host_route(&server, "grid");
     route.callback = Arc::new(BlockingEcho {
-        started: Arc::clone(&started),
+        started: std::sync::Mutex::new(Some(started)),
         release: Arc::clone(&release),
     });
     server.register_route(route).await.unwrap();
@@ -3919,15 +3931,16 @@ async fn raw_buddy_request_releases_before_blocked_callback_completes() {
         .unwrap();
 
     assert_eq!(read_release_id(&mut client).await, loan_id);
-    assert!(started.load(Ordering::SeqCst));
+    // The release is written before the resource method runs, so wait for
+    // the callback to start instead of assuming it already has.
+    tokio::time::timeout(Duration::from_secs(5), callback_started)
+        .await
+        .expect("callback did not start")
+        .unwrap();
     assert_eq!(pool.stats().alloc_count, 1);
     pool.release_handle(handle);
     assert_eq!(pool.stats().alloc_count, 0);
-    {
-        let (lock, changed) = &*release;
-        *lock.lock().unwrap() = true;
-        changed.notify_all();
-    }
+    drop(release_callback);
     let (request_id, flags, payload) = read_reply_frame(&mut client).await;
     assert_eq!(request_id, 41);
     assert_ne!(flags & FLAG_RESPONSE, 0);
