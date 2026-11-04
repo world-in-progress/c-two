@@ -49,7 +49,7 @@ unary 的 OPEN 直接带输入、CALL_END 直接带结果；inline 时每方向�
 
 只保留一个扩大覆盖面的字节设置 `payload_buffer_budget_bytes`，环境变量 `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`、relay CLI `--call-payload-buffer-budget-bytes`（沿用调用限额 `C2_CALL_` 与 `--call-` 的分组），记为 B，替换 retained-input 字节设置，不留别名。沿用其默认 16 GiB、完整 u64 范围，0 只拒绝正字节准入；Runtime 和 relay 各自共享一份，Host 的流本地副本使用同一规范默认值的独立接收域。依据为 `core/foundation/c2-config/src/call.rs:132`、`:140`、`:157` 及[配置](../reference/configuration.md)两处 retained-input 表。覆盖面在原 retained input 之外扩到 HTTP 缓冲及流的本地副本，不把所有 unary IPC 数据改成流控消息。SHM/file/reassembly 仍按原预算计物理存储。
 
-B 不足时 next 等待，不因暂时竞争报告容量错误。调用方保留的多个 hold 都计 B；若它们用满 B，下一条会等到释放、原截止时间或取消。无限等待可能一直不返回；应用须释放不再需要的 hold，或配置能容纳同时保留数据的 B。C-Two 不偷释放、不让同一流的多 hold 报使用错误。调用本身保留的输入也是真实占用，预算应覆盖实际同时存活的数据，不能靠提前失效腾容量。
+B 不足时 next 等待，不因暂时竞争报告容量错误。等待只能等别的调用释放的容量：长度未知的数据按片增长时，调用已持有同一份数据的预约，拿不到新增预约就立即报确定的容量错误，不等待，否则单个调用会自等、多个调用会互相卡死；等待只留给第一份预约（长度已知时的整份，未知时的第一片）与流的条目（2026-11-04 实施块 3 时发现，对第十二节第 4 项的收窄）。调用方保留的多个 hold 都计 B；若它们用满 B，下一条会等到释放、原截止时间或取消。无限等待可能一直不返回；应用须释放不再需要的 hold，或配置能容纳同时保留数据的 B。C-Two 不偷释放、不让同一流的多 hold 报使用错误。调用本身保留的输入也是真实占用，预算应覆盖实际同时存活的数据，不能靠提前失效腾容量。
 
 每份 C-Two 存储携带唯一 reservation；slice/clone 共享，最后实际引用结束才退款；复制过渡同时存在的存储须同时有预约。等待之前不先创建未计费副本，输入只保留到最后真实读者结束，不为可能重放多留一份。接收完整值可移动 Vec，不能多造一个快照；已预约的 SHM/文件重组存储也不能因 trim 提前退款。序列化临时工作区、应用材料化对象、peer 映射及 HTTP 库/内核缓冲须单列，B 不是 RSS 上限。
 
@@ -113,7 +113,7 @@ Runtime shutdown 与路由注销都向本路由开着的流的调用记录提交
 
 relay 只有在下游 Body 被拉取且取得本地缓冲预约时才从上游取下一片；多跳同样逐跳拉取。原生 IPC 响应必须提供绑定实际 carrier 的增量读接口，relay 不先调用 into_owned_bytes，不先组成完整条目 Vec。whole SHM 沿 3.4 保留真实 owner，逐片复制后交给 HTTP；Bytes clone/slice 保留同一 reservation，到最后实际引用结束退款，Body 自身 Drop 不是所有字节已经释放的证明。unary HTTP 调用的资源语义不变，只把响应转发改成这个 Body。
 
-B 覆盖请求保留、成功/错误响应、HTTP 暂存及流本地副本，长度已知先预约、未知按片增长；临时不足等待而非失败，等待可由原截止时间/取消结束。请求保留在最后读者结束时释放，不能为了等响应强留完整请求；两个方向的最小发送缓冲在派发前从同一 B 留出，避免全部空间被输入占满。多跳各有自己的 B；SHM backing、HTTP 库内部空间和 OS 缓冲另记，不称整个路径只有一个窗口占用。
+B 覆盖请求保留、成功/错误响应、HTTP 暂存及流本地副本，长度已知先预约、未知按片增长；临时不足等待而非失败（增长时例外，见 3.1），等待可由原截止时间/取消结束。请求保留在最后读者结束时释放，不能为了等响应强留完整请求；两个方向的最小发送缓冲在派发前从同一 B 留出，避免全部空间被输入占满。多跳各有自己的 B；SHM backing、HTTP 库内部空间和 OS 缓冲另记，不称整个路径只有一个窗口占用。
 
 专项静态核对：当前 `core/Cargo.lock:637` 锁定 hyper 1.8.1。[HTTP/1 写循环](https://github.com/hyperium/hyper/blob/v1.8.1/src/proto/h1/dispatch.rs#L328-L373)先检查 can_buffer_body，不能缓冲就 poll_flush；只有恢复后才 poll_frame。[缓冲实现](https://github.com/hyperium/hyper/blob/v1.8.1/src/proto/h1/io.rs#L575-L581)按已有字节/队列容量判断，默认 flush_pipeline=false（同文件第 67 行）。这证明默认路径有发送缓冲门，未证明“每拉一次 Body 就是客户端已消费一次”：一次 frame 仍可越过软水位，已写入库/OS 的字节还能继续积压。本次只读源码，未运行慢读实验。
 
