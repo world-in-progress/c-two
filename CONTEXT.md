@@ -56,6 +56,56 @@ _Avoid_: 运行时 or a lowercase runtime for this object (both name C-Two as a 
 The server side of a Runtime: it listens on an IPC endpoint and serves the registered resources.
 _Avoid_: 宿主, server process
 
+### Calls and streams
+
+**一元调用 / unary call**:
+A call that sends at most one value each way and ends with one terminal outcome.
+_Avoid_: simple call, request (for the whole call)
+
+**服务端流 / server stream**:
+A call that sends one input and returns zero or more items, declared with `@cc.stream`; its contract method carries `"mode": "server_stream"`.
+_Avoid_: subscription, streaming call (for this kind alone)
+
+**条目 / item**:
+One complete domain value a server stream delivers per iteration; it may travel as several chunks.
+_Avoid_: message, event, element
+
+**资源推进 / resource step**:
+One run of a server stream's resource code under a route permit, until it yields an item, finishes or raises. Waiting for demand, budget or the network happens between steps.
+_Avoid_: iteration (for the server side), tick
+
+**调用记录 / call record**:
+The single state of one call inside C-Two: its admission, progress, values awaiting delivery, terminal outcome and cleanup.
+_Avoid_: request state, call context
+
+**准入凭证 / admission token**:
+The proof that a call was admitted to a route. Later steps and the cleanup of the same call continue under it while the route drains.
+_Avoid_: lease, permit (for the admission)
+
+**路由许可 / route permit**:
+The execution permission one resource step or cleanup takes under the route's concurrency mode; it is released when the step ends.
+_Avoid_: lock, slot
+
+**调用槽 / call slot**:
+The counted capacity an active call occupies for its whole life, limited by `max_pending_requests` and a route's `max_pending`; a single step's worker is counted separately.
+_Avoid_: worker (for a slot)
+
+**条目需求 / item demand**:
+Permission for a server stream to produce one more item. The first is granted when the stream opens, and each delivered item grants the next.
+_Avoid_: credit (for demand)
+
+**窗口 / flow-control window**:
+Staging space a receiver has really reserved and granted to its sender. Only a hop that forwards while it receives uses one, returning the space chunk by chunk.
+_Avoid_: buffer (for the grant), quota
+
+**调用终态 / call terminal outcome**:
+The one final result of a call, reported after its execution and cleanup have really ended; separate from the settlement of its loans.
+_Avoid_: status (alone), completion
+
+**调用定位符 / call locator**:
+The server instance, connection and request id an error carries to identify the original call. It is not a durable query handle.
+_Avoid_: call id, trace id
+
 ### Transport
 
 **直接 IPC / direct IPC**:

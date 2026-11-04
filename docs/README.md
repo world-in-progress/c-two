@@ -64,6 +64,7 @@ The dated plans and reviews in `design/` belong to work still in progress; each 
 | --- | --- |
 | [0001](decisions/0001-single-owner-release.md) | Single-owner release of shared memory |
 | [0002](decisions/0002-remove-owner-subsystem.md) | Removal of the owner subsystem |
+| [0003](decisions/0003-server-streams.md) | Server streams: call records, receiver-granted credit, contract mode and stream ending |
 
 ## Records
 
