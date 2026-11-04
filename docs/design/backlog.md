@@ -1,12 +1,12 @@
 # 待办
 
-尚未完成的工作与待用户决定的事项都列在这里，细节写在各自的文档里。做完的条目从这里删掉，并在验收或发行记录里注明。顺序由用户定；Host 的建议标明是建议。
+尚未完成的工作与待用户决定的事项都列在这里，细节写在各自的文档里。做完的条目从这里删掉，并在验收或发行记录里注明。顺序由用户定；建议都标明是建议。
 
 ## 进行中
 
 - **流式 RPC**（[设计](2026-11-03-streaming-rpc-design.md)于 2026-11-04 批准，[ADR 0003](../decisions/0003-server-streams.md)；执行计划是设计第十节）：第一阶段：块 2 已合入（2026-11-04）；块 1、3 实施中，块 4 等它们合入后开始。
 
-## 接下来（Host 建议的顺序，待用户确认）
+## 接下来（建议的顺序，待用户确认）
 
 同一块代码里的事合成一批做，免得先做的被后面的批次推翻。
 
@@ -17,11 +17,12 @@
    - **relay：** F2（删 watch 闸门，轮询降到秒级）、F3、F6；F4、F8、F10；relay-aware 调用没有每次调用的路由回执，`observed_route` 仍是连接时的值；F7 剩下的 `/_admin/unregister` 与注销 202/204/404 的区分，等用户答复。`relay/conn_pool.rs` 为替代 P4 删掉的 `force_connected`，在生产代码里加了只在测试构建生效的连通状态覆盖（`test_assume_connected` 等），看能否改用真实连接，移出生产路径。`c3 relay --upstream` 只在 relay 启动时登记一次：路由那时还没开放就报 "does not export route"，`c3 relay` 直接退出；登记成功之后，上游重启（身份改变）或路由被注销时，relay 会把它撤下，也不会再自己重新接手，只能重启 relay 或手工 `POST /_register` 补上。用户 2026-11-01 要求记入：改为启动后持续重试、路由开放后接手、上游重启后重新接手；待定的是重试的节奏与上限、启动时登记失败是否仍让 `c3 relay` 退出、以及与资源进程经 relay anchor 自行登记同一路由时谁优先。
    - **契约、代码生成与 CLI：** H1、H4、H6、H8（用校验过的构造器加私有字段，取代 C01）、H9；R29 等剩下的 codegen 同次缓存与 typed projection。
 3. **配置收敛**（[接口审查](2026-10-31-api-surface-review.md)第三节）：逐项表定下之后进行。与 B8、H3、H7、H12、C4 交叉，R09、R10 的 EnvCatalog 多次加载一并处理。`chunk_threshold_ratio`（`C2_IPC_CHUNK_THRESHOLD_RATIO`）已证实没有作用：只在 c2-config 里解析与校验，c2-ipc 只在比较两份客户端池配置时用到它，分片判断不读它；连同环境变量、Python 字段与测试一起删除。
-4. **错误类型**（接口审查第四节）：协议批之后。一并：删除从没产生过的错误码 706 `WriteConflict`，连同 Python 的错误类、映射与相关测试（用户 2026-10-31 同意；704 是还在使用的 `RouteStale`，不动）；711 `RouteCatalogCompacted` 在协议批删掉 IPC 路由目录之后也没有生产者了（2026-11-03 核实，只剩注册表、Python 错误类、映射与 `__all__`），Host 建议一并删除；`sdk/python/src/c_two/error.py` 里重复注册错误的 docstring 写成 resource name，改为 route name；R32、R33 等剩下的结构化错误内部序列化、Python 错误常量与孤立的 `wrap_error`。
+4. **错误类型**（接口审查第四节）：协议批之后。一并：删除从没产生过的错误码 706 `WriteConflict`，连同 Python 的错误类、映射与相关测试（用户 2026-10-31 同意；704 是还在使用的 `RouteStale`，不动）；711 `RouteCatalogCompacted` 在协议批删掉 IPC 路由目录之后也没有生产者了（2026-11-03 核实，只剩注册表、Python 错误类、映射与 `__all__`），建议一并删除；`sdk/python/src/c_two/error.py` 里重复注册错误的 docstring 写成 resource name，改为 route name；R32、R33 等剩下的结构化错误内部序列化、Python 错误常量与孤立的 `wrap_error`。
 5. **TypeScript 与 Node：** R16 剩下的完整 Node→Core 投影迁移；解码不透明的响应 allocator。
 6. **发版工具，方案 B**（[发版敏捷性审查](2026-10-30-release-agility-review.md)第三、四节）：与产品代码无关，可以随时插入。B1 候选重整、B2 删除约 8 千行（`tools/local_rc` 与 `local-endpoint-validation.yml` 仍在）、B3 FastDB 版本只写一处、B5 精简各条线的 gate、B6 修 `PROBE_BUDGET` 的偶发失败。
 7. **路线图上的其余产品能力**（完成标准见[路线图](roadmap.zh-CN.md#产品能力)）：官方不可变的包分发、契约兼容、调用元数据与准入钩子、dry-run、async unary、遥测与背压、可发布的 TypeScript SDK、发现与命名空间治理。顺序待用户定。
-8. **下一次发版时：** 根 README、SDK README 与 `cli/README.md` 里的版本说明（IPC 14、SHM 3、ABI 6）改为 IPC 15、SHM 4、ABI 7、mesh 7。
+8. **文档里的协作流程用词**（2026-11-04 用户同意）：设计文档里用 Host、Worker、微任务、看板、委派块、任务书指协作流程，约 60 处，分布在 9 份设计文档里；仓库外的读者不知道它们指谁，Host 还与术语表里的 Host 撞名，worker 与执行 worker 撞名。改为不写角色，例如“Host 建议”只写“建议”；冻结的验收记录不改。
+9. **下一次发版时：** 根 README、SDK README 与 `cli/README.md` 里的版本说明（IPC 14、SHM 3、ABI 6）改为 IPC 15、SHM 4、ABI 7、mesh 7。
 
 各批一并删除只钉源码文本或已删名字的测试（复审第六节）；复审附录里各区未裁决的待议项，实施到对应区域时再定。[瘦身账本](2026-10-13-local-slimming-batches.md)暂缓表与条目边界表里的其余各项仍按账本写明的条件。
 

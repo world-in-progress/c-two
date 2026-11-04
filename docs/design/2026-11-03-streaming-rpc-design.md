@@ -299,7 +299,7 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 - 块 7：c2-mem-ffi 连接入口的 Rust 文档注释与 C 头文件对身份校验失败状态码的写法统一。
 - 块 8：`LocalEndpointNamespaceRequired` 的消息改为资源一方的本地端点命名空间。
 
-## 十一、与任务书不一致之处
+## 十一、与设计要求不一致之处
 
 早期八问要求关闭预算内主动结束流，现行 AGENTS/Runtime 则要求 shutdown 只停新调用。用户选定 (b)：shutdown 与注销让开着的流在步之间结束，当前步照常完成并交付，实际清理之后才报终态；预算超时仍不当作完成，也不强行中断当前步。AGENTS.md 的相应一句随块 6 改写。调研第 7 节的强停先例不足以代替这一产品裁决。
 
