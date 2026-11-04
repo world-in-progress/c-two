@@ -3151,10 +3151,12 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        assert_eq!(reg.active_count(), 1);
         // Final storage release uses its fixed owner and can finish while
         // admission is waiting for the unrelated public pool write guard.
+        // GC publishes Retired before it detaches the entry, so the count is
+        // checked only after the sweep has returned.
         assert_eq!(gc_thread.join().unwrap().expired, 1);
+        assert_eq!(reg.active_count(), 1);
         assert_eq!(reassembly_used(&budget), 64 + 1);
         drop(pool_guard);
         assert_eq!(reassembly_used(&budget), 64 + 1);
