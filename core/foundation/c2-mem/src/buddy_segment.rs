@@ -5,16 +5,23 @@
 
 use crate::alloc::BuddyAllocator;
 use crate::budget::BudgetReservation;
+use crate::segment::ChargedMapping;
 use crate::segment::ShmRegion;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+struct CacheState {
+    mapping: Option<Arc<ChargedMapping>>,
+    retain: bool,
+    idle_since: Option<Instant>,
+}
 
 /// A payload mapping, with local allocator state only in its owner process.
 pub struct BuddySegment {
-    region: ShmRegion,
+    name: String,
+    size: usize,
+    cache: Mutex<CacheState>,
     allocator: Option<BuddyAllocator>,
-    /// Owner-creation budget charge for this backing. Declared last so it is
-    /// dropped after `region` (munmap + shm_unlink), returning the charge
-    /// exactly when the backing is actually released.
-    budget_guard: Option<BudgetReservation>,
 }
 
 unsafe impl Send for BuddySegment {}
@@ -43,9 +50,17 @@ impl BuddySegment {
         let allocator = unsafe { BuddyAllocator::init(region.base_ptr(), layout, min_block) };
 
         Ok(Self {
-            region,
+            name: region.name().to_owned(),
+            size: region.size(),
+            cache: Mutex::new(CacheState {
+                mapping: Some(Arc::new(ChargedMapping {
+                    region,
+                    reservation: None,
+                })),
+                retain: true,
+                idle_since: None,
+            }),
             allocator: Some(allocator),
-            budget_guard: None,
         })
     }
 
@@ -56,9 +71,17 @@ impl BuddySegment {
         let region = ShmRegion::open(name, expected_size)?;
 
         Ok(Self {
-            region,
+            name: region.name().to_owned(),
+            size: region.size(),
+            cache: Mutex::new(CacheState {
+                mapping: Some(Arc::new(ChargedMapping {
+                    region,
+                    reservation: None,
+                })),
+                retain: true,
+                idle_since: None,
+            }),
             allocator: None,
-            budget_guard: None,
         })
     }
 
@@ -67,8 +90,83 @@ impl BuddySegment {
     /// The pool attaches this once after budgeted creation and before
     /// publishing the backing.
     pub(crate) fn with_budget_guard(mut self, guard: BudgetReservation) -> Self {
-        self.budget_guard = Some(guard);
+        Arc::get_mut(
+            self.cache
+                .get_mut()
+                .expect("buddy cache poisoned")
+                .mapping
+                .as_mut()
+                .unwrap(),
+        )
+        .expect("backing not published")
+        .reservation = Some(guard);
         self
+    }
+
+    pub(crate) fn pin(&self) -> Arc<ChargedMapping> {
+        self.try_pin().expect("live allocation pins its mapping")
+    }
+
+    pub(crate) fn try_pin(&self) -> Option<Arc<ChargedMapping>> {
+        self.cache
+            .lock()
+            .expect("buddy cache poisoned")
+            .mapping
+            .clone()
+    }
+
+    pub(crate) fn is_mapped(&self) -> bool {
+        self.cache
+            .lock()
+            .expect("buddy cache poisoned")
+            .mapping
+            .is_some()
+    }
+
+    pub(crate) fn alloc(&self, size: usize) -> Option<crate::Allocation> {
+        let mut cache = self.cache.lock().expect("buddy cache poisoned");
+        cache.mapping.as_ref()?;
+        let allocation = self.allocator().alloc(size)?;
+        cache.idle_since = None;
+        Some(allocation)
+    }
+
+    /// Release the exact local allocation after its owner's last borrow.
+    pub(crate) unsafe fn free(&self, offset: u32, level: u16) {
+        let removed = {
+            let mut cache = self.cache.lock().expect("buddy cache poisoned");
+            unsafe { self.allocator().free(offset, level) };
+            if self.allocator().alloc_count() == 0 {
+                cache.idle_since = Some(Instant::now());
+                if !cache.retain {
+                    cache.mapping.take()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        drop(removed);
+    }
+
+    pub(crate) fn set_retention(&self, retain: bool) {
+        let removed = {
+            let mut cache = self.cache.lock().expect("buddy cache poisoned");
+            cache.retain = retain;
+            if !retain && self.allocator().alloc_count() == 0 {
+                cache.mapping.take()
+            } else {
+                None
+            }
+        };
+        drop(removed);
+    }
+
+    pub(crate) fn expired(&self, now: Instant, delay: Duration) -> bool {
+        let mut cache = self.cache.lock().expect("buddy cache poisoned");
+        self.allocator().alloc_count() == 0
+            && now.duration_since(*cache.idle_since.get_or_insert(now)) >= delay
     }
 
     pub fn allocator(&self) -> &BuddyAllocator {
@@ -82,14 +180,20 @@ impl BuddySegment {
     }
 
     pub fn name(&self) -> &str {
-        self.region.name()
+        &self.name
     }
 
     pub fn size(&self) -> usize {
-        self.region.size()
+        self.size
     }
 
+    /// Raw address metadata, without mapping retention or payload access.
+    /// An owner's allocator keeps the address even after backing retirement;
+    /// safe payload access requires the allocation owner's scoped borrow.
     pub fn base_ptr(&self) -> *mut u8 {
-        self.region.base_ptr()
+        match &self.allocator {
+            Some(allocator) => allocator.data_ptr(0),
+            None => self.pin().region.base_ptr(),
+        }
     }
 }

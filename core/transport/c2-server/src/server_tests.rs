@@ -6127,7 +6127,6 @@ async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
 
     const TOTAL_CHUNKS: usize = 2;
     const CHUNK_SIZE: usize = 512;
-    let reassembly_bytes = (TOTAL_CHUNKS * (CHUNK_SIZE + std::mem::size_of::<bool>())) as u64;
     let budget = c2_mem::MemoryBudget::new(1 << 20, 1 << 20, 4096);
     let reassembly_pool = Arc::new(parking_lot::RwLock::new(
         MemPool::new_with_prefix_and_budget(
@@ -6220,8 +6219,10 @@ async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
     assert_eq!(server.chunk_admission_gate.len(), 0);
     assert_eq!(server.chunk_processing_permits.available_permits(), 4);
 
-    // Observe the two release orders while the real pool prevents backing
-    // release. Run synchronous teardown off the Tokio worker.
+    // Both terminal paths must release their fixed backing owner and route
+    // admission even while an unrelated caller holds the public pool lock.
+    // Entry-borrow/destructor ordering is exercised with barriers in c2-wire.
+    // Run synchronous teardown off the Tokio worker.
     for (request_id, rollback) in [(32, false), (33, true)] {
         let admission = reserve_accepted_route_execution(&server, &call_identity("grid"), 0)
             .await
@@ -6260,35 +6261,17 @@ async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
                 }
             })
         };
-        wait_until("assembly detached before backing release", || {
-            server.chunk_registry.active_count() == 0
-        })
-        .await;
-        assert!(!cleanup.is_finished());
-        assert_eq!(
-            budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            reassembly_bytes
-        );
-        if rollback {
-            // Registry detachment precedes the lock-free permit drop.
-            // Wait for that drop while backing release remains blocked.
-            tokio::time::timeout(Duration::from_secs(5), scheduler.wait_drained_async())
-                .await
-                .expect("rollback releases its permit before the backing");
-        }
-        match scheduler.try_acquire(0) {
-            Ok(guard) if rollback => drop(guard),
-            Err(SchedulerAcquireError::Capacity {
-                field: "max_pending",
-                limit: 1,
-            }) if !rollback => {}
-            other => panic!("unexpected capacity during rollback={rollback}: {other:?}"),
-        }
-        drop(pool_guard);
         tokio::time::timeout(Duration::from_secs(5), cleanup)
             .await
-            .expect("teardown completes after pool unlock")
+            .expect("fixed-owner teardown completes while the public pool is locked")
             .unwrap();
+        assert_eq!(pool_guard.stats().alloc_count, 0);
+        assert_eq!(server.chunk_registry.active_count(), 0);
+        assert_eq!(server.chunk_registry.total_bytes(), 0);
+        assert_eq!(server.chunk_admission_gate.len(), 0);
+        assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
+        assert!(scheduler.try_acquire(0).is_ok());
+        drop(pool_guard);
         assert_eq!(reassembly_pool.read().stats().alloc_count, 0);
         assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
         assert!(scheduler.try_acquire(0).is_ok());

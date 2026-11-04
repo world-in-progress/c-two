@@ -336,7 +336,7 @@ impl ConnectionPublisher {
         side: ConnectionSide,
     ) -> Self {
         let connection_id = NEXT_CONNECTION_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("physical connection identifiers exhausted");
         let (closed, _) = watch::channel(None);
         Self {

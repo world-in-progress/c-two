@@ -1,9 +1,9 @@
-//! Chunked payload reassembly backed by [`MemHandle`].
+//! Chunked payload reassembly in fixed local storage.
 //!
 //! Provides a single Rust implementation that writes chunks directly into a unified
-//! [`MemHandle`] (buddy SHM, dedicated SHM, or file-backed mmap). The allocated
-//! backing, its owner pool, and its reassembly budget reservation travel together
-//! in one [`ReassemblyBacking`] carrier from admission to release.
+//! [`c2_mem::OwnedAllocation`] (buddy SHM, dedicated SHM, or file-backed mmap).
+//! Its fixed mapping, release authority, and reassembly budget reservation
+//! travel together in one [`ReassemblyBacking`] carrier from admission to release.
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use parking_lot::{RwLock, RwLockWriteGuard};
 use crate::chunk::ChunkAdmissionError;
 use crate::chunk::backing::{ReassemblyBacking, checked_capacity};
 
-/// Reassembles chunked payloads into a contiguous [`MemHandle`].
+/// Reassembles chunked payloads into a contiguous owned allocation.
 ///
 /// # Lifecycle
 /// ```text
@@ -21,8 +21,8 @@ use crate::chunk::backing::{ReassemblyBacking, checked_capacity};
 /// ```
 ///
 /// Every exit path is ownership-safe: `finish()` on an incomplete assembly,
-/// `abort()`, and plain drop all release the backing storage through the pool
-/// authority and then refund the reassembly budget charge exactly once.
+/// `abort()`, and plain drop all release storage through its fixed allocation
+/// owner and then refund the reassembly budget charge exactly once.
 pub struct ChunkAssembler {
     total_chunks: usize,
     chunk_size: usize,
@@ -169,8 +169,8 @@ impl ChunkAssembler {
     /// retains its chunk flags and their charge; trimming never refunds storage.
     ///
     /// On an incomplete assembly this returns `Err`; the assembler value
-    /// drops on that return, releasing the backing storage through the pool
-    /// authority and refunding the reassembly charge exactly once.
+    /// drops on that return, releasing storage through its fixed allocation
+    /// owner and refunding the reassembly charge exactly once.
     pub fn finish(self) -> Result<ReassemblyBacking, String> {
         if !self.is_complete() {
             return Err(format!(
@@ -190,11 +190,6 @@ impl ChunkAssembler {
     /// marker for callers.
     pub fn abort(self) {
         drop(self)
-    }
-
-    /// Try to release without consuming the assembler on local pool contention.
-    pub fn try_release(&mut self) -> bool {
-        self.backing.try_release()
     }
 
     /// One past the last byte written (actual data length).
@@ -253,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn try_release_file_keeps_partial_assembly_for_retry() {
+    fn release_file_does_not_wait_for_public_pool_borrow() {
         let budget = MemoryBudget::new(0, 8192, 8194);
         let pool = Arc::new(RwLock::new(
             MemPool::new_with_prefix_and_budget(
@@ -261,35 +256,20 @@ mod tests {
                     spill_threshold: 0.0,
                     ..PoolConfig::default()
                 },
-                "assembler-try-release-file".into(),
+                "assembler-file-release".into(),
                 budget.clone(),
             )
             .unwrap(),
         ));
-        let mut asm = ChunkAssembler::new(Arc::clone(&pool), 2, 4096, 8192).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 2, 4096, 8192).unwrap();
         assert!(asm.backing.is_file_spill());
         assert!(!asm.feed_chunk(0, &[27; 4096]).unwrap());
-        {
-            let _reader = pool.read();
-            assert!(!asm.try_release());
-            assert_eq!(asm.received(), 1);
-            assert_eq!(asm.written_end(), 4096);
-            assert_eq!(asm.capacity_bytes(), 8194);
-            assert_eq!(budget.snapshot().file.used_bytes, 8192);
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
-        }
-        // Failed cleanup left data and chunk geometry intact, rather than
-        // consuming the assembler or silently refunding an unfinished owner.
-        assert!(asm.feed_chunk(1, &[38; 1024]).unwrap());
-        assert_eq!(&asm.backing.copy_bytes().unwrap()[..4096], &[27; 4096]);
-        assert_eq!(&asm.backing.copy_bytes().unwrap()[4096..5120], &[38; 1024]);
-        assert!(asm.try_release());
-        assert_eq!(asm.capacity_bytes(), 0);
+        assert_eq!(budget.snapshot().file.used_bytes, 8192);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
+        let _reader = pool.read();
+        asm.abort();
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
-        let _writer = pool.write();
-        assert!(asm.try_release());
-        drop(asm); // successful cleanup's Drop must not reacquire the pool
     }
 
     #[test]
