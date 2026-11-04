@@ -287,6 +287,8 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 | 8 relay | 3.4 末段、3.8 | c2-http 的 client、relay 与 payload；c2-ipc 的逐片响应读取入口；cli | 3、5，与块 6、7 协同 | 请求一次发完，响应逐条发送；不组成完整响应 Vec，上游响应每片先取得 B 的预约再复制；whole SHM 按片复制；取消只影响本调用；mesh 7 的消息不变；真实慢读测出预产步数的上限。 |
 | 9 交叉验收 | 第九节 | 三语言测试、CI、参考文档、验收记录 | 全部 | 同一候选在 Linux、macOS、Windows x64 与 ARM64 的 CI 全绿；直接 IPC 与 relay 矩阵通过；[闲置驱逐审查](../acceptance/2026-10-10-idle-eviction-regression-audit.md)的六道门禁在 Python、Rust SDK 与生成的 Node 客户端上补齐，包括持久直连、relay-local 与 HTTP 全链和真实断流；配对基准对照实施前的 main，过第十二节第 7 项的门槛。 |
 
+块 5 分两步实施（2026-11-05 补记）。生成的 TypeScript 客户端内嵌自己的 IPC 编解码（`core/foundation/c2-codegen/assets/typescript_transport.ts:1106` 的握手版本仍是 15），只改 Rust 一侧会让 Node 在块 7 合入之前连不上，违反上面每块合入时可发布的要求。5a 定下七种记录的字节布局，实现 OPEN、CALL_END 与 RELEASE、写端分配请求号、高水位、准入拒绝报派发前，以及块 5 的顺带项，把 Rust 与生成的 TypeScript 传输一起切到 IPC 16；TypeScript 保留现有的 callChain 与逐调用读取，由块 7 替换。写入范围在原表之外加上 c2-http 里 relay 对 IPC 准入错误的映射，以及 c2-codegen 的 TypeScript 传输及其测试。5b 实现 ITEM_BEGIN、ITEM_DATA、CREDIT、CANCEL 与 `CallCancelled=718`，用 Rust 测试回调跑通服务端流的建立、按步推进、需求、取消与终态，写入范围同原表。
+
 关键路径为块 1、3 → 4 → 5 → 6、7 → 8 → 9，块 1、2、3 可以同时开始。第一阶段是块 1 至 4，仍为 IPC 15，对外只有两项设置改名；第二阶段是块 5 至 8，IPC 16 与 ABI 8 同批切换；第三阶段是块 9。每个阶段结束时，整合分支跑一次全平台 CI。块 6 与块 7 都改 `c2-codegen/src/targets.rs`，各自只动本目标的生成函数，共用的方法遍历与 mode 处理由块 2 定下。
 
 顺带做掉同一块里的小待办：
