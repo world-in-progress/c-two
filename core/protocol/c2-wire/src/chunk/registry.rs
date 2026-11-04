@@ -36,8 +36,10 @@ pub struct GcStats {
 }
 
 #[repr(u8)]
+#[derive(Clone, Copy)]
 enum StorageState {
     Pending,
+    Reserved,
     Assembling,
     Retired,
 }
@@ -48,6 +50,7 @@ struct RequestState {
     // Storage admission ends at take, GC, abort or settlement. Frame tokens
     // retain this exact fact even after removal from the shard.
     storage: AtomicU8,
+    waiters: Mutex<Vec<(Arc<()>, std::task::Waker)>>,
 }
 
 impl Default for RequestState {
@@ -56,22 +59,92 @@ impl Default for RequestState {
             settled: AtomicBool::new(false),
             last_received: AtomicBool::new(false),
             storage: AtomicU8::new(StorageState::Pending as u8),
+            waiters: Mutex::new(Vec::new()),
         }
     }
 }
 
 /// One request's shared error-reply claim. Dispatched frames retain this exact
 /// claim even after its last frame removes the registry entry.
-pub struct ChunkRequest {
+pub struct ChunkRequest<C = ()> {
     conn_id: u64,
     request_id: u64,
     state: Arc<RequestState>,
+    entry: Arc<TrackedRequest<C>>,
 }
 
-impl ChunkRequest {
+impl<C> Clone for ChunkRequest<C> {
+    fn clone(&self) -> Self {
+        Self {
+            conn_id: self.conn_id,
+            request_id: self.request_id,
+            state: self.state.clone(),
+            entry: self.entry.clone(),
+        }
+    }
+}
+
+impl<C> ChunkRequest<C> {
     pub fn is_settled(&self) -> bool {
         self.state.settled.load(Ordering::Acquire)
     }
+
+    /// Wait only for this call's storage publication, using its actual progress.
+    /// Unknown continuations have no reservation to wait for.
+    pub async fn wait_ready(&self) -> bool {
+        let waiter = ReadyWaiter {
+            state: self.state.clone(),
+            key: Arc::new(()),
+        };
+        std::future::poll_fn(|cx| {
+            let mut waiters = waiter.state.waiters.lock();
+            match waiter.state.storage.load(Ordering::Acquire) {
+                state if state == StorageState::Assembling as u8 => std::task::Poll::Ready(true),
+                state if state == StorageState::Reserved as u8 => {
+                    if let Some((_, waker)) = waiters
+                        .iter_mut()
+                        .find(|(key, _)| Arc::ptr_eq(key, &waiter.key))
+                    {
+                        waker.clone_from(cx.waker());
+                    } else {
+                        waiters.push((waiter.key.clone(), cx.waker().clone()));
+                    }
+                    std::task::Poll::Pending
+                }
+                _ => std::task::Poll::Ready(false),
+            }
+        })
+        .await
+    }
+}
+
+impl RequestState {
+    fn notify_ready(&self) {
+        let waiters = std::mem::take(&mut *self.waiters.lock());
+        for (_, waker) in waiters {
+            waker.wake();
+        }
+    }
+}
+
+struct ReadyWaiter {
+    state: Arc<RequestState>,
+    key: Arc<()>,
+}
+
+impl Drop for ReadyWaiter {
+    fn drop(&mut self) {
+        self.state
+            .waiters
+            .lock()
+            .retain(|(key, _)| !Arc::ptr_eq(key, &self.key));
+    }
+}
+
+#[derive(Default)]
+struct RegistryAccounting {
+    active_count: AtomicUsize,
+    total_bytes: AtomicU64,
 }
 
 struct RequestContents<C> {
@@ -80,6 +153,22 @@ struct RequestContents<C> {
     context: Option<C>,
     last_activity: Instant,
     total_bytes: u64,
+    accounting: Arc<RegistryAccounting>,
+}
+
+// The last real call owner may outlive its shard entry during a copy.
+// Storage is destroyed before the admission token and the call slot.
+impl<C> Drop for RequestContents<C> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            self.accounting.active_count.fetch_sub(1, Ordering::Relaxed);
+            self.accounting
+                .total_bytes
+                .fetch_sub(self.total_bytes, Ordering::Relaxed);
+            drop(inner);
+        }
+        drop(self.context.take());
+    }
 }
 
 /// The shard owns a reference to this entry, never its payload borrow. All
@@ -90,13 +179,14 @@ struct TrackedRequest<C> {
 }
 
 impl<C> TrackedRequest<C> {
-    fn pending() -> Self {
+    fn pending(accounting: Arc<RegistryAccounting>) -> Self {
         Self {
             contents: Mutex::new(RequestContents {
                 inner: None,
                 context: None,
                 last_activity: Instant::now(),
                 total_bytes: 0,
+                accounting,
             }),
             request: Arc::new(RequestState::default()),
         }
@@ -114,8 +204,7 @@ pub struct ChunkRegistry<C> {
     shards: [Shard<C>; SHARD_COUNT],
     pool: Arc<RwLock<MemPool>>,
     config: ChunkConfig,
-    active_count: AtomicUsize,
-    total_bytes: AtomicU64,
+    accounting: Arc<RegistryAccounting>,
     // A sweep without skipped borrows proves no entry expires before this time.
     gc_not_before: Mutex<Option<Instant>>,
     #[cfg(test)]
@@ -131,8 +220,7 @@ impl<C> ChunkRegistry<C> {
             shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             pool,
             config,
-            active_count: AtomicUsize::new(0),
-            total_bytes: AtomicU64::new(0),
+            accounting: Arc::new(RegistryAccounting::default()),
             gc_not_before: Mutex::new(None),
             #[cfg(test)]
             admission_probe: Mutex::new(None),
@@ -156,7 +244,7 @@ impl<C> ChunkRegistry<C> {
         &self,
         conn_id: u64,
         request_id: u64,
-        request: Option<&ChunkRequest>,
+        request: Option<&ChunkRequest<C>>,
     ) -> Option<Arc<TrackedRequest<C>>> {
         let mut shard = self.shard(conn_id).lock();
         if let Some(request) = request {
@@ -175,7 +263,7 @@ impl<C> ChunkRegistry<C> {
             Some(
                 shard
                     .entry((conn_id, request_id))
-                    .or_insert_with(|| Arc::new(TrackedRequest::pending()))
+                    .or_insert_with(|| Arc::new(TrackedRequest::pending(self.accounting.clone())))
                     .clone(),
             )
         }
@@ -219,20 +307,22 @@ impl<C> ChunkRegistry<C> {
         let context = contents.context.take();
         let bytes = std::mem::take(&mut contents.total_bytes);
         if inner.is_some() {
-            self.active_count.fetch_sub(1, Ordering::Relaxed);
-            self.total_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            self.accounting.active_count.fetch_sub(1, Ordering::Relaxed);
+            self.accounting
+                .total_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
         }
         (inner, context, bytes)
     }
 
     /// Number of in-flight assemblies, excluding transferred finished owners.
     pub fn active_count(&self) -> usize {
-        self.active_count.load(Ordering::Relaxed)
+        self.accounting.active_count.load(Ordering::Relaxed)
     }
     /// Payload and tracking capacity currently owned by registry entries.
     /// Finished backing reservations remain charged independently.
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes.load(Ordering::Relaxed)
+        self.accounting.total_bytes.load(Ordering::Relaxed)
     }
     /// Borrow the chunk configuration.
     pub fn config(&self) -> &ChunkConfig {
@@ -250,14 +340,22 @@ impl<C> ChunkRegistry<C> {
         })
     }
 
+    /// An admission token exists before allocation and remains authoritative
+    /// while its call drains after connection deactivation.
+    pub fn has_admission(&self, conn_id: u64, request_id: u64) -> bool {
+        self.lookup(conn_id, request_id).is_some_and(|entry| {
+            matches!(entry.request.storage.load(Ordering::Acquire), state if state == StorageState::Reserved as u8 || state == StorageState::Assembling as u8)
+        })
+    }
+
     /// Observe a frame before dispatch. A last settled frame retires only its
     /// marker; already dispatched tasks retain the same error-reply claim.
-    pub fn begin_frame(&self, conn_id: u64, request_id: u64, last: bool) -> ChunkRequest {
+    pub fn begin_frame(&self, conn_id: u64, request_id: u64, last: bool) -> ChunkRequest<C> {
         let (entry, request) = {
             let mut shard = self.shard(conn_id).lock();
             let entry = shard
                 .entry((conn_id, request_id))
-                .or_insert_with(|| Arc::new(TrackedRequest::pending()))
+                .or_insert_with(|| Arc::new(TrackedRequest::pending(self.accounting.clone())))
                 .clone();
             if last {
                 entry.request.last_received.store(true, Ordering::Release);
@@ -266,6 +364,7 @@ impl<C> ChunkRegistry<C> {
                 conn_id,
                 request_id,
                 state: entry.request.clone(),
+                entry: entry.clone(),
             };
             (entry, request)
         };
@@ -280,46 +379,114 @@ impl<C> ChunkRegistry<C> {
             .is_some_and(|entry| entry.request.settled.load(Ordering::Acquire))
     }
 
-    /// Claim this exact request's one error reply, then retire its storage.
-    /// The fence is acquired under the shard, but payload borrows and backing
-    /// or context destruction always finish outside that shard.
-    pub fn settle<F>(&self, request: &ChunkRequest, fence: impl FnOnce() -> F) -> bool {
-        let entry = self
-            .lookup(request.conn_id, request.request_id)
-            .filter(|entry| Arc::ptr_eq(&entry.request, &request.state));
-        // Taking the entry borrow before the shard makes storage terminal
-        // transitions serialize with feed, take and GC without blocking a shard.
-        let mut contents = entry.as_ref().map(|entry| entry.contents.lock());
-        let fence = {
-            let _shard = self.shard(request.conn_id).lock();
-            if request
-                .state
-                .settled
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return false;
-            }
-            fence()
-        };
+    /// Claim this call's one error reply without waiting for allocation/copy.
+    /// Active tasks keep the original record's storage and admission alive.
+    pub fn settle(&self, request: &ChunkRequest<C>) -> bool {
+        if request
+            .state
+            .settled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.retire_request(request, true);
+        true
+    }
+
+    fn retire_request(&self, request: &ChunkRequest<C>, keep_marker: bool) {
         request
             .state
             .storage
             .store(StorageState::Retired as u8, Ordering::Release);
-        let removed = contents.as_mut().map(|contents| {
-            let removed = self.detach(contents);
-            contents.last_activity = Instant::now();
-            removed
-        });
-        if request.state.last_received.load(Ordering::Acquire) {
-            if let Some(entry) = &entry {
-                self.remove((request.conn_id, request.request_id), entry);
+        request.state.notify_ready();
+        let removed = {
+            let mut shard = self.shard(request.conn_id).lock();
+            let key = (request.conn_id, request.request_id);
+            if shard
+                .get(&key)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.request, &request.state))
+            {
+                if keep_marker && !request.state.last_received.load(Ordering::Acquire) {
+                    let mut marker = TrackedRequest::pending(self.accounting.clone());
+                    marker.request = request.state.clone();
+                    shard.insert(key, Arc::new(marker))
+                } else {
+                    shard.remove(&key)
+                }
+            } else {
+                None
             }
-        }
-        drop(contents);
+        };
         drop(removed);
-        drop(fence);
-        true
+        // A busy borrow observes Retired before leaving and releases the same
+        // contents outside its lock. No reader waits behind payload work.
+        let detached = request
+            .entry
+            .contents
+            .try_lock()
+            .map(|mut contents| self.detach(&mut contents));
+        drop(detached);
+    }
+
+    /// Publish the call's admission token before submitting allocation/copy.
+    /// Only the first frame can change Pending to Reserved.
+    pub fn prepare_request(
+        &self,
+        request: &ChunkRequest<C>,
+        context: C,
+    ) -> Result<(), (ChunkAdmissionError, C)> {
+        if request
+            .state
+            .storage
+            .compare_exchange(
+                StorageState::Pending as u8,
+                StorageState::Reserved as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err((
+                ChunkAdmissionError::Duplicate {
+                    conn_id: request.conn_id,
+                    request_id: request.request_id,
+                },
+                context,
+            ));
+        }
+        // Reserved cannot yet have an allocator or a payload borrow.
+        let mut contents = request.entry.contents.lock();
+        if request.state.storage.load(Ordering::Acquire) != StorageState::Reserved as u8 {
+            return Err((
+                ChunkAdmissionError::Duplicate {
+                    conn_id: request.conn_id,
+                    request_id: request.request_id,
+                },
+                context,
+            ));
+        }
+        contents.context = Some(context);
+        contents.last_activity = Instant::now();
+        Ok(())
+    }
+
+    /// Allocate only for this already-published call record.
+    pub fn allocate_request(
+        &self,
+        request: &ChunkRequest<C>,
+        total_chunks: usize,
+        chunk_size: usize,
+    ) -> Result<(), ChunkAdmissionError> {
+        self.insert_tracked(
+            request.conn_id,
+            request.request_id,
+            Some(request),
+            total_chunks,
+            chunk_size,
+            None,
+        )
+        .map_err(|(error, _)| error)
     }
 
     /// Admit storage and its context together. Geometry and the per-message
@@ -333,13 +500,21 @@ impl<C> ChunkRegistry<C> {
         chunk_size: usize,
         context: C,
     ) -> Result<(), (ChunkAdmissionError, C)> {
-        self.insert_tracked(conn_id, request_id, None, total_chunks, chunk_size, context)
+        self.insert_tracked(
+            conn_id,
+            request_id,
+            None,
+            total_chunks,
+            chunk_size,
+            Some(context),
+        )
+        .map_err(|(error, context)| (error, context.unwrap()))
     }
 
     /// Admit only through this frame's original, still-active request state.
     pub fn insert_request(
         &self,
-        request: &ChunkRequest,
+        request: &ChunkRequest<C>,
         total_chunks: usize,
         chunk_size: usize,
         context: C,
@@ -350,19 +525,25 @@ impl<C> ChunkRegistry<C> {
             Some(request),
             total_chunks,
             chunk_size,
-            context,
+            Some(context),
         )
+        .map_err(|(error, context)| (error, context.unwrap()))
     }
 
     fn insert_tracked(
         &self,
         conn_id: u64,
         request_id: u64,
-        request: Option<&ChunkRequest>,
+        request: Option<&ChunkRequest<C>>,
         total_chunks: usize,
         chunk_size: usize,
-        context: C,
-    ) -> Result<(), (ChunkAdmissionError, C)> {
+        mut context: Option<C>,
+    ) -> Result<(), (ChunkAdmissionError, Option<C>)> {
+        let expected = if context.is_some() {
+            StorageState::Pending
+        } else {
+            StorageState::Reserved
+        };
         if self.active_count() >= self.config.soft_limit as usize
             || self.total_bytes() >= self.config.max_reassembly_bytes
         {
@@ -377,6 +558,7 @@ impl<C> ChunkRegistry<C> {
                 );
             }
         }
+        let mut geometry = None;
         loop {
             let Some(entry) = self.admission_entry(conn_id, request_id, request) else {
                 return Err((
@@ -389,7 +571,7 @@ impl<C> ChunkRegistry<C> {
             };
             let mut contents = entry.contents.lock();
             if entry.request.settled.load(Ordering::Acquire)
-                || entry.request.storage.load(Ordering::Acquire) != StorageState::Pending as u8
+                || entry.request.storage.load(Ordering::Acquire) != expected as u8
             {
                 return Err((
                     ChunkAdmissionError::Duplicate {
@@ -403,17 +585,21 @@ impl<C> ChunkRegistry<C> {
             if let Some(probe) = self.admission_probe.lock().clone() {
                 probe();
             }
-            let geometry = match ChunkAssembler::check_geometry(
-                total_chunks,
-                chunk_size,
-                self.config.max_reassembly_bytes,
-            ) {
-                Ok(geometry) => geometry,
-                Err(error) => {
-                    self.remove_if_unobserved((conn_id, request_id), &entry);
-                    return Err((error, context));
-                }
-            };
+            if geometry.is_none() {
+                geometry = Some(
+                    match ChunkAssembler::check_geometry(
+                        total_chunks,
+                        chunk_size,
+                        self.config.max_reassembly_bytes,
+                    ) {
+                        Ok(geometry) => geometry,
+                        Err(error) => {
+                            self.remove_if_unobserved((conn_id, request_id), &entry);
+                            return Err((error, context));
+                        }
+                    },
+                );
+            }
             let Some(pool_guard) = self.pool.try_write() else {
                 drop(contents);
                 #[cfg(test)]
@@ -428,7 +614,7 @@ impl<C> ChunkRegistry<C> {
             let assembler = match ChunkAssembler::new_with_guard(
                 Arc::clone(&self.pool),
                 pool_guard,
-                geometry,
+                geometry.take().expect("geometry checked at admission"),
             ) {
                 Ok(assembler) => assembler,
                 Err(error) => {
@@ -438,15 +624,56 @@ impl<C> ChunkRegistry<C> {
             };
             let bytes = assembler.capacity_bytes();
             contents.inner = Some(assembler);
-            contents.context = Some(context);
             contents.total_bytes = bytes;
             contents.last_activity = Instant::now();
-            self.active_count.fetch_add(1, Ordering::Relaxed);
-            self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
-            entry
+            self.accounting.active_count.fetch_add(1, Ordering::Relaxed);
+            self.accounting
+                .total_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            if entry
                 .request
                 .storage
-                .store(StorageState::Assembling as u8, Ordering::Release);
+                .compare_exchange(
+                    expected as u8,
+                    StorageState::Assembling as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                let removed = self.detach(&mut contents);
+                drop(contents);
+                drop(removed);
+                return Err((
+                    ChunkAdmissionError::Duplicate {
+                        conn_id,
+                        request_id,
+                    },
+                    context,
+                ));
+            }
+            if let Some(context) = context.take() {
+                contents.context = Some(context);
+            }
+            if entry.request.storage.load(Ordering::Acquire) == StorageState::Retired as u8 {
+                let (inner, returned_context, _) = self.detach(&mut contents);
+                drop(contents);
+                drop(inner);
+                return Err((
+                    ChunkAdmissionError::Duplicate {
+                        conn_id,
+                        request_id,
+                    },
+                    if matches!(expected, StorageState::Reserved) {
+                        drop(returned_context);
+                        None
+                    } else {
+                        returned_context
+                    },
+                ));
+            }
+            drop(contents);
+            entry.request.notify_ready();
             return Ok(());
         }
     }
@@ -464,20 +691,68 @@ impl<C> ChunkRegistry<C> {
         })
     }
 
+    /// Borrow the original call's reassembly while obtaining/copying a frame's
+    /// source data. Terminal cleanup keeps both storage and admission through
+    /// this real read interval and destroys them after leaving the borrow.
+    pub fn with_request<R>(
+        &self,
+        request: &ChunkRequest<C>,
+        f: impl FnOnce(&mut ChunkAssembler) -> R,
+    ) -> Result<R, String> {
+        self.with_entry(
+            &request.entry,
+            request.conn_id,
+            request.request_id,
+            |inner| Ok(f(inner)),
+        )
+    }
+
+    pub fn feed_request(
+        &self,
+        request: &ChunkRequest<C>,
+        chunk_idx: usize,
+        data: &[u8],
+    ) -> Result<bool, String> {
+        self.with_entry(
+            &request.entry,
+            request.conn_id,
+            request.request_id,
+            |inner| inner.feed_chunk(chunk_idx, data),
+        )
+    }
+
     fn with_assembly<R>(
         &self,
         conn_id: u64,
         request_id: u64,
         f: impl FnOnce(&mut ChunkAssembler) -> Result<R, String>,
     ) -> Result<R, String> {
+        let entry = self
+            .lookup(conn_id, request_id)
+            .ok_or_else(|| format!("no assembly for ({conn_id}, {request_id})"))?;
+        self.with_entry(&entry, conn_id, request_id, f)
+    }
+
+    fn with_entry<R>(
+        &self,
+        entry: &Arc<TrackedRequest<C>>,
+        conn_id: u64,
+        request_id: u64,
+        f: impl FnOnce(&mut ChunkAssembler) -> Result<R, String>,
+    ) -> Result<R, String> {
         let missing = || format!("no assembly for ({conn_id}, {request_id})");
-        let entry = self.lookup(conn_id, request_id).ok_or_else(missing)?;
         let mut contents = entry.contents.lock();
-        if entry.request.settled.load(Ordering::Acquire) {
+        if entry.request.storage.load(Ordering::Acquire) != StorageState::Assembling as u8 {
             return Err(missing());
         }
         let result = f(contents.inner.as_mut().ok_or_else(missing)?);
         contents.last_activity = Instant::now();
+        if entry.request.storage.load(Ordering::Acquire) == StorageState::Retired as u8 {
+            let removed = self.detach(&mut contents);
+            drop(contents);
+            drop(removed);
+            return Err(missing());
+        }
         result
     }
 
@@ -486,34 +761,67 @@ impl<C> ChunkRegistry<C> {
     pub fn take(&self, conn_id: u64, request_id: u64) -> Result<(ChunkAssembler, C), String> {
         let missing = || format!("no assembly for ({conn_id}, {request_id})");
         let entry = self.lookup(conn_id, request_id).ok_or_else(missing)?;
+        self.take_entry(&entry, conn_id, request_id, false)
+    }
+
+    pub fn take_request(&self, request: &ChunkRequest<C>) -> Result<(ChunkAssembler, C), String> {
+        self.take_entry(&request.entry, request.conn_id, request.request_id, true)
+    }
+
+    fn take_entry(
+        &self,
+        entry: &Arc<TrackedRequest<C>>,
+        conn_id: u64,
+        request_id: u64,
+        claim_reply: bool,
+    ) -> Result<(ChunkAssembler, C), String> {
+        let missing = || format!("no assembly for ({conn_id}, {request_id})");
         let mut contents = entry.contents.lock();
-        if contents.inner.is_none() || entry.request.settled.load(Ordering::Acquire) {
+        if contents.inner.is_none()
+            || entry.request.storage.load(Ordering::Acquire) != StorageState::Assembling as u8
+            || entry.request.settled.load(Ordering::Acquire)
+        {
             return Err(missing());
         }
-        entry
+        if claim_reply
+            && entry
+                .request
+                .settled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(missing());
+        }
+        if entry
             .request
             .storage
-            .store(StorageState::Retired as u8, Ordering::Release);
+            .compare_exchange(
+                StorageState::Assembling as u8,
+                StorageState::Retired as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(missing());
+        }
+        entry.request.notify_ready();
         let (inner, context, _) = self.detach(&mut contents);
         self.remove((conn_id, request_id), &entry);
         drop(contents);
         Ok((inner.unwrap(), context.unwrap()))
     }
 
-    /// Retire one entry, releasing backing before its context outside locks.
+    /// Retire this exact key; existing copy tasks retain its original owners.
     pub fn abort(&self, conn_id: u64, request_id: u64) {
         if let Some(entry) = self.lookup(conn_id, request_id) {
-            let removed = {
-                let mut contents = entry.contents.lock();
-                entry
-                    .request
-                    .storage
-                    .store(StorageState::Retired as u8, Ordering::Release);
-                let removed = self.detach(&mut contents);
-                self.remove((conn_id, request_id), &entry);
-                removed
+            let request = ChunkRequest {
+                conn_id,
+                request_id,
+                state: entry.request.clone(),
+                entry,
             };
-            drop(removed);
+            self.retire_request(&request, false);
         }
     }
 
@@ -546,6 +854,7 @@ impl<C> ChunkRegistry<C> {
                         .request
                         .storage
                         .store(StorageState::Retired as u8, Ordering::Release);
+                    entry.request.notify_ready();
                     let removed = self.detach(&mut contents);
                     if removed.0.is_some() {
                         stats.expired += 1;
@@ -568,7 +877,7 @@ impl<C> ChunkRegistry<C> {
         stats
     }
 
-    /// Retire this connection's entries without touching other connections.
+    /// Connection cancellation uses each original call's terminal claim.
     pub fn cleanup_connection(&self, conn_id: u64) {
         let entries: Vec<_> = self
             .shard(conn_id)
@@ -577,18 +886,15 @@ impl<C> ChunkRegistry<C> {
             .filter(|(key, _)| key.0 == conn_id)
             .map(|(key, entry)| (*key, entry.clone()))
             .collect();
-        for (key, entry) in entries {
-            let removed = {
-                let mut contents = entry.contents.lock();
-                entry
-                    .request
-                    .storage
-                    .store(StorageState::Retired as u8, Ordering::Release);
-                let removed = self.detach(&mut contents);
-                self.remove(key, &entry);
-                removed
+        for ((_, request_id), entry) in entries {
+            let request = ChunkRequest {
+                conn_id,
+                request_id,
+                state: entry.request.clone(),
+                entry,
             };
-            drop(removed);
+            request.state.settled.store(true, Ordering::Release);
+            self.retire_request(&request, false);
         }
     }
 
@@ -692,6 +998,7 @@ impl<C> ChunkRegistry<C> {
                 .request
                 .storage
                 .store(StorageState::Retired as u8, Ordering::Release);
+            entry.request.notify_ready();
             let removed = self.detach(&mut contents);
             if removed.0.is_some() {
                 stats.expired += 1;
@@ -809,6 +1116,162 @@ mod tests {
     }
 
     #[test]
+    fn call_record_readiness_uses_publication_and_cancellation_notifications() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for retire in [false, true] {
+            let (pool, _) = budgeted_pool(4096);
+            let registry = ChunkRegistry::new(pool, ChunkConfig::default());
+            let request = registry.begin_frame(1, 11, false);
+            registry.prepare_request(&request, ()).unwrap();
+            let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
+            let waker = Waker::from(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut cancelled = Box::pin(request.wait_ready());
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(request.state.waiters.lock().len(), 1);
+            drop(cancelled);
+            assert!(request.state.waiters.lock().is_empty());
+            let mut waiting = Box::pin(request.wait_ready());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            if retire {
+                registry.cleanup_connection(1);
+            } else {
+                registry.allocate_request(&request, 2, 64).unwrap();
+            }
+            assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+            assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(!retire));
+            // Publication before the first poll is observed without another wake.
+            let mut late_waiter = Box::pin(request.wait_ready());
+            assert_eq!(late_waiter.as_mut().poll(&mut cx), Poll::Ready(!retire));
+            assert!(request.state.waiters.lock().is_empty());
+        }
+    }
+
+    #[test]
+    fn old_call_tasks_cannot_feed_take_or_settle_a_reused_key() {
+        for dispatched in [false, true] {
+            let (pool, budget) = budgeted_pool(4096);
+            let registry = ChunkRegistry::new(pool, ChunkConfig::default());
+            let old = registry.begin_frame(1, 11, true);
+            registry.prepare_request(&old, 41).unwrap();
+            registry.allocate_request(&old, 1, 64).unwrap();
+            assert!(registry.feed_request(&old, 0, &[7; 64]).unwrap());
+            let completed = if dispatched {
+                Some(registry.take_request(&old).unwrap())
+            } else {
+                registry.abort(1, 11);
+                None
+            };
+            let current = registry.begin_frame(1, 11, true);
+            registry.prepare_request(&current, 42).unwrap();
+            registry.allocate_request(&current, 1, 32).unwrap();
+            assert_eq!(registry.settle(&old), !dispatched);
+            assert!(!registry.settle(&old));
+            assert!(registry.feed_request(&old, 0, &[9; 32]).is_err());
+            assert!(registry.take_request(&old).is_err());
+            assert!(registry.has_admission(1, 11));
+            assert!(registry.feed_request(&current, 0, &[5; 32]).unwrap());
+            let (assembly, admission) = registry.take_request(&current).unwrap();
+            assert_eq!(admission, 42);
+            assert_eq!(assembly.finish().unwrap().copy_bytes().unwrap(), &[5; 32]);
+            drop(completed);
+            assert_eq!(reassembly_used(&budget), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_refusals_claim_one_terminal_reply_and_release_one_admission() {
+        let (pool, budget) = budgeted_pool(4096);
+        let registry = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
+        let request = registry.begin_frame(1, 11, false);
+        let admission = Arc::new(());
+        registry
+            .prepare_request(&request, admission.clone())
+            .unwrap();
+        registry.allocate_request(&request, 1, 64).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let mut competitors = Vec::new();
+        for _ in 0..8 {
+            let registry = registry.clone();
+            let request = request.clone();
+            let start = start.clone();
+            competitors.push(thread::spawn(move || {
+                start.wait();
+                registry.settle(&request)
+            }));
+        }
+        start.wait();
+        let winners = competitors
+            .into_iter()
+            .map(|task| usize::from(task.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+        assert_eq!(Arc::strong_count(&admission), 1);
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(registry.active_count(), 0);
+        assert!(!registry.settle(&request));
+    }
+
+    #[test]
+    fn settlement_during_copy_retains_only_the_original_call_owners() {
+        struct CallSlot(Arc<AtomicUsize>);
+        impl Drop for CallSlot {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let (pool, budget) = budgeted_pool(4096);
+        let registry = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
+        let slots = Arc::new(AtomicUsize::new(2));
+        let request = registry.begin_frame(1, 11, true);
+        registry
+            .insert_request(&request, 1, 64, CallSlot(slots.clone()))
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let copying = registry.clone();
+        let copy_entered = entered.clone();
+        let copy_resume = resume.clone();
+        let worker = thread::spawn(move || {
+            copying.with_assembly(1, 11, |assembly| {
+                copy_entered.wait();
+                copy_resume.wait();
+                assembly.feed_chunk(0, &[7; 64])
+            })
+        });
+        entered.wait();
+        let settling = registry.clone();
+        let (done, observed) = std::sync::mpsc::channel();
+        let terminal = thread::spawn(move || {
+            assert!(settling.settle(&request));
+            done.send(()).unwrap();
+        });
+        let progressed = observed.recv_timeout(Duration::from_secs(2));
+        assert_eq!(reassembly_used(&budget), 65);
+        assert_eq!(slots.load(Ordering::SeqCst), 2);
+        resume.wait();
+        let _ = worker.join().unwrap();
+        terminal.join().unwrap();
+        progressed.expect("reader settlement waited for the payload copy");
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(slots.load(Ordering::SeqCst), 1);
+        registry
+            .insert(1, 11, 1, 32, CallSlot(slots.clone()))
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+        assert_eq!(slots.load(Ordering::SeqCst), 1);
+        assert_eq!(reassembly_used(&budget), 33);
+        registry.abort(1, 11);
+        assert_eq!(slots.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn failed_admission_retains_only_existing_frame_tokens() {
         for (reassembly_limit, file_limit) in [(0, 4096), (1024, 0)] {
             let (reg, pool, budget) = typed_file_registry(reassembly_limit, file_limit);
@@ -828,8 +1291,8 @@ mod tests {
             assert!(reg.insert_request(&request, 2, 64, ()).is_err());
             let continuation = reg.begin_frame(1, 99, true);
             assert!(Arc::ptr_eq(&request.state, &continuation.state));
-            assert!(reg.settle(&request, || ()));
-            assert!(!reg.settle(&continuation, || ()));
+            assert!(reg.settle(&request));
+            assert!(!reg.settle(&continuation));
             assert!(reg.shard(1).lock().is_empty());
             assert_eq!(reg.active_count(), 0);
             assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
@@ -856,7 +1319,7 @@ mod tests {
             entered.wait();
             if settled {
                 let last = reg.begin_frame(1, 11, true);
-                assert!(reg.settle(&last, || ()));
+                assert!(reg.settle(&last));
             } else {
                 reg.abort(1, 11);
             }
@@ -991,7 +1454,7 @@ mod tests {
                 let request = advancing.begin_frame(1, 22, true);
                 advancing.insert_request(&request, 1, 4096, ()).unwrap();
                 advancing.feed(1, 22, 0, &[0x22; 4096]).unwrap();
-                assert!(advancing.settle(&request, || ()));
+                assert!(advancing.settle(&request));
                 assert!(advancing.try_abort(1, 22));
                 done.send(()).unwrap();
             });
@@ -1095,7 +1558,7 @@ mod tests {
                         }
                         "take" => Some(terminal.take(1, 11).unwrap()),
                         "settle" => {
-                            assert!(terminal.settle(&request, || ()));
+                            assert!(terminal.settle(&request));
                             None
                         }
                         "abort" => {
@@ -1111,7 +1574,7 @@ mod tests {
                     done.send(taken).unwrap();
                 });
                 terminal_started.wait();
-                let before_resume = observed.recv_timeout(if action == "gc" {
+                let before_resume = observed.recv_timeout(if action != "take" {
                     Duration::from_secs(2)
                 } else {
                     Duration::ZERO
@@ -1121,7 +1584,7 @@ mod tests {
                 let checking = reg.clone();
                 let progress = thread::spawn(move || {
                     let other = checking.begin_frame(1, 33, true);
-                    assert!(checking.settle(&other, || ()));
+                    assert!(checking.settle(&other));
                     progressed.send(()).unwrap();
                 });
                 let advanced = progress_observed.recv_timeout(Duration::from_secs(2));
@@ -1133,10 +1596,18 @@ mod tests {
                 resume.wait();
                 progress.join().unwrap();
                 advanced.expect("a terminal path retained the shard while waiting for a copy");
-                assert!(worker.join().unwrap().unwrap());
+                let copied = worker.join().unwrap();
+                if matches!(action, "gc" | "take") {
+                    assert!(copied.unwrap());
+                } else {
+                    assert!(
+                        copied.is_err(),
+                        "retired copy must not gain dispatch authority"
+                    );
+                }
                 terminating.join().unwrap();
-                let taken = if action == "gc" {
-                    before_resume.expect("GC waited for a payload borrow")
+                let taken = if action != "take" {
+                    before_resume.expect("retirement waited for a payload borrow")
                 } else {
                     assert!(matches!(
                         before_resume,
@@ -1180,7 +1651,7 @@ mod tests {
         let competing = reg.begin_frame(1, 7, false);
         reg.insert(1, 7, 2, 32, ()).unwrap();
         assert!(reassembly_used(&budget) > 0);
-        assert!(reg.settle(&first, || ()));
+        assert!(reg.settle(&first));
         assert_eq!(reassembly_used(&budget), 0);
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
@@ -1188,7 +1659,7 @@ mod tests {
         assert!(reg.begin_frame(1, 7, true).is_settled());
         assert!(!reg.shard(1).lock().contains_key(&(1, 7)));
         assert!(
-            !reg.settle(&competing, || ()),
+            !reg.settle(&competing),
             "a delayed task cannot reply again after last-frame cleanup"
         );
     }
@@ -1206,7 +1677,7 @@ mod tests {
             );
             for id in 1..=100 {
                 let request = reg.begin_frame(1, id, false);
-                assert!(reg.settle(&request, || ()));
+                assert!(reg.settle(&request));
             }
             assert_eq!(reassembly_used(&budget), 0);
             assert_eq!(reg.active_count(), 0);
@@ -1252,11 +1723,11 @@ mod tests {
         assert_eq!(reassembly_used(&budget), 0);
         let late = reg.begin_frame(1, 9, false);
         assert!(Arc::ptr_eq(&queued.state, &late.state));
-        assert!(reg.settle(&queued, || ()));
-        assert!(!reg.settle(&late, || ()));
+        assert!(reg.settle(&queued));
+        assert!(!reg.settle(&late));
         reg.cleanup_connection(1);
         assert!(reg.shard(1).lock().is_empty());
-        assert!(!reg.settle(&queued, || ()));
+        assert!(!reg.settle(&queued));
     }
 
     #[test]

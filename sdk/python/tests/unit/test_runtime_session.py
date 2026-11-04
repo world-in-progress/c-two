@@ -135,7 +135,7 @@ def test_native_runtime_session_projects_ipc_overrides_copy(side: str) -> None:
         'pool_min_retained_segments': 0,
         'reassembly_segment_size': 16 * 1024 * 1024,
         'reassembly_max_segments': 4,
-        'max_total_chunks': 128,
+        'max_inflight_chunk_frames': 128,
         'chunk_gc_interval': 0.5,
         'chunk_threshold_ratio': 0.75,
         'chunk_assembler_timeout': 1.0,

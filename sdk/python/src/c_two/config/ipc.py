@@ -34,8 +34,9 @@ class BaseIPCOverrides(TypedDict, total=False):
     reassembly_segment_size: int
     # Maximum number of reassembly segments retained for a transfer.
     reassembly_max_segments: int
-    # Maximum number of chunks tracked across active reassembly operations.
-    max_total_chunks: int
+    # Maximum server chunk frames processed at once; the reassembly registry
+    # derives its soft maintenance threshold from this value.
+    max_inflight_chunk_frames: int
     # Seconds between garbage-collection sweeps for stale chunks.
     chunk_gc_interval: float
     # Fraction of a segment at which payloads switch to chunked transfer.

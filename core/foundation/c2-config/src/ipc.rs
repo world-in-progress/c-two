@@ -40,7 +40,7 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
     "pool_min_retained_segments",
     "reassembly_segment_size",
     "reassembly_max_segments",
-    "max_total_chunks",
+    "max_inflight_chunk_frames",
     "chunk_gc_interval",
     "chunk_threshold_ratio",
     "chunk_assembler_timeout",
@@ -68,7 +68,7 @@ pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
     "pool_min_retained_segments",
     "reassembly_segment_size",
     "reassembly_max_segments",
-    "max_total_chunks",
+    "max_inflight_chunk_frames",
     "chunk_gc_interval",
     "chunk_threshold_ratio",
     "chunk_assembler_timeout",
@@ -116,7 +116,9 @@ pub struct BaseIpcConfig {
     pub reassembly_max_segments: u32,
 
     // ── Chunked transfer settings ────────────────────────────────────────
-    pub max_total_chunks: u32,
+    /// Maximum server chunk frames being processed at once; the reassembly
+    /// registry derives its soft maintenance threshold from this value.
+    pub max_inflight_chunk_frames: u32,
     pub chunk_gc_interval_secs: f64,
     pub chunk_threshold_ratio: f64,
     pub chunk_assembler_timeout_secs: f64,
@@ -183,7 +185,7 @@ impl Default for BaseIpcConfig {
             reassembly_segment_size: 64 * 1024 * 1024, // 64 MB
             reassembly_max_segments: 4,
 
-            max_total_chunks: 512,
+            max_inflight_chunk_frames: 512,
             chunk_gc_interval_secs: 5.0,
             chunk_threshold_ratio: 0.9,
             chunk_assembler_timeout_secs: 60.0,
@@ -408,6 +410,9 @@ impl BaseIpcConfig {
         }
         if self.chunk_size == 0 {
             return Err("chunk_size must be > 0".into());
+        }
+        if self.max_inflight_chunk_frames == 0 {
+            return Err("max_inflight_chunk_frames must be > 0".into());
         }
         if !self.chunk_gc_interval_secs.is_finite() {
             return Err(format!(
@@ -1102,7 +1107,7 @@ mod tests {
                 ..base.clone()
             },
             BaseIpcConfig {
-                max_total_chunks: base.max_total_chunks + 1,
+                max_inflight_chunk_frames: base.max_inflight_chunk_frames + 1,
                 ..base.clone()
             },
             BaseIpcConfig {

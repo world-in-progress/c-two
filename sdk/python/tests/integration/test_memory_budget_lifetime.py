@@ -132,7 +132,7 @@ def test_local_hold_outlives_reassembly_backing_and_public_shutdown(tier: str) -
         'pool_prewarm_segments': 0,
         'pool_min_retained_segments': 0,
         'chunk_size': CHUNK_SIZE,
-        'max_total_chunks': 64,
+        'max_inflight_chunk_frames': 64,
         'max_reassembly_bytes': REASSEMBLY_SEGMENT_SIZE,
         'shm_backing_budget_bytes': 0,
         'file_backing_budget_bytes': 2 * REASSEMBLY_SEGMENT_SIZE,

@@ -676,6 +676,30 @@ fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
     );
 }
 
+#[test]
+fn inflight_chunk_frames_configuration_uses_the_core_resolver() {
+    for capacity in [0, 1, 7] {
+        let runtime = test_runtime(RuntimeOptions {
+            server_ipc_overrides: Some(c2_config::ServerIpcConfigOverrides {
+                max_inflight_chunk_frames: Some(capacity),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        match runtime.server_ipc_config() {
+            Ok(config) => {
+                assert_ne!(capacity, 0, "zero frame capacity must be rejected");
+                assert_eq!(config.max_inflight_chunk_frames, capacity);
+            }
+            Err(c_two::LifecycleError::Configuration(message)) if capacity == 0 => {
+                assert!(message.contains("max_inflight_chunk_frames"));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn runtime_roots_and_admin_contexts_share_the_core_freeze_authority() {

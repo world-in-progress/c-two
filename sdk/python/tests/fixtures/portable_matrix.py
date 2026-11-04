@@ -71,7 +71,7 @@ IPC_OVERRIDES = {
     "max_pool_segments": 1,
     "reassembly_segment_size": 1024 * 1024,
     "reassembly_max_segments": 1,
-    "max_total_chunks": 32,
+    "max_inflight_chunk_frames": 32,
     "chunk_gc_interval": 1.0,
     "chunk_assembler_timeout": 10.0,
     "max_reassembly_bytes": 16 * 1024 * 1024,

@@ -95,7 +95,7 @@ pub struct ServerIpcConfigOverrides {
     pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
-    pub max_total_chunks: Option<u32>,
+    pub max_inflight_chunk_frames: Option<u32>,
     pub chunk_gc_interval_secs: Option<f64>,
     pub chunk_threshold_ratio: Option<f64>,
     pub chunk_assembler_timeout_secs: Option<f64>,
@@ -123,7 +123,7 @@ pub struct ClientIpcConfigOverrides {
     pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
-    pub max_total_chunks: Option<u32>,
+    pub max_inflight_chunk_frames: Option<u32>,
     pub chunk_gc_interval_secs: Option<f64>,
     pub chunk_threshold_ratio: Option<f64>,
     pub chunk_assembler_timeout_secs: Option<f64>,
@@ -519,7 +519,7 @@ macro_rules! resolve_ipc_fields {
             pool_min_retained_segments: optional_u32("C2_IPC_POOL_MIN_RETAINED_SEGMENTS"),
             reassembly_segment_size: optional_u64("C2_IPC_REASSEMBLY_SEGMENT_SIZE"),
             reassembly_max_segments: optional_u32("C2_IPC_REASSEMBLY_MAX_SEGMENTS"),
-            max_total_chunks: optional_u32("C2_IPC_MAX_TOTAL_CHUNKS"),
+            max_inflight_chunk_frames: optional_u32("C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES"),
             chunk_gc_interval_secs: optional_f64("C2_IPC_CHUNK_GC_INTERVAL"),
             chunk_threshold_ratio: optional_f64("C2_IPC_CHUNK_THRESHOLD_RATIO"),
             chunk_assembler_timeout_secs: optional_f64("C2_IPC_CHUNK_ASSEMBLER_TIMEOUT"),
@@ -1005,6 +1005,59 @@ mod tests {
         )
         .expect("explicit execution worker override should resolve");
         assert_eq!(from_override.max_execution_workers, 7);
+    }
+
+    #[test]
+    fn inflight_chunk_frames_new_env_and_old_env_resolution() {
+        let old_only = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_TOTAL_CHUNKS", "invalid")]),
+        };
+        let server = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            old_only,
+        )
+        .expect("retired environment variable is ignored");
+        assert_eq!(server.max_inflight_chunk_frames, 512);
+
+        let new_env = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES", "1")]),
+        };
+        let client = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            new_env,
+        )
+        .expect("new environment variable resolves");
+        assert_eq!(client.max_inflight_chunk_frames, 1);
+    }
+
+    #[test]
+    fn inflight_chunk_frames_rejects_zero_and_invalid_environment() {
+        let zero = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides {
+                max_inflight_chunk_frames: Some(0),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect_err("zero processing capacity is invalid");
+        assert!(zero.to_string().contains("max_inflight_chunk_frames"));
+
+        let invalid_env = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES", "invalid")]),
+        };
+        let err = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            invalid_env,
+        )
+        .expect_err("invalid new environment variable fails");
+        assert!(err.to_string().contains("C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES"));
     }
 
     #[test]

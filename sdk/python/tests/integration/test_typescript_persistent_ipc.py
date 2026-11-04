@@ -240,7 +240,7 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reuses_connection
             "reassembly_segment_size": 65536,
             "reassembly_max_segments": 1,
             "max_reassembly_bytes": 65536,
-            "max_total_chunks": 2,
+            "max_inflight_chunk_frames": 2,
         })
         manager = CountingResource()
         node: PersistentNode | None = None
@@ -272,7 +272,7 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reuses_connection
                  "chunked call reassembly admission failed: "
                  "reassembly size 67108864 exceeds limit 65536"),
                 (702, "ResourceUnavailable",
-                 "server chunk processing capacity exceeded: max_total_chunks=2"),
+                 "server chunk processing capacity exceeded: max_inflight_chunk_frames=2"),
             ), rejected
             assert manager.calls == 1 and rejected["chunkRequests"] == 1
             stopped_at = rejected["chunkWrites"]

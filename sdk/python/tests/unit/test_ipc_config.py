@@ -47,6 +47,8 @@ def _reset_registry_and_settings(monkeypatch):
         'C2_IPC_POOL_PREWARM_SEGMENTS',
         'C2_IPC_POOL_MIN_RETAINED_SEGMENTS',
         'C2_IPC_POOL_DECAY_SECONDS',
+        'C2_IPC_MAX_TOTAL_CHUNKS',
+        'C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES',
         'C2_IPC_SHM_BACKING_BUDGET_BYTES',
         'C2_IPC_FILE_BACKING_BUDGET_BYTES',
         'C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES',
@@ -271,7 +273,7 @@ _COMMON_IPC_FIELDS = (
     ('pool_min_retained_segments', 'C2_IPC_POOL_MIN_RETAINED_SEGMENTS', 2, 0),
     ('reassembly_segment_size', 'C2_IPC_REASSEMBLY_SEGMENT_SIZE', 65536, 131072),
     ('reassembly_max_segments', 'C2_IPC_REASSEMBLY_MAX_SEGMENTS', 3, 2),
-    ('max_total_chunks', 'C2_IPC_MAX_TOTAL_CHUNKS', 8192, 16384),
+    ('max_inflight_chunk_frames', 'C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES', 8192, 16384),
     ('chunk_gc_interval', 'C2_IPC_CHUNK_GC_INTERVAL', 2.5, 5.0),
     ('chunk_threshold_ratio', 'C2_IPC_CHUNK_THRESHOLD_RATIO', 0.5, 0.75),
     ('chunk_assembler_timeout', 'C2_IPC_CHUNK_ASSEMBLER_TIMEOUT', 30.0, 60.0),
@@ -288,6 +290,29 @@ _SERVER_IPC_FIELDS = (
     ('max_pending_requests', 'C2_IPC_MAX_PENDING_REQUESTS', 7, 11),
     ('max_execution_workers', 'C2_IPC_MAX_EXECUTION_WORKERS', 9, 7),
 )
+
+
+@pytest.mark.parametrize('role', ('server', 'client'))
+def test_retired_chunk_capacity_override_is_rejected_and_env_ignored(monkeypatch, role):
+    resolve = getattr(_native, f'resolve_{role}_ipc_config')
+    monkeypatch.setenv('C2_IPC_MAX_TOTAL_CHUNKS', 'invalid')
+    cfg = resolve(None, None)
+    assert cfg['max_inflight_chunk_frames'] == 512
+    assert 'max_total_chunks' not in cfg
+
+    with pytest.raises(ValueError, match='max_total_chunks'):
+        resolve({'max_total_chunks': 2}, None)
+
+
+@pytest.mark.parametrize('role', ('server', 'client'))
+def test_new_chunk_capacity_rejects_zero(monkeypatch, role):
+    resolve = getattr(_native, f'resolve_{role}_ipc_config')
+    with pytest.raises(ValueError, match='max_inflight_chunk_frames'):
+        resolve({'max_inflight_chunk_frames': 0}, None)
+
+    monkeypatch.setenv('C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES', '0')
+    with pytest.raises(ValueError, match='max_inflight_chunk_frames'):
+        resolve(None, None)
 
 
 @pytest.mark.parametrize(

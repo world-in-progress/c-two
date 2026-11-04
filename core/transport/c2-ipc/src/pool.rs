@@ -85,7 +85,7 @@ fn differing_client_policy_fields(
         pool_min_retained_segments,
         reassembly_segment_size,
         reassembly_max_segments,
-        max_total_chunks,
+        max_inflight_chunk_frames,
         chunk_gc_interval_secs,
         chunk_threshold_ratio,
         chunk_assembler_timeout_secs,
