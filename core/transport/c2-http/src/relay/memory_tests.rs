@@ -552,7 +552,11 @@ async fn shared_response_capacity(file_is_tighter: bool) {
                 assert_eq!(cell.rejected_allocations, old_cell.rejected_allocations);
             } else {
                 assert_eq!(cell.rejected_allocations, old_cell.rejected_allocations + 1);
-                let charge = if file_is_tighter { one } else { REASSEMBLY_CHARGE };
+                let charge = if file_is_tighter {
+                    one
+                } else {
+                    REASSEMBLY_CHARGE
+                };
                 assert_eq!(cell.rejected_bytes, old_cell.rejected_bytes + charge);
                 assert_eq!(
                     expect_inline(call(client, binding, upstream).await),
@@ -627,7 +631,10 @@ async fn zero_response_budgets_reject_real_allocation_without_charge_or_replay()
             before_cell.rejected_allocations + 1
         );
         let charge = if file_zero { one } else { REASSEMBLY_CHARGE };
-        assert_eq!(after_cell.rejected_bytes, before_cell.rejected_bytes + charge);
+        assert_eq!(
+            after_cell.rejected_bytes,
+            before_cell.rejected_bytes + charge
+        );
         assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 1);
         assert!(client.is_connected());
         drop(lease);
