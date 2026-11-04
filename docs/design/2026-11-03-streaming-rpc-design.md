@@ -47,7 +47,7 @@ unary 的 OPEN 直接带输入、CALL_END 直接带结果；inline 时每方向�
 
 每流初始授予第一条需求；交付第 k 条给本地消费接口即授予第 k+1 条，不等应用再次调用 next，也不等 hold 释放。第一期最多一条尚未交付的结果，允许计算与消费重叠；这不是任意深度的预取队列。relay 的“本地消费接口”是下游 Body，实际消费者可能落后，边界见 3.8。
 
-只保留一个扩大覆盖面的字节设置 `payload_buffer_budget_bytes`，环境变量 `C2_PAYLOAD_BUFFER_BUDGET_BYTES`、relay CLI `--payload-buffer-budget-bytes`，记为 B，替换 retained-input 字节设置，不留别名。沿用其默认 16 GiB、完整 u64 范围，0 只拒绝正字节准入；Runtime 和 relay 各自共享一份，Host 的流本地副本使用同一规范默认值的独立接收域。依据为 `core/foundation/c2-config/src/call.rs:132`、`:140`、`:157` 及[配置](../reference/configuration.md)两处 retained-input 表。覆盖面在原 retained input 之外扩到 HTTP 缓冲及流的本地副本，不把所有 unary IPC 数据改成流控消息。SHM/file/reassembly 仍按原预算计物理存储。
+只保留一个扩大覆盖面的字节设置 `payload_buffer_budget_bytes`，环境变量 `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`、relay CLI `--call-payload-buffer-budget-bytes`（沿用调用限额 `C2_CALL_` 与 `--call-` 的分组），记为 B，替换 retained-input 字节设置，不留别名。沿用其默认 16 GiB、完整 u64 范围，0 只拒绝正字节准入；Runtime 和 relay 各自共享一份，Host 的流本地副本使用同一规范默认值的独立接收域。依据为 `core/foundation/c2-config/src/call.rs:132`、`:140`、`:157` 及[配置](../reference/configuration.md)两处 retained-input 表。覆盖面在原 retained input 之外扩到 HTTP 缓冲及流的本地副本，不把所有 unary IPC 数据改成流控消息。SHM/file/reassembly 仍按原预算计物理存储。
 
 B 不足时 next 等待，不因暂时竞争报告容量错误。调用方保留的多个 hold 都计 B；若它们用满 B，下一条会等到释放、原截止时间或取消。无限等待可能一直不返回；应用须释放不再需要的 hold，或配置能容纳同时保留数据的 B。C-Two 不偷释放、不让同一流的多 hold 报使用错误。调用本身保留的输入也是真实占用，预算应覆盖实际同时存活的数据，不能靠提前失效腾容量。
 
