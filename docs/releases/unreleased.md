@@ -214,4 +214,4 @@ There are no aliases. The old Python keyword, override key and c3 flag are rejec
 
 ### Validation
 
-Each block was checked on macOS before it was merged: the Rust Core, c3 and Rust SDK tests and the CI Python gates passed, and the findings of independent reviews of the reassembly, budget and chunked-call changes were reproduced and fixed first. Linux, Windows and the other Python versions have not run these changes yet; the full-platform CI run on the exact candidate is still to come.
+The exact candidate `787d4205b5e9a23505c22b8155cf18a5a92dcad2` passed [Source Validation 41857452303](https://github.com/Dsssyc/c-two/actions/runs/41857452303) on every lane: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64. The two full runs before it exposed three races in tests, which were fixed in the tests only. Each block was checked on macOS before it was merged, and the findings of independent reviews of the reassembly, budget and chunked-call changes were reproduced and fixed first; the [phase 1 acceptance record](../acceptance/2026-11-04-streaming-phase-1-acceptance.md) has the details.

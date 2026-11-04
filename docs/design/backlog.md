@@ -4,7 +4,7 @@
 
 ## 进行中
 
-- **流式 RPC**（[设计](2026-11-03-streaming-rpc-design.md)于 2026-11-04 批准，[ADR 0003](../decisions/0003-server-streams.md)；执行计划是设计第十节）：第一阶段的块 1 至 4 已于 2026-11-04 合入本地整合分支 `socu/streaming`，参考文档与发行说明已随之更新。下一步是这个分支的全平台 CI（要推送到 fork，等维护者发话），通过后写第一阶段的验收记录，再开始块 5。
+- **流式 RPC**（[设计](2026-11-03-streaming-rpc-design.md)于 2026-11-04 批准，[ADR 0003](../decisions/0003-server-streams.md)；执行计划是设计第十节）：第一阶段（块 1 至 4）已于 2026-11-04 验收：确切候选 `787d4205` 的全平台 CI 通过，见[验收记录](../acceptance/2026-11-04-streaming-phase-1-acceptance.md)；分支 `socu/streaming` 在 fork 上，尚未合入上游 main。下一步是块 5。
 
 ## 接下来（建议的顺序，待维护者确认）
 
