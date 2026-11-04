@@ -186,3 +186,32 @@ Found by the strict comparison against 0.10.1 and not listed above:
 ### Validation
 
 Host checks of each block are recorded in the [protocol batch acceptance record](../acceptance/2026-11-03-protocol-batch-acceptance.md). The exact candidate is `11f892145c439b3183ed125d32c1c59eb51f5ee6`, merged as `b81405fe` with the same tree: [Source Validation 41520721125](https://github.com/world-in-progress/c-two/actions/runs/41520721125) passed on every lane (Linux x64 with Python 3.12 and 3.14t, macOS arm64, Windows x64 and ARM64, workflow policy and tests). The paired IPC benchmark ran on `d772ca3a`, whose code is identical to that candidate, in [41642698332](https://github.com/Dsssyc/c-two/actions/runs/41642698332) against `b861f994`: Linux, macOS, Windows x64 and ARM64 passed with no candidate failures, and all 22 abnormal-client scenario and control pairs passed on each platform. An earlier run on `d646fc12` ([41444159385](https://github.com/Dsssyc/c-two/actions/runs/41444159385)) gave the same picture. Three earlier exact-candidate runs failed and are fixed by this batch: `abac9f8b` ([41368084528](https://github.com/Dsssyc/c-two/actions/runs/41368084528), paired [41382919073](https://github.com/Dsssyc/c-two/actions/runs/41382919073)), `26403fe5` ([41394772446](https://github.com/Dsssyc/c-two/actions/runs/41394772446), paired [41394919731](https://github.com/Dsssyc/c-two/actions/runs/41394919731)) and `63979601`, the first PR run ([41484700985](https://github.com/world-in-progress/c-two/actions/runs/41484700985)). Later documentation-only commits are not source commits.
+
+## Payload buffer budget and chunked-call ordering (breaking)
+
+These changes prepare server streams ([ADR 0003](../decisions/0003-server-streams.md), [design](../design/2026-11-03-streaming-rpc-design.md)); server streams themselves are not available yet. IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh 7 are unchanged.
+
+### Renamed settings
+
+| Before | Now |
+| --- | --- |
+| `retained_input_budget_bytes` in Python `cc.set_call_execution_limits(...)` and Rust `CallExecutionLimits`, `C2_CALL_RETAINED_INPUT_BUDGET_BYTES`, c3 `--call-retained-input-budget-bytes` | `payload_buffer_budget_bytes`, `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`, `--call-payload-buffer-budget-bytes` |
+| IPC override `max_total_chunks`, `C2_IPC_MAX_TOTAL_CHUNKS` | `max_inflight_chunk_frames`, `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES` |
+
+There are no aliases. The old Python keyword, override key and c3 flag are rejected; the old environment variables are ignored, so rename them where they are set.
+
+### Behavior
+
+- One payload buffer budget per Runtime and per relay replaces the retained-input budget. It charges a call's owned input until the transport has written or copied it, the HTTP request and response bodies C-Two holds, and the relay's copies of forwarded request bodies, for calls with and without a deadline. 0.10.1 charged only the input that finite-deadline calls kept, until their reply. The relay does not yet charge the upstream responses it sends back. See the [memory policy](../reference/memory-policy.md#payload-buffer-budget).
+- When the budget is short, a call waits for capacity within its own deadline instead of failing, and a call without a deadline can wait without bound. A request larger than the whole budget, and unknown-length data that grows past its first reservation, fail at once with `CallCapacityExceeded` and `stage=payload_buffer_admission`. A hold of an HTTP response keeps its reservation until it is released.
+- A call's input is released as soon as the transport has written or copied it, not when the reply arrives.
+- `cc.observe.memory_stats()` adds `payload_buffer`, the budget's limit, use, peak and rejections, and `retired_payload_buffers` for earlier sessions. A wait is not counted as a rejection.
+- A relay-aware call sends its business POST once. When the relay reports that the route is stale, the call fails with that pre-dispatch `RouteStale` error and the next call resolves the route again; 0.10.1 re-sent the call once from a retained copy of its input. Generated TypeScript clients still re-send once; they follow in a later change.
+- A chunked IPC call reserves its route at its first chunk in the connection's receive loop, in frame order, as an unchunked call does, and takes the server-wide pending permit there. Under `exclusive` and `read_parallel`, a later call on the same connection can no longer run before an earlier chunked write.
+- Registering or unregistering a route no longer makes a connection's receive loop wait, and reassembly copies no longer hold the pool or registry locks, so a large copy does not delay other calls or the expiry sweep.
+- Contract v2 accepts `"mode": "server_stream"` on a method that returns a payload. The mode enters the ABI and signature fingerprints only for such methods, so unary contracts keep their fingerprints. Code generation rejects server-stream methods until the SDKs support them.
+- A server prewarms its response pool once when it starts, no longer also when it is constructed.
+
+### Validation
+
+Each block was checked on macOS before it was merged: the Rust Core, c3 and Rust SDK tests and the CI Python gates passed, and the findings of independent reviews of the reassembly, budget and chunked-call changes were reproduced and fixed first. Linux, Windows and the other Python versions have not run these changes yet; the full-platform CI run on the exact candidate is still to come.

@@ -85,7 +85,7 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 | `live_reassembly_budget_bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | 未完成及仍被保留的重组容量字节预算 |
 | `reassembly_segment_size` | `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | 64 MiB | 重组池每段的字节数 |
 | `reassembly_max_segments` | `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | 4 | 重组池段数上限，范围为 1 到 255 |
-| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | 服务端同时处理的分片帧数上限；拿不到名额的分片让它的请求以 `ResourceUnavailable` 失败。在途重组达到这个数目时还会提前清扫一次，清扫本身从不拒绝 |
+| `max_inflight_chunk_frames` | `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES` | 512 | 服务端同时处理的分片帧数上限；拿不到名额的分片让它的请求以 `ResourceUnavailable` 失败。在途重组达到这个数目时，接纳下一个之前先清扫一次过期的重组，清扫本身从不拒绝 |
 | `chunk_size` | `C2_IPC_CHUNK_SIZE` | 128 KiB | 单个分片的字节数 |
 | `chunk_threshold_ratio` | `C2_IPC_CHUNK_THRESHOLD_RATIO` | 0.9 | 最大 frame 大小的配置比例；接受并校验，但当前传输选择不使用此值 |
 | `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 秒 | 未完成分片重组的超时秒数 |
@@ -121,7 +121,7 @@ C2_RELAY_IDLE_TIMEOUT=60
 | Mesh seeds | `--seeds` | `C2_RELAY_SEEDS` | 空 |
 | 上游 IPC 空闲断连 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | 60 秒，`0` 关闭时间驱逐 |
 | 转发事务数量 | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 / Relay |
-| 转发保留输入 | `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB / Relay |
+| 载荷缓冲预算 | `--call-payload-buffer-budget-bytes` | `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB / Relay |
 | 系统 HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | 反熵交换间隔 | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 秒，`0` 关闭反熵 |
 
@@ -131,11 +131,11 @@ Core relay-aware 客户端进行一次路由观察，随后至多进行一次派
 
 预注册上游的语法为 `--upstream NAME=SERVER_ID@ADDRESS`，身份与 IPC handshake 一致。上游 budget 参数、mesh 和 dry-run 用法见 [c3 指南](../../cli/README.md)。
 
-Relay 在启动时冻结转发限额，所有业务转发均受约束，包括调用方无限等待的请求。数量限额 `0` 拒绝全部新转发；输入预算 `0` 拒绝正数输入。已知长度在移交请求前预留，未知长度随实际输入检查增长；超限返回容量错误，不撤销路由。该预算独立于上游 IPC backing 和 reassembly budget，不代表整个进程内存。
+Relay 在启动时冻结转发限额，所有业务转发均受约束，包括调用方无限等待的请求。数量限额 `0` 拒绝全部新转发；载荷缓冲预算 `0` 拒绝所有正字节的预约。已知长度的请求体在读取之前一次预约；预算不足时，转发等到有容量释放，或者 HTTP 调用方断开。未知长度的请求体以同样方式预约第一段，之后增长时没有容量就立即失败。超限返回容量错误，不撤销路由。这些限额独立于上游 IPC backing 和 reassembly 预算，不代表整个进程内存；载荷缓冲预算计入哪些数据，见[内存策略](memory-policy.md#payload-buffer-budget)。
 
 Relay 容量不足时，拒绝结果在业务准入前确定。对于没有 Expect 头、长度声明有效的请求，HTTP handler 按帧丢弃传输数据，受声明长度和 2 秒的总截止时间约束；不聚合整包、不解码、不调用资源、不再次申请业务准入。期间容量释放也不改变拒绝结果。Expect 或未知长度的拒绝请求不读取 body；读取错误、长度不符或超时保留原容量错误。未完成或错误的传输可能使客户端无法收到该响应。
 
-HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接，直到实际完成。Relay 关闭先停止准入，再等待转发和原生客户端清理。始终不返回的资源方法会持续占用名额，也会阻塞关闭。
+HTTP 调用方断开后，已经派发的转发仍持有上游连接，直到实际完成；它的请求体在复制到上游之后就释放。Relay 关闭先停止准入，再等待转发和原生客户端清理。始终不返回的资源方法会持续占用名额，也会阻塞关闭。
 
 ## 本地端点位置与平台差异
 
@@ -173,14 +173,14 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 | --- | --- | --- | --- |
 | 单次调用等待 | `cc.with_call_options(proxy, timeout=...)` | 继承传输默认 | 单次远程业务调用的调用方等待预算 |
 | Relay 逻辑调用截止时间 | `C2_RELAY_CALL_TIMEOUT` | 300 秒，`0` 为无限 | Relay HTTP CRM 调用超时秒数；0 关闭 reqwest 总超时 |
-| 有限调用名额 | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 / Runtime | 保留原生事务、带有限截止时间的并发调用数上限 |
-| 有限调用保留输入 | `retained_input_budget_bytes=...` / `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB / Runtime | 上述带有限截止时间的调用所保留输入的字节预算 |
+| 有限调用名额 | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 / Runtime | 带有限截止时间、尚未结束的调用数上限，包括调用方已不再等待、仍在继续的调用 |
+| 载荷缓冲预算 | `payload_buffer_budget_bytes=...` / `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB / Runtime | C-Two 为调用保留的载荷缓冲的字节预算，有无截止时间的调用都计入；见[内存策略](memory-policy.md#payload-buffer-budget) |
 
 直连 IPC 默认无限等待；HTTP 的预算覆盖一个逻辑调用和其内的路由重取。`timeout=None` 显式无限，`0` 在派发前到期，负数和非有限值在入口拒绝。同进程同步调用只接受继承或无限策略。
 
-截止时间到达后结束调用方等待，已经派发的原生事务仍可能继续完成传输，随后释放其保留的输入。单次调用截止时间到期不会撤销 relay 路由，也不会使已经取得的 held 响应的载荷所有者失效。错误区分派发前到期与派发状态不确定；后者不能自动重放调用。
+截止时间到达后结束调用方等待，已经派发的原生事务仍可能继续，直到真实结束；它的输入在传输复制之后就已释放。单次调用截止时间到期不会撤销 relay 路由，也不会使已经取得的 held 响应的载荷所有者失效。错误区分派发前到期与派发状态不确定；后者不能自动重放调用。
 
-有限调用的数量上限 `0` 拒绝所有新有限调用，字节预算 `0` 只拒绝正数输入；无限调用不受这两项准入限额约束。`cc.observe.call_execution_snapshot()` 查看当前及退休域的真实计费。示例与错误阶段见[调用截止时间指南](../releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
+有限调用的数量上限 `0` 拒绝所有新有限调用，没有截止时间的调用不计入这一上限。载荷缓冲预算 `0` 拒绝所有正字节的预约，有无截止时间的调用都一样。预算不足时，调用在自己的截止时间之内等待容量；预算计入哪些数据、什么情况下预约立即失败，见[内存策略](memory-policy.md#payload-buffer-budget)。`cc.observe.call_execution_snapshot()` 查看当前及退休域的真实计费，`cc.observe.memory_stats()['payload_buffer']` 查看这项预算。示例与错误阶段见[调用截止时间指南](../releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
 
 ## 并发与资源生命周期
 

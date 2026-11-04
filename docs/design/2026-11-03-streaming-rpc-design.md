@@ -295,7 +295,7 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 - 块 3：c2-http 连接池里的同一处 `fetch_update`。
 - 块 4：删掉 c2-server 构造时多余的一次响应池预热。
 - 块 5：c2-ipc 判定零借出 ID 改用 c2-wire 的专用错误类型，不再匹配字段名 `"loan id"`；给已接纳调用的回复不再借用 `WriteRequest::Control` 的名字；资源进程在执行前的路由准入拒绝（例如路由过期）要报成派发前失败，现在它经资源错误的路径报成 HTTP 500（`core/transport/c2-server/src/server.rs:3179`、`:3338`）。
-- 块 6：Python `register` 的 `input_lifetime` 写成 `Literal['materialized', 'borrowed']`，与服务端桥的私有别名 `_InputLifetime` 合成一处；服务端桥 `shutdown()` 的 5 秒缺省只在注册失败的回滚路径上用到（`sdk/python/src/c_two/transport/registry.py:529`），统一为 30 秒。
+- 块 6：Python `register` 的 `input_lifetime` 写成 `Literal['materialized', 'borrowed']`，与服务端桥的私有别名 `_InputLifetime` 合成一处；服务端桥 `shutdown()` 的 5 秒缺省只在注册失败的回滚路径上用到（`sdk/python/src/c_two/transport/registry.py:529`），统一为 30 秒。建议一并处理：块 3 之后 `call_execution_snapshot()` 的 `max_retained_bytes`、`used_retained_bytes`、`peak_retained_bytes` 描述整份载荷缓冲预算，与 `memory_stats()['payload_buffer']` 重复，名字还是旧的 retained input（`core/foundation/c2-mem/src/retention.rs:416` 的注释承认了这一点）；字节只留在 `memory_stats()`，`call_execution_snapshot()` 只报有限调用的数量，`rejected_reservations` 先核实计的是哪一种拒绝，`registry.py` 里 `call_execution_snapshot` 的 docstring 同改。
 - 块 7：c2-mem-ffi 连接入口的 Rust 文档注释与 C 头文件对身份校验失败状态码的写法统一。Node 的 relay-aware 客户端与 Rust 一致，只发一次业务 POST，遇到过期路由报派发前错误、不再自动重发（现在仍会排除该 relay 后重发，`core/foundation/c2-codegen/assets/typescript_transport.ts:1074`）；FallbackDenied 保留首个 IPC 失败的类型化原因（`:1007`、`:2960` 仍丢失）。
 - 块 8：`LocalEndpointNamespaceRequired` 的消息改为资源一方的本地端点命名空间。relay 现在先取得上游连接的租约、再等 B（`core/transport/c2-http/src/relay/router.rs:1937`、`:1966`），等待期间闲置回收不会收走这条连接；补上 B 等待与闲置驱逐、取消、续连交错的测试，必要时把预约移到租约之前，并在等待之后重新核对路由。
 

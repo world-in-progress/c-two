@@ -210,6 +210,10 @@ _Avoid_: disk cache, swap
 A finite allowance of bytes or time that one scope may consume, such as the SHM backing bytes of one direction or the wait of one call.
 _Avoid_: quota; limit (for a budget)
 
+**载荷缓冲预算 / payload buffer budget**:
+The one byte budget of a Runtime or relay for the payload buffers C-Two keeps for calls, such as a call's input before its transport copy and HTTP bodies. It is separate from the IPC backing and reassembly budgets.
+_Avoid_: retained input budget
+
 **释放 / release**:
 Ending a lease, an allocation or a hold. Across processes it travels as a release record on the physical connection; a local release does not mean the pool owner has reclaimed the allocation.
 _Avoid_: free (for a lease), close, 归还

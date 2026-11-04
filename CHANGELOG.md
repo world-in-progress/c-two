@@ -16,6 +16,9 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Breaking: Rust `direct_ipc_endpoint`, `ping_direct_ipc` and `shutdown_direct_ipc` take an optional endpoint context and replace the `*_with_context` functions.
 - `cc.connect(timeout=...)` also bounds the OS connection, the namespace gate wait and the handshake.
 - Small IPC calls are slower: a 1-byte call takes about 40–70 µs more. See the [unreleased notes](docs/releases/unreleased.md).
+- Breaking: one payload buffer budget per Runtime and relay (`payload_buffer_budget_bytes`, `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`, `--call-payload-buffer-budget-bytes`) replaces the retained-input budget. It also charges HTTP bodies and calls without a deadline, releases input once the transport has copied it, and makes a call wait within its deadline when the budget is short.
+- Breaking: `max_total_chunks` / `C2_IPC_MAX_TOTAL_CHUNKS` is renamed `max_inflight_chunk_frames` / `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES`.
+- A relay-aware call no longer re-sends after the relay reports a stale route, and chunked IPC calls reserve their route in frame order like unchunked calls.
 
 ### Added
 

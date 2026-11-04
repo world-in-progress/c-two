@@ -69,7 +69,7 @@ finally:
 
 `cc.hold(echo.echo)(source)` 将响应保留为 `HeldResult`，它持有一份本地副本：复制完成后传输内存就已释放，所以 hold 不会占住服务端的共享内存。显式 `release()` 让载荷所有者失效一次，再释放本地副本；失效操作不会重放，此后该值不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(method)(args) as held`，需要超出作用域存活的值应实体化。
 
-`cc.observe.memory_stats()['holds']` 统计这些本地副本：`active_holds`、`total_held_bytes`（逻辑字节，不是 SHM 容量）、`oldest_hold_seconds` 与 `by_direction`。backing 与重组预算的各项及其核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
+`cc.observe.memory_stats()['holds']` 统计这些本地副本：`active_holds`、`total_held_bytes`（逻辑字节，不是 SHM 容量）、`oldest_hold_seconds` 与 `by_direction`。backing、重组与载荷缓冲预算的各项及其核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
 
 ## 远程连接与截止时间
 

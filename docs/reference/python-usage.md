@@ -69,7 +69,7 @@ A portable method carries zero or one `Payload` envelope in each direction; C-Tw
 
 `cc.hold(echo.echo)(source)` retains a response as `HeldResult`, which owns a local copy: the transport memory was released right after the copy, so holding never keeps the server's shared memory. Explicit `release()` runs FastDB invalidation once, then frees the local copy; invalidation does not replay and the value stays inaccessible afterwards. Release an additional exported memoryview before retrying an export rejection, which occurs before invalidation. Manually constructed `HeldResult(release_cb=...)` callbacks still run once. Use `with cc.hold(method)(args) as held` for normal scopes and materialize values that must outlive them.
 
-`cc.observe.memory_stats()['holds']` counts these local copies: `active_holds`, `total_held_bytes` (logical bytes, not SHM capacity), `oldest_hold_seconds` and `by_direction`. See [memory policy](memory-policy.md#statistics-and-payload-lifetime) for the backing and reassembly cells and their accounting limits.
+`cc.observe.memory_stats()['holds']` counts these local copies: `active_holds`, `total_held_bytes` (logical bytes, not SHM capacity), `oldest_hold_seconds` and `by_direction`. See [memory policy](memory-policy.md#statistics-and-payload-lifetime) for the backing, reassembly and payload buffer cells and their accounting limits.
 
 ## Remote connections and deadlines
 

@@ -113,7 +113,7 @@ Useful options:
 | `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
 | `--ipc-live-reassembly-budget-bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | Shared upstream reassembly/retention capacity budget. |
 | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 | Outstanding forwarding transactions; zero refuses all new forwarding. |
-| `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB | Retained forwarding input; zero refuses positive input. |
+| `--call-payload-buffer-budget-bytes` | `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB | Shared budget for the request bodies the relay buffers and copies while forwarding; a short budget makes a forward wait, and zero refuses positive input. |
 | `--upstream`, `-u` | none | empty | Pre-register an upstream as `NAME=SERVER_ID@ADDRESS`. `SERVER_ID` must match the IPC server handshake identity. Repeatable. |
 
 Examples:
