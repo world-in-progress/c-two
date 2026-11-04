@@ -89,7 +89,7 @@ Python finalizer、Rust Drop、Node 最后流句柄回收或 iterator return 都
 
 ### 3.6 服务端结束流与关闭
 
-Runtime shutdown 与路由注销都向本路由开着的流的调用记录提交同一个 CANCEL，复用 CANCEL → 清理 → CallCancelled，不设第二套强杀状态机，也不新增运维取消接口（用户 2026-11-04 选定 (b)）。注销也这样做，是因为它和 shutdown 一样要等路由上的工作排空（`core/transport/c2-server/src/server.rs:1027`、`:1038`）；只对 shutdown 生效的话，开着无限流的路由永远注销不掉。注销这一条是从 (b) 推出的，待用户确认。这里作用于 Host 作为资源方的流；Runtime 作为客户端持有的流句柄仍按 3.5 回收或显式关闭。
+Runtime shutdown 与路由注销都向本路由开着的流的调用记录提交同一个 CANCEL，复用 CANCEL → 清理 → CallCancelled，不设第二套强杀状态机，也不新增运维取消接口（用户 2026-11-04 选定 (b)）。注销也这样做，是因为它和 shutdown 一样要等路由上的工作排空（`core/transport/c2-server/src/server.rs:1027`、`:1038`）；只对 shutdown 生效的话，开着无限流的路由永远注销不掉。注销这一条由 (b) 推出，用户 2026-11-04 确认。这里作用于 Host 作为资源方的流；Runtime 作为客户端持有的流句柄仍按 3.5 回收或显式关闭。
 
 停在 yield 或等需求、预算的流直接开始清理；正在运行的步照常完成，不再推进下一步。已产出结果和当前步结果先交付，再发送 CallCancelled，错误消息写明起因是 shutdown 还是注销；客户端没有自己取消却收到 CallCancelled，就是服务端结束了流。这改变了现行“shutdown 只停新调用、已派发的调用都跑完”对流的承诺，unary 不受影响；块 6 合入时同步 AGENTS.md、生命周期文档与发行说明。
 
@@ -313,7 +313,7 @@ dispatcher 异步读锁不是 B2 才引入的隐患：现有 unary 接收循环�
 
 1. 第一期只做服务端流，按步推进；async unary、客户端流与双向流随后；Node 只做客户端。
 2. 第四节的顺序条文，包括 Node 去掉 callChain 后、不等待就连发的 unary 会并发；发行说明写明。
-3. 服务端结束流选 (b)，不新增 `cancel_streams()`：shutdown 与注销让开着的流在步之间结束，见 3.6。注销的部分是从 (b) 推出的，待用户确认。
+3. 服务端结束流选 (b)，不新增 `cancel_streams()`：shutdown 与注销让开着的流在步之间结束，见 3.6。注销的部分由 (b) 推出，用户同日确认。
 4. B 只有一项，缺省 16 GiB，沿原范围并扩到 HTTP 缓冲与流的本地副本；临时不足时等待；调用方的多个 hold 用满 B 时，下一条一直等到释放、截止时间或取消。
 5. relay 靠逐跳的有限缓冲背压，经 relay 的生成器可能多推进几步；以真实慢读测出上限，不承诺成最终消费者的精确确认。
 6. IPC 16、ABI 8，SHM 4、mesh 7 与契约 v2 不变；Node 生成的传输产物要随之重新生成；同进程的流暂不接受有限截止时间。
