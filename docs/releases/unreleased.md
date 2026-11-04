@@ -245,4 +245,4 @@ IPC 16 replaces 15. A version 15 peer and a version 16 endpoint receive a typed 
 
 ### Validation
 
-On macOS with the FastDB sibling, the Rust Core workspace (1732 tests), c3 (81), the Rust SDK (27) and the CI Python gates, including the TypeScript and portable phases and the direct/relay matrix, passed on the integrated tree. An independent review's four findings were reproduced and fixed first. The full-platform CI run on the exact candidate is still to come.
+On macOS with the FastDB sibling, the Rust Core workspace (1732 tests), c3 (81), the Rust SDK (27) and the CI Python gates, including the TypeScript and portable phases and the direct/relay matrix, passed on the integrated tree. An independent review's four findings were reproduced and fixed first. The exact candidate `b5b4853cc52a2747380db9824b500903655cf8db` (the IPC 16 code of `ea20ea0c` plus its documentation) passed [Source Validation 41911808218](https://github.com/Dsssyc/c-two/actions/runs/41911808218) on every lane on the first attempt: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64.
